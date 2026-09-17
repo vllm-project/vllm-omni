@@ -23,7 +23,11 @@ from vllm.transformers_utils.config import get_config
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+    set_forward_context_denoise_step_idx,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
@@ -88,6 +92,10 @@ def to_device(data, device):
         return [to_device(x, device) for x in data]
     else:
         return data
+
+
+def get_hunyuan_image_3_prefix_cache_func(od_config: OmniDiffusionConfig):
+    return request_layout_utils.prepare_hunyuan_prefix_cache
 
 
 def _to_pil_image(image: Any) -> PILImage.Image:
@@ -1300,6 +1308,13 @@ class HunyuanImage3Pipeline(
         )
         full_attn_spans: list[list[tuple[int, int]]] = [[] for _ in range(bsz)]
         for i in range(bsz):
+            for reference_slice in tokenizer_output.joint_image_slices[i]:
+                logger.debug(
+                    "Hunyuan reference span: sequence_id=%d start=%d end=%d",
+                    i,
+                    int(reference_slice.start or 0),
+                    int(reference_slice.stop or seq_len),
+                )
             for j, image_slice in enumerate(batch_image_slices[i]):
                 attention_mask[i, image_slice, image_slice] = True
                 start = image_slice.start if image_slice.start is not None else 0
@@ -1311,6 +1326,69 @@ class HunyuanImage3Pipeline(
         attention_mask = attention_mask.unsqueeze(1)
         model_kwargs["full_attn_spans"] = full_attn_spans
         return attention_mask
+
+    @staticmethod
+    def _slice_cached_prefix_inputs(
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        position_ids: torch.Tensor | None,
+        custom_pos_emb: tuple[torch.Tensor, ...] | None,
+        image_mask: torch.Tensor | None,
+        gen_timestep_scatter_index: torch.Tensor | None,
+        query_lens: list[int] | None,
+        seq_lens: list[int] | None,
+        cached_prefix_len: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        tuple[torch.Tensor, ...],
+        torch.Tensor,
+        torch.Tensor,
+        list[int],
+        int,
+    ]:
+        """Remove a cached first-step prefix while preserving full KV lengths."""
+
+        seq_len = int(inputs_embeds.shape[1])
+        if (
+            query_lens is None
+            or seq_lens is None
+            or len(query_lens) != inputs_embeds.shape[0]
+            or len(seq_lens) != len(query_lens)
+        ):
+            raise ValueError("Hunyuan paged prefix execution requires one query/sequence length per row")
+        if any(query_len != seq_len for query_len in query_lens) or any(
+            logical_len != seq_len for logical_len in seq_lens
+        ):
+            raise ValueError(
+                "Hunyuan paged prefix slicing requires an untrimmed first-step tensor: "
+                f"query_lens={query_lens}, tensor_len={seq_len}"
+            )
+        if not 0 < cached_prefix_len < seq_len:
+            raise ValueError(
+                "Hunyuan cached prefix must leave a non-empty first-step suffix: "
+                f"cached={cached_prefix_len}, seq_len={seq_len}"
+            )
+        if (
+            attention_mask is None
+            or position_ids is None
+            or custom_pos_emb is None
+            or image_mask is None
+            or gen_timestep_scatter_index is None
+        ):
+            raise ValueError("Hunyuan paged prefix slicing is missing first-step layout tensors")
+
+        return (
+            inputs_embeds[:, cached_prefix_len:],
+            attention_mask[:, :, cached_prefix_len:, :],
+            position_ids[:, cached_prefix_len:],
+            tuple(pos[:, cached_prefix_len:] for pos in custom_pos_emb),
+            image_mask[:, cached_prefix_len:],
+            gen_timestep_scatter_index - cached_prefix_len,
+            [query_len - cached_prefix_len for query_len in query_lens],
+            seq_len - cached_prefix_len,
+        )
 
     def prepare_inputs_for_generation(
         self,
@@ -1598,6 +1676,40 @@ class HunyuanImage3Pipeline(
         assert inputs_embeds is not None
         bsz, seq_len, n_embd = inputs_embeds.shape
 
+        paged_kv_cached_prefix_len = 0
+        if first_step and self._uses_scheduler_paged_kv():
+            if not is_forward_context_available():
+                raise RuntimeError("Hunyuan paged prefix execution requires an Omni ForwardContext")
+            paged_kv_cached_prefix_len = int(get_forward_context().paged_kv_cached_prefix_len)
+        if paged_kv_cached_prefix_len:
+            if ar_kv_reuse_len:
+                raise ValueError("Hunyuan cannot combine imported AR KV and Scheduler prefix-cache hits")
+            (
+                inputs_embeds,
+                attention_mask,
+                position_ids,
+                custom_pos_emb,
+                image_mask,
+                gen_timestep_scatter_index,
+                query_lens,
+                seq_len,
+            ) = self._slice_cached_prefix_inputs(
+                inputs_embeds,
+                attention_mask,
+                position_ids,
+                custom_pos_emb,
+                image_mask,
+                gen_timestep_scatter_index,
+                query_lens,
+                seq_lens,
+                paged_kv_cached_prefix_len,
+            )
+            logger.debug(
+                "Hunyuan prefix slice: cached_prefix_len=%d query_len=%d",
+                paged_kv_cached_prefix_len,
+                seq_len,
+            )
+
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         from vllm.forward_context import set_forward_context
 
@@ -1621,6 +1733,7 @@ class HunyuanImage3Pipeline(
                 gen_timestep_scatter_index=gen_timestep_scatter_index,
                 uncond_cfg_prefill=uncond_cfg_prefill,
                 ar_kv_reuse_len=ar_kv_reuse_len,
+                paged_kv_cached_prefix_len=paged_kv_cached_prefix_len,
                 full_attn_spans=full_attn_spans,
             )
         hidden_states = outputs[0]

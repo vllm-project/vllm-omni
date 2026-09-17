@@ -1,0 +1,131 @@
+[
+  {
+    "test_name": "test_hunyuan_image3_prefix_dense",
+    "mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 4}}, "diffusion", "local_model"],
+    "description": "Same-reference, fixed-seed, distinct-edit workload: dense baseline (TP4, CFGP1)",
+    "server_type": "vllm-omni",
+    "benchmark_endpoint": "/v1/images/edits",
+    "server_params": {
+      "model": "tencent/HunyuanImage-3.0-Instruct",
+      "serve_args": {
+        "trust-remote-code": true,
+        "deploy-config-inline": {
+          "type": "yaml",
+          "content": {
+            "pipeline": "hunyuan_image3_dit",
+            "async_chunk": false,
+            "trust_remote_code": true,
+            "stages": [{
+              "stage_id": 0,
+              "devices": "0,1,2,3",
+              "max_num_seqs": 1,
+              "max_model_len": 22800,
+              "max_num_batched_tokens": 32768,
+              "diffusion_kv_mode": "dense_legacy",
+              "diffusion_kv_max_rows_per_request": 2,
+              "enable_prefix_caching": false,
+              "gpu_memory_utilization": 0.9,
+              "enforce_eager": true,
+              "vae_use_tiling": true,
+              "parallel_config": {
+                "tensor_parallel_size": 4,
+                "enable_expert_parallel": true,
+                "sequence_parallel_size": 1,
+                "cfg_parallel_size": 1,
+                "vae_patch_parallel_size": 4
+              },
+              "default_sampling_params": {"seed": 42}
+            }]
+          }
+        }
+      }
+    },
+    "benchmark_params": {"$ref": "../fixtures/hunyuan_image3_prefix_params.json"}
+  },
+  {
+    "test_name": "test_hunyuan_image3_prefix_paged_no_cache",
+    "mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 4}}, "diffusion", "local_model"],
+    "description": "Same-reference, fixed-seed, distinct-edit workload: paged without cross-request reuse (TP4, CFGP1)",
+    "server_type": "vllm-omni",
+    "benchmark_endpoint": "/v1/images/edits",
+    "server_params": {
+      "model": "tencent/HunyuanImage-3.0-Instruct",
+      "serve_args": {
+        "trust-remote-code": true,
+        "deploy-config-inline": {
+          "type": "yaml",
+          "content": {
+            "pipeline": "hunyuan_image3_dit",
+            "async_chunk": false,
+            "trust_remote_code": true,
+            "stages": [{
+              "stage_id": 0,
+              "devices": "0,1,2,3",
+              "max_num_seqs": 1,
+              "max_model_len": 22800,
+              "max_num_batched_tokens": 32768,
+              "diffusion_kv_mode": "paged_scheduler",
+              "diffusion_kv_max_rows_per_request": 2,
+              "enable_prefix_caching": false,
+              "gpu_memory_utilization": 0.9,
+              "enforce_eager": true,
+              "vae_use_tiling": true,
+              "parallel_config": {
+                "tensor_parallel_size": 4,
+                "enable_expert_parallel": true,
+                "sequence_parallel_size": 1,
+                "cfg_parallel_size": 1,
+                "vae_patch_parallel_size": 4
+              },
+              "default_sampling_params": {"seed": 42}
+            }]
+          }
+        }
+      }
+    },
+    "benchmark_params": {"$ref": "../fixtures/hunyuan_image3_prefix_params.json"}
+  },
+  {
+    "test_name": "test_hunyuan_image3_prefix_paged_prefix",
+    "mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 4}}, "diffusion", "local_model"],
+    "description": "Same-reference, fixed-seed, distinct-edit workload: paged with partial prefix reuse (TP4, CFGP1)",
+    "server_type": "vllm-omni",
+    "benchmark_endpoint": "/v1/images/edits",
+    "server_params": {
+      "model": "tencent/HunyuanImage-3.0-Instruct",
+      "serve_args": {
+        "trust-remote-code": true,
+        "deploy-config-inline": {
+          "type": "yaml",
+          "content": {
+            "pipeline": "hunyuan_image3_dit",
+            "async_chunk": false,
+            "trust_remote_code": true,
+            "stages": [{
+              "stage_id": 0,
+              "devices": "0,1,2,3",
+              "max_num_seqs": 1,
+              "max_model_len": 22800,
+              "max_num_batched_tokens": 32768,
+              "diffusion_kv_mode": "paged_scheduler",
+              "diffusion_kv_max_rows_per_request": 2,
+              "enable_prefix_caching": true,
+              "gpu_memory_utilization": 0.9,
+              "enforce_eager": true,
+              "vae_use_tiling": true,
+              "parallel_config": {
+                "tensor_parallel_size": 4,
+                "enable_expert_parallel": true,
+                "sequence_parallel_size": 1,
+                "cfg_parallel_size": 1,
+                "vae_patch_parallel_size": 4
+              },
+              "default_sampling_params": {"seed": 42}
+            }]
+          }
+        }
+      }
+    },
+    "benchmark_params": {"$ref": "../fixtures/hunyuan_image3_prefix_params.json"}
+  }
+]

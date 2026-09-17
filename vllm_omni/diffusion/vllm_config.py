@@ -222,8 +222,7 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
         vllm_config.parallel_config.pipeline_parallel_size = parallel_config.pipeline_parallel_size
         vllm_config.cache_config.gpu_memory_utilization = float(getattr(od_config, "gpu_memory_utilization", 0.9))
         vllm_config.cache_config.kv_cache_memory_bytes = getattr(od_config, "kv_cache_memory_bytes", None)
-        # Prefix hashes/publication are intentionally deferred to the next PR.
-        vllm_config.cache_config.enable_prefix_caching = False
+        vllm_config.cache_config.enable_prefix_caching = bool(getattr(od_config, "enable_prefix_caching", False))
         vllm_config.scheduler_config.max_num_seqs = int(od_config.max_num_seqs)
         max_num_batched_tokens = getattr(od_config, "max_num_batched_tokens", None)
         if max_num_batched_tokens is not None:

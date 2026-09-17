@@ -146,6 +146,47 @@ def test_prepare_model_inputs_reuses_prepared_layout(monkeypatch):
     torch.testing.assert_close(model_inputs["input_ids"], prepared.tokenizer_output.tokens)
 
 
+def test_slice_cached_prefix_inputs_keeps_full_kv_axis() -> None:
+    inputs_embeds = torch.arange(12, dtype=torch.float32).reshape(1, 6, 2)
+    attention_mask = torch.arange(36).reshape(1, 1, 6, 6)
+    position_ids = torch.arange(6).reshape(1, 6)
+    custom_pos_emb = (torch.arange(6).reshape(1, 6), torch.arange(10, 16).reshape(1, 6))
+    image_mask = torch.tensor([[False, False, True, True, True, True]])
+    gen_timestep_scatter_index = torch.tensor([[2]])
+
+    sliced = HunyuanImage3Pipeline._slice_cached_prefix_inputs(
+        inputs_embeds,
+        attention_mask,
+        position_ids,
+        custom_pos_emb,
+        image_mask,
+        gen_timestep_scatter_index,
+        [6],
+        [6],
+        2,
+    )
+
+    (
+        sliced_embeds,
+        sliced_mask,
+        sliced_positions,
+        sliced_rope,
+        sliced_image_mask,
+        sliced_scatter,
+        sliced_query_lens,
+        sliced_seq_len,
+    ) = sliced
+    torch.testing.assert_close(sliced_embeds, inputs_embeds[:, 2:])
+    torch.testing.assert_close(sliced_mask, attention_mask[:, :, 2:, :])
+    torch.testing.assert_close(sliced_positions, position_ids[:, 2:])
+    torch.testing.assert_close(sliced_rope[0], custom_pos_emb[0][:, 2:])
+    torch.testing.assert_close(sliced_rope[1], custom_pos_emb[1][:, 2:])
+    torch.testing.assert_close(sliced_image_mask, image_mask[:, 2:])
+    torch.testing.assert_close(sliced_scatter, torch.tensor([[0]]))
+    assert sliced_query_lens == [4]
+    assert sliced_seq_len == 4
+
+
 def test_hunyuan_step_group_key_ignores_step_index_for_later_steps():
     pipeline = _pipeline()
     states = [_state("req-0", 1), _state("req-1", 3)]

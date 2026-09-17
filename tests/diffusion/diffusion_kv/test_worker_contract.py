@@ -111,6 +111,29 @@ def test_runner_builds_prefill_and_denoise_rows_from_scheduler_metadata() -> Non
     ] == [("req-0", 0, 4, 2, 6), ("req-0", 1, 5, 2, 7)]
 
 
+def test_runner_builds_suffix_prefill_row_for_a_prefix_hit() -> None:
+    runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    metadata = DiffusionKVMetadata(
+        request_id="req-0",
+        allocation_generation=1,
+        sequences=(
+            DiffusionKVSequenceMetadata(
+                sequence_id=0,
+                prefix_len=8,
+                target_len=4,
+                seq_len=12,
+                block_ids=([1, 2, 3],),
+                cached_prefix_len=4,
+            ),
+        ),
+    )
+
+    attn_metadata = runner._build_paged_attention_metadata([metadata])
+
+    row = attn_metadata.prefill_rows[0]
+    assert (row.kv_start_pos, row.query_len, row.seq_len) == (4, 8, 12)
+
+
 def test_runner_selects_only_local_cfg_parallel_row(monkeypatch: pytest.MonkeyPatch) -> None:
     runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
     runner.od_config.parallel_config.cfg_parallel_size = 2

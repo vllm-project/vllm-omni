@@ -96,6 +96,12 @@ class BaseScheduler(ABC):
                 scheduler_block_size=scheduler_block_size,
                 hash_block_size=hash_block_size,
                 max_in_flight_tokens=kv_vllm_config.max_in_flight_tokens,
+                enable_prefix_caching=bool(getattr(kv_vllm_config.cache_config, "enable_prefix_caching", False)),
+                prefix_caching_hash_algo=getattr(
+                    kv_vllm_config.cache_config,
+                    "prefix_caching_hash_algo",
+                    "sha256",
+                ),
             )
         else:
             if any(
@@ -351,6 +357,11 @@ class BaseScheduler(ABC):
         # Also surface admission failures recorded while schedule() built this
         # output. Older finished ids retained only for Worker cleanup have
         # already been popped by the Engine and are deliberately ignored.
+        if self._diffusion_kv_manager is not None:
+            for request_id, status in statuses.items():
+                if status == DiffusionRequestStatus.FINISHED_COMPLETED:
+                    self._diffusion_kv_manager.publish_request(request_id)
+
         finished_req_ids = {
             request_id for request_id in sched_output.finished_req_ids if request_id in self._request_states
         }

@@ -387,6 +387,15 @@ class DiffusionKVModelRunnerBackend:
         for sequence in metadata.sequences:
             if type(sequence.sequence_id) is not int or sequence.sequence_id < 0:
                 raise ValueError(f"Diffusion KV sequence_id must be a non-negative integer: {sequence.sequence_id!r}")
+            if (
+                type(sequence.cached_prefix_len) is not int
+                or sequence.cached_prefix_len < 0
+                or sequence.cached_prefix_len > sequence.prefix_len
+            ):
+                raise ValueError(
+                    "Diffusion KV cached_prefix_len must lie within the stable prefix: "
+                    f"cached={sequence.cached_prefix_len!r}, prefix={sequence.prefix_len!r}"
+                )
             sequence_identity = (metadata.request_id, sequence.sequence_id, None)
             sequence_install = self._validate_row(
                 identity=sequence_identity,
@@ -401,6 +410,7 @@ class DiffusionKVModelRunnerBackend:
                     sequence.prefix_len,
                     sequence.target_len,
                     sequence.seq_len,
+                    sequence.cached_prefix_len,
                     sequence_install.block_ids,
                     sequence.context_ids,
                 )

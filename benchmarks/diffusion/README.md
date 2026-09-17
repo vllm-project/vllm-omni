@@ -130,6 +130,9 @@ Enable SLO evaluation with `--slo`.
 Warmup flags:
 
 - `--warmup-requests`: Number of warmup requests.
+- `--warmup-prompt`: Override warmup text only, keeping each request's reference
+  image, seed, and other parameters. Use a disjoint prompt for partial-prefix
+  benchmarks. A failed custom-prompt warmup aborts measurement.
 - `--warmup-num-inference-steps`: Steps used during warmup.
 - `--warmup-concurrency`: Maximum concurrent warmup requests. Use this to warm
   the same batch shape as the measured run instead of warming only batch=`1`.
@@ -149,3 +152,57 @@ batch may still pay compile or CUDA-graph capture cost.
 
 For a Qwen-Image continuous-batching replay example, see
 [`performance_dashboard/qwen_image_serving_performance.md`](./performance_dashboard/qwen_image_serving_performance.md).
+
+## HunyuanImage3 reference-prefix reuse
+
+The [DFX configuration](../../tests/dfx/perf/tests/test_hunyuan_image3_prefix_caching.json)
+compares dense, paged without prefix caching, and paged with prefix caching on
+the same DiT-only TP4 / CFGP1 deployment. It uses the checked-in reference image,
+eight distinct editing instructions, a fixed seed per run, and concurrency 1.
+Reference tokens precede the changed text, allowing partial-prefix reuse.
+There is no AR-to-DiT KV transfer. The performance matrix covers guidance 1.0
+(one row) and 2.5 (two CFG rows on CFGP1), each at 2 and 8 denoising steps.
+
+Two warmups use a separate instruction and are excluded from latency metrics.
+The four guidance/step combinations use separate seeds (42–45), **fixed across
+all requests and modes within each run**. This prevents later combinations
+from hitting complete prompts left by earlier ones. Do not increase `num-prompts`
+beyond the eight dataset rows without adding distinct instructions: the custom
+dataset cycles, which would change the workload to exact-request repetition.
+Local image paths may be relative to the JSONL (existing cwd-relative paths
+still take precedence).
+
+From the repository root, with four GPUs allocated by your environment's GPU
+scheduler:
+
+```bash
+python -m pytest tests/dfx/perf/scripts/run_diffusion_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_hunyuan_image3_prefix_caching.json -s
+python -m pytest tests/e2e/accuracy/test_hunyuan_image3_prefix_cache_accuracy.py -s
+```
+
+The DFX runner writes latency/QPS metrics under `tests/dfx/perf/results` (override
+with `DIFFUSION_BENCHMARK_DIR`). Compare each guidance/step combination separately:
+
+- paged-no-cache vs dense isolates paged execution overhead;
+- paged-prefix vs paged-no-cache isolates prefix reuse savings;
+- paged-prefix vs dense measures the net user-visible benefit.
+
+There are no prefilled performance baselines or assumed speedup thresholds.
+This is a favorable low-step, repeated-reference workload, not a representative
+50-step quality or maximum-batch-throughput benchmark. Prefix reuse saves
+first-step Transformer work, not reference encoding or all denoising steps.
+To audit hit lengths, run a separate diagnostic with `VLLM_LOGGING_LEVEL=DEBUG`
+and inspect `Diffusion prefix prefill` worker lines; avoid mixing DEBUG timings
+with normal performance runs.
+
+The accuracy regression compares paged-no-cache, partial-hit and exact-repeat
+outputs against the checked-in official-repository reference-image goldens at
+**50 steps, CFG=2.5, seeds 43/45** (both CFG branches remain on CFGP1).
+It uses the AR-to-DiT image criteria: CLIP ≥ 90, SSIM ≥ 0.26, PSNR ≥ 12.5 dB.
+`HUNYUAN_IMAGE3_INCLUDE_DENSE=1` adds dense as another comparison to the goldens.
+It also requires actual reference-image hits and model-side query slicing,
+and checks bitwise repeatability for repeated requests at the same hit boundary.
+Images, logs, deployment YAMLs, hit traces and quality metrics are saved under
+pytest's temporary output directory. `HUNYUAN_IMAGE3_MODEL` selects a local model;
+DFX uses the repository's normal model/cache resolution.

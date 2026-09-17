@@ -496,8 +496,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     DiffusionPagedAttentionRow(
                         request_id=request_metadata.request_id,
                         sequence_id=sequence.sequence_id,
-                        query_len=sequence.seq_len,
+                        query_len=sequence.seq_len - sequence.cached_prefix_len,
                         seq_len=sequence.seq_len,
+                        kv_start_pos=sequence.cached_prefix_len,
                     )
                 )
                 denoise_rows.append(
@@ -708,14 +709,38 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         f"metadata={len(diffusion_kv_metadata)}, requests={len(reqs)}"
                     )
                 paged_metadata = self._build_paged_attention_metadata(diffusion_kv_metadata)
+                cached_prefix_lens = {row.kv_start_pos for row in paged_metadata.prefill_rows}
+                if len(cached_prefix_lens) != 1:
+                    raise ValueError(
+                        "One paged request-level forward requires a uniform cached prefix boundary; "
+                        f"got {sorted(cached_prefix_lens)}"
+                    )
+                paged_kv_cached_prefix_len = next(iter(cached_prefix_lens))
                 paged_kv_runtime, paged_kv_context = self.diffusion_kv_backend.activate_paged_attention_metadata(
                     paged_metadata
                 )
+                if is_primary:
+                    # Trace the boundary actually passed to the model, not a
+                    # speculative lookup. Useful for warm-cache regressions.
+                    for request_metadata in diffusion_kv_metadata:
+                        for sequence in request_metadata.sequences:
+                            logger.debug(
+                                "Diffusion prefix prefill: request_id=%s sequence_id=%d "
+                                "cached_prefix_len=%d prefix_len=%d query_len=%d",
+                                request_metadata.request_id,
+                                sequence.sequence_id,
+                                sequence.cached_prefix_len,
+                                sequence.prefix_len,
+                                sequence.seq_len - sequence.cached_prefix_len,
+                            )
+            else:
+                paged_kv_cached_prefix_len = 0
             with (
                 set_forward_context(
                     vllm_config=self.vllm_config,
                     omni_diffusion_config=od_config,
                     paged_kv_runtime=paged_kv_runtime,
+                    paged_kv_cached_prefix_len=paged_kv_cached_prefix_len,
                     in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
                 ),
                 paged_kv_context,

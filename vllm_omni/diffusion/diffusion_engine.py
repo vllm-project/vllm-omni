@@ -50,6 +50,7 @@ from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
     get_diffusion_post_process_func,
     get_diffusion_pre_process_func,
+    get_diffusion_prefix_cache_func,
 )
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
@@ -299,6 +300,7 @@ class DiffusionEngine:
     def _init_process_hooks(self, od_config: OmniDiffusionConfig) -> None:
         self.post_process_func = get_diffusion_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
+        self.prefix_cache_func = get_diffusion_prefix_cache_func(od_config) if self._prefix_cache_enabled() else None
         # Cache whether the model-specific postprocess accepts request-level
         # sampling params so step() can support both legacy and extended hooks.
         self._post_process_accepts_sampling_params = _func_accepts_parameter(self.post_process_func, "sampling_params")
@@ -841,6 +843,12 @@ class DiffusionEngine:
         engine.run_startup_warmup()
         return engine
 
+    def _prefix_cache_enabled(self) -> bool:
+        config = getattr(self, "od_config", None)
+        return getattr(config, "diffusion_kv_mode", None) is DiffusionKVCacheMode.PAGED_SCHEDULER and bool(
+            getattr(config, "enable_prefix_caching", False)
+        )
+
     def _prepare_request_for_admission(self, request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         """Run model-owned preprocessing once, before entering Engine locks."""
 
@@ -848,6 +856,12 @@ class DiffusionEngine:
         if pre_process_func is not None:
             request = pre_process_func(request)
         self._validate_diffusion_kv_profile_limits(request)
+        # Gate cache-input preparation itself: disabled caching must not inspect
+        # tensors / RNG state or copy token IDs just to discard their hashes.
+        # Both dependency hashing and preprocessing stay outside Engine locks.
+        prefix_cache_func = getattr(self, "prefix_cache_func", None)
+        if self._prefix_cache_enabled() and prefix_cache_func is not None and request.diffusion_kv_requests:
+            prefix_cache_func(request)
         return request
 
     def _validate_diffusion_kv_profile_limits(self, request: OmniDiffusionRequest) -> None:

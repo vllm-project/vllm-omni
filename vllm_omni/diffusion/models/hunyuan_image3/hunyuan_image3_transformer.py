@@ -1087,6 +1087,7 @@ class ImageKVCacheManager(nn.Module):
         shard_image_size: int | None,
         full_attn_spans: list[list[tuple[int, int]]],
         uncond_cfg_prefill: bool,
+        cached_prefix_len: int,
     ) -> torch.Tensor:
         """Run Hunyuan attention against Worker-managed Scheduler pages.
 
@@ -1103,6 +1104,8 @@ class ImageKVCacheManager(nn.Module):
             raise ValueError("Hunyuan Scheduler-paged KV requires matching query and sequence lengths")
         if len(full_attn_spans) != len(query_lens):
             raise ValueError("Hunyuan Scheduler-paged KV requires one full-attention span row per sequence")
+        if cached_prefix_len < 0:
+            raise ValueError(f"cached_prefix_len must be non-negative, got {cached_prefix_len}")
 
         self.clear_legacy_prompt_kv_cache()
         bs = len(query_lens)
@@ -1122,19 +1125,20 @@ class ImageKVCacheManager(nn.Module):
         if self.sp_size > 1 and first_step:
             if shard_image_size is None or shard_image_size <= 0:
                 raise ValueError("Hunyuan paged Ulysses requires a positive local image shard size")
-            local_prompt_len = seq_len - shard_image_size
+            logical_prompt_len = seq_len - shard_image_size
             joint_query_len = query.shape[1] - shard_image_size
-            if local_prompt_len != joint_query_len:
+            if logical_prompt_len != cached_prefix_len + joint_query_len:
                 raise ValueError(
                     "Hunyuan paged Ulysses prompt layout mismatch: "
-                    f"key_prompt={local_prompt_len}, query_prompt={joint_query_len}"
+                    f"logical_prompt={logical_prompt_len}, cached_prefix={cached_prefix_len}, "
+                    f"query_prompt={joint_query_len}"
                 )
             joint_text_query = query[:, :joint_query_len]
-            joint_text_key = key[:, :local_prompt_len]
-            joint_text_value = value[:, :local_prompt_len]
+            joint_text_key = key[:, :joint_query_len]
+            joint_text_value = value[:, :joint_query_len]
             query = query[:, joint_query_len:]
-            key = key[:, local_prompt_len:]
-            value = value[:, local_prompt_len:]
+            key = key[:, joint_query_len:]
+            value = value[:, joint_query_len:]
 
         if joint_text_query is None:
             attn_metadata = AttentionMetadata(full_attn_spans=full_attn_spans)
@@ -1265,6 +1269,7 @@ class ImageKVCacheManager(nn.Module):
                 shard_image_size=kwargs.get("shard_image_size") if self.sp_size > 1 else None,
                 full_attn_spans=full_attn_spans,
                 uncond_cfg_prefill=kwargs.get("uncond_cfg_prefill", False),
+                cached_prefix_len=int(kwargs.get("paged_kv_cached_prefix_len", 0)),
             )
         if attention_mask is None:
             raise ValueError("Hunyuan dense attention requires an attention mask")
@@ -2461,6 +2466,7 @@ class HunyuanImage3Model(nn.Module):
         gen_timestep_scatter_index: torch.Tensor | None = None,
         uncond_cfg_prefill: bool = False,
         ar_kv_reuse_len: int = 0,
+        paged_kv_cached_prefix_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
     ) -> tuple | BaseModelOutputWithPast:
         current_omni_platform.reset_diffusion_fused_moe_forward_context()
@@ -2519,7 +2525,9 @@ class HunyuanImage3Model(nn.Module):
             else:
                 shard_padding_size = shard_image_size * sp_world_size - num_image_tokens
             if first_step:
-                seq_lens = [prompt_size + shard_image_size + ar_kv_reuse_len for _ in seq_lens]
+                seq_lens = [
+                    prompt_size + shard_image_size + ar_kv_reuse_len + paged_kv_cached_prefix_len for _ in seq_lens
+                ]
             else:
                 seq_lens = [x - y for x, y in zip(seq_lens, query_lens)]
                 seq_lens = [seq_len + shard_image_size for seq_len in seq_lens]
@@ -2569,6 +2577,7 @@ class HunyuanImage3Model(nn.Module):
                 shard_image_size=shard_image_size,
                 shard_padding_size=shard_padding_size,
                 uncond_cfg_prefill=uncond_cfg_prefill,
+                paged_kv_cached_prefix_len=paged_kv_cached_prefix_len,
                 full_attn_spans=full_attn_spans,
             )
 

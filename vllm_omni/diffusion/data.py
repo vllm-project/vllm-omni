@@ -770,6 +770,9 @@ class OmniDiffusionConfig:
 
     # Local Diffusion KV ownership and cache-layout mode.
     diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
+    # Reuse block-aligned, immutable diffusion prefixes across requests when
+    # Scheduler-owned paged KV is active.
+    enable_prefix_caching: bool = False
     # Maximum number of native BlockTable rows one public request can own
     # (sequences plus independent contexts). The model adapter defines it.
     diffusion_kv_max_rows_per_request: int | None = None
@@ -1058,6 +1061,8 @@ class OmniDiffusionConfig:
         if not isinstance(self.diffusion_compile_dynamic, bool):
             raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
+        if not isinstance(self.enable_prefix_caching, bool):
+            raise TypeError("enable_prefix_caching must be a bool")
         if self.diffusion_kv_max_rows_per_request is not None and (
             type(self.diffusion_kv_max_rows_per_request) is not int or self.diffusion_kv_max_rows_per_request <= 0
         ):

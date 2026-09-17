@@ -40,6 +40,7 @@ class DiffusionKVSequenceMetadata:
     target_len: int
     seq_len: int
     block_ids: tuple[list[int], ...]
+    cached_prefix_len: int = 0
     context_ids: tuple[str, ...] = ()
 
 

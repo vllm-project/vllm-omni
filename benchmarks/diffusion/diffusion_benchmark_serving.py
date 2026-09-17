@@ -639,9 +639,12 @@ class CustomDataset(BaseDataset):
             if isinstance(paths, str):
                 paths = [paths]
 
-            # Verify all paths exist
+            # Preserve existing cwd-relative paths; also accept paths relative
+            # to the JSONL so checked-in datasets are portable across runners.
             valid_paths = []
             for path in paths:
+                if not os.path.exists(path) and not os.path.isabs(path):
+                    path = os.path.join(os.path.dirname(self.dataset_path), path)
                 if os.path.exists(path):
                     valid_paths.append(path)
                 else:
@@ -1049,6 +1052,10 @@ def _make_warmup_request(
     args,
 ) -> RequestFuncInput:
     warm_req = requests_list[index % len(requests_list)]
+    # Keep the reference image / seed but allow a disjoint text suffix when
+    # measuring partial prefix reuse. Never mutate the measured request.
+    if getattr(args, "warmup_prompt", None) is not None:
+        warm_req = replace(warm_req, prompt=args.warmup_prompt)
     if args.warmup_num_inference_steps is not None:
         warm_req = replace(
             warm_req,
@@ -1086,6 +1093,10 @@ async def _run_warmups(
 
     warmup_tasks = [asyncio.create_task(limited_warmup_request_func(req)) for req in warmup_requests]
     warmup_outputs = await asyncio.gather(*warmup_tasks)
+    if getattr(args, "warmup_prompt", None) is not None:
+        errors = [out.error for out in warmup_outputs if not out.success]
+        if errors:
+            raise RuntimeError(f"Custom-prompt warmup failed; refusing to measure an unprimed cache: {errors}")
     return list(zip(warmup_requests, warmup_outputs))
 
 
@@ -1506,6 +1517,13 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Number of warmup requests to run before measurement.",
+    )
+    parser.add_argument(
+        "--warmup-prompt",
+        type=str,
+        default=None,
+        help="Override only warmup request text, retaining images, seed and other parameters. "
+        "Use a prompt absent from the measured dataset to benchmark partial prefix reuse.",
     )
     # NOTE Changed default from 1 to 2 because some models (e.g., Bagel) run
     # `num_timesteps - 1` denoising iterations. A default of 1 results in 0 steps,

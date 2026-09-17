@@ -94,6 +94,7 @@ def _initialize_paged_scheduler(
     *,
     num_blocks: int = 64,
     max_num_seqs: int = 1,
+    enable_prefix_caching: bool = False,
 ) -> None:
     native_kv_managers.register_all_kvcache_specs(None)
     spec = FullAttentionSpec(
@@ -119,11 +120,20 @@ def _initialize_paged_scheduler(
         kv_vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(max_model_len=64),
             max_in_flight_tokens=64,
+            cache_config=SimpleNamespace(
+                enable_prefix_caching=enable_prefix_caching,
+                prefix_caching_hash_algo="sha256",
+            ),
         ),
     )
 
 
-def _attach_diffusion_kv(request: OmniDiffusionRequest, *, seq_len: int = 8) -> None:
+def _attach_diffusion_kv(
+    request: OmniDiffusionRequest,
+    *,
+    seq_len: int = 8,
+    cache_token_ids=(),
+) -> None:
     request.diffusion_kv_requests = (
         DiffusionKVRequest(
             f"{request.request_id}/diffusion-kv/0",
@@ -131,7 +141,17 @@ def _attach_diffusion_kv(request: OmniDiffusionRequest, *, seq_len: int = 8) -> 
             prefix_len=4,
             target_len=4,
             seq_len=seq_len,
+            cache_token_ids=cache_token_ids,
         ),
+    )
+
+
+def _make_aborted_request_output(req_id: str) -> RunnerOutput:
+    return RunnerOutput(
+        request_id=req_id,
+        step_index=None,
+        finished=True,
+        result=DiffusionOutput(output=None, aborted=True),
     )
 
 
@@ -473,6 +493,53 @@ class TestRequestScheduler:
         assert metadata is not None
         assert metadata.request_id == request.request_id
         assert len(metadata.sequences[0].block_ids[0]) == 4
+
+    def test_diffusion_kv_publishes_only_after_successful_completion(self) -> None:
+        _initialize_paged_scheduler(self.scheduler, enable_prefix_caching=True)
+        first = _make_request("publish-success")
+        _attach_diffusion_kv(first, cache_token_ids=range(4))
+        self.scheduler.add_request(first)
+        first_schedule = self.scheduler.schedule()
+        assert self.scheduler.update_from_output(first_schedule, _make_request_output(first.request_id)) == {
+            first.request_id
+        }
+
+        warm = _make_request("publish-warm")
+        _attach_diffusion_kv(warm, cache_token_ids=range(4))
+        self.scheduler.add_request(warm)
+        warm_schedule = self.scheduler.schedule()
+        metadata = warm_schedule.scheduled_new_reqs[0].diffusion_kv_metadata
+        assert metadata is not None
+        assert metadata.sequences[0].cached_prefix_len == 4
+
+    @pytest.mark.parametrize(
+        "terminal_output",
+        [
+            pytest.param(
+                _make_request_output("publish-error", error="worker failed"),
+                id="error",
+            ),
+            pytest.param(_make_aborted_request_output("publish-abort"), id="abort"),
+        ],
+    )
+    def test_diffusion_kv_does_not_publish_failed_or_aborted_request(
+        self,
+        terminal_output: RunnerOutput,
+    ) -> None:
+        _initialize_paged_scheduler(self.scheduler, enable_prefix_caching=True)
+        first = _make_request(terminal_output.request_id)
+        _attach_diffusion_kv(first, cache_token_ids=range(4))
+        self.scheduler.add_request(first)
+        first_schedule = self.scheduler.schedule()
+        assert self.scheduler.update_from_output(first_schedule, terminal_output) == {first.request_id}
+
+        warm = _make_request(f"{first.request_id}-warm")
+        _attach_diffusion_kv(warm, cache_token_ids=range(4))
+        self.scheduler.add_request(warm)
+        warm_schedule = self.scheduler.schedule()
+        metadata = warm_schedule.scheduled_new_reqs[0].diffusion_kv_metadata
+        assert metadata is not None
+        assert metadata.sequences[0].cached_prefix_len == 0
 
     def test_diffusion_kv_capacity_backpressures_fifo_until_blocks_are_freed(self) -> None:
         _initialize_paged_scheduler(self.scheduler, num_blocks=3, max_num_seqs=2)
