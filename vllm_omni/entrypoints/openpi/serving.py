@@ -103,6 +103,14 @@ class ServingRealtimeRobotOpenPI:
             for stage_config in getattr(engine_client, "stage_configs", []) or []:
                 if getattr(stage_config, "stage_type", None) != "diffusion":
                     continue
+                # Typed diffusion stages keep model-owned OpenPI handshake
+                # metadata in diffusion_config.model_config. The out-of-process
+                # head only has this stage view because full od_config lives in
+                # the worker.
+                diffusion_config = getattr(stage_config, "diffusion_config", None)
+                model_config = getattr(diffusion_config, "model_config", None)
+                if model_config is not None:
+                    break
                 engine_args = getattr(stage_config, "engine_args", None)
                 model_config = getattr(engine_args, "model_config", None)
                 if model_config is not None:

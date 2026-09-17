@@ -32,9 +32,9 @@ HEIGHT = 512
 NUM_INFERENCE_STEPS = 20
 TRUE_CFG_SCALE = 4.0
 SEED = 42
-SSIM_THRESHOLD = 0.94
-# With --fa-deterministic, H100 nightlies stably land near SSIM 0.958 / PSNR 27.8
-# vs Diffusers on the FA3 hub path (see #5734 / #5963 / #6971).
+# H100 nightly after RotaryEmbedding CUDA RoPE: SSIM 0.978375 / PSNR 31.83
+# vs Diffusers (Buildkite #15339). SSIM 0.97 so a drop is visible.
+SSIM_THRESHOLD = 0.97
 PSNR_THRESHOLD = 27.0
 
 MODEL_2512_ID = "Qwen/Qwen-Image-2512"

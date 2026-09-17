@@ -34,7 +34,11 @@ from vllm_omni.entrypoints.openai.diffusion_request_utils import (
     apply_normalized_diffusion_request_extra_args,
     normalize_diffusion_request_args,
 )
-from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
+from vllm_omni.entrypoints.openai.protocol.chat_completion import (
+    OmniChatCompletionResponse,
+    OmniChatCompletionResponseChoice,
+    OmniChatCompletionResponseStreamChoice,
+)
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.metrics import definitions as _metric_defs
@@ -244,10 +248,27 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             return obj.get(key, default)
         return getattr(obj, key, default)
 
+    @classmethod
+    def _stage_model_metadata(cls, stage: Any) -> tuple[str | None, str | None]:
+        """Return ``(model_arch, model_stage)`` for typed or legacy stages."""
+        model_config = cls._stage_get(stage, "model_config")
+        model_arch = cls._stage_get(model_config, "model_arch")
+        model_stage = cls._stage_get(stage, "model_stage")
+
+        topology = cls._stage_get(stage, "stage_pipeline_config")
+        if model_stage is None:
+            model_stage = cls._stage_get(topology, "model_stage")
+
+        engine_args = cls._stage_get(stage, "engine_args")
+        if model_arch is None:
+            model_arch = cls._stage_get(engine_args, "model_arch")
+        if model_stage is None:
+            model_stage = cls._stage_get(engine_args, "model_stage")
+        return model_arch, model_stage
+
     def _has_minicpmo45_stage(self) -> bool:
         for stage in getattr(self.engine_client, "stage_configs", []) or []:
-            engine_args = self._stage_get(stage, "engine_args")
-            model_arch = self._stage_get(engine_args, "model_arch")
+            model_arch, _ = self._stage_model_metadata(stage)
             if model_arch == "MiniCPMO45OmniForConditionalGeneration":
                 return True
         return False
@@ -320,11 +341,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if not hasattr(sp, "output_kind"):
                 continue
 
-            engine_args = self._stage_get(stage, "engine_args")
-            if self._stage_get(engine_args, "model_arch") != "MiniCPMO45OmniForConditionalGeneration":
+            model_arch, model_stage = self._stage_model_metadata(stage)
+            if model_arch != "MiniCPMO45OmniForConditionalGeneration":
                 continue
 
-            model_stage = self._stage_get(engine_args, "model_stage")
             if model_stage == "llm":
                 sp.output_kind = RequestOutputKind.FINAL_ONLY
             elif model_stage == "tts":
@@ -2860,18 +2880,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         for output in final_res.outputs:
             if stream:
-                choice_data = ChatCompletionResponseStreamChoice(
+                choice_data = OmniChatCompletionResponseStreamChoice(
                     index=output.index,
                     delta=DeltaMessage(role=role, content=audio_base64),
+                    audio_metadata=audio_response.audio_metadata,
                     logprobs=None,
                     finish_reason=output.finish_reason,
                     stop_reason=output.stop_reason,
                     token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
                 )
             else:
-                choice_data = ChatCompletionResponseChoice(
+                choice_data = OmniChatCompletionResponseChoice(
                     index=output.index,
                     message=ChatMessage(role=role, audio=audio_obj),
+                    audio_metadata=audio_response.audio_metadata,
                     logprobs=None,
                     finish_reason="stop",
                     stop_reason=output.stop_reason,

@@ -20,6 +20,7 @@ from comfy_api.input import AudioInput, VideoInput
 
 from .format import (
     audio_to_base64,
+    audio_to_bytes,
     base64_to_audio,
     base64_to_image_tensor,
     bytes_to_audio,
@@ -31,7 +32,13 @@ from .format import (
 )
 from .logger import get_logger, pretty_printer
 from .models import lookup_model_spec
-from .types import AudioFormat
+from .types import (
+    MAX_REFERENCE_AUDIOS,
+    MAX_REFERENCE_IMAGES,
+    MAX_REFERENCE_VIDEOS,
+    MAX_TOTAL_REFERENCES,
+    AudioFormat,
+)
 
 logger = get_logger(__name__)
 
@@ -304,38 +311,44 @@ class VLLMOmniClient:
 
         # === multimodal inputs (first-last-frames, references, etc.) ===
         input_reference_image: torch.Tensor | None = None
-        audio_reference: AudioInput | None = None
-        reference_videos: list[VideoInput] = []
         video_task: str | None = None
 
         if frame is not None:
             input_reference_image = frame
             video_task = "fl2va"
         elif references is not None:
-            images = [references[k] for k in ("image_1", "image_2") if k in references and references[k] is not None]
-            audios = [references[k] for k in ("audio_1", "audio_2") if k in references and references[k] is not None]
-            videos = [references[k] for k in ("video_1", "video_2") if k in references and references[k] is not None]
-
-            if not images and not audios and not videos:
-                raise ValueError("references is empty; connect at least one image/audio/video.")
-
-            if videos:
-                if images or audios:
-                    raise ValueError(
-                        "Video references cannot be combined with image or audio references. "
-                        "Connect only video_1/video_2 for multi-video Ref2VA."
-                    )
-                reference_videos = videos
-                video_task = "ref2va"
-            elif len(images) == 1 and len(audios) == 1:
-                input_reference_image = images[0]
-                audio_reference = audios[0]
-                video_task = "ref2va"
-            else:
+            reference_formats = (
+                ("image", MAX_REFERENCE_IMAGES, "png", "image/png", image_tensor_to_png_bytes),
+                ("video", MAX_REFERENCE_VIDEOS, "mp4", "video/mp4", video_to_bytes),
+                ("audio", MAX_REFERENCE_AUDIOS, "mp3", "audio/mpeg", audio_to_bytes),
+            )
+            supported_inputs = {f"{kind}_{i}" for kind, limit, *_ in reference_formats for i in range(1, limit + 1)}
+            connected = {name: value for name, value in references.items() if value is not None}
+            unsupported = connected.keys() - supported_inputs
+            if unsupported:
+                raise ValueError(f"Unsupported reference input(s): {', '.join(sorted(unsupported))}.")
+            if not any(name.startswith(("image_", "video_")) for name in connected):
                 raise ValueError(
-                    "Invalid references combination. Supported modes: "
-                    "(1) one or more videos only, or (2) exactly one image and one audio."
+                    "references requires at least one image or video; audio-only inputs are not supported."
                 )
+            if len(connected) > MAX_TOTAL_REFERENCES:
+                raise ValueError(
+                    f"references supports at most {MAX_TOTAL_REFERENCES} inputs in total "
+                    f"(up to {MAX_REFERENCE_IMAGES} images, {MAX_REFERENCE_VIDEOS} videos, "
+                    f"and {MAX_REFERENCE_AUDIOS} audios)."
+                )
+            for kind, limit, extension, content_type, encode in reference_formats:
+                for index in range(1, limit + 1):
+                    name = f"{kind}_{index}"
+                    if name in connected:
+                        filename = f"{name}.{extension}"
+                        form.add_field(
+                            "input_references",
+                            encode(connected[name], filename),
+                            filename=filename,
+                            content_type=content_type,
+                        )
+            video_task = "ref2va"
         else:
             video_task = "t2va"
 
@@ -346,21 +359,6 @@ class VLLMOmniClient:
                 image_tensor_to_png_bytes(input_reference_image, image_filename),
                 filename=image_filename,
                 content_type="image/png",
-            )
-
-        if audio_reference is not None:
-            form.add_field(
-                "audio_reference",
-                json.dumps({"audio_url": audio_to_base64(audio_reference)}, ensure_ascii=False),
-            )
-
-        for idx, video in enumerate(reference_videos, start=1):
-            video_filename = f"reference_{idx}.mp4"
-            form.add_field(
-                "input_references",
-                video_to_bytes(video, video_filename),
-                filename=video_filename,
-                content_type="video/mp4",
             )
 
         # === model specific params. Either use a specialized builder, or add flattened fields as-is ===

@@ -186,10 +186,11 @@ def test_minimax_h3_quantization_quality(config: QualityTestConfig):
     common_kwargs = {
         "model": model_ref,
         "enforce_eager": True,
-        "tensor_parallel_size": 2,
         # The fused BF16 baseline only fits on H100-80GB with encoder TP.
-        "text_encoder_tp_size": 2,
+        "stage_0_tensor_parallel_size": 2,
         "vae_use_tiling": True,
+        # MiniMax H3's VAE is implemented by code shipped with the checkpoint.
+        "trust_remote_code": True,
     }
 
     omni_bl = Omni(**common_kwargs)

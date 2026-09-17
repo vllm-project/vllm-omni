@@ -4611,9 +4611,6 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
-        """Forward pass through thinker model."""
-        text_inputs_embeds = None
-
         if intermediate_tensors is not None:
             inputs_embeds = None
 
@@ -4621,22 +4618,12 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         elif inputs_embeds is None:
             multimodal_embeddings = self.get_multimodal_embeddings(**kwargs)
             inputs_embeds = self.get_input_embeddings(input_ids, multimodal_embeddings)
-            text_inputs_embeds = self.get_input_embeddings(
-                input_ids,
-                (
-                    [(torch.zeros_like(embeddings), "image") for embeddings in multimodal_embeddings]
-                    if multimodal_embeddings is not None
-                    else None
-                ),
-            )
             input_ids = None
-        else:
-            text_inputs_embeds = inputs_embeds
 
         # Forward through language model
         hidden_states = self.llm.model(input_ids, positions, intermediate_tensors, inputs_embeds=inputs_embeds)
 
-        return text_inputs_embeds, hidden_states.unsqueeze(0) if hidden_states.ndim == 2 else hidden_states
+        return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         """Compute logits from hidden states."""

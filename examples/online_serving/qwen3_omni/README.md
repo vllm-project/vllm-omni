@@ -14,6 +14,17 @@ Please refer to [README.md](../../../README.md)
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
+For a local deployment with multiple API frontend processes sharing one set
+of stage engines, add `--api-server-count`:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --api-server-count 2 --port 8091
+```
+
+This mode currently supports local EngineCore stages. It is not available
+with headless or remote stage deployments, and pure diffusion stages remain
+single-frontend.
+
 The default deployment configuration, situated at `vllm_omni/deploy/qwen3_omni_moe.yaml`, is resolved and loaded
 automatically via the model registry, obviating the `--deploy-config` flag in standard deployment topologies.
 Asynchronous chunk streaming operates as **enabled by default** within this bundled configuration.
@@ -156,7 +167,7 @@ parser defaults). If you don't pass a flag, the YAML value wins.
 > chunked vs end-to-end modes (e.g. qwen3_tts code2wav) dispatch
 > automatically based on that bool — no extra flag or variant yaml is
 > needed.
-
+>
 > ⚠️ **For multi-stage models that share GPUs (qwen3_omni_moe by default
 > shares cuda:1 between stages 1 and 2), avoid using global memory flags.**
 > A global `--gpu-memory-utilization 0.85` would apply to every stage and

@@ -15,7 +15,12 @@ from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.diffusion_engine as diffusion_engine_module
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import (
+    DIFFUSION_REQUEST_LIFECYCLE_KEY,
+    DIFFUSION_REQUEST_STARTED,
+    DiffusionOutput,
+    OmniDiffusionConfig,
+)
 from vllm_omni.diffusion.diffusion_engine import (
     DiffusionEngine,
     DiffusionExecutionMode,
@@ -181,6 +186,28 @@ def _make_request_mode_sched_output(*request_ids: str) -> RealDiffusionScheduler
         num_running_reqs=len(new_reqs),
         num_waiting_reqs=0,
     )
+
+
+@pytest.mark.cpu
+def test_request_started_output_is_emitted_only_for_opted_in_requests() -> None:
+    sched_output = _make_request_mode_sched_output("tracked", "untracked")
+    sched_output.scheduled_new_reqs[0].req.sampling_params.emit_request_lifecycle = True
+    engine = object.__new__(DiffusionEngine)
+    emitted = []
+    engine._put_output = lambda request_id, output: emitted.append((request_id, output))
+
+    engine._emit_request_started_outputs(sched_output)
+
+    assert len(emitted) == 1
+    request_id, output = emitted[0]
+    assert request_id == "tracked"
+    assert output.request_started is True
+    assert output.finished is False
+    [formatted] = engine.postprocess_output(sched_output.scheduled_new_reqs[0].req, output)
+    assert formatted.custom_output == {
+        DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED,
+    }
+    assert formatted.finished is False
 
 
 class TestRequestBatchCapability:

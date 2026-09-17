@@ -6,27 +6,36 @@ Both variants share the same build/validate flow (``_build_moss_tts_params``
 handles each); they are registered under distinct model-type names.
 """
 
+import asyncio
+import threading
 from typing import TYPE_CHECKING, Any, cast
 
+from transformers import AutoModel, AutoTokenizer
+from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from vllm.inputs import tokens_input
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
     ARTTSAdapter,
+    OutputPolicy,
     PreparedRequest,
     apply_max_new_tokens,
     conditioning_cache_salt,
 )
+from vllm_omni.model_executor.models.moss_tts.realtime_prompt import build_realtime_prompt
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
 
 class _MossTTSAdapterBase(ARTTSAdapter):
+    accumulate_nonstreaming: bool = False
+
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
         self._moss_variant = None if self.name == "moss_tts_nano" else self._detect_moss_variant()
         self._moss_processor_cache = None
+        self._moss_realtime_components_lock = threading.Lock()
 
     @property
     def engine_client(self):
@@ -60,7 +69,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         # inside the model package; this layer only supplies the processor and
         # the process-wide speaker cache.
         encoder = build_reference_encoder(
-            self._get_moss_processor(),
+            self._get_moss_realtime_components()[2] if self._moss_variant == "realtime" else self._get_moss_processor(),
             variant=cast(str, self._moss_variant),
             speaker_cache=self._speaker_cache,
         )
@@ -154,6 +163,45 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         self._moss_processor_cache = proc
         return proc
 
+    def _get_moss_realtime_components(self):
+        with self._moss_realtime_components_lock:
+            cached = getattr(self, "_moss_realtime_components", None)
+            if cached is not None:
+                return cached
+
+            model_id = self.engine_client.model_config.model
+            processor_cls = get_class_from_dynamic_module(
+                "processing_mossttsrealtime.MossTTSRealtimeProcessor",
+                model_id,
+            )
+            tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+            processor = processor_cls(tokenizer=tokenizer)
+            hf_config = self.engine_client.model_config.hf_config
+            codec_path = str(
+                getattr(
+                    hf_config,
+                    "codec_model_name_or_path",
+                    getattr(
+                        hf_config,
+                        "audio_tokenizer_name_or_path",
+                        "OpenMOSS-Team/MOSS-Audio-Tokenizer",
+                    ),
+                )
+            )
+            codec = (
+                AutoModel.from_pretrained(
+                    codec_path,
+                    trust_remote_code=True,
+                )
+                # Reference encoding runs in the API process. Keep the codec on CPU
+                # so it does not reserve accelerator memory outside the model workers.
+                .to("cpu")
+                .eval()
+            )
+            cached = (tokenizer, processor, codec)
+            self._moss_realtime_components = cached
+            return cached
+
     async def _build_moss_tts_params(
         self,
         request: "OpenAICreateSpeechRequest",
@@ -193,24 +241,18 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             params["ref_audio_cache_key"] = cache_key
             return params
 
-        # ---- MOSS-TTS-Realtime: keep the old prompt_audio_array path ----
-        # ``AutoProcessor.from_pretrained`` doesn't auto-discover
-        # ``MossTTSRealtimeProcessor`` (no ``processor_config.json`` in the
-        # snapshot), and Realtime's prompt format diverges from MossTTSDelay
-        # (16-channel grid, separate per-step text feed). The
-        # ``prompt_audio_array`` shape lines up well enough with what the
-        # talker reads for short prompts; full Realtime support needs a
-        # separate processor.from_module path which we don't wire here.
         if v == "realtime":
-            params = {
-                "text": [request.input or ""],
-                "mode": ["voice_clone"],
-            }
+            tokenizer, processor, _ = await asyncio.to_thread(self._get_moss_realtime_components)
+            references, realtime_resolve_keys = await self._encode_moss_references(
+                request,
+                has_inline_ref_audio=has_inline_ref_audio,
+                two_speaker=False,
+            )
+            params = build_realtime_prompt(tokenizer, processor, request.input or "", references[0])
             if request.max_new_tokens is not None:
                 params["max_new_frames"] = [request.max_new_tokens]
-            wav_list, sr, cache_key = await self._resolve_ref_audio(cast(str, request.ref_audio))
-            params["prompt_audio_array"] = [[wav_list, sr]]
-            params["ref_audio_cache_key"] = cache_key
+            if 0 in realtime_resolve_keys:
+                params["ref_audio_cache_key"] = realtime_resolve_keys[0]
             return params
 
         # ---- MossTTSDelay family (tts/ttsd/sound_effect/voice_generator)
@@ -369,7 +411,12 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             prompt = tokens_input(prompt_token_ids=[1])
         prompt["additional_information"] = tts_params
         prompt["cache_salt"] = conditioning_cache_salt(request, tts_params)
-        return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type=self.name)
+        return PreparedRequest(
+            prompt=prompt,
+            tts_params=tts_params,
+            model_type=self.name,
+            output_policy=OutputPolicy(accumulate_nonstreaming=self.accumulate_nonstreaming),
+        )
 
     def apply_sampling_overrides(
         self,
@@ -385,6 +432,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
 class MossTTSNanoAdapter(_MossTTSAdapterBase):
     stage_keys = frozenset({"moss_tts_nano"})
     name = "moss_tts_nano"
+    accumulate_nonstreaming = True
 
 
 @register_tts_adapter

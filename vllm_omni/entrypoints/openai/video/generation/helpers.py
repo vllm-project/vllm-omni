@@ -58,6 +58,7 @@ from vllm_omni.entrypoints.openai.serving_video import (
     ReferenceAudio,
     ReferenceImage,
     ReferenceVideo,
+    _stage_diffusion_model_class_name,
 )
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE
@@ -136,10 +137,6 @@ def _config_get(config: Any, key: str, default: Any = None) -> Any:
     return getattr(config, key, default)
 
 
-def _stage_engine_args(stage_cfg: Any) -> Any:
-    return _config_get(stage_cfg, "engine_args", {}) or {}
-
-
 def _diffusion_model_classes(stage_configs: list[Any] | None) -> list[type]:
     if not stage_configs:
         return []
@@ -150,7 +147,7 @@ def _diffusion_model_classes(stage_configs: list[Any] | None) -> list[type]:
     for stage_cfg in stage_configs:
         if get_stage_type(stage_cfg) != "diffusion":
             continue
-        model_class_name = _config_get(_stage_engine_args(stage_cfg), "model_class_name")
+        model_class_name = _stage_diffusion_model_class_name(stage_cfg)
         if not model_class_name:
             continue
         model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
@@ -330,9 +327,12 @@ async def _run_video_generation_job(
         _cleanup_video_references(reference_video, reference_audio, control_path)
         return
 
-    await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
     started_at = time.perf_counter()
     try:
+
+        async def _mark_started() -> None:
+            await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
+
         video_bytes, stage_durations, peak_memory_mb, action, video_metadata = _unpack_video_generation_result(
             await handler.generate_video_bytes(
                 request,
@@ -340,6 +340,7 @@ async def _run_video_generation_job(
                 reference_image=reference_image,
                 reference_video=reference_video,
                 reference_audio=reference_audio,
+                on_started=_mark_started,
             )
         )
 

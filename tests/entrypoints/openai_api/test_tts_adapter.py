@@ -22,6 +22,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     detect_tts_model_type,
     resolve_adapter,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.base import resolve_stage_model_path
 from vllm_omni.entrypoints.openai.tts_adapters.covo_audio import CovoAudioAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.higgs_audio_v2 import HiggsAudioV2Adapter
 from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import (
@@ -65,9 +66,11 @@ EXPECTED_MODEL_TYPES = {
     "higgs_audio_v2",
     "higgs_audio_v3",
     "glm_tts",
+    "breeze_tts_2",
     "step_audio2",
     "indextts2",
     "indextts2_5",
+    "gepard",
     "dots_tts",
 }
 
@@ -95,6 +98,31 @@ def test_resolve_qwen3_tts_class():
 def test_resolve_unknown_returns_none():
     assert resolve_adapter("not_a_real_model") is None
     assert resolve_adapter(None) is None
+
+
+def test_stage_model_path_prefers_typed_override():
+    engine_client = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(engine_args=SimpleNamespace(model="legacy-stage-model")),
+            SimpleNamespace(
+                model_config=SimpleNamespace(model="typed-stage-model"),
+            ),
+        ],
+        model="served-model",
+    )
+
+    assert resolve_stage_model_path(engine_client) == "typed-stage-model"
+
+
+def test_stage_model_path_falls_back_to_legacy_then_served_model():
+    legacy_client = SimpleNamespace(
+        stage_configs=[SimpleNamespace(engine_args=SimpleNamespace(model="legacy-stage-model"))],
+        model="served-model",
+    )
+    served_client = SimpleNamespace(stage_configs=[SimpleNamespace()], model="served-model")
+
+    assert resolve_stage_model_path(legacy_client) == "legacy-stage-model"
+    assert resolve_stage_model_path(served_client) == "served-model"
 
 
 def test_voxcpm2_resolves():
@@ -140,6 +168,17 @@ def _build_moss_tts_request(adapter_cls, mocker, *, request_seed):
             has_inline_ref_audio=False,
         )
     )
+
+
+@pytest.mark.parametrize(
+    ("adapter_cls", "expect_accumulate"),
+    [(MossTTSAdapter, False), (MossTTSNanoAdapter, True)],
+)
+def test_moss_tts_accumulate_nonstreaming_follows_adapter_flag(adapter_cls, expect_accumulate, mocker):
+    prepared = _build_moss_tts_request(adapter_cls, mocker, request_seed=7)
+
+    assert adapter_cls.accumulate_nonstreaming is expect_accumulate
+    assert prepared.output_policy.accumulate_nonstreaming is expect_accumulate
 
 
 # Full-family coverage pins the adapter contract; only Nano consumes this seed end to end today.
