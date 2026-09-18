@@ -393,6 +393,7 @@ def test_speech_with_voice_param_accepted(omni_server, online_client, voice) -> 
         "response_format": "wav",
         "timeout": 180.0,
         "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
+        "transcript_escalation_model": "large-v3",
     }
     online_client.send_audio_speech_request(request_config)
 
@@ -406,6 +407,7 @@ def test_voice_request_before_and_after_clone_registration(omni_server, online_c
         "model": omni_server.model,
         "input": get_prompt("text"),
         "voice": _DEFAULT_VOICE_NAME,
+        "transcript_escalation_model": "large-v3",
     }
 
     # 1) "default" should appear in the voices list before any uploads
@@ -446,6 +448,7 @@ def test_registered_default_voice_overrides_placeholder(omni_server, online_clie
         "model": omni_server.model,
         "input": get_prompt("text"),
         "voice": _DEFAULT_VOICE_NAME,
+        "transcript_escalation_model": "large-v3",
     }
 
     # 1) Placeholder default works before any registration
