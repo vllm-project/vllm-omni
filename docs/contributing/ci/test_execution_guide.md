@@ -160,13 +160,11 @@ Failed jobs: 1/2
     ```bash
     pytest -s -v -m "full_model and L4 and not cards_1"  --run-level=full_model
     ```
-    Note: ``run_benchmark.py`` and ``run_diffusion_benchmark.py`` accept an optional ``--test-config-file``. If omitted, each loads every ``*.json`` under ``tests/dfx/perf/tests/`` (omni/tts/generation vs remaining diffusion-client split by ``is_diffusion_perf_config``) and pytest ``-m`` filters by each case's JSON ``mark``:
+    Note: ``run_benchmark.py`` and ``run_diffusion_benchmark.py`` accept an optional ``--test-config-file``. If omitted, each loads every ``*.json`` under ``tests/dfx/perf/tests/`` (omni/tts vs diffusion split by ``is_diffusion_perf_config``) and pytest ``-m`` filters by each case's JSON ``mark``:
     ```bash
     pytest -sv tests/dfx/perf/scripts/run_benchmark.py -m "full_model and tts and H100"
-    pytest -sv tests/dfx/perf/scripts/run_benchmark.py -m "full_model and diffusion and H100"
     pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and diffusion and H100"
     pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_tts.json
-    pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
     pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json
     ```
     Nightly **Perf Test** jobs in [``test-nightly.yml``](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml) use ``--test-config-file`` only (no ``-m``). Weekly **Perf Test** in [``test-weekly.yml``](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-weekly.yml) runs ``test_qwen3_omni_vllm_text.json`` and ``test_qwen3_omni_multi_replicas.json`` (JSON ``mark`` includes ``slow``). E2e L4 function tests use ``full_model`` + ``--run-level full_model``. Example:

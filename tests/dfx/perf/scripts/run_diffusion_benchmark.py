@@ -2,25 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
-Performance benchmark CI runner for remaining diffusion-client cases.
-
-Most image/video OpenAI endpoints now use ``run_benchmark.py``
-(``vllm bench serve --omni``). This runner keeps cases that still need the
-diffusion client schema (``benchmark_params[].dataset``), for example custom
-jsonl such as ``test_hunyuan_image3_it2i.json``.
+Performance benchmark CI runner for diffusion models.
 
 This runner separates two concepts:
 
 1. ``server_type``: how the serving process is started.
    Currently only ``vllm-omni`` is supported here.
 2. ``benchmark_endpoint``: which serving API the benchmark client calls.
-   Examples: ``/v1/chat/completions`` and ``/v1/images/edits``.
+   Examples: ``/v1/chat/completions`` and ``/v1/videos``.
 
 A config JSON file may be passed via --test-config-file. If omitted, every ``*.json`` under
-``tests/dfx/perf/tests/`` is loaded and only ``is_diffusion_perf_config`` cases are kept;
-pytest ``-m`` filters by each case's ``mark``:
+``tests/dfx/perf/tests/`` is loaded and pytest ``-m`` filters by each case's ``mark``:
   pytest run_diffusion_benchmark.py -m "diffusion"
-  pytest run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_hunyuan_image3_it2i.json
+  pytest run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
 
 Optional JSON field ``mark`` is applied as pytest marks on that case via
 ``pytest.param`` (e.g. ``"mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}}, "full_model", "diffusion"]``).

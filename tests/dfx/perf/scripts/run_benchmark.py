@@ -61,7 +61,7 @@ else:
     if skipped:
         print(
             f"--test-config-file: loaded {len(BENCHMARK_CONFIGS)} omni/tts/generation case(s); "
-            f"skipped {skipped} remaining diffusion case(s) (custom jsonl / diffusion-only client)"
+            f"skipped {skipped} remaining diffusion case(s) (chat completions / custom jsonl)"
         )
 
 DEPLOY_CONFIGS_DIR = Path(__file__).parent.parent / "deploy"

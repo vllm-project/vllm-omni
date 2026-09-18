@@ -765,6 +765,7 @@ _IMAGE_EDITS_EXTRA_BODY_FORM_FIELDS = (
     "negative_prompt",
     "num_inference_steps",
     "guidance_scale",
+    "guidance_scale_2",
     "strength",
     "true_cfg_scale",
     "seed",
