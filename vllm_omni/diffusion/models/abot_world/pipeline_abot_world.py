@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """ABot-World causal DMD pipeline with offline and realtime inference."""
 
 from __future__ import annotations
@@ -7,7 +7,7 @@ from __future__ import annotations
 import math
 import os
 import warnings
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -17,7 +17,6 @@ import PIL.Image
 import PIL.ImageOps
 import torch
 import torch.nn.functional as F
-from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, UMT5Config, UMT5EncoderModel
@@ -33,12 +32,15 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import retrieve_latents
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
 )
+from vllm_omni.experimental.ar_diffusion.streaming_decode import StreamingDecodeState, WanStreamingDecoder
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionChunkMetadata,
     ARDiffusionTickRequest,
@@ -49,6 +51,7 @@ from .abot_world_transformer import (
     ABotTransformerCache,
     ABotWorldCausalTransformer3DModel,
 )
+from .taew2_2 import TAEW2Decoder
 
 if TYPE_CHECKING:
     from tqdm.std import tqdm as TqdmProgressBar
@@ -70,7 +73,32 @@ _SOURCE_IMAGE_ERROR = (
     "Unable to load multi_modal_data.image; expected a decodable image within 4096 * 4096 source pixels."
 )
 _PREPROCESSED_ACTION_KEY = "_abot_camera_actions"
+_PREPROCESSED_ACTION_SCRIPT_KEY = "_abot_camera_action_script"
 _ACTION_CONTROL_DIM = 32
+
+
+def _wan_decode_cache_bytes(decoder: nn.Module, height: int, width: int, dtype: torch.dtype) -> int:
+    """Bound Wan2.2 causal features without allocating or running the decoder.
+
+    Every cached convolution input retains at most two temporal slices. Count
+    residual inputs at their own spatial stage, not decoder weights or outputs.
+    This is checked against real streaming state in the two-session benchmark.
+    """
+    area = height * width
+    elements = decoder.conv_in.in_channels * area
+    for resnet in decoder.mid_block.resnets:
+        elements += (resnet.conv1.in_channels + resnet.conv2.in_channels) * area
+    for block in decoder.up_blocks:
+        for resnet in block.resnets:
+            elements += (resnet.conv1.in_channels + resnet.conv2.in_channels) * area
+        if block.upsampler is not None:
+            if block.upsampler.mode == "upsample3d":
+                elements += block.upsampler.time_conv.in_channels * area
+            area *= 4
+    elements += decoder.conv_out.in_channels * area
+    # CUDA autocast can retain FP32 normalized activations even when the VAE
+    # weights are BF16. Admission must budget those features, not weight dtype.
+    return 2 * elements * max(dtype.itemsize, torch.float32.itemsize)
 
 
 def _paged_kv_tokens_per_frame(
@@ -139,6 +167,7 @@ class _ABotRequestInputs:
     image: PIL.Image.Image | torch.Tensor
     reference_images: tuple[PIL.Image.Image | torch.Tensor, ...] | None
     camera_actions: tuple[tuple[str, ...], ...] | None
+    camera_action_script: tuple[tuple[tuple[str, ...], ...], ...] | None
     height: int
     width: int
     num_frames: int
@@ -157,7 +186,7 @@ class _ABotARSessionState:
     generator_state: torch.Tensor | None = None
     first_frame_latent: torch.Tensor | None = None
     current_actions: tuple[tuple[str, ...], ...] | None = None
-    vae_decode_cache: list[torch.Tensor | str | None] | None = None
+    prompt_embeds: torch.Tensor | None = None
 
 
 def _resolve_local_model_path(model: str) -> str:
@@ -171,13 +200,17 @@ def _resolve_local_model_path(model: str) -> str:
     return os.path.abspath(model)
 
 
-def _validate_local_model_files(model_path: str) -> None:
+def _validate_local_model_files(model_path: str, *, vae_backend: str = "wan") -> None:
+    if vae_backend not in {"wan", "taew2_2"}:
+        raise ValueError("abot_vae must be 'wan' or 'taew2_2'.")
     required_files = (
         "config.json",
         "diffusion_pytorch_model.safetensors",
         "models_t5_umt5-xxl-enc-bf16.pth",
         "Wan2.2_VAE.pth",
     )
+    if vae_backend == "taew2_2":
+        required_files += ("taew2_2.pth",)
     missing = [name for name in required_files if not os.path.isfile(os.path.join(model_path, name))]
     if not os.path.isdir(os.path.join(model_path, "google", "umt5-xxl")):
         missing.append("google/umt5-xxl/")
@@ -377,6 +410,11 @@ def get_abot_world_pre_process_func(
                     camera_actions = parse_abot_camera_action_frames(camera_controls[0].data, expected_frames=3)
 
         extra_args = dict(getattr(request.sampling_params, "extra_args", None) or {})
+        camera_action_script = extra_args.get("camera_action_script")
+        if camera_action_script is not None:
+            from vllm_omni.diffusion.models.abot_world.actions import parse_abot_camera_action_script
+
+            camera_action_script = parse_abot_camera_action_script(camera_action_script)
         updated_prompt = dict(prompt)
         updated_mmd = dict(multi_modal_data)
         updated_mmd["image"] = image
@@ -385,6 +423,7 @@ def get_abot_world_pre_process_func(
         updated_prompt["multi_modal_data"] = updated_mmd
         request.prompt = updated_prompt
         extra_args[_PREPROCESSED_ACTION_KEY] = camera_actions
+        extra_args[_PREPROCESSED_ACTION_SCRIPT_KEY] = camera_action_script
         request.sampling_params.extra_args = extra_args
         return request
 
@@ -427,6 +466,13 @@ class ABotWorldCausalPipeline(
     dummy_run_num_frames: ClassVar[int] = 0
     _AR_BRANCH = "main"
     _AR_TEXT_CACHE = "text"
+    supports_step_execution: ClassVar[bool] = True
+    _PROFILER_TARGETS = [
+        "prepare_encode",
+        "denoise_step",
+        "_commit_stepwise_kv",
+        "_decode_realtime_chunk",
+    ]
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__()
@@ -437,7 +483,9 @@ class ABotWorldCausalPipeline(
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model = od_config.model
         model_path = _resolve_local_model_path(model)
-        _validate_local_model_files(model_path)
+        model_config = getattr(od_config, "model_config", None) or {}
+        self._vae_backend = model_config.get("abot_vae", "wan")
+        _validate_local_model_files(model_path, vae_backend=self._vae_backend)
         managed_offload = bool(
             getattr(od_config, "enable_cpu_offload", False) or getattr(od_config, "enable_layerwise_offload", False)
         )
@@ -461,10 +509,15 @@ class ABotWorldCausalPipeline(
         if not managed_offload:
             self.text_encoder = self.text_encoder.to(self.device)
 
-        # VAE
-        self.vae = self._load_vae(model_path, dtype)
-        if not managed_offload:
-            self.vae = self.vae.to(self.device)
+        # Both decoders use the original Wan image encoder and latent contract.
+        self.vae_encoder = self._load_vae(model_path, dtype)
+        if self._vae_backend == "taew2_2":
+            self.vae = TAEW2Decoder(os.path.join(model_path, "taew2_2.pth"), dtype).to(self.device)
+            self._streaming_decoder = self.vae
+        else:
+            self.vae = self.vae_encoder.to(self.device)
+            self._streaming_decoder = WanStreamingDecoder(self.vae)
+        self._streaming_decode_states: dict[str, StreamingDecodeState] = {}
 
         # Custom causal transformer
         self.transformer = self._create_transformer(model_path)
@@ -487,8 +540,8 @@ class ABotWorldCausalPipeline(
 
         self.setup_diffusion_pipeline_profiler(
             profiler_targets=[
-                "vae.encode",
-                "vae.decode",
+                "vae_encoder.encode",
+                "_decode_realtime_chunk",
                 "_generate_block",
                 "text_encoder.forward",
                 "tokenizer.forward",
@@ -710,6 +763,20 @@ class ABotWorldCausalPipeline(
             * latent_w
             * torch.empty((), dtype=self.transformer.dtype).element_size()
         )
+        if self._vae_backend == "taew2_2":
+            vae_cache_bytes = TAEW2Decoder.persistent_state_bytes(latent_h, latent_w, self.vae.dtype)
+        else:
+            vae_cache_bytes = _wan_decode_cache_bytes(self.vae.decoder, latent_h, latent_w, self.vae.dtype)
+        # Stepwise state also retains prompt embeddings and the current action
+        # tensor. They are outside the runner-owned self/cross-attention KV pools.
+        condition_bytes += _MAX_SEQUENCE_LENGTH * int(cfg.text_dim) * self.transformer.dtype.itemsize
+        condition_bytes += (
+            _ACTION_CONTROL_DIM
+            * self._num_frame_per_block
+            * self._ar_height
+            * self._ar_width
+            * self.transformer.dtype.itemsize
+        )
         return ARDiffusionKVCacheSpec(
             num_layers=int(cfg.num_layers),
             num_kv_heads=num_local_heads,
@@ -721,7 +788,7 @@ class ABotWorldCausalPipeline(
             kv_branches=(ARDiffusionKVBranchSpec(self._AR_BRANCH, 0),),
             session_capacity=2,
             cross_attention=(ARDiffusionCrossAttentionKVSpec(self._AR_TEXT_CACHE, _MAX_SEQUENCE_LENGTH),),
-            model_owned_state_bytes_per_session=condition_bytes,
+            model_owned_state_bytes_per_session=condition_bytes + vae_cache_bytes,
         )
 
     @contextmanager
@@ -737,10 +804,13 @@ class ABotWorldCausalPipeline(
             self._ar_diffusion_kv_state = None
 
     def reset_ar_diffusion_session(self, session_id: str) -> None:
-        self._ar_sessions.pop(session_id, None)
+        self.close_ar_diffusion_session(session_id)
 
     def close_ar_diffusion_session(self, session_id: str) -> None:
         self._ar_sessions.pop(session_id, None)
+        state = self._streaming_decode_states.pop(session_id, None)
+        if state is not None:
+            state.release()
 
     # ── Request parsing ──────────────────────────────────────────────────
 
@@ -795,6 +865,7 @@ class ABotWorldCausalPipeline(
 
         extra_args = getattr(sampling, "extra_args", None) or {}
         camera_actions = extra_args.get(_PREPROCESSED_ACTION_KEY)
+        camera_action_script = extra_args.get(_PREPROCESSED_ACTION_SCRIPT_KEY)
         flow_shift = _positive_finite_flow_shift(extra_args.get("flow_shift", 5.0))
 
         height = getattr(sampling, "height", None) or _DEFAULT_HEIGHT
@@ -815,11 +886,14 @@ class ABotWorldCausalPipeline(
         num_frames = getattr(sampling, "num_frames", None) or 9
         if isinstance(num_frames, bool) or not isinstance(num_frames, int) or num_frames <= 0:
             raise ValueError(f"num_frames must be a positive integer, got {num_frames!r}.")
-        if num_frames > _MAX_RAW_FRAMES:
+        if num_frames > _MAX_RAW_FRAMES and not bool(getattr(self.od_config, "step_execution", False)):
             raise ValueError(f"num_frames must not exceed {_MAX_RAW_FRAMES}.")
         if (num_frames - 1) % self.vae_scale_factor_temporal:
             raise ValueError(f"(num_frames - 1) must be divisible by {self.vae_scale_factor_temporal}.")
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
+        rope_max_seq_len = int(getattr(self.transformer.config, "rope_max_seq_len", num_latent_frames))
+        if num_latent_frames > rope_max_seq_len:
+            raise ValueError(f"num_latent_frames must not exceed RoPE horizon {rope_max_seq_len}.")
         if num_latent_frames % self._num_frame_per_block:
             raise ValueError(
                 f"num_latent_frames ({num_latent_frames}) must be divisible by {self._num_frame_per_block}."
@@ -837,6 +911,7 @@ class ABotWorldCausalPipeline(
             image=image,
             reference_images=reference_images,
             camera_actions=camera_actions,
+            camera_action_script=camera_action_script,
             height=height,
             width=width,
             num_frames=num_frames,
@@ -876,13 +951,8 @@ class ABotWorldCausalPipeline(
 
     def _vae_latent_stats(self, ref: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         shape = (1, -1, 1, 1, 1)
-        # Read from buffer (populated by load_state_dict), fall back to config
-        mean_val = getattr(self.vae, "latents_mean", None)
-        if mean_val is None:
-            mean_val = self.vae.config.latents_mean
-        std_val = getattr(self.vae, "latents_std", None)
-        if std_val is None:
-            std_val = self.vae.config.latents_std
+        mean_val = self.vae_encoder.config.latents_mean
+        std_val = self.vae_encoder.config.latents_std
         if mean_val is None or std_val is None:
             return (
                 torch.as_tensor(0.0, device=ref.device, dtype=ref.dtype),
@@ -895,33 +965,38 @@ class ABotWorldCausalPipeline(
     def _decode_realtime_chunk(
         self,
         latents: torch.Tensor,
-        cache: list[torch.Tensor | str | None] | None,
-    ) -> tuple[torch.Tensor, list[torch.Tensor | str | None]]:
+        cache: StreamingDecodeState | None,
+    ) -> tuple[torch.Tensor, StreamingDecodeState]:
         """Decode one ABot chunk while keeping causal VAE state in the session."""
-        if latents.ndim != 5 or latents.shape[0] != 1:
-            raise ValueError("ABot realtime VAE decode requires a 5D batch-size-1 latent.")
-
-        first_chunk = cache is None
+        decoder = self._streaming_decoder
         if cache is None:
-            cache = [None] * self.vae._cached_conv_counts["decoder"]
+            cache = decoder.new_decode_state("offline")
+        if self._vae_backend == "wan":
+            mean, std = self._vae_latent_stats(latents)
+            latents = latents * std + mean
+        try:
+            return decoder.decode_chunk(latents.to(dtype=self.vae.dtype), cache), cache
+        except Exception:
+            cache.release()
+            raise
 
-        decoded = []
-        with self.vae._execution_context():
-            hidden_states = self.vae.post_quant_conv(latents)
-            for frame_index in range(hidden_states.shape[2]):
-                decoded.append(
-                    self.vae.decoder(
-                        hidden_states[:, :, frame_index : frame_index + 1],
-                        feat_cache=cache,
-                        feat_idx=[0],
-                        first_chunk=first_chunk and frame_index == 0,
-                    )
-                )
+    def _decode_session_chunk(self, latents: torch.Tensor, session_id: str) -> torch.Tensor:
+        cache = self._streaming_decode_states.get(session_id)
+        if cache is None:
+            cache = self._streaming_decoder.new_decode_state(session_id)
+            self._streaming_decode_states[session_id] = cache
+        try:
+            frames, _ = self._decode_realtime_chunk(latents, cache)
+            return frames
+        except Exception:
+            self._streaming_decode_states.pop(session_id, None)
+            raise
 
-        video = torch.cat(decoded, dim=2)
-        if self.vae.config.patch_size is not None:
-            video = unpatchify(video, patch_size=self.vae.config.patch_size)
-        return video.clamp(-1.0, 1.0), cache
+    @staticmethod
+    def _format_video(frames: torch.Tensor, output_type: str) -> Any:
+        from diffusers.video_processor import VideoProcessor
+
+        return VideoProcessor(vae_scale_factor=16).postprocess_video(frames, output_type=output_type)
 
     def _encode_first_frame(
         self, image: PIL.Image.Image | torch.Tensor, height: int, width: int, dtype: torch.dtype
@@ -929,7 +1004,16 @@ class ABotWorldCausalPipeline(
         """VAE-encode the first frame image into a single 48-channel latent frame."""
         img = self._prepare_image_tensor(image, height=height, width=width)
         video = img.unsqueeze(2)  # [1, 3, 1, H, W]
-        latent = retrieve_latents(self.vae.encode(video.to(dtype=self.vae.dtype)), sample_mode="argmax")
+        self.vae_encoder.to(self.device)
+        try:
+            latent = retrieve_latents(
+                self.vae_encoder.encode(video.to(dtype=self.vae_encoder.dtype)),
+                sample_mode="argmax",
+            )
+        finally:
+            if self._vae_backend == "taew2_2":
+                self.vae_encoder.to("cpu")
+                torch.accelerator.empty_cache()
         _validate_latent_tensor(
             latent,
             expected_channels=int(self.transformer.config.in_channels),
@@ -1139,6 +1223,206 @@ class ABotWorldCausalPipeline(
             state.commit_paged_context(self._AR_BRANCH)
         return current_latents
 
+    def _require_bound_ar_state(self) -> None:
+        if self._ar_diffusion_kv_state is None:
+            raise RuntimeError("ABot step execution requires AR-Diffusion session binding.")
+
+    def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
+        del kwargs
+        self._require_bound_ar_state()
+        req = DiffusionRequestBatch(
+            requests=[
+                OmniDiffusionRequest(
+                    prompt=state.prompt,
+                    sampling_params=state.sampling,
+                    request_id=state.request_id,
+                )
+            ]
+        )
+        inputs = self._parse_request(req)
+        if ARDiffusionTickRequest.from_extra_args(state.sampling.extra_args) is not None:
+            raise ValueError("ABot step execution does not accept AR-Diffusion ticks.")
+        if (inputs.height, inputs.width) != (self._ar_height, self._ar_width):
+            raise ValueError("ABot stepwise resolution must match the fixed AR cache geometry.")
+        total_chunks = inputs.num_latent_frames // inputs.num_frame_per_block
+        if inputs.camera_action_script is not None and len(inputs.camera_action_script) != total_chunks:
+            raise ValueError(
+                "camera_action_script must contain one action chunk per generated chunk; "
+                f"got {len(inputs.camera_action_script)} for {total_chunks} chunks."
+            )
+        dtype = self.transformer.dtype
+        prompt_embeds = self.encode_prompt(inputs.prompt, max_sequence_length=inputs.max_sequence_length, dtype=dtype)
+        state.prompt_embeds = prompt_embeds
+        state.chunk_index = 0
+        state.step_index = 0
+        state.step_in_chunk = 0
+        state.total_chunks = total_chunks
+        state.chunk_num_steps = len(ABOT_DMD_TIMESTEPS)
+        state.extra = {
+            "inputs": inputs,
+            "first_frame_latent": self._encode_first_frame(inputs.image, inputs.height, inputs.width, dtype),
+            "schedule": _build_shifted_flow_schedule(flow_shift=inputs.flow_shift),
+            "dtype": dtype,
+        }
+        self._ar_text_caches(prompt_embeds, invalidate=False)
+        self._prepare_next_chunk(state)
+        return state
+
+    def _prepare_next_chunk(self, state: StepRequestState) -> None:
+        inputs: _ABotRequestInputs = state.extra["inputs"]
+        block_frames = inputs.num_frame_per_block
+        start_frame = state.chunk_index * block_frames
+        actions = (
+            inputs.camera_action_script[state.chunk_index]
+            if inputs.camera_action_script is not None
+            else inputs.camera_actions
+        )
+        state.extra["start_frame"] = start_frame
+        state.extra["action_condition"] = self._build_action_tensor(
+            actions, block_frames, inputs.height, inputs.width, state.extra["dtype"]
+        )
+        state.extra["ar_cross_attention"] = self._ar_text_caches(
+            cast(torch.Tensor, state.prompt_embeds),
+            invalidate=False,
+        )
+        latent_h = inputs.height // self.vae_scale_factor_spatial
+        latent_w = inputs.width // self.vae_scale_factor_spatial
+        state.latents = randn_tensor(
+            (1, int(self.transformer.config.out_channels), block_frames, latent_h, latent_w),
+            generator=inputs.generator,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        state.timesteps = torch.tensor(
+            [timestep for timestep, _ in state.extra["schedule"]], device=self.device, dtype=torch.float32
+        )
+        state.step_in_chunk = 0
+        state.step_index = 0
+
+    def denoise_step(
+        self,
+        input_batch: InputBatch,
+        *,
+        states: Sequence[StepRequestState] | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor | None:
+        del input_batch, kwargs
+        if states is None or len(states) != 1:
+            raise ValueError("ABot step execution supports exactly one request.")
+        self._require_bound_ar_state()
+        state = states[0]
+        latents = state.latents
+        if latents is None:
+            raise RuntimeError("ABot step execution requires prepared latents.")
+        step = state.step_in_chunk
+        ts_val, sigma = state.extra["schedule"][step]
+        start_frame = int(state.extra["start_frame"])
+        if start_frame == 0:
+            latents[:, :, 0] = state.extra["first_frame_latent"][:, :, 0]
+        set_forward_context_denoise_step_idx(step)
+        timestep = torch.full((1, latents.shape[2]), ts_val, device=self.device, dtype=torch.float32)
+        if start_frame == 0:
+            timestep[:, 0] = 0
+        cache = self._ar_transformer_cache(
+            latent=latents,
+            cross_attention=state.extra["ar_cross_attention"],
+            commit_current=False,
+        )
+        flow_pred = self.transformer(
+            hidden_states=latents.to(dtype=self.transformer.dtype),
+            timestep=timestep,
+            encoder_hidden_states=state.prompt_embeds,
+            cache=cache,
+            start_frame=start_frame,
+            update_cache=False,
+            action_condition=state.extra["action_condition"],
+        )
+        return flow_pred[:, : int(self.transformer.config.out_channels)]
+
+    def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
+        del kwargs
+        latents = state.latents
+        if latents is None:
+            raise RuntimeError("ABot step execution requires prepared latents.")
+        schedule = state.extra["schedule"]
+        step = state.step_in_chunk
+        _, sigma = schedule[step]
+        x0 = latents - sigma * noise_pred.float()
+        if step + 1 < len(schedule):
+            next_sigma = schedule[step + 1][1]
+            noise = randn_tensor(
+                latents.shape,
+                generator=state.extra["inputs"].generator,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            state.latents = (1.0 - next_sigma) * x0 + next_sigma * noise
+        else:
+            state.latents = x0
+        state.step_in_chunk += 1
+        state.step_index = state.step_in_chunk
+
+    def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
+        del kwargs
+        self._require_bound_ar_state()
+        latents = state.latents
+        if latents is None:
+            raise RuntimeError("ABot step execution requires prepared latents.")
+        extra = state.extra
+        start_frame = int(extra["start_frame"])
+        if start_frame == 0:
+            latents[:, :, 0] = extra["first_frame_latent"][:, :, 0]
+        self._commit_stepwise_kv(state, latents)
+
+        inputs: _ABotRequestInputs = extra["inputs"]
+        if inputs.output_type == "latent":
+            payload: dict[str, Any] = {"latents": latents}
+        else:
+            frames = self._decode_session_chunk(latents, state.request_id)
+            payload = {"video": self._format_video(frames, inputs.output_type)}
+        completed_chunk = state.chunk_index
+        state.chunk_index += 1
+        finished = state.request_denoise_completed
+        if not finished:
+            self._prepare_next_chunk(state)
+        return DiffusionOutput(
+            output={
+                "payload": payload,
+                "metadata": {
+                    "ar_diffusion": ARDiffusionChunkMetadata(
+                        session_id=state.request_id,
+                        request_id=state.request_id,
+                        chunk_index=completed_chunk,
+                        applied_event_ids=(),
+                    ).to_dict()
+                },
+            },
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            chunk_index=completed_chunk,
+            total_chunks=state.total_chunks,
+            finished=finished,
+        )
+
+    def _commit_stepwise_kv(self, state: StepRequestState, latents: torch.Tensor) -> None:
+        extra = state.extra
+        start_frame = int(extra["start_frame"])
+        commit_cache = self._ar_transformer_cache(
+            latent=latents,
+            cross_attention=extra["ar_cross_attention"],
+            commit_current=True,
+        )
+        _ = self.transformer(
+            hidden_states=latents.to(dtype=self.transformer.dtype),
+            timestep=torch.zeros((1, latents.shape[2]), device=self.device, dtype=torch.float32),
+            encoder_hidden_states=state.prompt_embeds,
+            cache=commit_cache,
+            start_frame=start_frame,
+            update_cache=True,
+            action_condition=extra["action_condition"],
+        )
+        assert self._ar_diffusion_kv_state is not None
+        self._ar_diffusion_kv_state.commit_paged_context(self._AR_BRANCH)
+
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         inputs = self._parse_request(req)
         tick = ARDiffusionTickRequest.from_extra_args(req.sampling_params.extra_args)
@@ -1146,8 +1430,6 @@ class ABotWorldCausalPipeline(
             raise RuntimeError("ABot typed ticks require ARDiffusionEngine session binding.")
         if tick is None and self._ar_diffusion_kv_state is not None:
             raise ValueError("ABot ARDiffusionEngine requests must carry ar_diffusion_tick.")
-        if tick is not None and inputs.output_type != "latent":
-            raise ValueError("ABot realtime ticks require output_type='latent'.")
 
         session_state: _ABotARSessionState | None = None
         if tick is not None:
@@ -1159,18 +1441,21 @@ class ABotWorldCausalPipeline(
                     "ABot realtime chunks must be contiguous: "
                     f"got {tick.chunk_index}, expected {session_state.next_chunk_index}."
                 )
-            max_realtime_ticks = (
-                (_MAX_RAW_FRAMES - 1) // self.vae_scale_factor_temporal + 1
-            ) // self._num_frame_per_block
-            if tick.chunk_index >= max_realtime_ticks:
-                raise ValueError("ABot realtime session exceeds the supported frame horizon.")
-
         schedule = _build_shifted_flow_schedule(flow_shift=inputs.flow_shift)
         dtype = self.transformer.dtype
         out_channels = int(self.transformer.config.out_channels)
         block_frames = inputs.num_frame_per_block
 
-        prompt_embeds = self.encode_prompt(inputs.prompt, max_sequence_length=inputs.max_sequence_length, dtype=dtype)
+        if (
+            session_state is not None
+            and session_state.prompt == inputs.prompt
+            and session_state.prompt_embeds is not None
+        ):
+            prompt_embeds = session_state.prompt_embeds
+        else:
+            prompt_embeds = self.encode_prompt(
+                inputs.prompt, max_sequence_length=inputs.max_sequence_length, dtype=dtype
+            )
         latent_h = inputs.height // self.vae_scale_factor_spatial
         latent_w = inputs.width // self.vae_scale_factor_spatial
 
@@ -1282,19 +1567,19 @@ class ABotWorldCausalPipeline(
                 expected_channels=int(self.vae.config.z_dim),
                 source="ABot transformer",
             )
-            mean, std = self._vae_latent_stats(generated_latents)
-            vae_latents = (generated_latents * std + mean).to(dtype=self.vae.dtype)
-            frames, session_state.vae_decode_cache = self._decode_realtime_chunk(
-                vae_latents,
-                session_state.vae_decode_cache,
-            )
+            if inputs.output_type == "latent":
+                payload = {"latents": generated_latents}
+            else:
+                frames = self._decode_session_chunk(generated_latents, tick.session_id)
+                payload = {"video": self._format_video(frames, inputs.output_type)}
             session_state.prompt = inputs.prompt
+            session_state.prompt_embeds = prompt_embeds
             session_state.generator_state = inputs.generator.get_state()
             session_state.current_actions = inputs.camera_actions
             session_state.next_chunk_index += 1
 
             output = {
-                "payload": {"latents": generated_latents, "frames": frames},
+                "payload": payload,
                 "metadata": {"ar_diffusion": ARDiffusionChunkMetadata.from_tick(tick).to_dict()},
             }
         elif inputs.output_type == "latent":
@@ -1305,9 +1590,7 @@ class ABotWorldCausalPipeline(
                 expected_channels=int(self.vae.config.z_dim),
                 source="ABot transformer",
             )
-            mean, std = self._vae_latent_stats(generated_latents)
-            vae_latents = (generated_latents * std + mean).to(dtype=self.vae.dtype)
-            output = self.vae.decode(vae_latents, return_dict=False)[0]
+            output, _ = self._decode_realtime_chunk(generated_latents, None)
             if output.shape[2] != inputs.num_frames:
                 raise RuntimeError(f"VAE decode mismatch: expected {inputs.num_frames} frames, got {output.shape[2]}.")
 
@@ -1323,5 +1606,6 @@ class ABotWorldCausalPipeline(
         )
         loaded = {f"transformer.{name}" for name in self.transformer.load_weights(transformer_weights)}
         loaded.update(f"vae.{name}" for name, _ in self.vae.named_parameters())
+        loaded.update(f"vae_encoder.{name}" for name, _ in self.vae_encoder.named_parameters())
         loaded.update(f"text_encoder.{name}" for name, _ in self.text_encoder.named_parameters())
         return loaded

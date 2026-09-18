@@ -1,0 +1,226 @@
+{
+  "hardware": "1 x NVIDIA L20X 140GB",
+  "date": "2026-09-19",
+  "latency": {
+    "wan/typed": {
+      "first_chunk_ms": 578.6277009174228,
+      "steady_median_ms": 590.3029544278979,
+      "steady_p95_ms": 605.530294124037,
+      "steady_mean_ms": 592.1468688312042,
+      "sum_tick_wall_ms": 20711.621241178364
+    },
+    "wan/stepwise": {
+      "first_chunk_ms": 595.8688263781369,
+      "steady_median_ms": 587.847237708047,
+      "steady_p95_ms": 611.3121407106519,
+      "steady_mean_ms": 593.2103737860042,
+      "sum_tick_wall_ms": 20765.021535102278
+    },
+    "taew2_2/typed": {
+      "first_chunk_ms": 1407.2228888981044,
+      "steady_median_ms": 304.65972190722823,
+      "steady_p95_ms": 330.43347485363483,
+      "steady_mean_ms": 310.39258766481106,
+      "sum_tick_wall_ms": 11618.351800367236
+    },
+    "taew2_2/stepwise": {
+      "first_chunk_ms": 1001.7850999720395,
+      "steady_median_ms": 299.49309304356575,
+      "steady_p95_ms": 323.11599189415574,
+      "steady_mean_ms": 300.2888547968777,
+      "sum_tick_wall_ms": 11211.60616306588
+    }
+  },
+  "memory": {
+    "wan": {
+      "vae_budget_bytes_per_session": 3040460800,
+      "vae_actual_bytes_per_session": 3006062592,
+      "dual_peak_allocated_GiB": 46.07800579071045,
+      "dual_live_allocated_GiB": 40.848938941955566,
+      "both_closed_allocated_GiB": 34.88430118560791,
+      "pool_session_capacity": 2,
+      "all_six_chunks_exact": true,
+      "snapshots": {
+        "engine_ready": {
+          "allocated_bytes": 37392507904,
+          "peak_allocated_bytes": 37392507904,
+          "vae_cache_bytes": {}
+        },
+        "a0": {
+          "allocated_bytes": 40652813312,
+          "peak_allocated_bytes": 46267259904,
+          "vae_cache_bytes": {
+            "a": 3006062592
+          }
+        },
+        "b0": {
+          "allocated_bytes": 43854595072,
+          "peak_allocated_bytes": 49461398528,
+          "vae_cache_bytes": {
+            "a": 3006062592,
+            "b": 3006062592
+          }
+        },
+        "a1": {
+          "allocated_bytes": 43861214208,
+          "peak_allocated_bytes": 49467952128,
+          "vae_cache_bytes": {
+            "a": 3006062592,
+            "b": 3006062592
+          }
+        },
+        "b1": {
+          "allocated_bytes": 43860165632,
+          "peak_allocated_bytes": 49474571264,
+          "vae_cache_bytes": {
+            "a": 3006062592,
+            "b": 3006062592
+          }
+        },
+        "a2": {
+          "allocated_bytes": 43861214208,
+          "peak_allocated_bytes": 49475881984,
+          "vae_cache_bytes": {
+            "a": 3006062592,
+            "b": 3006062592
+          }
+        },
+        "b2": {
+          "allocated_bytes": 43861214208,
+          "peak_allocated_bytes": 49475881984,
+          "vae_cache_bytes": {
+            "a": 3006062592,
+            "b": 3006062592
+          }
+        },
+        "a_closed_b_live": {
+          "allocated_bytes": 40657466368,
+          "peak_allocated_bytes": 49475881984,
+          "vae_cache_bytes": {
+            "b": 3006062592
+          }
+        },
+        "both_closed": {
+          "allocated_bytes": 37456733184,
+          "peak_allocated_bytes": 49475881984,
+          "vae_cache_bytes": {}
+        }
+      }
+    },
+    "taew2_2": {
+      "vae_budget_bytes_per_session": 17891328,
+      "vae_actual_bytes_per_session": 17891328,
+      "dual_peak_allocated_GiB": 40.15027713775635,
+      "dual_live_allocated_GiB": 39.70764970779419,
+      "both_closed_allocated_GiB": 39.31007432937622,
+      "pool_session_capacity": 2,
+      "all_six_chunks_exact": true,
+      "snapshots": {
+        "engine_ready": {
+          "allocated_bytes": 42144645632,
+          "peak_allocated_bytes": 42144645632,
+          "vae_cache_bytes": {}
+        },
+        "a0": {
+          "allocated_bytes": 42413371904,
+          "peak_allocated_bytes": 44568103936,
+          "vae_cache_bytes": {
+            "a": 17891328
+          }
+        },
+        "b0": {
+          "allocated_bytes": 42628096512,
+          "peak_allocated_bytes": 44780518400,
+          "vae_cache_bytes": {
+            "a": 17891328,
+            "b": 17891328
+          }
+        },
+        "a1": {
+          "allocated_bytes": 42635764224,
+          "peak_allocated_bytes": 43103626240,
+          "vae_cache_bytes": {
+            "a": 17891328,
+            "b": 17891328
+          }
+        },
+        "b1": {
+          "allocated_bytes": 42635502080,
+          "peak_allocated_bytes": 43111293952,
+          "vae_cache_bytes": {
+            "a": 17891328,
+            "b": 17891328
+          }
+        },
+        "a2": {
+          "allocated_bytes": 42635502080,
+          "peak_allocated_bytes": 43111031808,
+          "vae_cache_bytes": {
+            "a": 17891328,
+            "b": 17891328
+          }
+        },
+        "b2": {
+          "allocated_bytes": 42635764224,
+          "peak_allocated_bytes": 43111031808,
+          "vae_cache_bytes": {
+            "a": 17891328,
+            "b": 17891328
+          }
+        },
+        "a_closed_b_live": {
+          "allocated_bytes": 42423595520,
+          "peak_allocated_bytes": 43111031808,
+          "vae_cache_bytes": {
+            "b": 17891328
+          }
+        },
+        "both_closed": {
+          "allocated_bytes": 42208870912,
+          "peak_allocated_bytes": 43111031808,
+          "vae_cache_bytes": {}
+        }
+      }
+    }
+  },
+  "provenance": {
+    "base_commit": "5a978b042620f2ea80e272a567921c918051d838",
+    "tested_candidate_tree": "87d7d7f22703ce1d971a329ee77d1d4cd283e3fb",
+    "tested_source_hashes": {
+      "diffusion/models/abot_world/abot_world_transformer.py": "c781275bcac21bb83af35cc017a04191cc4abf021e3488c4f0258af8eca8ea64",
+      "diffusion/models/abot_world/actions.py": "515fe257ce418e85f73197592f847a5728983e5d60f421aabecac813e10f3540",
+      "diffusion/models/abot_world/__init__.py": "203db7a53837023deb5d0f62065f8db7f36038bde59fa2b92d9b63dbd4191ea4",
+      "diffusion/models/abot_world/taew2_2.py": "d3fdbc4153c5d99c1928681348ef5bb2811196bf29d98f31b5918d5111e6f8f4",
+      "diffusion/models/abot_world/pipeline_abot_world.py": "0104e0fcf4c4f8af963b8558ebb697de2584137362a74acce5c1ce7af49d604e",
+      "experimental/ar_diffusion/engine.py": "5268469e48744ef49f6d8a4b546d2b182414ba249c08bea8978c94ce384cfe9f",
+      "experimental/ar_diffusion/capability.py": "158731aa98be1a46d9449ecc2382907b4015c121a359bb5976dc9b3d2be929f7",
+      "experimental/ar_diffusion/tick_protocol.py": "da270b90316669094d9b86f909c372128859f8f7829488630d69e44424ededd1",
+      "experimental/ar_diffusion/__init__.py": "838d26654626a1c4cd2a5af14409e1e1efa3d3922d35ac2e7d46222bc6dbaa67",
+      "experimental/ar_diffusion/streaming_decode.py": "ee029a4841bec0e000374577410087a9bc91d458fcae0fb8a36db84bf85fde9d",
+      "experimental/ar_diffusion/session.py": "9992aff9b962d1e5ada00d7c84548d799594f02fcb004b986f5ab87b015db6ba",
+      "experimental/ar_diffusion/runner.py": "273fd6df7ac7a8e9fb5d6cb89a08d265dd22f96f43336ea2570bb6abc4a8e4b6",
+      "experimental/ar_diffusion/consumer.py": "e8c4aea8c4782d196d061a12cacde86f573106795b5e77ab34561f75e7879d14",
+      "experimental/ar_diffusion/kv_cache/__init__.py": "0872c696c384c9e1f3b905f75ce1f574d810836bddeb2375f3572e756b90beb2",
+      "experimental/ar_diffusion/kv_cache/paged.py": "86243cea0848cba55b845f3c567ac681cd2a311b50ecd873086122b5278cad1f",
+      "experimental/ar_diffusion/kv_cache/paged_attention.py": "f01aa4a7f03d5cc6dbd75b57acf177b9a428068d614cb14c83e138ab0582a2ad",
+      "experimental/ar_diffusion/kv_cache/config.py": "43514956ae549fa2132752d24760aa21200efbe40d72c2a5380795d80c3056c3",
+      "experimental/ar_diffusion/kv_cache/state.py": "b898d5edd84511a84986d210c2930a4dbd42b3a34c8e5e9edbec22e4f94e7404",
+      "experimental/ar_diffusion/kv_cache/manager.py": "b4b51e92523764256262215e930ed5e9cbfa14b0e7e3be3c6cb876ce0326d377"
+    },
+    "input_sha256": "b0cf44d3ae4e8c22eedcce1fee66fa70fc745e722ab161fdc92e7264c83ff17c",
+    "checkpoint": "acvlab/ABot-World-0-5B-LF",
+    "measurement": "CPU-ready video; includes request/compute/decode/return; excludes MP4/network transport",
+    "configuration": "512x832, seed 42, BF16 eager, TP=1, max_num_seqs=1, gpu_memory_fraction=0.15",
+    "events": {
+      "cuda_graph_capture": "disabled: enforce_eager=True, warmup_cudagraph=False",
+      "kv_pool_growth": "compare real fixed pool storage identities and sizes; page reuse is not growth"
+    },
+    "post_measurement_edits": "SPDX/header normalization in model files; portable memory counter aliases in evidence script; quality reporting and docs only"
+  },
+  "quality": {
+    "same_backend_all_40_chunk_comparisons_exact": true,
+    "tiny_vs_wan_mean_float_PSNR_dB": 30.126519538475826,
+    "tiny_vs_wan_mean_RGB8_SSIM": 0.7988268,
+    "scope": "one scene, seed 42, no motion actions, first 10 ticks / 117 frames; not upstream parity"
+  }
+}

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Realtime keyboard controls for ABot-World."""
 
 from __future__ import annotations
@@ -54,6 +54,25 @@ def parse_abot_camera_action_frames(
             f"latent frame; expected {expected_frames}, got {len(frames)}."
         )
     return frames
+
+
+def parse_abot_camera_action_script(
+    value: object,
+    *,
+    frames_per_chunk: int = 3,
+) -> tuple[tuple[tuple[str, ...], ...], ...]:
+    """Validate a request-scoped action script, one frame list per chunk."""
+
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise ValueError("camera_action_script must be a sequence of chunks.")
+    chunks = tuple(
+        _normalize_frames(chunk, field=f"camera_action_script[{index}]") for index, chunk in enumerate(value)
+    )
+    if any(len(chunk) != frames_per_chunk for chunk in chunks):
+        raise ValueError(
+            f"camera_action_script must contain exactly {frames_per_chunk} latent-frame action lists per chunk."
+        )
+    return chunks
 
 
 @dataclass(frozen=True)

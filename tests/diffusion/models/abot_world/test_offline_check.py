@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU-only regression tests for ABot-World configuration and helpers."""
 
 from __future__ import annotations
@@ -13,6 +13,10 @@ import torch
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.abot_world import abot_world_transformer as abot_transformer
+from vllm_omni.diffusion.models.abot_world.abot_world_transformer import (
+    ABotCausalHead,
+    ABotWorldCausalTransformer3DModel,
+)
 from vllm_omni.diffusion.models.abot_world.pipeline_abot_world import (
     _DEFAULT_HEIGHT,
     _DEFAULT_WIDTH,
@@ -27,12 +31,41 @@ from vllm_omni.diffusion.models.abot_world.pipeline_abot_world import (
     _validate_local_model_files,
     _validate_parallel_config,
 )
-from vllm_omni.diffusion.models.abot_world.abot_world_transformer import (
-    ABotCausalHead,
-    ABotWorldCausalTransformer3DModel,
-)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+def test_tiny_checkpoint_is_required_only_when_selected(tmp_path) -> None:
+    for name in (
+        "config.json",
+        "diffusion_pytorch_model.safetensors",
+        "models_t5_umt5-xxl-enc-bf16.pth",
+        "Wan2.2_VAE.pth",
+    ):
+        (tmp_path / name).touch()
+    (tmp_path / "google" / "umt5-xxl").mkdir(parents=True)
+    _validate_local_model_files(str(tmp_path))
+    with pytest.raises(FileNotFoundError, match="taew2_2.pth"):
+        _validate_local_model_files(str(tmp_path), vae_backend="taew2_2")
+    (tmp_path / "taew2_2.pth").touch()
+    _validate_local_model_files(str(tmp_path), vae_backend="taew2_2")
+    with pytest.raises(ValueError, match="abot_vae"):
+        _validate_local_model_files(str(tmp_path), vae_backend="unknown")
+
+
+def test_registry_loads_model_and_processing_functions() -> None:
+    from vllm_omni.diffusion.models.abot_world.pipeline_abot_world import ABotWorldCausalPipeline
+    from vllm_omni.diffusion.registry import (
+        DiffusionModelRegistry,
+        get_diffusion_post_process_func,
+        get_diffusion_pre_process_func,
+    )
+
+    config = SimpleNamespace(model_class_name="ABotWorldCausalPipeline")
+
+    assert DiffusionModelRegistry._try_load_model_cls(config.model_class_name) is ABotWorldCausalPipeline
+    assert callable(get_diffusion_pre_process_func(config))
+    assert callable(get_diffusion_post_process_func(config))
 
 
 @pytest.mark.parametrize("enforce_eager", [False, True])

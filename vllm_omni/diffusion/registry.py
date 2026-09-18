@@ -148,7 +148,7 @@ _DIFFUSION_MODELS = {
     ),
     "ABotWorldCausalPipeline": (
         "abot_world",
-        "pipeline",
+        "pipeline_abot_world",
         "ABotWorldCausalPipeline",
     ),
     "LongCatImagePipeline": (

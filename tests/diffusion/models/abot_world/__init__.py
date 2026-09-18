@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for ABot-World model module structure and type validation."""
 
 from __future__ import annotations
@@ -69,7 +69,7 @@ def test_registry_entry():
     assert "ABotWorldCausalPipeline" in _DIFFUSION_MODELS
     mod_folder, mod_relname, cls_name = _DIFFUSION_MODELS["ABotWorldCausalPipeline"]
     assert mod_folder == "abot_world"
-    assert mod_relname == "pipeline"
+    assert mod_relname == "pipeline_abot_world"
     assert cls_name == "ABotWorldCausalPipeline"
 
     assert "ABotWorldCausalPipeline" in _DIFFUSION_POST_PROCESS_FUNCS
