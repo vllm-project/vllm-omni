@@ -83,7 +83,7 @@ def get_max_batch_size(size_type="few"):
 @pytest.mark.core_model
 @pytest.mark.omni
 @pytest.mark.skipif(_USE_PD, reason="Temporarily skip PD mode in this test module.")
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3 if _USE_PD else 2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325", "npu": "A3"}, num_cards=3 if _USE_PD else 2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_mix_to_text_audio_001(omni_server, online_client) -> None:
     """
@@ -123,7 +123,7 @@ def test_mix_to_text_audio_001(omni_server, online_client) -> None:
 @pytest.mark.core_model
 @pytest.mark.omni
 @pytest.mark.skipif(_USE_PD, reason="Temporarily skip PD mode in this test module.")
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3 if _USE_PD else 2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325", "npu": "A3"}, num_cards=3 if _USE_PD else 2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_001(omni_server, online_client) -> None:
     """
@@ -248,7 +248,7 @@ def test_thinker_prefix_caching_audio_output(omni_server, online_client) -> None
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325", "npu": "A3"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_completions_rejected_for_thinker_talker(omni_server, online_client) -> None:
     """Ensure Thinker-talker models reject /v1/completions; we do this because the
@@ -272,7 +272,7 @@ def test_completions_rejected_for_thinker_talker(omni_server, online_client) -> 
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325", "npu": "A3"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_batched_completions_text(omni_server, openai_client) -> None:
     """Ensure that we can make a batch chat completions request (text only)."""
@@ -302,7 +302,7 @@ def test_batched_completions_text(omni_server, openai_client) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325", "npu": "A3"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_batched_completions_audio_out(omni_server, openai_client) -> None:
     """Ensure that we can make a batch chat completions request (audio + text)."""
@@ -337,7 +337,7 @@ def test_batched_completions_audio_out(omni_server, openai_client) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325", "npu": "A3"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @pytest.mark.parametrize(
     "sad_opts",
