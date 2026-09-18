@@ -3,7 +3,7 @@
 """MiniCPM-o 4.5 Daily-Omni + Seed-TTS accuracy regression coverage.
 
 Daily-Omni settings follow the MiniCPM interleaved AV recipe that reaches
-~78% overall accuracy on Daily-Omni (``minicpm-interleave``, ``temperature=0``,
+~77% overall accuracy on Daily-Omni (``minicpm-interleave``, ``temperature=0``,
 text modalities, and server ``--interleave-mm-strings`` + 1fps / 128-frame
 media-io kwargs, also pinned in ``minicpmo_4_5.yaml``).
 """
@@ -48,7 +48,12 @@ _RESULT_DIR = Path(
     )
 )
 
-_MIN_DAILY_OMNI_ACCURACY = 0.78
+# The 0.78 gate (934/1197) sits 1 item above the observed NPU mean
+# (~933/1197) and inside the observed 932~940 spread, so it flips nightly -
+# 3 failures in the latest 7 dated NPU nightlies (#6887). 0.77 (922/1197)
+# sits 10 items below the observed minimum (932) while still failing a
+# >=1pp real accuracy regression.
+_MIN_DAILY_OMNI_ACCURACY = 0.77
 _MAX_SEED_TTS_MEAN_WER = 0.05
 # Match the validated Daily-Omni client body from daily_omni_bench.sh.
 _DAILY_EXTRA_BODY = {

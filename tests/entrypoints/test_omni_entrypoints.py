@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import queue
 from collections.abc import Callable
@@ -16,6 +17,8 @@ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.config.omni_config import VllmOmniConfig
+from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import StageConfig
 from vllm_omni.engine.async_omni_engine import StageRuntimeInfo
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
@@ -118,8 +121,6 @@ class FakeAsyncOmniEngine:
         self.output_processors = [SimpleNamespace(tokenizer=None) for _ in range(self.num_stages)]
         self.input_processor = None
         self.endpoint_restrictions = ()
-        self.duplex_session_config = None
-        self.duplex_serving_adapter_path = None
 
         self.output_q: queue.Queue[Any] = queue.Queue()
         self.submitted: list[dict[str, Any]] = []
@@ -167,7 +168,8 @@ class FakeAsyncOmniEngine:
     def abort(self, request_ids: list[str]) -> None:
         self.aborted.append(list(request_ids))
 
-    async def abort_async(self, request_ids: list[str]) -> None:
+    async def abort_async(self, request_ids: list[str], timeout=None) -> None:
+        del timeout
         self.abort(request_ids)
 
     async def collective_rpc_async(self, **_: Any) -> list[Any]:
@@ -182,7 +184,8 @@ class FakeAsyncOmniEngine:
 
 
 def _patch_engine(monkeypatch: pytest.MonkeyPatch, engine: FakeAsyncOmniEngine) -> None:
-    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", lambda *args, **kwargs: engine)
+    monkeypatch.setattr("vllm_omni.entrypoints.omni.AsyncOmniEngine", lambda *args, **kwargs: engine)
+    monkeypatch.setattr("vllm_omni.entrypoints.async_omni.AsyncOmniEngine", lambda *args, **kwargs: engine)
     monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model: model)
     # Don't add random UUIDs to requests calling .generate since we usually
     # just want to check for present requests anyway, and would need to just
@@ -199,6 +202,49 @@ def _make_base():
     obj.engine = MagicMock()
     obj.request_states = {}
     return obj
+
+
+@pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
+def test_resolve_sampling_params_list_preserves_stage_constraints(typed):
+    from vllm_omni.config.omni_config import VllmOmniARStageConfig
+    from vllm_omni.config.stage_config import StagePipelineConfig
+
+    base = _make_base()
+    base.engine.num_stages = 1
+    base.default_sampling_params_list = [SamplingParams(max_tokens=1000, detokenize=False, stop_token_ids=[42])]
+    if typed:
+        stage = VllmOmniARStageConfig(
+            stage_pipeline_config=StagePipelineConfig(
+                stage_id=0,
+                model_stage="dummy-model",
+                sampling_constraints={"detokenize": False, "stop_token_ids": [42]},
+            )
+        )
+    else:
+        stage = StageConfig(
+            stage_id=0,
+            model_stage="dummy-model",
+            sampling_constraints={"detokenize": False, "stop_token_ids": [42]},
+        ).to_omegaconf()
+    base.engine.stage_configs = [stage]
+    base.sampling_constraints_list = base._get_sampling_constraints_list(base.engine.stage_configs)
+    assert base.sampling_constraints_list == [{"detokenize": False, "stop_token_ids": [42]}]
+
+    resolved_defaults = base.resolve_sampling_params_list(None)
+    assert resolved_defaults[0].stop_token_ids == [42]
+
+    caller_params = SamplingParams(seed=1234, max_tokens=7, detokenize=True, stop_token_ids=[7])
+    resolved = base.resolve_sampling_params_list(caller_params)
+
+    assert resolved[0] is not caller_params
+    assert resolved[0].seed == 1234
+    assert resolved[0].max_tokens == 7
+    assert resolved[0].detokenize is False
+    assert resolved[0].stop_token_ids == [7, 42]
+    assert 7 in resolved[0]._all_stop_token_ids
+    assert 42 in resolved[0]._all_stop_token_ids
+    assert caller_params.detokenize is True
+    assert caller_params.stop_token_ids == [7]
 
 
 def test_resolve_sampling_params_list_merges_required_stop_tokens():
@@ -218,22 +264,13 @@ def test_resolve_sampling_params_list_merges_required_stop_tokens():
     base.sampling_constraints_list = base._get_sampling_constraints_list(base.engine.stage_configs)
     assert base.sampling_constraints_list == [{"detokenize": False, "stop_token_ids": required_stop_ids}]
 
-    resolved_defaults = base.resolve_sampling_params_list(None)
 
-    assert resolved_defaults[0].stop_token_ids == [99, 151704, 151645]
+def test_sampling_constraints_are_forwarded_by_typed_stage_configs():
+    config = VllmOmniConfig.from_pipeline_config(OMNI_PIPELINES["qwen3_tts"])
 
-    caller_params = SamplingParams(seed=1234, max_tokens=7, detokenize=True, stop_token_ids=[100, 151704])
+    constraints = OmniBase._get_sampling_constraints_list(config.stage_configs)
 
-    resolved = base.resolve_sampling_params_list(caller_params)
-
-    assert resolved[0] is not caller_params
-    assert resolved[0].seed == 1234
-    assert resolved[0].max_tokens == 7
-    assert resolved[0].detokenize is False
-    assert resolved[0].stop_token_ids == [100, 151704, 151645]
-    assert {100, 151704, 151645}.issubset(resolved[0]._all_stop_token_ids)
-    assert caller_params.detokenize is True
-    assert caller_params.stop_token_ids == [100, 151704]
+    assert constraints == [dict(stage.stage_pipeline_config.sampling_constraints) for stage in config.stage_configs]
 
 
 @pytest.mark.parametrize("use_defaults", [False, True])
@@ -631,6 +668,43 @@ async def test_async_omni_llm_diffusion_yields_text_stream_then_image(monkeypatc
         "req-1-image-final",
     ]
     assert outputs[-1].images == ["req-1-image"]
+    assert "req-1" not in app.request_states
+
+
+@pytest.mark.asyncio
+async def test_async_omni_abort_yields_terminal_from_requested_final_stage(monkeypatch: pytest.MonkeyPatch):
+    stage_metadata = [
+        _stage_meta(stage_type="llm", final_output=False, final_output_type=None),
+        _stage_meta(stage_type="llm", final_output=True, final_output_type="audio"),
+    ]
+    engine = FakeAsyncOmniEngine(stage_metadata=stage_metadata)
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+
+    async def collect_outputs() -> list[OmniRequestOutput]:
+        return [
+            output
+            async for output in app.generate(
+                prompt="hello",
+                request_id="req-1",
+                output_modalities=["audio"],
+            )
+        ]
+
+    try:
+        generate_task = asyncio.create_task(collect_outputs())
+        while not engine.submitted:
+            await asyncio.sleep(0)
+        await app.abort("req-1")
+        outputs = await asyncio.wait_for(generate_task, timeout=1)
+    finally:
+        app.shutdown()
+
+    assert len(outputs) == 1
+    assert outputs[0].stage_id == 1
+    assert outputs[0].final_output_type == "audio"
+    assert outputs[0].finished is True
+    assert outputs[0].outputs[0].finish_reason == "abort"
     assert "req-1" not in app.request_states
 
 

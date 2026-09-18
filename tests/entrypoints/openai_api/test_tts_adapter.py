@@ -22,6 +22,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     detect_tts_model_type,
     resolve_adapter,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.base import resolve_stage_model_path
 from vllm_omni.entrypoints.openai.tts_adapters.covo_audio import CovoAudioAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.higgs_audio_v2 import HiggsAudioV2Adapter
 from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import (
@@ -69,6 +70,7 @@ EXPECTED_MODEL_TYPES = {
     "step_audio2",
     "indextts2",
     "indextts2_5",
+    "gepard",
     "dots_tts",
 }
 
@@ -96,6 +98,31 @@ def test_resolve_qwen3_tts_class():
 def test_resolve_unknown_returns_none():
     assert resolve_adapter("not_a_real_model") is None
     assert resolve_adapter(None) is None
+
+
+def test_stage_model_path_prefers_typed_override():
+    engine_client = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(engine_args=SimpleNamespace(model="legacy-stage-model")),
+            SimpleNamespace(
+                model_config=SimpleNamespace(model="typed-stage-model"),
+            ),
+        ],
+        model="served-model",
+    )
+
+    assert resolve_stage_model_path(engine_client) == "typed-stage-model"
+
+
+def test_stage_model_path_falls_back_to_legacy_then_served_model():
+    legacy_client = SimpleNamespace(
+        stage_configs=[SimpleNamespace(engine_args=SimpleNamespace(model="legacy-stage-model"))],
+        model="served-model",
+    )
+    served_client = SimpleNamespace(stage_configs=[SimpleNamespace()], model="served-model")
+
+    assert resolve_stage_model_path(legacy_client) == "legacy-stage-model"
+    assert resolve_stage_model_path(served_client) == "served-model"
 
 
 def test_voxcpm2_resolves():
@@ -141,6 +168,17 @@ def _build_moss_tts_request(adapter_cls, mocker, *, request_seed):
             has_inline_ref_audio=False,
         )
     )
+
+
+@pytest.mark.parametrize(
+    ("adapter_cls", "expect_accumulate"),
+    [(MossTTSAdapter, False), (MossTTSNanoAdapter, True)],
+)
+def test_moss_tts_accumulate_nonstreaming_follows_adapter_flag(adapter_cls, expect_accumulate, mocker):
+    prepared = _build_moss_tts_request(adapter_cls, mocker, request_seed=7)
+
+    assert adapter_cls.accumulate_nonstreaming is expect_accumulate
+    assert prepared.output_policy.accumulate_nonstreaming is expect_accumulate
 
 
 # Full-family coverage pins the adapter contract; only Nano consumes this seed end to end today.
@@ -215,6 +253,115 @@ def test_moss_reference_transcript_mode(variant, ref_text, mode, mocker):
     assert prepared.tts_params["seed"] == [0]
     assert prepared.prompt["cache_salt"]
     assert request.input == "Target."
+
+
+def _moss_adapter_with_stage_configs(stage_configs, mocker):
+    engine_client = SimpleNamespace(
+        model_config=SimpleNamespace(model="OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"),
+        stage_configs=stage_configs,
+    )
+    return MossTTSAdapter(SpeechServingContext(server=mocker.Mock(), engine_client=engine_client))
+
+
+def _moss_cuda_available(mocker, device_count=8):
+    mocker.patch("torch.cuda.is_available", return_value=True)
+    mocker.patch("torch.accelerator.device_count", return_value=device_count)
+
+
+@pytest.mark.parametrize(
+    "stage_configs,expected",
+    [
+        # Follows the code2wav stage's first device.
+        (
+            [
+                SimpleNamespace(model_stage="moss_tts_local", runtime_config=SimpleNamespace(devices="0")),
+                SimpleNamespace(model_stage="moss_tts_local_codec", runtime_config=SimpleNamespace(devices="3")),
+            ],
+            "cuda:3",
+        ),
+        # No codec-named stage: anchors on the last stage of the pipeline.
+        (
+            [
+                SimpleNamespace(model_stage="talker", runtime_config=SimpleNamespace(devices="1")),
+                SimpleNamespace(model_stage="decoder", runtime_config=SimpleNamespace(devices="2")),
+            ],
+            "cuda:2",
+        ),
+        # Multi-device codec stage pins replica 0 on the first device.
+        (
+            [
+                SimpleNamespace(model_stage="moss_tts_local_codec", runtime_config=SimpleNamespace(devices="5,6")),
+            ],
+            "cuda:5",
+        ),
+        # No explicit pinning anywhere: stage worker defaults to cuda:0.
+        (
+            [SimpleNamespace(model_stage="moss_tts_local_codec", runtime_config=SimpleNamespace(devices=None))],
+            "cuda:0",
+        ),
+    ],
+)
+def test_moss_ref_encoder_device_follows_codec_stage(stage_configs, expected, mocker):
+    import torch
+
+    _moss_cuda_available(mocker)
+    adapter = _moss_adapter_with_stage_configs(stage_configs, mocker)
+    assert adapter._resolve_ref_encoder_device() == torch.device(expected)
+
+
+def test_moss_ref_encoder_device_accepts_dict_runtime(mocker):
+    import torch
+
+    _moss_cuda_available(mocker)
+    adapter = _moss_adapter_with_stage_configs(
+        [SimpleNamespace(model_stage="moss_tts_local_codec", runtime={"devices": "2"})],
+        mocker,
+    )
+    assert adapter._resolve_ref_encoder_device() == torch.device("cuda:2")
+
+
+def test_moss_ref_encoder_device_cpu_when_cuda_unavailable(mocker):
+    import torch
+
+    mocker.patch("torch.cuda.is_available", return_value=False)
+    adapter = _moss_adapter_with_stage_configs(
+        [SimpleNamespace(model_stage="moss_tts_local_codec", runtime_config=SimpleNamespace(devices="3"))],
+        mocker,
+    )
+    assert adapter._resolve_ref_encoder_device() == torch.device("cpu")
+
+
+def test_moss_ref_encoder_device_cpu_when_index_out_of_range(mocker):
+    import torch
+
+    _moss_cuda_available(mocker, device_count=2)
+    adapter = _moss_adapter_with_stage_configs(
+        [SimpleNamespace(model_stage="moss_tts_local_codec", runtime_config=SimpleNamespace(devices="5"))],
+        mocker,
+    )
+    assert adapter._resolve_ref_encoder_device() == torch.device("cpu")
+
+
+def test_moss_get_processor_places_audio_tokenizer_on_codec_stage_device(mocker):
+    import torch
+
+    _moss_cuda_available(mocker)
+    adapter = _moss_adapter_with_stage_configs(
+        [SimpleNamespace(model_stage="moss_tts_local_codec", runtime_config=SimpleNamespace(devices="3"))],
+        mocker,
+    )
+    audio_tokenizer = mocker.Mock()
+    audio_tokenizer.to.return_value = audio_tokenizer
+    processor = SimpleNamespace(audio_tokenizer=audio_tokenizer)
+    from_pretrained = mocker.patch("transformers.AutoProcessor.from_pretrained", return_value=processor)
+
+    assert adapter._get_moss_processor() is processor
+    audio_tokenizer.to.assert_called_once_with(torch.device("cuda", 3))
+    audio_tokenizer.eval.assert_called_once_with()
+    # Lazy cache: no re-load / re-placement on the second call.
+    assert adapter._get_moss_processor() is processor
+    from_pretrained.assert_called_once()
+    audio_tokenizer.to.assert_called_once()
 
 
 def test_qwen3_tts_metadata():

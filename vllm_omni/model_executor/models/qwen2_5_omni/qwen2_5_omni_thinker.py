@@ -758,6 +758,7 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
         tokenizer = self.info.get_tokenizer()
         processor = self.info.get_hf_processor()
         audio_token_id = tokenizer.get_vocab()[processor.audio_token]
+        video_token_id = tokenizer.get_vocab()[processor.video_token]
 
         result_placeholders = dict(placeholders)
         audio_placeholders = []
@@ -765,7 +766,10 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
 
         audio_idx = 0
         for video_idx, video_placeholder in enumerate(placeholders["video"]):
-            audio_is_embed = torch.tensor(video_placeholder.tokens) == audio_token_id
+            placeholder_tokens = torch.tensor(video_placeholder.tokens)
+            audio_is_embed = placeholder_tokens == audio_token_id
+            # Audio boundary tokens keep their text embeddings.
+            video_is_embed = placeholder_tokens == video_token_id
 
             if video_use_audio_in_video[video_idx]:
                 audio_placeholder = PlaceholderFeaturesInfo(
@@ -783,7 +787,7 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
                 item_idx=video_idx,
                 start_idx=video_placeholder.start_idx,
                 tokens=video_placeholder.tokens,
-                is_embed=~audio_is_embed,
+                is_embed=video_is_embed,
             )
             video_placeholders.append(video_placeholder_with_mask)
 

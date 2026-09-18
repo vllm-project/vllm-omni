@@ -83,6 +83,25 @@ test_params = [
     ),
 ]
 
+turn_test_params = [
+    pytest.param(
+        OmniServerParams(
+            model=_MODEL,
+            stage_config_path=modify_stage_config(_CI_DEPLOY, updates={"session_mode": "turn"}),
+            use_stage_cli=False,
+            server_args=[
+                "--trust-remote-code",
+                "--async-chunk",
+                "--chat-template",
+                str(_NATIVE_CHAT_TEMPLATE),
+                "--chat-template-content-format",
+                "openai",
+            ],
+        ),
+        id="turn_async_chunk",
+    ),
+]
+
 
 def get_system_prompt():
     return {
@@ -138,7 +157,7 @@ def _read_prompt_selection_log(offset: int) -> str:
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params + turn_test_params, indirect=True)
 def test_text_to_text_001(omni_server, openai_client) -> None:
     """
     Test text-only input generating text output via OpenAI API.
@@ -163,7 +182,7 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
 @pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params + turn_test_params, indirect=True)
 def test_text_to_audio_001(omni_server, openai_client) -> None:
     """
     Test text-only input generating text + audio output via OpenAI API.

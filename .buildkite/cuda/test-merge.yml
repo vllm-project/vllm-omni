@@ -66,7 +66,9 @@ steps:
         # 0.26 startup regression is understood and fixed.
         timeout_in_minutes: 90
         commands:
-          - pytest -s -v tests/entrypoints/ -m "advanced_model and cuda and H100" --run-level "advanced_model"
+          # Turn-based server VAD over /v1/realtime is deferred to RFC #7181 PR 5
+          # (see the P0 thread on #7413); the test stays in the tree and runs again there.
+          - pytest -s -v tests/entrypoints/ -m "advanced_model and cuda and H100" --run-level "advanced_model" --deselect tests/entrypoints/openai_api/test_qwen3_omni_realtime_websocket.py::TestQwen3OmniRealtimeWebSocket::test_server_vad_multi_turn_without_client_commit
         mirror_hardwares: h100_2
 
       - label: "Entrypoint Test with L4"
