@@ -1,5 +1,9 @@
 # MiniCPM-o 4.5 three-stage deploy on one large-memory GPU.
 pipeline: minicpmo_4_5
+# Both AR stages default to async_scheduling, so async_chunk also turns on
+# async Omni output materialization (payload built off the decode path) as
+# long as the remaining gates hold: no Omni prefix cache, no speculative
+# decoding, no routed-expert return.
 async_chunk: true
 # Use minicpmo_4_5_turn.yaml to select the ordinary turn-based serving engine.
 session_mode: duplex
@@ -129,8 +133,14 @@ platforms:
         compilation_config:
           cudagraph_mode: PIECEWISE
       - stage_id: 2
-        # Stage 2 stays outer-eager and captures only exact-shape CFM DiT
-        # estimator kernels through the NPU platform patch.
+        # Stage 2 stays outer-eager; capture CFM, the flow encoder, and
+        # the HiFT convolution body with independent exact-shape budgets.
         additional_config:
           code2wav_enable_npu_graph: true
           code2wav_max_npu_graphs: 32
+          code2wav_enable_full_cfm_npu_graph: true
+          code2wav_max_full_cfm_npu_graphs: 32
+          code2wav_enable_encoder_npu_graph: true
+          code2wav_max_encoder_npu_graphs: 32
+          code2wav_enable_hift_npu_graph: true
+          code2wav_max_hift_npu_graphs: 32

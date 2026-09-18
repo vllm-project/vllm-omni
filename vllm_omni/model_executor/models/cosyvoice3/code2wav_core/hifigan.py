@@ -654,7 +654,10 @@ class HiFTGenerator(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         s_stft_real, s_stft_imag = self._stft(s.squeeze(1))
         s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
+        return self._decode_from_source_stft(x, s_stft)
 
+    def _decode_from_source_stft(self, x: torch.Tensor, s_stft: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Tensor-only vocoder body, separate from source generation and FFT."""
         x = self.conv_pre(x)
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, self.lrelu_slope)

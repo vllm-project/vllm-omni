@@ -182,7 +182,9 @@ def test_code2wav_runtime_rejects_launch_blocking(monkeypatch):
         (True, 0, 0),
     ],
 )
+@pytest.mark.parametrize("encoder_enabled", [False, True])
 def test_code2wav_patch_reads_stage_additional_config(
+    encoder_enabled,
     monkeypatch,
     enabled,
     max_graphs,
@@ -201,6 +203,8 @@ def test_code2wav_patch_reads_stage_additional_config(
             additional_config={
                 "code2wav_enable_npu_graph": enabled,
                 "code2wav_max_npu_graphs": max_graphs,
+                "code2wav_enable_encoder_npu_graph": encoder_enabled,
+                "code2wav_max_encoder_npu_graphs": 3,
             }
         ),
     )
@@ -223,6 +227,13 @@ def test_code2wav_patch_reads_stage_additional_config(
         assert graph_runner.max_graphs == max_graphs
     else:
         assert model.backend not in code2wav_patch._backend_graph_runners
+
+    if expected_prepared and encoder_enabled:
+        encoder_runner = code2wav_patch._encoder_graph_runners[model.backend]
+        assert encoder_runner.max_graphs == 3
+        assert encoder_runner is not graph_runner
+    else:
+        assert model.backend not in code2wav_patch._encoder_graph_runners
 
 
 @pytest.mark.parametrize("value", [True, "true", "false", "0", "off"])
@@ -373,3 +384,276 @@ def test_code2wav_platform_wraps_flow_execution_context(monkeypatch):
         last_chunk=True,
     ) == ("decode", True, False)
     assert entered == [(torch.device("cpu"), True), (torch.device("cpu"), True)]
+
+
+@pytest.mark.parametrize("has_cnn,has_att", [(False, False), (True, True), (False, True), (True, False)])
+@pytest.mark.parametrize("last_chunk", [False, True])
+def test_encoder_graph_preserves_cache_and_final_chunk(monkeypatch, has_cnn, has_att, last_chunk):
+    events = []
+    cnn = torch.tensor([3.0]) if has_cnn else None
+    att = torch.tensor([5.0]) if has_att else None
+    tokens = torch.tensor([2.0])
+
+    def forward_chunk(*, xs, last_chunk, cnn_cache, att_cache):
+        assert cnn_cache is cnn
+        assert att_cache is att
+        events.append(last_chunk)
+        return xs + int(last_chunk), torch.ones(1), torch.ones(1) * 2
+
+    class Backend:
+        flow = SimpleNamespace(
+            input_embedding=lambda x: x * 2,
+            encoder=SimpleNamespace(forward_chunk=forward_chunk, embed=SimpleNamespace(pe=torch.zeros(4))),
+            encoder_proj=lambda x: x * 3,
+        )
+
+        def _ensure_relpos_pe(self, tokens, cache):
+            assert cache is att
+            events.append("prepare")
+
+    class Runner:
+        def run(self, operation, inputs, constants, compute):
+            assert events == ["prepare"]
+            assert operation == "flow_encoder"
+            assert constants[:3] == (last_chunk, has_cnn, has_att)
+            # Simulate eager warmup followed by capture. Preparation must only
+            # happen once, outside the body invoked again during capture.
+            compute(*inputs)
+            return compute(*inputs)
+
+    backend = Backend()
+    monkeypatch.setattr(code2wav_patch, "_original_encode_chunk", lambda *a, **kw: pytest.fail("unexpected eager"))
+    code2wav_patch._encoder_graph_runners[backend] = Runner()
+    out, new_cnn, new_att = code2wav_patch._patched_encode_chunk(
+        backend, tokens, last_chunk=last_chunk, cnn_cache=cnn, att_cache=att
+    )
+    torch.testing.assert_close(out, (tokens * 2 + int(last_chunk)) * 3)
+    torch.testing.assert_close(new_cnn, torch.ones(1))
+    torch.testing.assert_close(new_att, torch.ones(1) * 2)
+    assert events == ["prepare", last_chunk, last_chunk]
+
+
+def test_encoder_graph_disabled_uses_original(monkeypatch):
+    class Backend:
+        pass
+
+    backend = Backend()
+    tokens = torch.ones(1)
+    expected = object()
+
+    def original(self, value, **kwargs):
+        assert self is backend
+        assert value is tokens
+        assert kwargs == dict(last_chunk=True, cnn_cache=None, att_cache=None)
+        return expected
+
+    monkeypatch.setattr(code2wav_patch, "_original_encode_chunk", original)
+    assert (
+        code2wav_patch._patched_encode_chunk(backend, tokens, last_chunk=True, cnn_cache=None, att_cache=None)
+        is expected
+    )
+
+
+@pytest.mark.parametrize("has_cache", [False, True])
+@pytest.mark.parametrize("steps", [1, 4])
+def test_full_cfm_matches_original(monkeypatch, has_cache, steps):
+    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
+
+    def estimator_body(backend, estimator, *, x, mu, time_embedding, speakers, cond, cnn_cache, att_cache):
+        result = x * 0.2 + mu + cond + time_embedding.reshape(x.shape[0], 1, 1)
+        new_cnn = result.unsqueeze(0)
+        if cnn_cache is not None:
+            result = result + cnn_cache[0] * 0.1
+        new_att = result.transpose(1, 2).unsqueeze(0).unsqueeze(2)
+        if att_cache is not None:
+            new_att = torch.cat((new_att, att_cache), dim=3)
+        return result, new_cnn, new_att
+
+    class Backend:
+        _trt_stepper = None
+        _cfm_graph_wrapper = None
+        n_timesteps = steps
+        _estimator_att_cache_dtype = torch.float32
+        flow = SimpleNamespace(
+            decoder=SimpleNamespace(
+                rand_noise=torch.arange(24, dtype=torch.float32).reshape(1, 1, 24) / 24,
+                inference_cfg_rate=0.7,
+                estimator=SimpleNamespace(t_embedder=lambda t: t[:, None]),
+            )
+        )
+
+        def _estimator_step(self, estimator, *, time, attn_mask, valid_lengths, **kwargs):
+            return estimator_body(self, estimator, time_embedding=estimator.t_embedder(time).unsqueeze(1), **kwargs)
+
+    class Runner:
+        calls = 0
+
+        def run(self, operation, inputs, constants, compute):
+            assert operation == "full_cfm"
+            self.calls += 1
+            return compute(*inputs)
+
+    backend = Backend()
+    runner = Runner()
+    code2wav_patch._cfm_graph_runners[backend] = runner
+    monkeypatch.setattr(code2wav_patch, "_original_decode_cfm", BatchedToken2Wav._decode_cfm)
+    monkeypatch.setattr(code2wav_patch, "_graphable_estimator_step", estimator_body)
+    mu = torch.tensor([[[0.1, 0.2, 0.3]], [[0.4, 0.5, 0.6]]])
+    speakers = torch.ones(2, 1)
+    cond = mu * 0.3
+    cnn = torch.ones(steps, 1, 4, 1, 3) if has_cache else None
+    att = torch.ones(steps, 1, 4, 1, 2) if has_cache else None
+    # Attention cache layout: steps, layers, CFG batch, heads, width, channels.
+    att = att.unsqueeze(-1) if att is not None else None
+    # Fake estimator uses width in dim 3, matching the real estimator's cache.
+    for scale in (1, 2):
+        expected = BatchedToken2Wav._decode_cfm(backend, mu * scale, speakers, cond, cnn_cache=cnn, att_cache=att)
+        actual = code2wav_patch._patched_decode_cfm(backend, mu * scale, speakers, cond, cnn_cache=cnn, att_cache=att)
+        for value, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(value, reference, rtol=0, atol=0)
+    assert runner.calls == 2
+
+
+@pytest.mark.parametrize("reason", ["disabled", "ragged", "trt", "cuda_graph", "partial_cache"])
+def test_full_cfm_falls_back(monkeypatch, reason):
+    class Backend:
+        _trt_stepper = object() if reason == "trt" else None
+        _cfm_graph_wrapper = object() if reason == "cuda_graph" else None
+
+    backend = Backend()
+    if reason != "disabled":
+        code2wav_patch._cfm_graph_runners[backend] = object()
+    lengths = [2] if reason == "ragged" else None
+    cnn = torch.ones(1) if reason == "partial_cache" else None
+    expected = object()
+
+    def original(self, mu, speakers, cond, **kwargs):
+        assert self is backend
+        assert kwargs["valid_lengths"] is lengths
+        assert kwargs["cnn_cache"] is cnn
+        return expected
+
+    monkeypatch.setattr(code2wav_patch, "_original_decode_cfm", original)
+    assert (
+        code2wav_patch._patched_decode_cfm(
+            backend,
+            torch.ones(1),
+            torch.ones(1),
+            torch.ones(1),
+            cnn_cache=cnn,
+            att_cache=None,
+            valid_lengths=lengths,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize("cache_width", [0, 8])
+def test_hift_graph_body_matches_eager_and_preserves_rng(monkeypatch, cache_width):
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
+
+    class F0(torch.nn.Module):
+        def forward(self, mel):
+            return mel[:, 0].abs() + 100
+
+    class Backend:
+        hift_graph_wrapper = None
+        hift: HiFTGenerator
+
+    class Runner:
+        def run(self, operation, inputs, constants, compute):
+            assert operation == "hift_decoder"
+            # Warmup/capture repeat only the deterministic body, never source RNG.
+            compute(*inputs)
+            return compute(*inputs)
+
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        backend = Backend()
+        backend.hift = HiFTGenerator(
+            in_channels=4,
+            base_channels=16,
+            nb_harmonics=2,
+            upsample_rates=[2, 2],
+            upsample_kernel_sizes=[4, 4],
+            istft_params={"n_fft": 4, "hop_len": 2},
+            resblock_kernel_sizes=[3],
+            resblock_dilation_sizes=[[1, 3, 5]],
+            source_resblock_kernel_sizes=[3, 3],
+            source_resblock_dilation_sizes=[[1, 3, 5], [1, 3, 5]],
+            f0_predictor=F0(),
+        ).eval()
+        monkeypatch.setattr(code2wav_patch, "_original_hift_inference", lambda *a: pytest.fail("unexpected fallback"))
+        code2wav_patch._hift_graph_runners[backend] = Runner()
+        with torch.random.fork_rng(devices=[]):
+            for width in (6, 9):
+                mel = torch.randn(2, 4, width)
+                cache = torch.randn(2, 1, cache_width)
+                torch.manual_seed(17)
+                expected = backend.hift.inference(mel, cache)
+                expected_rng = torch.get_rng_state()
+                torch.manual_seed(17)
+                actual = code2wav_patch._patched_hift_inference(backend, mel, cache)
+                assert torch.equal(torch.get_rng_state(), expected_rng)
+                for value, reference in zip(actual, expected, strict=True):
+                    torch.testing.assert_close(value, reference, rtol=0, atol=0)
+                if cache_width:
+                    torch.testing.assert_close(actual[1][:, :, :cache_width], cache)
+    finally:
+        torch.set_num_threads(previous_threads)
+
+
+@pytest.mark.parametrize("existing_wrapper", [False, True])
+def test_hift_graph_fallback(monkeypatch, existing_wrapper):
+    class Backend:
+        hift_graph_wrapper = object() if existing_wrapper else None
+
+    backend = Backend()
+    if existing_wrapper:
+        code2wav_patch._hift_graph_runners[backend] = object()
+    mel, cache = torch.ones(1), torch.zeros(0)
+    expected = object()
+
+    def original(self, value, source):
+        assert self is backend and value is mel and source is cache
+        return expected
+
+    monkeypatch.setattr(code2wav_patch, "_original_hift_inference", original)
+    assert code2wav_patch._patched_hift_inference(backend, mel, cache) is expected
+
+
+@pytest.mark.parametrize("enabled,limit", [(True, 3), (False, 3), (True, 0)])
+def test_hift_graph_config_has_independent_budget(monkeypatch, enabled, limit):
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
+
+    class Backend:
+        speech_window = torch.zeros(1)
+        flow = SimpleNamespace(training=False)
+        hift: HiFTGenerator
+
+    backend = Backend()
+    backend.hift = HiFTGenerator.__new__(HiFTGenerator)
+    torch.nn.Module.__init__(backend.hift)
+    backend.hift.eval()
+    model = SimpleNamespace(
+        backend=None,
+        _extra_config=lambda: {},
+        vllm_config=SimpleNamespace(
+            additional_config={
+                "code2wav_enable_npu_graph": True,
+                "code2wav_max_npu_graphs": 7,
+                "code2wav_enable_hift_npu_graph": enabled,
+                "code2wav_max_hift_npu_graphs": limit,
+            }
+        ),
+    )
+    monkeypatch.setattr(code2wav_patch, "_original_build_backend", lambda model: setattr(model, "backend", backend))
+    monkeypatch.setattr(code2wav_patch, "prepare_code2wav_graph_runtime", lambda: None)
+    code2wav_patch._patched_build_backend(model)
+    if enabled and limit:
+        runner = code2wav_patch._hift_graph_runners[backend]
+        assert runner.max_graphs == limit
+        assert runner is not code2wav_patch._backend_graph_runners[backend]
+    else:
+        assert backend not in code2wav_patch._hift_graph_runners

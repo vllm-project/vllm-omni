@@ -20,9 +20,21 @@ logger = init_logger(__name__)
 _PATCHED = False
 _original_build_backend = None
 _original_estimator_step = None
+_original_encode_chunk = None
+_original_decode_cfm = None
+_original_hift_inference = None
 _original_setup_batch = None
 _original_decode_batch = None
 _backend_graph_runners: WeakKeyDictionary[object, NPUExactGraphRunner] = WeakKeyDictionary()
+_encoder_graph_runners: WeakKeyDictionary[object, NPUExactGraphRunner] = WeakKeyDictionary()
+_cfm_graph_runners: WeakKeyDictionary[object, NPUExactGraphRunner] = WeakKeyDictionary()
+_hift_graph_runners: WeakKeyDictionary[object, NPUExactGraphRunner] = WeakKeyDictionary()
+_HIFT_ENABLE_KEY = "code2wav_enable_hift_npu_graph"
+_HIFT_MAX_GRAPHS_KEY = "code2wav_max_hift_npu_graphs"
+_CFM_ENABLE_KEY = "code2wav_enable_full_cfm_npu_graph"
+_CFM_MAX_GRAPHS_KEY = "code2wav_max_full_cfm_npu_graphs"
+_ENCODER_ENABLE_KEY = "code2wav_enable_encoder_npu_graph"
+_ENCODER_MAX_GRAPHS_KEY = "code2wav_max_encoder_npu_graphs"
 _ENABLE_KEY = "code2wav_enable_npu_graph"
 _MAX_GRAPHS_KEY = "code2wav_max_npu_graphs"
 _BF16_ATTENTION_CACHE_KEY = "code2wav_bfloat16_attention_cache"
@@ -187,6 +199,135 @@ def _patched_estimator_step(
     )
 
 
+def _patched_decode_cfm(self, mu, speakers, cond, *, cnn_cache, att_cache, valid_lengths=None):
+    assert _original_decode_cfm is not None
+    runner = _cfm_graph_runners.get(self)
+    if (
+        runner is None
+        or valid_lengths is not None
+        or self._trt_stepper is not None
+        or self._cfm_graph_wrapper is not None
+    ):
+        return _original_decode_cfm(
+            self, mu, speakers, cond, cnn_cache=cnn_cache, att_cache=att_cache, valid_lengths=valid_lengths
+        )
+    if (cnn_cache is None) != (att_cache is None):
+        return _original_decode_cfm(
+            self, mu, speakers, cond, cnn_cache=cnn_cache, att_cache=att_cache, valid_lengths=valid_lengths
+        )
+
+    decoder = self.flow.decoder
+    batch_size = int(mu.shape[0])
+    offset = int(att_cache.shape[4]) if att_cache is not None else 0
+    end = offset + int(mu.shape[2])
+    if end > int(decoder.rand_noise.shape[2]):
+        raise RuntimeError(
+            "MiniCPMO45Code2WavBatchError "
+            f'{{"reason":"noise_capacity","required":{end},'
+            f'"available":{int(decoder.rand_noise.shape[2])}}}'
+        )
+    # Preserve the original time + dt recurrence, including its rounding.
+    # The upstream timestep embedder creates host tensors, so keep it outside
+    # capture. Pass noise as an input rather than binding a request's offset.
+    timeline = torch.linspace(0, 1, self.n_timesteps + 1, device=mu.device, dtype=mu.dtype)
+    timeline = 1 - torch.cos(timeline * 0.5 * torch.pi)
+    time = timeline[0].expand(batch_size)
+    dt = timeline[1] - timeline[0]
+    embeddings, deltas = [], []
+    for step in range(self.n_timesteps):
+        embeddings.append(decoder.estimator.t_embedder(torch.cat((time, time))).unsqueeze(1))
+        deltas.append(dt)
+        time = time + dt
+        if step + 1 < self.n_timesteps:
+            dt = timeline[step + 2] - time[0]
+    noise = decoder.rand_noise[:, :, offset:end].expand(batch_size, -1, -1)
+    has_cache = cnn_cache is not None
+    inputs = (mu, speakers, cond, noise, torch.stack(embeddings), torch.stack(deltas))
+    if has_cache:
+        inputs += (cnn_cache, att_cache)
+
+    def compute(step_mu, step_speakers, step_cond, step_noise, step_embeddings, step_deltas, *caches):
+        x = step_noise.clone()
+        mu_cfg = torch.cat((step_mu, torch.zeros_like(step_mu)))
+        speakers_cfg = torch.cat((step_speakers, torch.zeros_like(step_speakers)))
+        cond_cfg = torch.cat((step_cond, torch.zeros_like(step_cond)))
+        next_cnn, next_att = [], []
+        for step in range(self.n_timesteps):
+            estimate, new_cnn, new_att = _graphable_estimator_step(
+                self,
+                decoder.estimator,
+                x=torch.cat((x, x)),
+                mu=mu_cfg,
+                time_embedding=step_embeddings[step],
+                speakers=speakers_cfg,
+                cond=cond_cfg,
+                cnn_cache=caches[0][step] if has_cache else None,
+                att_cache=caches[1][step] if has_cache else None,
+            )
+            conditional, unconditional = estimate.split(batch_size, dim=0)
+            velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional
+            x = x + step_deltas[step] * velocity
+            next_cnn.append(new_cnn)
+            next_att.append(new_att.to(dtype=self._estimator_att_cache_dtype))
+        return x, torch.stack(next_cnn), torch.stack(next_att)
+
+    with _flow_execution_context(mu.device, require_math=True):
+        return runner.run(
+            "full_cfm",
+            inputs,
+            (has_cache, self.n_timesteps, decoder.inference_cfg_rate, self._estimator_att_cache_dtype),
+            compute,
+        )
+
+
+@torch.inference_mode()
+def _patched_hift_inference(self, mel, source_cache):
+    assert _original_hift_inference is not None
+    runner = _hift_graph_runners.get(self)
+    if runner is None or self.hift_graph_wrapper is not None:
+        return _original_hift_inference(self, mel, source_cache)
+
+    hift = self.hift
+    # Generate fresh excitation exactly once per chunk, outside warmup/capture.
+    # Keep FFT and its complex-valued intermediates outside the NPU graph too.
+    f0 = hift.f0_predictor(mel)
+    source = hift.f0_upsamp(f0[:, None]).transpose(1, 2)
+    source, _, _ = hift.m_source(source)
+    source = source.transpose(1, 2)
+    if source_cache.shape[2] != 0:
+        source[:, :, : source_cache.shape[2]] = source_cache
+    real, imag = hift._stft(source.squeeze(1))
+    source_stft = torch.cat((real, imag), dim=1)
+    magnitude, phase = runner.run("hift_decoder", (mel, source_stft), (), hift._decode_from_source_stft)
+    return hift._finalize_decode(magnitude, phase), source
+
+
+def _patched_encode_chunk(self, tokens, *, last_chunk, cnn_cache, att_cache):
+    assert _original_encode_chunk is not None
+    runner = _encoder_graph_runners.get(self)
+    if runner is None:
+        return _original_encode_chunk(self, tokens, last_chunk=last_chunk, cnn_cache=cnn_cache, att_cache=att_cache)
+
+    # Growing positional encoding may allocate host tensors; do it before
+    # capture. A replacement PE buffer must not reuse a graph holding the old one.
+    self._ensure_relpos_pe(tokens, att_cache)
+    pe = getattr(getattr(self.flow.encoder, "embed", None), "pe", None)
+    pe_key = (pe.data_ptr(), tuple(pe.shape), str(pe.dtype)) if isinstance(pe, torch.Tensor) else None
+    has_cnn, has_att = cnn_cache is not None, att_cache is not None
+    inputs = (tokens,) + ((cnn_cache,) if has_cnn else ()) + ((att_cache,) if has_att else ())
+
+    def compute(step_tokens, *caches):
+        step_cnn = caches[0] if has_cnn else None
+        step_att = caches[int(has_cnn)] if has_att else None
+        embedded = self.flow.input_embedding(step_tokens)
+        hidden, new_cnn, new_att = self.flow.encoder.forward_chunk(
+            xs=embedded, last_chunk=last_chunk, cnn_cache=step_cnn, att_cache=step_att
+        )
+        return self.flow.encoder_proj(hidden), new_cnn, new_att
+
+    return runner.run("flow_encoder", inputs, (last_chunk, has_cnn, has_att, pe_key), compute)
+
+
 def _patched_setup_batch(self, features, batch_size):
     assert _original_setup_batch is not None
     with _flow_execution_context(
@@ -261,6 +402,44 @@ def _patched_build_backend(self) -> None:
             raise ValueError("MiniCPM-o Code2Wav NPUGraph capture requires flow.eval()")
         _backend_graph_runners[self.backend] = graph_runner
 
+    # Encoder capture is opt-in under the existing Code2Wav graph switch.
+    # Keep its budget independent of the CFM estimator's shape cache.
+    encoder_max_graphs = max(0, int(cast(int | str, config.get(_ENCODER_MAX_GRAPHS_KEY, 32))))
+    if graph_enabled and encoder_max_graphs > 0 and _config_bool(config.get(_ENCODER_ENABLE_KEY), False):
+        _encoder_graph_runners[self.backend] = NPUExactGraphRunner(
+            max_graphs=encoder_max_graphs,
+            component_name="MiniCPM-o Code2Wav encoder",
+            disable_config_hint="set code2wav_enable_encoder_npu_graph=false in stage 2 additional_config",
+        )
+        logger.info("MiniCPM-o Code2Wav encoder NPUGraph enabled (max_graphs=%d)", encoder_max_graphs)
+
+    cfm_max_graphs = max(0, int(cast(int | str, config.get(_CFM_MAX_GRAPHS_KEY, 32))))
+    if graph_enabled and cfm_max_graphs > 0 and _config_bool(config.get(_CFM_ENABLE_KEY), False):
+        _cfm_graph_runners[self.backend] = NPUExactGraphRunner(
+            max_graphs=cfm_max_graphs,
+            component_name="MiniCPM-o Code2Wav full CFM",
+            disable_config_hint="set code2wav_enable_full_cfm_npu_graph=false in stage 2 additional_config",
+        )
+        logger.info("MiniCPM-o Code2Wav full CFM NPUGraph enabled (max_graphs=%d)", cfm_max_graphs)
+
+    hift_max_graphs = max(0, int(cast(int | str, config.get(_HIFT_MAX_GRAPHS_KEY, 32))))
+    if graph_enabled and hift_max_graphs > 0 and _config_bool(config.get(_HIFT_ENABLE_KEY), False):
+        from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
+
+        # Causal/custom generators can override source and decoder semantics.
+        # Only route the concrete implementation whose inference we preserve.
+        if type(self.backend.hift) is not HiFTGenerator:
+            logger.warning("HiFT NPUGraph skipped for unsupported generator %s", type(self.backend.hift).__name__)
+        elif self.backend.hift.training:
+            raise ValueError("MiniCPM-o HiFT NPUGraph capture requires hift.eval()")
+        else:
+            _hift_graph_runners[self.backend] = NPUExactGraphRunner(
+                max_graphs=hift_max_graphs,
+                component_name="MiniCPM-o Code2Wav HiFT",
+                disable_config_hint="set code2wav_enable_hift_npu_graph=false in stage 2 additional_config",
+            )
+            logger.info("MiniCPM-o Code2Wav HiFT NPUGraph enabled (max_graphs=%d)", hift_max_graphs)
+
     if graph_enabled:
         logger.info(
             "MiniCPM-o Code2Wav NPUGraph replay enabled (max_graphs=%d)",
@@ -270,8 +449,8 @@ def _patched_build_backend(self) -> None:
 
 def apply_minicpmo_4_5_code2wav_patch() -> None:
     """Patch the generic Code2Wav backend builder with Ascend acceleration."""
-    global _PATCHED, _original_build_backend
-    global _original_decode_batch, _original_estimator_step, _original_setup_batch
+    global _PATCHED, _original_build_backend, _original_encode_chunk, _original_decode_cfm
+    global _original_decode_batch, _original_estimator_step, _original_setup_batch, _original_hift_inference
     if _PATCHED:
         return
 
@@ -283,11 +462,17 @@ def apply_minicpmo_4_5_code2wav_patch() -> None:
     )
 
     _original_build_backend = MiniCPMO45Code2Wav._build_backend
+    _original_hift_inference = BatchedToken2Wav._hift_inference
+    _original_decode_cfm = BatchedToken2Wav._decode_cfm
+    _original_encode_chunk = BatchedToken2Wav._encode_chunk
     _original_estimator_step = BatchedToken2Wav._estimator_step
     _original_setup_batch = BatchedToken2Wav.setup_batch
     _original_decode_batch = BatchedToken2Wav.decode_batch
 
     MiniCPMO45Code2Wav._build_backend = _patched_build_backend  # type: ignore[method-assign]
+    BatchedToken2Wav._hift_inference = _patched_hift_inference  # type: ignore[method-assign]
+    BatchedToken2Wav._decode_cfm = _patched_decode_cfm  # type: ignore[method-assign]
+    BatchedToken2Wav._encode_chunk = _patched_encode_chunk  # type: ignore[method-assign]
     BatchedToken2Wav._estimator_step = _patched_estimator_step  # type: ignore[method-assign]
     BatchedToken2Wav.setup_batch = _patched_setup_batch  # type: ignore[method-assign]
     BatchedToken2Wav.decode_batch = _patched_decode_batch  # type: ignore[method-assign]
