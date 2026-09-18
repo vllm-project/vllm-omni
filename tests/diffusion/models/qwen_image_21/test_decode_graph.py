@@ -8,6 +8,7 @@ import torch
 
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.diffusion.models.qwen_image_21 import decode_graph
+from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
@@ -73,14 +74,14 @@ def decode(manager, cache, layout=(1, 2, 2)):
 
 
 @pytest.mark.cpu
-def test_model_level_offload_config_disables_decode_graphs():
+def test_model_level_offload_without_staging_disables_decode_graphs():
     manager = decode_graph.QwenImage21DecodeGraphManager(DecodeModel(), model_level_offload=True)
     assert manager._offload_reason() is not None
     assert manager.eligible() is False
 
 
 @pytest.mark.cpu
-def test_top_level_offload_hook_disables_decode_graphs():
+def test_top_level_offload_hook_without_staging_disables_decode_graphs():
     model = DecodeModel()
     manager = decode_graph.QwenImage21DecodeGraphManager(model)
     registry = HookRegistry.get_or_create(model)
@@ -89,6 +90,22 @@ def test_top_level_offload_hook_disables_decode_graphs():
     registry.register_hook("sequential_offload", ModelHook())
     assert manager._offload_reason() is not None
     assert manager.eligible() is False
+
+
+@pytest.mark.cpu
+def test_persistent_staging_makes_model_level_offload_graph_eligible():
+    model = DecodeModel()
+    manager = decode_graph.QwenImage21DecodeGraphManager(model, model_level_offload=True)
+    hook = SequentialOffloadHook(offload_targets=[], device=torch.device("cpu"))
+    HookRegistry.get_or_create(model).register_hook(SequentialOffloadHook._HOOK_NAME, hook)
+    # No staging storage yet: a swap would allocate fresh storage per generation.
+    assert manager._offload_reason() is not None
+    # Staging established: fixed device storage keeps captured pointers valid.
+    hook._stager = object()
+    assert manager._offload_reason() is None
+    # A second, non-offload hook on the top-level module still disqualifies.
+    model._hook_registry.register_hook("teacache", ModelHook())
+    assert manager._offload_reason() is not None
 
 
 @pytest.mark.cpu

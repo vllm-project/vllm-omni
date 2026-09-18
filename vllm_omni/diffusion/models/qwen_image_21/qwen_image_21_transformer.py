@@ -799,8 +799,9 @@ class QwenImage21Transformer2DModel(CachedTransformer):
 
         # Use decode graphs unless the caller requests eager execution.
         # Model-level (sequential) offload registers its swap hook on this
-        # top-level module rather than on individual blocks, so the manager's
-        # block-level hook check cannot see it; refuse capture up front.
+        # top-level module rather than on individual blocks; graphs stay
+        # eligible only when that hook keeps weights on persistent staging
+        # storage (see QwenImage21DecodeGraphManager._offload_reason).
         self.enable_cuda_graph_decode = not od_config.enforce_eager
         self._decode_graph_manager = (
             QwenImage21DecodeGraphManager(

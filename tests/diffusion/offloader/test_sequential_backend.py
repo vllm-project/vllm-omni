@@ -284,6 +284,49 @@ def test_component_selective_model_offload_requires_swap_counterpart(component, 
         backend.enable(pipeline)
 
 
+def test_persistent_dit_staging_reuses_fixed_device_storage(accelerator_device) -> None:
+    dit = _create_simple_module().to(accelerator_device)
+    encoder = _create_simple_module().to(accelerator_device)
+    original_weight = dit.linear.weight.detach().clone()
+
+    apply_sequential_offload(
+        dit_modules=[dit],
+        encoder_modules=[encoder],
+        device=accelerator_device,
+        pin_memory=False,
+        persistent_dit_staging=True,
+    )
+
+    dit_hook = dit._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME)
+    encoder_hook = encoder._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME)
+    assert dit_hook._stager is not None
+    assert encoder_hook._stager is None  # encoders keep plain move semantics
+
+    # Registration snapshots the CPU master and rebinds to it.
+    assert dit.linear.weight.device.type == "cpu"
+
+    dit_hook._to_gpu(dit)
+    first_ptr = dit.linear.weight.data_ptr()
+    assert dit.linear.weight.device == accelerator_device
+    torch.testing.assert_close(dit.linear.weight.data, original_weight)
+
+    # Offload via a *different* module's hook (the cross-module swap path),
+    # then reload: the same fixed device storage must be reused so that
+    # CUDA-graph-captured weight pointers stay valid.
+    encoder_hook._to_cpu(dit)
+    assert dit.linear.weight.device.type == "cpu"
+    dit_hook._to_gpu(dit)
+    assert dit.linear.weight.data_ptr() == first_ptr
+    torch.testing.assert_close(dit.linear.weight.data, original_weight)
+
+    # A second offload/load cycle through the DiT hook itself stays put too.
+    dit_hook._to_cpu(dit)
+    dit_hook._to_gpu(dit)
+    assert dit.linear.weight.data_ptr() == first_ptr
+
+    remove_sequential_offload([dit, encoder])
+
+
 def test_sequential_offload_can_begin_with_dit_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
     dit = _create_simple_module()
     encoder = _create_simple_module()
