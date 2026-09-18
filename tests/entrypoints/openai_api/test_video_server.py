@@ -463,6 +463,7 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
 @pytest.fixture
 def test_client():
     app = FastAPI()
+    app.state.api_server_count = 1
     app.include_router(router)
     app.state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
         diffusion_engine=FakeAsyncOmni(),
@@ -1134,6 +1135,32 @@ def test_mixed_reference_capability_uses_model_metadata_when_config_defaults_fal
     assert handler.supports_mixed_reference_inputs
 
 
+def test_typed_stage_drives_video_capability_checks():
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    minimax_stage = StageConfigFactory.create_typed_default_diffusion(
+        "minimax-h3",
+        {"model_class_name": "MiniMaxH3Pipeline"},
+    ).stage_configs[0]
+    minimax_handler = OmniOpenAIServingVideo.for_diffusion(
+        SimpleNamespace(od_config=SimpleNamespace(model_class_name=None)),
+        model_name="minimax-h3",
+        stage_configs=[minimax_stage],
+    )
+    assert minimax_handler.supports_mixed_reference_inputs
+
+    cosmos_stage = StageConfigFactory.create_typed_default_diffusion(
+        "cosmos3",
+        {"model_class_name": "Cosmos3OmniDiffusersPipeline"},
+    ).stage_configs[0]
+    cosmos_handler = OmniOpenAIServingVideo.for_diffusion(
+        SimpleNamespace(od_config=SimpleNamespace(model_class_name=None)),
+        model_name="cosmos3",
+        stage_configs=[cosmos_stage],
+    )
+    assert cosmos_handler.supported_control_upload_types == frozenset({"edge", "blur", "depth", "seg", "wsm"})
+
+
 @pytest.mark.parametrize("model_class_name", ["Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"])
 def test_control_upload_capability_is_declared_only_by_cosmos3(test_client, model_class_name):
     handler = test_client.app.state.openai_serving_video
@@ -1189,6 +1216,35 @@ def test_cosmos3_reference_video_limit_uses_v2v_condition_frames():
     spec = _reference_video_decode_spec(request, _cosmos3_stage_configs())
     assert spec.max_frames == 9
     assert spec.keep == "first"
+
+
+@pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
+@pytest.mark.parametrize(
+    ("num_frames", "extra_params", "expected"),
+    [
+        (189, {"condition_frame_indexes_vision": [0, 2], "condition_video_keep": "last"}, (9, "last")),
+        (189, {"condition_frame_indexes_vision": [0, 2]}, (9, "first")),
+        (5, {"condition_frame_indexes_vision": [0, 20]}, (5, "first")),
+        (None, {"action_mode": "inverse_dynamics", "action_chunk_size": 16}, (17, "first")),
+    ],
+)
+def test_cosmos3_reference_video_decode_policy_with_runtime_configs(typed, num_frames, extra_params, expected):
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    if typed:
+        stages = list(
+            StageConfigFactory.create_typed_default_diffusion(
+                "cosmos3",
+                {"model_class_name": "Cosmos3OmniDiffusersPipeline"},
+            ).stage_configs
+        )
+    else:
+        stages = _cosmos3_stage_configs()
+    request = VideoGenerationRequest(prompt="Continue this motion.", num_frames=num_frames, extra_params=extra_params)
+
+    spec = _reference_video_decode_spec(request, stages)
+
+    assert (spec.max_frames, spec.keep) == expected
 
 
 def test_cosmos3_reference_video_limit_preserves_action_frames():
@@ -1749,6 +1805,7 @@ def test_action_extraction_accepts_multimodal_actions_payload():
 
 def test_missing_handler_returns_503():
     app = FastAPI()
+    app.state.api_server_count = 1
     app.include_router(router)
     app.state.openai_serving_video = None
     client = TestClient(app)
@@ -2735,6 +2792,7 @@ def test_cosmos3_control_upload_rejects_invalid_size(control_bytes, message, tes
 
 def test_sync_missing_handler_returns_503():
     app = FastAPI()
+    app.state.api_server_count = 1
     app.include_router(router)
     app.state.openai_serving_video = None
     client = TestClient(app)

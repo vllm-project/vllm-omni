@@ -61,11 +61,12 @@ from vllm_omni.engine.stage_client import StageClient
 from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.engine.stage_runtime import (
+    OmniClientConfig,
     StageRuntimeInfo,
     create_stage_runtime,
 )
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
-from vllm_omni.entrypoints.utils import parse_stage_overrides
+from vllm_omni.entrypoints.utils import prepare_stage_config_inputs
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 
@@ -122,6 +123,7 @@ class OmniEngineBase:
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
     _enable_orch_monitor: bool = False
+    _client_config: OmniClientConfig | None = None
     # Lazily created by get_output_blocking_async().
     _output_drain_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
@@ -136,6 +138,7 @@ class OmniEngineBase:
         log_stats: bool = False,
         tokenizer: str | None = None,
         trust_remote_code: bool | None = None,
+        client_config: OmniClientConfig | None = None,
         **kwargs: Any,
     ) -> None:
         self.model = model
@@ -155,6 +158,7 @@ class OmniEngineBase:
         # --log-stats CLI flag set by the user via OmniBase.
         self._log_stats = log_stats
         self._enable_orch_monitor = bool(kwargs.pop("enable_orch_monitor", False))
+        self._client_config = client_config
 
         logger.info(f"[OmniEngine] Initializing with model {model}")
 
@@ -166,6 +170,8 @@ class OmniEngineBase:
         _stage_id_kwarg = kwargs.get("stage_id")
         if isinstance(_stage_id_kwarg, int) and not single_stage_mode:
             single_stage_mode = True
+        if client_config is not None and int(client_config.get("client_count", 1)) > 1 and single_stage_mode:
+            raise ValueError("Multiple API servers cannot be combined with single-stage distributed mode")
 
         self.single_stage_mode: bool = single_stage_mode
         self._single_stage_id_filter: int | None = (
@@ -272,7 +278,14 @@ class OmniEngineBase:
 
         self.num_stages = len(self.stage_configs)
         self.async_chunk = any(
-            bool(getattr(getattr(stage, "engine_args", None), "async_chunk", False)) for stage in self.stage_configs
+            bool(
+                getattr(
+                    getattr(stage, "connector_config", None),
+                    "async_chunk",
+                    getattr(getattr(stage, "engine_args", None), "async_chunk", False),
+                )
+            )
+            for stage in self.stage_configs
         )
         self.stage_pools: list[StagePool] = []
         self.stage_clients: list[StageClient] = []  # logical-stage view for external readers
@@ -371,6 +384,7 @@ class OmniEngineBase:
             omni_lb_policy=self._omni_lb_policy,
             request_queue=self.request_queue,
             log_stats=self._log_stats,
+            client_config=self._client_config,
         )
         self._runtime.initialize()
 
@@ -885,24 +899,15 @@ class OmniEngineBase:
     ) -> tuple[str, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
 
-        for legacy_arg in ("stage_configs_path", "stage_configs"):
-            if legacy_arg in kwargs:
-                raise ValueError(f"`{legacy_arg}` is no longer supported; use `deploy_config` instead.")
-
-        # log_stats is captured by __init__; its CLI-only negative alias must
-        # not cross into per-stage structured config ownership validation.
-        kwargs.pop("disable_log_stats", None)
-        deploy_config_path = kwargs.pop("deploy_config", None)
-        strategy_config_path = kwargs.pop("strategy_config", None)
-        # CLI callers arrive pre-parsed; offline Python callers may use the
-        # JSON-string form documented in recipes.
-        stage_overrides = parse_stage_overrides(kwargs.pop("stage_overrides", None))
-
-        # ``diffusion_streaming_output`` is the public AsyncOmni/serve kwarg;
-        # stage configs know the field as ``streaming_output``. Mirror only a
-        # truthy value so the CLI's False default does not override deploy YAML.
-        if kwargs.get("diffusion_streaming_output") and kwargs.get("streaming_output") is None:
-            kwargs["streaming_output"] = True
+        config_inputs = prepare_stage_config_inputs(
+            model,
+            kwargs,
+            trust_remote_code=trust_remote_code,
+        )
+        kwargs = config_inputs.kwargs
+        deploy_config_path = config_inputs.deploy_config_path
+        strategy_config_path = config_inputs.strategy_config_path
+        stage_overrides = config_inputs.stage_overrides
 
         resolution = cast(
             _ConfigResolutionResult,

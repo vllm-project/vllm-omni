@@ -58,6 +58,7 @@ from vllm_omni.entrypoints.openai.serving_video import (
     ReferenceAudio,
     ReferenceImage,
     ReferenceVideo,
+    _stage_diffusion_model_class_name,
 )
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE
@@ -136,10 +137,6 @@ def _config_get(config: Any, key: str, default: Any = None) -> Any:
     return getattr(config, key, default)
 
 
-def _stage_engine_args(stage_cfg: Any) -> Any:
-    return _config_get(stage_cfg, "engine_args", {}) or {}
-
-
 def _diffusion_model_classes(stage_configs: list[Any] | None) -> list[type]:
     if not stage_configs:
         return []
@@ -150,7 +147,7 @@ def _diffusion_model_classes(stage_configs: list[Any] | None) -> list[type]:
     for stage_cfg in stage_configs:
         if get_stage_type(stage_cfg) != "diffusion":
             continue
-        model_class_name = _config_get(_stage_engine_args(stage_cfg), "model_class_name")
+        model_class_name = _stage_diffusion_model_class_name(stage_cfg)
         if not model_class_name:
             continue
         model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)

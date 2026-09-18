@@ -20,7 +20,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from vllm_omni.engine.duplex.config import (
@@ -51,6 +51,42 @@ if TYPE_CHECKING:
 
 def _default_lease() -> DuplexLeaseState:
     return DuplexLeaseState(config=DuplexLeaseConfig(), generation=0, last_activity=time.monotonic())
+
+
+def _object_dict(**fields: object) -> dict[str, object]:
+    return dict(fields)
+
+
+def _as_int(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return default
+
+
+def _as_optional_int(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return None
+
+
+def _copy_mapping(value: object) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    return {str(key): item for key, item in value.items()}
+
+
+def _copy_list(value: object) -> list[object] | None:
+    if not isinstance(value, list):
+        return None
+    return [item for item in value]
 
 
 @dataclass
@@ -624,7 +660,7 @@ class DuplexEngineSession:
             input_audio_part["transcript"] = transcript
         self._bind_active_response_to_input_commit(self._input.commit_seq + 1)
         self._input.commit_seq += 1
-        message = {"role": "user", "content": [input_audio_part]}
+        message = _object_dict(role="user", content=[input_audio_part])
         if transcript:
             message["transcript"] = transcript
         self._conversation.messages.append(message)
@@ -694,7 +730,7 @@ class DuplexEngineSession:
         self._response.stage_metric_tpot_weighted_ms.clear()
         self._response.stage_metric_tpot_weight.clear()
 
-    def stash_stage_metrics(self, stage_metrics: Mapping[object, object] | None) -> None:
+    def stash_stage_metrics(self, stage_metrics: Mapping[Any, Any] | None) -> None:
         """Hold a stage snapshot until a response exists to attribute it to.
 
         A stage that hands its output to the next stage instead of the client
@@ -706,9 +742,10 @@ class DuplexEngineSession:
         """
         if not isinstance(stage_metrics, Mapping):
             return
-        snapshot = {
-            str(stage_id): dict(values) for stage_id, values in stage_metrics.items() if isinstance(values, Mapping)
-        }
+        snapshot: dict[str, dict[str, object]] = {}
+        for stage_id, values in stage_metrics.items():
+            if isinstance(values, Mapping):
+                snapshot[str(stage_id)] = {str(key): value for key, value in values.items()}
         if not snapshot:
             return
         if self.active_response_id is not None:
@@ -718,7 +755,7 @@ class DuplexEngineSession:
 
     def accumulate_response_stage_metrics(
         self,
-        stage_metrics: Mapping[object, object] | None,
+        stage_metrics: Mapping[Any, Any] | None,
     ) -> dict[str, dict[str, object]]:
         if self.active_response_id is None:
             return copy.deepcopy(self._response.stage_metrics)
@@ -762,7 +799,9 @@ class DuplexEngineSession:
             for name in additive_fields:
                 value = raw_values.get(name)
                 if isinstance(value, int | float) and not isinstance(value, bool):
-                    current[name] = current.get(name, 0) + value
+                    previous = current.get(name, 0)
+                    addend = previous if isinstance(previous, int | float) and not isinstance(previous, bool) else 0
+                    current[name] = addend + value
             for name in first_positive_fields:
                 value = raw_values.get(name)
                 current_value = current.get(name)
@@ -776,7 +815,8 @@ class DuplexEngineSession:
             for list_name, mean_name in interval_fields:
                 values = raw_values.get(list_name)
                 if isinstance(values, list):
-                    combined = list(current.get(list_name, []))
+                    existing = current.get(list_name, [])
+                    combined = list(existing) if isinstance(existing, list) else []
                     combined.extend(
                         value for value in values if isinstance(value, int | float) and not isinstance(value, bool)
                     )
@@ -805,7 +845,7 @@ class DuplexEngineSession:
 
     def replace_response_stage_metric_snapshots(
         self,
-        stage_metrics: Mapping[object, object] | None,
+        stage_metrics: Mapping[Any, Any] | None,
     ) -> dict[str, dict[str, object]]:
         """Merge cumulative chat snapshots by replacing each stage's latest value."""
         if self.active_response_id is None or not isinstance(stage_metrics, Mapping):
@@ -839,8 +879,12 @@ class DuplexEngineSession:
         *,
         text_chars: int | None = None,
         audio_text_marks: list[dict[str, object]] | None = None,
+        text_requires_complete_audio: bool = False,
+        audio_complete: bool = False,
     ) -> None:
         playback = self._playback.current
+        playback.text_requires_complete_audio |= text_requires_complete_audio
+        playback.audio_complete |= audio_complete
         if duration_ms is not None:
             playback.generated_ms = max(playback.generated_ms, duration_ms)
             playback.sent_ms = max(playback.sent_ms, duration_ms)
@@ -925,9 +969,9 @@ class DuplexEngineSession:
             response_input_commit_seq = self.input_commit_seq
         response_history_is_late = self.input_commit_seq > response_input_commit_seq
         assistant_text = "".join(self._response.assistant_text_buffer).strip()
-        message = None
+        message: dict[str, object] | None = None
         if assistant_text:
-            self._conversation.last_assistant_full_message = {"role": "assistant", "content": assistant_text}
+            self._conversation.last_assistant_full_message = _object_dict(role="assistant", content=assistant_text)
             self._conversation.last_assistant_audio_text_marks = list(self._response.assistant_audio_text_marks)
             if response_id is not None:
                 self._conversation.assistant_response_snapshots[response_id] = (
@@ -943,7 +987,7 @@ class DuplexEngineSession:
         else:
             committed_text = ""
         if commit_text and committed_text:
-            message = {"role": "assistant", "content": committed_text}
+            message = _object_dict(role="assistant", content=committed_text)
             item_id = f"item_{response_id}" if response_id is not None else None
             if item_id is not None and item_id in self._conversation.history_item_placeholders:
                 self._store_history_item_message(item_id, message)
@@ -1078,8 +1122,8 @@ class DuplexEngineSession:
             self._conversation.pending_truncations_ms.pop(item_id, None)
             return True
 
-        message = self._conversation.item_ids.get(item_id)
-        if message is None:
+        stored_message = self._conversation.item_ids.get(item_id)
+        if stored_message is None:
             pending = self._conversation.pending_item_ids.get(item_id)
             if pending is None:
                 self._conversation.pending_truncations_ms[item_id] = max(0, int(audio_end_ms))
@@ -1113,6 +1157,7 @@ class DuplexEngineSession:
             if item_id.startswith("item_"):
                 self._conversation.assistant_response_snapshots.pop(item_id.removeprefix("item_"), None)
             return True
+        message = stored_message
         changed = self._truncate_message_to_audio_ms(
             message,
             audio_end_ms=audio_end_ms,
@@ -1209,12 +1254,20 @@ class DuplexEngineSession:
         sent_ms = max(self.playback.sent_ms, self.playback.generated_ms)
         committed_ms = self.playback.committed_ms
         policy = playback_commit_policy or self.config.playback_commit_policy
+        commit_all = policy == DuplexPlaybackCommitPolicy.COMMIT_ALL_ON_DONE.value
+        if self.playback.text_requires_complete_audio:
+            # Unaligned text has no spoken prefix to cut at, so history gets
+            # the whole answer or none of it. Under commit_all_on_done that
+            # choice is the whole answer --- which is also the only thing a
+            # client that never acks playback can be credited with.
+            if commit_all:
+                return assistant_text
+            keep_chars = self._text_chars_for_audio_ms(committed_ms, len(assistant_text))
+            return assistant_text[:keep_chars].rstrip()
         if sent_ms <= 0 or committed_ms >= sent_ms:
             return assistant_text
         if committed_ms <= 0:
-            if policy == DuplexPlaybackCommitPolicy.COMMIT_ALL_ON_DONE.value:
-                return assistant_text
-            return ""
+            return assistant_text if commit_all else ""
         keep_chars = self._text_chars_for_audio_ms(committed_ms, len(assistant_text))
         if keep_chars <= 0:
             return ""
@@ -1233,6 +1286,11 @@ class DuplexEngineSession:
         audio_end_ms = max(0, int(audio_end_ms))
         marks = marks if marks is not None else self._response.assistant_audio_text_marks
         playback = playback or self._playback.current
+        if playback.text_requires_complete_audio:
+            # Unaligned streams cannot establish a spoken prefix. A terminal
+            # boundary plus its playback ACK can establish the whole answer.
+            total_ms = max(playback.sent_ms, playback.generated_ms)
+            return text_len if playback.audio_complete and total_ms > 0 and audio_end_ms >= total_ms else 0
         if not marks:
             sent_ms = max(1, playback.sent_ms, playback.generated_ms)
             return int(text_len * max(0.0, min(1.0, audio_end_ms / sent_ms)))
@@ -1307,11 +1365,9 @@ class DuplexEngineSession:
         elif event_type == DuplexTurnEventType.ASSISTANT_DONE.value:
             self.transition_turn(DuplexTurnState.IDLE)
         elif event_type == DuplexTurnEventType.PLAYBACK_ACK.value:
-            played_ms = int(payload.get("played_ms", 0) or 0)
-            committed_ms = payload.get("committed_ms")
             self.acknowledge_playback(
-                played_ms,
-                int(committed_ms) if isinstance(committed_ms, int | float) else None,
+                _as_int(payload.get("played_ms", 0)),
+                _as_optional_int(payload.get("committed_ms")),
             )
         elif event_type == DuplexTurnEventType.BARGE_IN.value:
             self.transition_turn(DuplexTurnState.BARGE_IN)
@@ -1346,29 +1402,45 @@ class DuplexEngineSession:
             "playback": self.playback.as_dict(),
             "capabilities": self.capabilities.as_dict(),
         }
-        if isinstance(self.config.extra_body.get("realtime_tools"), list):
-            payload["tools"] = self.config.extra_body["realtime_tools"]
-        if isinstance(self.config.extra_body.get("realtime_tool_choice"), str | dict):
-            payload["tool_choice"] = self.config.extra_body["realtime_tool_choice"]
-        if isinstance(self.config.extra_body.get("realtime_metadata"), dict):
-            payload["metadata"] = dict(self.config.extra_body["realtime_metadata"])
-        if isinstance(self.config.extra_body.get("realtime_include"), list):
-            payload["include"] = list(self.config.extra_body["realtime_include"])
-        if isinstance(self.config.extra_body.get("realtime_prompt"), dict):
-            payload["prompt"] = dict(self.config.extra_body["realtime_prompt"])
-        if isinstance(self.config.extra_body.get("realtime_input_audio_transcription"), dict):
-            payload["input_audio_transcription"] = dict(self.config.extra_body["realtime_input_audio_transcription"])
-        if isinstance(self.config.extra_body.get("realtime_input_audio_noise_reduction"), dict):
-            payload["input_audio_noise_reduction"] = dict(
-                self.config.extra_body["realtime_input_audio_noise_reduction"]
-            )
-        if isinstance(self.config.extra_body.get("realtime_audio"), dict):
-            payload["audio"] = dict(self.config.extra_body["realtime_audio"])
-        if isinstance(self.config.extra_body.get("realtime_tracing"), str | dict):
-            payload["tracing"] = self.config.extra_body["realtime_tracing"]
-        raw_realtime_session = self.config.extra_body.get("realtime_session_payload")
-        if isinstance(raw_realtime_session, dict):
-            for key, value in raw_realtime_session.items():
+        extra_body = self.config.extra_body
+        realtime_tools = _copy_list(extra_body.get("realtime_tools"))
+        if realtime_tools is not None:
+            payload["tools"] = realtime_tools
+        realtime_tool_choice = extra_body.get("realtime_tool_choice")
+        if isinstance(realtime_tool_choice, str):
+            payload["tool_choice"] = realtime_tool_choice
+        else:
+            copied_tool_choice = _copy_mapping(realtime_tool_choice)
+            if copied_tool_choice is not None:
+                payload["tool_choice"] = copied_tool_choice
+        realtime_metadata = _copy_mapping(extra_body.get("realtime_metadata"))
+        if realtime_metadata is not None:
+            payload["metadata"] = realtime_metadata
+        realtime_include = _copy_list(extra_body.get("realtime_include"))
+        if realtime_include is not None:
+            payload["include"] = realtime_include
+        realtime_prompt = _copy_mapping(extra_body.get("realtime_prompt"))
+        if realtime_prompt is not None:
+            payload["prompt"] = realtime_prompt
+        realtime_transcription = _copy_mapping(extra_body.get("realtime_input_audio_transcription"))
+        if realtime_transcription is not None:
+            payload["input_audio_transcription"] = realtime_transcription
+        realtime_noise_reduction = _copy_mapping(extra_body.get("realtime_input_audio_noise_reduction"))
+        if realtime_noise_reduction is not None:
+            payload["input_audio_noise_reduction"] = realtime_noise_reduction
+        realtime_audio = _copy_mapping(extra_body.get("realtime_audio"))
+        if realtime_audio is not None:
+            payload["audio"] = realtime_audio
+        realtime_tracing = extra_body.get("realtime_tracing")
+        if isinstance(realtime_tracing, str):
+            payload["tracing"] = realtime_tracing
+        else:
+            copied_tracing = _copy_mapping(realtime_tracing)
+            if copied_tracing is not None:
+                payload["tracing"] = copied_tracing
+        copied_session = _copy_mapping(extra_body.get("realtime_session_payload"))
+        if copied_session is not None:
+            for key, value in copied_session.items():
                 if key not in payload and key != "extra_body":
                     payload[key] = value
         return payload

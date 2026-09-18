@@ -25,6 +25,12 @@ from vllm_omni.diffusion.model_metadata import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.fixture(autouse=True)
+def _local_model_paths(monkeypatch):
+    # These tests exercise config transport, not model repository resolution.
+    monkeypatch.setattr("vllm_omni.diffusion.data.get_model_path", lambda model, revision: model)
+
+
 def _roundtrip_diffusion_config(**kwargs) -> OmniDiffusionConfig:
     """Simulate the real path: create_default_diffusion → OmniDiffusionConfig.
 

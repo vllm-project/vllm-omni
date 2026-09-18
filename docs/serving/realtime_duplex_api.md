@@ -768,7 +768,10 @@ events with `server_event_seq > 40` are replayed in order)
 ```
 
 with camera frames (omni video; rides the append that closes a 1 s model
-unit; each entry is a **bare** base64 JPEG/PNG — no `data:` URL prefix)
+unit; each entry is a **bare** base64 JPEG/PNG — no `data:` URL prefix).
+Only a model whose Stage 0 interleaves a frame track at unit boundaries takes
+this field; a turn model has no such boundary and rejects it, expecting
+`conversation.item.create` with `input_image` content instead.
 
 ```json
 {
