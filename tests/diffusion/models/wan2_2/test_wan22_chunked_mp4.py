@@ -138,13 +138,13 @@ def test_request_batch_threshold_controls_transfers_without_losing_frames(monkey
     from vllm_omni.diffusion.utils import chunked_video
 
     transfers = []
-    quantize = chunked_video.chunk_to_uint8_frames
+    quantize = chunked_video.quantize_chunk
 
     def capture(chunk, value_range):
         transfers.append(chunk.shape[2])
         return quantize(chunk, value_range)
 
-    monkeypatch.setattr(chunked_video, "chunk_to_uint8_frames", capture)
+    monkeypatch.setattr(chunked_video, "quantize_chunk", capture)
     params = SimpleNamespace(extra_args={"preencode_mp4": True, "preencode_batch_frames": value})
     vae = _FakeWanVAE(batch=1, chunks=4, frames_per_chunk=3, height=16, width=32)
     videos = decode_to_mp4(vae, torch.zeros(1), fps=24, batch_frames=resolve_wan_preencode_batch_frames(params))

@@ -941,7 +941,8 @@ class OmniServeCommand(CLISubcommand):
             "--diffusion-kv-cache-dtype",
             type=str,
             default=None,
-            help="Diffusion attention KV cache dtype (e.g. fp8). Separate from vLLM --kv-cache-dtype.",
+            help="Diffusion Q/K/V precision: fp8, mxfp8, mxfp4, or float (NPU). "
+            "Separate from vLLM --kv-cache-dtype. Use --diffusion-attention-config for per-role fallback.",
         )
         omni_config_group.add_argument(
             "--diffusion-kv-cache-skip-steps",
