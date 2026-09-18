@@ -501,10 +501,13 @@ class NixlConnector(OmniConnectorBase):
         if self._transfer_thread is not None:
             self._transfer_thread.join(timeout=5.0)
             self._transfer_thread = None
-        while self._deferred_transfers:
-            self._reap_deferred_transfers()
-            if self._deferred_transfers:
-                time.sleep(max(self._poll_interval_s, 0.01))
+        self._reap_deferred_transfers()
+        if self._deferred_transfers:
+            _RETAINED_PRODUCERS.add(self)
+            self._closed = False
+            self._closing = True
+            logger.warning("NIXL close deferred: local transfers still own DMA resources; retry close after completion")
+            return
         if self._zmq_ctx is not None:
             # destroy() rather than term(): REQ sockets live in thread-local
             # caches this thread cannot reach, and term() blocks until every
@@ -525,7 +528,7 @@ class NixlConnector(OmniConnectorBase):
 
     def health(self) -> dict[str, Any]:
         return {
-            "status": "unhealthy" if self._closed else "healthy",
+            "status": "unhealthy" if self._closed or getattr(self, "_closing", False) else "healthy",
             "pending_requests": len(self._pending),
             **self._metrics,
         }

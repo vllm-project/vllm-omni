@@ -92,7 +92,8 @@ Parameters:
 - `transfer_timeout_s`: how long a `get()` waits for its `READ` to complete
   (default 300). NIXL 1.3 has no transfer cancellation API, so a timed-out transfer's
   buffers and registrations remain owned by the connector until NIXL reports a
-  terminal state; `close()` waits for that state before releasing them.
+  terminal state. `close()` polls remaining transfers once and returns without
+  releasing active DMA resources; call it again after completion to finish cleanup.
   `VLLM_OMNI_NIXL_XFER_TIMEOUT_S` overrides it.
 
 ### Source ownership and failure limits
@@ -110,7 +111,12 @@ claim indefinitely. NIXL 1.3 cannot prove remote cancellation, so neither TTL no
 `cleanup()` frees those allocations. Producer `close()` rejects new work and
 retains its agent, listener and claimed allocations; a later `close()` finishes
 teardown after claims drain. Permanently abandoned claims remain until process
-exit. This favors memory safety over bounded shutdown/memory usage. Only trusted
+exit. A consumer with unfinished local transfers likewise retains a strong reference
+to its connector, agent, tensors and registrations after `close()` returns. Its
+background reapers have stopped, so final cleanup requires another `close()` call;
+permanently stuck transfers retain resources until process exit. Closing connectors
+reject new work and report unhealthy. This avoids an unbounded transfer-polling loop
+in shutdown without freeing DMA-owned memory. Only trusted
 peers may access this unauthenticated control plane. Both endpoints must use the
 claim-aware protocol; rolling compatibility with older GET_META clients is not
 provided. Legacy externally-owned metadata without a generation is accepted only

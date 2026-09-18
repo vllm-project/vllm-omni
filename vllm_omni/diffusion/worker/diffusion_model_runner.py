@@ -622,18 +622,21 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             logger.warning("Stage payload connector unavailable: %s", exc)
             return None
 
-    def _stage_payload_broadcast_group(self) -> Any | None:
-        """Return the group whose ranks share one stage payload."""
+    def _stage_payload_broadcast_groups(self) -> tuple[Any, ...]:
+        """Return orthogonal groups spanning the stage's TP x SP ranks."""
+        groups = []
         tp_group = self._get_local_tp_group()
         if tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
-            return tp_group
+            groups.append(tp_group)
         try:
             from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 
             sp_group = get_sp_group()
         except (AssertionError, ImportError):
-            return None
-        return sp_group if getattr(sp_group, "world_size", 1) > 1 else None
+            sp_group = None
+        if sp_group is not None and getattr(sp_group, "world_size", 1) > 1:
+            groups.append(sp_group)
+        return tuple(groups)
 
     def _stage_input_payload_keys(self) -> tuple[str, ...]:
         """Payload keys this stage expects to receive from the previous stage.
@@ -669,9 +672,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             return
 
         from_stage, to_stage = self.kv_transfer_manager.recv_stages
-        broadcast_group = self._stage_payload_broadcast_group()
-        group_active = broadcast_group is not None
-        is_transfer_rank = not group_active or getattr(broadcast_group, "rank_in_group", 0) == 0
+        broadcast_groups = self._stage_payload_broadcast_groups()
+        is_transfer_rank = all(group.rank_in_group == 0 for group in broadcast_groups)
 
         connector = None
         if is_transfer_rank:
@@ -716,10 +718,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 logger.warning("Stage payload get failed for %s: %s", get_key, exc)
 
         payload = result[0] if result else None
-        if broadcast_group is not None:
-            delivered = broadcast_group.broadcast_object(isinstance(payload, dict) if is_transfer_rank else None, src=0)
+        for broadcast_group in broadcast_groups:
+            is_group_leader = broadcast_group.rank_in_group == 0
+            delivered = broadcast_group.broadcast_object(isinstance(payload, dict) if is_group_leader else None, src=0)
             if delivered:
-                payload = broadcast_group.broadcast_tensor_dict(payload if is_transfer_rank else None, src=0)
+                payload = broadcast_group.broadcast_tensor_dict(payload if is_group_leader else None, src=0)
 
         if payload is None:
             if is_transfer_rank:
@@ -1241,6 +1244,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 new_request_ids.append(request_id)
                 if request_id in self.state_cache:
                     raise ValueError(f"Received duplicate new-request payload for cached request {request_id}.")
+                self._maybe_recv_stage_payload(sched_new_req.req)
                 new_state = StepRequestState(
                     request_id=request_id,
                     sampling=copy.deepcopy(sched_new_req.req.sampling_params),

@@ -271,11 +271,11 @@ def test_sp_payload_is_fetched_once_by_leader_and_broadcast_to_followers():
 
     leader = _make_runner(connector)
     leader._get_local_tp_group = lambda: None
-    leader._stage_payload_broadcast_group = lambda: _FakeSPGroup(0)
+    leader._stage_payload_broadcast_groups = lambda: (_FakeSPGroup(0),)
     follower = _make_runner(connector)
     follower._local_rank = 1
     follower._get_local_tp_group = lambda: None
-    follower._stage_payload_broadcast_group = lambda: _FakeSPGroup(1)
+    follower._stage_payload_broadcast_groups = lambda: (_FakeSPGroup(1),)
 
     leader_req = _make_request({"prompt": "a cat"})
     follower_req = _make_request({"prompt": "a cat"})
@@ -297,6 +297,81 @@ def test_missing_incoming_edge_is_reported_not_fetched():
 
     assert connector.calls == []
     assert "additional_information" not in req.prompt
+
+
+@pytest.mark.parametrize("delivered", [True, False])
+def test_payload_reaches_full_tp_sp_grid_once(monkeypatch, delivered):
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    connector = _FakeConnector(_conditioning() if delivered else None)
+    packets = {}
+
+    class GridGroup:
+        world_size = 2
+
+        def __init__(self, dimension, peer_rank, rank):
+            self.key = (dimension, peer_rank)
+            self.rank_in_group = rank
+
+        def broadcast_object(self, value, src=0):
+            if self.rank_in_group == src:
+                packets[self.key, "delivered"] = value
+            return packets[self.key, "delivered"]
+
+        def broadcast_tensor_dict(self, value, src=0):
+            if self.rank_in_group == src:
+                packets[self.key, "payload"] = value
+            return packets[self.key, "payload"]
+
+    for sp_rank in range(2):
+        for tp_rank in range(2):
+            runner = _make_runner(connector)
+            tp_group = GridGroup("tp", sp_rank, tp_rank)
+            sp_group = GridGroup("sp", tp_rank, sp_rank)
+            monkeypatch.setattr(runner, "_get_local_tp_group", lambda: tp_group)
+            monkeypatch.setattr(parallel_state, "get_sp_group", lambda: sp_group)
+            request = _make_request({"prompt": "a cat"})
+
+            runner._maybe_recv_stage_payload(request)
+
+            if delivered:
+                output = request.prompt["additional_information"]["text_encoder_output"]
+                assert torch.equal(output["hidden_states"], connector._payload["text_encoder_output"]["hidden_states"])
+            else:
+                assert "additional_information" not in request.prompt
+    assert len(connector.calls) == 1
+
+
+def test_step_mode_receives_payload_before_kv_and_reuses_cached_state():
+    connector = _FakeConnector(_conditioning())
+    runner = _make_runner(connector)
+    runner.state_cache = {}
+    request = _make_request({"prompt": "a cat"})
+    request.sampling_params = SimpleNamespace()
+    kv_calls = []
+
+    def receive_kv(state_request, **kwargs):
+        assert "text_encoder_output" in state_request.prompt["additional_information"]
+        kv_calls.append(state_request.request_id)
+
+    runner.kv_transfer_manager.receive_multi_kv_cache_distributed = receive_kv
+    scheduled = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(request_id=request.request_id, req=request)],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+    states, new_ids = runner._update_states(scheduled)
+    assert new_ids == [request.request_id]
+    assert states[0].prompt is request.prompt
+    assert len(connector.calls) == 1
+    assert kv_calls == [request.request_id]
+
+    scheduled.scheduled_new_reqs = []
+    scheduled.scheduled_cached_reqs.request_ids = [request.request_id]
+    cached_states, new_ids = runner._update_states(scheduled)
+    assert cached_states == states
+    assert new_ids == []
+    assert len(connector.calls) == 1
+    assert kv_calls == [request.request_id]
 
 
 def test_non_dict_prompt_is_left_alone():

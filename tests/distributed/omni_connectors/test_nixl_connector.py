@@ -548,21 +548,31 @@ def test_source_endpoint_metadata_overrides_configured_sender(consumer, monkeypa
     assert queried == [("req-tp4-rank3", "10.0.0.3", PORT + 3 * 16)]
 
 
-def test_unknown_key_is_queried_once(producer, consumer, monkeypatch):
+@pytest.mark.parametrize("force_timeout", [False, True], ids=["real-query", "recv-timeout"])
+def test_unknown_key_is_queried_once(producer, consumer, monkeypatch, force_timeout):
     socket = consumer._get_req_socket(f"tcp://127.0.0.1:{PORT}")
     send_count = 0
     original_send = socket.send
 
     def count_send(message):
         nonlocal send_count
+        assert socket.getsockopt(zmq.RCVTIMEO) == 10
+        assert socket.getsockopt(zmq.SNDTIMEO) == 10
         send_count += 1
         return original_send(message)
 
     monkeypatch.setattr(socket, "send", count_send)
+    if force_timeout:
+
+        def timeout_recv():
+            raise zmq.Again()
+
+        monkeypatch.setattr(socket, "recv", timeout_recv)
 
     assert consumer._resolve_metadata("never-published", None) is None
     assert send_count == 1
-    assert socket.getsockopt(zmq.RCVTIMEO) == 10
+    if force_timeout:
+        assert socket.closed
 
 
 @pytest.mark.usefixtures("reliable_claim_queries")
@@ -679,6 +689,66 @@ def test_deferred_transfer_releases_exactly_once_after_done(nixl_connector_cls):
         assert transfer.tensors == []
     finally:
         connector.close()
+
+
+@pytest.mark.parametrize("poll_raises", [False, True], ids=["stuck", "poll-error"])
+def test_close_returns_without_releasing_active_dma(nixl_connector_cls, poll_raises):
+    import threading
+
+    from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import (
+        _RETAINED_PRODUCERS,
+        _DeferredTransfer,
+    )
+
+    connector = nixl_connector_cls({"role": "receiver"})
+    released = []
+
+    def check_state(handle):
+        if poll_raises:
+            raise RuntimeError("device unavailable")
+        return "PROC"
+
+    connector._agent.check_xfer_state = check_state
+    connector._agent.release_xfer_handle = lambda handle: released.append(("handle", handle))
+    connector._agent.release_dlist_handle = lambda handle: released.append(("dlist", handle))
+    connector._agent.remove_remote_agent = lambda agent: released.append(("agent", agent))
+    connector._agent.deregister_memory = lambda descs: released.append(("registration", descs))
+    transfer = _DeferredTransfer(
+        tensors=[torch.zeros(1)],
+        registrations=["registration"],
+        dlists=["local", "remote"],
+        handles=["transfer"],
+        remote_agent="producer",
+    )
+    connector._defer_transfer(transfer)
+    closing = threading.Thread(target=connector.close, daemon=True)
+    try:
+        closing.start()
+        closing.join(timeout=2.0)
+        assert not closing.is_alive(), "close must not wait forever for DMA completion"
+        assert released == []
+        assert transfer in connector._deferred_transfers
+        assert transfer.tensors
+        assert connector._closing
+        assert connector in _RETAINED_PRODUCERS
+        assert connector.health()["status"] == "unhealthy"
+    finally:
+        connector._agent.check_xfer_state = lambda handle: "DONE"
+        closing.join(timeout=2.0)
+        connector.close()
+
+    assert released == [
+        ("handle", "transfer"),
+        ("dlist", "local"),
+        ("dlist", "remote"),
+        ("agent", "producer"),
+        ("registration", "registration"),
+    ]
+    assert not connector._deferred_transfers
+    assert not transfer.tensors
+    assert connector not in _RETAINED_PRODUCERS
+    connector.close()
+    assert len(released) == 5
 
 
 def test_active_sibling_transfer_requires_deferred_ownership(nixl_connector_cls):
