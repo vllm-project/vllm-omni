@@ -104,7 +104,6 @@ _MAX_SEQUENCE_LENGTH = 512
 # sequence -- a few MiB at 512 tokens -- so a handful covers a session's prompt
 # plus the switches it makes, at no meaningful cost next to its KV.
 _PROMPT_EMBEDS_CACHE_SIZE = 4
-_ACTION_ROOT_ENV = "VLLM_OMNI_LINGBOT_ACTION_ROOT"
 _PREPROCESSED_CAMERA_KEY = "_lingbot_camera_trajectory"
 _PREPROCESSED_CAMERA_ACTIONS_KEY = "_lingbot_camera_actions"
 _PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY = "_lingbot_camera_action_script"
@@ -296,7 +295,7 @@ def get_lingbot_world_pre_process_func(
     """Materialize request-local files once before dispatching GPU workers."""
 
     model_config = getattr(od_config, "model_config", None) or {}
-    configured_action_root = model_config.get("lingbot_action_root") or os.environ.get(_ACTION_ROOT_ENV)
+    configured_action_root = model_config.get("lingbot_action_root")
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         prompt = request.prompt
@@ -390,7 +389,7 @@ def get_lingbot_world_pre_process_func(
             if not configured_action_root:
                 raise ValueError(
                     "sampling_params.extra_args.action_path requires a trusted action root configured by "
-                    f"model_config.lingbot_action_root or {_ACTION_ROOT_ENV}."
+                    "model_config.lingbot_action_root."
                 )
             action_directory = resolve_trusted_action_directory(
                 action_path,

@@ -1673,7 +1673,6 @@ class TestVoiceCloneReferenceCache:
         )
 
         monkeypatch.setenv("HIGGS_AUDIO_TOKENIZER_PATH", str(parent))
-        monkeypatch.setenv("HIGGS_AUDIO_V2_TOKENIZER_PATH", "")
         monkeypatch.setattr(
             huggingface_hub,
             "try_to_load_from_cache",
