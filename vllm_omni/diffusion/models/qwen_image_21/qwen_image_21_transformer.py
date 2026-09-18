@@ -798,9 +798,19 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         self.sequence_prepare = QwenImage21SequencePrepare(self.img_in, self.pos_embed)
 
         # Use decode graphs unless the caller requests eager execution.
+        # Model-level (sequential) offload registers its swap hook on this
+        # top-level module rather than on individual blocks, so the manager's
+        # block-level hook check cannot see it; refuse capture up front.
         self.enable_cuda_graph_decode = not od_config.enforce_eager
         self._decode_graph_manager = (
-            QwenImage21DecodeGraphManager(self, max_entries=cuda_graph_max_decode_graphs)
+            QwenImage21DecodeGraphManager(
+                self,
+                max_entries=cuda_graph_max_decode_graphs,
+                model_level_offload=(
+                    od_config.enable_cpu_offload
+                    or getattr(od_config, "enable_distributed_layerwise_offload", False)
+                ),
+            )
             if self.enable_cuda_graph_decode
             else None
         )

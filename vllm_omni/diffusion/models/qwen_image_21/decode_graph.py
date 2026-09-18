@@ -18,11 +18,11 @@ Memory note: graph entries own an additional copy of the prefix K/V. Decode
 attention concatenates that prefix with target K/V inside the captured region;
 transient tensors use the graph memory pool.
 
-Fallbacks (all logged, all eager): CUDA unavailable, sequence/ring/tensor
-parallelism, HSDP/offload hooks, torch.compile'd blocks, KV-cache quantization,
-dynamic LoRA wrappers, padded text masks (the masked attention path branches on
-mask contents, which cannot be captured), unknown graph key at decode, and
-capture failure.
+Fallbacks (all logged, all eager): CUDA unavailable, model-level CPU offload,
+sequence/ring/tensor parallelism, HSDP/offload hooks, torch.compile'd blocks,
+KV-cache quantization, dynamic LoRA wrappers, padded text masks (the masked
+attention path branches on mask contents, which cannot be captured), unknown
+graph key at decode, and capture failure.
 """
 
 from __future__ import annotations
@@ -154,22 +154,40 @@ class QwenImage21DecodeGraphEntry:
 class QwenImage21DecodeGraphManager:
     """Owns the static KV buffers and captured graphs of one transformer."""
 
-    def __init__(self, model: QwenImage21Transformer2DModel, max_entries: int = 8):
+    def __init__(self, model: QwenImage21Transformer2DModel, max_entries: int = 8, model_level_offload: bool = False):
         self.model = model
         self.max_entries = max_entries
+        self.model_level_offload = model_level_offload
         self.entries: OrderedDict[tuple, QwenImage21DecodeGraphEntry | None] = OrderedDict()
         self._static_eligible: bool | None = None
 
     # ── eligibility ──
 
+    def _offload_reason(self) -> str | None:
+        """Reason decode graphs are incompatible with model-level offload, if any.
+
+        Model-level (sequential) offload registers its hook on the top-level
+        transformer module, not on individual blocks, and swaps ``p.data``
+        between CPU and GPU storage around every forward. A captured graph
+        binds the GPU addresses seen at capture time, so replaying it after a
+        swap reads stale pointers. Graph capture must stay disabled; only the
+        eager decode fallback is safe.
+        """
+        if self.model_level_offload:
+            return "model-level CPU offload swaps weight storage after capture"
+        registry = getattr(self.model, "_hook_registry", None)
+        if registry is not None and registry._hooks:
+            return "model module carries offload/cache hooks"
+        return None
+
     def _check_static_eligibility(self) -> bool:
         """One-time checks that cannot change after weights are loaded."""
         model = self.model
-        reason = None
+        reason = self._offload_reason()
         param = next(model.parameters(), None)
-        if param is None or param.device.type != "cuda":
+        if reason is None and (param is None or param.device.type != "cuda"):
             reason = f"model is not on CUDA (device={None if param is None else param.device})"
-        else:
+        elif reason is None:
             parallel_config = getattr(model, "parallel_config", None)
             if parallel_config is not None:
                 sp = getattr(parallel_config, "sequence_parallel_size", None) or 1

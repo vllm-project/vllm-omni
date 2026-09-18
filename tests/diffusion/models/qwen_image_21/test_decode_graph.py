@@ -6,6 +6,7 @@ import weakref
 import pytest
 import torch
 
+from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.diffusion.models.qwen_image_21 import decode_graph
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -69,6 +70,25 @@ def decode(manager, cache, layout=(1, 2, 2)):
         img_mask=torch.tensor([[False, False, True]], device=device),
         encoder_hidden_states_mask=None,
     )
+
+
+@pytest.mark.cpu
+def test_model_level_offload_config_disables_decode_graphs():
+    manager = decode_graph.QwenImage21DecodeGraphManager(DecodeModel(), model_level_offload=True)
+    assert manager._offload_reason() is not None
+    assert manager.eligible() is False
+
+
+@pytest.mark.cpu
+def test_top_level_offload_hook_disables_decode_graphs():
+    model = DecodeModel()
+    manager = decode_graph.QwenImage21DecodeGraphManager(model)
+    registry = HookRegistry.get_or_create(model)
+    # A present-but-empty registry (e.g. after hooks were removed) must not disqualify.
+    assert manager._offload_reason() is None
+    registry.register_hook("sequential_offload", ModelHook())
+    assert manager._offload_reason() is not None
+    assert manager.eligible() is False
 
 
 @pytest.mark.cpu
