@@ -75,10 +75,15 @@ def _graphable_estimator_step(
     cond,
     cnn_cache,
     att_cache,
+    valid_frames=None,
 ):
     """Run the CFM estimator body after host-backed timestep embedding."""
     width = int(x.shape[-1])
     speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
+    if valid_frames is not None and valid_frames < width:
+        # Match the CUDA path: padded columns must not carry the speaker vector.
+        speaker_features = speaker_features.clone()
+        speaker_features[:, :, valid_frames:] = 0.0
     estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
     cnn_out, att_out = backend._estimator_buffers(estimator, estimator_input, att_cache)
     old_cnn = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
@@ -108,6 +113,7 @@ def _patched_estimator_step(
     att_cache,
     attn_mask=None,
     valid_lengths=None,
+    valid_frames=None,
 ):
     assert _original_estimator_step is not None
     graph_runner = _backend_graph_runners.get(self)
@@ -130,9 +136,15 @@ def _patched_estimator_step(
             att_cache=att_cache,
             attn_mask=attn_mask,
             valid_lengths=valid_lengths,
+            valid_frames=valid_frames,
         )
     if (cnn_cache is None) != (att_cache is None):
         raise ValueError("estimator CNN and attention caches must both be present or absent")
+
+    # valid_frames only matters for padded inputs; skip forwarding it for
+    # unpadded calls so platform-owned graphable bodies that predate the
+    # padding feature keep working with the old signature.
+    graphable_kwargs = {"valid_frames": valid_frames} if valid_frames is not None else {}
 
     # The upstream embedder creates a frequency tensor on the host. Keep it
     # outside capture while retaining the tensor-only estimator body in graph.
@@ -152,6 +164,7 @@ def _patched_estimator_step(
                 cond=step_cond,
                 cnn_cache=None,
                 att_cache=None,
+                **graphable_kwargs,
             ),
         )
 
@@ -169,6 +182,7 @@ def _patched_estimator_step(
             cond=step_cond,
             cnn_cache=step_cnn,
             att_cache=step_att,
+            **graphable_kwargs,
         ),
     )
 

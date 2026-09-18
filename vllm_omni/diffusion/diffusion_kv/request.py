@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.v1.core.kv_cache_utils import BlockHash, generate_block_hash_extra_keys, hash_block_tokens
@@ -70,6 +71,8 @@ class DiffusionKVRequest:
         mm_features: Sequence[MultiModalFeatureSpec] = (),
         cache_namespace: str = "diffusion-primary-v1",
         kv_contexts: Sequence[DiffusionKVContext] = (),
+        kv_transfer_params: dict[str, Any] | None = None,
+        prompt_token_ids: list[int] | None = None,
     ) -> None:
         if not request_id:
             raise ValueError("request_id must be non-empty")
@@ -132,6 +135,11 @@ class DiffusionKVRequest:
         # vLLM 0.26+ uses this optional boundary when publishing cached blocks;
         # zero means that no sparse-retention boundary is active.
         self.shared_prefix_boundary = 0
+        # Opaque request-scoped parameters consumed by an upstream KVConnector.
+        self.kv_transfer_params = kv_transfer_params
+        # Mooncake derives the remote-load length from this list. PR0 carries
+        # the field without creating a placeholder or starting a load.
+        self.prompt_token_ids = prompt_token_ids
 
     def _validate_mm_features(self) -> None:
         # Native block traversal expects sorted, non-overlapping placeholders.

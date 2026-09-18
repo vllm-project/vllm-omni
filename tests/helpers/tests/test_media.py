@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import sys
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import nullcontext
+from multiprocessing.context import BaseContext
 from types import SimpleNamespace
 
 import numpy as np
@@ -13,6 +14,14 @@ import soundfile as sf
 from tests.helpers import media
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_preprocess_text_normalizes_spoken_kilohertz():
+    expected = "This response should be encoded as eight kilohertz audio."
+    transcript = "This response should be encoded as 8 kHz audio."
+
+    assert media.preprocess_text(expected) == media.preprocess_text(transcript)
+    assert media.cosine_similarity_text(expected, transcript) == pytest.approx(1.0)
 
 
 def _stub_transcribe(monkeypatch) -> dict:
@@ -61,6 +70,7 @@ class _FakeExecutor:
 
     def __init__(self, outcomes=()):
         self._outcomes = list(outcomes)
+        self.init_kwargs: dict[str, object] = {}
         self.submitted: list[tuple] = []
         self.shutdown_calls = 0
 
@@ -105,6 +115,44 @@ def _reset_transcriber_singletons():
     media._WHISPER_MODELS.clear()
 
 
+@pytest.mark.parametrize(
+    ("free_memory_by_device", "expected_device", "expected_probe_order"),
+    [
+        ([media._MIN_FREE_VRAM], "cuda:0", [0]),
+        ([media._MIN_FREE_VRAM] * 3, "cuda:2", [2]),
+        ([8 * 1024**3, 20 * 1024**3, 24 * 1024**3], "cuda:2", [2]),
+        ([media._MIN_FREE_VRAM - 1], "cpu", [0]),
+        ([20 * 1024**3, 8 * 1024**3], "cuda:0", [1, 0]),
+        ([8 * 1024**3, 12 * 1024**3], "cpu", [1, 0]),
+    ],
+)
+def test_select_whisper_device_by_available_memory(
+    monkeypatch, free_memory_by_device, expected_device, expected_probe_order
+):
+    probed_devices = []
+
+    def get_free_memory(device):
+        index = int(device.rsplit(":", 1)[1])
+        probed_devices.append(index)
+        return free_memory_by_device[index]
+
+    platform = SimpleNamespace(
+        is_available=lambda: True,
+        get_device_count=lambda: len(free_memory_by_device),
+        get_torch_device=lambda index: f"cuda:{index}",
+        get_free_memory=get_free_memory,
+        set_device=lambda device: None,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_omni.platforms",
+        SimpleNamespace(current_omni_platform=platform),
+    )
+
+    assert media._select_whisper_device() == expected_device
+    assert probed_devices == expected_probe_order
+
+
 def test_bytes_entrypoint_forwards_language_to_subprocess(monkeypatch, tmp_path):
     """Cover the two hops the tests above skip: bytes -> file -> executor.submit.
 
@@ -139,7 +187,9 @@ def test_parent_reuses_one_spawned_worker_across_calls(monkeypatch):
     assert len(created) == 1
     assert len(created[0].submitted) == 2
     assert created[0].init_kwargs["max_workers"] == 1
-    assert created[0].init_kwargs["mp_context"].get_start_method() == "spawn"
+    mp_context = created[0].init_kwargs["mp_context"]
+    assert isinstance(mp_context, BaseContext)
+    assert mp_context.get_start_method() == "spawn"
 
 
 def test_release_forces_a_new_process_pool(monkeypatch):

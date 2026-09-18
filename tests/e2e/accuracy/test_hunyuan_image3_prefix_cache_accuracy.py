@@ -173,9 +173,7 @@ def _image_metrics(clip_scorer, prediction, reference):
     if prediction.size != reference.size:
         prediction = prediction.resize(reference.size)
     ssim, psnr = compute_image_ssim_psnr(prediction=prediction, reference=reference)
-    difference = np.abs(
-        np.asarray(prediction, dtype=np.float32) / 255 - np.asarray(reference, dtype=np.float32) / 255
-    )
+    difference = np.abs(np.asarray(prediction, dtype=np.float32) / 255 - np.asarray(reference, dtype=np.float32) / 255)
     return {
         "clip_score": clip_scorer.image_image_score(prediction, reference),
         "ssim": ssim,
@@ -284,9 +282,7 @@ def test_hunyuan_image3_warm_prefix_accuracy(tmp_path, capfd, seed_base):
                     )
                     traces[f"{label}_warmup"] = [vars(event) for event in warmup]
 
-                image, events = _generate_edit(
-                    **common, prompt=_PROMPT, output_path=output_dir / f"{label}.png"
-                )
+                image, events = _generate_edit(**common, prompt=_PROMPT, output_path=output_dir / f"{label}.png")
                 results[mode, guidance] = image
                 traces[label] = [vars(event) for event in events]
                 if mode == "dense":
@@ -343,8 +339,7 @@ def test_hunyuan_image3_warm_prefix_accuracy(tmp_path, capfd, seed_base):
         if include_dense:
             predictions = ["dense"] + predictions
         comparisons = [
-            (prediction, reference_image, _REFERENCE_THRESHOLDS, "vs input reference")
-            for prediction in predictions
+            (prediction, reference_image, _REFERENCE_THRESHOLDS, "vs input reference") for prediction in predictions
         ]
         no_cache = results["paged_no_cache", guidance]
         comparisons += [

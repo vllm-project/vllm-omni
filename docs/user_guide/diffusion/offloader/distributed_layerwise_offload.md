@@ -1,11 +1,13 @@
 # Distributed Layerwise Offloading
 
 Distributed layerwise offloading (DLO) extends block streaming to multi-device
-deployments. With AllGather enabled, each rank stores roughly `1 / dp_size` of
-the host weights and reconstructs each layer at runtime. Without AllGather,
-each rank streams a complete block independently. Compatible TP1 deployments
-can share checkpoint-backed host pages among processes on the same node;
-otherwise DLO streams the ordinary loader's rank-local tensors.
+deployments. Each selected component chooses its transfer independently. With
+`allgather`, each rank stores roughly one shard per member of the effective DLO
+group (DP, or SP when DP is one) and reconstructs each layer at runtime. With
+`rank-local`, each rank streams a complete loader-produced block independently.
+Compatible TP1 DiT deployments can share checkpoint-backed host pages among
+processes on the same node; otherwise DLO streams the ordinary loader's
+rank-local tensors.
 
 See the [DLO feature design](../../../design/feature/offloader/distributed_layerwise_offload.md)
 for the implementation contract and compatibility matrix.
@@ -24,52 +26,120 @@ Slots:           slot 0: Layer N    slot 1: Layer N+1
 AllGather communicates only request-independent weight shards, so data-
 parallel ranks may process different requests concurrently.
 
+The public API describes intent in one nested configuration:
+
+| Level | Setting | Question answered |
+| --- | --- | --- |
+| Granularity | `mode` | move a complete component (`module`) or stream its blocks (`layer`) |
+| Selection | `components` list | whether `dit` and/or `text_encoder` may move to CPU |
+| Per-component layer options | `layer_options` | choose rank-local or AllGather weight transfer and optionally retain leading DiT blocks |
+
+`weight_transfer` applies only to model weights. It does not change encoder
+activations or the encoder's compute parallelism. `rank-local` copies each
+rank's loader-produced block to its device. `allgather` stores one shard of
+that block per rank, copies each shard to its device, and reconstructs the
+complete block with a device-side AllGather before compute.
+
+The historical `enable_cpu_offload`, `enable_layerwise_offload`, and
+`enable_distributed_layerwise_offload` fields remain compatibility aliases
+for existing callers and model-specific stage lifecycles. Existing
+combinations retain their priority (`distributed layerwise` > `layerwise` >
+`module`). A compact config rejects conflicting compatibility strategies and
+non-default legacy DLO tuning.
+`distributed-layerwise` remains an internal backend name; users select
+`mode="layer"`, and the runtime chooses the capable backend.
+
 ## Usage
 
 ```bash
-# Four ranks with sharded host weights and AllGather
-vllm serve /path/to/model --omni \
-  --enable-distributed-layerwise-offload \
-  --data-parallel-size 4
+# Four SP ranks; Wan declares replicated text-encoder weights, so both
+# selected components can use AllGather safely.
+vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni \
+  --diffusion-offload-config \
+  '{"mode":"layer","components":["dit","text_encoder"],"layer_options":{"dit":{"weight_transfer":"allgather"},"text_encoder":{"weight_transfer":"allgather"}}}' \
+  --usp 4
 
-# Standard-loader rank-local weights, without DLO AllGather
+# Mix transfers independently: sharded DiT, loader-produced encoder layout
 vllm serve /path/to/model --omni \
-  --enable-distributed-layerwise-offload \
-  --data-parallel-size 4 \
-  --dlo-no-use-allgather
+  --diffusion-offload-config \
+  '{"mode":"layer","components":["dit","text_encoder"],"layer_options":{"dit":{"weight_transfer":"allgather"},"text_encoder":{"weight_transfer":"rank-local"}}}' \
+  --usp 4
 
-# Sequence parallel deployment
+# Full-topology rank-local DLO for an existing model-specific lifecycle
 vllm serve /path/to/model --omni \
   --enable-distributed-layerwise-offload \
+  --dlo-no-use-allgather \
   --usp 4
 ```
+
+A compact layer config whose selected components are all `rank-local` and
+whose `resident_layers` is zero resolves to the ordinary layerwise backend. It
+uses the ordinary loader and does not request DLO's direct-checkpoint mmap.
+Keep the compatibility DLO flags for a model-specific full-topology rank-local
+lifecycle; do not add resident layers solely to force backend selection.
 
 ```python
 from vllm_omni import Omni
 
 omni = Omni(
     model="/path/to/model",
-    enable_distributed_layerwise_offload=True,
-    dlo_use_allgather=True,
+    diffusion_offload_config={
+        "mode": "layer",
+        "components": ["dit", "text_encoder"],
+        "layer_options": {
+            "dit": {
+                "weight_transfer": "rank-local",
+                "resident_layers": 20,
+            },
+            "text_encoder": {
+                "weight_transfer": "allgather",
+            },
+        },
+        "pin_memory": True,
+    },
 )
 ```
 
 ## Flags
 
-| Flag | Meaning | Default |
+| Setting | Meaning | Default |
 | --- | --- | --- |
-| `--enable-distributed-layerwise-offload` | Enable DLO | `false` |
-| `--data-parallel-size N` | DP ranks and AllGather weight-sharding group | `1` |
-| `--dlo-use-allgather` | Shard host weights and reconstruct with AllGather | `true` |
-| `--dlo-no-use-allgather` | Stream complete rank-local blocks without a DLO weight collective | `false` |
-| `--dlo-resident-layers N` | Keep N leading main-DiT blocks on device; requires no-AllGather and model-declared resident paths | `0` |
+| `diffusion_offload_config.mode` | `module` or `layer` granularity | required |
+| `diffusion_offload_config.components` | Non-empty list containing `dit`, `text_encoder`, or both | required |
+| `layer_options.NAME.weight_transfer` | `rank-local` or `allgather` | `rank-local` |
+| `layer_options.dit.resident_layers` | Leading main-DiT blocks kept on device; requires `rank-local` and model-declared resident paths | `0` |
+| `diffusion_offload_config.pin_memory` | Pin streamed host memory for faster H2D copies | `true` |
+| `--data-parallel-size N` | DP ranks; DP is the DLO group when greater than one, otherwise SP is used | `1` |
 | `--host-weight-runtime-mode {disabled,preferred,required}` | HWR policy: no interaction, populate on a miss, or require an exact hit | `disabled` |
 | `--host-weight-runtime-root PATH` | Writable node-local HWR store shared by workers in one storage domain; required for `preferred` and `required` | unset |
 | `--dlo-host-registration-limit-gib N` | Optional per-worker ceiling for registering an HWR mmap; zero adds no ceiling | `0` |
 
+HWR and host-registration tuning remain on the compatibility DLO interface and
+cannot be combined with `diffusion_offload_config` in this release.
+
+## Component and weight-transfer matrix
+
+| Component | `allgather` | `rank-local` |
+| --- | --- | --- |
+| DiT | Shard each loader-visible block across the DLO DP group, or the SP group when DP is one | Stream each rank's complete loader-produced block |
+| Text encoder | Same shard + AllGather path when the model declares identical encoder weights across the DLO group | Stream each rank's complete encoder block, including encoder-TP shards |
+
+The text encoder's compute group and weight-transfer group are separate
+concepts. An encoder TP group owns different parameter shards, so it is not a
+valid AllGather offload group. Models opt in through
+`OffloadPlan.encoder_dlo_weight_replication`; otherwise multi-rank encoder
+AllGather fails at startup with guidance to use `rank-local`. This makes SP
+AllGather available to replicated encoders without silently corrupting an
+encoder-TP layout.
+
+`resident_layers` remains a DiT-only setting and currently requires the DiT
+transfer to be `rank-local`.
+
 ## Host-weight loading
 
-The diffusion loader chooses host storage before DLO is enabled. It first
+When the distributed backend is selected by AllGather, resident DiT layers, or
+the compatibility DLO flag, the diffusion loader chooses host storage before
+DLO is enabled. It first
 attempts to build a complete, validated direct-checkpoint mmap plan. If names,
 coverage, shape, dtype, topology, or loader-callback compatibility cannot be
 proven, it runs the ordinary model loader instead. DLO consumes that result and
@@ -97,20 +167,20 @@ With direct checkpoint mmap, the loader:
 6. preserves `post_load_weights()` and `validate_loaded_weights()` lifecycle
    hooks.
 
-For AllGather with a group larger than one, each process copies only its
-persistent shard and then releases the source mapping. For no-AllGather, each
-process keeps the mapping open and packs complete blocks through two bounded
-pinned staging slots. Processes mapping the same files on one node share the
-immutable pages; no-AllGather still performs a complete-block H2D copy in each
-process.
+For a DiT using `allgather` with a group larger than one, each process copies
+only its persistent shard and then releases the source mapping. For a DiT using
+`rank-local`, each process keeps the mapping open and packs complete blocks
+through two bounded pinned staging slots. Processes mapping the same files on
+one node share the immutable pages; rank-local transfer still performs a
+complete-block H2D copy in each process.
 
-When the effective DLO group size is one, `dlo_use_allgather=True` does not
+When the effective DLO group size is one, `weight_transfer="allgather"` does not
 perform a collective and uses the same rank-local transfer behavior.
 
 ### Final-layout Host Weight Runtime
 
 HWR is an opt-in startup optimization for models that declare the final-layout
-BF16 restore contract. Use it only with no-AllGather DLO:
+BF16 restore contract. Use it only when the selected DiT uses `rank-local`:
 
 The validated BF16 model contracts currently cover MiniMax H3 and
 `black-forest-labs/FLUX.2-klein-4B`. FLUX.2-klein-9B shares the same model
@@ -204,7 +274,7 @@ H2D behavior.
 #### Registered direct H2D
 
 Registration is attempted automatically only for an eligible warm HWR hit when
-`pin_cpu_memory` is enabled. A successful path is:
+the existing `pin_cpu_memory` policy is enabled. A successful path is:
 
 ```text
 shared read-only HWR mmap -> existing rotating HBM block buffer -> GPU kernel
@@ -217,10 +287,10 @@ kernels access host memory directly.
 CUDA requires read-only host-registration capability for the immutable HWR
 mapping. Unsupported capability, a positive registration limit smaller than
 the complete page-aligned mapping, or a safely rolled-back registration error
-falls back to bounded staging. Programmatic configurations can set
-`pin_cpu_memory=False` to disable registration explicitly. A successful
-registration locks the complete mapped range in host memory for that worker's
-lifetime, so use
+falls back to bounded staging. Programmatic compatibility configurations can
+set `pin_cpu_memory=False` to disable registration explicitly.
+A successful registration locks the complete mapped range in host memory for
+that worker's lifetime, so use
 `--dlo-host-registration-limit-gib` when an operator-enforced ceiling is
 required.
 
@@ -228,8 +298,8 @@ Shutdown drains H2D work, releases hook/source references, unregisters every
 range, and only then closes the HWR lease. AllGather and direct checkpoint mmap
 retain their existing transfer paths.
 
-When HWR is disabled, DLO is disabled, or AllGather is enabled, the loader does
-not resolve HWR sources or construct its store.
+When HWR is disabled, DLO is disabled, or the DiT uses `allgather`, the loader
+does not resolve HWR sources or construct its store.
 
 ## Declarative topology
 
@@ -241,38 +311,54 @@ from vllm_omni.diffusion.offloader import OffloadPlan
 
 class MyPipeline(nn.Module):
     _dit_modules = ["transformer"]
+    _encoder_modules = ["prompt_model"]
     _offload_plan = OffloadPlan(
         block_attrs={"transformer": ("blocks",)},
         offload_submodules={"context_encoder": "layers"},
+        encoder_component_types={"prompt_model": "text_encoder"},
+        encoder_block_attrs={"prompt_model": ("encoder.layers",)},
+        encoder_dlo_weight_replication=frozenset({"prompt_model"}),
+        on_demand_component_paths=frozenset({"prompt_model"}),
     )
 ```
 
-When no plan exists, discovery falls back to
-`_layerwise_offload_blocks_attrs` and then heuristic attribute lookup.
+`encoder_component_types` maps arbitrary encoder paths to the public
+`text_encoder` selector. `encoder_dlo_weight_replication` is the explicit
+safety declaration for reusing the DiT DLO group. On-demand encoder non-block
+state is loaded and offloaded by its pipeline phase.
+
+When no plan exists, DiT discovery falls back to
+`_layerwise_offload_blocks_attrs` and then heuristic attribute lookup;
+undeclared auxiliary components remain resident.
 
 ## Data-parallel concurrency
 
 With `data_parallel_size > 1` and AllGather enabled, the scheduler can process
-up to `dp_size` requests per denoising step. Every concurrent request must set
-the same explicit `num_inference_steps`; `None` is rejected because every rank
-must enter each collective.
+up to `dp_size` requests per denoising step. Concurrent requests must resolve
+to the same denoise schedule, so every request must provide the same explicit
+`num_inference_steps`. Pipeline defaults are rejected because different request
+modes can resolve the same `None` value to different schedules.
 
 ## Limitations
 
 - Direct checkpoint mmap currently requires TP1. TP greater than one is
   outside the Phase A shared-mmap support scope and falls back before model
   mutation to the ordinary TP-aware loader. DLO can stream that runtime layout,
-  and eligible no-AllGather configurations may use HWR final-layout artifacts,
+  and eligible DiT rank-local configurations may use HWR final-layout artifacts,
   but direct checkpoint mmap provides no shared-mmap host-memory guarantee for
   TP greater than one.
-- HSDP plus AllGather is rejected to avoid double sharding. HSDP without
-  AllGather has limited end-to-end validation.
+- HSDP with `allgather` on any selected component is rejected to avoid double
+  sharding. HSDP with rank-local transfers has limited end-to-end validation.
+- With data parallelism, `allgather` cannot be combined with TeaCache or
+  Cache-DiT on any selected component. Prompt-embedding cache is also
+  incompatible when the text encoder uses `allgather`. Rank-local cache hits
+  could otherwise make ranks enter different weight collectives.
 - Per-tensor online FP8 linears use the ordinary loader and can run with either
-  DLO transfer path. With AllGather, every rank temporarily materializes the
-  complete FP8 model in host memory before DLO retains only its shard. Other
-  online quantization methods require no-AllGather until their runtime layouts
-  are validated.
-- Resident leading layers require `--dlo-no-use-allgather` and a model
+  DiT transfer path. With DiT `allgather`, every rank temporarily materializes
+  the complete FP8 model in host memory before DLO retains only its shard.
+  Other online quantization methods require rank-local transfer for the
+  affected component until their runtime layouts are validated.
+- Resident leading layers require DiT `rank-local` transfer and a model
   `OffloadPlan` that declares eligible `resident_dit_paths`.
 - DP concurrency requires an explicit, identical inference-step count.
 

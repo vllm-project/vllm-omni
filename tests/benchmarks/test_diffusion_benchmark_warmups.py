@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+import importlib
+import sys
+
+import pytest
+
+from benchmarks.diffusion import backends
+from benchmarks.diffusion.backends import RequestFuncInput, RequestFuncOutput
+
+pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu, pytest.mark.asyncio]
+
+ENDPOINT = "/v1/chat/completions"
+TEST_MODEL = "test-model"
+
+
+@pytest.fixture
+def diffusion_benchmark(monkeypatch):
+    # The standalone script imports its sibling backend module by name.
+    monkeypatch.setitem(sys.modules, "backends", backends)
+    return importlib.import_module("benchmarks.diffusion.diffusion_benchmark_serving")
+
+
+@pytest.fixture
+def warmup_args(diffusion_benchmark):
+    from benchmarks.diffusion.diffusion_benchmark_serving import build_parser
+
+    parser = build_parser()
+    return parser.parse_args(
+        [
+            f"--endpoint={ENDPOINT}",
+            "--dataset=random",
+            "--task=t2i",
+            "--warmup-requests=2",
+            "--warmup-num-inference-steps=4",
+        ]
+    )
+
+
+@pytest.fixture
+def input_requests():
+    return [
+        RequestFuncInput(
+            prompt=prompt,
+            api_url=f"http://test.local{ENDPOINT}",
+            model=TEST_MODEL,
+            num_inference_steps=20,
+        )
+        for prompt in ("first", "second")
+    ]
+
+
+async def test_disabled_warmup_sends_no_requests(diffusion_benchmark, warmup_args, input_requests):
+    warmup_args.warmup_requests = 0
+
+    async def unexpected_request(*args):
+        pytest.fail("disabled warmup must not send requests")
+
+    pairs = await diffusion_benchmark._run_warmups(input_requests, warmup_args, None, unexpected_request)
+
+    assert pairs == []
+
+
+@pytest.mark.parametrize("warmup_prompt", [None, "warmup-only edit"])
+async def test_successful_warmups_preserve_request_output_pairs(
+    diffusion_benchmark, warmup_args, input_requests, warmup_prompt
+):
+    warmup_args.warmup_prompt = warmup_prompt
+    outputs = [RequestFuncOutput(success=True, latency=0.5), RequestFuncOutput(success=True, latency=1.0)]
+    pending_outputs = iter(outputs)
+
+    async def successful_request(req, session, pbar):
+        return next(pending_outputs)
+
+    pairs = await diffusion_benchmark._run_warmups(input_requests, warmup_args, None, successful_request)
+
+    expected_prompts = [warmup_prompt] * 2 if warmup_prompt is not None else ["first", "second"]
+    assert [request.prompt for request, _ in pairs] == expected_prompts
+    assert [request.num_inference_steps for request, _ in pairs] == [4, 4]
+    assert [output for _, output in pairs] == outputs
+    assert [request.num_inference_steps for request in input_requests] == [20, 20]
+    assert [request.prompt for request in input_requests] == ["first", "second"]
+
+
+@pytest.mark.parametrize("failed_count", [1, 2], ids=["partial-failure", "all-failed"])
+@pytest.mark.parametrize("warmup_prompt", [None, "warmup-only edit"])
+@pytest.mark.parametrize(
+    "error",
+    ["HTTP 503: private prompt rejected", "Cannot connect to https://test.local/?token=private"],
+    ids=["http-error", "transport-error"],
+)
+async def test_failed_warmups_abort_without_exposing_response_errors(
+    diffusion_benchmark, warmup_args, input_requests, failed_count, warmup_prompt, error
+):
+    warmup_args.warmup_prompt = warmup_prompt
+    outputs = iter(
+        [RequestFuncOutput(success=False, error=error) for _ in range(failed_count)]
+        + [RequestFuncOutput(success=True) for _ in range(2 - failed_count)]
+    )
+
+    async def request(req, session, pbar):
+        return next(outputs)
+
+    with pytest.raises(RuntimeError, match=f"{failed_count}/2 warmup requests failed") as exc_info:
+        await diffusion_benchmark._run_warmups(input_requests, warmup_args, None, request)
+
+    assert error not in str(exc_info.value)
+    assert "server logs" in str(exc_info.value)
+
+
+async def test_benchmark_does_not_start_measurement_after_failed_warmup(
+    monkeypatch, mocker, diffusion_benchmark, warmup_args, input_requests
+):
+    sent = []
+
+    async def failed_request(req, session, pbar):
+        sent.append(req)
+        return RequestFuncOutput(success=False, error="HTTP 503: unavailable")
+
+    monkeypatch.setitem(
+        diffusion_benchmark.backends_function_mapping["2i"],
+        warmup_args.endpoint,
+        (failed_request, warmup_args.endpoint),
+    )
+    dataset = mocker.Mock(spec=diffusion_benchmark.RandomDataset)
+    dataset.get_requests.return_value = input_requests
+    monkeypatch.setattr(diffusion_benchmark, "RandomDataset", mocker.Mock(return_value=dataset))
+    timer = mocker.Mock(spec=diffusion_benchmark.time)
+    timer.perf_counter.side_effect = AssertionError("measurement started after failed warmup")
+    monkeypatch.setattr(diffusion_benchmark, "time", timer)
+
+    with pytest.raises(RuntimeError, match="2/2 warmup requests failed"):
+        await diffusion_benchmark.benchmark(warmup_args)
+
+    assert len(sent) == warmup_args.warmup_requests

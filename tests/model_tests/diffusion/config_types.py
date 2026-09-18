@@ -76,6 +76,11 @@ class DiffusionModelTestOpts(NamedTuple):
     check_multi_output: bool = True  # Runs multiple generations in one request
     check_determinism: bool = True  # Runs 2 generations with the same seed and check determinism
 
+    # For IMAGE_TO_VIDEO, also run a T2V request and assert the outputs differ, to catch a
+    # silently dropped input image. Only valid for unified text/image pipelines (e.g. LTX2);
+    # set False for pipelines that mandate an image and fail closed without one (SANA-Video I2V).
+    check_i2v_t2v_divergence: bool = True
+
 
 ### Mappings & utils for building offline Omni() instances given a list of enabled accelerations
 ACC_OMNI_KWARGS = {

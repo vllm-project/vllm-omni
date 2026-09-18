@@ -8,8 +8,12 @@ from typing import Any
 import pytest
 import torch
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import (
+    AttentionMetadata,
+    PackedPaddingMetadata,
+)
 from vllm_omni.diffusion.attention.backends.fastvideo_vsa import (
+    FastVideoVSABackend,
     FastVideoVSAImpl,
 )
 from vllm_omni.diffusion.attention.backends.registry import (
@@ -21,6 +25,12 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 def test_fastvideo_vsa_backend_is_registered():
     assert DiffusionAttentionBackendEnum.FASTVIDEO_VSA.get_path().endswith("fastvideo_vsa.FastVideoVSABackend")
+
+
+def test_fastvideo_vsa_reports_missing_optional_kernel(monkeypatch):
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
+    with pytest.raises(ImportError, match="fastvideo-kernel"):
+        FastVideoVSABackend.validate_available()
 
 
 def test_fastvideo_vsa_tiles_3d_sequence_and_untiles(monkeypatch):
@@ -201,3 +211,37 @@ def test_fastvideo_vsa_allows_topk_equal_to_num_blocks():
     # CPU/float32 is rejected later, but k=N itself must not trigger fallback.
     assert all_blocks._fallback_reason(query, query, query, metadata) == "dtype torch.float32 is not supported"
     assert too_many._fallback_reason(query, query, query, metadata) == "topk 3 > num_blocks 2"
+
+
+def test_sdpa_fallback_never_attends_the_structural_padding(monkeypatch):
+    # The backend advertises supports_packed_mask_free, so a model may skip
+    # building the padding mask. Every fallback out of the VSA path must honour
+    # that contract itself; SDPA reads attn_mask and nothing else.
+    impl = FastVideoVSAImpl(
+        num_heads=2,
+        head_size=8,
+        softmax_scale=8**-0.5,
+        backend_kwargs={"topk": 1, "min_seq_len": 4096},
+    )
+    valid = 40
+    torch.manual_seed(0)
+    query = torch.randn(1, 64, 2, 8)
+    padding = PackedPaddingMetadata(
+        q_length=valid,
+        kv_length=valid,
+        cu_seqlens_q=torch.tensor([0, valid], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, valid], dtype=torch.int32),
+    )
+
+    monkeypatch.setattr(impl.sdpa_fallback, "forward", impl.sdpa_fallback.forward_cuda)
+
+    baseline = impl.forward_cuda(query, query, query, AttentionMetadata(packed_padding=padding, extra={}))
+    perturbed_input = query.clone()
+    perturbed_input[:, valid:] += 100.0
+    perturbed = impl.forward_cuda(
+        perturbed_input, perturbed_input, perturbed_input, AttentionMetadata(packed_padding=padding, extra={})
+    )
+
+    assert baseline.shape == query.shape
+    torch.testing.assert_close(baseline[:, :valid], perturbed[:, :valid])
+    assert torch.count_nonzero(baseline[:, valid:]) == 0

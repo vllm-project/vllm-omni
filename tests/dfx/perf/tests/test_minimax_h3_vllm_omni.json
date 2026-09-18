@@ -5,7 +5,7 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100"
+            "cuda": ["H100", "B200"]
           },
           "num_cards": 4
         }
@@ -30,7 +30,6 @@
         "vae-patch-parallel-size": 4,
         "vae-parallel-mode": "tile",
         "vae-use-tiling": true,
-        "diffusion-attention-backend": "FLASH_ATTN",
         "stage-init-timeout": 1800,
         "init-timeout": 1800,
         "enable-diffusion-pipeline-profiler": true
@@ -77,7 +76,7 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100"
+            "cuda": ["H100", "B200"]
           },
           "num_cards": 4
         }
@@ -102,7 +101,6 @@
         "vae-patch-parallel-size": 4,
         "vae-parallel-mode": "tile",
         "vae-use-tiling": true,
-        "diffusion-attention-backend": "FLASH_ATTN",
         "stage-init-timeout": 1800,
         "init-timeout": 1800,
         "enable-diffusion-pipeline-profiler": true
@@ -150,7 +148,7 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100"
+            "cuda": ["H100", "B200"]
           },
           "num_cards": 4
         }
@@ -175,7 +173,6 @@
         "vae-patch-parallel-size": 4,
         "vae-parallel-mode": "tile",
         "vae-use-tiling": true,
-        "diffusion-attention-backend": "FLASH_ATTN",
         "stage-init-timeout": 1800,
         "init-timeout": 1800,
         "enable-diffusion-pipeline-profiler": true
@@ -222,7 +219,7 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100"
+            "cuda": ["H100", "B200"]
           },
           "num_cards": 4
         }
@@ -247,7 +244,6 @@
         "vae-patch-parallel-size": 4,
         "vae-parallel-mode": "tile",
         "vae-use-tiling": true,
-        "diffusion-attention-backend": "FLASH_ATTN",
         "stage-init-timeout": 1800,
         "init-timeout": 1800,
         "enable-diffusion-pipeline-profiler": true,

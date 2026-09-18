@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Typed pipeline contract for the model-neutral AR-Diffusion runtime."""
 
 from __future__ import annotations
@@ -80,6 +81,7 @@ class ARDiffusionKVCacheSpec:
     sink_frames: int = 0
     reset_at_boundary: bool = False
     cross_attention: tuple[ARDiffusionCrossAttentionKVSpec, ...] = ()
+    # Initial vLLM storage horizon; extended to fit an in-flight span.
     max_model_len: int = 1 << 20
     max_scratch_tokens_per_branch: int = 0
     model_owned_state_bytes_per_session: int = 0
@@ -139,10 +141,13 @@ class SupportsARDiffusionPipeline(Protocol):
     """Required pipeline capability for :class:`ARDiffusionModelRunner`.
 
     A session begins when the runner first sees its ``session_id`` and persists
-    across requests until reset, explicit close, LRU eviction, or a failed
-    forward. ``bind_ar_diffusion_state`` exposes the runner-owned KV state only
-    for the duration of one request. The pipeline must not retain the state
-    after the context exits.
+    until reset, explicit close, LRU eviction, a failed forward, or request
+    completion on the stepwise path. ``bind_ar_diffusion_state`` exposes the
+    runner-owned KV state only for the duration of one runner invocation
+    (``execute_model`` or ``execute_stepwise``). The pipeline must not retain
+    the state after the context exits. Uncommitted scratch lives on the
+    runner-owned session object and survives across stepwise invocations of
+    the same request.
     """
 
     def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
@@ -154,7 +159,7 @@ class SupportsARDiffusionPipeline(Protocol):
         session_id: str,
         state: ARDiffusionKVState,
     ) -> AbstractContextManager[None]:
-        """Bind ``state`` to model execution for one request."""
+        """Bind ``state`` to model execution for one runner invocation."""
         ...
 
     def reset_ar_diffusion_session(self, session_id: str) -> None:
