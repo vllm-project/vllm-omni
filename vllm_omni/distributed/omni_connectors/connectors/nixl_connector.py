@@ -625,10 +625,17 @@ class NixlConnector(OmniConnectorBase):
 
         Each call performs one bounded query so a missing key cannot starve
         other requests in the shared receive loop. The caller retries later.
+        Retries after a lost reply reuse ownership until metadata is received.
         """
         zmq_addr = f"tcp://{host}:{port}"
+        claims = getattr(self._req_local, "claims", None)
+        if claims is None:
+            claims = {}
+            self._req_local.claims = claims
+        query_key = (zmq_addr, get_key, generation)
+        claim_id = claims.setdefault(query_key, uuid.uuid4().hex)
         request = _GET_META_MSG + msgspec.msgpack.encode(
-            {"key": get_key, "generation": generation, "claim_id": uuid.uuid4().hex}
+            {"key": get_key, "generation": generation, "claim_id": claim_id}
         )
         sock = self._get_req_socket(zmq_addr, self._metadata_query_timeout_ms)
         try:
@@ -639,8 +646,11 @@ class NixlConnector(OmniConnectorBase):
             logger.debug("NixlConnector handshake query to %s failed for %s", zmq_addr, get_key, exc_info=True)
             return None
         if reply == _META_NOT_FOUND:
+            claims.pop(query_key, None)
             return None
-        return msgspec.msgpack.decode(reply)
+        metadata = msgspec.msgpack.decode(reply)
+        claims.pop(query_key, None)
+        return metadata
 
     def _notify_transfer_done(self, get_key: str, metadata: dict[str, Any]) -> None:
         """Tell the producer its buffer is drained so it can deregister now.

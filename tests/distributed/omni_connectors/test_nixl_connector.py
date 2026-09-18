@@ -576,6 +576,42 @@ def test_unknown_key_is_queried_once(producer, consumer, monkeypatch, force_time
         assert socket.closed
 
 
+@pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize("lost_replies", [1, 3])
+def test_lost_metadata_reply_retry_releases_source(producer, consumer, monkeypatch, direct, lost_replies):
+    _, _, metadata = producer.put("0", "1", "lost-reply", torch.ones(1))
+    replies = []
+    requests = []
+
+    def send(message):
+        requests.append(message)
+        replies.append(producer._handle_handshake_message(message))
+
+    def recv():
+        reply = replies.pop(0)
+        if len(requests) <= lost_replies:
+            raise zmq.Again()
+        return reply
+
+    socket = types.SimpleNamespace(send=send, recv=recv)
+    monkeypatch.setattr(consumer, "_get_req_socket", lambda *args: socket)
+    forwarded = metadata if direct else None
+    for attempt in range(lost_replies):
+        assert consumer._resolve_metadata("lost-reply", forwarded) is None
+    resolved = consumer._resolve_metadata("lost-reply", forwarded)
+    assert resolved is not None
+    assert producer._pending["lost-reply"].claims == {resolved["claim_id"]}
+    independent = consumer._resolve_metadata("lost-reply", forwarded)
+    assert independent["claim_id"] != resolved["claim_id"]
+    consumer._notify_transfer_done("lost-reply", resolved)
+    consumer._notify_transfer_done("lost-reply", resolved)
+    assert producer._pending["lost-reply"].claims == {independent["claim_id"]}
+    consumer._notify_transfer_done("lost-reply", independent)
+    assert producer._pending == {}
+    assert producer._registered_descs == []
+    assert consumer._req_local.claims == {}
+
+
 @pytest.mark.usefixtures("reliable_claim_queries")
 def test_transfer_done_releases_the_producer_buffer(producer, consumer):
     _, _, metadata = producer.put("0", "1", "req-3", torch.arange(4, dtype=torch.float32))

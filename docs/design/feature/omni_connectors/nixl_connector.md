@@ -107,8 +107,12 @@ transfers retain the complete destination bundle and source claim until terminal
 Zero-element tensors retain their shape/dtype/skeleton positions but never create
 DMA descriptors or registrations.
 
-A lost metadata response, lost completion ACK, or abandoned consumer can retain a
-claim indefinitely. NIXL 1.3 cannot prove remote cancellation, so neither TTL nor
+After a lost metadata response, retries on the same consumer thread reuse the
+claim ID for that endpoint, key and requested generation until a reply arrives.
+This makes claim acquisition idempotent; subsequent independent reads still get
+distinct claims. Callers must retry on the same thread to recover that ownership.
+A metadata query abandoned without retry, lost completion ACK, or abandoned
+consumer can retain a claim indefinitely. NIXL 1.3 cannot prove remote cancellation, so neither TTL nor
 `cleanup()` frees those allocations. Producer `close()` rejects new work and
 retains its agent, listener and claimed allocations; the background closer finishes
 teardown after claims drain. Permanently abandoned claims remain until process
