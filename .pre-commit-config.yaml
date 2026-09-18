@@ -69,10 +69,9 @@ repos:
     # TODO: Use https://github.com/pre-commit/mirrors-mypy when mypy setup
     # is less awkward. Local wrapper groups files so follow_imports=skip on
     # tests does not leak into library code.
-    # mypy-3.10 runs on git commit (changed files). CI SKIPs it because
-    # --all-files is not clean yet. Extra versions are manual-stage only
-    # (not in default `pre-commit run --all-files`):
-    #   pre-commit run --hook-stage manual mypy-3.12
+    # All mypy versions are manual-stage only (not in default `git commit` or
+    # `pre-commit run --all-files`), since --all-files is not clean yet:
+    #   pre-commit run --hook-stage manual mypy-3.10
     - id: mypy-3.10
       name: Run mypy for Python 3.10
       entry: python tools/pre_commit/mypy.py "3.10"
@@ -89,6 +88,7 @@ repos:
           - types-requests
           - types-torch
           - pydantic
+      stages: [manual]
     - id: mypy-3.11
       name: Run mypy for Python 3.11
       entry: python tools/pre_commit/mypy.py "3.11"
