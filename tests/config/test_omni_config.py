@@ -255,6 +255,30 @@ def test_from_pipeline_config_applies_cli_overrides_without_stage_config_runtime
     assert stage1.runtime_config.num_gpus == stage1.parallel_config.world_size
 
 
+def test_diffusion_cli_parallel_overrides_beat_nested_deploy_parallel_config():
+    """Flat CLI parallel flags override the deploy YAML's nested parallel_config.
+
+    Regression for the NPU nightly failure (#7778): hunyuan_image3_dit.yaml's
+    platform section sets nested parallel_config.tensor_parallel_size=4 while
+    the perf tests pass --tensor-parallel-size 2. The flat CLI value must win,
+    mirroring StageConfig.to_omegaconf, or the stage demands more devices than
+    the machine has (tp=4 x usp=2 = 8 on a 4-card box).
+    """
+    omni_config = VllmOmniConfig.from_pipeline_config(
+        _resolve_pipeline_or_skip("hunyuan_image3_dit"),
+        user_deploy_config=DeployConfig(
+            stages=[StageDeployConfig(stage_id=0, engine_extras={"parallel_config": {"tensor_parallel_size": 4}})]
+        ),
+        cli_overrides={"tensor_parallel_size": 2, "ulysses_degree": 2},
+    )
+
+    stage = omni_config.stage_by_id(0)
+
+    assert stage.parallel_config.tensor_parallel_size == 2
+    assert stage.parallel_config.ulysses_degree == 2
+    assert stage.parallel_config.world_size == 4
+
+
 @pytest.mark.parametrize(
     "cli_overrides",
     [

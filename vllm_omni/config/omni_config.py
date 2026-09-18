@@ -43,6 +43,7 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
     StageType,
+    _apply_diffusion_parallel_runtime_overrides,
     _apply_platform_overrides,
     _get_recursively_merged_dict,
     _resolve_scheduler,
@@ -1328,8 +1329,13 @@ def _stage_engine_values(
     if topology.omni_kv_config:
         engine["omni_kv_config"] = _copy_value(topology.omni_kv_config)
     if stage_cli_overrides:
+        stage_cli_overrides = dict(stage_cli_overrides)
         if topology.execution_type == StageExecutionType.DIFFUSION:
             # Mirror StageConfig.to_omegaconf so both projections resolve alike.
+            # CLI parallel fields move into the nested ``parallel_config`` dict,
+            # otherwise the deploy YAML's nested values would win over flat CLI
+            # flags when ``_build_parallel_config`` merges nested over flat.
+            _apply_diffusion_parallel_runtime_overrides(engine, stage_cli_overrides)
             reconcile_diffusion_attention_overrides(engine, stage_cli_overrides)
         for key, value in stage_cli_overrides.items():
             existing = engine.get(key)
