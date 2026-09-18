@@ -712,8 +712,16 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         result = None
         if connector is not None:
+            deadline = time.monotonic() + 2.0
             try:
-                result = connector.get(str(from_stage), str(to_stage), str(get_key), metadata=metadata)
+                while True:
+                    result = connector.get(str(from_stage), str(to_stage), str(get_key), metadata=metadata)
+                    if result is not None:
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(0.05, remaining))
             except Exception as exc:
                 logger.warning("Stage payload get failed for %s: %s", get_key, exc)
 
@@ -764,9 +772,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         that fails or is rejected leaves the inline payload untouched, so the
         stage degrades to the pre-connector behaviour instead of losing data.
 
-        Only the local leader rank talks to the connector -- stage payloads are
-        TP-identical -- and the resulting handles are broadcast so every rank
-        reports the same ``custom_output``.
+        Only the TP x SP leader talks to the connector. Declared payloads must
+        be complete on that rank; sharded outputs must be gathered by the
+        pipeline first. Handles are broadcast across TP x SP so every rank
+        reports the same transfer and drops the corresponding inline keys.
         """
         payload_keys = self._stage_output_payload_keys()
         if not payload_keys:
@@ -782,7 +791,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # Every rank must reach the broadcast below, so the leader-only work is
         # confined to this block rather than short-circuiting the whole method.
         handles: dict[str, dict[str, Any]] = {}
-        if self.is_data_transfer_rank():
+        broadcast_groups = self._stage_payload_broadcast_groups()
+        if all(group.rank_in_group == 0 for group in broadcast_groups):
             connector = self._stage_payload_connector()
             if connector is not None:
                 for req, output in zip(reqs, outputs):
@@ -812,7 +822,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     }
                     logger.debug("Stage payload put %s size=%s keys=%s", put_key, size, list(payload))
 
-        handles = self._broadcast_tp_payload_packet(handles) or {}
+        for broadcast_group in broadcast_groups:
+            handles = (
+                broadcast_group.broadcast_object(handles if broadcast_group.rank_in_group == 0 else None, src=0) or {}
+            )
         if not handles:
             return
         for req, output in zip(reqs, outputs):

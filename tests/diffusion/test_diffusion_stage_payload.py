@@ -114,6 +114,46 @@ def test_handle_path_uses_its_own_key_and_metadata():
     assert "text_encoder_output" in req.prompt["additional_information"]
 
 
+def test_receive_retries_until_producer_publishes(monkeypatch):
+    connector = _FakeConnector(_conditioning())
+    get = connector.get
+    attempts = []
+
+    def delayed_get(*args, **kwargs):
+        attempts.append(args)
+        return get(*args, **kwargs) if len(attempts) == 3 else None
+
+    monkeypatch.setattr(connector, "get", delayed_get)
+    runner = _make_runner(connector)
+    request = _make_request({"prompt": "a cat"})
+
+    runner._maybe_recv_stage_payload(request)
+
+    assert len(attempts) == 3
+    assert "text_encoder_output" in request.prompt["additional_information"]
+
+
+def test_receive_retry_budget_preserves_inline_payload(monkeypatch):
+    from vllm_omni.diffusion.worker import diffusion_model_runner
+
+    clock = [0.0]
+
+    def advance(duration):
+        clock[0] += duration
+
+    monkeypatch.setattr(diffusion_model_runner, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=advance))
+    connector = _FakeConnector(None)
+    runner = _make_runner(connector)
+    inline = _conditioning()
+    request = _make_request({"additional_information": inline})
+
+    runner._maybe_recv_stage_payload(request)
+
+    assert 1 < len(connector.calls) <= 41
+    assert clock[0] == pytest.approx(2.0)
+    assert request.prompt["additional_information"] is inline
+
+
 def test_stage_without_declared_keys_never_touches_the_connector():
     connector = _FakeConnector(_conditioning())
     runner = _make_runner(connector, payload_keys=())
@@ -246,7 +286,7 @@ def test_tp_payload_miss_is_broadcast_without_follower_connector_access():
     leader._maybe_recv_stage_payload(_make_request({"prompt": "a cat"}))
     follower._maybe_recv_stage_payload(_make_request({"prompt": "a cat"}))
 
-    assert len(connector.calls) == 1
+    assert 1 < len(connector.calls) <= 41
 
 
 def test_sp_payload_is_fetched_once_by_leader_and_broadcast_to_followers():
@@ -339,7 +379,10 @@ def test_payload_reaches_full_tp_sp_grid_once(monkeypatch, delivered):
                 assert torch.equal(output["hidden_states"], connector._payload["text_encoder_output"]["hidden_states"])
             else:
                 assert "additional_information" not in request.prompt
-    assert len(connector.calls) == 1
+    if delivered:
+        assert len(connector.calls) == 1
+    else:
+        assert 1 < len(connector.calls) <= 41
 
 
 def test_step_mode_receives_payload_before_kv_and_reuses_cached_state():
@@ -510,3 +553,43 @@ def test_send_puts_only_on_the_tp_leader(monkeypatch, rank_in_group):
     # ...and every rank drops the inline copy, not just the sender.
     assert "prompt_embeds" not in output.custom_output
     assert len(tp_group.broadcast_calls) == 1
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+@pytest.mark.parametrize("accepted", [True, False])
+def test_send_elects_one_tp_sp_leader(monkeypatch, tp_size, accepted):
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    connector = _FakeConnector(put_result=(accepted, 128, {"schema_version": 1}))
+    packets = {}
+    outputs = []
+
+    class GridGroup:
+        def __init__(self, dimension, peer_rank, rank, world_size):
+            self.key = (dimension, peer_rank)
+            self.rank_in_group = rank
+            self.world_size = world_size
+
+        def broadcast_object(self, value, src=0):
+            if self.rank_in_group == src:
+                packets[self.key] = value
+            return packets[self.key]
+
+    for sp_rank in range(2):
+        for tp_rank in range(tp_size):
+            runner = _make_sender(connector)
+            tp_group = GridGroup("tp", sp_rank, tp_rank, tp_size)
+            sp_group = GridGroup("sp", tp_rank, sp_rank, 2)
+            monkeypatch.setattr(runner, "_get_local_tp_group", lambda: tp_group)
+            monkeypatch.setattr(parallel_state, "get_sp_group", lambda: sp_group)
+            output = _make_output(prompt_embeds=torch.zeros(2, 8))
+
+            runner._maybe_send_stage_payload([_make_request({})], [output])
+
+            outputs.append(output.custom_output)
+            assert (HANDLE_KEY in output.custom_output) == accepted
+            assert ("prompt_embeds" in output.custom_output) != accepted
+
+    assert len(connector.put_calls) == 1
+    if accepted:
+        assert all(output[HANDLE_KEY] == outputs[0][HANDLE_KEY] for output in outputs)

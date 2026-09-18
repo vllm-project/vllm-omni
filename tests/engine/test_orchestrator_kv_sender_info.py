@@ -43,13 +43,16 @@ class _DummyDiffusionStage:
         self.engine_input_source = engine_input_source or [0]
         self.calls = []
 
-    async def add_request_async(self, request_id, prompt, sampling_params, kv_sender_info=None):
+    async def add_request_async(
+        self, request_id, prompt, sampling_params, kv_sender_info=None, payload_sender_info=None
+    ):
         self.calls.append(
             {
                 "request_id": request_id,
                 "prompt": prompt,
                 "sampling_params": sampling_params,
                 "kv_sender_info": kv_sender_info,
+                "payload_sender_info": payload_sender_info,
             }
         )
 
@@ -370,6 +373,36 @@ def test_forward_to_diffusion_attaches_kv_sender_info():
         0: {"host": "10.0.0.2", "zmq_port": 50151},
     }
     assert req_state.stage_submit_ts[1] > 0
+
+
+def test_diffusion_resubmission_preserves_sender_endpoints():
+    orchestrator = object.__new__(Orchestrator)
+    diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
+    sender_pool = _build_sender_pool(0, {"host": "10.0.0.2", "zmq_port": 50151})
+    payload_endpoint = {"host": "10.0.0.2", "zmq_port": 50071}
+    sender_pool.stage_client.get_payload_sender_info = lambda: payload_endpoint
+    diffusion_pool = StagePool(1, diffusion_stage)
+    orchestrator.num_stages = 2
+    orchestrator.stage_pools = [sender_pool, diffusion_pool]
+    orchestrator._cfg_tracker = CfgCompanionTracker()
+    state = OrchestratorRequestState(
+        request_id="streaming",
+        prompt={"prompt": "hello"},
+        sampling_params_list=[SamplingParams(max_tokens=4), OmniDiffusionSamplingParams()],
+        final_stage_id=1,
+    )
+    output = SimpleNamespace(request_id="streaming", finished=True)
+
+    async def forward_twice():
+        await orchestrator._forward_to_next_stage("streaming", 0, output, state)
+        await orchestrator._forward_to_next_stage("streaming", 0, output, state)
+
+    asyncio.run(forward_twice())
+
+    assert len(diffusion_stage.calls) == 2
+    for call in diffusion_stage.calls:
+        assert call["kv_sender_info"] == {0: {"host": "10.0.0.2", "zmq_port": 50151}}
+        assert call["payload_sender_info"] == payload_endpoint
 
 
 def test_forward_to_diffusion_uses_engine_input_source_for_kv_sender_info():

@@ -1051,8 +1051,10 @@ class StagePool:
         request: Any,
         *,
         prompt_text: Any = None,
+        submit_kwargs: dict[str, Any] | None = None,
     ) -> int:
         """Submit a streaming update to an already admitted request."""
+        submit_kwargs = submit_kwargs or {}
         params = req_state.sampling_params_list[self.stage_id]
         if self.stage_type == "diffusion":
             params = OmniDiffusionSamplingParams.from_params(params)
@@ -1070,7 +1072,7 @@ class StagePool:
                     "Diffusion list-prompt batch requests are no longer supported. "
                     "Submit multiple independent requests to use scheduler batching."
                 )
-            await self._diffusion_client(replica_id).add_request_async(request_id, request, params)
+            await self._diffusion_client(replica_id).add_request_async(request_id, request, params, **submit_kwargs)
         else:
             # Refresh the shared output-processor state before yielding to the
             # stage client so streaming segments are merged against the latest
@@ -1083,7 +1085,7 @@ class StagePool:
                     request_index=0,
                     queue=None,
                 )
-                await self._llm_client(replica_id).add_request_async(request)
+                await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
             except Exception:
                 rollback = getattr(self.output_processor, "remove_request", None)
                 if callable(rollback):
