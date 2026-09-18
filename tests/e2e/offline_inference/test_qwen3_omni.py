@@ -118,7 +118,9 @@ def test_structured_multistage_config_reaches_runtime(omni_runner, offline_clien
         {
             "temperature": 0.0,
             "top_p": 1.0,
-            "top_k": -1,
+            # Deploy writes top_k=-1; SamplingParams normalizes the disabled
+            # sentinel to 0 (and greedy temperature forces 0 regardless).
+            "top_k": 0,
             "max_tokens": 65536,
             "repetition_penalty": 1.1,
         },
