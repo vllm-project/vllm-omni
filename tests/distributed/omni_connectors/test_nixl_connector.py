@@ -279,8 +279,9 @@ def test_abandoned_claim_survives_close_and_late_completion(producer, consumer, 
     consumer._notify_transfer_done("abandoned", claimed)
     assert not producer._pending
     assert not producer._agent.registered
-    assert producer._listener_thread.is_alive()
-    producer.close()
+    producer._close_thread.join(timeout=2.0)
+    assert not producer._close_thread.is_alive()
+    assert producer._listener_thread is None
     assert not producer._agent.registered
     assert producer._closed
 
@@ -732,6 +733,17 @@ def test_close_returns_without_releasing_active_dma(nixl_connector_cls, poll_rai
         assert connector._closing
         assert connector in _RETAINED_PRODUCERS
         assert connector.health()["status"] == "unhealthy"
+        cleanup_thread = connector._close_thread
+        assert cleanup_thread is not None
+        connector.close()
+        assert connector._close_thread is cleanup_thread
+        connector._agent.check_xfer_state = lambda handle: "DONE"
+        cleanup_thread.join(timeout=2.0)
+        assert not cleanup_thread.is_alive()
+        assert connector._closed
+        assert not connector._deferred_transfers
+        assert not transfer.tensors
+        assert connector not in _RETAINED_PRODUCERS
     finally:
         connector._agent.check_xfer_state = lambda handle: "DONE"
         closing.join(timeout=2.0)
