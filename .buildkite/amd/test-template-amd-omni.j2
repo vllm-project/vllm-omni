@@ -157,6 +157,14 @@ steps:
           - "{{ path }}"
 {% endfor %}
 {% endif %}
+{% if step.retry %}
+        retry:
+          automatic:
+{% for retry_rule in step.retry.automatic %}
+            - exit_status: {{ retry_rule.exit_status }}
+              limit: {{ retry_rule.limit }}
+{% endfor %}
+{% endif %}
         {% if step.timeout_in_minutes %}
         timeout_in_minutes: {{ step.timeout_in_minutes }}
         {% endif %}
@@ -223,6 +231,14 @@ steps:
     artifact_paths:
 {% for path in step.artifact_paths %}
       - "{{ path }}"
+{% endfor %}
+{% endif %}
+{% if step.retry %}
+    retry:
+      automatic:
+{% for retry_rule in step.retry.automatic %}
+        - exit_status: {{ retry_rule.exit_status }}
+          limit: {{ retry_rule.limit }}
 {% endfor %}
 {% endif %}
     {% if step.timeout_in_minutes %}

@@ -39,6 +39,13 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
       }
       this.notifyIfDrained();
     } else if (message.type === 'clear') {
+      if (this.activeResponseId) {
+        this.port.postMessage({
+          type: 'playback-stopped',
+          responseId: this.activeResponseId,
+          playedMs: Math.round((this.playedFrames * 1000) / sampleRate),
+        });
+      }
       this.queue = [];
       this.offset = 0;
       this.playedFrames = 0;

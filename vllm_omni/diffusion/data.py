@@ -1028,11 +1028,8 @@ class OmniDiffusionConfig:
     # has already resolved to vLLM's ModelOpt FP8 linear method.
     force_cutlass_fp8: bool = False
 
-    # Diffusion attention KV cache dtype (not vLLM's --kv-cache-dtype for AR models).
-    # None = native dtype (no quantization).
-    # "fp8" = dynamic FP8 (float8_e4m3fn) quantization per forward pass.
-    # On Hopper+FA3: native FP8 attention (memory + compute savings).
-    # On other backends: no benefit, backends skip quantization.
+    # Runtime diffusion attention method (not vLLM's --kv-cache-dtype for AR models).
+    # None/"auto" keeps native dtype; other values are validated by the selected backend.
     diffusion_kv_cache_dtype: str | None = None
     # Optional skip selectors for KV-cache quantization. Format: "0-9,20,25-30".
     # Listed steps/layers skip quantization; others keep quantized execution.
@@ -1613,6 +1610,11 @@ class OmniDiffusionConfig:
                     # π0 (Pi-Zero) VLA — the LeRobot config.json uses ``type: "pi0"``.
                     if self.model_class_name is None:
                         self.model_class_name = "Pi0Pipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
+                elif cfg.get("type") == "pi05":
+                    if self.model_class_name is None:
+                        self.model_class_name = "Pi05Pipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
                 elif architectures and len(architectures) == 1:

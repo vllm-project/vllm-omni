@@ -29,7 +29,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_pipeline_parallel_world_size,
@@ -417,6 +417,7 @@ class WanSelfAttention(nn.Module):
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
             role="self",
+            qkv_layout="BSND",
             prefix=prefix,
         )
 
@@ -609,8 +610,8 @@ class WanCrossAttention(nn.Module):
             qkv_layout="BSND",
             prefix=prefix,
             skip_sequence_parallel=True,
-            # Wan2.2 cross-attn operates on short text-encoder sequences; per-block
-            # FP8 quant offers no perf win and degrades quality. Opt out until a
+            # Wan2.2 cross-attn operates on short text-encoder sequences; runtime
+            # Q/K/V quantization offers no perf win and degrades quality. Opt out until a
             # dedicated quant backend handles this case.
             disable_kv_quant=True,
         )
@@ -764,7 +765,15 @@ class WanTransformerBlock(nn.Module):
             self_attn_extra["vsa_dit_seq_shape"] = vsa_dit_seq_shape
         if preserve_vsa_all_blocks:
             self_attn_extra["preserve_vsa_all_blocks"] = True
-        self_attn_metadata = AttentionMetadata(attn_mask=hidden_states_mask, extra=self_attn_extra)
+        video_layout = None
+        if vsa_dit_seq_shape is not None:
+            grid = tuple(int(dim) for dim in vsa_dit_seq_shape)
+            # Publish geometry independently of backend selection. Do not add
+            # partial cu_seqlens/max_seqlen metadata to dense CUDA attention.
+            video_layout = VideoTokenLayout(prefix_len=0, latent_grid=grid, used_len=math.prod(grid))
+        self_attn_metadata = AttentionMetadata(
+            attn_mask=hidden_states_mask, extra=self_attn_extra, video_layout=video_layout
+        )
         attn_output = self.attn1(norm_hidden_states, rotary_emb, self_attn_metadata)
         hidden_states = (hidden_states + attn_output * gate_msa).type_as(hidden_states)
 

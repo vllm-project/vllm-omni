@@ -123,6 +123,11 @@ class DuplexModelSessionState(ABC):
     continuation_units: int
     pending_silence_task: asyncio.Task[bool] | None
     pending_silence_owner_id: str | None
+    # Deadline-aligned silence continuation state: the monotonic submission
+    # time of the most recent native input unit and the next silence
+    # continuation deadline. A real (non-silence) input resets the chain.
+    last_native_submit_monotonic: float | None
+    silence_deadline_monotonic: float | None
 
     @abstractmethod
     def retain_committed_audio(
@@ -174,6 +179,7 @@ class DuplexModelPlugin(ABC):
     two halves is impossible by construction.
     """
 
+    projects_intermediate_outputs: bool = False
     plugin_id: str = ""
     private_runtime_config_keys: frozenset[str] = frozenset()
     #: Samples per silence unit the runner appends to keep a model turn going.
@@ -193,6 +199,16 @@ class DuplexModelPlugin(ABC):
         runtime_config: dict[str, object],
         defaults: tuple[object, ...],
     ) -> tuple[object, ...]: ...
+
+    def prepare_prompt_config(
+        self, config: dict[str, object], *, state: DuplexModelSessionState, payload: dict[str, object]
+    ) -> dict[str, object]:
+        """Add model-owned context before planning an append on the session loop."""
+        return config
+
+    async def prepare_append_plan(self, **kwargs) -> DuplexAppendPlan:
+        """Prepare a plan; plugins may offload expensive work on owned snapshots."""
+        return self.plan_append(**kwargs)
 
     @abstractmethod
     def plan_append(
@@ -307,10 +323,16 @@ def payload_turn_id(payload: object) -> int | None:
 
 
 def coerce_int(value: object) -> int | None:
-    try:
-        return int(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float | str | bytes | bytearray):
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return None
 
 
 __all__ = [

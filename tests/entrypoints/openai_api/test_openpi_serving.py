@@ -270,12 +270,14 @@ def test_build_request_uses_unique_engine_request_id_per_inference():
 
 def test_build_request_clones_stage_defaults_before_protocol_fields():
     default_params = OmniDiffusionSamplingParams(
+        num_inference_steps=12,
+        output_type="latent",
         extra_args={
             "format_prompt_as_json": True,
             "session_id": "configured-session-must-not-win",
             "reset": False,
             "nested": {"values": []},
-        }
+        },
     )
     od_config = SimpleNamespace(model_config={"policy_server_config": {}})
     engine_client = SimpleNamespace(
@@ -297,10 +299,18 @@ def test_build_request_clones_stage_defaults_before_protocol_fields():
         session_id="wire-session",
         reset=False,
     )
+    request_c = serving._build_request(
+        {"prompt": "pick up the object", "sampling_params": {"num_inference_steps": 4}},
+        session_id="wire-session",
+        reset=False,
+    )
 
     assert request_a.sampling_params.extra_args["format_prompt_as_json"] is True
     assert request_a.sampling_params.extra_args["session_id"] == "wire-session"
     assert request_a.sampling_params.extra_args["reset"] is True
+    assert request_a.sampling_params.num_inference_steps == 12
+    assert request_a.sampling_params.output_type == "latent"
+    assert request_c.sampling_params.num_inference_steps == 4
     request_a.sampling_params.extra_args["nested"]["values"].append("request-a")
     assert request_b.sampling_params.extra_args["nested"] == {"values": []}
     assert default_params.extra_args["nested"] == {"values": []}
@@ -316,6 +326,46 @@ def test_build_request_forwards_seed_to_sampling_params():
     assert seeded.sampling_params.seed == 42
     assert "seed" not in seeded.sampling_params.extra_args["robot_obs"]
     assert isinstance(unseeded.sampling_params.seed, int)
+
+
+# Per-request inference parameters live in their own namespace so robot feature
+# names stay open-ended. Unknown keys inside it are ignored rather than rejected.
+def test_build_request_forwards_num_inference_steps():
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+
+    request = serving._build_request(
+        {"prompt": "pick up the object", "sampling_params": {"num_inference_steps": 4}},
+        session_id="session-a",
+        reset=True,
+    )
+
+    assert request.sampling_params.num_inference_steps == 4
+    # The namespace is an engine concern; the pipeline must not see it as a feature.
+    assert "sampling_params" not in request.sampling_params.extra_args["robot_obs"]
+
+
+def test_build_request_omits_num_inference_steps_when_not_sent():
+    """Absent must stay absent: the pipeline reads None as "use the configured
+    default", so materialising a null here would be a different request."""
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+
+    request = serving._build_request({"prompt": "x"}, session_id="s", reset=True)
+
+    assert request.sampling_params.num_inference_steps is None
+
+
+def test_build_request_does_not_forward_arbitrary_observation_keys():
+    """A robot observation may carry any feature name; none of them become
+    engine parameters."""
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+
+    request = serving._build_request(
+        {"prompt": "x", "state": np.zeros(32), "guidance_scale": 7.5}, session_id="s", reset=True
+    )
+
+    extra_args = request.sampling_params.extra_args
+    assert set(extra_args) == {"reset", "session_id", "robot_obs"}
+    assert extra_args["robot_obs"]["guidance_scale"] == 7.5
 
 
 def test_infer_keeps_session_state_but_uses_unique_engine_request_ids():

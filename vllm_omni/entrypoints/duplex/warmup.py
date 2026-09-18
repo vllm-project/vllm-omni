@@ -46,6 +46,7 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
         # One silence unit as the engine-side plugin defines it (DuplexOmniEngine.plugin).
         plugin = getattr(getattr(app.state.engine_client, "engine", None), "plugin", None)
         frame_samples = int(getattr(plugin, "silence_continuation_samples", 16000))
+        native_append = plugin.capabilities(max_sessions=1).supports_core_resumable_request if plugin else True
         silence = base64.b64encode(bytes(frame_samples * 4)).decode("ascii")
         from vllm_omni.clients.duplex import build_realtime_url
 
@@ -81,7 +82,7 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
                             "output_audio_format": "pcm16",
                             "idle_timeout_s": 60,
                             "turn_detection": None,
-                            "extra_body": {"auto_response": True},
+                            "extra_body": {"auto_response": native_append},
                         },
                     }
                 )
@@ -108,6 +109,8 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
                 await ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": silence}))
                 sent += 1
                 await asyncio.sleep(0.08)
+            if not native_append:
+                await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
             # Wait for the pipeline's first audio output so every stage ran.
             saw_audio = await _recv_until(lambda e: e.get("type") == "response.output_audio.delta", 30)
             # Close the session EXPLICITLY: a bare websocket close parks the
