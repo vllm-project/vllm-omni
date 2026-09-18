@@ -146,7 +146,7 @@ class AppendAttempt:
             )
             if append_ok:
                 model_state.context_locked = True
-                if self.pcm_reservation is not None:
+                if self.pcm_reservation is not None and self.pcm_reservation.active:
                     self.pcm_reservation.commit()
                     session.release_input_bytes(self.pcm_reservation.byte_count)
                 self.discard_retained_audio()
