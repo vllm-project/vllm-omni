@@ -118,7 +118,9 @@ def test_structured_multistage_config_reaches_runtime(omni_runner, offline_clien
         {
             "temperature": 0.0,
             "top_p": 1.0,
-            "top_k": -1,
+            # SamplingParams normalizes the disabled greedy-sampling sentinel
+            # from the deploy YAML (top_k=-1) to its runtime value (top_k=0).
+            "top_k": 0,
             "max_tokens": 65536,
             "repetition_penalty": 1.1,
         },
