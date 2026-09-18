@@ -30,9 +30,19 @@ Four prompt modes are selected automatically from the request fields:
 | `ref_clone_tata` (clone) | `ref_audio` + `ref_text` + `input` | reference clip and its exact transcript |
 | `ref_edit_tata` (voice direction) | reference trio + `instructions` | keep the reference timbre, direct the delivery |
 
-Current scope: greedy sampling with `cfg_scale=1.0`; CFG ≠ 1.0 and
+Current scope: greedy sampling with `cfg_scale=1.0` and a default
+`repetition_penalty=1.1` on generated codebook-0 tokens; CFG ≠ 1.0 and
 `negative_prompt` are rejected with explicit client errors until companion
 request support lands.
+
+The [official inference example](https://github.com/breezeblue-ai/breeze-tts/blob/main/infer.py)
+also uses repetition penalty `1.1`, but its
+[runtime defaults](https://github.com/breezeblue-ai/breeze-tts/blob/main/breeze_infer/runtime.py)
+sample both the backbone and depth decoder with temperature `0.9` and top-k
+`50`. The [official voice-design examples](https://huggingface.co/BreezeBlue/Breeze-TTS-2#-voice-design)
+use CFG `4`. Those sampling and guidance settings are outside the current
+port's scope, so the examples below do not establish parity with the official
+voice-design outputs.
 
 ## Supported model contract
 
@@ -42,9 +52,9 @@ request support lands.
 | Modes | plain, voice design (`instructions`), voice clone (`ref_audio` + `ref_text`), voice direction (reference + `instructions`) |
 | Languages | English and Chinese (model card) |
 | Reference audio | exactly one clip per request with its exact transcript; encoded by the bundled Qwen3-TTS tokenizer to 16 codebooks at 12.5 Hz |
-| Output | 24 kHz mono; `wav` or `pcm`; streaming SSE `speech.audio.delta` |
+| Output | 24 kHz mono; `wav` or `pcm`; raw audio streaming (`stream_format="audio"`) or SSE `speech.audio.delta` (`stream_format="sse"`) |
 | Length | prompt bounded by stage-0 `max_model_len=4096`; synthesis bounded by `max_new_tokens` codec frames (default 2048, about 164 s) |
-| Sampling | greedy (`temperature=0`) with `cfg_scale=1.0`; other guidance values and `negative_prompt` are rejected |
+| Sampling | greedy (`temperature=0`) with `cfg_scale=1.0` and `repetition_penalty=1.1`; other guidance values and `negative_prompt` are rejected |
 | Deployment profile | `vllm_omni/deploy/breeze_tts_2.yaml`: two stages on one GPU, async-chunk streaming with 8-frame codec chunks, stage 0 `gpu_memory_utilization=0.80`, stage 1 `0.15` |
 
 ## References
@@ -106,7 +116,7 @@ Voice design (instruction only, no reference audio):
 curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
-        "input": "[laughs] Welcome to tonight's story time.",
+        "input": "(laugh) Welcome to our story time.",
         "instructions": "A warm young woman, clear voice, lively delivery.",
         "response_format": "wav"
     }' --output breeze_design.wav
@@ -139,7 +149,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     }' --output breeze_direction.wav
 ```
 
-Streaming PCM (SSE `speech.audio.delta` events):
+Streaming raw PCM (`stream_format="audio"`):
 
 ```bash
 curl -N -X POST http://localhost:8091/v1/audio/speech \
@@ -153,8 +163,9 @@ curl -N -X POST http://localhost:8091/v1/audio/speech \
     }' --output breeze_stream.pcm
 ```
 
-Expected results: finite, non-silent 24 kHz mono WAV files; streaming requests
-return incremental PCM deltas. On 1x L20 (greedy, single request after
+Expected results: finite, non-silent 24 kHz mono WAV files; the streaming example
+returns raw PCM bytes. Use `stream_format="sse"` for `speech.audio.delta`
+events containing base64-encoded audio. On 1x L20 (greedy, single request after
 warm-up) a few seconds of speech completes in roughly 3.4–3.8 s wall time.
 
 ## Notes
@@ -166,6 +177,12 @@ warm-up) a few seconds of speech completes in roughly 3.4–3.8 s wall time.
   supported yet.
 - **CFG**: `guidance_scale`/`cfg_scale` must be `1.0`. Non-1.0 values and
   `negative_prompt` return a client error.
+- **Repetition penalty**: the default `1.1` matches upstream's penalty on
+  generated codebook-0 tokens and discourages repeated silence. Override it
+  with `extra_params: {"repetition_penalty": 1.0}` to disable it, or another
+  finite positive value. Text and reference audio are excluded from its history.
+  The legacy `tools/breeze_tts_2_upstream_golden.py` uses penalty `1.0`; set
+  the same serving override when comparing against those golden frames.
 - **Length budget**: prompt length is bounded by stage 0 `max_model_len=4096`;
   synthesis length by `max_new_tokens` (default 2048 frames ≈ 164 s at the
   12.5 Hz codec frame rate) — set `max_new_tokens` for shorter caps.
@@ -181,7 +198,7 @@ warm-up) a few seconds of speech completes in roughly 3.4–3.8 s wall time.
 
 | Feature | Status | Notes |
 | ------- | ------ | ----- |
-| Streaming output | ✓ | `async_chunk: true`, 8-frame inter-stage chunks, SSE `speech.audio.delta` PCM |
+| Streaming output | ✓ | `async_chunk: true`, 8-frame inter-stage chunks; raw audio or SSE `speech.audio.delta` |
 | Voice cloning | ✓ | one reference clip plus transcript per request |
 | Voice design / voice direction | ✓ | `instructions` field, with or without a reference |
 | Classifier-free guidance | ✗ | `cfg_scale` must be `1.0`; `negative_prompt` rejected (follow-up) |

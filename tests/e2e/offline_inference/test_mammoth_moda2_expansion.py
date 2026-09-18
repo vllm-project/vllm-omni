@@ -108,7 +108,7 @@ pytestmark = [
 ]
 
 
-@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/3201")
+@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/7718")
 @hardware_test(res={"cuda": "H100"})
 def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
     """

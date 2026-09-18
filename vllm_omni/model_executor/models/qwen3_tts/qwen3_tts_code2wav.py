@@ -499,7 +499,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             if wav.numel() == 0:
                 continue
             if wav.shape[0] > 0:
-                # Decoder already runs in fp32, so the .to(float32) is a redundant dispatch.
+                # Return FP32 audio regardless of the decoder compute dtype.
                 audios[idx] = (wav if wav.dtype == torch.float32 else wav.to(torch.float32)).reshape(-1)
 
         for req_id, finished, segment_finished in zip(
@@ -560,7 +560,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         )
 
         device = self.vllm_config.device_config.device
-        self.decoder.to(device=device, dtype=torch.float32)
+        self.decoder.to(device=device, dtype=self.vllm_config.model_config.dtype)
 
         # Precompute SnakeBeta exp caches (benefits both Triton and eager paths)
         if hasattr(self.decoder, "precompute_snake_caches"):

@@ -9,72 +9,25 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from PIL import Image
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
-def test_h3_profiler_targets_cover_reference_encoders_and_vae_decoders():
+def test_h3_full_pipeline_profiler_includes_local_encoding():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     targets = MiniMaxH3Pipeline._PROFILER_TARGETS
-    assert "_encode_visual_conditions" in targets
-    assert "_encode_reference_audio_conditions" in targets
-    assert "video_vae.decode_latent" in targets
-    assert "audio_vae.decode_latent" in targets
-    assert "_encode_video_conditions" not in targets
-    assert "_encode_video_audio_conditions" not in targets
-    assert "_encode_audio_conditions" not in targets
-
-
-@pytest.mark.parametrize("distributed", [False, True])
-def test_manual_component_offload_wins_over_requested_model_offload(distributed):
-    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
-
-    pipeline = object.__new__(MiniMaxH3Pipeline)
-    torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = SimpleNamespace(
-        enable_cpu_offload=True,
-        enable_layerwise_offload=not distributed,
-        enable_distributed_layerwise_offload=distributed,
-    )
-    pipeline._model_cpu_offload_modules = []
-    pipeline.text_encoder = Mock()
-    expected = torch.ones(2, 3)
-    pipeline.text_encoder.encode_ids.return_value = expected
-    component = Mock()
-
-    actual = pipeline._encode_text_hidden(torch.tensor([1, 2]), {})
-    with pipeline._component_on_device(component):
-        component.load_to_device.assert_called_once_with()
-        component.offload_to_cpu.assert_not_called()
-
-    assert actual is expected
-    pipeline.text_encoder.load_to_device.assert_called_once_with()
-    pipeline.text_encoder.offload_to_cpu.assert_called_once_with()
-    component.offload_to_cpu.assert_called_once_with()
-
-
-def test_requested_model_offload_without_backend_uses_resident_components():
-    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
-
-    pipeline = object.__new__(MiniMaxH3Pipeline)
-    torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = SimpleNamespace(
-        enable_cpu_offload=True,
-        enable_layerwise_offload=False,
-        enable_distributed_layerwise_offload=False,
-    )
-    pipeline._model_cpu_offload_modules = []
-    pipeline.text_encoder = Mock()
-    expected = torch.ones(2, 3)
-    pipeline.text_encoder.encode_ids.return_value = expected
-
-    actual = pipeline._encode_text_hidden(torch.tensor([1, 2]), {})
-
-    assert actual is expected
-    pipeline.text_encoder.load_to_device.assert_called_once_with()
-    pipeline.text_encoder.encode_ids.assert_called_once()
+    assert targets == [
+        "encode_prompt",
+        "_encode_local_media",
+        "diffuse",
+        "decode",
+        "video_vae.decode_latent",
+        "audio_vae.decode_latent",
+        "prepare_encode",
+        "denoise_step",
+        "post_decode",
+    ]
 
 
 def test_decoded_output_is_unchanged_without_active_model_offload():
@@ -194,7 +147,7 @@ def test_forward_releases_video_after_quantization_and_before_next_seed(monkeypa
         _extract_prompt=lambda raw: ("a prompt", {}),
         _extract_text_conditioning=lambda raw: None,
         _extract_prepared_reference_videos=lambda raw: None,
-        _prepare_request_inputs=lambda **kwargs: context,
+        _prepare_request_inputs=lambda *args, **kwargs: context,
         _denoise_kwargs=lambda ctx: {},
         diffuse=diffuse,
         decode=decode,
@@ -243,7 +196,7 @@ def test_forward_drops_the_decoded_video_before_the_next_seed_diffuses(monkeypat
         _extract_prompt=lambda raw: ("a prompt", {}),
         _extract_text_conditioning=lambda raw: None,
         _extract_prepared_reference_videos=lambda raw: None,
-        _prepare_request_inputs=lambda **kwargs: context,
+        _prepare_request_inputs=lambda *args, **kwargs: context,
         _denoise_kwargs=lambda ctx: {},
         diffuse=diffuse,
         decode=decode,
@@ -318,7 +271,8 @@ def test_output_owner_rank_matches_executor_contract(monkeypatch, available, ini
     assert MiniMaxH3Pipeline._is_output_owner_rank() is expected
 
 
-def test_h3_model_cpu_offload_registers_direct_vae_stages(monkeypatch):
+@pytest.mark.parametrize("load_text_encoder", [True, False])
+def test_h3_model_cpu_offload_registers_direct_vae_stages(monkeypatch, load_text_encoder):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
 
@@ -326,9 +280,11 @@ def test_h3_model_cpu_offload_registers_direct_vae_stages(monkeypatch):
     torch.nn.Module.__init__(pipeline)
     pipeline.transformer = torch.nn.Linear(2, 2)
     pipeline.transformers_ref = torch.nn.Linear(2, 2)
-    pipeline.text_encoder = torch.nn.Linear(2, 2)
     pipeline.video_vae = torch.nn.Linear(2, 2)
     pipeline.audio_vae = torch.nn.Linear(2, 2)
+    pipeline._encoder_modules = ["text_encoder"] if load_text_encoder else []
+    if load_text_encoder:
+        pipeline.text_encoder = torch.nn.Linear(2, 2)
     apply_offload = Mock()
     remove_offload = Mock()
     monkeypatch.setattr(module, "apply_sequential_offload", apply_offload)
@@ -341,7 +297,7 @@ def test_h3_model_cpu_offload_registers_direct_vae_stages(monkeypatch):
     )
 
     dits = [pipeline.transformer, pipeline.transformers_ref]
-    stages = [pipeline.text_encoder, pipeline.video_vae, pipeline.audio_vae]
+    stages = [*([pipeline.text_encoder] if load_text_encoder else []), pipeline.video_vae, pipeline.audio_vae]
     apply_offload.assert_called_once_with(
         dit_modules=dits,
         encoder_modules=stages,
@@ -354,6 +310,46 @@ def test_h3_model_cpu_offload_registers_direct_vae_stages(monkeypatch):
     pipeline.disable_omni_model_cpu_offload()
 
     remove_offload.assert_called_once_with([*dits, *stages])
+
+
+@pytest.mark.parametrize("decode_fails", [False, True])
+def test_h3_model_cpu_offload_scopes_direct_vae_call(monkeypatch, decode_fails):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    component = torch.nn.Linear(2, 2)
+    events: list[tuple[Any, ...]] = []
+
+    @contextmanager
+    def record_component(value):
+        events.append(("activate", value))
+        try:
+            yield
+        finally:
+            events.append(("offload", value))
+
+    monkeypatch.setattr(module, "sequential_offload_component", record_component)
+    pipeline._model_cpu_offload_modules = [component]
+
+    def decode():
+        with pipeline._component_on_device(component):
+            events.append(("decode", component))
+            if decode_fails:
+                raise RuntimeError("decode failed")
+
+    if decode_fails:
+        with pytest.raises(RuntimeError, match="decode failed"):
+            decode()
+    else:
+        decode()
+
+    assert events == [
+        ("activate", component),
+        ("decode", component),
+        ("offload", component),
+    ]
 
 
 def test_h3_model_cpu_offload_keeps_unselected_vaes_resident(monkeypatch):
@@ -416,44 +412,20 @@ def test_h3_model_cpu_offload_rejects_unloaded_selected_encoder(monkeypatch):
     apply_offload.assert_not_called()
 
 
-@pytest.mark.parametrize("decode_fails", [False, True])
-def test_h3_model_cpu_offload_scopes_direct_vae_call(monkeypatch, decode_fails):
-    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
-    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
+def _encode_media(pipeline, **kwargs):
+    from vllm_omni.model_executor.models.minimax_h3.conditioning import MiniMaxH3EncoderMediaInput
+    from vllm_omni.model_executor.models.minimax_h3.encoder_processing import encode_media
 
-    pipeline = object.__new__(MiniMaxH3Pipeline)
-    torch.nn.Module.__init__(pipeline)
-    component = torch.nn.Linear(2, 2)
-    events: list[tuple[Any, ...]] = []
-
-    @contextmanager
-    def record_component(value):
-        events.append(("activate", value))
-        try:
-            yield
-        finally:
-            events.append(("offload", value))
-
-    monkeypatch.setattr(module, "sequential_offload_component", record_component)
-    pipeline._model_cpu_offload_modules = [component]
-
-    def decode():
-        with pipeline._component_on_device(component):
-            events.append(("decode", component))
-            if decode_fails:
-                raise RuntimeError("decode failed")
-
-    if decode_fails:
-        with pytest.raises(RuntimeError, match="decode failed"):
-            decode()
-    else:
-        decode()
-
-    assert events == [
-        ("activate", component),
-        ("decode", component),
-        ("offload", component),
-    ]
+    media = MiniMaxH3EncoderMediaInput(
+        task="ref2va", height=32, width=32, num_frames=124, latent_t=31, audio_t=208, **kwargs
+    )
+    return encode_media(
+        media,
+        video_vae=getattr(pipeline, "video_vae", None),
+        audio_vae=getattr(pipeline, "audio_vae", None),
+        emit_conditioning=True,
+        component_scope=pipeline._component_on_device,
+    )
 
 
 @pytest.mark.parametrize("encode_fails", [False, True])
@@ -463,7 +435,6 @@ def test_h3_model_cpu_offload_batches_visual_reference_scope(monkeypatch, encode
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.device = torch.device("cpu")
     pipeline.video_vae = Mock()
     pipeline._model_cpu_offload_modules = [pipeline.video_vae]
     events = []
@@ -484,17 +455,15 @@ def test_h3_model_cpu_offload_batches_visual_reference_scope(monkeypatch, encode
 
     pipeline.video_vae.encode_image.side_effect = encode_image
     monkeypatch.setattr(module, "sequential_offload_component", record_component)
-    monkeypatch.setattr(module, "_dit_rank_world", lambda: (None, 0, 1))
-    monkeypatch.setattr(module, "_broadcast_tensor", lambda value, **kwargs: value)
-    images = [Image.new("RGB", (16, 16)), Image.new("RGB", (32, 16))]
+    images = (torch.zeros(16, 16, 3, dtype=torch.uint8), torch.zeros(16, 32, 3, dtype=torch.uint8))
 
     if encode_fails:
         with pytest.raises(RuntimeError, match="encode failed"):
-            pipeline._encode_visual_conditions(images, None, video_count=0)
+            _encode_media(pipeline, images=images)
     else:
-        rows, shapes = pipeline._encode_visual_conditions(images, None, video_count=0)
-        assert rows.shape == (3, 4)
-        assert shapes == [(1, 1, 1), (1, 1, 2)]
+        result = _encode_media(pipeline, images=images)
+        assert result.visual_condition.shape == (3, 4)
+        assert result.visual_condition_shapes == ((1, 1, 1), (1, 1, 2))
 
     assert events == [
         ("activate", pipeline.video_vae),
@@ -510,9 +479,7 @@ def test_h3_model_cpu_offload_shares_image_and_video_scope(monkeypatch):
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.device = torch.device("cpu")
     pipeline.video_vae = Mock()
-    pipeline.video_vae.is_distributed_enabled.return_value = False
     pipeline._model_cpu_offload_modules = [pipeline.video_vae]
     events = []
 
@@ -529,31 +496,26 @@ def test_h3_model_cpu_offload_shares_image_and_video_scope(monkeypatch):
         return torch.ones(1, 4)
 
     def encode_video(frames):
-        events.append(("video", frames))
+        events.append(("video", frames.shape))
         return torch.ones(3, 4), (3, 2, 2)
 
     pipeline.video_vae.encode_image.side_effect = encode_image
     pipeline.video_vae.encode_video.side_effect = encode_video
     monkeypatch.setattr(module, "sequential_offload_component", record_component)
-    monkeypatch.setattr(module, "_dit_rank_world", lambda: (None, 0, 1))
-    monkeypatch.setattr(module, "_broadcast_tensor", lambda value, **kwargs: value)
-    monkeypatch.setattr(module, "load_video_frames", lambda path: f"frames:{path}")
-    images = [Image.new("RGB", (16, 16)), Image.new("RGB", (32, 16))]
-    prepared_videos = [{"prepared_path": "reference.mp4"}]
-
-    rows, shapes = pipeline._encode_visual_conditions(
-        images,
-        prepared_videos,
-        video_count=1,
+    result = _encode_media(
+        pipeline,
+        images=(torch.zeros(16, 16, 3, dtype=torch.uint8), torch.zeros(16, 32, 3, dtype=torch.uint8)),
+        videos=(torch.zeros(12, 32, 32, 3, dtype=torch.uint8),),
+        video_audios=(None,),
     )
 
-    assert rows.shape == (5, 4)
-    assert shapes == [(1, 1, 1), (1, 1, 2), (3, 2, 2)]
+    assert result.visual_condition.shape == (5, 4)
+    assert result.visual_condition_shapes == ((1, 1, 1), (1, 1, 2), (3, 2, 2))
     assert events == [
         ("activate", pipeline.video_vae),
         ("image", (16, 16)),
         ("image", (32, 16)),
-        ("video", "frames:reference.mp4"),
+        ("video", (12, 32, 32, 3)),
         ("offload", pipeline.video_vae),
     ]
 
@@ -567,7 +529,7 @@ def test_h3_model_cpu_offload_shares_embedded_and_standalone_audio_scope(monkeyp
     torch.nn.Module.__init__(pipeline)
     pipeline.audio_vae = Mock()
     pipeline._model_cpu_offload_modules = [pipeline.audio_vae]
-    events: list[tuple[Any, ...]] = []
+    events = []
 
     @contextmanager
     def record_component(value):
@@ -577,26 +539,20 @@ def test_h3_model_cpu_offload_shares_embedded_and_standalone_audio_scope(monkeyp
         finally:
             events.append(("offload", value))
 
-    def encode_embedded(*args, **kwargs):
-        events.append(("embedded",))
+    def encode_waveform(waveform, sample_rate):
+        events.append(("audio", int(waveform[0]), sample_rate))
         if encode_fails:
             raise RuntimeError("audio encode failed")
-        return torch.ones(1, 2), [1]
+        return torch.ones(80, 32), 80
 
-    def encode_standalone(*args, **kwargs):
-        events.append(("standalone",))
-        return torch.ones(1, 2), [1]
-
-    pipeline._encode_video_audio_conditions_resident = encode_embedded
-    pipeline._encode_audio_conditions_resident = encode_standalone
+    pipeline.audio_vae.encode_waveform.side_effect = encode_waveform
     monkeypatch.setattr(module, "sequential_offload_component", record_component)
 
     def call():
-        return pipeline._encode_reference_audio_conditions(
-            [{"input_has_audio": True}],
-            has_audio=[True],
-            standalone_audios=[(torch.ones(1), 16_000)],
-            max_duration_seconds=1.0,
+        return _encode_media(
+            pipeline,
+            video_audios=(),
+            audios=((torch.ones(32_000), 16_000),),
         )
 
     if encode_fails:
@@ -604,10 +560,61 @@ def test_h3_model_cpu_offload_shares_embedded_and_standalone_audio_scope(monkeyp
             call()
     else:
         result = call()
-        assert result[0].shape == (1, 2)
-        assert result[2].shape == (1, 2)
+        assert result.audio_condition.shape == (80, 32)
+        assert result.audio_condition_lengths == (80,)
+        assert events[1:-1] == [("audio", 1, 16_000)]
 
     assert events[0] == ("activate", pipeline.audio_vae)
     assert events[-1] == ("offload", pipeline.audio_vae)
     assert events.count(("activate", pipeline.audio_vae)) == 1
     assert events.count(("offload", pipeline.audio_vae)) == 1
+
+
+@pytest.mark.parametrize("distributed", [False, True])
+def test_manual_component_offload_wins_over_requested_model_offload(distributed):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = SimpleNamespace(
+        enable_cpu_offload=True,
+        enable_layerwise_offload=not distributed,
+        enable_distributed_layerwise_offload=distributed,
+    )
+    pipeline._model_cpu_offload_modules = []
+    pipeline.text_encoder = Mock()
+    expected = torch.ones(2, 3)
+    pipeline.text_encoder.encode_ids.return_value = expected
+    component = Mock()
+
+    actual = pipeline._encode_text_hidden(torch.tensor([1, 2]), {})
+    with pipeline._component_on_device(component):
+        component.load_to_device.assert_called_once_with()
+        component.offload_to_cpu.assert_not_called()
+
+    assert actual is expected
+    pipeline.text_encoder.load_to_device.assert_called_once_with()
+    pipeline.text_encoder.offload_to_cpu.assert_called_once_with()
+    component.offload_to_cpu.assert_called_once_with()
+
+
+def test_requested_model_offload_without_backend_uses_resident_components():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = SimpleNamespace(
+        enable_cpu_offload=True,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=False,
+    )
+    pipeline._model_cpu_offload_modules = []
+    pipeline.text_encoder = Mock()
+    expected = torch.ones(2, 3)
+    pipeline.text_encoder.encode_ids.return_value = expected
+
+    actual = pipeline._encode_text_hidden(torch.tensor([1, 2]), {})
+
+    assert actual is expected
+    pipeline.text_encoder.load_to_device.assert_called_once_with()
+    pipeline.text_encoder.encode_ids.assert_called_once()

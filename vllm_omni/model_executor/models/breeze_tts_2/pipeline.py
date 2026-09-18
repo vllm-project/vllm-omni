@@ -28,6 +28,12 @@ BREEZE_TTS_2_PIPELINE = PipelineConfig(
             custom_process_next_stage_input_func=f"{_PROC}.talker2codec_full_payload",
             sampling_constraints={
                 "detokenize": False,
+                # Text EOS 1 is a valid codec token; only the backbone's
+                # explicit codec EOS below may terminate audio generation.
+                "ignore_eos": True,
+                # The talker has already selected the emitted frame's token;
+                # min_tokens must not mask that token in the sampler.
+                "min_tokens": 0,
                 "stop_token_ids": [2051],
             },
         ),

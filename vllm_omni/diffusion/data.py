@@ -541,6 +541,8 @@ class DiffusionCacheConfig:
                     scm_steps_mask_policy, scm_steps_policy
         - MagCache: mag_threshold, mag_max_skip_steps, mag_retention_ratio,
                     mag_ratios, mag_calibrate
+        - SeaCache: sea_threshold, sea_residual_order,
+                    sea_max_consecutive_cached, sea_power_exp
         - step_cache: step_cache_dit_enabled, velocity_sim_thresholds,
                           velocity_skip_countdowns, step_cache_dit_min_history
 
@@ -559,6 +561,12 @@ class DiffusionCacheConfig:
     # None defers to the model-specific TeaCache default (0.2 fallback).
     rel_l1_thresh: float | None = None
     coefficients: list[float] | None = None  # Uses model-specific defaults if None
+
+    # SeaCache parameters [sea_cache only]
+    sea_threshold: float = 0.25
+    sea_residual_order: int = 1
+    sea_max_consecutive_cached: int = 2
+    sea_power_exp: float = 3.0
 
     # MagCache parameters [mag_cache only]
     # Default: 0.24 threshold for accumulated magnitude error
@@ -976,6 +984,7 @@ class OmniDiffusionConfig:
             "transformer": True,
             "vae": True,
             "text_encoder": True,
+            "vae_encoder": True,
         }
     )
     override_transformer_cls_name: str | None = None
@@ -1012,16 +1021,15 @@ class OmniDiffusionConfig:
     # str is resolved to {"method": <str>} internally.
     # Per-component: {"transformer": {"method": "fp8"}, "vae": None}
     quantization_config: str | QuantizationConfig | dict[str, Any] | None = None
+    # Internal provenance, retained across config projection and worker transport.
+    quantization_config_is_auto_detected: bool = False
     # Explicit runtime override for ModelOpt FP8 diffusion checkpoints. This
     # does not enable FP8 by itself; it only selects CUTLASS once the checkpoint
     # has already resolved to vLLM's ModelOpt FP8 linear method.
     force_cutlass_fp8: bool = False
 
-    # Diffusion attention KV cache dtype (not vLLM's --kv-cache-dtype for AR models).
-    # None = native dtype (no quantization).
-    # "fp8" = dynamic FP8 (float8_e4m3fn) quantization per forward pass.
-    # On Hopper+FA3: native FP8 attention (memory + compute savings).
-    # On other backends: no benefit, backends skip quantization.
+    # Runtime diffusion attention method (not vLLM's --kv-cache-dtype for AR models).
+    # None/"auto" keeps native dtype; other values are validated by the selected backend.
     diffusion_kv_cache_dtype: str | None = None
     # Optional skip selectors for KV-cache quantization. Format: "0-9,20,25-30".
     # Listed steps/layers skip quantization; others keep quantized execution.
@@ -1349,6 +1357,8 @@ class OmniDiffusionConfig:
             or (is_checkpoint_nvfp4 and self._is_generic_nvfp4_quant_config(self.quantization_config))
         )
         if should_use_checkpoint_config:
+            if self.quantization_config is None:
+                self.quantization_config_is_auto_detected = True
             self.quantization_config = tf_config.quant_config
             logger.info(
                 "Auto-detected quantization '%s' from model config",
@@ -1602,6 +1612,11 @@ class OmniDiffusionConfig:
                         self.model_class_name = "Pi0Pipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
+                elif cfg.get("type") == "pi05":
+                    if self.model_class_name is None:
+                        self.model_class_name = "Pi05Pipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
                 elif architectures and len(architectures) == 1:
                     architecture = architectures[0]
                     from vllm_omni.diffusion.registry import DiffusionModelRegistry
@@ -1627,6 +1642,18 @@ class OmniDiffusionConfig:
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
         return cls(**cls.normalize_init_kwargs(kwargs))
+
+
+DIFFUSION_REQUEST_LIFECYCLE_KEY = "_diffusion_request_lifecycle"
+DIFFUSION_REQUEST_STARTED = "started"
+
+
+def is_diffusion_request_started_output(output: Any) -> bool:
+    custom_output = getattr(output, "custom_output", None)
+    return (
+        isinstance(custom_output, dict)
+        and custom_output.get(DIFFUSION_REQUEST_LIFECYCLE_KEY) == DIFFUSION_REQUEST_STARTED
+    )
 
 
 @dataclass
@@ -1676,6 +1703,9 @@ class DiffusionOutput:
     # the output is shipped across process boundaries (e.g. step-execution
     # mode) and the receiving side must not initialise a stray CUDA context.
     to_cpu: bool = False
+
+    # Internal control-plane event emitted on first scheduler admission.
+    request_started: bool = False
 
     # Typed video-media contract. Declared last so the pre-existing positional
     # constructor order (output, trajectory_timesteps, ...) that out-of-tree

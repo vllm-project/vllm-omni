@@ -888,3 +888,24 @@ def test_abort_snapshot_leaves_state_until_commit():
     assert "0_parent" not in processor.request_states
     assert "parent" not in processor.parent_requests
     assert "parent" not in processor.external_req_ids
+
+
+def test_cumulative_audio_terminal_output_supplies_full_aligner_waveform():
+    from vllm_omni.model_executor.stage_input_processors.forced_aligner import code2wav2aligner
+
+    state = _make_state(RequestOutputKind.CUMULATIVE)
+    for index, count in enumerate((800, 1200, 400)):
+        state.add_multimodal_tensor(torch.full((1, count), float(index)), mm_type=AUDIO)
+        output = state.make_request_output([index], None, FinishReason.STOP if index == 2 else None, None)
+        assert output is not None
+        if index < 2:
+            assert code2wav2aligner([output], {}) == []
+    prompt = {"additional_information": {"text": ["Hello world"], "language": ["English"]}}
+    aligned = code2wav2aligner([output], prompt)[0]
+    waveform, sr = aligned["multi_modal_data"]["audio"]
+    assert sr == 24000
+    assert waveform.shape == (2400,)
+    assert (waveform[:800] == 0).all()
+    assert (waveform[800:2000] == 1).all()
+    assert (waveform[2000:] == 2).all()
+    assert aligned["additional_information"]["aligner_audio_duration_ms"] == [100.0]

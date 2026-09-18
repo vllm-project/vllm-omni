@@ -33,12 +33,6 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     VideoTokenLayout,
 )
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.attention.ops.minimax_h3_modulation import (
-    indexed_gate,
-    indexed_gate_rms_norm_scale_shift,
-    indexed_scale_shift_,
-    rms_norm_indexed_scale_shift,
-)
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
@@ -50,10 +44,18 @@ from vllm_omni.diffusion.forward_context import (
 )
 from vllm_omni.diffusion.layers.activation import SiluAndMul
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
+from vllm_omni.diffusion.layers.indexed_modulation import (
+    indexed_gate,
+    indexed_gate_rms_norm_scale_shift,
+    indexed_scale_shift_,
+    rms_norm_indexed_scale_shift,
+)
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
 from vllm_omni.platforms import current_omni_platform
+
+from .fasth3 import _resolve_native_target
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -118,6 +120,18 @@ class MiniMaxH3DiTArchConfig:
 
     @classmethod
     def from_mapping(cls, config: Mapping[str, Any]) -> MiniMaxH3DiTArchConfig:
+        # The modular Diffusers checkpoint uses these spellings for the same
+        # architecture. Normalize before constructing the existing native DiT.
+        aliases = {
+            "num_refiner_layers": "token_refiner_num_layers",
+            "ffn_dim": "ffn_hidden_size",
+            "in_channels": "latents_dim",
+            "audio_in_channels": "audio_latents_dim",
+            "freq_dim": "timestep_input_dim",
+            "time_embed_hidden_dim": "time_embed_hidden_size",
+            "rope_freq_dim": "rope_inv_freq_len",
+        }
+        config = {aliases.get(name, name): value for name, value in config.items()}
         fields = cls.__dataclass_fields__
         values = {name: config[name] for name in fields if name in config}
         if "patch_size" in values:
@@ -394,6 +408,9 @@ def _sdpa_varlen_attention(
 
 
 class MiniMaxH3Attention(nn.Module):
+    # Full sparse checkpoints pin a ratio; legacy adapters use backend top-k.
+    vsa_sparsity: float | None = None
+
     def __init__(
         self,
         arch: MiniMaxH3DiTArchConfig,
@@ -442,6 +459,8 @@ class MiniMaxH3Attention(nn.Module):
         self._gate_hidden_size = arch.hidden_size
         self._gate_quant_config = quant_config
         self._gate_prefix = f"{prefix}.to_gate_compress"
+        from .attention.fastvideo_h3 import MiniMaxH3VSAImpl
+
         self.attention = Attention(
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
@@ -454,6 +473,7 @@ class MiniMaxH3Attention(nn.Module):
             role_category=role_category,
             skip_sequence_parallel=skip_sequence_parallel,
             prefix=prefix,
+            impl_overrides={"FASTVIDEO_VSA": MiniMaxH3VSAImpl},
         )
 
     def enable_vsa_gate(self) -> None:
@@ -585,6 +605,7 @@ class MiniMaxH3Attention(nn.Module):
                 # (see MINIMAX_H3_LASER_INPUT_SCALE). Ignored by every other
                 # backend/path.
                 "laser_input_scale": MINIMAX_H3_LASER_INPUT_SCALE,
+                **({"vsa_h3_sparsity": self.vsa_sparsity} if self.vsa_sparsity is not None else {}),
                 # Present only for a VSA artifact; the VSA backend reads it as
                 # the learned compression gate and every other backend ignores it.
                 **({"gate_compress": gate_compress.unsqueeze(0)} if gate_compress is not None else {}),
@@ -1124,10 +1145,23 @@ class MiniMaxH3DiTModel(nn.Module):
         self,
         od_config: OmniDiffusionConfig,
         quant_config: QuantizationConfig | None = None,
+        *,
+        diffusers_weights: bool | None = None,
     ) -> None:
         super().__init__()
         tf_config = od_config.tf_model_config
         config_mapping = tf_config.to_dict() if hasattr(tf_config, "to_dict") else dict(tf_config)
+        # The native MiniMax-H3 Hub snapshot advertises the Diffusers
+        # transformer class in its root config, while its FL2VA/Ref2VA
+        # components still contain native weights.  The pipeline has already
+        # resolved the actual source format, so let it override the
+        # class-name heuristic.  Keep the heuristic for standalone callers.
+        self._diffusers_weights = (
+            config_mapping.get("_class_name") == "MiniMaxH3Transformer3DModel"
+            if diffusers_weights is None
+            else diffusers_weights
+        )
+        self._rope_theta = float(config_mapping.get("rope_theta", 10000.0))
         arch = MiniMaxH3DiTArchConfig.from_mapping(config_mapping)
         self.arch = arch
         self.od_config = od_config
@@ -1208,7 +1242,7 @@ class MiniMaxH3DiTModel(nn.Module):
         )
         self._mark_missing_params_required()
 
-    def enable_vsa_gates(self) -> None:
+    def enable_vsa_gates(self, *, sparsity: float | None = None) -> None:
         """Give every DiT block's attention a VSA compression gate.
 
         A FastH3 VSA artifact assigns these projections rather than adding to
@@ -1220,6 +1254,9 @@ class MiniMaxH3DiTModel(nn.Module):
             return
         for block in self.blocks:
             block.attn.enable_vsa_gate()
+            block.attn.vsa_sparsity = sparsity
+            if sparsity is not None:
+                block.attn.to_gate_compress.weight.missing_param_init = "error"
         self.vsa_gates_enabled = True
 
     def _mark_missing_params_required(self) -> None:
@@ -1290,17 +1327,37 @@ class MiniMaxH3DiTModel(nn.Module):
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
-        """Load exact H3 checkpoint names with logical TP-aware loaders."""
+        """Load native or Diffusers H3 weights with the existing TP-aware loaders."""
         params = dict(self.named_parameters())
         params.update(dict(self.named_buffers()))
         loaded: set[str] = set()
+        diffusers_weights = getattr(self, "_diffusers_weights", False)
+        qkv_parts: dict[str, set[str]] = {}
+        source_names: set[str] = set()
         for name, loaded_weight in weights:
+            layout = "plain"
+            if diffusers_weights:
+                if name in source_names:
+                    raise ValueError(f"duplicate Diffusers H3 weight: {name}")
+                source_names.add(name)
+                module, _, kind = name.rpartition(".")
+                target = _resolve_native_target(module)
+                if target is None or kind not in {"weight", "bias"}:
+                    raise ValueError(f"unsupported Diffusers H3 weight: {name}")
+                name, layout = f"{target[0]}.{kind}", target[1]
             param = params.get(name)
             if param is None:
+                if diffusers_weights:
+                    raise ValueError(f"Diffusers H3 weight has no model parameter: {name}")
                 logger.warning("Skipping MiniMax H3 weight not present in model: %s", name)
                 continue
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            if name.endswith(".attn.qkv_proj.weight"):
+            if layout in {"q", "k", "v"}:
+                # vLLM can load each projection directly into its packed QKV
+                # parameter, including TP slicing and online quantization.
+                weight_loader(param, loaded_weight, layout)
+                qkv_parts.setdefault(name, set()).add(layout)
+            elif name.endswith(".attn.qkv_proj.weight"):
                 # Transform checkpoint layout before entering vLLM's loader so
                 # online FP8 can keep ``online_process_loader`` outermost.
                 loaded_weight = _reorder_grouped_qkv_to_qkv(
@@ -1316,12 +1373,26 @@ class MiniMaxH3DiTModel(nn.Module):
                         "MiniMax H3 fc1 checkpoint rows must split evenly into "
                         f"gate/up matrices, got {tuple(loaded_weight.shape)}"
                     )
-                gate, up = loaded_weight.chunk(2, dim=0)
+                first, second = loaded_weight.chunk(2, dim=0)
+                gate, up = (second, first) if layout == "swap_halves" else (first, second)
                 weight_loader(param, gate, 0)
                 weight_loader(param, up, 1)
             else:
                 weight_loader(param, loaded_weight)
             loaded.add(name)
+        if diffusers_weights:
+            for name, parts in qkv_parts.items():
+                if parts != {"q", "k", "v"}:
+                    raise ValueError(f"incomplete Diffusers H3 QKV group {name}: {sorted(parts)}")
+            # Diffusers reconstructs RoPE from config instead of storing this
+            # native checkpoint buffer. Compute on CPU for identical values.
+            freq_dim = self.arch.rope_inv_freq_len
+            rope = 1.0 / (
+                self._rope_theta
+                ** (torch.arange(0, 2 * freq_dim, 2, dtype=torch.float32, device="cpu") / (2 * freq_dim))
+            )
+            default_weight_loader(params["rope.inv_freq"], rope)
+            loaded.add("rope.inv_freq")
         return loaded
 
     @staticmethod

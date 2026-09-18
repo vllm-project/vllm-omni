@@ -389,7 +389,7 @@ def test_cli_generate_partial_resume_merges_metrics(tmp_path: Path, monkeypatch:
 def test_collect_duplex_session_metrics_matches_omniinteract_window():
     collector = EventCollector()
     audio = {
-        "type": "response.audio.delta",
+        "type": "response.output_audio.delta",
         "response_id": "r1",
         "format": "pcm16",
         "delta": base64.b64encode(bytes((1, 0)) * 2400).decode(),

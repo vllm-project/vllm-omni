@@ -308,3 +308,16 @@ class OmniGPUWorkerBase(GPUWorker):
                     pass
             tid = task.task_id if hasattr(task, "task_id") else "unknown"
             return OmniACK(task_id=tid, status="ERROR", error_msg=str(e))
+
+    def encoder_loaded(self) -> bool:
+        """Check if encoder weights are loaded in the model.
+
+        This method is exposed via collective_rpc to check encoder availability
+        for models that support voice cloning with reference audio.
+
+        Returns:
+            bool: True if encoder weights are available, False otherwise.
+        """
+        if hasattr(self.model_runner, "model") and hasattr(self.model_runner.model, "encoder_loaded"):
+            return self.model_runner.model.encoder_loaded()
+        return False

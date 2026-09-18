@@ -152,7 +152,6 @@ def test_realtime_duplex_demo_pair_launches_demo_processes_concurrently(tmp_path
                 "parser.add_argument('--output-dir')",
                 "parser.add_argument('--chunk-ms')",
                 "parser.add_argument('--timeout-s')",
-                "parser.add_argument('--session-id')",
                 "parser.add_argument('--ref-audio')",
                 "parser.add_argument('--require-audio', action='store_true')",
                 "parser.add_argument('--no-realtime-pacing', action='store_true')",
@@ -1027,7 +1026,7 @@ def test_realtime_duplex_demo_resolves_distinct_turn_inputs():
         demo._turn_input_paths(primary, ["second.wav"], turns=3)
 
 
-def test_realtime_duplex_demo_explicitly_enables_native_runtime_before_connect():
+def test_realtime_duplex_demo_url_carries_no_model_opt_in_or_session_id():
     demo = _load_demo_module()
 
     url = demo._url_with_model(
@@ -1036,23 +1035,12 @@ def test_realtime_duplex_demo_explicitly_enables_native_runtime_before_connect()
     )
 
     query = parse_qs(urlsplit(url).query)
-    assert query["native_duplex"] == ["1"]
+    assert query["duplex"] == ["1"]
+    assert "native_duplex" not in query
+    assert "session_id" not in query
 
 
-def test_realtime_duplex_demo_explicit_session_id_reaches_autostart_query():
-    demo = _load_demo_module()
-
-    url = demo._url_with_model(
-        "ws://localhost:8099/v1/realtime?duplex=1",
-        "openbmb/MiniCPM-o-4_5",
-        session_id="reopen-e2e",
-    )
-
-    query = parse_qs(urlsplit(url).query)
-    assert query["session_id"] == ["reopen-e2e"]
-
-
-def test_realtime_duplex_demo_session_update_uses_explicit_session_id():
+def test_realtime_duplex_demo_session_update_leaves_session_id_to_the_server():
     demo = _load_demo_module()
 
     event = demo._session_update_event(
@@ -1066,8 +1054,8 @@ def test_realtime_duplex_demo_session_update_uses_explicit_session_id():
 
     assert event["type"] == "session.update"
     assert "session_id" not in event
-    assert event["session"]["session_id"] == "reopen-e2e"
-    assert event["session"]["extra_body"]["native_duplex"] is True
+    assert "session_id" not in event["session"]
+    assert "native_duplex" not in event["session"]["extra_body"]
 
 
 def test_realtime_duplex_demo_response_required_uses_deterministic_sampling():

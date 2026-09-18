@@ -338,6 +338,9 @@ class HunyuanImage3Pipeline(
     supports_step_execution: ClassVar[bool] = True
     supports_request_batch = False
     support_image_input = True
+    # The warmup request's blank image routes this AR+diffusion model down its
+    # image-edit path, where the token block cannot match the latent patch grid.
+    dummy_run_num_frames: ClassVar[int] = 0
     _dit_modules: ClassVar[list[str]] = ["model"]
     _encoder_modules: ClassVar[list[str]] = ["vision_model"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
