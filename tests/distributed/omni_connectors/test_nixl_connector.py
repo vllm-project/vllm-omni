@@ -131,6 +131,7 @@ def test_manager_receiver_does_not_bind_shared_producer_port(producer, need_recv
                 "role": "receiver",
                 "host": "127.0.0.1",
                 "zmq_port": PORT,
+                "metadata_query_timeout_ms": 5000,
                 "backends": ["UCX"],
             },
             from_stage="0",
@@ -317,6 +318,7 @@ def ownership_copying_agent(consumer, monkeypatch):
 
 
 @pytest.mark.parametrize("case", ["empty", "all_empty", "mixed", "scalar", "structured_empty", "structured_mixed"])
+@pytest.mark.usefixtures("reliable_claim_queries")
 def test_zero_byte_leaves_complete_source_claim(producer, consumer, ownership_copying_agent, case):
     empty = torch.empty((2, 0, 3), dtype=torch.float64)
     other = torch.empty((0,), dtype=torch.int64)
@@ -349,6 +351,7 @@ def test_zero_byte_leaves_complete_source_claim(producer, consumer, ownership_co
 
 @pytest.mark.parametrize("direct", [False, True])
 @pytest.mark.parametrize("outcome", ["done", "error", "timeout", "unknown"])
+@pytest.mark.usefixtures("reliable_claim_queries")
 def test_read_ownership_through_terminal_and_deferred_paths(
     producer, consumer, ownership_copying_agent, monkeypatch, direct, outcome
 ):
@@ -941,6 +944,7 @@ def copying_native_agent(consumer, monkeypatch):
 
 
 @pytest.mark.parametrize("case", ["empty", "all_empty", "mixed", "scalar", "structured_empty", "structured_mixed"])
+@pytest.mark.usefixtures("reliable_claim_queries")
 def test_zero_byte_leaves_roundtrip_without_native_descriptors(
     producer, consumer, copying_native_agent, monkeypatch, case
 ):
@@ -1032,6 +1036,7 @@ def test_zero_byte_leaves_roundtrip_without_native_descriptors(
         "bad_spec",
     ],
 )
+@pytest.mark.usefixtures("reliable_claim_queries")
 def test_invalid_empty_tensor_metadata_rejected_before_native_calls(producer, consumer, copying_native_agent, defect):
     success, _, metadata = producer.put(
         "0", "1", "req-invalid-empty", [torch.empty((0, 2)), torch.tensor(3.0), torch.empty((1, 0))]
