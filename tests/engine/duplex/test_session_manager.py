@@ -1281,6 +1281,45 @@ async def test_control_dispatch_is_ordered_per_session_without_blocking_other_se
         assert manager.active_count() == 2
 
 
+@pytest.mark.parametrize("stop", ["shutdown", "predecessor", "tail", "failure"])
+async def test_control_queue_preserves_cancellation(stop: str) -> None:
+    async with Harness.create() as harness:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        ran: list[str] = []
+
+        async def first() -> None:
+            started.set()
+            await release.wait()
+            raise ValueError("control failed")
+
+        async def next_operation() -> None:
+            ran.append("next")
+
+        manager = harness.manager
+        predecessor = manager._run_control("sid", "first", first)
+        await started.wait()
+        tail = manager._run_control("sid", "next", next_operation)
+        # Let the tail enter its await of the predecessor before cancelling.
+        await asyncio.sleep(0)
+        if stop == "shutdown":
+            await asyncio.wait_for(manager.shutdown(), timeout=1.0)
+        elif stop == "predecessor":
+            predecessor.cancel()
+        elif stop == "tail":
+            tail.cancel()
+        else:
+            release.set()
+        await asyncio.wait_for(asyncio.gather(predecessor, tail, return_exceptions=True), timeout=1.0)
+        if stop == "failure":
+            assert ran == ["next"]
+            assert not tail.cancelled()
+        else:
+            assert predecessor.cancelled()
+            assert tail.cancelled()
+            assert ran == []
+
+
 async def test_shutdown_closes_every_runner_and_stops_dispatch_tasks() -> None:
     harness = Harness.create()
     await harness.open("sid-a")
