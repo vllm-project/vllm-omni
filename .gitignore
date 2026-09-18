@@ -246,6 +246,7 @@ datasets/
 !tests/dfx/perf/tests/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
 *.jsonl
+!tests/assets/livekit/client_vad_replay.jsonl
 *.parquet
 
 # Output files

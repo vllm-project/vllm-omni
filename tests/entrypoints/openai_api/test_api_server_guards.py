@@ -54,6 +54,7 @@ from starlette.requests import Request
 from starlette.websockets import WebSocketDisconnect
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.entrypoints.duplex import openai as duplex_openai
 from vllm_omni.entrypoints.openai import api_server
 from vllm_omni.entrypoints.serve.utils import errors as serve_errors
 
@@ -154,7 +155,6 @@ _MULTISTAGE_APP_STATE_KEYS = {
     "openai_streaming_speech",
     "openai_streaming_video",
     "openai_serving_duplex",
-    "openai_serving_realtime",
     "openai_serving_video",
     "openai_serving_realtime_robot",
     "rl_rollout_serving",
@@ -602,7 +602,7 @@ async def test_realtime_route_defaults_to_configured_duplex_handler(
         async def handle_connection(self) -> None:
             calls.append("legacy")
 
-    monkeypatch.setattr(api_server, "RealtimeConnection", lambda _websocket, _serving: _LegacyConnection())
+    monkeypatch.setattr(duplex_openai, "RealtimeConnection", lambda _websocket, _serving: _LegacyConnection())
     query_params = {} if duplex_query is None else {"duplex": duplex_query}
     websocket = SimpleNamespace(
         app=SimpleNamespace(
@@ -918,7 +918,6 @@ async def test_multistage_app_state_key_snapshot(monkeypatch) -> None:
     monkeypatch.setattr(api_server, "OmniOpenAIServingAudioGenerate", _FakeCtor)
     monkeypatch.setattr(api_server, "OmniStreamingSpeechHandler", _FakeCtor)
     monkeypatch.setattr(api_server, "create_streaming_video_handler", lambda **_k: _marker("streaming_video"))
-    monkeypatch.setattr(api_server, "OpenAIServingRealtime", _FakeCtor)
     monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeCtor)
     monkeypatch.setattr(api_server, "should_enable_duplex_endpoint", lambda *_a, **_k: False)
 

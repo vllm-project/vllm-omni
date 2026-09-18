@@ -147,6 +147,11 @@ class OmniServerParams(NamedTuple):
     use_stage_cli: bool = False
     init_timeout: int | None = None
     stage_init_timeout: int | None = None  # None: fixture supplies default (600 s)
+    # use_stage_cli only: launch each stage process only after the previous one
+    # has finished loading/profiling/warmup, instead of firing them ~2s apart.
+    # Opt in when a config colocates multiple stages on one GPU -- see
+    # OmniServerStageCli._wait_for_stage_engine_ready.
+    sequential_stage_launch: bool = False
 
 
 class OmniServer:
@@ -376,6 +381,12 @@ class OmniServer:
 class OmniServerStageCli(OmniServer):
     """Omni server harness that exercises the stage CLI flow."""
 
+    # Logged once by vllm.v1.engine.core.EngineCore._initialize_kv_caches after
+    # weight loading, GPU memory profiling, KV cache allocation, and warmup/graph
+    # capture all complete -- i.e. once the stage's GPU memory footprint is fully
+    # committed. Used by ``_wait_for_stage_engine_ready`` below.
+    _STAGE_READY_LOG_MARKER = "init engine (profile, create kv cache, warmup model) took"
+
     def __init__(
         self,
         model: str,
@@ -385,9 +396,11 @@ class OmniServerStageCli(OmniServer):
         stage_ids: list[int] | None = None,
         port: int | None = None,
         env_dict: dict[str, str] | None = None,
+        sequential_stage_launch: bool = False,
     ) -> None:
         super().__init__(model, serve_args or [], port=port, env_dict=env_dict, use_omni=True)
         self.stage_config_path = stage_config_path
+        self.sequential_stage_launch = sequential_stage_launch
         self.master_port = get_open_port()
         resolved_cfg = resolve_deploy_yaml(stage_config_path)
         # Dump the resolved deploy config so CI logs show each stage's
@@ -484,17 +497,58 @@ class OmniServerStageCli(OmniServer):
                     f"Stage {stage_id} replica {replica_id} exited with code {ret} before API server became ready.{tail}"
                 )
 
+    def _wait_for_stage_engine_ready(self, stage_id: int, replica_id: int, timeout_s: int = 600) -> None:
+        """Block until stage (stage_id, replica_id) finishes loading/profiling/warmup.
+
+        Unlike the in-process ``StageRuntime`` path (``vllm serve --omni --deploy``),
+        which holds a per-device file lock across each stage's init so stages
+        sharing a GPU profile memory one at a time (see
+        ``vllm_omni.engine.stage_init_utils.acquire_device_locks``), the stage-CLI
+        flow launches every stage as an independent OS process with no such
+        cross-process serialization. Two stages colocated on the same device can
+        then race to profile GPU memory against each other and overcommit it. This
+        waits for the previous stage's memory footprint to be fully committed
+        (weights loaded, profiled, KV cache allocated, warmup/graph capture done)
+        before the next one starts, by polling its log for the marker vLLM logs
+        once at the end of that sequence.
+        """
+        stage_key = (stage_id, replica_id)
+        log_path = self._stage_log_paths[stage_key]
+        proc = self.stage_procs[stage_key]
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            ret = proc.poll()
+            if ret is not None:
+                raise RuntimeError(
+                    f"Stage {stage_id} replica {replica_id} exited with code {ret} "
+                    f"before finishing engine init (see {log_path})"
+                )
+            if log_path.exists():
+                with open(log_path, encoding="utf-8", errors="replace") as f:
+                    if self._STAGE_READY_LOG_MARKER in f.read():
+                        return
+            time.sleep(1)
+        raise RuntimeError(
+            f"Timed out after {timeout_s}s waiting for stage {stage_id} replica {replica_id} "
+            f"to finish engine init (see {log_path})"
+        )
+
     def _start_server(self) -> None:
         startup_t0 = time.perf_counter()
         ordered_stage_ids = [0, *[stage_id for stage_id in self.stage_ids if stage_id != 0]]
 
         self._launch_stage(0, headless=False, replica_id=0)
-        time.sleep(2)
+        if self.sequential_stage_launch:
+            self._wait_for_stage_engine_ready(0, 0)
+        else:
+            time.sleep(2)
         self._ensure_stage_processes_alive()
 
         for stage_id in ordered_stage_ids[1:]:
             for replica_id in range(self.stage_replica_counts.get(stage_id, 1)):
                 self._launch_stage(stage_id, headless=True, replica_id=replica_id)
+                if self.sequential_stage_launch:
+                    self._wait_for_stage_engine_ready(stage_id, replica_id)
 
         max_wait = 1200
         start_time = time.time()
@@ -975,6 +1029,7 @@ def iter_omni_server(
                 server_args,
                 port=port,
                 env_dict=params.env_dict,
+                sequential_stage_launch=params.sequential_stage_launch,
             ) as server:
                 if model != original_model:
                     server.model = original_model
