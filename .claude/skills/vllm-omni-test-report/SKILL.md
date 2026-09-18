@@ -1,6 +1,6 @@
 ---
 name: vllm-omni-test-report
-description: Three report kinds; **default output is always HTML** unless the user explicitly asks for Markdown (.md). **Release** — `scripts/compose_full_report.py` (**Test conclusion**, Buildkite metrics, **Test Result** = Common stack + optional `--log-dir-h*` nightly-style summaries + H100/CI block, **Issue tracking** = GitHub `ci-failure` + *local test* in:title, Open bugs); use `--format markdown` only when the user wants .md or `patch_report_*.py`. **Development** — `compose_full_report.py --kind development` — same **Test Result + Open issues (stats window)** layout as release, but **drops Test conclusion + Issue tracking** and replaces **Metrics overview** with a 4-row snapshot (Outstanding DI, Open Critical Issue, merge CI result, Unassigned Open Issue). Each row turns red (`<span class="dev-snapshot-alert">`) when its threshold is breached: DI > 30; open critical issue > 0; merge CI not all passing; unassigned open issue > 0. Each H200/H800/A100 section under Test Result gets a `#### Performance Data Comparison` subsection (reuses nightly Local Test perf comparison logic; read-only against kanban `docs/assets/charts/*_history.json`; no `prepare_kanban_before_report.py` / no push). **Nightly** — `scripts/nightly_local_log_report.py` from local `nightly_jobs` (fetch: vllm-omni-local-test) plus optional latest Buildkite scheduled nightly when token is set; use `--markdown-report` / `--to-stdout markdown` only when the user asks for Markdown. **Archive (opt-in)** — when the user asks to archive/commit/push, run **`scripts/push_report_to_kanban.py`** then **`scripts/push_kanban_report.py`** (push only in the second step; **requires [gh CLI](https://cli.github.com/)**; prompt install if missing). Use when generating Buildkite release summaries, parsing local nightly_jobs with CI cross-check, or opening https://buildkite.com/vllm/vllm-omni/builds?branch=main for CI documentation.
+description: Three report kinds; **default output is always HTML** unless the user explicitly asks for Markdown (.md). **Release** — `scripts/compose_full_report.py` (**Test conclusion**, Buildkite metrics, **Test Result** = Common stack + optional `--log-dir-h*` nightly-style summaries + H100/CI block, Open bugs); use `--format markdown` only when the user wants .md or `patch_report_*.py`. **Development** — `compose_full_report.py --kind development` — same **Test Result** layout as release, but **drops Test conclusion** + the top-level Open issues section and replaces **Metrics overview** with a 3-row snapshot (Outstanding DI, Open Critical Issue, DI Top10 + CI Failure) followed by **DI Top10 + CI Failure** sub-tables and a top-level **遗留事项 (Next Steps)** action table (combined with editable Assignee/Status columns in HTML, persisted via `localStorage`). Each snapshot row turns red (`<span class="dev-snapshot-alert">`) when its threshold is breached: DI > 30; open critical issue > 0; DI Top10+CI Failure row alerts when DI > 30 or any open ci-failure issue exists. Each H200/H800/A100 section under Test Result gets a `#### Performance Data Comparison` subsection (reuses nightly Local Test perf comparison logic; read-only against kanban `docs/assets/charts/*_history.json`; no `prepare_kanban_before_report.py` / no push). **Nightly** — `scripts/nightly_local_log_report.py` from local `nightly_jobs` (fetch: vllm-omni-local-test) plus optional latest Buildkite scheduled nightly when token is set; use `--markdown-report` / `--to-stdout markdown` only when the user asks for Markdown. **Archive (opt-in)** — when the user asks to archive/commit/push, run **`scripts/push_report_to_kanban.py`** then **`scripts/push_kanban_report.py`** (push only in the second step; **requires [gh CLI](https://cli.github.com/)**; prompt install if missing). Use when generating Buildkite release summaries, parsing local nightly_jobs with CI cross-check, or opening https://buildkite.com/vllm/vllm-omni/builds?branch=main for CI documentation.
 ---
 
 # vLLM-Omni Test Report
@@ -9,8 +9,8 @@ description: Three report kinds; **default output is always HTML** unless the us
 
 | Kind | Output | When to use |
 |------|--------|-------------|
-| **release** | **HTML** (default): `compose_full_report.py` (or `--kind release`) | **Test conclusion** + **Metrics** (UT coverage is **manual-edit**, backed by `localStorage`; same pattern as development) + **Test Result** (matrix Common stack; H200/H800/A100 optional log roots; H100 = CI nightly) + **Failure Analysis** (per-GPU failure detail with interactive **Status** column — Filed / Not an issue) + **Issue tracking** (ci-failure + *local test* in:title) + **Open issues** (bugs in stats window). |
-| **development** | **HTML** (default): `compose_full_report.py --kind development` | Same **Test Result + Open issues (stats window)** layout as release, but **drops** *Test conclusion* + *Issue tracking*; **Metrics overview** is replaced with a 4-row snapshot (Outstanding DI · Open Critical Issue · **merge CI result** · **Unassigned Open Issue**) followed by the full unassigned-open-bug table. Each row turns red when its threshold is breached (see Development Quick Path below). Use when the audience is development rather than release-gating. |
+| **release** | **HTML** (default): `compose_full_report.py` (or `--kind release`) | **Test conclusion** + **Metrics** (only the **bugs (first response)** row is rendered; the `ready` / `merge` / `nightly` / `weekly` CI-category buckets and the `ut` / `ut (exclude models)` rows are dropped so the section stays focused on bug response times + the appended CI issue detection rate row + the appended operator-editable **Device-Hours / Build (7-day avg)** row — see [Device-Hours / Build (7-day avg)](#device-hours--build-7-day-avg--operator-editable-metric-row)) + **Quality Defense Radar** (per-model 5-axis coverage radar across 9 flagship models in a 3×3 grid — Qwen3-Omni, MiniCPM, Qwen-TTS, Qwen-Image, HunyuanImage, HunyuanVideo, Wan, MinimaxH3, Cosmos. Each radar carries 8 clickable segments — 2 single + 3 axes split into GPU/NPU halves of the same circle; GPU halves turn green and NPU halves turn blue on click; NPU halves also carry a dashed outline in the default state; state kept in `localStorage` and mirrored to a `data-quality-on` attribute for Save-As persistence) + **Test Result** (matrix Common stack; H200/H800/A100 optional log roots; H100 = CI nightly) + **Failure Analysis** (per-GPU failure detail with interactive **Status** column — Filed / Not an issue) + **Open issues** (open `label:bug` in stats window, narrowed to `critical` / `high priority` / `medium priority`) + **Next Steps / Outstanding Items** (manual-entry action table with **Add Item** button, persisted via `localStorage` — same implementation as the Development variant). |
+| **development** | **HTML** (default): `compose_full_report.py --kind development` | Same **Test Result** layout as release, but **drops** *Test conclusion* + the top-level *Open issues* section; **Metrics overview** is replaced with a 3-row snapshot (Outstanding DI · Open Critical Issue · **DI Top10 + CI Failure**) followed by the **DI Top10** + **CI Failure Issues** sub-tables and a top-level **遗留事项 (Next Steps)** action table (combines DI Top10 + open CI-Failure with editable **Assignee** / **Status** columns; HTML upgrades persist via `localStorage`). Each snapshot row turns red when its threshold is breached (see Development Quick Path below). Use when the audience is development rather than release-gating. |
 | **nightly** | **HTML** (default): `nightly_local_log_report.py --html-report …` | **Local** `nightly_jobs` tree (see vllm-omni-local-test) **and** optional **Buildkite** latest scheduled nightly (same log analysis as local; needs token unless `--no-buildkite`). |
 
 ## Default output (HTML)
@@ -143,16 +143,16 @@ python scripts/compose_full_report.py \
 
 ### Development Quick Path
 
-The **Development** variant shares the **Test Result** layout with `--kind release` but **drops Test conclusion + Issue tracking** and replaces **Metrics overview** with a 4-row snapshot focused on outstanding defect inventory + latest CI verdicts + unassigned-owner triage. Each H200/H800/A100 section in **Test Result** also gains a `#### Performance Data Comparison` subsection (read-only kanban usage — see below).
+The **Development** variant shares the **Test Result** layout with `--kind release` but **drops Test conclusion + Open issues + the H100 (CI — Buildkite scheduled nightly) chapter** and replaces **Metrics overview** with a 3-row snapshot focused on outstanding defect inventory + top-DI / open CI-failure triage. Each H200/H800/A100/A3 section in **Test Result** also gains a `#### Performance Data Comparison` subsection (read-only kanban usage — see below).
 
-**Document body layout (Development variant):** The Development HTML/Markdown **starts directly at the `## Metrics overview` section** — there is no leading multi-bullet descriptive preamble (no release/development comparison paragraph, no section-ordering bullet list, no CSS-class explainer). Only a single `* **Report date (UTC):** YYYY-MM-DD*` line sits between the H1 title and the first section so the date is unambiguous in the rendered output. Section ordering remains: Metrics overview → Test Result → Failure Analysis → Performance Data Comparison → **Skip Test Case Monitoring** → Open issues → **Bugfix Monitor** (last 7 days of `[Bugfix]` PRs on `vllm-project/vllm-omni`, split into Open / Closed `<details>` sub-folds, with a per-PR "needs more tests?" verdict).
+**Document body layout (Development variant):** The Development HTML/Markdown **starts directly at the `## Metrics overview` section** — there is no leading multi-bullet descriptive preamble (no release/development comparison paragraph, no section-ordering bullet list, no CSS-class explainer). Only a single `* **Report date (UTC):** YYYY-MM-DD*` line sits between the H1 title and the first section so the date is unambiguous in the rendered output. Section ordering remains: Metrics overview → Test Result → Failure Analysis → Performance Data Comparison → **Skip Test Case Monitoring** → **遗留事项 (Next Steps)**.
 
 **Skip Test Case Monitoring (Development variant):** static AST scan of `<vllm-omni>/tests/**` for pytest skips whose reason references a GitHub issue. **`Issue #` is the first column** (then Issue Title / State / Updated, then Test File / Test / Skip Mark / Skip Reason), rows are sorted by issue number, and in **HTML** every site that shares an issue number is folded under **one collapsible group row** (`▸ #N · N sites`) — click the group row or its caret to expand, or use the *Expand all* / *Collapse all* buttons above the table. All groups start collapsed. Markdown output stays a flat, Issue-#-first table. Implementation: `skip_issue_monitor.SKIP_MONITOR_HEADERS` + `release_md_to_html._group_skip_monitor_table_by_issue` / `_SKIP_GROUP_SCRIPT` (CSS in `report_html_theme.RELEASE_MARKDOWN_DOC_CSS`).
 
 Ask for or infer:
 - Buildkite token in the environment (`BUILDKITE_TOKEN` or `BUILDKITE_API_TOKEN`) — required unless using `--preview`.
 - GitHub token (`GITHUB_TOKEN` or `GH_TOKEN`) — recommended for stable issue data.
-- Optional GPU local logs: `--log-dir-h200`, `--log-dir-h800`, `--log-dir-a100` (same as release).
+- Optional GPU local logs: `--log-dir-h200`, `--log-dir-h800`, `--log-dir-a100`, `--log-dir-a3` (same as release; A3 follows the H200/H800/A100 generation pattern).
 - Optional kanban assets source for the per-GPU perf subsection: `--kanban-repo-root <vllm-omni-kanban>`. **Resolution order:** (1) explicit `--kanban-repo-root`, (2) `$KANBAN_REPO_ROOT` env var, (3) `$VLLM_OMNI_KANBAN_ROOT` env var, (4) **default `~/vllm-omni-kanban`** (if exists). Alternatively use `--perf-assets-dir <kanban>/docs/assets/charts` to directly specify the assets directory.
 - Optional output path: `--out ./vllm-omni-test-report-development-YYYY-MM-DD.html`.
 
@@ -164,7 +164,7 @@ python scripts/compose_full_report.py \
   --out ./vllm-omni-test-report-development-YYYY-MM-DD.html
 ```
 
-With optional GPU nightly summaries + perf comparison (Test Result layout is identical to `--kind release`; per-GPU `#### Performance Data Comparison` is added under H200/H800/A100 when both `--log-dir-h*` and a kanban assets source are supplied):
+With optional GPU nightly summaries + perf comparison (Test Result layout is identical to `--kind release` except the H100 / Buildkite scheduled nightly chapter is dropped; per-GPU `#### Performance Data Comparison` is added under H200/H800/A100 when both `--log-dir-h*` and a kanban assets source are supplied):
 
 ```bash
 python scripts/compose_full_report.py \
@@ -172,15 +172,17 @@ python scripts/compose_full_report.py \
   --log-dir-h200 /path/to/nightly_jobs_h200 \
   --log-dir-h800 /path/to/nightly_jobs_h800 \
   --log-dir-a100 /path/to/nightly_jobs_a100 \
+  --log-dir-a3 /path/to/nightly_jobs_a3 \
   --kanban-repo-root /path/to/vllm-omni-kanban \
   --out ./vllm-omni-test-report-development-YYYY-MM-DD.html
 ```
 
-The 4-row **Metrics overview** snapshot (per spec) is:
-1. **Outstanding DI** — sum of priority-label weights for **all** open `label:bug` issues (`critical=10` / `high priority=3` / `medium priority=1` / `low priority=0.1` / `invalid=0`); no date filter (cumulative snapshot).
+The 3-row **Metrics overview** snapshot (per spec) is:
+1. **Outstanding DI** — sum of per-issue SLO DI for **all** open `label:bug` issues using the same model as the nightly Daily focus (`DI = base × ⌈days_open / slo_days⌉`; see the **Per-issue DI formula (SLO-escalating)** table below); no date filter (cumulative snapshot).
 2. **Open Critical Issue** — count of open issues that carry **both** labels `bug` **and** `critical` (AND filter; RFC / Feature tickets tagged only with `critical` are intentionally excluded) + the first 10 issue numbers.
-3. **merge CI result (all pass / fail)** — Buildkite latest finished **merge** build (`buildkite_build_stats.fetch_latest_finished_merge_build`); "✅ All pass" iff every reportable job (excluding `Upload * Pipeline`) is `passed`.
-4. **Unassigned Open Issue** — count of open `label:bug` issues with empty `assignees[]`, followed by the full Markdown table of those issues (Issue · Title · Opened at · Priority · DI · Status).
+3. **DI Top10 + CI Failure** — replaces the former "Unassigned Open Issue" row. The cell summarises the **top 10 open `label:bug` issues ranked by DI** (SLO-escalating model, same as nightly Daily focus) and **all open `label:bug` + `label:ci-failure` issues**. Full tables render immediately below the snapshot under `### DI Top10 (SLO-escalating: ...)` and `### CI Failure Issues (...)`.
+
+> The previous **merge CI result** and **nightly CI result** rows (Buildkite latest finished merge / scheduled nightly) were removed in this revision. The development variant drops the H100 / Buildkite scheduled nightly chapter from **Test Result** entirely; H100 still appears in the release variant under Test Result.
 
 **Red-alert rules** (each row's cell is wrapped in `<span class="dev-snapshot-alert">…</span>` so it renders red via `.release-doc .dev-snapshot-alert` in `release_html_theme.RELEASE_MARKDOWN_DOC_CSS`):
 
@@ -188,8 +190,7 @@ The 4-row **Metrics overview** snapshot (per spec) is:
 |-----|---------|
 | Outstanding DI | DI > 30 (i.e. `total_tenths > BUG_DI_THRESHOLD_TENTHS = 300` tenths) |
 | Open Critical Issue | open `bug` + `critical` count > 0 |
-| merge CI result | latest finished merge build is not all passing |
-| Unassigned Open Issue | count > 0 |
+| DI Top10 + CI Failure | total DI > 30 OR any open `label:bug` + `label:ci-failure` exists |
 
 #### Performance Data Comparison — collapsible per-GPU subsections
 
@@ -207,7 +208,12 @@ Each GPU subsection (e.g., `#### H200`) is rendered as a collapsible `<details>`
 
 If a GPU has no `--log-dir-h*` the subsection is omitted entirely (no placeholder). If kanban assets are missing the subsection renders a one-line skip note (`"*--kanban-repo-root / --perf-assets-dir not provided — skipping perf baseline comparison …*"`); it never blocks report generation.
 
-After **Test Result** the report also includes **`## Open issues (stats window)`** (same layout and same data source as the release variant: paginated `GET /repos/vllm-project/vllm-omni/issues?state=open&labels=bug`, filtered to `created_at` UTC date in `--stats-from`..`--stats-to`).
+After **Skip Test Case Monitoring** the report includes **`## 遗留事项 (Next Steps)`** (top-level, replaces the release variant's *Open issues* section) — a single action table combining:
+
+- all issues in **DI Top10** (top-10 open `label:bug` ranked by DI, SLO-escalating model) and
+- all open issues with both `label:bug` + `label:ci-failure` (de-duplicated against DI Top10).
+
+Columns: **Issue** (link) · **Title** · **Priority** · **DI** · **Assignee** · **Status**. In HTML the **Assignee** column becomes an inline editable input (click to edit; persisted via `localStorage`) and the **Status** column becomes a `<select>` with options `Open / In Progress / Blocked / Won't fix / Fixed`. Markdown output keeps `—` placeholders. Implementation: `compose_full_report.render_next_steps_section` / `NEXT_STEPS_HEADERS` / `NEXT_STEPS_STATUS_OPTIONS` + `release_md_to_html._upgrade_next_steps_cells` / `_NEXT_STEPS_ACTION_SCRIPT` (CSS in `report_html_theme.RELEASE_MARKDOWN_DOC_CSS`).
 
 Preview-only (no Buildkite / GitHub / pytest calls): `--preview --kind development` writes `vllm-omni-test-report-development-preview-YYYY-MM-DD.html` (default). The per-GPU subsections are shown as placeholder notes in preview mode; remove `--preview` to populate from real data.
 
@@ -253,6 +259,41 @@ python scripts/nightly_local_log_report.py \
 
 Other flags: `--title`, `--buildkite-build`, `--kanban-repo-root`, `--kanban-assets-dir` (required for the Days failing column — see Nightly Quick Path), `--kanban-raw-root`, `--kanban-refresh-from-raw`, `--kanban-expected-remote`, `--kanban-expected-branch`. **Markdown** (only if the user explicitly asks): `--markdown-report`, `--to-stdout markdown`. See `python scripts/nightly_local_log_report.py --help`.
 
+**Daily focus DI card (SLO-escalating model):** The nightly Daily focus HTML grid now includes an **`Outstanding DI`** card as the 5th focus tile, mirroring the development snapshot's first row with a **time-based** SLO-escalation formula. The calculation lives in `nightly_local_log_report.py::_compute_outstanding_di(gh_token)` and is fully decoupled from the development-snapshot implementation in `compose_full_report.py`.
+
+**Source:** paginated `GET /repos/vllm-project/vllm-omni/issues?state=open&labels=bug&per_page=100&page=…` (PRs excluded). Requires `GITHUB_TOKEN` / `GH_TOKEN` env var; if absent the call falls back to unauthenticated REST (more aggressively rate-limited but still functional — the card degrades to `0 open bug(s)` if the API blocks the request). `_resolve_github_token()` reads both env names in order.
+
+**Per-issue DI formula (SLO-escalating):**
+
+| priority         | base | SLO (days) | order |
+|------------------|------|------------|-------|
+| critical         | 10.0 | 1          | 0     |
+| high priority    | 3.0  | 5          | 1     |
+| medium priority  | 1.0  | 10         | 2     |
+| low priority     | 0.1  | 14         | 3     |
+| invalid          | 0.0  | —          | 4     |
+
+For each open issue:
+1. **Highest-priority** label wins (invalid → DI=0, unlabelled → DI=0).
+2. **DI = base × ⌈days_open / slo_days⌉**, where `days_open` is the number of full days from `issue.created_at` (UTC) to report-time. `⌈·⌉` is `math.ceil`; the per-issue DI is always ≥ 0 — for a freshly created bug `days_open = 0` ⇒ DI = 0 (no SLO fully elapsed yet).
+
+Total Outstanding DI = sum of per-issue DI across all open bugs. **Severity** flips to `focus-card--fail` when the total > 30 (matches the development-snapshot red-alert rule: "DI > 30 ⇒ Pass becomes Fail").
+
+**Example ladder for a `critical` issue (SLO = 1 day):**
+
+| days_open (since `created_at`) | ⌈days/SLO⌉ | per-issue DI |
+|--------------------------------|------------|--------------|
+| 0                              | 0          | 0            |
+| 0.5                            | 1          | 10           |
+| 1.0                            | 1          | 10           |
+| 1.001                          | 2          | 20           |
+| 2.0                            | 2          | 20           |
+| 3.0                            | 3          | 30           |
+
+**Card value:** decimal string, trailing zeros stripped (e.g. `12.3`, `0`, `110`). **Card detail:** `N open bug(s); critical=K, high priority=K, medium priority=K, low priority=K; top: priority(DI=X, Nd), priority2(DI=Y, Md), priority3(DI=Z, Kd)...` — the per-issue snippet is sorted by DI descending.
+
+The DI card is implemented in `nightly_local_log_report.py` via `_compute_outstanding_di(gh_token)` + `_render_focus_metric_card("Outstanding DI", …)` in `_render_daily_focus_html`, and the matching `- **Outstanding DI**: \`X\` — N open bug(s); …` line in `_append_daily_focus_markdown` (with a `(alert)` suffix when the total > 30). Both branches share the same `_resolve_github_token()` helper that reads `GITHUB_TOKEN` / `GH_TOKEN` from the process env.
+
 ## Release report (Buildkite, HTML)
 
 **Automated (recommended):** from **this** skill directory with `BUILDKITE_TOKEN` or `BUILDKITE_API_TOKEN` set:
@@ -279,12 +320,13 @@ python scripts/compose_full_report.py --format markdown --out ./vllm-omni-test-r
 
 Generate a **human-readable test report** ordered as:
 
-1. **Test conclusion** — Checklist table: only **UT coverage…**, **requirements**, and **performance** (3 items) are manual **Pass / Fail** in HTML; **Latest L2&L3 pass rate is 100%**, **Remaining DI < 30**, **No remaining critical issues**, and **All remaining bugs have assignees** are **automatic** (Buildkite: same **ready** (non-main) and **merge** (main non-nightly/weekly) latest **finished** builds as Metrics — any `failed`/`broken` job fails the row; GitHub: open **`label:bug`** whose `created_at` ≤ `--stats-to` (start date unbounded; issues created after the stats window are excluded) weighted by priority labels **DI < 30**; **no** open **`critical`**; open **`label:bug`** all have **assignee**). Archive/plain Markdown matches HTML.
-2. **Metrics overview** — `buildkite_build_stats.py --markdown` generates the main table (**Success rate**, **Bug avg first response**, aligned with **`--stats-from`..`--stats-to`**). The **UT coverage** rows (`ut` and `ut (exclude models)`) are **manual-edit** cells (click the cell to enter the coverage value; persisted in `localStorage` via the same `ut-coverage-modal` as the Development variant). This replaces the previous auto-computed `ut` / `ut (exclude models)` rows from `buildkite_build_stats.py`.
+1. **Test conclusion** — Checklist table: only **UT coverage…**, **requirements**, **performance**, and **NPU CI** (4 items) are manual **Pass / Fail** in HTML; **Latest GPU CI(L1-L5) pass rate is 100%**, **Remaining DI < 30**, and **No remaining critical issues** are **automatic** (Buildkite: same **ready** (non-main) and **merge** (main non-nightly/weekly) latest **finished** builds as Metrics — any `failed`/`broken` job fails the row; GitHub: open **`label:bug`** whose `created_at` ≤ `--stats-to` (start date unbounded; issues created after the stats window are excluded) weighted by priority labels **DI < 30**; **no** open **`critical`**). Archive/plain Markdown matches HTML.
+2. **Metrics overview** — `buildkite_build_stats.py --markdown` generates the main table (Bug avg first response, aligned with **`--stats-from`..`--stats-to`**). The release Metrics overview intentionally drops the CI-category buckets (`ready` / `merge` / `nightly` / `weekly`) and the `ut` / `ut (exclude models)` rows so the section stays focused on bug response times — only the **`bugs (first response, …)`** row is rendered from the upstream script. Below that, `compose_full_report.append_ci_issue_detection_rate_row` adds a **CI issue detection rate** row (share of bugs in the stats window that carry the `ci-failure` label), and `compose_full_report._append_device_hours_build_row` adds a final **Device-Hours / Build (7-day avg)** row whose value is operator-editable — see [Device-Hours / Build (7-day avg)](#device-hours--build-7-day-avg--operator-editable-metric-row) below.
 3. **Test Result** — `### Common stack (all rows)` from [references/local-test-matrix.md](references/local-test-matrix.md); `### H200` / `### H800` / `### A100` use the same grouped tables as nightly local **Summary** (pass `--log-dir-h200` / `--log-dir-h800` / `--log-dir-a100`; directories must match [references/nightly-local-log-layout.md](references/nightly-local-log-layout.md)); `### H100 (CI — Buildkite scheduled nightly)` includes **Build** (build number/branch/commit), reportable job **Summary**, **Failed test jobs** (**excludes** per-job pytest detail and **Analysis (CI Failure)**; maintain separately via hand edits or `nightly_job_pytest_table.py` / `patch_report_ci_failure.py` when needed).
 4. **Failure Analysis** — Top-level section with one collapsible subsection per GPU (H200 / H800 / A100 from local nightly logs; H100 from Buildkite scheduled nightly). Each failure table has an interactive **Status** column with two buttons — **Filed** / **Not an issue** — backed by `localStorage`. Clicking **Filed** opens an in-page modal where the user enters the GitHub issue number (and an optional note); the cell renders as `Filed #<n>` with a link to the GitHub issue. Clicking **Not an issue** opens the same modal with the issue-number field hidden so the user can record an optional note. The modal has its own **Save** / **Cancel** / **Reset** buttons; Esc closes it (iframe-safe). State is keyed by the row's `data-row-id` (derived from the nearest preceding section heading + row index) so reloads keep the chosen status. Mirrors the Development variant's Failure Analysis layout.
-5. **Issue tracking** — GitHub Search: `label:ci-failure`, **title** contains **`local test`**, `created` within the stats window (same date range as metrics).
-6. **Open issues (stats window)** — Paginated **`label:bug`**, **open**, `created_at` UTC date in **`--stats-from`..`--stats-to`**; precompute daily DI from the same issues: `critical` = 10, `high priority` = 3, `medium priority` = 1, `low priority` = 0.1, `invalid` = 0 — sum feeds the **Remaining DI < 30** auto row. The table ends with two **manual triage** columns shared by the release *and* development variants: **Follow-up action** (HTML `<select>`: *Fix in a later iteration* / *Blocked by dependency* / *Won't fix (evaluated)*; empty = not set) and **Remarks** (click the cell to open an inline textarea; Save / Cancel, Ctrl+Enter saves, Esc cancels). Both persist in `localStorage` keyed by the row's **issue number** (`open-issue-followup:#N` / `open-issue-note:#N`), so triage survives report regeneration and is shared between the two report kinds. Markdown output keeps `—` placeholders. Implementation: `compose_full_report.OPEN_ISSUES_HEADERS` + `release_md_to_html._upgrade_open_issue_action_cells` / `_OPEN_ISSUE_ACTION_SCRIPT` (CSS in `report_html_theme.RELEASE_MARKDOWN_DOC_CSS`).
+5. **Open issues (stats window)** — Paginated **`label:bug`**, **open**, `created_at` UTC date in **`--stats-from`..`--stats-to`**, further filtered to issues whose highest-priority label is `critical` / `high priority` / `medium priority` (drops `low priority`, `invalid`, and unlabelled-priority bugs; the **Remaining DI < 30** auto row is intentionally **not** narrowed — it sums across every open `label:bug` issue via `slo_open_bug_di_total` to preserve the existing threshold semantics). Precompute daily DI from the same issues: `critical` = 10, `high priority` = 3, `medium priority` = 1, `low priority` = 0.1, `invalid` = 0. The table ends with two **manual triage** columns shared by the release *and* development variants: **Follow-up action** (HTML `<select>`: *Fix in a later iteration* / *Blocked by dependency* / *Won't fix (evaluated)*; empty = not set) and **Remarks** (click the cell to open an inline textarea; Save / Cancel, Ctrl+Enter saves, Esc cancels). Both persist in `localStorage` keyed by the row's **issue number** (`open-issue-followup:#N` / `open-issue-note:#N`), so triage survives report regeneration and is shared between the two report kinds. Markdown output keeps `—` placeholders. Implementation: `compose_full_report.OPEN_ISSUES_HEADERS` + `OPEN_ISSUES_RELEASE_PRIORITIES` (the priority filter set) + `github_open_bug_rows_in_range(..., priority_filter=)` + `release_md_to_html._upgrade_open_issue_action_cells` / `_OPEN_ISSUE_ACTION_SCRIPT` (CSS in `report_html_theme.RELEASE_MARKDOWN_DOC_CSS`).
+6. **Next Steps (Outstanding Items)** — Manual-entry action table for the **release** variant. Three columns (**Item** / **Assignee** / **Status**) plus a per-row delete button, seeded with a single placeholder row. Click **Add Item** below the table to append a row; every cell is inline-editable in HTML (`<input>`). All edits persist via `localStorage` keyed by `outstanding-items:<row-uuid>`, surviving report regeneration and reloads on the same origin. H2 appears between Open issues and Data source so it matches the Development variant's ordering; `_release_section_theme` substring match (`"outstanding items"`) auto-applies the `--outstanding` card theme (clipboard SVG + red accent). Implementation: `compose_full_report.render_next_steps_section()` (already used by the Development variant) + `release_md_to_html._upgrade_next_steps_outstanding_cells` / `_NEXT_STEPS_OUTSTANDING_SCRIPT` (already injected unconditionally for both variants).
+7. **Quality Defense Radar** — **Release variant only**. A 3×3 CSS Grid of nine inline SVG radars / pentagons — one per flagship model: **Qwen3-Omni, MiniCPM, Qwen-TTS, Qwen-Image, HunyuanImage, HunyuanVideo, Wan, MinimaxH3, Cosmos**. Each radar has **5 axes** (Functionality / Performance / Documentation / Stability / Reliability) arranged clockwise from the top. Three of them (Functionality / Performance / Stability) are split into **GPU + NPU halves of the same circle**, so the GPU half and the NPU half share one circle but are independently clickable; Documentation and Reliability are single full circles. Each radar therefore carries **8 clickable segments** (`func-gpu` / `func-npu` / `perf-gpu` / `perf-npu` / `doc` / `stab-gpu` / `stab-npu` / `rel`), giving **72 clickable targets** across the 9-model grid (segment keys are namespaced as `<model-id>:<segment-id>`). GPU and NPU are visually distinguished three ways so reviewers can tell them apart at a glance: (1) **GPU halves carry a solid outline, NPU halves carry a dashed outline** in the default gray state; (2) on click, **GPU halves turn green** (`#4ade80` fill, `#22c55e` stroke) and **NPU halves turn blue** (`#7dd3fc` fill, `#0284c7` stroke); (3) each split segment carries a `data-qd-side="gpu"|"npu"` attribute for CSS targeting. State is mirrored to a `data-quality-on="1"|"0"` attribute on each `<g>` (so `Ctrl+S` Save-Page-As preserves state across origins) **and** to `localStorage["quality-defense:<model>:<segment-id>"]` for reload persistence; an in-memory `mem = {}` fallback covers Chrome `file://` reloads. H2 appears right after the **Metrics overview** section (and before Test Result); `_release_section_theme` substring match (`"quality defense"` / `"quality radar"`) auto-applies the `--quality-defense` card theme (shield SVG + green accent). Keyboard support: focus a segment via Tab, press Space / Enter to toggle. Implementation: `compose_full_report.render_quality_defense_section()` + `release_md_to_html._upgrade_quality_defense_block` / `_quality_defense_block_html()` (per-model SVG generator with `_qd_model_radar_svg` / `_QUALITY_DEFENSE_MODELS`) + `_QUALITY_DEFENSE_SCRIPT` + CSS in `report_html_theme.RELEASE_MARKDOWN_DOC_CSS` (`.qd-grid`, `.qd-cell`, `.qd-radar`, `.qd-half`, `.qd-circle`, `.qd-segment[data-qd-side="..."][data-quality-on="1"]`).
 
 ## When to Apply
 
@@ -293,7 +335,7 @@ Generate a **human-readable test report** ordered as:
 - User wants to summarize failures, flaky steps, or duration from Buildkite
 - User needs **Common stack** or optional **H200/H800/A100** nightly log summaries in the **release** report — set **`--log-dir-h*`** on `compose_full_report.py` when logs are available
 - User asks for **nightly** report from **local** `nightly_jobs` — **default to HTML** (`nightly_local_log_report.py --html-report`); Markdown **only** if they explicitly ask (`fetch` in vllm-omni-local-test)
-- User asks for a **development** / **dev** variant of the test report (or wants to skip Test conclusion + Issue tracking and focus on outstanding defects / latest CI verdicts / unassigned owners) — `compose_full_report.py --kind development`; same Test Result layout as release
+- User asks for a **development** / **dev** variant of the test report (or wants to skip Test conclusion and focus on outstanding defects / latest CI verdicts / unassigned owners) — `compose_full_report.py --kind development`; same Test Result layout as release
 - User asks to **archive / commit / push** the report to [vllm-omni-kanban](https://github.com/hsliuustc0106/vllm-omni-kanban) — run [references/kanban-report-archive.md](references/kanban-report-archive.md) **after** HTML is written
 
 ## Definitions
@@ -314,7 +356,7 @@ Generate a **human-readable test report** ordered as:
 
 **Test Result (Common stack):** Maintain **`## Common stack (all rows)`** in [references/local-test-matrix.md](references/local-test-matrix.md); H200/H800/A100 sections depend on synced `nightly_jobs` paths passed to `compose_full_report.py` via **`--log-dir-h*`**.
 
-**Metrics overview, H100 (CI), Issue tracking, Open issues:** See Steps 2–3 below; **nightly** HTML uses only the **Nightly report** section at the top of this doc.
+**Metrics overview, H100 (CI), Open issues:** See Steps 2–3 below; **nightly** HTML uses only the **Nightly report** section at the top of this doc.
 
 ### Step 1: Resolve the target build (CI testing)
 
@@ -380,11 +422,11 @@ python scripts/nightly_job_pytest_table.py --build 4708
 
 Paste the emitted **Per-job test execution (pytest)** table where needed. The script **skips** `Upload * Pipeline` jobs.
 
-### Step 2c: Metrics overview (success rate and average duration)
+### Step 2c: Metrics overview (bug avg first response)
 
 1. From the skill directory, run [scripts/buildkite_build_stats.py](scripts/buildkite_build_stats.py) with `BUILDKITE_TOKEN` or `BUILDKITE_API_TOKEN` set. Optional `GITHUB_TOKEN` (or `GH_TOKEN`) for the **Bug avg first response** column. The script uses `requests` (`pip install requests` if needed).
 2. Optional: pass `--from` / `--to` as `YYYY-MM-DD` (UTC, inclusive) for a custom window. If **both are omitted**, the script uses **the current UTC calendar month through today** (month-to-date). To override one past month, pass both dates (e.g. `--from 2025-01-01 --to 2025-01-31`).
-3. Add `--markdown` to print a ready-to-paste **Metrics overview** block: Source line plus CI category table (**Success rate/UT coverage**; **Bug avg first response** on **bugs (first response, YYYY-MM-DD..YYYY-MM-DD)** row from GitHub - same date window as **`--from` / `--to`**; **ut** / **ut (exclude models)** from **Simple Unit Test** log parsing - implementation detail stays in `buildkite_build_stats.py`, not in the pasted report prose).
+3. Add `--markdown` to print a ready-to-paste **Metrics overview** block: Source line plus the full metrics table (**Success rate/UT coverage**; **Bug avg first response** on **bugs (first response, YYYY-MM-DD..YYYY-MM-DD)** row from GitHub - same date window as **`--from` / `--to`**; **ut** / **ut (exclude models)** from **Simple Unit Test** log parsing - implementation detail stays in `buildkite_build_stats.py`, not in the pasted report prose). The release Metrics overview filters out the **CI category** rows (`ready` / `merge` / `nightly` / `weekly`) and the **`ut`** / **`ut (exclude models)`** rows so only the **`bugs (first response, …)`** row remains; the **CI issue detection rate** row is appended below it (see Step 2d).
 
 ```bash
 pip install requests   # if not already installed
@@ -393,7 +435,7 @@ python scripts/buildkite_build_stats.py --markdown
 # python scripts/buildkite_build_stats.py --from YYYY-MM-DD --to YYYY-MM-DD --markdown
 ```
 
-4. Paste the full script output (the `## Metrics overview` section through the main metrics table, including **ut**, **ut (exclude models)**, and **bugs (first response, ...)** rows) into the report as the **first** body section (immediately after the report title). **Do not** hand-edit numbers or coverage; they must match the script run.
+4. Paste the full script output (the `## Metrics overview` section through the main metrics table — the release report drops `ready` / `merge` / `nightly` / `weekly` / `ut` / `ut (exclude models)` rows via `compose_full_report.replace_ut_coverage_with_manual_edit`, leaving only `bugs (first response, ...)`; the `append_ci_issue_detection_rate_row` row is appended below; the `_append_device_hours_build_row` row is appended last — see [Device-Hours / Build (7-day avg)](#device-hours--build-7-day-avg--operator-editable-metric-row)). **Do not** hand-edit numbers or coverage; they must match the script run.
 
 See [references/buildkite-api.md](references/buildkite-api.md) for how builds are classified into **ready** / **merge** / **nightly** buckets.
 
@@ -404,6 +446,74 @@ See [references/buildkite-api.md](references/buildkite-api.md) for how builds ar
 3. Optional: `GITHUB_TOKEN` / `GH_TOKEN` in the environment for higher rate limits (do not paste tokens into chat).
 4. Add **#### Analysis (CI Failure)** (optional hand section; **not** generated by `compose_full_report.py`) with columns **Issue #** | **Title** | **Status** (`Open` / `Closed`). If none match, state that explicitly.
 5. **compose_full_report.py** does **not** emit this subsection; use `scripts/patch_report_ci_failure.py` on a hand-maintained `.md` if you need it inside a report file.
+
+### Step 2e: Device-Hours / Build (7-day avg) — operator-editable metric row
+
+The release Metrics overview always ends with a final row whose first column
+reads **`**Device-Hours / Build (7-day avg)**`** and whose **Success rate/UT
+coverage** cell is a stub — the report does **not** compute this number
+itself. Compute-burn lives in a separate spreadsheet; rather than wire the
+source into the report (which would tie the script to that sheet's format),
+the cell ships as a manually-editable input and persists in `localStorage`.
+
+**How it shows up**
+
+* **Markdown export** (`.md`, generated by `--format markdown`): the cell is
+  rendered as the literal marker text `@@DEVICE_HOURS_PER_BUILD_CELL@@` so
+  the round-trip is stable and visible in a plain text diff. To fill the
+  value in Markdown, replace the marker with the chosen value (for example
+  `132.4 h`) before publishing the `.md`.
+* **HTML export** (default): the marker is replaced at render time by an
+  inline `<input class="dhpb-input">` whose `placeholder` reads
+  `click to fill (e.g. 132.4 h)`. Click the cell, type the value, press
+  Tab/Enter. The input keeps the value while you type (no submit step) and
+  mirrors it to a `data-dhpb-value` attribute so a browser *Save Page As*
+  download captures the user's edits across origins.
+
+**Persistence**
+
+| Storage | Key | Use |
+|---------|-----|-----|
+| `data-dhpb-value` attribute on the `<input>` | inline DOM | Survives Save-Page-As download (preferred source on reload) |
+| `localStorage` | `"device-hours-per-build"` | Survives reload / re-open on the same origin |
+| in-memory `mem` | (transient, per-page-load) | Fallback when `localStorage` throws (Chrome `file://`) |
+
+**Implementation**
+
+* `compose_full_report._append_device_hours_build_row` — appends the row
+  beneath the CI issue detection rate row with the marker placeholder.
+* `compose_full_report.DEVICE_HOURS_PER_BUILD_MARKER` — the literal
+  marker string (`@@DEVICE_HOURS_PER_BUILD_CELL@@`).
+* `release_md_to_html._upgrade_device_hours_cell` — substitutes the
+  marker for the editable `<input>` during HTML conversion.
+* `release_md_to_html._DEVICE_HOURS_BUILD_SCRIPT` — JS handler that wires
+  the input to `localStorage["device-hours-per-build"]`, mirrors the value
+  to the `data-dhpb-value` attribute on every input/blur, and reads the
+  attribute on hydration so a saved copy retains the value across origins.
+* `report_html_theme.RELEASE_MARKDOWN_DOC_CSS` — `.release-doc .dhpb-input*`
+  styles (dashed border, accent on focus, solid border once persisted).
+
+**Verification**
+
+```bash
+PYTHONPATH=scripts python3 - <<'PY'
+from compose_full_report import (
+    _append_device_hours_build_row, DEVICE_HOURS_PER_BUILD_MARKER,
+    append_ci_issue_detection_rate_row, replace_ut_coverage_with_manual_edit,
+)
+sample = '''
+| CI category | Success rate/UT coverage | Avg duration | Other finished count | Bug avg first response |
+|-------------|--------------------------|--------------|----------------------|------------------------|
+| bugs (first response, 2026-08-01..2026-09-01) | - | - | - | 12.3h |
+'''
+out = append_ci_issue_detection_rate_row(
+    replace_ut_coverage_with_manual_edit(sample), None, "2026-08-01", "2026-09-01"
+)
+assert DEVICE_HOURS_PER_BUILD_MARKER in out
+assert "Device-Hours / Build (7-day avg)" in out
+print(out)
+PY
+```
 
 ### Step 3: Fetch **all** open bug issues (paginated), filter by stats window
 
@@ -424,7 +534,6 @@ Use the **Report structure** below when assembling manually. Fill:
 - **Test conclusion** — Checklist table + Go/Rejected (interactive HTML; Markdown static default Go)
 - **Metrics overview** from Step 2c — immediately after **Test conclusion**
 - **Test Result** — Common stack from [references/local-test-matrix.md](references/local-test-matrix.md); H200/H800/A100 nightly-style grouped tables (when log dirs exist); **H100** embeds **Build** (build link, branch, commit only), Summary, failed table (excludes Step 2b pytest, Step 2d **Analysis (CI Failure)**)
-- **Issue tracking** — GitHub Search: `label:ci-failure`, title contains **`local test`**, `created` in stats window
 - *(Optional)* **Test content (job scope)** — not generated by compose; use `patch_report_scope_local.py` or hand-author
 - **Open issues** from Step 3
 - **Unknown** if data was incomplete
@@ -439,11 +548,11 @@ Hand-authored or review-only; automation emits the same sections in HTML by defa
 ## Test conclusion
 
 | Check item | Result |
-| ... | Pass / Fail (HTML: **UT, requirements, performance, DI** clickable; **L2&L3 / critical issues / bug assignees** three rows auto-locked; **Test conclusion:** Go or Rejected) |
+| ... | Pass / Fail (HTML: **UT, requirements, performance, NPU CI** clickable; **GPU CI / critical issues / bug assignees** three rows auto-locked; **Test conclusion:** Go or Rejected) |
 
 ## Metrics overview
 
-(`buildkite_build_stats.py --markdown`, aligned with `--stats-from`..`--stats-to`. UT coverage rows are **manual-edit** cells in HTML — click to enter value, persisted via `localStorage`.)
+(`buildkite_build_stats.py --markdown`, aligned with `--stats-from`..`--stats-to`. The release report keeps only the **`bugs (first response, ...)`** row from the upstream table; the `ready` / `merge` / `nightly` / `weekly` CI-category buckets and the `ut` / `ut (exclude models)` rows are dropped via `compose_full_report.replace_ut_coverage_with_manual_edit`. `append_ci_issue_detection_rate_row` appends a **CI issue detection rate** row beneath it.)
 
 ## Test Result
 
@@ -487,13 +596,6 @@ Per-machine failure detail. Click the *Failed* cell in the Test Result summary t
 
 #### H100 (CI — Buildkite scheduled nightly) failures
 (Buildkite failed/broken steps with interactive **Status** column.)
-
-## Issue tracking
-
-**Filter:** `label:ci-failure` + **`local test` in:title** + `created` in stats window.
-
-| Issue | Title | State | Created (UTC date) |
-|-------|-------|-------|---------------------|
 
 ## Open issues (stats window)
 

@@ -1,15 +1,15 @@
 ---
 name: buildkite-ci-daily-analysis
-description: "Fetch yesterday's Buildkite builds (in **Beijing Time, CST, UTC+8**) for vllm-omni and vllm-omni-npu-ci pipelines (the default date window is the previous full CST calendar day, 00:00 — 23:59 CST) and analyze per-job and per-build success/failure and duration (with default infra-job filtering for `:pipeline: init`, `:docker: Build image`, `:buildkit: Build and Push`, `:github: Resolve skip-ci`, `Upload … Pipeline`, `Collect results`), then emit an HTML report with interactive **Pipeline**, **Branch**, **CI**, **State**, and **Job Name** filter dropdowns plus a **CI Aggregate** panel broken down by `ready` / `merge` / `nightly` / `weekly` buckets × pipeline (each card has both job-level and build-level stats). **Default output is always an HTML file** unless the user explicitly asks for Markdown or JSON. When the user explicitly says '归档报告' (or 'archive' / '提交报告' / 'push report'), copy the report to `vllm-omni-kanban/data/ci_monitor/`, commit it, and push to `origin`. Use when the user says 'daily CI analysis', 'today's CI jobs', 'nightly status', 'CI health check', '今日 CI 分析', '今日 job 分析', '今日 build 分析', 'Buildkite 当日分析', or '归档报告'."
+description: "Fetch yesterday's Buildkite builds (in **Beijing Time, CST, UTC+8**) for vllm-omni, vllm-omni-npu-ci, and vllm-omni-amd-ci pipelines (the default date window is the previous full CST calendar day, 00:00 — 23:59 CST) and analyze per-job and per-build success/failure and duration (with default infra-job filtering for `:pipeline: init`, `:docker: Build image`, `:buildkit: Build and Push`, `:github: Resolve skip-ci`, `Upload … Pipeline`, `Collect results`), then emit an HTML report with interactive **Pipeline**, **Branch**, **CI**, **State**, and **Job Name** filter dropdowns plus a **CI Aggregate** panel broken down by `ready` / `merge` / `nightly` / `weekly` buckets × pipeline (each card has both job-level and build-level stats). **Default output is always an HTML file** unless the user explicitly asks for Markdown or JSON. When the user explicitly says '归档报告' (or 'archive' / '提交报告' / 'push report'), copy the report to `vllm-omni-kanban/data/ci_monitor/`, commit it, and push to `origin`. Use when the user says 'daily CI analysis', 'today's CI jobs', 'nightly status', 'CI health check', '今日 CI 分析', '今日 job 分析', '今日 build 分析', 'Buildkite 当日分析', or '归档报告'."
 ---
 
 # Buildkite Daily CI Analysis
 
 Analyze **yesterday's** Buildkite builds in **Beijing Time (CST, UTC+8)**
-across `vllm-omni` and `vllm-omni-npu-ci` and emit a self-contained HTML
-report with interactive **Pipeline** / **Branch** / **CI** / **State** /
-**Job Name** filter dropdowns plus a **CI Aggregate** panel broken down by
-`ready` / `merge` / `nightly` / `weekly`.
+across `vllm-omni`, `vllm-omni-npu-ci`, and `vllm-omni-amd-ci` and emit a
+self-contained HTML report with interactive **Pipeline** / **Branch** /
+**CI** / **State** / **Job Name** filter dropdowns plus a **CI Aggregate**
+panel broken down by `ready` / `merge` / `nightly` / `weekly`.
 
 > **Why "yesterday" by default?** "Yesterday" is interpreted in **Beijing
 > Time (CST)** — i.e. the previous full CST calendar day, 00:00 — 23:59 CST,
@@ -26,7 +26,7 @@ report with interactive **Pipeline** / **Branch** / **CI** / **State** /
 
 ## What this skill does
 
-For each pipeline (`vllm-omni` and `vllm-omni-npu-ci`), the script:
+For each pipeline (`vllm-omni`, `vllm-omni-npu-ci`, `vllm-omni-amd-ci`), the script:
 
 1. Fetches every build created in the requested **CST calendar day**,
    which maps to UTC `(date-1) 16:00 UTC` → `date 15:59:59 UTC` (default:
@@ -75,7 +75,7 @@ styled tables) consistent with the vllm-omni test report suite and the
 
 ## Usage
 
-### Default: yesterday CST, both pipelines, HTML file
+### Default: yesterday CST, all pipelines, HTML file
 
 ```bash
 export BUILDKITE_API_TOKEN="..."
@@ -224,11 +224,18 @@ fields (logic adapted from the `vllm-omni-test-report` skill):
 |------------|------|
 | `ready`    | `branch != "main"` |
 | `merge`    | `branch == "main"`, ordinary run, not scheduled nightly / weekly |
-| `nightly`  | `branch == "main"` AND (`source == "schedule"` OR message contains `"nightly"` OR (`"scheduled"` AND `"build"` in message)), excluding scheduled weekly |
-| `weekly`   | `branch == "main"` AND message matches `scheduled\s+weekly` (regex, case-insensitive) |
+| `nightly`  | `branch == "main"` AND `source == "schedule"` AND message contains `"nightly"`, excluding scheduled weekly |
+| `weekly`   | `branch == "main"` AND `source == "schedule"` AND message contains `"weekly"` |
 
 The `weekly` check runs before `nightly`, so a `"Scheduled weekly"`
 build is never double-counted as nightly.
+
+> **AND, not OR (revised).** Both `nightly` and `weekly` require **both**
+> `source == "schedule"` **and** the matching keyword in the message. The
+> previous OR-based heuristics mis-bucketed webhook/PR builds whose commit
+> title merely mentioned "nightly" (e.g. "Add experimental AMD MI300
+> nightly lane") as nightly. Only a true scheduled run (`source ==
+> "schedule"`) whose message carries the keyword counts.
 
 ## Output naming (required)
 

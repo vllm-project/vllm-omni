@@ -702,63 +702,6 @@ def _fmt_pct(value: float | None) -> str:
     return f"{sign}{value:.2f}%"
 
 
-def _as_markdown(summary: dict[str, Any]) -> str:
-    if summary.get("status") != "ok":
-        return f"*{summary.get('message') or 'No performance rows available.'}*"
-
-    def _md_cell(value: Any) -> str:
-        return str(value or "").replace("|", "/").replace("\n", " ")
-
-    rows = summary.get("rows", [])
-    header = "| Model | Type | Config | Test | Metric | latest | baseline | vs baseline | Status |"
-    sep = "|---|---|---|---|---|---|---|---|---|"
-    body = [
-        "| "
-        + " | ".join(
-            [
-                _md_cell(item.get("model") or ""),
-                _md_cell(item.get("model_type") or ""),
-                _md_cell(item.get("config_view") or ""),
-                _md_cell(item.get("test_name") or ""),
-                _md_cell(item.get("metric") or ""),
-                _fmt_number(_as_float(item.get("latest"))),
-                _fmt_number(_as_float(item.get("baseline"))),
-                _fmt_pct(_as_float(item.get("vs_baseline_pct"))),
-                _md_cell(item.get("status") or ""),
-            ]
-        )
-        + " |"
-        for item in rows
-    ]
-    src = summary.get("source") or {}
-    lines = [
-        f"- latest day: `{summary.get('latest_day')}`\n"
-        f"- pass/normal/fail/n-a: `{summary['summary'].get('pass', 0)}` / "
-        f"`{summary['summary'].get('normal', 0)}` / "
-        f"`{summary['summary'].get('fail', 0)}` / `{summary['summary'].get('n/a', 0)}`\n",
-        f"- assets dir: `{summary.get('assets_dir') or ''}`",
-    ]
-    if src.get("repo_root"):
-        lines.append(f"- kanban repo: `{src.get('repo_root')}`")
-    if src.get("current_branch"):
-        lines.append(f"- current branch: `{src.get('current_branch')}`")
-    if src.get("upstream_remote") or src.get("upstream_branch"):
-        lines.append(f"- upstream: `{src.get('upstream_remote') or ''}/{src.get('upstream_branch') or ''}`")
-    hist = summary.get("history") or {}
-    if hist:
-        lines.append(
-            f"- history: `{len(hist.get('files') or [])}` files, "
-            f"`{hist.get('group_count', 0)}` groups, selection `{hist.get('selection') or ''}`"
-        )
-        if hist.get("generated_at"):
-            lines.append(f"- history generated: `{hist.get('generated_at')}`")
-    for warning in summary.get("warnings") or []:
-        lines.append(f"- warning: {warning}")
-    lines.append("")
-    title = "\n".join(lines) + "\n"
-    return "\n".join([title, header, sep, *body])
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Summarize latest-day baseline comparisons from kanban assets history."
@@ -795,7 +738,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--format",
-        choices=("json", "markdown"),
+        choices=("json",),
         default="json",
         help="Output format.",
     )
@@ -808,9 +751,6 @@ def main() -> None:
         expected_remote=(args.expected_remote or "").strip() or None,
         expected_branch=(args.expected_branch or "").strip() or None,
     )
-    if args.format == "markdown":
-        print(_as_markdown(summary))
-        return
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

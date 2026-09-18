@@ -14,11 +14,15 @@ import html
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
+import urllib.parse
+import urllib.request
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -60,8 +64,1250 @@ from report_naming import (  # noqa: E402
     nightly_report_title,
     resolve_report_date_iso,
 )
+from stability_log_manifest import (  # noqa: E402
+    discover_manifests as discover_stability_manifests,
+)
 
 _SKILL_DIR = _SCRIPTS.parent
+
+
+# --- Outstanding DI (SLO-escalating model) ---
+# Each open ``label:bug`` issue contributes
+#     ``base × ⌈days_open / slo_days⌉``
+# to the Outstanding DI total, with the highest-priority label winning per
+# issue. (An earlier draft described a 1-class downgrade for "flaky"-family
+# labels — that rule was not adopted and is not implemented here.) The
+# red-alert rule keeps the original Development-snapshot threshold: total
+# DI > 30 ⇒ ``focus-card--fail``.
+#
+#       priority         | base | slo_days
+#       -----------------|------|----------
+#       critical         | 10.0 |  1
+#       high priority    |  3.0 |  5
+#       medium priority  |  1.0 | 10
+#       low priority     |  0.1 | 14
+#       invalid          |  0.0 |  -
+#
+# The fetch path uses the same paginated
+# ``GET /repos/vllm-project/vllm-omni/issues?state=open&labels=bug`` (PRs
+# excluded) as the Development snapshot, so DI numbers from the two reports are
+# directly comparable.
+BUG_DI_TABLE: dict[str, dict[str, Any]] = {
+    "critical": {"base": 10.0, "slo_days": 1, "order": 0},
+    "high priority": {"base": 3.0, "slo_days": 5, "order": 1},
+    "medium priority": {"base": 1.0, "slo_days": 10, "order": 2},
+    "low priority": {"base": 0.1, "slo_days": 14, "order": 3},
+    "invalid": {"base": 0.0, "slo_days": None, "order": 4},
+}
+BUG_DI_RED_THRESHOLD = 30  # total DI > 30 ⇒ focus-card--fail
+
+# Issues that carry any of these labels are intentionally dropped from the
+# **Top DI Contributors** table** of (both the nightly focus and the development
+# snapshot). GitHub's ``wontfix`` / ``won't fix`` label means the maintainers have
+# decided not to act on the bug; it is not actionable debt and listing it in the
+# top-N just pollutes the table with rows nobody will triage. ``invalid`` is
+# already excluded from DI math (base=0); we keep the explicit filter here so
+# future DI runs don't accidentally promote invalid rows again if the table is
+# ever re-tuned.
+_DROPPED_DI_LABELS: frozenset[str] = frozenset({"wontfix", "won't fix", "won’t fix", "invalid"})
+
+
+def _issue_label_names(issue: dict[str, Any]) -> set[str]:
+    """Normalised label names on a GitHub issue (lowercased, stripped)."""
+    names: set[str] = set()
+    for label in issue.get("labels") or []:
+        raw = label.get("name") if isinstance(label, dict) else str(label)
+        if raw:
+            names.add(str(raw).strip().lower())
+    return names
+
+
+def _issue_is_dropped_for_di(issue: dict[str, Any]) -> bool:
+    """True when *issue* carries any label that disqualifies it from the Top DI
+    table (``wontfix`` / ``won't fix`` / ``invalid``).
+
+    See :data:`_DROPPED_DI_LABELS` for the full list. Callers should drop the
+    issue before computing DI / ranking so the dropped row never appears in the
+    rendered table.
+    """
+    return any(label in _DROPPED_DI_LABELS for label in _issue_label_names(issue))
+
+
+def _filter_dropped_di_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return *issues* with any :data:`_DROPPED_DI_LABELS`-tagged rows removed.
+    Order preserved. Cheap O(N×labels) loop — no API calls.
+    """
+    return [i for i in issues if not _issue_is_dropped_for_di(i)]
+
+
+BUG_DI_LABEL_ORDER: tuple[str, ...] = (
+    "invalid",
+    "critical",
+    "high priority",
+    "medium priority",
+    "low priority",
+)
+
+
+# --- Bugfix PR ↔ Issue linking ---
+#
+# The Top-N DI Contributors → Bugfix column is sourced from a single
+# authoritative endpoint: the GraphQL field ``Issue.closedByPullRequestsReferences``
+# on ``vllm-project/vllm-omni`` (see
+# https://docs.github.com/en/graphql/reference/objects#issue — "List of
+# pull requests referenced from this issue"). This is the canonical
+# mirror of GitHub's *Development panel* sidebar and is the only
+# endpoint that exposes PRs linked via the new "connected" event whose
+# REST ``source`` field is empty.
+#
+# Earlier revisions added a per-issue timeline scan and a body-keyword
+# search as supplementary passes; both over-counted because they
+# surfaced PRs that merely cross-referenced the issue in a body or
+# commit message without a real Development link. The user explicitly
+# asked (2026-08-20) to restrict the column to Development-panel links
+# only, so the old passes are removed and the GraphQL pass is the sole
+# source.
+
+
+def _fetch_bugfix_pr_links_via_graphql(
+    gh_token: str | None,
+    issue_numbers: list[int],
+) -> dict[int, list[int]]:
+    """GraphQL pass: ``Issue.closedByPullRequestsReferences``.
+
+    GitHub's *Development panel* uses a richer set of link types than the
+    REST timeline surfaces. A PR linked only via the new "Development →
+    Linked issues" sidebar entry produces a ``connected`` event in the
+    REST timeline whose ``source`` field is empty — so neither the
+    timeline scan nor the body-keyword search can find it. The same
+    sidebar link, however, is exposed via the GraphQL field
+    ``Issue.closedByPullRequestsReferences`` (see
+    https://docs.github.com/en/graphql/reference/objects#issue — "List of
+    pull requests referenced from this issue"). This pass fires a single
+    GraphQL query that aliases ``closedByPullRequestsReferences`` for every
+    target issue and merges the result, which is the canonical mirror of
+    GitHub's Development panel.
+
+    The pass is keyed off the issue number; PR numbers are stored as ints.
+    """
+
+    if not issue_numbers:
+        return {}
+
+    headers: dict[str, str] = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "vllm-omni-nightly-report-bugfix-link",
+        "Content-Type": "application/json",
+    }
+    if gh_token:
+        headers["Authorization"] = f"Bearer {gh_token}"
+
+    # Build the per-issue selection set. Each issue gets its own alias so
+    # we can map the response back to the issue number when the response
+    # arrives. We only fetch the PR number — the title/state/url are
+    # ignored because the bugfix cell only renders the PR number.
+    parts: list[str] = []
+    for n in issue_numbers:
+        parts.append(
+            f"i{n}: issue(number: {n}) {{ closedByPullRequestsReferences(first: 10) {{ nodes {{ number }} }} }}"
+        )
+    query = (
+        "query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { " + " ".join(parts) + " } }"
+    )
+    payload = {
+        "query": query,
+        "variables": {"owner": "vllm-project", "name": "vllm-omni"},
+    }
+
+    try:
+        data = _http_post_json_nightly(
+            "https://api.github.com/graphql",
+            payload=payload,
+            headers=headers,
+            timeout=60,
+        )
+    except Exception:
+        return {}
+
+    repo = (data or {}).get("data", {}).get("repository") or {}
+    links: dict[int, list[int]] = {}
+    for n in issue_numbers:
+        node = repo.get(f"i{n}")
+        if not isinstance(node, dict):
+            continue
+        cbp = node.get("closedByPullRequestsReferences") or {}
+        prs: list[int] = []
+        for it in cbp.get("nodes") or []:
+            pr_num = (it or {}).get("number")
+            if pr_num:
+                prs.append(int(pr_num))
+        if prs:
+            links[n] = list(dict.fromkeys(prs))
+    return links
+
+
+def _http_post_json_nightly(
+    url: str,
+    *,
+    payload: dict[str, Any],
+    headers: dict[str, str] | None = None,
+    timeout: int = 60,
+) -> object:
+    """Minimal JSON POST helper for GraphQL calls (mirrors
+    :func:`_http_get_json_nightly`). Same ``requests`` first / ``urllib``
+    fallback strategy; honors ``GITHUB_INSECURE_SSL`` for ``api.github.com``
+    hosts. Returns the parsed JSON body (or ``None`` on failure).
+    """
+    h = dict(headers or {})
+    body = json.dumps(payload).encode("utf-8")
+    insecure = os.environ.get("GITHUB_INSECURE_SSL") == "1"
+    try:
+        import requests as _requests
+    except Exception:
+        _requests = None
+    if _requests is not None:
+        try:
+            if insecure and url.startswith("https://api.github.com"):
+                resp = _requests.post(url, headers=h, data=body, timeout=timeout, verify=False)
+            else:
+                resp = _requests.post(url, headers=h, data=body, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            try:
+                return json.loads(resp.text) if resp is not None else None
+            except Exception:
+                return None
+    # urllib fallback
+    try:
+        req = urllib.request.Request(url, data=body, headers=h, method="POST")
+        if insecure and url.startswith("https://api.github.com"):
+            ctx = ssl._create_unverified_context()
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _fetch_bugfix_pr_links(
+    gh_token: str | None,
+    issue_numbers: list[int],
+) -> dict[int, list[int]]:
+    """Build ``{issue_number: [pr_number, …]}`` for the top DI contributors.
+
+    Single source of truth: the GraphQL field
+    ``Issue.closedByPullRequestsReferences`` on ``vllm-project/vllm-omni``.
+    This field is the canonical mirror of GitHub's *Development panel*
+    sidebar — it lists every PR linked from the issue's Development panel
+    regardless of whether the link was created via closing keyword,
+    ``Refs``, the new "Linked issues" sidebar entry, or a development-branch
+    reference.
+
+    Earlier revisions also ran a per-issue REST timeline scan (looking for
+    ``cross-referenced`` events) and a body-keyword search over recent
+    ``[Bugfix]`` PRs. Both passes were removed on 2026-08-20 because they
+    over-counted: the timeline surfaces cross-references in commit
+    messages / bodies even when the PR is not actually linked to the
+    issue in the Development panel, and the body scan double-counted
+    cross-references that are also visible via the panel. The user
+    explicitly asked to restrict the Bugfix column to Development-panel
+    links only, so the GraphQL pass is now the sole source.
+
+    Returns an empty dict on any network / API failure (graceful
+    degradation — the Bugfix column shows ``—``).
+    """
+    if not issue_numbers:
+        return {}
+
+    return _fetch_bugfix_pr_links_via_graphql(gh_token, issue_numbers)
+
+
+def _http_get_json_nightly(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    timeout: int = 60,
+) -> object:
+    """Minimal JSON GET helper for the nightly script (mirrors
+    ``compose_full_report.http_get_json`` but inlined to avoid pulling the
+    compose module's transitive imports). Prefers ``requests`` for better
+    TLS/proxy handling, falls back to ``urllib.request``. Honors the
+    ``GITHUB_INSECURE_SSL`` env var for ``api.github.com`` calls.
+    """
+    h = dict(headers or {})
+    try:
+        import requests
+    except ImportError:
+        requests = None
+    if requests is not None:
+        try:
+            resp = requests.get(url, headers=h, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            pass  # fall through to urllib
+    req = urllib.request.Request(url, headers=h)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+
+def _github_fetch_open_bug_issues_nightly(gh_token: str | None) -> list[dict[str, Any]]:
+    """Paginate open ``label:bug`` issues on vllm-project/vllm-omni (PR entries excluded).
+
+    Mirror of ``compose_full_report._github_fetch_open_bug_issues`` — duplicated
+    here to avoid pulling the entire compose module's transitive imports. If the
+    network or the API fails, returns ``[]`` and the DI card degrades gracefully
+    to "—" (the focus section's other cards are unaffected).
+    """
+    base = "https://api.github.com/repos/vllm-project/vllm-omni/issues"
+    headers: dict[str, str] = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "vllm-omni-nightly-report",
+    }
+    if gh_token:
+        headers["Authorization"] = f"Bearer {gh_token}"
+    all_items: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        url = f"{base}?state=open&labels=bug&per_page=100&page={page}"
+        try:
+            batch = _http_get_json_nightly(url, headers=headers, timeout=60)
+        except Exception:
+            return all_items  # partial OK; caller handles empty DI
+        if not batch:
+            break
+        for issue in batch:
+            if issue.get("pull_request"):
+                continue
+            all_items.append(issue)
+        if len(batch) < 100:
+            break
+        page += 1
+    return all_items
+
+
+def _github_fetch_open_pulls_nightly(gh_token: str | None) -> list[dict[str, Any]]:
+    """Paginate open PRs on vllm-project/vllm-omni (any labels).
+
+    Mirrors ``_github_fetch_open_bug_issues_nightly`` but hits ``/pulls``
+    (NOT ``/issues``) so each PR carries ``requested_reviewers[]`` and
+    ``requested_teams[]`` — those fields don't exist on issues, so the
+    /issues endpoint won't work for reviewer-bucketed grouping. Returns
+    ``[]`` on any network failure so the focus section degrades gracefully
+    the same way the Outstanding DI card does.
+    """
+    base = "https://api.github.com/repos/vllm-project/vllm-omni/pulls"
+    headers: dict[str, str] = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "vllm-omni-nightly-report",
+    }
+    if gh_token:
+        headers["Authorization"] = f"Bearer {gh_token}"
+    all_items: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        url = f"{base}?state=open&per_page=100&page={page}"
+        try:
+            batch = _http_get_json_nightly(url, headers=headers, timeout=60)
+        except Exception:
+            return all_items  # partial OK; caller handles empty list
+        if not batch:
+            break
+        all_items.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return all_items
+
+
+def _github_search_open_prs_with_bot_comments_nightly(
+    gh_token: str | None,
+    bot_login: str,
+) -> set[int]:
+    """Return the set of open PR numbers that ``bot_login`` has commented on.
+
+    Uses the GitHub search API:
+    ``GET /search/issues?q=commenter:<bot_login>+is:open+is:pr+repo:vllm-project/vllm-omni``
+    which is much cheaper than fetching every comment on every open PR (the
+    repo has ~1000 open PRs and ~thousands of comments). Search returns PRs
+    as issue objects (PRs are issues), so we extract ``number`` directly.
+
+    Pagination is capped at 300 results (3 pages of 100). In practice the bot
+    has commented on ~160 open PRs so this is plenty of headroom — if the
+    repo ever grows past 300 such PRs we should revisit, but for now we
+    prefer a fast bounded fetch over a streaming unlimited one.
+
+    Fails closed: returns ``set()`` on any HTTP / network / parse error so
+    the section degrades gracefully.
+    """
+    out: set[int] = set()
+    if gh_token is None:
+        return out
+    base = "https://api.github.com/search/issues"
+    headers: dict[str, str] = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "vllm-omni-nightly-report",
+    }
+    if gh_token:
+        headers["Authorization"] = f"Bearer {gh_token}"
+    # ``commenter:`` matches users who have *left any comment* (issue or review
+    # comment) on the issue/PR. That matches our intent — the bot's cc-style
+    # triage comment is the comment we want. Qualifiers are separated by
+    # SPACE (not ``+``); ``urllib.parse.urlencode`` below percent-encodes the
+    # spaces as ``%20`` and ``+`` would be interpreted as a literal char in
+    # the username, breaking the query.
+    q = f"commenter:{bot_login} is:open is:pr repo:vllm-project/vllm-omni"
+    for page in range(1, 4):  # hard cap at 300 results
+        url = f"{base}?q={urllib.parse.quote(q, safe=': -')}&per_page=100&page={page}"
+        try:
+            j = _http_get_json_nightly(url, headers=headers, timeout=60)
+        except Exception:
+            return out  # partial OK
+        if not isinstance(j, dict):
+            return out
+        items = j.get("items") or []
+        if not items:
+            break
+        for it in items:
+            try:
+                n = int(it.get("number"))
+            except (TypeError, ValueError):
+                continue
+            out.add(n)
+        if len(items) < 100:
+            break
+    return out
+
+
+def _github_fetch_pr_issue_comments_nightly(
+    gh_token: str | None,
+    pr_number: int,
+) -> list[dict[str, Any]]:
+    """Fetch all issue comments on a single PR (``/issues/{n}/comments``).
+
+    Pagination stops on empty batch (most PRs have <100 comments so a single
+    page suffices). Fails closed: returns ``[]`` on any error.
+
+    The bot's "Module owners: @alice @bob" triage message lives at the top
+    level — that's where the assignment signal lives. Inline review comments
+    (``/pulls/{n}/comments``) are usually code-review feedback with no
+    ``@`` mentions, so we don't bother fetching them.
+    """
+    if gh_token is None or not pr_number:
+        return []
+    base = f"https://api.github.com/repos/vllm-project/vllm-omni/issues/{int(pr_number)}/comments"
+    headers: dict[str, str] = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "vllm-omni-nightly-report",
+    }
+    if gh_token:
+        headers["Authorization"] = f"Bearer {gh_token}"
+    out: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        url = f"{base}?per_page=100&page={page}"
+        try:
+            batch = _http_get_json_nightly(url, headers=headers, timeout=60)
+        except Exception:
+            return out  # partial OK
+        if not batch:
+            break
+        out.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return out
+
+
+# The bot's triage comment format is::
+#
+#     This PR appears to belong to: **<module>.md**.
+#
+#     Module owners: @alice @bob
+#
+#     @author, please review your own changes …
+#
+# i.e. one "owners" line (Module / Model / Issue variants observed) lists the
+# assigned reviewers, followed by a separate sentence asking the PR author to
+# self-review. We want the FIRST list (the reviewer assignments) but NOT the
+# author self-review mention. So we look for the ``<Owner-type> owners:``
+# line and parse ``@`` mentions from THAT line only — any later ``@user`` in
+# the body (the self-review reminder) is excluded.
+_OWNERS_LINE_RE = re.compile(
+    r"^\s*(?:\*\*)?\s*(?:Module|Model|Issue|Component|File)\s+owners?\s*:\s*"
+    r"(?P<owners>[^\n]+)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _extract_bot_owners(body: str, *, exclude_logins: tuple[str, ...] = ()) -> list[str]:
+    """Parse a bot triage comment body and return the assigned reviewers.
+
+    Looks for the first ``Module owners:`` / ``Model owners:`` / ``Issue
+    owners:`` / ``Component owners:`` / ``File owners:`` line and extracts
+    ``@`` mentions from that line only. Returns ``[]`` when no owners line
+    is found (e.g. the bot posted a non-triage reply, or the bot uses a
+    phrasing we don't recognize yet).
+
+    Applies the same filtering as :func:`_github_extract_mentions` (bot
+    accounts, ``@here`` / ``@everyone`` aliases, known bot logins) plus
+    any explicit ``exclude_logins`` (used by the caller to drop the
+    bot's own login so we never bucket a PR under the bot itself).
+    """
+    if not body:
+        return []
+    m = _OWNERS_LINE_RE.search(body)
+    if not m:
+        return []
+    mentions = _github_extract_mentions(m.group("owners"))
+    if exclude_logins:
+        excl = {login.lower() for login in exclude_logins}
+        mentions = [m for m in mentions if m.lower() not in excl]
+    return mentions
+
+
+# GitHub login rules: 1–39 chars, alphanumeric or single hyphens (not leading/trailing).
+# We require a non-username char (or start-of-string) before the ``@`` so we don't
+# match email addresses like ``foo@bar`` (preceded by alphanumeric), and a non-username
+# char (or end-of-string) after so we don't capture ``vllm-project`` out of
+# ``@vllm-project/vllm-omni`` (followed by ``/``).
+_GITHUB_MENTION_RE = re.compile(r"(?<![\w-])@([A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38})(?![\w/-])")
+# Well-known non-user ``@here`` / ``@everyone`` aliases people sometimes type
+# in comment bodies — they look like mentions to the regex but aren't people.
+_MENTION_ALIAS_BLACKLIST = frozenset({"here", "everyone", "channel"})
+
+# GitHub App bot logins that GitHub renders in markdown comments *without* the
+# ``[bot]`` suffix that the API uses. The ``endswith("[bot]")`` filter alone
+# can't catch these (the body text reads ``@dependabot`` not
+# ``@dependabot[bot]``), so we maintain a small blacklist for the well-known
+# ones. Login matching is case-insensitive.
+_KNOWN_BOT_LOGINS = frozenset(
+    {
+        "dependabot",
+        "dependabot-preview",
+        "renovate",
+        "renovate-bot",
+        "github-actions",
+        "codecov",
+        "codecov-bot",
+        "codecov-commenter",
+        "sonarcloud",
+        "snyk-bot",
+        "mergify",
+        "imgbot",
+        "greenkeeper",
+        "pull-bot",
+    }
+)
+
+
+def _github_extract_mentions(body: str) -> list[str]:
+    """Return unique user logins ``@-mentioned`` in ``body``.
+
+    Filters:
+      * bot accounts — login ends with ``[bot]`` (matches the raw API form
+        if a bot comment body mentions another bot that way) **or** login
+        is in the :data:`_KNOWN_BOT_LOGINS` set (matches the rendered form
+        GitHub uses in markdown, e.g. ``@dependabot``)
+      * ``@here`` / ``@everyone`` / ``@channel`` (not real users)
+      * org references — the regex already excludes ``@org/team`` shapes via
+        the trailing negative lookahead, so no extra check is needed
+
+    Returns de-duplicated logins preserving first-seen order so the same
+    user mentioned twice in a single comment body doesn't double-bucket
+    the PR into their group.
+    """
+    if not body:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in _GITHUB_MENTION_RE.finditer(body):
+        login = m.group(1)
+        if not login or login.endswith("[bot]"):
+            continue
+        if login.lower() in _MENTION_ALIAS_BLACKLIST:
+            continue
+        if login.lower() in _KNOWN_BOT_LOGINS:
+            continue
+        if login in seen:
+            continue
+        seen.add(login)
+        out.append(login)
+    return out
+
+
+def _bug_di_priority_class_nightly(issue: dict[str, Any]) -> str:
+    """Pick the **highest-priority** label name for an issue (matches the
+    Development snapshot's ``_bug_di_label_and_value`` semantics)."""
+    label_names = [str(label.get("name") or "") for label in issue.get("labels", []) or []]
+    if "invalid" in label_names:
+        return "invalid"
+    for label in BUG_DI_LABEL_ORDER:
+        if label == "invalid":
+            continue
+        if label in label_names:
+            return label
+    return "unclassified"
+
+
+def _compute_issue_di_nightly(
+    issue: dict[str, Any],
+    now: datetime | None = None,
+) -> tuple[float, str, float, int, str, str]:
+    """Return ``(di, priority, days_open, issue_number, title, assignee)`` for one issue.
+
+    Formula: ``di = base × ⌈days_open / slo_days⌉`` (⌈·⌉ = ceil). An issue
+    with no priority label, or ``invalid``, contributes 0 DI (but is still
+    counted). The issue number, title, and assignee are returned for the Top-10 table.
+
+    Note: the 7-element form ``(di, priority, days_open, issue_number, title,
+    assignee, linked_bugfix_prs)`` is produced by :func:`_compute_outstanding_di`,
+    which additionally populates the ``linked_bugfix_prs`` field via
+    :func:`_fetch_bugfix_pr_links`. Callers that need the bugfix link should
+    go through :func:`_compute_outstanding_di` rather than this helper.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    priority = _bug_di_priority_class_nightly(issue)
+    created = str(issue.get("created_at") or "").strip()
+    days_open = 0.0
+    if created:
+        try:
+            created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            days_open = max(0.0, (now - created_dt).total_seconds() / 86400.0)
+        except Exception:
+            days_open = 0.0
+    issue_number = int(issue.get("number") or 0)
+    title = str(issue.get("title") or "").strip()
+    assignees = issue.get("assignees") or []
+    assignee = (
+        ", ".join("@" + str(a.get("login", "")) for a in assignees if isinstance(a, dict) and a.get("login"))
+        if assignees
+        else ""
+    )
+    if priority not in BUG_DI_TABLE:
+        return 0.0, priority, days_open, issue_number, title, assignee
+    info = BUG_DI_TABLE[priority]
+    if info["slo_days"] is None or info["base"] == 0:
+        return 0.0, priority, days_open, issue_number, title, assignee
+    import math
+
+    n_slos = max(0, math.ceil(days_open / info["slo_days"]))
+    return info["base"] * n_slos, priority, days_open, issue_number, title, assignee
+
+
+def _bug_di_summary_nightly(
+    issues: list[dict[str, Any]],
+    now: datetime | None = None,
+) -> tuple[float, dict[str, int], int]:
+    """Return ``(total_di, per_label_counts, n_issues)`` for the focus card."""
+    counts = {label: 0 for label in BUG_DI_TABLE}
+    counts["unclassified"] = 0
+    total = 0.0
+    for issue in issues:
+        di, priority, _, _, _, _ = _compute_issue_di_nightly(issue, now=now)
+        total += di
+        if priority in counts:
+            counts[priority] += 1
+        else:
+            counts["unclassified"] += 1
+    return total, counts, len(issues)
+
+
+def _bug_di_detail_nightly(
+    total_di: float,
+    per_issue: list[tuple[float, str, float, int, str, str]],
+    counts: dict[str, int],
+) -> str:
+    """Compact ``label=count`` breakdown only — the per-issue top contributors
+    are rendered in the standalone Top-10 table (see ``_render_top_di_table_html``
+    / ``_render_top_di_table_md``), so the card detail intentionally omits the
+    inline preview to avoid two competing displays of the same data.
+    """
+    base_parts = [f"{p}={counts[p]}" for p in BUG_DI_TABLE if counts.get(p, 0)]
+    if counts.get("unclassified", 0):
+        base_parts.append(f"unclassified={counts['unclassified']}")
+    return ", ".join(base_parts) if base_parts else "no open bug in snapshot"
+
+
+def _format_di_value_nightly(value: float) -> str:
+    """Format a DI float as a clean decimal string, dropping trailing zeros."""
+    if value == 0:
+        return "0"
+    s = f"{value:.2f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
+def _shorten_title_for_table(title: str, max_len: int = 60) -> str:
+    """Condense an issue title for the Top-10 table cell."""
+    if len(title) <= max_len:
+        return title
+    return title[: max_len - 1].rstrip() + "…"
+
+
+def _di_assignee_cell_html(
+    issue_number: int,
+    assignee: str,
+    *,
+    override: str | None = None,
+) -> str:
+    """Render the **Assignee** cell for one DI Top-10 row.
+
+    When *assignee* is non-empty, render as plain text (no input) — the value
+    is already populated from GitHub, so editing support would only invite
+    drift. The cell renders a ``<span class="di-assignee-text">`` carrying the
+    ``data-da-key="#N"`` attribute so the value still surfaces to the
+    inspector; no persistence layer.
+
+    When *assignee* is empty (or em-dash), render an editable inline
+    ``<input>`` so the operator can fill it in. Persistence: every keystroke
+    and ``blur`` writes to (a) the input's ``data-da-value`` attribute — so a
+    browser "Save Page As" captures it into the HTML file — and (b)
+    ``localStorage`` + in-memory store keyed by ``di-assignee:#N``. The DOM
+    attribute is preferred on reload so a saved copy retains the user's edits
+    across origins (``file://`` → ``github.io``).
+
+    The optional ``override`` argument carries the value inherited from
+    yesterday's nightly report (:func:`_parse_previous_nightly_di_overrides`).
+    When present, the cell renders as a **filled input** with the inherited
+    value pre-loaded into both ``value`` and ``data-da-value`` (plus
+    ``data-da-persisted="1"`` so the inline-edit hydration handler treats it
+    as authoritative). The cell still uses the same persistence path so the
+    operator can correct it; visually it shows up as filled (not empty +
+    placeholder) so the inheritance is obvious at a glance.
+    """
+    key = f"#{issue_number}"
+    key_attr = html.escape(key, quote=True)
+    if assignee:
+        text = html.escape(assignee, quote=True)
+        return (
+            f'<td class="di-assignee-cell is-filled">'
+            f'<span class="di-assignee-text" data-da-key="{key_attr}">'
+            f"{text}</span></td>"
+        )
+    if override:
+        text = html.escape(override, quote=True)
+        return (
+            f'<td class="di-assignee-cell is-filled">'
+            f'<input type="text" class="di-assignee-input" '
+            f'data-da-key="{key_attr}" data-da-value="{text}" '
+            f'data-da-persisted="1" '
+            f'value="{text}" />'
+            f"</td>"
+        )
+    placeholder = html.escape("+ Add assignee", quote=True)
+    return (
+        f'<td class="di-assignee-cell is-empty">'
+        f'<input type="text" class="di-assignee-input" '
+        f'data-da-key="{key_attr}" data-da-value="" '
+        f'data-da-persisted="0" '
+        f'placeholder="{placeholder}" value="" />'
+        f"</td>"
+    )
+
+
+def _di_maintainer_cell_html(issue_number: int, *, override: str | None = None) -> str:
+    """Render the **Maintainer** cell for one DI Top-10 row.
+
+    Always-empty editable inline ``<input>`` with placeholder
+    ``+ Add maintainer``. There is no GitHub source for "maintainer"
+    (it's a free-form user-entered field), so the cell always starts
+    editable. Persistence: ``data-dm-value`` attribute + ``localStorage``
+    keyed by ``di-maintainer:#N``, identical reload-across-origins semantics
+    to the Assignee cell.
+
+    The optional ``override`` argument carries the value inherited from
+    yesterday's nightly report (:func:`_parse_previous_nightly_di_overrides`).
+    When present, the cell renders as a **filled input** with the inherited
+    value pre-loaded into both ``value`` and ``data-dm-value`` (plus
+    ``data-dm-persisted="1"``).
+    """
+    key = f"#{issue_number}"
+    key_attr = html.escape(key, quote=True)
+    if override:
+        text = html.escape(override, quote=True)
+        return (
+            f'<td class="di-maintainer-cell is-filled">'
+            f'<input type="text" class="di-maintainer-input" '
+            f'data-dm-key="{key_attr}" data-dm-value="{text}" '
+            f'data-dm-persisted="1" '
+            f'value="{text}" />'
+            f"</td>"
+        )
+    placeholder = html.escape("+ Add maintainer", quote=True)
+    return (
+        f'<td class="di-maintainer-cell is-empty">'
+        f'<input type="text" class="di-maintainer-input" '
+        f'data-dm-key="{key_attr}" data-dm-value="" '
+        f'data-dm-persisted="0" '
+        f'placeholder="{placeholder}" value="" />'
+        f"</td>"
+    )
+
+
+def _di_top10_inline_edit_script() -> str:
+    """Client script: handle editable Assignee cells in the DI Top-10 table.
+
+    Mirrors the Open-issues ``Remarks`` column pattern
+    (``_OPEN_ISSUE_ACTION_SCRIPT`` in ``release_md_to_html.py``):
+
+      * Cells with a GitHub-sourced assignee (``data-has-github-assignee="true"``)
+        are read-only.
+      * Cells without an assignee show a dashed-border "Click to set" button.
+      * Click the button → cell expands into an inline ``<input>`` + Save/Cancel.
+      * Save (or Enter) → value is written to the cell's ``data-da-value``
+        attribute (so browser "Save As" serialises it into the HTML file) and
+        also persisted to ``localStorage`` + in-memory store.
+      * Cancel (or Esc) → reverts to the button display.
+      * On page load, ``data-da-value`` is preferred over ``localStorage``,
+        ensuring that a saved-as copy retains the user's edits.
+
+    The in-memory ``mem`` store is the source of truth for rendering;
+    ``localStorage`` is a best-effort persistence layer. Without ``mem``,
+    opening the report from a ``file://`` URL (where Chrome denies
+    ``localStorage``) would silently drop every edit.
+    """
+    return """
+<script>
+(function () {
+  "use strict";
+
+  // In-memory fallback when localStorage throws (e.g. Chrome file://).
+  var mem = {};
+  function lsGet(k) {
+    try { return localStorage.getItem(k); }
+    catch (e) { return Object.prototype.hasOwnProperty.call(mem, k) ? mem[k] : null; }
+  }
+  function lsSet(k, v) {
+    try { v ? localStorage.setItem(k, v) : localStorage.removeItem(k); }
+    catch (e) { if (v) mem[k] = v; else delete mem[k]; }
+  }
+
+  function aKey(k) { return "di-assignee:" + k; }
+  function mKey(k) { return "di-maintainer:" + k; }
+
+  function hydrate(input, kind, key) {
+    // Prefer the DOM attribute (captured by "Save Page As"), fall back to
+    // localStorage (reload on the same origin). Both editors share this
+    // exact pattern, so the only difference is the localStorage key prefix.
+    var attr = input.getAttribute("data-" + kind + "-value");
+    if (attr === null || attr === undefined) {
+      var ls = lsGet(key);
+      if (ls !== null && ls !== undefined && ls !== "") {
+        attr = ls;
+        input.value = ls;
+      }
+    } else if (attr) {
+      input.value = attr;
+    }
+    if (input.value) {
+      input.setAttribute("data-" + kind + "-persisted", "1");
+    }
+    function persist() {
+      input.setAttribute("data-" + kind + "-value", input.value || "");
+      lsSet(key, input.value || "");
+    }
+    input.addEventListener("input", persist);
+    input.addEventListener("blur", persist);
+  }
+
+  function initAll() {
+    var aInputs = document.querySelectorAll("input.di-assignee-input");
+    for (var i = 0; i < aInputs.length; i++) {
+      var k = aInputs[i].getAttribute("data-da-key") || "";
+      hydrate(aInputs[i], "da", aKey(k));
+    }
+    var mInputs = document.querySelectorAll("input.di-maintainer-input");
+    for (var j = 0; j < mInputs.length; j++) {
+      var k2 = mInputs[j].getAttribute("data-dm-key") || "";
+      hydrate(mInputs[j], "dm", mKey(k2));
+    }
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initAll);
+  } else {
+    initAll();
+  }
+})();
+</script>"""
+
+
+def _render_top_di_table_html(
+    per_issue: list[tuple[float, str, float, int, str, str, list[int]]],
+    *,
+    overrides: dict[int, dict[str, str]] | None = None,
+) -> str:
+    """Render the Top DI contributors table (default Top 20, expandable to Top 40).
+
+    Each row: ``#issue | title | priority | days | DI | assignee | maintainer | bugfix``.
+
+    The first 20 rows render in the main ``<tbody>`` and are always visible.
+    Rows 21–40 (when present) render in a second ``<tbody class="di-top-table-collapsed">``
+    that starts hidden; the caller injects an **Expand to show Top 40** button
+    that toggles ``hidden`` on that tbody via inline ``onclick``. Both visible
+    and collapsed rows share the same ``<thead>`` and column layout, so the
+    expanded view reads as one continuous table.
+
+    The **Assignee** cell renders an always-visible ``<input>`` pre-filled with
+    the GitHub-sourced assignee (or empty + placeholder). The **Maintainer**
+    cell is an always-visible ``<input>`` that always starts empty (no GitHub
+    source for "maintainer") with placeholder "+ Add maintainer". Both cells
+    share the same persistence pattern: ``data-*-value`` attribute + localStorage
+    keyed by ``di-assignee:#N`` / ``di-maintainer:#N``, driven by
+    :func:`_di_top10_inline_edit_script`. The **Bugfix** cell renders linked
+    ``[Bugfix]`` PRs or ``—`` when none / GitHub unavailable.
+
+    The optional ``overrides`` dict is the second-day inheritance payload
+    produced by :func:`_parse_previous_nightly_di_overrides`: ``{issue_n:
+    {"assignee": "...", "maintainer": "..."}}``. When the issue has neither a
+    GitHub-sourced assignee nor yesterday's override, the cell renders as the
+    empty + placeholder input. When ``overrides`` is ``None`` or doesn't
+    contain the issue, the cell falls back to the original GitHub-assignee or
+    empty rendering.
+    """
+    if not per_issue:
+        return ""
+
+    def _row_html(
+        di: float,
+        priority: str,
+        days_open: float,
+        issue_number: int,
+        title: str,
+        assignee: str,
+        linked_bugfix_prs: list[int],
+    ) -> str:
+        title_disp = html.escape(_shorten_title_for_table(title))
+        issue_url = f"https://github.com/vllm-project/vllm-omni/issues/{issue_number}"
+        days_disp = f"{int(days_open)}"
+        di_disp = html.escape(_format_di_value_nightly(di))
+        priority_disp = html.escape(priority)
+        override = (overrides or {}).get(issue_number, {})
+        assignee_cell = _di_assignee_cell_html(issue_number, assignee, override=override.get("assignee") or None)
+        maintainer_cell = _di_maintainer_cell_html(issue_number, override=override.get("maintainer") or None)
+        bugfix_cell = _di_bugfix_cell_html(linked_bugfix_prs)
+        return (
+            "<tr>"
+            f'<td><a href="{issue_url}" target="_blank" rel="noopener">#{issue_number}</a></td>'
+            f"<td>{title_disp}</td>"
+            f"<td>{priority_disp}</td>"
+            f'<td class="di-days">{days_disp}</td>'
+            f'<td class="di-value">{di_disp}</td>'
+            f"{assignee_cell}"
+            f"{maintainer_cell}"
+            f"{bugfix_cell}"
+            "</tr>"
+        )
+
+    visible_rows = per_issue[:20]
+    extra_rows = per_issue[20:40]
+
+    main_tbody = "".join(_row_html(*row) for row in visible_rows)
+
+    parts: list[str] = [
+        '<div class="focus-top-table" data-top-di-table>',
+        '<table class="summary top-di-table">',
+        "<thead><tr>",
+        "<th>#</th><th>Title</th><th>Priority</th><th>Days</th>",
+        "<th>DI</th><th>Assignee</th><th>Maintainer</th><th>Bugfix</th>",
+        "</tr></thead>",
+        f"<tbody>{main_tbody}</tbody>",
+    ]
+
+    if extra_rows:
+        extra_tbody = "".join(_row_html(*row) for row in extra_rows)
+        table_id = "di-top-table-extra"
+        # ``hidden`` keeps the rows out of the layout AND the a11y tree until
+        # the user clicks the toggle; the inline ``onclick`` adds/removes the
+        # attribute and flips the button label/state.
+        parts.extend(
+            [
+                f'<tbody class="di-top-table-collapsed" id="{table_id}" hidden>',
+                extra_tbody,
+                "</tbody>",
+                "</table>",
+                "</div>",
+                '<div class="di-top-table-toggle-row">',
+                '<button type="button" class="di-top-table-toggle" '
+                f'aria-expanded="false" aria-controls="{table_id}" '
+                f'onclick="'
+                f"var t=document.getElementById('{table_id}');"
+                "if(t.hasAttribute('hidden')){t.removeAttribute('hidden');"
+                "this.setAttribute('aria-expanded','true');"
+                "this.textContent='Collapse to Top 20';"
+                "this.classList.add('is-open');"
+                "}else{t.setAttribute('hidden','');"
+                "this.setAttribute('aria-expanded','false');"
+                "this.textContent='Expand to show Top 40';"
+                "this.classList.remove('is-open');"
+                '}">'
+                "Expand to show Top 40"
+                "</button>",
+                "</div>",
+            ]
+        )
+    else:
+        parts.extend(["</table>", "</div>"])
+
+    return "".join(parts)
+
+
+def _di_bugfix_cell_html(linked_bugfix_prs: list[int]) -> str:
+    """Render the **Bugfix** cell for one DI Top-10 row.
+
+    When *linked_bugfix_prs* is non-empty, render each PR number as a link
+    to its GitHub PR page, separated by ``, ``. When empty, render an
+    em-dash placeholder so the column never collapses.
+    """
+    if linked_bugfix_prs:
+        parts: list[str] = []
+        for n in linked_bugfix_prs:
+            url = f"https://github.com/vllm-project/vllm-omni/pull/{n}"
+            parts.append(f'<a href="{url}" target="_blank" rel="noopener">#{n}</a>')
+        joined = ", ".join(parts)
+        return f'<td class="di-bugfix-cell">{joined}</td>'
+    return '<td class="di-bugfix-cell di-bugfix-cell--none">—</td>'
+
+
+def _render_top_di_table_md(per_issue: list[tuple[float, str, float, int, str, str, list[int]]]) -> str:
+    """Markdown rendering of the Top DI contributors table.
+
+    Slices the top 20 by default (matching the HTML default view); the HTML
+    render additionally exposes a collapse toggle that reveals rows 21–40.
+    Markdown is non-interactive, so the top 20 stays as the canonical
+    Markdown output (rows 21–40 are HTML-only).
+
+    Columns: ``# | Title | Priority | Days | DI | Assignee | Maintainer | Bugfix``
+    (8 columns). The Maintainer column is intentionally empty in Markdown
+    output (no GitHub source) — the HTML post-processor
+    (:func:`release_md_to_html._upgrade_di_top10_input_cells`) upgrades both
+    Assignee and Maintainer cells into a uniform editable inline input
+    (``<input class="di-top10-{assignee,maintainer}-input">``) when empty,
+    and into a plain ``<span>`` when filled. UI is identical to the
+    nightly-rendered ``_render_top_di_table_html`` so the dev and nightly
+    reports share one Top DI Contributors layout.
+    """
+    if not per_issue:
+        return ""
+    headers = ["#", "Title", "Priority", "Days", "DI", "Assignee", "Maintainer", "Bugfix"]
+    body_rows: list[list[str]] = []
+    for di, priority, days_open, issue_number, title, assignee, linked_bugfix_prs in per_issue[:20]:
+        if linked_bugfix_prs:
+            bugfix_disp = ", ".join(f"#{n}" for n in linked_bugfix_prs)
+        else:
+            bugfix_disp = "—"
+        body_rows.append(
+            [
+                f"#{issue_number}",
+                _shorten_title_for_table(title),
+                priority,
+                str(int(days_open)),
+                _format_di_value_nightly(di),
+                assignee or "—",
+                "—",  # Maintainer is always empty in MD; HTML upgrade inserts the input.
+                bugfix_disp,
+            ]
+        )
+    return render_markdown_table(headers, body_rows)
+
+
+def _compute_outstanding_di(
+    gh_token: str | None,
+    now: datetime | None = None,
+    *,
+    overrides: dict[int, dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Compute Outstanding DI for the Daily focus snapshot.
+
+    Returns a dict with ``total_di``, ``n_issues``, ``counts``,
+    ``per_issue`` (top contributors; each entry is
+    ``(di, priority, days_open, issue_number, title, assignee, linked_bugfix_prs)``)
+    and pre-formatted ``value`` / ``detail`` / ``severity`` ready for the focus card.
+    ``severity`` is ``"fail"`` when total DI > ``BUG_DI_RED_THRESHOLD`` (i.e. > 30),
+    matching the Development snapshot's red-alert rule.
+
+    The 7th field of each ``per_issue`` tuple is a list of linked bugfix PR
+    numbers (empty list when no Development-panel link exists). It is
+    populated by :func:`_fetch_bugfix_pr_links`, which issues a single
+    GraphQL alias-query against
+    ``Issue.closedByPullRequestsReferences`` on
+    ``vllm-project/vllm-omni`` — the canonical mirror of GitHub's
+    Development panel. Network or API failure degrades gracefully to an
+    empty mapping — every row then shows ``—`` in the Bugfix column.
+
+    The optional ``overrides`` dict (per-issue ``{assignee, maintainer}``)
+    carries the values inherited from yesterday's nightly report. When the
+    issue has neither a GitHub-sourced assignee nor an override, the cell
+    tuple keeps the empty placeholder. The override is applied to the
+    Assignee field only — Maintainer is the 7th-to-last column in the
+    rendered HTML, not a tuple field, so the renderer reads it from the
+    overrides dict directly.
+
+    ``now`` is the reference UTC instant for ``days_open``; callers should pass
+    a value captured once at report generation start so the Daily focus card
+    stays on the same time base as a Development report generated back-to-back.
+    Defaults to ``datetime.now(timezone.utc)``.
+    """
+    issues = _github_fetch_open_bug_issues_nightly(gh_token)
+    # Drop ``wontfix`` / ``won't fix`` / ``invalid`` issues from the Top DI table
+    # so un-actionable rows never pollute the focus card. These issues still
+    # count toward the **total Outstanding DI** below (they are real backlog
+    # unless explicitly wontfix), but they never appear as ranked rows.
+    rankable_issues = _filter_dropped_di_issues(issues)
+    if now is None:
+        now = datetime.now(timezone.utc)
+    per_issue_raw: list[tuple[float, str, float, int, str, str]] = []
+    counts = {label: 0 for label in BUG_DI_TABLE}
+    counts["unclassified"] = 0
+    total = 0.0
+    for issue in issues:
+        di, priority, _, _, _, _ = _compute_issue_di_nightly(issue, now=now)
+        total += di
+        if priority in counts:
+            counts[priority] += 1
+        else:
+            counts["unclassified"] += 1
+    # Top DI ranking: only rankable issues (wontfix / invalid excluded).
+    for issue in rankable_issues:
+        di, priority, days_open, issue_number, title, assignee = _compute_issue_di_nightly(issue, now=now)
+        # If the GitHub-sourced assignee is empty but yesterday's nightly
+        # report recorded one, lift yesterday's value into the tuple so the
+        # renderer (= ``_di_assignee_cell_html``) can show it as a filled
+        # cell. The cell still passes the override via the overrides kwarg
+        # so :func:`_di_maintainer_cell_html` can pick up the Maintainer
+        # inheritance too.
+        if not assignee and overrides:
+            ovr = overrides.get(issue_number, {})
+            assignee = ovr.get("assignee") or ""
+        per_issue_raw.append((di, priority, days_open, issue_number, title, assignee))
+    per_issue_sorted = sorted(per_issue_raw, key=lambda x: -x[0])
+
+    # Look up linked bugfix PRs for the top contributors (cap at 40 to keep
+    # the search bounded; the table renders the top 20 by default and a
+    # collapsible rows 21-40 when the user clicks the expand button).
+    top_issue_numbers = [t[3] for t in per_issue_sorted[:40] if t[3]]
+    bugfix_links = _fetch_bugfix_pr_links(gh_token, top_issue_numbers)
+    per_issue_with_bugfix: list[tuple[float, str, float, int, str, str, list[int]]] = []
+    for di, priority, days_open, issue_number, title, assignee in per_issue_sorted:
+        linked = bugfix_links.get(issue_number, [])
+        per_issue_with_bugfix.append((di, priority, days_open, issue_number, title, assignee, linked))
+
+    n_issues = len(issues)
+    severity = "fail" if total > BUG_DI_RED_THRESHOLD else "ok"
+    return {
+        "total_di": total,
+        "n_issues": n_issues,
+        "counts": counts,
+        "per_issue": per_issue_with_bugfix,
+        "value": _format_di_value_nightly(total),
+        "detail": _bug_di_detail_nightly(total, per_issue_sorted, counts),
+        "severity": severity,
+    }
+
+
+# Regexes for the DI Top Contributors table cells we need to inherit from the
+# previous day's nightly report. Two cell shapes per column:
+#   * **Assignee** — either a filled ``<span class="di-assignee-text" data-da-key="#N">value</span>``
+#     (GitHub-sourced assignee) or an empty ``<input ... data-da-key="#N" data-da-value="value" ...>``
+#     (operator-saved override). We accept either source.
+#   * **Maintainer** — always an ``<input ... data-dm-key="#N" data-dm-value="value" ...>``.
+#     The persisted value lives in ``data-dm-value``; ``value=""`` mirrors the
+#     current input state but is not the authoritative saved value.
+# Keys are matched against an issue number captured from the ``data-*-key`` URL
+# fragment so we never inherit a wrong row.
+_DI_ASSIGNEE_FILLED_RE = re.compile(
+    r'<span\b[^>]*\bclass="di-assignee-text"[^>]*\bdata-da-key="#(?P<n>\d+)"[^>]*>'
+    r"(?P<val>[^<]{1,200})"
+    r"</span>",
+    re.IGNORECASE,
+)
+_DI_ASSIGNEE_INPUT_RE = re.compile(
+    r'<input\b[^>]*\bclass="di-assignee-input"[^>]*\bdata-da-key="#(?P<n>\d+)"[^>]*\bdata-da-value="(?P<val>[^"]*)"',
+    re.IGNORECASE,
+)
+_DI_MAINTAINER_INPUT_RE = re.compile(
+    r'<input\b[^>]*\bclass="di-maintainer-input"[^>]*\bdata-dm-key="#(?P<n>\d+)"[^>]*\bdata-dm-value="(?P<val>[^"]*)"',
+    re.IGNORECASE,
+)
+
+
+def _parse_previous_nightly_di_overrides(
+    kanban_repo_root: Path | None,
+    today: datetime | None = None,
+) -> dict[int, dict[str, str]]:
+    """Read yesterday's archived nightly report and return per-issue DI overrides.
+
+    The nightly report's DI Top Contributors table is the operator's
+    authoritative record of who is responsible for each open bug. When
+    generating today's report we want to inherit yesterday's edits so the
+    operator does not have to re-type the same names every day.
+
+    The function looks for
+    ``<kanban_repo_root>/data/nightly_test_report/nightly-report-buildkite-latest-YYYY-MM-DD.html``
+    where ``YYYY-MM-DD`` is **yesterday's UTC date** (so tonight's report picks
+    up tonight's edits without a race against today's archived HTML). When
+    the file does not exist, or when no kanban repo root is configured, the
+    function returns an empty dict — the caller treats that as "no overrides".
+
+    The returned dict maps issue number (int) -> ``{"assignee": str, "maintainer": str}``.
+    Either field is the empty string when the previous day's cell was empty
+    (so the caller can still distinguish "never had a value" from "had a value
+    but it was edited to empty"). Whitespace-only values are normalised to
+    empty strings.
+
+    Implementation notes
+    --------------------
+    * We use regex on the raw HTML rather than an HTML parser because the
+      cells are emitted by :func:`_di_assignee_cell_html` and
+      :func:`_di_maintainer_cell_html` in this very file — the markup is
+      stable and we only need three attributes. Adding a dependency on
+      ``beautifulsoup4`` for this would be overkill.
+    * When both a filled ``<span>`` and an empty ``<input>`` match the same
+      issue number (theoretical — the renderer never emits both), the
+      filled span wins (the GitHub-sourced assignee is at least as good as
+      the empty persisted value).
+    * HTML entity decoding is **not** performed at this layer; the caller
+      passes the raw value to ``html.escape`` again when rendering, so
+      leftover entities (``&amp;``) would double-escape. The cell text
+      usually contains only ``@username`` so this is not a practical issue;
+      if a maintainer name ever needs ``&`` it will be re-escaped below.
+    """
+    if kanban_repo_root is None:
+        return {}
+    if today is None:
+        today = datetime.now(timezone.utc)
+    prev_date = today.date() - timedelta(days=1)
+    archive_dir = kanban_repo_root / "data" / "nightly_test_report"
+    prev_html = archive_dir / f"nightly-report-buildkite-latest-{prev_date.isoformat()}.html"
+    if not prev_html.is_file():
+        return {}
+    try:
+        html_text = prev_html.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+
+    overrides: dict[int, dict[str, str]] = {}
+
+    def _store(issue_n: int, kind: str, value: str) -> None:
+        cleaned = value.strip()
+        if not cleaned:
+            return
+        slot = overrides.setdefault(issue_n, {"assignee": "", "maintainer": ""})
+        # Only fill in the field if the caller hasn't already supplied a more
+        # authoritative value (the filled-span rule for Assignee).
+        if not slot.get(kind):
+            slot[kind] = cleaned
+
+    for match in _DI_ASSIGNEE_FILLED_RE.finditer(html_text):
+        _store(int(match.group("n")), "assignee", match.group("val"))
+    for match in _DI_ASSIGNEE_INPUT_RE.finditer(html_text):
+        _store(int(match.group("n")), "assignee", match.group("val"))
+    for match in _DI_MAINTAINER_INPUT_RE.finditer(html_text):
+        _store(int(match.group("n")), "maintainer", match.group("val"))
+    return overrides
 
 
 class BkTarget(NamedTuple):
@@ -334,21 +1580,38 @@ def _fail_status_submit_script() -> str:
   function repoIssueUrl(n) {
     return "https://github.com/vllm-project/vllm-omni/issues/" + encodeURIComponent(n);
   }
+  // In-memory fallback when localStorage throws (e.g. Chrome file://).
+  var failStatusMem = {};
   function lsKey(rowId) { return "fail-status:" + rowId; }
   function saveStatus(rowId, payload) {
+    var has = payload && (payload.status || payload.issue || payload.note);
     try {
-      if (payload && (payload.status || payload.issue || payload.note)) {
+      if (has) {
         localStorage.setItem(lsKey(rowId), JSON.stringify(payload));
       } else {
         localStorage.removeItem(lsKey(rowId));
       }
-    } catch (e) { /* localStorage unavailable */ }
+    } catch (e) { if (has) failStatusMem[lsKey(rowId)] = payload; else delete failStatusMem[lsKey(rowId)]; }
   }
   function loadStatus(rowId) {
     try {
       var raw = localStorage.getItem(lsKey(rowId));
       return raw ? JSON.parse(raw) : null;
-    } catch (e) { return null; }
+    } catch (e) {
+      return failStatusMem.hasOwnProperty(lsKey(rowId)) ? failStatusMem[lsKey(rowId)] : null;
+    }
+  }
+  // Read the most recent status a row has been rendered into. The cell's
+  // data-* attributes are written by every render and survive a browser
+  // "Save Page As" so they trump localStorage for cross-origin loads.
+  function loadStatusFromDom(cell) {
+    var status = cell.getAttribute("data-status");
+    if (!status || status === "unset") return null;
+    return {
+      status: status,
+      issue: cell.getAttribute("data-status-issue") || "",
+      note: cell.getAttribute("data-status-note") || "",
+    };
   }
   function renderUnset(cell) {
     cell.setAttribute("data-status", "unset");
@@ -398,7 +1661,7 @@ def _fail_status_submit_script() -> str:
     if (!modal) return;
     activeCell = cell;
     activeMode = mode;
-    var saved = loadStatus(cell.getAttribute("data-row-id")) || {};
+    var saved = loadStatusFromDom(cell) || loadStatus(cell.getAttribute("data-row-id")) || {};
     if (modalTitle) {
       modalTitle.textContent = mode === "filed" ? "Mark as filed" : "Mark as not an issue";
     }
@@ -512,7 +1775,10 @@ def _fail_status_submit_script() -> str:
   function restoreSaved() {
     document.querySelectorAll(".fail-status-cell[data-row-id]").forEach(function (cell) {
       var rowId = cell.getAttribute("data-row-id");
-      var saved = loadStatus(rowId);
+      // Prefer the DOM data-* attributes (captured by Save Page As) over
+      // localStorage so a saved copy displays correctly even with cleared
+      // storage / different origin.
+      var saved = loadStatusFromDom(cell) || loadStatus(rowId);
       if (!saved) return;
       if (saved.status === "filed") {
         renderFiled(cell, saved.issue || "", saved.note || "");
@@ -617,6 +1883,8 @@ def _ut_coverage_submit_script() -> str:
     return """
 <script>
 (function () {
+  // In-memory fallback when localStorage throws (e.g. Chrome file://).
+  var mem = {};
   function lsKey(rowId) { return "ut-coverage:" + rowId; }
   function saveValue(rowId, value) {
     try {
@@ -625,16 +1893,21 @@ def _ut_coverage_submit_script() -> str:
       } else {
         localStorage.removeItem(lsKey(rowId));
       }
-    } catch (e) { /* localStorage unavailable */ }
+    } catch (e) { if (value) mem[lsKey(rowId)] = value; else delete mem[lsKey(rowId)]; }
   }
   function loadValue(rowId) {
     try {
       return localStorage.getItem(lsKey(rowId));
-    } catch (e) { return null; }
+    } catch (e) { return mem.hasOwnProperty(lsKey(rowId)) ? mem[lsKey(rowId)] : null; }
   }
   function setCellValue(cell, value) {
     var btn = cell.querySelector(".ut-coverage-btn");
     if (btn) btn.textContent = value;
+    // DOM writeback: persist the chosen value on the cell's
+    // ``data-ut-value`` attribute so a browser "Save Page As" captures it
+    // and a later load of the saved file (potentially from a different
+    // origin — file:// vs github.io) still displays the entered coverage.
+    cell.setAttribute("data-ut-value", value === "—" ? "" : (value || ""));
   }
 
   var modal = document.getElementById("ut-coverage-modal");
@@ -645,9 +1918,15 @@ def _ut_coverage_submit_script() -> str:
     if (!modal) return;
     activeCell = cell;
     var rowId = cell.getAttribute("data-row-id");
-    var saved = loadValue(rowId) || cell.getAttribute("data-original");
+    // Preference order on opening: data-ut-value (captured by Save Page As)
+    // > localStorage > original placeholder. The data attribute is
+    // authoritative for cross-origin loads where localStorage is gone.
+    var saved = cell.getAttribute("data-ut-value");
+    if (saved === null || saved === "") {
+      saved = loadValue(rowId) || "";
+    }
     if (modalInput) {
-      modalInput.value = (saved === cell.getAttribute("data-original") || saved === "—") ? "" : saved;
+      modalInput.value = (!saved || saved === "—") ? "" : saved;
     }
     modal.hidden = false;
     document.body.classList.add("ut-coverage-modal-open");
@@ -674,7 +1953,8 @@ def _ut_coverage_submit_script() -> str:
     if (!activeCell) return;
     var rowId = activeCell.getAttribute("data-row-id");
     saveValue(rowId, "");
-    setCellValue(activeCell, activeCell.getAttribute("data-original"));
+    var original = activeCell.getAttribute("data-original") || "—";
+    setCellValue(activeCell, original);
     closeModal();
   }
   if (modal) {
@@ -716,7 +1996,13 @@ def _ut_coverage_submit_script() -> str:
   function restoreSaved() {
     document.querySelectorAll(".ut-coverage-cell[data-row-id]").forEach(function (cell) {
       var rowId = cell.getAttribute("data-row-id");
-      var saved = loadValue(rowId);
+      // Prefer the DOM ``data-ut-value`` (captured by Save Page As) over
+      // localStorage so a saved copy displays correctly even with cleared
+      // storage / different origin.
+      var saved = cell.getAttribute("data-ut-value");
+      if (saved === null || saved === "") {
+        saved = loadValue(rowId);
+      }
       if (saved) {
         setCellValue(cell, saved);
       }
@@ -730,6 +2016,21 @@ def _ut_coverage_submit_script() -> str:
   restoreSaved();
 })();
 </script>"""
+
+
+def _format_utc_date_nightly(iso: str) -> str:
+    """Render a GitHub-style ISO-8601 timestamp as ``YYYY-MM-DD`` (UTC).
+
+    Returns ``"-"`` when parsing fails so an unparsable timestamp never
+    breaks the table.
+    """
+    if not iso:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return "-"
+    return dt.strftime("%Y-%m-%d")
 
 
 def _details_subcard(
@@ -1297,13 +2598,286 @@ def _classify_local_nightly_job(job_name: str) -> tuple[str | None, str | None]:
 
 def _local_job_rows_with_info(
     groups: list[tuple[str, list[Path]]],
+    *,
+    log_dir: Path | None = None,
 ) -> list[tuple[str, list[Path], dict[str, Any]]]:
+    """Build ``(job_name, paths, info)`` rows for the Local Test summary.
+
+    Source-of-truth precedence for each job's status:
+
+    1. ``timing_summary.log`` — the nightly wrapper writes one rollup per
+       run directory (``nightly_jobs_*`` / ``nightly_jobs_local_*`` /
+       ``nightly_stability_jobs_*``) listing the **whole-job** status as
+       ``OK`` / ``FAILED (exit N)`` / ``TIMED OUT``. When a manifest entry
+       exists for a job (and ``log_dir`` was supplied), the manifest
+       status wins — even if the per-job ``.log`` happens to mention a
+       stale ``FAILED`` pytest footer (e.g. concatenated prior-run output,
+       worker subprocess crashes that the wrapper still rolled up as OK
+       because the parent script exited 0).
+    2. ``parse_pytest_log`` on the ``.log`` file(s) — used as a fallback
+       when the manifest has no entry for the job, and to populate the
+       detailed pytest counts (``passed`` / ``failed`` / ``skipped`` /
+       ``error``) and ``failed_nodes`` for **manifest-failed** jobs so the
+       Failure Analysis section still has the per-test detail.
+
+    A manifest ``status="ok"`` job is forced to an "ok" ``info`` dict
+    regardless of what the pytest parser extracts from the log file. This
+    prevents the A100-style bug where the report inflated the failure
+    count from stale pytest footers in concatenated run logs.
+    """
+    manifest_lookup: dict[str, Any] = {}
+    if log_dir is not None:
+        try:
+            for manifest in discover_stability_manifests(log_dir):
+                for entry in manifest.entries:
+                    # Only the first occurrence wins (multiple manifests
+                    # for the same job are unlikely but keep deterministic
+                    # precedence by keeping the first).
+                    manifest_lookup.setdefault(entry.job_name, entry)
+                    manifest_lookup.setdefault(entry.job_name + " (manifest only)", entry)
+        except Exception:
+            # Manifest parsing is best-effort — failures here must not
+            # abort report generation. Fall back to the .log-only path.
+            manifest_lookup = {}
+
     out: list[tuple[str, list[Path], dict[str, Any]]] = []
     for job_name, paths in groups:
+        # Synthetic row from a ``timing_summary.log`` whose actual log
+        # was deliberately not pulled (selective-pull optimization).
+        if not paths and job_name.endswith(" (manifest only)"):
+            entry = manifest_lookup.get(job_name)
+            if entry is not None:
+                out.append(
+                    (
+                        job_name,
+                        paths,
+                        _synth_manifest_info(entry.status, entry.duration, entry.raw_status),
+                    )
+                )
+            else:
+                out.append((job_name, paths, _synth_manifest_info("ok", "?", "OK (manifest only)")))
+            continue
+
+        # If the manifest says the whole job exited OK, trust it — even if
+        # the .log body has stale pytest output that ``parse_pytest_log``
+        # would otherwise classify as failed.
+        entry = manifest_lookup.get(job_name)
+        if entry is not None and entry.status == "ok":
+            duration = entry.duration or "?"
+            ok_info = _synth_manifest_info("ok", duration, entry.raw_status)
+            # Override the "manifest only" marker since this row *does*
+            # have a real .log on disk; we just chose to honour the
+            # rollup instead of re-parsing pytest output. The summary
+            # keeps ``passed`` in it so ``_summary_row_kind``'s regex
+            # (``\d+\s+passed``) classifies the row as ``ok`` rather
+            # than ``unknown`` — the row renders green and counts as a
+            # clean pass in the Summary table.
+            ok_info["summary"] = (
+                f"1 passed in {duration} (manifest OK; .log pytest output ignored)"
+            )
+            out.append((job_name, paths, ok_info))
+            continue
+
         text = read_job_text(paths)
         info = parse_pytest_log(text)
+        # If the manifest says the job FAILED but ``parse_pytest_log`` could
+        # not extract any pytest failure markers (e.g. log truncated before
+        # the summary line), keep an explicit failure flag so the Failure
+        # Analysis section still surfaces the row.
+        if entry is not None and entry.status == "fail":
+            if not info.get("failed_nodes") and not info.get("error_nodes") and not info.get("failed"):
+                info = dict(info)
+                info["failed"] = 1
+                info["failed_nodes"] = [f"<manifest:{entry.raw_status}>"]
+                info["failed_reasons"] = {
+                    f"<manifest:{entry.raw_status}>": (
+                        f"Job exited with {entry.raw_status} per timing_summary.log; "
+                        "log did not include a parseable pytest summary line."
+                    )
+                }
+                info["summary"] = (
+                    f"1 failed in {entry.duration} (manifest-driven; .log had no "
+                    f"parseable pytest summary; status: {entry.raw_status})"
+                )
         out.append((job_name, paths, info))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Selective-pull (manifest-only) integration
+# ---------------------------------------------------------------------------
+# When the agent uses ``scripts/selective_stability_pull.py`` to download a
+# stability run, only ``OK``-status jobs are skipped. The companion sidecar
+# ``logs/.selective_pull_manifest.json`` (also ``timing_summary.log`` per run)
+# still records the OK result, so the report must surface those rows without
+# reading a real ``.log`` file. The helpers below synthesize ``info`` dicts
+# that match the shape of ``parse_pytest_log`` output — they carry enough
+# fields (``summary``, ``passed``/``failed``/``skipped``/``error`` counts,
+# ``failed_nodes``) for the existing Local Test summary + Failure Analysis
+# paths to render an ``ok`` row with a small "manifest only" note, while a
+# FAILED status would still surface as ``fail`` even without a log on disk.
+# ---------------------------------------------------------------------------
+
+
+def _synth_manifest_info(manifest_status: str, duration: str, raw_status: str) -> dict[str, Any]:
+    """Return a synthetic ``info`` dict matching the ``parse_pytest_log`` shape.
+
+    ``manifest_status`` is ``"ok"`` / ``"fail"`` (canonical form);
+    ``raw_status`` is the original token from the rollup (e.g. ``"FAILED (exit 1)"``).
+    """
+    if manifest_status == "ok":
+        # ``passed=1`` is a synthetic marker — the report consumes
+        # ``counts["passed"]`` / ``counts["failed"]`` etc., not raw pytest
+        # numbers, and the summary text drives ``_summary_row_kind``.
+        # Include a real pytest-shaped summary so the row classifies as
+        # ``ok`` (the ``re.search(r"\d+\s+passed", summ, re.I)`` branch in
+        # ``_summary_row_kind`` needs the magic token).
+        summary = f"1 passed in {duration or '?'} (manifest only — log not pulled, status: OK)"
+        return {
+            "summary": summary,
+            "passed_nodes": [],
+            "failed_nodes": [],
+            "error_nodes": [],
+            "skipped_nodes": [],
+            "passed_reasons": {},
+            "failed_reasons": {},
+            "error_reasons": {},
+            "skipped_reasons": {},
+            "failure_excerpts": {},
+            "error_excerpts": {},
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "error": 0,
+            "elapsed_display": duration,
+            "_manifest_only": True,
+            "_manifest_raw_status": raw_status,
+        }
+    # fail
+    summary = f"Manifest only — log not pulled (status: {raw_status}, {duration})"
+    return {
+        "summary": summary,
+        "passed_nodes": [],
+        # Use the job name as a synthetic failure node so the Failure
+        # Analysis table still surfaces this row with an explicit "log not
+        # pulled" note (rather than silently disappearing).
+        "failed_nodes": [f"<manifest-only:{raw_status}>"],
+        "error_nodes": [],
+        "skipped_nodes": [],
+        "passed_reasons": {},
+        "failed_reasons": {
+            f"<manifest-only:{raw_status}>": f"Job exited with {raw_status}; log not pulled (selective-pull mode)."
+        },
+        "error_reasons": {},
+        "skipped_reasons": {},
+        "failure_excerpts": {},
+        "error_excerpts": {},
+        "passed": 0,
+        "failed": 1,
+        "skipped": 0,
+        "error": 0,
+        "elapsed_display": duration,
+        "_manifest_only": True,
+        "_manifest_raw_status": raw_status,
+    }
+
+
+def _augment_groups_with_manifest_only(
+    groups: list[tuple[str, list[Path]]],
+    log_dir: Path,
+) -> tuple[list[tuple[str, list[Path]]], dict[str, Any]]:
+    """Inject synthetic ``info``-less groups for OK jobs whose ``.log`` is missing.
+
+    Reads every ``timing_summary.log`` under ``log_dir``; for each manifest
+    entry that lists a job whose ``.log`` is **not** present in ``log_dir``,
+    a synthetic ``(name, [])`` group is appended (only when no real log file
+    with the same stem already exists). The returned summary covers the
+    counts so the report can render a footer note.
+
+    The synthetic ``name`` carries a ``(manifest only)`` suffix so the Local
+    Test summary visibly distinguishes it from real log-backed rows. The
+    downstream ``_local_job_rows_with_info`` step pairs each such group with
+    a synthetic ``info`` dict via :func:`_synth_manifest_info`.
+
+    Note: synthetic groups only carry the (job_name, paths) shape used by
+    ``_local_job_rows_with_info``. The synthetic ``info`` defaults to the
+    ``ok`` payload — failed-job rows must have their ``.log`` pulled by the
+    selective-pull script's phase-2 (or be present on disk), so we never
+    silently downgrade a real failure to ``ok`` here. The
+    ``manifest_only_status_fail`` count below is informational only.
+    """
+    summary = {
+        "manifest_only_jobs": 0,
+        "manifest_only_status_ok": 0,
+        "manifest_only_status_fail": 0,
+        "manifest_only_runs": [],
+    }
+    if not log_dir.is_dir():
+        return groups, summary
+
+    manifests = discover_stability_manifests(log_dir)
+    if not manifests:
+        return groups, summary
+
+    # Real job-name stems currently discovered from disk. Anything in the
+    # manifest whose stem is not in this set is treated as "manifest only".
+    disk_stems: set[str] = set()
+    for name, paths in groups:
+        disk_stems.add(name)
+        for p in paths:
+            disk_stems.add(p.stem)
+
+    augmented: list[tuple[str, list[Path]]] = list(groups)
+    for manifest in manifests:
+        run_summary = {
+            "run_dir": manifest.run_dir_name,
+            "manifest_only": [],
+            "on_disk": [],
+        }
+        for entry in manifest.entries:
+            # The selective-pull script preserves the run directory under
+            # ``log_dir/<run_dir>/<job>.log``; but the report's discovery
+            # expects ``<job>.log`` directly under ``log_dir``. Walk the run
+            # dir explicitly so we don't miss files nested one level deeper.
+            rel_log_path = log_dir / manifest.run_dir_name / f"{entry.job_name}.log"
+            direct_log_path = log_dir / f"{entry.job_name}.log"
+            log_present = rel_log_path.is_file() or direct_log_path.is_file()
+            if log_present:
+                run_summary["on_disk"].append(entry.job_name)
+                continue
+            # Only synthesize rows for OK entries — failed jobs that the
+            # script could not pull (network glitch, missing log on disk)
+            # deserve a visible "unknown" / "log not pulled" warning rather
+            # than a silent downgrade. The caller (selective pull script)
+            # should retry phase-2 for failed jobs that ended up missing.
+            if entry.status != "ok":
+                run_summary["manifest_only"].append(
+                    {
+                        "job": entry.job_name,
+                        "status": entry.raw_status,
+                        "duration": entry.duration,
+                        "synthesized": False,
+                    }
+                )
+                summary["manifest_only_status_fail"] += 1
+                summary["manifest_only_jobs"] += 1
+                continue
+            # Skip if the job was already added (e.g. as a real log).
+            if entry.job_name in disk_stems:
+                continue
+            synthetic_name = f"{entry.job_name} (manifest only)"
+            augmented.append((synthetic_name, []))
+            disk_stems.add(entry.job_name)
+            disk_stems.add(synthetic_name)
+            summary["manifest_only_jobs"] += 1
+            summary["manifest_only_status_ok"] += 1
+            run_summary["manifest_only"].append(
+                {"job": entry.job_name, "status": entry.raw_status, "duration": entry.duration, "synthesized": True}
+            )
+        if run_summary["manifest_only"]:
+            summary["manifest_only_runs"].append(run_summary)
+
+    return augmented, summary
 
 
 def _render_local_summary_table_html(
@@ -1476,8 +3050,18 @@ def markdown_local_summary_from_log_dir(log_dir: Path) -> str:
 
     Used by ``compose_full_report.py`` for **Test Result → H200 / H800 / A100** when
     ``--log-dir-h*`` points at a ``nightly_jobs``-style tree.
+
+    Augments the discovered groups with ``_augment_groups_with_manifest_only``
+    so that stability runs whose per-job ``.log`` files were cleaned up — but
+    whose ``timing_summary.log`` still records an OK status — surface as a
+    synthetic ``(manifest only)`` row instead of disappearing entirely. The
+    nightly main flow (``emit_report_html``) already does this; without the
+    augmentation here, ``compose_full_report.py`` would report "No parseable
+    job logs found" for H800-style clusters whose logs were pruned to the
+    summary.
     """
     groups = discover_job_logs(log_dir)
+    groups, _manifest_summary = _augment_groups_with_manifest_only(groups, log_dir)
     lines: list[str] = [
         f"*Log root:* `{log_dir}` (layout: "
         f"[references/nightly-local-log-layout.md](references/nightly-local-log-layout.md)).",
@@ -1494,7 +3078,7 @@ def markdown_local_summary_from_log_dir(log_dir: Path) -> str:
         lines.append("")
         return "\n".join(lines)
 
-    job_rows = _local_job_rows_with_info(groups)
+    job_rows = _local_job_rows_with_info(groups, log_dir=log_dir)
     _append_local_summary_grouped_markdown(lines, job_rows)
     lines.append(
         "*Per-job failure/error excerpts expand only in the full nightly report; "
@@ -2067,10 +3651,45 @@ def _focus_item_consec_fail_days(
     lookup: dict[tuple[str, str, str, str], dict[str, bool]],
 ) -> int:
     """Compute consecutive-failing-day count for a focus item using the history
-    lookup. Tries the (config_key) path first, then falls back to a wildcard
-    scan across config_key values when the focus item only carries the
-    human-readable config_view.
+    lookup.
+
+    Resolution order (each step short-circuits on a hit):
+
+    1. **``config_key`` (canonical slug)** — when the focus item carries the
+       slug (e.g. ``"openai-chat-omni | ... | 2500 | 900 | 8 | 32 | audio_metrics"``),
+       use it as the exact ``config_key`` in the lookup. This is the canonical
+       path — one focus row == one perf variant == one Days-failing value.
+       Multiple variants of the same ``(model, test, metric)`` therefore get
+       their own rows with their own streak.
+    2. **``config`` (human-readable config_view)** — legacy strict match
+       against the slug, kept so older callers that only set ``config`` still
+       work when the strings happen to align.
+    3. **Wildcard MAX fallback** — when the focus item carries neither a
+       matching slug nor an aligned ``config_view``, fall back to scanning
+       *all* ``config_key`` values for the same ``(model, test, metric)`` and
+       returning the worst streak. This is the previous behavior; it is only
+       used as a last resort so a missing slug cannot silently zero out the
+       Days-failing cell.
+
+    Note: step 3 is **not** the default. With the canonical slug from
+    ``_buildkite_perf_rows`` (``config_key``) attached to every focus item,
+    step 1 resolves the lookup deterministically and the row-level config
+    variant is preserved (one row per ``(c, n, ...)``). The MAX fallback is
+    what produced the user's reported "3 days" bug for qwen3_omni
+    audio_metrics — the c=1 n=4 variant had been chronically failing and the
+    fallback propagated its 3-day streak onto the c=8 n=32 row.
     """
+    if item.config_key:
+        key = _normalize_focus_key((item.model, item.test, item.config_key, item.metric))
+        by_date = lookup.get(key)
+        if by_date:
+            return _consec_fail_days_from_history(
+                lookup,
+                model=key[0],
+                test=key[1],
+                config_key=key[2],
+                metric=key[3],
+            )
     key_strict = _normalize_focus_key((item.model, item.test, item.config, item.metric))
     by_date = lookup.get(key_strict)
     if by_date:
@@ -2110,6 +3729,14 @@ class NightlyFocusItem:
     model_type: str
     hardware: str = ""
     config: str = ""
+    # Canonical config slug from the kanban history (e.g.
+    # "openai-chat-omni | openai-chat-omni | Qwen/... | qwen3_omni | random |
+    # 2500 | 900 | 8 | 32 | audio_metrics"). Distinct rows that share the same
+    # ``config_view`` (human-readable label) but differ in ``c``/``n`` will have
+    # distinct ``config_key`` values; that lets ``_focus_item_consec_fail_days``
+    # do a precise per-variant lookup instead of falling back to a MAX scan
+    # across all variants of ``(model, test, metric)``.
+    config_key: str = ""
     test: str = ""
     metric: str = ""
     latest: Any = None
@@ -2165,6 +3792,12 @@ def _focus_item_from_perf_row(
         model_type=str(get_value("model_type", "") or ""),
         hardware=str(get_value("hardware", "") or ""),
         config=str(get_value("config_view", "") or ""),
+        # ``config_key`` is the canonical slug from ``_buildkite_perf_rows``;
+        # when present it lets the consec-fail-day lookup match the exact
+        # perf variant instead of falling back to the MAX scan across all
+        # ``(model, test, metric)`` variants (see
+        # ``_focus_item_consec_fail_days``).
+        config_key=str(get_value("config_key", "") or ""),
         test=str(get_value("test_name", "") or ""),
         metric=str(get_value("metric", "") or ""),
         latest=get_value("latest"),
@@ -2226,28 +3859,6 @@ def _select_focus_perf_items(items: list[NightlyFocusItem]) -> tuple[str, list[N
     if normal:
         return "normal", normal[:3]
     return "empty", []
-
-
-def _focus_perf_table_rows(items: list[NightlyFocusItem]) -> list[list[str]]:
-    rows: list[list[str]] = []
-    for item in items:
-        rows.append(
-            [
-                _md_cell(item.source),
-                _md_cell(item.model),
-                _md_cell(_norm_focus_hardware(item.hardware)),
-                _md_cell(item.model_type),
-                _md_cell(item.config),
-                _md_cell(item.test),
-                _md_cell(item.metric),
-                _perf_num(item.latest),
-                _perf_num(item.baseline),
-                _perf_pct(item.vs_baseline_pct),
-                _md_cell(item.status),
-                _format_consec_fail_days(item.consec_fail_days),
-            ]
-        )
-    return rows
 
 
 def _render_focus_perf_table_html(items: list[NightlyFocusItem]) -> str:
@@ -2369,6 +3980,9 @@ def _daily_focus_data(
     local_job_rows: list[tuple[str, list[Path], dict[str, Any]]],
     kanban_cfg: KanbanAssetsConfig,
     log_dir: Path,
+    gh_token: str | None = None,
+    now: datetime | None = None,
+    di_overrides: dict[int, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     bk_perf_summary, _ = _buildkite_perf_rows(kanban_cfg, log_dir=log_dir, exclude_local_overlap=True)
     local_perf_summary, _ = _buildkite_perf_rows(kanban_cfg, log_dir=log_dir)
@@ -2381,6 +3995,10 @@ def _daily_focus_data(
     local_perf_counts = _perf_counts(local_perf_summary)
     job_fail_count = int(bk_job_counts["fail"]) + int(local_job_counts["fail"])
     perf_fail_count = int(bk_perf_counts["fail"]) + int(local_perf_counts["fail"])
+    # ``_compute_outstanding_di`` lifts inherited Assignee values into the
+    # per-issue tuple so the snapshot card's pre-formatted display stays
+    # consistent with the rendered table below.
+    outstanding_di = _compute_outstanding_di(gh_token, now=now, overrides=di_overrides)
     if job_fail_count or perf_fail_count:
         conclusion = (
             f"Attention needed: {job_fail_count} test failure(s)/anomaly(ies) and "
@@ -2409,6 +4027,8 @@ def _daily_focus_data(
         "local_perf_status": local_perf_summary.get("status", ""),
         "bk_perf_message": bk_perf_summary.get("message", ""),
         "local_perf_message": local_perf_summary.get("message", ""),
+        "outstanding_di": outstanding_di,
+        "di_overrides": di_overrides or {},
     }
 
 
@@ -2422,11 +4042,75 @@ def _render_focus_metric_card(title: str, value: str, detail: str, severity: str
     )
 
 
+def _render_manifest_only_note_html(summary: dict[str, Any]) -> str:
+    """Render a small note when selective-pull left some jobs as manifest-only.
+
+    The note only fires when at least one stability job came from the
+    ``timing_summary.log`` rather than a real ``.log`` file (i.e. when the
+    user ran ``scripts/selective_stability_pull.py`` and the run had no
+    failures for some jobs). It explains the ``(manifest only)`` suffix on
+    the Job column and surfaces any failed-but-not-pulled rows so the user
+    can re-run phase-2 if needed.
+    """
+    n_jobs = summary.get("manifest_only_jobs", 0)
+    if n_jobs <= 0:
+        return ""
+    n_ok = summary.get("manifest_only_status_ok", 0)
+    n_fail = summary.get("manifest_only_status_fail", 0)
+
+    parts: list[str] = []
+    if n_ok:
+        parts.append(
+            f"{n_ok} stability job(s) marked <code>(manifest only)</code> — "
+            f"status taken from <code>timing_summary.log</code>; full "
+            f"<code>.log</code> not pulled (selective-pull optimization)."
+        )
+    if n_fail:
+        runs = summary.get("manifest_only_runs", []) or []
+        failed_runs = []
+        for run in runs:
+            failed_in_run = [
+                f"{m['job']} ({m['status']})" for m in run.get("manifest_only", []) if not m.get("synthesized")
+            ]
+            if failed_in_run:
+                failed_runs.append(f"{run['run_dir']}: {', '.join(failed_in_run)}")
+        if failed_runs:
+            parts.append(
+                f"<strong>{n_fail} failed stability job(s) had no log pulled</strong> — "
+                f"the manifest records the failure but the actual log is missing on disk. "
+                f"Re-run <code>scripts/selective_stability_pull.py</code> to retry. "
+                f"<br>Affects: {'; '.join(html.escape(r) for r in failed_runs)}"
+            )
+        else:
+            parts.append(
+                f"<strong>{n_fail} failed stability job(s) had no log pulled</strong> — "
+                f"re-run <code>scripts/selective_stability_pull.py</code> to retry."
+            )
+
+    body = " ".join(parts)
+    return (
+        '<p class="manifest-only-note" '
+        'style="margin: 0.25rem 0 0.75rem; padding: 0.5rem 0.75rem; '
+        "background: var(--dashboard-card-tint, #f6f8fa); "
+        "border-left: 3px solid var(--dashboard-link, #1d4ed8); "
+        'font-size: 0.85rem; color: var(--dashboard-soft-text, #475569);">'
+        f"{body}"
+        "</p>"
+    )
+
+
 def _render_daily_focus_html(data: dict[str, Any]) -> str:
     bk_jobs = data["bk_job_counts"]
     local_jobs = data["local_job_counts"]
     bk_perf = data["bk_perf_counts"]
     local_perf = data["local_perf_counts"]
+    di = data.get("outstanding_di") or {}
+    di_value = di.get("value", "—")
+    di_detail = di.get("detail", "")
+    if di_detail:
+        di_detail_full = f"{di.get('n_issues', 0)} open bug(s); {di_detail}"
+    else:
+        di_detail_full = f"{di.get('n_issues', 0)} open bug(s)"
     cards = [
         _render_focus_metric_card(
             "Buildkite jobs",
@@ -2452,20 +4136,27 @@ def _render_daily_focus_html(data: dict[str, Any]) -> str:
             f"pass={int(local_perf['pass'])}, normal={int(local_perf['normal'])}, n/a={int(local_perf['n/a'])}",
             "fail" if local_perf["fail"] else "ok",
         ),
+        _render_focus_metric_card(
+            "Outstanding DI",
+            di_value,
+            di_detail_full,
+            di.get("severity", "ok"),
+        ),
     ]
-    parts: list[str] = [
-        f'<section class="panel nightly-focus nightly-focus--{html.escape(str(data["severity"]))}">',
+    parts: list[str] = []
+    parts.append(f'<section class="panel nightly-focus nightly-focus--{html.escape(str(data["severity"]))}">')
+    parts.append(
         _heading_html(
             "h2",
             _SVG_SPARK,
             html.escape("Daily focus"),
             sub=html.escape("Performance regressions and test failures"),
-        ),
-        f'<p class="focus-conclusion">{html.escape(str(data["conclusion"]))}</p>',
-        '<div class="focus-card-grid">',
-        "\n".join(cards),
-        "</div>",
-    ]
+        )
+    )
+    parts.append(f'<p class="focus-conclusion">{html.escape(str(data["conclusion"]))}</p>')
+    parts.append('<div class="focus-card-grid">')
+    parts.append("\n".join(cards))
+    parts.append("</div>")
     top_items: list[NightlyFocusItem] = data.get("top_items") or []
     if top_items:
         label = "All major regressions" if data.get("focus_kind") == "fail" else "Minor fluctuation watchlist"
@@ -2493,44 +4184,16 @@ def _render_daily_focus_html(data: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def _append_daily_focus_markdown(lines: list[str], data: dict[str, Any]) -> None:
-    lines.append("## Daily focus")
-    lines.append("")
-    lines.append(f"- **Conclusion:** {_md_cell(str(data['conclusion']))}")
-    bk_jobs = data["bk_job_counts"]
-    local_jobs = data["local_job_counts"]
-    bk_perf = data["bk_perf_counts"]
-    local_perf = data["local_perf_counts"]
-    lines.append(
-        f"- **Test failures:** Buildkite `{int(bk_jobs['fail'])}/{int(bk_jobs['total'])}`, "
-        f"Local `{int(local_jobs['fail'])}/{int(local_jobs['total'])}`"
-    )
-    lines.append(f"- **Performance fail:** Buildkite `{int(bk_perf['fail'])}`, Local `{int(local_perf['fail'])}`")
-    lines.append("")
-    top_items: list[NightlyFocusItem] = data.get("top_items") or []
-    if top_items:
-        title = "### All major regressions" if data.get("focus_kind") == "fail" else "### Minor fluctuation watchlist"
-        lines.append(title)
-        lines.append("")
-        lines.append(
-            render_markdown_table(
-                list(_FOCUS_TABLE_HEADERS),
-                _focus_perf_table_rows(top_items),
-            )
-        )
-        lines.append("")
-        return
-    notes = []
-    if data.get("bk_perf_status") != "ok" and data.get("bk_perf_message"):
-        notes.append(f"Buildkite perf: {data['bk_perf_message']}")
-    if data.get("local_perf_status") != "ok" and data.get("local_perf_message"):
-        notes.append(f"Local perf: {data['local_perf_message']}")
-    if notes:
-        for note in notes:
-            lines.append(f"- **Data note:** {_md_cell(str(note))}")
-    else:
-        lines.append("*No performance regressions require top-level display.*")
-    lines.append("")
+def _resolve_github_token() -> str | None:
+    """Pick up ``GITHUB_TOKEN`` / ``GH_TOKEN`` from the environment for the
+    Outstanding DI card. Without a token the call falls back to unauthenticated
+    GitHub REST, which still works but is more aggressively rate-limited.
+    """
+    for var in ("GITHUB_TOKEN", "GH_TOKEN"):
+        value = os.environ.get(var, "").strip()
+        if value:
+            return value
+    return None
 
 
 def _render_perf_model_table_html(table_id: str, rows: list[list[str]]) -> str:
@@ -2781,15 +4444,6 @@ def _render_kanban_fallback_html(summary: dict[str, Any]) -> str:
     )
 
 
-def _append_kanban_fallback_markdown(lines: list[str], summary: dict[str, Any]) -> None:
-    items = _kanban_fallback_items(summary)
-    if not items:
-        return
-    lines.append("- **Raw data fallback diagnostics:**")
-    for item in items:
-        lines.append(f"  - {_md_cell(item)}")
-
-
 def _render_buildkite_perf_inner_html(
     kanban_cfg: KanbanAssetsConfig,
     *,
@@ -2853,344 +4507,27 @@ def _render_buildkite_perf_inner_html(
     return "\n".join(parts)
 
 
-def _append_local_perf_baseline_markdown(
-    lines: list[str],
-    kanban_cfg: KanbanAssetsConfig,
-    *,
-    log_dir: Path,
-) -> None:
-    lines.append("## Local performance baseline comparison")
-    lines.append("")
-    summary, grouped_rows = _buildkite_perf_rows(kanban_cfg, log_dir=log_dir)
-    _append_buildkite_perf_markdown(lines, summary, grouped_rows)
-
-
-def _append_buildkite_perf_markdown(
-    lines: list[str],
-    summary: dict[str, Any],
-    grouped_rows: dict[str, list[list[str]]],
-    *,
-    model_heading_level: int = 4,
-) -> None:
-    # Verbose diagnostic lines (Data source / Local filter / History / History generated_at /
-    # Description / Raw data fallback diagnostics) were removed: the perf comparison block
-    # should focus on per-model baseline rows, not on data-source plumbing. Diagnostics
-    # remain available in `_buildkite_perf_rows` / `_kanban_fallback_items` for tooling.
-    for warning in summary.get("warnings") or []:
-        lines.append(f"- **Note:** {_md_cell(str(warning))}")
-    if summary.get("status") != "ok":
-        lines.append("")
-        return
-    stats = summary.get("summary", {})
-    per_file_days = summary.get("latest_day_per_file") or {}
-    per_file_str = ", ".join(f"{k}={v}" for k, v in sorted(per_file_days.items())) if per_file_days else "n/a"
-    lines.append(f"- **Latest date per file:** `{summary.get('latest_day')}` (freshest; per-file = {per_file_str})")
-    lines.append(
-        f"- **Stats:** pass `{int(stats.get('pass', 0))}` / "
-        f"normal `{int(stats.get('normal', 0))}` / "
-        f"fail `{int(stats.get('fail', 0))}` / n-a `{int(stats.get('n/a', 0))}`"
-    )
-    lines.append("")
-    lines.append("*Grouped by model (Markdown has no collapse).*")
-    lines.append("")
-    heading_prefix = "#" * model_heading_level
-    for model_name in sorted(grouped_rows.keys()):
-        lines.append(f"{heading_prefix} {model_name}")
-        lines.append("")
-        lines.append(
-            render_markdown_table(
-                _PERF_TABLE_HEADERS,
-                grouped_rows[model_name],
-            )
-        )
-        lines.append("")
-
-
-def _append_buildkite_markdown(
-    lines: list[str],
-    bk_build: dict[str, Any] | None,
-    bk_jobs: list[dict[str, Any]] | None,
-    bk_note: str | None,
-    kanban_cfg: KanbanAssetsConfig,
-    target: BkTarget,
-    *,
-    log_dir: Path | None = None,
-) -> None:
-    """Render one collapsible Buildkite chapter (Markdown).
-
-    Each chapter is wrapped in a ``<details>`` block so it can be folded in
-    the rendered Markdown viewer. The chapter content mirrors the existing
-    Buildkite rendering (build metadata, per-job summary, perf comparison,
-    per-step failure analysis) — only ``build_url`` and the chapter label
-    change per target.
-    """
-    lines.append(f"### Buildkite ({target.label}): latest scheduled nightly")
-    lines.append("")
-    lines.append(
-        f"<details><summary><strong>{target.label} — Buildkite ({target.org}/{target.pipeline})</strong></summary>"
-    )
-    lines.append("")
-    if bk_note:
-        lines.append(bk_note)
-        lines.append("")
-        lines.append("### Performance baseline comparison")
-        lines.append("")
-        summary, grouped_rows = _buildkite_perf_rows(
-            kanban_cfg,
-            log_dir=log_dir,
-            exclude_local_overlap=log_dir is not None,
-        )
-        _append_buildkite_perf_markdown(lines, summary, grouped_rows)
-        lines.append("")
-        lines.append("</details>")
-        lines.append("")
-        return
-    if not bk_build or bk_jobs is None:
-        lines.append(f"*(Buildkite ({target.label}) section not available.)*")
-        lines.append("")
-        lines.append("### Performance baseline comparison")
-        lines.append("")
-        summary, grouped_rows = _buildkite_perf_rows(
-            kanban_cfg,
-            log_dir=log_dir,
-            exclude_local_overlap=log_dir is not None,
-        )
-        _append_buildkite_perf_markdown(lines, summary, grouped_rows)
-        lines.append("")
-        lines.append("</details>")
-        lines.append("")
-        return
-    bn = int(bk_build["number"])
-    build_url = f"https://buildkite.com/{target.org}/{target.pipeline}/builds/{bn}"
-    lines.append(f"- **Build:** [{bn}]({build_url})")
-    lines.append(f"- **State:** `{bk_build.get('state') or ''}`")
-    lines.append(f"- **Message:** {_md_cell((bk_build.get('message') or '')[:500])}")
-    co = (bk_build.get("commit") or "")[:12]
-    if co:
-        lines.append(f"- **Commit:** `{co}`")
-    lines.append("")
-    sum_rows = [_summary_row_for_bk_rec(r) for r in bk_jobs]
-    lines.append(
-        render_markdown_table(
-            ["Job", "Total", "Passed", "Failed", "Skipped", "Errors", "Elapsed time"],
-            sum_rows,
-        )
-    )
-    lines.append("")
-    lines.append("*Failed Buildkite steps only: detailed excerpts below. Passing steps are in the table only.*")
-    lines.append("")
-    lines.append("### Performance baseline comparison")
-    lines.append("")
-    summary, grouped_rows = _buildkite_perf_rows(
-        kanban_cfg,
-        log_dir=log_dir,
-        exclude_local_overlap=log_dir is not None,
-    )
-    _append_buildkite_perf_markdown(lines, summary, grouped_rows)
-    for rec in bk_jobs:
-        info = rec.get("info")
-        if rec.get("log_error"):
-            lines.append(f"### Buildkite step: `{_md_cell(rec['name'])}` (log fetch failed)")
-            lines.append("")
-            lines.append(f"- **Step link:** {rec['step_link']}")
-            lines.append(f"- **Error:** {_md_cell(rec['log_error'][:500])}")
-            lines.append("")
-            continue
-        if not info or _job_is_clean(info):
-            continue
-        lines.append(f"### Buildkite step: `{_md_cell(rec['name'])}`")
-        lines.append("")
-        lines.append(f"- **Step link:** [{rec['step_link']}]({rec['step_link']})")
-        lines.append("")
-        fail_rows: list[list[str]] = []
-        for node in info["failed_nodes"]:
-            fail_rows.append(
-                [
-                    _md_cell(node),
-                    _md_cell(info["failed_reasons"].get(node, "")),
-                    _md_cell(info["failure_analyses"].get(node, "")),
-                    _excerpt_md_cell(info["failure_excerpts"].get(node, "")),
-                    "Submit issue",
-                    "Filed / Not an issue",
-                ]
-            )
-        for node in info["error_nodes"]:
-            fail_rows.append(
-                [
-                    _md_cell(node) + " (ERROR)",
-                    _md_cell(info["error_reasons"].get(node, "")),
-                    _md_cell(info["error_analyses"].get(node, "")),
-                    _excerpt_md_cell(info["error_excerpts"].get(node, "")),
-                    "Submit issue",
-                    "Filed / Not an issue",
-                ]
-            )
-        lines.append("#### Failures & errors")
-        lines.append("")
-        lines.append(
-            render_markdown_table(
-                ["Test node", "Log reason", "Analysis", "Excerpt (truncated)", "Submit Issue", "Status"],
-                fail_rows,
-            )
-        )
-        lines.append("")
-    lines.append("</details>")
-    lines.append("")
-
-
-def _excerpt_md_cell(excerpt: str, limit: int = 900) -> str:
-    """Render excerpt in Markdown table cell, preserving line breaks.
-
-    Uses HTML-like line break markers since standard Markdown tables don't support
-    multi-line content. The excerpt is truncated if too long, but line breaks
-    are preserved as visible separators for readability.
-    """
-    t = (excerpt or "").strip()
-    if not t:
-        return _md_cell("—")
-    # Truncate if needed but preserve structure
-    if len(t) > limit:
-        lines = t.splitlines()
-        # Truncate by lines first for better readability
-        truncated_lines = []
-        total_len = 0
-        for line in lines:
-            if total_len + len(line) + 1 > limit - 3:
-                break
-            truncated_lines.append(line)
-            total_len += len(line) + 1
-        if truncated_lines:
-            t = "\n".join(truncated_lines) + "\n…"
-        else:
-            t = t[: limit - 1] + "…"
-    # Use explicit line break representation for Markdown table cells
-    # Replace newlines with a visible separator that HTML can render
-    t = t.replace("\n", "  \n")  # Two spaces + newline = line break in Markdown
-    return _md_cell(t)
-
-
-def emit_report(
-    *,
-    title: str,
-    repo_root: Path,
-    log_dir: Path,
-    out_fp: Any,
-    bk_results: dict[BkTarget, tuple[dict[str, Any] | None, list[dict[str, Any]] | None, str | None]] | None = None,
-    kanban_cfg: KanbanAssetsConfig | None = None,
-) -> None:
-    groups = discover_job_logs(log_dir)
-    if kanban_cfg is None:
-        kanban_cfg = KanbanAssetsConfig(
-            assets_dir=DEFAULT_KANBAN_ASSETS_DIR,
-            repo_root=DEFAULT_KANBAN_REPO_ROOT,
-        )
-    if bk_results is None:
-        bk_results = {t: (None, None, None) for t in ALL_BK_TARGETS}
-
-    lines: list[str] = [
-        f"# {_md_cell(title)}",
-        "",
-    ]
-
-    job_rows = _local_job_rows_with_info(groups) if groups else []
-    # Daily Focus uses the CUDA (canonical) Buildkite data — that is the
-    # pipeline that matches the local H200/H800/A100 runs by default.
-    cuda_build, cuda_jobs, _ = bk_results.get(CUDA_TARGET, (None, None, None))
-    _append_daily_focus_markdown(
-        lines,
-        _daily_focus_data(
-            bk_jobs=cuda_jobs,
-            local_job_rows=job_rows,
-            kanban_cfg=kanban_cfg,
-            log_dir=log_dir,
-        ),
-    )
-
-    lines.append("## Buildkite Test")
-    lines.append("")
-    lines.append("Scheduled nightly — CUDA & NPU chapters. Click a chapter to expand.")
-    lines.append("")
-    for target in ALL_BK_TARGETS:
-        bk_build, bk_jobs, bk_note = bk_results.get(target, (None, None, None))
-        _append_buildkite_markdown(
-            lines,
-            bk_build,
-            bk_jobs,
-            bk_note,
-            kanban_cfg,
-            target,
-            log_dir=log_dir,
-        )
-
-    lines.append("## Local cluster (nightly_jobs)")
-    lines.append("")
-
-    if not groups:
-        lines.append(
-            f"*No job logs found under `{log_dir}`. "
-            "Confirm nightly jobs ran, copy logs from the cluster "
-            "(vllm-omni-local-test references/nightly-local-log-fetch.md), "
-            "and match paths in references/nightly-local-log-layout.md.*"
-        )
-        lines.append("")
-        _append_local_perf_baseline_markdown(lines, kanban_cfg, log_dir=log_dir)
-        print("\n".join(lines), file=out_fp)
-        return
-
-    lines.append("### Summary")
-    lines.append("")
-    _append_local_summary_grouped_markdown(lines, job_rows)
-    lines.append(
-        "*Failed and errored jobs only: detailed excerpts below. Passing jobs appear in the summary table only.*"
-    )
-    lines.append("")
-    _append_local_perf_baseline_markdown(lines, kanban_cfg, log_dir=log_dir)
-
-    for job_name, paths, info in job_rows:
-        if _job_is_clean(info):
-            continue
-        lines.append(f"### Local job: `{_md_cell(job_name)}`")
-        lines.append("")
-        rel = ", ".join(f"`{p.name}`" for p in paths)
-        lines.append(f"- {rel}")
-        lines.append("")
-
-        fail_rows: list[list[str]] = []
-        for node in info["failed_nodes"]:
-            fail_rows.append(
-                [
-                    _md_cell(node),
-                    _md_cell(info["failed_reasons"].get(node, "")),
-                    _md_cell(info["failure_analyses"].get(node, "")),
-                    _excerpt_md_cell(info["failure_excerpts"].get(node, "")),
-                ]
-            )
-        for node in info["error_nodes"]:
-            fail_rows.append(
-                [
-                    _md_cell(node) + " (ERROR)",
-                    _md_cell(info["error_reasons"].get(node, "")),
-                    _md_cell(info["error_analyses"].get(node, "")),
-                    _excerpt_md_cell(info["failure_excerpts"].get(node, "")),
-                ]
-            )
-
-        lines.append("#### Failures & errors")
-        lines.append("")
-        lines.append(
-            render_markdown_table(
-                ["Test node", "Log reason", "Analysis", "Excerpt (truncated)", "Submit Issue", "Status"],
-                fail_rows,
-            )
-        )
-        lines.append("")
-
-    print("\n".join(lines), file=out_fp)
-
-
 def _excerpt_storage_id(report_context: str, node: str, row_index: int) -> str:
     digest = hashlib.sha1(f"{report_context}\0{node}\0{row_index}".encode()).hexdigest()[:12]
     return f"log-excerpt-{digest}"
+
+
+def _excerpt_md_cell(excerpt: str, *, node: str = "", row_index: int = 0,
+                     report_context: str = "compose-failure") -> str:
+    """Backward-compatible shim for ``compose_full_report._render_local_gpu_failure_section``.
+
+    The release/development HTML composer wants a one-shot ``excerpt`` string
+    (no kwargs), while the full :func:`_excerpt_cell_html` API needs a stable
+    ``storage_id`` and ``title``. This shim derives both from ``node`` /
+    ``row_index`` / ``report_context`` via :func:`_excerpt_storage_id` so each
+    cell still maps to a unique modal-backed log store entry.
+    """
+    storage_id = _excerpt_storage_id(report_context, node or "excerpt", row_index)
+    return _excerpt_cell_html(
+        excerpt,
+        storage_id=storage_id,
+        title=node or "Excerpt",
+    )
 
 
 def _excerpt_cell_html(
@@ -3590,6 +4927,12 @@ def emit_report_html(
     kanban_cfg: KanbanAssetsConfig | None = None,
 ) -> None:
     groups = discover_job_logs(log_dir)
+    # Inject synthetic "manifest only" rows for stability jobs whose ``.log``
+    # was deliberately not pulled by ``selective_stability_pull.py`` — the
+    # ``timing_summary.log`` still records the result so the report can
+    # surface the OK status without fetching the full log.
+    groups, manifest_summary = _augment_groups_with_manifest_only(groups, log_dir)
+    manifest_only_total = manifest_summary.get("manifest_only_jobs", 0)
     if kanban_cfg is None:
         kanban_cfg = KanbanAssetsConfig(
             assets_dir=DEFAULT_KANBAN_ASSETS_DIR,
@@ -3598,7 +4941,68 @@ def emit_report_html(
     if bk_results is None:
         bk_results = {t: (None, None, None) for t in ALL_BK_TARGETS}
 
-    css = EDITORIAL_THEME_CSS
+    css = EDITORIAL_THEME_CSS + (
+        "\n"
+        + "  width: 100%;\n"
+        + "  font-size: 0.9rem;\n"
+        + "  border-collapse: collapse;\n"
+        + "}\n"
+        + "  padding: 0.35rem 0.6rem;\n"
+        + "  border-bottom: 1px solid var(--omni-divider, #e5e7eb);\n"
+        + "  text-align: left;\n"
+        + "  vertical-align: top;\n"
+        + "}\n"
+        + "  background: var(--dashboard-card-tint, #f6f8fa);\n"
+        + "  font-weight: 600;\n"
+        + "  color: var(--dashboard-soft-text, #475569);\n"
+        + "}\n"
+        + "  color: var(--dashboard-link, #1d4ed8);\n"
+        + "  text-decoration: none;\n"
+        + "}\n"
+        + "  text-align: right;\n"
+        + "  font-variant-numeric: tabular-nums;\n"
+        + "  color: var(--omni-critical-fg, #b91c1c);\n"
+        + "  font-weight: 600;\n"
+        + "}\n"
+        + "  text-align: right;\n"
+        + "  font-variant-numeric: tabular-nums;\n"
+        + "  color: var(--dashboard-soft-text, #64748b);\n"
+        + "}\n"
+        + "  white-space: nowrap;\n"
+        + "  font-variant-numeric: tabular-nums;\n"
+        + "}\n"
+        + "  color: var(--dashboard-link, #1d4ed8);\n"
+        + "  text-decoration: none;\n"
+        + "}\n"
+        + "  text-decoration: underline;\n"
+        + "}\n"
+        + "  color: var(--dashboard-soft-text, #94a3b8);\n"
+        + "  font-style: italic;\n"
+        + "}\n"
+        + "  margin: -0.5rem 0 1rem;\n"
+        + "  text-align: right;\n"
+        + "}\n"
+        + "  appearance: none;\n"
+        + "  background: var(--dashboard-card-tint, #f6f8fa);\n"
+        + "  color: var(--dashboard-link, #1d4ed8);\n"
+        + "  border: 1px dashed var(--dashboard-link, #1d4ed8);\n"
+        + "  border-radius: 6px;\n"
+        + "  padding: 0.35rem 0.85rem;\n"
+        + "  font-size: 0.85rem;\n"
+        + "  font-weight: 600;\n"
+        + "  cursor: pointer;\n"
+        + "  transition: background-color 120ms ease, color 120ms ease;\n"
+        + "}\n"
+        + "  background: var(--dashboard-link, #1d4ed8);\n"
+        + "  color: #fff;\n"
+        + "}\n"
+        + "  outline: 2px solid var(--dashboard-link, #1d4ed8);\n"
+        + "  outline-offset: 2px;\n"
+        + "}\n"
+        + "  background: var(--dashboard-link, #1d4ed8);\n"
+        + "  color: #fff;\n"
+        + "}\n"
+    )
 
     body_parts: list[str] = [
         '<div class="top-bar"><div class="shell top-bar-inner">'
@@ -3613,10 +5017,19 @@ def emit_report_html(
 
     job_rows: list[tuple[str, list[Path], dict[str, Any]]] = []
     if groups:
-        job_rows = _local_job_rows_with_info(groups)
+        job_rows = _local_job_rows_with_info(groups, log_dir=log_dir)
     # Daily Focus uses the CUDA (canonical) Buildkite data — that is the
     # pipeline that matches the local H200/H800/A100 runs by default.
     cuda_build, cuda_jobs, _ = bk_results.get(CUDA_TARGET, (None, None, None))
+    # Capture one reference instant for all SLO-escalating DI computations in
+    # this run; see the markdown counterpart for rationale.
+    report_now = datetime.now(timezone.utc)
+    # Inherit yesterday's operator-entered Assignee / Maintainer values from
+    # the most recently archived nightly report so the operator doesn't have
+    # to re-type the same names every day. ``_parse_previous_nightly_di_overrides``
+    # returns an empty dict when no kanban repo root is configured or when
+    # yesterday's HTML is missing.
+    di_overrides = _parse_previous_nightly_di_overrides(kanban_cfg.repo_root, today=report_now)
     body_parts.append(
         _render_daily_focus_html(
             _daily_focus_data(
@@ -3624,6 +5037,9 @@ def emit_report_html(
                 local_job_rows=job_rows,
                 kanban_cfg=kanban_cfg,
                 log_dir=log_dir,
+                gh_token=_resolve_github_token(),
+                now=report_now,
+                di_overrides=di_overrides,
             )
         )
     )
@@ -3672,6 +5088,10 @@ def emit_report_html(
         )
     else:
         summary_body = _render_local_summary_grouped_html(job_rows)
+    if manifest_only_total:
+        manifest_note = _render_manifest_only_note_html(manifest_summary)
+        if manifest_note:
+            summary_body = manifest_note + summary_body
     local_chunks.append(
         _details_subcard(
             "Summary",
@@ -3757,7 +5177,7 @@ def emit_report_html(
         title,
         css,
         "\n".join(body_parts),
-        tail=_github_issue_submit_script(),
+        tail=_github_issue_submit_script() + "\n" + _di_top10_inline_edit_script(),
     )
     print(doc, file=out_fp)
 
@@ -3836,7 +5256,6 @@ def _resolve_buildkite_for_report(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Emit HTML by default (use --html-report or stdout). "
-        "Use Markdown only when explicitly requested (--markdown-report / --to-stdout markdown). "
         "Local nightly job logs plus optional Buildkite latest scheduled nightly (needs token).",
     )
     parser.add_argument(
@@ -3871,21 +5290,9 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--markdown-report",
-        type=Path,
-        default=None,
-        help="Write Markdown report to this file (optional).",
-    )
-    parser.add_argument(
         "--stdout",
         action="store_true",
         help="Print report to stdout instead of the default dated HTML file.",
-    )
-    parser.add_argument(
-        "--to-stdout",
-        choices=("html", "markdown"),
-        default="html",
-        help="Format when using --stdout (default: html).",
     )
     parser.add_argument(
         "--no-buildkite",
@@ -3942,16 +5349,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.html_report and args.markdown_report:
-        print("Use only one of --html-report or --markdown-report.", file=sys.stderr)
-        sys.exit(2)
-    if args.stdout and (args.html_report or args.markdown_report):
-        print("Use --stdout without --html-report or --markdown-report.", file=sys.stderr)
+    if args.stdout and args.html_report:
+        print("Use --stdout without --html-report.", file=sys.stderr)
         sys.exit(2)
 
     report_date = resolve_report_date_iso(args.report_date)
     title = args.title or nightly_report_title(report_date)
-    if args.html_report is None and args.markdown_report is None and not args.stdout:
+    if args.html_report is None and not args.stdout:
         args.html_report = default_nightly_html_path(_SKILL_DIR, report_date)
 
     if args.repo_root is not None:
@@ -3995,38 +5399,15 @@ def main() -> None:
                 kanban_cfg=kanban_cfg,
             )
         print(f"Wrote {out}")
-    elif args.markdown_report:
-        out = args.markdown_report
-        out.parent.mkdir(parents=True, exist_ok=True)
-        with out.open("w", encoding="utf-8") as fp:
-            emit_report(
-                title=title,
-                repo_root=repo,
-                log_dir=log_dir,
-                out_fp=fp,
-                bk_results=bk_results,
-                kanban_cfg=kanban_cfg,
-            )
-        print(f"Wrote {out}")
     else:
-        if args.to_stdout == "markdown":
-            emit_report(
-                title=title,
-                repo_root=repo,
-                log_dir=log_dir,
-                out_fp=sys.stdout,
-                bk_results=bk_results,
-                kanban_cfg=kanban_cfg,
-            )
-        else:
-            emit_report_html(
-                title=title,
-                repo_root=repo,
-                log_dir=log_dir,
-                out_fp=sys.stdout,
-                bk_results=bk_results,
-                kanban_cfg=kanban_cfg,
-            )
+        emit_report_html(
+            title=title,
+            repo_root=repo,
+            log_dir=log_dir,
+            out_fp=sys.stdout,
+            bk_results=bk_results,
+            kanban_cfg=kanban_cfg,
+        )
 
 
 if __name__ == "__main__":

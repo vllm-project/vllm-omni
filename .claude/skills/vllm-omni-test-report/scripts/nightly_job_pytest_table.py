@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """
-Fetch vllm-omni Buildkite nightly jobs (excluding Upload * Pipeline, :docker: Build image,
-:email: Nightly Collection & Email, :pipeline: init), pull each job raw log,
-and emit Markdown rows for a per-job pytest summary table.
+Shared Buildkite nightly helpers (data-fetch only; no Markdown rendering).
 
-Requires: BUILDKITE_TOKEN or BUILDKITE_API_TOKEN in the environment.
-Optional: BUILDKITE_BUILD_NUMBER to pin a build; otherwise picks latest main build whose
-message matches (?i)scheduled nightly.
+Exports:
+  - constants: ``ORG`` / ``PIPELINE`` / ``BRANCH``
+  - :func:`resolve_latest_scheduled_nightly_number` — pick the latest scheduled-nightly
+    build number on ``branch`` (falls back to most recent green/red ``branch`` build)
+  - :func:`fetch_nightly_build` — load a build JSON
+  - :func:`collect_nightly_job_log_analyses` — pull every reportable job's raw log
+    and run it through :func:`pytest_log_parse.parse_pytest_log`
+
+Excluded jobs (not pytest, no useful footer): ``Upload * Pipeline``, ``:docker: Build image``,
+``:email: Nightly Collection & Email``, ``:pipeline: init``, ``:bar_chart: Testcase Statistics``,
+``:github: Resolve skip-ci…upload pipeline``.
+
+Requires: ``BUILDKITE_TOKEN`` / ``BUILDKITE_API_TOKEN`` in the environment for any HTTP call.
 """
 
 from __future__ import annotations
 
-import argparse
 import http.client
 import json
-import os
 import re
 import sys
 import time
@@ -26,7 +32,6 @@ from typing import Any
 _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
-from md_table import render_markdown_table  # noqa: E402
 from pytest_log_parse import parse_pytest_log  # noqa: E402
 
 ORG = "vllm"
@@ -191,19 +196,6 @@ def resolve_latest_scheduled_nightly_number(
     return None
 
 
-def latest_scheduled_nightly_number(
-    token: str,
-    *,
-    org: str = ORG,
-    pipeline: str = PIPELINE,
-    branch: str = BRANCH,
-) -> int:
-    n = resolve_latest_scheduled_nightly_number(token, org=org, pipeline=pipeline, branch=branch)
-    if n is None:
-        sys.exit(f"No scheduled nightly build found on {org}/{pipeline} (branch={branch}, per_page=50).")
-    return n
-
-
 def fetch_nightly_build(
     token: str,
     build_number: int | None,
@@ -285,141 +277,3 @@ def job_anchor(
     pipeline: str = PIPELINE,
 ) -> str:
     return f"https://buildkite.com/{org}/{pipeline}/builds/{build_no}#{job_id}"
-
-
-def md_cell(s: str) -> str:
-    return (s or "").replace("|", "/")
-
-
-def append_markdown_rows_for_nightly_job(rows: list[list[str]], rec: dict[str, Any]) -> None:
-    """Append Markdown table rows for one Buildkite job record."""
-    name = md_cell(rec["name"])
-    state = rec["state"]
-    link = rec["step_link"]
-    em_dash = "—"
-
-    if not rec["raw_url"]:
-        rows.append([name, f"{md_cell(state)} — no log URL", em_dash, em_dash, f"[open]({link})"])
-        return
-    if rec["log_error"]:
-        rows.append(
-            [
-                name,
-                f"{md_cell(state)} — log fetch failed",
-                em_dash,
-                em_dash,
-                f"[open]({link})",
-            ]
-        )
-        return
-
-    info = rec["info"]
-    assert info is not None
-    summary = info["summary"]
-    fails = info["failed_nodes"]
-    errors = info["error_nodes"]
-
-    if summary is None and not fails and not errors:
-        rows.append(
-            [
-                name,
-                f"{md_cell(state)} — non-pytest or log truncated",
-                em_dash,
-                em_dash,
-                f"[open]({link})",
-            ]
-        )
-        return
-
-    agg_result = md_cell(state or "unknown")
-    if fails or errors:
-        if fails and errors:
-            agg_result = "failed/error"
-        elif fails:
-            agg_result = "failed"
-        else:
-            agg_result = "error"
-    elif summary and re.search(r"\b[1-9]\d*\s+failed\b", summary, re.I):
-        agg_result = "failed"
-    elif summary and re.search(r"\b[1-9]\d*\s+error\b", summary, re.I):
-        agg_result = "error"
-    elif (state == "passed" or state == "finished") and not fails and not errors:
-        agg_result = "passed"
-
-    if agg_result == "passed" and not fails and not errors:
-        rows.append([name, "passed", em_dash, em_dash, f"[open]({link})"])
-        return
-
-    summ_short = md_cell((summary or "")[:260])
-    if fails or errors:
-        hint = "This step has failed/error cases; see rows below."
-    elif agg_result in ("failed", "error", "failed/error"):
-        hint = (
-            "Build state is failed, but no FAILED/ERROR lines were parsed from the log "
-            "(possibly truncated or non-pytest)."
-        )
-    else:
-        hint = em_dash
-
-    rows.append([name, md_cell(agg_result), summ_short, hint, f"[open]({link})"])
-
-    for node in fails:
-        rows.append(
-            [
-                md_cell(node),
-                "failed",
-                md_cell(info["failed_reasons"].get(node, "")),
-                md_cell(info["failure_analyses"].get(node, "")),
-                f"[open]({link})",
-            ]
-        )
-    for node in errors:
-        rows.append(
-            [
-                md_cell(node),
-                "error",
-                md_cell(info["error_reasons"].get(node, "")),
-                md_cell(info["error_analyses"].get(node, "")),
-                f"[open]({link})",
-            ]
-        )
-
-
-def emit_markdown(build: dict[str, Any], token: str, *, org: str = ORG, pipeline: str = PIPELINE) -> None:
-    rows: list[list[str]] = []
-    for rec in collect_nightly_job_log_analyses(build, token, org=org, pipeline=pipeline):
-        append_markdown_rows_for_nightly_job(rows, rec)
-    print("## Per-job test execution (pytest)")
-    print()
-    print(
-        render_markdown_table(
-            ["Job / test node", "Result", "Reason (from log)", "Heuristic analysis", "Step link"],
-            rows,
-        )
-    )
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Markdown table: nightly jobs vs pytest outcomes.")
-    parser.add_argument(
-        "--build",
-        type=int,
-        default=None,
-        help="Build number (default: latest scheduled nightly on main).",
-    )
-    args = parser.parse_args()
-
-    token = (os.environ.get("BUILDKITE_API_TOKEN") or os.environ.get("BUILDKITE_TOKEN") or "").strip()
-    if not token:
-        print(
-            "BUILDKITE_API_TOKEN or BUILDKITE_TOKEN is not set.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-
-    build = fetch_nightly_build(token, args.build)
-    emit_markdown(build, token)
-
-
-if __name__ == "__main__":
-    main()

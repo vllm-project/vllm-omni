@@ -1627,27 +1627,6 @@ details.local-summary-dim[open] > summary.local-summary-dim-summary::before {
 
 # Scoped rules for release Markdown → HTML (compose_full_report body).
 RELEASE_MARKDOWN_DOC_CSS = """
-.top-bar-actions {
-  flex-shrink: 0;
-}
-.btn-release-archive {
-  margin-top: 0.2rem;
-  padding: 0.52rem 1.05rem;
-  border-radius: 999px;
-  border: 1px solid rgba(59, 130, 246, 0.35);
-  background: rgba(59, 130, 246, 0.12);
-  color: var(--accent-hover);
-  font-weight: 700;
-  font-size: 0.88rem;
-  cursor: pointer;
-  font-family: inherit;
-  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
-}
-.btn-release-archive:hover {
-  background: rgba(59, 130, 246, 0.2);
-  border-color: var(--accent);
-  color: var(--accent);
-}
 .release-doc {
   display: flex;
   flex-direction: column;
@@ -1772,6 +1751,70 @@ RELEASE_MARKDOWN_DOC_CSS = """
     color-mix(in srgb, var(--danger-bg) 52%, var(--dashboard-panel-bg)) 0%,
     var(--dashboard-panel-bg) 46%
   );
+}
+.release-doc .release-section-card--outstanding {
+  --section-accent: color-mix(in srgb, #dc2626 88%, #991b1b);
+  --section-ico-bg: rgba(220, 38, 38, 0.14);
+  --section-ico-color: #dc2626;
+  border-top: 4px solid var(--section-accent);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--section-ico-bg) 75%, var(--dashboard-panel-bg)) 0%,
+    var(--dashboard-panel-bg) 46%
+  );
+}
+.release-doc .release-section-card--outstanding .release-section-h2-ico svg {
+  color: var(--section-ico-color);
+}
+
+/* Quality Defense Radar — per-model 5-axis coverage; green-leaning accent
+   so the section card prefigures the click-to-green segment fill. The
+   per-segment green is owned by
+   `.qd-segment[data-quality-on="1"] .qd-half` / `.qd-circle { fill: #4ade80; }`
+   in the radar CSS block below — no overlap. */
+.release-doc .release-section-card--quality-defense {
+  --section-accent: color-mix(in srgb, #22c55e 80%, #15803d);
+  --section-ico-bg: rgba(34, 197, 94, 0.14);
+  --section-ico-color: #22c55e;
+  border-top: 4px solid var(--section-accent);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--section-ico-bg) 75%, var(--dashboard-panel-bg)) 0%,
+    var(--dashboard-panel-bg) 46%
+  );
+}
+.release-doc .release-section-card--quality-defense .release-section-h2-ico svg {
+  color: var(--section-ico-color);
+}
+
+/* Stability Run Results — long-running test results; amber accent */
+.release-doc .release-section-card--stability {
+  --section-accent: #b45309;
+  --section-ico-bg: rgba(180, 83, 9, 0.12);
+  --section-ico-color: #b45309;
+  border-top: 4px solid var(--section-accent);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--section-ico-bg) 75%, var(--dashboard-panel-bg)) 0%,
+    var(--dashboard-panel-bg) 46%
+  );
+}
+.release-doc .release-section-card--stability .release-section-h2-ico svg {
+  color: var(--section-ico-color);
+}
+.release-doc .release-section-card--skip-monitor {
+  --section-accent: #f59e0b;
+  --section-ico-bg: rgba(245, 158, 11, 0.12);
+  --section-ico-color: #d97706;
+  border-top: 4px solid var(--section-accent);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--section-ico-bg) 75%, var(--dashboard-panel-bg)) 0%,
+    var(--dashboard-panel-bg) 46%
+  );
+}
+.release-doc .release-section-card--skip-monitor .release-section-h2-ico svg {
+  color: var(--section-ico-color);
 }
 .release-doc .release-section-card--data {
   --section-accent: #64748b;
@@ -1899,6 +1942,9 @@ RELEASE_MARKDOWN_DOC_CSS = """
 }
 .release-doc details.panel.test-result-gpu-card.release-gpu-details.release-gpu-details--a100 {
   --release-gpu-ico: #059669;
+}
+.release-doc details.panel.test-result-gpu-card.release-gpu-details.release-gpu-details--a3 {
+  --release-gpu-ico: #f59e0b;
 }
 .release-doc details.panel.test-result-gpu-card.release-gpu-details.release-gpu-details--h100 {
   --release-gpu-ico: var(--ci);
@@ -2273,6 +2319,453 @@ RELEASE_MARKDOWN_DOC_CSS = """
   overflow: hidden;
 }
 
+/* ------------------------------------------------------------------ */
+/* DI Top-10 Assignee + Maintainer cells — text when filled,           */
+/* white-background dashed-border input when empty.                    */
+/*                                                                     */
+/* Filled cells render a plain <span class="di-{assignee,maintainer}-  */
+/* text">; empty cells render an inline <input class="di-{assignee,      */
+/* maintainer}-input">. Same pattern as the development report's         */
+/* `di-top10-{assignee,maintainer}-*` block (lines below) so the two    */
+/* report kinds stay visually consistent.                              */
+/*                                                                     */
+/* Persistence: `_di_top10_inline_edit_script` (nightly) and            */
+/* `_DI_TOP10_INPUT_SCRIPT` (development) write to `data-di-*-value`     */
+/* attributes + localStorage keys `di-{top10-,}assignee:#N` and          */
+/* `di-{top10-,}maintainer:#N`.                                        */
+/* ------------------------------------------------------------------ */
+td.di-assignee-cell,
+td.di-maintainer-cell {
+  min-width: 7rem;
+  vertical-align: middle;
+}
+/* Filled text — plain text, no edit affordance. */
+.di-assignee-text,
+.di-maintainer-text {
+  color: var(--dashboard-text);
+  font-weight: 500;
+  font-size: 0.9rem;
+  display: inline-block;
+  padding: 0.18rem 0.1rem;
+}
+/* Empty input — white background, dashed muted border (matches the */
+/* development report's earlier ns-item-btn pattern).                */
+.di-assignee-input,
+.di-maintainer-input {
+  width: 100%;
+  min-width: 7rem;
+  padding: 0.35rem 0.55rem;
+  border: 1px dashed color-mix(in srgb, var(--dashboard-muted) 55%, transparent);
+  border-radius: 7px;
+  background: var(--dashboard-panel-bg);
+  color: var(--dashboard-text);
+  font-family: inherit;
+  font-size: 0.9rem;
+  outline: none;
+  transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
+}
+.di-assignee-input::placeholder,
+.di-maintainer-input::placeholder {
+  color: color-mix(in srgb, var(--dashboard-muted) 80%, transparent);
+  font-style: italic;
+  font-weight: 500;
+}
+.di-assignee-input:hover,
+.di-maintainer-input:hover {
+  border-style: solid;
+  border-color: var(--accent);
+  background: var(--dashboard-panel-bg);
+}
+.di-assignee-input:focus,
+.di-maintainer-input:focus {
+  border-style: solid;
+  border-color: var(--accent);
+  background: var(--dashboard-panel-bg);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 24%, transparent);
+}
+.di-assignee-input[data-da-persisted="1"],
+.di-maintainer-input[data-dm-persisted="1"] {
+  border-style: solid;
+  border-color: color-mix(in srgb, var(--dashboard-muted) 70%, transparent);
+  background: var(--dashboard-panel-bg);
+  font-weight: 500;
+}
+
+/* ── Outstanding Items — inline editing & action buttons ────────── */
+
+/* Add Item button */
+.ns-add-item-wrap {
+  margin-bottom: 0.65rem;
+}
+.ns-add-item-btn {
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 600;
+  padding: 0.35rem 1rem;
+  border-radius: 999px;
+  border: 1.5px solid var(--accent);
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s, box-shadow 0.15s;
+  letter-spacing: 0.02em;
+}
+.ns-add-item-btn:hover {
+  background: var(--accent);
+  color: #fff;
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.ns-add-item-btn:active {
+  filter: brightness(0.92);
+}
+
+/* Delete row button */
+td.ns-del-cell {
+  width: 2.2rem;
+  text-align: center;
+  vertical-align: middle;
+}
+th.ns-del-th {
+  width: 2.2rem;
+}
+.ns-del-btn {
+  font: inherit;
+  font-size: 0.9rem;
+  line-height: 1;
+  width: 1.55rem;
+  height: 1.55rem;
+  border-radius: 50%;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--dashboard-muted);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.ns-del-btn:hover {
+  background: rgba(220, 38, 38, 0.10);
+  color: #dc2626;
+  border-color: rgba(220, 38, 38, 0.25);
+}
+
+/* Item cell */
+td.ns-item-cell {
+  min-width: 10rem;
+  vertical-align: middle;
+}
+.ns-item-cell--editable {
+  cursor: pointer;
+}
+.ns-item-btn {
+  font: inherit;
+  font-size: 0.82rem;
+  text-align: left;
+  width: 100%;
+  padding: 0.22rem 0.4rem;
+  border-radius: 7px;
+  border: 1px dashed color-mix(in srgb, var(--dashboard-muted) 55%, transparent);
+  background: transparent;
+  color: var(--dashboard-text);
+  cursor: pointer;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ns-item-btn:hover {
+  border-style: solid;
+  border-color: var(--accent);
+}
+.ns-item-btn.ns-item-empty {
+  color: var(--dashboard-muted);
+  font-style: italic;
+}
+.ns-item-value {
+  font-weight: 500;
+}
+td.ns-item-cell[data-ns-item-state="set"] .ns-item-value {
+  color: var(--dashboard-text);
+}
+.ns-item-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  min-width: 12rem;
+}
+.ns-item-input {
+  font: inherit;
+  font-size: 0.82rem;
+  width: 100%;
+  padding: 0.3rem 0.4rem;
+  border-radius: 7px;
+  border: 1px solid var(--accent);
+  background: var(--dashboard-panel-bg);
+  color: var(--dashboard-text);
+}
+.ns-item-actions {
+  display: flex;
+  gap: 0.35rem;
+}
+.ns-item-save,
+.ns-item-cancel {
+  font: inherit;
+  font-size: 0.75rem;
+  padding: 0.18rem 0.6rem;
+  border-radius: 999px;
+  border: 1px solid var(--dashboard-border);
+  background: var(--dashboard-panel-bg);
+  color: var(--dashboard-text);
+  cursor: pointer;
+}
+.ns-item-save {
+  background: var(--dashboard-healthy);
+  border-color: var(--dashboard-healthy);
+  color: #fff;
+  font-weight: 600;
+}
+.ns-item-save:hover {
+  filter: brightness(0.95);
+}
+.ns-item-cancel:hover {
+  border-color: var(--dashboard-warning);
+  color: var(--danger-strong);
+}
+
+td.ns-assignee-cell {
+  min-width: 7rem;
+  vertical-align: middle;
+}
+/* DI Top10 Assignee cell — plain text (filled); editable input (empty). */
+/* Mirrors the development report's earlier ns-item-btn pattern: white    */
+/* background, dashed muted border (not accent-tinted).                   */
+.release-doc td.di-top10-assignee-cell {
+  min-width: 7rem;
+  vertical-align: middle;
+}
+.release-doc td.di-top10-assignee-cell.is-filled .di-top10-assignee-text {
+  color: var(--dashboard-text);
+  font-weight: 500;
+  font-size: 0.9rem;
+  display: inline-block;
+  padding: 0.18rem 0.1rem;
+}
+.release-doc .di-top10-assignee-input {
+  width: 100%;
+  min-width: 7rem;
+  padding: 0.35rem 0.55rem;
+  border: 1px dashed color-mix(in srgb, var(--dashboard-muted) 55%, transparent);
+  border-radius: 7px;
+  background: var(--dashboard-panel-bg);
+  color: var(--dashboard-text);
+  font-family: inherit;
+  font-size: 0.9rem;
+  outline: none;
+  transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
+}
+.release-doc .di-top10-assignee-input::placeholder {
+  color: color-mix(in srgb, var(--dashboard-muted) 80%, transparent);
+  font-style: italic;
+  font-weight: 500;
+}
+.release-doc .di-top10-assignee-input:hover {
+  border-style: solid;
+  border-color: var(--accent);
+  background: var(--dashboard-panel-bg);
+}
+.release-doc .di-top10-assignee-input:focus {
+  border-style: solid;
+  border-color: var(--accent);
+  background: var(--dashboard-panel-bg);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 24%, transparent);
+}
+.release-doc .di-top10-assignee-input[data-di-assignee-persisted="1"] {
+  border-style: solid;
+  border-color: color-mix(in srgb, var(--dashboard-muted) 70%, transparent);
+  background: var(--dashboard-panel-bg);
+  font-weight: 500;
+}
+
+/* DI Top10 Maintainer cell — development report variant. Mirrors the     */
+/* `.di-top10-assignee-*` block above so the two columns render identically. */
+.release-doc td.di-top10-maintainer-cell {
+  min-width: 7rem;
+  vertical-align: middle;
+}
+.release-doc td.di-top10-maintainer-cell.is-filled .di-top10-maintainer-text {
+  color: var(--dashboard-text);
+  font-weight: 500;
+  font-size: 0.9rem;
+  display: inline-block;
+  padding: 0.18rem 0.1rem;
+}
+.release-doc .di-top10-maintainer-input {
+  width: 100%;
+  min-width: 7rem;
+  padding: 0.35rem 0.55rem;
+  border: 1px dashed color-mix(in srgb, var(--dashboard-muted) 55%, transparent);
+  border-radius: 7px;
+  background: var(--dashboard-panel-bg);
+  color: var(--dashboard-text);
+  font-family: inherit;
+  font-size: 0.9rem;
+  outline: none;
+  transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
+}
+.release-doc .di-top10-maintainer-input::placeholder {
+  color: color-mix(in srgb, var(--dashboard-muted) 80%, transparent);
+  font-style: italic;
+  font-weight: 500;
+}
+.release-doc .di-top10-maintainer-input:hover {
+  border-style: solid;
+  border-color: var(--accent);
+  background: var(--dashboard-panel-bg);
+}
+.release-doc .di-top10-maintainer-input:focus {
+  border-style: solid;
+  border-color: var(--accent);
+  background: var(--dashboard-panel-bg);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 24%, transparent);
+}
+.release-doc .di-top10-maintainer-input[data-di-maintainer-persisted="1"] {
+  border-style: solid;
+  border-color: color-mix(in srgb, var(--dashboard-muted) 70%, transparent);
+  background: var(--dashboard-panel-bg);
+  font-weight: 500;
+}
+
+/* Device-Hours / Build (7-day avg) — manual metric row. Mirrors the   */
+/* di-top10-assignee / -maintainer input pattern so the cell visually  */
+/* matches the rest of the editable cells in the Metrics overview.    */
+.release-doc .dhpb-input {
+  width: 100%;
+  min-width: 8rem;
+  padding: 0.35rem 0.55rem;
+  border: 1px dashed color-mix(in srgb, var(--dashboard-muted) 55%, transparent);
+  border-radius: 7px;
+  background: var(--dashboard-panel-bg);
+  color: var(--dashboard-text);
+  font-family: inherit;
+  font-size: 0.9rem;
+  outline: none;
+  transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
+}
+.release-doc .dhpb-input::placeholder {
+  color: color-mix(in srgb, var(--dashboard-muted) 80%, transparent);
+  font-style: italic;
+  font-weight: 500;
+}
+.release-doc .dhpb-input:hover {
+  border-style: solid;
+  border-color: var(--accent);
+  background: var(--dashboard-panel-bg);
+}
+.release-doc .dhpb-input:focus {
+  border-style: solid;
+  border-color: var(--accent);
+  background: var(--dashboard-panel-bg);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 24%, transparent);
+}
+.release-doc .dhpb-input[data-dhpb-persisted="1"] {
+  border-style: solid;
+  border-color: color-mix(in srgb, var(--dashboard-muted) 70%, transparent);
+  background: var(--dashboard-panel-bg);
+  font-weight: 500;
+}
+.ns-assignee-btn {
+  font: inherit;
+  font-size: 0.82rem;
+  text-align: left;
+  width: 100%;
+  padding: 0.22rem 0.4rem;
+  border-radius: 7px;
+  border: 1px dashed color-mix(in srgb, var(--dashboard-muted) 55%, transparent);
+  background: transparent;
+  color: var(--dashboard-text);
+  cursor: pointer;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ns-assignee-btn:hover {
+  border-style: solid;
+  border-color: var(--accent);
+}
+.ns-assignee-btn.ns-assignee-empty {
+  color: var(--dashboard-muted);
+  font-style: italic;
+}
+.ns-assignee-value {
+  font-weight: 600;
+}
+td.ns-assignee-cell[data-ns-assignee-state="set"] .ns-assignee-value {
+  color: color-mix(in srgb, var(--accent) 80%, var(--dashboard-text));
+}
+.ns-assignee-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  min-width: 10rem;
+}
+.ns-assignee-input {
+  font: inherit;
+  font-size: 0.82rem;
+  width: 100%;
+  padding: 0.3rem 0.4rem;
+  border-radius: 7px;
+  border: 1px solid var(--accent);
+  background: var(--dashboard-panel-bg);
+  color: var(--dashboard-text);
+}
+.ns-assignee-actions {
+  display: flex;
+  gap: 0.35rem;
+}
+.ns-assignee-save,
+.ns-assignee-cancel {
+  font: inherit;
+  font-size: 0.75rem;
+  padding: 0.18rem 0.6rem;
+  border-radius: 999px;
+  border: 1px solid var(--dashboard-border);
+  background: var(--dashboard-panel-bg);
+  color: var(--dashboard-text);
+  cursor: pointer;
+}
+.ns-assignee-save {
+  background: var(--dashboard-healthy);
+  border-color: var(--dashboard-healthy);
+  color: #fff;
+  font-weight: 600;
+}
+.ns-assignee-save:hover {
+  filter: brightness(0.95);
+}
+.ns-assignee-cancel:hover {
+  border-color: var(--dashboard-warning);
+  color: var(--danger-strong);
+}
+/* Status <select> in Next Steps table */
+td.ns-status-cell {
+  vertical-align: middle;
+}
+.ns-status-select {
+  font: inherit;
+  font-size: 0.82rem;
+  padding: 0.22rem 0.4rem;
+  border-radius: 7px;
+  border: 1px solid var(--dashboard-border);
+  background: var(--dashboard-panel-bg);
+  color: var(--dashboard-text);
+  cursor: pointer;
+  min-width: 7rem;
+}
+.ns-status-select:focus {
+  border-color: var(--accent);
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
 /* Fail-status modal — used by the failure-analysis tables when the report is
    embedded via iframe (kanban Reports page). The legacy ``window.prompt()``
    flow is blocked by iframe sandbox lacking ``allow-modals``; this in-page
@@ -2601,5 +3094,302 @@ td.oi-followup-cell[data-oi-state="set"] .oi-followup-select {
 .oi-note-cancel:hover {
   border-color: var(--dashboard-warning);
   color: var(--danger-strong);
+}
+
+/* -----------------------------------------------------------------------
+ * Resource Usage Analysis — manual-entry editor block (multi-module)
+ * The editor lives inside the collapsible section body and holds a list of
+ * modules (each with its own editable title + body textarea). Clicking the
+ * module title (or the caret toggle) collapses / expands the module body.
+ * Persistence: localStorage['resource-usage-analysis'] + data-uri-value.
+ * ----------------------------------------------------------------------- */
+.resource-usage-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin: 0.4rem 0 0.2rem;
+}
+.resource-usage-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.resource-usage-toolbar--top {
+  padding-bottom: 0.3rem;
+  border-bottom: 1px dashed color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.resource-usage-status {
+  font-size: 0.78rem;
+  color: var(--dashboard-muted);
+}
+.resource-usage-status[data-resource-usage-state="saved"] {
+  color: var(--dashboard-healthy);
+}
+.resource-usage-add {
+  font: inherit;
+  font-size: 0.8rem;
+  padding: 0.28rem 0.8rem;
+  border-radius: 999px;
+  border: 1px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+  font-weight: 600;
+  cursor: pointer;
+}
+.resource-usage-add:hover {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+/* Per-module card --------------------------------------------------- */
+.resource-usage-modules {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.resource-usage-module {
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  border-radius: 8px;
+  background: var(--dashboard-panel-bg);
+  overflow: hidden;
+}
+.resource-usage-module-header {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.5rem;
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  cursor: pointer;
+  user-select: none;
+}
+.resource-usage-module-header:hover {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+.resource-usage-toggle {
+  font: inherit;
+  font-size: 0.9rem;
+  width: 1.4rem;
+  height: 1.4rem;
+  line-height: 1;
+  border: none;
+  background: transparent;
+  color: var(--dashboard-text);
+  cursor: pointer;
+  padding: 0;
+}
+.resource-usage-module-title {
+  font: inherit;
+  font-size: 0.92rem;
+  font-weight: 600;
+  flex: 1;
+  min-width: 0;
+  padding: 0.18rem 0.4rem;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--dashboard-text);
+  cursor: text;
+}
+.resource-usage-module-title:hover {
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.resource-usage-module-title:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: var(--dashboard-panel-bg);
+}
+.resource-usage-delete {
+  font: inherit;
+  font-size: 1rem;
+  width: 1.6rem;
+  height: 1.6rem;
+  line-height: 1;
+  border: 1px solid transparent;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--dashboard-muted);
+  cursor: pointer;
+  padding: 0;
+}
+.resource-usage-delete:hover {
+  border-color: var(--dashboard-warning);
+  color: var(--danger-strong);
+}
+.resource-usage-module-body {
+  padding: 0.7rem 0.8rem 0.8rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  border-top: 1px solid color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.resource-usage-module[data-collapsed="true"] .resource-usage-module-body {
+  display: none;
+}
+.resource-usage-module-textarea {
+  font: inherit;
+  font-size: 0.95rem;
+  line-height: 1.6;
+  width: 100%;
+  min-height: 16rem;
+  padding: 0.6rem 0.7rem;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  background: var(--dashboard-panel-bg);
+  color: var(--dashboard-text);
+  resize: vertical;
+  box-sizing: border-box;
+  /* Allow the textarea to grow with content; the `rows` attribute already
+     sets the empty-state visible height, this just caps runaway growth. */
+  max-height: 60vh;
+}
+.resource-usage-module-textarea::placeholder {
+  color: color-mix(in srgb, var(--dashboard-muted) 80%, transparent);
+  font-style: italic;
+}
+.resource-usage-module-textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+.resource-usage-module-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  font-size: 0.74rem;
+  color: var(--dashboard-muted);
+}
+.resource-usage-module-empty .resource-usage-module-title::before {
+  content: "Untitled module — ";
+  color: var(--dashboard-muted);
+  font-weight: 400;
+}
+
+/* ── Quality Defense Radar — 9 models × 5 axes ──────────────────── */
+.release-doc .qd-radar-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 6px 0;
+}
+.release-doc .qd-intro {
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--dashboard-fg, #1f2328);
+  margin: 0;
+  padding: 10px 14px;
+  background: var(--dashboard-card-bg);
+  border-left: 3px solid var(--section-ico-color, #22c55e);
+  border-radius: 4px;
+}
+.release-doc .qd-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+@media (max-width: 960px) {
+  .release-doc .qd-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 620px) {
+  .release-doc .qd-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.release-doc .qd-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 10px 8px 8px;
+  border: 1px solid var(--dashboard-border, #d0d7de);
+  border-radius: 8px;
+  background: var(--dashboard-card-bg);
+}
+.release-doc .qd-cell-title {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0 0 6px;
+  color: var(--dashboard-fg, #1f2328);
+  letter-spacing: 0.02em;
+}
+.release-doc .qd-cell svg.qd-radar {
+  width: 100%;
+  max-width: 260px;
+  height: auto;
+  font-family: inherit;
+}
+.release-doc .qd-radar .qd-grid {
+  pointer-events: none;
+}
+.release-doc .qd-radar .qd-pentagon-outer,
+.release-doc .qd-radar .qd-pentagon-inner {
+  fill: none;
+  stroke: var(--dashboard-border, #d0d7de);
+  stroke-width: 1.5;
+  stroke-dasharray: 4 4;
+  opacity: 0.7;
+}
+.release-doc .qd-radar line {
+  stroke: var(--dashboard-border, #d0d7de);
+  stroke-width: 1;
+  stroke-dasharray: 3 4;
+  opacity: 0.6;
+}
+.release-doc .qd-radar .qd-axis-label {
+  font-size: 11px;
+  font-weight: 600;
+  fill: var(--dashboard-fg, #1f2328);
+}
+.release-doc .qd-radar .qd-segment {
+  cursor: pointer;
+  outline: none;
+}
+.release-doc .qd-radar .qd-segment:focus-visible .qd-circle,
+.release-doc .qd-radar .qd-segment:focus-visible .qd-half {
+  stroke: var(--section-accent, #22c55e);
+  stroke-width: 3;
+}
+/* Default gray state — half-circles (split segments, GPU + NPU halves). */
+.release-doc .qd-radar .qd-segment .qd-half {
+  fill: var(--dashboard-muted-bg, #e5e7eb);
+  stroke: var(--dashboard-border, #9ca3af);
+  stroke-width: 1.5;
+  transition: fill 160ms ease, stroke 160ms ease;
+}
+/* NPU halves carry a dashed outline even in the default state so reviewers
+   can tell GPU from NPU at a glance, before clicking. */
+.release-doc .qd-radar .qd-segment[data-qd-side="npu"] .qd-half {
+  stroke-dasharray: 4 2;
+}
+/* Default gray state — full circles (single segments, doc / rel). */
+.release-doc .qd-radar .qd-segment .qd-circle {
+  fill: var(--dashboard-muted-bg, #e5e7eb);
+  stroke: var(--dashboard-border, #9ca3af);
+  stroke-width: 1.5;
+  transition: fill 160ms ease, stroke 160ms ease;
+}
+.release-doc .qd-radar .qd-segment:hover .qd-circle,
+.release-doc .qd-radar .qd-segment[data-qd-side="gpu"]:hover .qd-half {
+  fill: color-mix(in srgb, #4ade80 35%, var(--dashboard-muted-bg, #e5e7eb));
+}
+.release-doc .qd-radar .qd-segment[data-qd-side="npu"]:hover .qd-half {
+  fill: color-mix(in srgb, #7dd3fc 35%, var(--dashboard-muted-bg, #e5e7eb));
+}
+/* On state — GPU halves turn green, NPU halves turn blue so the two
+   halves of the same circle are unmistakably distinct when "checked". */
+.release-doc .qd-radar .qd-segment[data-qd-side="gpu"][data-quality-on="1"] .qd-half,
+.release-doc .qd-radar .qd-segment[data-quality-on="1"] .qd-circle {
+  fill: #4ade80;
+  stroke: #22c55e;
+}
+.release-doc .qd-radar .qd-segment[data-qd-side="npu"][data-quality-on="1"] .qd-half {
+  fill: #7dd3fc;
+  stroke: #0284c7;
+}
+.release-doc .qd-legend {
+  font-size: 12px;
+  color: var(--dashboard-muted, #6b7280);
+  text-align: center;
+  margin: 0;
 }
 """

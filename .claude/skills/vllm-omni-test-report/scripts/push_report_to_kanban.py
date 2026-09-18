@@ -694,6 +694,45 @@ def _prepare_staged_push(
     ensure_gh_authenticated()
 
     if not skip_pull:
+        # Defensive pre-pull: ``archive_report_to_kanban`` already wrote the
+        # new report to ``plan.dest_rel`` via shutil.copy2, so the working
+        # tree is intentionally dirty on that one path. ``git pull --rebase``
+        # refuses any unstaged changes, so stash just the destination file
+        # before pulling, then pop it back. Any OTHER dirty file is a real
+        # conflict and we abort with a clear message instead of silently
+        # clobbering it.
+        status_proc = _run_git(
+            kanban_repo, "status", "--porcelain", check=False
+        )
+        stashed_dest = False
+        if status_proc.returncode == 0 and (status_proc.stdout or "").strip():
+            dirty_relpaths = [
+                line.split(maxsplit=1)[1].strip()
+                for line in (status_proc.stdout or "").splitlines()
+                if line.strip()
+            ]
+            dest_posix = plan.dest_rel.as_posix()
+            other = [p for p in dirty_relpaths if p != dest_posix]
+            if other:
+                raise RuntimeError(
+                    "git pull --rebase refused: kanban repo has unstaged "
+                    f"changes outside the archive target: {', '.join(other)}. "
+                    "Commit, stash, or revert them before re-running."
+                )
+            # Stash just the destination file so the pull can proceed, then
+            # pop it back so our new content survives the rebase.
+            stash_proc = _run_git(
+                kanban_repo, "stash", "push", "--keep-index", "--include-untracked",
+                "--", plan.dest_rel.as_posix(),
+                check=False,
+            )
+            if stash_proc.returncode != 0:
+                detail = (stash_proc.stderr or stash_proc.stdout or "").strip()
+                raise RuntimeError(
+                    f"git stash push -- {dest_posix} failed: {detail}"
+                )
+            stashed_dest = True
+
         pull = _run_git(
             kanban_repo,
             "pull",
@@ -706,6 +745,21 @@ def _prepare_staged_push(
         if pull.returncode != 0:
             detail = (pull.stderr or pull.stdout or "").strip()
             raise RuntimeError(f"git pull --rebase {remote} {branch} failed: {detail}")
+
+        if stashed_dest:
+            # Restore the destination file we stashed. If the stash pop
+            # conflicts with new commits, surface the conflict instead of
+            # silently overwriting remote content.
+            pop_proc = _run_git(
+                kanban_repo, "stash", "pop", check=False,
+            )
+            if pop_proc.returncode != 0:
+                detail = (pop_proc.stderr or pop_proc.stdout or "").strip()
+                raise RuntimeError(
+                    f"git stash pop after pull failed: {detail}. "
+                    "Resolve manually with `git stash show -p | git apply` "
+                    "or re-run the archive with --skip-pull."
+                )
 
     _git_add_archive_paths(kanban_repo, plan)
     status = _run_git(kanban_repo, "status", "--porcelain", *paths, check=False)

@@ -3,9 +3,8 @@
 
 from __future__ import annotations
 
-import base64
 import html
-import json
+import math
 import re
 import sys
 from datetime import datetime, timezone
@@ -24,21 +23,21 @@ RELEASE_CONCLUSION_ITEMS: tuple[str, ...] = (
     # 0 — "guide" row (user-selectable, excluded from the final verdict)
     "UT coverage meets this iteration requirement(Guide)",
     # 1 — "guide" row (user-selectable, excluded from the final verdict)
-    "Performance regression < 5%(Guide)",
+    "Performance regression < 10%(Guide)",
     # 2 — auto: latest finished ready + merge builds have no failed/broken jobs
     # (Upload * Pipeline upload-only steps are skipped).
-    "Latest L2&L3 pass rate is 100%",
-    # 3 — manual (user-selectable)
+    "Latest GPU CI(L1-L5) pass rate is 100%",
+    # 3 — manual (user-selectable): NPU CI pass rate — placeholder until the
+    # NPU pipeline gate is wired into compose_full_report.py.
+    "Latest NPU CI(L1-L4) pass rate is 100%",
+    # 4 — manual (user-selectable)
     "Requirement completion rate > 85%",
-    # 4 — auto: cumulative Outstanding DI from all open `label:bug` (self-calculated
+    # 5 — auto: cumulative Outstanding DI from all open `label:bug` (self-calculated
     #     the same way as the Development report). Threshold rule: DI ≤ 30 → Pass,
     #     DI > 30 → Fail.
     "Remaining DI < 30",
-    # 5 — auto: compose checks for open issues labeled ``critical``
+    # 6 — auto: compose checks for open issues labeled ``critical``
     "No remaining critical issues",
-    # 6 — manual (user-selectable): the assignee check is now a case-by-case
-    #     judgement rather than a single auto-computed rule.
-    "All remaining bugs have assignees",
 )
 
 # Indices in ``RELEASE_CONCLUSION_ITEMS`` whose cells are **(Guide)** markers.
@@ -46,15 +45,14 @@ RELEASE_CONCLUSION_ITEMS: tuple[str, ...] = (
 # final Go / Rejected verdict ignores them.
 RELEASE_CONCLUSION_GUIDE_ROW_INDICES: frozenset[int] = frozenset({0, 1})
 
-# "Latest L2&L3 pass rate is 100%": latest finished ready + merge builds have no failed/broken jobs
+# "Latest GPU CI(L1-L5) pass rate is 100%": latest finished ready + merge builds have no failed/broken jobs
 CONCLUSION_L2_L3_ROW_INDEX = 2
+# "Latest NPU CI(L1-L4) pass rate is 100%": manual row (placeholder until NPU gate lands).
+CONCLUSION_NPU_ROW_INDEX = 3
 # "Remaining DI < 30": auto-computed cumulative Outstanding DI; threshold ≤ 30 ⇒ Pass.
-CONCLUSION_DI_ROW_INDEX = 4
+CONCLUSION_DI_ROW_INDEX = 5
 # "No remaining critical issues": compose checks for open issues labeled ``critical``
-CONCLUSION_CRITICAL_ROW_INDEX = 5
-# "All remaining bugs have assignees" is now manual (user-selectable) — kept as
-# a name for back-compat with any external caller that still imports the symbol.
-CONCLUSION_ASSIGNEE_ROW_INDEX = 6
+CONCLUSION_CRITICAL_ROW_INDEX = 6
 
 
 # Release chapter heading icons (24×24 stroke; same visual language as nightly HTML).
@@ -85,6 +83,20 @@ _RELEASE_SVG_SERVER = (
     '<rect x="2" y="2" width="20" height="8" rx="2" ry="2"/>'
     '<rect x="2" y="14" width="20" height="8" rx="2" ry="2"/>'
     '<line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/>'
+)
+_RELEASE_SVG_CLIPBOARD = (
+    '<rect x="8" y="2" width="8" height="4" rx="1" ry="1"/>'
+    '<path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>'
+    '<line x1="9" y1="11" x2="15" y2="11"/><line x1="9" y1="15" x2="15" y2="15"/><line x1="9" y1="19" x2="13" y2="19"/>'
+)
+_RELEASE_SVG_HOURGLASS = (
+    '<line x1="6" y1="2" x2="18" y2="2"/><line x1="6" y1="22" x2="18" y2="22"/>'
+    '<path d="M6 2h12v6a6 6 0 0 1-6 6 6 6 0 0 1-6-6V2z"/>'
+    '<path d="M6 22h12v-6a6 6 0 0 0-6-6 6 6 0 0 0-6 6v6z"/>'
+)
+_RELEASE_SVG_SHIELD = (
+    '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>'
+    '<polyline points="9 12 11 14 15 10"/>'
 )
 
 
@@ -120,67 +132,15 @@ def _release_section_theme(title_plain: str) -> tuple[str, str]:
         return "tracking", _RELEASE_SVG_ALERT
     if "open issues" in low:
         return "open-issues", _RELEASE_SVG_INBOX
+    if "outstanding items" in low:
+        return "outstanding", _RELEASE_SVG_CLIPBOARD
+    if "quality defense" in low or "quality radar" in low or "quality line" in low:
+        return "quality-defense", _RELEASE_SVG_SHIELD
+    if "stability run results" in low:
+        return "stability", _RELEASE_SVG_HOURGLASS
     if "data source" in low:
         return "data", _RELEASE_SVG_DATABASE
     return "default", _RELEASE_SVG_LAYOUT
-
-
-def test_conclusion_markdown_for_archive(
-    *,
-    l2_l3_row_ok: bool | None = None,
-    l2_l3_row_detail: str = "",
-    di_row_ok: bool | None = None,
-    di_row_detail: str = "",
-    critical_row_ok: bool | None = None,
-    critical_row_detail: str = "",
-    assignee_row_ok: bool | None = None,
-    assignee_row_detail: str = "",
-) -> str:
-    """Static Markdown block (no ``##`` heading): table + **Test conclusion:** Go / Rejected.
-
-    Guide rows (see :data:`RELEASE_CONCLUSION_GUIDE_ROW_INDICES`) still render
-    in the table — they just don't influence the final Go / Rejected verdict.
-    The ``All remaining bugs have assignees`` row is manual (user-selectable)
-    in the archive .md it defaults to "Pass" and never affects the verdict.
-    """
-    lines = [
-        "| Check item | Result |",
-        "| --- | --- |",
-    ]
-    verdict_ok = True
-    for i, item in enumerate(RELEASE_CONCLUSION_ITEMS):
-        safe = item.replace("|", "\\|")
-        cell = "Pass"
-        extra = ""
-        affects_verdict = i not in RELEASE_CONCLUSION_GUIDE_ROW_INDICES
-        if i == CONCLUSION_L2_L3_ROW_INDEX and l2_l3_row_ok is not None:
-            cell = "Pass" if l2_l3_row_ok else "Fail"
-            if affects_verdict and not l2_l3_row_ok:
-                verdict_ok = False
-            if l2_l3_row_detail:
-                extra = f" ({l2_l3_row_detail.replace('|', '/')})"
-        elif i == CONCLUSION_DI_ROW_INDEX and di_row_ok is not None:
-            cell = "Pass" if di_row_ok else "Fail"
-            if affects_verdict and not di_row_ok:
-                verdict_ok = False
-            if di_row_detail:
-                extra = f" ({di_row_detail.replace('|', '/')})"
-        elif i == CONCLUSION_CRITICAL_ROW_INDEX and critical_row_ok is not None:
-            cell = "Pass" if critical_row_ok else "Fail"
-            if affects_verdict and not critical_row_ok:
-                verdict_ok = False
-            if critical_row_detail:
-                extra = f" ({critical_row_detail.replace('|', '/')})"
-        elif i == CONCLUSION_ASSIGNEE_ROW_INDEX and assignee_row_ok is not None:
-            # Manual: never auto-affects the verdict (caller may still pass a
-            # value, but the static archive always treats it as a guide row).
-            cell = "Pass" if assignee_row_ok else "Fail"
-            if assignee_row_detail:
-                extra = f" ({assignee_row_detail.replace('|', '/')})"
-        lines.append(f"| {safe} | {cell}{extra} |")
-    vtxt = "Go" if verdict_ok else "Rejected"
-    lines.extend(["", f"**Test conclusion:** {vtxt}", ""])
-    return "\n".join(lines)
 
 
 def release_conclusion_widget_html(
@@ -191,17 +151,16 @@ def release_conclusion_widget_html(
     di_row_detail: str = "",
     critical_row_ok: bool | None = None,
     critical_row_detail: str = "",
-    assignee_row_ok: bool | None = None,
-    assignee_row_detail: str = "",
 ) -> str:
     """Interactive table + verdict (Go / Rejected) for ``.release-doc`` HTML.
 
-    Automatic rows (non-clickable when ``*_row_ok`` is not ``None``): **L2&L3**,
-    **Remaining DI**, **critical issues**. The ``All remaining bugs have
-    assignees`` row is **manual** (always user-selectable, per the
-    "用例自己选择结果" rule). Rows whose index is in
-    :data:`RELEASE_CONCLUSION_GUIDE_ROW_INDICES` render in the table and stay
-    user-selectable, but the final Go / Rejected verdict ignores them.
+    Automatic rows (non-clickable when ``*_row_ok`` is not ``None``):
+    **Latest GPU CI(L1-L5)**, **Remaining DI**, **critical issues**.
+    The **Latest NPU CI(L1-L4)** row is **manual** (always user-selectable,
+    per the "用例自己选择结果" rule).
+    Rows whose index is in :data:`RELEASE_CONCLUSION_GUIDE_ROW_INDICES` render
+    in the table and stay user-selectable, but the final Go / Rejected verdict
+    ignores them.
     """
     rows: list[str] = []
     for i, item in enumerate(RELEASE_CONCLUSION_ITEMS):
@@ -216,11 +175,6 @@ def release_conclusion_widget_html(
         elif i == CONCLUSION_CRITICAL_ROW_INDEX:
             auto_ok = critical_row_ok
             row_detail = critical_row_detail
-        elif i == CONCLUSION_ASSIGNEE_ROW_INDEX:
-            # Manual: always user-selectable. The auto-computed signal
-            # (assignee_row_ok) is intentionally ignored so the operator can
-            # make a case-by-case judgement in the HTML widget.
-            auto_ok = None
         is_auto = auto_ok is not None
         pass_on = bool(auto_ok) if is_auto else True
         pass_cls = "is-on" if pass_on else ""
@@ -312,8 +266,6 @@ def apply_release_conclusion_placeholder(
     di_row_detail: str = "",
     critical_row_ok: bool | None = None,
     critical_row_detail: str = "",
-    assignee_row_ok: bool | None = None,
-    assignee_row_detail: str = "",
 ) -> str:
     """Replace paragraph-wrapped placeholder with interactive widget."""
     escaped = html.escape(RELEASE_CONCLUSION_PLACEHOLDER, quote=False)
@@ -325,51 +277,12 @@ def apply_release_conclusion_placeholder(
         di_row_detail=di_row_detail,
         critical_row_ok=critical_row_ok,
         critical_row_detail=critical_row_detail,
-        assignee_row_ok=assignee_row_ok,
-        assignee_row_detail=assignee_row_detail,
     )
     if p_wrap in fragment:
         return fragment.replace(p_wrap, widget, 1)
     if RELEASE_CONCLUSION_PLACEHOLDER in fragment:
         return fragment.replace(RELEASE_CONCLUSION_PLACEHOLDER, widget, 1)
     return fragment
-
-
-def materialize_release_conclusion_in_markdown(
-    md: str,
-    *,
-    l2_l3_row_ok: bool | None = None,
-    l2_l3_row_detail: str = "",
-    di_row_ok: bool | None = None,
-    di_row_detail: str = "",
-    critical_row_ok: bool | None = None,
-    critical_row_detail: str = "",
-    assignee_row_ok: bool | None = None,
-    assignee_row_detail: str = "",
-) -> str:
-    """Replace placeholder with static Markdown (archived .md or ``--format markdown`` output).
-
-    Also materializes the UT-coverage editable-cell placeholder
-    (``@@UT_CELL_INSERTION_POINT@@``) with static text so the archived
-    Markdown is readable without the interactive JS handler.
-    """
-    result = md
-    if RELEASE_CONCLUSION_PLACEHOLDER in result:
-        block = test_conclusion_markdown_for_archive(
-            l2_l3_row_ok=l2_l3_row_ok,
-            l2_l3_row_detail=l2_l3_row_detail,
-            di_row_ok=di_row_ok,
-            di_row_detail=di_row_detail,
-            critical_row_ok=critical_row_ok,
-            critical_row_detail=critical_row_detail,
-            assignee_row_ok=assignee_row_ok,
-            assignee_row_detail=assignee_row_detail,
-        )
-        result = result.replace(RELEASE_CONCLUSION_PLACEHOLDER, block, 1)
-    # Replace UT-coverage manual-edit placeholder with static Markdown text.
-    # In the archived .md the cell reads as "(manual edit — editable in HTML)".
-    result = result.replace("@@UT_CELL_INSERTION_POINT@@", "*manual edit — editable in HTML*")
-    return result
 
 
 def _italic_in_plain(s: str) -> str:
@@ -622,7 +535,7 @@ def _wrap_release_report_h2_sections(html_fragment: str) -> str:
 
 
 def _test_result_h3_is_gpu_card(h3_block: str) -> bool:
-    """True if the block opens with an ``h3`` for H100 / H200 / H800 / A100 (not Common stack)."""
+    """True if the block opens with an ``h3`` for H100 / H200 / H800 / A100 / A3 (not Common stack)."""
     m = re.match(r"\s*<h3>([\s\S]*?)</h3>", h3_block.strip())
     if not m:
         return False
@@ -635,6 +548,8 @@ def _test_result_h3_is_gpu_card(h3_block: str) -> bool:
     if re.fullmatch(r"H800", inner_text, re.IGNORECASE):
         return True
     if re.fullmatch(r"A100", inner_text, re.IGNORECASE):
+        return True
+    if re.fullmatch(r"A3", inner_text, re.IGNORECASE):
         return True
     # ``### H100``, ``### H100 (CI ...)``, ``### H100（CI ...）`` — reject ``H1000``-style labels.
     # Allow optional whitespace between ``H100`` and the opening paren so that the
@@ -813,85 +728,6 @@ def _wrap_failure_analysis_h4_in_details(html_fragment: str) -> str:
     and tables that follow until the next h4 (or end of the Failure Analysis section).
     """
     return _wrap_section_h4_in_details(html_fragment, "Failure Analysis")
-
-
-_BUGFIX_MONITOR_H3_RE = re.compile(
-    r"<h3>\s*(Open|Closed)\s+bugfix\s+PRs\s*\([^)]+\)\s*</h3>",
-    re.IGNORECASE,
-)
-
-
-def _wrap_bugfix_monitor_h3_in_details(html_fragment: str) -> str:
-    """Wrap ``### Open bugfix PRs (N)`` / ``### Closed bugfix PRs (N)`` headings
-    inside **Bugfix Monitor** as collapsible ``<details>`` blocks (the custom
-    markdown→HTML converter doesn't preserve raw ``<details>`` HTML, so we
-    emit ``### h3`` headings and post-process the body to wrap them).
-
-    Each h3 becomes a fold; its body content is the tables that follow until
-    the next h3 (or end of the section). The wrapper reuses the same
-    ``report-subcard`` CSS class so the styling matches the rest of the report.
-    """
-    # Locate the actual ``<h2 class="release-section-h2">Bugfix Monitor`` heading
-    # by matching the *complete* h2 element up to and including the closing
-    # ``</h2>`` so the regex is bounded to a single h2 (the inner label text
-    # is what we actually want to match). The non-greedy ``.*?`` inside the
-    # ico span is safe; the ``</h2>`` at the tail anchors the match.
-    h2_match = re.search(
-        r'<h2 class="release-section-h2"[^>]*>'
-        r"(?:(?!</h2>).)*?"
-        r'<span class="release-section-h2-label">\s*Bugfix Monitor[^<]*</span>'
-        r"(?:(?!</h2>).)*?"
-        r"</h2>",
-        html_fragment,
-        re.DOTALL,
-    )
-    if not h2_match:
-        return html_fragment
-    # The enclosing <section class="panel release-section-card"> is the most
-    # recent one before the h2 — rfind the full class string so we don't
-    # accidentally pick up the intro section.
-    sec_start = html_fragment.rfind('<section class="panel release-section-card', 0, h2_match.start())
-    if sec_start < 0:
-        return html_fragment
-    # The regex match is bounded to the full ``<h2 …>…</h2>`` element, so
-    # ``h2_match.end()`` points one past the closing ``</h2>``.
-    head_end = h2_match.end()
-    # _balanced_outer_section_end returns the index one past the matching
-    # ``</section>``. The body sits between ``</h2>`` and that closing tag.
-    sec_close = _balanced_outer_section_end(html_fragment, sec_start)
-    if sec_close is None:
-        return html_fragment
-    prefix = html_fragment[:sec_start]
-    head = html_fragment[sec_start:head_end]
-    body = html_fragment[head_end : sec_close - len("</section>")]
-    tail = html_fragment[sec_close - len("</section>") :]
-
-    parts = re.split(r"(?=<h3\b)", body)
-    out = [prefix, head]
-    if parts and parts[0].strip():
-        out.append(parts[0])
-    for p in parts[1:]:
-        stripped = p.strip()
-        hm = re.match(r"(?s)(<h3[^>]*>[\s\S]*?</h3>)([\s\S]*)", stripped)
-        if not hm:
-            if stripped:
-                out.append(p)
-            continue
-        h3_el, rest = hm.group(1), hm.group(2)
-        title_text = re.sub(r"<[^>]+>", "", h3_el).strip()
-        if not _BUGFIX_MONITOR_H3_RE.search(h3_el):
-            out.append(p)
-            continue
-        out.append(
-            '<details class="report-subcard release-h-fold release-bugfix-monitor-fold" open>'
-            '<summary class="report-subcard-summary">'
-            f'<span class="report-subcard-title">{html.escape(title_text)}</span>'
-            "</summary>"
-            f'<div class="report-subcard-body">{rest.strip()}</div>'
-            "</details>"
-        )
-    out.append(tail)
-    return "".join(out)
 
 
 def _wrap_h5_blocks_in_details(fragment: str) -> str:
@@ -1601,6 +1437,1278 @@ _OPEN_ISSUE_ACTION_SCRIPT = """<script>
 </script>"""
 
 
+def _upgrade_di_top10_input_cells(html_fragment: str) -> str:
+    """Make the **Assignee** and **Maintainer** columns editable in the **DI Top10** sub-table.
+
+    The development report's ``### DI Top10 (SLO-escalating: ...)`` table is a
+    plain Markdown table. Operators want to fill in assignees and maintainers
+    directly in the report; this post-processor walks that table only and
+    rewrites each **Assignee** and **Maintainer** cell.
+
+    Filled cells (GitHub-sourced value present) become a plain
+    ``<span class="di-top10-{assignee,maintainer}-text">`` — editing would
+    invite drift between the report and GitHub, so we just render the value
+    and skip any input affordance. Empty cells become an editable inline
+    ``<input>`` (placeholder ``+ Add assignee`` / ``+ Add maintainer``) so
+    the operator can fill them in directly.
+
+    The editable input path shares the runtime JS in :data:`_DI_TOP10_INPUT_SCRIPT`:
+    every keystroke and ``blur`` writes to (a) the input's
+    ``data-di-*-value`` attribute (so a browser "Save Page As" captures it)
+    and (b) ``localStorage`` keyed by ``di-top10-assignee:#N`` /
+    ``di-top10-maintainer:#N``. The DOM attribute is preferred on reload so
+    a saved copy retains the user's edits across origins
+    (``file://`` → ``github.io``).
+
+    Implementation pattern mirrors the Open-issues Follow-up action columns
+    (see :func:`_upgrade_open_issue_action_cells`).
+    """
+    if "DI Top10" not in html_fragment:
+        return html_fragment
+
+    # Find the DI Top10 sub-table. Strategy: locate the <h3>DI Top10 heading,
+    # then walk forward to the FIRST <table> that follows it.
+    h3_match = re.search(r"<h3>[^<]*DI\s*Top10[\s\S]*?</h3>", html_fragment)
+    if not h3_match:
+        return html_fragment
+    after_h3 = html_fragment[h3_match.end() :]
+    table_match = re.search(r"<table\b[^>]*>(.*?)</table>", after_h3, re.DOTALL | re.IGNORECASE)
+    if not table_match:
+        return html_fragment
+    table_start = h3_match.end() + table_match.start()
+    table_end = h3_match.end() + table_match.end()
+    table_html = html_fragment[table_start:table_end]
+
+    # Find the Assignee + Maintainer column indices from the header row.
+    th_matches = re.findall(r"<th[^>]*>(.*?)</th>", table_html, re.DOTALL | re.IGNORECASE)
+    if not th_matches:
+        return html_fragment
+    column_specs: list[tuple[int, str]] = []  # (col_idx, header_lower)
+    for idx, th in enumerate(th_matches):
+        plain = re.sub(r"<[^>]+>", "", th).strip().lower()
+        if plain == "assignee":
+            column_specs.append((idx, "assignee"))
+        elif plain == "maintainer":
+            column_specs.append((idx, "maintainer"))
+    if not column_specs:
+        return html_fragment
+
+    def _upgrade_row(tr_html: str) -> str:
+        tds = re.findall(r"<td[^>]*>([\s\S]*?)</td>", tr_html)
+        if not tds:
+            return tr_html
+        # Pull the issue number from the first <td>'s "#1234" content.
+        first_td = tds[0]
+        issue_num_match = re.search(r"#(\d+)", first_td)
+        if not issue_num_match:
+            return tr_html
+        issue_num = issue_num_match.group(1)
+        # Build a map of (column_index → replacement HTML) for both columns.
+        new_cells: dict[int, str] = {}
+        for col_idx, header in column_specs:
+            if col_idx >= len(tds):
+                continue
+            original_value = re.sub(r"<[^>]+>", "", tds[col_idx]).strip()
+            # Treat em-dash / dash placeholders as empty (matches the original
+            # behaviour so filled rows still pre-fill the input with the real
+            # GitHub-sourced value, not the literal "—").
+            is_empty = original_value in ("", "—", "—", "-", "N/A")
+            effective = "" if is_empty else original_value
+            initial = html.escape(effective, quote=True)
+            placeholder_text = f"+ Add {header}"
+            cell_class = f"di-top10-{header}-cell {'is-filled' if effective else 'is-empty'}"
+            cell_attr = f'data-di-{header}-issue="{issue_num}"'
+            if effective:
+                # Filled cell: plain text, no input. Editing would invite
+                # drift between the report and GitHub, so we just render the
+                # value. The data-di-*-issue attribute is still emitted so
+                # any inspector / future script can still identify the row.
+                new_cells[col_idx] = (
+                    f'<td class="{cell_class}" {cell_attr}>'
+                    f'<span class="di-top10-{header}-text" '
+                    f'data-di-{header}-issue="{issue_num}">'
+                    f"{initial}</span></td>"
+                )
+            else:
+                # Empty cell: editable input with localStorage persistence.
+                new_cells[col_idx] = (
+                    f'<td class="{cell_class}" {cell_attr}>'
+                    f'<input type="text" class="di-top10-{header}-input" '
+                    f'data-di-{header}-issue="{issue_num}" '
+                    f'data-di-{header}-persist="1" '
+                    f'data-di-{header}-value="" '
+                    f'placeholder="{placeholder_text}" '
+                    f'value="" />'
+                    f"</td>"
+                )
+        # Replace each targeted cell in document order. We can't use a single regex
+        # sub with a counter when both columns share the same row, so apply
+        # replacements one-by-one from the highest column index down so the
+        # lower indices keep their offsets.
+        if not new_cells:
+            return tr_html
+        for col_idx in sorted(new_cells, reverse=True):
+            replacement = new_cells[col_idx]
+            pattern = re.compile(r"<td[^>]*>([\s\S]*?)</td>", re.DOTALL | re.IGNORECASE)
+            counter = {"i": 0}
+            replaced = {"done": False}
+
+            def _replace_td(
+                m: re.Match[str],
+                _ci: int = col_idx,
+                _rep: str = replacement,
+                _st: dict[str, bool] = replaced,
+            ) -> str:
+                if _st["done"]:
+                    return m.group(0)
+                if counter["i"] == _ci:
+                    counter["i"] += 1
+                    _st["done"] = True
+                    return _rep
+                counter["i"] += 1
+                return m.group(0)
+
+            tr_html = pattern.sub(_replace_td, tr_html, count=len(tds))
+        return tr_html
+
+    new_table = re.sub(
+        r"<tr[^>]*>([\s\S]*?)</tr>",
+        lambda m: _upgrade_row(m.group(0)),
+        table_html,
+    )
+    return html_fragment[:table_start] + new_table + html_fragment[table_end:]
+
+
+def _upgrade_next_steps_outstanding_cells(html_fragment: str) -> str:
+    """Replace the Outstanding Items markdown table with a clean thead-only
+    table and an "Add Item" button.
+
+    The markdown emits a 3-column table (Item / Assignee / Status) with one
+    placeholder data row.  In HTML we replace the entire ``<table>`` with:
+
+    * ``<thead>``: Item / Assignee / Status headers + empty 4th column for
+      the delete button
+    * Empty ``<tbody>`` — all data rows are created dynamically by clicking
+      "Add Item" and persisted in localStorage
+
+    The JS in ``_NEXT_STEPS_OUTSTANDING_SCRIPT`` handles row creation, inline
+    editing, and localStorage persistence.
+    """
+    TABLE_RE = re.compile(r"<table\b[^>]*>.*?</table>", re.DOTALL | re.IGNORECASE)
+    TAG_RE = re.compile(r"<[^>]+>")
+
+    def _upgrade_table(table_html: str) -> str:
+        headers = [
+            TAG_RE.sub("", h).strip()
+            for h in re.findall(r"<th\b[^>]*>(.*?)</th>", table_html, re.DOTALL | re.IGNORECASE)
+        ]
+        has_item = any("Item" in h or "\u4e8b\u9879" in h for h in headers)
+        has_assignee = any("Assignee" in h or "\u8d23\u4efb\u4eba" in h for h in headers)
+        has_status = any("Status" in h or "\u72b6\u6001" in h for h in headers)
+        if not (has_item and has_assignee and has_status):
+            return table_html
+
+        add_btn = (
+            '<div class="ns-add-item-wrap">'
+            '<button type="button" class="ns-add-item-btn" data-ns-add-item="1">'
+            "\uff0b Add Item</button></div>"
+        )
+        new_table = (
+            '<table class="ns-outstanding-table" data-ns-table="outstanding-items">\n'
+            "<thead><tr>"
+            "<th>Item</th>"
+            "<th>Assignee</th>"
+            "<th>Status</th>"
+            '<th class="ns-del-th"></th>'
+            "</tr></thead>\n"
+            "<tbody></tbody>\n"
+            "</table>"
+        )
+        return add_btn + new_table
+
+    return TABLE_RE.sub(lambda m: _upgrade_table(m.group(0)), html_fragment)
+
+
+# ── Device-Hours / Build (7-day avg) — manual metric row ────────────────
+# Operator-editable metric appended to the release Metrics overview table
+# by ``compose_full_report._append_device_hours_build_row``. The row ships
+# with a marker placeholder ``@@DEVICE_HOURS_PER_BUILD_CELL@@`` in the
+# **Success rate/UT coverage** cell; this upgrade substitutes an inline
+# editable ``<input>`` whose value persists in ``localStorage['device-hours-per-build']``.
+DEVICE_HOURS_PER_BUILD_CELL_HTML = (
+    '<input type="text" class="dhpb-input" data-dhpb-persist="1" '
+    'data-dhpb-marker="1" placeholder="click to fill (e.g. 132.4 h)" '
+    'value="" />'
+)
+
+
+def _upgrade_device_hours_cell(html_fragment: str) -> str:
+    """Swap the ``@@DEVICE_HOURS_PER_BUILD_CELL@@`` marker for an editable input.
+
+    The marker is emitted by ``compose_full_report._append_device_hours_build_row``
+    inside the **Success rate/UT coverage** cell of the final row of the
+    release Metrics overview table. The Markdown ``|`` cell wrapper is
+    plain text so we do a literal ``str.replace`` rather than regex; the
+    marker string is unique enough that a global swap is safe. JS handler
+    lives in :data:`_DEVICE_HOURS_BUILD_SCRIPT`.
+    """
+    marker = "@@DEVICE_HOURS_PER_BUILD_CELL@@"
+    if marker not in html_fragment:
+        return html_fragment
+    return html_fragment.replace(marker, DEVICE_HOURS_PER_BUILD_CELL_HTML)
+
+
+_DEVICE_HOURS_BUILD_SCRIPT = """<script>
+(function () {
+  "use strict";
+
+  // In-memory fallback when localStorage throws (e.g. Chrome file://).
+  var mem = {};
+  function lsGet(k) {
+    try { return localStorage.getItem(k); } catch (e) { return mem.hasOwnProperty(k) ? mem[k] : null; }
+  }
+  function lsSet(k, v) {
+    try { v ? localStorage.setItem(k, v) : localStorage.removeItem(k); }
+    catch (e) { if (v) mem[k] = v; else delete mem[k]; }
+  }
+
+  var STORAGE_KEY = "device-hours-per-build";
+
+  function hydrate(input) {
+    // Prefer the DOM attribute first (captured by "Save Page As"),
+    // fall back to localStorage (reload on the same origin).
+    var attr = input.getAttribute("data-dhpb-value");
+    var saved = null;
+    if (attr === null || attr === undefined) {
+      saved = lsGet(STORAGE_KEY);
+    } else if (attr) {
+      saved = attr;
+    }
+    if (saved !== null && saved !== undefined && saved !== "") {
+      input.value = saved;
+    }
+    if (input.value) {
+      input.setAttribute("data-dhpb-persisted", "1");
+    }
+    function persist() {
+      var v = input.value || "";
+      input.setAttribute("data-dhpb-value", v);
+      lsSet(STORAGE_KEY, v);
+      if (v) {
+        input.setAttribute("data-dhpb-persisted", "1");
+      } else {
+        input.removeAttribute("data-dhpb-persisted");
+      }
+    }
+    input.addEventListener("input", persist);
+    input.addEventListener("blur", persist);
+  }
+
+  function initAll() {
+    var inputs = document.querySelectorAll("input.dhpb-input[data-dhpb-marker=\"1\"]");
+    for (var i = 0; i < inputs.length; i++) { hydrate(inputs[i]); }
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initAll);
+  } else {
+    initAll();
+  }
+})();
+</script>"""
+
+
+_DI_TOP10_INPUT_SCRIPT = """<script>
+(function () {
+  "use strict";
+
+  // In-memory fallback when localStorage throws (e.g. Chrome file://).
+  var mem = {};
+  function lsGet(k) {
+    try { return localStorage.getItem(k); }
+    catch (e) { return Object.prototype.hasOwnProperty.call(mem, k) ? mem[k] : null; }
+  }
+  function lsSet(k, v) {
+    try { v ? localStorage.setItem(k, v) : localStorage.removeItem(k); }
+    catch (e) { if (v) mem[k] = v; else delete mem[k]; }
+  }
+
+  function keyFor(kind, issue) { return "di-top10-" + kind + ":#" + issue; }
+
+  function hydrate(input, kind) {
+    // Prefer the DOM attribute (captured by "Save Page As"), fall back to
+    // localStorage (reload on the same origin). Both editors share this
+    // exact pattern, so the only difference is the localStorage key prefix.
+    var issue = input.getAttribute("data-di-" + kind + "-issue");
+    if (!issue) return;
+    var key = keyFor(kind, issue);
+    var attr = input.getAttribute("data-di-" + kind + "-value");
+    if (attr === null || attr === undefined) {
+      var saved = lsGet(key);
+      if (saved !== null && saved !== undefined && saved !== "") {
+        attr = saved;
+        input.value = saved;
+      }
+    } else if (attr) {
+      input.value = attr;
+    }
+    if (input.value) {
+      input.setAttribute("data-di-" + kind + "-persisted", "1");
+      var td0 = input.closest ? input.closest("td.di-top10-" + kind + "-cell") : null;
+      if (td0) td0.classList.remove("is-empty");
+    }
+    function persist() {
+      input.setAttribute("data-di-" + kind + "-value", input.value || "");
+      lsSet(key, input.value || "");
+    }
+    input.addEventListener("input", persist);
+    input.addEventListener("blur", persist);
+  }
+
+  function initAll() {
+    var aInputs = document.querySelectorAll("input.di-top10-assignee-input");
+    for (var i = 0; i < aInputs.length; i++) { hydrate(aInputs[i], "assignee"); }
+    var mInputs = document.querySelectorAll("input.di-top10-maintainer-input");
+    for (var j = 0; j < mInputs.length; j++) { hydrate(mInputs[j], "maintainer"); }
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initAll);
+  } else {
+    initAll();
+  }
+})();
+</script>"""
+
+
+# Backward-compatible alias — older call sites still reference this name.
+_DI_TOP10_ASSIGNEE_SCRIPT = _DI_TOP10_INPUT_SCRIPT
+
+
+_NEXT_STEPS_OUTSTANDING_SCRIPT = """<script>
+(function () {
+  "use strict";
+
+  // --- Storage helpers (with in-memory fallback when localStorage is unavailable) ---
+  var mem = {};
+  function lsGet(k) {
+    try { return localStorage.getItem(k); } catch (e) { return mem.hasOwnProperty(k) ? mem[k] : null; }
+  }
+  function lsSet(k, v) {
+    try { v ? localStorage.setItem(k, v) : localStorage.removeItem(k); }
+    catch (e) { if (v) mem[k] = v; else delete mem[k]; }
+  }
+
+  // --- Constants ---
+  var TABLE_ID = "outstanding-items-table";
+  var STATUSES = ["Open", "In Progress", "Blocked", "Won't fix", "Fixed"];
+  var PLACEHOLDER = "\u2014";
+
+  // Row keys are generated as ``ns-row-<base36 timestamp>-<random>``. This
+  // is globally unique per row creation so two reports / regenerations /
+  // browser sessions can't collide \u2014 and the key travels with the row
+  // because it is written to ``data-ns-row-key`` on every save and persisted
+  // inside ``data-ns-row-value`` (the JSON payload) for "Save Page As".
+  function newRowKey() {
+    return "ns-row-" + Date.now().toString(36) + "-" + Math.floor(Math.random() * 1e9).toString(36);
+  }
+
+  // --- Build a fresh editable row. All three columns are inputs from the start
+  //     (no "Click to set" placeholder cell) so users can type immediately. ---
+  function buildRow(key) {
+    var tr = document.createElement("tr");
+    tr.setAttribute("data-ns-row-key", key);
+
+    // Item column \u2014 text input
+    var tdItem = document.createElement("td");
+    tdItem.className = "ns-item-cell";
+    var inpItem = document.createElement("input");
+    inpItem.type = "text";
+    inpItem.className = "ns-item-input ns-row-input";
+    inpItem.setAttribute("data-ns-field", "item");
+    inpItem.setAttribute("data-ns-key", key);
+    inpItem.placeholder = "Item description";
+    tdItem.appendChild(inpItem);
+
+    // Assignee column \u2014 text input
+    var tdAssignee = document.createElement("td");
+    tdAssignee.className = "ns-assignee-cell";
+    var inpAssignee = document.createElement("input");
+    inpAssignee.type = "text";
+    inpAssignee.className = "ns-assignee-input ns-row-input";
+    inpAssignee.setAttribute("data-ns-field", "assignee");
+    inpAssignee.setAttribute("data-ns-key", key);
+    inpAssignee.placeholder = "Assignee";
+    tdAssignee.appendChild(inpAssignee);
+
+    // Status column \u2014 select
+    var tdStatus = document.createElement("td");
+    tdStatus.className = "ns-status-cell";
+    var sel = document.createElement("select");
+    sel.className = "ns-status-select";
+    sel.setAttribute("data-ns-field", "status");
+    sel.setAttribute("data-ns-key", key);
+    sel.setAttribute("aria-label", "Status");
+    var optEmpty = document.createElement("option");
+    optEmpty.value = "";
+    optEmpty.textContent = PLACEHOLDER;
+    sel.appendChild(optEmpty);
+    for (var i = 0; i < STATUSES.length; i++) {
+      var opt = document.createElement("option");
+      opt.value = STATUSES[i];
+      opt.textContent = STATUSES[i];
+      sel.appendChild(opt);
+    }
+    tdStatus.appendChild(sel);
+
+    // Delete column \u2014 button
+    var tdDel = document.createElement("td");
+    tdDel.className = "ns-del-cell";
+    var btnDel = document.createElement("button");
+    btnDel.type = "button";
+    btnDel.className = "ns-del-btn";
+    btnDel.setAttribute("data-ns-del-row", key);
+    btnDel.title = "Delete this row";
+    btnDel.textContent = "\u2715";
+    tdDel.appendChild(btnDel);
+
+    tr.appendChild(tdItem);
+    tr.appendChild(tdAssignee);
+    tr.appendChild(tdStatus);
+    tr.appendChild(tdDel);
+    return tr;
+  }
+
+  function readRowValue(tr) {
+    var inpItem = tr.querySelector("input[data-ns-field='item']");
+    var inpAssignee = tr.querySelector("input[data-ns-field='assignee']");
+    var selStatus = tr.querySelector("select[data-ns-field='status']");
+    return {
+      item: inpItem ? inpItem.value : "",
+      assignee: inpAssignee ? inpAssignee.value : "",
+      status: selStatus ? selStatus.value : "",
+    };
+  }
+
+  function writeRowValue(tr, entry) {
+    var inpItem = tr.querySelector("input[data-ns-field='item']");
+    var inpAssignee = tr.querySelector("input[data-ns-field='assignee']");
+    var selStatus = tr.querySelector("select[data-ns-field='status']");
+    if (inpItem) inpItem.value = entry.item || "";
+    if (inpAssignee) inpAssignee.value = entry.assignee || "";
+    if (selStatus) selStatus.value = entry.status || "";
+  }
+
+  // --- Persistence: serialize/deserialize the full table state. ---
+  function saveTable(table) {
+    var rows = table.querySelectorAll("tbody tr");
+    var data = [];
+    for (var i = 0; i < rows.length; i++) {
+      var tr = rows[i];
+      var key = tr.getAttribute("data-ns-row-key") || newRowKey();
+      tr.setAttribute("data-ns-row-key", key);  // ensure stable identity
+      var payload = readRowValue(tr);
+      // Per-row DOM writeback: a single JSON attribute on the <tr> that
+      // browser "Save Page As" captures verbatim. On reload from a saved
+      // file the script reads from this attribute first (see loadTable),
+      // then falls back to localStorage for same-origin reloads without
+      // a saved copy.
+      tr.setAttribute("data-ns-row-value", JSON.stringify({
+        key: key, item: payload.item, assignee: payload.assignee, status: payload.status,
+      }));
+      data.push({key: key, item: payload.item, assignee: payload.assignee, status: payload.status});
+    }
+    lsSet("outstanding-items:" + TABLE_ID, JSON.stringify(data));
+  }
+
+  function loadTable(table) {
+    // First, harvest rows already present in the DOM (captured by
+    // "Save Page As"). The Python post-processor currently emits an empty
+    // <tbody>, but a saved copy may contain a hydrated <tr data-ns-row-value>
+    // for each row \u2014 preserve those as-is so a saved copy displays correctly
+    // even with localStorage cleared / on a different origin.
+    var tbody = table.querySelector("tbody");
+    if (!tbody) return false;
+    var savedRows = [];
+    var existingTrs = tbody.querySelectorAll("tr");
+    for (var i = 0; i < existingTrs.length; i++) {
+      var tr = existingTrs[i];
+      var raw = tr.getAttribute("data-ns-row-value");
+      if (!raw) continue;
+      try {
+        var payload = JSON.parse(raw);
+        savedRows.push({
+          key: payload.key || tr.getAttribute("data-ns-row-key") || newRowKey(),
+          item: payload.item || "",
+          assignee: payload.assignee || "",
+          status: payload.status || "",
+        });
+      } catch (e) { /* skip */ }
+    }
+    tbody.innerHTML = "";
+
+    // Then merge with localStorage so an unsaved edit on the same origin
+    // is honoured (localStorage wins on conflict because it represents the
+    // most recent in-memory change).
+    var rawLs = lsGet("outstanding-items:" + TABLE_ID);
+    if (rawLs) {
+      try {
+        var lsData = JSON.parse(rawLs);
+        if (Array.isArray(lsData)) {
+          var byKey = {};
+          for (var j = 0; j < savedRows.length; j++) { byKey[savedRows[j].key] = savedRows[j]; }
+          for (var k = 0; k < lsData.length; k++) {
+            var entry = lsData[k];
+            if (entry && entry.key) byKey[entry.key] = entry;  // LS overrides DOM
+          }
+          savedRows = Object.keys(byKey).map(function (k) { return byKey[k]; });
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    for (var m = 0; m < savedRows.length; m++) {
+      var rowKey = savedRows[m].key;
+      var tr2 = buildRow(rowKey);
+      tbody.appendChild(tr2);
+      writeRowValue(tr2, savedRows[m]);
+      // Persist the freshly written row back into the DOM so the next
+      // "Save Page As" picks up exactly this state.
+      tr2.setAttribute("data-ns-row-value", JSON.stringify({
+        key: rowKey,
+        item: savedRows[m].item || "",
+        assignee: savedRows[m].assignee || "",
+        status: savedRows[m].status || "",
+      }));
+    }
+    return savedRows.length > 0;
+  }
+
+  // --- Row management ---
+  function addRowToTable(table) {
+    var tbody = table.querySelector("tbody");
+    if (!tbody) {
+      tbody = document.createElement("tbody");
+      table.appendChild(tbody);
+    }
+    var tr = buildRow(newRowKey());
+    tbody.appendChild(tr);
+    saveTable(table);
+    var firstInput = tr.querySelector("input[data-ns-field='item']");
+    if (firstInput) {
+      try { firstInput.focus(); } catch (e) { /* no-op */ }
+    }
+  }
+
+  function deleteRow(btn) {
+    var tr = btn.closest ? btn.closest("tr") : null;
+    if (!tr) return;
+    var table = tr.closest ? tr.closest("table") : null;
+    if (tr.parentNode) tr.parentNode.removeChild(tr);
+    if (table) saveTable(table);
+  }
+
+  // --- Initialise each outstanding-items table in the document ---
+  function initTable(table) {
+    loadTable(table);
+
+    table.addEventListener("input", function (ev) {
+      if (ev.target && ev.target.classList && ev.target.classList.contains("ns-row-input")) {
+        saveTable(table);
+      }
+    });
+    table.addEventListener("change", function (ev) {
+      var t = ev.target;
+      if (t && t.classList && t.classList.contains("ns-status-select")) {
+        saveTable(table);
+      }
+    });
+    table.addEventListener("click", function (ev) {
+      if (!ev.target || !ev.target.closest) return;
+      var delBtn = ev.target.closest("[data-ns-del-row]");
+      if (delBtn) {
+        ev.preventDefault();
+        deleteRow(delBtn);
+      }
+    });
+  }
+
+  function initAll() {
+    var tables = document.querySelectorAll("table.ns-outstanding-table");
+    for (var i = 0; i < tables.length; i++) { initTable(tables[i]); }
+
+    var addBtns = document.querySelectorAll("[data-ns-add-item]");
+    for (var j = 0; j < addBtns.length; j++) {
+      (function (btn) {
+        btn.addEventListener("click", function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          var wrap = btn.closest ? btn.closest(".ns-add-item-wrap") : null;
+          var table = null;
+          if (wrap) {
+            var next = wrap.nextElementSibling;
+            if (next && next.tagName === "TABLE") {
+              table = next;
+            } else {
+              var parent = wrap.parentElement;
+              if (parent) table = parent.querySelector("table");
+            }
+          }
+          if (!table) {
+            table = document.querySelector("table.ns-outstanding-table");
+          }
+          if (table) addRowToTable(table);
+        });
+      })(addBtns[j]);
+    }
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initAll);
+  } else {
+    initAll();
+  }
+})();
+</script>"""
+
+
+_RESOURCE_USAGE_BLOCK_HTML = (
+    '<div class="resource-usage-block" data-uri-state="empty" data-uri-value="">'
+    '<div class="resource-usage-toolbar resource-usage-toolbar--top">'
+    '<button type="button" class="resource-usage-add">+ Add module</button>'
+    '<span class="resource-usage-status" data-resource-usage-state="pristine">No modules yet — click "Add module" to start</span>'
+    '</div>'
+    '<div class="resource-usage-modules"></div>'
+    '</div>'
+)
+
+
+def _upgrade_resource_usage_block(html_fragment: str) -> str:
+    """Replace the ``@@RESOURCE_USAGE_INSERTION_POINT@@`` marker with an editor.
+
+    The development-variant **Resource Usage Analysis** section
+    is a manual-entry engineering artefact: the Markdown body is empty by
+    design and the editor is injected here so that:
+
+    * The H2 heading stays a single, stable Markdown heading (so it can be
+      matched by ``_wrap_release_report_h2_sections`` and wrapped in the
+      themed collapsible ``<details>`` card).
+    * The H2 → ``<details>`` wrapper added by
+      ``_fold_release_report_section_cards`` turns the heading itself into a
+      click-to-expand handle — the user clicks the title and the editor
+      appears below.
+    * Persistence is split between ``data-uri-value`` (so a browser *Save
+      Page As* download captures the analysis into the saved HTML) and
+      ``localStorage['resource-usage-analysis']`` (so reloads on http(s)
+      origins keep the value).
+
+    Note: the report's custom Markdown converter wraps every paragraph in a
+    ``<p>``, so the substituted block ends up inside ``<p><div …></div></p>``.
+    Browsers' HTML5 parser implicitly closes the ``<p>`` before the ``<div>``
+    so the editor block is a direct child of the section body in the DOM; the
+    empty surrounding ``<p>`` tags are harmless. The JavaScript handler
+    queries ``.resource-usage-block`` directly so the wrapping does not
+    affect behaviour.
+
+    The handler lives in :data:`_RESOURCE_USAGE_SCRIPT`.
+    """
+    marker = "@@RESOURCE_USAGE_INSERTION_POINT@@"
+    if marker not in html_fragment:
+        return html_fragment
+    return html_fragment.replace(marker, _RESOURCE_USAGE_BLOCK_HTML)
+
+
+# ── Quality Defense Radar ──────────────────────────────────────────────
+# Per-model 5-axis coverage radar. Nine flagship models are rendered as a
+# 3×3 grid of small pentagon SVGs; each radar carries 8 clickable segments
+# (5 axes, of which Functionality / Performance / Stability are split into
+# GPU + NPU halves that share one circle, while Documentation / Reliability
+# are single circles). Click any segment to toggle gray ↔ green; state is
+# mirrored to a ``data-quality-on`` attribute on the ``<g class="qd-segment">``
+# (so a Save-Page-As download preserves the toggled state) **and** to
+# ``localStorage["quality-defense:<model>:<axis>"]`` for reload persistence.
+#
+# The geometry below is hand-precomputed from a regular pentagon:
+#   * ViewBox 300×300, centre at (150, 150).
+#   * Outer pentagon radius 105, inner pentagon radius 50.
+#   * Split-axis midpoints sit at radius 75 (between inner and outer).
+#   * Half-circle radius 18 for split segments; full-circle radius 18 for
+#     single segments.
+#   * Pentagon vertex angles (degrees, SVG Y-down, clockwise from top):
+#       Functionality  -90°   (top)
+#       Performance   -18°   (top-right)
+#       Documentation  54°   (bottom-right)
+#       Stability     126°   (bottom-left)
+#       Reliability   198°  (top-left)
+_QUALITY_DEFENSE_MODELS = (
+    ("qwen-omni",   "Qwen3-Omni"),
+    ("minicpm",     "MiniCPM"),
+    ("qwen-tts",    "Qwen-TTS"),
+    ("qwen-image",  "Qwen-Image"),
+    ("HunyuanImage",  "HunyuanImage"),
+    ("HunyuanVideo",  "HunyuanVideo"),
+    ("Wan",         "Wan"),
+    ("MinimaxH3",   "MinimaxH3"),
+    ("Cosmos",      "Cosmos"),
+)
+
+_QUALITY_DEFENSE_AXIS_KEYS = ("func", "perf", "doc", "stab", "rel")
+_QUALITY_DEFENSE_AXIS_LABELS = {
+    "func": "Functionality",
+    "perf": "Performance",
+    "doc":  "Documentation",
+    "stab": "Stability",
+    "rel":  "Reliability",
+}
+_QUALITY_DEFENSE_AXIS_ANGLES = {
+    "func": -90,
+    "perf": -18,
+    "doc":  54,
+    "stab": 126,
+    "rel":  198,
+}
+# Visual offset (in SVG units) from the outer pentagon vertex where the
+# axis label is drawn. Keys map the axis name to (dx, dy).
+_QUALITY_DEFENSE_LABEL_OFFSETS = {
+    "func": (0, -10),
+    "perf": (10, -4),
+    "doc":  (0, 16),
+    "stab": (0, 16),
+    "rel":  (-10, -4),
+}
+
+
+def _qd_pentagon_point(angle_deg: float, radius: float) -> tuple[float, float]:
+    """Regular pentagon vertex at the given angle and radius from (150,150)."""
+    rad = math.radians(angle_deg)
+    return (150 + radius * math.cos(rad), 150 + radius * math.sin(rad))
+
+
+def _qd_model_radar_svg(model_id: str) -> str:
+    """Inline SVG for a single model's 5-axis coverage radar."""
+    # Pentagon rings (outer and inner) — drawn once as decoration.
+    outer_pts = [
+        _qd_pentagon_point(_QUALITY_DEFENSE_AXIS_ANGLES[k], 105)
+        for k in _QUALITY_DEFENSE_AXIS_KEYS
+    ]
+    inner_pts = [
+        _qd_pentagon_point(_QUALITY_DEFENSE_AXIS_ANGLES[k], 50)
+        for k in _QUALITY_DEFENSE_AXIS_KEYS
+    ]
+    outer_str = " ".join(f"{p[0]:.1f},{p[1]:.1f}" for p in outer_pts)
+    inner_str = " ".join(f"{p[0]:.1f},{p[1]:.1f}" for p in inner_pts)
+
+    axis_lines = "\n        ".join(
+        f'<line x1="150" y1="150" x2="{p[0]:.1f}" y2="{p[1]:.1f}"/>'
+        for p in outer_pts
+    )
+
+    axis_label_xml = "\n      ".join(
+        f'<text class="qd-axis-label" x="{outer_pts[i][0] + _QUALITY_DEFENSE_LABEL_OFFSETS[k][0]:.1f}" '
+        f'y="{outer_pts[i][1] + _QUALITY_DEFENSE_LABEL_OFFSETS[k][1]:.1f}" '
+        f'text-anchor="middle">{_QUALITY_DEFENSE_AXIS_LABELS[k]}</text>'
+        for i, k in enumerate(_QUALITY_DEFENSE_AXIS_KEYS)
+    )
+
+    # Split axes (Functionality / Performance / Stability) — two halves of
+    # one circle each. Each half is rendered inside a `<g transform="…">` so
+    # the canonical vertical-diameter half-circles get rotated to align with
+    # the axis direction. The canonical LEFT half (sweep=0, bulges to −X)
+    # labels "GPU"; the canonical RIGHT half (sweep=1, bulges to +X) labels
+    # "NPU". After rotation the GPU half always bulges opposite to the axis
+    # direction (closer to centre); NPU bulges along the axis (further out).
+    #
+    # GPU vs NPU are visually distinguished two ways (so reviewers can tell
+    # them apart at a glance):
+    #   1. ``data-qd-side="gpu"|"npu"`` attribute drives CSS colour rules
+    #      (GPU on = light green; NPU on = light blue — see the radar CSS).
+    #   2. The NPU halves also carry ``stroke-dasharray`` in the default
+    #      state so even before clicking, the two halves read as "solid
+    #      outline" vs "dashed outline".
+    split_xml_parts: list[str] = []
+    for axis_key in ("func", "perf", "stab"):
+        angle = _QUALITY_DEFENSE_AXIS_ANGLES[axis_key]
+        mx, my = _qd_pentagon_point(angle, 75)
+        axis_label = _QUALITY_DEFENSE_AXIS_LABELS[axis_key]
+        split_xml_parts.append(
+            f'<g class="qd-segment" data-quality-key="{model_id}:{axis_key}-gpu" '
+            f'data-qd-side="gpu" tabindex="0" role="button" '
+            f'aria-label="{model_id} {axis_label} GPU" aria-pressed="false">'
+            f'<g transform="translate({mx:.1f} {my:.1f}) rotate({angle})">'
+            f'<path class="qd-half qd-half--gpu" d="M 0 18 A 18 18 0 0 0 0 -18 Z"/>'
+            f"</g></g>"
+        )
+        split_xml_parts.append(
+            f'<g class="qd-segment" data-quality-key="{model_id}:{axis_key}-npu" '
+            f'data-qd-side="npu" tabindex="0" role="button" '
+            f'aria-label="{model_id} {axis_label} NPU" aria-pressed="false">'
+            f'<g transform="translate({mx:.1f} {my:.1f}) rotate({angle})">'
+            f'<path class="qd-half qd-half--npu" d="M 0 18 A 18 18 0 0 1 0 -18 Z"/>'
+            f"</g></g>"
+        )
+    split_xml = "\n      ".join(split_xml_parts)
+
+    # Single axes (Documentation / Reliability) — one circle each.
+    single_xml_parts: list[str] = []
+    for axis_key in ("doc", "rel"):
+        angle = _QUALITY_DEFENSE_AXIS_ANGLES[axis_key]
+        mx, my = _qd_pentagon_point(angle, 75)
+        axis_label = _QUALITY_DEFENSE_AXIS_LABELS[axis_key]
+        single_xml_parts.append(
+            f'<g class="qd-segment" data-quality-key="{model_id}:{axis_key}" '
+            f'tabindex="0" role="button" '
+            f'aria-label="{model_id} {axis_label}" aria-pressed="false">'
+            f'<circle class="qd-circle" cx="{mx:.1f}" cy="{my:.1f}" r="18"/>'
+            f"</g>"
+        )
+    single_xml = "\n      ".join(single_xml_parts)
+
+    return f"""<svg class="qd-radar" viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="{model_id} quality defense radar">
+      <g class="qd-grid" aria-hidden="true">
+        <polygon class="qd-pentagon-outer" points="{outer_str}"/>
+        <polygon class="qd-pentagon-inner" points="{inner_str}"/>
+        {axis_lines}
+      </g>
+      {single_xml}
+      {split_xml}
+      {axis_label_xml}
+    </svg>"""
+
+
+def _quality_defense_block_html() -> str:
+    """Assemble the full Quality Defense Radar block — intro + 3×3 grid + legend.
+
+    The grid is rendered as nine ``<div class="qd-cell">`` cards; each card
+    carries its own ``<svg class="qd-radar">`` so click handlers remain
+    isolated per model (and per segment). The ``data-quality-key`` namespace
+    is ``<model-id>:<axis>[-gpu|-npu]`` so 72 unique localStorage entries are
+    produced for the full grid.
+    """
+    cells: list[str] = []
+    for model_id, display_name in _QUALITY_DEFENSE_MODELS:
+        cells.append(
+            f'<div class="qd-cell" data-qd-model="{model_id}">'
+            f'<h3 class="qd-cell-title">{display_name}</h3>'
+            f"{_qd_model_radar_svg(model_id)}"
+            f"</div>"
+        )
+    cells_xml = "\n      ".join(cells)
+    return (
+        '<div class="qd-radar-wrap">'
+        '<p class="qd-intro">Per-model 5-axis coverage radar across '
+        '<strong>9 flagship models</strong> (Functionality / Performance / '
+        'Documentation / Stability / Reliability). Click any segment to mark '
+        'it as confirmed. The three split axes (Functionality / Performance / '
+        'Stability) expose <strong>GPU</strong> and <strong>NPU</strong> '
+        'halves of a single circle independently: GPU halves turn '
+        '<strong style="color:#16a34a">green</strong> on click, NPU halves '
+        'turn <strong style="color:#0284c7">blue</strong>; NPU halves also '
+        'carry a dashed outline so the two sides are distinguishable even '
+        'before clicking. State is persisted in <code>localStorage</code>.</p>'
+        f'<div class="qd-grid">\n      {cells_xml}\n    </div>'
+        '<p class="qd-legend">Click a module: gray → '
+        '<strong style="color:#16a34a">green</strong> (GPU, confirmed) or '
+        '<strong style="color:#0284c7">blue</strong> (NPU, confirmed); '
+        'click again to revert. GPU halves carry a solid outline, NPU halves '
+        'carry a dashed outline. State saved in localStorage.</p>'
+        '</div>'
+    )
+
+
+_QUALITY_DEFENSE_BLOCK_HTML = _quality_defense_block_html()
+
+
+_QUALITY_DEFENSE_MARKER = "@@QUALITY_DEFENSE_INSERTION_POINT@@"
+
+
+def _upgrade_quality_defense_block(html_fragment: str) -> str:
+    """Replace the ``@@QUALITY_DEFENSE_INSERTION_POINT@@`` marker with the
+    inline SVG radar.
+
+    The H2 ``## 模型质量防线`` stays as a stable Markdown heading so it
+    matches :func:`_release_section_theme`'s substring match (returns the
+    ``quality-defense`` modifier + shield icon) and so
+    :func:`_wrap_release_report_h2_sections` wraps it in the themed
+    collapsible ``<details>`` card. Click handling lives in
+    :data:`_QUALITY_DEFENSE_SCRIPT`.
+
+    Safe no-op when the section is absent (development variant / nightly
+    f-string never emits the marker).
+    """
+    if _QUALITY_DEFENSE_MARKER not in html_fragment:
+        return html_fragment
+    return html_fragment.replace(_QUALITY_DEFENSE_MARKER, _QUALITY_DEFENSE_BLOCK_HTML)
+
+
+_QUALITY_DEFENSE_SCRIPT = """<script>
+(function () {
+  var mem = {};
+  function lsGet(k) {
+    try { var v = localStorage.getItem(k); if (v !== null) { mem[k] = v; } return v; }
+    catch (e) { return mem[k] || null; }
+  }
+  function lsSet(k, v) {
+    try {
+      if (v && v !== "0") { localStorage.setItem(k, v); mem[k] = v; }
+      else { localStorage.removeItem(k); delete mem[k]; }
+    } catch (e) {
+      if (v && v !== "0") { mem[k] = v; } else { delete mem[k]; }
+    }
+  }
+  function k(key) { return "quality-defense:" + key; }
+  function apply(g) {
+    var key = g.getAttribute("data-quality-key");
+    var attr = g.getAttribute("data-quality-on");
+    var v = (attr && attr !== "") ? attr : (lsGet(k(key)) || "0");
+    if (v !== "1" && v !== "0") { v = "0"; }
+    g.setAttribute("data-quality-on", v);
+    g.setAttribute("aria-pressed", v === "1" ? "true" : "false");
+  }
+  function toggle(g) {
+    var key = g.getAttribute("data-quality-key");
+    var next = g.getAttribute("data-quality-on") === "1" ? "0" : "1";
+    g.setAttribute("data-quality-on", next);
+    g.setAttribute("aria-pressed", next === "1" ? "true" : "false");
+    lsSet(k(key), next);
+  }
+  function init() {
+    var nodes = document.querySelectorAll("g.qd-segment[data-quality-key]");
+    for (var i = 0; i < nodes.length; i++) {
+      (function (g) {
+        apply(g);
+        g.addEventListener("click", function () { toggle(g); });
+        g.addEventListener("keydown", function (e) {
+          if (e.key === "Enter" || e.key === " " || e.key === "Spacebar") {
+            e.preventDefault();
+            toggle(g);
+          }
+        });
+      })(nodes[i]);
+    }
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else { init(); }
+})();
+</script>"""
+
+
+_RESOURCE_USAGE_SCRIPT = """<script>
+(function () {
+  var KEY = "resource-usage-analysis";
+  function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+  function lsSet(k, v) {
+    try {
+      if (v === null || v === undefined) { localStorage.removeItem(k); }
+      else { localStorage.setItem(k, v); }
+    }
+    catch (e) { /* localStorage unavailable (e.g. file:// in Chrome) */ }
+  }
+
+  // In-memory store is the source of truth for rendering; localStorage is a
+  // best-effort persistence layer on top. Without this, opening the report
+  // from a file:// URL would silently drop every change because the inputs
+  // would otherwise re-read straight from storage on every render.
+  var mem = { raw: null, modules: null };
+  function readRaw() {
+    if (mem.raw !== null) return mem.raw;
+    mem.raw = lsGet(KEY) || "";
+    return mem.raw;
+  }
+  function writeRaw(raw) {
+    mem.raw = raw || "";
+    if (mem.raw) { lsSet(KEY, mem.raw); } else { lsSet(KEY, null); }
+  }
+
+  // --- Migration: old format was a single textarea string under the same
+  // key. If we see a non-JSON value, treat it as the body of a single module.
+  function loadModules() {
+    if (Array.isArray(mem.modules)) return mem.modules;
+    var raw = readRaw();
+    var parsed = null;
+    if (raw) {
+      try { parsed = JSON.parse(raw); } catch (e) { parsed = null; }
+    }
+    if (Array.isArray(parsed)) {
+      // New format already.
+      mem.modules = parsed.filter(function (m) { return m && typeof m === "object"; })
+                          .map(function (m) { return normalize(m); });
+    } else if (raw && typeof raw === "string") {
+      // Legacy migration: one module carrying the old single textarea content.
+      mem.modules = [makeModule({ title: "", body: raw, collapsed: false })];
+      writeRaw(JSON.stringify(mem.modules));
+    } else {
+      mem.modules = [];
+    }
+    return mem.modules;
+  }
+  function persist() {
+    var list = loadModules();
+    writeRaw(JSON.stringify(list));
+    var blocks = document.querySelectorAll(".resource-usage-block");
+    for (var i = 0; i < blocks.length; i++) { syncBlock(blocks[i]); }
+  }
+
+  function newId() {
+    return "m_" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+  }
+  function makeModule(p) {
+    p = p || {};
+    return {
+      id: p.id || newId(),
+      title: typeof p.title === "string" ? p.title : "",
+      body: typeof p.body === "string" ? p.body : "",
+      collapsed: !!p.collapsed,
+    };
+  }
+  function normalize(m) {
+    return {
+      id: typeof m.id === "string" && m.id ? m.id : newId(),
+      title: typeof m.title === "string" ? m.title : "",
+      body: typeof m.body === "string" ? m.body : "",
+      collapsed: !!m.collapsed,
+    };
+  }
+
+  // --- Rendering ----------------------------------------------------
+  function escapeAttr(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/"/g, "&quot;")
+      .replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+  function renderModule(m) {
+    var node = document.createElement("div");
+    node.className = "resource-usage-module";
+    node.setAttribute("data-module-id", m.id);
+    node.setAttribute("data-collapsed", m.collapsed ? "true" : "false");
+    if (!m.title && !m.body) node.classList.add("resource-usage-module-empty");
+    node.innerHTML =
+      '<div class="resource-usage-module-header" role="button" tabindex="0" aria-expanded="' + (m.collapsed ? "false" : "true") + '">'
+      + '<button type="button" class="resource-usage-toggle" aria-label="Collapse / expand module">' + (m.collapsed ? "▸" : "▾") + '</button>'
+      + '<input type="text" class="resource-usage-module-title" placeholder="Module title…" value="' + escapeAttr(m.title) + '">'
+      + '<button type="button" class="resource-usage-delete" aria-label="Delete module" title="Delete module">×</button>'
+      + '</div>'
+      + '<div class="resource-usage-module-body">'
+      + '<textarea class="resource-usage-module-textarea" rows="14" placeholder="Module body — describe the observation, peak/avg figures, follow-up actions…">' + escapeAttr(m.body) + '</textarea>'
+      + '<div class="resource-usage-module-footer">'
+      + '<span class="resource-usage-module-status" data-resource-usage-state="saved">Saved</span>'
+      + '</div>'
+      + '</div>';
+    return node;
+  }
+
+  function renderAll(block) {
+    var list = loadModules();
+    var host = block.querySelector(".resource-usage-modules");
+    if (!host) return;
+    host.innerHTML = "";
+    for (var i = 0; i < list.length; i++) { host.appendChild(renderModule(list[i])); }
+    syncBlock(block);
+  }
+
+  function syncBlock(block) {
+    var list = loadModules();
+    var total = list.length;
+    var saved = 0;
+    for (var i = 0; i < total; i++) {
+      if (list[i].title || list[i].body) saved++;
+    }
+    var raw = readRaw();
+    block.setAttribute("data-uri-value", raw || "");
+    block.setAttribute("data-uri-state", raw ? "saved" : "empty");
+    var status = block.querySelector(".resource-usage-toolbar--top .resource-usage-status");
+    if (status) {
+      if (total === 0) {
+        status.setAttribute("data-resource-usage-state", "pristine");
+        status.textContent = 'No modules yet — click "Add module" to start';
+      } else {
+        status.setAttribute("data-resource-usage-state", "saved");
+        status.textContent = total + " module(s), " + saved + " with content";
+      }
+    }
+  }
+
+  // --- Mutation helpers ----------------------------------------------
+  function addModule(block) {
+    var list = loadModules();
+    var m = makeModule({ title: "", body: "", collapsed: false });
+    list.push(m);
+    persist();
+    renderAll(block);
+    // Focus the new module's title input.
+    var host = block.querySelector(".resource-usage-modules");
+    if (host) {
+      var last = host.lastElementChild;
+      if (last) {
+        var ti = last.querySelector(".resource-usage-module-title");
+        if (ti) ti.focus();
+      }
+    }
+    return m;
+  }
+
+  function deleteModule(block, id) {
+    var list = loadModules();
+    var idx = -1;
+    for (var i = 0; i < list.length; i++) { if (list[i].id === id) { idx = i; break; } }
+    if (idx === -1) return;
+    list.splice(idx, 1);
+    persist();
+    renderAll(block);
+  }
+
+  function updateModule(block, id, patch) {
+    var list = loadModules();
+    var m = null;
+    for (var i = 0; i < list.length; i++) { if (list[i].id === id) { m = list[i]; break; } }
+    if (!m) return;
+    if (Object.prototype.hasOwnProperty.call(patch, "title")) { m.title = patch.title; }
+    if (Object.prototype.hasOwnProperty.call(patch, "body")) { m.body = patch.body; }
+    if (Object.prototype.hasOwnProperty.call(patch, "collapsed")) { m.collapsed = !!patch.collapsed; }
+    persist();
+    // Light sync: status text in the toolbar + module footer.
+    syncBlock(block);
+    var node = block.querySelector('.resource-usage-module[data-module-id="' + id + '"]');
+    if (node) {
+      var footer = node.querySelector(".resource-usage-module-status");
+      if (footer) {
+        footer.setAttribute("data-resource-usage-state", "saved");
+        footer.textContent = "Saved";
+      }
+      if (m.title || m.body) node.classList.remove("resource-usage-module-empty");
+      else node.classList.add("resource-usage-module-empty");
+    }
+  }
+
+  function toggleModule(block, id) {
+    var list = loadModules();
+    var m = null;
+    for (var i = 0; i < list.length; i++) { if (list[i].id === id) { m = list[i]; break; } }
+    if (!m) return;
+    updateModule(block, id, { collapsed: !m.collapsed });
+    // Reflect DOM state for collapsed / caret / aria without a full re-render.
+    var node = block.querySelector('.resource-usage-module[data-module-id="' + id + '"]');
+    if (node) {
+      var collapsed = m.collapsed;
+      node.setAttribute("data-collapsed", collapsed ? "true" : "false");
+      var caret = node.querySelector(".resource-usage-toggle");
+      if (caret) caret.textContent = collapsed ? "▸" : "▾";
+      var header = node.querySelector(".resource-usage-module-header");
+      if (header) header.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    }
+  }
+
+  // --- Event delegation ---------------------------------------------
+  function findModule(node) {
+    while (node && node !== document) {
+      if (node.classList && node.classList.contains("resource-usage-module")) return node;
+      node = node.parentNode;
+    }
+    return null;
+  }
+  function moduleIdFromNode(node) {
+    return node ? node.getAttribute("data-module-id") : null;
+  }
+
+  // Click on Add / toggle / delete / header background.
+  document.addEventListener("click", function (ev) {
+    var target = ev.target;
+    if (!target || !target.classList) return;
+
+    // Add module.
+    if (target.classList.contains("resource-usage-add")) {
+      var block = target.closest(".resource-usage-block");
+      if (block) { ev.preventDefault(); addModule(block); }
+      return;
+    }
+
+    var mod = findModule(target);
+    if (!mod) return;
+    var block = mod.closest(".resource-usage-block");
+    if (!block) return;
+    var id = moduleIdFromNode(mod);
+
+    // Delete.
+    if (target.classList.contains("resource-usage-delete")) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      deleteModule(block, id);
+      return;
+    }
+    // Toggle caret.
+    if (target.classList.contains("resource-usage-toggle")) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      toggleModule(block, id);
+      return;
+    }
+    // Header background (but not the input itself, so clicking the input
+    // focuses it for editing instead of toggling).
+    if (target.classList.contains("resource-usage-module-header")) {
+      ev.preventDefault();
+      toggleModule(block, id);
+      return;
+    }
+  });
+
+  // Title / body input persistence + caret click.
+  document.addEventListener("input", function (ev) {
+    var target = ev.target;
+    if (!target || !target.classList) return;
+    var mod = findModule(target);
+    if (!mod) return;
+    var block = mod.closest(".resource-usage-block");
+    if (!block) return;
+    var id = moduleIdFromNode(mod);
+    if (target.classList.contains("resource-usage-module-title")) {
+      updateModule(block, id, { title: target.value });
+    } else if (target.classList.contains("resource-usage-module-textarea")) {
+      updateModule(block, id, { body: target.value });
+    }
+  });
+
+  // Keyboard: Enter on the title collapses the module; Esc on title / body blurs.
+  document.addEventListener("keydown", function (ev) {
+    var target = ev.target;
+    if (!target || !target.classList) return;
+    if (target.classList.contains("resource-usage-module-title")) {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        var mod = findModule(target);
+        if (mod) {
+          var block = mod.closest(".resource-usage-block");
+          if (block) toggleModule(block, moduleIdFromNode(mod));
+        }
+      } else if (ev.key === "Escape") {
+        ev.preventDefault();
+        target.blur();
+      }
+    } else if (target.classList.contains("resource-usage-module-textarea")) {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        target.blur();
+      }
+    }
+  });
+
+  function initAll() {
+    var blocks = document.querySelectorAll(".resource-usage-block");
+    for (var i = 0; i < blocks.length; i++) {
+      // Force a fresh in-memory cache per block; the underlying localStorage
+      // is shared so all blocks stay in sync.
+      mem.modules = null;
+      renderAll(blocks[i]);
+    }
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initAll);
+  } else {
+    initAll();
+  }
+})();
+</script>"""
+
+
 def _wrap_summary_section_in_details(html_fragment: str) -> str:
     """Wrap the ``### Summary`` section (Test Result → first h3 after Common stack) in a collapsible ``<details>``.
 
@@ -1684,6 +2792,8 @@ def _gpu_details_extra_classes(title: str) -> str:
         return " release-gpu-details--h800"
     if re.fullmatch(r"A100", t, re.IGNORECASE):
         return " release-gpu-details--a100"
+    if re.fullmatch(r"A3", t, re.IGNORECASE):
+        return " release-gpu-details--a3"
     if re.match(r"H100", t, re.IGNORECASE):
         return " release-gpu-details--h100"
     return ""
@@ -1696,7 +2806,7 @@ def _gpu_summary_icon_markup(title: str) -> str:
 
 
 def _gpu_short_title(title: str) -> str:
-    """Reduce GPU h3 title to its short token (H100 / H200 / H800 / A100).
+    """Reduce GPU h3 title to its short token (H100 / H200 / H800 / A100 / A3).
 
     ``### H100 (CI — Buildkite scheduled nightly)`` should still display as ``H100`` in the
     collapsible summary. Falls back to the original title when no token is found.
@@ -1704,7 +2814,7 @@ def _gpu_short_title(title: str) -> str:
     t = (title or "").strip()
     if not t:
         return t
-    m = re.match(r"\s*(H100|H200|H800|A100)\b", t, re.IGNORECASE)
+    m = re.match(r"\s*(H100|H200|H800|A100|A3)\b", t, re.IGNORECASE)
     return m.group(1).upper() if m else t
 
 
@@ -1848,16 +2958,6 @@ def _release_brand_clipboard_svg() -> str:
     )
 
 
-def _default_archive_filename(title: str, generated_utc: str) -> str:
-    m = re.match(r"^(\d{4}-\d{2}-\d{2})", generated_utc.strip())
-    date_part = m.group(1) if m else datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    base = "vllm-omni-test-report"
-    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", title).strip("-")[:72]
-    if slug:
-        return f"{slug}-{date_part}.md"
-    return f"{base}-{date_part}.md"
-
-
 # Ensure <details> toggles even when inline SVG / ::before hit-testing blocks native behavior.
 _RELEASE_DETAILS_TOGGLE_SCRIPT = """<script>
 (function () {
@@ -1948,8 +3048,6 @@ def wrap_html_document(
     body_inner: str,
     generated_utc: str | None = None,
     tagline: str = "Release · CI test report",
-    archive_markdown: str | None = None,
-    archive_download_name: str | None = None,
 ) -> str:
     t = html.escape(title)
     when = generated_utc or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -1957,52 +3055,6 @@ def wrap_html_document(
     brand = _release_brand_clipboard_svg()
     tl = html.escape(tagline)
     css = EDITORIAL_THEME_CSS + "\n" + RELEASE_MARKDOWN_DOC_CSS
-    dl_name = archive_download_name or _default_archive_filename(title, when)
-    dl_name_esc = html.escape(dl_name, quote=True)
-    archive_top = ""
-    archive_scripts = ""
-    if archive_markdown is not None:
-        b64 = base64.b64encode(archive_markdown.encode("utf-8")).decode("ascii")
-        b64_json = json.dumps(b64)
-        archive_top = (
-            '<div class="top-bar-actions">'
-            '<button type="button" class="btn-release-archive" '
-            'id="release-archive-md-btn" '
-            f'data-download-name="{dl_name_esc}" '
-            'title="Download a Markdown file matching this report (for archive or patch_report_*.py)">'
-            "Archive Markdown</button>"
-            "</div>"
-        )
-        archive_scripts = (
-            f'<script type="application/json" id="release-archive-md-b64">{b64_json}</script>\n'
-            """<script>
-(function () {
-  var btn = document.getElementById("release-archive-md-btn");
-  var el = document.getElementById("release-archive-md-b64");
-  if (!btn || !el) return;
-  btn.addEventListener("click", function () {
-    try {
-      var b64 = JSON.parse(el.textContent || '""');
-      var bin = atob(b64);
-      var bytes = new Uint8Array(bin.length);
-      for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-      var text = new TextDecoder("utf-8").decode(bytes);
-      var blob = new Blob([text], { type: "text/markdown;charset=utf-8" });
-      var url = URL.createObjectURL(blob);
-      var a = document.createElement("a");
-      a.href = url;
-      a.download = btn.getAttribute("data-download-name") || "vllm-omni-test-report.md";
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      alert("Archive failed: " + e);
-    }
-  });
-})();
-</script>"""
-        )
     top_bar = (
         '<div class="top-bar"><div class="shell top-bar-inner">'
         '<div class="brand">'
@@ -2011,7 +3063,6 @@ def wrap_html_document(
         f"<h1>{t}</h1>"
         f'<p class="tagline">{tl}</p>'
         "</div></div>"
-        f"{archive_top}"
         "</div></div>"
     )
     shell = f'<div class="shell"><div class="release-doc">{meta}\n{body_inner}</div></div>'
@@ -2031,13 +3082,17 @@ def wrap_html_document(
 {_LOG_EXCERPT_MODAL_HTML}
 {_FAIL_STATUS_MODAL_HTML}
 {_UT_COVERAGE_MODAL_HTML}
-{archive_scripts}
 {_RELEASE_DETAILS_TOGGLE_SCRIPT}
 {_FAIL_STATUS_SCRIPT}
 {_GITHUB_ISSUE_SUBMIT_SCRIPT}
 {_UT_COVERAGE_SUBMIT_SCRIPT}
 {_SKIP_GROUP_SCRIPT}
 {_OPEN_ISSUE_ACTION_SCRIPT}
+{_NEXT_STEPS_OUTSTANDING_SCRIPT}
+{_DI_TOP10_ASSIGNEE_SCRIPT}
+{_QUALITY_DEFENSE_SCRIPT}
+{_RESOURCE_USAGE_SCRIPT}
+{_DEVICE_HOURS_BUILD_SCRIPT}
 </body>
 </html>
 """
@@ -2046,19 +3101,16 @@ def wrap_html_document(
 def convert_release_report_markdown(
     md: str,
     *,
-    archive_download_name: str | None = None,
     l2_l3_row_ok: bool | None = None,
     l2_l3_row_detail: str = "",
     di_row_ok: bool | None = None,
     di_row_detail: str = "",
     critical_row_ok: bool | None = None,
     critical_row_detail: str = "",
-    assignee_row_ok: bool | None = None,
-    assignee_row_detail: str = "",
 ) -> str:
     """Full HTML document from a release report Markdown string.
 
-    Pass ``*_row_ok`` for automatic conclusion rows; when omitted, that row defaults to Pass in the archive table.
+    Pass ``*_row_ok`` for automatic conclusion rows; when omitted, that row defaults to Pass in the conclusion table.
     """
     title = "vLLM-Omni Test Report"
     for line in md.splitlines():
@@ -2092,8 +3144,6 @@ def convert_release_report_markdown(
         di_row_detail=di_row_detail,
         critical_row_ok=critical_row_ok,
         critical_row_detail=critical_row_detail,
-        assignee_row_ok=assignee_row_ok,
-        assignee_row_detail=assignee_row_detail,
     )
     body = _wrap_release_report_h2_sections(body)
     body = _wrap_test_result_gpu_subcards(body)
@@ -2103,26 +3153,17 @@ def convert_release_report_markdown(
     body = _upgrade_status_cells_in_failure_tables(body)
     body = _group_skip_monitor_table_by_issue(body)
     body = _upgrade_open_issue_action_cells(body)
+    body = _upgrade_di_top10_input_cells(body)
+    body = _upgrade_device_hours_cell(body)
+    body = _upgrade_next_steps_outstanding_cells(body)
+    body = _upgrade_quality_defense_block(body)
+    body = _upgrade_resource_usage_block(body)
     body = _wrap_summary_section_in_details(body)
     body = _wrap_failure_analysis_h4_in_details(body)
     body = _wrap_pdc_h4_in_details(body)
-    body = _wrap_bugfix_monitor_h3_in_details(body)
     body = _fold_release_report_section_cards(body)
-    archive_markdown = materialize_release_conclusion_in_markdown(
-        md,
-        l2_l3_row_ok=l2_l3_row_ok,
-        l2_l3_row_detail=l2_l3_row_detail,
-        di_row_ok=di_row_ok,
-        di_row_detail=di_row_detail,
-        critical_row_ok=critical_row_ok,
-        critical_row_detail=critical_row_detail,
-        assignee_row_ok=assignee_row_ok,
-        assignee_row_detail=assignee_row_detail,
-    )
     return wrap_html_document(
         title=title,
         body_inner=body,
         generated_utc=when,
-        archive_markdown=archive_markdown,
-        archive_download_name=archive_download_name,
     )

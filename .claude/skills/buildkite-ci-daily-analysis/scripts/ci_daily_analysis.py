@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Fetch yesterday's Buildkite builds (in Beijing Time / CST) for vllm-omni
-and vllm-omni-npu-ci and analyze per-job and per-build success/failure/duration,
-then emit a self-contained HTML report with interactive **Pipeline** /
-**Branch** / **CI** / **State** / **Job Name** filter dropdowns plus a CI
-Aggregate panel broken down by ``ready`` / ``merge`` / ``nightly`` / ``weekly``.
+Fetch today's Buildkite builds (in Beijing Time / CST) for vllm-omni,
+vllm-omni-npu-ci, and vllm-omni-amd-ci and analyze per-job and per-build
+success/failure/duration, then emit a self-contained HTML report with
+interactive **Pipeline** / **Branch** / **CI** / **State** / **Job Name**
+filter dropdowns plus a CI Aggregate panel broken down by
+``ready`` / ``merge`` / ``nightly`` / ``weekly``.
 
-The default window is the **previous full Beijing Time (CST, UTC+8) calendar
-day** — i.e. yesterday 00:00 — 23:59 CST, which maps to the UTC span
-``(yesterday-1) 16:00 UTC`` → ``yesterday 15:59:59 UTC``. Pass ``--today``
-for the current CST day, or ``--date YYYY-MM-DD`` for an arbitrary CST day.
+The default window is **today Beijing Time (CST, UTC+8)** — i.e. today
+00:00 CST through the current time. Note that "today" is a partial day and
+may yield incomplete Buildkite coverage; scheduled runs (e.g. cron jobs)
+should pass ``--date YYYY-MM-DD`` explicitly to target a specific full day.
 
 > **Note on the 18:00 UTC nightly run:** under the old UTC default, the
 > nightly job triggered at 18:00 UTC fell into "yesterday UTC". Under the
@@ -18,7 +19,7 @@ for the current CST day, or ``--date YYYY-MM-DD`` for an arbitrary CST day.
 
 For each ``script``/``command`` job, the script records:
 
-  - pipeline (vllm-omni / vllm-omni-npu-ci)
+  - pipeline (vllm-omni / vllm-omni-npu-ci / vllm-omni-amd-ci)
   - branch, ci_bucket, build number, job name, job state, job URL
   - duration seconds (finished_at - started_at)
 
@@ -29,10 +30,10 @@ CI Aggregate panel can show build-level success rate and runtime per bucket.
 Usage:
 
   export BUILDKITE_API_TOKEN=...
-  python scripts/ci_daily_analysis.py                  # default = yesterday CST
+  python scripts/ci_daily_analysis.py                  # default = today CST
   python scripts/ci_daily_analysis.py --date 2026-07-22   # explicit CST date
   python scripts/ci_daily_analysis.py --today          # current CST day
-  python scripts/ci_daily_analysis.py --pipeline vllm-omni,vllm-omni-npu-ci
+  python scripts/ci_daily_analysis.py --pipeline vllm-omni,vllm-omni-npu-ci,vllm-omni-amd-ci
   python scripts/ci_daily_analysis.py --output my-report.html
 
 Default output is an HTML file written to ``ci-daily-YYYY-MM-DD.html`` in
@@ -64,7 +65,7 @@ except ImportError:
 
 BUILDKITE_API_BASE = "https://api.buildkite.com/v2"
 ORG_SLUG = "vllm"
-DEFAULT_PIPELINES = ["vllm-omni", "vllm-omni-npu-ci"]
+DEFAULT_PIPELINES = ["vllm-omni", "vllm-omni-npu-ci", "vllm-omni-amd-ci"]
 
 # ── Timezone handling ──────────────────────────────────────────────────
 
@@ -77,6 +78,7 @@ CST = timezone(timedelta(hours=8))
 PIPELINE_DISPLAY = {
     "vllm-omni": "vllm-omni (GPU)",
     "vllm-omni-npu-ci": "vllm-omni-npu-ci (NPU)",
+    "vllm-omni-amd-ci": "vllm-omni-amd-ci (AMD)",
 }
 
 # CI bucket names — used for the CI Aggregate panel and as `data-ci-bucket`
@@ -132,11 +134,25 @@ def compile_extra_patterns(raw: str | None) -> list[re.Pattern[str]]:
     return out
 
 
-_WEEKLY_MSG = re.compile(r"scheduled\s+weekly", re.IGNORECASE)
+_WEEKLY_MSG = re.compile(r"weekly", re.IGNORECASE)
+_NIGHTLY_MSG = re.compile(r"nightly", re.IGNORECASE)
+
+
+def _is_scheduled(build: dict) -> bool:
+    """True if the build was triggered by a Buildkite schedule (cron)."""
+    return (build.get("source") or "").strip().lower() == "schedule"
 
 
 def _is_scheduled_weekly(build: dict) -> bool:
-    """True if the build's message indicates a Buildkite *Scheduled weekly* run."""
+    """True if a *scheduled* build's message indicates a Buildkite *Scheduled weekly* run.
+
+    Requires **both** conditions (AND): ``source == "schedule"`` **and** the
+    message contains ``weekly``. The message-only check was dropped so a
+    webhook/PR commit that merely mentions "weekly" in its title is no longer
+    mis-bucketed as weekly.
+    """
+    if not _is_scheduled(build):
+        return False
     return bool(_WEEKLY_MSG.search(build.get("message") or ""))
 
 
@@ -144,21 +160,18 @@ def _is_nightly_bucket(build: dict) -> bool:
     """
     True if a `main`-branch build counts as **nightly**.
 
-    Excludes scheduled weekly (handled separately). Includes other scheduled
-    `main` runs (`source == "schedule"`) and legacy message heuristics
-    (`"nightly"` substring, or `"scheduled"` + `"build"`).
+    Requires **both** conditions (AND): ``source == "schedule"`` **and** the
+    message contains ``nightly``. Excludes scheduled weekly (handled
+    separately). The previous OR-based heuristics (``source == "schedule"``
+    alone, or ``"nightly" in msg`` alone, or ``"scheduled" + "build"``)
+    mis-bucketed webhook/PR builds whose commit title happened to mention
+    "nightly" (e.g. "Add experimental AMD MI300 nightly lane") as nightly.
     """
     if _is_scheduled_weekly(build):
         return False
-    source = (build.get("source") or "").strip().lower()
-    if source == "schedule":
-        return True
-    msg = (build.get("message") or "").lower()
-    if "nightly" in msg:
-        return True
-    if "scheduled" in msg and "build" in msg:
-        return True
-    return False
+    if not _is_scheduled(build):
+        return False
+    return bool(_NIGHTLY_MSG.search(build.get("message") or ""))
 
 
 def classify_build(build: dict) -> str:
@@ -192,6 +205,13 @@ STATE_BUCKET = {
     "not_run": STATE_OTHER,
     "broken": STATE_OTHER,
 }
+
+# Build states considered "settled" for the **latest build per CI bucket**
+# selection. Builds in any other state (running / failing / canceling /
+# canceled / scheduled / creating / skipped / not_run / blocked / broken
+# or unknown) are skipped, and the next-newest build in the bucket is
+# considered instead.
+LATEST_BUILD_SETTLED_STATES: frozenset[str] = frozenset({"passed", "failed"})
 
 
 # ── Editorial CSS (aligned with the dashboard palette) ──────────────────
@@ -654,6 +674,26 @@ table.job-analysis td.url-cell a:hover {
   gap: 0.85rem;
   margin: 0.85rem 0 0;
 }
+
+/* Latest-build metric panel — the duration is the headline number */
+.metric-hero-card {
+  grid-column: span 2;
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--ci-soft) 70%, var(--dashboard-panel-bg)) 0%,
+    var(--dashboard-panel-bg) 100%
+  );
+  border-left: 4px solid var(--ci);
+}
+.metric-hero-value {
+  font-size: 2.55rem;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  background: linear-gradient(135deg, var(--ci), var(--accent));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
 .aggregate-card {
   border-radius: var(--radius-sm);
   border: 1px solid var(--dashboard-border);
@@ -725,6 +765,45 @@ table.job-analysis td.url-cell a:hover {
   color: var(--dashboard-text);
 }
 .aggregate-card .agg-toggle input:checked + label {
+  background: var(--dashboard-panel-bg);
+  color: var(--ci);
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12);
+}
+
+/* Section-level daily/latest toggle for CI Aggregate panel */
+.ci-mode-toggle {
+  display: inline-flex;
+  gap: 0;
+  padding: 3px;
+  border: 1px solid var(--dashboard-border-strong);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  margin-bottom: 0.9rem;
+  box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+.ci-mode-toggle input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+  width: 0;
+  height: 0;
+}
+.ci-mode-toggle label {
+  padding: 0.38rem 1.1rem;
+  font-size: 0.78rem;
+  font-weight: 760;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+  border-radius: 999px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.ci-mode-toggle label:hover {
+  color: var(--dashboard-text);
+}
+.ci-mode-toggle input:checked + label {
   background: var(--dashboard-panel-bg);
   color: var(--ci);
   box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12);
@@ -995,6 +1074,42 @@ def fetch_builds(
     return all_builds
 
 
+def fetch_recent_builds(
+    token: str,
+    pipeline_slug: str,
+    *,
+    per_page: int = 30,
+    max_builds: int = 100,
+) -> list[dict]:
+    """Fetch the most recent builds for a pipeline (no date filter).
+
+    Used by the "latest" CI Aggregate mode to find the most recent build
+    per CI bucket. Fetches up to ``max_builds`` builds and returns them
+    sorted newest-first (the Buildkite API default order).
+    """
+    url = f"{BUILDKITE_API_BASE}/organizations/{ORG_SLUG}/pipelines/{pipeline_slug}/builds"
+    params: dict[str, str | int] = {
+        "per_page": per_page,
+    }
+    all_builds: list[dict] = []
+    while len(all_builds) < max_builds:
+        r = _bk_get_with_retries(url, token, params=params)
+        data = r.json()
+        page = data if isinstance(data, list) else [data]
+        all_builds.extend(page)
+        if len(page) < per_page:
+            break
+        link = r.headers.get("Link") or r.headers.get("link")
+        links = parse_link_header(link)
+        next_url = links.get("next")
+        if not next_url:
+            break
+        url = next_url
+        params = {}
+        time.sleep(max(0.0, float(os.environ.get("BUILDKITE_BUILDS_PAGE_SLEEP", "0.12"))))
+    return all_builds[:max_builds]
+
+
 def fetch_build_with_jobs(token: str, pipeline_slug: str, build_number: int | str) -> dict:
     url = f"{BUILDKITE_API_BASE}/organizations/{ORG_SLUG}/pipelines/{pipeline_slug}/builds/{build_number}"
     r = _bk_get_with_retries(url, token)
@@ -1104,7 +1219,148 @@ class AggregateStats:
         return success_rate(self.passed, self.failed)
 
 
+@dataclass
+class LatestBuildByNameMetric:
+    """One build matching a name pattern, with its duration.
+
+    Returned by :func:`collect_latest_build_by_name`. The duration is
+    ``finished_at - started_at`` when both timestamps are present; for
+    in-flight builds it is ``None``. ``matched_field`` records which
+    build field contained the requested name (``name``, ``message``, or
+    ``pipeline_name``) so the report can show *why* the build matched.
+    """
+
+    pipeline_slug: str
+    pipeline_name: str
+    pipeline_url: str
+    build_number: int
+    matched_field: str
+    matched_text: str
+    state: str
+    branch: str
+    commit: str
+    started_at: datetime | None
+    finished_at: datetime | None
+    duration_seconds: float | None
+    build_url: str
+    creator: str
+
+
 # ── Data collection ──────────────────────────────────────────────────────
+
+
+def _pipeline_display_for_metric(b: dict, slug: str) -> tuple[str, str]:
+    """Extract a human-readable pipeline name + URL from a build object.
+
+    Falls back to the slug when ``b.pipeline`` is missing or empty (older
+    or synthetic build objects)."""
+    p = b.get("pipeline") or {}
+    name = (p.get("name") or p.get("slug") or slug or "").strip() or slug
+    url = (p.get("web_url") or "").strip()
+    return name, url
+
+
+def collect_latest_build_by_name(
+    token: str,
+    pipeline_slug: str,
+    name_pattern: str,
+    *,
+    max_builds: int = 50,
+) -> LatestBuildByNameMetric | None:
+    """Fetch the latest build from ``pipeline_slug`` that matches ``name_pattern``.
+
+    A build "matches" the pattern (case-insensitive substring) if any of
+    the following holds, in priority order:
+
+    1. ``build.name`` contains the pattern (Buildkite builds have an
+       optional explicit name set via API; usually ``None``).
+    2. ``build.message`` contains the pattern (the commit message or
+       the build message set by a manual trigger).
+    3. ``build.pipeline.name`` contains the pattern (the parent
+       pipeline's human-readable name; e.g. the omni-release pipeline
+       has ``name == "omni release"`` for every build, so this is how
+       "builds named omni release" get identified).
+
+    This makes the function useful both for finding builds with literal
+    names (case A) and for "the latest build in pipeline X" semantics
+    (case B), where the pipeline's display name matches the pattern.
+
+    Returns the newest (API returns builds newest-first) match as a
+    :class:`LatestBuildByNameMetric`, or ``None`` when no match is found
+    in the first ``max_builds`` builds.
+    """
+    print(f"Searching latest build matching {name_pattern!r} in {ORG_SLUG}/{pipeline_slug} (max={max_builds})...")
+    builds = fetch_recent_builds(token, pipeline_slug, max_builds=max_builds)
+    print(f"Fetched {len(builds)} recent build(s); scanning for matches...")
+
+    pat_re = re.compile(re.escape(name_pattern), re.IGNORECASE)
+    for b in builds:
+        build_name = (b.get("name") or "").strip()
+        build_message = (b.get("message") or "").strip()
+        pipeline_name, _pipeline_url = _pipeline_display_for_metric(b, pipeline_slug)
+
+        matched_field: str | None = None
+        matched_text: str = ""
+        if build_name and pat_re.search(build_name):
+            matched_field, matched_text = "name", build_name
+        elif build_message and pat_re.search(build_message):
+            matched_field = "message"
+            # Trim long commit messages so the report stays compact.
+            matched_text = build_message.splitlines()[0][:120] if build_message else ""
+        elif pipeline_name and pat_re.search(pipeline_name):
+            matched_field, matched_text = "pipeline_name", pipeline_name
+
+        if not matched_field:
+            continue
+
+        # Refetch to ensure timing fields are populated even on cached builds.
+        bnum = b.get("number")
+        if bnum is not None:
+            try:
+                fresh = fetch_build_with_jobs(token, pipeline_slug, bnum)
+                if isinstance(fresh, dict):
+                    b = fresh
+            except Exception as exc:  # noqa: BLE001 — keep going on transient errors
+                print(f"  warn: refetch failed for build #{bnum}: {exc}", file=sys.stderr)
+
+        full_name, full_url = _pipeline_display_for_metric(b, pipeline_slug)
+
+        state = (b.get("state") or "").strip().lower() or "unknown"
+        started_at = parse_buildkite_time(b.get("started_at"))
+        finished_at = parse_buildkite_time(b.get("finished_at"))
+        duration: float | None = None
+        if started_at is not None and finished_at is not None:
+            d = (finished_at - started_at).total_seconds()
+            if d >= 0:
+                duration = d
+
+        creator_obj = b.get("creator") or {}
+        creator_str = (creator_obj.get("name") or creator_obj.get("email") or "").strip()
+
+        print(
+            f"  match: build #{bnum} (matched via {matched_field}: {matched_text!r}) "
+            f"state={state} duration={format_duration(duration)}"
+        )
+
+        return LatestBuildByNameMetric(
+            pipeline_slug=pipeline_slug,
+            pipeline_name=full_name,
+            pipeline_url=full_url,
+            build_number=int(bnum) if bnum is not None else 0,
+            matched_field=matched_field,
+            matched_text=matched_text,
+            state=state,
+            branch=(b.get("branch") or "").strip(),
+            commit=(b.get("commit") or "").strip(),
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_seconds=duration,
+            build_url=(b.get("web_url") or "").strip(),
+            creator=creator_str,
+        )
+
+    print(f"  no build matching {name_pattern!r} in the first {max_builds} build(s)")
+    return None
 
 
 def collect_jobs(
@@ -1232,6 +1488,181 @@ def collect_jobs(
     return records, build_records, skipped
 
 
+def collect_latest_jobs(
+    token: str,
+    pipeline_slug: str,
+    *,
+    verbose: bool = False,
+    include_infra: bool = False,
+    extra_skip_patterns: list[re.Pattern[str]] | None = None,
+) -> tuple[list[JobRecord], list[BuildRecord]]:
+    """Fetch the **most recent settled build** per CI bucket (ready/merge/nightly/weekly)
+    for a single pipeline, and return its job-level and build-level records.
+
+    A build is "settled" — and therefore eligible to be the latest — only if:
+
+    1. Its ``state`` is in ``LATEST_BUILD_SETTLED_STATES`` (currently
+       ``{"passed", "failed"}``). This skips builds that are still in
+       flight (``running`` / ``failing`` / ``scheduled`` / ``creating`` /
+       ``skipped`` / ``not_run`` / ``blocked``) or have been preempted
+       (``canceling`` / ``canceled``).
+    2. After the infrastructure-skip filter is applied, at least one
+       script/command job survives. Dynamic-pipeline builds where every
+       job is infrastructure (e.g. ``Upload * Pipeline`` failed so the
+       real test steps were never injected) yield zero real jobs and are
+       skipped even when the build itself passed.
+
+    The Buildkite API does not support filtering by CI bucket, so we
+    fetch recent builds (up to 100), classify each, and keep the newest
+    settled build per bucket. Builds are returned newest-first by the
+    API.
+    """
+    print(f"Fetching recent builds for {ORG_SLUG}/{pipeline_slug} (latest CI mode)...")
+    builds = fetch_recent_builds(token, pipeline_slug, max_builds=100)
+    print(f"Fetched {len(builds)} recent build(s) for {pipeline_slug}.")
+
+    # Walk newest-first. For each CI bucket, pick the newest build that is
+    # both in a settled state AND has at least one non-infra job. We
+    # only call ensure_build_with_jobs (an extra API request) on the
+    # first build per bucket that passes the state filter — every older
+    # build per bucket is examined in API order without a refetch.
+    needed_buckets = set(CI_BUCKET_ORDER)
+    candidates_by_bucket: dict[str, dict] = {}
+    for b in builds:
+        if not needed_buckets:
+            break
+        ci_bucket = classify_build(b)
+        if ci_bucket not in needed_buckets:
+            continue
+        bstate = (b.get("state") or "").strip().lower()
+        if bstate not in LATEST_BUILD_SETTLED_STATES:
+            if verbose:
+                print(f"  skip {ci_bucket} #{b.get('number')} (state={bstate!r} not settled)")
+            continue
+        candidates_by_bucket[ci_bucket] = b
+
+    latest_by_bucket: dict[str, dict] = {}
+    for ci_bucket, b in candidates_by_bucket.items():
+        b = ensure_build_with_jobs(token, pipeline_slug, b)
+        jobs = b.get("jobs") or []
+        real_jobs = [
+            j
+            for j in jobs
+            if (j.get("type") or "").strip().lower() in ("script", "command")
+            and (
+                include_infra
+                or not should_skip_job(
+                    (j.get("name") or "").strip() or "(unnamed)",
+                    extra_skip_patterns,
+                )
+            )
+        ]
+        if not real_jobs:
+            if verbose:
+                print(
+                    f"  skip {ci_bucket} #{b.get('number')} (build {b.get('state')!r} "
+                    f"but no non-infra jobs after filter — likely dynamic-pipeline upload failed)"
+                )
+            continue
+        latest_by_bucket[ci_bucket] = b
+
+    if verbose:
+        for bucket, b in latest_by_bucket.items():
+            bnum = b.get("number", "?")
+            bstate = (b.get("state") or "").strip()
+            print(f"  Latest {bucket}: build #{bnum} state={bstate}")
+
+    records: list[JobRecord] = []
+    build_records: list[BuildRecord] = []
+
+    for ci_bucket, b in latest_by_bucket.items():
+        b = ensure_build_with_jobs(token, pipeline_slug, b)
+        jobs = b.get("jobs") or []
+
+        branch = (b.get("branch") or "").strip() or "(unknown)"
+        commit = (b.get("commit") or "").strip()
+        bnum = b.get("number")
+        build_url = (b.get("web_url") or "").strip()
+        build_message = (b.get("message") or "").strip()
+
+        # Build-level record
+        build_state_raw = (b.get("state") or "").strip().lower() or "unknown"
+        build_bucket = STATE_BUCKET.get(build_state_raw, STATE_OTHER)
+        build_started = parse_buildkite_time(b.get("started_at"))
+        build_finished = parse_buildkite_time(b.get("finished_at"))
+        build_duration: float | None = None
+        if build_started is not None and build_finished is not None:
+            build_duration = (build_finished - build_started).total_seconds()
+            if build_duration < 0:
+                build_duration = None
+        build_records.append(
+            BuildRecord(
+                pipeline=pipeline_slug,
+                branch=branch,
+                build_number=bnum if bnum is not None else 0,
+                state=build_state_raw,
+                bucket=build_bucket,
+                ci_bucket=ci_bucket,
+                started_at=build_started,
+                finished_at=build_finished,
+                duration_seconds=build_duration,
+                build_url=build_url,
+                message=build_message,
+            )
+        )
+
+        for j in jobs:
+            jtype = (j.get("type") or "").strip().lower()
+            if jtype not in ("script", "command"):
+                continue
+
+            job_name = (j.get("name") or "").strip() or "(unnamed)"
+
+            if not include_infra and should_skip_job(job_name, extra_skip_patterns):
+                continue
+
+            raw_state = (j.get("state") or "").strip().lower() or "unknown"
+            bucket = STATE_BUCKET.get(raw_state, STATE_OTHER)
+
+            started_at = parse_buildkite_time(j.get("started_at"))
+            finished_at = parse_buildkite_time(j.get("finished_at"))
+            duration: float | None = None
+            if started_at is not None and finished_at is not None:
+                duration = (finished_at - started_at).total_seconds()
+                if duration < 0:
+                    duration = None
+
+            exit_status = j.get("exit_status")
+            if exit_status is not None:
+                try:
+                    exit_status = int(exit_status)
+                except (ValueError, TypeError):
+                    exit_status = None
+
+            records.append(
+                JobRecord(
+                    pipeline=pipeline_slug,
+                    branch=branch,
+                    build_number=bnum if bnum is not None else 0,
+                    build_url=build_url,
+                    commit=commit[:7] if commit else "",
+                    job_id=str(j.get("id") or ""),
+                    job_name=job_name,
+                    state=raw_state,
+                    bucket=bucket,
+                    ci_bucket=ci_bucket,
+                    build_message=build_message,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    duration_seconds=duration,
+                    job_url=(j.get("web_url") or "").strip(),
+                    exit_status=exit_status,
+                )
+            )
+
+    return records, build_records
+
+
 # ── HTML rendering ───────────────────────────────────────────────────────
 
 
@@ -1275,6 +1706,128 @@ def _summary_cards_html(cards: list[dict]) -> str:
             f"</div>"
         )
     return '<div class="focus-card-grid">\n' + "\n".join(parts) + "\n</div>"
+
+
+def _latest_build_metric_panel(
+    metric: LatestBuildByNameMetric | None,
+    *,
+    name_pattern: str,
+    pipeline_slug: str,
+) -> str:
+    """Render the "Latest build duration" panel.
+
+    The duration metric is the hero (large numeric value). Surrounding
+    cards (build #, state, branch/commit, started/finished, link) give
+    enough context to interpret it. When ``metric`` is ``None`` (no
+    matching build found) the panel still renders with an italic
+    placeholder so the user can see the query was attempted.
+    """
+    title = f"Latest “{html.escape(name_pattern)}” Build Duration"
+
+    if metric is None:
+        return (
+            '<div class="panel panel-bk">\n'
+            '  <h2><span class="heading-row"><span class="heading-ico">'
+            f"{ICON_CLOCK}</span>{title}</span></h2>\n"
+            '  <p class="no-data">'
+            f"No build matching “<code>{html.escape(name_pattern)}</code>” was found in the "
+            f"first 50 builds of <code>{html.escape(pipeline_slug)}</code>."
+            "</p>\n"
+            "</div>"
+        )
+
+    dur_str = format_duration(metric.duration_seconds) if metric.duration_seconds is not None else "N/A"
+    state_pill = f'<span class="state-pill {html.escape(metric.state)}">{html.escape(metric.state)}</span>'
+    elapsed_note = ""
+    if metric.duration_seconds is None and metric.started_at is not None and metric.finished_at is None:
+        # Build is still running — show the elapsed time so far for context.
+        elapsed = (datetime.now(timezone.utc) - metric.started_at).total_seconds()
+        if elapsed > 0:
+            elapsed_note = f" (running for {format_duration(elapsed)} so far)"
+
+    match_label = {
+        "name": "build.name",
+        "message": "build.message",
+        "pipeline_name": "build.pipeline.name",
+    }.get(metric.matched_field, metric.matched_field)
+    matched_value_html = (
+        (f"— matched via <code>{html.escape(match_label)}</code>: <code>{html.escape(metric.matched_text)}</code>")
+        if metric.matched_text
+        else ""
+    )
+
+    pipeline_label = (
+        f"{html.escape(metric.pipeline_name)} <code>({html.escape(metric.pipeline_slug)})</code>"
+        if metric.pipeline_name and metric.pipeline_name != metric.pipeline_slug
+        else f"<code>{html.escape(metric.pipeline_slug)}</code>"
+    )
+    link_html = (
+        f'<a href="{html.escape(metric.build_url)}" target="_blank" rel="noopener">open in Buildkite ↗</a>'
+        if metric.build_url
+        else "—"
+    )
+
+    # Hero card — duration is the headline metric the user asked for.
+    hero_card = (
+        '<div class="focus-card focus-card--ci metric-hero-card">\n'
+        f'  <div class="focus-card-title">{ICON_CLOCK} Build duration</div>\n'
+        f'  <div class="focus-card-value metric-hero-value">{html.escape(dur_str)}'
+        f"{html.escape(elapsed_note)}</div>\n"
+        f'  <div class="focus-card-detail">'
+        f"build #{metric.build_number} · pipeline {pipeline_label}</div>\n"
+        "</div>"
+    )
+
+    # Detail cards — rendered manually (NOT through _summary_cards_html)
+    # because some details contain raw HTML (state pill, code spans) that
+    # must not be escaped. Each card has the same `focus-card focus-card--ci`
+    # shape used elsewhere on the page so the grid stays consistent.
+    def _detail_card(icon: str, title: str, value_html: str, detail_html: str) -> str:
+        return (
+            '<div class="focus-card focus-card--ci">\n'
+            f'  <div class="focus-card-title">{icon} {html.escape(title)}</div>\n'
+            f'  <div class="focus-card-value">{value_html}</div>\n'
+            f'  <div class="focus-card-detail">{detail_html}</div>\n'
+            "</div>"
+        )
+
+    matched_text_disp = metric.matched_text or "—"
+    if len(matched_text_disp) > 80:
+        matched_text_disp = matched_text_disp[:80] + "…"
+
+    detail_card_html_parts = [
+        _detail_card(
+            ICON_JOBS,
+            "Matched name",
+            html.escape(matched_text_disp),
+            matched_value_html or "&nbsp;",
+        ),
+        _detail_card(
+            ICON_CHECK,
+            "State",
+            html.escape(metric.state),
+            state_pill,
+        ),
+        _detail_card(
+            ICON_TREND,
+            "Branch / Commit",
+            html.escape(metric.branch) if metric.branch else "—",
+            f"<code>{html.escape(metric.commit[:12])}</code>" if metric.commit else "—",
+        ),
+    ]
+    hero_grid_html = '<div class="focus-card-grid">\n' + hero_card + "\n".join(detail_card_html_parts) + "\n</div>"
+
+    return (
+        '<div class="panel panel-bk">\n'
+        '  <h2><span class="heading-row"><span class="heading-ico">'
+        f"{ICON_CLOCK}</span>{title}</span></h2>\n"
+        '  <p class="meta" style="margin-top:0.2rem;">'
+        f"Source: latest build from <code>{html.escape(metric.pipeline_url or '')}</code> "
+        f"matching <code>{html.escape(name_pattern)}</code> (case-insensitive). "
+        f"{link_html}</p>\n"
+        f"  {hero_grid_html}\n"
+        "</div>"
+    )
 
 
 def _aggregate_card_html(
@@ -1646,6 +2199,9 @@ def render_html(
     *,
     skipped_summary: dict[str, int] | None = None,
     build_records: list[BuildRecord] | None = None,
+    latest_records: list[JobRecord] | None = None,
+    latest_build_records: list[BuildRecord] | None = None,
+    latest_build_metric: tuple[LatestBuildByNameMetric, str, str] | None = None,
 ) -> str:
     """
     Render the full self-contained HTML page.
@@ -1657,6 +2213,14 @@ def render_html(
                      that were filtered out before aggregation.
     build_records:   optional list of BuildRecord for build-level stats in
                      the CI Aggregate panel. Defaults to an empty list.
+    latest_records:  optional list of JobRecord from the latest build per
+                     CI bucket (for the "latest" toggle in CI Aggregate).
+    latest_build_records: optional list of BuildRecord for the latest builds.
+    latest_build_metric: optional ``(metric, name_pattern, pipeline_slug)``
+                     triple. When provided, a "Latest <name> Build Duration"
+                     panel is rendered between the summary cards and the
+                     Per-Pipeline Aggregate, prominently showing the
+                     duration of the most recent matching build.
     """
     cards = _summary_cards(records)
     pipelines_listed = sorted(pipelines)
@@ -1704,6 +2268,30 @@ def render_html(
                 )
             )
     ci_cards_html = "\n".join(ci_cards_parts)
+
+    # ── Latest-mode aggregate cards: job-level data from the most recent
+    # build of each CI bucket per pipeline.
+    latest_by_ci_pipeline: dict[tuple[str, str], AggregateStats] = defaultdict(AggregateStats)
+    latest_by_ci_pipeline_build: dict[tuple[str, str], AggregateStats] = defaultdict(AggregateStats)
+    for r in latest_records or []:
+        latest_by_ci_pipeline[(r.ci_bucket, r.pipeline)].add(r)
+    for b in latest_build_records or []:
+        latest_by_ci_pipeline_build[(b.ci_bucket, b.pipeline)].add(b)
+
+    latest_ci_cards_parts: list[str] = []
+    for b in CI_BUCKET_ORDER:
+        for p in pipelines_listed:
+            # Latest mode only shows job-level data — build-level stats
+            # are not meaningful when each card represents a single build,
+            # so we intentionally omit build_stats here.
+            latest_ci_cards_parts.append(
+                _aggregate_card_html(
+                    f"{CI_BUCKET_DISPLAY.get(b, b)} · {PIPELINE_DISPLAY.get(p, p)}",
+                    latest_by_ci_pipeline.get((b, p), AggregateStats()),
+                    data_ci_bucket=f"latest-{b}-{p}",
+                )
+            )
+    latest_ci_cards_html = "\n".join(latest_ci_cards_parts)
 
     pipeline_cards_html = "\n".join(
         _aggregate_card_html(
@@ -1764,7 +2352,7 @@ def render_html(
         '<div class="legend">\n'
         "<dl>\n"
         "  <dt>Pipeline</dt>\n"
-        "  <dd>Buildkite pipeline slug (<code>vllm-omni</code>, <code>vllm-omni-npu-ci</code>).</dd>\n"
+        "  <dd>Buildkite pipeline slug (<code>vllm-omni</code>, <code>vllm-omni-npu-ci</code>, <code>vllm-omni-amd-ci</code>).</dd>\n"
         "  <dt>Branch</dt>\n"
         "  <dd>Source branch from the parent build, e.g. <code>main</code>, "
         "<code>alice/add-thing</code>. All branches from the date range are listed; "
@@ -1827,8 +2415,19 @@ def render_html(
         "</div>\n"
         "</div>\n"
         "</header>\n"
-        '<div class="shell">\n' + _summary_cards_html(cards) + "\n"
-        '<div class="panel panel-bk">\n'
+        '<div class="shell">\n'
+        + _summary_cards_html(cards)
+        + "\n"
+        + (
+            _latest_build_metric_panel(
+                latest_build_metric[0],
+                name_pattern=latest_build_metric[1],
+                pipeline_slug=latest_build_metric[2],
+            )
+            if latest_build_metric is not None
+            else ""
+        )
+        + '<div class="panel panel-bk">\n'
         f'  <h2><span class="heading-row"><span class="heading-ico">{ICON_TREND}</span>'
         f" Per-Pipeline Aggregate</span></h2>\n"
         f'  <div class="aggregate-grid">\n{pipeline_cards_html}\n  </div>\n'
@@ -1837,7 +2436,15 @@ def render_html(
         f'  <h2><span class="heading-row"><span class="heading-ico">{ICON_FILTER}</span>'
         f' CI Aggregate <span class="meta" style="border:none;padding:0;margin-left:.4rem;">'
         f"(ready · merge · nightly · weekly · split by pipeline)</span></span></h2>\n"
-        f'  <div class="aggregate-grid">\n{ci_cards_html}\n  </div>\n'
+        '  <div class="ci-mode-toggle" id="ci-mode-toggle">\n'
+        '    <input type="radio" id="ci-mode-daily" name="ci-mode" value="daily" checked>\n'
+        '    <label for="ci-mode-daily">Daily</label>\n'
+        '    <input type="radio" id="ci-mode-latest" name="ci-mode" value="latest">\n'
+        '    <label for="ci-mode-latest">Latest</label>\n'
+        "  </div>\n"
+        f'  <div class="aggregate-grid ci-daily-grid" id="ci-daily-grid">\n{ci_cards_html}\n  </div>\n'
+        f'  <div class="aggregate-grid ci-latest-grid" id="ci-latest-grid"'
+        f' style="display:none">\n{latest_ci_cards_html}\n  </div>\n'
         "</div>\n"
         '<div class="panel panel-bk">\n'
         f'  <h2><span class="heading-row"><span class="heading-ico">{ICON_FILTER}</span>'
@@ -1848,7 +2455,9 @@ def render_html(
         f"window: <code>{html.escape(date_str)}</code> (00:00 — 23:59 CST, UTC+8)"
         + (
             "; filtered infra jobs: "
-            + ", ".join(f"<code>{html.escape(name)}</code>×{count}" for name, count in skipped_summary.items())
+            + ", ".join(
+                f"<code>{html.escape(name)}</code>×{count}" for name, count in skipped_summary.items()
+            )
             if skipped_summary
             else ""
         )
@@ -1861,12 +2470,12 @@ def render_html(
 
 def _toggle_script() -> str:
     """Wire up the Job level / Build level pill-button toggle on each
-    CI Aggregate card. When the user clicks a pill, the matching section
-    becomes visible and the other is hidden. Default state (Job level)
-    is set by the checked attribute in the markup."""
+    CI Aggregate card, and the section-level daily/latest toggle for the
+    CI Aggregate panel."""
     return """
 <script>
 (function() {
+  // ── Job level / Build level toggle on each aggregate card
   var toggles = document.querySelectorAll('.aggregate-card .agg-toggle');
   toggles.forEach(function(toggle) {
     toggle.addEventListener('change', function(ev) {
@@ -1880,6 +2489,20 @@ def _toggle_script() -> str:
       });
     });
   });
+
+  // ── Section-level daily/latest toggle for CI Aggregate
+  var ciModeToggle = document.getElementById('ci-mode-toggle');
+  var dailyGrid = document.getElementById('ci-daily-grid');
+  var latestGrid = document.getElementById('ci-latest-grid');
+  if (ciModeToggle && dailyGrid && latestGrid) {
+    ciModeToggle.addEventListener('change', function(ev) {
+      var sel = ev.target;
+      if (!sel || sel.type !== 'radio') return;
+      var mode = sel.value;
+      dailyGrid.style.display = (mode === 'daily') ? '' : 'none';
+      latestGrid.style.display = (mode === 'latest') ? '' : 'none';
+    });
+  }
 })();
 </script>
 """
@@ -1992,23 +2615,23 @@ def render_json(records: list[JobRecord], date_str: str) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Analyze yesterday's Buildkite builds for vllm-omni and "
-        "vllm-omni-npu-ci (the default date window is the previous "
-        "full Beijing Time / CST calendar day, 00:00 — 23:59 CST "
-        "= UTC (date-1) 16:00 → date 15:59:59), and emit an HTML "
-        "report with Pipeline / Branch / CI / State / Job Name "
-        "filter dropdowns plus a CI Aggregate panel broken down "
-        "by ready / merge / nightly / weekly buckets. Default "
-        "output is HTML."
+        description="Analyze today's Buildkite builds for vllm-omni, "
+        "vllm-omni-npu-ci, and vllm-omni-amd-ci (the default date window "
+        "is today Beijing Time / CST calendar day, 00:00 CST — now; "
+        "partial day — scheduled runs should pass --date YYYY-MM-DD "
+        "explicitly for a full day), and emit an HTML report with "
+        "Pipeline / Branch / CI / State / Job Name filter dropdowns plus "
+        "a CI Aggregate panel broken down by ready / merge / nightly "
+        "/ weekly buckets. Default output is HTML."
     )
     parser.add_argument(
         "--date",
         default=None,
         metavar="YYYY-MM-DD",
-        help="CST calendar date to analyze. Default: yesterday CST (00:00 — 23:59 CST).",
+        help="CST calendar date to analyze. Default: today CST (00:00 CST — now; partial day).",
     )
     parser.add_argument(
-        "--today", dest="use_today", action="store_true", help="Analyze today CST instead of yesterday CST."
+        "--today", dest="use_today", action="store_true", help="Analyze today CST instead of the default (today CST)."
     )
     parser.add_argument(
         "--pipeline",
@@ -2056,11 +2679,11 @@ def main() -> int:
     elif args.use_today:
         date_str = today_range_cst()[0]
     else:
-        # Default to yesterday CST (UTC+8) — the previous full Beijing-time
-        # calendar day, i.e. 00:00 — 23:59 CST = (yesterday-1) 16:00 UTC →
-        # yesterday 15:59:59 UTC. Saying "today's report" naturally maps to
-        # "the most recent fully completed CI day".
-        date_str = yesterday_range_cst()[0]
+        # Default to today CST (UTC+8) — the current Beijing-time calendar day
+        # (00:00 CST through now). Scheduled runs (e.g. cron jobs) should pass
+        # --date YYYY-MM-DD explicitly to target a specific full day, since
+        # "today" is only a partial day and may yield incomplete coverage.
+        date_str = today_range_cst()[0]
 
     pipeline_slugs: list[str]
     if args.pipelines:
@@ -2094,6 +2717,26 @@ def main() -> int:
             all_skipped.extend(skipped)
         except requests.RequestException as e:
             print(f"API request failed for {slug}: {e}", file=sys.stderr)
+            if hasattr(e, "response") and e.response is not None:
+                print(f"HTTP status: {e.response.status_code}", file=sys.stderr)
+                print(e.response.text[:500], file=sys.stderr)
+
+    # ── Fetch latest build per CI bucket (for the "latest" toggle)
+    all_latest_records: list[JobRecord] = []
+    all_latest_build_records: list[BuildRecord] = []
+    for slug in pipeline_slugs:
+        try:
+            recs, builds = collect_latest_jobs(
+                token,
+                slug,
+                verbose=args.verbose,
+                include_infra=args.include_infra,
+                extra_skip_patterns=extra_patterns,
+            )
+            all_latest_records.extend(recs)
+            all_latest_build_records.extend(builds)
+        except requests.RequestException as e:
+            print(f"API request failed for {slug} (latest): {e}", file=sys.stderr)
             if hasattr(e, "response") and e.response is not None:
                 print(f"HTTP status: {e.response.status_code}", file=sys.stderr)
                 print(e.response.text[:500], file=sys.stderr)
@@ -2134,12 +2777,46 @@ def main() -> int:
             from collections import Counter
 
             skipped_summary = dict(Counter(name for name, _ in all_skipped).most_common())
+
+        # ── Latest omni release build duration metric
+        latest_metric: tuple[LatestBuildByNameMetric, str, str] | None = None
+        try:
+            omni_release_pipeline = "omni-release"
+            omni_release_pattern = "omni release"
+            omni_metric = collect_latest_build_by_name(
+                token,
+                omni_release_pipeline,
+                omni_release_pattern,
+            )
+            if omni_metric is not None:
+                latest_metric = (omni_metric, omni_release_pattern, omni_release_pipeline)
+                print(
+                    f"omni-release latest build #{omni_metric.build_number}: "
+                    f"state={omni_metric.state}, "
+                    f"duration={format_duration(omni_metric.duration_seconds)}, "
+                    f"matched_via={omni_metric.matched_field}, "
+                    f"url={omni_metric.build_url}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"omni-release: no build matching {omni_release_pattern!r} in the recent builds window",
+                    file=sys.stderr,
+                )
+        except requests.RequestException as e:
+            print(f"omni-release latest build query failed: {e}", file=sys.stderr)
+            if hasattr(e, "response") and e.response is not None:
+                print(f"HTTP status: {e.response.status_code}", file=sys.stderr)
+
         html_content = render_html(
             all_records,
             date_str,
             pipeline_slugs,
             skipped_summary=skipped_summary,
             build_records=all_build_records,
+            latest_records=all_latest_records,
+            latest_build_records=all_latest_build_records,
+            latest_build_metric=latest_metric,
         )
         out_path = Path(args.output_path) if args.output_path else Path(f"ci-daily-{date_str}.html")
         out_path.write_text(html_content, encoding="utf-8")

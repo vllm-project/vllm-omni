@@ -375,4 +375,54 @@ fi
 
 Same pattern: pull **`nightly_jobs_local_*`** when scope = `local`/`all`; **`nightly_stability_jobs_*`** when scope = `stability`/`all`; **`nightly_jobs_YYYYMMDD-*`** only when scope = `default`/`all`; then run step 4.
 
+<a id="selective-stability-pull"></a>
+
+## Optional: selective pull for stability logs
+
+When the sync scope is **`stability`** (or **`all`**) the regular
+**`tar czf - <run_dir>`** pull downloads every `<job>.log` — but
+long-stability logs are routinely tens to hundreds of megabytes each and
+most jobs pass. The selective-pull optimization pulls only
+**`timing_summary.log` + `jobs/`** in phase 1, parses the rollup, then
+re-issues a tarball for **only the FAILED / TIMED OUT jobs** in phase 2.
+`OK` jobs are never downloaded; their status still lands in the HTML
+report as a synthetic `(manifest only)` row.
+
+| Tool | Purpose |
+|------|---------|
+| **`scripts/selective_stability_pull.py`** (in [`vllm-omni-test-report`][vot]) | Two-phase pull driver (H200 direct SSH or H800 `srun + docker exec`). Writes `logs/.selective_pull_manifest.json` sidecar. |
+| **`scripts/stability_log_manifest.py`** (in [`vllm-omni-test-report`][vot]) | Standalone parser for `timing_summary.log` — used by the report to detect manifest-only mode. |
+
+[vot]: ../../vllm-omni-test-report/SKILL.md
+
+```bash
+# H200 — direct SSH (already in container)
+python3 scripts/selective_stability_pull.py \
+    --ssh-host my_h200 \
+    --repo-root ~/vllm-omni \
+    --sync-scope stability
+
+# H800 — srun + docker exec; --slurm-jobid auto-resolves via --slurm-user if omitted
+python3 scripts/selective_stability_pull.py \
+    --ssh-host h800.example.com \
+    --slurm-user fq9hpsacuser07 \
+    --slurm-jobid 12345 \
+    --container-name omni_wy_24g \
+    --repo-root ~/vllm-omni \
+    --sync-scope stability
+```
+
+Full reference: [vllm-omni-test-report/references/stability-selective-pull.md](../../vllm-omni-test-report/references/stability-selective-pull.md).
+
+**Compatibility with the rest of the flow:**
+
+- After the script finishes, run steps **4** and **5** as normal — the
+  pull writes into the same `<repo>/logs/<run_dir>/` layout the regular
+  flow uses, so `discover_job_logs(log_dir)` finds both pulled-failure
+  `.log` files and the manifest-only stub rows.
+- `--sync-scope all` triggers phase-2 only for stability runs (where
+  savings matter); local and general nightly runs are pulled in full.
+- **`local` / `general` runs** are not worth selective-pulling — pass
+  `--include-local` only on explicit user request.
+
 Then continue with [Verify and generate report](#5-verify-prepare-kanban-and-generate-report-same-for-h200-and-h800) (step 5 above).

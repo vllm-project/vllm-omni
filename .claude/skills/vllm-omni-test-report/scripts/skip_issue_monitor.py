@@ -128,6 +128,13 @@ class SkipMonitorResult:
     scan_note: str = ""
     files_scanned: int = 0
     files_failed: int = 0
+    # Sites whose ``test_file`` is no longer tracked in canonical upstream
+    # (``vllm-project/vllm-omni`` at ``main``). Surfaced as "stale" diagnostics
+    # so a personal fork that hasn't pulled upstream deletions doesn't
+    # masquerade as a fresh skip. Populated only when the upstream tree fetch
+    # succeeded.
+    stale_sites: list[SkipSite] = field(default_factory=list)
+    stale_check_note: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +217,71 @@ def _skill_ancestor_repo_root() -> Path | None:
     return candidate if (candidate / "tests").is_dir() else None
 
 
+def _sibling_of_skill_ancestor() -> tuple[str, Path | None]:
+    """A ``vllm-omni`` directory living next to the workspace that hosts this skill.
+
+    When the operator installs the skill inside a fork (e.g.
+    ``~/vllm-omni-yn`` or ``~/vllm-omni-fork``) and keeps the canonical
+    upstream clone at the sibling ``~/vllm-omni``, the sibling is by far
+    the most reliable scan target — the ancestor itself is the operator's
+    fork (often a personal feature branch that lags canonical HEAD), and
+    the ``~/vllm-omni`` tilde default can land on another operator's clone
+    under a multi-user laptop layout (``/home/<other>/vllm-omni``).
+
+    Returns ``("skill sibling", path)`` when the sibling exists and is a
+    distinct directory from the ancestor; otherwise the path is ``None``.
+    The label is consumed verbatim by :func:`resolve_omni_repo_root` for
+    diagnostics in the rendered section.
+    """
+    ancestor = _skill_ancestor_repo_root()
+    if ancestor is None:
+        return ("skill sibling", None)
+    sibling = ancestor.parent / "vllm-omni"
+    try:
+        if sibling.is_dir() and sibling.resolve() != ancestor.resolve():
+            return ("skill sibling", sibling.resolve())
+    except OSError:
+        pass
+    return ("skill sibling", None)
+
+
+def _git_remote_url(repo_root: Path) -> str:
+    """Return ``repo_root``'s ``origin`` remote URL, or ``""`` on any failure.
+
+    Used by :func:`resolve_omni_repo_root` to prefer the canonical
+    ``vllm-project/vllm-omni`` checkout over a personal fork. Failures
+    (no git, no remote, timeout) degrade to ``""`` which the caller
+    treats as "unknown remote" — never as "canonical".
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def _is_canonical_omni_remote(url: str) -> bool:
+    """True iff ``url`` points at the canonical ``vllm-project/vllm-omni``.
+
+    Accepts both ``https://github.com/vllm-project/vllm-omni`` and the
+    ``.git`` suffix; ignores the scheme (ssh, git, https).
+    """
+    if not url:
+        return False
+    norm = url.strip().rstrip("/")
+    return (
+        norm.endswith("/vllm-project/vllm-omni")
+        or norm.endswith("/vllm-project/vllm-omni.git")
+        or "github.com/vllm-project/vllm-omni" in norm
+    )
+
+
 def resolve_omni_repo_root(explicit: Path | None = None) -> Path | None:
     """Resolve the vllm-omni checkout for scanning.
 
@@ -217,10 +289,16 @@ def resolve_omni_repo_root(explicit: Path | None = None) -> Path | None:
 
     1. ``explicit`` (the ``--omni-repo-root`` CLI flag).
     2. ``$OMNI_REPO_ROOT`` env, then ``$REPO_ROOT`` env.
-    3. The skill's containing checkout.
-    4. ``~/vllm-omni`` (the documented laptop default).
+    3. ``~/vllm-omni`` (the documented laptop default, canonical-upstream first).
+    4. The skill's containing checkout (used only when no canonical-upstream
+       candidate was found — the ancestor heuristic is fragile in
+       multi-checkout environments because the in-repo skill copy under
+       ``<fork>/.claude/skills/`` would otherwise win).
 
-    Returns ``None`` when no candidate has a ``tests/`` directory.
+    A defensive pass after resolution rejects the chosen path when its
+    ``origin`` remote points at a personal fork and a canonical-upstream
+    candidate exists among the runners-up. Returns ``None`` when no
+    candidate has a ``tests/`` directory.
     """
     candidates: list[tuple[str, Path | None]] = []
 
@@ -232,9 +310,16 @@ def resolve_omni_repo_root(explicit: Path | None = None) -> Path | None:
         if raw:
             candidates.append((f"${env}", Path(raw).expanduser().resolve()))
 
-    ancestor = _skill_ancestor_repo_root()
-    if ancestor is not None:
-        candidates.append(("skill ancestor", ancestor))
+    # Skill sibling (``<workspace-parent>/vllm-omni``) — see
+    # :func:`_sibling_of_skill_ancestor`. Inserted BEFORE the
+    # ``~/vllm-omni`` candidate so the operator's own upstream clone
+    # (canonical remote) overrides a multi-user ``/home/*`` collision
+    # where some other operator's ``~/vllm-omni`` sorts first. Inserted
+    # BEFORE the skill ancestor so the upstream clone sitting next to a
+    # fork workspace wins over the fork itself.
+    sibling_label, sibling = _sibling_of_skill_ancestor()
+    if sibling is not None:
+        candidates.append((sibling_label, sibling))
 
     try:
         from laptop_path_defaults import resolve_laptop_repo_root
@@ -243,15 +328,31 @@ def resolve_omni_repo_root(explicit: Path | None = None) -> Path | None:
     except Exception:
         candidates.append(("~/vllm-omni", Path("~/vllm-omni").expanduser().resolve()))
 
+    ancestor = _skill_ancestor_repo_root()
+    if ancestor is not None:
+        candidates.append(("skill ancestor", ancestor))
+
+    resolved: Path | None = None
+    canonical_upstream: Path | None = None
     for _, path in candidates:
         if path is None:
             continue
         try:
-            if (path / "tests").is_dir():
-                return path
+            if not (path / "tests").is_dir():
+                continue
         except OSError:
             continue
-    return None
+        if resolved is None:
+            resolved = path
+        # Track the first canonical-upstream candidate we see, in case the
+        # first match turned out to be a fork.
+        if canonical_upstream is None and _is_canonical_omni_remote(_git_remote_url(path)):
+            canonical_upstream = path
+
+    if resolved is not None and canonical_upstream is not None and resolved != canonical_upstream:
+        if not _is_canonical_omni_remote(_git_remote_url(resolved)):
+            return canonical_upstream
+    return resolved
 
 
 def pull_omni_repo(
@@ -730,6 +831,49 @@ def fetch_issue(ref: IssueRef, gh_token: str | None, *, timeout: int = 30) -> Is
     return info
 
 
+def fetch_upstream_tracked_paths(
+    gh_token: str | None,
+    *,
+    ref: str = "main",
+    timeout: int = 45,
+) -> tuple[set[str] | None, str]:
+    """Return ``(paths, note)`` for files tracked at ``ref`` in canonical upstream.
+
+    Uses GitHub's recursive tree endpoint. ``paths`` is the set of repo-relative
+    POSIX paths whose tree entry is a blob; ``note`` describes the outcome:
+
+    - ``paths is None`` + empty note: request failed (no auth, timeout, 5xx …)
+      — callers fall back to keeping every scanned site.
+    - ``paths is None`` + non-empty note: same plus a one-line reason for
+      diagnostics in the rendered section.
+    - Truncated tree (``truncated=true`` in the response): we keep what we
+      have and note the truncation — partial coverage still catches the
+      common case of recently-deleted test files.
+    """
+    url = f"{GITHUB_API}/repos/{HOME_REPO}/git/trees/{ref}?recursive=1"
+    try:
+        status, _, body = _http_get(url, gh_token=gh_token, timeout=timeout)
+    except Exception as exc:
+        return None, f"upstream tree fetch raised {type(exc).__name__}: {str(exc)[:80]}"
+    if status != 200:
+        return None, f"upstream tree fetch returned HTTP {status}"
+    try:
+        import json as _json
+
+        payload = _json.loads(body.decode("utf-8"))
+    except Exception as exc:
+        return None, f"upstream tree JSON decode failed: {str(exc)[:80]}"
+    tree = payload.get("tree") or []
+    paths = {
+        entry["path"]
+        for entry in tree
+        if isinstance(entry, dict) and entry.get("type") == "blob" and entry.get("path")
+    }
+    if payload.get("truncated"):
+        return paths, "upstream tree was truncated; stale-check is best-effort"
+    return paths, ""
+
+
 def fetch_issues(
     refs: Iterable[IssueRef],
     gh_token: str | None,
@@ -787,12 +931,34 @@ def collect_skip_monitor(
     result.pull_note = pull_omni_repo(resolved, enabled=pull)
 
     sites, files_scanned, scan_note = scan_skip_sites(resolved)
-    result.sites = sites
     result.files_scanned = files_scanned
-    result.files_failed = sum(1 for _ in [])  # placeholder; updated below
     result.scan_note = scan_note
-    if sites:
-        result.issues = fetch_issues((s.issue for s in sites), gh_token, max_fetches=max_fetches)
+
+    # Cross-reference scanned files against canonical upstream so that a
+    # personal fork that hasn't pulled upstream deletions doesn't masquerade
+    # as a fresh skip. On any network/auth failure we keep the original
+    # sites unchanged and record the reason in ``stale_check_note``.
+    upstream_paths, upstream_note = fetch_upstream_tracked_paths(gh_token)
+    if upstream_paths is None:
+        result.stale_check_note = upstream_note or "upstream tree unavailable"
+        result.sites = sites
+    else:
+        live_sites: list[SkipSite] = []
+        stale_sites: list[SkipSite] = []
+        for site in sites:
+            if site.test_file in upstream_paths:
+                live_sites.append(site)
+            else:
+                stale_sites.append(site)
+        result.sites = live_sites
+        result.stale_sites = stale_sites
+        if upstream_note:
+            result.stale_check_note = upstream_note
+
+    if result.sites:
+        result.issues = fetch_issues(
+            (s.issue for s in result.sites), gh_token, max_fetches=max_fetches
+        )
     return result
 
 
@@ -936,6 +1102,17 @@ def render_skip_issue_monitor_section(
         f"- **Scanned:** {result.files_scanned} test file(s) under `tests/`"
         + (f" - {result.scan_note}" if result.scan_note else "")
     )
+    if result.stale_sites:
+        unique_stale = sorted({s.test_file for s in result.stale_sites})
+        sample = ", ".join(f"`{p}`" for p in unique_stale[:5])
+        more = f" (+{len(unique_stale) - 5} more)" if len(unique_stale) > 5 else ""
+        lines.append(
+            f"- **Stale (file deleted in upstream `main`):** "
+            f"{len(result.stale_sites)} site(s) across {len(unique_stale)} file(s) — "
+            f"{sample}{more}. Pull upstream or `git fetch upstream main` to drop them."
+        )
+    elif result.stale_check_note:
+        lines.append(f"- *Upstream stale-check skipped: {result.stale_check_note}*")
     if gh_token is None and n_sites:
         lines.append(
             "- *GitHub fetch ran unauthenticated; Issue Title / State / "
@@ -1041,8 +1218,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Scan vllm-omni/tests for issue-linked pytest skips and render "
-            "the dev-report section. Use --no-pull and --markdown for offline "
-            "debugging."
+            "the dev-report section. Use --no-pull for offline debugging."
         )
     )
     parser.add_argument(
@@ -1052,11 +1228,6 @@ def main(argv: list[str] | None = None) -> int:
         help="Explicit vllm-omni checkout path (overrides env and defaults).",
     )
     parser.add_argument("--no-pull", action="store_true", help="Skip the git pull step.")
-    parser.add_argument(
-        "--markdown",
-        action="store_true",
-        help="Emit the section Markdown to stdout.",
-    )
     parser.add_argument(
         "--json",
         action="store_true",
@@ -1085,6 +1256,22 @@ def main(argv: list[str] | None = None) -> int:
             "scan_note": result.scan_note,
             "files_scanned": result.files_scanned,
             "files_failed": result.files_failed,
+            "stale_check_note": result.stale_check_note,
+            "stale_sites": [
+                {
+                    "test_file": s.test_file,
+                    "lineno": s.lineno,
+                    "scope": s.scope,
+                    "mark": s.mark,
+                    "reason": s.reason,
+                    "issue": {
+                        "owner": s.issue.owner,
+                        "repo": s.issue.repo,
+                        "number": s.issue.number,
+                    },
+                }
+                for s in result.stale_sites
+            ],
             "sites": [
                 {
                     "test_file": s.test_file,
@@ -1104,15 +1291,6 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
 
-    if args.markdown:
-        section = render_skip_issue_monitor_section(
-            repo_root=args.omni_repo_root,
-            gh_token=gh_token,
-            pull=not args.no_pull,
-        )
-        print(section, end="")
-        return 0
-
     # Default: short summary.
     print(f"repo_root: {result.repo_root}")
     print(f"pull: {result.pull_note}")
@@ -1120,6 +1298,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"sites: {len(result.sites)}")
     distinct = {(s.issue.owner, s.issue.repo, s.issue.number) for s in result.sites}
     print(f"distinct_issues: {len(distinct)}")
+    print(f"stale_sites: {len(result.stale_sites)}")
+    if result.stale_check_note:
+        print(f"stale_check_note: {result.stale_check_note}")
     return 0
 
 
