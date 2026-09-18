@@ -111,6 +111,50 @@ def test_kv_config_sliding_window_property():
     assert ARDiffusionKVConfig(chunk_size=16, window_chunks=None).sliding_window is None
 
 
+def test_kv_cache_normalizes_unspecified_standalone_defaults():
+    kv = ARDiffusionKVCache(
+        ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=2),
+        num_layers=1,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        block_size=BLOCK,
+        max_model_len=4 * BLOCK,
+        available_bytes=1 << 16,
+        kv_branches=(ARDiffusionKVBranchSpec("main", 0),),
+        session_capacity=1,
+    )
+
+    assert kv.config.sink_chunks == 0
+    assert kv.config.reset_at_boundary is False
+
+
+@pytest.mark.parametrize(
+    ("config", "error"),
+    [
+        (ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=0), "window_chunks must be positive"),
+        (
+            ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=2, sink_chunks=-1),
+            "sink_chunks must be non-negative",
+        ),
+    ],
+)
+def test_kv_cache_rejects_invalid_window_overrides(config, error):
+    with pytest.raises(ValueError, match=error):
+        ARDiffusionKVCache(
+            config,
+            num_layers=1,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            block_size=BLOCK,
+            max_model_len=4 * BLOCK,
+            available_bytes=1 << 16,
+            kv_branches=(ARDiffusionKVBranchSpec("main", 0),),
+            session_capacity=1,
+        )
+
+
 # --- ARDiffusionRequestAdapter ------------------------------------------------------
 
 
