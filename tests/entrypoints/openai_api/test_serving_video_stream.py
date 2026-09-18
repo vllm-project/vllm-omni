@@ -1272,3 +1272,118 @@ def test_build_messages_keeps_recent_history_text_only():
     assert messages[1] == {"role": "assistant", "content": "recent answer"}
     assert messages[2] == user_message
     assert user_message["content"][-1] == {"type": "text", "text": "current question"}
+
+
+def test_build_messages_can_keep_full_history_text_only():
+    handler = QwenOmniStreamingVideoHandler(chat_service=object())
+    old_frame = _b64(_make_jpeg(1, 2, 3))
+    current_frame = _b64(_make_jpeg(4, 5, 6))
+    history = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{old_frame}"},
+                },
+                {"type": "text", "text": "old question"},
+            ],
+        },
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "recent question"},
+        {"role": "assistant", "content": "recent answer"},
+    ]
+
+    messages, user_message = handler._build_messages(
+        StreamingVideoSessionConfig(
+            model="test",
+            num_frames=1,
+            max_history_turns=None,
+        ),
+        [current_frame],
+        bytearray(),
+        history,
+        "current question",
+        {},
+    )
+
+    assert messages[:-1] == [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "recent question"},
+        {"role": "assistant", "content": "recent answer"},
+    ]
+    assert messages[-1] == user_message
+    assert user_message["content"][-1] == {
+        "type": "text",
+        "text": "current question",
+    }
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sessions_apply_their_own_history_policy(mocker):
+    """Exercise config -> completed turns -> rendered prompt through the real loop."""
+    captured = {}
+
+    class SessionSocket(TimedWebSocket):
+        def __init__(self):
+            super().__init__()
+            self.completed: asyncio.Queue[str] = asyncio.Queue()
+
+        async def send_json(self, data):
+            await super().send_json(data)
+            if data["type"] == "response.text.done":
+                self.completed.put_nowait(data["text"])
+
+    async def preprocess(request):
+        question = request.messages[-1]["content"][-1]["text"]
+        captured[question] = request.messages
+        return {"prompt": question}
+
+    async def generate(**kwargs):
+        yield _text_result("answer " + kwargs["prompt"]["prompt"])
+
+    engine = mocker.Mock(spec=["generate", "abort"])
+    engine.generate = generate
+    engine.abort = mocker.AsyncMock()
+    handler = QwenOmniStreamingVideoHandler(chat_service=object(), engine_client=engine, idle_timeout=5.0)
+    preprocessor = mocker.patch.object(handler, "_preprocess_to_engine_prompt", side_effect=preprocess)
+
+    async def session(name, depth):
+        ws = SessionSocket()
+        ws.put(
+            {
+                "type": "session.config",
+                "model": "test",
+                "modalities": ["text"],
+                "system_prompt": "voice",
+                "max_history_turns": depth,
+                "enable_frame_filter": False,
+            }
+        )
+        ws.put({"type": "video.frame", "data": _b64(_make_jpeg())})
+        task = asyncio.create_task(handler.handle_session(ws))
+        try:
+            for turn in range(3):
+                question = f"{name}-{turn}"
+                ws.put({"type": "video.query", "text": question})
+                assert await asyncio.wait_for(ws.completed.get(), timeout=5.0) == "answer " + question
+            ws.put({"type": "video.done"})
+            await asyncio.wait_for(task, timeout=5.0)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        assert "error" not in ws.sent_types()
+
+    await asyncio.gather(session("bounded", 1), session("full", None))
+    assert preprocessor.await_count == 6
+    for name, first in (("bounded", 1), ("full", 0)):
+        expected = [{"role": "system", "content": "voice"}]
+        for turn in range(first, 2):
+            expected.extend(
+                [
+                    {"role": "user", "content": f"{name}-{turn}"},
+                    {"role": "assistant", "content": f"answer {name}-{turn}"},
+                ]
+            )
+        assert captured[f"{name}-2"][:-1] == expected
