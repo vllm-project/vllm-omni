@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ca-certificates ffmpeg libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install \
+    "livekit-agents[openai,turn-detector,silero]>=1.6.10"
+
+RUN useradd --create-home --uid 10001 agent
+
+WORKDIR /app
+COPY --chown=agent:agent agent.py ./agent.py
+
+USER agent
+
+ENTRYPOINT ["python", "agent.py", "start"]

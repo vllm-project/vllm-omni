@@ -60,6 +60,12 @@ The initial non-final commit intentionally starts generation before all audio
 has arrived. Continue sending `input_audio_buffer.append` events while the
 engine is consuming the stream.
 
+This turn-based streaming path is distinct from the model-native full-duplex
+lane. For the buffered OpenAI Realtime connection, `response.create` instead
+builds a prompt from the audio committed before that request; audio appended
+while generation is running is used by the next response rather than being
+fed into the current generation.
+
 ## Audio Handling
 
 - Input is mono PCM16 at 16 kHz for the Qwen3-Omni example.
