@@ -849,7 +849,7 @@ def test_image_edits_streaming_returns_ar_delta_then_image(streaming_image_edit_
     assert payloads[0]["index"] == 0
     assert payloads[1]["delta"] == " done"
     assert payloads[2]["output_format"] == "png"
-    assert payloads[2]["size"] == "16x16"
+    assert payloads[2]["size"] == "32x24"
 
     image_payload = payloads[2]["data"][0]
     img = Image.open(io.BytesIO(base64.b64decode(image_payload["b64_json"])))
@@ -1719,7 +1719,7 @@ def test_image_edit_parameter_pass(async_omni_test_client):
         img = Image.open(io.BytesIO(img_bytes))
         assert img.format.lower() == "jpeg"
         assert data["output_format"] == "jpeg"
-        assert data["size"] == "16x24"
+        assert data["size"] == f"{img.width}x{img.height}"
 
 
 def test_image_edit_layers_and_resolution(async_omni_test_client):

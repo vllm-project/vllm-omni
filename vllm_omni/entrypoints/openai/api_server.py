@@ -2001,8 +2001,8 @@ def _build_image_generation_response(
             peak_memory_mb=peak_memory_mb,
         ),
     }
-    if request.size is not None:
-        response_kwargs["size"] = request.size
+    if images:
+        response_kwargs["size"] = f"{images[0].width}x{images[0].height}"
     response = ImageGenerationResponse(**response_kwargs)
     if request.response_format == ResponseFormat.FILE:
         return response.stream_response()
@@ -2235,6 +2235,7 @@ async def generate_images(
 
 @router.post(
     "/v1/images/edits",
+    response_model=None,
     responses={
         HTTPStatus.OK.value: {"model": ImageGenerationResponse},
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
@@ -2242,6 +2243,7 @@ async def generate_images(
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
     },
 )
+@with_cancellation
 async def edit_images(
     raw_request: Request,
     image: list[UploadFile] | None = File(None),
@@ -2579,7 +2581,7 @@ async def edit_images(
             created=int(time.time()),
             data=image_data,
             output_format=output_format,
-            size=size_str,
+            size=f"{images[0].width}x{images[0].height}" if images else size_str,
             cot_output=cot_output,
             metrics=_build_image_response_metrics(
                 response_metrics=response_metrics,

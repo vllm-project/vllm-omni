@@ -232,6 +232,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if model is None:
             return
 
+        if getattr(model, "enable_cuda_graph_decode", False):
+            logger.info("Model runner: %s uses CUDA graph decode instead of torch.compile.", attr_name)
+            return
+
         compile_granularity = self.od_config.diffusion_compile_granularity
         compile_dynamic = self.od_config.diffusion_compile_dynamic
         try:

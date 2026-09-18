@@ -73,6 +73,8 @@ class OmniDiffusionRequest:
     # A model preprocessor may keep selected requests on the legacy full-forward
     # path even when the engine is globally configured for step execution.
     use_step_execution: bool = True
+    # Whether first and later denoising steps may share a step batch.
+    allow_mixed_step_phases: bool = True
     # KV-recv wall-clock (ms), set by the runner's _prepare_request_for_forward
     # and carried to DiffusionOutput for the vllm_omni:diffusion_kv_load_s metric.
     kv_recv_ms: float = 0.0
