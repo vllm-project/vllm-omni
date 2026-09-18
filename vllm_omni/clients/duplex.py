@@ -1011,6 +1011,10 @@ class DuplexClientBase(ABC):
             self._adopt_session(event)
         elif isinstance(event, SessionCreated):
             self._adopt_session(event)
+        elif event.type == "session.updated":
+            session = data.get("session")
+            if isinstance(session, dict) and session:
+                self.session_info = session
         elif isinstance(event, ResponseCreated):
             response_id = event.response_id
             if response_id and response_id not in self._responses:
