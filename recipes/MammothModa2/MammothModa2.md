@@ -177,6 +177,84 @@ ls -lh mammoth_t2i.png
 python -c "from PIL import Image; print(Image.open('mammoth_t2i.png').size)"
 ```
 
+### VAE decode memory options (slicing / tiling)
+
+The DiT stage decodes latents with its own `gen_vae` (`AutoencoderKL`), which supports the diffusers slicing and tiling memory modes. Both are off by default and are enabled per deployment through the DiT stage's `additional_config`:
+
+```yaml
+stages:
+  - stage_id: 1
+    additional_config:
+      vae_use_slicing: true   # decode the latent in slices instead of at once
+      vae_use_tiling: true    # decode the latent tile by tile
+```
+
+Notes:
+
+- These are capacity options: they bound VAE-decode peak memory for memory-constrained or high-resolution workloads and may increase decode latency. Measure both before enabling them in production.
+- Tiling geometry comes from the checkpoint's VAE config (`sample_size`, `tile_sample_min_size`). A resolution below the tiling threshold decodes in a single tile: the mode is enabled but not exercised.
+- A requested mode that the loaded VAE cannot honour fails at stage startup with an explicit error instead of silently decoding without it.
+- VAE slicing is a batch-level option; batch-size-one serving may see little or no benefit.
+
+#### Measured end-to-end (RTX PRO 6000 Blackwell 96 GB)
+
+##### Environment
+
+- OS: Ubuntu 24.04.3 LTS, Linux 7.0.0-30-generic, x86_64
+- Container: `docker.m.daocloud.io/vllm/vllm-omni:nightly`
+- Python: 3.12.3
+- PyTorch: 2.13.0+cu130
+- Driver / runtime: NVIDIA 595.84 / CUDA 13.2
+- GPU: one NVIDIA RTX PRO 6000 Blackwell Server Edition, 97,887 MiB
+- vLLM version: 0.29.0
+- transformers: 5.14.1; diffusers: 0.40.0
+- vLLM Omni version or commit: `624ebea19ec298d4f5332d9fb15cc7c5095df610`
+- The measured code was loaded with `PYTHONPATH=/app/vllm_omni`. The container's
+  installed `vllm_omni` package metadata is `0.29.0rc2.dev104+g21d86ec92`, which
+  does not contain this change — without the override the run exercises the
+  released pipeline and the flags never reach `gen_vae`.
+
+##### Measurement protocol
+
+Fixed prompt, `seed=42`, `text_guidance_scale=9.0`, `num_inference_steps=50`,
+batch size 1, both stages on one device with the deploy config's
+`gpu_memory_utilization` (0.5 / 0.3). End-to-end latency is the mean of five
+requests after four warmups; the stage split is the per-stage wall time reported
+under `--log-stats`; device peak is whole-device memory sampled every 0.5 s.
+
+At 1536x1536 — above the tiling threshold, so tiling is actually exercised:
+
+| Config | Stage 0 (AR) ms | Stage 1 (DiT + VAE) ms | End-to-end s | Device peak MiB | PSNR vs baseline |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| baseline | 202,346 | 24,423 | 225.9 | 67,354 | — |
+| slicing | 196,867 | 24,379 | 221.3 | 67,354 | identical |
+| tiling | 197,883 | 24,471 | 222.9 | **61,814** | 46.75 dB |
+| slicing + tiling | 196,289 | 24,464 | 220.8 | **61,814** | 46.75 dB |
+
+At 1024x1024 the latent (128) does not exceed `tile_latent_min_size`, so tiling
+is enabled but decodes in a single tile: all four configs produce byte-identical
+images and peak at 61,004 MiB.
+
+What these measurements show:
+
+- **Tiling bounds the device peak by 5.4 GiB at 1536x1536** (67,354 -> 61,814 MiB)
+  once it engages, and is a no-op below the threshold. The saving is larger at
+  higher resolution; the VAE-level decode peak falls steeply because untiled
+  attention runs over the whole latent.
+- **Slicing alone changes nothing at batch size 1** — same peak, byte-identical
+  output. Enable it for batch workloads, not for these.
+- **End-to-end latency is a poor instrument for this option.** The AR stage is
+  ~89% of the wall time and never touches the VAE; it drifts by more between runs
+  (baseline 202.3 s vs slicing 196.9 s) than stage 1 varies across all four
+  configs (24,379 - 24,471 ms, a 0.4% spread). Judge this option on device peak
+  or a VAE-level decode benchmark, not on end-to-end timing.
+- **Tiling introduces no visible seams.** Tiled output differs from baseline at
+  46.75 dB PSNR (max 61/255, mean 0.8/255 over 85% of pixels). An 8x-amplified
+  difference image traces image content — edges and contours — rather than the
+  tile grid, and an autocorrelation test on the detrended row/column difference
+  profiles finds no consistent periodic peak on both axes. Treat the difference
+  as tiled-decode numerical noise.
+
 ### 1x AMD MI300X, MammothModa2 Preview
 
 #### Environment
