@@ -475,6 +475,8 @@ class JoyImageEditPipeline(
         true_cfg_scale = sampling_params.true_cfg_scale
         guidance_provided = sampling_params.guidance_scale_provided
         guidance_scale = sampling_params.guidance_scale
+        if guidance_scale is None:
+            guidance_scale = 1.0
         if true_cfg_scale is None:
             return float(guidance_scale if guidance_provided else default_true_cfg_scale)
         guidance_is_disabled_default = math.isclose(float(guidance_scale), 1.0)
