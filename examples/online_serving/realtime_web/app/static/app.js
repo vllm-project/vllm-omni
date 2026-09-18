@@ -79,6 +79,8 @@
   let echoTimer = null;
   let sessionGeneration = 0;
   let audioChain = Promise.resolve();
+  const interruptedResponses = new Set();
+  const pendingEvents = new Set();
   let assistantTextChannel = null;
   let connectionReady = false;
   let turnCounter = 0;
@@ -389,8 +391,9 @@
     currentResponseId = action.responseId || currentResponseId || `turn-${turnCounter}`;
     setModel('Speaking');
     const generation = sessionGeneration;
+    const responseId = currentResponseId;
     const decoded = await decodeAudioDelta(action.event);
-    if (generation === sessionGeneration) feedPlayback(decoded, currentResponseId);
+    if (generation === sessionGeneration && !interruptedResponses.has(responseId)) feedPlayback(decoded, responseId);
   }
 
   function handleTranscriptEvent(action) {
@@ -410,19 +413,32 @@
     } else finishTranscript(action.role, action.text);
   }
 
-  async function handleEvent(event) {
+  async function handleEvent(event, action = profile.mapEvent(event)) {
     appendEventLog(event);
-    const action = profile.mapEvent(event);
-    const responseId = action.responseId;
+    const responseId = action.responseId || responseIdOf(event);
+    if (responseId && interruptedResponses.has(responseId) && action.kind !== 'interrupt') return;
     switch (action.kind) {
       case 'connected':
         setConnection('Connected', 'online');
         if (!assistantActive) setModel(profile.waiting);
         break;
-      case 'interrupt':
+      case 'interrupt': {
+        if (responseId) interruptedResponses.add(responseId);
+        // A late cancellation belongs to its own response, not the newer one
+        // currently playing. Speech-start events interrupt the local playback.
+        if (responseId && responseId !== currentResponseId) break;
+        if (currentResponseId) interruptedResponses.add(currentResponseId);
         sessionGeneration += 1;
-        // A cancelled response never reaches 'done', so nothing else would
-        // disarm the turn watchdog it left armed.
+        audioChain = Promise.resolve();
+        // Move queued events off the interrupted decode, preserving any newer
+        // response already received. Its chunks must not be lost with the old one.
+        const queued = [...pendingEvents];
+        pendingEvents.clear();
+        for (const pending of queued) enqueueEvent(pending.event, pending.action, pending.source);
+        clearTimeout(echoTimer);
+        echoTimer = null;
+        // Local playback completes immediately on interruption, including
+        // when the server already completed generation.
         clearTimeout(turnTimeout);
         if (playbackNode) playbackNode.port.postMessage({ type: 'clear' });
         responseComplete = true;
@@ -435,6 +451,7 @@
         setPlayback('Idle');
         setModel(profile.waiting);
         break;
+      }
       case 'listen':
         assistantActive = false;
         setModel(profile.waiting);
@@ -538,6 +555,18 @@
     await captureContext.resume();
   }
 
+  function enqueueEvent(event, action, source) {
+    const pending = { event, action, source };
+    pendingEvents.add(pending);
+    const generation = sessionGeneration;
+    audioChain = audioChain.then(() => {
+      if (!pendingEvents.delete(pending)) return;
+      if (socket === source || action.kind === 'closed') return handleEvent(event, action);
+    }).catch((error) => {
+      if (generation === sessionGeneration) return failSession(`Server event failed: ${error.message}`);
+    });
+  }
+
   function openSocket() {
     return new Promise((resolve, reject) => {
       const url = realtimeUrl();
@@ -591,11 +620,13 @@
           runtimeDetail.textContent = `${captureRate} Hz capture / ${playbackRate} Hz playback`;
           resolve();
         }
-        // Serialize decoding with terminal events: a drain must never overtake
-        // an asynchronously decoded WAV chunk.
-        audioChain = audioChain.then(() => {
-          if (socket === current || action.kind === 'closed') return handleEvent(event);
-        }).catch((error) => failSession(`Server event failed: ${error.message}`));
+        // Stop the speaker immediately, even while an old WAV is decoding.
+        // Ordinary completion still waits for its preceding audio chunks.
+        if (action.kind === 'interrupt') {
+          void handleEvent(event, action);
+          return;
+        }
+        enqueueEvent(event, action, current);
       };
       current.onerror = () => rejectOnce(`WebSocket connection failed. ${profile.connectionHint}`);
       current.onclose = (event) => {
@@ -628,6 +659,8 @@
     try {
       sessionGeneration += 1;
       audioChain = Promise.resolve();
+      interruptedResponses.clear();
+      pendingEvents.clear();
       await openPlayback();
       await openCapture();
       await openSocket();
@@ -731,6 +764,7 @@
 
   async function cleanupSession({ terminal = true } = {}) {
     sessionGeneration += 1;
+    pendingEvents.clear();
     connectionReady = false;
     clearTimeout(echoTimer);
     clearTimeout(turnTimeout);

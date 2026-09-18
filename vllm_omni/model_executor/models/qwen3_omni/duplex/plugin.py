@@ -237,18 +237,25 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             return isinstance(content, list) and any(p.get("type") == "image_url" for p in content)
 
         selected = [m for m in history[:-16] if has_image(m)] + history[-16:]
+        dropped_user = False
         for message in selected:
+            if message.get("role") == "user":
+                dropped_user = False
+            elif message.get("role") == "assistant" and dropped_user:
+                continue
             content = message.get("content")
             audio = next((value for key, value in retained if key is content), None)
             if audio is not None:
                 messages.append({"role": "user", "audio_payload": audio})
             elif isinstance(content, list) and any(part.get("type") == "image_url" for part in content):
                 messages.append(message)
-            elif isinstance(content, str) and content:
+            elif isinstance(content, str) and (content or message.get("role") == "assistant"):
+                # Even without committed text, the assistant separates turns.
                 messages.append(message)
             elif message.get("role") == "user":
                 # Do not keep an assistant answer after dropping its user audio.
                 messages = [m for m in messages if has_image(m)]
+                dropped_user = True
         while messages and messages[0].get("role") == "assistant":
             messages.pop(0)
         if has_audio and not current_is_in_history:

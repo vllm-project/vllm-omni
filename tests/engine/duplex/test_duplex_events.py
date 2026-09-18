@@ -11,6 +11,7 @@ import inspect
 import pytest
 
 from vllm_omni.engine.duplex import events as events_module
+from vllm_omni.engine.duplex.commands import ClearOutputAudio
 from vllm_omni.engine.duplex.events import (
     REALTIME_ERROR_TYPES_BY_CODE,
     AudioDelta,
@@ -40,6 +41,7 @@ from vllm_omni.engine.duplex.events import (
 from vllm_omni.engine.duplex.realtime_events import (
     RealtimeProjectionState,
     project_internal_event,
+    resolve_clear_output_audio,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -371,6 +373,72 @@ def test_projection_of_output_audio_buffer_clear_emits_cleared_before_terminals(
     assert cleared[0].response_id == "resp_1"
     assert _types(cleared)[-2:] == ["response.done", "rate_limits.updated"]
     assert state.item_truncation_cursors["item_resp_1"] == (0, 250)
+
+
+@pytest.mark.parametrize("reason", ["turn_detected", "barge_in", "output_audio_buffer_clear"])
+@pytest.mark.parametrize("committed_ms", [1000, 10000])
+def test_completed_response_cancellation_only_clears_pending_playback(reason, committed_ms):
+    state = RealtimeProjectionState(session_id="duplex-playback")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+    project_internal_event(state, {"type": "response.done", "response_id": "resp_1"})
+
+    cancelled = project_internal_event(
+        state,
+        {
+            "type": "audio.cancelled",
+            "response_id": "resp_1",
+            "reason": reason,
+            "committed_ms": committed_ms,
+            "playback": {"sent_ms": 10000, "committed_ms": committed_ms},
+        },
+    )
+
+    if reason == "output_audio_buffer_clear" or committed_ms < 10000:
+        assert _types(cancelled) == ["output_audio_buffer.cleared"]
+        assert cancelled[0].response_id == "resp_1"
+    else:
+        assert cancelled == []
+
+
+@pytest.mark.parametrize("explicit_response_id", [False, True])
+def test_clear_latest_completed_response_reaches_playback_owner(explicit_response_id):
+    state = RealtimeProjectionState(session_id="duplex-clear")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+    project_internal_event(state, {"type": "response.done", "response_id": "resp_1"})
+
+    control = resolve_clear_output_audio(
+        state, ClearOutputAudio(response_id="resp_1" if explicit_response_id else None, event_id="clear_1")
+    )
+
+    # Generation completion does not prove the client has drained its audio.
+    # A cleared event must follow the engine clearing its playback cursor.
+    assert control.events == []
+    assert control.payloads == [
+        {
+            "type": "output_audio_buffer.clear",
+            "reason": "output_audio_buffer.clear",
+            "response_id": "resp_1",
+            "realtime_event_id": "clear_1",
+        }
+    ]
+
+
+@pytest.mark.parametrize("new_response_finished", [False, True])
+def test_late_clear_of_completed_response_does_not_touch_new_response(new_response_finished):
+    state = RealtimeProjectionState(session_id="duplex-clear")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+    project_internal_event(state, {"type": "response.done", "response_id": "resp_1"})
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_2"})
+    if new_response_finished:
+        project_internal_event(state, {"type": "response.done", "response_id": "resp_2"})
+
+    control = resolve_clear_output_audio(state, ClearOutputAudio(response_id="resp_1"))
+
+    assert control.payloads == []
+    assert _types(control.events) == ["output_audio_buffer.cleared"]
+    assert control.events[0].response_id == "resp_1"
+    assert state.active_response_id == (None if new_response_finished else "resp_2")
+    assert state.last_response_id == "resp_2"
 
 
 def test_projection_leaves_error_to_typed_emit_sites():
