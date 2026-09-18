@@ -321,6 +321,8 @@ class PipelineConfig:
     # Dotted path of the model's ``DuplexModelPlugin``. Online serving uses
     # DuplexOmni only when the deploy configuration selects session_mode: duplex.
     duplex_plugin: str | None = None
+    # Preserve legacy turn deployments when adding an optional duplex plugin.
+    default_session_mode: str | None = None
     # Legacy duplex wiring of the models that are not ported to the plugin
     # framework yet (PersonaPlex, Nemotron VoiceChat). Nothing reads them: a
     # pipeline that only declares these is served turn-based. Each field goes

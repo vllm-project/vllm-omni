@@ -515,3 +515,48 @@ async def test_a_dead_replica_closes_the_sessions_it_was_serving() -> None:
     messages = [output_q.get_nowait() for _ in range(output_q.qsize())]
     types = [getattr(getattr(m, "event", None), "type", type(m).__name__) for m in messages]
     assert types[-1] in {"session.expired", "session.closed"}, f"the client needs a terminal event, got {types}"
+
+
+@pytest.mark.asyncio
+async def test_turn_plugin_processes_multimodal_prompt_before_stage_submission(monkeypatch):
+    from vllm_omni.engine.orchestrator import build_engine_core_request_from_tokens
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
+
+    orchestrator, clients, rpc_q, _ = _build()
+    plugin = Qwen3OmniDuplexPlugin(_encode_audio)
+    plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "audio prompt")
+    orchestrator.plugin = orchestrator.session_manager.plugin = plugin
+    seen = []
+
+    def process_inputs(**kwargs):
+        seen.append(kwargs)
+        return build_engine_core_request_from_tokens(
+            request_id=kwargs["request_id"],
+            prompt={"prompt_token_ids": [1, 2]},
+            params=kwargs["params"],
+            model_config=orchestrator.stage_pools[0].stage_vllm_config.model_config,
+            resumable=kwargs["resumable"],
+        )
+
+    monkeypatch.setattr(
+        orchestrator, "_get_stage_input_processor", lambda stage_id: SimpleNamespace(process_inputs=process_inputs)
+    )
+    await orchestrator._dispatch_message(
+        OpenDuplexSessionMessage(
+            control_id="open-qwen",
+            session_id=SESSION_ID,
+            session_config=DuplexSessionConfig(model="qwen", modalities=["text", "audio"]),
+        )
+    )
+    assert (await rpc_q.get()).ok
+    try:
+        await _submit(orchestrator, _append_audio())
+        assert not clients[0].add_request_calls
+        await _submit(orchestrator, commands.Commit(final=True, create_response=True))
+        assert len(seen) == 1
+        assert seen[0]["prompt"]["multi_modal_data"]["audio"][0][0].shape == (16000,)
+        submitted = clients[0].add_request_calls[0][0]
+        assert submitted.resumable is False
+        assert not orchestrator.request_states[submitted.request_id].streaming.enabled
+    finally:
+        await _close(orchestrator, rpc_q)

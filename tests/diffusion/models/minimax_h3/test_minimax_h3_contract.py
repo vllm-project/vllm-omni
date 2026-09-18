@@ -168,7 +168,7 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
 
     class FakeEncoder:
-        instances = []
+        instances: list["FakeEncoder"] = []
 
         def __init__(self, **kwargs):
             self.pushes = []
@@ -189,6 +189,8 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
             return torch.zeros(1, 1, 2)
 
     class FakeVideoVAE:
+        chunk_value_range = (0.0, 1.0)
+
         def decode_with_chunks(self, latent, *, on_chunk):
             for value in (0.0, 0.25, 0.5):
                 on_chunk(torch.full((1, 3, 3, 2, 2), value))
@@ -200,7 +202,7 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
     pipeline.device = torch.device("cpu")
     monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_uses_manual_component_offload", lambda self, component: False)
     monkeypatch.setattr(
-        "vllm_omni.diffusion.utils.media_utils.ChunkedMP4Encoder",
+        "vllm_omni.diffusion.utils.chunked_video.ChunkedMP4Encoder",
         FakeEncoder,
     )
 
@@ -225,7 +227,7 @@ def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatc
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
 
     class FakeEncoder:
-        instances = []
+        instances: list["FakeEncoder"] = []
 
         def __init__(self, **kwargs):
             self.kwargs = kwargs
@@ -245,6 +247,8 @@ def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatc
             return torch.zeros(1, 1, 2)
 
     class FakeVideoVAE:
+        chunk_value_range = (0.0, 1.0)
+
         def decode_with_chunks(self, latent, *, on_chunk):
             on_chunk(torch.zeros(1, 3, 1, 2, 2))
 
@@ -254,7 +258,7 @@ def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatc
     pipeline.video_vae = FakeVideoVAE()
     pipeline.device = torch.device("cpu")
     monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_uses_manual_component_offload", lambda self, component: False)
-    monkeypatch.setattr("vllm_omni.diffusion.utils.media_utils.ChunkedMP4Encoder", FakeEncoder)
+    monkeypatch.setattr("vllm_omni.diffusion.utils.chunked_video.ChunkedMP4Encoder", FakeEncoder)
 
     pipeline.decode_to_mp4(
         torch.zeros(1),
@@ -285,14 +289,14 @@ def test_preencode_request_preserves_serving_codec_defaults(codec_extra, expecte
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.load_text_encoder = False
-    pipeline.load_vae_encoder = False
     pipeline.partition = "fl2va"
     pipeline.supported_tasks = frozenset({"t2va"})
     pipeline.default_video_shift = 12.0
     pipeline.default_audio_shift = 3.0
     pipeline.device = torch.device("cpu")
     pipeline.od_config = SimpleNamespace()
+    pipeline.load_text_encoder = False
+    pipeline.load_vae_encoder = False
     pipeline.text_encoder = object()
     pipeline.encode_prompt = Mock(return_value=(torch.ones(1, 2), torch.ones(1, dtype=torch.long)))
     pipeline._quality_policy = Mock()
@@ -308,7 +312,7 @@ def test_preencode_request_preserves_serving_codec_defaults(codec_extra, expecte
         extra_args={"task": "t2va", "aspect_ratio": "16:9", "preencode_mp4": True, **codec_extra, **batch_extra},
     )
     batch = DiffusionRequestBatch(
-        [OmniDiffusionRequest(prompt=_encoder_prompt(), sampling_params=sampling, request_id="codec-defaults")]
+        [OmniDiffusionRequest(prompt=_encoder_prompt("test"), sampling_params=sampling, request_id="codec-defaults")]
     )
 
     pipeline.forward(batch)
@@ -710,6 +714,7 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
     assert pipeline.partition == expected_partition
     assert pipeline.supported_tasks == expected_tasks
     assert len(created["dit"]) == expected_dits
+    assert all(kwargs["diffusers_weights"] is False for _, kwargs in created["dit"])
     component_path = tmp_path / component_partition
     assert created["video_vae"] == [str(component_path / "video_vae")]
     assert created["audio_vae"] == [str(component_path / "audio_vae")]
@@ -3276,3 +3281,72 @@ def test_pad_seq_len_request_validation_accepts_aligned_values():
     assert _resolve_pad_seq_len(None) is None
     assert _resolve_pad_seq_len(54080) == 54080
     assert _resolve_pad_seq_len(MINIMAX_H3_MAX_PAD_SEQ_LEN) == MINIMAX_H3_MAX_PAD_SEQ_LEN
+
+
+def _peer_rank_preencode_pipeline(monkeypatch):
+    """An H3 pipeline whose video VAE is a distributed rank that owns no output.
+
+    Every rank of the VAE group must call ``decode_with_chunks`` to keep the
+    temporal collectives in lockstep, but only the owner receives chunks, so a
+    peer's callback is never invoked.
+    """
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+
+    class FakeAudioVAE:
+        def decode_latent(self, latent):
+            return torch.zeros(1, 1, 2)
+
+    class PeerRankVideoVAE:
+        chunk_value_range = (0.0, 1.0)
+
+        def decode_with_chunks(self, latent, *, on_chunk):
+            del latent, on_chunk
+
+    pipeline = object.__new__(mod.MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.audio_vae = FakeAudioVAE()
+    pipeline.video_vae = PeerRankVideoVAE()
+    pipeline.device = torch.device("cpu")
+    pipeline.od_config = SimpleNamespace()
+    monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_uses_manual_component_offload", lambda self, component: False)
+    return pipeline
+
+
+def test_peer_vae_rank_returns_no_preencoded_output_instead_of_failing(monkeypatch):
+    """A rank that owns no output must not turn its silence into a request error."""
+    pipeline = _peer_rank_preencode_pipeline(monkeypatch)
+
+    output = pipeline.decode_to_mp4(torch.zeros(1), torch.zeros(1), height=2, width=2)
+
+    assert output == b""
+
+
+def test_peer_vae_rank_post_decode_reaches_post_processing(monkeypatch):
+    """The real H3 post_decode chain, not just the shared consumer, tolerates a peer rank."""
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.worker.utils import StepRequestState
+
+    pipeline = _peer_rank_preencode_pipeline(monkeypatch)
+    monkeypatch.setattr(pipeline, "_unpack_denoised_rows", lambda *args, **kwargs: (torch.zeros(1), torch.zeros(1)))
+    state = StepRequestState(
+        request_id="peer-rank",
+        sampling=SimpleNamespace(num_outputs_per_prompt=1),
+        prompt="a prompt",
+    )
+    state.latents = torch.zeros(1)
+    state.extra[mod._STEP_BRANCH] = object()
+    state.extra[mod._STEP_AUDIO_ROWS] = torch.zeros(1)
+    state.extra[mod._STEP_SHAPE] = {
+        "latent_t": 1,
+        "latent_h": 1,
+        "latent_w": 1,
+        "audio_t": 1,
+        "height": 2,
+        "width": 2,
+        "preencode_mp4": True,
+    }
+
+    output = pipeline.post_decode(state)
+
+    assert output.output == (b"", None)
+    assert mod._minimax_h3_post_process(output.output)["video"] == [b""]

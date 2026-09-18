@@ -567,10 +567,10 @@ def test_overlap_policy_defaults_and_invalid_values_to_listen_only():
     assert DuplexSessionConfig.from_event({"session": {"overlap_policy": "bogus"}}).overlap_policy == "listen_only"
 
 
-def test_capabilities_as_dict_reports_model_native_duplex_constants():
+def test_capabilities_as_dict_reports_declared_implementation():
     caps = DuplexCapabilities().as_dict()
 
-    assert caps["implementation_level"] == "model_native_duplex"
+    assert caps["implementation_level"] == "turn_based_duplex"
     assert caps["input_modes"] == ["append_audio_chunk"]
     assert caps["supports_kv_lease"] is False
     assert caps["supports_core_kv_lease"] is False

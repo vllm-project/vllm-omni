@@ -44,6 +44,7 @@ x-minicpmo-4-5-duplex: &minicpmo_4_5_duplex
   - vllm_omni/entrypoints/duplex/
   - vllm_omni/entrypoints/duplex_omni.py
   - vllm_omni/entrypoints/async_omni_base.py
+  - vllm_omni/protocol/
   - vllm_omni/clients/
   - vllm_omni/outputs/duplex.py
   - vllm_omni/model_executor/duplex_sampling.py
@@ -259,6 +260,7 @@ source_file_dependencies:
     - tests/entrypoints/test_duplex_omni.py
     - tests/entrypoints/openai_api/test_duplex_api_server.py
     - tests/model_executor/models/minicpmo_4_5/duplex/
+    - tests/protocol/
 
   omni_minicpmo_4_5_duplex_perf:
     - *minicpmo_4_5

@@ -29,6 +29,11 @@ class MiniCPMO45ServingSessionState(DuplexModelSessionState):
     continuation_units: int = 0
     pending_silence_task: asyncio.Task[bool] | None = None
     pending_silence_owner_id: str | None = None
+    # Deadline-aligned silence continuation state: the monotonic submission
+    # time of the most recent native input unit and the next silence
+    # continuation deadline. A real (non-silence) input resets the chain.
+    last_native_submit_monotonic: float | None = None
+    silence_deadline_monotonic: float | None = None
 
     def retain_committed_audio(
         self,
@@ -55,3 +60,5 @@ class MiniCPMO45ServingSessionState(DuplexModelSessionState):
         self.continuation_units = 0
         self.pending_silence_task = None
         self.pending_silence_owner_id = None
+        self.last_native_submit_monotonic = None
+        self.silence_deadline_monotonic = None
