@@ -348,6 +348,30 @@ class QwenImage21Rope(nn.Module):
         return torch.cat([self.freqs[0][frame_index], self.freqs[1][height_index], self.freqs[2][width_index]], dim=-1)
 
 
+def _enable_pattern_ignored_layers(quant_config: QuantizationConfig | None) -> QuantizationConfig | None:
+    """Switch vLLM FP8-style `ignored_layers` to pattern (substring) matching.
+
+    vLLM's ``Fp8Config`` matches ``ignored_layers`` against full layer prefixes
+    exactly, but the diffusion quantization docs and CLI describe them as name
+    patterns (e.g. ``img_mlp``) — under exact matching such patterns silently
+    skip nothing. Substring matching is a strict superset for exact full
+    prefixes, so existing exact-prefix configs keep working.
+    """
+    if quant_config is None:
+        return quant_config
+    component_configs = getattr(quant_config, "component_configs", None)
+    if component_configs is not None:
+        configs = [*component_configs.values(), getattr(quant_config, "default_config", None)]
+    else:
+        configs = [quant_config]
+    for config in configs:
+        if config is None:
+            continue
+        if getattr(config, "ignored_layers", None) and hasattr(config, "ignored_layers_match_mode"):
+            config.ignored_layers_match_mode = "substring"
+    return quant_config
+
+
 class QwenImage21Attention(nn.Module):
     r"""Single-stream attention for Qwen-Image 2.1.
 
@@ -736,7 +760,8 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         self.inner_dim = num_attention_heads * attention_head_dim
         self.causal_condition = causal_condition
         self.causal_block = causal_block
-        self.quant_config = quant_config
+        self.quant_config = _enable_pattern_ignored_layers(quant_config)
+        quant_config = self.quant_config
 
         self.pos_embed = QwenImage21Rope(theta=10000, axes_dim=list(axes_dims_rope))
         self.time_text_embed = QwenImage21TimestepProjEmbeddings(
