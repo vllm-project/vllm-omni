@@ -3,6 +3,7 @@
 # Adapted from diffusers' pipeline_qwenimage21.py (Qwen-Image 2.1 T2I + image-conditioned generation).
 
 import copy
+import dataclasses
 import json
 import logging
 import os
@@ -19,7 +20,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 )
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
+from transformers import AutoConfig, AutoModelForImageTextToText, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -44,6 +45,7 @@ from vllm_omni.diffusion.models.qwen_image_21.cfg_parallel import QwenImage21CFG
 from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import (
     QwenImage21Transformer2DModel,
 )
+from vllm_omni.diffusion.models.utils import create_transformers_model
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
@@ -55,8 +57,12 @@ from vllm_omni.diffusion.utils.size_utils import (
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.inputs.data import OmniTextPrompt
+from vllm_omni.quantization import resolve_component_quant_config
+from vllm_omni.quantization.component_config import resolve_encoder_quant_config
 
 if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
     from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import StepRequestState
 
@@ -94,6 +100,50 @@ def _read_vae_scale_factor(od_config: OmniDiffusionConfig) -> int:
     if vae_config.get("scale_factor_spatial"):
         return int(vae_config["scale_factor_spatial"])
     return 16
+
+
+def _resolve_text_encoder_quant_config(
+    quant_config: "QuantizationConfig | None",
+) -> "QuantizationConfig | None":
+    """Resolve the text-encoder slice of a global or per-component quant config.
+
+    Pre-quantized formats (modelopt, svdquant, ...) require serialized scale
+    tensors the BF16 text-encoder checkpoint does not ship, so they are stripped
+    and the encoder stays in checkpoint precision.
+    """
+    resolved = resolve_component_quant_config(quant_config, "text_encoder")
+    return resolve_encoder_quant_config(resolved)
+
+
+# Subtrees of the HF Qwen3-VL text encoder that must stay in checkpoint
+# precision: the vision tower (condition-image encoding is numerically
+# sensitive) and the LM head (unused — the pipeline reads hidden states).
+_TEXT_ENCODER_QUANT_EXCLUDED_PREFIXES = ("model.visual", "lm_head")
+
+
+def _exclude_text_encoder_subtrees_from_quant(
+    quant_config: "QuantizationConfig | None",
+) -> "QuantizationConfig | None":
+    """Keep the vision tower and LM head in checkpoint precision.
+
+    Uses the config's standard ``ignored_layers`` mechanism, with substring
+    matching so the prefixes cover whole subtrees (same convention as the
+    DiT's ``_enable_pattern_ignored_layers``).
+    """
+    if quant_config is None:
+        return None
+    if not hasattr(quant_config, "ignored_layers"):
+        logger.warning(
+            "Quantization config %s has no ignored_layers; the Qwen3-VL vision tower "
+            "and LM head cannot be excluded from quantization.",
+            type(quant_config).__name__,
+        )
+        return quant_config
+    config = copy.copy(quant_config)
+    config.ignored_layers = [*config.ignored_layers, *_TEXT_ENCODER_QUANT_EXCLUDED_PREFIXES]
+    if hasattr(config, "ignored_layers_match_mode"):
+        config.ignored_layers_match_mode = "substring"
+    return config
 
 
 def get_qwen_image_21_pre_process_func(
@@ -280,13 +330,41 @@ class QwenImage21Pipeline(
         )
         # Unlike the 2.0 T2I pipeline, the vision tower is required: condition
         # images are encoded jointly with the prompt by the VLM.
-        self.text_encoder = from_pretrained_with_prefetch(
-            Qwen3VLForConditionalGeneration.from_pretrained,
-            model,
-            subfolder="text_encoder",
-            prefetch_list=qwen_subfolders,
-            local_files_only=local_files_only,
-        ).to(self.device)
+        text_encoder_quant_config = _resolve_text_encoder_quant_config(od_config.quantization_config)
+        if text_encoder_quant_config is None:
+            self.text_encoder = from_pretrained_with_prefetch(
+                Qwen3VLForConditionalGeneration.from_pretrained,
+                model,
+                subfolder="text_encoder",
+                prefetch_list=qwen_subfolders,
+                local_files_only=local_files_only,
+            ).to(self.device)
+        else:
+            # Quantized path: build the HF model on meta, swap its nn.Linear
+            # modules for vLLM quantizable linears, and stream the weights
+            # through the pipeline loader (same integration as Z-Image). The
+            # encoder-scoped quant config rides on a copied od_config so the
+            # shared create_transformers_model signature stays untouched.
+            text_encoder_config = AutoConfig.from_pretrained(
+                model, subfolder="text_encoder", local_files_only=local_files_only
+            )
+            encoder_od_config = dataclasses.replace(
+                od_config,
+                quantization_config=_exclude_text_encoder_subtrees_from_quant(text_encoder_quant_config),
+            )
+            self.text_encoder = create_transformers_model(
+                AutoModelForImageTextToText,
+                encoder_od_config,
+                hf_config=text_encoder_config,
+            ).to(self.device)
+            self.weights_sources.append(
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=model,
+                    subfolder="text_encoder",
+                    revision=None,
+                    prefix="text_encoder.",
+                )
+            )
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKLQwenImage21.from_pretrained,
             model,
@@ -297,7 +375,7 @@ class QwenImage21Pipeline(
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImage21Transformer2DModel)
         self.transformer = QwenImage21Transformer2DModel(
             od_config=od_config,
-            quant_config=od_config.quantization_config,
+            quant_config=resolve_component_quant_config(od_config.quantization_config, "transformer"),
             **transformer_kwargs,
         )
         self.processor = from_pretrained_with_prefetch(

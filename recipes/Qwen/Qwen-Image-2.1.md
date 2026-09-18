@@ -183,7 +183,81 @@ automatically when the checkpoint declares `causal_condition: true` and is
 re-created per generation, so no state leaks between requests. It changes the
 compute path — cached prefix vs. full recompute at every step — so exact
 numerical reproduction against a no-cache reference (e.g. the diffusers
-pipeline) requires matching the cache setting on both sides.
+pipeline) requires matching the cache setting on both sides. The prefix KV
+cache is orthogonal to weight quantization and works unchanged under FP8.
+
+### FP8 quantization
+
+Online FP8 quantization of the transformer is supported; the fused
+`to_qkv` projections load correctly, and the prefix KV cache path is
+unaffected. Only block-internal linears are eligible — the boundary
+projections (`img_in`/`txt_in`/`modulation`/`proj_out`/`time_text_embed`) stay
+in BF16 by construction:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model Qwen/Qwen-Image-2.1 \
+  --prompt "A ceramic teapot on a wooden table" \
+  --negative-prompt "blurry, low quality, text, watermark" \
+  --output qwen_image_21_fp8.png \
+  --num-inference-steps 50 --cfg-scale 4.0 \
+  --quantization fp8 --ignored-layers "img_mlp"
+```
+
+`ignored_layers` entries are matched as name patterns for this model (e.g.
+`img_mlp` matches every block's `img_mlp.proj`/`img_mlp.gate_layer`/
+`img_mlp.out`); exact full prefixes like
+`transformer.transformer_blocks.3.attn.to_qkv` also work.
+
+A per-module sensitivity sweep (fixed prompt embeds / latent / timestep, 5
+timesteps across the trajectory, relative L2 of the noise prediction vs BF16)
+ranks the groups: `img_mlp` is the most sensitive (3.8% max error on its own,
+driven by `img_mlp.proj` 2.8% and `img_mlp.out` 2.5%), then `attn.to_out`
+(2.7%), then `attn.to_qkv` (1.6%); errors are largest at the late (low-sigma)
+steps. End-to-end on 4 fixed prompts at 1024x1024, 50 steps, seed 42
+(GB200, single GPU):
+
+| Config | Quantized block linears | Avg PSNR vs BF16 | Min PSNR | Steady-state time/image | Peak memory |
+| --- | --- | --- | --- | --- | --- |
+| BF16 | 0 / 160 | — | — | 7.2 s | 40.0 GB |
+| FP8 all layers | 160 / 160 | 26.1 dB | 19.1 dB | 8.4 s | 33.4 GB |
+| FP8, `ignored_layers=["img_mlp"]` | 64 / 160 | 29.7 dB | 21.6 dB | 8.8 s | 38.3 GB |
+
+All-layer FP8 is usable but its composition can drift on some prompts
+(fine detail and layout shift, worst case ~19 dB); keeping `img_mlp` in BF16
+preserves composition noticeably better and is the recommended setting. On
+Blackwell (GB200) FP8 here is a memory optimization, not a speedup: dynamic
+per-token activation quantization costs more than the FP8 GEMM saves at these
+shapes, so BF16 remains the fastest option.
+
+## Quantization
+
+Online FP8 is supported per component via `quantization_config`:
+
+```python
+from vllm_omni import Omni
+
+omni = Omni(
+    model="Qwen/Qwen-Image-2.1",
+    quantization_config={
+        # DiT: skip the sensitive image-stream MLPs if quality regresses.
+        "transformer": {"method": "fp8", "ignored_layers": ["img_mlp"]},
+        # Qwen3-VL text encoder: only the language-model linear layers are
+        # quantized; the vision tower and the (unused) LM head stay BF16.
+        "text_encoder": {"method": "fp8"},
+    },
+)
+```
+
+Either component can be quantized on its own. Measured on GB200 at 1024×1024
+(seed 42, 50 steps): text-encoder FP8 lowers peak GPU memory from ~41.0 GiB to
+~34.4 GiB (−6.6 GiB); adding DiT FP8 reaches ~28.1 GiB. Output quality stays
+close to BF16 (T2I PSNR vs BF16 ≈ 28–32 dB with text-encoder FP8; the
+image-conditioned edit path ≈ 36 dB). FP8 saves memory but does not speed up
+generation on this hardware. The edit path routes condition images through the
+BF16 vision tower, so it is unaffected by text-encoder FP8. See
+[`docs/user_guide/quantization/fp8.md`](../../docs/user_guide/quantization/fp8.md)
+for the scope rules.
 
 ## Known Limitations
 
