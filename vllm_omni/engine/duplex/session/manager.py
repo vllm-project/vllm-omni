@@ -214,7 +214,7 @@ class DuplexSessionManager:
             if predecessor is not None:
                 try:
                     await predecessor
-                except BaseException:
+                except Exception:
                     pass
             await operation()
 
