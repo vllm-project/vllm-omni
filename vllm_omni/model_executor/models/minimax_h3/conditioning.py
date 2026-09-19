@@ -259,6 +259,7 @@ class MiniMaxH3EncoderMediaInput:
     video_audios: tuple[tuple[torch.Tensor, int] | None, ...] = ()
     audios: tuple[tuple[torch.Tensor, int], ...] = ()
     keyframe_frame_indices: tuple[int, ...] = ()
+    audio_mode: str = "native"
 
     @classmethod
     def from_mm_tensors(
@@ -334,6 +335,7 @@ class MiniMaxH3EncoderMediaInput:
         if cursor != len(tensors):
             raise ValueError(f"MiniMax H3 encoder media input has {len(tensors) - cursor} trailing tensors")
         return cls(
+            audio_mode=str(metadata.get("audio_mode", "native")),
             task=task,
             height=height,
             width=width,
@@ -373,6 +375,7 @@ class MiniMaxH3EncoderMediaInput:
 
     def to_metadata(self) -> dict[str, Any]:
         return {
+            "audio_mode": self.audio_mode,
             "task": self.task,
             "height": self.height,
             "width": self.width,

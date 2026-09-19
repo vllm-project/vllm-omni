@@ -91,7 +91,9 @@ def minimax_h3_batched_forward_kwargs(
         timesteps[seq_offset : seq_offset + branch.seq_len] = float(t_video[index])
         timesteps[img_pos[branch.update_mask_dev]] = float(t_video[index])
         timesteps[img_pos[~branch.update_mask_dev]] = float(imgvid_cond_timesteps[index])
-        timesteps[audio_pos[branch.audio_update_mask_dev]] = float(t_audio[index])
+        timesteps[audio_pos[branch.audio_update_mask_dev]] = (
+            float(t_audio[index]) if branch.locked_audio_rows is None else 1.0
+        )
         timesteps[audio_pos[~branch.audio_update_mask_dev]] = float(audio_ref_cond_timesteps[index])
 
         # Empty documents are omitted because not every varlen kernel accepts

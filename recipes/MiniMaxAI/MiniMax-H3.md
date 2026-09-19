@@ -825,7 +825,7 @@ at most 15 seconds combined.
 | FL2VA | first image, last image, or ordered first+last images | at most 2 images; `frame_indices` is `[0]`, `[-1]`, or `[0,-1]` |
 | Ref2VA | image-only, image+image, image+video, video+audio, and mixed image/video/audio | images ≤9, videos ≤3, audios ≤3, total references ≤12; audio requires a visual reference |
 
-The H3 output contract is 4–15 seconds at 24 FPS, stereo 32 kHz audio, and a
+The default H3 output contract is 4–15 seconds at 24 FPS, stereo 32 kHz audio, and a
 32-pixel canvas multiple. T2VA requires one named output ratio from `21:9`,
 `16:9`, `4:3`, `1:1`, `3:4`, or `9:16`. FL2VA always follows the first input
 image's ratio and ignores a generic `aspect_ratio` override. Ref2VA defaults to
@@ -835,6 +835,115 @@ default. `short_edge` controls the 768-pixel canvas and must be `768`.
 `seed + output_index`. The asynchronous endpoint returns all
 outputs; the synchronous raw-MP4 endpoint returns the first output when more
 than one is requested.
+
+## Long video and driving audio
+
+Set `extra_params.long_video=true` to opt into durations above 15 seconds.
+Ref2VA long-video requests now default to latent continuation with global
+temporal RoPE positions (A+B), described below. Set `long_video_mode=full`
+explicitly to sample the entire target latent at once for comparison. Both modes
+retain the native `17n+5` video-frame grid, `5n+2` video-latent grid, and 40 Hz
+audio latents. A request for 75 seconds becomes 1,807 frames (75.292 seconds at
+24 FPS). In full mode, attention cost and activation memory grow with the full
+sequence length. Reference-video and reference-audio limits remain unchanged.
+Other task types retain full-mode behavior.
+
+Use `audio_mode=lock_source` with one `audio_reference` to drive generation
+with a soundtrack, rather than treating it as a short reference. The encoder
+places that waveform in the target audio latent, crops or zero-pads its two
+channels independently to the output duration, and keeps those rows clean
+(timestep 1) throughout sampling. This mode does not insert an `<Audio 1>`
+reference tag. It supports request and step execution; the default `native`
+mode continues generating audio normally. Returned audio is the audio VAE's
+reconstruction, not a byte-for-byte copy of the input recording.
+
+Against a Ref2VA server, using the same asset-server setup as above:
+
+```bash
+curl --fail-with-body -sS -X POST "${API_URL}" \
+  -F 'prompt=<prompt.txt' \
+  -F 'width=960' -F 'height=544' -F 'fps=24' \
+  -F 'num_inference_steps=50' -F 'flow_shift=12' -F 'seed=19960422' \
+  -F 'extra_params={"task":"ref2va","duration":75,"long_video":true,"audio_mode":"lock_source","audio_flow_shift":3,"preencode_mp4":true,"preencode_batch_frames":17}' \
+  -F "input_reference=@${REF_IMAGE};type=image/png" \
+  -F "audio_reference={\"audio_url\":\"${AUDIO_URL}\"}" \
+  -o long-video.mp4
+```
+
+`preencode_mp4` decodes and muxes temporal chunks on the worker, avoiding a
+full decoded long video in the API process. It does not reduce the denoiser's
+sequence length. For Turbo adapters, use the matching adapter's step count
+and flow shift from the Turbo table below.
+
+The [RunningHub workflow](https://www.runninghub.cn/post/2100530217365364737/)
+uses T8's `MiniMaxH3AudioConditioningT8`, a full-length latent, and
+`MiniMaxH3DualClockSamplerT8`; its `remix_source` strength is zero, equivalent
+to source locking. This differs from rolling-overlap continuation nodes.
+See [T8 conditioning](https://github.com/T8mars/comfyui-minimax-h3-audio-T8)
+and [ComfyUI H3 masking](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/ldm/minimax/model.py).
+The workflow's custom Dasiwa weights, Sol attention, and T8-specific LoRA are
+not supplied by this feature.
+
+### Latent-tail continuation with global temporal positions (A+B)
+
+`long_video=true` selects this mode by default for Ref2VA. It can also be selected
+explicitly with `long_video_mode=continuation`. This experimental mode supports
+Ref2VA request execution with uncached denoising (`quality=lossless`); step
+execution is rejected. Use `long_video_mode=full` explicitly for whole-target
+sampling, including long requests that require step execution.
+
+```json
+{
+  "task": "ref2va",
+  "duration": 75,
+  "long_video": true,
+  "long_video_mode": "continuation",
+  "continuation_window_frames": 277,
+  "continuation_overlap_frames": 22,
+  "audio_mode": "lock_source",
+  "audio_flow_shift": 3,
+  "preencode_mp4": true,
+  "preencode_batch_frames": 17
+}
+```
+
+These defaults sample seven windows for a 1,807-frame output. Each continuation
+uses the preceding AV latent tail as fixed condition rows at the new target's
+time origin, samples a fresh unmasked target, discards its hidden overlap, and
+appends only the new suffix. The reference image and full prompt remain present
+in every window. Both window and overlap use the `17n+5` frame grid; the window
+must be 107..345 frames and larger than the overlap. A final window may be shorter.
+Audio boundaries are rounded on the cumulative 24 FPS / 40 Hz timeline to avoid
+drift; a locked driving track is sliced separately for each stereo channel.
+
+Before RoPE evaluation, every window adds `start_frame * 40 / 24` to the temporal
+position IDs of its target audio/video, reference audio/video, and latent-tail
+guides. The start includes the overlap (not just the newly appended frames).
+Text, static image references, spatial coordinates, and padding remain unchanged.
+Offsets retain fractional precision independently of rounded audio slice indices.
+For the default windows starting at frames 0, 255, 510, the added positions are
+0, 425, 850. This follows the media-only global-offset convention in
+[LongMedia temporal positioning](https://github.com/vizart-vj/ComfyUI-MiniMax-H3-LongMedia/blob/main/temporal_positioning.py).
+The shifted layout is constructed once per window and then used by all denoising
+steps and sequence-parallel ranks; no RoPE-frequency scaling is applied.
+
+For a narrative with different scenes, pass `continuation_prompts` as a JSON
+list containing exactly one non-empty prompt string per planned window (seven
+strings for the default 75-second request). These prompts are independently
+encoded with the same reference assets and selected in window order. Shot times
+inside each prompt describe that local window, including its hidden overlap.
+This option requires a local text encoder; external-encoder stage execution is
+not supported. Media positions use one shared origin after the longest encoded
+text prefix, so different prompt lengths do not shift the global AV clock.
+Without this list, the request's single prompt is reused as before.
+
+The cumulative latent is decoded once after all windows. Denoising memory is
+bounded by the window, while cumulative latent storage still grows with duration.
+This follows the [ComfyUI latent-tail continuation algorithm](https://github.com/ttulttul/ComfyUI-Minimax-H3-Continuation).
+Global positions can still exceed the model's trained temporal range. This
+mode does not guarantee seamless cuts or adherence to absolute shot timestamps in
+a repeated prompt. For comparison, keep the model, seed, prompt, source media,
+steps, shifts, and output size fixed, changing only `long_video_mode`.
 
 ## Request-scoped quality
 

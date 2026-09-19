@@ -156,7 +156,8 @@ def test_step_execution_matches_request_mode_denoise_loop():
     torch.testing.assert_close(state.extra[mod._STEP_AUDIO_ROWS], reference_audio)
 
 
-def test_batched_step_execution_matches_independent_requests():
+@pytest.mark.parametrize("lock_audio", [False, True])
+def test_batched_step_execution_matches_independent_requests(lock_audio):
     """Two co-batched requests must land where they would have landed alone."""
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
 
@@ -174,6 +175,8 @@ def test_batched_step_execution_matches_independent_requests():
     alone: list[tuple[torch.Tensor, torch.Tensor]] = []
     for spec, (sigmas_video, sigmas_audio) in zip(specs, schedules):
         branch, video_rows, audio_rows = _make_branch(**spec)
+        if lock_audio and spec["seed"] == 7:
+            branch.locked_audio_rows = audio_rows.clone()
         state = _make_state("solo", model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio)
         while not state.denoise_completed:
             pipeline.step_scheduler(state, pipeline.denoise_step(SimpleNamespace(states=(state,)), states=[state]))
@@ -182,6 +185,8 @@ def test_batched_step_execution_matches_independent_requests():
     states = []
     for index, (spec, (sigmas_video, sigmas_audio)) in enumerate(zip(specs, schedules)):
         branch, video_rows, audio_rows = _make_branch(**spec)
+        if lock_audio and spec["seed"] == 7:
+            branch.locked_audio_rows = audio_rows.clone()
         if index == 0:
             assert branch.used_len == branch.seq_len
         states.append(_make_state(f"req-{index}", model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio))
@@ -450,3 +455,33 @@ def test_packed_batch_rejects_backends_that_cannot_isolate_requests(attention):
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 
     assert MiniMaxH3Pipeline._packed_batch_supported(_FakeTransformer([attention])) is False
+
+
+def test_locked_driving_audio_is_clean_and_unchanged_during_denoising():
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
+
+    branch, video, audio = _make_branch(text_len=3, latent_t=2, latent_h=2, latent_w=2, audio_t=3, seed=7)
+    branch.locked_audio_rows = audio.clone()
+    seen = []
+
+    def model(**kwargs):
+        positions = kwargs["audio_pos_info"]["position_ids"]
+        times = kwargs["unique_timesteps"][kwargs["inverse_indices"]]
+        torch.testing.assert_close(times[positions], torch.ones_like(times[positions]))
+        torch.testing.assert_close(kwargs["audio_x"][0, positions], audio)
+        seen.append(True)
+        return torch.ones_like(video), torch.ones_like(audio)
+
+    result_video, result_audio = minimax_h3_denoise_loop(
+        model=model,
+        positive=branch,
+        initial_video_rows=video,
+        initial_audio_rows=audio,
+        keyframe_cond_rows=None,
+        sigmas_video=[1.0, 0.5, 0.0],
+        sigmas_audio=[1.0, 0.25, 0.0],
+        device=torch.device("cpu"),
+    )
+    assert len(seen) == 2
+    torch.testing.assert_close(result_audio, audio)
+    assert not torch.equal(result_video, video)
