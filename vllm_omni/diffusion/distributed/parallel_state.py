@@ -532,11 +532,17 @@ def set_seq_parallel_pg(
     use_ulysses_low: bool = True,
     sp_group_ranks: list[list[int]] | None = None,
     sp_allgather_degree: int = 1,
+    sp_window_degree: int = 1,
 ) -> tuple[torch.distributed.ProcessGroup, torch.distributed.ProcessGroup, torch.distributed.ProcessGroup]:
     """
     Initialize Ulysses, Ring, and AllGather-KV process groups.
 
     AllGather-KV is mutually exclusive with Ulysses and Ring.
+
+    Window-aligned SP (``sp_window_degree > 1``) is a fourth mode: the plain SP
+    group is the whole communication domain and the Ulysses / Ring / AllGather
+    subgroups are degenerate singletons, so no legacy accessor can mistake a
+    window-SP run for a Ulysses run.
 
     Args:
         sp_ulysses_degree: Size of each Ulysses subgroup.
@@ -549,6 +555,8 @@ def set_seq_parallel_pg(
             of length sp_ulysses_degree * sp_ring_degree. When provided, groups
             are built from these ranks instead of auto-generated contiguous
             ranges.
+        sp_allgather_degree: Size of each AllGather-KV group.
+        sp_window_degree: Size of each window-aligned SP group.
 
     Returns:
         ulysses_pg (torch.distributed.ProcessGroup): The Ulysses process group
@@ -568,6 +576,30 @@ def set_seq_parallel_pg(
         - If sp_group_ranks is None, groups are auto-generated within each DP
           slice using offsets of size sp_size.
     """
+    if sp_window_degree > 1:
+        if sp_ulysses_degree > 1 or sp_ring_degree > 1 or sp_allgather_degree > 1:
+            raise ValueError(
+                "Window-aligned SP is mutually exclusive with Ulysses / Ring / AllGather-KV "
+                f"(got ulysses={sp_ulysses_degree}, ring={sp_ring_degree}, "
+                f"allgather={sp_allgather_degree}, window={sp_window_degree})"
+            )
+        sp_size = sp_window_degree
+        if sp_group_ranks is None:
+            sp_group_ranks = [list(range(offset, offset + sp_size)) for offset in range(0, world_size, sp_size)]
+        if len(sp_group_ranks) * sp_size != world_size or any(len(ranks) != sp_size for ranks in sp_group_ranks):
+            raise ValueError(
+                f"Invalid sp_group_ranks for window SP: expected {world_size // sp_size} groups of size {sp_size}."
+            )
+        # The window group is the SP group itself; Ulysses / Ring / AllGather are
+        # singletons so legacy helpers cannot pick up an N-way subgroup.
+        singleton_pg = None
+        for singleton_rank in range(world_size):
+            group = torch.distributed.new_group([singleton_rank])
+            if rank == singleton_rank:
+                singleton_pg = group
+        assert singleton_pg is not None
+        return singleton_pg, singleton_pg, singleton_pg
+
     if sp_allgather_degree > 1:
         if sp_ulysses_degree > 1 or sp_ring_degree > 1:
             raise ValueError("AllGather-KV is mutually exclusive with Ulysses and Ring")
@@ -708,6 +740,7 @@ def _initialize_model_parallel(
     ulysses_degree: int = 1,
     ring_degree: int = 1,
     allgather_degree: int = 1,
+    window_parallel_size: int = 1,
     tensor_parallel_size: int = 1,
     pipeline_parallel_size: int = 1,
     fully_shard_degree: int = 1,
@@ -779,7 +812,20 @@ def _initialize_model_parallel(
                 f"allgather_degree={allgather_degree}."
             )
 
-    expected_sequence_parallel_size = allgather_degree if allgather_degree > 1 else ring_degree * ulysses_degree
+    if window_parallel_size > 1:
+        if ulysses_degree != 1 or ring_degree != 1 or allgather_degree != 1:
+            raise ValueError(
+                "Window-aligned SP (window_parallel_size>1) is mutually exclusive with "
+                "Ulysses / Ring / AllGather-KV. "
+                f"Got ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, "
+                f"allgather_degree={allgather_degree}."
+            )
+
+    expected_sequence_parallel_size = (
+        window_parallel_size
+        if window_parallel_size > 1
+        else (allgather_degree if allgather_degree > 1 else ring_degree * ulysses_degree)
+    )
     if sequence_parallel_size is None:
         sequence_parallel_size = expected_sequence_parallel_size
         logger.info("sequence_parallel_size is not provided, using %d", sequence_parallel_size)
@@ -870,6 +916,7 @@ def _initialize_model_parallel(
         sp_ulysses_degree=ulysses_degree,
         sp_ring_degree=ring_degree,
         sp_allgather_degree=allgather_degree,
+        sp_window_degree=window_parallel_size,
         rank=get_world_group().rank_in_group,
         world_size=world_size,
         sp_group_ranks=sp_group_ranks,
@@ -967,6 +1014,7 @@ def initialize_model_parallel(
     ulysses_degree: int = 1,
     ring_degree: int = 1,
     allgather_degree: int = 1,
+    window_parallel_size: int = 1,
     tensor_parallel_size: int = 1,
     pipeline_parallel_size: int = 1,
     fully_shard_degree: int = 1,
@@ -1005,6 +1053,7 @@ def initialize_model_parallel(
             ulysses_degree=ulysses_degree,
             ring_degree=ring_degree,
             allgather_degree=allgather_degree,
+            window_parallel_size=window_parallel_size,
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
             fully_shard_degree=fully_shard_degree,

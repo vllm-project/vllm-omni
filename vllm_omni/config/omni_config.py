@@ -703,6 +703,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     ulysses_degree: int = Field(default=1, ge=1)
     ring_degree: int = Field(default=1, ge=1)
     allgather_degree: int = Field(default=1, ge=1)
+    window_parallel_size: int = Field(default=1, ge=1)
     ulysses_mode: str = "strict"
     ulysses_a2a_permute: bool = False
     cfg_parallel_size: int = Field(default=1, ge=1)
@@ -717,10 +718,18 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     def __post_init__(self) -> None:
         self.data_parallel_index = self.data_parallel_rank
         self.sequence_parallel_size = (
-            self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
+            self.window_parallel_size
+            if self.window_parallel_size > 1
+            else (self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree)
         )
         if self.allgather_degree > 1 and (self.ulysses_degree > 1 or self.ring_degree > 1):
             raise ValueError("allgather_degree > 1 is mutually exclusive with ulysses_degree/ring_degree > 1")
+        if self.window_parallel_size > 1 and (
+            self.ulysses_degree > 1 or self.ring_degree > 1 or self.allgather_degree > 1
+        ):
+            raise ValueError(
+                "window_parallel_size > 1 is mutually exclusive with ulysses_degree/ring_degree/allgather_degree > 1"
+            )
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:
             raise ValueError("ulysses_mode must be 'strict' or 'advanced_uaa'")
         if self.vae_parallel_mode not in {"tile", "spatial_shard_height", "spatial_shard_width"}:

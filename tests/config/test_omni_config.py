@@ -933,6 +933,7 @@ def test_sub_config_fields_match_structured_scopes():
         "ulysses_degree",
         "ring_degree",
         "allgather_degree",
+        "window_parallel_size",
         "ulysses_mode",
         "ulysses_a2a_permute",
         "cfg_parallel_size",

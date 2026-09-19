@@ -145,7 +145,7 @@ def _apply_diffusion_parallel_runtime_overrides(
             continue
         if parallel_config_dict is None:
             parallel_config_dict = {}
-        if key in ("ulysses_degree", "ring_degree", "allgather_degree"):
+        if key in ("ulysses_degree", "ring_degree", "allgather_degree", "window_parallel_size"):
             degree_overridden = True
         parallel_config_dict[key] = runtime_overrides.pop(key)
 
@@ -153,8 +153,11 @@ def _apply_diffusion_parallel_runtime_overrides(
         ulysses_degree = parallel_config_dict.get("ulysses_degree") or 1
         ring_degree = parallel_config_dict.get("ring_degree") or 1
         allgather_degree = parallel_config_dict.get("allgather_degree") or 1
+        window_parallel_size = parallel_config_dict.get("window_parallel_size") or 1
         parallel_config_dict["sequence_parallel_size"] = (
-            allgather_degree if allgather_degree > 1 else ulysses_degree * ring_degree
+            window_parallel_size
+            if window_parallel_size > 1
+            else (allgather_degree if allgather_degree > 1 else ulysses_degree * ring_degree)
         )
 
     if parallel_config_dict is not None:

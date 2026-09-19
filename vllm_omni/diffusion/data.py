@@ -276,6 +276,17 @@ class DiffusionParallelConfig:
     allgather_degree: int = 1
     """Number of GPUs used for AllGather-KV sequence parallelism (causal=False only)."""
 
+    window_parallel_size: int = 1
+    """Number of GPUs used for window-aligned sequence parallelism.
+
+    Window-aligned SP assigns whole attention windows to ranks and re-shards
+    activations only between layers whose window layouts differ.  It is only
+    meaningful for models with window-local attention (e.g. SeedVR2), which own
+    their redistribution path; the framework provides the process group and the
+    degree configuration.  Mutually exclusive with Ulysses / Ring / AllGather-KV,
+    so a window-SP run is never reported as a Ulysses run.
+    """
+
     ulysses_mode: str = "strict"
     """Ulysses sequence-parallel mode.
 
@@ -352,6 +363,7 @@ class DiffusionParallelConfig:
         assert self.ulysses_degree > 0, "Ulysses degree must be > 0"
         assert self.ring_degree > 0, "Ring degree must be > 0"
         assert self.allgather_degree > 0, "AllGather degree must be > 0"
+        assert self.window_parallel_size > 0, "Window parallel size must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
         assert self.vae_parallel_mode in {"tile", "spatial_shard_height", "spatial_shard_width"}, (
@@ -364,8 +376,17 @@ class DiffusionParallelConfig:
                 f"Got ulysses_degree={self.ulysses_degree}, ring_degree={self.ring_degree}, "
                 f"allgather_degree={self.allgather_degree}."
             )
+        if self.window_parallel_size > 1:
+            assert self.ulysses_degree == 1 and self.ring_degree == 1 and self.allgather_degree == 1, (
+                "Window-aligned SP (window_parallel_size>1) is mutually exclusive with "
+                "Ulysses / Ring / AllGather-KV. "
+                f"Got ulysses_degree={self.ulysses_degree}, ring_degree={self.ring_degree}, "
+                f"allgather_degree={self.allgather_degree}."
+            )
         expected_sp_size = (
-            self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
+            self.window_parallel_size
+            if self.window_parallel_size > 1
+            else (self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree)
         )
         assert self.sequence_parallel_size == expected_sp_size, (
             f"Sequence parallel size must be {expected_sp_size}, but got {self.sequence_parallel_size}"
@@ -383,7 +404,9 @@ class DiffusionParallelConfig:
     def __post_init__(self) -> None:
         if self.sequence_parallel_size is None:
             self.sequence_parallel_size = (
-                self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
+                self.window_parallel_size
+                if self.window_parallel_size > 1
+                else (self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree)
             )
 
         # Until the runtime WORLD size is known, an omitted DP dimension means

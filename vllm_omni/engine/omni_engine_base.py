@@ -665,6 +665,7 @@ class OmniEngineBase:
             ulysses_degree = normalized_kwargs.get("ulysses_degree") or 1
             ring_degree = normalized_kwargs.get("ring_degree") or 1
             allgather_degree = normalized_kwargs.get("allgather_degree") or 1
+            window_parallel_size = normalized_kwargs.get("window_parallel_size") or 1
             ulysses_mode = normalized_kwargs.get("ulysses_mode") or "strict"
             ulysses_a2a_permute = bool(normalized_kwargs.get("ulysses_a2a_permute", False))
             sequence_parallel_size = normalized_kwargs.get("sequence_parallel_size")
@@ -681,7 +682,11 @@ class OmniEngineBase:
             hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size", -1)
             hsdp_replicate_size = normalized_kwargs.get("hsdp_replicate_size", 1)
             if sequence_parallel_size is None:
-                sequence_parallel_size = allgather_degree if allgather_degree > 1 else ulysses_degree * ring_degree
+                sequence_parallel_size = (
+                    window_parallel_size
+                    if window_parallel_size > 1
+                    else (allgather_degree if allgather_degree > 1 else ulysses_degree * ring_degree)
+                )
 
             parallel_config = DiffusionParallelConfig(
                 pipeline_parallel_size=pipeline_parallel_size,
@@ -692,6 +697,7 @@ class OmniEngineBase:
                 ulysses_degree=ulysses_degree,
                 ring_degree=ring_degree,
                 allgather_degree=allgather_degree,
+                window_parallel_size=window_parallel_size,
                 ulysses_mode=ulysses_mode,
                 ulysses_a2a_permute=ulysses_a2a_permute,
                 cfg_parallel_size=cfg_parallel_size,
