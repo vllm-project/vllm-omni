@@ -683,7 +683,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         if isinstance(result, AsyncDiffusionOutput) and result.kind == AsyncOutputKind.COMPUTE_DONE:
             # Propagate async_output_id to per-request RunnerOutputs so the
             # engine waits in step_streaming() instead of blocking here.
-            batch_id = result.async_output_id
+            batch_id = cast(str, result.async_output_id)
             per_req_map: dict[str, str] = {}
             runner_outputs: list[RunnerOutput] = []
             for new_req in scheduler_output.scheduled_new_reqs:
@@ -958,18 +958,19 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     if batch_id:
                         with self._futures_lock:
                             pending = self._output_futures.pop(batch_id, None)
-                            if pending is not None and not pending.done():
-                                if exc is not None:
-                                    try_set_exception(pending, exc)
-                                else:
-                                    try_set_result(pending, output_result)
+                            if pending is not None:
+                                if not pending.done():
+                                    if exc is not None:
+                                        try_set_exception(pending, exc)
+                                    else:
+                                        try_set_result(pending, cast(DiffusionOutput, output_result))
                             else:
-                                fut = concurrent.futures.Future()
+                                completed_fut: concurrent.futures.Future[DiffusionOutput] = concurrent.futures.Future()
                                 if exc is not None:
-                                    fut.set_exception(exc)
+                                    completed_fut.set_exception(exc)
                                 else:
-                                    fut.set_result(output_result)
-                                self._completed_outputs[batch_id] = fut
+                                    completed_fut.set_result(cast(DiffusionOutput, output_result))
+                                self._completed_outputs[batch_id] = completed_fut
 
     def _deliver_batch_split(
         self,
@@ -989,8 +990,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 per_req_result = DiffusionOutput(error="No output result for batch request")
             with self._futures_lock:
                 pending = self._output_futures.pop(per_req_id, None)
-                if pending is not None and not pending.done():
-                    try_set_result(pending, per_req_result)
+                if pending is not None:
+                    if not pending.done():
+                        try_set_result(pending, per_req_result)
                 else:
                     fut: concurrent.futures.Future = concurrent.futures.Future()
                     fut.set_result(per_req_result)
@@ -1058,12 +1060,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             self._result_mqs = []
             self._result_pump_threads = []
             with self._futures_lock:
-                for fut in self._rpc_futures.values():
-                    if not fut.done():
-                        try_set_exception(fut, RuntimeError("Executor shut down"))
-                for fut in self._output_futures.values():
-                    if not fut.done():
-                        try_set_exception(fut, RuntimeError("Executor shut down"))
+                for rpc_fut in self._rpc_futures.values():
+                    if not rpc_fut.done():
+                        try_set_exception(rpc_fut, RuntimeError("Executor shut down"))
+                for output_fut in self._output_futures.values():
+                    if not output_fut.done():
+                        try_set_exception(output_fut, RuntimeError("Executor shut down"))
                 self._rpc_futures.clear()
                 self._output_futures.clear()
                 self._batch_split_map.clear()
