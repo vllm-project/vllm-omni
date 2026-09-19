@@ -99,6 +99,7 @@ nav:
       - Frame Interpolation: user_guide/diffusion/frame_interpolation.md
       - Startup and Loading: user_guide/diffusion/startup_and_loading.md
       - LoRA: user_guide/diffusion/lora.md
+      - Batch Invariance: features/batch_invariance.md
     - Experimental:
       - Session State Manager: features/session_state_manager.md
   - Integrations:
