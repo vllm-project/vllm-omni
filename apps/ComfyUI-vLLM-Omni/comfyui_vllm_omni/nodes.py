@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from typing import Literal
 
 import torch
@@ -7,9 +10,13 @@ from .utils.api_client import VLLMOmniClient
 from .utils.logger import get_logger
 from .utils.models import lookup_model_spec
 from .utils.types import (
+    MAX_REFERENCE_AUDIOS,
+    MAX_REFERENCE_IMAGES,
+    MAX_REFERENCE_VIDEOS,
     AudioFormat,
     AutoregressionSamplingParams,
     DiffusionSamplingParams,
+    FastH3Deployment,
     MiniMaxH3ModelSpecificParams,
     QwenTTSModelSpecificParams,
     VideoReferences,
@@ -21,6 +28,23 @@ from .utils.validators import (
 )
 
 logger = get_logger(__name__)
+
+FASTH3_INFERENCE_STEPS = 4
+FASTH3_FPS = 24
+# A FastH3 deployment may expose H3 under any --served-model-name, so the payload
+# spec has to be named outright rather than recovered from that alias.
+FASTH3_SPEC_MODEL = "MiniMax-H3"
+
+
+def _resolve_fast_h3_deployment(deployment: dict) -> tuple[str, str]:
+    if not isinstance(deployment, dict):
+        raise ValueError("FastH3 deployment must be provided by a FastH3 Deployment node.")
+
+    url = str(deployment.get("url") or "").strip().rstrip("/")
+    model = str(deployment.get("model") or "").strip()
+    if not url or not model:
+        raise ValueError("FastH3 deployment requires both URL and model.")
+    return url, model
 
 
 class _VLLMOmniGenerateBase:
@@ -162,7 +186,20 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
                 "width": ("INT", {"default": 832, "min": 1}),
                 "height": ("INT", {"default": 480, "min": 1}),
                 "fps": ("INT", {"default": 16, "min": 1}),
-                "num_frames": ("INT", {"default": 41, "min": 1}),
+                "duration": (
+                    "FLOAT",
+                    {
+                        "default": 4.0,
+                        "min": 0.1,
+                        "step": 0.1,
+                        "round": 0.001,
+                        "tooltip": (
+                            "Clip length in seconds, converted to frames with the fps above. "
+                            "Models that only accept certain frame counts (e.g. MiniMax-H3) round to "
+                            "their own lattice, so the served clip can be slightly longer than requested."
+                        ),
+                    },
+                ),
             },
             "optional": {
                 "frame": ("IMAGE",),
@@ -170,6 +207,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
                 "sampling_params": ("SAMPLING_PARAMS",),
                 "lora": ("REMOTE_LORA",),
                 "model_params": ("VIDEO_PARAMS",),
+                "fast_h3": ("FASTH3_DEPLOYMENT",),
             },
         }
 
@@ -194,20 +232,66 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         width: int,
         height: int,
         fps: int,
-        num_frames: int,
+        duration: float,
         negative_prompt: str | None = None,
         frame: torch.Tensor | None = None,
         references: dict | None = None,
         sampling_params: dict | list[dict] | None = None,
         model_params: dict | None = None,
         lora: dict | None = None,
+        fast_h3: dict | None = None,
         **kwargs,
     ):
         if kwargs:
             logger.info("Uncaught kwargs: %s", kwargs)
         logger.debug("Got sampling params: %s", sampling_params)
         logger.debug("Got model params: %s", model_params)
-        validate_model_and_sampling_params_types(model, sampling_params)
+
+        # Which spec builds the payload. Only a FastH3 deployment separates this
+        # from the served name; every other path keeps them equal.
+        spec_model = model
+
+        if fast_h3 is not None:
+            if frame is not None or references is not None:
+                raise ValueError("FastH3 Preview supports T2VA only; disconnect frame and references inputs.")
+            if lora is not None:
+                raise ValueError(
+                    "FastH3 is already fused into the selected server; disconnect the request-level LoRA input."
+                )
+
+            url, model = _resolve_fast_h3_deployment(fast_h3)
+            logger.info("Using FastH3 deployment at %s", url)
+            fps = FASTH3_FPS
+            # The served name is whatever the operator passed to --served-model-name.
+            # Left alone, lookup_model_spec would miss H3 for an alias such as
+            # "fasth3", drop the params builder, and send a t2va request carrying no
+            # aspect_ratio -- which the server refuses.
+            spec_model = FASTH3_SPEC_MODEL
+
+            if sampling_params is None:
+                sampling_params = DiffusionSamplingParams()
+            elif isinstance(sampling_params, list):
+                if len(sampling_params) != 1:
+                    raise ValueError("FastH3 expects a single diffusion sampling params group.")
+                sampling_params = sampling_params[0].__class__(sampling_params[0])
+            else:
+                sampling_params = sampling_params.__class__(sampling_params)
+            sampling_params["num_inference_steps"] = FASTH3_INFERENCE_STEPS
+
+            # FastH3 owns both modality shifts. Sending the ordinary H3 values
+            # from a connected H3 Params node would turn a deployment choice
+            # into a request-level override, which the server intentionally
+            # rejects when it differs from the fused adapter contract.
+            if model_params is not None:
+                model_params = model_params.__class__(model_params)
+                model_params.pop("flow_shift", None)
+                model_params.pop("audio_flow_shift", None)
+
+        # Frames stay the wire unit. Convert after the FastH3 branch above, so the
+        # duration is measured against the fps the server will actually apply.
+        num_frames = max(1, round(duration * fps))
+
+        validate_model_and_sampling_params_types(spec_model, sampling_params)
 
         # Currently, all video generation models are single-stage diffusion models
         if isinstance(sampling_params, list):
@@ -227,6 +311,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         client = VLLMOmniClient(url)
         output = await client.generate_video(
             model=model,
+            spec_model=spec_model,
             prompt=prompt,
             frame=frame,  # frame present => fl2va / Wan I2V
             references=references,
@@ -414,6 +499,66 @@ class VLLMOmniTTS(_VLLMOmniGenerateBase):
             response_format=response_format,
             speed=speed,
             **combined_params,
+        )
+        return (audio,)
+
+
+class VLLMOmniGenerateMusic(_VLLMOmniGenerateBase):
+    """Generate a song from lyrics and a musical description with MiniMax Music 3."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url": ("STRING", {"default": "http://localhost:8000/v1"}),
+                "model": ("STRING", {"default": "MiniMaxAI/MiniMax-Music3"}),
+                "instructions": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "display_name": "caption",
+                        "tooltip": "Music caption: describe genre, instruments, tempo and mood.",
+                    },
+                ),
+                "lyrics": ("STRING", {"multiline": True}),
+                "max_duration_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 300.0,
+                        "min": 1,
+                        "max": 360,
+                        "step": 0.01,
+                        "tooltip": "Upper limit; rounded down to whole 25 Hz audio frames. May end earlier.",
+                    },
+                ),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 2**53 - 1, "control_after_generate": True}),
+                "response_format": (["wav", "mp3", "flac", "opus"],),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "generate"
+
+    async def generate(
+        self,
+        url: str,
+        model: str,
+        lyrics: str,
+        instructions: str,
+        response_format: AudioFormat,
+        max_duration_seconds: float,
+        seed: int = 0,
+    ) -> tuple[AudioInput]:
+        audio = await VLLMOmniClient(url.rstrip("/")).generate_speech(
+            model=model,
+            input=lyrics,
+            instructions=instructions,
+            voice="default",
+            speed=1.0,
+            response_format=response_format,
+            max_new_tokens=int(max_duration_seconds * 25),
+            seed=seed,
         )
         return (audio,)
 
@@ -695,6 +840,52 @@ class VLLMOmniRemoteLoRA:
         return (lora,)
 
 
+class VLLMOmniFastH3Deployment:
+    """Select a vLLM-Omni service that fused FastH3 at startup."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url": (
+                    "STRING",
+                    {
+                        "default": "http://localhost:8000/v1",
+                        "tooltip": "URL of a vLLM-Omni server started with a FastH3 --lora-path.",
+                    },
+                ),
+                "model": (
+                    "STRING",
+                    {
+                        "default": "MiniMaxAI/MiniMax-H3",
+                        "tooltip": "Model name exposed by the FastH3 deployment.",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("FASTH3_DEPLOYMENT",)
+    RETURN_NAMES = ("deployment",)
+    FUNCTION = "get_deployment"
+    CATEGORY = "vLLM-Omni"
+    DESCRIPTION = (
+        "Selects a server with FastH3 fused at startup. The connected Generate Video node uses T2VA, "
+        "four inference steps, and 24 FPS without sending a request-level LoRA."
+    )
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, url, model) -> str | Literal[True]:
+        try:
+            _resolve_fast_h3_deployment({"url": url, "model": model})
+        except ValueError as exc:
+            return str(exc)
+        return True
+
+    def get_deployment(self, url: str, model: str):
+        url, model = _resolve_fast_h3_deployment({"url": url, "model": model})
+        return (FastH3Deployment({"url": url, "model": model}),)
+
+
 class VLLMOmniQwenTTSParams:
     @classmethod
     def INPUT_TYPES(cls):
@@ -790,6 +981,10 @@ class VLLMOmniVideoReferences:
                 "audio_2": ("AUDIO",),
                 "video_1": ("VIDEO",),
                 "video_2": ("VIDEO",),
+                # Append ports to preserve connections in saved workflows.
+                **{f"image_{i}": ("IMAGE",) for i in range(3, MAX_REFERENCE_IMAGES + 1)},
+                **{f"audio_{i}": ("AUDIO",) for i in range(3, MAX_REFERENCE_AUDIOS + 1)},
+                **{f"video_{i}": ("VIDEO",) for i in range(3, MAX_REFERENCE_VIDEOS + 1)},
             },
         }
 
@@ -806,21 +1001,26 @@ class VLLMOmniVideoReferences:
         audio_2: AudioInput | None = None,
         video_1: VideoInput | None = None,
         video_2: VideoInput | None = None,
+        image_3: torch.Tensor | None = None,
+        image_4: torch.Tensor | None = None,
+        image_5: torch.Tensor | None = None,
+        image_6: torch.Tensor | None = None,
+        image_7: torch.Tensor | None = None,
+        image_8: torch.Tensor | None = None,
+        image_9: torch.Tensor | None = None,
+        audio_3: AudioInput | None = None,
+        video_3: VideoInput | None = None,
         **kwargs,
     ):
         if kwargs:
             logger.info("Uncaught kwargs: %s", kwargs)
         refs = VideoReferences()
-        if image_1 is not None:
-            refs["image_1"] = image_1
-        if image_2 is not None:
-            refs["image_2"] = image_2
-        if audio_1 is not None:
-            refs["audio_1"] = audio_1
-        if audio_2 is not None:
-            refs["audio_2"] = audio_2
-        if video_1 is not None:
-            refs["video_1"] = video_1
-        if video_2 is not None:
-            refs["video_2"] = video_2
+        for kind, values in (
+            ("image", (image_1, image_2, image_3, image_4, image_5, image_6, image_7, image_8, image_9)),
+            ("video", (video_1, video_2, video_3)),
+            ("audio", (audio_1, audio_2, audio_3)),
+        ):
+            for index, value in enumerate(values, start=1):
+                if value is not None:
+                    refs[f"{kind}_{index}"] = value
         return (refs,)

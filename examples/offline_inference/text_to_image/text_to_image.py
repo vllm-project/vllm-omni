@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import argparse
 import functools
@@ -58,6 +58,7 @@ def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]
 
 
 parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
+parse_custom_pipeline_args = functools.partial(parse_json_object, flag_name="--custom-pipeline-args")
 
 
 def build_text_to_image_prompt(prompt: str, negative_prompt: str | None) -> dict[str, Any]:
@@ -380,6 +381,18 @@ def parse_args() -> argparse.Namespace:
         help="Supplementary auxiliary text encoder parameters model name or path (especially for Hidream-l1-full).",
     )
     parser.add_argument(
+        "--model-class-name",
+        type=str,
+        default=None,
+        help="Override the diffusion pipeline class name (e.g. AnimaPipeline).",
+    )
+    parser.add_argument(
+        "--custom-pipeline-args",
+        type=parse_custom_pipeline_args,
+        default=None,
+        help='JSON object passed to native/custom pipelines (e.g. \'{"components_path": "/path"}\').',
+    )
+    parser.add_argument(
         "--trust-remote-code",
         action="store_true",
         help="Trust and execute custom modeling code from the model repo (required by e.g. HunyuanImage-3.0).",
@@ -576,9 +589,13 @@ def main():
         omni_kwargs["trust_remote_code"] = True
     if args.deploy_config:
         omni_kwargs["deploy_config"] = args.deploy_config
-    if use_nextstep:
+    if args.model_class_name:
+        omni_kwargs["model_class_name"] = args.model_class_name
+    elif use_nextstep:
         # NextStep-1.1 requires explicit pipeline class
         omni_kwargs["model_class_name"] = "NextStep11Pipeline"
+    if args.custom_pipeline_args is not None:
+        omni_kwargs["custom_pipeline_args"] = args.custom_pipeline_args
     # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
     # gate is an engine-level config (offline analog of the server's --no-guardrails).
     if args.extra_body and "guardrails" in args.extra_body:
@@ -614,6 +631,10 @@ def main():
         print(f"  LoRA: scale={args.lora_scale}")
     if args.deploy_config:
         print(f"  deploy-config: {args.deploy_config}")
+    if args.model_class_name:
+        print(f"  Model class name: {args.model_class_name}")
+    if args.custom_pipeline_args is not None:
+        print(f"  Custom pipeline args: {args.custom_pipeline_args}")
     print(f"{'=' * 60}\n")
 
     # Build LoRA request when --lora-path is set

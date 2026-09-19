@@ -32,7 +32,7 @@ from tests.helpers.media import (
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.config.stage_config import load_deploy_config
-from vllm_omni.entrypoints.duplex.server_vad import (
+from vllm_omni.engine.duplex.vad import (
     SILERO_VAD_FILENAME,
     SILERO_VAD_REPO_ID,
     SILERO_VAD_REVISION,

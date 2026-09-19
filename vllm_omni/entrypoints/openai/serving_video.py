@@ -6,20 +6,23 @@ from __future__ import annotations
 import copy
 import math
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from functools import cached_property
 from http import HTTPStatus
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
+import pybase64 as base64
 from fastapi import HTTPException
 from PIL import Image
 from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
-from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.diffusion.utils.media_utils import count_mp4_frames, normalize_preencode_batch_frames
+from vllm_omni.entrypoints.async_omni import ABORT_TIMEOUT_S, AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoAction,
     VideoData,
@@ -49,6 +52,30 @@ from vllm_omni.outputs.output_metadata import (
 logger = init_logger(__name__)
 
 _VIDEO_RESPONSE_FRAME_CONVERSION_WORKERS = 8
+
+
+def _config_value(config: Any, key: str, default: Any = None) -> Any:
+    if isinstance(config, Mapping):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _stage_diffusion_model_class_name(stage_config: Any) -> str | None:
+    """Resolve a stage's diffusion class across typed and legacy shapes."""
+    diffusion_config = _config_value(stage_config, "diffusion_config")
+    model_class_name = _config_value(diffusion_config, "model_class_name")
+    if model_class_name:
+        return str(model_class_name)
+
+    model_config = _config_value(stage_config, "model_config")
+    model_arch = _config_value(model_config, "model_arch") or _config_value(stage_config, "model_arch")
+    if model_arch:
+        return str(model_arch)
+
+    engine_args = _config_value(stage_config, "engine_args", {})
+    model_class_name = _config_value(engine_args, "model_class_name")
+    return str(model_class_name) if model_class_name else None
+
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -99,7 +126,12 @@ def _video_metadata_from_artifacts(artifacts: VideoGenerationArtifacts) -> dict[
     if not artifacts.videos:
         return metadata
 
-    num_frames = count_video_frames(artifacts.videos[0])
+    video = artifacts.videos[0]
+    # Pre-encoded outputs arrive as MP4 bytes, which carry no tensor shape.
+    if isinstance(video, (bytes, bytearray, memoryview)):
+        num_frames = count_mp4_frames(bytes(video))
+    else:
+        num_frames = count_video_frames(video)
     if num_frames is not None and num_frames > 0:
         metadata["num_frames"] = num_frames
         if artifacts.output_fps > 0:
@@ -187,18 +219,7 @@ class OmniOpenAIServingVideo:
         model_class_name = getattr(od_config, "model_class_name", None)
         model_archs = [model_class_name]
         for stage_config in self.stage_configs or ():
-            stage_get = (
-                stage_config.get if isinstance(stage_config, Mapping) else lambda key: getattr(stage_config, key, None)
-            )
-            engine_args = stage_get("engine_args") or {}
-            model_archs.extend(
-                (
-                    stage_get("model_arch"),
-                    engine_args.get("model_class_name")
-                    if isinstance(engine_args, Mapping)
-                    else getattr(engine_args, "model_class_name", None),
-                )
-            )
+            model_archs.append(_stage_diffusion_model_class_name(stage_config))
         metadata_capability = any(
             get_diffusion_model_metadata(model_arch).supports_mixed_reference_inputs for model_arch in model_archs
         )
@@ -215,18 +236,7 @@ class OmniOpenAIServingVideo:
         od_config = self._resolve_diffusion_od_config()
         model_archs = [None if od_config is None else getattr(od_config, "model_class_name", None)]
         for stage_config in self.stage_configs or ():
-            stage_get = (
-                stage_config.get if isinstance(stage_config, Mapping) else lambda key: getattr(stage_config, key, None)
-            )
-            engine_args = stage_get("engine_args") or {}
-            model_archs.extend(
-                (
-                    stage_get("model_arch"),
-                    engine_args.get("model_class_name")
-                    if isinstance(engine_args, Mapping)
-                    else getattr(engine_args, "model_class_name", None),
-                )
-            )
+            model_archs.append(_stage_diffusion_model_class_name(stage_config))
 
         supported: set[str] = set()
         for model_arch in model_archs:
@@ -249,6 +259,9 @@ class OmniOpenAIServingVideo:
     def shutdown(self) -> None:
         self._video_frame_converter.shutdown()
 
+    async def abort_request(self, request_id: str) -> None:
+        await self._engine_client.abort(request_id, timeout=ABORT_TIMEOUT_S)
+
     async def _run_and_extract(
         self,
         request: VideoGenerationRequest,
@@ -257,6 +270,7 @@ class OmniOpenAIServingVideo:
         reference_image: ReferenceImage | None = None,
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
+        on_started: Callable[[], Awaitable[None]] | None = None,
     ) -> VideoGenerationArtifacts:
         """Run the generation pipeline and extract video/audio/profiler outputs."""
         prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt, modalities=["video"])
@@ -402,6 +416,11 @@ class OmniOpenAIServingVideo:
                     status_code=HTTPStatus.BAD_REQUEST.value,
                     detail="extra_params must be a JSON object/dict.",
                 )
+            if request.extra_params.get("preencode_mp4") and "preencode_batch_frames" in request.extra_params:
+                try:
+                    normalize_preencode_batch_frames(request.extra_params["preencode_batch_frames"])
+                except ValueError as exc:
+                    raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
             # Merge extra_params into extra_args
             gen_params.extra_args.update(request.extra_params)
 
@@ -432,7 +451,12 @@ class OmniOpenAIServingVideo:
             gen_params.seed,
         )
 
-        result = await self._run_generation(prompt, gen_params, reference_id)
+        result = await self._run_generation(
+            prompt,
+            gen_params,
+            reference_id,
+            on_started=on_started,
+        )
         multimodal_output = self._extract_multimodal_output(result)
         metadata = multimodal_output.get("metadata") if isinstance(multimodal_output, dict) else {}
         common_metadata = metadata.get("common") if isinstance(metadata, dict) else {}
@@ -479,26 +503,22 @@ class OmniOpenAIServingVideo:
             if "video_codec_options" in request.extra_params:
                 video_codec_options = request.extra_params["video_codec_options"]
 
+        def encode_video_result(idx: int, video: Any) -> str:
+            if isinstance(video, bytes):
+                return base64.b64encode(video).decode("utf-8")
+            return encode_video_base64(
+                video,
+                fps=artifacts.output_fps,
+                audio=artifacts.audios[idx],
+                audio_sample_rate=artifacts.audio_sample_rate,
+                video_codec_options=video_codec_options,
+                frame_converter=self._video_frame_converter,
+            )
+
         _t_encode_start = time.perf_counter()
         video_data = [
             VideoData(
-                b64_json=(
-                    encode_video_base64(
-                        video,
-                        fps=artifacts.output_fps,
-                        video_codec_options=video_codec_options,
-                        frame_converter=self._video_frame_converter,
-                    )
-                    if artifacts.audios[idx] is None
-                    else encode_video_base64(
-                        video,
-                        fps=artifacts.output_fps,
-                        audio=artifacts.audios[idx],
-                        audio_sample_rate=artifacts.audio_sample_rate,
-                        video_codec_options=video_codec_options,
-                        frame_converter=self._video_frame_converter,
-                    )
-                ),
+                b64_json=encode_video_result(idx, video),
                 action=artifacts.actions[idx],
             )
             for idx, video in enumerate(artifacts.videos)
@@ -520,6 +540,7 @@ class OmniOpenAIServingVideo:
         reference_image: ReferenceImage | None = None,
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
+        on_started: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[bytes, dict[str, float], float, VideoAction | None, dict[str, object]]:
         """Generate a video and return raw MP4 bytes, bypassing base64 encoding."""
         artifacts = await self._run_and_extract(
@@ -528,6 +549,7 @@ class OmniOpenAIServingVideo:
             reference_image=reference_image,
             reference_video=reference_video,
             reference_audio=reference_audio,
+            on_started=on_started,
         )
         if len(artifacts.videos) > 1:
             logger.warning(
@@ -549,6 +571,17 @@ class OmniOpenAIServingVideo:
             return b"", artifacts.stage_durations, artifacts.peak_memory_mb, action, video_metadata
 
         _t_encode_start = time.perf_counter()
+        if isinstance(artifacts.videos[0], bytes):
+            video_bytes = artifacts.videos[0]
+            _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
+            logger.info("Video response received pre-encoded MP4 bytes: %.2f ms", _t_encode_ms)
+            return (
+                video_bytes,
+                artifacts.stage_durations,
+                artifacts.peak_memory_mb,
+                artifacts.actions[0],
+                video_metadata,
+            )
         video_bytes = _encode_video_bytes(
             artifacts.videos[0],
             fps=artifacts.output_fps,
@@ -622,6 +655,8 @@ class OmniOpenAIServingVideo:
         prompt: OmniTextPrompt,
         gen_params: OmniDiffusionSamplingParams,
         request_id: str,
+        *,
+        on_started: Callable[[], Awaitable[None]] | None = None,
     ) -> object:
         stage_configs = self._stage_configs or getattr(self._engine_client, "stage_configs", None)
 
@@ -641,6 +676,7 @@ class OmniOpenAIServingVideo:
 
         # Common generation logic for both paths
         engine_client = cast(AsyncOmni, self._engine_client)
+        gen_params.emit_request_lifecycle = on_started is not None
         sampling_params_list = build_stage_sampling_params_list(
             list(stage_configs),
             get_default_sampling_params_list(engine_client),
@@ -649,11 +685,17 @@ class OmniOpenAIServingVideo:
         )
 
         result = None
+        started_notified = False
         async for output in engine_client.generate(
             prompt=prompt,
             request_id=request_id,
             sampling_params_list=sampling_params_list,
         ):
+            if is_diffusion_request_started_output(output):
+                if on_started is not None and not started_notified:
+                    await on_started()
+                    started_notified = True
+                continue
             result = output
 
         if result is None:

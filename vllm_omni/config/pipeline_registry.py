@@ -33,6 +33,7 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
 from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE
+from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE
 from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_S2S_PIPELINE,
     AUDEX_THINKER_ONLY_PIPELINE,
@@ -47,6 +48,7 @@ from vllm_omni.model_executor.models.bagel.pipeline import (
     BAGEL_SINGLE_STAGE_PIPELINE,
     BAGEL_THINK_PIPELINE,
 )
+from vllm_omni.model_executor.models.breeze_tts_2.pipeline import BREEZE_TTS_2_PIPELINE
 from vllm_omni.model_executor.models.cosmos3.pipeline import COSMOS3_POLICY_PIPELINE
 from vllm_omni.model_executor.models.cosyvoice3.pipeline import COSYVOICE3_PIPELINE
 from vllm_omni.model_executor.models.covo_audio.pipeline import COVO_AUDIO_PIPELINE
@@ -128,6 +130,7 @@ PipelineResolverFunc: TypeAlias = Callable[[PretrainedConfig | None], PipelineCo
 # --- Multi-stage omni pipelines (LLM-centric; audio / video I/O) ---
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "aura_omni": AURA_OMNI_PIPELINE,
+    "breeze": BREEZE_TTS_2_PIPELINE,
     "joyai_vl_interaction": JOYAI_VL_INTERACTION_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
@@ -151,6 +154,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "lingbot_world": LINGBOT_WORLD_PIPELINE,
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
     "pi0": PI0_PIPELINE,
+    "pi05": PI05_PIPELINE,
     # Cosmos3 policy checkpoints share HF metadata with the T2I/video Cosmos3
     # checkpoints (which stay on the single-stage diffusion fallback), so this
     # entry is only reachable through a deploy yaml's ``pipeline:`` key

@@ -14,7 +14,7 @@ import time
 import traceback
 import uuid
 import wave
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -2153,10 +2153,68 @@ async def async_request_openai_audio_speech(
     return output
 
 
+#: Silence budget per Seed-TTS turn: a model-native duplex session generates
+#: per audio unit, and the target text rides the session context, so the
+#: silence only advances the clock. It stops at the turn's response.done --
+#: a native model that keeps hearing silence after its turn may decide to
+#: speak again, and the benchmark measures one response per utterance -- so
+#: the budget is only spent on a turn the model is slow to take: it may
+#: choose to listen on a few units first, and a turn that has not settled
+#: when the budget runs out is reported with what the model did.
+_SEED_TTS_SILENCE_SECONDS = 30.0
+#: A native model normally answers the seeded text within this much silence;
+#: a turn that needs more is logged so a slow-to-speak model shows in the run.
+_SEED_TTS_PROMPT_RESPONSE_S = 12.0
+#: MiniCPM-o emits 24 kHz mono; used to report audio_frames after the session closed.
+_SEED_TTS_OUTPUT_SAMPLE_RATE_HZ = 24_000
+
+
+def _seed_tts_turn_stall_report(events: object, response_offset: int, request_index: int, silence_s: float) -> str:
+    """Explain a Seed-TTS turn that never settled: what the model did with the silence."""
+    response_ids = list(getattr(events, "response_ids")[response_offset:])
+    if not response_ids:
+        return (
+            f"Seed-TTS Realtime TTS turn {request_index} never started a response: the model listened "
+            f"through {silence_s:.1f}s of silence and the wait that followed"
+        )
+    audio_bytes = getattr(events, "audio_bytes")
+    response_text = getattr(events, "response_text")
+    started = ", ".join(
+        f"{response_id} ({len(audio_bytes(response_id))} audio bytes, text {response_text(response_id)!r})"
+        for response_id in response_ids
+    )
+    return (
+        f"Seed-TTS Realtime TTS turn {request_index} started {len(response_ids)} response(s) after "
+        f"{silence_s:.1f}s of silence but none reached response.done: {started}"
+    )
+
+
+def _seed_tts_turn_response_id(events: object, response_offset: int, request_index: int) -> str:
+    """The response id the Seed-TTS turn is measured on: the first one with audio.
+
+    A model-native session answers the seeded text once, but nothing in the
+    protocol stops it from speaking again on silence it hears afterwards, so
+    a later audio response is the model's own and not a failed turn.
+    """
+    response_ids = getattr(events, "response_ids")
+    audio_bytes = getattr(events, "audio_bytes")
+    audio_response_ids = [response_id for response_id in response_ids[response_offset:] if audio_bytes(response_id)]
+    if not audio_response_ids:
+        raise RuntimeError(f"Seed-TTS Realtime TTS turn {request_index} produced no audio response")
+    if len(audio_response_ids) > 1:
+        logger.warning(
+            "Seed-TTS Realtime TTS turn %d: model spoke again after its response (%d audio responses); "
+            "measuring the first",
+            request_index,
+            len(audio_response_ids),
+        )
+    return audio_response_ids[0]
+
+
 def _realtime_websocket_url(api_url: str) -> str:
     from vllm_omni.clients.duplex import build_realtime_url
 
-    return build_realtime_url(api_url, None, native_duplex=None)
+    return build_realtime_url(api_url, None)
 
 
 def _nonnegative_number(value: object) -> bool:
@@ -2272,9 +2330,11 @@ async def _async_request_omniinteract(
         output.audio_duration = case_result.audio_bytes / (24_000 * 2)
         output.audio_frames = case_result.audio_bytes // 2
         session_metrics = case_result.duplex_session_metrics
-        output.ttft = float(session_metrics.get("mean_ttft_ms") or 0.0) / 1000.0
-        output.audio_ttfp = float(session_metrics.get("mean_ttfp_ms") or 0.0) / 1000.0
-        output.audio_rtf = float(session_metrics.get("mean_rtf") or 0.0)
+        from vllm_omni.clients.duplex import metric_mean
+
+        output.ttft = (metric_mean(session_metrics.get("ttft_ms")) or 0.0) / 1000.0
+        output.audio_ttfp = (metric_mean(session_metrics.get("ttfp_ms")) or 0.0) / 1000.0
+        output.audio_rtf = metric_mean(session_metrics.get("rtf")) or 0.0
         token_timing_measured = _apply_stage0_token_timings(
             output,
             [request_metric.get("stage0_tokens") for request_metric in case_result.duplex_request_metrics],
@@ -2319,6 +2379,13 @@ class _RealtimeTTSProbe:
     request time.
     """
 
+    #: How long ``configure`` waits for a free duplex session. Every Seed-TTS
+    #: utterance is one session and the deploy config admits ``max_sessions``
+    #: of them, so a benchmark run above that concurrency queues for a slot
+    #: rather than counting the server's (retryable) refusal as a failed
+    #: request.
+    _SESSION_SLOT_WAIT_S = 120.0
+
     def __init__(self, url: str) -> None:
         from vllm_omni.clients.duplex import EventCollector
 
@@ -2345,16 +2412,13 @@ class _RealtimeTTSProbe:
         *,
         output_audio_format: str = "pcm16",
         instructions: str | None = None,
-        native_duplex: bool = False,
         auto_response: bool = False,
         extra_body: dict[str, object] | None = None,
-        session_id: str | None = None,
         timeout_s: float = 120.0,
     ) -> None:
-        from vllm_omni.clients.duplex import AudioFormat, DuplexClient, SessionConfig
+        from vllm_omni.clients.duplex import AudioFormat, DuplexClient, DuplexProtocolError, SessionConfig
 
         session_extra_body: dict[str, object] = dict(extra_body or {})
-        session_extra_body["native_duplex"] = bool(native_duplex)
         config = SessionConfig(
             output_audio=AudioFormat(output_audio_format, 24_000),
             instructions=instructions,
@@ -2363,16 +2427,33 @@ class _RealtimeTTSProbe:
             playback_commit_policy="ack_only",
             extra_body=session_extra_body,
         )
-        self._client = DuplexClient(
-            self._url,
-            model=model,
-            config=config,
-            session_id=session_id,
-            reconnect=None,
-            heartbeat_interval_s=None,
-            handshake_timeout_s=timeout_s,
-        )
-        await self._client.__aenter__()
+        deadline = time.monotonic() + self._SESSION_SLOT_WAIT_S
+        delay_s = 0.25
+        waited = False
+        while True:
+            # A failed handshake closes the socket on the client's side, so
+            # a refused attempt leaves nothing behind to clean up.
+            client = DuplexClient(
+                self._url,
+                model=model,
+                config=config,
+                reconnect=None,
+                heartbeat_interval_s=None,
+                handshake_timeout_s=timeout_s,
+            )
+            try:
+                await client.__aenter__()
+            except DuplexProtocolError as exc:
+                if exc.code != "resource_exhausted" or time.monotonic() >= deadline:
+                    raise
+                if not waited:
+                    logger.info("Seed-TTS Realtime TTS: no free duplex session (%s); waiting for a slot", exc)
+                    waited = True
+                await asyncio.sleep(delay_s)
+                delay_s = min(delay_s * 2.0, 2.0)
+                continue
+            self._client = client
+            break
         self._consume_task = asyncio.create_task(self.events.consume(self._client))
 
     async def send(self, event: dict[str, object]) -> None:
@@ -2384,6 +2465,32 @@ class _RealtimeTTSProbe:
 
         assert self._client is not None
         await acknowledge_collected_playback(self._client, self.events)
+
+    async def stream_silence(
+        self,
+        *,
+        seconds: float,
+        chunk_ms: int = 200,
+        until: Callable[[], bool] | None = None,
+    ) -> float:
+        """Append silent PCM16 units so a model-native session has units to speak on.
+
+        A duplex model generates per audio unit. The target text rides the
+        session context (``duplex_initial_user_text``), so the audio only has
+        to advance the clock; silence keeps it from adding content of its own.
+        Streams in real time for at most ``seconds``, stopping as soon as
+        ``until`` holds, and returns the seconds actually appended.
+        """
+        assert self._client is not None
+        input_format = self._client.config.input_audio
+        chunk = bytes(max(input_format.byte_count(chunk_ms), input_format.bytes_per_sample))
+        chunk_s = input_format.duration_ms(len(chunk)) / 1000.0
+        streamed_s = 0.0
+        while streamed_s < seconds and not (until is not None and until()):
+            await self._client.append_audio(chunk, is_speech=False)
+            streamed_s += chunk_s
+            await asyncio.sleep(chunk_s)
+        return streamed_s
 
     async def close_session(self, *, timeout_s: float = 20.0) -> None:
         assert self._client is not None
@@ -2421,69 +2528,70 @@ async def async_request_openai_realtime_duplex(
     if not turn_prompts:
         turn_prompts = [("", request_func_input.prompt)]
     session_id = f"seed-tts-{request_func_input.request_id or uuid.uuid4().hex}"
+    silence_seconds = float(getattr(request_func_input, "seed_tts_silence_seconds", 0.0) or _SEED_TTS_SILENCE_SECONDS)
+    turn_metrics: list[dict[str, object]] = []
+    turn_timings: list[dict[str, object]] = []
+    turn_pcm_bytes: list[bytes] = []
+    turn_transcripts: list[str] = []
+    measurement_origin = {
+        "ttft": "first silence append client send to first non-empty text delta",
+        "ttfp": "first silence append client send to first audio packet",
+        "rtf": "request-start-to-last-audio receive time divided by emitted audio duration",
+    }
     try:
-        async with _RealtimeTTSProbe(_realtime_websocket_url(request_func_input.api_url)) as client:
-            await client.configure(
-                request_func_input.model_name or request_func_input.model,
-                output_audio_format="pcm16",
-                instructions=getattr(
-                    request_func_input,
-                    "seed_tts_system_prompt",
-                    SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
-                ),
-                native_duplex=False,
-                auto_response=False,
-                extra_body=speech_extra,
-                session_id=session_id,
-                timeout_s=120.0,
-            )
-            turn_metrics: list[dict[str, object]] = []
-            turn_timings: list[dict[str, object]] = []
-            turn_pcm_bytes: list[bytes] = []
-            turn_transcripts: list[str] = []
-            measurement_origin = {
-                "ttft": "conversation.item.create client send to first non-empty text delta",
-                "ttfp": "conversation.item.create client send to first audio packet",
-                "rtf": "request-start-to-last-audio receive time divided by emitted audio duration",
-            }
-            for request_index, (utterance_id, target_text) in enumerate(turn_prompts):
+        # One session per utterance. A model-native duplex session takes its
+        # text once, in the session context (``duplex_initial_user_text``), so
+        # a session cannot be re-seeded for a second target text.
+        for request_index, (utterance_id, target_text) in enumerate(turn_prompts):
+            async with _RealtimeTTSProbe(_realtime_websocket_url(request_func_input.api_url)) as client:
+                await client.configure(
+                    request_func_input.model_name or request_func_input.model,
+                    output_audio_format="pcm16",
+                    instructions=getattr(
+                        request_func_input,
+                        "seed_tts_system_prompt",
+                        SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
+                    ),
+                    auto_response=True,
+                    extra_body={
+                        **speech_extra,
+                        "duplex_initial_user_text": target_text,
+                        "force_listen_count": 0,
+                    },
+                    timeout_s=120.0,
+                )
                 response_offset = len(client.events.response_ids)
                 done_before = client.events.count("response.done")
                 errors_before = len(client.events.errors())
-                turn_started_at_s = time.monotonic()
-                await client.send(
-                    {
-                        "type": "conversation.item.create",
-                        "item": {
-                            "type": "message",
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": target_text}],
-                        },
-                    }
-                )
-                await client.send({"type": "response.create"})
-                await wait_for_condition(
-                    lambda: (
+
+                def turn_settled() -> bool:
+                    return (
                         client.events.count("response.done") > done_before
                         or len(client.events.errors()) > errors_before
-                    ),
-                    timeout_s=180.0,
-                    label=f"Seed-TTS Realtime TTS turn {request_index} response.done",
-                )
+                    )
+
+                turn_started_at_s = time.monotonic()
+                silence_s = await client.stream_silence(seconds=silence_seconds, until=turn_settled)
+                if silence_s > _SEED_TTS_PROMPT_RESPONSE_S:
+                    logger.warning(
+                        "Seed-TTS Realtime TTS turn %d: the model took %.1fs of silence to settle its response",
+                        request_index,
+                        silence_s,
+                    )
+                try:
+                    await wait_for_condition(
+                        turn_settled,
+                        timeout_s=180.0,
+                        label=f"Seed-TTS Realtime TTS turn {request_index} response.done",
+                    )
+                except TimeoutError as exc:
+                    raise RuntimeError(
+                        _seed_tts_turn_stall_report(client.events, response_offset, request_index, silence_s)
+                    ) from exc
                 errors = client.events.errors()
                 if len(errors) > errors_before:
                     raise RuntimeError(f"Seed-TTS Realtime TTS server error: {errors[-1]}")
-                new_audio_response_ids = [
-                    response_id
-                    for response_id in client.events.response_ids[response_offset:]
-                    if client.events.audio_bytes(response_id)
-                ]
-                if len(new_audio_response_ids) != 1:
-                    raise RuntimeError(
-                        f"Seed-TTS Realtime TTS turn {request_index} expected one audio response, "
-                        f"got {len(new_audio_response_ids)}"
-                    )
-                response_id = new_audio_response_ids[0]
+                response_id = _seed_tts_turn_response_id(client.events, response_offset, request_index)
                 timing = client.events.timing_summary(
                     after_s=turn_started_at_s,
                     input_committed_at_s=turn_started_at_s,
@@ -2516,43 +2624,43 @@ async def async_request_openai_realtime_duplex(
                 )
                 turn_transcripts.append(client.events.response_text(response_id))
                 await client.acknowledge_playback()
-            request_finished_at = time.perf_counter()
-            session_metrics = summarize_session_request_metrics(
-                turn_metrics,
-                session_id=session_id,
-            )
-            await client.close_session(timeout_s=30.0)
+                await client.close_session(timeout_s=30.0)
+        request_finished_at = time.perf_counter()
+        session_metrics = summarize_session_request_metrics(
+            turn_metrics,
+            session_id=session_id,
+        )
 
-            output.generated_text = " ".join(filter(None, turn_transcripts))
-            output.ttft = float(session_metrics.get("mean_ttft_ms") or 0.0) / 1000.0
-            output.audio_ttfp = float(session_metrics.get("mean_ttfp_ms") or 0.0) / 1000.0
-            output.audio_rtf = float(session_metrics.get("mean_rtf") or 0.0)
-            output.audio_duration = (
-                sum(float(metric.get("audio_duration_ms") or 0.0) for metric in turn_metrics) / 1000.0
+        output.generated_text = " ".join(filter(None, turn_transcripts))
+        from vllm_omni.clients.duplex import metric_mean
+
+        output.ttft = (metric_mean(session_metrics.get("ttft_ms")) or 0.0) / 1000.0
+        output.audio_ttfp = (metric_mean(session_metrics.get("ttfp_ms")) or 0.0) / 1000.0
+        output.audio_rtf = metric_mean(session_metrics.get("rtf")) or 0.0
+        output.audio_duration = sum(float(metric.get("audio_duration_ms") or 0.0) for metric in turn_metrics) / 1000.0
+        output.audio_frames = int(output.audio_duration * _SEED_TTS_OUTPUT_SAMPLE_RATE_HZ)
+        output.latency = request_finished_at - output.start_time
+        output.tts_turn_pcm_bytes = turn_pcm_bytes
+        output.tts_output_pcm_bytes = b"".join(turn_pcm_bytes)
+        if bool((request_func_input.extra_body or {}).get("save_duplex_request_metrics")):
+            output.duplex_request_metrics = turn_metrics
+            output.duplex_session_metrics = session_metrics
+        output.output_tokens = sum(
+            int(stage0.get("output_token_count") or 0)
+            for timing in turn_timings
+            if isinstance((stage0 := timing.get("stage0_tokens")), dict)
+        )
+        token_timing_measured = _apply_stage0_token_timings(
+            output,
+            [timing.get("stage0_tokens") for timing in turn_timings],
+            expected_output_tokens=output.output_tokens,
+        )
+        if not token_timing_measured and output.output_tokens > 1:
+            logger.warning(
+                "Realtime TTS session %s omitted complete engine token timing; standard TPOT/ITL are unavailable",
+                session_id,
             )
-            output.audio_frames = int(output.audio_duration * client.events.output_sample_rate_hz)
-            output.latency = request_finished_at - output.start_time
-            output.tts_turn_pcm_bytes = turn_pcm_bytes
-            output.tts_output_pcm_bytes = b"".join(turn_pcm_bytes)
-            if bool((request_func_input.extra_body or {}).get("save_duplex_request_metrics")):
-                output.duplex_request_metrics = turn_metrics
-                output.duplex_session_metrics = session_metrics
-            output.output_tokens = sum(
-                int(stage0.get("output_token_count") or 0)
-                for timing in turn_timings
-                if isinstance((stage0 := timing.get("stage0_tokens")), dict)
-            )
-            token_timing_measured = _apply_stage0_token_timings(
-                output,
-                [timing.get("stage0_tokens") for timing in turn_timings],
-                expected_output_tokens=output.output_tokens,
-            )
-            if not token_timing_measured and output.output_tokens > 1:
-                logger.warning(
-                    "Realtime TTS session %s omitted complete engine token timing; standard TPOT/ITL are unavailable",
-                    session_id,
-                )
-            output.success = True
+        output.success = True
     except Exception:
         output.success = False
         output.error = traceback.format_exc()
@@ -2926,7 +3034,7 @@ async def benchmark(
 
         def measured_ttft(output: RequestFuncOutput) -> float | None:
             session_metrics = getattr(output, "duplex_session_metrics", None)
-            if isinstance(session_metrics, dict) and session_metrics.get("mean_ttft_ms") is None:
+            if isinstance(session_metrics, dict) and session_metrics.get("ttft_ms") is None:
                 return None
             return output.ttft
 
@@ -2970,6 +3078,14 @@ async def benchmark(
             "max_concurrent_requests": metrics.max_concurrent_requests,
             "rtfx": metrics.rtfx,
         }
+        for sample_count in (
+            "num_ttft_samples",
+            "num_tpot_samples",
+            "num_itl_samples",
+            "num_audio_ttfp_samples",
+            "num_audio_rtf_samples",
+        ):
+            result[sample_count] = getattr(metrics, sample_count)
     else:
         result = {
             "duration": benchmark_duration,
@@ -2998,6 +3114,24 @@ async def benchmark(
     ]
     if duplex_session_metrics:
         result["duplex_session_metrics"] = duplex_session_metrics
+        from vllm_omni.clients.duplex import distribution_summary
+
+        for session_key, result_key, digits in (
+            ("stream_ttft_ms", "duplex_stream_ttft_ms", 3),
+            ("stream_ttfp_ms", "duplex_stream_ttfp_ms", 3),
+            ("stream_rtf", "duplex_stream_rtf", 6),
+        ):
+            values = [
+                float(value)
+                for metric in duplex_session_metrics
+                if isinstance((value := metric.get(session_key)), int | float)
+                and not isinstance(value, bool)
+                and np.isfinite(value)
+                and value >= 0
+            ]
+            summary = distribution_summary(values, digits=digits)
+            if summary is not None:
+                result[result_key] = summary
     if omniinteract_summary is not None:
         result["omniinteract"] = omniinteract_summary
 

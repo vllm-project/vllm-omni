@@ -54,6 +54,9 @@ def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
 
+        from vllm_omni.model_executor.models.breeze_tts_2.configuration_breeze_tts_2 import (
+            BreezeTTS2Config,
+        )
         from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
             IndexTTS2Config,
             IndexTTS25Config,
@@ -105,6 +108,7 @@ def _register_omni_hf_configs() -> None:
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
         ("voxcpm2", VoxCPM2Config),
+        ("breeze", BreezeTTS2Config),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)
@@ -177,9 +181,9 @@ class OmniEngineArgs(EngineArgs):
             (e.g. ["text", "audio"]). If None, all modalities supported by
             the model are used.
         log_stats: Whether to log engine statistics. Defaults to False.
-        custom_pipeline_args: Dictionary of arguments for custom pipeline
-            initialization (e.g., ``{"pipeline_class": "my.Module"}``).
-            Passed through to the diffusion stage engine.
+        custom_pipeline_args: Dictionary of arguments passed through to the
+            diffusion pipeline. When it contains ``pipeline_class``, it triggers
+            custom pipeline initialization.
     """
 
     stage_id: int = 0
