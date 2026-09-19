@@ -146,15 +146,24 @@ class _OmniConnectorRuntimeMixin:
         self,
         model_config: OmniModelConfig,
         kv_transfer_manager: OmniKVTransferManager | None = None,
+        *,
+        synchronous: bool = False,
     ) -> None:
         """Initialize connectors and background threads.
 
         Args:
             model_config: Stage-level model config with connector settings.
             kv_transfer_manager: Existing KV transfer manager to delegate to.
+            synchronous: Borrow the manager's lazy connector without background
+                threads or changes to its KV callbacks. The manager retains ownership.
         """
+        self._synchronous_payload_transport = synchronous
+        if synchronous and kv_transfer_manager is None:
+            raise ValueError("Synchronous payload transport requires a KV transfer manager")
         self._omni_connector: OmniConnectorBase | None = (
-            self._create_connector(model_config) if _should_create_payload_connector(model_config) else None
+            self._create_connector(model_config)
+            if not synchronous and _should_create_payload_connector(model_config)
+            else None
         )
         self._kv_transfer_manager = kv_transfer_manager
 
@@ -165,7 +174,9 @@ class _OmniConnectorRuntimeMixin:
             stage_id = int(stage_id)
         self._stage_id: int = stage_id if isinstance(stage_id, int) else 0
 
-        self._custom_process_func_path, self._custom_process_func = self._load_custom_func(model_config)
+        self._custom_process_func_path, self._custom_process_func = (
+            (None, None) if synchronous else self._load_custom_func(model_config)
+        )
         self._custom_process_supports_is_finished = self._custom_process_supports_is_finished_kwarg()
         logger.debug(
             "[Stage-%s] init_omni_connectors: async_chunk=%s, custom_process_func=%s, connector=%s, func_path=%s",
@@ -201,7 +212,7 @@ class _OmniConnectorRuntimeMixin:
         self._from_tp: int = rank_cfg["from_tp"]
         self._to_tp: int = rank_cfg["to_tp"]
         self._local_rank: int = rank_cfg["local_rank"]
-        if self._kv_transfer_manager is not None:
+        if self._kv_transfer_manager is not None and not synchronous:
             self._kv_transfer_manager.kv_send_key_builder = self.get_rank_aware_kv_send_keys
             self._kv_transfer_manager.kv_recv_key_builder = self.get_rank_aware_kv_keys
             self._kv_transfer_manager.kv_payload_merger = self._merge_rank_sharded_kv_payloads
@@ -299,6 +310,8 @@ class _OmniConnectorRuntimeMixin:
 
     def shutdown_omni_connectors(self) -> None:
         """Stop background threads and release connector resources."""
+        if getattr(self, "_synchronous_payload_transport", False):
+            return
         self._stop_event.set()
         if self._recv_thread is not None:
             self._recv_thread.join(timeout=5)
@@ -1053,15 +1066,14 @@ class _OmniConnectorRuntimeMixin:
     def is_data_transfer_rank(self) -> bool:
         """Whether this rank should participate in data (non-KV) transfer.
 
-        Ordinary stage payloads are TP-identical, so exactly one TP rank
-        should talk to the connector. When TP is initialized, use TP rank 0
-        so the connector leader matches TP-local broadcast source rank.
+        Ordinary stage payloads are identical across the configured payload
+        groups. Only the rank leading every group talks to the connector.
         Otherwise fall back to LOCAL_RANK==0 for the single-rank case.
         """
-        tp_group = self._get_local_tp_group()
-        if tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
-            return getattr(tp_group, "rank_in_group", 0) == 0
-        return self._local_rank == 0
+        groups = self._stage_payload_broadcast_groups()
+        if groups:
+            return all(getattr(group, "rank_in_group", 0) == 0 for group in groups)
+        return getattr(self, "_local_rank", 0) == 0
 
     def get_kv_connector_key(
         self,

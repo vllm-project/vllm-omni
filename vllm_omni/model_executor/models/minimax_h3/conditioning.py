@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""MiniMax H3 text-conditioning contract."""
+"""MiniMax H3 validated text and unified encoder-conditioning contracts."""
 
 from __future__ import annotations
 

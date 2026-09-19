@@ -10,7 +10,15 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.minimax_h3.conditioning import MiniMaxH3EncoderMediaInput
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+def _media(**kwargs):
+    return MiniMaxH3EncoderMediaInput(
+        task="ref2va", height=768, width=1344, num_frames=124, latent_t=37, audio_t=207, **kwargs
+    )
 
 
 def test_h3_full_pipeline_profiler_includes_local_encoding():
@@ -28,6 +36,9 @@ def test_h3_full_pipeline_profiler_includes_local_encoding():
         "denoise_step",
         "post_decode",
     ]
+    assert "_encode_video_conditions" not in targets
+    assert "_encode_video_audio_conditions" not in targets
+    assert "_encode_audio_conditions" not in targets
 
 
 def test_decoded_output_is_unchanged_without_active_model_offload():
@@ -312,46 +323,6 @@ def test_h3_model_cpu_offload_registers_direct_vae_stages(monkeypatch, load_text
     remove_offload.assert_called_once_with([*dits, *stages])
 
 
-@pytest.mark.parametrize("decode_fails", [False, True])
-def test_h3_model_cpu_offload_scopes_direct_vae_call(monkeypatch, decode_fails):
-    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
-    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
-
-    pipeline = object.__new__(MiniMaxH3Pipeline)
-    torch.nn.Module.__init__(pipeline)
-    component = torch.nn.Linear(2, 2)
-    events: list[tuple[Any, ...]] = []
-
-    @contextmanager
-    def record_component(value):
-        events.append(("activate", value))
-        try:
-            yield
-        finally:
-            events.append(("offload", value))
-
-    monkeypatch.setattr(module, "sequential_offload_component", record_component)
-    pipeline._model_cpu_offload_modules = [component]
-
-    def decode():
-        with pipeline._component_on_device(component):
-            events.append(("decode", component))
-            if decode_fails:
-                raise RuntimeError("decode failed")
-
-    if decode_fails:
-        with pytest.raises(RuntimeError, match="decode failed"):
-            decode()
-    else:
-        decode()
-
-    assert events == [
-        ("activate", component),
-        ("decode", component),
-        ("offload", component),
-    ]
-
-
 def test_h3_model_cpu_offload_keeps_unselected_vaes_resident(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
@@ -410,6 +381,46 @@ def test_h3_model_cpu_offload_rejects_unloaded_selected_encoder(monkeypatch):
         )
 
     apply_offload.assert_not_called()
+
+
+@pytest.mark.parametrize("decode_fails", [False, True])
+def test_h3_model_cpu_offload_scopes_direct_vae_call(monkeypatch, decode_fails):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    component = torch.nn.Linear(2, 2)
+    events: list[tuple[Any, ...]] = []
+
+    @contextmanager
+    def record_component(value):
+        events.append(("activate", value))
+        try:
+            yield
+        finally:
+            events.append(("offload", value))
+
+    monkeypatch.setattr(module, "sequential_offload_component", record_component)
+    pipeline._model_cpu_offload_modules = [component]
+
+    def decode():
+        with pipeline._component_on_device(component):
+            events.append(("decode", component))
+            if decode_fails:
+                raise RuntimeError("decode failed")
+
+    if decode_fails:
+        with pytest.raises(RuntimeError, match="decode failed"):
+            decode()
+    else:
+        decode()
+
+    assert events == [
+        ("activate", component),
+        ("decode", component),
+        ("offload", component),
+    ]
 
 
 def _encode_media(pipeline, **kwargs):

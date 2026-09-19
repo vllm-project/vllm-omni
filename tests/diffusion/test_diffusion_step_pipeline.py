@@ -512,7 +512,8 @@ def test_input_batch_cached_repack_keeps_static_prompt_fields_for_same_compositi
 
 
 @pytest.mark.cpu
-def test_step_profiler_reports_denoise_step_as_diffuse():
+def test_step_profiler_reports_denoise_step_as_diffuse(monkeypatch):
+    monkeypatch.setattr(current_omni_platform, "synchronize", lambda: None)
     pipeline = _AutoDenoiseProfilerPipeline()
 
     assert pipeline.denoise_step() == "ok"
@@ -524,6 +525,13 @@ def test_step_profiler_reports_denoise_step_as_diffuse():
 @pytest.mark.cpu
 class TestRunner:
     """DiffusionModelRunner.execute_stepwise"""
+
+    @pytest.fixture(autouse=True)
+    def mock_platform_memory(self, monkeypatch):
+        monkeypatch.setattr(model_runner_module.current_omni_platform, "is_available", lambda: True)
+        monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
+        monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+        monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
 
     @pytest.mark.parametrize(
         ("diffusion_kv_mode", "should_cleanup"),

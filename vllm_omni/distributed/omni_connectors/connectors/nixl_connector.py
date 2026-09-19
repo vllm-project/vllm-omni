@@ -91,6 +91,8 @@ class NixlConnector(OmniConnectorBase):
         self._pending: dict[str, _PendingPayload] = {}
         self._published: dict[str, dict[str, Any]] = {}
         self._state_lock = threading.RLock()
+        self._close_lock = threading.Lock()
+        self._close_thread: threading.Thread | None = None
         self._remote_agents: list[str] = []
         self._metrics: dict[str, int] = {
             "puts": 0,
@@ -474,11 +476,27 @@ class NixlConnector(OmniConnectorBase):
             return self._pending.pop(request_id)
 
     def close(self) -> None:
+        with self._close_lock:
+            self._close_once()
+            if not self._closed and self._close_thread is None:
+                self._close_thread = threading.Thread(
+                    target=self._finish_close_in_background, name="nixl-close", daemon=True
+                )
+                self._close_thread.start()
+
+    def _finish_close_in_background(self) -> None:
+        retry = threading.Event()
+        while not retry.wait(max(self._poll_interval_s, 0.1)):
+            with self._close_lock:
+                self._close_once()
+                if self._closed:
+                    return
+
+    def _close_once(self) -> None:
         if self._closed:
             return
         self._closed = True
-        # Stop accepting puts/gets, but keep serving completion ACKs for outstanding
-        # remote READs. A later close() call can finish teardown once drained.
+        # Keep completion ACKs available until the automatic closer drains ownership.
         for request_id in list(self._pending):
             self.cleanup(request_id)
         with self._state_lock:
@@ -486,25 +504,33 @@ class NixlConnector(OmniConnectorBase):
                 _RETAINED_PRODUCERS.add(self)
                 self._closed = False
                 self._closing = True
-                logger.warning("NIXL close deferred: remote READ claims still own source allocations")
+                if self._close_thread is None:
+                    logger.warning("NIXL close deferred: remote READ claims still own source allocations")
                 return
         _RETAINED_PRODUCERS.discard(self)
         self._stop_event.set()
         self._lease_wakeup.set()
         self._transfer_wakeup.set()
-        if self._listener_thread is not None:
-            self._listener_thread.join(timeout=5.0)
-            self._listener_thread = None
-        if self._lease_thread is not None:
-            self._lease_thread.join(timeout=5.0)
-            self._lease_thread = None
-        if self._transfer_thread is not None:
-            self._transfer_thread.join(timeout=5.0)
-            self._transfer_thread = None
-        while self._deferred_transfers:
-            self._reap_deferred_transfers()
-            if self._deferred_transfers:
-                time.sleep(max(self._poll_interval_s, 0.01))
+        for thread_name in ("_listener_thread", "_lease_thread", "_transfer_thread"):
+            thread = getattr(self, thread_name)
+            if thread is None:
+                continue
+            if thread is not threading.current_thread():
+                thread.join(timeout=5.0)
+            if thread.is_alive():
+                _RETAINED_PRODUCERS.add(self)
+                self._closed = False
+                self._closing = True
+                return
+            setattr(self, thread_name, None)
+        self._reap_deferred_transfers()
+        if self._deferred_transfers:
+            _RETAINED_PRODUCERS.add(self)
+            self._closed = False
+            self._closing = True
+            if self._close_thread is None:
+                logger.warning("NIXL close deferred: local DMA resources retained for automatic cleanup")
+            return
         if self._zmq_ctx is not None:
             # destroy() rather than term(): REQ sockets live in thread-local
             # caches this thread cannot reach, and term() blocks until every
@@ -525,7 +551,7 @@ class NixlConnector(OmniConnectorBase):
 
     def health(self) -> dict[str, Any]:
         return {
-            "status": "unhealthy" if self._closed else "healthy",
+            "status": "unhealthy" if self._closed or getattr(self, "_closing", False) else "healthy",
             "pending_requests": len(self._pending),
             **self._metrics,
         }
@@ -599,10 +625,17 @@ class NixlConnector(OmniConnectorBase):
 
         Each call performs one bounded query so a missing key cannot starve
         other requests in the shared receive loop. The caller retries later.
+        Retries after a lost reply reuse ownership until metadata is received.
         """
         zmq_addr = f"tcp://{host}:{port}"
+        claims = getattr(self._req_local, "claims", None)
+        if claims is None:
+            claims = {}
+            self._req_local.claims = claims
+        query_key = (zmq_addr, get_key, generation)
+        claim_id = claims.setdefault(query_key, uuid.uuid4().hex)
         request = _GET_META_MSG + msgspec.msgpack.encode(
-            {"key": get_key, "generation": generation, "claim_id": uuid.uuid4().hex}
+            {"key": get_key, "generation": generation, "claim_id": claim_id}
         )
         sock = self._get_req_socket(zmq_addr, self._metadata_query_timeout_ms)
         try:
@@ -613,8 +646,11 @@ class NixlConnector(OmniConnectorBase):
             logger.debug("NixlConnector handshake query to %s failed for %s", zmq_addr, get_key, exc_info=True)
             return None
         if reply == _META_NOT_FOUND:
+            claims.pop(query_key, None)
             return None
-        return msgspec.msgpack.decode(reply)
+        metadata = msgspec.msgpack.decode(reply)
+        claims.pop(query_key, None)
+        return metadata
 
     def _notify_transfer_done(self, get_key: str, metadata: dict[str, Any]) -> None:
         """Tell the producer its buffer is drained so it can deregister now.
