@@ -243,6 +243,7 @@ datasets/
 *.csv
 *.json
 !recipes/cosmos3/negative_prompt.json
+!benchmarks/mammoth_moda2/reference_results.json
 !tests/dfx/perf/tests/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
 *.jsonl
