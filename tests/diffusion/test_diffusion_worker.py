@@ -13,6 +13,7 @@ import pytest
 import torch
 from pytest_mock import MockerFixture
 
+from vllm_omni.diffusion.cache.prompt_embed_cache import PromptEmbedCache
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.gpu]
@@ -67,6 +68,48 @@ class TestDiffusionWorkerSleep:
         self.mock_allocator_class.get_instance.return_value = self.mock_allocator
         self.mock_allocator.get_current_usage.return_value = 4 * 1024**3
         self.mock_allocator.sleep = mocker.Mock()
+
+    @pytest.mark.parametrize("level", [1, 2])
+    def test_sleep_clears_prompt_embed_cache_before_allocator(self, mocker, mock_gpu_worker, level):
+        events = []
+        prompt_cache = PromptEmbedCache(max_size=1)
+        prompt_cache.put("prompt-key", torch.ones(1))
+        mock_platform = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform")
+        mock_platform.get_free_memory.side_effect = [10 * 1024**3, 12 * 1024**3]
+        mock_platform.get_device_total_memory.return_value = 80 * 1024**3
+        mock_gpu_worker.model_runner.pipeline.named_buffers.return_value = []
+
+        def clear_prompt_embed_cache():
+            prompt_cache.clear()
+            events.append("clear")
+
+        mock_gpu_worker.model_runner.clear_prompt_embed_cache.side_effect = clear_prompt_embed_cache
+        self.mock_allocator.sleep.side_effect = lambda **_: events.append("sleep")
+
+        mock_gpu_worker.sleep(level=level)
+
+        assert events == ["clear", "sleep"]
+        assert prompt_cache.stats()["size"] == 0
+
+    def test_sleep_accepts_model_runner_without_prompt_cache_hook(self, mocker, mock_gpu_worker):
+        mock_platform = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform")
+        mock_platform.get_free_memory.side_effect = [10 * 1024**3, 12 * 1024**3]
+        mock_platform.get_device_total_memory.return_value = 80 * 1024**3
+        mock_gpu_worker.model_runner = object()
+
+        mock_gpu_worker.sleep(level=1)
+
+        self.mock_allocator.sleep.assert_called_once_with(offload_tags=("weights",))
+
+    @pytest.mark.parametrize("level", [1, 2])
+    def test_sleep_does_not_enter_allocator_if_prompt_cache_clear_fails(self, mock_gpu_worker, level):
+        mock_gpu_worker.model_runner.clear_prompt_embed_cache.side_effect = RuntimeError("clear failed")
+
+        with pytest.raises(RuntimeError, match="clear failed"):
+            mock_gpu_worker.sleep(level=level)
+
+        self.mock_allocator.sleep.assert_not_called()
+        mock_gpu_worker.model_runner.release_captured_graphs.assert_not_called()
 
     def test_sleep_level_1(self, mocker: MockerFixture, mock_gpu_worker):
         """Test sleep mode level 1 (offload weights only)."""
