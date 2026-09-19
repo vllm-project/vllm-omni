@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import json
 import os
 import re
@@ -10,9 +13,6 @@ from typing import Any
 import pytest
 
 from tests.helpers.mark import get_hardware_mark_list, hardware_marks
-from tests.helpers.runtime import OmniServerParams
-from tests.helpers.stage_config import modify_stage_config
-from vllm_omni.platforms import current_omni_platform
 
 
 def _named_pytest_marks(names: list[str]) -> list[pytest.MarkDecorator]:
@@ -203,6 +203,8 @@ def modify_stage(default_path: str, updates: dict[str, Any] | None, deletes: dic
     if deletes is not None:
         kwargs["deletes"] = deletes
     if kwargs:
+        from tests.helpers.stage_config import modify_stage_config
+
         return modify_stage_config(default_path, **kwargs)
     return default_path
 
@@ -288,6 +290,8 @@ def _create_unique_server_params(
 
 def configs_with_platform_stage_configs(configs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Resolve stage config for XPU vs CUDA/ROCm."""
+    from vllm_omni.platforms import current_omni_platform
+
     out: list[dict[str, Any]] = []
     for config in configs:
         config_copy = json.loads(json.dumps(config))
@@ -307,9 +311,9 @@ def extract_server_args_by_test_name(configs: list[dict[str, Any]]) -> dict[str,
     return mapping
 
 
-def create_reliability_omni_server_params(
-    configs: list[dict[str, Any]], stage_configs_dir: Path
-) -> list[OmniServerParams]:
+def create_reliability_omni_server_params(configs: list[dict[str, Any]], stage_configs_dir: Path) -> list[Any]:
+    from tests.helpers.runtime import OmniServerParams
+
     adjusted_configs = configs_with_platform_stage_configs(configs)
     unique_params = _create_unique_server_params(adjusted_configs, stage_configs_dir)
     server_args_by_name = extract_server_args_by_test_name(adjusted_configs)
@@ -497,6 +501,8 @@ def _normalize_runtime_device_label(raw: str) -> str:
 
 def _read_runtime_device_name(*, device_id: int = 0) -> str | None:
     """Device name from the active Omni platform."""
+    from vllm_omni.platforms import current_omni_platform
+
     if current_omni_platform.device_count() <= device_id:
         return None
     get_name = getattr(current_omni_platform, "get_device_name", None)
