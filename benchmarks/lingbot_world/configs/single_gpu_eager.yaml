@@ -1,0 +1,45 @@
+# Benchmark deploy config: LingBot-World 2.0 on one GPU, eager.
+#
+# This is the portable smoke configuration -- it matches the shipped
+# vllm_omni/deploy/lingbot_world_v2_stepwise.yaml so a number measured here is
+# comparable to the default deployment. It is NOT a realtime configuration: one
+# GPU runs all five forwards of every AR block serially and nothing is compiled,
+# so expect a chunk interval several times the real-time deadline.
+#
+# Use configs/usp4_compiled.yaml for the realtime topology.
+#
+#   vllm serve robbyant/lingbot-world-v2-14b-causal-fast-diffusers \
+#     --omni --deploy-config benchmarks/lingbot_world/configs/single_gpu_eager.yaml \
+#     --port 8000
+
+pipeline: lingbot_world
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    # AR-Diffusion binds one session per runner invocation; the runner rejects
+    # anything larger.
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: LingBotWorldCausalDMDPipeline
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    step_execution: true
+    streaming_output: true
+    default_sampling_params:
+      # The causal-fast checkpoint pins a four-step DMD schedule; this sizes the
+      # step budget before the pipeline is reached.
+      num_inference_steps: 4
+      output_type: pil
+      extra_args:
+        flow_shift: 5.0
+    model_config:
+      # The AR cache geometry is fixed at load time, so a benchmark request must
+      # ask for exactly this resolution.
+      ar_diffusion_height: 480
+      ar_diffusion_width: 832
+      ar_diffusion_kv_config:
+        gpu_memory_fraction: 0.6
+        warmup_cudagraph: true
