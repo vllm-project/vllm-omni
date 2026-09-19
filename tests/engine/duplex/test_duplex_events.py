@@ -33,7 +33,9 @@ from vllm_omni.engine.duplex.events import (
     SessionReplaced,
     SessionResumed,
     SessionResyncRequired,
+    Speak,
     TextDelta,
+    TranscriptDelta,
     TranscriptDone,
     TurnEvent,
     error_event,
@@ -117,6 +119,18 @@ def test_optional_wire_fields_are_omitted_when_none():
     assert delta["format"] == "pcm16"
     assert delta["output_index"] == 0
     assert delta["content_index"] == 0
+
+    transcript = TranscriptDelta(response_id="resp_1", item_id="item_resp_1", delta="hi").to_realtime()
+    assert "metadata" not in transcript
+    assert (
+        TranscriptDelta(
+            response_id="resp_1",
+            item_id="item_resp_1",
+            delta="hi",
+            metadata={"vllm_omni": {"response_request_metrics": {"ttft_ms": 200.0}}},
+        ).to_realtime()["metadata"]["vllm_omni"]["response_request_metrics"]["ttft_ms"]
+        == 200.0
+    )
 
     anonymous_listen = Listen(session_id="sid", epoch=0, details={"reason": "silence"}).to_realtime()
     assert "response_id" not in anonymous_listen
@@ -411,3 +425,87 @@ def test_projection_leaves_error_to_typed_emit_sites():
     assert isinstance(projected[0], DuplexRawEvent)
     assert projected[0].type == "duplex.error"
     assert projected[0].to_realtime()["event"]["code"] == "bad_event"
+
+
+def test_response_speak_projection_keeps_vllm_omni_request_metrics():
+    state = RealtimeProjectionState(session_id="duplex-proj", model="test-model")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+    metrics = {
+        "source": "server_monotonic_request_start",
+        "ttft_ms": 200.0,
+        "measurement_origin": {"ttft": "text", "ttfp": "audio"},
+    }
+
+    events = project_internal_event(
+        state,
+        {
+            "type": "response.speak",
+            "response_id": "resp_1",
+            "session_id": "duplex-proj",
+            "epoch": 0,
+            "model_speak": True,
+            "vllm_omni": {"response_request_metrics": metrics},
+        },
+    )
+
+    assert _types(events) == ["response.speak"]
+    assert isinstance(events[0], Speak)
+    assert events[0].to_realtime()["metadata"]["vllm_omni"]["response_request_metrics"]["ttft_ms"] == 200.0
+
+
+def test_text_then_audio_projects_ttft_on_transcript_and_ttfp_on_audio_delta():
+    state = RealtimeProjectionState(session_id="duplex-proj", model="test-model")
+    project_internal_event(
+        state, {"type": "response.created", "response_id": "resp_1", "modalities": ["audio", "text"]}
+    )
+    ttft = {
+        "source": "server_monotonic_request_start",
+        "ttft_ms": 200.0,
+        "measurement_origin": {"ttft": "text", "ttfp": "audio"},
+    }
+
+    text_only = project_internal_event(
+        state,
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "resp_1",
+            "audio": "",
+            "text": "hi",
+            "session_id": "duplex-proj",
+            "epoch": 0,
+            "model_speak": True,
+            "vllm_omni": {"response_request_metrics": ttft},
+        },
+    )
+
+    assert _types(text_only) == ["response.output_audio_transcript.delta"]
+    assert isinstance(text_only[0], TranscriptDelta)
+    text_metrics = text_only[0].to_realtime()["metadata"]["vllm_omni"]["response_request_metrics"]
+    assert text_metrics["ttft_ms"] == 200.0
+    assert "ttfp_ms" not in text_metrics
+
+    pcm = base64.b64encode(b"\x00\x10" * 8).decode("ascii")
+    ttfp = {
+        "source": "server_monotonic_request_start",
+        "ttft_ms": 200.0,
+        "ttfp_ms": 400.0,
+        "measurement_origin": {"ttft": "text", "ttfp": "audio"},
+    }
+    audio = project_internal_event(
+        state,
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "resp_1",
+            "audio": pcm,
+            "text": "",
+            "format": "pcm16",
+            "vllm_omni": {"response_request_metrics": ttfp},
+        },
+    )
+
+    assert "response.output_audio.delta" in _types(audio)
+    audio_delta = next(event for event in audio if event.type == "response.output_audio.delta")
+    assert isinstance(audio_delta, AudioDelta)
+    audio_metrics = audio_delta.to_realtime()["metadata"]["vllm_omni"]["response_request_metrics"]
+    assert audio_metrics["ttft_ms"] == 200.0
+    assert audio_metrics["ttfp_ms"] == 400.0

@@ -43,6 +43,8 @@ from vllm_omni.engine.duplex.session.lease import (
     DuplexLeaseConfig,
     DuplexLeaseState,
 )
+from vllm_omni.metrics import definitions as metric_defs
+from vllm_omni.metrics.stats import DUPLEX_STAGE_TABLE_EXCLUDE, OrchestratorAggregator, StageRequestStats
 
 if TYPE_CHECKING:
     from vllm_omni.engine.duplex.plugin import DuplexModelSessionState
@@ -89,6 +91,70 @@ def _copy_list(value: object) -> list[object] | None:
     return [item for item in value]
 
 
+def _as_float(value: object, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int | float):
+        return float(value)
+    return default
+
+
+def _as_float_list(value: object) -> list[float]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, int | float) and not isinstance(item, bool)]
+
+
+def _apply_merged_stage_stats(template: StageRequestStats, merged: dict[str, object]) -> StageRequestStats:
+    """Write one ``_merge_stage_metric_event`` snapshot back onto a stats row."""
+    stats = copy.copy(template)
+    stats.stage_id = _as_int(merged.get("stage_id"), default=template.stage_id or 0)
+    stats.final_output_type = (
+        str(merged["final_output_type"])
+        if isinstance(merged.get("final_output_type"), str)
+        else template.final_output_type
+    )
+    stats.finish_reason = str(merged["finish_reason"]) if isinstance(merged.get("finish_reason"), str) else None
+    stats.num_tokens_in = _as_int(merged.get(metric_defs.NUM_TOKENS_IN))
+    stats.num_tokens_out = _as_int(merged.get(metric_defs.NUM_TOKENS_OUT))
+    stats.stage_gen_time_ms = _as_float(merged.get(metric_defs.STAGE_GEN_TIME_MS))
+    stats.postprocess_time_ms = _as_float(merged.get(metric_defs.POSTPROCESS_TIME_MS))
+    stats.audio_generated_frames = _as_int(merged.get(metric_defs.AUDIO_FRAMES))
+    stats.audio_sample_rate = _as_int(merged.get(metric_defs.AUDIO_SAMPLE_RATE))
+    stats.audio_duration_s = _as_float(merged.get(f"{metric_defs.AUDIO_DURATION}_s"))
+    stats.image_pixels = _as_int(merged.get(metric_defs.IMAGE_PIXELS))
+    stats.denoise_step_latency_ms = _as_float(merged.get(metric_defs.DENOISE_STEP_LATENCY_MS))
+    stats.output_unit_type = (
+        str(merged["output_unit_type"])
+        if isinstance(merged.get("output_unit_type"), str)
+        else template.output_unit_type
+    )
+    stats.output_unit_count = _as_int(merged.get(metric_defs.OUTPUT_UNIT_COUNT))
+    stats.serving_time_to_first_output_ms = _as_float(merged.get(metric_defs.SERVING_TIME_TO_FIRST_OUTPUT_MS))
+    stats.image_time_to_first_output_ms = _as_float(merged.get(metric_defs.IMAGE_TIME_TO_FIRST_OUTPUT_MS))
+    stats.time_per_output_unit_ms = _as_float(merged.get(metric_defs.TIME_PER_OUTPUT_UNIT_MS))
+    stats.inter_output_latencies_ms = _as_float_list(merged.get(metric_defs.INTER_OUTPUT_LATENCIES_MS))
+    stats.inter_output_latency_ms = _as_float(merged.get(metric_defs.INTER_OUTPUT_LATENCY_MS))
+    stats.vllm_ttft_ms = _as_float(merged.get(metric_defs.VLLM_TTFT_MS))
+    stats.vllm_tpot_ms = _as_float(merged.get(metric_defs.VLLM_TPOT_MS))
+    stats.vllm_itls_ms = _as_float_list(merged.get(metric_defs.VLLM_ITLS_MS))
+    stats.vllm_itl_ms = _as_float(merged.get(metric_defs.VLLM_ITL_MS))
+    return stats
+
+
+def _one_row_per_stage(events: list[StageRequestStats]) -> list[StageRequestStats]:
+    """Fold chunk snapshots so the logger table has one column per stage."""
+    merged_by_stage: dict[int, dict[str, object]] = {}
+    templates: dict[int, StageRequestStats] = {}
+    for evt in events:
+        if evt.stage_id is None:
+            continue
+        sid = int(evt.stage_id)
+        templates.setdefault(sid, evt)
+        merged_by_stage[sid] = OrchestratorAggregator._merge_stage_metric_event(merged_by_stage.get(sid), evt)
+    return [_apply_merged_stage_stats(templates[sid], merged_by_stage[sid]) for sid in sorted(merged_by_stage)]
+
+
 @dataclass
 class InputBufferState:
     commit_seq: int = 0
@@ -113,6 +179,22 @@ class ResponseState:
     stage_metrics: dict[str, dict[str, object]] = field(default_factory=dict)
     stage_metric_tpot_weighted_ms: dict[str, float] = field(default_factory=dict)
     stage_metric_tpot_weight: dict[str, int] = field(default_factory=dict)
+    request_started_at_s_by_turn: dict[int, float] = field(default_factory=dict)
+    active_response_request_started_at_s: float | None = None
+    active_response_ttft_ms: float | None = None
+    active_response_ttfp_ms: float | None = None
+
+
+RESPONSE_REQUEST_MEASUREMENT_ORIGIN: dict[str, str] = {
+    "ttft": (
+        "accepted native-append start to first non-empty text output; "
+        "pending turns keep the latest append before first output, so overlapping user speech shortens TTFT"
+    ),
+    "ttfp": (
+        "accepted native-append start to first audio output; "
+        "pending turns keep the latest append before first output, so overlapping user speech shortens TTFP"
+    ),
+}
 
 
 @dataclass
@@ -214,6 +296,14 @@ class DuplexEngineSession:
     model_state: DuplexModelSessionState | None = field(default=None, repr=False)
     projector: RealtimeProjectionState | None = field(default=None, repr=False)
     created_monotonic: float = field(default_factory=time.monotonic)
+    #: Pipeline width for the per-response ``OrchestratorAggregator`` table.
+    num_stages: int = 1
+    #: Same serve ``log_stats`` gate as HTTP ``build_and_log_summary``.
+    log_stats: bool = False
+    _response_aggregator: OrchestratorAggregator | None = field(default=None, repr=False)
+    #: ``StageRequestStats`` that arrived before ``begin_response`` (stage 0
+    #: feeding TTS). Replayed onto the aggregator when the response opens.
+    _pending_stage_request_stats: list[tuple[int, StageRequestStats]] = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
         if self.accepted_fence is None:
@@ -675,6 +765,11 @@ class DuplexEngineSession:
     def complete_model_turn(self, turn_id: int) -> None:
         """Advance the model-owned output identity after its terminal signal."""
         completed_turn_id = int(turn_id)
+        self._response.request_started_at_s_by_turn = {
+            pending_turn_id: started_at_s
+            for pending_turn_id, started_at_s in self._response.request_started_at_s_by_turn.items()
+            if pending_turn_id > completed_turn_id
+        }
         if completed_turn_id >= self.turn_id:
             self.turn_id = completed_turn_id + 1
             self.sync_fence()
@@ -708,10 +803,17 @@ class DuplexEngineSession:
         self._response.pending_options = None
 
     def begin_response(self, *, turn_id: int | None = None) -> str:
+        if self._response_aggregator is not None:
+            self._log_response_aggregator()
         self._activate_response_options()
         response_id = f"resp-{self.session_id}-{self.epoch}-{uuid4().hex[:8]}"
         self._response.active_response_id = response_id
         self._response.active_response_turn_id = self.turn_id if turn_id is None else int(turn_id)
+        self._clear_response_request_timing()
+        self._response.active_response_request_started_at_s = self._response.request_started_at_s_by_turn.pop(
+            self._response.active_response_turn_id,
+            None,
+        )
         self._response.active_response_input_commit_seq = self.input_commit_seq
         self._response.active_response_awaits_input_commit = self.turn_state == DuplexTurnState.USER_SPEAKING
         self._response.last_response_id = response_id
@@ -723,12 +825,119 @@ class DuplexEngineSession:
         self._playback.current = DuplexPlaybackCursor()
         self._playback.by_response[response_id] = self._playback.current
         self.turn_state = DuplexTurnState.ASSISTANT_GENERATING
+        self._start_response_aggregator()
         return response_id
 
     def _clear_response_metrics(self) -> None:
         self._response.stage_metrics.clear()
         self._response.stage_metric_tpot_weighted_ms.clear()
         self._response.stage_metric_tpot_weight.clear()
+
+    def _new_response_aggregator(self) -> OrchestratorAggregator:
+        num_stages = max(int(self.num_stages), 1)
+        return OrchestratorAggregator(
+            num_stages=num_stages,
+            log_stats=True,
+            wall_start_ts=time.time(),
+            final_stage_id_for_e2e=num_stages - 1,
+            stage_table_exclude=DUPLEX_STAGE_TABLE_EXCLUDE,
+        )
+
+    def _start_response_aggregator(self) -> None:
+        if not self.log_stats:
+            self._pending_stage_request_stats.clear()
+            return
+        self._response_aggregator = self._new_response_aggregator()
+        pending, self._pending_stage_request_stats = self._pending_stage_request_stats, []
+        for stage_id, stats in pending:
+            self._record_stage_request_stats(stage_id, stats)
+
+    def _record_stage_request_stats(self, stage_id: int, metrics: StageRequestStats) -> None:
+        aggregator = self._response_aggregator
+        request_id = self.active_response_id
+        if aggregator is None or request_id is None:
+            return
+        if stage_id < 0 or stage_id >= aggregator.num_stages:
+            return
+        aggregator.on_stage_metrics(stage_id, request_id, metrics, metrics.final_output_type)
+
+    def observe_stage_request_stats(self, stage_id: int, metrics: StageRequestStats) -> None:
+        """Feed one engine ``StageRequestStats`` into the response's logger table."""
+        if not self.log_stats:
+            return
+        event = copy.copy(metrics)
+        if event.stage_id is None:
+            event.stage_id = stage_id
+        if self.active_response_id is None:
+            self._pending_stage_request_stats.append((int(stage_id), event))
+            return
+        if self._response_aggregator is None:
+            self._start_response_aggregator()
+        self._record_stage_request_stats(int(stage_id), event)
+
+    def _log_response_aggregator(self) -> None:
+        aggregator = self._response_aggregator
+        self._response_aggregator = None
+        self._pending_stage_request_stats.clear()
+        if aggregator is None:
+            return
+        response_id = self._response.active_response_id
+        if response_id is not None and str(response_id) not in aggregator.e2e_done:
+            final_stage = aggregator.num_stages - 1 if aggregator.num_stages > 0 else 0
+            aggregator.on_finalize_request(final_stage, response_id, aggregator.wall_start_ts)
+        for rid, events in aggregator.stage_events.items():
+            aggregator.stage_events[rid] = _one_row_per_stage(events)
+        aggregator.build_and_log_summary()
+
+    def _clear_response_request_timing(self) -> None:
+        self._response.active_response_request_started_at_s = None
+        self._response.active_response_ttft_ms = None
+        self._response.active_response_ttfp_ms = None
+
+    def mark_model_turn_request_started(self, turn_id: int, started_at_s: float) -> None:
+        """Record the native request start that can own one model turn.
+
+        Pending turns keep the latest accepted append. After ``begin_response``
+        the first accepted append wins; later appends must not rebind.
+        """
+        turn_id = int(turn_id)
+        started_at_s = float(started_at_s)
+        if self.active_response_turn_id == turn_id:
+            if self._response.active_response_request_started_at_s is None:
+                self._response.active_response_request_started_at_s = started_at_s
+            return
+        self._response.request_started_at_s_by_turn[turn_id] = started_at_s
+
+    def mark_response_first_outputs(
+        self,
+        *,
+        observed_at_s: float,
+        has_text: bool,
+        has_audio: bool,
+    ) -> dict[str, object]:
+        """Return server-monotonic TTF metrics newly observed for the active response."""
+        started_at_s = self._response.active_response_request_started_at_s
+        if started_at_s is None:
+            return {}
+        elapsed_ms = max(0.0, (float(observed_at_s) - started_at_s) * 1000.0)
+        newly_observed = False
+        if has_text and self._response.active_response_ttft_ms is None:
+            self._response.active_response_ttft_ms = elapsed_ms
+            newly_observed = True
+        if has_audio and self._response.active_response_ttfp_ms is None:
+            self._response.active_response_ttfp_ms = elapsed_ms
+            newly_observed = True
+        if not newly_observed:
+            return {}
+        metrics: dict[str, object] = {
+            "source": "server_monotonic_request_start",
+            "measurement_origin": dict(RESPONSE_REQUEST_MEASUREMENT_ORIGIN),
+        }
+        if self._response.active_response_ttft_ms is not None:
+            metrics["ttft_ms"] = self._response.active_response_ttft_ms
+        if self._response.active_response_ttfp_ms is not None:
+            metrics["ttfp_ms"] = self._response.active_response_ttfp_ms
+        return metrics
 
     def stash_stage_metrics(self, stage_metrics: Mapping[Any, Any] | None) -> None:
         """Hold a stage snapshot until a response exists to attribute it to.
@@ -963,6 +1172,7 @@ class DuplexEngineSession:
         playback_commit_policy: str | None = None,
         preserve_request: bool = False,
     ) -> dict[str, object] | None:
+        self._log_response_aggregator()
         response_id = self._response.active_response_id
         response_input_commit_seq = self._response.active_response_input_commit_seq
         if response_input_commit_seq is None:
@@ -1008,6 +1218,7 @@ class DuplexEngineSession:
             self._response.active_request_id = None
         self._response.active_response_id = None
         self._response.active_response_turn_id = None
+        self._clear_response_request_timing()
         self._response.active_response_input_commit_seq = None
         self._response.active_response_awaits_input_commit = False
         self._clear_response_metrics()
@@ -1326,6 +1537,7 @@ class DuplexEngineSession:
         return self._playback.by_response.get(item_id.removeprefix("item_"))
 
     def barge_in(self) -> int:
+        self._log_response_aggregator()
         self.epoch += 1
         self.sync_fence()
         self._response.assistant_text_buffer.clear()
@@ -1333,6 +1545,8 @@ class DuplexEngineSession:
         self._response.active_request_id = None
         self._response.active_response_id = None
         self._response.active_response_turn_id = None
+        self._response.request_started_at_s_by_turn.clear()
+        self._clear_response_request_timing()
         self._response.active_response_input_commit_seq = None
         self._response.active_response_awaits_input_commit = False
         self._clear_response_metrics()
@@ -1345,9 +1559,12 @@ class DuplexEngineSession:
             self.state = DuplexSessionState.CLOSING
 
     def close(self) -> None:
+        self._log_response_aggregator()
         self.state = DuplexSessionState.CLOSED
         self.turn_state = DuplexTurnState.IDLE
         self._response.active_response_turn_id = None
+        self._response.request_started_at_s_by_turn.clear()
+        self._clear_response_request_timing()
         self._response.active_response_input_commit_seq = None
         self._response.active_response_awaits_input_commit = False
         self._clear_response_metrics()

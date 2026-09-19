@@ -130,6 +130,11 @@ STAGE_EXCLUDE = {
     "finish_reason",
     "pipeline_timings",
 }
+# Duplex logs one StageRequestStats table per response. Chunk submits refresh
+# ``request_timestamp``, so serving_time_to_first_output_ms is often a clamped
+# 0 on the audio column and is not a useful TTFP. HTTP ``--print-stage`` keeps
+# the row.
+DUPLEX_STAGE_TABLE_EXCLUDE = frozenset({defs.SERVING_TIME_TO_FIRST_OUTPUT_MS})
 TRANSFER_EXCLUDE = {"from_stage", "to_stage", "request_id", "used_shm"}
 E2E_EXCLUDE = {"request_id"}
 
@@ -150,10 +155,12 @@ class OrchestratorAggregator:
         *,
         transfer_emitter: OmniTransferMetrics | None = None,
         replica_resolver: Callable[[int, str], int | None] | None = None,
+        stage_table_exclude: frozenset[str] = frozenset(),
     ) -> None:
         self.num_stages = int(num_stages)
         self.log_stats = bool(log_stats)
         self.final_stage_id_for_e2e = final_stage_id_for_e2e
+        self.stage_table_exclude = frozenset(stage_table_exclude)
         self.init_run_state(wall_start_ts)
         self.stage_events: dict[str, list[StageRequestStats]] = {}
         self.transfer_events: dict[
@@ -880,7 +887,8 @@ class OrchestratorAggregator:
             # === Stage table (columns = stage_id) ===
             # if any stage has diffusion_metrics, remove postprocess_time_ms field
             # because it is already included in diffusion_metrics
-            local_exclude = STAGE_EXCLUDE.copy()
+            local_exclude: set[str] = set(STAGE_EXCLUDE)
+            local_exclude.update(self.stage_table_exclude)
             has_diffusion_metrics = any(getattr(evt, "diffusion_metrics", None) for evt in stage_evts)
             if has_diffusion_metrics:
                 local_exclude.add("postprocess_time_ms")
