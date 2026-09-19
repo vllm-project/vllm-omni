@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import inspect
 import json
@@ -45,6 +45,7 @@ from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
+from vllm_omni.quantization import resolve_component_quant_config
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
@@ -692,7 +693,7 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, OmniGen2Transformer2DModel)
         self.transformer = OmniGen2Transformer2DModel(
             **transformer_kwargs,
-            quant_config=od_config.quantization_config,
+            quant_config=resolve_component_quant_config(od_config.quantization_config, "transformer"),
         )
         self.mllm = from_pretrained_with_prefetch(
             Qwen2_5_VLForConditionalGeneration.from_pretrained,
@@ -701,6 +702,11 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
             prefetch_list=omnigen2_subfolders,
             local_files_only=local_files_only,
         ).to(self.device)
+        from .mllm_quantization import prepare_mllm_fp8
+
+        mllm_fp8_layers = prepare_mllm_fp8(self.mllm, od_config.quantization_config)
+        if mllm_fp8_layers:
+            logger.info("Prepared %d OmniGen2 mllm decoder linears for online FP8", mllm_fp8_layers)
         self.processor = from_pretrained_with_prefetch(
             Qwen2_5_VLProcessor.from_pretrained,
             model,
