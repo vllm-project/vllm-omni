@@ -11,6 +11,7 @@ import inspect
 import pytest
 
 from vllm_omni.engine.duplex import events as events_module
+from vllm_omni.engine.duplex.commands import TruncateItem
 from vllm_omni.engine.duplex.events import (
     REALTIME_ERROR_TYPES_BY_CODE,
     AudioDelta,
@@ -40,6 +41,8 @@ from vllm_omni.engine.duplex.events import (
 from vllm_omni.engine.duplex.realtime_events import (
     RealtimeProjectionState,
     project_internal_event,
+    resolve_truncate_item,
+    retrieve_item_events,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -371,6 +374,30 @@ def test_projection_of_output_audio_buffer_clear_emits_cleared_before_terminals(
     assert cleared[0].response_id == "resp_1"
     assert _types(cleared)[-2:] == ["response.done", "rate_limits.updated"]
     assert state.item_truncation_cursors["item_resp_1"] == (0, 250)
+
+
+def test_one_truncate_command_truncates_retrieved_transcript_once():
+    state = RealtimeProjectionState(session_id="duplex-truncate")
+    state.conversation_items["item_resp_1"] = {
+        "id": "item_resp_1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_audio", "transcript": "abcdefghij", "audio_duration_ms": 10_000}],
+    }
+
+    control = resolve_truncate_item(state, TruncateItem(item_id="item_resp_1", audio_end_ms=4_000))
+    # The runner executes this signal and projects its acknowledgement.
+    signal = control.payloads[0]
+    payload = signal["payload"]
+    assert isinstance(payload, dict)
+    assert signal["event"] == "conversation.item.truncate"
+    project_internal_event(state, {"type": "conversation.item.truncated", **payload})
+
+    retrieved = retrieve_item_events(state, {"item_id": "item_resp_1"})[0].to_realtime()
+    assert retrieved["item"]["content"][0]["transcript"] == "abcd"
+    # Keep the cursor: later output must not restore the untruncated item.
+    assert state.item_truncation_cursors["item_resp_1"] == (0, 4_000)
 
 
 def test_projection_leaves_error_to_typed_emit_sites():

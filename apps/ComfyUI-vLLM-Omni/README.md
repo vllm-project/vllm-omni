@@ -52,6 +52,7 @@ This extension offers the following nodes based on the output modalities (at **C
 - **FastH3 Deployment** for routing text-to-video requests to a MiniMax-H3 server with FastH3 fused at startup
 - **Multimodality Understanding** for multimodality-to-text and multimodality-to-audio tasks
 - **TTS** and **TTS Voice Clone** for TTS tasks
+- **Generate Music** for lyrics-and-description-to-music generation
 
 This extension also offers example workflows (at **ComfyUI sidebar -> Templates -> vLLM-Omni**)
 
@@ -273,6 +274,17 @@ The node records which server the workflow targets; it does not start one, nor s
 
 > [!TIP]
 > There is a dedicated node for VoiceClone tasks with reference audio input. Other simple text-to-speech tasks should use the regular TTS node.
+
+### Music generation (e.g., MiniMax Music 3)
+
+(Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni Music Generation**)
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-music-generation.jpg">
+    <img alt="vLLM-Omni Music Generation" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-music-generation.jpg" width=55%>
+  </picture>
+</p>
 
 ### Chaining multiple model services
 

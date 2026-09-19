@@ -60,17 +60,6 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 logger = init_logger(__name__)
 
 
-def _apply_qwen_image_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    """Rotate interleaved pairs before rounding back to the activation dtype.
-
-    Qwen-Image's reference uses complex FP32 multiplication. Rounding the
-    frequencies to BF16 before rotation loses positional precision; those
-    errors accumulate across the denoising steps.
-    """
-    paired = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    return torch.view_as_real(paired * freqs.unsqueeze(1)).flatten(3).to(x.dtype)
-
-
 def _qwen_image_qk_norm_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -103,16 +92,11 @@ def _qwen_image_qk_norm_rope(
             fused_k.reshape(batch, seq_len, num_kv_heads, head_dim),
         )
 
+    # Eager path: BF16/activation-dtype RotaryEmbedding on every device.
+    # CUDA used to call FP32 complex multiply here; that matches the Diffusers
+    # helper in unit tests but drops Omni vs Diffusers pipeline PSNR (#7494).
     q = norm_q(q)
     k = norm_k(k)
-    if q.device.type == "cuda":
-        return (
-            _apply_qwen_image_rotary_emb(q, freqs),
-            _apply_qwen_image_rotary_emb(k, freqs),
-        )
-
-    # Retain the platform-specific kernels on other accelerators, which may
-    # not support complex tensors.
     cos = torch.real(freqs).to(q.dtype)
     sin = torch.imag(freqs).to(q.dtype)
     return rope(q, cos, sin), rope(k, cos, sin)

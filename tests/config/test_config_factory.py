@@ -2625,6 +2625,15 @@ class TestPlatformOverrides:
 
         assert stages[1].yaml_engine_args["dtype"] == dtype
 
+    def test_moss_tts_rocm_disables_codec_cudagraph(self):
+        deploy_path = Path(get_deploy_config_path("moss_tts.yaml"))
+
+        base = load_deploy_config(deploy_path)
+        assert base.stages[1].enforce_eager is False
+
+        rocm = _apply_platform_overrides(base, platform="rocm")
+        assert rocm.stages[1].enforce_eager is True
+
     def test_higgs_audio_v3_rocm_uses_triton_attention(self):
         deploy_path = Path(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
 
@@ -2687,6 +2696,13 @@ class TestPlatformOverrides:
             replica_stages = merge_pipeline_deploy(pipeline, replica)
             # Explicit null clears the inherited single-GPU 2 GiB CUDA cap.
             assert replica_stages[1].yaml_engine_args.get("kv_cache_memory_bytes") is None
+
+    def test_fish_speech_npu_uses_ascend_kv_block_size(self):
+        deploy_path = Path(get_deploy_config_path("fish_qwen3_omni.yaml"))
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+
+        assert deploy.stages[0].engine_extras["block_size"] == 128
 
     def test_npu_overrides(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))

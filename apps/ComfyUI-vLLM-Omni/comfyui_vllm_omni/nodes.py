@@ -503,6 +503,66 @@ class VLLMOmniTTS(_VLLMOmniGenerateBase):
         return (audio,)
 
 
+class VLLMOmniGenerateMusic(_VLLMOmniGenerateBase):
+    """Generate a song from lyrics and a musical description with MiniMax Music 3."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url": ("STRING", {"default": "http://localhost:8000/v1"}),
+                "model": ("STRING", {"default": "MiniMaxAI/MiniMax-Music3"}),
+                "instructions": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "display_name": "caption",
+                        "tooltip": "Music caption: describe genre, instruments, tempo and mood.",
+                    },
+                ),
+                "lyrics": ("STRING", {"multiline": True}),
+                "max_duration_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 300.0,
+                        "min": 1,
+                        "max": 360,
+                        "step": 0.01,
+                        "tooltip": "Upper limit; rounded down to whole 25 Hz audio frames. May end earlier.",
+                    },
+                ),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 2**53 - 1, "control_after_generate": True}),
+                "response_format": (["wav", "mp3", "flac", "opus"],),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "generate"
+
+    async def generate(
+        self,
+        url: str,
+        model: str,
+        lyrics: str,
+        instructions: str,
+        response_format: AudioFormat,
+        max_duration_seconds: float,
+        seed: int = 0,
+    ) -> tuple[AudioInput]:
+        audio = await VLLMOmniClient(url.rstrip("/")).generate_speech(
+            model=model,
+            input=lyrics,
+            instructions=instructions,
+            voice="default",
+            speed=1.0,
+            response_format=response_format,
+            max_new_tokens=int(max_duration_seconds * 25),
+            seed=seed,
+        )
+        return (audio,)
+
+
 class VLLMOmniVoiceClone(_VLLMOmniGenerateBase):
     @classmethod
     def INPUT_TYPES(cls):

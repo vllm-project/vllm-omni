@@ -187,8 +187,14 @@ def test_minimax_h3_quantization_quality(config: QualityTestConfig):
         "model": model_ref,
         "enforce_eager": True,
         # The fused BF16 baseline only fits on H100-80GB with encoder TP.
-        "stage_0_tensor_parallel_size": 2,
+        # This test loads the direct FL2VA diffusion pipeline (not the
+        # disaggregated two-stage MiniMax-H3 pipeline), so configure both the
+        # DiT world and the Qwen3-VL encoder TP explicitly.
+        "tensor_parallel_size": 2,
+        "text_encoder_tp_size": 2,
         "vae_use_tiling": True,
+        # MiniMax H3's VAE is implemented by code shipped with the checkpoint.
+        "trust_remote_code": True,
     }
 
     omni_bl = Omni(**common_kwargs)

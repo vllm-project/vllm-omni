@@ -177,6 +177,8 @@ class _MiniDiT(nn.Module):
         cnn_cache_buffer: torch.Tensor | None = None,
         att_cache_buffer: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        assert cnn_cache_buffer is not None
+        assert att_cache_buffer is not None
         x = x.transpose(1, 2)
         x = self.in_proj(x)
         for b_idx in range(len(self.blocks)):

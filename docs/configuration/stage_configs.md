@@ -53,7 +53,7 @@ The new deploy schema lives under `vllm_omni/deploy/` and is paired with a froze
 | ------- | ------ | ---------- | --------- | ------------- |
 | `base_config` | str (path) | optional | — | Overlay parent (relative or absolute). `stages:` / `platforms:` deep-merged by stage_id; other scalars overlay-wins. Intended for user-authored overlays; prod yamls stay flat. |
 | `async_chunk` | bool | optional | `true` | Enable chunked streaming between stages. Pin to `false` if the pipeline runs end-to-end. |
-| `session_mode` | str | optional | `"turn"` | Session behavior. Duplex models (pipelines with a `duplex_plugin`, e.g. MiniCPM-o 4.5) set `"duplex"`; `vllm-omni serve` then serves it over `/v1/realtime?duplex=1` and `/v1/chat/completions`, both on duplex sessions. |
+| `session_mode` | str | optional | `"turn"` | Session behavior. For pipelines with a `duplex_plugin`, explicitly select `"duplex"` for the duplex engine or `"turn"` for the ordinary online serving stack. The shipped MiniCPM-o 4.5 default remains `"duplex"`. See [Full Duplex](../serving/full_duplex_api.md#enable-full-duplex). |
 | `active_stream_window` | int | optional | `0` | Number of active downstream stream slots; `0` preserves all-stream cycling. |
 | `duplex_session` | dict | optional | runtime defaults | Full-duplex session lifecycle, buffering, replay, and capacity limits. |
 | `connectors` | dict | optional | `null` | Named connector specs (`{name, extra}`). Referenced by each stage's `input_connectors` / `output_connectors`. See [Connector schema](#connector-schema). |

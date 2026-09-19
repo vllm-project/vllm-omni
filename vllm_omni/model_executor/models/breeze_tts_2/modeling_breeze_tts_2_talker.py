@@ -13,6 +13,7 @@ generation order without importing HuggingFace GenerationMixin.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
@@ -367,10 +368,12 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
             return None
         logits = self._main_head_logits(hidden_states)
 
-        # ``make_omni_output`` runs immediately before this hook. It records
-        # requests whose previous hidden state selected EOS or reached the
-        # frame budget, so the scheduler receives a real stop token instead
-        # of depending on an arbitrary deploy-level max_tokens timeout.
+        # ``make_omni_output`` already selected codebook 0 and completed its
+        # frame. Return that same decision to the scheduler, including EOS.
+        # A finite zero survives the sampler's repetition/temperature passes
+        # without applying the repetition penalty twice or changing the frame.
+        # These logits describe deterministic codec selection, not model
+        # confidence; sampled-token logprobs are consequently zero.
         states = self._batch_state or []
         if states:
             for state, row_start, row_end in _iter_request_rows(
@@ -378,10 +381,11 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
                 getattr(self, "_batch_state_spans", None),
                 int(logits.shape[0]),
             ):
-                if state.get("breeze_force_eos", False):
+                selected_code0 = state.get("breeze_selected_code0")
+                if selected_code0 is not None:
                     row = logits[row_start:row_end]
                     row.fill_(float("-inf"))
-                    row[:, self.codebook_vocab_size] = 0.0
+                    row[:, int(selected_code0)] = 0.0
         return logits
 
     def _main_head_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -443,6 +447,13 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
         self._batch_state = info_items
         self._batch_state_spans = spans
         per_request_codes: list[torch.Tensor] = []
+        # The runner passes the same per-request sampling metadata to this
+        # hook and compute_logits, including offline SamplingParams overrides.
+        # When no_penalties is true vLLM does not initialize this GPU buffer.
+        sampling_metadata = kwargs.get("sampling_metadata")
+        repetition_penalties = None
+        if sampling_metadata is not None and not sampling_metadata.no_penalties:
+            repetition_penalties = sampling_metadata.repetition_penalties.tolist()
 
         for index, info in enumerate(info_items):
             if spans is not None and index < len(spans):
@@ -458,11 +469,22 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
             row_hidden = hidden[row_end - 1]
             if self._golden_dump_dir and bool(info.get("_omni_is_prefill", False)):
                 self._dump_golden_prefill(info, row_hidden)
-            main_logits = self._main_head_logits(row_hidden.reshape(1, -1))
+            main_logits = self._main_head_logits(row_hidden.reshape(1, -1)).float()
+            penalty = float(repetition_penalties[index]) if repetition_penalties is not None else 1.0
+            if not math.isfinite(penalty) or penalty <= 0:
+                raise ValueError("Breeze repetition_penalty must be finite and positive")
+            # Match upstream: penalize each previously generated codebook-0
+            # id once, excluding the text prompt and reference audio codes.
+            history = info.setdefault("breeze_generated_code0_ids", [])
+            if penalty != 1.0 and history:
+                history_ids = torch.tensor(history, device=main_logits.device, dtype=torch.long)
+                scores = main_logits[0, history_ids]
+                main_logits[0, history_ids] = torch.where(scores < 0, scores * penalty, scores / penalty)
             code0 = int(torch.argmax(main_logits, dim=-1).item())
             generated_frames = int(info.get("breeze_generated_frames", 0) or 0)
             max_new_frames = int(info.get("breeze_max_new_frames", -1))
             terminal = code0 == self.codebook_vocab_size or (max_new_frames > 0 and generated_frames >= max_new_frames)
+            info["breeze_selected_code0"] = self.codebook_vocab_size if terminal else code0
             if terminal:
                 info["breeze_force_eos"] = True
                 existing = info.get("breeze_audio_codes")
@@ -476,6 +498,7 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
                 raise RuntimeError(f"Breeze main head produced invalid codec id {code0}")
 
             frame = self._generate_depth_codes(row_hidden, code0)
+            history.append(code0)
             info["breeze_current_frame"] = frame[0].detach()
             info["breeze_generated_frames"] = generated_frames + 1
             info["breeze_force_eos"] = False

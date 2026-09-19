@@ -32,8 +32,12 @@ stages:
       temperature: 0.0
       top_p: 1.0
       top_k: -1
+      # Match upstream's penalty on generated codebook-0 history.
+      repetition_penalty: 1.1
       max_tokens: 2048
-      min_tokens: 1
+      # min_tokens also masks the tokenizer's EOS 1 despite ignore_eos.
+      # Keep valid codec token 1 and an immediate backbone EOS available.
+      min_tokens: 0
 
   - stage_id: 1
     max_num_seqs: 8

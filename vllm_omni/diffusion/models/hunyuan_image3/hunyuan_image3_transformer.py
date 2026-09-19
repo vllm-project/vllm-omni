@@ -3040,7 +3040,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         # 3. negative cfg prefill
         # For CFG distilled models, skip negative CFG prefill (cfg_factor=1, no negative prompt)
-        if self.do_classifier_free_guidance and not self.model.config.cfg_distilled:
+        if self.do_classifier_free_guidance and not getattr(self.model.config, "cfg_distilled", False):
             self._maybe_run_negative_cfg_prefill(
                 input_ids=input_ids,
                 model_kwargs=model_kwargs,
@@ -3151,7 +3151,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         # For CFG distilled models, skip CFG parallel (cfg_factor=1, no negative branch)
         cfg_parallel_ready = (
             self.do_classifier_free_guidance
-            and not self.model.config.cfg_distilled
+            and not getattr(self.model.config, "cfg_distilled", False)
             and get_classifier_free_guidance_world_size() == 2
         )
 
@@ -3207,7 +3207,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             self._split_model_kwargs_for_cfg_parallel(model_kwargs, batch_size, cfg_rank)
         else:
             # For CFG distilled models, cfg_factor is always 1 (CFG embedded in model)
-            if self.model.config.cfg_distilled:
+            if getattr(self.model.config, "cfg_distilled", False):
                 cfg_factor = 1
             else:
                 cfg_factor = 1 + self.do_classifier_free_guidance
@@ -3252,7 +3252,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     # Sequential CFG: double the batch
                     latent_model_input = torch.cat([latents] * cfg_factor)
 
-                if self.model.config.use_meanflow:
+                if getattr(self.model.config, "use_meanflow", False):
                     r = self.scheduler.get_timestep_r(t)
                     r_expand = r.repeat(latent_model_input.shape[0])
                 else:
@@ -3281,7 +3281,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
                 if should_compute:
                     # Handle guidance for CFG distilled models
-                    if self.model.config.cfg_distilled:
+                    if getattr(self.model.config, "cfg_distilled", False):
                         model_kwargs["guidance"] = torch.tensor(
                             [1000.0 * self._guidance_scale],
                             device=self.device,
@@ -3308,7 +3308,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                 # Perform guidance
                 # For CFG distilled models, guidance is already embedded in the model,
                 # so we skip the explicit CFG computation
-                if self.model.config.cfg_distilled:
+                if getattr(self.model.config, "cfg_distilled", False):
                     # CFG distilled: guidance is handled internally via guidance_emb
                     pass
                 elif cfg_parallel_ready:

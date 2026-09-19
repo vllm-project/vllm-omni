@@ -32,9 +32,11 @@ from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.logger import init_logger
 from vllm.multimodal.media import MediaConnector
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.config.stage_config import StagePipelineConfig
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin, StreamingAudioResampler
 from vllm_omni.entrypoints.openai.protocol.audio import (
     AudioResponse,
@@ -74,6 +76,24 @@ _SPEECH_USAGE_OUTPUT_TOKENS_HEADER = "X-VLLM-OMNI-OUTPUT-TOKENS"
 _SPEECH_USAGE_TOTAL_TOKENS_HEADER = "X-VLLM-OMNI-TOTAL-TOKENS"
 _SPEECH_USAGE_INPUT_TEXT_TOKENS_HEADER = "X-VLLM-OMNI-INPUT-TEXT-TOKENS"
 _SPEECH_USAGE_INPUT_AUDIO_TOKENS_HEADER = "X-VLLM-OMNI-INPUT-AUDIO-TOKENS"
+
+
+def _stage_speech_metadata(stage: Any) -> tuple[str | None, str | None, str | None]:
+    """Return speech routing metadata from typed or legacy stage configs."""
+    topology = getattr(stage, "stage_pipeline_config", None)
+    if isinstance(topology, StagePipelineConfig):
+        return (
+            getattr(topology, "model_stage", None),
+            getattr(getattr(stage, "model_config", None), "model_arch", None),
+            getattr(stage, "worker_type", None),
+        )
+    engine_args = getattr(stage, "engine_args", None)
+    return (
+        getattr(engine_args, "model_stage", None),
+        getattr(engine_args, "model_arch", None),
+        getattr(engine_args, "worker_type", None),
+    )
+
 
 # TTS Configuration
 #
@@ -471,12 +491,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Find and return the TTS stage config, or None if not found."""
         tts_stage_keys = all_tts_stage_keys()
         entry_stage_archs = tts_entry_stage_archs()
-        all_stages = frozenset(stage.engine_args.model_stage for stage in self.engine_client.stage_configs)
+        all_stages = frozenset(
+            model_stage
+            for stage in self.engine_client.stage_configs
+            if (model_stage := _stage_speech_metadata(stage)[0]) is not None
+        )
         for stage in self.engine_client.stage_configs:
-            engine_args = stage.engine_args
-            model_stage = engine_args.model_stage
-            model_arch = getattr(engine_args, "model_arch", None)
-            worker_type = getattr(engine_args, "worker_type", None)
+            model_stage, model_arch, worker_type = _stage_speech_metadata(stage)
             if model_stage in tts_stage_keys:
                 # Owning the stage key is not always enough: a model may be
                 # speech-capable only in some deployment topologies. Ask the
@@ -500,10 +521,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """
         if self._tts_stage is None:
             return None
-        return detect_tts_model_type(
-            getattr(self._tts_stage.engine_args, "model_stage", None),
-            getattr(self._tts_stage.engine_args, "model_arch", None),
-        )
+        return detect_tts_model_type(*_stage_speech_metadata(self._tts_stage)[:2])
 
     def _compute_max_instructions_length(self) -> int:
         """Compute max instructions length with precedence: CLI > stage config > default.
@@ -517,7 +535,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # 2. Try to get from TTS stage config
         if self._tts_stage is not None:
-            tts_args = getattr(self._tts_stage, "tts_args", {})
+            topology = getattr(self._tts_stage, "stage_pipeline_config", None)
+            tts_args = (
+                getattr(topology, "extras", {}).get("tts_args", {})
+                if isinstance(topology, StagePipelineConfig)
+                else getattr(self._tts_stage, "tts_args", {})
+            )
             if "max_instructions_length" in tts_args:
                 return tts_args["max_instructions_length"]
 
@@ -1444,14 +1467,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         tts_params: dict[str, Any] | None = None,
         collect: dict | None = None,
         target_sample_rate: int | None = None,
+        cumulative_audio: bool = False,
     ):
         """Generate audio chunks for streaming response.
 
         Handles two audio output modes from the engine:
         - Cumulative mode (list): Engine returns growing list of chunks;
         we emit only the new tail on each iteration.
-        - Per-step mode (tensor): Engine returns single tensor per iteration;
-        we emit it directly.
+        - Tensor mode: Emit each tensor directly, or only its new samples when
+        cumulative_audio is set for requests that retain audio for alignment.
 
         Args:
             generator: Async generator from the engine
@@ -1462,6 +1486,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             Raw audio bytes for each chunk (with WAV header for first chunk if wav format)
         """
         prev_count = 0
+        emitted_samples = 0
         sample_rate_val = 24000
         first_chunk = True
         first_audio_chunk_s: float | None = None
@@ -1563,6 +1588,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     )
                     if chunk_np.ndim > 1:
                         chunk_np = chunk_np.squeeze()
+                    if cumulative_audio and not isinstance(audio_val, list):
+                        total_samples = chunk_np.shape[-1]
+                        chunk_np = chunk_np[..., emitted_samples:]
+                        emitted_samples = total_samples
+                        if chunk_np.size == 0:
+                            continue
                     if resampler is not None:
                         chunk_np = resampler.process(chunk_np)
                         if chunk_np.size == 0:
@@ -1887,9 +1918,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # chat-template markers (im_start_token_id 151644).  A raw-text
             # prompt produces a 1-token placeholder that crashes the talker's
             # prefill/decode handoff.  Reject early with an actionable message.
-            stage_names = {
-                getattr(getattr(s, "engine_args", None), "model_stage", None) for s in self.engine_client.stage_configs
-            }
+            stage_names = {_stage_speech_metadata(s)[0] for s in self.engine_client.stage_configs}
             if "talker" in stage_names:
                 raise ValueError(
                     "The /v1/audio/speech endpoint is only supported for "
@@ -1957,6 +1986,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             from vllm_omni.model_executor.stage_input_processors.forced_aligner import TIMESTAMPS_MODALITY
 
             output_modalities.append(TIMESTAMPS_MODALITY)
+            if is_streaming_request:
+                # The aligner consumes the terminal waveform, so retain earlier
+                # audio chunks instead of draining them after each DELTA output.
+                sampling_params_list = [
+                    sp.clone() if isinstance(sp, SamplingParams) else sp for sp in sampling_params_list
+                ]
+                for sp in sampling_params_list:
+                    if isinstance(sp, SamplingParams):
+                        sp.output_kind = RequestOutputKind.CUMULATIVE
 
         generator = self.engine_client.generate(
             prompt=prompt,
@@ -1990,6 +2028,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         tts_params: dict[str, Any] | None = None,
         collect: dict | None = None,
         target_sample_rate: int | None = None,
+        cumulative_audio: bool = False,
     ):
         """Yield raw PCM byte chunks from the engine generator.
 
@@ -2009,6 +2048,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 tts_params=tts_params,
                 collect=collect,
                 target_sample_rate=target_sample_rate,
+                cumulative_audio=cumulative_audio,
             )
         ) as chunks:
             async for chunk in chunks:
@@ -2024,6 +2064,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     request_id,
                     tts_params=tts_params,
                     target_sample_rate=request.sample_rate,
+                    cumulative_audio=request.word_timestamps,
                 )
             ) as chunks:
                 async for chunk in chunks:

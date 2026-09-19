@@ -56,6 +56,11 @@ _DIFFUSION_MODELS = {
         "pipeline_ovis_image",
         "OvisImagePipeline",
     ),
+    "MammothModa2DiTPipeline": (
+        "mammoth_moda2",
+        "pipeline_mammothmoda2_dit",
+        "MammothModa2DiTPipeline",
+    ),
     "WanPipeline": (
         "wan2_2",
         "pipeline_wan2_2",
@@ -205,6 +210,11 @@ _DIFFUSION_MODELS = {
         "pi0",
         "pipeline_pi0",
         "Pi0Pipeline",
+    ),
+    "Pi05Pipeline": (
+        "pi05",
+        "pipeline_pi05",
+        "Pi05Pipeline",
     ),
     "LongCatImageEditPipeline": (
         "longcat_image",
@@ -382,6 +392,7 @@ _NO_CACHE_ACCELERATION = {
     # to it; list it here so a stray cache_backend override disables gracefully
     # instead of erroring.
     "Pi0Pipeline",
+    "Pi05Pipeline",
     "LingBotWorldCausalDMDPipeline",
 }
 
@@ -558,6 +569,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "GlmImagePipeline": "get_glm_image_post_process_func",
     "ZImagePipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
+    "MammothModa2DiTPipeline": "get_mammoth_moda2_post_process_func",
     "BooguImagePipeline": "get_boogu_image_post_process_func",
     "BooguImageTurboPipeline": "get_boogu_image_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",
@@ -586,6 +598,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "MingImagePipeline": "get_ming_image_post_process_func",
     "InternVLAA1Pipeline": "get_internvla_a1_post_process_func",
     "Pi0Pipeline": "get_pi0_post_process_func",
+    "Pi05Pipeline": "get_pi05_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
     "FluxKontextPipeline": "get_flux_kontext_post_process_func",
