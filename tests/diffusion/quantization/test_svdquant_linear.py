@@ -11,6 +11,58 @@ from vllm_omni.quantization import svdquant_config as svdquant
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+@pytest.mark.parametrize("settings", [{"activation_bits": 16}, {"rank": 16}, {"rank": 160}])
+def test_native_backend_rejects_unsupported_contract(settings):
+    with pytest.raises(ValueError, match="Native FlashInfer SVDQuant requires"):
+        svdquant.DiffusionSVDQuantConfig(linear_backend="flashinfer", **settings)
+
+
+def test_native_backend_metadata_roundtrip():
+    config = svdquant.DiffusionSVDQuantConfig.from_config({"linear_backend": "flashinfer", "rank": 32})
+    assert config.linear_backend == "flashinfer"
+    assert "linear_backend='flashinfer'" in repr(config)
+    with pytest.raises(ValueError, match="linear_backend must"):
+        svdquant.DiffusionSVDQuantConfig(linear_backend="unknown")
+
+
+def test_native_epilogue_preserves_original_input_channel_scale_and_bias(monkeypatch):
+    monkeypatch.setattr(svdquant, "_assert_supported", lambda: None)
+    generator = torch.Generator().manual_seed(6493)
+    base = (torch.randn(128, 128, generator=generator) * 0.125).bfloat16()
+    calls = []
+
+    def native(x, weight, sf, alpha, pre_quant, down, up, global_scale, bias=None, backend=None):
+        assert weight.dtype == sf.dtype == torch.uint8
+        assert backend == "cute-dsl" and bias is None
+        assert torch.equal(global_scale, torch.ones(1))
+        calls.append((pre_quant.clone(), down.clone()))
+        return (torch.addmm(torch.nn.functional.linear(x * pre_quant, base), x @ down, up.T) * alpha).bfloat16()
+
+    monkeypatch.setattr(svdquant, "_flashinfer_svdquant", lambda: (native, lambda scales: scales.flatten(), "cute-dsl"))
+    method = svdquant.DiffusionSVDQuantLinearMethod(svdquant.DiffusionSVDQuantConfig(linear_backend="flashinfer"))
+    layer = torch.nn.Module()
+    method.create_weights(layer, 128, [128], 128, 128, torch.bfloat16)
+    layer.wtscale.data.fill_(2)
+    layer.wcscales.data.copy_(torch.tensor([0.5, 1, 2, 4] * 32).bfloat16())
+    layer.smooth_factor.data.copy_(torch.tensor([2, 4] * 64).bfloat16())
+    layer.proj_down.data.copy_(torch.randn(128, 32, generator=generator).bfloat16() * 0.25)
+    layer.proj_up.data.copy_(torch.randn(128, 32, generator=generator).bfloat16() * 0.25)
+    original_down, original_up = layer.proj_down.detach().clone(), layer.proj_up.detach().clone()
+    original_smooth, original_channels = layer.smooth_factor.detach().clone(), layer.wcscales.detach().clone()
+    x = torch.randn(2, 128, 3, generator=generator).bfloat16().transpose(1, 2)
+    bias = torch.linspace(-1, 1, 128).bfloat16()
+    flat = x.reshape(-1, 128)
+    expected = torch.nn.functional.linear(flat / original_smooth, base * 2) * original_channels
+    expected = torch.addmm(expected, flat @ original_down, original_up.T) + bias
+    method.process_weights_after_loading(layer)
+    actual = method.apply(layer, x, bias)
+    torch.testing.assert_close(actual, expected.reshape(2, 3, 128), rtol=0.02, atol=0.25)
+    assert len(calls) == 1
+    torch.testing.assert_close(calls[0][0], original_smooth.reciprocal())
+    assert torch.equal(calls[0][1], original_down)
+    assert not hasattr(layer, "wscales") and not hasattr(layer, "wcscales")
+
+
 class _FakeNvfp4Kernel:
     def __init__(self, base_weight: torch.Tensor | None = None) -> None:
         self.base_weight = base_weight
@@ -45,11 +97,11 @@ def _register_parameter(
     )
 
 
-def test_supports_only_validated_datacenter_blackwell() -> None:
-    assert not svdquant._supports_capability(SimpleNamespace(major=10, minor=0))
+def test_supports_blackwell_nvfp4_targets() -> None:
+    assert svdquant._supports_capability(SimpleNamespace(major=10, minor=0))
     assert svdquant._supports_capability(SimpleNamespace(major=10, minor=3))
     assert not svdquant._supports_capability(SimpleNamespace(major=11, minor=0))
-    assert not svdquant._supports_capability(SimpleNamespace(major=12, minor=0))
+    assert svdquant._supports_capability(SimpleNamespace(major=12, minor=0))
     assert not svdquant._supports_capability(None)
 
 

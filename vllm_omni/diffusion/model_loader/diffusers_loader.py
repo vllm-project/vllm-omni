@@ -834,7 +834,10 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                         else:
                             self.load_weights(model)
                     self._maybe_fuse_distilled_lora(model)
-                    self._process_weights_after_loading(model, target_device)
+                    # Offline CPU loading still needs accelerator-only weight
+                    # layout transforms. The processor stages one linear at a
+                    # time and restores it to its original loading device.
+                    self._process_weights_after_loading(model, device or target_device)
 
                 # A warm final-layout hit has already completed all
                 # byte-changing work through the restorer.  Shared runtime
