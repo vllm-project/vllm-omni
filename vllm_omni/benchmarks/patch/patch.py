@@ -85,6 +85,7 @@ from vllm_omni.benchmarks.omniinteract import (
 from vllm_omni.benchmarks.omniinteract import (
     write_batch_artifacts as write_omniinteract_batch_artifacts,
 )
+from vllm_omni.errors import MULTIMODAL_CACHE_MISS_ERROR_TYPE
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.metrics.utils import coerce_bool, coerce_positive_float_scalar, coerce_positive_int_scalar
 
@@ -98,6 +99,13 @@ if TYPE_CHECKING:
 # (tests/engine/test_duplex_import_boundary.py enforces the boundary).
 
 logger = init_logger(__name__)
+
+
+class _StreamingResponseError(RuntimeError):
+    def __init__(self, message: str, error_type: str) -> None:
+        super().__init__(message)
+        self.error_type = error_type
+
 
 _AUDIO_CONTINUITY_THRESHOLD_ENV = "VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S"
 RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
@@ -1437,6 +1445,15 @@ async def async_request_openai_chat_omni_completions(
                             if chunk != "[DONE]":
                                 timestamp = time.perf_counter()
                                 data = json.loads(chunk)
+                                if "error" in data:
+                                    error = data["error"]
+                                    if isinstance(error, dict):
+                                        message = str(error.get("message") or "Streaming request failed")
+                                        error_type = str(error.get("type") or "")
+                                    else:
+                                        message = str(error)
+                                        error_type = ""
+                                    raise _StreamingResponseError(message, error_type)
                                 _update_output_stage_metrics_from_payload(output, data)
                                 _update_output_peak_memory_from_payload(output, data)
                                 usage = data.get("usage")
@@ -1624,6 +1641,24 @@ async def async_request_openai_chat_omni_completions(
                 else:
                     output.error = response.reason or ""
                     output.success = False
+            break
+        except _StreamingResponseError as e:
+            output.success = False
+            output.error = str(e)
+            if e.error_type == MULTIMODAL_CACHE_MISS_ERROR_TYPE and attempt < max_retries:
+                logger.warning(
+                    "Multimodal cache miss in omni benchmark request (will retry): attempt=%d/%d delay=%.2fs",
+                    attempt + 1,
+                    max_retries + 1,
+                    retry_delay,
+                )
+                await asyncio.sleep(retry_delay)
+                continue
+            logger.error(
+                "Streaming error in omni benchmark request (giving up, type=%s): %s",
+                e.error_type or "unknown",
+                output.error,
+            )
             break
         except aiohttp.ClientError as e:
             # transient transport error: may retry
