@@ -2692,7 +2692,6 @@ from vllm.benchmarks.serve import TaskType, calculate_metrics_for_embeddings, ge
 
 from vllm_omni.benchmarks.metrics.metrics import (
     MultiModalsBenchmarkMetrics,
-    aggregate_stage_durations,
     calculate_metrics,
     has_metric_samples,
 )
@@ -3047,6 +3046,9 @@ async def benchmark(
             defs.MEAN_PEAK_MEMORY_MB: getattr(metrics, defs.MEAN_PEAK_MEMORY_MB),
             defs.MEDIAN_PEAK_MEMORY_MB: getattr(metrics, defs.MEDIAN_PEAK_MEMORY_MB),
             defs.PERCENTILES_PEAK_MEMORY_MB: getattr(metrics, defs.PERCENTILES_PEAK_MEMORY_MB),
+            defs.STAGE_DURATIONS_MEAN: getattr(metrics, defs.STAGE_DURATIONS_MEAN) or {},
+            defs.STAGE_DURATIONS_P50: getattr(metrics, defs.STAGE_DURATIONS_P50) or {},
+            defs.STAGE_DURATIONS_P99: getattr(metrics, defs.STAGE_DURATIONS_P99) or {},
             "input_lens": [output.prompt_len for output in outputs],
             "start_times": [output.start_time for output in outputs],
             "output_lens": actual_output_lens,
@@ -3106,10 +3108,6 @@ async def benchmark(
                 result[result_key] = summary
     if omniinteract_summary is not None:
         result["omniinteract"] = omniinteract_summary
-
-    stage_duration_summaries = aggregate_stage_durations(outputs)
-    if stage_duration_summaries:
-        result.update(stage_duration_summaries)
 
     from vllm_omni.benchmarks.data_modules.daily_omni_eval import (
         compute_daily_omni_accuracy_metrics,

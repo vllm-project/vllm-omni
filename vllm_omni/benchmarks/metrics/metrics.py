@@ -16,6 +16,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm_omni.metrics import definitions as defs
 
 _PERCENTILE_ROWS_TYPE = list[tuple[float, float]] | None
+_STAGE_DURATION_MAP_TYPE = dict[str, float] | None
 _FLOAT_LIST_TYPE = list[float]
 _INT_LIST_TYPE = list[int]
 
@@ -68,6 +69,9 @@ _MULTIMODAL_BENCHMARK_FIELDS = [
     (defs.MEDIAN_PEAK_MEMORY_MB, float, field(default=0.0)),
     (defs.STD_PEAK_MEMORY_MB, float, field(default=0.0)),
     (defs.PERCENTILES_PEAK_MEMORY_MB, _PERCENTILE_ROWS_TYPE, field(default=None)),
+    (defs.STAGE_DURATIONS_MEAN, _STAGE_DURATION_MAP_TYPE, field(default=None)),
+    (defs.STAGE_DURATIONS_P50, _STAGE_DURATION_MAP_TYPE, field(default=None)),
+    (defs.STAGE_DURATIONS_P99, _STAGE_DURATION_MAP_TYPE, field(default=None)),
 ]
 
 # ``make_dataclass`` returns a runtime class that mypy treats as a variable, not
@@ -243,6 +247,7 @@ def print_metrics(
     if isinstance(metrics, MultiModalsBenchmarkMetrics):
         print("{:<40} {:<10.2f}".format("Peak concurrent requests:", metrics.max_concurrent_requests))
         print_peak_memory_metrics(metrics)
+        print_stage_durations_metrics(selected_percentiles or [], metrics)
     if task_type != TaskType.GENERATION or "e2el" in selected_percentile_metrics:
         process_one_metric("e2el", metrics)
     print_text_metrics(task_type, selected_percentile_metrics, metrics)
@@ -253,7 +258,6 @@ def print_metrics(
             print_image_metrics(selected_percentiles or [], metrics)
         if _has_video_output(metrics):
             print_video_metrics(selected_percentiles or [], metrics)
-        print_stage_durations_metrics(outputs)
         if print_stage and outputs and selected_percentiles is not None:
             stage_metrics = _build_stage_metrics_from_outputs(outputs)
             if stage_metrics:
@@ -343,10 +347,12 @@ def print_peak_memory_metrics(metrics: MultiModalsBenchmarkMetrics):
 
 
 def aggregate_stage_durations(outputs: Sequence[RequestFuncOutput]) -> dict[str, dict[str, float]]:
-    """Aggregate per-request pipeline profiler timings into mean/p50/p99 maps.
+    """Aggregate pipeline profiler timings into mean/p50/p99 maps.
 
-    Mirrors ``diffusion_benchmark_serving`` so ``--save-result`` JSON can carry
-    ``stage_durations_{mean,p50,p99}`` for Diffuse / VAE / TextEncoder keys.
+    ``stage_N_gen_ms`` is omitted. That clock already belongs to
+    ``stage_gen_time`` / image / video generation, not to this profiler block.
+    The maps are stored on ``MultiModalsBenchmarkMetrics`` and printed with the
+    other run-level metrics. ``--print-stage`` does not gate them.
     """
     stage_duration_lists: dict[str, list[float]] = {}
     for output in outputs:
@@ -356,17 +362,19 @@ def aggregate_stage_durations(outputs: Sequence[RequestFuncOutput]) -> dict[str,
         if not isinstance(stage_durations, dict):
             continue
         for stage, duration in stage_durations.items():
+            if _is_printed_stage_gen_key(str(stage)):
+                continue
             if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not np.isfinite(duration):
                 continue
             stage_duration_lists.setdefault(str(stage), []).append(float(duration))
     if not stage_duration_lists:
         return {}
     return {
-        "stage_durations_mean": {stage: float(np.mean(values)) for stage, values in stage_duration_lists.items()},
-        "stage_durations_p50": {
+        defs.STAGE_DURATIONS_MEAN: {stage: float(np.mean(values)) for stage, values in stage_duration_lists.items()},
+        defs.STAGE_DURATIONS_P50: {
             stage: float(np.percentile(values, 50)) for stage, values in stage_duration_lists.items()
         },
-        "stage_durations_p99": {
+        defs.STAGE_DURATIONS_P99: {
             stage: float(np.percentile(values, 99)) for stage, values in stage_duration_lists.items()
         },
     }
@@ -377,7 +385,7 @@ def _stage_duration_display_name(stage: str) -> str:
 
     ``Wan22I2VPipeline.diffuse`` -> ``Diffuse``
     ``Wan22I2VPipeline.text_encoder.forward`` -> ``Text Encoder Forward``
-    ``queue_wait_ms`` / ``stage_0_gen_ms`` -> ``Queue Wait`` / ``Stage 0 Gen``
+    ``queue_wait_ms`` -> ``Queue Wait``
     """
     name = str(stage)
     head, sep, tail = name.partition(".")
@@ -388,25 +396,40 @@ def _stage_duration_display_name(stage: str) -> str:
     return name.replace("_", " ").replace(".", " ").title()
 
 
-def print_stage_durations_metrics(outputs: Sequence[RequestFuncOutput] | None) -> None:
-    """Print per-stage mean / median / p99 in the same style as other bench metrics."""
-    if not outputs:
-        return
-    summaries = aggregate_stage_durations(outputs)
-    mean = summaries.get("stage_durations_mean") or {}
+def _is_printed_stage_gen_key(stage: str) -> bool:
+    """True for ``stage_0_gen_ms``, which duplicates ``--print-stage`` stage timing."""
+    name = str(stage)
+    prefix, suffix = "stage_", "_gen_ms"
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        return False
+    return name[len(prefix) : -len(suffix)].isdigit()
+
+
+def print_stage_durations_metrics(
+    selected_percentiles: list[float],
+    metrics: MultiModalsBenchmarkMetrics,
+) -> None:
+    """Print profiler timings already stored on ``metrics``.
+
+    Mean and median always print, matching :func:`print_image_metrics`. P99 prints
+    only when 99 is in ``selected_percentiles``. ``stage_N_gen_ms`` is not here;
+    that clock stays on stage_gen_time / image / video generation.
+    """
+    mean = getattr(metrics, defs.STAGE_DURATIONS_MEAN, None) or {}
     if not mean:
         return
-    p50 = summaries.get("stage_durations_p50") or {}
-    p99 = summaries.get("stage_durations_p99") or {}
+    p50 = getattr(metrics, defs.STAGE_DURATIONS_P50, None) or {}
+    p99 = getattr(metrics, defs.STAGE_DURATIONS_P99, None) or {}
+    show_p99 = any(float(p) == 99.0 for p in selected_percentiles)
     print("{s:{c}^{n}}".format(s=" Stage Durations ", n=50, c="-"))
     for stage in mean:
         label = _stage_duration_display_name(stage)
         unit = " (ms)" if str(stage).endswith("_ms") else " (s)"
-        print("{:<40} {:<10.4f}".format(f"Mean {label}{unit}:", mean[stage]))
+        print("{:<40} {:<10.2f}".format(f"Mean {label}{unit}:", mean[stage]))
         if stage in p50:
-            print("{:<40} {:<10.4f}".format(f"Median {label}{unit}:", p50[stage]))
-        if stage in p99:
-            print("{:<40} {:<10.4f}".format(f"P99 {label}{unit}:", p99[stage]))
+            print("{:<40} {:<10.2f}".format(f"Median {label}{unit}:", p50[stage]))
+        if show_p99 and stage in p99:
+            print("{:<40} {:<10.2f}".format(f"P99 {label}{unit}:", p99[stage]))
 
 
 def print_image_metrics(selected_percentiles: list[float], metrics: MultiModalsBenchmarkMetrics):
@@ -1153,6 +1176,7 @@ def calculate_metrics(
         isinstance(getattr(output, "duplex_session_metrics", None), dict) for output in outputs
     )
     missing_duplex_value = float("nan") if duplex_metrics_present else 0
+    stage_duration_summaries = aggregate_stage_durations(outputs)
     metrics = MultiModalsBenchmarkMetrics(
         completed=completed,
         failed=len(failed_outputs),
@@ -1246,6 +1270,9 @@ def calculate_metrics(
             defs.AUDIO_CONTINUITY_OK_RATE: (
                 (sum(audio_continuity_ok) / len(audio_continuity_ok)) if audio_continuity_ok else 1.0
             ),
+            defs.STAGE_DURATIONS_MEAN: stage_duration_summaries.get(defs.STAGE_DURATIONS_MEAN) or {},
+            defs.STAGE_DURATIONS_P50: stage_duration_summaries.get(defs.STAGE_DURATIONS_P50) or {},
+            defs.STAGE_DURATIONS_P99: stage_duration_summaries.get(defs.STAGE_DURATIONS_P99) or {},
         },
     )
     print_metrics(

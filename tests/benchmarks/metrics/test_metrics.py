@@ -591,10 +591,10 @@ def test_image_with_generated_text_still_reports_text_result(capsys):
 def test_aggregate_stage_durations_mean_p50_p99() -> None:
     ok_a = MixRequestFuncOutput()
     ok_a.success = True
-    ok_a.stage_durations = {"diffuse": 1.0, "vae.decode": 0.2}
+    ok_a.stage_durations = {"diffuse": 1.0, "vae.decode": 0.2, "stage_0_gen_ms": 50.0}
     ok_b = MixRequestFuncOutput()
     ok_b.success = True
-    ok_b.stage_durations = {"diffuse": 3.0, "vae.decode": 0.4}
+    ok_b.stage_durations = {"diffuse": 3.0, "vae.decode": 0.4, "stage_1_gen_ms": 80.0}
     failed = MixRequestFuncOutput()
     failed.success = False
     failed.stage_durations = {"diffuse": 99.0}
@@ -604,6 +604,8 @@ def test_aggregate_stage_durations_mean_p50_p99() -> None:
     assert summaries["stage_durations_p50"]["diffuse"] == pytest.approx(2.0)
     assert summaries["stage_durations_mean"]["vae.decode"] == pytest.approx(0.3)
     assert "stage_durations_p99" in summaries
+    assert "stage_0_gen_ms" not in summaries["stage_durations_mean"]
+    assert "stage_1_gen_ms" not in summaries["stage_durations_mean"]
 
 
 def test_print_stage_durations_metrics(capsys) -> None:
@@ -613,8 +615,11 @@ def test_print_stage_durations_metrics(capsys) -> None:
         "Wan22I2VPipeline.diffuse": 1.25,
         "Wan22I2VPipeline.text_encoder.forward": 0.4,
         "queue_wait_ms": 0.5,
+        "stage_0_gen_ms": 1000.0,
     }
-    print_stage_durations_metrics([output])
+    summaries = aggregate_stage_durations([output])
+    metrics = SimpleNamespace(**summaries)
+    print_stage_durations_metrics([99.0], metrics)
     out = capsys.readouterr().out
     assert "Wan22I2VPipeline" not in out
     assert "Mean Diffuse (s):" in out
@@ -622,6 +627,40 @@ def test_print_stage_durations_metrics(capsys) -> None:
     assert "P99 Diffuse (s):" in out
     assert "Mean Text Encoder Forward (s):" in out
     assert "Mean Queue Wait (ms):" in out
+    assert "Stage 0 Gen" not in out
+    assert "stage_0_gen" not in out
+
+
+def test_profiler_stage_durations_print_without_print_stage(capsys) -> None:
+    output = MixRequestFuncOutput()
+    output.success = True
+    output.prompt_len = 8
+    output.latency = 1.0
+    output.stage_durations = {
+        "Wan22I2VPipeline.diffuse": 1.25,
+        "queue_wait_ms": 0.5,
+        "stage_0_gen_ms": 1000.0,
+    }
+    common = dict(
+        input_requests=[],
+        outputs=[output],
+        dur_s=1.0,
+        tokenizer=None,
+        selected_percentiles=[50.0, 99.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=["e2el"],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=1.0,
+    )
+    metrics, _ = calculate_metrics(**common, print_stage=False)
+    shown = capsys.readouterr().out
+    assert "Mean Diffuse (s):" in shown
+    assert "Mean Queue Wait (ms):" in shown
+    assert "Stage 0 Gen" not in shown
+    assert metrics.stage_durations_mean["Wan22I2VPipeline.diffuse"] == pytest.approx(1.25)
+    assert "stage_0_gen_ms" not in metrics.stage_durations_mean
 
 
 if __name__ == "__main__":
