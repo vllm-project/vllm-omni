@@ -1248,8 +1248,9 @@ class QwenImageTransformer2DModel(CachedTransformer):
                 self.parallel_config.sequence_parallel_size,
             )
 
-        if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
-            encoder_hidden_states_mask = None
+        # All-valid masks are canonicalized once by QwenImagePipeline before
+        # denoising. Do not perform a tensor reduction followed by a Python
+        # branch here: it splits full-transformer torch.compile graphs.
 
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(

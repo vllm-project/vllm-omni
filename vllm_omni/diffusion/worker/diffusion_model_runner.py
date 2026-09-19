@@ -226,7 +226,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 f"Diffusion KV metadata request mismatch: expected={request_id!r}, got={metadata.request_id!r}"
             )
 
-    def _compile_transformer(self, attr_name: str) -> None:
+    def _compile_transformer(self, attr_name: str, *, backend: str | Callable | None = None) -> None:
         """Compile a transformer attribute on the pipeline with torch.compile."""
         model = getattr(self.pipeline, attr_name, None)
         if model is None:
@@ -234,14 +234,23 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         compile_granularity = self.od_config.diffusion_compile_granularity
         compile_dynamic = self.od_config.diffusion_compile_dynamic
+        compile_kwargs: dict[str, object] = {"dynamic": compile_dynamic}
+        if backend is not None:
+            compile_kwargs["backend"] = backend
+        # Full-transformer ACLGraph must capture one graph. Fail on a new graph
+        # break instead of silently producing multiple captured segments.
+        if compile_granularity == "full" and self.od_config.diffusion_compile_aclgraph:
+            compile_kwargs["fullgraph"] = True
         try:
             if compile_granularity == "full":
-                model.compile(dynamic=compile_dynamic)
+                model.compile(**compile_kwargs)
                 compiled_model = model
             else:
-                compiled_model = regionally_compile(model, dynamic=compile_dynamic)
+                compiled_model = regionally_compile(model, **compile_kwargs)
             setattr(self.pipeline, attr_name, compiled_model)
         except Exception as e:
+            if self.od_config.diffusion_compile_backend != "auto":
+                raise RuntimeError(f"Requested diffusion compile setup failed for {attr_name}.") from e
             logger.warning(
                 "Model runner: %s torch.compile setup for %s failed before activation: %s. "
                 "Continuing with the uncompiled model; lazy compilation errors can still "
@@ -259,6 +268,29 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             compile_granularity,
             compile_dynamic,
         )
+
+    def _compile_model(self, backend: str | Callable | None) -> None:
+        if self.od_config.enforce_eager:
+            return
+        if backend is None:
+            logger.warning(
+                "Model runner: No diffusion compile backend selected for %s; running eagerly.",
+                current_omni_platform.get_torch_device(),
+            )
+            return
+        if backend == "inductor" and hasattr(self.pipeline, "setup_compile"):
+            try:
+                self.pipeline.setup_compile()
+            except Exception as exc:
+                if self.od_config.diffusion_compile_backend != "auto":
+                    raise RuntimeError("Requested diffusion compile setup failed for pipeline.setup_compile().") from exc
+                logger.warning("Model runner: setup_compile() failed (%s); running without compile.", exc)
+        else:
+            transformer_attrs = getattr(self.pipeline, "_dit_modules", None)
+            if not transformer_attrs:
+                transformer_attrs = ("transformer", "transformer_2")
+            for attr_name in transformer_attrs:
+                self._compile_transformer(attr_name, backend=backend)
 
     def load_model(
         self,
@@ -302,6 +334,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 "AllGather across data-parallel ranks; disable the cache or use "
                 "rank-local text_encoder transfer."
             )
+        compile_backend = (
+            None
+            if self.od_config.enforce_eager
+            else current_omni_platform.get_diffusion_compile_backend(self.od_config)
+        )
 
         current_omni_platform.init_diffusion_model_runner_runtime(
             vllm_config=self.vllm_config,
@@ -369,28 +406,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             device=self.device,
         )
 
-        # Apply torch.compile if not in eager mode
-        if not self.od_config.enforce_eager:
-            if current_omni_platform.supports_torch_inductor():
-                if hasattr(self.pipeline, "setup_compile"):
-                    try:
-                        self.pipeline.setup_compile()
-                    except Exception as exc:
-                        logger.warning(
-                            "Model runner: setup_compile() failed (%s); running without compile.",
-                            exc,
-                        )
-                else:
-                    transformer_attrs = getattr(self.pipeline, "_dit_modules", None)
-                    if not transformer_attrs:
-                        transformer_attrs = ("transformer", "transformer_2")
-                    for attr_name in transformer_attrs:
-                        self._compile_transformer(attr_name)
-            else:
-                logger.warning(
-                    "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",
-                    current_omni_platform.get_torch_device(),
-                )
+        self._compile_model(compile_backend)
 
         # Setup cache backend
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)

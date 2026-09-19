@@ -110,6 +110,10 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         self.is_cross_attn = role == "cross"
         cfg = get_current_diffusion_config_or_none()
         self.fa_deterministic = bool(getattr(cfg, "fa_deterministic", False)) if cfg is not None else False
+        # Resolve the MindIE override outside forward so full-transformer
+        # torch.compile does not trace torch_npu's patched os.getenv in every
+        # repeated attention block.
+        self.npu_fa_op_type = os.environ.get("MINDIE_SD_FA_TYPE") or "fused_attn_score"
         if backend_kwargs:
             logger.warning("FlashAttentionImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
 
@@ -665,7 +669,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         #     type is honored; the TND varlen op cannot be).
         extra = attn_metadata.extra if attn_metadata else {}
         if extra.get("npu_attn_varlen", False):
-            if os.environ.get("MINDIE_SD_FA_TYPE") == "ascend_laser_attention":
+            if self.npu_fa_op_type == "ascend_laser_attention":
                 out = self._forward_prefix_kv_slice_npu(query, key, value, extra)
             else:
                 out = self._forward_varlen_packed_npu(query, key, value, extra)
@@ -698,8 +702,9 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             value,
             attn_mask=attention_mask,
             opt_mode="manual",
-            op_type="fused_attn_score",
+            op_type=self.npu_fa_op_type,
             layout=layout,
+            use_env_override=False,
         )
 
     def _resolve_packed_seq_npu(
@@ -844,8 +849,9 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 value,
                 attn_mask=None,
                 opt_mode="manual",
-                op_type="fused_attn_score",  # MINDIE_SD_FA_TYPE env overrides this
+                op_type=self.npu_fa_op_type,
                 layout=layout,
                 scale=scale,
+                use_env_override=False,
             )
         )

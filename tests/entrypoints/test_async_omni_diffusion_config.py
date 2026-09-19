@@ -197,8 +197,10 @@ def test_default_stage_config_preserves_omitted_dp_for_runtime_inference():
             "tensor_parallel_size": None,
             "enable_expert_parallel": None,
             "enforce_eager": None,
+            "diffusion_compile_backend": None,
             "diffusion_compile_granularity": None,
             "diffusion_compile_dynamic": None,
+            "diffusion_compile_aclgraph": None,
         }
     )[0]
 
@@ -209,8 +211,10 @@ def test_default_stage_config_preserves_omitted_dp_for_runtime_inference():
     assert parallel_config["enable_expert_parallel"] is False
     terminal_config = _terminal_config(stage_cfg)
     assert terminal_config.enforce_eager is False
+    assert terminal_config.diffusion_compile_backend == "auto"
     assert terminal_config.diffusion_compile_granularity == "regional"
     assert terminal_config.diffusion_compile_dynamic is True
+    assert terminal_config.diffusion_compile_aclgraph is False
 
 
 def test_default_stage_config_propagates_ulysses_mode():
@@ -575,7 +579,7 @@ def test_serve_cli_forwards_hwr_policy_for_no_allgather_dlo():
 
 
 def test_serve_cli_accepts_diffusion_compile_controls():
-    """Ensure both compile controls reach the diffusion stage."""
+    """Ensure compile controls reach the diffusion stage."""
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
     OmniServeCommand().subparser_init(subparsers)
@@ -587,7 +591,10 @@ def test_serve_cli_accepts_diffusion_compile_controls():
             "--omni",
             "--diffusion-compile-granularity",
             "full",
+            "--diffusion-compile-backend",
+            "inductor",
             "--no-diffusion-compile-dynamic",
+            "--diffusion-compile-aclgraph",
         ]
     )
 
@@ -595,9 +602,13 @@ def test_serve_cli_accepts_diffusion_compile_controls():
     stage_cfg = StageConfigFactory.create_default_diffusion(explicit_kwargs)[0]
 
     assert args.diffusion_compile_granularity == "full"
+    assert args.diffusion_compile_backend == "inductor"
     assert args.diffusion_compile_dynamic is False
+    assert args.diffusion_compile_aclgraph is True
     assert stage_cfg["engine_args"]["diffusion_compile_granularity"] == "full"
+    assert stage_cfg["engine_args"]["diffusion_compile_backend"] == "inductor"
     assert stage_cfg["engine_args"]["diffusion_compile_dynamic"] is False
+    assert stage_cfg["engine_args"]["diffusion_compile_aclgraph"] is True
 
 
 def test_serve_cli_accepts_diffusion_attention_backend():

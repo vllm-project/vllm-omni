@@ -58,6 +58,13 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
 logger = logging.getLogger(__name__)
 
 
+def canonicalize_qwen_image_attention_mask(mask: torch.Tensor | None) -> torch.Tensor | None:
+    """Drop an all-valid prompt mask before entering the compiled denoise path."""
+    if mask is not None and bool(mask.all()):
+        return None
+    return mask
+
+
 def get_qwen_image_post_process_func(
     od_config: OmniDiffusionConfig,
 ):
@@ -728,6 +735,12 @@ class QwenImagePipeline(
         else:
             negative_prompt_embeds = None
             negative_prompt_embeds_mask = None
+
+        # This reduction is request-level work. Keeping it outside transformer
+        # forward prevents one data-dependent Dynamo graph break per denoise
+        # invocation while preserving real padding masks.
+        prompt_embeds_mask = canonicalize_qwen_image_attention_mask(prompt_embeds_mask)
+        negative_prompt_embeds_mask = canonicalize_qwen_image_attention_mask(negative_prompt_embeds_mask)
 
         num_channels_latents = self.transformer.in_channels // 4
         latents = self.prepare_latents(

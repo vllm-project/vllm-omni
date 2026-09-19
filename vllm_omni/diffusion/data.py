@@ -923,8 +923,12 @@ class OmniDiffusionConfig:
     enforce_eager: bool = False
     # Controls the generic compilation path used when a pipeline does not
     # provide its own setup_compile() implementation.
+    diffusion_compile_backend: str = "auto"
     diffusion_compile_granularity: str = "regional"
     diffusion_compile_dynamic: bool = True
+    # Opt into MindIE-SD ACLGraph capture/replay in addition to pattern
+    # compilation. Kept disabled by default because it is process-global.
+    diffusion_compile_aclgraph: bool = False
 
     # Parallel weight loading (for faster diffusion model startup)
     enable_multithread_weight_load: bool = True
@@ -1140,6 +1144,11 @@ class OmniDiffusionConfig:
             materialize_legacy_offload_flags,
         )
 
+        if self.diffusion_compile_backend not in {"auto", "inductor", "mindiesd"}:
+            raise ValueError(
+                "diffusion_compile_backend must be 'auto', 'inductor', or 'mindiesd', "
+                f"got {self.diffusion_compile_backend!r}"
+            )
         if self.diffusion_compile_granularity not in {"regional", "full"}:
             raise ValueError(
                 "diffusion_compile_granularity must be 'regional' or 'full', "
@@ -1147,6 +1156,11 @@ class OmniDiffusionConfig:
             )
         if not isinstance(self.diffusion_compile_dynamic, bool):
             raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
+        if not isinstance(self.diffusion_compile_aclgraph, bool):
+            raise TypeError(
+                "diffusion_compile_aclgraph must be a bool, "
+                f"got {type(self.diffusion_compile_aclgraph)!r}"
+            )
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
         if self.diffusion_kv_max_rows_per_request is not None and (
             type(self.diffusion_kv_max_rows_per_request) is not int or self.diffusion_kv_max_rows_per_request <= 0
