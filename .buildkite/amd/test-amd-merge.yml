@@ -12,6 +12,7 @@ steps:
       parallelism: 3
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
+      timeout_in_minutes: 240
       grade: Blocking
       timeout_in_minutes: 90
       commands:
