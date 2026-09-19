@@ -17,6 +17,7 @@ import pytest
 import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.engine import FinishReason
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
@@ -1261,3 +1262,47 @@ def test_context_overflow_emits_an_error_output_with_the_reason() -> None:
 
     sched._emit_streaming_context_overflow_outputs(outputs)
     assert len(outputs[2]) == 1
+
+
+@pytest.mark.parametrize("native", [True, False])
+def test_async_chunk_reserves_parked_slots_during_ar_admission(monkeypatch, native) -> None:
+    sched = _make_scheduler(stage_id=1)
+    parked = SimpleNamespace(request_id="parked")
+    sched.requests = {"parked": parked}
+    sched.waiting = []
+    sched.running = []
+    sched._native_data_plane = native
+    sched.use_v2_model_runner = native
+    sched.max_num_running_reqs = 8
+    sched.input_coordinator = (
+        SimpleNamespace(_waiting_for_chunk_running=[parked], restore_queues=lambda _w, _r: None) if native else None
+    )
+    sched.chunk_transfer_adapter = (
+        None
+        if native
+        else SimpleNamespace(
+            waiting_for_chunk_running_requests=[parked],
+            _held_non_active=[],
+            process_pending_chunks=lambda *_a, **_kw: None,
+            collect_failed_send_request_ids=lambda: {},
+            restore_queues=lambda *_a, **_kw: None,
+            postprocess_scheduler_output=lambda *_a, **_kw: None,
+        )
+    )
+    sched._consume_pending_connector_output = lambda model_mode: None
+    sched._process_pending_input_timeouts = lambda: None
+    sched._should_defer_waiting_admission = lambda: False
+    sched.get_finished_requests_needing_kv_transfer = lambda: {}
+    sched._wrap_omni_scheduler_output = lambda output, **_kwargs: output
+    observed_limits: list[int] = []
+
+    def fake_schedule(self, _throttle_prefills=False):
+        observed_limits.append(self.max_num_running_reqs)
+        return SimpleNamespace(scheduled_new_reqs=[])
+
+    monkeypatch.setattr(VLLMScheduler, "schedule", fake_schedule)
+
+    sched.schedule()
+
+    assert observed_limits == [7 if native else 8]
+    assert sched.max_num_running_reqs == 8

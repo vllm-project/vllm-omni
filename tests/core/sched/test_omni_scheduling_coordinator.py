@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for OmniSchedulingCoordinator.
 
 These tests use mock request objects and mock queues.  They do not require
@@ -20,7 +20,9 @@ import torch
 import vllm_omni.core.sched.omni_scheduling_coordinator as coord_mod
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
+    uses_native_mrv2_data_plane,
 )
+from vllm_omni.core.sched.output import OmniChunkRecvHandle
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -56,6 +58,7 @@ def _make_request(req_id: str, status: str = "waiting") -> SimpleNamespace:
         prompt_token_ids=[],
         num_prompt_tokens=0,
         num_computed_tokens=0,
+        num_output_placeholders=0,
         _all_token_ids=[],
         _output_token_ids=[],
         payload_sender_info=None,
@@ -96,7 +99,35 @@ class MockQueue:
 # ------------------------------------------------------------------ #
 
 
-class TestCoordinatorUpdateRequestMetadata(unittest.TestCase):
+class TestNativeMRV2DataPlaneSelection(unittest.TestCase):
+    def test_native_plane_requires_v2_and_async_chunk_capability(self):
+        native = SimpleNamespace(async_chunk=True, supports_native_mrv2_data_plane=True)
+
+        self.assertTrue(uses_native_mrv2_data_plane(native, use_v2_model_runner=True))
+        self.assertFalse(uses_native_mrv2_data_plane(native, use_v2_model_runner=False))
+        self.assertFalse(uses_native_mrv2_data_plane(SimpleNamespace(async_chunk=False), use_v2_model_runner=True))
+
+
+def test_chunk_registration_ready_and_terminal_lifecycle():
+    coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
+    req = _make_request("internal", status=RequestStatus.WAITING)
+    req.external_req_id = "external"
+    waiting = MockQueue([req])
+    coord.process_pending_chunks(waiting, [], set(), set())
+    assert req.status == RequestStatus.WAITING_FOR_CHUNK
+    [handle] = coord.pending_chunk_registrations
+    assert isinstance(handle, OmniChunkRecvHandle)
+    assert (handle.request_id, handle.external_req_id) == ("internal", "external")
+    coord.restore_queues(waiting, [])
+    coord.process_pending_chunks(waiting, [], {"internal"}, set())
+    assert req.status == RequestStatus.WAITING
+    assert "internal" in coord.requests_with_ready_chunks
+    req.status = RequestStatus.WAITING_FOR_CHUNK
+    coord.process_pending_chunks(waiting, [], set(), {"internal"})
+    assert "internal" in coord.finished_requests
+
+
+class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
     """Test update_request_metadata applies scheduling metadata to requests."""
 
     def test_ar_mode_no_longer_sets_additional_information(self):
@@ -382,17 +413,18 @@ class TestTimeoutDetection(unittest.TestCase):
         self.assertEqual(result, {"r1"})
         self.assertEqual(len(coord._waiting_for_input), 0)
 
-    def test_free_finished_request_clears_waiting_since(self):
-        """free_finished_request clears coordinator lifecycle markers."""
-        coord = OmniSchedulingCoordinator(stage_id=1)
-        coord._waiting_since["r1"] = 0.0
-        coord._full_payload_input_received.add("r1")
+    def test_free_finished_request_clears_all_lifecycle_state(self):
+        """free_finished_request makes stale connector events harmless."""
+        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
+        r1, r2 = _make_request("r1"), _make_request("r2")
         coord.finished_requests.add("r1")
+        coord.requests_with_ready_chunks.add("r1")
+        coord._waiting_for_chunk_running.extend([r1, r2])
+        coord.pending_chunk_registrations = [OmniChunkRecvHandle(request_id="r1"), OmniChunkRecvHandle(request_id="r2")]
+
         coord.free_finished_request("r1")
-        self.assertNotIn("r1", coord._waiting_since)
-        self.assertNotIn("r1", coord._full_payload_input_received)
+
         self.assertNotIn("r1", coord.finished_requests)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        self.assertNotIn("r1", coord.requests_with_ready_chunks)
+        self.assertEqual([r.request_id for r in coord._waiting_for_chunk_running], ["r2"])
+        self.assertEqual([h.request_id for h in coord.pending_chunk_registrations], ["r2"])

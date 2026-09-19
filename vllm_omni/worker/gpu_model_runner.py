@@ -2042,10 +2042,20 @@ class OmniGPUModelRunner(GPUModelRunner):
                     if req_state is not None:
                         existing = self.model_intermediate_buffer.setdefault(req_id, {})
                         existing.setdefault(out_key[0], {})[out_key[1]] = row
+                        validity_key = getattr(self.model, "talker_mtp_validity_key", None)
+                        if validity_key is not None:
+                            existing.setdefault(validity_key[0], {})[validity_key[1]] = torch.ones(
+                                (), dtype=torch.bool, device=code_predictor_codes.device
+                            )
                         req_state.additional_information_cpu = existing
             else:
                 for idx, req_id in enumerate(decode_req_ids):
                     update_dict = {out_key[0]: {out_key[1]: code_predictor_codes[idx : idx + 1]}}
+                    validity_key = getattr(self.model, "talker_mtp_validity_key", None)
+                    if validity_key is not None:
+                        update_dict.setdefault(validity_key[0], {})[validity_key[1]] = torch.ones(
+                            (), dtype=torch.bool, device=code_predictor_codes.device
+                        )
                     self._update_intermediate_buffer(req_id, update_dict)
 
     def _model_forward(
