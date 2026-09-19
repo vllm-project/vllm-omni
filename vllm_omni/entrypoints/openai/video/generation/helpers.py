@@ -22,6 +22,7 @@ See ``video/generation/README.md`` (utils vs helpers, no overlap).
 """
 
 import asyncio
+import dataclasses
 import io
 import json
 import os
@@ -51,16 +52,18 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoError,
     VideoGenerationRequest,
     VideoGenerationStatus,
+    VideoLidarArtifact,
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.serving_video import (
+    EncodedVideoResult,
     OmniOpenAIServingVideo,
     ReferenceAudio,
     ReferenceImage,
     ReferenceVideo,
     _stage_diffusion_model_class_name,
 )
-from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
+from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, SaveContext, StorageBaseManager
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE
 from vllm_omni.entrypoints.openai.utils import get_stage_type
 from vllm_omni.entrypoints.openai.video_api_utils import (
@@ -71,6 +74,10 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
     decode_input_reference,
 )
 from vllm_omni.errors import OmniClientError
+from vllm_omni.model_extras.cosmos3 import (
+    has_multiview_upload_indexes,
+    resolve_multiview_uploads,
+)
 
 logger = init_logger(__name__)
 
@@ -94,6 +101,11 @@ CONTROL_REFERENCE_VIDEO_SUFFIXES = frozenset({".mkv", ".mov", ".mp4", ".webm"})
 CONTROL_REFERENCE_MAX_BYTES = 512 * 1024 * 1024
 
 VIDEO_SYNC_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", 600.0))
+VIDEO_DELETE_TIMEOUT_S = 2.0
+_VIDEO_SAVE_CANCEL_GRACE_S = 1.0
+_VIDEO_CLEANUP_TIMEOUT_S = 1.0
+# Keep unfinished storage operations alive after their request stops waiting.
+_VIDEO_STORAGE_TASKS: set[asyncio.Task[Any]] = set()
 
 
 def _resolve_video_runtime_context(raw_request: Request) -> tuple[str | None, list[Any] | None]:
@@ -257,7 +269,7 @@ def _video_error_from_exception(exc: Exception) -> VideoError:
     if isinstance(exc, OmniClientError):
         return VideoError(code=exc.status_code, message=exc.message)
 
-    if isinstance(exc, (EngineGenerateError, EngineDeadError)):
+    if isinstance(exc, EngineGenerateError | EngineDeadError):
         err = create_error_response(exc)
         return VideoError(code=err.error.code, message=err.error.message)
 
@@ -267,11 +279,85 @@ def _video_error_from_exception(exc: Exception) -> VideoError:
     )
 
 
+def _lidar_storage_key(video_id: str) -> str:
+    return f"{video_id}.lidar.safetensors"
+
+
 async def _cleanup_video(video_id: str):
+    tasks = []
+    for key in (video_id, _lidar_storage_key(video_id)):
+        task = asyncio.create_task(_cleanup_video_artifact(STORAGE_MANAGER, key))
+        _track_video_storage_task(task, key)
+        tasks.append(task)
+    # Start both deletes even if another cancellation interrupts this cleanup.
+    await asyncio.gather(*(asyncio.shield(task) for task in tasks))
+
+
+async def _cleanup_video_artifact(manager: StorageBaseManager, key: str) -> None:
     try:
-        await STORAGE_MANAGER.delete(video_id)
+        await _delete_video_artifact(manager, key)
     except Exception:
-        logger.warning("Failed to cleanup partial video file '%s'", video_id)
+        logger.warning("Failed to cleanup partial video artifact '%s'", key, exc_info=True)
+
+
+def _track_video_storage_task(task: asyncio.Task[Any], key: str) -> None:
+    _VIDEO_STORAGE_TASKS.add(task)
+
+    def completed(done: asyncio.Task[Any]) -> None:
+        _VIDEO_STORAGE_TASKS.discard(done)
+        if not done.cancelled():
+            try:
+                done.result()
+            except Exception:
+                logger.warning("Deferred video storage operation failed for '%s'", key, exc_info=True)
+
+    task.add_done_callback(completed)
+
+
+async def _delete_video_artifact(manager: StorageBaseManager, key: str) -> None:
+    task = asyncio.create_task(manager.delete(key))
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=_VIDEO_CLEANUP_TIMEOUT_S)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        # Cancelling a coroutine cannot stop its filesystem thread. Retain the
+        # deletion so it can finish without blocking request cancellation.
+        _track_video_storage_task(task, key)
+        raise
+
+
+def _cleanup_late_video_save(task: asyncio.Task[SaveContext], manager: StorageBaseManager, key: str) -> None:
+    _track_video_storage_task(task, key)
+
+    def completed(done: asyncio.Task[SaveContext]) -> None:
+        if not done.cancelled():
+            # A backend may publish a file and then raise. Clean up on either
+            # success or failure, using the manager that performed the save.
+            cleanup = asyncio.create_task(_cleanup_video_artifact(manager, key))
+            _track_video_storage_task(cleanup, key)
+
+    task.add_done_callback(completed)
+
+
+async def _save_video_artifact(data: bytes, key: str, *, cancel_grace_s: float = 0.0) -> SaveContext:
+    manager = STORAGE_MANAGER
+    task = asyncio.create_task(manager.save(data, key))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Only joint video/LiDAR jobs request a grace period. Use one deadline
+        # so repeated DELETEEs cannot extend it; ordinary video cancels at once.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + cancel_grace_s
+        while not task.done() and (remaining := deadline - loop.time()) > 0:
+            try:
+                await asyncio.wait({task}, timeout=remaining)
+            except asyncio.CancelledError:
+                continue
+        if not task.done():
+            _cleanup_late_video_save(task, manager, key)
+        elif not task.cancelled():
+            task.exception()  # Retrieve errors; the cancelled job cleans up below.
+        raise
 
 
 def _cleanup_video_references(
@@ -293,8 +379,10 @@ def _cleanup_video_references(
 
 
 def _unpack_video_generation_result(
-    result: Sequence[object],
+    result: Sequence[object] | EncodedVideoResult,
 ) -> tuple[bytes, dict[str, float], float, VideoAction | None, dict[str, object]]:
+    if isinstance(result, EncodedVideoResult):
+        return result.video_bytes, result.stage_durations, result.peak_memory_mb, result.action, result.video_metadata
     video_metadata: dict[str, object] = {}
     if len(result) == 5:
         video_bytes, stage_durations, peak_memory_mb, action, raw_metadata = result
@@ -311,6 +399,22 @@ def _unpack_video_generation_result(
     )
 
 
+@dataclasses.dataclass
+class VideoUploadResources:
+    """Files owned by this request, never caller-supplied paths from extra_params."""
+
+    paths: list[str] = dataclasses.field(default_factory=list)
+
+    def cleanup(self) -> None:
+        for path in self.paths:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning("Failed to remove uploaded video reference %s", path, exc_info=True)
+
+
 async def _run_video_generation_job(
     handler: OmniOpenAIServingVideo,
     request: VideoGenerationRequest,
@@ -320,31 +424,39 @@ async def _run_video_generation_job(
     reference_audio: ReferenceAudio | None = None,
     control_path: str | None = None,
     app_state: Any | None = None,
+    upload_resources: VideoUploadResources | None = None,
 ) -> None:
-    job = await VIDEO_STORE.get(video_id)
-    if job is None:
-        logger.warning("Video job %s missing before generation task started; skipping", video_id)
-        _cleanup_video_references(reference_video, reference_audio, control_path)
-        return
-
     started_at = time.perf_counter()
     try:
+        job = await VIDEO_STORE.get(video_id)
+        if job is None:
+            logger.warning("Video job %s missing before generation task started; skipping", video_id)
+            return
 
         async def _mark_started() -> None:
             await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
 
-        video_bytes, stage_durations, peak_memory_mb, action, video_metadata = _unpack_video_generation_result(
-            await handler.generate_video_bytes(
-                request,
-                video_id,
-                reference_image=reference_image,
-                reference_video=reference_video,
-                reference_audio=reference_audio,
-                on_started=_mark_started,
-            )
+        result = await handler.generate_video_bytes(
+            request,
+            video_id,
+            reference_image=reference_image,
+            reference_video=reference_video,
+            reference_audio=reference_audio,
+            on_started=_mark_started,
         )
+        video_bytes, stage_durations, peak_memory_mb, action, video_metadata = _unpack_video_generation_result(result)
+        lidar = None
+        if isinstance(result, EncodedVideoResult):
+            lidar = VideoLidarArtifact(
+                url=f"/v1/videos/{video_id}/lidar",
+                file_name=_lidar_storage_key(video_id),
+                **result.lidar_metadata,
+            )
 
-        save_context = await STORAGE_MANAGER.save(video_bytes, video_id)
+        cancel_grace_s = _VIDEO_SAVE_CANCEL_GRACE_S if lidar is not None else 0.0
+        save_context = await _save_video_artifact(video_bytes, video_id, cancel_grace_s=cancel_grace_s)
+        if lidar is not None:
+            await _save_video_artifact(result.lidar_bytes, _lidar_storage_key(video_id), cancel_grace_s=cancel_grace_s)
         logger.info("Video request %s persisted %s output file.", video_id, save_context.key)
 
         updated_fields = {
@@ -356,6 +468,7 @@ async def _run_video_generation_job(
             "stage_durations": stage_durations,
             "peak_memory_mb": peak_memory_mb,
             "action": action,
+            "lidar": lidar,
         }
         updated_fields.update({key: value for key, value in video_metadata.items() if value is not None})
         if save_context.expires_at is not None:
@@ -396,11 +509,15 @@ async def _run_video_generation_job(
             },
         )
     except asyncio.CancelledError:
-        await _cleanup_video(video_id)
-        await VIDEO_STORE.pop(video_id)
+        try:
+            await _cleanup_video(video_id)
+        finally:
+            await VIDEO_STORE.pop(video_id)
         raise
     finally:
         _cleanup_video_references(reference_video, reference_audio, control_path)
+        if upload_resources is not None:
+            upload_resources.cleanup()
 
 
 async def _persist_uploaded_video_references(uploads: list[UploadFile]) -> list[str]:
@@ -427,18 +544,10 @@ async def _persist_uploaded_control_reference(
     upload: UploadFile,
     *,
     max_bytes: int = CONTROL_REFERENCE_MAX_BYTES,
+    numeric_lidar: bool = False,
 ) -> str:
     """Stream one model control upload to request-scoped local storage."""
-    kind = _uploaded_media_kind(upload)
-    suffix = Path(upload.filename or "").suffix.lower()
-    supported_suffixes = CONTROL_REFERENCE_IMAGE_SUFFIXES | CONTROL_REFERENCE_VIDEO_SUFFIXES
-    if kind == "audio" or (suffix and suffix not in supported_suffixes):
-        raise HTTPException(
-            status_code=HTTPStatus.BAD_REQUEST.value,
-            detail="control_reference must be an image or video file.",
-        )
-    if not suffix:
-        suffix = ".png" if kind == "image" else ".mp4"
+    suffix = _control_upload_suffix(upload, numeric_lidar=numeric_lidar)
 
     declared_size = getattr(upload, "size", None)
     if isinstance(declared_size, Integral) and int(declared_size) > max_bytes:
@@ -471,6 +580,25 @@ async def _persist_uploaded_control_reference(
         if not persisted:
             with suppress(OSError):
                 os.unlink(path)
+
+
+def _control_upload_suffix(upload: UploadFile, *, numeric_lidar: bool = False) -> str:
+    """Use the same media classification before and during persistence."""
+    suffix = Path(upload.filename or "").suffix.lower()
+    if numeric_lidar:
+        if suffix != ".safetensors":
+            raise HTTPException(400, detail="lidar.control_reference_index must reference a .safetensors file.")
+        return suffix
+    kind = _uploaded_media_kind(upload)
+    supported_suffixes = CONTROL_REFERENCE_IMAGE_SUFFIXES | CONTROL_REFERENCE_VIDEO_SUFFIXES
+    if kind == "audio" or (suffix and suffix not in supported_suffixes):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="control_reference must be an image or video file.",
+        )
+    if not suffix:
+        suffix = ".png" if kind == "image" else ".mp4"
+    return suffix
 
 
 def _validate_control_upload(
@@ -740,6 +868,7 @@ async def _parse_video_form(
     ReferenceVideo | None,
     ReferenceAudio | None,
     str | None,
+    VideoUploadResources,
 ]:
     """FastAPI dependency that parses video form data, validates inputs,
     resolves the handler, and decodes any reference image.
@@ -834,6 +963,56 @@ async def _parse_video_form(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
             detail=f"Video generation setup failed: {str(e)}",
         )
+
+    upload_resources = VideoUploadResources()
+    supports_multiview = bool(getattr(handler, "supports_multiview_reference_inputs", False))
+    has_indexes = has_multiview_upload_indexes(request.extra_params or {})
+    if has_indexes and not supports_multiview:
+        raise HTTPException(400, detail="This model does not support multiview uploaded references.")
+    if supports_multiview and (input_references or has_indexes):
+        if any(
+            value is not None
+            for value in (
+                input_reference,
+                parsed_image_reference,
+                parsed_video_reference,
+                parsed_audio_reference,
+                control_reference,
+                control_type,
+            )
+        ):
+            raise HTTPException(400, detail="Multiview uploads cannot be combined with generic reference fields.")
+        try:
+            # Validate all camera/role mappings and media kinds before creating files.
+            lidar_manifest = (request.extra_params or {}).get("lidar")
+            lidar_index = lidar_manifest.get("control_reference_index") if isinstance(lidar_manifest, dict) else None
+            resolve_multiview_uploads(
+                request.extra_params or {},
+                [
+                    "reference" + _control_upload_suffix(upload, numeric_lidar=index == lidar_index)
+                    for index, upload in enumerate(input_references)
+                ],
+            )
+            for index, upload in enumerate(input_references):
+                try:
+                    path = await _persist_uploaded_control_reference(
+                        upload, max_bytes=CONTROL_REFERENCE_MAX_BYTES, numeric_lidar=index == lidar_index
+                    )
+                except HTTPException as exc:
+                    raise HTTPException(exc.status_code, detail=f"input_references[{index}]: {exc.detail}") from exc
+                upload_resources.paths.append(path)
+                if index == lidar_index:
+                    from vllm_omni.model_extras.cosmos3_lidar import validate_lidar_header
+
+                    validate_lidar_header(path)
+            request.extra_params = resolve_multiview_uploads(request.extra_params or {}, upload_resources.paths)
+            return request, handler, effective_model_name, None, None, None, None, upload_resources
+        except (TypeError, ValueError) as exc:
+            upload_resources.cleanup()
+            raise HTTPException(400, detail=str(exc)) from exc
+        except BaseException:
+            upload_resources.cleanup()
+            raise
 
     normalized_control_type = _validate_control_upload(handler, request, control_reference, control_type)
     if normalized_control_type is not None:
@@ -984,4 +1163,5 @@ async def _parse_video_form(
         reference_video,
         reference_audio,
         control_path,
+        upload_resources,
     )

@@ -85,6 +85,7 @@ class FakeAsyncOmni:
         self.captured_prompt = None
         self.captured_reference_video_bytes = None
         self.captured_control_reference_bytes = {}
+        self.captured_multiview_bytes = []
         self.captured_sampling_params_list = None
 
     def get_diffusion_od_config(self):
@@ -93,6 +94,14 @@ class FakeAsyncOmni:
     async def generate(self, prompt, request_id, sampling_params_list):
         self.captured_prompt = prompt
         self.captured_sampling_params_list = sampling_params_list
+        for view in sampling_params_list[0].extra_args.get("multiview", {}).get("views", []):
+            self.captured_multiview_bytes.append(
+                {
+                    role: Path(view[f"{role}_path"]).read_bytes()
+                    for role in ("control", "vision")
+                    if f"{role}_path" in view
+                }
+            )
         for control_type in ("edge", "blur", "depth", "seg", "wsm"):
             control_params = sampling_params_list[0].extra_args.get(control_type)
             if isinstance(control_params, dict) and isinstance(control_params.get("control_path"), str):
@@ -2007,11 +2016,12 @@ def test_invalid_lora_returns_400(test_client):
 
 def test_failed_generation_awaits_storage_cleanup(test_client, isolated_video_backends, mocker: MockerFixture):
     """Regression (merge seam): when async generation raises, the failure handler
-    must ``await _cleanup_video(video_id)`` (single-arg, async) and still record
-    FAILED. Upstream carried a sync ``_cleanup_video(video_id, output_path)`` whose
-    stale call in the generic handler sat outside the conflict markers; against the
-    PR's async storage manager that raised NameError before the FAILED update,
-    wedging the job in IN_PROGRESS and orphaning the artifact."""
+    must ``await _cleanup_video(video_id)`` (single-arg, async), remove every
+    possible output artifact, and still record FAILED. Upstream carried a sync
+    ``_cleanup_video(video_id, output_path)`` whose stale call in the generic
+    handler sat outside the conflict markers; against the PR's async storage
+    manager that raised NameError before the FAILED update, wedging the job in
+    IN_PROGRESS and orphaning the artifact."""
     _store, _tasks, storage = isolated_video_backends
     delete_spy = mocker.spy(storage, "delete")
     mocker.patch.object(
@@ -2027,7 +2037,9 @@ def test_failed_generation_awaits_storage_cleanup(test_client, isolated_video_ba
     failed = _wait_for_status(test_client, video_id, VideoGenerationStatus.FAILED.value)
     assert failed["error"]["code"] == 500
     assert "GPU exploded" in failed["error"]["message"]
-    delete_spy.assert_called_once_with(video_id)
+    assert delete_spy.call_count == 2
+    delete_spy.assert_any_call(video_id)
+    delete_spy.assert_any_call(f"{video_id}.lidar.safetensors")
 
 
 def test_async_guardrail_error_returns_400_on_retrieve(test_client, mocker: MockerFixture):
@@ -2790,6 +2802,238 @@ def test_cosmos3_control_upload_rejects_invalid_size(control_bytes, message, tes
     assert test_client.app.state.openai_serving_video._engine_client.captured_prompt is None
 
 
+def _multiview_upload_request(vision=False, suffix=".mp4", joint=False):
+    from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS
+
+    count = 22 if vision else 11
+    extra = {
+        "wsm": True,
+        "multiview": {
+            "views": [
+                {
+                    "camera_key": camera,
+                    "control_reference_index": 10 - index,
+                    **({"vision_reference_index": 21 - index} if vision else {}),
+                }
+                for index, camera in enumerate(COSMOS3_MADS_CAMERAS)
+            ]
+        },
+    }
+    files = [
+        (
+            "input_references",
+            (f"same{suffix}", f"clip-{index}".encode(), "image/png" if suffix == ".png" else "video/mp4"),
+        )
+        for index in range(count)
+    ]
+    if joint:
+        import torch
+        from safetensors.torch import save
+
+        frames = torch.zeros(3, 2, 128, 1800, dtype=torch.float32)
+        frames[0].fill_(10)
+        frames[1:].fill_(1)
+        extra["lidar"] = {"control_reference_index": len(files)}
+        for view in extra["multiview"]["views"]:
+            view["prompt"] = "Raw camera caption."
+        files.append(("input_references", ("map.safetensors", save({"frames": frames}), "application/octet-stream")))
+    return extra, files
+
+
+@pytest.fixture
+def multiview_upload_dir(test_client, monkeypatch, tmp_path):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "Cosmos3MultiviewPipeline"
+    directory = tmp_path / "uploads"
+    directory.mkdir()
+    mkstemp = video_generation_helpers.tempfile.mkstemp
+    monkeypatch.setattr(video_generation_helpers.tempfile, "mkstemp", lambda **kwargs: mkstemp(dir=directory, **kwargs))
+    return directory
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize("vision", [False, True])
+@pytest.mark.parametrize("suffix", [".mp4", ".png"])
+@pytest.mark.parametrize("resolution", [None, "480", "720"])
+@pytest.mark.parametrize("joint", [False, True])
+def test_multiview_uploads_reach_camera_roles(
+    endpoint, vision, suffix, resolution, joint, test_client, multiview_upload_dir, mocker
+):
+    _mock_encode_video_bytes(mocker, b"multiview-output")
+    extra, files = _multiview_upload_request(vision, suffix, joint)
+    if resolution is not None:
+        extra["multiview"]["resolution"] = resolution
+    response = test_client.post(endpoint, data={"prompt": "drive", "extra_params": json.dumps(extra)}, files=files)
+    assert response.status_code == 200
+    if not endpoint.endswith("/sync"):
+        _wait_for_status(test_client, response.json()["id"], "completed")
+    engine = test_client.app.state.openai_serving_video._engine_client
+    for index, view in enumerate(engine.captured_multiview_bytes):
+        assert view["control"] == f"clip-{10 - index}".encode()
+        if vision:
+            assert view["vision"] == f"clip-{21 - index}".encode()
+    assert len(engine.captured_multiview_bytes) == 11
+    assert "video" not in engine.captured_prompt.get("multi_modal_data", {})
+    assert "reference_index" not in json.dumps(engine.captured_sampling_params_list[0].extra_args)
+    if resolution is not None:
+        assert engine.captured_sampling_params_list[0].extra_args["multiview"]["resolution"] == resolution
+    assert not list(multiview_upload_dir.iterdir())
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize("dimension", [None, "width", "height"])
+@pytest.mark.parametrize("location", ["top", "extra", "nested"])
+def test_multiview_aspect_ratio_and_dimension_constraints_reach_pipeline(
+    endpoint,
+    dimension,
+    location,
+    test_client,
+    multiview_upload_dir,
+    mocker,
+):
+    _mock_encode_video_bytes(mocker, b"multiview-output")
+    extra, files = _multiview_upload_request()
+    data = {"prompt": "drive", "aspect_ratio": "auto"}
+    if location == "top":
+        data["aspect_ratio"] = "9:16"
+    elif location == "extra":
+        extra["aspect_ratio"] = "9:16"
+    else:
+        extra["aspect_ratio"] = "1:1"
+        extra["multiview"]["aspect_ratio"] = "9:16"
+    if dimension is not None:
+        data[dimension] = "480" if dimension == "width" else "832"
+    data["extra_params"] = json.dumps(extra)
+    response = test_client.post(endpoint, data=data, files=files)
+    assert response.status_code == 200
+    if not endpoint.endswith("/sync"):
+        _wait_for_status(test_client, response.json()["id"], "completed")
+    engine = test_client.app.state.openai_serving_video._engine_client
+    sp = engine.captured_sampling_params_list[0]
+    resolved = sp.extra_args["multiview"].get("aspect_ratio", sp.extra_args.get("aspect_ratio"))
+    assert resolved == "9:16"
+    if dimension is not None:
+        assert getattr(sp, dimension) == int(data[dimension])
+    else:
+        assert sp.width is None and sp.height is None
+    assert not list(multiview_upload_dir.iterdir())
+
+
+def test_multiview_uploads_preserve_caller_owned_paths(test_client, multiview_upload_dir, tmp_path, mocker):
+    _mock_encode_video_bytes(mocker)
+    owned = tmp_path / "owned.mp4"
+    owned.write_bytes(b"owned-control")
+    extra, files = _multiview_upload_request()
+    view = extra["multiview"]["views"][0]
+    view.pop("control_reference_index")
+    view["control_path"] = str(owned)
+    files.pop()  # Index 10 belonged to the first camera.
+    response = test_client.post(
+        "/v1/videos/sync", data={"prompt": "drive", "extra_params": json.dumps(extra)}, files=files
+    )
+    assert response.status_code == 200
+    assert owned.read_bytes() == b"owned-control"
+    assert not list(multiview_upload_dir.iterdir())
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "unsupported",
+        "unused_upload",
+        "no_files",
+        "audio",
+        "singular_control",
+        "bad_index",
+    ],
+)
+def test_multiview_uploads_fail_before_generation(case, test_client, multiview_upload_dir):
+    extra, files = _multiview_upload_request()
+    data = {"prompt": "drive"}
+    if case == "unsupported":
+        test_client.app.state.openai_serving_video._engine_client.model_class_name = "WanPipeline"
+    elif case == "unused_upload":
+        files.append(("input_references", ("generic.mp4", b"generic", "video/mp4")))
+    elif case == "no_files":
+        files = []
+    elif case == "audio":
+        data["audio_reference"] = '{"audio_url":"https://example.com/audio.wav"}'
+    elif case == "singular_control":
+        data["control_type"] = "wsm"
+        files.append(("control_reference", ("control.mp4", b"control", "video/mp4")))
+    elif case == "bad_index":
+        extra["multiview"]["views"][0]["control_reference_index"] = True
+    data["extra_params"] = json.dumps(extra)
+    response = test_client.post("/v1/videos", data=data, files=files)
+    assert response.status_code == 400
+    assert test_client.app.state.openai_serving_video._engine_client.captured_prompt is None
+    assert not list(multiview_upload_dir.iterdir())
+
+
+@pytest.mark.parametrize("bad_payload", [b"", b"x" * 9])
+def test_multiview_partial_persistence_is_cleaned(bad_payload, test_client, multiview_upload_dir, monkeypatch):
+    monkeypatch.setattr(video_generation_helpers, "CONTROL_REFERENCE_MAX_BYTES", 8)
+    extra, files = _multiview_upload_request()
+    files[1] = ("input_references", ("bad.mp4", bad_payload, "video/mp4"))
+    response = test_client.post("/v1/videos", data={"prompt": "drive", "extra_params": json.dumps(extra)}, files=files)
+    assert response.status_code == 400
+    assert "input_references[1]" in response.json()["detail"]
+    assert not list(multiview_upload_dir.iterdir())
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+def test_multiview_failed_generation_is_cleaned(endpoint, test_client, multiview_upload_dir, mocker):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", side_effect=RuntimeError("encode failed")
+    )
+    extra, files = _multiview_upload_request()
+    response = test_client.post(endpoint, data={"prompt": "drive", "extra_params": json.dumps(extra)}, files=files)
+    if endpoint.endswith("/sync"):
+        assert response.status_code == 500
+    else:
+        assert response.status_code == 200
+        _wait_for_status(test_client, response.json()["id"], "failed")
+    assert not list(multiview_upload_dir.iterdir())
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize("joint", [False, True])
+def test_multiview_upload_lifetime_and_cancellation(endpoint, joint, test_client, multiview_upload_dir, monkeypatch):
+    started = threading.Event()
+    cancelled = threading.Event()
+
+    async def block(request, reference_id, **kwargs):
+        assert len(list(multiview_upload_dir.iterdir())) == (12 if joint else 11)
+        started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(test_client.app.state.openai_serving_video, "generate_video_bytes", block)
+    monkeypatch.setattr(api_server, "VIDEO_SYNC_TIMEOUT_S", 0.05)
+    extra, files = _multiview_upload_request(joint=joint)
+    response = test_client.post(endpoint, data={"prompt": "drive", "extra_params": json.dumps(extra)}, files=files)
+    if endpoint.endswith("/sync"):
+        assert response.status_code == 504
+    else:
+        assert response.status_code == 200
+        assert started.wait(timeout=2)
+        assert len(list(multiview_upload_dir.iterdir())) == (
+            12 if joint else 11
+        )  # POST has returned; the job still owns the files.
+        assert test_client.delete(f"/v1/videos/{response.json()['id']}").status_code == 200
+    assert cancelled.wait(timeout=2)
+    assert not list(multiview_upload_dir.iterdir())
+
+
+def test_multiview_scheduling_failure_is_cleaned(test_client, multiview_upload_dir, mocker):
+    mocker.patch.object(api_server.VIDEO_TASKS, "upsert", side_effect=RuntimeError("cannot register task"))
+    extra, files = _multiview_upload_request()
+    with pytest.raises(RuntimeError, match="cannot register task"):
+        test_client.post("/v1/videos", data={"prompt": "drive", "extra_params": json.dumps(extra)}, files=files)
+    assert not list(multiview_upload_dir.iterdir())
+
+
 def test_sync_missing_handler_returns_503():
     app = FastAPI()
     app.state.api_server_count = 1
@@ -3018,3 +3262,13 @@ def test_worker_fps_multiplier_is_applied_to_sync_encoding(test_client, mocker: 
     assert response.status_code == 200
     assert response.content == b"fps-multiplied"
     assert fps_values == [16]
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+def test_joint_invalid_numeric_payload_cleans_all_uploads(endpoint, test_client, multiview_upload_dir):
+    extra, files = _multiview_upload_request(joint=True)
+    files[-1] = ("input_references", ("map.safetensors", b"corrupt numeric file", "application/octet-stream"))
+    response = test_client.post(endpoint, data={"prompt": "drive", "extra_params": json.dumps(extra)}, files=files)
+    assert response.status_code == 400
+    assert not list(multiview_upload_dir.iterdir())
+    assert test_client.app.state.openai_serving_video._engine_client.captured_prompt is None

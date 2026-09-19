@@ -193,7 +193,7 @@ def _transfer_fps_param(extra: Mapping[str, Any], sp: Any, prompt_data: Any) -> 
     return _param_any(extra, sp, prompt_data, _FPS_KEYS)
 
 
-def _as_bool(value: Any, default: bool = False) -> bool:
+def as_bool(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
     if isinstance(value, str):
@@ -312,11 +312,11 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
             _param(extra, sp, prompt_data, "num_conditional_frames", TRANSFER_SAMPLE_DEFAULTS["num_conditional_frames"])
         ),
         max_frames=int(_param(extra, sp, prompt_data, "max_frames", TRANSFER_SAMPLE_DEFAULTS["max_frames"])),
-        show_control_condition=_as_bool(
+        show_control_condition=as_bool(
             _param(extra, sp, prompt_data, "show_control_condition", None),
             bool(TRANSFER_SAMPLE_DEFAULTS["show_control_condition"]),
         ),
-        show_input=_as_bool(
+        show_input=as_bool(
             _param(extra, sp, prompt_data, "show_input", None),
             bool(TRANSFER_SAMPLE_DEFAULTS["show_input"]),
         ),
@@ -329,11 +329,11 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
                 TRANSFER_SAMPLE_DEFAULTS["num_first_chunk_conditional_frames"],
             )
         ),
-        share_vision_temporal_positions=_as_bool(
+        share_vision_temporal_positions=as_bool(
             _param(extra, sp, prompt_data, "share_vision_temporal_positions", None),
             bool(TRANSFER_SAMPLE_DEFAULTS["share_vision_temporal_positions"]),
         ),
-        emphasize_control_in_prompt=_as_bool(
+        emphasize_control_in_prompt=as_bool(
             _param(extra, sp, prompt_data, "emphasize_control_in_prompt", None),
             bool(TRANSFER_SAMPLE_DEFAULTS["emphasize_control_in_prompt"]),
         ),

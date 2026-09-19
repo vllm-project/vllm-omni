@@ -20,7 +20,7 @@ import socket
 import time
 from argparse import Namespace
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from http import HTTPStatus
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -179,8 +179,12 @@ from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHan
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type
 from vllm_omni.entrypoints.openai.video.generation.helpers import (
+    VIDEO_DELETE_TIMEOUT_S,
     VIDEO_SYNC_TIMEOUT_S,
+    VideoUploadResources,
+    _cleanup_video,
     _cleanup_video_references,
+    _lidar_storage_key,
     _parse_video_form,
     _run_video_generation_job,
     _status_code_for_video_failure,
@@ -202,6 +206,7 @@ from vllm_omni.entrypoints.serve.utils.routes import (
 from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.model_extras.cosmos3_lidar import lidar_output_requested
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
@@ -2623,6 +2628,7 @@ async def create_video(
         ReferenceVideo | None,
         ReferenceAudio | None,
         str | None,
+        VideoUploadResources,
     ] = Depends(_parse_video_form),
 ) -> VideoResponse:
     """Create an asynchronous video generation job.
@@ -2638,22 +2644,39 @@ async def create_video(
         reference_video,
         reference_audio,
         control_path,
+        upload_resources,
     ) = ctx
-    ref = video_response_from_request(effective_model_name, request)
-    await VIDEO_STORE.upsert(ref.id, ref)
-    task = asyncio.create_task(
-        _run_video_generation_job(
-            handler,
-            request,
-            ref.id,
-            reference_image,
-            reference_video,
-            reference_audio,
-            control_path,
-            app_state=raw_request.app.state,
+    task: asyncio.Task[None] | None = None
+    ref = None
+    try:
+        ref = video_response_from_request(effective_model_name, request)
+        await VIDEO_STORE.upsert(ref.id, ref)
+        task = asyncio.create_task(
+            _run_video_generation_job(
+                handler,
+                request,
+                ref.id,
+                reference_image,
+                reference_video,
+                reference_audio,
+                control_path,
+                app_state=raw_request.app.state,
+                upload_resources=upload_resources,
+            )
         )
-    )
-    await VIDEO_TASKS.upsert(ref.id, task)
+        # A task cancelled before its first step never enters its finally block.
+        task.add_done_callback(lambda _: upload_resources.cleanup())
+        await VIDEO_TASKS.upsert(ref.id, task)
+    except BaseException:
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+        upload_resources.cleanup()
+        _cleanup_video_references(reference_video, reference_audio, control_path)
+        if ref is not None:
+            await VIDEO_STORE.pop(ref.id)
+        raise
     return ref
 
 
@@ -2676,6 +2699,7 @@ async def create_video_sync(
         ReferenceVideo | None,
         ReferenceAudio | None,
         str | None,
+        VideoUploadResources,
     ] = Depends(_parse_video_form),
 ) -> Response:
     """Synchronous video generation endpoint.
@@ -2695,11 +2719,14 @@ async def create_video_sync(
         reference_video,
         reference_audio,
         control_path,
+        upload_resources,
     ) = ctx
     request_id = f"video_sync-{random_uuid()}"
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
     started_at = time.perf_counter()
     try:
+        if lidar_output_requested(request.extra_params):
+            raise HTTPException(status_code=400, detail="LiDAR output requires asynchronous POST /v1/videos.")
         video_bytes, stage_durations, peak_memory_mb, _action, _video_metadata = _unpack_video_generation_result(
             await asyncio.wait_for(
                 handler.generate_video_bytes(
@@ -2732,6 +2759,7 @@ async def create_video_sync(
         ) from exc
     finally:
         _cleanup_video_references(reference_video, reference_audio, control_path)
+        upload_resources.cleanup()
     inference_time_s = time.perf_counter() - started_at
 
     return Response(
@@ -2850,12 +2878,13 @@ async def delete_video(video_id: str, raw_request: Request) -> VideoDeleteRespon
         if task is not None:
             task.cancel()
             try:
-                # Cancel cleanup may spend a full abort budget; +2s covers scheduling slack.
-                await asyncio.wait_for(task, timeout=VIDEO_ABORT_TIMEOUT_S + 2.0)
+                # Allow the abort budget while shielding artifact cleanup from a second cancellation.
+                await asyncio.wait_for(asyncio.shield(task), timeout=VIDEO_ABORT_TIMEOUT_S + VIDEO_DELETE_TIMEOUT_S)
             except asyncio.TimeoutError:
                 raise HTTPException(status_code=409, detail="Cancellation in progress. Please try again later.")
             except asyncio.CancelledError:
-                pass
+                if not task.cancelled():
+                    raise
 
         job = await VIDEO_STORE.get(video_id)
         if job is None:
@@ -2865,18 +2894,16 @@ async def delete_video(video_id: str, raw_request: Request) -> VideoDeleteRespon
             return VideoDeleteResponse(id=job.id, deleted=True)
 
     if job.status is VideoGenerationStatus.FAILED:
-        if job.file_name is not None:
-            try:
-                await STORAGE_MANAGER.delete(video_id)
-            except Exception:
-                logger.warning("Failed to delete stored artifact for failed video job %s", video_id, exc_info=True)
-
+        # Partial artifacts may exist before their descriptors are published.
+        await _cleanup_video(video_id)
         await VIDEO_STORE.pop(video_id)
         return VideoDeleteResponse(id=job.id, deleted=True)
 
     if job.file_name is None:
         raise HTTPException(status_code=409, detail="Video output not yet available. Please try again later.")
 
+    if job.lidar is not None:
+        await STORAGE_MANAGER.delete(_lidar_storage_key(video_id))
     await STORAGE_MANAGER.delete(video_id)
     await VIDEO_STORE.pop(video_id)
     return VideoDeleteResponse(id=job.id, deleted=True)
@@ -2919,6 +2946,26 @@ async def download_video(video_id: str) -> Response:
         )
 
     return response
+
+
+@router.get("/v1/videos/{video_id}/lidar")
+async def download_video_lidar(video_id: str) -> Response:
+    """Download numeric LiDAR for a completed joint generation job."""
+    job = await VIDEO_STORE.get(video_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Video not found")
+    if job.status == VideoGenerationStatus.FAILED:
+        raise HTTPException(status_code=422, detail="Video generation failed. Check job status for error details.")
+    if job.status != VideoGenerationStatus.COMPLETED:
+        raise HTTPException(status_code=404, detail="Generation is still in-progress")
+    if job.lidar is None:
+        raise HTTPException(status_code=404, detail="This job has no LiDAR output")
+    handle = await STORAGE_MANAGER.open(_lidar_storage_key(video_id))
+    if handle is None:
+        raise HTTPException(status_code=404, detail="Generated LiDAR file not found on disk")
+    if not isinstance(handle, FileStorageHandle):
+        raise HTTPException(status_code=500, detail="Unsupported LiDAR storage handle")
+    return FileResponse(path=handle.path, media_type=job.lidar.media_type, filename=job.lidar.file_name)
 
 
 @profiler_router.post("/start_profile")

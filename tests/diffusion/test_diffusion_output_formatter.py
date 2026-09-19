@@ -45,17 +45,20 @@ def test_formatter_preserves_single_video_audio_actions_and_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    lidar = torch.ones(1, 3, 2, 128, 1800)
     postprocess_output = normalize_diffusion_postprocess_output(
         {
             "payload": {
                 "video": ["frame-0"],
                 "audio": "audio-0",
                 "actions": "action-0",
+                "lidar": lidar,
             },
             "metadata": {
                 "audio": {"sample_rate": 48000},
                 "video": {"fps": 24.0},
                 "actions": {"action_mode": "policy"},
+                "lidar": {"fps": 10, "shape": list(lidar.shape)},
             },
         }
     )
@@ -82,11 +85,13 @@ def test_formatter_preserves_single_video_audio_actions_and_metadata(
             "audio": {"sample_rate": 48000},
             "video": {"fps": 24.0},
             "actions": {"action_mode": "policy"},
+            "lidar": {"fps": 10, "shape": list(lidar.shape)},
         },
         "audio": "audio-0",
         "audio_sample_rate": 48000,
         "fps": 24.0,
         "actions": "action-0",
+        "lidar": lidar,
     }
     assert result.stage_durations == {"execute": 1.25}
     assert result.peak_memory_mb == 321.0

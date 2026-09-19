@@ -11,6 +11,7 @@ class DiffusionModelMetadata:
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
     supports_mixed_reference_inputs: bool = False
+    supports_multiview_reference_inputs: bool = False
     # Multipart controls are exposed as ``control_reference`` plus
     # ``control_type`` by the video API.  A pipeline that opts in receives the
     # persisted upload through ``extra_args[control_type]["control_path"]``.
@@ -110,6 +111,10 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     ),
     "Cosmos3OmniPipeline": DiffusionModelMetadata(
         supported_control_upload_types=("edge", "blur", "depth", "seg", "wsm"),
+        final_output_type="video",
+    ),
+    "Cosmos3MultiviewPipeline": DiffusionModelMetadata(
+        supports_multiview_reference_inputs=True,
         final_output_type="video",
     ),
     "SanaVideoPipeline": DiffusionModelMetadata(final_output_type="video"),

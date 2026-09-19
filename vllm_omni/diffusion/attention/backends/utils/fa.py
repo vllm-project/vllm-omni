@@ -223,12 +223,17 @@ def vllm_flash_attn_varlen_with_lse(
     causal: bool = False,
     deterministic: bool = False,
     fa_version: int | None = None,
+    fa_version_is_resolved: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run packed vLLM FlashAttention and retain LSE for post-processing."""
 
     from vllm.vllm_flash_attn import flash_attn_varlen_func as vllm_flash_attn_varlen_func
 
-    version = resolve_vllm_flash_attn_version(fa_version)
+    # Maskless workers pin their selection at load time; do not inspect kernel
+    # availability again for every layer/pass of a serving request.
+    version = fa_version if fa_version_is_resolved else resolve_vllm_flash_attn_version(fa_version)
+    if version not in (2, 3, 4):
+        raise ValueError(f"A resolved FlashAttention version must be 2, 3, or 4; got {version!r}.")
     out, lse = vllm_flash_attn_varlen_func(
         q,
         k,
