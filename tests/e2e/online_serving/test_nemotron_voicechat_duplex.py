@@ -41,6 +41,10 @@ pytestmark = [
 ]
 
 
+# TODO(#7636): Re-enable after Nemotron VoiceChat is ported to
+# DuplexModelPlugin. The unified duplex server does not consume its legacy
+# runtime extension and serving adapter.
+@pytest.mark.skip(reason="Nemotron VoiceChat awaits its DuplexModelPlugin port; see #7636, issue 17")
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 @pytest.mark.parametrize(
     "omni_server",
