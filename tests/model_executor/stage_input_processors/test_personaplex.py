@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -103,12 +103,18 @@ def test_post_sample_talker_mtp_uses_current_temporal_state() -> None:
     model = SimpleNamespace(
         _dtype=torch.float32,
         depformer=depformer,
+        _depformer_graphs_enabled=False,
+        _depformer_graph=None,
         _duplex_stage0_runtime=lambda: SimpleNamespace(
             record_sample=lambda *, request_id, text_token, agent_codes: recorded.append(
                 (request_id, text_token.clone(), agent_codes.clone())
             )
         ),
     )
+    model._maybe_init_depformer_graphs = PersonaPlexTalkerForConditionalGeneration._maybe_init_depformer_graphs.__get__(
+        model
+    )
+    model._run_depformer = PersonaPlexTalkerForConditionalGeneration._run_depformer.__get__(model)
     method = getattr(PersonaPlexTalkerForConditionalGeneration, "post_sample_talker_mtp", None)
     assert callable(method)
 

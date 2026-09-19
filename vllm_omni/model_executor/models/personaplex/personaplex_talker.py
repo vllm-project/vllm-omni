@@ -50,6 +50,10 @@ from vllm_omni.model_executor.models.personaplex.modeling_helium import HeliumMo
 from vllm_omni.model_executor.models.personaplex.personaplex_depformer import (
     PersonaPlexDepformer,
 )
+from vllm_omni.model_executor.models.personaplex.personaplex_depformer_cudagraph import (
+    CUDAGraphDepformerWrapper,
+    resolve_depformer_graph_settings,
+)
 from vllm_omni.model_executor.models.personaplex.personaplex_embeddings import (
     PersonaPlexInputEmbeddings,
 )
@@ -95,13 +99,26 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(config.text_vocab_size)
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
+        # Depformer CUDA graph wrapper settings.
+        (
+            self._depformer_graphs_enabled,
+            self._depformer_capture_sizes,
+            depformer_max_batch,
+            self._depformer_warmup_iters,
+        ) = resolve_depformer_graph_settings(
+            vllm_config,
+            enabled=getattr(config, "depformer_cuda_graphs", False),
+        )
+
         # Verified custom components: embed_codes + depformer.
         self.input_embeddings = PersonaPlexInputEmbeddings(config)
         self.depformer = PersonaPlexDepformer(
             config.depformer_config,
             temporal_hidden_size=hidden,
             text_card=config.text_vocab_size,
+            max_graph_batch_size=depformer_max_batch,
         )
+        self._depformer_graph: CUDAGraphDepformerWrapper | None = None
 
         # Omni AR runner contract.
         self.have_multimodal_outputs = True
@@ -468,7 +485,7 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         text_token = input_ids.reshape(bsz).to(torch.long)
         hidden = last_talker_hidden.reshape(bsz, 1, -1).to(dtype)
 
-        codes = self.depformer(text_token, hidden)  # [B, dep_q] == gen[t]
+        codes = self._run_depformer(text_token, hidden)  # [B, dep_q] == gen[t]
 
         # The frame's inputs_embeds is built fully in preprocess (Moshi cache read at
         # offset-1, with agent cb0 = gen[t-1]); gen[t] feeds the NEXT frame, so pass
@@ -490,7 +507,9 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         step. PersonaPlex's unified duplex request instead appends one audio
         frame and stops after one sampled text token, so there is no next decode
         step. Run the same depformer dependency immediately from the current
-        sampled text token and temporal hidden state.
+        sampled text token and temporal hidden state. When
+        ``depformer_cuda_graphs`` is on, the depformer call is dispatched
+        through :class:`CUDAGraphDepformerWrapper`.
         """
         bsz = int(input_ids.shape[0])
         if len(req_infos) != bsz:
@@ -515,7 +534,7 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
                 )
             audio_tokens.append(tokens)
             audio_provided.append(provided)
-        codes = self.depformer(
+        codes = self._run_depformer(
             text_token,
             hidden,
             audio_tokens=torch.stack(audio_tokens).to(
@@ -535,6 +554,43 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
                 agent_codes=codes[row],
             )
         return codes
+
+    def _run_depformer(
+        self,
+        text_token: torch.Tensor,
+        hidden: torch.Tensor,
+        audio_tokens: torch.Tensor | None = None,
+        audio_provided: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Dispatch to the CUDA-graph wrapper when captured, else eager."""
+        self._maybe_init_depformer_graphs()
+        if self._depformer_graph is not None:
+            return self._depformer_graph(
+                text_token,
+                hidden,
+                audio_tokens=audio_tokens,
+                audio_provided=audio_provided,
+            )
+        out = self.depformer(
+            text_token,
+            hidden,
+            audio_tokens=audio_tokens,
+            audio_provided=audio_provided,
+        )
+        return out
+
+    def _maybe_init_depformer_graphs(self) -> None:
+        if not self._depformer_graphs_enabled:
+            return
+        if self._depformer_graph is None:
+            self._depformer_graph = CUDAGraphDepformerWrapper(
+                self.depformer,
+                capture_sizes=self._depformer_capture_sizes,
+                enabled=True,
+                warmup_iters=self._depformer_warmup_iters,
+            )
+            device = next(self.depformer.parameters()).device
+            self._depformer_graph.warmup(device)
 
     # ------------------------------------------------------------------
     # Weight loading
@@ -569,6 +625,7 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             module = getattr(self, sub)
             for tgt in module.load_weights(sub_w):
                 loaded.add(f"{sub}.{tgt}")
+        self._maybe_init_depformer_graphs()
         return loaded
 
     def _load_temporal(

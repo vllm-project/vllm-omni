@@ -43,6 +43,12 @@ stages:
     # Temporal transformer sliding_window is 3000 frames; keep model len within.
     max_model_len: 3000
     devices: "0"
+    enforce_eager: false
+    hf_overrides:
+      depformer_cuda_graphs: true
+    compilation_config:
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16]
+      cudagraph_num_of_warmups: 3
     output_connectors:
       to_stage_1: connector_of_shared_memory
     default_sampling_params:
