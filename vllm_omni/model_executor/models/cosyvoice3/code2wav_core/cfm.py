@@ -3,6 +3,7 @@
 # Adopted from https://github.com/FunAudioLLM/CosyVoice/tree/main/cosyvoice/flow
 """Conditional Flow Matching (CFM) classes for audio generation."""
 
+import inspect
 from abc import ABC
 
 import torch
@@ -93,7 +94,7 @@ class ConditionalCFM(BASECFM):
         with cosyvoice3_batch_flow_profile(f"cosyvoice3_cfm_euler_{max(1, int(n_timesteps))}_steps"):
             return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), cache
 
-    def solve_euler(self, x, t_span, mu, mask, spks, cond):
+    def solve_euler(self, x, t_span, mu, mask, spks, cond, streaming: bool = False):
         """
         Fixed euler solver for ODEs.
         Args:
@@ -107,6 +108,7 @@ class ConditionalCFM(BASECFM):
             spks (torch.Tensor, optional): speaker ids. Defaults to None.
                 shape: (batch_size, spk_emb_dim)
             cond (Optional[Any], optional): Not used but kept for future purposes
+            streaming: forwarded to the PyTorch DiT estimator (chunk attention).
         """
         t, _, dt = t_span[0], t_span[-1], t_span[1] - t_span[0]
         t = t.unsqueeze(dim=0)
@@ -141,7 +143,7 @@ class ConditionalCFM(BASECFM):
                 if cond is not None:
                     cond_in[:batch_size] = cond
             with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_forward_estimator"):
-                dphi_dt = self.forward_estimator(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
+                dphi_dt = self.forward_estimator(x_in, mask_in, mu_in, t_in, spks_in, cond_in, streaming=streaming)
             with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cfg_combine"):
                 dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [batch_size, batch_size], dim=0)
                 dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
@@ -154,8 +156,17 @@ class ConditionalCFM(BASECFM):
 
         return sol[-1].float()
 
-    def forward_estimator(self, x, mask, mu, t, spks, cond):
+    def forward_estimator(self, x, mask, mu, t, spks, cond, streaming: bool = False):
         if isinstance(self.estimator, torch.nn.Module):
+            # PyTorch estimator: pass streaming into DiT. Keep TRT unchanged
+            # (chunk mask is baked into the ONNX/engine if present).
+            forward_fn = self.estimator.forward
+            try:
+                params = inspect.signature(forward_fn).parameters
+            except (TypeError, ValueError):
+                params = {}
+            if "streaming" in params:
+                return self.estimator(x, mask, mu, t, spks, cond, streaming=streaming)
             return self.estimator(x, mask, mu, t, spks, cond)
         else:
             # TensorRT estimator: bind raw device pointers. The flow runs in
@@ -222,6 +233,7 @@ class CausalConditionalCFM(ConditionalCFM):
             spks (torch.Tensor, optional): speaker ids. Defaults to None.
                 shape: (batch_size, spk_emb_dim)
             cond (Optional[Any], optional): Not used but kept for future purposes
+            streaming: forwarded to the DiT estimator for chunk attention.
 
         Returns:
             sample (torch.Tensor): generated mel-spectrogram
@@ -246,7 +258,7 @@ class CausalConditionalCFM(ConditionalCFM):
                 t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
 
         with cosyvoice3_batch_flow_profile(f"cosyvoice3_cfm_euler_{max(1, int(n_timesteps))}_steps"):
-            return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), None
+            return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond, streaming=streaming), None
 
 
 class CausalMaskedDiffWithDiT(torch.nn.Module):
