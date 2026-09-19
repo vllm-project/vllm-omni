@@ -603,10 +603,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 args: tuple = (req, self.od_config, scheduler_output.kv_prefetch_job)
                 if new_req.diffusion_kv_metadata is not None:
                     args += (new_req.diffusion_kv_metadata,)
-                allgather_active = any_selected_component_uses_allgather(self.od_config)
-                timeout_options: dict[str, Any] = {}
-                if allgather_active:
-                    timeout_options["timeout"] = _DLO_DP_WAVE_TIMEOUT_S
+                timeout_options: dict[str, Any] = {"timeout": _DLO_DP_WAVE_TIMEOUT_S}
                 result = self.collective_rpc(
                     "execute_model",
                     args=args,
@@ -674,12 +671,20 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             # need to advertise supports_request_batch=True.
             return self.execute_request(scheduler_output)
 
-        result = self.collective_rpc(
-            "execute_model_batch",
-            args=(scheduler_output, self.od_config),
-            unique_reply_rank=0,
-            exec_all_ranks=True,
-        )
+        try:
+            result = self.collective_rpc(
+                "execute_model_batch",
+                args=(scheduler_output, self.od_config),
+                unique_reply_rank=0,
+                exec_all_ranks=True,
+                timeout=_DLO_DP_WAVE_TIMEOUT_S,
+            )
+        except TimeoutError as exc:
+            # A rank that never replied leaves the process group unusable, so
+            # tear the worker group down instead of letting the next wave hang
+            # on it too. Mirrors the execute_request() contract.
+            self._fail_closed_on_dp_wave_timeout(exc)
+            raise
         if isinstance(result, AsyncDiffusionOutput) and result.kind == AsyncOutputKind.COMPUTE_DONE:
             # Propagate async_output_id to per-request RunnerOutputs so the
             # engine waits in step_streaming() instead of blocking here.
@@ -730,6 +735,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             args=(scheduler_output,),
             unique_reply_rank=0,
             exec_all_ranks=True,
+            timeout=_DLO_DP_WAVE_TIMEOUT_S,
         )
 
         if isinstance(result, BaseRunnerOutput):

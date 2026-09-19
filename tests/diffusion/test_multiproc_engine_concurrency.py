@@ -570,6 +570,61 @@ class TestRequestModeDispatch:
         assert executor.collective_rpc.call_args.kwargs["timeout"] == executor_module._DLO_DP_WAVE_TIMEOUT_S
         executor._fail_closed_on_dp_wave_timeout.assert_called_once()
 
+    def test_single_rank_local_request_times_out_and_fails_closed(self):
+        """A no-AllGather wave must be bounded too (#6964).
+
+        Without a timeout the dequeue deadline is ``None``, so a rank that
+        never replies leaves ``collective_rpc()`` retrying forever.
+        """
+        from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+            diffusion_offload_config={
+                "mode": "layer",
+                "components": ["dit"],
+                "layer_options": {"dit": {"weight_transfer": "rank-local"}},
+            },
+        )
+        executor.collective_rpc = Mock(side_effect=TimeoutError("timed out"))
+        executor._fail_closed_on_dp_wave_timeout = Mock()
+
+        result = executor.execute_request(_make_sched_output("A"))
+
+        assert result.runner_outputs[0].result.error == "timed out"
+        assert executor.collective_rpc.call_args.kwargs["timeout"] == executor_module._DLO_DP_WAVE_TIMEOUT_S
+        executor._fail_closed_on_dp_wave_timeout.assert_called_once()
+
+    def test_rank_local_batch_wave_times_out_and_fails_closed(self):
+        """Two concurrent requests take ``execute_model_batch`` (#6964).
+
+        That path had no timeout at all, which is why the report only
+        reproduced with concurrency.
+        """
+        from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+            diffusion_offload_config={
+                "mode": "layer",
+                "components": ["dit"],
+                "layer_options": {"dit": {"weight_transfer": "rank-local"}},
+            },
+        )
+        executor.collective_rpc = Mock(side_effect=TimeoutError("timed out"))
+        executor._fail_closed_on_dp_wave_timeout = Mock()
+
+        with pytest.raises(TimeoutError):
+            executor.execute_batch(_make_sched_output("A", "B"))
+
+        assert executor.collective_rpc.call_args.args[0] == "execute_model_batch"
+        assert executor.collective_rpc.call_args.kwargs["timeout"] == executor_module._DLO_DP_WAVE_TIMEOUT_S
+        executor._fail_closed_on_dp_wave_timeout.assert_called_once()
+
 
 # ───────────────── concurrent collective RPC ─────────────────
 
