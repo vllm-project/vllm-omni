@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -69,6 +69,16 @@ def extract_glyph_texts(prompt: str) -> str | None:
     if result:
         return ". ".join([f'Text "{text}"' for text in result]) + ". "
     return None
+
+
+def _get_encoder_hidden_states_indices(
+    image_mask: torch.Tensor,
+    prompt_mask_2: torch.Tensor,
+    prompt_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    if image_mask.shape[0] != 1:
+        return None
+    return tuple(mask[0].bool().nonzero(as_tuple=False).squeeze(1) for mask in (image_mask, prompt_mask_2, prompt_mask))
 
 
 def get_hunyuan_video_15_post_process_func(od_config: OmniDiffusionConfig):
@@ -462,8 +472,6 @@ class HunyuanVideo15Pipeline(
         )
         cond_latents, mask = self.prepare_cond_latents_and_mask(latents, dtype, device)
 
-        # Image embeds (zeros for T2V, no mask — let the transformer detect T2V
-        # via the all-zeros check, matching the diffusers reference behaviour)
         image_embeds = torch.zeros(
             batch_size,
             self.vision_num_semantic_tokens,
@@ -471,6 +479,15 @@ class HunyuanVideo15Pipeline(
             dtype=dtype,
             device=device,
         )
+        image_embeds_mask = torch.zeros(image_embeds.shape[:2], dtype=torch.bool, device=device)
+        encoder_hidden_states_indices = _get_encoder_hidden_states_indices(
+            image_embeds_mask, prompt_embeds_mask_2, prompt_embeds_mask
+        )
+        negative_encoder_hidden_states_indices = None
+        if negative_prompt_embeds_mask is not None and negative_prompt_embeds_mask_2 is not None:
+            negative_encoder_hidden_states_indices = _get_encoder_hidden_states_indices(
+                image_embeds_mask, negative_prompt_embeds_mask_2, negative_prompt_embeds_mask
+            )
 
         # Timesteps — the scheduler handles flow_shift via its config (`shift` param).
         # We just provide unshifted linear sigmas, matching the diffusers reference.
@@ -503,6 +520,8 @@ class HunyuanVideo15Pipeline(
                     "encoder_hidden_states_2": prompt_embeds_2,
                     "encoder_attention_mask_2": prompt_embeds_mask_2,
                     "image_embeds": image_embeds,
+                    "image_embeds_mask": image_embeds_mask,
+                    "encoder_hidden_states_indices": encoder_hidden_states_indices,
                     "return_dict": False,
                 }
 
@@ -517,6 +536,8 @@ class HunyuanVideo15Pipeline(
                         "encoder_hidden_states_2": negative_prompt_embeds_2,
                         "encoder_attention_mask_2": negative_prompt_embeds_mask_2,
                         "image_embeds": image_embeds,
+                        "image_embeds_mask": image_embeds_mask,
+                        "encoder_hidden_states_indices": negative_encoder_hidden_states_indices,
                         "return_dict": False,
                     }
 
