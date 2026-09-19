@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2026 The vLLM-Omni team.
 # Copyright (c) rednote-hilab. All rights reserved.
 # Adapted from:
@@ -127,12 +128,13 @@ class TransformerEncoderLayer(nn.Module):
         *,
         cache: tuple[torch.Tensor, torch.Tensor],
         positions: torch.Tensor,
+        attn_bias: torch.Tensor = None,
     ):
         if x.size(1) <= 0:
             raise ValueError("TransformerEncoderLayer.decode_step expects a non-empty input.")
 
         h = self.attn_norm(x)
-        h, cache = self.attn.decode_step(h, cache=cache, positions=positions)
+        h, cache = self.attn.decode_step(h, cache=cache, positions=positions, attn_bias=attn_bias)
         x = x + h
 
         h = self.ffn_norm(x)
@@ -202,9 +204,30 @@ class SuperviseEncoder(nn.Module):
     def decode_step(self, x, *, layer_caches, positions: torch.Tensor):
         if len(layer_caches) != len(self.layers):
             raise ValueError("Layer cache count does not match encoder depth.")
-
+        block_len = x.size(1)
+        cache_capacity = layer_caches[0][0].size(2)
+        key_positions = torch.arange(
+            cache_capacity,
+            device=x.device,
+            dtype=torch.long,
+        ).unsqueeze(0)
+        query_positions = positions.unsqueeze(1)
+        causal_mask = key_positions <= query_positions
+        valid_mask = key_positions <= positions[-1]
+        attn_bias = torch.zeros(
+            x.size(0),
+            self.layers[0].attn.num_heads,
+            block_len,
+            cache_capacity,
+            dtype=x.dtype,
+            device=x.device,
+        )
+        attn_bias.masked_fill_(
+            (causal_mask & valid_mask).unsqueeze(0).unsqueeze(0).logical_not(),
+            float("-inf"),
+        )
         for layer, cache in zip(self.layers, layer_caches, strict=True):
-            x, _ = layer.decode_step(x, cache=cache, positions=positions)
+            x, _ = layer.decode_step(x, cache=cache, positions=positions, attn_bias=attn_bias)
         return x
 
 
