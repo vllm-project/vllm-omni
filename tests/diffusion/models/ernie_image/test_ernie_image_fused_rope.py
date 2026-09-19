@@ -5,10 +5,11 @@ import pytest
 import torch
 from vllm.triton_utils import HAS_TRITON
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.ernie_image.ernie_image_transformer import _apply_rotary_emb
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 @pytest.fixture(autouse=True)
@@ -36,9 +37,9 @@ def _inputs(shape: tuple[int, int, int, int]):
     return query, key, freqs_cos, freqs_sin
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="NVIDIA CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
-@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="Fused RoPE requires NVIDIA CUDA")
 @pytest.mark.parametrize(
     "shape",
     [
@@ -62,9 +63,9 @@ def test_fused_qk_rope_is_bit_exact(shape):
     assert torch.equal(actual_key, expected_key)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="NVIDIA CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
-@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="Fused RoPE requires NVIDIA CUDA")
 def test_launch_failure_disables_runtime_key(monkeypatch):
     from vllm_omni.diffusion.models.ernie_image import fused_rope
 
@@ -105,6 +106,7 @@ def test_non_cuda_platform_does_not_launch_fused_kernel(monkeypatch):
     assert not fused_rope._FAILED_KEYS
 
 
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_failed_runtime_key_cache_is_bounded():
     from vllm_omni.diffusion.models.ernie_image import fused_rope
 
@@ -116,7 +118,8 @@ def test_failed_runtime_key_cache_is_bounded():
     assert (fused_rope._FAILED_KEYS_MAX_SIZE,) in fused_rope._FAILED_KEYS
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="NVIDIA CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_compile_path_does_not_launch_fused_kernel(monkeypatch):
     from vllm_omni.diffusion.models.ernie_image import fused_rope
@@ -136,7 +139,8 @@ def test_compile_path_does_not_launch_fused_kernel(monkeypatch):
         assert fused_rope.try_fused_qk_rotary_emb(query, key, freqs_cos, freqs_sin) is None
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="NVIDIA CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 @pytest.mark.parametrize("requires_grad_input", ["query", "key", "cos", "sin"])
 def test_gradient_inputs_do_not_launch_fused_kernel(monkeypatch, requires_grad_input):
@@ -162,7 +166,8 @@ def test_gradient_inputs_do_not_launch_fused_kernel(monkeypatch, requires_grad_i
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="NVIDIA CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_mismatched_key_dtype_or_device_does_not_launch(monkeypatch):
     from vllm_omni.diffusion.models.ernie_image import fused_rope
