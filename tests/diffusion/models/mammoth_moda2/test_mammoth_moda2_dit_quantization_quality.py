@@ -7,14 +7,11 @@ from __future__ import annotations
 
 import gc
 import time
-from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
 import pytest
-import torch
 import yaml
-from diffusers.image_processor import VaeImageProcessor
 from PIL import Image
 from vllm.sampling_params import SamplingParams
 
@@ -48,52 +45,28 @@ _VISION_START_TOKEN_ID = 151652
 _VISION_END_TOKEN_ID = 151653
 
 
-def _extract_image(outputs, *, height: int = HEIGHT, width: int = WIDTH) -> torch.Tensor:
+def _extract_image(outputs, *, height: int = HEIGHT, width: int = WIDTH) -> Image.Image:
     images = []
     for output_group in outputs:
         request_outputs = output_group if isinstance(output_group, list) else [output_group]
         for request_output in request_outputs:
-            completions = getattr(request_output, "outputs", None)
-            if not isinstance(completions, list):
-                continue
-            for completion in completions:
-                multimodal = getattr(completion, "multimodal_output", None)
-                if not isinstance(multimodal, Mapping) or "image" not in multimodal:
-                    continue
-                payload = multimodal["image"]
-                tensors = payload if isinstance(payload, list) else [payload]
-                for tensor in tensors:
-                    if not isinstance(tensor, torch.Tensor):
-                        raise TypeError(f"Expected an image tensor, got {type(tensor)!r}")
-                    if tensor.ndim == 4:
-                        images.extend(tensor.unbind(0))
-                    elif tensor.ndim == 3:
-                        images.append(tensor)
-                    else:
-                        raise ValueError(f"Expected a CHW or BCHW image tensor, got shape {tuple(tensor.shape)}")
+            output_images = getattr(request_output, "images", None)
+            if isinstance(output_images, list):
+                images.extend(output_images)
 
-    # Count across every completion, image list, and tensor batch. Never
-    # silently discard extra outputs before the quality comparison.
+    # Count across every request output and image list. Never silently discard
+    # extra outputs before the quality comparison.
     if len(images) != 1:
         raise ValueError(f"Expected exactly one image, got {len(images)}")
     image = images[0]
-    expected_shape = (3, height, width)
-    if tuple(image.shape) != expected_shape:
-        raise ValueError(f"Expected RGB image with CHW shape {expected_shape}, got {tuple(image.shape)}")
-    image = image.detach().float().cpu()
-    if not torch.isfinite(image).all():
-        raise ValueError("Generated image contains non-finite values")
+    if not isinstance(image, Image.Image):
+        raise TypeError(f"Expected a PIL image, got {type(image)!r}")
+    if image.mode != "RGB":
+        raise ValueError(f"Expected an RGB image, got mode {image.mode!r}")
+    expected_size = (width, height)
+    if image.size != expected_size:
+        raise ValueError(f"Expected image size {expected_size}, got {image.size}")
     return image
-
-
-def _to_pil(image: torch.Tensor) -> Image.Image:
-    # The pipeline returns raw VAE output with a known [-1, 1] range, even
-    # when all pixels in an individual image happen to be nonnegative.
-    return VaeImageProcessor().postprocess(
-        image.detach().float().cpu().unsqueeze(0),
-        output_type="pil",
-        do_denormalize=[True],
-    )[0]
 
 
 def _generate(deploy_config: str) -> tuple[Image.Image, float, float]:
@@ -155,10 +128,7 @@ def _generate(deploy_config: str) -> tuple[Image.Image, float, float]:
         gc.collect()
         current_omni_platform.empty_cache()
 
-    pil_image = _to_pil(image)
-    assert pil_image.mode == "RGB"
-    assert pil_image.size == (WIDTH, HEIGHT)
-    return pil_image, device_peak_memory_mb, generation_latency_s
+    return image, device_peak_memory_mb, generation_latency_s
 
 
 @pytest.fixture(scope="module")
