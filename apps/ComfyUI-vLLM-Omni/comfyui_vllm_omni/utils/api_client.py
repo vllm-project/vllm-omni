@@ -30,6 +30,7 @@ from .format import (
     video_to_base64,
     video_to_bytes,
 )
+from .latent_mask import scalar_mask_to_json, video_mask_to_grid_json
 from .logger import get_logger, pretty_printer
 from .models import lookup_model_spec
 from .types import (
@@ -281,6 +282,7 @@ class VLLMOmniClient:
         sampling_params: dict | None = None,
         model_params: dict | None = None,
         lora: dict | None = None,
+        latent_edit: dict | None = None,
         spec_model: str | None = None,
         **extra_params,
     ) -> VideoInput:
@@ -360,6 +362,44 @@ class VLLMOmniClient:
                 filename=image_filename,
                 content_type="image/png",
             )
+
+        # === latent-mask editing (MiniMax H3) ===
+        if latent_edit is not None:
+            source_video = latent_edit.get("source_video")
+            source_audio = latent_edit.get("source_audio")
+            video_mask = latent_edit.get("video_mask")
+            audio_mask = latent_edit.get("audio_mask")
+
+            if video_mask is None and audio_mask is None:
+                raise ValueError("Latent-mask editing requires at least one mask.")
+
+            if source_video is not None:
+                form.add_field(
+                    "source_video",
+                    video_to_bytes(source_video, "source.mp4"),
+                    filename="source.mp4",
+                    content_type="video/mp4",
+                )
+            if source_audio is not None:
+                form.add_field(
+                    "source_audio",
+                    audio_to_bytes(source_audio, "source_audio.mp3"),
+                    filename="source_audio.mp3",
+                    content_type="audio/mpeg",
+                )
+            if video_mask is not None:
+                mask_json = video_mask_to_grid_json(video_mask, width=width, height=height, num_frames=num_frames)
+                if len(mask_json) > 1024 * 1024:
+                    form.add_field(
+                        "video_noise_mask",
+                        mask_json.encode("utf-8"),
+                        filename="video-mask.json",
+                        content_type="application/json",
+                    )
+                else:
+                    form.add_field("video_noise_mask", mask_json)
+            if audio_mask is not None:
+                form.add_field("audio_noise_mask", scalar_mask_to_json(audio_mask))
 
         # === model specific params. Either use a specialized builder, or add flattened fields as-is ===
         if model_params is not None:
