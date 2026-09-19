@@ -1,8 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Utilities for resolving real models to their tiny model equivalents.
 """
 
 import logging
+from pathlib import Path
 
 from tests.model_tests.diffusion.model_settings import DIFFUSION_TEST_SETTINGS
 from vllm_omni.diffusion.data import resolve_model_class_name
@@ -30,4 +34,7 @@ def resolve_tiny_model_path(model: str) -> str:
         )
         return model
 
-    return test_opts.builder()
+    model_path = test_opts.builder()
+    if test_opts.checkpoint_filename is not None:
+        return str(Path(model_path) / test_opts.checkpoint_filename)
+    return model_path
