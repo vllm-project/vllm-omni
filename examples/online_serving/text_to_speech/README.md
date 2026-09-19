@@ -1001,7 +1001,7 @@ Single-stage native AR TTS at 48 kHz.
 ### Launch
 
 ```bash
-vllm serve openbmb/VoxCPM2 --omni --host 0.0.0.0 --port 8000
+vllm serve openbmb/VoxCPM2 --omni --host 0.0.0.0 --port 8000 --served-model-name voxcpm2 openbmb/VoxCPM2
 ```
 
 Deploy config auto-loads from `vllm_omni/deploy/voxcpm2.yaml`. Pass `--deploy-config <path>` to override or `--stage-N-<field> <value>` for per-stage runtime tweaks.

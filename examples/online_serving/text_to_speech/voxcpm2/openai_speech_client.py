@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """OpenAI-compatible client for VoxCPM2 TTS via /v1/audio/speech endpoint.
 
 Examples:
@@ -13,7 +16,7 @@ Examples:
         --ref-audio "https://example.com/reference.wav"
 
 Server setup:
-    vllm serve openbmb/VoxCPM2 --omni --host 0.0.0.0 --port 8000
+    vllm serve openbmb/VoxCPM2 --omni --host 0.0.0.0 --port 8000 --served-model-name voxcpm2 openbmb/VoxCPM2
 """
 
 from __future__ import annotations
