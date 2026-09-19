@@ -11,7 +11,7 @@ from torch import nn
 
 from vllm_omni.diffusion.media import VideoTensorEncoding, VideoTensorLayout, VideoValueRange
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, build_wan_scheduler
-from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
+from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention, WanTransformer3DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -693,3 +693,38 @@ def test_load_weights_keeps_trained_vsa_gate(monkeypatch) -> None:
 
     assert pipeline.has_gate_compress_weights is True
     assert gate.to_gate_compress is original_gate
+
+
+@pytest.mark.parametrize("transformer_name", ["transformer", "transformer_2"])
+@pytest.mark.parametrize("gate_name", ["to_gate_compress", "attn1.to_gate_compress"])
+def test_load_weights_restores_checkpoint_vsa_gate(monkeypatch, transformer_name, gate_name) -> None:
+    """Load real gate values through both the pipeline and transformer loaders."""
+    module = importlib.import_module("vllm_omni.diffusion.models.wan2_2.wan2_2_transformer")
+    monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+
+    pipeline = Wan22Pipeline.__new__(Wan22Pipeline)
+    nn.Module.__init__(pipeline)
+    transformer = WanTransformer3DModel.__new__(WanTransformer3DModel)
+    nn.Module.__init__(transformer)
+    attention = WanSelfAttention.__new__(WanSelfAttention)
+    nn.Module.__init__(attention)
+    attention.to_gate_compress = nn.Linear(1, 1)
+    nn.init.zeros_(attention.to_gate_compress.weight)
+    nn.init.zeros_(attention.to_gate_compress.bias)
+    block = nn.Module()
+    block.attn1 = attention
+    transformer.blocks = nn.ModuleList([block])
+    setattr(pipeline, transformer_name, transformer)
+
+    prefix = f"{transformer_name}.blocks.0.{gate_name}"
+    loaded = pipeline.load_weights(
+        iter(((f"{prefix}.weight", torch.tensor([[2.0]])), (f"{prefix}.bias", torch.tensor([3.0]))))
+    )
+
+    assert pipeline.has_gate_compress_weights is True
+    assert f"{transformer_name}.blocks.0.attn1.to_gate_compress.weight" in loaded
+    assert f"{transformer_name}.blocks.0.attn1.to_gate_compress.bias" in loaded
+    torch.testing.assert_close(attention.to_gate_compress.weight, torch.tensor([[2.0]]))
+    torch.testing.assert_close(attention.to_gate_compress.bias, torch.tensor([3.0]))
+    torch.testing.assert_close(attention.to_gate_compress(torch.tensor([[4.0]])), torch.tensor([[11.0]]))
