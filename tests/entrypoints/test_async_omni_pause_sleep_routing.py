@@ -32,9 +32,9 @@ def _make_omni(*, stage_types: list[str]) -> AsyncOmni:
     omni._final_output_handler = lambda: None
     omni.reset_mm_cache = AsyncMock()
 
-    stage_clients = [SimpleNamespace(stage_type=stage_type) for stage_type in stage_types]
+    stage_configs = [SimpleNamespace(stage_type=stage_type) for stage_type in stage_types]
     omni.engine = SimpleNamespace(
-        stage_clients=stage_clients,
+        stage_configs=stage_configs,
         stage_vllm_configs=[None] * len(stage_types),
         collective_rpc_async=AsyncMock(return_value=[True]),
     )
