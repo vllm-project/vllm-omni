@@ -5,7 +5,7 @@
 
 import functools
 from contextlib import ExitStack
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import cache_dit
 import torch
@@ -29,12 +29,38 @@ from vllm_omni.diffusion.cache.cachedit.backend import (
     RefreshCacheContextFunc,
     _build_cache_context_refresh,
     _default_get_pipeline_transformer,
+    _make_pipeline_transformer_getter,
     _maybe_build_block_adapter,
     enable_cache_for_dit,
 )
 from vllm_omni.diffusion.cache.cachedit.config import CacheDiTConfig
+from vllm_omni.diffusion.data import DiffusionCacheConfig
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.models.diffusers_adapter import DiffusersAdapterPipeline
 
 logger = init_logger(__name__)
+
+
+def enable_cache_for_diffusers(
+    pipeline: "DiffusersAdapterPipeline", cache_config: DiffusionCacheConfig
+) -> CacheDiTEnableResult:
+    """Delegate the complete Diffusers pipeline to Cache-DiT."""
+    config = CacheDiTConfig.from_diffusion_config(cache_config)
+    if config.scm_steps_mask_policy is not None:
+        raise ValueError("SCM step masks are not supported with the diffusers backend.")
+    cache_dit.enable_cache(
+        pipeline._pipeline,
+        cache_config=config.to_db_cache_config(),
+        calibrator_config=config.to_calibrator_config(),
+    )
+
+    def refresh(pipeline: "DiffusersAdapterPipeline", num_inference_steps: int, verbose: bool = True) -> None:
+        # Cache-DiT's pipeline __call__ hook creates a fresh context per request.
+        # refresh_context is for transformer-only persistent contexts.
+        pass
+
+    return CacheDiTEnableResult(refresh=refresh, targets=(pipeline._pipeline,))
 
 
 # from https://github.com/vipshop/cache-dit/pull/542
@@ -149,7 +175,7 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
     )
 
     refresh_trans_one = _build_cache_context_refresh(cache_config)
-    refresh_trans_two = _build_cache_context_refresh(cache_config, lambda pipeline: pipeline.transformer_2)
+    refresh_trans_two = _build_cache_context_refresh(cache_config, _make_pipeline_transformer_getter("transformer_2"))
 
     def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
         """Refresh cache context for both transformers with new num_inference_steps.
@@ -876,6 +902,7 @@ def register_custom_dit_enablers() -> None:
     """
     CUSTOM_DIT_ENABLERS.update(
         {
+            "DiffusersAdapterPipeline": enable_cache_for_diffusers,
             "Wan22Pipeline": enable_cache_for_wan22,
             "Wan22I2VPipeline": enable_cache_for_wan22,
             "Wan22TI2VPipeline": enable_cache_for_wan22,
