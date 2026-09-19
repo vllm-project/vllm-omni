@@ -19,6 +19,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .mhc_fused import mhc_sinkhorn_matrix, sinkhorn_knopp
 from .parallel import Magi2ParallelGroup, get_magi2_tp_group
 
 
@@ -329,14 +330,6 @@ class ElementWiseFourierEmbed(nn.Module):
 MHCTensorTuple = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
-def sinkhorn_knopp(matrix_logits: torch.Tensor, iterations: int, epsilon: float) -> torch.Tensor:
-    matrix = torch.exp(matrix_logits - matrix_logits.amax(dim=(-2, -1), keepdim=True))
-    for _ in range(iterations):
-        matrix = matrix / (matrix.sum(dim=-2, keepdim=True) + epsilon)
-        matrix = matrix / (matrix.sum(dim=-1, keepdim=True) + epsilon)
-    return matrix
-
-
 class MHCHandler:
     """Exact four-stream manifold-constrained hyper-connection math."""
 
@@ -398,12 +391,16 @@ class MHCHandler:
         alpha_post, bias_post, post_logits = post
         alpha_residual, bias_residual, residual_logits = residual
         post_coefficients = 2.0 * torch.sigmoid(alpha_post * self.matmul_scale * post_logits + bias_post.unsqueeze(0))
-        residual_matrix = sinkhorn_knopp(
-            alpha_residual * self.matmul_scale * residual_logits.float() + bias_residual.unsqueeze(0).float(),
-            self.sinkhorn_iterations,
-            self.sinkhorn_epsilon,
+        residual_matrix = mhc_sinkhorn_matrix(
+            residual_logits,
+            alpha_residual,
+            bias_residual,
+            matmul_scale=self.matmul_scale,
+            iterations=self.sinkhorn_iterations,
+            epsilon=self.sinkhorn_epsilon,
+            out_dtype=out_dtype,
         )
-        return post_coefficients.to(out_dtype), residual_matrix.to(out_dtype)
+        return post_coefficients.to(out_dtype), residual_matrix
 
     def hyper_connect(
         self,
