@@ -18,6 +18,11 @@ from PIL import Image
 from safetensors import safe_open
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    is_layer_skipped,
+)
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
@@ -38,8 +43,127 @@ MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
 MINIMAX_H3_AUDIO_CHANNELS = 2
 
-
 logger = init_logger(__name__)
+
+# MiniMax-H3 always runs video-VAE decode under FP16 autocast. vLLM's scaled
+# FP8 GEMM requires a fused bias to match the output dtype, so construct the
+# replacement linears (and therefore their biases) in that compute dtype.
+_VIDEO_VAE_DECODE_DTYPE = torch.float16
+
+
+def _validate_video_vae_quant_config(
+    quant_config: QuantizationConfig | None,
+) -> None:
+    if quant_config is None:
+        return
+    if quant_config.get_name() != "fp8":
+        raise ValueError(
+            f"MiniMax H3 video VAE currently supports online FP8 quantization only, got {quant_config.get_name()!r}"
+        )
+    if bool(getattr(quant_config, "is_checkpoint_fp8_serialized", False)):
+        raise ValueError("MiniMax H3 video VAE does not have serialized FP8 weights; use online FP8 quantization")
+
+
+def _make_online_fp8_linear(
+    linear: nn.Linear,
+    quant_config: QuantizationConfig,
+    prefix: str,
+) -> ReplicatedLinear:
+    """Build an FP16-in/out online-FP8 linear from a loaded VAE linear."""
+    replacement = ReplicatedLinear(
+        linear.in_features,
+        linear.out_features,
+        bias=linear.bias is not None,
+        params_dtype=_VIDEO_VAE_DECODE_DTYPE,
+        quant_config=quant_config,
+        prefix=prefix,
+        return_bias=False,
+        disable_tp=True,
+    )
+
+    # The global diffusion dtype is BF16, but video-VAE decode runs in FP16.
+    method = replacement.quant_method
+    method.input_dtype = method.out_dtype = _VIDEO_VAE_DECODE_DTYPE
+    method.fp8_linear.config.input_dtype = _VIDEO_VAE_DECODE_DTYPE
+    method.fp8_linear.config.out_dtype = _VIDEO_VAE_DECODE_DTYPE
+
+    # Use vLLM's loaders so online FP8 finalizes each loaded weight once.
+    replacement.weight.weight_loader(replacement.weight, linear.weight.detach())
+    if linear.bias is not None:
+        replacement.bias.weight_loader(replacement.bias, linear.bias.detach())
+    return replacement
+
+
+def _discover_video_vae_transformer_linear_paths(
+    blocks: nn.ModuleList,
+) -> tuple[str, ...]:
+    """Discover the common plain-Linear schema used by every VAE block."""
+    if not blocks:
+        raise RuntimeError("MiniMax H3 video VAE decoder has no transformer blocks")
+
+    schemas = [
+        tuple(sorted(name for name, module in block.named_modules() if name and isinstance(module, nn.Linear)))
+        for block in blocks
+    ]
+    expected = schemas[0]
+    if not expected:
+        raise RuntimeError("MiniMax H3 video VAE TransformerBlocks expose no nn.Linear modules")
+
+    for block_index, schema in enumerate(schemas[1:], start=1):
+        if schema != expected:
+            raise RuntimeError(
+                "MiniMax H3 video VAE TransformerBlock Linear schemas differ: "
+                f"block 0 has {expected}, block {block_index} has {schema}"
+            )
+    return expected
+
+
+@torch.no_grad()
+def _quantize_video_vae_transformer_linears(
+    decoder: nn.Module,
+    quant_config: QuantizationConfig | None,
+) -> int:
+    """Replace the decoder TransformerBlock GEMMs with online-FP8 linears.
+
+    The checkpoint-owned VAE is constructed and loaded before Omni sees it, so
+    its projections are ordinary ``nn.Linear`` modules. Input/output
+    projections, convolutions, norms, and control flow retain checkpoint
+    precision.
+    """
+    _validate_video_vae_quant_config(quant_config)
+    if quant_config is None:
+        return 0
+
+    blocks = getattr(decoder, "transformer_blocks", None)
+    if not isinstance(blocks, nn.ModuleList):
+        raise RuntimeError("MiniMax H3 video VAE decoder does not expose transformer_blocks")
+    linear_paths = _discover_video_vae_transformer_linear_paths(blocks)
+
+    replaced = 0
+    for block_index, block in enumerate(blocks):
+        for relative_path in linear_paths:
+            linear = block.get_submodule(relative_path)
+            prefix = f"video_vae.model.decoder.transformer_blocks.{block_index}.{relative_path}"
+            if is_layer_skipped(
+                prefix=prefix,
+                ignored_layers=quant_config.ignored_layers,
+                fused_mapping=quant_config.packed_modules_mapping,
+                match_mode=quant_config.ignored_layers_match_mode,
+            ):
+                continue
+
+            block.set_submodule(
+                relative_path,
+                _make_online_fp8_linear(linear, quant_config, prefix),
+            )
+            replaced += 1
+
+    logger.info(
+        "MiniMax H3 video VAE online FP8 enabled for %d decoder TransformerBlock linears at paths %s.",
+        replaced,
+        linear_paths,
+    )
+    return replaced
 
 
 @contextmanager
@@ -276,6 +400,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         encode_only: bool = False,
         decode_only: bool = False,
         trust_remote_code: bool = False,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -302,6 +427,13 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             install_h3_vae_optimizations(
                 decoder,
                 device=device,
+            )
+        self.quant_config = quant_config
+        self.quantized_decoder_linear_count = 0
+        if quant_config is not None and decoder is not None:
+            self.quantized_decoder_linear_count = _quantize_video_vae_transformer_linears(
+                decoder,
+                quant_config,
             )
         self._stager = None
         if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
