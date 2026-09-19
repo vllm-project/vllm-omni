@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import torch
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.kernel import IrOpPriorityConfig
 from vllm.logger import init_logger
-from vllm.platforms.rocm import RocmPlatform
+from vllm.platforms.rocm import RocmPlatform, on_gfx942, on_gfx950
 
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
@@ -134,6 +134,14 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
     @classmethod
     def supports_torch_inductor(cls) -> bool:
         return True
+
+    @classmethod
+    def get_gfx_arch(cls) -> str | None:
+        if on_gfx942():
+            return "gfx942"
+        if on_gfx950():
+            return "gfx950"
+        return None
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:

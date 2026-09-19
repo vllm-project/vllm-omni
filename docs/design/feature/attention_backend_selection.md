@@ -60,6 +60,8 @@ unstructured keyword dictionaries:
 
 - `quant` is consumed by FlashInfer and TRTLLM with backend-specific value
   validation;
+- `aiter_quant` is consumed by AITER MHA v4 and selects an
+  architecture-compatible operand format;
 - `skip_softmax` is consumed by TRTLLM; and
 - `block_sparse` is consumed by block-sparse backends such as RainFusion; and
 - `fastvideo_vsa_topk` is consumed by FastVideo VSA.
