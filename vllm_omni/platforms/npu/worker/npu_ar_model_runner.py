@@ -252,7 +252,9 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         num_tokens_unpadded: int,
         num_tokens_padded: int,
     ):
-        if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
+        # Pooling outputs can be classification logits, not model hidden states.
+        # Match GPUARModelRunner: do not insert them into the Omni tensor cache.
+        if not self.is_pooling_model and self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
             hs_for_cache = hidden_states if self._model_needs_full_prefix_hidden_states() else None
             slot_mapping_gpu = self.input_batch.block_table[0].slot_mapping.gpu
             slot_mapping_cpu = slot_mapping_gpu[:num_tokens_padded].cpu()
