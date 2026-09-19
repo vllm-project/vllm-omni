@@ -1,6 +1,7 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates.
 # Copyright (c) 2024 The Qwen Team and The HuggingFace Inc. team.
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # This file has been modified by ByteDance Ltd. and/or its affiliates.
 #
@@ -1828,7 +1829,16 @@ class Bagel(CFGParallelMixin, nn.Module):
         # ``mse_loss_indexes``-exclusion behaviour from PR #33: cond
         # positions are never updated and get ``timestep=0``.
         frame_condition_token_indexes: torch.LongTensor | None = None,
+        # Per-image lengths used for the final ``x_t`` unpack, defaulting to
+        # ``packed_seqlens``.  Callers that collapse several images into ONE
+        # packed query sequence (recon3d multi-view; upstream sums the
+        # per-view seqlens in ``inferencer.py:164-166``) must pass the
+        # pre-collapse per-view lengths here, since the denoised ``x_t`` still
+        # holds one contiguous chunk of ``h*w`` latent tokens per image.
+        unpack_seqlens: torch.IntTensor | None = None,
     ):
+        if unpack_seqlens is None:
+            unpack_seqlens = packed_seqlens
         x_t = packed_init_noises
         # Snapshot the pinned subtensor BEFORE the denoise loop touches
         # x_t; the cond positions in packed_init_noises hold the
@@ -1881,6 +1891,7 @@ class Bagel(CFGParallelMixin, nn.Module):
                 return_trajectory_latents=return_trajectory_latents,
                 scheduler=scheduler,
                 scheduler_kwargs=scheduler_kwargs,
+                unpack_seqlens=unpack_seqlens,
             )
 
         # ── SP + CFG: sequential single-branch forwards ──
@@ -1950,7 +1961,7 @@ class Bagel(CFGParallelMixin, nn.Module):
                     trajectory_latents.append(x_t.clone())
                     trajectory_timesteps.append(timesteps[i])
 
-            unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
+            unpacked_latent = x_t.split((unpack_seqlens - 2).tolist())
             return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
 
         # ── SP without CFG: direct single-branch loop ──
@@ -1988,7 +1999,7 @@ class Bagel(CFGParallelMixin, nn.Module):
                     trajectory_latents.append(x_t.clone())
                     trajectory_timesteps.append(timesteps[i])
 
-            unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
+            unpacked_latent = x_t.split((unpack_seqlens - 2).tolist())
             return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
 
         # ── Sequential CFG mode (cfg_parallel_size=1, no SP) ──
@@ -2057,7 +2068,7 @@ class Bagel(CFGParallelMixin, nn.Module):
                 trajectory_latents.append(x_t.clone())
                 trajectory_timesteps.append(timesteps[i])
 
-        unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
+        unpacked_latent = x_t.split((unpack_seqlens - 2).tolist())
         return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
 
     def _generate_image_parallel(
@@ -2085,6 +2096,7 @@ class Bagel(CFGParallelMixin, nn.Module):
         scheduler: object | None = None,
         scheduler_kwargs: dict | None = None,
         frame_condition_token_indexes: torch.LongTensor | None = None,
+        unpack_seqlens: torch.IntTensor | None = None,
     ):
         """CFG parallel denoising loop: each rank computes one CFG branch.
 
@@ -2187,7 +2199,7 @@ class Bagel(CFGParallelMixin, nn.Module):
                 trajectory_latents.append(x_t.clone())
                 trajectory_timesteps.append(timesteps[i])
 
-        unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
+        unpacked_latent = x_t.split(((packed_seqlens if unpack_seqlens is None else unpack_seqlens) - 2).tolist())
         return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
 
     @staticmethod
