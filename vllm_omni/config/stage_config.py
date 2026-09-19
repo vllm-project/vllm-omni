@@ -515,6 +515,8 @@ class DuplexSessionRuntimeConfig:
     resume_replay_max_bytes_per_session: int = 8 * 1024 * 1024
     max_pending_input_bytes_per_session: int = 16 * 1024 * 1024
     max_pending_turns_per_session: int = 4
+    max_pending_output_bytes_per_session: int = 2 * 1024 * 1024
+    max_pending_output_events_per_session: int = 512
     max_sessions: int = 1
     # Unread by the plugin framework. It used to bound the per-session
     # completed-append table that made a retried append RPC submit once; the
@@ -538,6 +540,8 @@ class DuplexSessionRuntimeConfig:
             "resume_replay_max_bytes_per_session": self.resume_replay_max_bytes_per_session,
             "max_pending_input_bytes_per_session": self.max_pending_input_bytes_per_session,
             "max_pending_turns_per_session": self.max_pending_turns_per_session,
+            "max_pending_output_bytes_per_session": self.max_pending_output_bytes_per_session,
+            "max_pending_output_events_per_session": self.max_pending_output_events_per_session,
             "max_sessions": self.max_sessions,
             "completed_append_cache_size": self.completed_append_cache_size,
         }

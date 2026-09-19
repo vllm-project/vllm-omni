@@ -6,7 +6,7 @@
 The runner is driven exactly the way ``DuplexOrchestrator`` drives it: typed
 commands go through ``DuplexSessionManager.dispatch``, stage outputs are pushed
 with ``runner.on_stage_output`` and everything the session says is read back
-from the manager's output sink as typed events. The stage port is a recording
+from the session's output buffer as typed events. The stage port is a recording
 fake; the model plugin is the real MiniCPM-o 4.5 one so append planning and
 output projection are exercised end to end.
 """
@@ -38,6 +38,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexStageSubmissionResult,
     duplex_resource_request_id,
 )
+from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.events import DuplexEvent
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
@@ -113,6 +114,7 @@ class Harness:
     manager: DuplexSessionManager
     port: RecordingStagePort
     output: asyncio.Queue[Any]
+    output_buffer: DuplexOutputBuffer
     results: asyncio.Queue[Any]
     runner: DuplexSessionRunner
     events: list[DuplexEvent] = field(default_factory=list)
@@ -132,6 +134,12 @@ class Harness:
         collected: list[DuplexEvent] = []
         while True:
             drained = False
+            while self.output_buffer.pending_events:
+                event = await self.output_buffer.get()
+                assert event is not None
+                if self.output_buffer.is_valid(event):
+                    collected.append(event)
+                drained = True
             while not self.output.empty():
                 message = self.output.get_nowait()
                 if isinstance(message, DuplexSessionEventMessage):
@@ -204,12 +212,17 @@ async def open_harness(
     port = RecordingStagePort(stage_count=stage_count)
     output: asyncio.Queue[Any] = asyncio.Queue()
     results: asyncio.Queue[Any] = asyncio.Queue()
+    limits = runtime_config or DuplexSessionRuntimeConfig()
+    output_buffer = DuplexOutputBuffer(
+        max_bytes=limits.max_pending_output_bytes_per_session,
+        max_events=limits.max_pending_output_events_per_session,
+    )
     manager = DuplexSessionManager(
         plugin=plugin,
         stage_port=port,
         output_sink=output,
         result_sink=results,
-        runtime_config=runtime_config or DuplexSessionRuntimeConfig(),
+        runtime_config=limits,
         model_config=None,
         clock=clock,
     )
@@ -220,10 +233,21 @@ async def open_harness(
         instructions="You are a concise assistant.",
         extra_body=body,
     )
-    await manager.handle(OpenDuplexSessionMessage(control_id="c-open", session_id=SESSION_ID, session_config=config))
+    await manager.handle(
+        OpenDuplexSessionMessage(
+            control_id="c-open", session_id=SESSION_ID, session_config=config, output_buffer=output_buffer
+        )
+    )
     result = await asyncio.wait_for(results.get(), timeout=2.0)
     assert isinstance(result, DuplexControlResultMessage) and result.ok, result
-    harness = Harness(manager=manager, port=port, output=output, results=results, runner=manager.runners[SESSION_ID])
+    harness = Harness(
+        manager=manager,
+        port=port,
+        output=output,
+        output_buffer=output_buffer,
+        results=results,
+        runner=manager.runners[SESSION_ID],
+    )
     await harness.settle()
     return harness
 

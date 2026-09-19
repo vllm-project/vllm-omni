@@ -470,6 +470,8 @@ class ModelChannel:
         close_reason, emitted_response = await self._send_model_output_events(
             drain_result, expected_epoch=expected_epoch
         )
+        if self._ctx.run.closing:
+            return
         if close_reason is not None:
             await self._close_from_runtime(close_reason)
             return
@@ -498,7 +500,7 @@ class ModelChannel:
         expected_epoch: int | None = None,
     ) -> tuple[str | None, bool]:
         session = self._ctx.session
-        if expected_epoch is not None and session.epoch != expected_epoch:
+        if self._ctx.run.closing or (expected_epoch is not None and session.epoch != expected_epoch):
             return None, False
         close_reason: str | None = None
         emitted_response = False
@@ -515,7 +517,7 @@ class ModelChannel:
             )
             emitted_response = emitted_response or did_emit
             close_reason = close_reason or close_reason_for_result
-            if expected_epoch is not None and session.epoch != expected_epoch:
+            if self._ctx.run.closing or (expected_epoch is not None and session.epoch != expected_epoch):
                 return None, emitted_response
         return close_reason, emitted_response
 
@@ -527,7 +529,7 @@ class ModelChannel:
             str(model_result.get("error_code")),
             str(model_result.get("error") or "Duplex native data-plane error"),
         )
-        if response_id is None:
+        if self._ctx.run.closing or response_id is None:
             return
         session.end_response(commit_text=False)
         self._out.emit(
@@ -600,6 +602,8 @@ class ModelChannel:
         close_reason: str | None = None
         emitted_response = False
         self._end_active_response_before_future_model_turn(model_turn_id=model_turn_id)
+        if self._ctx.run.closing:
+            return close_reason, emitted_response
         if (
             session.active_response_id is not None
             and model_turn_id is not None
@@ -642,8 +646,12 @@ class ModelChannel:
             payload["response_id"] = response_id
         self._attach_runtime_metadata(payload, model_result)
         self._out.emit(payload)
+        if self._ctx.run.closing:
+            return close_reason, emitted_response
         if model_result.get("abort_data_plane_request") is True and isinstance(data_plane_request_id, str):
             await self._abort_request(data_plane_request_id, notify=False)
+            if self._ctx.run.closing:
+                return close_reason, emitted_response
         if response_id is not None:
             if not auto_response and self.response_continuations_remaining(response_id):
                 self._ctx.services.spawn(
@@ -681,7 +689,7 @@ class ModelChannel:
         data_plane = self._ctx.plugin.data_plane
         close_reason: str | None = None
         emitted_response = False
-        if expected_epoch is not None and session.epoch != expected_epoch:
+        if self._ctx.run.closing or (expected_epoch is not None and session.epoch != expected_epoch):
             return close_reason, emitted_response
         data_plane_request_id = model_result.get("data_plane_request_id")
         if isinstance(data_plane_request_id, str) and data_plane.is_terminal(data_plane_request_id):
@@ -764,6 +772,8 @@ class ModelChannel:
             # Late audio of a completed model turn must not reserve a second response.
             return close_reason, emitted_response
         self._end_active_response_before_future_model_turn(model_turn_id=model_turn_id)
+        if self._ctx.run.closing:
+            return close_reason, emitted_response
         if (
             session.active_response_id is not None
             and model_turn_id is not None
@@ -777,6 +787,8 @@ class ModelChannel:
             response_id = session.begin_response(turn_id=model_turn_id)
             response_created = True
             self._out.emit(self.response_created_payload(response_id, epoch=session.epoch))
+            if self._ctx.run.closing:
+                return close_reason, emitted_response
         stage_metrics = model_result.get("stage_metrics")
         response_stage_metrics = session.accumulate_response_stage_metrics(
             stage_metrics if isinstance(stage_metrics, Mapping) else None
@@ -793,6 +805,8 @@ class ModelChannel:
             }
             self._attach_runtime_metadata(speak_payload, model_result, stage_metrics=response_stage_metrics)
             self._out.emit(speak_payload)
+            if self._ctx.run.closing:
+                return close_reason, emitted_response
         previous_sent_ms = session.playback.sent_ms
         text_chars_before_append = len("".join(session.assistant_text_buffer))
         if isinstance(text, str):
@@ -856,6 +870,8 @@ class ModelChannel:
             payload["sample_rate_hz"] = int(sample_rate_hz)
         self._attach_runtime_metadata(payload, model_result, stage_metrics=response_stage_metrics)
         self._out.emit(payload)
+        if self._ctx.run.closing:
+            return close_reason, emitted_response
         if (
             not end_of_turn
             and model_result.get("stage_role") == "tts"
@@ -1010,7 +1026,7 @@ class ModelChannel:
         response_id = session.active_response_id
         response_epoch = session.epoch
         response_turn_id = model_turn_id if model_turn_id is not None else session.active_response_turn_id
-        if expected_epoch is not None and response_epoch != expected_epoch:
+        if self._ctx.run.closing or (expected_epoch is not None and response_epoch != expected_epoch):
             return
         model_state.clear_continuation()
         payload: dict[str, object] = {
@@ -1023,6 +1039,8 @@ class ModelChannel:
         if response_id is not None:
             payload["response_id"] = response_id
         self._out.emit(payload)
+        if self._ctx.run.closing:
+            return
         if response_id is None:
             if session.epoch == response_epoch and response_turn_id is not None:
                 session.complete_model_turn(response_turn_id)
@@ -1054,7 +1072,8 @@ class ModelChannel:
     ) -> bool:
         session = self._ctx.session
         stale_common_owner = (
-            session.state == DuplexSessionState.CLOSED
+            self._ctx.run.closing
+            or session.state == DuplexSessionState.CLOSED
             or session.active_request_id != request_id
             or (expected_epoch is not None and session.epoch != expected_epoch)
         )
@@ -1125,6 +1144,6 @@ class ModelChannel:
         except Exception as exc:
             logger.exception("Failed to schedule duplex native response continuation: %s", exc)
             scheduled = False
-        if scheduled:
+        if scheduled and not self._ctx.run.closing:
             model_state.continuation_owner_id = owner_id
             model_state.continuation_units = count + 1

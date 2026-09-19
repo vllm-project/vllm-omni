@@ -19,6 +19,7 @@ from tests.engine.duplex.test_session_runner import (
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.commands import AckPlayback, CancelResponse, Commit, UpdateSession
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
+from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.messages import OpenDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
@@ -69,6 +70,7 @@ async def open_qwen():
     port = RecordingStagePort(stage_count=3)
     output: asyncio.Queue[Any] = asyncio.Queue()
     results: asyncio.Queue[Any] = asyncio.Queue()
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
     manager = DuplexSessionManager(
         plugin=plugin,
         stage_port=port,
@@ -78,10 +80,21 @@ async def open_qwen():
         model_config=None,
     )
     config = DuplexSessionConfig(model="qwen", modalities=["text", "audio"], overlap_policy="barge_in_on_speech")
-    await manager.handle(OpenDuplexSessionMessage(control_id="open", session_id=SESSION_ID, session_config=config))
+    await manager.handle(
+        OpenDuplexSessionMessage(
+            control_id="open", session_id=SESSION_ID, session_config=config, output_buffer=output_buffer
+        )
+    )
     result = await results.get()
     assert result.ok, result
-    harness = Harness(manager, port, output, results, manager.runners[SESSION_ID])
+    harness = Harness(
+        manager=manager,
+        port=port,
+        output=output,
+        output_buffer=output_buffer,
+        results=results,
+        runner=manager.runners[SESSION_ID],
+    )
     await harness.settle()
     return harness
 

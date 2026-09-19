@@ -804,7 +804,9 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
             "status": "in_progress",
             "content": [],
         }
-        state.conversation_items[item_id] = item
+        # Later deltas grow the state item. Keep creation events independent
+        # so their queued payloads retain the size measured at admission.
+        state.conversation_items[item_id] = {**item, "content": []}
         events = [
             _response_created_event(event),
             *_conversation_item_added_events(state, item),
