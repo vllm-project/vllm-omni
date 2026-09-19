@@ -115,6 +115,11 @@ quack = [
     "quack-kernels>=0.3.11",
 ]
 
+# Optional forward-only FlashAttention-3 backend for Ampere, Ada, and Hopper.
+fa3 = [
+    "fa3-fwd==0.0.3",
+]
+
 # Optional Blackwell-native FlashAttention-4 backend. Keep this opt-in because
 # the CuTe/CUTLASS dependency is CUDA 13 and Blackwell specific.
 fa4 = [
