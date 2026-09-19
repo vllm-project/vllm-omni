@@ -56,3 +56,22 @@ def test_streaming_attention_preserves_ring_wrap_reordering_and_slot_reset():
         if step == 4:
             for model in (reference, candidate):
                 model._streaming_state.reset_slots(torch.tensor([0], device="cuda"))
+
+
+def test_output_layout_compile():
+    from vllm_omni.model_executor.models.moss_tts import streaming_attention as attention
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    q = torch.randn(1, 12, 15, 64, device="cuda", dtype=torch.bfloat16)
+    k, v = torch.randn(2, 1, 12, 125, 64, device="cuda", dtype=q.dtype)
+    mask = torch.ones(1, 1, 15, 125, device="cuda", dtype=torch.bool)
+    out = attention.masked_attention(q, k, v, mask)
+    if attention.OUTPUT_BTHD:
+        flattened = out.transpose(1, 2).reshape(1, 15, 768)
+        assert flattened.data_ptr() == out.data_ptr()
+        assert flattened.is_contiguous()
+    compiled = torch.compile(attention.masked_attention, fullgraph=True)
+    value = compiled(q, k, v, mask)
+    assert value.stride() == out.stride()
+    torch.testing.assert_close(value, out, rtol=0, atol=0)
