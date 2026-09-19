@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for MossReferenceEncoder: content-addressed caching,
 single-flight, and micro-batched encoding."""
 
@@ -12,7 +12,9 @@ import torch
 
 from vllm_omni.model_executor.models.moss_tts.reference_encoder import (
     MossReferenceEncoder,
+    _prep_wav_sync,
     _RefEncodeBatcher,
+    _reference_resampler,
     build_reference_encoder,
     encode_request_references,
 )
@@ -534,3 +536,41 @@ async def test_encode_request_references_keys_second_speaker_by_slot(make_encode
     assert proc.total_items == 2
     # Concurrent, so both clips shared one batch window.
     assert proc.attempt_sizes == [2]
+
+
+@pytest.mark.parametrize("sr", [16000, 24000, 32000, 44100, 48000])
+@pytest.mark.parametrize("channels", [None, 1, 2])
+def test_reference_preparation_matches_functional_resample(sr, channels):
+    import torchaudio
+
+    shape = (sr // 10,) if channels is None else (channels, sr // 10)
+    waveform = torch.rand(shape, generator=torch.Generator().manual_seed(123)).tolist()
+    expected = torch.tensor(waveform, dtype=torch.float32)
+    if expected.ndim == 1:
+        expected = expected.unsqueeze(0)
+    if sr != _SR:
+        expected = torchaudio.functional.resample(expected, sr, _SR)
+
+    _reference_resampler.cache_clear()
+    try:
+        for _ in range(2):  # Both newly built and cached kernels preserve samples.
+            torch.testing.assert_close(_prep_wav_sync(waveform, sr, _SR), expected, rtol=0, atol=0)
+    finally:
+        _reference_resampler.cache_clear()
+
+
+def test_reference_resampler_reused_without_cross_clip_state():
+    import torchaudio
+
+    _reference_resampler.cache_clear()
+    try:
+        first = _reference_resampler(48000, _SR)
+        first(torch.ones(1, 4800))
+        assert _reference_resampler(48000, _SR) is first
+        assert _reference_resampler(16000, _SR) is not first
+        assert _reference_resampler(48000, 16000) is not first
+        silence = torch.zeros(1, 2400)
+        expected = torchaudio.functional.resample(silence, 48000, _SR)
+        torch.testing.assert_close(first(silence), expected, rtol=0, atol=0)
+    finally:
+        _reference_resampler.cache_clear()
