@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
+from collections.abc import Callable
 from functools import cache, partial
 
 import torch
@@ -75,18 +76,18 @@ class FlashAttentionBackend(AttentionBackend):
 
 
 class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
-    # Per-platform FP8 KV quantization support.
-    # To enable FP8 on a new platform, add its OmniPlatformEnum value here
+    # Per-platform attention quantization support.
+    # To enable a method on a new platform, add its OmniPlatformEnum value here
     # and handle kv_cache_dtype in the corresponding forward_{platform}().
     #
-    # TODO(quant-backend): The FP8 quant path currently lives inside
+    # TODO(quant-backend): The quantized path currently lives inside
     # FlashAttentionImpl gated by ``attn_metadata.extra["kv_cache_dtype"]``.
     # Eventually extract it into a dedicated FlashAttentionQuantBackend so
-    # backend selection (not metadata) decides quant. Until then, model
-    # authors can opt a specific Attention layer out via
+    # backend selection decides quant.
+    # Until then, model authors can opt a specific Attention layer out via
     # ``Attention(disable_kv_quant=True)``.
     _supported_kv_cache_dtypes = {
-        "npu": {"fp8"},
+        "npu": {"fp8", "mxfp8", "mxfp4"},
     }
 
     def __init__(
@@ -526,10 +527,46 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
     ) -> torch.Tensor:
         """NPU attention implementation using mindiesd."""
 
-        kv_cache_dtype = attn_metadata.extra.get("kv_cache_dtype") if attn_metadata else None
-        if kv_cache_dtype is not None:
+        extra = attn_metadata.extra if attn_metadata else {}
+        method = extra.get("kv_cache_dtype")
+        if method not in (None, "float", "auto"):
             return self.forward_fa_quant_npu(query, key, value, attn_metadata)
         return self.forward_fa_npu(query, key, value, attn_metadata)
+
+    @staticmethod
+    def _load_quant_runtime(method: str) -> Callable[..., torch.Tensor]:
+        if method not in ("fp8", "mxfp8", "mxfp4"):
+            raise ValueError(f"Unsupported NPU attention quantization method {method!r}.")
+        from mindiesd import quant_attention
+
+        return quant_attention
+
+    def _validate_quant_request(
+        self,
+        method: str,
+        query: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+    ) -> None:
+        extra = attn_metadata.extra if attn_metadata else {}
+        reason = None
+        if self.causal:
+            reason = "causal quantized FA is not supported"
+        elif any(name in extra for name in ("cu_seqlens_q", "cu_seqlens_k")) or extra.get("npu_attn_varlen"):
+            reason = "packed/varlen metadata requires the float attention path"
+        elif attn_metadata is not None and attn_metadata.full_attn_spans is not None:
+            reason = "piecewise attention requires the float attention path"
+        elif attn_metadata is not None and attn_metadata.attn_mask is not None:
+            reason = "caller masks require the float attention path"
+        elif method in ("fp8", "mxfp8", "mxfp4") and (
+            query.ndim != 4 or query.shape[-1] <= 0 or query.shape[-1] & (query.shape[-1] - 1)
+        ):
+            reason = "generated Hadamard rotations require a four-dimensional input and power-of-two head size"
+        if reason is not None:
+            raise ValueError(
+                f"NPU attention precision {method!r} is unavailable: {reason}. "
+                "Set diffusion_kv_cache_dtype to a supported method, or set it to "
+                "'auto'. Automatic precision fallback is not performed."
+            )
 
     def forward_fa_quant_npu(
         self,
@@ -538,18 +575,29 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        from vllm_omni.platforms.npu.quant.kv_quant_npu import fp8_rotate_quant_fa
+        extra = attn_metadata.extra if attn_metadata else {}
+        method = extra.get("kv_cache_dtype", "fp8")
+        layout = self.qkv_layout or "BSND"
+        self._validate_quant_request(method, query, attn_metadata)
+        try:
+            runtime = self._load_quant_runtime(method)
+        except ImportError as exc:
+            raise ImportError(
+                f"NPU attention precision {method!r} requires a compatible MindIE-SD "
+                "quant Runtime. Install a compatible MindIE-SD build, select another "
+                "diffusion_kv_cache_dtype, or set it to 'auto'. Automatic precision "
+                "fallback is not performed."
+            ) from exc
+        kwargs = dict(precision=method, layout=layout, scale=self.softmax_scale)
+        # Apply Omni's deterministic Q/K rotation before every Dense quantized path.
+        if method in ("fp8", "mxfp8", "mxfp4"):
+            from vllm_omni.platforms.npu.quant.kv_quant_npu import get_quant_attention_rotation
 
-        layout = self.qkv_layout or "BNSD"
-        # Models pass (B, S, H, D); NPU fused op expects (B, N, S, D).
-        out = fp8_rotate_quant_fa(
-            query.transpose(1, 2),
-            key.transpose(1, 2),
-            value.transpose(1, 2),
-            layout=layout,
-            softmax_scale=self.softmax_scale,
-        )
-        return out.transpose(1, 2)
+            rotation = get_quant_attention_rotation(query.device, query.dtype, query.shape[-1])
+            kwargs.update(q_rot=rotation, k_rot=rotation)
+        logger.info_once("NPU attention uses MindIE-SD %s Runtime, layout=%s.", method, layout)
+        # Execution errors propagate. Never retry with another precision.
+        return runtime(query, key, value, **kwargs)
 
     def forward_fa_npu(
         self,

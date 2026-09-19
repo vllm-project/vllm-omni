@@ -33,6 +33,7 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
 from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE
+from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE
 from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_S2S_PIPELINE,
     AUDEX_THINKER_ONLY_PIPELINE,
@@ -153,6 +154,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "lingbot_world": LINGBOT_WORLD_PIPELINE,
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
     "pi0": PI0_PIPELINE,
+    "pi05": PI05_PIPELINE,
     # Cosmos3 policy checkpoints share HF metadata with the T2I/video Cosmos3
     # checkpoints (which stay on the single-stage diffusion fallback), so this
     # entry is only reachable through a deploy yaml's ``pipeline:`` key

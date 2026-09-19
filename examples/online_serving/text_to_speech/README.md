@@ -13,7 +13,7 @@ For the full list of supported architectures across all modalities, see
 ## Supported Models
 
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker tags (`S0`..`S9`, default `S0`) | — |
 | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | uploaded audio voice only; no presets | ✓ |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
@@ -781,6 +781,20 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni --port 8091
 ./qwen3_tts/run_server.sh Base
 ```
 
+For a local deployment with multiple API frontend processes sharing one set
+of TTS stage engines, add `--api-server-count`:
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+    --omni --api-server-count 2 --port 8091
+```
+
+This mode supports local EngineCore stages only; headless or remote stage
+deployments are not supported. Runtime voice upload and deletion are disabled
+with multiple API frontends because their registries are process-local.
+Built-in voices, inline `ref_audio`, and voices restored from `custom_voice_dir`
+at startup are supported.
+
 ### Executor backend
 
 Single-GPU serves now default to the uniproc executor (lower IPC overhead, the Base cloning use case from [#2603](https://github.com/vllm-project/vllm-omni/issues/2603) / [#2604](https://github.com/vllm-project/vllm-omni/pull/2604)). `vllm_omni/deploy/qwen3_tts.yaml` is the only Qwen3-TTS deploy config; pass `--deploy-config <path>` to override.
@@ -834,6 +848,10 @@ For Qwen3-TTS, uploaded voices are Base voice-cloning inputs and require a Base
 checkpoint. When a request names an uploaded voice, the server infers
 `task_type="Base"`. Built-in presets such as `vivian` and `ryan` remain
 CustomVoice speakers and require a CustomVoice checkpoint.
+
+The runtime upload and delete routes require a single API frontend; with
+`--api-server-count > 1`, use inline `ref_audio` or restore precomputed voices
+from `custom_voice_dir` at startup.
 
 ### Precomputed custom voices
 

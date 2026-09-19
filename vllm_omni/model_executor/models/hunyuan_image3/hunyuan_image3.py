@@ -1557,7 +1557,11 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self._end_ratio_id = tokenizer.convert_tokens_to_ids("<img_ratio_32>")
         ratio_33 = tokenizer.convert_tokens_to_ids("<img_ratio_33>")
         ratio_36 = tokenizer.convert_tokens_to_ids("<img_ratio_36>")
-        self._ratio_other_slices = [(ratio_33, ratio_36 + 1)]
+        # The base checkpoint stops at <img_ratio_32>; only Instruct has 33-36.
+        if ratio_33 is None or ratio_36 is None:
+            self._ratio_other_slices = []
+        else:
+            self._ratio_other_slices = [(ratio_33, ratio_36 + 1)]
         # Build the full set of ratio token IDs for use as stop tokens.
         self._all_ratio_ids = set(range(self._start_ratio_id, self._end_ratio_id + 1))
         for s, e in self._ratio_other_slices:

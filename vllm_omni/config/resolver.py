@@ -14,7 +14,6 @@ from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remot
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.stage_config import PipelineConfig
-from vllm_omni.config.yaml_util import create_config
 from vllm_omni.diffusion.data import resolve_model_class_name
 from vllm_omni.diffusion.registry import DiffusionModelRegistry
 from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
@@ -24,19 +23,10 @@ logger = init_logger(__name__)
 
 @dataclass(frozen=True)
 class OmniConfigResolution:
-    """Migration envelope returned by the production config resolver.
-
-    ``stage_configs`` intentionally carries the current OmegaConf-compatible
-    runtime ABI only until stage startup consumes ``VllmOmniConfig`` directly.
-    ``pipeline_config`` is the effective topology after runtime stage injection,
-    so both fields always describe the same set of stages.
-    It is not a stable authoring or extension API; new production callers
-    should resolve through :func:`resolve_omni_config` and must not construct or
-    merge this compatibility shape themselves.
-    """
+    """Canonical typed result returned by the production config resolver."""
 
     config_path: str | None
-    stage_configs: tuple[Any, ...]  # Temporary StageConfig/OmegaConf bridge.
+    stage_configs: tuple[Any, ...]
     pipeline_config: PipelineConfig | None = None
     omni_lb_policy: str | None = None
 
@@ -176,27 +166,13 @@ def _load_strategy_specs(strategy_config_path: str | None) -> Mapping[Any, Any] 
 
 def _build_registered_resolution(
     structured_config: VllmOmniConfig,
-    *,
-    cli_overrides: dict[str, Any],
-    strategy_config_path: str | None,
 ) -> OmniConfigResolution:
-    """Build the temporary runtime view for an already-resolved pipeline."""
-    # Runtime consumers have not yet moved to typed per-stage configs. Use the
-    # factory-owned compatibility bridge instead of reimplementing legacy YAML
-    # discovery and merging in this resolver.
-    effective_deploy_path = structured_config.orchestrator_config.deploy_config_path
-    legacy_resolution = StageConfigFactory._resolve_legacy_from_registry(
-        structured_config.pipeline_config,
-        cli_overrides,
-        effective_deploy_path,
-        strategy_specs=_load_strategy_specs(strategy_config_path),
-    )
-
+    """Return the canonical structured runtime view for a resolved pipeline."""
     return OmniConfigResolution(
-        config_path=effective_deploy_path,
-        stage_configs=tuple(stage.to_omegaconf() for stage in legacy_resolution.stage_configs),
-        pipeline_config=legacy_resolution.pipeline_config,
-        omni_lb_policy=legacy_resolution.omni_lb_policy,
+        config_path=structured_config.orchestrator_config.deploy_config_path,
+        stage_configs=tuple(structured_config.stage_configs),
+        pipeline_config=structured_config.pipeline_config,
+        omni_lb_policy=getattr(structured_config, "strategy_omni_lb_policy", None),
     )
 
 
@@ -231,18 +207,16 @@ def resolve_omni_config(
     registry_overrides = dict(normalized_overrides)
     _flatten_stage_overrides(registry_overrides, stage_overrides)
 
+    strategy_specs = _load_strategy_specs(strategy_config_path)
     structured_config = StageConfigFactory.create_from_model(
         model,
         trust_remote_code=trust_remote_code,
         cli_overrides=registry_overrides,
         deploy_config_path=deploy_config_path,
+        strategy_specs=strategy_specs,
     )
     if structured_config is not None:
-        return _build_registered_resolution(
-            structured_config,
-            cli_overrides=registry_overrides,
-            strategy_config_path=strategy_config_path,
-        )
+        return _build_registered_resolution(structured_config)
 
     _apply_generic_stage_overrides(normalized_overrides, stage_overrides)
     supported, model_class_name = _resolve_generic_diffusion_model_class(model, normalized_overrides)
@@ -252,11 +226,12 @@ def resolve_omni_config(
         )
     if model_class_name is not None:
         normalized_overrides.setdefault("model_class_name", model_class_name)
-    default_stages = StageConfigFactory.create_default_diffusion(normalized_overrides)
+    default_config = StageConfigFactory.create_typed_default_diffusion(model, normalized_overrides)
 
     return OmniConfigResolution(
         config_path=deploy_config_path,
-        stage_configs=tuple(create_config(_convert_dataclasses_to_dict(default_stages))),
+        stage_configs=tuple(default_config.stage_configs),
+        pipeline_config=default_config.pipeline_config,
     )
 
 

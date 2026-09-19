@@ -262,7 +262,10 @@ def test_a_vsa_variant_is_recognised_by_its_compression_gates(tmp_path):
 
 def test_a_tensor_naming_no_h3_parameter_is_an_error(tmp_path):
     path = tmp_path / "fasth3" / "adapter_model.safetensors"
-    _write_adapter(path, tensors={"transformer_blocks.0.attn.norm_q.lora_A.weight": torch.ones((_RANK, _HIDDEN))})
+    _write_adapter(
+        path,
+        tensors={"transformer_blocks.0.attn.not_a_projection.lora_A.weight": torch.ones((_RANK, _HIDDEN))},
+    )
     # Dropping it silently would load a model that is not the distilled student.
     with pytest.raises(FastH3AdapterError, match="name no known"):
         _load(path.parent)

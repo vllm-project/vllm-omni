@@ -608,6 +608,7 @@ def test_omni_tpot_baseline_accepts_measured_finite_sample():
 @pytest.mark.parametrize(
     ("num_tpot_samples", "mean_tpot_ms", "match"),
     [
+        (None, 10.0, "no measurable TPOT samples"),
         (0, float("nan"), "no measurable TPOT samples"),
         (1, float("nan"), "mean_tpot_ms is not finite"),
     ],
@@ -615,14 +616,17 @@ def test_omni_tpot_baseline_accepts_measured_finite_sample():
 def test_omni_tpot_baseline_rejects_missing_or_nonfinite_sample(num_tpot_samples, mean_tpot_ms, match):
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
+    result = {
+        "completed": 1,
+        "Hardware": "H100",
+        "mean_tpot_ms": mean_tpot_ms,
+    }
+    if num_tpot_samples is not None:
+        result["num_tpot_samples"] = num_tpot_samples
+
     with pytest.raises(AssertionError, match=match):
         assert_result(
-            {
-                "completed": 1,
-                "Hardware": "H100",
-                "num_tpot_samples": num_tpot_samples,
-                "mean_tpot_ms": mean_tpot_ms,
-            },
+            result,
             {"baseline": {"H100": {"mean_tpot_ms": 20.0}}},
             1,
         )

@@ -197,6 +197,28 @@ class ChunkWindowManager(SlidingWindowManager):
             reset_at_boundary=spec.reset_at_boundary,
         )
 
+    def compact_block_table(self, request_id: str) -> int:
+        """Remove the evicted gap after the sink; return its size in tokens.
+
+        Call only after commit/eviction, then shift the request's storage
+        position by the returned amount. Physical pages and model positions
+        are unchanged, including any allocated but not yet committed tail.
+        """
+        if self.enable_caching:
+            raise RuntimeError("AR block-table compaction requires prefix caching to be disabled")
+        blocks = self.req_to_blocks.get(request_id, [])
+        start = self.kv_cache_spec.sink_chunks
+        end = start
+        while end < len(blocks) and blocks[end] == self._null_block:
+            end += 1
+        if end == start:
+            return 0
+        del blocks[start:end]
+        if request_id in self.num_cached_block:
+            cached = self.num_cached_block[request_id]
+            self.num_cached_block[request_id] = min(cached, start) + max(0, cached - end)
+        return (end - start) * self.block_size
+
     def remove_skipped_blocks(
         self,
         request_id: str,
