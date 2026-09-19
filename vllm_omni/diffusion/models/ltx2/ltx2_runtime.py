@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager, nullcontext
@@ -75,6 +76,34 @@ def _deterministic_ltx_vocoder():
         torch.backends.cudnn.deterministic = previous
 
 
+# Formula source: Diffusers ``diffusers/pipelines/ltx2/vocoder.py``,
+# ``UpSample1d.__init__`` Hann-window branch (``window_type="hann"``).
+def _restore_ltx_bwe_resampler_filter(vocoder: nn.Module) -> None:
+    """Materialize the non-checkpoint BWE Hann filter in the official FP32 dtype."""
+    resampler = getattr(vocoder, "resampler", None)
+    current_filter = getattr(resampler, "filter", None)
+    ratio = getattr(resampler, "ratio", None)
+    kernel_size = getattr(resampler, "kernel_size", None)
+    if not isinstance(current_filter, torch.Tensor) or not isinstance(ratio, int) or not isinstance(kernel_size, int):
+        return
+
+    # ``filter`` is deliberately non-persistent, so loading the component with
+    # BF16 also casts this analytically constructed buffer. The official
+    # pipeline retains the original FP32 coefficients before its FP32 vocoder
+    # pass. Rebuild rather than cast back, because BF16 conversion lost bits.
+    rolloff = 0.99
+    lowpass_filter_width = 6
+    width = math.ceil(lowpass_filter_width / rolloff)
+    expected_kernel_size = 2 * width * ratio + 1
+    if kernel_size != expected_kernel_size:
+        return
+    time_axis = (torch.arange(kernel_size, device=current_filter.device, dtype=torch.float32) / ratio - width) * rolloff
+    time_clamped = time_axis.clamp(-lowpass_filter_width, lowpass_filter_width)
+    window = torch.cos(time_clamped * math.pi / lowpass_filter_width / 2).square()
+    filter_value = (torch.sinc(time_axis) * window * rolloff / ratio).reshape(1, 1, -1)
+    resampler.filter = filter_value
+
+
 def _run_ltx_vocoder(vocoder: nn.Module, generated_mel: torch.Tensor) -> torch.Tensor:
     """Run the BWE vocoder in FP32, matching the official LTX pipeline."""
     device_type = generated_mel.device.type
@@ -83,6 +112,7 @@ def _run_ltx_vocoder(vocoder: nn.Module, generated_mel: torch.Tensor) -> torch.T
         if not hasattr(vocoder, "bwe_generator"):
             return vocoder(generated_mel)
 
+        _restore_ltx_bwe_resampler_filter(vocoder)
         input_dtype = generated_mel.dtype
         module_dtype = next(vocoder.parameters()).dtype
         if device_type == "mps":
