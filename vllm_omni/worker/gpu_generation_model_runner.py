@@ -114,7 +114,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
                 flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
                 if flush_ids:
-                    self.flush_full_payload_outputs(flush_ids)
+                    self.flush_full_payload_outputs(
+                        flush_ids, discarded_req_ids=getattr(scheduler_output, "discarded_req_ids", set())
+                    )
 
         if self.routed_experts_initialized:
             capturer = self.routed_experts_capturer

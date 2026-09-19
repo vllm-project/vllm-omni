@@ -704,6 +704,7 @@ def _make_full_payload_accumulation_runner(
     )
     runner._custom_process_func = object()
     runner._pending_full_payload_send = {}
+    runner._full_payload_token_ends = {}
     runner._stage_id = 1
     runner._omni_connector = object()
     return runner
@@ -802,6 +803,7 @@ def _make_request_end_payload_runner(*, enabled=True, prefix_cache=None):
     )
     runner._custom_process_func = object()
     runner._pending_full_payload_send = {}
+    runner._full_payload_token_ends = {}
     runner._stage_id = 0
     runner._omni_connector = object()
     return runner
