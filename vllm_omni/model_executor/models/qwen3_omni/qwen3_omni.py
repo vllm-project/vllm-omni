@@ -6,7 +6,7 @@
 import asyncio
 from collections.abc import AsyncGenerator, Iterable
 from functools import cached_property
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -26,10 +26,14 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
     SupportsQuant,
     SupportsRealtime,
+    SupportsTranscription,
 )
 from vllm.model_executor.models.qwen3_asr_realtime import Qwen3ASRRealtimeBuffer
 from vllm.model_executor.models.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeConditionalGenerationMixin,
+)
+from vllm.model_executor.models.qwen3_omni_moe_thinker import (
+    Qwen3OmniMoeThinkerForConditionalGeneration as VllmQwen3OmniMoeThinker,
 )
 from vllm.model_executor.models.utils import (
     WeightsMapper,
@@ -60,6 +64,9 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerMultiModalProcessor,
     Qwen3OmniMoeThinkerProcessingInfo,
 )
+
+if TYPE_CHECKING:
+    from vllm.config import SpeechToTextConfig, SpeechToTextParams
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
 from vllm_omni.platforms import current_omni_platform
 
@@ -102,6 +109,7 @@ class Qwen3OmniMoeForConditionalGeneration(
     SupportsMRoPE,
     SupportsRealtime,
     SupportsQuant,
+    SupportsTranscription,
 ):
     """
     Unified Qwen3 Omni MoE model combining thinker, talker, and code2wav.
@@ -134,6 +142,19 @@ class Qwen3OmniMoeForConditionalGeneration(
         apply_outer_quant_config_mapping(self)
 
     realtime_max_tokens = 64
+
+    # Speech-to-text serving resolves this composite class from the checkpoint
+    # architecture; transcription itself runs on the thinker stage, so the
+    # classmethods delegate to vLLM's thinker implementation.
+    supported_languages = VllmQwen3OmniMoeThinker.supported_languages
+
+    @classmethod
+    def get_speech_to_text_config(cls, model_config: ModelConfig, task_type: str) -> "SpeechToTextConfig":
+        return VllmQwen3OmniMoeThinker.get_speech_to_text_config(model_config, task_type)
+
+    @classmethod
+    def get_generation_prompt(cls, stt_params: "SpeechToTextParams") -> PromptType:
+        return VllmQwen3OmniMoeThinker.get_generation_prompt(stt_params)
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()

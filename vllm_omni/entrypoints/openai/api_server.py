@@ -19,7 +19,7 @@ import signal
 import socket
 import time
 from argparse import Namespace
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from pathlib import Path
@@ -81,6 +81,7 @@ from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
 from vllm.logger import init_logger
+from vllm.outputs import RequestOutput
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
@@ -211,6 +212,29 @@ router = APIRouter()
 VIDEO_ABORT_TIMEOUT_S = ABORT_TIMEOUT_S
 
 profiler_router = APIRouter()
+
+
+class _TextOnlyEngineClient:
+    """Engine-client view that pins generation to text output.
+
+    OMNI: upstream speech-to-text serving calls ``generate()`` through vLLM's
+    ``EngineClient`` protocol, which has no ``output_modalities`` parameter.
+    ``AsyncOmni.generate`` defaults ``output_modalities`` to every stage's
+    output type, so an unpinned transcription request on a thinker+talker
+    pipeline would also synthesize audio of its own transcript. Handing the
+    speech-to-text handlers this view keeps them unmodified while routing
+    their requests through comprehension stages only.
+    """
+
+    def __init__(self, engine_client: EngineClient) -> None:
+        self._engine_client = engine_client
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._engine_client, name)
+
+    def generate(self, *args: Any, **kwargs: Any) -> AsyncGenerator[RequestOutput, None]:
+        kwargs.setdefault("output_modalities", ["text"])
+        return self._engine_client.generate(*args, **kwargs)
 
 
 # Server entry points
@@ -1083,9 +1107,11 @@ async def omni_init_app_state(
         default_chat_template_kwargs=args.default_chat_template_kwargs,
         trust_request_chat_template=args.trust_request_chat_template,
     )
+
+    stt_engine_client = _TextOnlyEngineClient(engine_client)
     state.openai_serving_transcription = (
         OpenAIServingTranscription(
-            engine_client,
+            stt_engine_client,
             state.openai_serving_models,
             request_logger=request_logger,
             enable_force_include_usage=args.enable_force_include_usage,
@@ -1095,7 +1121,7 @@ async def omni_init_app_state(
     )
     state.openai_serving_translation = (
         OpenAIServingTranslation(
-            engine_client,
+            stt_engine_client,
             state.openai_serving_models,
             request_logger=request_logger,
             enable_force_include_usage=args.enable_force_include_usage,

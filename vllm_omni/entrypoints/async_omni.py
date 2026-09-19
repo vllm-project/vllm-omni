@@ -24,11 +24,11 @@ from vllm.outputs import PoolingRequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.renderers.inputs.preprocess import extract_prompt_components
 from vllm.sampling_params import RequestOutputKind, SamplingParams
-from vllm.tasks import SupportedTask
 
 from vllm_omni.diffusion.data import CuMemTag, OmniACK, OmniSleepTask, OmniWakeTask
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import ErrorMessage
+from vllm_omni.engine.omni_engine_base import OmniSupportedTask
 from vllm_omni.entrypoints.async_omni_base import ABORT_TIMEOUT_S, AsyncOmniBase
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.errors import client_error_metadata
@@ -1104,6 +1104,6 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         """
         pass
 
-    async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+    async def get_supported_tasks(self) -> tuple[OmniSupportedTask, ...]:
         """Return the task set exposed by the orchestrator-backed engine."""
         return tuple(self.engine.supported_tasks)
