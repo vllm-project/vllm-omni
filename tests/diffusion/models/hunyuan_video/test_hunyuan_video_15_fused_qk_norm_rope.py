@@ -74,25 +74,83 @@ def test_packed_table_video_rows_then_identity_text_rows(monkeypatch):
     assert _packed_qk_norm_rope_table((cos, sin), 7, 2, torch.float16) is None  # non-bf16 activations
 
 
+def _identity_table(tokens: int, rotary_half: int) -> torch.Tensor:
+    """``[cos = 1 | sin = 0]`` rows: the rotation the text tokens receive."""
+    return torch.cat((torch.ones(tokens, rotary_half), torch.zeros(tokens, rotary_half)), dim=-1).to(
+        "cuda", torch.bfloat16
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
-def test_identity_rotation_rows_are_exact():
-    """Text rows must come out as plain RMSNorm: cos 1 / sin 0 is exact in the kernel."""
+def test_identity_rotation_rows_are_exact(monkeypatch):
+    """Identity rows are bitwise the kernel's un-rotated RMSNorm.
+
+    With ``cos = 1`` / ``sin = 0`` the tile computes ``n * 1 - pair * 0`` in
+    fp32 on the already-rounded ``n``, i.e. exactly what its pass-through
+    branch stores for the dims beyond ``rotary_dim``. So a full-head identity
+    table must give the same bits as a ``rotary_dim = 2`` identity table, where
+    126 of the 128 dims take that un-rotated branch; and the text rows of the
+    joint launch (the op HunyuanVideo calls) must equal the single-stream
+    launch over the text tokens alone under that same table.
+    """
+    from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+        _launch_fused_joint_qkv_norm_rope,
+        _launch_fused_qk_norm_rope,
+    )
+
+    torch.manual_seed(1)
+    tokens = 300
+    q = torch.randn(tokens, _HEADS, _HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(tokens, _HEADS, _HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    q_w = torch.rand(_HEAD_DIM, device="cuda", dtype=torch.bfloat16) + 0.5
+    k_w = torch.rand(_HEAD_DIM, device="cuda", dtype=torch.bfloat16) + 0.5
+    full_q, full_k = _launch_fused_qk_norm_rope(q, k, q_w, k_w, _identity_table(tokens, _HEAD_DIM // 2), 1e-6, True)
+    plain_q, plain_k = _launch_fused_qk_norm_rope(q, k, q_w, k_w, _identity_table(tokens, 1), 1e-6, True)
+    assert torch.equal(full_q, plain_q)
+    assert torch.equal(full_k, plain_k)
+
+    # Joint launch: video rows rotated, text rows identity (the model's table).
+    monkeypatch.delenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", raising=False)
+    batch, video, txt = 2, 96, 40
+    streams = [
+        torch.randn(batch, seq, _HEADS, _HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+        for seq in (video, video, video, txt, txt, txt)
+    ]
+    weights = [torch.rand(_HEAD_DIM, device="cuda", dtype=torch.bfloat16) + 0.5 for _ in range(4)]
+    angles = torch.randn(video, _HEAD_DIM // 2, device="cuda")
+    table = _packed_qk_norm_rope_table((torch.cos(angles), torch.sin(angles)), txt, batch, torch.bfloat16)
+    joint_q, joint_k, joint_v = _launch_fused_joint_qkv_norm_rope(*streams, *weights, table, 1e-6, True)
+    text_q, text_k = _launch_fused_qk_norm_rope(
+        streams[3].reshape(-1, _HEADS, _HEAD_DIM),
+        streams[4].reshape(-1, _HEADS, _HEAD_DIM),
+        weights[2],
+        weights[3],
+        _identity_table(batch * txt, 1),
+        1e-6,
+        True,
+    )
+    assert torch.equal(joint_q[:, video:].reshape(-1, _HEADS, _HEAD_DIM), text_q)
+    assert torch.equal(joint_k[:, video:].reshape(-1, _HEADS, _HEAD_DIM), text_k)
+    assert torch.equal(joint_v[:, video:], streams[5])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+def test_identity_rows_match_eager_within_rounding():
+    """Sanity check against the eager chain at the usual RMSNorm rounding
+    tolerance (reduction order / vLLM's double rounding; not bitwise)."""
     from vllm_omni.diffusion.layers.fused_qk_norm_rope import _eager_qk_norm_rope, _launch_fused_qk_norm_rope
 
     torch.manual_seed(1)
     q = torch.randn(300, _HEADS, _HEAD_DIM, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(300, _HEADS, _HEAD_DIM, device="cuda", dtype=torch.bfloat16)
     w = torch.rand(_HEAD_DIM, device="cuda", dtype=torch.bfloat16) + 0.5
-    ident = (
-        torch.cat((torch.ones(300, _HEAD_DIM // 2), torch.zeros(300, _HEAD_DIM // 2)), dim=-1).cuda().to(torch.bfloat16)
-    )
     zero_angle = torch.cat((torch.ones(300, _HEAD_DIM // 2), torch.zeros(300, _HEAD_DIM // 2)), dim=-1).cuda()
-    fq, fk = _launch_fused_qk_norm_rope(q, k, w, w, ident, 1e-6, interleaved=True)
+    fq, fk = _launch_fused_qk_norm_rope(q, k, w, w, _identity_table(300, _HEAD_DIM // 2), 1e-6, interleaved=True)
     eq, ek = _eager_qk_norm_rope(q, k, w, w, zero_angle, 1e-6, _HEAD_DIM, _HEAD_DIM, True)
     torch.testing.assert_close(fq, eq, atol=0.0625, rtol=0.02)
     torch.testing.assert_close(fk, ek, atol=0.0625, rtol=0.02)
-    # and against an un-rotated table-free normalization: identical up to reduction order
     ref = torch.nn.functional.rms_norm(q.float(), (_HEAD_DIM,), w.float(), 1e-6).to(torch.bfloat16)
     assert (fq != ref).float().mean().item() < 0.02
 
