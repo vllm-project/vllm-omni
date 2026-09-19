@@ -249,6 +249,7 @@ REALTIME_COMMAND_TYPES: frozenset[str] = frozenset(
         "conversation.item.create",
         "conversation.item.delete",
         "conversation.item.truncate",
+        "conversation.item.retrieve",
         "session.update",
         "playback.ack",
         "session.heartbeat",
