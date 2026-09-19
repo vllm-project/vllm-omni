@@ -82,7 +82,6 @@ EXCLUDED_MODELS = [
     "HiDreamImagePipeline",
     "HiDreamO1ImagePipeline",
     "DreamZeroPipeline",
-    "StableDiffusionXLPipeline",
     "Gr00tN1d7Pipeline",
     "Pi0Pipeline",
     "Pi05Pipeline",

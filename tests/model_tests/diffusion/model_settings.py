@@ -136,4 +136,10 @@ DIFFUSION_TEST_SETTINGS = {
         builder=diff_model_builders.tiny_qwen_image_edit_plus_builder,
         supported_tasks=[DiffusionTasks.IMAGE_TO_IMAGE],
     ),
+    "StableDiffusionXLPipeline": DiffusionModelTestOpts(
+        model="stabilityai/stable-diffusion-xl-base-1.0",
+        builder=diff_model_builders.tiny_sdxl_builder,
+        supported_tasks=[DiffusionTasks.TEXT_TO_IMAGE],
+        extra_test_groups=[[DiffusionAccs.CPU_OFFLOAD]],
+    ),
 }
