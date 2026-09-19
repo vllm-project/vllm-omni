@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Configuration for AR-Diffusion engine-level KV cache management."""
 
 from __future__ import annotations
