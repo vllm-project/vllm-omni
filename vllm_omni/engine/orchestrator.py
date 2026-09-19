@@ -689,13 +689,23 @@ class OrchestratorBase:
         stage_ids: list[int] = []
         for pool in target_pools:
             for replica_id in pool.live_replica_ids():
-                stage_result = await pool.collective_rpc(
-                    replica_id=replica_id,
-                    method=method,
-                    timeout=timeout,
-                    args=args,
-                    kwargs=kwargs,
-                )
+                try:
+                    stage_result = await pool.collective_rpc(
+                        replica_id=replica_id,
+                        method=method,
+                        timeout=timeout,
+                        args=args,
+                        kwargs=kwargs,
+                    )
+                except Exception as exc:
+                    if method not in ("pause_scheduler", "resume_scheduler"):
+                        raise
+                    # A pause or resume that fails on one replica leaves the
+                    # engine usable, so report it as this replica's result
+                    # rather than out of the request handler; the caller
+                    # reaches both through _engine_core_rpc, which raises on
+                    # the error result and can then retry or resume.
+                    stage_result = {"supported": False, "error": f"{type(exc).__name__}: {exc}"}
                 stage_ids.append(pool.stage_id)
                 results.append(stage_result)
 

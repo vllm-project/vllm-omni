@@ -857,6 +857,14 @@ class DiffusionWorker:
         logger.info(f"[Worker {self.rank}] Wake-up complete.")
         return True
 
+    def synchronize_device(self, timeout: float | None = None) -> None:
+        """Wait until this rank has no device work left from the batch that ran.
+
+        ``timeout`` bounds the output drain that the multi-process worker
+        runs before this call; the device wait itself is unbounded.
+        """
+        current_omni_platform.synchronize()
+
     def handle_sleep_task(self, task: OmniSleepTask | dict) -> OmniACK | None:
         from vllm_omni.platforms import current_omni_platform
 
@@ -1194,11 +1202,13 @@ class WorkerProc:
                     self._async_output_pending = max(0, self._async_output_pending - 1)
                     self._async_output_done.notify_all()
 
-    def drain_async_outputs(self, timeout: float = _ASYNC_OUTPUT_DRAIN_TIMEOUT_S) -> bool:
+    def drain_async_outputs(self, timeout: float | None = None) -> bool:
         """Block until background D2H/SHM packing has no work left.
 
         Returns False if outputs are still in flight when ``timeout`` expires.
         """
+        if timeout is None:
+            timeout = _ASYNC_OUTPUT_DRAIN_TIMEOUT_S
         with self._async_output_done:
             if self._async_output_pending == 0:
                 return True
@@ -1310,6 +1320,8 @@ class WorkerProc:
         }
 
         try:
+            if method == "synchronize_device" and not self.drain_async_outputs(timeout=kwargs.get("timeout")):
+                raise TimeoutError("Diffusion async outputs did not drain before pause")
             if method in _MEMORY_RELEASING_METHODS:
                 self.drain_async_outputs()
             # Use execute_method from WorkerWrapperBase for consistent method resolution
