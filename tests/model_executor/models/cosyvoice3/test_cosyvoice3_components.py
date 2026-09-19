@@ -502,7 +502,8 @@ class TestCFM:
             def __init__(self):
                 self.released = []
 
-            def acquire_estimator(self):
+            def acquire_estimator(self, batch_size=2, sequence_length=None):
+                assert (batch_size, sequence_length) == (6, 4)
                 return [context, estimator_stream], FakeEngine()
 
             def release_estimator(self, released_context, released_stream):
@@ -525,12 +526,12 @@ class TestCFM:
             estimator=estimator_pool,
         )
 
-        x = torch.randn(2, 80, 4)
-        mask = torch.ones(2, 1, 4)
-        mu = torch.randn(2, 80, 4)
-        timestep = torch.randn(2)
-        speakers = torch.randn(2, 80)
-        condition = torch.randn(2, 80, 4)
+        x = torch.randn(6, 80, 4)
+        mask = torch.ones(6, 1, 4)
+        mu = torch.randn(6, 80, 4)
+        timestep = torch.randn(6)
+        speakers = torch.randn(6, 80)
+        condition = torch.randn(6, 80, 4)
 
         output = cfm.forward_estimator(x, mask, mu, timestep, speakers, condition)
 
@@ -542,6 +543,59 @@ class TestCFM:
         assert stream_contexts == [estimator_stream]
         assert context.execute_stream == estimator_stream.cuda_stream
         assert estimator_pool.released == [(context, estimator_stream)]
+
+    @pytest.mark.core_model
+    @pytest.mark.cpu
+    def test_trt_long_batch_falls_back_to_cfg2_pairs(self, monkeypatch):
+        from omegaconf import DictConfig
+
+        from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import ConditionalCFM
+
+        class FakeEstimator:
+            io_dtype = torch.float32
+
+            @staticmethod
+            def supports_estimator_shape(batch_size, sequence_length):
+                if batch_size == 2:
+                    return sequence_length <= 3000
+                return 4 <= batch_size <= 16 and batch_size % 2 == 0 and sequence_length <= 1024
+
+        cfm = ConditionalCFM(
+            in_channels=80,
+            cfm_params=DictConfig(
+                {
+                    "sigma_min": 1e-6,
+                    "solver": "euler",
+                    "t_scheduler": "cosine",
+                    "training_cfg_rate": 0.2,
+                    "inference_cfg_rate": 0.7,
+                }
+            ),
+            n_spks=1,
+            spk_emb_dim=80,
+            estimator=FakeEstimator(),
+        )
+
+        calls = []
+
+        def fake_trt_once(x, mask, mu, timestep, speakers, condition):
+            calls.append(x[:, 0, 0].clone())
+            return x + 100.0
+
+        monkeypatch.setattr(cfm, "_forward_estimator_trt_once", fake_trt_once)
+
+        seq_len = 1025
+        x = torch.arange(6, dtype=torch.float32).view(6, 1, 1).expand(6, 80, seq_len).clone()
+        mask = torch.ones(6, 1, seq_len)
+        mu = torch.zeros(6, 80, seq_len)
+        timestep = torch.zeros(6)
+        speakers = torch.zeros(6, 80)
+        condition = torch.zeros(6, 80, seq_len)
+
+        output = cfm.forward_estimator(x, mask, mu, timestep, speakers, condition)
+
+        assert [call.tolist() for call in calls] == [[0.0, 3.0], [1.0, 4.0], [2.0, 5.0]]
+        assert torch.equal(output, x + 100.0)
 
     @pytest.mark.core_model
     @pytest.mark.cpu
