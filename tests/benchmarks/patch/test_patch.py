@@ -20,6 +20,7 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SeedTTSSampleRequest,
     SeedTTSTextSampleRequest,
 )
+from vllm_omni.benchmarks.metrics.metrics import _build_stage_metrics_from_outputs
 from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
     _add_video_extra_body_to_form,
@@ -132,7 +133,9 @@ class MockResponse:
 
 
 @pytest.mark.asyncio
-async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch):
+@pytest.mark.parametrize("save_details", [False, True])
+@pytest.mark.parametrize("missing_metrics_turn", [None, 2])
+async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch, save_details, missing_metrics_turn):
     class FakeRealtimeClient:
         last_instance = None
         instances: list = []
@@ -143,6 +146,7 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
             self.configure_kwargs = None
             self.sent = []
             self.response_count = 0
+            self.turn_number = len(type(self).instances) + 1
             self.ack_count = 0
             self.silence_seconds = []
             self.closed = 0
@@ -209,12 +213,17 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
                             "vllm_omni": {
                                 "stage_metrics": {
                                     "0": {
+                                        "stage_name": "thinker",
+                                        "final_output_type": "text",
+                                        "output_unit_type": "token",
                                         "num_tokens_out": 3,
-                                        "vllm_ttft_ms": 20.0,
+                                        "vllm_ttft_ms": 20.0 * self.turn_number,
                                         "vllm_tpot_ms": 10.0,
                                         "vllm_itls_ms": [10.0, 10.0],
                                     }
                                 }
+                                if self.turn_number != missing_metrics_turn
+                                else {}
                             }
                         },
                     },
@@ -242,7 +251,7 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
         logprobs=None,
         multi_modal_content=None,
         ignore_eos=False,
-        extra_body={"save_duplex_request_metrics": True},
+        extra_body={"save_duplex_request_metrics": save_details},
     )
     request_input.seed_tts_speech_extra = {"ref_audio": "data:audio/wav;base64,AAAA"}
     request_input.seed_tts_system_prompt = "Speak exactly."
@@ -281,41 +290,58 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
     assert output.audio_ttfp > output.ttft
     assert output.audio_rtf > 0
     assert output.latency > 0
-    assert output.output_tokens == 12
-    assert output.itl == [0.01, 0.01] * 4
-    assert output.text_latency == pytest.approx(output.ttft + 0.08)
-    assert output.tpot_measured is True
+    measured_turns = [index for index in range(1, 5) if index != missing_metrics_turn]
+    assert output.output_tokens == 3 * len(measured_turns)
+    expected_itls = [0.01, 0.01] * 4 if missing_metrics_turn is None else []
+    assert output.itl == expected_itls
+    assert output.text_latency == pytest.approx(output.ttft + sum(expected_itls))
+    assert output.tpot_measured is (missing_metrics_turn is None)
     assert output.tts_turn_pcm_bytes == [b"\x00\x00" * 2400] * 4
     assert output.tts_output_pcm_bytes == b"\x00\x00" * 9600
+    assert set(output.stage_metrics_by_response) == {f"{index - 1}:resp-1" for index in measured_turns}
+    stages = _build_stage_metrics_from_outputs([output])
+    assert len(stages) == 1
+    assert stages[0].total_output == 3 * len(measured_turns)
+    assert stages[0].vllm_ttfts == pytest.approx([0.02 * index for index in measured_turns])
+    assert stages[0].vllm_itls == [0.01, 0.01] * len(measured_turns)
+    if not save_details:
+        assert output.duplex_request_metrics is None
+        assert output.duplex_session_metrics is None
+        return
     session_id = output.duplex_request_metrics[0]["session_id"]
     assert len(output.duplex_request_metrics) == 4
     for index, metrics in enumerate(output.duplex_request_metrics):
-        assert metrics == {
+        has_tpot = index + 1 != missing_metrics_turn
+        measurement_origin = {
+            "ttft": "first silence append client send to first non-empty text delta",
+            "ttfp": "first silence append client send to first audio packet",
+            "rtf": "request-start-to-last-audio receive time divided by emitted audio duration",
+        }
+        expected_metrics = {
             "session_id": session_id,
             "request_index": index,
             "utterance_id": f"utt-{index}",
             # Response ids are per session, and each utterance now gets its own.
             "response_id": "resp-1",
             "source": "client_monotonic_receive",
-            "measurement_origin": {
-                "ttft": "first silence append client send to first non-empty text delta",
-                "ttfp": "first silence append client send to first audio packet",
-                "rtf": "request-start-to-last-audio receive time divided by emitted audio duration",
-                "tpot": "Stage-0 engine mean time per output token",
-            },
+            "measurement_origin": measurement_origin,
             "ttft_ms": pytest.approx(20.0, abs=2.0),
-            "tpot_ms": 10.0,
             "ttfp_ms": pytest.approx(30.0, abs=2.0),
             "rtf": pytest.approx(0.3, abs=0.03),
             "audio_generation_ms": pytest.approx(30.0, abs=2.0),
             "audio_duration_ms": 100.0,
         }
+        if has_tpot:
+            measurement_origin["tpot"] = "Stage-0 engine mean time per output token"
+            expected_metrics["tpot_ms"] = 10.0
+
+        assert metrics == expected_metrics
     session = output.duplex_session_metrics
     assert session["session_id"] == session_id
     assert session["audio_turn_count"] == 4
     assert session["ttft_ms"]["count"] == 4
     assert session["ttft_ms"]["mean"] == pytest.approx(20.0, abs=2.0)
-    assert session["tpot_ms"] == {"count": 4, "mean": 10.0, "p50": 10.0, "p99": 10.0}
+    assert session["tpot_ms"] == {"count": len(measured_turns), "mean": 10.0, "p50": 10.0, "p99": 10.0}
     assert session["ttfp_ms"]["count"] == 4
     assert session["ttfp_ms"]["mean"] == pytest.approx(30.0, abs=2.0)
     assert session["rtf"]["count"] == 4
