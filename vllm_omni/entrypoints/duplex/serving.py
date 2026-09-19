@@ -41,6 +41,7 @@ from vllm_omni.entrypoints.duplex.session_attachment import (
     DuplexJournalGapError,
     DuplexJournalOverflowError,
     DuplexSessionAttachmentRegistry,
+    DuplexSessionResumeResult,
     InvalidResumeTokenError,
     ResumeToken,
 )
@@ -277,6 +278,12 @@ class OmniDuplexSessionHandler:
                 resume_token=token.plaintext,
             ).to_realtime()
 
+        # From here on the engine lease is resumed (``detached_at`` cleared), so
+        # every exit that does not hand the attachment to the caller has to
+        # put the lease back into its disconnect grace, or the session sits
+        # attached to nothing until idle expiry. That includes cancellation of
+        # the handler task, which is not an ``Exception``.
+        resumed: DuplexSessionResumeResult | None = None
         try:
             resumed = await self._attachment_registry.resume(
                 session_id,
@@ -286,25 +293,24 @@ class OmniDuplexSessionHandler:
                 close=attachment_close,
                 activation_payload_factory=activation_payload_factory,
             )
+            replaced = resumed.replaced_attachment
+            if replaced is not None:
+                with suppress(Exception):
+                    await replaced.send(
+                        SessionReplaced(session_id=session_id, attachment_generation=replaced.generation).to_realtime()
+                    )
+                with suppress(Exception):
+                    await replaced.close("session_replaced")
+        except asyncio.CancelledError:
+            await self._abandon_resume(
+                session_id,
+                attachment_generation=resumed.attachment_generation if resumed is not None else None,
+            )
+            raise
         except Exception as exc:
-            # The engine lease was already resumed above, so a failed activation
-            # would leave the session attached to nothing -- unless another
-            # connection won the race and is attached right now. Detaching then
-            # would start the disconnect grace for the *winner*, which ordinary
-            # heartbeats do not clear. Roll back only what this attempt owns.
-            if not await self._attachment_registry.has_attachment(session_id):
-                with suppress(DuplexSessionError):
-                    await self._omni.detach_session(session_id)
+            await self._abandon_resume(session_id, attachment_generation=None)
             await send_json(envelope.error_payload("session_resume_conflict", str(exc)))
             return None
-        replaced = resumed.replaced_attachment
-        if replaced is not None:
-            with suppress(Exception):
-                await replaced.send(
-                    SessionReplaced(session_id=session_id, attachment_generation=replaced.generation).to_realtime()
-                )
-            with suppress(Exception):
-                await replaced.close("session_replaced")
         # A reconnect brings a fresh envelope carrying pcm16/16 kHz wire
         # defaults. The negotiated input format is a wire default, not part of
         # the public session object, so it has to be carried over explicitly:
@@ -314,6 +320,24 @@ class OmniDuplexSessionHandler:
             envelope.defaults = remembered
         self._start_pump(handle, None)
         return _Attachment(handle=handle, generation=resumed.attachment_generation)
+
+    async def _abandon_resume(self, session_id: str, *, attachment_generation: int | None) -> None:
+        """Roll the engine lease of a resume this connection will never serve back into disconnect grace.
+
+        Only what this attempt owns is rolled back. ``attachment_generation``
+        is the attachment it activated, or ``None`` when activation did not
+        happen: then the lease is detached only if nobody is attached, because
+        another connection may have won the race and be attached right now.
+        Detaching then would start the disconnect grace for the *winner*,
+        which ordinary heartbeats do not clear.
+        """
+        if attachment_generation is not None:
+            owns_lease = await self._attachment_registry.detach(session_id, attachment_generation=attachment_generation)
+        else:
+            owns_lease = not await self._attachment_registry.has_attachment(session_id)
+        if owns_lease:
+            with suppress(DuplexSessionError):
+                await self._omni.detach_session(session_id)
 
     # ------------------------------------------------------------------ #
     # Outbound pump (session-scoped, survives reconnects)                #

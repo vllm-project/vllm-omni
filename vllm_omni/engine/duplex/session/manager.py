@@ -511,31 +511,59 @@ class DuplexSessionManager:
                 # and the stage resource straight back.
                 self._abandoned_opens.discard(session_id)
                 await self._close_runner(runner, kind="close", reason="open_abandoned")
+        except asyncio.CancelledError:
+            # A cancel (engine teardown, task cancellation) while awaiting the
+            # plugin or the result sink is not an ``Exception``: without this
+            # branch the runner stayed in ``runners`` with its Stage0
+            # reservation, and since admission counts runners, every cancelled
+            # open burned one slot for good. Nobody is answered: the caller's
+            # RPC waiter is being torn down with us or times out.
+            logger.info("open_duplex_session cancelled for %s; rolling the admission back", session_id)
+            await self._rollback_open(session_id, session=session, runner=runner)
+            raise
         except Exception as exc:
             error_code, _, _ = self._control_error(exc)
             if error_code in {"resource_exhausted", "session_exists"}:
                 logger.info("open_duplex_session rejected: %s", exc)
             else:
                 logger.exception("open_duplex_session failed: %s", exc)
-            if runner is not None and self.runners.get(session_id) is runner:
-                self.runners.pop(session_id, None)
-                try:
-                    await runner.shutdown()
-                except Exception:
-                    logger.exception("duplex open rollback: runner shutdown failed for %s", session_id)
-            if session is not None:
-                reserved = session.release_all_requests()
-                if reserved:
-                    try:
-                        await self.stage_port.cleanup(list(reserved))
-                    except Exception:
-                        logger.warning("duplex open rollback: request cleanup pending for %s", session_id)
-                self._unregister_session_requests(session_id)
+            await self._rollback_open(session_id, session=session, runner=runner)
             await self._put_result(message, operation="open", ok=False, error=exc)
         finally:
             if holds_admission_slot:
                 self._admitting.discard(session_id)
             self._abandoned_opens.discard(session_id)
+
+    async def _rollback_open(
+        self,
+        session_id: str,
+        *,
+        session: DuplexEngineSession | None,
+        runner: DuplexSessionRunner | None,
+    ) -> None:
+        """Undo whatever an open that will not complete already did.
+
+        The bookkeeping that decides admission (``runners`` and the session's
+        request reservations) is undone synchronously first, so a second
+        cancellation landing in the awaits below cannot leave the slot burned.
+        """
+        owned_runner = runner is not None and self.runners.get(session_id) is runner
+        if owned_runner:
+            self.runners.pop(session_id, None)
+        reserved: list[str] = []
+        if session is not None:
+            reserved = list(session.release_all_requests())
+            self._unregister_session_requests(session_id)
+        if owned_runner and runner is not None:
+            try:
+                await runner.shutdown()
+            except Exception:
+                logger.exception("duplex open rollback: runner shutdown failed for %s", session_id)
+        if reserved:
+            try:
+                await self.stage_port.cleanup(reserved)
+            except Exception:
+                logger.warning("duplex open rollback: request cleanup pending for %s", session_id)
 
     def _require_runner(self, session_id: str) -> DuplexSessionRunner:
         runner = self.runners.get(session_id)

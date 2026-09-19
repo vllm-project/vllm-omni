@@ -1573,3 +1573,82 @@ async def test_reaper_loop_survives_one_cleanup_failure(first_cleanup_delay: flo
     finally:
         shutdown.set()
         await asyncio.wait_for(task, timeout=5.0)
+
+
+# --------------------------------------------------------------------------- #
+# Cancelled open (#7636 Issue 1)                                              #
+# --------------------------------------------------------------------------- #
+
+
+class _BlockingResultSink(asyncio.Queue):
+    """A result sink whose ``put`` parks, so an open can be cancelled after it admitted the session."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.gate = asyncio.Event()
+
+    async def put(self, item: object) -> None:
+        self.entered.set()
+        await self.gate.wait()
+        await super().put(item)
+
+
+async def test_an_open_cancelled_while_awaiting_the_plugin_frees_the_admission_slot() -> None:
+    """``CancelledError`` is not an ``Exception``: the rollback used to be skipped.
+
+    Admission counts ``runners | closing | admitting``, so every open cancelled
+    mid-flight (engine teardown, task cancellation) burned one slot for good;
+    after ``max_sessions`` of them every new session was refused.
+    """
+    async with Harness.create(max_sessions=1) as harness:
+        harness.plugin.blocked_session_ids.add("blocked")
+        config = DuplexSessionConfig(model="fake-model", instructions="blocked")
+        open_task = asyncio.create_task(harness.open("sid-cancelled", config))
+        await asyncio.wait_for(harness.plugin.runtime_config_started.wait(), timeout=1.0)
+
+        open_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await open_task
+
+        assert harness.manager.get("sid-cancelled") is None
+        assert harness.manager.active_count() == 0
+        assert harness.result_sink.empty(), "a cancelled open answers nobody"
+        assert (await harness.open("sid-replacement")).ok is True
+
+
+async def test_an_open_cancelled_after_admission_releases_the_runner_and_its_stage_reservation() -> None:
+    """The worst landing spot for the cancel: the runner is registered and Stage0 is reserved.
+
+    Both have to be undone, or the runner stays in ``runners`` (one slot gone)
+    and the Stage0 request stays reserved in the orchestrator.
+    """
+    async with Harness.create(max_sessions=1) as harness:
+        sink = _BlockingResultSink()
+        original_sink = harness.manager._result_sink
+        harness.manager._result_sink = sink
+        open_task = asyncio.create_task(
+            harness.manager.handle(
+                OpenDuplexSessionMessage(
+                    control_id="open-cancelled",
+                    session_id="sid-cancelled",
+                    session_config=DuplexSessionConfig(model="fake-model"),
+                )
+            )
+        )
+        await asyncio.wait_for(sink.entered.wait(), timeout=1.0)
+        assert "sid-cancelled" in harness.manager.runners
+        assert [context.request_id for context in harness.stage_port.ensure_calls] == [
+            stage0_request_id("sid-cancelled")
+        ]
+
+        open_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await open_task
+        harness.manager._result_sink = original_sink
+
+        assert "sid-cancelled" not in harness.manager.runners
+        assert harness.manager.active_count() == 0
+        assert harness.stage_port.cleanup_calls == [([stage0_request_id("sid-cancelled")], False)]
+        assert stage0_request_id("sid-cancelled") not in harness.manager._request_index
+        assert (await harness.open("sid-replacement")).ok is True

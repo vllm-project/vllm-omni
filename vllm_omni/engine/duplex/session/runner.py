@@ -1018,6 +1018,7 @@ class DuplexSessionRunner:
             operation_id=operation_id,
             retained_committed_payload=retained_committed_payload,
             precreated_response_id=session.active_response_id if precreate_response else None,
+            owns_request=final or precreate_response,
             on_append_accepted=on_append_accepted,
             before_append=before_append,
         )

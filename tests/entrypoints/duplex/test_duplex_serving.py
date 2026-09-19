@@ -607,3 +607,96 @@ async def test_a_resume_that_fails_to_activate_does_not_detach_the_live_attachme
                 pending.cancel()
                 with suppress(asyncio.CancelledError, Exception):
                     await pending
+
+
+# --------------------------------------------------------------------------- #
+# Cancelled resume and the engine disconnect grace (#7636 Issue 3)            #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_resume_cancelled_during_activation_puts_the_engine_lease_back_into_grace() -> None:
+    """``_resume`` resumes the engine lease first; a cancel mid-activation must detach it again.
+
+    The rollback used to catch ``Exception`` only. A handler task cancelled
+    while sending ``session.resumed`` or a replay entry left the engine with
+    ``detached_at=None`` and the outer handler with no attachment to clean up:
+    the reaper reclaimed nothing after the grace, and with one slot the next
+    open was refused with ``resource_exhausted``.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    token = ws.sent[0]["resume_token"]
+    ws.disconnect()
+    await asyncio.wait_for(task, timeout=2.0)
+    assert omni.detached == [handle.session_id]
+    registry = handler._attachment_registry
+
+    activating = asyncio.Event()
+
+    async def parked_resume(*args, **kwargs):
+        activating.set()
+        await asyncio.Event().wait()
+
+    original_resume = registry.resume
+    registry.resume = parked_resume  # type: ignore[method-assign]
+    try:
+        ws2, task2 = await _resume(handler, handle.session_id, token)
+        await asyncio.wait_for(activating.wait(), timeout=2.0)
+        assert omni.resumed == [(handle.session_id, 0)], "the engine lease was resumed before activation"
+
+        task2.cancel()
+        with suppress(asyncio.CancelledError):
+            await task2
+    finally:
+        registry.resume = original_resume  # type: ignore[method-assign]
+
+    # The lease is detached again, so the disconnect grace runs for it.
+    assert omni.detached == [handle.session_id, handle.session_id]
+    assert not await registry.has_attachment(handle.session_id)
+    assert handle.close_reasons == []
+    # And the session is still resumable with the token the cancelled attempt presented.
+    ws3, task3 = await _resume(handler, handle.session_id, token)
+    resumed = await ws3.wait_for("session.resumed")
+    assert resumed["session_id"] == handle.session_id
+    ws3.disconnect()
+    await asyncio.wait_for(task3, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_a_resume_cancelled_after_activation_detaches_the_attachment_it_made() -> None:
+    """A cancel after the registry activated the new attachment must undo that attachment too.
+
+    Otherwise the session stays attached to a socket nobody serves, with the
+    engine lease resumed: no grace, no expiry, until the idle TTL.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    token = ws.sent[0]["resume_token"]
+    registry = handler._attachment_registry
+
+    # The takeover notifies the replaced socket after activation; park there.
+    notifying = asyncio.Event()
+
+    async def parked_send(payload: dict[str, Any]) -> None:
+        notifying.set()
+        await asyncio.Event().wait()
+
+    ws.send_json = parked_send  # type: ignore[method-assign]
+    ws2, task2 = await _resume(handler, handle.session_id, token)
+    await asyncio.wait_for(notifying.wait(), timeout=2.0)
+    assert await registry.is_current_attachment(handle.session_id, 2), "the new socket is attached"
+
+    task2.cancel()
+    with suppress(asyncio.CancelledError):
+        await task2
+
+    assert not await registry.has_attachment(handle.session_id)
+    assert omni.detached == [handle.session_id]
+    assert handle.close_reasons == []
+
+    task.cancel()
+    with suppress(asyncio.CancelledError, Exception):
+        await task
