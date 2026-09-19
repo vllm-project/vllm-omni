@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -77,7 +78,7 @@ def test_pipeline_declares_native_components_and_single_request_mode_only() -> N
     assert MammothModa2DiTPipeline._dit_modules == ["gen_transformer"]
     assert MammothModa2DiTPipeline._encoder_modules == ["gen_image_condition_refiner"]
     assert MammothModa2DiTPipeline._vae_modules == ["gen_vae"]
-    assert MammothModa2DiTPipeline.supports_request_batch is False
+    assert MammothModa2DiTPipeline.supports_request_batch is True
     assert MammothModa2DiTPipeline.supports_step_execution is False
 
 
@@ -195,12 +196,12 @@ def test_parse_request_standard_fields_precede_request_level_fallbacks() -> None
     assert parsed.num_inference_steps == 7
 
 
-def test_parse_request_rejects_multiple_requests_and_outputs() -> None:
+def test_parse_request_parses_each_request_and_rejects_multi_output() -> None:
     pipeline = _pipeline_shell()
     batch = _batch()
     batch.requests.append(_batch(request_id="req-8").requests[0])
-    with pytest.raises(ValueError, match="exactly one request"):
-        pipeline._parse_request(batch)
+    assert pipeline._parse_request(batch, 0).request_id == "req-7"
+    assert pipeline._parse_request(batch, 1).request_id == "req-8"
     with pytest.raises(ValueError, match="num_outputs_per_prompt=1"):
         pipeline._parse_request(_batch(sampling=OmniDiffusionSamplingParams(num_outputs_per_prompt=2)))
 
@@ -326,10 +327,12 @@ class _FakeVae(nn.Module):
         super().__init__()
         self.anchor = nn.Parameter(torch.zeros(1))
         self.config = _FakeVaeConfig()
+        self.last_decode_dtype: torch.dtype | None = None
 
     def decode(self, latents, return_dict=False):
         assert return_dict is False
-        return (torch.zeros(1, 3, 32, 48, dtype=latents.dtype),)
+        self.last_decode_dtype = latents.dtype
+        return (latents[:, :3].repeat(1, 1, 8, 8)[:, :3, :32, :48],)
 
 
 class _FakeScheduler:
@@ -357,7 +360,8 @@ def test_forward_returns_diffusion_output_with_request_sampling(mocker) -> None:
 
     def fake_randn_tensor(shape, *, generator, device, dtype):
         captured["shape"] = shape
-        captured["seed"] = generator.initial_seed()
+        gen = generator[0] if isinstance(generator, list) else generator
+        captured["seed"] = gen.initial_seed() if gen else 0
         return torch.zeros(shape, device=device, dtype=dtype)
 
     module = "vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit"
@@ -371,8 +375,9 @@ def test_forward_returns_diffusion_output_with_request_sampling(mocker) -> None:
         )
     )
 
-    assert isinstance(result, DiffusionOutput)
-    assert result.output.shape == (1, 3, 32, 48)
+    assert isinstance(result, list) and len(result) == 1
+    assert isinstance(result[0], DiffusionOutput)
+    assert result[0].output.shape == (1, 3, 32, 48)
     assert captured["shape"] == (1, 4, 4, 6)
     assert captured["seed"] == 42
     assert scheduler.requested_steps == 2
@@ -390,3 +395,184 @@ def test_forward_rejects_missing_visual_tokens_before_model_access() -> None:
     }
     with pytest.raises(ValueError, match="no visual-token hidden states.*req-empty"):
         _pipeline_shell().forward(_batch(request_id="req-empty", prompt=prompt))
+
+
+def test_pre_process_registers_batch_compatibility_key() -> None:
+    from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import (
+        get_mammoth_moda2_pre_process_func,
+    )
+
+    pre_process = get_mammoth_moda2_pre_process_func(None)
+    req = _batch().requests[0]
+    pre_process(req)
+    assert req.batch_compatibility_key == ("mammoth_moda2_dit", 32, 48, 7)
+
+
+def test_pre_process_rejects_missing_ar_conditions() -> None:
+    from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import (
+        get_mammoth_moda2_pre_process_func,
+    )
+
+    pre_process = get_mammoth_moda2_pre_process_func(None)
+    req = _batch(request_id="req-bad-ar", prompt={"prompt": "test"}).requests[0]
+    with pytest.raises(ValueError, match="Missing additional_information AR conditions.*req-bad-ar"):
+        pre_process(req)
+
+
+@pytest.mark.parametrize(
+    ("height", "width", "message"),
+    [
+        (0, 32, "Invalid image size.*req-dim"),
+        (32, -1, "Invalid image size.*req-dim"),
+        (30, 32, "multiples of 16.*req-dim"),
+        (32, 31, "multiples of 16.*req-dim"),
+    ],
+)
+def test_pre_process_rejects_invalid_dimensions(height, width, message) -> None:
+    from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import (
+        get_mammoth_moda2_pre_process_func,
+    )
+
+    pre_process = get_mammoth_moda2_pre_process_func(None)
+    batch = _batch(request_id="req-dim")
+    batch.prompts[0].update(height=height, width=width)
+    with pytest.raises(ValueError, match=message):
+        pre_process(batch.requests[0])
+
+
+def test_pre_process_rejects_non_positive_steps() -> None:
+    from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import (
+        get_mammoth_moda2_pre_process_func,
+    )
+
+    pre_process = get_mammoth_moda2_pre_process_func(None)
+    req = _batch(
+        request_id="req-zero-steps",
+        sampling=OmniDiffusionSamplingParams(num_inference_steps=0),
+    ).requests[0]
+    with pytest.raises(ValueError, match="num_inference_steps must be positive.*req-zero-steps"):
+        pre_process(req)
+
+
+def test_pre_process_allows_dummy_run() -> None:
+    from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import (
+        get_mammoth_moda2_pre_process_func,
+    )
+
+    pre_process = get_mammoth_moda2_pre_process_func(None)
+    req = _batch(
+        request_id="dummy_req_id",
+        prompt={"prompt": "dummy run"},
+        sampling=OmniDiffusionSamplingParams(height=512, width=512, num_inference_steps=20),
+    ).requests[0]
+    pre_process(req)
+    assert req.batch_compatibility_key == ("mammoth_moda2_dit", 512, 512, 20)
+
+
+def test_forward_casts_latents_to_vae_dtype() -> None:
+    pipeline = _pipeline_shell()
+    pipeline.gen_transformer = _FakeTransformer()
+    pipeline.gen_image_condition_refiner = None
+    vae = _FakeVae()
+    vae.anchor = nn.Parameter(torch.zeros(1, dtype=torch.float16))
+    pipeline.gen_vae = vae
+    pipeline.gen_freqs_cis = torch.zeros(1)
+    scheduler = _FakeScheduler()
+
+    module = "vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit"
+    with (
+        patch(f"{module}.FlowMatchEulerDiscreteScheduler", return_value=scheduler),
+        patch(
+            f"{module}.randn_tensor",
+            side_effect=lambda s, **kw: torch.zeros(s, device=kw.get("device"), dtype=kw.get("dtype")),
+        ),
+    ):
+        result = pipeline.forward(_batch())
+
+    assert len(result) == 1
+    assert vae.last_decode_dtype == torch.float16
+
+
+def test_group_requests_by_geometry_and_steps() -> None:
+    from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import (
+        _MammothRequest,
+    )
+
+    def make_req(idx: int, h: int, w: int, s: int) -> _MammothRequest:
+        return _MammothRequest(
+            index=idx,
+            request_id=f"r{idx}",
+            full_hidden_states=torch.zeros(1, 8),
+            full_token_ids=[1],
+            answer_start_index=0,
+            height=h,
+            width=w,
+            text_guidance_scale=1.0,
+            cfg_range=(0.0, 1.0),
+            num_inference_steps=s,
+            seed=None,
+            generator=None,
+            generator_device=None,
+        )
+
+    reqs = [make_req(0, 32, 32, 5), make_req(1, 32, 32, 5), make_req(2, 64, 64, 5)]
+    groups = MammothModa2DiTPipeline._group_requests(reqs)
+    assert sorted(groups) == [[0, 1], [2]]
+
+
+def test_pad_cond_sequence_right_pads() -> None:
+    from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import (
+        _pad_cond_sequence,
+    )
+
+    embeds = [torch.ones(1, 2, 8), torch.ones(1, 4, 8) * 2]
+    masks = [torch.ones(1, 2, dtype=torch.bool), torch.ones(1, 4, dtype=torch.bool)]
+    padded, mask = _pad_cond_sequence(embeds, masks)
+    assert padded.shape == (2, 4, 8)
+    assert mask.tolist() == [[True, True, False, False], [True, True, True, True]]
+
+
+def test_forward_batched_matches_solo_output() -> None:
+    pipeline = _pipeline_shell()
+    pipeline.gen_transformer = _FakeTransformer()
+    pipeline.gen_image_condition_refiner = None
+    pipeline.gen_vae = _FakeVae()
+    pipeline.gen_freqs_cis = torch.zeros(1)
+    scheduler = _FakeScheduler()
+
+    def fake_randn_tensor(shape, *, generator, device, dtype):
+        if isinstance(generator, list):
+            tensors = [
+                torch.full((1, *shape[1:]), float(g.initial_seed() if g else 0), device=device, dtype=dtype)
+                for g in generator
+            ]
+            return torch.cat(tensors, dim=0)
+        val = float(generator.initial_seed() if generator else 0)
+        return torch.full(shape, val, device=device, dtype=dtype)
+
+    module = "vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit"
+    with (
+        patch(f"{module}.FlowMatchEulerDiscreteScheduler", return_value=scheduler),
+        patch(f"{module}.randn_tensor", side_effect=fake_randn_tensor),
+    ):
+        req1 = _batch(
+            request_id="r1",
+            sampling=OmniDiffusionSamplingParams(
+                height=32, width=48, seed=10, guidance_scale=1.0, num_inference_steps=2
+            ),
+        ).requests[0]
+        req2 = _batch(
+            request_id="r2",
+            sampling=OmniDiffusionSamplingParams(
+                height=32, width=48, seed=20, guidance_scale=1.0, num_inference_steps=2
+            ),
+        ).requests[0]
+
+        batched_out = pipeline.forward(DiffusionRequestBatch([req1, req2]))
+        solo1 = pipeline.forward(DiffusionRequestBatch([req1]))
+        solo2 = pipeline.forward(DiffusionRequestBatch([req2]))
+
+    assert len(batched_out) == 2
+    torch.testing.assert_close(batched_out[0].output, solo1[0].output)
+    torch.testing.assert_close(batched_out[1].output, solo2[0].output)
+    assert not torch.equal(batched_out[0].output, batched_out[1].output)
