@@ -508,3 +508,4 @@ Read `references/optimization-playbook.md` when drafting the optimization table 
 - Scheduler work can create small host/device gaps; cache tiny solve coefficients when timesteps/order are known.
 - `torch.cuda.empty_cache()` can prevent OOM but creates synchronization/idle. Make it optional if memory headroom is sufficient.
 - `Command Buffer Full` in profiler output is profiler overhead, not a model optimization target.
+- For a newly integrated model, most platform optimizations (attention backend choice, response encoding, regional torch.compile, fused Q/K norm+RoPE, CFG/USP, request batching, quantization router) arrive via flags and small interfaces rather than custom code. Check the add-diffusion-model skill's `references/platform-optimization-inheritance.md` before planning model-specific optimization work.
