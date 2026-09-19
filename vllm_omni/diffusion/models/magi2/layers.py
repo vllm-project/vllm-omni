@@ -259,7 +259,13 @@ class MultiModalityRMSNorm(nn.Module):
     ) -> torch.Tensor:
         original_dtype = tensor.dtype
         normalized = tensor.float()
-        normalized = normalized * torch.rsqrt(normalized.square().mean(dim=-1, keepdim=True) + self.eps)
+        if tensor.ndim > 0 and tensor.shape[-1] == self.dim and self.eps is not None:
+            # Reuse the backend RMSNorm operator without rounding the normalized
+            # activation before the checkpoint's (weight + 1) multiplication.
+            normalized = F.rms_norm(normalized, (self.dim,), None, self.eps)
+        else:
+            # Preserve broadcasting for nonstandard input shapes.
+            normalized = normalized * torch.rsqrt(normalized.square().mean(dim=-1, keepdim=True) + self.eps)
         if self.num_modality == 1:
             weight = self.weight.view(self.num_patterns, self.dim) + 1.0
             result = normalized * weight
