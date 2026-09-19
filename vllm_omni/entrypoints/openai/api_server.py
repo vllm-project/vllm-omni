@@ -1650,14 +1650,22 @@ async def delete_voice(name: str, raw_request: Request):
 
     try:
         # Delete the voice
-        success = await handler.delete_voice(name)
-        if not success:
-            return _create_speech_error_json_response(
-                raw_request,
-                f"Voice '{name}' not found",
-                err_type="NotFoundError",
-                status_code=HTTPStatus.NOT_FOUND,
-            )
+        err = await handler.delete_voice(name)
+        if err is not None:
+            if "not found" in err:
+                return _create_speech_error_json_response(
+                    raw_request,
+                    err,
+                    err_type="NotFoundError",
+                    status_code=HTTPStatus.NOT_FOUND,
+                )
+            else:
+                return _create_speech_error_json_response(
+                    raw_request,
+                    err,
+                    err_type="ForbiddenError",
+                    status_code=HTTPStatus.FORBIDDEN,
+                )
 
         return JSONResponse(content={"success": True, "message": f"Voice '{name}' deleted successfully"})
 

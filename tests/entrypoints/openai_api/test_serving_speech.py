@@ -329,9 +329,12 @@ def test_app(mocker: MockerFixture, tmp_path, monkeypatch):
     # Add delete_voice endpoint
     async def delete_voice(name: str):
         try:
-            success = await speech_server.delete_voice(name)
-            if not success:
-                raise HTTPException(status_code=404, detail=f"Voice '{name}' not found")
+            err = await speech_server.delete_voice(name)
+            if err is not None:
+                if "not found" in err:
+                    raise HTTPException(status_code=404, detail=err)
+                else:
+                    raise HTTPException(status_code=403, detail=err)
             return {"success": True, "message": f"Voice '{name}' deleted successfully"}
         except HTTPException:
             raise
@@ -4036,7 +4039,7 @@ def test_api_server_delete_voice_value_error_returns_400(mocker: MockerFixture):
 def test_api_server_delete_voice_not_found_returns_404(mocker: MockerFixture):
     _patch_api_server_base(mocker)
     handler = mocker.MagicMock()
-    handler.delete_voice = mocker.AsyncMock(return_value=False)
+    handler.delete_voice = mocker.AsyncMock(return_value="Voice 'missing' not found")
     raw_request = _make_api_server_request(handler, method="DELETE", path="/v1/audio/voices/missing")
 
     response = asyncio.run(api_server_module.delete_voice("missing", raw_request))
@@ -4046,6 +4049,41 @@ def test_api_server_delete_voice_not_found_returns_404(mocker: MockerFixture):
         status_code=404,
         message="Voice 'missing' not found",
         err_type="NotFoundError",
+    )
+
+
+def test_api_server_delete_built_in_voice_returns_403(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    handler = mocker.MagicMock()
+    handler.uploaded_speakers = set()
+    handler._get_available_speakers = mocker.Mock(return_value=set("built-in"))
+    handler.delete_voice = mocker.AsyncMock(return_value="Cannot delete built-in voice 'built-in'")
+    raw_request = _make_api_server_request(handler, method="DELETE", path="/v1/audio/voices/built-in")
+
+    response = asyncio.run(api_server_module.delete_voice("built-in", raw_request))
+
+    _assert_openai_error_response(
+        response,
+        status_code=403,
+        message="Cannot delete built-in voice 'built-in'",
+        err_type="ForbiddenError",
+    )
+
+
+def test_api_server_delete_default_voice_returns_403(mocker: MockerFixture):
+    _patch_api_server_base(mocker)
+    handler = mocker.MagicMock()
+    handler.uploaded_speakers = set()
+    handler.delete_voice = mocker.AsyncMock(return_value="Cannot delete built-in voice 'default'")
+    raw_request = _make_api_server_request(handler, method="DELETE", path="/v1/audio/voices/default")
+
+    response = asyncio.run(api_server_module.delete_voice("default", raw_request))
+
+    _assert_openai_error_response(
+        response,
+        status_code=403,
+        message="Cannot delete built-in voice 'default'",
+        err_type="ForbiddenError",
     )
 
 

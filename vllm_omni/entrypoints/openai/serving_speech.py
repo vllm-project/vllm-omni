@@ -1052,7 +1052,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "embedding_dim": emb_dim,
         }
 
-    async def delete_voice(self, name: str) -> bool:
+    async def delete_voice(self, name: str) -> str | None:
         """
         Delete an uploaded voice.
 
@@ -1060,14 +1060,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             name: Voice name to delete
 
         Returns:
-            bool: True if successful, False if voice doesn't exist
+            str | None: If voice successfully deleted return None
+                        If there is any error deleting the voice return a string describing it
         """
         async with self._upload_lock:
             voice_name_lower = name.lower()
+            built_in_speakers = self._get_available_voices() - set(self.uploaded_speakers)
+
+            if voice_name_lower in built_in_speakers:
+                warning = f"Cannot delete built-in voice '{name}'"
+                return warning
 
             if voice_name_lower not in self.uploaded_speakers:
-                logger.warning("Voice '%s' not found", name)
-                return False
+                warning = f"Voice '{name}' not found"
+                return warning
 
             speaker_info = self.uploaded_speakers.pop(voice_name_lower)
             self._ref_audio_data_url_cache.pop(voice_name_lower, None)
@@ -1077,12 +1083,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 try:
                     Path(file_path).unlink(missing_ok=True)
                 except Exception as e:
-                    logger.warning("Failed to delete audio file for '%s': %s", name, e)
+                    warning = f"Failed to delete audio file for '{name}': {e}"
 
             self._speaker_cache.clear(voice_name_lower)
 
         logger.info("Deleted voice '%s'", name)
-        return True
+        return None
 
     def _is_tts_model(self) -> bool:
         """Check if the current model is a supported TTS model."""
