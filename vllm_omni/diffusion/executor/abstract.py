@@ -1,5 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
+import concurrent.futures
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -7,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -125,6 +129,19 @@ class DiffusionExecutor(ABC):
         no-op implementation.
         """
         return None
+
+    def drop_output(self, async_output_id: str) -> None:
+        """Reclaim an async output whose consumer is no longer available.
+
+        Only executors with an async output path (result pump) cache outputs
+        that a consumer must later claim; executors without one have nothing to
+        reclaim and can keep the default no-op implementation.
+        """
+        return None
+
+    def wait_output_ready(self, async_output_id: str) -> concurrent.futures.Future[DiffusionOutput]:
+        """Return a future for an asynchronously materialized output."""
+        raise NotImplementedError
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         """Collect rank-local native specs after every Worker loads its model."""

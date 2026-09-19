@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
 import queue
@@ -866,7 +866,8 @@ async def _consume_final_output(generator):
 
 @pytest.mark.cpu
 @pytest.mark.parametrize("entrypoint", ["add_request", "async_add_req_and_stream_response"])
-def test_engine_admission_preprocesses_request_once(entrypoint: str) -> None:
+@pytest.mark.asyncio
+async def test_engine_admission_preprocesses_request_once(entrypoint: str, mocker: MockerFixture) -> None:
     raw_request = OmniDiffusionRequest(
         prompt="raw",
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
@@ -886,7 +887,17 @@ def test_engine_admission_preprocesses_request_once(entrypoint: str) -> None:
 
     engine = _make_admission_engine(preprocess)
 
-    getattr(engine, entrypoint)(raw_request)
+    if entrypoint == "async_add_req_and_stream_response":
+        output = DiffusionOutput(output="prepared", finished=True)
+
+        async def output_stream(request_id):
+            assert request_id == prepared_request.request_id
+            yield output
+
+        mocker.patch.object(engine, "get_output_stream", side_effect=output_stream)
+        assert [result async for result in engine.async_add_req_and_stream_response(raw_request)] == [output]
+    else:
+        engine.add_request(raw_request)
 
     assert preprocess_calls == [raw_request]
     assert engine.scheduler._waiting_queue == [prepared_request]
@@ -898,6 +909,7 @@ async def test_async_add_req_and_stream_response():
     engine = object.__new__(DiffusionEngine)
     engine.scheduler = MockScheduler()
     engine._out_streams = {}
+    engine._unclaimed_async_outputs = {}
     engine.abort_queue: queue.Queue[str] = queue.Queue()
     engine._rpc_queue = queue.Queue()
     engine._rpc_lock = threading.RLock()
@@ -919,7 +931,7 @@ async def test_async_add_req_and_stream_response():
 
     def _finalize(rid, out, err=None, **kwargs):
         # Stream consumers stop on ``finished``; keep result_data for assertions.
-        return SimpleNamespace(result_data=out.result.result_data, finished=True)
+        return SimpleNamespace(result_data=out.result.result_data, finished=True, async_output_id=None)
 
     engine._finalize_finished_request = _finalize
 
