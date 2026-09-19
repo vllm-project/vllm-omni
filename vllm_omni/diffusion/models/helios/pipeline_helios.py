@@ -1594,11 +1594,19 @@ class HeliosPipeline(
 
         device = generator.device if generator is not None else self.device
 
-        # Allocate directly on the execution device in float32 to use the device solver
-        # and avoid fp16/bf16 Cholesky on the covariance matrix.
+        # Allocate directly on the execution device in float32 to use the device
+        # solver and avoid fp16/bf16 Cholesky on the covariance matrix.
         eye = torch.eye(block_size, device=device, dtype=torch.float32)
         cov = eye * (1 + gamma) - torch.ones(block_size, block_size, device=device, dtype=torch.float32) * gamma
-        cov += eye * 1e-8
+        # gamma == 1 / (block_size - 1) (the Helios default 1/3 on a 4-element
+        # block) makes this covariance singular by construction: the all-ones
+        # direction has eigenvalue 1 - (block_size - 1) * gamma == 0. The
+        # jitter must therefore be representable in float32 -- ULP(1.0) is
+        # 1.19e-7, so the previous 1e-8 was rounded away entirely and Cholesky
+        # was handed an indefinite matrix (Ascend reports that as an AIV assert
+        # / 507035, CPU LAPACK as "not positive-definite"). Scale the jitter
+        # with the diagonal magnitude so non-default gamma values are covered.
+        cov += eye * (1e-6 * (1.0 + abs(gamma)))
         L = torch.linalg.cholesky(cov)
         block_number = batch_size * channel * num_frames * (height // ph) * (width // pw)
         z = torch.randn(block_number, block_size, generator=generator, device=device)
