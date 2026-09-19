@@ -1477,6 +1477,8 @@ class OnlineOmniClient:
             "stream_format",
             "x_vector_only_mode",
             "word_timestamps",
+            "num_inference_steps",
+            "guidance_scale",
         ):
             if key in request_config:
                 extra_body[key] = request_config[key]

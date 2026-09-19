@@ -16,6 +16,7 @@ For the full list of supported architectures across all modalities, see
 | --- | --- | --- | --- | --- | --- |
 | Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker tags (`S0`..`S9`, default `S0`) | — |
 | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | uploaded audio voice only; no presets | ✓ |
+| F5-TTS | `SWivid/F5-TTS/F5TTS_v1_Base` | ✓ (`ref_audio`+`ref_text`) | — | — | — |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | Gepard-1.0 | `nineninesix/gepard-1.0` | — (zero-shot default voice) | ✓ (PCM / WAV stream) | `default` only | — |
 | GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
@@ -103,6 +104,49 @@ For full request-shape documentation (all parameters, response formats, error co
 
 ---
 
+## F5-TTS
+
+Single-stage flow-matching DiT TTS at 24 kHz. Voice cloning takes
+`ref_audio` (URL or base64 data URL) plus its transcript `ref_text`.
+`num_inference_steps` (default 32) and `guidance_scale` (default 2.0) are
+request-level fields. Cache-DiT acceleration is available via
+`--cache-backend cache_dit`; TeaCache is not supported for this
+architecture (flow-matching + sway sampling).
+
+### Launch
+
+```bash
+vllm serve SWivid/F5-TTS/F5TTS_v1_Base --omni --trust-remote-code --port 8091
+```
+
+The 3-segment model id is required; F5-TTS runs on the default
+single-stage diffusion config (no deploy config). Enable the DiT CUDA
+Graph replay with
+`--stage-overrides '{"0":{"extras":{"f5_dit_cudagraph":true}}}'`
+(reference values in `vllm_omni/deploy/f5_tts.yaml`).
+
+### Sending requests
+
+```bash
+REF_BASE64=$(base64 -w 0 /path/to/reference.wav)
+
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    --output output.wav \
+    -d '{
+        "input": "Hello, this is a test of F5 TTS online serving.",
+        "ref_audio": "data:audio/wav;base64,'"${REF_BASE64}"'",
+        "ref_text": "Transcript of the reference audio.",
+        "num_inference_steps": 32,
+        "guidance_scale": 2.0
+    }'
+```
+
+A ready-made client is available at
+`examples/online_serving/text_to_speech/f5_tts/openai_speech_client.py`.
+
+---
+
 ## Gepard-1.0
 
 Single-stage native AR TTS at 22.05 kHz mono. Zero-shot only: omit `voice` or pass `"default"`. Voice cloning from reference audio is not available yet.
@@ -142,6 +186,8 @@ python examples/online_serving/text_to_speech/gepard/speech_client.py \
 - Unsupported: `speed`, `extra_params` (including `temperature`/`top_p`/`top_k`), `ref_audio`, `ref_text`, `speaker_embedding`, `task_type`, `instructions`, `language`, and `word_timestamps`.
 - Concurrent requests at `max_num_seqs: 4` are supported. Native-AR recompute preemption is a known limitation of this architecture (a request that is preempted mid-generation can resume incorrectly); keep concurrency at or below `max_num_seqs` and treat preemption as out of scope until the platform fix lands.
 - Optional comparison against the upstream Gepard reference server needs Blackwell/Hopper + CUDA 13 + Postgres and is not part of CI.
+
+---
 
 ## dots.tts
 

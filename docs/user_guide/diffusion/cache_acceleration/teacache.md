@@ -1,6 +1,5 @@
 # TeaCache Guide
 
-
 ## Table of Content
 
 - [Overview](#overview)
@@ -23,10 +22,7 @@ See supported models list in [Supported Models](../../diffusion_features.md#supp
 
 ## Quick Start
 
-
-
 ### Basic Usage
-
 
 ```python
 from vllm_omni import Omni
@@ -117,10 +113,10 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
 
 In `OmniDiffusionConfig`
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `rel_l1_thresh` | float | `0.2` | Similarity threshold for cache reuse. Lower values prioritize quality (less caching), higher values prioritize speed (more caching). Suggested range: 0.1-0.8 |
-| `coefficients` | list[float] \| None | `None` | Polynomial coefficients for rescaling L1 distance. Must contain exactly 5 elements if provided. If `None`, uses model-specific defaults based on transformer type. |
+| Parameter       | Type                | Default | Description                                                                                                                                                             |
+|-----------------|---------------------|---------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `rel_l1_thresh` | float               | `0.2`   | Similarity threshold for cache reuse. Lower values prioritize quality (less caching), higher values prioritize speed (more caching). Suggested range: 0.1-0.8           |
+| `coefficients`  | list[float] \| None | `None`  | Polynomial coefficients for rescaling L1 distance. Must contain exactly 5 elements if provided. If `None`, uses model-specific defaults based on transformer type.      |
 
 Users can find the default model coefficients in [`vllm_omni/diffusion/cache/teacache/config.py`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/diffusion/cache/teacache/config.py), for example:
 
@@ -157,6 +153,10 @@ _MODEL_COEFFICIENTS = {
 - Maximum quality requirements where no degradation is acceptable
 - Very short inference runs (< 20 steps) where caching overhead may outweigh benefits
 
+> **F5-TTS note**: TeaCache is not supported for F5-TTS. Extensive tuning
+> (48+ configurations) confirmed that step-level caching is fundamentally
+> incompatible with flow-matching + sway sampling. Use CacheDiT instead
+> (block-level caching, 1.62x speedup with zero quality loss).
 
 ---
 
@@ -178,6 +178,7 @@ cache_config={"rel_l1_thresh": 0.1}
 **Symptoms**: Actual speedup is less than expected (< 1.3x)
 
 **Solutions**:
+
 1. Increase the threshold to enable more aggressive caching:
    ```python
    cache_config={"rel_l1_thresh": 0.8}
@@ -186,7 +187,6 @@ cache_config={"rel_l1_thresh": 0.1}
 3. Check that your model architecture is supported (see Supported Models section)
 
 ---
-
 
 ## Summary
 

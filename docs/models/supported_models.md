@@ -74,6 +74,7 @@ th {
 | `VoxCPM2TalkerForConditionalGeneration` | VoxCPM2 | `openbmb/VoxCPM2` | ✅︎ | | | ✅︎ | — |
 | `BreezeForConditionalGeneration` | Breeze-TTS-2 (TTS, voice clone, voice direction) | `BreezeBlue/Breeze-TTS-2` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/BreezeBlue/Breeze-TTS-2.md) |
 | `DotsTTSForConditionalGeneration` | dots.tts | `dots-studio/dots.tts-soar` | ✅︎ | | | | — |
+| `F5TTSPipeline` | F5-TTS | `SWivid/F5-TTS/F5TTS_v1_Base` (also `F5TTS_v1_Base_no_zero_init`, `F5TTS_Base`, `F5TTS_Base_bigvgan`) | ✅︎ | | | | — |
 | `MammothModa2ForConditionalGeneration` | MammothModa2-Preview | `bytedance-research/MammothModa2-Preview` | ✅︎ | ✅︎ | | | — |
 | `MammothModa2ForConditionalGeneration` | MammothModa2-Dev (AR-only image understanding) | `bytedance-research/MammothModa2-Dev` | ✅︎ | | | | — |
 | `Flux2KleinPipeline` | FLUX.2-klein | `black-forest-labs/FLUX.2-klein-4B`, `black-forest-labs/FLUX.2-klein-9B` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
