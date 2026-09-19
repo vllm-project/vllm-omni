@@ -25,6 +25,9 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
     duplex_plugin="vllm_omni.model_executor.models.qwen3_omni.duplex.plugin.Qwen3OmniDuplexPlugin",
     default_deploy_config_name="qwen3_omni_moe.yaml",
     model_arch="Qwen3OmniMoeForConditionalGeneration",
+    duplex_serving_adapter=(
+        "vllm_omni.experimental.fullduplex.qwen3omni.serving_adapter.Qwen3OmniServingRuntimeAdapter"
+    ),
     endpoint_restrictions=(
         EndpointRestriction(
             OmniServingCapability.COMPLETIONS,
