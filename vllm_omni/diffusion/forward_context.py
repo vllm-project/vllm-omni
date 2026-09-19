@@ -57,6 +57,10 @@ class ForwardContext:
     sp_padding_size: int = 0
     # Original sequence length before padding (for removing padding in gather)
     sp_original_seq_len: int | None = None
+    # Pre-padding global sequence length per SequenceParallelInput shard_group,
+    # for models that auto-pad several independent sequences in one boundary.
+    # The singleton fields above remain for single-sequence models.
+    sp_shard_metadata: dict[str, int] = field(default_factory=dict)
 
     # Set by registry when _sp_plan hooks are applied.
     # When True, sp_active is determined by _sp_shard_depth (for _sp_plan hooks)
@@ -118,6 +122,13 @@ def get_forward_context() -> ForwardContext:
 
 def is_forward_context_available() -> bool:
     return _forward_context is not None
+
+
+def get_sp_shard_original_seq_len(shard_group: str) -> int | None:
+    """Pre-padding global length of `shard_group`, or None if it was not split."""
+    if not is_forward_context_available():
+        return None
+    return get_forward_context().sp_shard_metadata.get(shard_group)
 
 
 def build_local_sp_padding_mask(
