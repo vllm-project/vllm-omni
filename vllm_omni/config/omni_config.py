@@ -786,6 +786,7 @@ class _DiffusionConfigProjection:
     lora_scale: float = 1.0
     lora_backend: str = "peft"
     max_cpu_loras: int | None = None
+    lora_merge_on_load: bool = False
     output_type: str = "pil"
     diffusion_offload_config: dict[str, Any] | None = None
     # Compatibility aliases for existing callers and model-specific stage
