@@ -256,7 +256,11 @@ class Flux2KleinPipeline(
         ).to(self._execution_device)
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, Flux2Transformer2DModel)
-        self.transformer = Flux2Transformer2DModel(quant_config=od_config.quantization_config, **transformer_kwargs)
+        self.transformer = Flux2Transformer2DModel(
+            od_config=od_config,
+            quant_config=od_config.quantization_config,
+            **transformer_kwargs,
+        )
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         self.latent_channels = self.vae.config.latent_channels if hasattr(self.vae, "config") else 16
