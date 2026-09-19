@@ -2259,6 +2259,56 @@ def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_
     torch.testing.assert_close(result, torch.full_like(latents, 254.0))
 
 
+@pytest.mark.parametrize(
+    "guidance,control,expected_names",
+    [
+        (3.0, 1.5, ["cond", "cond_no_control", "uncond"]),
+        (1.0, 1.5, ["cond", "cond_no_control"]),
+        (3.0, 1.0, []),
+        (1.0, 1.0, []),
+    ],
+)
+def test_transfer_consensus_prepares_actual_inputs_before_any_forward(
+    make_cosmos3_pipeline, sequential_cfg_parallel, guidance, control, expected_names
+):
+    pipeline = make_cosmos3_pipeline()
+    latents = torch.zeros(1, 2, 1, 1, 1, dtype=torch.float64)
+    hint = torch.ones_like(latents)
+    seen = []
+
+    @contextmanager
+    def preflight(branch_latents):
+        assert not pipeline.transformer.calls
+        seen.extend(branch_latents)
+        for name, values in branch_latents.items():
+            assert len(values) == (1 if name == "cond_no_control" else 2)
+            assert all(v.dtype == latents.dtype for v in values)
+            torch.testing.assert_close(values[-1], latents)
+            if name != "cond_no_control":
+                torch.testing.assert_close(values[0], hint)
+        yield
+        assert len(pipeline.transformer.calls) == len(branch_latents)
+
+    pipeline._control_cfg_cache_context_factory = preflight
+    mask = torch.ones(1, 1, 1, 1, 1)
+    pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([7]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=guidance,
+        control_guidance=control,
+        control_guidance_interval=None,
+        control_latents=[hint],
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "noisy_frame_mask": mask},
+        velocity_mask=mask,
+        condition_latents=torch.zeros_like(latents),
+    )
+    assert seen == expected_names
+
+
 def test_diffuse_transfer_uses_named_seacache_contexts(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
     pipeline = make_cosmos3_pipeline()
     pipeline.scheduler.sigmas = torch.tensor([0.42])

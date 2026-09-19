@@ -1314,6 +1314,47 @@ class Cosmos3OmniDiffusersPipeline(
                     branch_caches[cache_key] = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
         return prediction
 
+    def predict_noise_with_multi_branch_cfg(
+        self,
+        do_true_cfg: bool,
+        true_cfg_scale: float | dict[str, float],
+        branches_kwargs: list[dict[str, Any]],
+        cfg_normalize: bool = False,
+        output_slice: int | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        # Control CFG changes the vision inputs across branches. Decide before
+        # any branch executes so neither decisions nor refresh anchors diverge.
+        factory = getattr(self, "_control_cfg_cache_context_factory", None)
+        context = nullcontext()
+        if (
+            callable(factory)
+            and do_true_cfg
+            and isinstance(true_cfg_scale, dict)
+            and true_cfg_scale.get("mode") == "cosmos3_transfer"
+            and true_cfg_scale.get("branch_mode") in ("control_only", "control_and_text")
+        ):
+            branch_latents = {}
+            conditioning_only = False
+            for kwargs in branches_kwargs:
+                name = str(kwargs["_cache_context"])
+                if name in branch_latents:
+                    raise ValueError(f"Duplicate Cosmos3 control-CFG cache context: {name}")
+                controls = kwargs.get("control_latents")
+                controls = (
+                    [] if controls is None else [controls] if isinstance(controls, torch.Tensor) else list(controls)
+                )
+                # Use exactly the vision tensors passed to the transformer.
+                branch_latents[name] = [*controls, kwargs["hidden_states"]]
+                mask = kwargs.get("noisy_frame_mask")
+                if isinstance(mask, torch.Tensor) and not bool(torch.any(mask != 0).item()):
+                    conditioning_only = True
+            if not conditioning_only:
+                context = factory(branch_latents)
+        with context:
+            return super().predict_noise_with_multi_branch_cfg(
+                do_true_cfg, true_cfg_scale, branches_kwargs, cfg_normalize, output_slice
+            )
+
     def combine_multi_branch_cfg_noise(
         self,
         predictions: list[torch.Tensor | tuple[torch.Tensor, ...]],
