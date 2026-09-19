@@ -78,20 +78,6 @@ def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
     ) from last_exc
 
 
-def get_distributed_init_method(prefix: str = "torch_dist_init_") -> str:
-    """Return a ``file://`` init_method for a ``torch.distributed`` process group.
-
-    Args:
-        prefix: Prefix for the temporary rendezvous filename. Defaults to
-            ``torch_dist_init_``.
-
-    Returns:
-        An init_method string for ``torch.distributed.init_process_group``.
-    """
-    with tempfile.NamedTemporaryFile(prefix=prefix) as f:
-        return f"file://{f.name}"
-
-
 def dummy_messages_from_mix_data(
     system_prompt: dict[str, Any] | None = None,
     video_data_url: Any = None,
