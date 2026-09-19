@@ -165,25 +165,52 @@ def test_shared_layer_owns_no_parameters_and_keeps_checkpoint_keys():
 
 
 @pytest.mark.parametrize("with_mask", [True, False], ids=["empty_mask", "no_mask"])
-def test_empty_text_stream_skips_the_kernel(monkeypatch, with_mask):
+def test_empty_text_stream_skipped_before_reaching_the_block(monkeypatch, with_mask):
     """CFG's unconditional branch carries zero text tokens (the pipeline's default
-    negative_prompt_embeds has no rows), so the context refiner attends over an
-    empty sequence. The flash-attention varlen fallback cannot take that
-    (arange step 0), so the processor must not reach the shared layer at all."""
-    block = _block(kv_heads=2, modulation=False)
-    attn = block.attn
+    negative_prompt_embeds has no rows). Historically the ``AttnProcessor`` had
+    a defensive ``sequence_length == 0`` short-circuit; that branch was removed
+    to keep ``TransformerBlock.forward`` fullgraph-clean under torch.compile,
+    and the responsibility moved to ``Transformer2DModel._apply_refiners``
+    (eager) which skips the ``context_refiner`` loop entirely when the text
+    stream is empty. This test asserts the new contract: with empty text, the
+    refiner loop is bypassed and the shared attention layer is never invoked."""
+    from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import Transformer2DModel
 
-    def _never(*args, **kwargs):
-        raise AssertionError("shared layer called with an empty sequence")
+    torch.manual_seed(0)
+    with set_current_diffusion_config(_SDPA_CONFIG):
+        model = Transformer2DModel(
+            patch_size=2,
+            in_channels=16,
+            hidden_size=DIM,
+            num_layers=1,
+            num_refiner_layers=1,
+            num_attention_heads=HEADS,
+            num_kv_heads=2,
+            multiple_of=8,
+            ffn_dim_multiplier=1.0,
+            norm_eps=1e-5,
+            axes_dim_rope=(4, 2, 2),
+            axes_lens=(32, 32, 32),
+            text_feat_dim=8,
+        ).eval()
 
-    monkeypatch.setattr(attn.omni_attn, "forward", _never)
-    hidden = torch.randn(BATCH, 0, DIM)
-    mask = torch.ones(BATCH, 0, dtype=torch.bool) if with_mask else None
-    angles = torch.rand(1, 0, block.head_dim)
-    out = attn(
-        hidden_states=hidden,
-        encoder_hidden_states=hidden,
-        attention_mask=mask,
-        image_rotary_emb=(angles.cos(), angles.sin()),
-    )
-    assert out.shape == (BATCH, 0, DIM)
+    def _never(*args, **kwargs):  # noqa: ARG001
+        raise AssertionError("shared layer called with an empty text sequence")
+
+    for refiner in model.context_refiner:
+        monkeypatch.setattr(refiner.attn.omni_attn, "forward", _never)
+
+    empty_text = torch.zeros(BATCH, 0, DIM)
+    text_mask = torch.ones(BATCH, 0, dtype=torch.bool) if with_mask else torch.zeros(BATCH, 0, dtype=torch.bool)
+    zero_rotary = (torch.zeros(BATCH, 0, sum(model.config.axes_dim_rope)),) * 2
+    img_tokens = torch.randn(BATCH, 4, DIM)
+    img_mask = torch.ones(BATCH, 4, dtype=torch.bool)
+    noise_rotary = (torch.zeros(BATCH, 4, sum(model.config.axes_dim_rope)),) * 2
+    temb = torch.randn(BATCH, min(DIM, 1024))
+
+    with torch.no_grad():
+        out_text, _ = model._apply_refiners(
+            empty_text, text_mask, zero_rotary, img_tokens, img_mask, noise_rotary, temb
+        )
+    assert out_text.shape == (BATCH, 0, DIM)
+    assert torch.equal(out_text, empty_text)
