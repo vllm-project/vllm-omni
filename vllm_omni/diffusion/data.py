@@ -63,6 +63,19 @@ def normalize_omni_diffusion_kwargs(raw_kwargs: Mapping[str, Any]) -> dict[str, 
             config_kwargs["lora_scale"] = config_kwargs["static_lora_scale"]
         config_kwargs.pop("static_lora_scale", None)
 
+    # Pack flat --pid-* CLI flags into "pid_decode" (dropped when PiD is off; merge, never mutate, an existing dict).
+    _pid_enable = config_kwargs.pop("enable_pid", False)
+    _pid_flat = {
+        "checkpoint_path": config_kwargs.pop("pid_checkpoint", None),
+        "gemma_model": config_kwargs.pop("pid_gemma", None),
+    }
+    if _pid_enable:
+        _existing = config_kwargs.get("pid_decode")
+        pid_decode = dict(_existing) if isinstance(_existing, Mapping) else {}
+        pid_decode.update({k: v for k, v in _pid_flat.items() if v is not None})
+        pid_decode["enabled"] = True
+        config_kwargs["pid_decode"] = pid_decode
+
     diffusion_quantization = config_kwargs.pop("diffusion_quantization_config", None)
     if config_kwargs.get("quantization_config") is None and diffusion_quantization is not None:
         config_kwargs["quantization_config"] = diffusion_quantization
@@ -874,6 +887,11 @@ class OmniDiffusionConfig:
 
     output_type: str = "pil"
 
+    # PiD (Pixel Diffusion) super-resolution decoder. When this config
+    # (or dict) with ``enabled=True``, the pipeline decodes the LDM x_0
+    # latent via PiD instead of the VAE, producing a higher-resolution RGB
+    # image. ``None`` keeps the standard VAE path.
+    pid_decode: dict[str, Any] | None = None
     # CPU offload parameters. Keep the public mapping raw so stage configs can
     # serialize it across processes; __post_init__ validates it once and caches
     # the internal typed resolution used at runtime.

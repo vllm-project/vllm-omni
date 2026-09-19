@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import argparse
 import functools
@@ -395,6 +395,25 @@ def parse_args() -> argparse.Namespace:
             "silently masking with a possibly-wrong prompt."
         ),
     )
+    # PiD (Pixel Diffusion) super-resolution decode flags.
+    parser.add_argument(
+        "--enable-pid",
+        action="store_true",
+        default=False,
+        help="Enable PiD super-resolution decode (replaces VAE decode). ",
+    )
+    parser.add_argument(
+        "--pid-checkpoint",
+        type=str,
+        default=None,
+        help="Path to the PiD decoder checkpoint (.pth).",
+    )
+    parser.add_argument(
+        "--pid-gemma",
+        type=str,
+        default="Efficient-Large-Model/gemma-2-2b-it",
+        help="Gemma text encoder used by PiD.",
+    )
     current_omni_platform.pre_register_and_update(parser)
     return parser.parse_args()
 
@@ -583,6 +602,16 @@ def main():
     # gate is an engine-level config (offline analog of the server's --no-guardrails).
     if args.extra_body and "guardrails" in args.extra_body:
         omni_kwargs["model_config"] = {"guardrails": bool(args.extra_body["guardrails"])}
+    # PiD: forward CLI keys to the engine; they are packed into a
+    # ``pid_decode`` dict by ``normalize_omni_diffusion_kwargs`` and consumed
+    # by OmniDiffusionConfig. Only inject when --enable-pid is set so non-PiD
+    # runs are unaffected.
+    if args.enable_pid:
+        omni_kwargs["enable_pid"] = True
+        if args.pid_checkpoint is not None:
+            omni_kwargs["pid_checkpoint"] = args.pid_checkpoint
+        if args.pid_gemma is not None:
+            omni_kwargs["pid_gemma"] = args.pid_gemma
     omni = Omni(**omni_kwargs)
     model_class_name = get_model_class_name(omni)
     declared_extra_body_params = get_extra_body_params(model_class_name)
