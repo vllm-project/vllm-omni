@@ -154,6 +154,53 @@ def test_preprocess_serve_args_applies_safe_omniinteract_prompt_default(
 
 
 @pytest.mark.parametrize(
+    ("extra", "match"),
+    [
+        (["--seed", "7"], "cannot be combined with --seed"),
+        (["--dataset-path", "/tmp/omniinteract-data"], "cannot be combined with --dataset-path"),
+        (["--omniinteract-scenario-tags", "realtime"], "cannot be combined with --omniinteract-scenario-tags"),
+        (["--omniinteract-scenario-focus"], "cannot be combined with --omniinteract-scenario-focus"),
+    ],
+)
+def test_preprocess_serve_args_rejects_omniinteract_video_list_conflicts(
+    tmp_path: Path,
+    extra: list[str],
+    match: str,
+) -> None:
+    ref = tmp_path / "ref.wav"
+    ref.touch()
+    video_list = tmp_path / "list.jsonl"
+    video_list.write_text("{}\n")
+    parser = TrackingArgumentParser()
+    parser.add_argument("--dataset-name", default="sharegpt")
+    parser.add_argument("--backend", default="vllm")
+    parser.add_argument("--endpoint", default="/v1/completions")
+    parser.add_argument("--model", default="dummy")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--dataset-path", default=None)
+    parser.add_argument("--num-prompts", type=int, default=1000)
+    parser.add_argument("--max-concurrency", type=int, default=None)
+    add_omni_args(parser)
+    args = parser.parse_args(
+        [
+            "--dataset-name",
+            "omniinteract",
+            "--backend",
+            "openai-realtime-duplex",
+            "--endpoint",
+            "/v1/realtime",
+            "--omniinteract-ref-audio",
+            str(ref),
+            "--omniinteract-video-list",
+            str(video_list),
+            *extra,
+        ]
+    )
+    with pytest.raises(ValueError, match=match):
+        preprocess_serve_args(args)
+
+
+@pytest.mark.parametrize(
     ("argv", "expected_extra_body", "expected_explicit"),
     [
         (

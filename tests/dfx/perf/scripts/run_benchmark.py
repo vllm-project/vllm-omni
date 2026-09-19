@@ -93,6 +93,71 @@ class _SingleActiveContext:
             stack.close()
 
 
+def _config_for_test(test_name: str) -> dict[str, object] | None:
+    for config in BENCHMARK_CONFIGS:
+        if isinstance(config, dict) and config.get("test_name") == test_name:
+            return config
+    return None
+
+
+def _judge_server_params_for_test(test_name: str) -> dict[str, object] | None:
+    config = _config_for_test(test_name)
+    if config is None:
+        return None
+    raw = config.get("judge_server_params")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise TypeError(f"judge_server_params for {test_name} must be an object")
+    return raw
+
+
+def _resolve_judge_cuda_visible_devices(configured: object) -> str:
+    """Map a judge card index onto the process-visible CUDA device list.
+
+    ``judge_server_params.cuda_visible_devices`` is an index into
+    ``CUDA_VISIBLE_DEVICES`` when that env is set (``1`` with
+    ``CUDA_VISIBLE_DEVICES=2,3`` selects physical GPU 3). Without the env it
+    is used as a raw device list.
+    """
+    if not isinstance(configured, str) or not configured:
+        raise ValueError("judge_server_params.cuda_visible_devices must be a non-empty string")
+    parent = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if parent is None or not parent.strip():
+        return configured
+    visible = [part.strip() for part in parent.split(",") if part.strip()]
+    if configured.isdigit():
+        index = int(configured)
+        if index < 0 or index >= len(visible):
+            raise ValueError(
+                f"judge_server_params.cuda_visible_devices={configured!r} is outside CUDA_VISIBLE_DEVICES={parent!r}"
+            )
+        return visible[index]
+    return configured
+
+
+@contextmanager
+def _start_judge_server(judge_params: dict[str, object]):
+    model = judge_params.get("model")
+    if not isinstance(model, str) or not model:
+        raise ValueError("judge_server_params.model must be a non-empty string")
+    extra = judge_params.get("extra_cli_args") or ()
+    if not isinstance(extra, list | tuple):
+        raise TypeError("judge_server_params.extra_cli_args must be a list")
+    visible = _resolve_judge_cuda_visible_devices(judge_params.get("cuda_visible_devices", "1"))
+    print(f"Starting OmniInteract judge with model: {model} on CUDA_VISIBLE_DEVICES={visible}")
+    with OmniServer(
+        model,
+        [str(item) for item in extra],
+        use_omni=bool(judge_params.get("use_omni", False)),
+        env_dict={"CUDA_VISIBLE_DEVICES": visible},
+    ) as judge:
+        print(f"OmniInteract judge started on {judge.host}:{judge.port}")
+        yield judge
+        print("OmniInteract judge stopping...")
+    print("OmniInteract judge stopped")
+
+
 @contextmanager
 def _start_omni_server(server_param):
     test_name, model, stage_config_path, stage_overrides, extra_cli_args, use_omni = server_param
@@ -110,10 +175,17 @@ def _start_omni_server(server_param):
         server_args = ["--stage-overrides", stage_overrides] + server_args
     if extra_cli_args:
         server_args = list(extra_cli_args) + server_args
+    judge_params = _judge_server_params_for_test(test_name)
     with OmniServer(model, server_args, use_omni=use_omni) as server:
         server.test_name = test_name
+        server.judge_base_url = None
         print("OmniServer started successfully")
-        yield server
+        if judge_params is None:
+            yield server
+        else:
+            with _start_judge_server(judge_params) as judge:
+                server.judge_base_url = f"http://{judge.host}:{judge.port}"
+                yield server
         print("OmniServer stopping...")
 
     print("OmniServer stopped")
@@ -170,6 +242,120 @@ def _resolve_num_warmups(params: dict[str, Any], *, default: int) -> int:
     return value
 
 
+def _is_finite_number(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+
+
+_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1 = "omniinteract_aggregate_min_ia_qtf1"
+_OMNIINTERACT_AGGREGATE_SUBSETS = "omniinteract_aggregate_subsets"
+_OMNIINTERACT_AGGREGATE_GROUP = "omniinteract_aggregate_group"
+_OMNIINTERACT_AGGREGATE_COUNTS: dict[tuple[str, str], tuple[float, float, float]] = {}
+_OMNIINTERACT_MIN_EVALUATED_CASES = 1
+
+
+def _reset_omniinteract_aggregate_counts() -> None:
+    _OMNIINTERACT_AGGREGATE_COUNTS.clear()
+
+
+def _ia_qtf1_from_counts(tp: float, fp: float, fn: float) -> float:
+    precision = tp / (tp + fp) if tp + fp > 0 else 0.0
+    recall = tp / (tp + fn) if tp + fn > 0 else 0.0
+    return (2.0 * precision * recall / (precision + recall)) if precision + recall > 0 else 0.0
+
+
+def _assert_subset_evaluated(accuracy: dict[str, object]) -> None:
+    """Reject a subset whose clipped or cancelled cases left nothing to score.
+
+    Individual ineligible cases may be skipped. A subset with fewer than
+    ``_OMNIINTERACT_MIN_EVALUATED_CASES`` evaluated cases must not pass, or its
+    zero TP/FP/FN would be pooled as a successful accuracy result.
+    """
+
+    evaluated = accuracy.get("evaluated")
+    if not isinstance(evaluated, int) or isinstance(evaluated, bool):
+        raise AssertionError("OmniInteract accuracy evaluated count is missing")
+    if evaluated < _OMNIINTERACT_MIN_EVALUATED_CASES:
+        raise AssertionError(
+            f"OmniInteract subset evaluated {evaluated} cases (skipped={accuracy.get('skipped')}); "
+            f"at least {_OMNIINTERACT_MIN_EVALUATED_CASES} evaluated case is required"
+        )
+
+
+def _finite_accuracy_count(value: object, name: str) -> float:
+    assert _is_finite_number(value), f"OmniInteract accuracy summary {name} is missing"
+    return float(value)
+
+
+def _aggregate_accuracy_params_for_test(test_name: str) -> dict[str, object]:
+    config = _config_for_test(test_name)
+    if config is None:
+        return {}
+    min_ia_qtf1 = config.get(_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1)
+    if min_ia_qtf1 is None:
+        return {}
+    if not _is_finite_number(min_ia_qtf1):
+        raise ValueError("omniinteract_aggregate_min_ia_qtf1 must be a finite number")
+    subsets: list[str] = []
+    raw_params = config.get("benchmark_params") or []
+    if not isinstance(raw_params, list):
+        raise TypeError(f"benchmark_params for {test_name} must be a list")
+    for item in raw_params:
+        if not isinstance(item, dict) or not item.get("omniinteract_evaluate"):
+            continue
+        subset = item.get("omniinteract_subsets")
+        if not isinstance(subset, str) or not subset:
+            raise ValueError("omniinteract_aggregate_min_ia_qtf1 requires omniinteract_subsets on each evaluated case")
+        subsets.append(subset)
+    if not subsets:
+        raise ValueError("omniinteract_aggregate_min_ia_qtf1 requires at least one evaluated OmniInteract subset")
+    if len(set(subsets)) != len(subsets):
+        raise ValueError("omniinteract_aggregate_subsets must not contain duplicates")
+    return {
+        _OMNIINTERACT_AGGREGATE_MIN_IA_QTF1: float(min_ia_qtf1),
+        _OMNIINTERACT_AGGREGATE_SUBSETS: subsets,
+        _OMNIINTERACT_AGGREGATE_GROUP: test_name,
+    }
+
+
+def _maybe_assert_aggregate_ia_qtf1(params: dict[str, object], acc_summary: dict[str, object]) -> None:
+    min_ia_qtf1 = params.get(_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1)
+    if min_ia_qtf1 is None:
+        return
+    assert _is_finite_number(min_ia_qtf1), "omniinteract_aggregate_min_ia_qtf1 must be a finite number"
+    subsets = params.get(_OMNIINTERACT_AGGREGATE_SUBSETS)
+    if not isinstance(subsets, list | tuple) or not subsets:
+        raise ValueError("omniinteract_aggregate_min_ia_qtf1 requires omniinteract_aggregate_subsets")
+    if len(set(subsets)) != len(subsets):
+        raise ValueError("omniinteract_aggregate_subsets must not contain duplicates")
+    if not all(isinstance(item, str) and item for item in subsets):
+        raise ValueError("omniinteract_aggregate_subsets must be non-empty strings")
+    subset = params.get("omniinteract_subsets")
+    if not isinstance(subset, str) or not subset:
+        raise ValueError("omniinteract_aggregate_min_ia_qtf1 requires omniinteract_subsets")
+    if subset not in subsets:
+        raise ValueError(f"omniinteract_subsets {subset!r} is not in omniinteract_aggregate_subsets")
+    group = params.get(_OMNIINTERACT_AGGREGATE_GROUP)
+    if not isinstance(group, str) or not group:
+        raise ValueError("omniinteract_aggregate_min_ia_qtf1 requires omniinteract_aggregate_group")
+    tp = _finite_accuracy_count(acc_summary.get("Global_TP"), "Global_TP")
+    fp = _finite_accuracy_count(acc_summary.get("Global_FP"), "Global_FP")
+    fn = _finite_accuracy_count(acc_summary.get("Global_FN"), "Global_FN")
+    _OMNIINTERACT_AGGREGATE_COUNTS[(group, subset)] = (tp, fp, fn)
+    recorded = [_OMNIINTERACT_AGGREGATE_COUNTS.get((group, name)) for name in subsets]
+    present = [counts for counts in recorded if counts is not None]
+    if len(present) != len(subsets):
+        return
+    total_tp = sum(counts[0] for counts in present)
+    total_fp = sum(counts[1] for counts in present)
+    total_fn = sum(counts[2] for counts in present)
+    ia_qtf1 = _ia_qtf1_from_counts(total_tp, total_fp, total_fn)
+    print(
+        f"OmniInteract aggregate All Global IA-QTF1: {ia_qtf1:.6f} "
+        f"(TP={total_tp:.6f} / FP={total_fp:.6f} / FN={total_fn:.6f})"
+    )
+    assert ia_qtf1 >= float(min_ia_qtf1), f"OmniInteract aggregate All Global IA-QTF1 {ia_qtf1} is below {min_ia_qtf1}"
+
+
 def assert_result(result, params, num_prompt) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
     if params.get("dataset_name") == "omniinteract":
@@ -181,6 +367,23 @@ def assert_result(result, params, num_prompt) -> None:
             0,
         ), "OmniInteract requests did not all succeed"
         assert summary.get("artifacts_complete") is True, "OmniInteract artifacts are incomplete"
+        if params.get("omniinteract_evaluate"):
+            accuracy = summary.get("accuracy")
+            assert isinstance(accuracy, dict), "OmniInteract accuracy is missing"
+            assert accuracy.get("status") == "ok", "OmniInteract accuracy did not complete"
+            assert accuracy.get("failed") == 0, "OmniInteract accuracy reported failed cases"
+            _assert_subset_evaluated(accuracy)
+            acc_summary = accuracy.get("summary")
+            assert isinstance(acc_summary, dict), "OmniInteract accuracy summary is missing"
+            ia_qtf1 = acc_summary.get("IA_QTF1")
+            assert _is_finite_number(ia_qtf1), "OmniInteract All Global IA-QTF1 is missing"
+            min_ia_qtf1 = params.get("omniinteract_min_ia_qtf1")
+            if min_ia_qtf1 is not None:
+                assert _is_finite_number(min_ia_qtf1), "omniinteract_min_ia_qtf1 must be a finite number"
+                assert float(ia_qtf1) >= float(min_ia_qtf1), (
+                    f"OmniInteract All Global IA-QTF1 {ia_qtf1} is below {min_ia_qtf1}"
+                )
+            _maybe_assert_aggregate_ia_qtf1(params, acc_summary)
     baseline = params.get("baseline")
     hardware = result.get("Hardware")
     hardware_baseline = baseline.get(hardware) if isinstance(baseline, dict) and isinstance(hardware, str) else None
@@ -214,8 +417,13 @@ def assert_result(result, params, num_prompt) -> None:
 )
 def test_performance_benchmark(omni_server, benchmark_params):
     test_name = benchmark_params["test_name"]
-    params = benchmark_params["params"]
+    params = dict(benchmark_params["params"])
     dataset_name = params.get("dataset_name", "")
+    if params.get("omniinteract_evaluate"):
+        judge_base_url = getattr(omni_server, "judge_base_url", None)
+        if not isinstance(judge_base_url, str) or not judge_base_url:
+            raise ValueError("omniinteract_evaluate requires top-level judge_server_params to start a judge")
+        params["omniinteract_judge_base_url"] = judge_base_url
 
     host = omni_server.host
     port = omni_server.port
@@ -259,6 +467,11 @@ def test_performance_benchmark(omni_server, benchmark_params):
         "eval_phase",
         "trust_remote_code",
         "expected_duplex_audio_turns_per_session",
+        "omniinteract_min_ia_qtf1",
+        _OMNIINTERACT_AGGREGATE_MIN_IA_QTF1,
+        _OMNIINTERACT_AGGREGATE_SUBSETS,
+        _OMNIINTERACT_AGGREGATE_GROUP,
+        "judge_server_params",
     }
 
     for key, value in params.items():
@@ -299,7 +512,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
             resource_label=resource_label,
             num_warmups=_resolve_num_warmups(params, default=2),
         )
-        assert_result(result, params, num_prompt)
+        assert_result(result, {**params, **_aggregate_accuracy_params_for_test(test_name)}, num_prompt)
 
     # concurrency test
     for sweep_index, (concurrency, num_prompt) in enumerate(zip(max_concurrency_list, num_prompt_list)):
@@ -317,4 +530,4 @@ def test_performance_benchmark(omni_server, benchmark_params):
             resource_label=resource_label,
             num_warmups=_resolve_num_warmups(params, default=max(2, int(concurrency))),
         )
-        assert_result(result, params, num_prompt)
+        assert_result(result, {**params, **_aggregate_accuracy_params_for_test(test_name)}, num_prompt)
