@@ -140,6 +140,7 @@ _PIPELINE_STAGES = [
     "audio_vae",
     "aura",
     "breeze_tts_2",
+    "breeze_tts_2_codec",
     "code2wav",
     "cosyvoice3_code2wav",
     "cosyvoice3_talker",

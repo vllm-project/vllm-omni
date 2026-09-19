@@ -117,7 +117,9 @@ def test_explicit_sender_port_is_not_derived(name):
 
 @pytest.mark.parametrize("need_recv_cache", [False, True])
 @pytest.mark.parametrize("update_before_init", [False, True])
-def test_manager_receiver_does_not_bind_shared_producer_port(producer, need_recv_cache, update_before_init):
+def test_manager_receiver_does_not_bind_shared_producer_port(
+    producer, need_recv_cache, update_before_init, monkeypatch
+):
     """Payload-only and KV receivers must dial, not bind, the incoming edge."""
     from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
         OmniKVCacheConfig,
@@ -152,6 +154,7 @@ def test_manager_receiver_does_not_bind_shared_producer_port(producer, need_recv
             manager.update_sender_info(sender_info)
         assert receiver._sender_zmq_port == producer._zmq_port
         assert manager.config.connector_config["zmq_port"] == PORT  # Do not mutate the shared specification.
+        _install_reliable_claim_queries(producer, receiver, monkeypatch)
         success, _, _ = producer.put("0", "1", "manager-receive", torch.ones(1))
         assert success
         metadata = _wait_for_metadata(receiver, "manager-receive")
@@ -164,7 +167,7 @@ def test_manager_receiver_does_not_bind_shared_producer_port(producer, need_recv
 
 
 @pytest.mark.parametrize("need_recv_cache", [False, True])
-def test_manager_receiver_preserves_explicit_standalone_sender(producer, need_recv_cache):
+def test_manager_receiver_preserves_explicit_standalone_sender(producer, need_recv_cache, monkeypatch):
     from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
         OmniKVCacheConfig,
         OmniKVTransferManager,
@@ -187,6 +190,7 @@ def test_manager_receiver_preserves_explicit_standalone_sender(producer, need_re
         assert receiver is not None
         assert receiver._zmq_port is None and not receiver._serving_handshake
         assert (receiver._sender_host, receiver._sender_zmq_port) == (producer.host, producer._zmq_port)
+        _install_reliable_claim_queries(producer, receiver, monkeypatch)
         success, _, _ = producer.put("0", "1", "standalone-receive", torch.ones(1))
         assert success
         metadata = _wait_for_metadata(receiver, "standalone-receive")
@@ -471,8 +475,7 @@ def consumer(nixl_connector_cls):
     connector.close()
 
 
-@pytest.fixture
-def reliable_claim_queries(producer, consumer, monkeypatch):
+def _install_reliable_claim_queries(producer, consumer, monkeypatch):
     """Ownership probes need exact claims, not claims retained after lost replies.
 
     Exercise the real resolver, wire encoding and producer handler synchronously;
@@ -489,6 +492,11 @@ def reliable_claim_queries(producer, consumer, monkeypatch):
         return None if reply == _META_NOT_FOUND else msgspec.msgpack.decode(reply)
 
     monkeypatch.setattr(consumer, "_query_metadata_at", query)
+
+
+@pytest.fixture
+def reliable_claim_queries(producer, consumer, monkeypatch):
+    _install_reliable_claim_queries(producer, consumer, monkeypatch)
 
 
 def test_put_publishes_its_handshake_endpoint(producer):

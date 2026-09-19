@@ -71,6 +71,9 @@ class AsyncEventResolver:
 
         if tid is None and isinstance(ack, dict):
             tid = ack.get("task_id")
+        if tid is None:
+            logger.warning("Received ACK without a task_id")
+            return
 
         async with self._lock:
             task_info = self._pending_tasks.get(tid)
@@ -382,6 +385,7 @@ class AsyncOmniBase(OmniBase):
                     if should_continue:
                         continue
 
+                    assert req_state is not None
                     req_state.stage_id = stage_id
 
                     # Route to the per-request queue
@@ -563,7 +567,8 @@ class AsyncOmniBase(OmniBase):
 
     # ==================== EngineClient Interface ====================
 
-    async def check_health(self) -> None:
+    # The async entrypoints expose the synchronous base health check as an awaitable.
+    async def check_health(self) -> None:  # type: ignore[override]
         """Check engine health by verifying the Orchestrator process is alive."""
         OmniBase.check_health(self)
 

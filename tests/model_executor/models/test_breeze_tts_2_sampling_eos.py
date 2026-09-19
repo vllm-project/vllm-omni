@@ -19,7 +19,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 @pytest.fixture
 def talker_sampling_params():
-    deploy_path = Path(__file__).parents[4] / "vllm_omni" / "deploy" / "breeze_tts_2.yaml"
+    deploy_path = Path(__file__).parents[3] / "vllm_omni" / "deploy" / "breeze_tts_2.yaml"
     deploy = yaml.safe_load(deploy_path.read_text(encoding="utf-8"))
     params = SamplingParams(
         **merge_sampling_constraints(

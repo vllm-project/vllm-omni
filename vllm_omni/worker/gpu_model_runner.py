@@ -1776,6 +1776,43 @@ class OmniGPUModelRunner(GPUModelRunner):
                 req_ids_b = [item[0] for item in decode_batch_items]
                 start_offsets_b = [item[1] for item in decode_batch_items]
                 req_infos_b = [item[2] for item in decode_batch_items]
+                if not self.has_talker_mtp:
+                    # Non-MTP hooks return (ids, embeds, per-request updates),
+                    # matching scalar preprocess without the MTP-only tensors.
+                    # Every non-decode row flushes the group, so these one-token
+                    # spans are contiguous in the runner's capture buffers.
+                    start = start_offsets_b[0]
+                    end = start + len(req_ids_b)
+                    if start < 0 or end > preprocess_input_ids.shape[0] or start_offsets_b != list(range(start, end)):
+                        raise RuntimeError(
+                            "Non-MTP batched decode preprocessing requires contiguous in-bounds token offsets"
+                        )
+                    ids_b = preprocess_input_ids[start:end]
+                    req_input_ids, req_embeds, updates = batch_decode_preprocess(
+                        input_ids=ids_b,
+                        req_infos=req_infos_b,
+                    )
+                    if (
+                        req_input_ids.numel() != len(req_ids_b)
+                        or req_embeds.ndim != 2
+                        or req_embeds.shape[0] != len(req_ids_b)
+                        or len(updates) != len(req_ids_b)
+                    ):
+                        raise ValueError("Batched decode preprocessing must return one output and update per request")
+                    if inputs_embeds is None:
+                        inputs_embeds = torch.empty(
+                            (preprocess_input_ids.shape[0], req_embeds.shape[-1]),
+                            device=req_embeds.device,
+                            dtype=req_embeds.dtype,
+                        )
+                    inputs_embeds[start:end].copy_(req_embeds)
+                    if req_input_ids is not ids_b:
+                        preprocess_input_ids[start:end].copy_(req_input_ids.reshape(-1))
+                    for req_id_b, update_dict_b in zip(req_ids_b, updates, strict=True):
+                        self._update_intermediate_buffer(req_id_b, update_dict_b)
+                    decode_batch_items.clear()
+                    return
+
                 ids_b = torch.stack(
                     [preprocess_input_ids[offset : offset + 1].reshape(-1)[0] for offset in start_offsets_b]
                 )
@@ -1845,7 +1882,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 # Seed, so a model that samples inside forward() can be
                 # reproducible: vLLM's own sampler seeding does not reach it.
                 req_infos["_omni_seed"] = getattr(sampling_params, "seed", None)
-                if callable(batch_decode_preprocess) and self.has_talker_mtp and span_len == 1 and not is_prefill:
+                if callable(batch_decode_preprocess) and span_len == 1 and not is_prefill:
                     decode_batch_items.append((req_id, s, req_infos))
                     continue
 

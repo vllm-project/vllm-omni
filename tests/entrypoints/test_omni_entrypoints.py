@@ -1133,6 +1133,7 @@ def test_async_omni_errored_property_alive():
     )
 
     assert omni.errored is False
+    assert omni.is_stopped is False
 
 
 def test_async_omni_errored_property_dead_engine():
@@ -1143,6 +1144,7 @@ def test_async_omni_errored_property_dead_engine():
     )
 
     assert omni.errored is True
+    assert omni.is_stopped is True
 
 
 def test_async_omni_errored_false_when_stage_dead():

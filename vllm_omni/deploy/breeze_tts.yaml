@@ -1,3 +1,4 @@
+# Compatibility alias for breeze_tts_2.yaml; keep both profiles synchronized.
 # Breeze-TTS-2, one GPU, voice design, cloning, and instruction guidance.
 # Both streamed and complete HTTP responses use the stateful codec pipeline.
 async_chunk: true

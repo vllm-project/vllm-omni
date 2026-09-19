@@ -1098,7 +1098,7 @@ vllm serve BreezeBlue/Breeze-TTS-2 --omni --port 8091
 ./breeze_tts_2/run_server.sh
 ```
 
-The deploy config at `vllm_omni/deploy/breeze_tts_2.yaml` auto-loads (async-chunk streaming, 8-frame inter-stage chunks).
+The deploy config at `vllm_omni/deploy/breeze_tts_2.yaml` auto-loads (async-chunk streaming with 1, 2, 4, then 5-frame inter-stage chunks).
 
 ### Sending requests
 
