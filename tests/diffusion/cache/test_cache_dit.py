@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from cache_dit import ForwardPattern
 from cache_dit.caching.cache_blocks.pattern_0_1_2 import CachedBlocks_Pattern_0_1_2
 from vllm.distributed import parallel_state
 
@@ -60,6 +61,7 @@ def test_custom_cache_dit_enablers_are_registered_explicitly():
         "Cosmos3OmniPipeline": cd_model_specific.enable_cache_for_cosmos3,
         "Krea2Pipeline": cd_model_specific.enable_cache_for_krea2,
         "Magi2Pipeline": cd_model_specific.enable_cache_for_magi2,
+        "BooguImagePipeline": cd_model_specific.enable_cache_for_boogu,
     }
 
     with patch.dict(cd_backend.CUSTOM_DIT_ENABLERS, {}, clear=True):
@@ -114,6 +116,37 @@ def test_magi2_cache_dit_targets_only_nested_repeated_layers(mock_block_adapter,
     assert result.targets == (adapter,)
     get_transformer = mock_enable_cache.call_args.kwargs["get_pipeline_transformer"]
     assert get_transformer(pipeline) is transformer_block
+
+
+@patch("vllm_omni.diffusion.cache.cachedit.model_specific.enable_cache_for_dit")
+@patch("vllm_omni.diffusion.cache.cachedit.model_specific.BlockAdapter")
+def test_boogu_cache_dit_wraps_double_and_single_stream_layers(mock_block_adapter, mock_enable_cache):
+    pipeline = Mock()
+    double_stream_layers = torch.nn.ModuleList([torch.nn.Identity()])
+    single_stream_layers = torch.nn.ModuleList([torch.nn.Identity()])
+    pipeline.transformer.double_stream_layers = double_stream_layers
+    pipeline.transformer.single_stream_layers = single_stream_layers
+    pipeline._cache_dit_separate_cfg = True
+    adapter = mock_block_adapter.return_value
+    refresh = Mock()
+    mock_enable_cache.return_value = refresh
+
+    result = cd_model_specific.enable_cache_for_boogu(pipeline, SAMPLE_CACHE_CONFIG)
+
+    adapter_kwargs = mock_block_adapter.call_args.kwargs
+    assert adapter_kwargs["transformer"] is pipeline.transformer
+    assert adapter_kwargs["blocks"] == [double_stream_layers, single_stream_layers]
+    assert adapter_kwargs["forward_pattern"] == [
+        ForwardPattern.Pattern_0,
+        ForwardPattern.Pattern_3,
+    ]
+    assert adapter_kwargs["has_separate_cfg"] is True
+    assert adapter_kwargs["check_forward_pattern"] is False
+    modifiers = adapter_kwargs["params_modifiers"]
+    assert modifiers[0]._context_kwargs["cache_config"].Fn_compute_blocks == 2
+    assert modifiers[1]._context_kwargs["cache_config"].Fn_compute_blocks == 4
+    assert result.refresh is refresh
+    assert result.targets == (adapter,)
 
 
 @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit.summary")
