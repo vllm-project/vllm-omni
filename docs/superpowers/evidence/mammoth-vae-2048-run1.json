@@ -1,0 +1,111 @@
+{
+  "commit": "4c7a98c26f6167a219b008263773c959a65ac0f2",
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "gpu_count": 2,
+  "torch": "2.13.0+cu129",
+  "latent_shape": [
+    1,
+    16,
+    256,
+    256
+  ],
+  "dtype": "float16",
+  "latent_transform": "normal(seed=7) / scaling_factor + shift_factor",
+  "tile_latent_min_size": 128,
+  "tile_overlap_factor": 0.25,
+  "warmup": 2,
+  "iterations": 5,
+  "weight_source": "/root/autodl-tmp/mammoth-vae-weights/model-00006-of-00008.safetensors",
+  "loaded_vae_tensors": 244,
+  "baseline": {
+    "pp_size": 1,
+    "use_tiling": false,
+    "latency_ms": [
+      1227.618545293808,
+      1224.9624580144882,
+      1226.1701226234436,
+      1229.9207299947739,
+      1231.382705271244
+    ],
+    "median_ms": 1227.618545293808,
+    "p95_ms": 1231.382705271244,
+    "peak_allocated_bytes_per_rank": [
+      10411582464,
+      175253504
+    ],
+    "peak_reserved_bytes_per_rank": [
+      18207473664,
+      178257920
+    ]
+  },
+  "tiled_baseline": {
+    "pp_size": 1,
+    "use_tiling": true,
+    "latency_ms": [
+      1717.1933129429817,
+      1713.3538872003555,
+      1713.320218026638,
+      1718.4130400419235,
+      1709.1389074921608
+    ],
+    "median_ms": 1713.3538872003555,
+    "p95_ms": 1718.4130400419235,
+    "peak_allocated_bytes_per_rank": [
+      2809406464,
+      175253504
+    ],
+    "peak_reserved_bytes_per_rank": [
+      4624220160,
+      178257920
+    ]
+  },
+  "parallel": {
+    "pp_size": 2,
+    "use_tiling": true,
+    "latency_ms": [
+      967.6244482398033,
+      964.8851156234741,
+      966.2751778960228,
+      964.7657424211502,
+      967.7125588059425
+    ],
+    "median_ms": 966.2751778960228,
+    "p95_ms": 967.7125588059425,
+    "peak_allocated_bytes_per_rank": [
+      2818843648,
+      2742297600
+    ],
+    "peak_reserved_bytes_per_rank": [
+      4657774592,
+      4716494848
+    ]
+  },
+  "output_shape": [
+    1,
+    3,
+    2048,
+    2048
+  ],
+  "error": {
+    "max_abs": 0.134521484375,
+    "mean_abs": 0.0019600993632688337,
+    "relative_l2": 0.005695084909010692,
+    "psnr_db": 56.85233924229293
+  },
+  "error_vs_tiled": {
+    "max_abs": 0.133056640625,
+    "mean_abs": 3.829421168669948e-05,
+    "relative_l2": 0.0005280302189291893,
+    "psnr_db": 77.4895144337796
+  },
+  "tiled_vs_untiled": {
+    "max_abs": 0.09814453125,
+    "mean_abs": 0.0019536927532660306,
+    "relative_l2": 0.005670955873735,
+    "psnr_db": 56.88921795077688
+  },
+  "spatial_error": {
+    "join_mean_abs": 0.0023128639440983534,
+    "away_mean_abs": 0.0019487200770527124
+  }
+}

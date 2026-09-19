@@ -1,0 +1,197 @@
+{
+  "commit": "4c7a98c26f6167a219b008263773c959a65ac0f2",
+  "worktree_changes": [
+    " M tests/diffusion/models/mammoth_moda2/test_pipeline_mammothmoda2_dit.py",
+    " M vllm_omni/diffusion/models/mammoth_moda2/pipeline_mammothmoda2_dit.py",
+    " M vllm_omni/diffusion/registry.py",
+    "?? benchmarks/diffusion/bench_mammoth_vae_patch_parallel.py",
+    "?? tests/diffusion/distributed/test_mammoth_vae_benchmark.py",
+    "?? tests/diffusion/test_registry_vae_patch_parallel.py"
+  ],
+  "source_sha256": {
+    "vllm_omni/diffusion/registry.py": "33637776bc5203b1eff4eab611a0bb832e3ae8db3c2bf39779b3bcb374c7aa1d",
+    "vllm_omni/diffusion/models/mammoth_moda2/pipeline_mammothmoda2_dit.py": "07725f8d74d3162c06f2d483fb05581bcad60635a60f7e76c9b6c490d1ee88a3",
+    "/root/autodl-tmp/vllm-omni-vae-pp/benchmarks/diffusion/bench_mammoth_vae_patch_parallel.py": "7b42018aa1e17cc20fcb7bdaebb759f5202a9ce7304bd1a0a7235d82f0dfff89"
+  },
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "gpu_count": 2,
+  "torch": "2.13.0+cu129",
+  "latent_shape": [
+    1,
+    16,
+    257,
+    257
+  ],
+  "dtype": "float16",
+  "deterministic": false,
+  "latent_transform": "normal(seed=7) / scaling_factor + shift_factor",
+  "tile_latent_min_size": 128,
+  "tile_overlap_factor": 0.25,
+  "warmup": 1,
+  "iterations": 3,
+  "weight_source": "/root/autodl-tmp/mammoth-vae-weights/model-00006-of-00008.safetensors",
+  "loaded_vae_tensors": 244,
+  "baseline": {
+    "pp_size": 1,
+    "use_tiling": false,
+    "latency_ms": [
+      1257.8407004475594,
+      1256.9159716367722,
+      1258.500523865223
+    ],
+    "median_ms": 1257.8407004475594,
+    "p95_ms": 1258.500523865223,
+    "peak_allocated_bytes_per_rank": [
+      10491578368,
+      175270400
+    ],
+    "peak_reserved_bytes_per_rank": [
+      18176016384,
+      199229440
+    ],
+    "latent_mutation_max_abs": 0.0,
+    "repeatability": {
+      "max_abs": 0.064697265625,
+      "mean_abs": 0.0001767286976529232,
+      "relative_l2": 0.0008592556512263749,
+      "psnr_db": 73.28225902423978
+    }
+  },
+  "tiled_baseline": {
+    "pp_size": 1,
+    "use_tiling": true,
+    "latency_ms": [
+      1730.0802022218704,
+      1731.043741106987,
+      1736.149713397026
+    ],
+    "median_ms": 1731.043741106987,
+    "p95_ms": 1736.149713397026,
+    "peak_allocated_bytes_per_rank": [
+      2784306688,
+      175270400
+    ],
+    "peak_reserved_bytes_per_rank": [
+      4680843264,
+      199229440
+    ],
+    "latent_mutation_max_abs": 0.0,
+    "repeatability": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "relative_l2": 0.0,
+      "psnr_db": null
+    }
+  },
+  "parallel": {
+    "pp_size": 2,
+    "use_tiling": true,
+    "latency_ms": [
+      977.7546003460884,
+      981.7085638642311,
+      977.686196565628
+    ],
+    "median_ms": 977.7546003460884,
+    "p95_ms": 981.7085638642311,
+    "peak_allocated_bytes_per_rank": [
+      2767677440,
+      2742314496
+    ],
+    "peak_reserved_bytes_per_rank": [
+      4680843264,
+      4720689152
+    ],
+    "latent_mutation_max_abs": 0.0,
+    "repeatability": {
+      "max_abs": 0.079498291015625,
+      "mean_abs": 4.45746689983127e-05,
+      "relative_l2": 0.00046216178952241483,
+      "psnr_db": 78.65530506018308
+    }
+  },
+  "output_shape": [
+    1,
+    3,
+    2056,
+    2056
+  ],
+  "error": {
+    "max_abs": 0.1387939453125,
+    "mean_abs": 0.0020632775337518614,
+    "relative_l2": 0.006144420851419964,
+    "psnr_db": 56.19496735555344
+  },
+  "error_vs_tiled": {
+    "max_abs": 0.140380859375,
+    "mean_abs": 7.903886509630836e-05,
+    "relative_l2": 0.0008494747580956509,
+    "psnr_db": 73.36822830531099
+  },
+  "tiled_vs_untiled": {
+    "max_abs": 0.1145782470703125,
+    "mean_abs": 0.0020505560614487166,
+    "relative_l2": 0.006091170663693795,
+    "psnr_db": 56.27057108479151
+  },
+  "center_stripe_error": {
+    "center_mean_abs": 0.0024206603411585093,
+    "off_center_mean_abs": 0.0020517949014902115
+  },
+  "center_stripe_error_vs_tiled": {
+    "center_mean_abs": 3.231932169001084e-06,
+    "off_center_mean_abs": 8.14744271337986e-05
+  },
+  "tile_boundaries": {
+    "grid_shape": [
+      3,
+      3
+    ],
+    "row_limit": 768,
+    "rank_grid": [
+      [
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        1,
+        1
+      ],
+      [
+        0,
+        1,
+        0
+      ]
+    ],
+    "half_width": 16,
+    "error_vs_tiled": {
+      "vertical_boundaries": [
+        768,
+        1536
+      ],
+      "horizontal_boundaries": [
+        768,
+        1536
+      ],
+      "cross_rank": {
+        "pixels": 139776,
+        "mean_abs": 8.976589742815122e-05
+      },
+      "same_rank": {
+        "pixels": 119296,
+        "mean_abs": 5.481911648530513e-05
+      },
+      "interior": {
+        "pixels": 3968064,
+        "mean_abs": 7.938914495753124e-05
+      }
+    }
+  },
+  "max_error_index_vs_tiled": [
+    0,
+    0,
+    1976,
+    282
+  ]
+}

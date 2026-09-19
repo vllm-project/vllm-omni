@@ -1,0 +1,64 @@
+{
+  "kind": "registry-stage-vae-integration-smoke",
+  "world_size": 2,
+  "model_class": "MammothModa2DiTPipeline",
+  "vae_class": "DistributedAutoencoderKL",
+  "vae_patch_parallel_size": 2,
+  "vae_use_tiling": true,
+  "sequence_parallel_size": 2,
+  "loaded_vae_tensors": 244,
+  "constructor_sec": 20.639009207487106,
+  "dit_max_abs_rank_delta": 0.0009765625,
+  "latent_max_abs_before_sync": 0.50390625,
+  "latent_max_abs_after_sync": 0.0,
+  "ranks": [
+    {
+      "rank": 0,
+      "output_shape": [
+        1,
+        3,
+        1024,
+        1024
+      ],
+      "output_numel": 3145728,
+      "output_finite": true,
+      "joint_dit_vae_peak_allocated_bytes": 7811330560,
+      "dit_output_shape": [
+        1,
+        16,
+        8,
+        8
+      ],
+      "dit_max_abs_rank_delta": 0.0009765625,
+      "stage_output_shape": [
+        1,
+        3,
+        64,
+        64
+      ],
+      "stage_output_finite": true
+    },
+    {
+      "rank": 1,
+      "output_shape": [
+        0
+      ],
+      "output_numel": 0,
+      "output_finite": true,
+      "joint_dit_vae_peak_allocated_bytes": 7811330560,
+      "dit_output_shape": [
+        1,
+        16,
+        8,
+        8
+      ],
+      "dit_max_abs_rank_delta": 0.0009765625,
+      "stage_output_shape": [
+        0
+      ],
+      "stage_output_finite": true
+    }
+  ],
+  "config_sha256": "ecbd3267a7ffa11c585575b0580296c561001be822156d0de0518770efca668e",
+  "limitations": "Full stage forward uses synthetic AR conditions and random/unloaded DiT weights; this is not end-to-end generation."
+}

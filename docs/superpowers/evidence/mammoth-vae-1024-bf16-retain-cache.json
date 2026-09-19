@@ -1,0 +1,159 @@
+{
+  "commit": "4c7a98c26f6167a219b008263773c959a65ac0f2",
+  "worktree_changes": [
+    " M tests/diffusion/models/mammoth_moda2/test_pipeline_mammothmoda2_dit.py",
+    " M vllm_omni/diffusion/models/mammoth_moda2/pipeline_mammothmoda2_dit.py",
+    " M vllm_omni/diffusion/registry.py",
+    "?? benchmarks/diffusion/bench_mammoth_vae_patch_parallel.py",
+    "?? tests/diffusion/distributed/test_mammoth_vae_benchmark.py",
+    "?? tests/diffusion/test_registry_vae_patch_parallel.py"
+  ],
+  "source_sha256": {
+    "vllm_omni/diffusion/registry.py": "33637776bc5203b1eff4eab611a0bb832e3ae8db3c2bf39779b3bcb374c7aa1d",
+    "vllm_omni/diffusion/models/mammoth_moda2/pipeline_mammothmoda2_dit.py": "07725f8d74d3162c06f2d483fb05581bcad60635a60f7e76c9b6c490d1ee88a3",
+    "/root/autodl-tmp/vllm-omni-vae-pp/benchmarks/diffusion/bench_mammoth_vae_patch_parallel.py": "c824b64aaae33adaa8dd6624ca49dd166ad608d9a0bb0f9a78c1b3c8a6cf669b"
+  },
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "gpu_count": 2,
+  "torch": "2.13.0+cu129",
+  "latent_shape": [
+    1,
+    16,
+    128,
+    128
+  ],
+  "dtype": "bfloat16",
+  "deterministic": true,
+  "clear_cache_between_modes": false,
+  "peak_reserved_bytes_note": "Allocator cache can carry across modes when clear_cache_between_modes=false",
+  "latent_transform": "normal(seed=7) / scaling_factor + shift_factor",
+  "tile_latent_min_size": 128,
+  "tile_overlap_factor": 0.25,
+  "warmup": 2,
+  "iterations": 5,
+  "weight_source": "/root/autodl-tmp/mammoth-vae-weights/model-00006-of-00008.safetensors",
+  "loaded_vae_tensors": 244,
+  "baseline": {
+    "pp_size": 1,
+    "use_tiling": false,
+    "latency_ms": [
+      255.6479200720787,
+      255.2904263138771,
+      255.5573508143425,
+      254.94065880775452,
+      256.440594792366
+    ],
+    "median_ms": 255.5573508143425,
+    "p95_ms": 256.440594792366,
+    "peak_allocated_bytes_per_rank": [
+      2765759488,
+      173680640
+    ],
+    "peak_reserved_bytes_per_rank": [
+      4695523328,
+      180355072
+    ],
+    "latent_mutation_max_abs": 0.0,
+    "repeatability": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "relative_l2": 0.0,
+      "psnr_db": null
+    }
+  },
+  "tiled_baseline": {
+    "pp_size": 1,
+    "use_tiling": true,
+    "latency_ms": [
+      255.24188578128815,
+      255.37816435098648,
+      255.38861006498337,
+      256.63380324840546,
+      256.5540224313736
+    ],
+    "median_ms": 255.38861006498337,
+    "p95_ms": 256.63380324840546,
+    "peak_allocated_bytes_per_rank": [
+      2765759488,
+      173680640
+    ],
+    "peak_reserved_bytes_per_rank": [
+      4695523328,
+      180355072
+    ],
+    "latent_mutation_max_abs": 0.0,
+    "repeatability": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "relative_l2": 0.0,
+      "psnr_db": null
+    }
+  },
+  "parallel": {
+    "pp_size": 2,
+    "use_tiling": true,
+    "latency_ms": [
+      192.70873069763184,
+      192.3973336815834,
+      192.2512650489807,
+      192.48239696025848,
+      192.6042065024376
+    ],
+    "median_ms": 192.48239696025848,
+    "p95_ms": 192.70873069763184,
+    "peak_allocated_bytes_per_rank": [
+      2128225280,
+      2121933824
+    ],
+    "peak_reserved_bytes_per_rank": [
+      4695523328,
+      3584032768
+    ],
+    "latent_mutation_max_abs": 0.0,
+    "repeatability": {
+      "max_abs": 0.80078125,
+      "mean_abs": 0.000188230857020244,
+      "relative_l2": 0.003623230366998672,
+      "psnr_db": 60.73672932060934
+    }
+  },
+  "output_shape": [
+    1,
+    3,
+    1024,
+    1024
+  ],
+  "error": {
+    "max_abs": 0.7998046875,
+    "mean_abs": 0.001922356808790937,
+    "relative_l2": 0.0067857182121672,
+    "psnr_db": 55.29305929945447
+  },
+  "error_vs_tiled": {
+    "max_abs": 0.7998046875,
+    "mean_abs": 0.001922356808790937,
+    "relative_l2": 0.0067857182121672,
+    "psnr_db": 55.29305929945447
+  },
+  "tiled_vs_untiled": {
+    "max_abs": 0.0,
+    "mean_abs": 0.0,
+    "relative_l2": 0.0,
+    "psnr_db": null
+  },
+  "center_stripe_error": {
+    "center_mean_abs": 0.0019229905446991324,
+    "off_center_mean_abs": 0.0019223145209252834
+  },
+  "center_stripe_error_vs_tiled": {
+    "center_mean_abs": 0.0019229905446991324,
+    "off_center_mean_abs": 0.0019223145209252834
+  },
+  "tile_boundaries": null,
+  "max_error_index_vs_tiled": [
+    0,
+    2,
+    1011,
+    469
+  ]
+}

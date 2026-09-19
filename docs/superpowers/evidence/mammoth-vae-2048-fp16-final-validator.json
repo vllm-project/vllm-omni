@@ -1,0 +1,205 @@
+{
+  "commit": "4c7a98c26f6167a219b008263773c959a65ac0f2",
+  "worktree_changes": [
+    " M tests/diffusion/models/mammoth_moda2/test_dit_attention.py",
+    " M tests/diffusion/models/mammoth_moda2/test_pipeline_mammothmoda2_dit.py",
+    " M vllm_omni/diffusion/models/mammoth_moda2/mammothmoda2_dit_model.py",
+    " M vllm_omni/diffusion/models/mammoth_moda2/pipeline_mammothmoda2_dit.py",
+    " M vllm_omni/diffusion/registry.py",
+    "?? benchmarks/diffusion/bench_mammoth_vae_patch_parallel.py",
+    "?? tests/diffusion/distributed/test_mammoth_vae_benchmark.py",
+    "?? tests/diffusion/test_registry_vae_patch_parallel.py"
+  ],
+  "source_sha256": {
+    "vllm_omni/diffusion/registry.py": "33637776bc5203b1eff4eab611a0bb832e3ae8db3c2bf39779b3bcb374c7aa1d",
+    "vllm_omni/diffusion/models/mammoth_moda2/pipeline_mammothmoda2_dit.py": "e652dedf46923dce7d5064bccdf2bca9619973af9748c3576517a20dadde3ae2",
+    "vllm_omni/diffusion/models/mammoth_moda2/mammothmoda2_dit_model.py": "2a1d2d9900df102d89b7ecddb06c6d07d159c15d401ce1177f656a497fecb6fe",
+    "/root/autodl-tmp/vllm-omni-vae-pp/benchmarks/diffusion/bench_mammoth_vae_patch_parallel.py": "e1296b52a53410007410c09f3733caacba5334db3c1589afd870d531cd994bbd"
+  },
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "gpu_count": 2,
+  "torch": "2.13.0+cu129",
+  "latent_shape": [
+    1,
+    16,
+    256,
+    256
+  ],
+  "dtype": "float16",
+  "deterministic": false,
+  "clear_cache_between_modes": false,
+  "peak_reserved_bytes_note": "Allocator cache can carry across modes when clear_cache_between_modes=false",
+  "latent_transform": "normal(seed=7) / scaling_factor + shift_factor",
+  "tile_latent_min_size": 128,
+  "tile_overlap_factor": 0.25,
+  "warmup": 1,
+  "iterations": 3,
+  "weight_source": "/root/autodl-tmp/mammoth-vae-weights/model-00006-of-00008.safetensors",
+  "loaded_vae_tensors": 244,
+  "baseline": {
+    "pp_size": 1,
+    "use_tiling": false,
+    "latency_ms": [
+      1230.2244827151299,
+      1225.0287905335426,
+      1226.8802970647812
+    ],
+    "median_ms": 1226.8802970647812,
+    "p95_ms": 1230.2244827151299,
+    "peak_allocated_bytes_per_rank": [
+      10411582464,
+      175253504
+    ],
+    "peak_reserved_bytes_per_rank": [
+      18020827136,
+      199229440
+    ],
+    "latent_mutation_max_abs": 0.0,
+    "output_dtype": "torch.float16",
+    "repeatability": {
+      "max_abs": 0.11767578125,
+      "mean_abs": 0.0001972116767016511,
+      "relative_l2": 0.001021724417077495,
+      "psnr_db": 71.77446405239928
+    }
+  },
+  "tiled_baseline": {
+    "pp_size": 1,
+    "use_tiling": true,
+    "latency_ms": [
+      1722.3629504442215,
+      1721.1542278528214,
+      1716.5414094924927
+    ],
+    "median_ms": 1721.1542278528214,
+    "p95_ms": 1722.3629504442215,
+    "peak_allocated_bytes_per_rank": [
+      2782275072,
+      175253504
+    ],
+    "peak_reserved_bytes_per_rank": [
+      18020827136,
+      199229440
+    ],
+    "latent_mutation_max_abs": 0.0,
+    "output_dtype": "torch.float16",
+    "repeatability": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "relative_l2": 0.0,
+      "psnr_db": null
+    }
+  },
+  "parallel": {
+    "pp_size": 2,
+    "use_tiling": true,
+    "latency_ms": [
+      1026.9169881939888,
+      1009.348101913929,
+      966.0642668604851
+    ],
+    "median_ms": 1009.348101913929,
+    "p95_ms": 1026.9169881939888,
+    "peak_allocated_bytes_per_rank": [
+      2766546432,
+      2742297600
+    ],
+    "peak_reserved_bytes_per_rank": [
+      18020827136,
+      4720689152
+    ],
+    "latent_mutation_max_abs": 0.0,
+    "output_dtype": "torch.float16",
+    "repeatability": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "relative_l2": 0.0,
+      "psnr_db": null
+    }
+  },
+  "output_shape": [
+    1,
+    3,
+    2048,
+    2048
+  ],
+  "error": {
+    "max_abs": 0.11553955078125,
+    "mean_abs": 0.0019085030956157805,
+    "relative_l2": 0.005568018536462265,
+    "psnr_db": 57.047114378079506
+  },
+  "error_vs_tiled": {
+    "max_abs": 0.0,
+    "mean_abs": 0.0,
+    "relative_l2": 0.0,
+    "psnr_db": null
+  },
+  "tiled_vs_untiled": {
+    "max_abs": 0.11553955078125,
+    "mean_abs": 0.0019085030956157805,
+    "relative_l2": 0.005568018536462265,
+    "psnr_db": 57.047114378079506
+  },
+  "center_stripe_error": {
+    "center_mean_abs": 0.0022694554645568132,
+    "off_center_mean_abs": 0.0018968594959005713
+  },
+  "center_stripe_error_vs_tiled": {
+    "center_mean_abs": 0.0,
+    "off_center_mean_abs": 0.0
+  },
+  "tile_boundaries": {
+    "grid_shape": [
+      3,
+      3
+    ],
+    "row_limit": 768,
+    "rank_grid": [
+      [
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        1,
+        1
+      ],
+      [
+        0,
+        1,
+        0
+      ]
+    ],
+    "half_width": 16,
+    "error_vs_tiled": {
+      "vertical_boundaries": [
+        768,
+        1536
+      ],
+      "horizontal_boundaries": [
+        768,
+        1536
+      ],
+      "cross_rank": {
+        "pixels": 138752,
+        "mean_abs": 0.0
+      },
+      "same_rank": {
+        "pixels": 119296,
+        "mean_abs": 0.0
+      },
+      "interior": {
+        "pixels": 3936256,
+        "mean_abs": 0.0
+      }
+    }
+  },
+  "max_error_index_vs_tiled": [
+    0,
+    0,
+    0,
+    0
+  ]
+}

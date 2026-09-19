@@ -1,0 +1,199 @@
+{
+  "commit": "4c7a98c26f6167a219b008263773c959a65ac0f2",
+  "worktree_changes": [
+    " M tests/diffusion/models/mammoth_moda2/test_pipeline_mammothmoda2_dit.py",
+    " M vllm_omni/diffusion/models/mammoth_moda2/pipeline_mammothmoda2_dit.py",
+    " M vllm_omni/diffusion/registry.py",
+    "?? benchmarks/diffusion/bench_mammoth_vae_patch_parallel.py",
+    "?? tests/diffusion/distributed/test_mammoth_vae_benchmark.py",
+    "?? tests/diffusion/test_registry_vae_patch_parallel.py"
+  ],
+  "source_sha256": {
+    "vllm_omni/diffusion/registry.py": "33637776bc5203b1eff4eab611a0bb832e3ae8db3c2bf39779b3bcb374c7aa1d",
+    "vllm_omni/diffusion/models/mammoth_moda2/pipeline_mammothmoda2_dit.py": "07725f8d74d3162c06f2d483fb05581bcad60635a60f7e76c9b6c490d1ee88a3",
+    "/root/autodl-tmp/vllm-omni-vae-pp/benchmarks/diffusion/bench_mammoth_vae_patch_parallel.py": "c824b64aaae33adaa8dd6624ca49dd166ad608d9a0bb0f9a78c1b3c8a6cf669b"
+  },
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "gpu_count": 2,
+  "torch": "2.13.0+cu129",
+  "latent_shape": [
+    1,
+    16,
+    256,
+    256
+  ],
+  "dtype": "bfloat16",
+  "deterministic": true,
+  "clear_cache_between_modes": false,
+  "peak_reserved_bytes_note": "Allocator cache can carry across modes when clear_cache_between_modes=false",
+  "latent_transform": "normal(seed=7) / scaling_factor + shift_factor",
+  "tile_latent_min_size": 128,
+  "tile_overlap_factor": 0.25,
+  "warmup": 1,
+  "iterations": 3,
+  "weight_source": "/root/autodl-tmp/mammoth-vae-weights/model-00006-of-00008.safetensors",
+  "loaded_vae_tensors": 244,
+  "baseline": {
+    "pp_size": 1,
+    "use_tiling": false,
+    "latency_ms": [
+      1229.324921965599,
+      1231.3002198934555,
+      1238.0318120121956
+    ],
+    "median_ms": 1231.3002198934555,
+    "p95_ms": 1238.0318120121956,
+    "peak_allocated_bytes_per_rank": [
+      10436617216,
+      175253504
+    ],
+    "peak_reserved_bytes_per_rank": [
+      18228445184,
+      199229440
+    ],
+    "latent_mutation_max_abs": 0.0,
+    "repeatability": {
+      "max_abs": 0.716796875,
+      "mean_abs": 0.0015293795295292512,
+      "relative_l2": 0.00835184402959397,
+      "psnr_db": 53.51897435060369
+    }
+  },
+  "tiled_baseline": {
+    "pp_size": 1,
+    "use_tiling": true,
+    "latency_ms": [
+      1735.7779517769814,
+      1733.6679846048355,
+      1733.3800718188286
+    ],
+    "median_ms": 1733.6679846048355,
+    "p95_ms": 1735.7779517769814,
+    "peak_allocated_bytes_per_rank": [
+      2808358400,
+      175253504
+    ],
+    "peak_reserved_bytes_per_rank": [
+      18228445184,
+      199229440
+    ],
+    "latent_mutation_max_abs": 0.0,
+    "repeatability": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "relative_l2": 0.0,
+      "psnr_db": null
+    }
+  },
+  "parallel": {
+    "pp_size": 2,
+    "use_tiling": true,
+    "latency_ms": [
+      1028.099238872528,
+      985.3571355342865,
+      985.0772693753242
+    ],
+    "median_ms": 985.3571355342865,
+    "p95_ms": 1028.099238872528,
+    "peak_allocated_bytes_per_rank": [
+      2792629760,
+      2767332352
+    ],
+    "peak_reserved_bytes_per_rank": [
+      18228445184,
+      4697620480
+    ],
+    "latent_mutation_max_abs": 0.0,
+    "repeatability": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "relative_l2": 0.0,
+      "psnr_db": null
+    }
+  },
+  "output_shape": [
+    1,
+    3,
+    2048,
+    2048
+  ],
+  "error": {
+    "max_abs": 0.921875,
+    "mean_abs": 0.003614640821633467,
+    "relative_l2": 0.013755579596382218,
+    "psnr_db": 49.18510389227069
+  },
+  "error_vs_tiled": {
+    "max_abs": 0.0,
+    "mean_abs": 0.0,
+    "relative_l2": 0.0,
+    "psnr_db": null
+  },
+  "tiled_vs_untiled": {
+    "max_abs": 0.921875,
+    "mean_abs": 0.003614640821633467,
+    "relative_l2": 0.013755579596382218,
+    "psnr_db": 49.18510389227069
+  },
+  "center_stripe_error": {
+    "center_mean_abs": 0.003846755949780345,
+    "off_center_mean_abs": 0.003607153194025159
+  },
+  "center_stripe_error_vs_tiled": {
+    "center_mean_abs": 0.0,
+    "off_center_mean_abs": 0.0
+  },
+  "tile_boundaries": {
+    "grid_shape": [
+      3,
+      3
+    ],
+    "row_limit": 768,
+    "rank_grid": [
+      [
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        1,
+        1
+      ],
+      [
+        0,
+        1,
+        0
+      ]
+    ],
+    "half_width": 16,
+    "error_vs_tiled": {
+      "vertical_boundaries": [
+        768,
+        1536
+      ],
+      "horizontal_boundaries": [
+        768,
+        1536
+      ],
+      "cross_rank": {
+        "pixels": 138752,
+        "mean_abs": 0.0
+      },
+      "same_rank": {
+        "pixels": 119296,
+        "mean_abs": 0.0
+      },
+      "interior": {
+        "pixels": 3936256,
+        "mean_abs": 0.0
+      }
+    }
+  },
+  "max_error_index_vs_tiled": [
+    0,
+    0,
+    0,
+    0
+  ]
+}

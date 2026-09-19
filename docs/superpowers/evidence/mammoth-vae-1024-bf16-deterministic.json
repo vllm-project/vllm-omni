@@ -1,0 +1,147 @@
+{
+  "commit": "4c7a98c26f6167a219b008263773c959a65ac0f2",
+  "worktree_changes": [
+    " M tests/diffusion/models/mammoth_moda2/test_pipeline_mammothmoda2_dit.py",
+    " M vllm_omni/diffusion/models/mammoth_moda2/pipeline_mammothmoda2_dit.py",
+    " M vllm_omni/diffusion/registry.py",
+    "?? benchmarks/diffusion/bench_mammoth_vae_patch_parallel.py",
+    "?? tests/diffusion/distributed/test_mammoth_vae_benchmark.py",
+    "?? tests/diffusion/test_registry_vae_patch_parallel.py"
+  ],
+  "source_sha256": {
+    "vllm_omni/diffusion/registry.py": "33637776bc5203b1eff4eab611a0bb832e3ae8db3c2bf39779b3bcb374c7aa1d",
+    "vllm_omni/diffusion/models/mammoth_moda2/pipeline_mammothmoda2_dit.py": "07725f8d74d3162c06f2d483fb05581bcad60635a60f7e76c9b6c490d1ee88a3",
+    "/root/autodl-tmp/vllm-omni-vae-pp/benchmarks/diffusion/bench_mammoth_vae_patch_parallel.py": "c5cab9599cc9483bc54190b8970b5a4a5786d3b28ddb4e5a08633fdfd47bbe4e"
+  },
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "gpu_count": 2,
+  "torch": "2.13.0+cu129",
+  "latent_shape": [
+    1,
+    16,
+    128,
+    128
+  ],
+  "dtype": "bfloat16",
+  "deterministic": true,
+  "latent_transform": "normal(seed=7) / scaling_factor + shift_factor",
+  "tile_latent_min_size": 128,
+  "tile_overlap_factor": 0.25,
+  "warmup": 1,
+  "iterations": 3,
+  "weight_source": "/root/autodl-tmp/mammoth-vae-weights/model-00006-of-00008.safetensors",
+  "loaded_vae_tensors": 244,
+  "baseline": {
+    "pp_size": 1,
+    "use_tiling": false,
+    "latency_ms": [
+      255.07236272096634,
+      254.82754409313202,
+      255.37046045064926
+    ],
+    "median_ms": 255.07236272096634,
+    "p95_ms": 255.37046045064926,
+    "peak_allocated_bytes_per_rank": [
+      2765759488,
+      173680640
+    ],
+    "peak_reserved_bytes_per_rank": [
+      4693426176,
+      178257920
+    ],
+    "repeatability": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "relative_l2": 0.0,
+      "psnr_db": null
+    }
+  },
+  "tiled_baseline": {
+    "pp_size": 1,
+    "use_tiling": true,
+    "latency_ms": [
+      255.72484731674194,
+      255.36835938692093,
+      256.8662688136101
+    ],
+    "median_ms": 255.72484731674194,
+    "p95_ms": 256.8662688136101,
+    "peak_allocated_bytes_per_rank": [
+      2765759488,
+      173680640
+    ],
+    "peak_reserved_bytes_per_rank": [
+      4693426176,
+      178257920
+    ],
+    "repeatability": {
+      "max_abs": 0.501953125,
+      "mean_abs": 0.0028513730503618717,
+      "relative_l2": 0.0131763504261213,
+      "psnr_db": 49.55060926268097
+    }
+  },
+  "parallel": {
+    "pp_size": 2,
+    "use_tiling": true,
+    "latency_ms": [
+      192.32981652021408,
+      192.8459107875824,
+      192.5189644098282
+    ],
+    "median_ms": 192.5189644098282,
+    "p95_ms": 192.8459107875824,
+    "peak_allocated_bytes_per_rank": [
+      2128225280,
+      2121933824
+    ],
+    "peak_reserved_bytes_per_rank": [
+      3584032768,
+      3584032768
+    ],
+    "repeatability": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "relative_l2": 0.0,
+      "psnr_db": null
+    }
+  },
+  "output_shape": [
+    1,
+    3,
+    1024,
+    1024
+  ],
+  "error": {
+    "max_abs": 0.0703125,
+    "mean_abs": 0.0018830900468553107,
+    "relative_l2": 0.00584810481289848,
+    "psnr_db": 56.58467276402182
+  },
+  "error_vs_tiled": {
+    "max_abs": 0.521484375,
+    "mean_abs": 0.003802808040442566,
+    "relative_l2": 0.01444407774034569,
+    "psnr_db": 48.754802632743136
+  },
+  "tiled_vs_untiled": {
+    "max_abs": 0.509765625,
+    "mean_abs": 0.0031727884973709783,
+    "relative_l2": 0.013405844482180235,
+    "psnr_db": 49.37909217870218
+  },
+  "spatial_error": {
+    "join_mean_abs": 0.001896156813018024,
+    "away_mean_abs": 0.0018822188721969724
+  },
+  "spatial_error_vs_tiled": {
+    "join_mean_abs": 0.0038274209946393967,
+    "away_mean_abs": 0.00380116724409163
+  },
+  "max_error_index_vs_tiled": [
+    0,
+    2,
+    640,
+    794
+  ]
+}

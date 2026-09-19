@@ -1,0 +1,156 @@
+{
+  "commit": "4c7a98c26f6167a219b008263773c959a65ac0f2",
+  "worktree_changes": [
+    " M tests/diffusion/models/mammoth_moda2/test_pipeline_mammothmoda2_dit.py",
+    " M vllm_omni/diffusion/models/mammoth_moda2/pipeline_mammothmoda2_dit.py",
+    " M vllm_omni/diffusion/registry.py",
+    "?? benchmarks/diffusion/bench_mammoth_vae_patch_parallel.py",
+    "?? tests/diffusion/distributed/test_mammoth_vae_benchmark.py",
+    "?? tests/diffusion/test_registry_vae_patch_parallel.py"
+  ],
+  "source_sha256": {
+    "vllm_omni/diffusion/registry.py": "33637776bc5203b1eff4eab611a0bb832e3ae8db3c2bf39779b3bcb374c7aa1d",
+    "vllm_omni/diffusion/models/mammoth_moda2/pipeline_mammothmoda2_dit.py": "07725f8d74d3162c06f2d483fb05581bcad60635a60f7e76c9b6c490d1ee88a3",
+    "/root/autodl-tmp/vllm-omni-vae-pp/benchmarks/diffusion/bench_mammoth_vae_patch_parallel.py": "85ab758dc9ee2c9fbf9d70f3f2086cbe65c24aa520bed4d7cb55259272b0ee04"
+  },
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "gpu_count": 2,
+  "torch": "2.13.0+cu129",
+  "latent_shape": [
+    1,
+    16,
+    256,
+    256
+  ],
+  "dtype": "float16",
+  "deterministic": false,
+  "latent_transform": "normal(seed=7) / scaling_factor + shift_factor",
+  "tile_latent_min_size": 128,
+  "tile_overlap_factor": 0.25,
+  "warmup": 2,
+  "iterations": 5,
+  "weight_source": "/root/autodl-tmp/mammoth-vae-weights/model-00006-of-00008.safetensors",
+  "loaded_vae_tensors": 244,
+  "baseline": {
+    "pp_size": 1,
+    "use_tiling": false,
+    "latency_ms": [
+      1226.488433778286,
+      1224.9126583337784,
+      1230.5148467421532,
+      1233.2403734326363,
+      1230.4079309105873
+    ],
+    "median_ms": 1230.4079309105873,
+    "p95_ms": 1233.2403734326363,
+    "peak_allocated_bytes_per_rank": [
+      10411582464,
+      175253504
+    ],
+    "peak_reserved_bytes_per_rank": [
+      18207473664,
+      178257920
+    ],
+    "latent_mutation_max_abs": 0.0,
+    "repeatability": {
+      "max_abs": 0.0810546875,
+      "mean_abs": 0.0002257442365589668,
+      "relative_l2": 0.0010474449495983483,
+      "psnr_db": 71.55973929942687
+    }
+  },
+  "tiled_baseline": {
+    "pp_size": 1,
+    "use_tiling": true,
+    "latency_ms": [
+      1704.8731595277786,
+      1705.9963643550873,
+      1704.547144472599,
+      1705.1390558481216,
+      1705.7542726397514
+    ],
+    "median_ms": 1705.1390558481216,
+    "p95_ms": 1705.9963643550873,
+    "peak_allocated_bytes_per_rank": [
+      2783192064,
+      175253504
+    ],
+    "peak_reserved_bytes_per_rank": [
+      4607442944,
+      178257920
+    ],
+    "latent_mutation_max_abs": 0.0,
+    "repeatability": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "relative_l2": 0.0,
+      "psnr_db": null
+    }
+  },
+  "parallel": {
+    "pp_size": 2,
+    "use_tiling": true,
+    "latency_ms": [
+      1012.2148394584656,
+      970.3125953674316,
+      967.2574251890182,
+      972.4464192986488,
+      968.3254286646843
+    ],
+    "median_ms": 970.3125953674316,
+    "p95_ms": 1012.2148394584656,
+    "peak_allocated_bytes_per_rank": [
+      2767463424,
+      2742297600
+    ],
+    "peak_reserved_bytes_per_rank": [
+      4607442944,
+      4716494848
+    ],
+    "latent_mutation_max_abs": 0.0,
+    "repeatability": {
+      "max_abs": 0.07421875,
+      "mean_abs": 2.461402163570862e-05,
+      "relative_l2": 0.00034183361631443383,
+      "psnr_db": 81.26634007163298
+    }
+  },
+  "output_shape": [
+    1,
+    3,
+    2048,
+    2048
+  ],
+  "error": {
+    "max_abs": 0.106689453125,
+    "mean_abs": 0.001964445100033648,
+    "relative_l2": 0.005705660437777218,
+    "psnr_db": 56.83630858110347
+  },
+  "error_vs_tiled": {
+    "max_abs": 0.086883544921875,
+    "mean_abs": 4.28902971473614e-05,
+    "relative_l2": 0.0005902664242953852,
+    "psnr_db": 76.52172838299128
+  },
+  "tiled_vs_untiled": {
+    "max_abs": 0.106689453125,
+    "mean_abs": 0.001956571720962567,
+    "relative_l2": 0.005677064417372826,
+    "psnr_db": 56.879950574215044
+  },
+  "spatial_error": {
+    "join_mean_abs": 0.0023154239170253277,
+    "away_mean_abs": 0.0019531233701854944
+  },
+  "spatial_error_vs_tiled": {
+    "join_mean_abs": 3.547115966284764e-06,
+    "away_mean_abs": 4.415943112690002e-05
+  },
+  "max_error_index_vs_tiled": [
+    0,
+    0,
+    1030,
+    230
+  ]
+}

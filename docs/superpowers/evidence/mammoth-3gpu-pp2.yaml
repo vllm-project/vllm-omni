@@ -1,0 +1,23 @@
+# Three 24 GiB RTX 3090s: AR TP=2 on GPU 0+1, DiT SP=2 and VAE PP=2
+# on GPU 1+2. GPU 1 is shared, so both stages use a reduced memory budget.
+async_chunk: false
+pipeline: mammoth_moda2
+stages:
+  - stage_id: 0
+    devices: "0,1"
+    tensor_parallel_size: 2
+    max_num_seqs: 1
+    max_model_len: 4096
+    gpu_memory_utilization: 0.55
+    dtype: half
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+  - stage_id: 1
+    devices: "1,2"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.20
+    dtype: half
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false

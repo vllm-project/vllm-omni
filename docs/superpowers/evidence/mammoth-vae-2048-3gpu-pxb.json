@@ -1,0 +1,198 @@
+{
+  "commit": "129a4d725",
+  "worktree_changes": [
+    "Git metadata unavailable"
+  ],
+  "source_sha256": {
+    "vllm_omni/diffusion/registry.py": "33637776bc5203b1eff4eab611a0bb832e3ae8db3c2bf39779b3bcb374c7aa1d",
+    "vllm_omni/diffusion/models/mammoth_moda2/pipeline_mammothmoda2_dit.py": "e652dedf46923dce7d5064bccdf2bca9619973af9748c3576517a20dadde3ae2",
+    "vllm_omni/diffusion/models/mammoth_moda2/mammothmoda2_dit_model.py": "2a1d2d9900df102d89b7ecddb06c6d07d159c15d401ce1177f656a497fecb6fe",
+    "/root/autodl-tmp/vllm-omni-vae-pp/benchmarks/diffusion/bench_mammoth_vae_patch_parallel.py": "8f435dbac794063d651f4d7b8f2247ee8537f54f13a2ef6fd1825758450c757a"
+  },
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "gpu_count": 2,
+  "torch": "2.13.0+cu130",
+  "latent_shape": [
+    1,
+    16,
+    256,
+    256
+  ],
+  "dtype": "float16",
+  "deterministic": false,
+  "clear_cache_between_modes": false,
+  "peak_reserved_bytes_note": "Allocator cache can carry across modes when clear_cache_between_modes=false",
+  "latent_transform": "normal(seed=7) / scaling_factor + shift_factor",
+  "tile_latent_min_size": 128,
+  "tile_overlap_factor": 0.25,
+  "warmup": 1,
+  "iterations": 3,
+  "weight_source": "/root/autodl-tmp/mammoth-vae-weights/model-00006-of-00008.safetensors",
+  "loaded_vae_tensors": 244,
+  "baseline": {
+    "pp_size": 1,
+    "use_tiling": false,
+    "latency_ms": [
+      1229.3784960056655,
+      1231.0339040122926,
+      1229.2887780349702
+    ],
+    "median_ms": 1229.3784960056655,
+    "p95_ms": 1231.0339040122926,
+    "peak_allocated_bytes_per_rank": [
+      10411582464,
+      175253504
+    ],
+    "peak_reserved_bytes_per_rank": [
+      18020827136,
+      199229440
+    ],
+    "latent_mutation_max_abs": 0.0,
+    "output_dtype": "torch.float16",
+    "repeatability": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "relative_l2": 0.0,
+      "psnr_db": null
+    }
+  },
+  "tiled_baseline": {
+    "pp_size": 1,
+    "use_tiling": true,
+    "latency_ms": [
+      1733.9841980137862,
+      1751.2037180131301,
+      1762.303521973081
+    ],
+    "median_ms": 1751.2037180131301,
+    "p95_ms": 1762.303521973081,
+    "peak_allocated_bytes_per_rank": [
+      2782275072,
+      175253504
+    ],
+    "peak_reserved_bytes_per_rank": [
+      18020827136,
+      199229440
+    ],
+    "latent_mutation_max_abs": 0.0,
+    "output_dtype": "torch.float16",
+    "repeatability": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "relative_l2": 0.0,
+      "psnr_db": null
+    }
+  },
+  "parallel": {
+    "pp_size": 2,
+    "use_tiling": true,
+    "latency_ms": [
+      1008.6797670228407,
+      994.2188040004112,
+      1001.8825060105883
+    ],
+    "median_ms": 1001.8825060105883,
+    "p95_ms": 1008.6797670228407,
+    "peak_allocated_bytes_per_rank": [
+      2766546432,
+      2742297600
+    ],
+    "peak_reserved_bytes_per_rank": [
+      18020827136,
+      4720689152
+    ],
+    "latent_mutation_max_abs": 0.0,
+    "output_dtype": "torch.float16",
+    "repeatability": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "relative_l2": 0.0,
+      "psnr_db": null
+    }
+  },
+  "output_shape": [
+    1,
+    3,
+    2048,
+    2048
+  ],
+  "error": {
+    "max_abs": 0.0894775390625,
+    "mean_abs": 0.0018550936951887327,
+    "relative_l2": 0.005356841087743009,
+    "psnr_db": 57.3831197602061
+  },
+  "error_vs_tiled": {
+    "max_abs": 0.0,
+    "mean_abs": 0.0,
+    "relative_l2": 0.0,
+    "psnr_db": null
+  },
+  "tiled_vs_untiled": {
+    "max_abs": 0.0894775390625,
+    "mean_abs": 0.0018550936951887327,
+    "relative_l2": 0.005356841087743009,
+    "psnr_db": 57.3831197602061
+  },
+  "center_stripe_error": {
+    "center_mean_abs": 0.002233497565612197,
+    "off_center_mean_abs": 0.0018428871408104897
+  },
+  "center_stripe_error_vs_tiled": {
+    "center_mean_abs": 0.0,
+    "off_center_mean_abs": 0.0
+  },
+  "tile_boundaries": {
+    "grid_shape": [
+      3,
+      3
+    ],
+    "row_limit": 768,
+    "rank_grid": [
+      [
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        1,
+        1
+      ],
+      [
+        0,
+        1,
+        0
+      ]
+    ],
+    "half_width": 16,
+    "error_vs_tiled": {
+      "vertical_boundaries": [
+        768,
+        1536
+      ],
+      "horizontal_boundaries": [
+        768,
+        1536
+      ],
+      "cross_rank": {
+        "pixels": 138752,
+        "mean_abs": 0.0
+      },
+      "same_rank": {
+        "pixels": 119296,
+        "mean_abs": 0.0
+      },
+      "interior": {
+        "pixels": 3936256,
+        "mean_abs": 0.0
+      }
+    }
+  },
+  "max_error_index_vs_tiled": [
+    0,
+    0,
+    0,
+    0
+  ]
+}

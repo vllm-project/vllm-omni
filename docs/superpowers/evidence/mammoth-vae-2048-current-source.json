@@ -1,0 +1,150 @@
+{
+  "commit": "4c7a98c26f6167a219b008263773c959a65ac0f2",
+  "worktree_changes": [
+    " M tests/diffusion/models/mammoth_moda2/test_pipeline_mammothmoda2_dit.py",
+    " M vllm_omni/diffusion/models/mammoth_moda2/pipeline_mammothmoda2_dit.py",
+    " M vllm_omni/diffusion/registry.py",
+    "?? benchmarks/diffusion/bench_mammoth_vae_patch_parallel.py",
+    "?? tests/diffusion/distributed/test_mammoth_vae_benchmark.py",
+    "?? tests/diffusion/test_registry_vae_patch_parallel.py"
+  ],
+  "source_sha256": {
+    "vllm_omni/diffusion/registry.py": "33637776bc5203b1eff4eab611a0bb832e3ae8db3c2bf39779b3bcb374c7aa1d",
+    "vllm_omni/diffusion/models/mammoth_moda2/pipeline_mammothmoda2_dit.py": "07725f8d74d3162c06f2d483fb05581bcad60635a60f7e76c9b6c490d1ee88a3",
+    "/root/autodl-tmp/vllm-omni-vae-pp/benchmarks/diffusion/bench_mammoth_vae_patch_parallel.py": "c6ecc91c5cc9c8f5490b82ddaf9249f8783125ee3c86ad37760f19e91336a02f"
+  },
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "gpu_count": 2,
+  "torch": "2.13.0+cu129",
+  "latent_shape": [
+    1,
+    16,
+    256,
+    256
+  ],
+  "dtype": "float16",
+  "deterministic": false,
+  "latent_transform": "normal(seed=7) / scaling_factor + shift_factor",
+  "tile_latent_min_size": 128,
+  "tile_overlap_factor": 0.25,
+  "warmup": 1,
+  "iterations": 3,
+  "weight_source": "/root/autodl-tmp/mammoth-vae-weights/model-00006-of-00008.safetensors",
+  "loaded_vae_tensors": 244,
+  "baseline": {
+    "pp_size": 1,
+    "use_tiling": false,
+    "latency_ms": [
+      1229.450561106205,
+      1230.6140139698982,
+      1230.4364070296288
+    ],
+    "median_ms": 1230.4364070296288,
+    "p95_ms": 1230.6140139698982,
+    "peak_allocated_bytes_per_rank": [
+      10411582464,
+      175253504
+    ],
+    "peak_reserved_bytes_per_rank": [
+      18207473664,
+      178257920
+    ],
+    "latent_mutation_max_abs": 0.0,
+    "repeatability": {
+      "max_abs": 0.062744140625,
+      "mean_abs": 0.0002148868946581691,
+      "relative_l2": 0.0009850429103450652,
+      "psnr_db": 72.09331031446021
+    }
+  },
+  "tiled_baseline": {
+    "pp_size": 1,
+    "use_tiling": true,
+    "latency_ms": [
+      1701.1125534772873,
+      1711.1363112926483,
+      1702.6720345020294
+    ],
+    "median_ms": 1702.6720345020294,
+    "p95_ms": 1711.1363112926483,
+    "peak_allocated_bytes_per_rank": [
+      2783192064,
+      175253504
+    ],
+    "peak_reserved_bytes_per_rank": [
+      4607442944,
+      178257920
+    ],
+    "latent_mutation_max_abs": 0.0,
+    "repeatability": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "relative_l2": 0.0,
+      "psnr_db": null
+    }
+  },
+  "parallel": {
+    "pp_size": 2,
+    "use_tiling": true,
+    "latency_ms": [
+      1013.049766421318,
+      1013.5981142520905,
+      1012.3495161533356
+    ],
+    "median_ms": 1013.049766421318,
+    "p95_ms": 1013.5981142520905,
+    "peak_allocated_bytes_per_rank": [
+      2767463424,
+      2742297600
+    ],
+    "peak_reserved_bytes_per_rank": [
+      4607442944,
+      4716494848
+    ],
+    "latent_mutation_max_abs": 0.0,
+    "repeatability": {
+      "max_abs": 0.0380859375,
+      "mean_abs": 2.525753923994974e-05,
+      "relative_l2": 0.00033603240371463567,
+      "psnr_db": 81.41501411210314
+    }
+  },
+  "output_shape": [
+    1,
+    3,
+    2048,
+    2048
+  ],
+  "error": {
+    "max_abs": 0.114593505859375,
+    "mean_abs": 0.0019632389029358896,
+    "relative_l2": 0.005702353300027732,
+    "psnr_db": 56.841310409566084
+  },
+  "error_vs_tiled": {
+    "max_abs": 0.10675048828125,
+    "mean_abs": 4.271393899557552e-05,
+    "relative_l2": 0.0005933730872380145,
+    "psnr_db": 76.47613309293337
+  },
+  "tiled_vs_untiled": {
+    "max_abs": 0.114654541015625,
+    "mean_abs": 0.001955366512319756,
+    "relative_l2": 0.005673482843859732,
+    "psnr_db": 56.885397917734124
+  },
+  "center_stripe_error": {
+    "center_mean_abs": 0.0023151396308094263,
+    "off_center_mean_abs": 0.0019518875051289797
+  },
+  "center_stripe_error_vs_tiled": {
+    "center_mean_abs": 3.605604433687404e-06,
+    "off_center_mean_abs": 4.397549855639227e-05
+  },
+  "max_error_index_vs_tiled": [
+    0,
+    1,
+    1030,
+    230
+  ]
+}
