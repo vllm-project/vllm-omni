@@ -133,6 +133,18 @@ steps:
           - pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex.py -m 'advanced_model and cuda' --run-level 'advanced_model'
         mirror_hardwares: h100_1
 
+      - label: "Diffusion · Sana-Sprint Test"
+        timeout_in_minutes: 20
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_sana_sprint.py
+          - tests/e2e/accuracy/test_sana_sprint.py
+          - vllm_omni/diffusion/models/sana_sprint/
+          - vllm_omni/diffusion/registry.py
+          - vllm_omni/model_extras/registry.py
+        commands:
+          - pytest -s -v tests/e2e/online_serving/test_sana_sprint.py tests/e2e/accuracy/test_sana_sprint.py -m 'advanced_model and diffusion' --run-level advanced_model
+        mirror_hardwares: l4_1
+
       - label: "Diffusion · Qwen Image Test"
         source_file_dependencies: diffusion_qwen_image_function
         commands:

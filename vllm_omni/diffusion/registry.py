@@ -306,6 +306,7 @@ _DIFFUSION_MODELS = {
         "pipeline_lingbot_video",
         "LingBotVideoPipeline",
     ),
+    "SanaSprintPipeline": ("sana_sprint", "pipeline_sana_sprint", "SanaSprintPipeline"),
     "SanaVideoPipeline": (
         "sana_video",
         "pipeline_sana_video",
@@ -616,6 +617,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
     "HunyuanImage3Pipeline": "get_hunyuan_image3_post_process_func",
     "LingBotVideoPipeline": "get_lingbot_video_post_process_func",
+    "SanaSprintPipeline": "get_sana_sprint_post_process_func",
     "SanaVideoPipeline": "get_sana_video_post_process_func",
     "SanaImageToVideoPipeline": "get_sana_video_i2v_post_process_func",
     "Magi2Pipeline": "get_magi2_post_process_func",

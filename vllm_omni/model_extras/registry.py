@@ -89,27 +89,36 @@ from vllm_omni.model_extras.vace import (
 )
 from vllm_omni.model_extras.video_generation import VideoGenerationDefaults
 
-TextToImagePromptBuilder = Callable[
-    [str, str | None, int | None, int | None],
-    dict[str, Any],
-]
 ImageToImagePromptBuilder = Callable[
     [str, str | None, "Image.Image | list[Image.Image]", int | None, int | None],
     dict[str, Any],
 ]
-ImageToVideoPromptBuilder = Callable[
-    [
-        str,
-        str | None,
-        "Mapping[str, Any]",
-        int | None,
-        int | None,
-        int | None,
-    ],
-    dict[str, Any],
-]
 XToTextPromptBuilder = Callable[[str, str, bool], tuple[dict[str, Any], list[int] | None]]
 OutputTensorRange = Literal["negative_one_to_one", "zero_to_one"]
+
+
+class TextToImagePromptBuilder(Protocol):
+    def __call__(
+        self,
+        *,
+        prompt: str,
+        negative_prompt: str | None,
+        height: int | None,
+        width: int | None,
+    ) -> dict[str, Any]: ...
+
+
+class ImageToVideoPromptBuilder(Protocol):
+    def __call__(
+        self,
+        *,
+        prompt: str,
+        negative_prompt: str | None,
+        media_inputs: Mapping[str, Any],
+        height: int | None,
+        width: int | None,
+        num_frames: int | None,
+    ) -> dict[str, Any]: ...
 
 
 class ReferenceImageSizeResolver(Protocol):
@@ -274,6 +283,9 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "init_extra_args_for_non_diffusion_stages": HUNYUAN_IMAGE3_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
         "ar_input_builder": build_hunyuan_image3_ar_stage_inputs,
         "ar_tokenizer_validator": validate_hunyuan_image3_ar_tokenizer,
+    },
+    "SanaSprintPipeline": {
+        "extra_body_params": frozenset({"use_resolution_binning"}),
     },
     "SanaVideoPipeline": {
         "extra_body_params": SANA_VIDEO_EXTRA_BODY_PARAMS,
