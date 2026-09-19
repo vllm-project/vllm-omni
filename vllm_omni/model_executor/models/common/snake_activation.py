@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The Qwen team.
 """Shared Snake/SnakeBeta activations for speech decoders.
 
@@ -52,6 +52,8 @@ class SnakeBeta(nn.Module):
             out_ptr,
             stride_b,
             stride_c,
+            out_stride_b,
+            out_stride_c,
             t_len,
             block_t: tl.constexpr,
         ):
@@ -68,7 +70,7 @@ class SnakeBeta(nn.Module):
             sin_val = tl.sin(x_float * ea)
             result = x + (ib * sin_val * sin_val).to(x.dtype)
 
-            tl.store(out_ptr + bid * stride_b + cid * stride_c + t_off, result, mask=mask)
+            tl.store(out_ptr + bid * out_stride_b + cid * out_stride_c + t_off, result, mask=mask)
 
         SnakeBeta._triton_kernel = _kernel
         return True
@@ -129,9 +131,12 @@ class SnakeBeta(nn.Module):
         if not self._cached:
             self.precompute_exp_cache()
 
-        x = x.contiguous()
+        # UpSample1d crops its output along T. Read that view directly while
+        # keeping the output contiguous; input and output channel strides differ.
+        if x.stride(-1) != 1:
+            x = x.contiguous()
         B, C, T = x.shape
-        out = torch.empty_like(x)
+        out = torch.empty_like(x, memory_format=torch.contiguous_format)
         block_t = min(triton.next_power_of_2(T), self._TRITON_MAX_BLOCK_T)
         self._triton_kernel[(B, C, triton.cdiv(T, block_t))](
             x,
@@ -140,6 +145,8 @@ class SnakeBeta(nn.Module):
             out,
             x.stride(0),
             x.stride(1),
+            out.stride(0),
+            out.stride(1),
             t_len=T,
             block_t=block_t,
         )
