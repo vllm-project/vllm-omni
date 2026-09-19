@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for generation streaming session replacement.
 
 These tests pin the behavior of `_update_request_as_session` against
@@ -205,6 +208,7 @@ class TestReplaceSessionWithStreamingUpdate:
         assert session.num_prompt_tokens == 3
         assert session.arrival_time == 200.0
         assert session.sampling_params is update.sampling_params
+        assert session.max_tokens == update.max_tokens
         assert session.status == RequestStatus.WAITING
         assert sched.num_waiting_for_streaming_input == 2
 
