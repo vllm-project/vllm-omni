@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 BagelPipeline implementation for vLLM-Omni.
 """
@@ -316,6 +316,11 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         "bagel.connector",
         "bagel.vit_pos_embed",
     ]
+    # LoRA scanning target. ``_dit_modules`` holds the dotted path
+    # "language_model.model", which DiffusionLoRAManager cannot resolve as a
+    # pipeline attribute, so the top-level ``bagel`` module (LLM plus ViT,
+    # connector, and VAE projections) is declared explicitly here.
+    _lora_components: ClassVar[list[str]] = ["bagel"]
     supports_step_execution: ClassVar[bool] = True
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):

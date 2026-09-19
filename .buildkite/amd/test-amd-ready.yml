@@ -9,26 +9,39 @@ steps:
   steps:
     - label: "Simple · Model Executor Test · Shard %N/%t"
       agent_pool: mi300_1
-      parallelism: 2
+      parallelism: 3
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
+      timeout_in_minutes: 90
       commands:
         - export VLLM_ROCM_USE_AITER=0
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
-        - "pytest -sv tests/model_executor -m 'core_model and cpu' --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
+        - "pytest -sv tests/model_executor -m 'core_model and cpu and not omni' --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
 
-    - label: "Simple · Diffusion Test"
+    - label: "Simple · Omni Processor Test"
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
+      timeout_in_minutes: 60
+      commands:
+        - export VLLM_ROCM_USE_AITER=0
+        - "pytest -sv tests/model_executor/models/test_omni_processing.py -m 'core_model and cpu and omni'"
+
+    - label: "Simple · Diffusion Test · Shard %N/%t"
+      agent_pool: mi300_1
+      parallelism: 4
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 45
       commands:
         - export VLLM_ROCM_USE_AITER=0
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
-        - "pytest -sv tests/diffusion -m 'core_model and cpu'  --ignore=tests/diffusion/cache/test_teacache_extractors.py"
+        - "pytest -sv tests/diffusion -m 'core_model and cpu' --ignore=tests/diffusion/cache/test_teacache_extractors.py --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
 
     - label: "Simple · Engine&Entrypoints Test"
       agent_pool: mi300_1
@@ -69,6 +82,27 @@ steps:
 
 - group: ":card_index_dividers: Diffusion Test"
   steps:
+    # Keep real FlashAttention execution out of the CPU-marked Simple lane.
+    # AITER may need to build several kernels on a cold worker, so run one
+    # pytest worker with job-local build directories and a bounded timeout.
+    - label: "ROCm · FlashAttention/AITER GPU Coverage"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      timeout_in_minutes: 60
+      commands:
+        - export VLLM_ROCM_USE_AITER=1
+        - export AITER_JIT_DIR="/tmp/vllm-omni-aiter-$$BUILDKITE_JOB_ID"
+        - export TORCH_EXTENSIONS_DIR="/tmp/vllm-omni-torch-extensions-$$BUILDKITE_JOB_ID"
+        - mkdir -p "$$AITER_JIT_DIR" "$$TORCH_EXTENSIONS_DIR"
+        - >-
+          timeout --signal=TERM --kill-after=2m 55m
+          pytest -s -v -n 1
+          tests/diffusion/attention/
+          -m 'core_model and rocm and MI325 and cards_1'
+          --run-level "core_model"
+
     - label: "Diffusion · Batch Test"
       agent_pool: mi300_1
       depends_on: amd-build
@@ -160,6 +194,39 @@ steps:
 #     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
 #     - timeout 20m pytest -s -v tests/e2e/offline_inference/test_stable_audio_expansion.py -m "advanced_model and diffusion and L4" --run-level advanced_model
 
+- label: "ROCm · Engine & Model Executor GPU Coverage (R2-01)"
+  agent_pool: mi300_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: NonBlocking
+  timeout_in_minutes: 20
+  artifact_paths:
+    - "artifacts/rocm-r2-01/**/*"
+  commands:
+    # Native AMD tests run from /app/vllm-omni, while Buildkite uploads
+    # artifacts relative to its checkout directory.
+    - export R2_01_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-r2-01"
+    - mkdir -p "$$R2_01_ARTIFACT_DIR"
+    # The CUDA ready job also covers tests/worker/test_batched_omni_output.py.
+    # Keep the initial ROCm burn-in scoped to the requested directories.
+    # Verbose pytest output and JUnit retain node IDs without a second
+    # collection-only pass over the same GPU-backed test tree.
+    # The CUDA/L4-only CosyVoice3 ragged-flow parity test cold-JITs multiple
+    # AITER kernels on ROCm and is covered by the CUDA ready lane.
+    - >-
+      pytest -s -v -ra
+      tests/engine/ tests/model_executor/
+      -m 'core_model and cuda and not
+      (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
+      -k 'not test_code2wav_streaming_batch_matches_ragged_flow_numerics'
+      --run-level "core_model"
+      --durations=0
+      --junitxml="$$R2_01_ARTIFACT_DIR/pytest.xml"
+      2>&1 | tee "$$R2_01_ARTIFACT_DIR/pytest.log"
+    - >-
+      tail -n 100 "$$R2_01_ARTIFACT_DIR/pytest.log" >
+      "$$R2_01_ARTIFACT_DIR/pytest-summary.txt"
+
 - label: "Engine Test"
   agent_pool: mi300_1
   depends_on: amd-build
@@ -171,6 +238,71 @@ steps:
       timeout 15m bash -c '
               pytest -s -v tests/engine/test_async_omni_engine_abort.py
       '
+
+- label: "ROCm · Entrypoints GPU Coverage (R2-02)"
+  agent_pool: mi300_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: NonBlocking
+  timeout_in_minutes: 30
+  env:
+    VLLM_WORKER_MULTIPROC_METHOD: spawn
+  artifact_paths:
+    - "artifacts/rocm-r2-02/**/*"
+  commands:
+    # Native AMD tests run from /app/vllm-omni, while Buildkite uploads
+    # artifacts relative to its checkout directory.
+    - export R2_02_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-r2-02"
+    - mkdir -p "$$R2_02_ARTIFACT_DIR"
+    - >-
+      ps -eo pid=,ppid=,lstart=,stat=,comm= >
+      "$$R2_02_ARTIFACT_DIR/processes-before.txt"
+    # Verbose pytest output and JUnit retain selected node IDs without a
+    # second collection-only pass over the same GPU-backed test tree.
+    # The inner timeout leaves five minutes for teardown verification and
+    # artifact generation before the Buildkite step timeout.
+    - >-
+      timeout --signal=TERM --kill-after=1m 25m
+      pytest -s -v -ra
+      tests/entrypoints/
+      -m 'core_model and cuda and not
+      (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
+      --run-level "core_model"
+      --durations=0
+      --junitxml="$$R2_02_ARTIFACT_DIR/pytest.xml"
+      2>&1 | tee "$$R2_02_ARTIFACT_DIR/pytest.log"
+    - >-
+      tail -n 100 "$$R2_02_ARTIFACT_DIR/pytest.log" >
+      "$$R2_02_ARTIFACT_DIR/pytest-summary.txt"
+    - |
+      sleep 5
+      ps -eo pid=,ppid=,lstart=,stat=,comm= > "$$R2_02_ARTIFACT_DIR/processes-after.txt"
+      # Compare PID plus process start time so PID reuse cannot hide a leak.
+      # Double dollars preserve awk field references through Buildkite interpolation.
+      awk '
+        NR == FNR {
+          if ($$9 != "ps") {
+            baseline[$$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7] = 1
+          }
+          next
+        }
+        $$9 != "ps" {
+          identity = $$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7
+          if (!(identity in baseline)) {
+            print
+            leaked = 1
+          }
+        }
+        END {
+          if (leaked) {
+            print "status=FAIL leaked_processes_detected=1"
+            exit 1
+          }
+          print "status=PASS leaked_processes=0"
+        }
+      ' "$$R2_02_ARTIFACT_DIR/processes-before.txt" \
+        "$$R2_02_ARTIFACT_DIR/processes-after.txt" \
+        2>&1 | tee "$$R2_02_ARTIFACT_DIR/process-cleanup.txt"
 
 # - label: "Omni Model Test Qwen3-Omni"
 #   agent_pool: mi300_2
@@ -201,6 +333,12 @@ steps:
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
+      # A ROCm hardware hang aborts the interpreter with 134. Let Buildkite
+      # create one fresh pod instead of retrying on the poisoned GPU process.
+      retry:
+        automatic:
+          - exit_status: 134
+            limit: 1
       commands:
         - pytest -s -v tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py -m "slow" --run-level "core_model"
 

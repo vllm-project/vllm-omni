@@ -174,6 +174,11 @@ class VoxtralTTSForConditionalGeneration(
             return self.model.get_language_model()
         return self.model
 
+    def encoder_loaded(self):
+        if self.audio_tokenizer is not None:
+            return self.audio_tokenizer.encoder_loaded
+        return False
+
     def _enable_acoustic_transformer_cudagraph(self):
         """Initialize and capture CUDA graphs for compute_mm_logits."""
         if self.model_stage != "audio_generation" or not hasattr(self, "_vllm_config"):

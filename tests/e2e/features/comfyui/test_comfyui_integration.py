@@ -16,15 +16,19 @@ import time
 import traceback
 from collections.abc import Iterable, Sequence
 from enum import Enum
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, NamedTuple
 
+import av
 import pytest
 import requests
 import torch
 from comfy_api.input import AudioInput, VideoInput
 from comfyui_vllm_omni.nodes import (
+    VLLMOmniFastH3Deployment,
     VLLMOmniGenerateImage,
+    VLLMOmniGenerateMusic,
     VLLMOmniGenerateVideo,
     VLLMOmniTTS,
     VLLMOmniUnderstanding,
@@ -59,6 +63,7 @@ class ServerCase(NamedTuple):
     stage_list: list
     stage_configs: list[Any]
     outputs: list[OmniRequestOutput]
+    tokenizer: Any = None
 
 
 class SamplingCase(NamedTuple):
@@ -76,10 +81,13 @@ class SamplingKind(str, Enum):
     UNDERSTANDING_AR_LIST = "understanding_ar_list"
     TTS_NONE = "tts_none"
     TTS_DIFFUSION_SINGLE = "tts_diffusion_single"
+    MUSIC_NONE = "music_none"
     VIDEO_NONE = "video_none"
     VIDEO_DIFFUSION_SINGLE = "video_diffusion_single"
+    VIDEO_FASTH3 = "video_fasth3"
     VIDEO_REF2VA_IMAGE_AUDIO = "video_ref2va_image_audio"
     VIDEO_REF2VA_MULTI_VIDEO = "video_ref2va_multi_video"
+    VIDEO_REF2VA_MIXED = "video_ref2va_mixed"
 
 
 # Pre-defined arguments to be used in function calls during the tests
@@ -89,6 +97,9 @@ VIDEO_WIDTH = 32
 VIDEO_HEIGHT = 32
 VIDEO_FPS = 8
 VIDEO_NUM_FRAMES = 5
+VIDEO_DURATION = VIDEO_NUM_FRAMES / VIDEO_FPS  # 0.625 s at the generic 8 fps
+# FastH3 pins 24 fps, so the same duration is a different frame count there.
+VIDEO_FASTH3_NUM_FRAMES = round(VIDEO_DURATION * 24)
 DIFFUSION_SINGLE_SAMPLING_PARAMS = DiffusionSamplingParams(
     {
         "n": 2,
@@ -147,6 +158,13 @@ H3_MODEL_PARAMS = MiniMaxH3ModelSpecificParams(
         "flow_shift": 12.0,
     }
 )
+
+H3_STAGE_CONFIG = {
+    "stage_type": "diffusion",
+    "final_output": True,
+    "final_output_type": "video",
+    "engine_args": {"model_class_name": "MiniMaxH3Pipeline"},
+}
 
 LORA_PARAMS = {"local_path": "test_lora_path", "name": "test_name", "scale": 0.7, "int_id": 10}
 
@@ -365,6 +383,11 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
             assert len(received_sampling_params_list) == 3
             for i, expected in enumerate(AR_LIST_SAMPLING_PARAMS):
                 _assert_sampling_param_values(received_sampling_params_list[i], expected)
+        elif sampling_case.kind is SamplingKind.MUSIC_NONE:
+            assert len(received_sampling_params_list) == 2
+            assert prompt["prompt_token_ids"] == [101, 102, 103]
+            assert prompt["additional_information"]["max_audio_frames"] == [1512]
+            assert received_sampling_params_list[0].seed == 7
         elif sampling_case.kind in {SamplingKind.TTS_NONE, SamplingKind.TTS_DIFFUSION_SINGLE}:
             assert len(received_sampling_params_list) == 1
         elif sampling_case.kind is SamplingKind.VIDEO_NONE:
@@ -394,6 +417,24 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
                 LORA_PARAMS,
             )
             _assert_model_param_values(received_sampling_params_list[0], VIDEO_MODEL_PARAMS)
+        elif sampling_case.kind is SamplingKind.VIDEO_FASTH3:
+            assert len(received_sampling_params_list) == 1
+            received = received_sampling_params_list[0]
+            _assert_sampling_param_values(
+                received,
+                {
+                    "width": VIDEO_WIDTH,
+                    "height": VIDEO_HEIGHT,
+                    "num_frames": VIDEO_FASTH3_NUM_FRAMES,
+                    "fps": 24,
+                    "num_inference_steps": 4,
+                },
+            )
+            assert received.lora_request is None
+            # t2va is refused without an explicit ratio; 32x32 derives "1:1".
+            _assert_model_param_values(received, {"task": "t2va", "aspect_ratio": "1:1"})
+            assert "flow_shift" not in received.extra_args
+            assert "audio_flow_shift" not in received.extra_args
         elif sampling_case.kind is SamplingKind.VIDEO_REF2VA_IMAGE_AUDIO:
             assert len(received_sampling_params_list) == 1
             assert isinstance(prompt, dict)
@@ -419,17 +460,30 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
                     "audio_flow_shift": 3.0,
                 },
             )
-        elif sampling_case.kind is SamplingKind.VIDEO_REF2VA_MULTI_VIDEO:
+        elif sampling_case.kind in (SamplingKind.VIDEO_REF2VA_MULTI_VIDEO, SamplingKind.VIDEO_REF2VA_MIXED):
             assert len(received_sampling_params_list) == 1
             assert isinstance(prompt, dict)
             multi_modal_data = prompt.get("multi_modal_data")
             assert isinstance(multi_modal_data, dict)
             input_videos = multi_modal_data.get("video")
             assert isinstance(input_videos, list)
-            assert len(input_videos) == 2
             assert all(isinstance(path, str) for path in input_videos)
-            assert "image" not in multi_modal_data
-            assert "audio" not in multi_modal_data
+            if sampling_case.kind is SamplingKind.VIDEO_REF2VA_MULTI_VIDEO:
+                assert len(input_videos) == 2
+                assert "image" not in multi_modal_data
+                assert "audio" not in multi_modal_data
+            else:
+                assert [Path(path).read_bytes() for path in input_videos] == [b"video-1", b"video-2", b"video-3"]
+                images = multi_modal_data.get("image")
+                assert isinstance(images, list)
+                assert len(images) == 6
+                assert [image.getpixel((0, 0)) for image in images] == [(i * 40,) * 3 for i in range(1, 7)]
+                audios = multi_modal_data.get("audio")
+                assert isinstance(audios, list)
+                assert len(audios) == 3
+                for path, sample_rate in zip(audios, (24000, 32000, 48000)):
+                    with av.open(path) as container:
+                        assert container.streams.audio[0].sample_rate == sample_rate
             _assert_sampling_param_values(
                 received_sampling_params_list[0],
                 {
@@ -479,11 +533,16 @@ def mock_async_omni(
     # Need to mock AsyncOmni itself (not only its generate method) because
     # 1. The API layer uses its stage_list and stage_configs attributes
     # 2. Its __init__ method has slow side effects (model & config loading).
+    # These cases use the non-duplex mock engine without loading model configs.
+    mocker.patch("vllm_omni.entrypoints.openai.api_server._should_serve_duplex", return_value=False)
     mock_async_omni_cls = mocker.patch("vllm_omni.entrypoints.openai.api_server.AsyncOmni")
     monkeypatch.setattr(
         "vllm_omni.entrypoints.openai.serving_chat.OmniOpenAIServingChat._preprocess_chat",
         _mock_preprocess_chat,
     )
+
+    if server_case.tokenizer is not None:
+        mocker.patch("transformers.AutoTokenizer.from_pretrained", return_value=server_case.tokenizer)
 
     mock_instance = mocker.AsyncMock(spec=RealAsyncOmni)
     mock_instance.generate = _build_mock_outputs(server_case.outputs, sampling_case, server_case)
@@ -512,7 +571,7 @@ def mock_async_omni(
     mock_instance.shutdown = mocker.MagicMock()
     mock_instance.get_vllm_config = mocker.AsyncMock(return_value=None)
     mock_instance.get_supported_tasks = mocker.AsyncMock(return_value=["generate"])
-    mock_instance.get_tokenizer = mocker.AsyncMock(return_value=None)
+    mock_instance.get_tokenizer = mocker.AsyncMock(return_value=server_case.tokenizer)
 
     mock_async_omni_cls.return_value = mock_instance
     yield mock_async_omni_cls
@@ -861,7 +920,7 @@ async def test_video_generation_node(api_server: str, model: str, image_input: b
         "width": VIDEO_WIDTH,
         "height": VIDEO_HEIGHT,
         "fps": VIDEO_FPS,
-        "num_frames": VIDEO_NUM_FRAMES,
+        "duration": VIDEO_DURATION,
         "model_params": VIDEO_MODEL_PARAMS,
     }
     if image_input:
@@ -880,13 +939,74 @@ async def test_video_generation_node(api_server: str, model: str, image_input: b
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "server_case,sampling_case,ref_mode",
+    "server_case,deployment_model",
     [
         pytest.param(
             ServerCase(
                 served_model="MiniMaxAI/MiniMax-H3",
                 stage_list=["diffusion"],
                 stage_configs=[{"stage_type": "diffusion", "final_output": True, "final_output_type": "video"}],
+                outputs=[_build_diffusion_video_output()],
+            ),
+            "MiniMaxAI/MiniMax-H3",
+            id="canonical_model_name",
+        ),
+        pytest.param(
+            ServerCase(
+                served_model="fasth3",
+                stage_list=["diffusion"],
+                stage_configs=[{"stage_type": "diffusion", "final_output": True, "final_output_type": "video"}],
+                outputs=[_build_diffusion_video_output()],
+            ),
+            "fasth3",
+            # A --served-model-name alias lookup_model_spec cannot resolve to H3. The
+            # request must still be built by the H3 params builder, or it goes out
+            # without the aspect_ratio (and task) a t2va request is refused without.
+            id="served_model_alias",
+        ),
+    ],
+    indirect=["server_case"],
+)
+@pytest.mark.parametrize(
+    "sampling_case",
+    [SamplingCase(kind=SamplingKind.VIDEO_FASTH3, sampling_params=DIFFUSION_VIDEO_SINGLE_SAMPLING_PARAMS)],
+    indirect=True,
+)
+async def test_fast_h3_deployment_node(api_server: str, sampling_case: SamplingCase, deployment_model: str):
+    deployment_node = VLLMOmniFastH3Deployment()
+    (deployment,) = deployment_node.get_deployment(
+        url=api_server,
+        model=deployment_model,
+    )
+
+    result = await VLLMOmniGenerateVideo().generate(
+        url="http://ignored.invalid/v1",
+        model="ignored-model",
+        prompt="A singer performs on a neon-lit stage.",
+        negative_prompt="",
+        width=VIDEO_WIDTH,
+        height=VIDEO_HEIGHT,
+        fps=VIDEO_FPS,
+        duration=VIDEO_DURATION,
+        sampling_params=sampling_case.sampling_params,
+        model_params=H3_MODEL_PARAMS,
+        fast_h3=deployment,
+    )
+
+    assert isinstance(result, tuple)
+    assert len(result) == 1
+    assert isinstance(result[0], VideoInput)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "server_case,sampling_case,ref_mode",
+    [
+        pytest.param(
+            ServerCase(
+                served_model="MiniMaxAI/MiniMax-H3",
+                stage_list=["diffusion"],
+                stage_configs=[H3_STAGE_CONFIG],
                 outputs=[_build_diffusion_video_output()],
             ),
             SamplingCase(kind=SamplingKind.VIDEO_REF2VA_IMAGE_AUDIO, sampling_params=None),
@@ -897,12 +1017,23 @@ async def test_video_generation_node(api_server: str, model: str, image_input: b
             ServerCase(
                 served_model="MiniMaxAI/MiniMax-H3",
                 stage_list=["diffusion"],
-                stage_configs=[{"stage_type": "diffusion", "final_output": True, "final_output_type": "video"}],
+                stage_configs=[H3_STAGE_CONFIG],
                 outputs=[_build_diffusion_video_output()],
             ),
             SamplingCase(kind=SamplingKind.VIDEO_REF2VA_MULTI_VIDEO, sampling_params=None),
             "multi_video",
             id="ref2va-multi-video",
+        ),
+        pytest.param(
+            ServerCase(
+                served_model="MiniMaxAI/MiniMax-H3",
+                stage_list=["diffusion"],
+                stage_configs=[H3_STAGE_CONFIG],
+                outputs=[_build_diffusion_video_output()],
+            ),
+            SamplingCase(kind=SamplingKind.VIDEO_REF2VA_MIXED, sampling_params=None),
+            "mixed",
+            id="ref2va-mixed-12-references",
         ),
     ],
     indirect=["server_case", "sampling_case"],
@@ -933,6 +1064,17 @@ async def test_video_generation_node_minimax_h3_ref2va(
         prompt = (
             "Remove the green screen background of Video 1 and replace it with the fairytale environment from Video 2."
         )
+    elif ref_mode == "mixed":
+        inputs = {f"image_{i}": torch.full((1, VIDEO_HEIGHT, VIDEO_WIDTH, 3), i * 40 / 255) for i in range(1, 7)}
+        inputs.update({f"video_{i}": VideoInput(f"video-{i}".encode()) for i in range(1, 4)})
+        inputs.update(
+            {
+                f"audio_{i}": {"waveform": torch.zeros(1, 1, sample_rate), "sample_rate": sample_rate}
+                for i, sample_rate in enumerate((24000, 32000, 48000), start=1)
+            }
+        )
+        (references,) = refs_node.get_references(**inputs)
+        prompt = "Combine the subjects from the images with the reference videos and audio clips."
     else:
         raise AssertionError(f"Unknown ref_mode: {ref_mode}")
 
@@ -944,7 +1086,7 @@ async def test_video_generation_node_minimax_h3_ref2va(
         width=VIDEO_WIDTH,
         height=VIDEO_HEIGHT,
         fps=VIDEO_FPS,
-        num_frames=VIDEO_NUM_FRAMES,
+        duration=VIDEO_DURATION,
         references=references,
         model_params=H3_MODEL_PARAMS,
     )
@@ -952,3 +1094,66 @@ async def test_video_generation_node_minimax_h3_ref2va(
     assert isinstance(result, tuple)
     assert len(result) == 1
     assert isinstance(result[0], VideoInput)
+
+
+def _build_music_tokenizer():
+    # Checkpoint token IDs required by the API adapter's tokenizer validation.
+    special_token_ids = {
+        "<|im_start|>": 151644,
+        "<|im_end|>": 151645,
+        "<|audio_cfg|>": 151654,
+        "<|audio_start|>": 151669,
+        "<|audio_end|>": 151670,
+        "<|caption_start|>": 151671,
+        "<|caption_end|>": 151672,
+        "<|lyrics_start|>": 151673,
+        "<|lyrics_end|>": 151674,
+    }
+
+    def encode(prompt):
+        assert prompt == (
+            "<|im_start|><|caption_start|>Warm acoustic pop at 92 BPM"
+            "<|caption_end|><|lyrics_start|>[start]\n[verse]\nThe morning light"
+            "<|lyrics_end|><|im_end|><|audio_start|>"
+        )
+        return [101, 102, 103]
+
+    return SimpleNamespace(encode=encode, convert_tokens_to_ids=special_token_ids.get)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "server_case",
+    [
+        ServerCase(
+            served_model="MiniMaxAI/MiniMax-Music3",
+            stage_list=["llm", "llm"],
+            stage_configs=[
+                _make_stage_config("llm", model_stage="minimax_music3_ar"),
+                _make_stage_config("llm", model_stage="minimax_music3_acoustic"),
+            ],
+            outputs=[_build_audio_speech_output()],
+            tokenizer=_build_music_tokenizer(),
+        )
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "sampling_case",
+    [SamplingCase(kind=SamplingKind.MUSIC_NONE, sampling_params=None)],
+    indirect=True,
+)
+async def test_music_generation_node_minimax_music3(api_server: str, sampling_case: SamplingCase):
+    result = await VLLMOmniGenerateMusic().generate(
+        url=api_server,
+        model="MiniMaxAI/MiniMax-Music3",
+        lyrics="[Verse]\nThe morning light",
+        instructions="Warm acoustic pop at 92 BPM",
+        max_duration_seconds=60.5,
+        seed=7,
+        response_format="wav",
+    )
+    assert isinstance(result, tuple)
+    assert len(result) == 1
+    assert result[0]["sample_rate"] == 24000
+    assert result[0]["waveform"].shape == (1, 1, 24000)

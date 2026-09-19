@@ -50,6 +50,14 @@ WebSocket /v1/video/chat/stream
 | Server -> Client | `session.done` | none | Session closed. |
 | Server -> Client | `error` | `message` | Recoverable protocol or generation error. |
 
+### Frame Consumption Reporting
+
+When buffered frames include client-supplied `frame_id` values, the server emits `video.frames.consumed` after the first engine output. Its `frame_ids`, `frames`, and `latest_pts_ms` describe the images included in that query's prompt.
+
+Queries stride-sample the buffered frames, keeping the last frame, then exclude frames already known to have failed decoding. Excluded frames are not replaced with other buffered frames. Frames whose background decoding has not finished remain eligible through the image URL path.
+
+**Bugfix compatibility note:** `video.frames.consumed` now excludes known decode failures that were already excluded from the prompt. Older versions could report those frames and their timestamps as consumed. The event name and fields are unchanged; an empty selection reports empty lists and `latest_pts_ms: null`.
+
 ### `session.config` Fields
 
 | Field | Type | Default | Description |
@@ -60,9 +68,23 @@ WebSocket /v1/video/chat/stream
 | `max_frames` | integer, 1-256 | `50` | Maximum retained frame buffer size. Oldest frames are evicted first. |
 | `system_prompt` | string or null | null | Optional custom system prompt. |
 | `use_audio_in_video` | bool | `true` | Include streamed audio chunks in multimodal video understanding when audio is present. |
-| `sampling_params_list` | list or null | null | Optional per-stage sampling parameter overrides. |
+| `sampling_params_list` | list or null | null | Optional per-stage parameter dictionaries. Each provided entry replaces that stage's deployment sampling settings. |
 | `enable_frame_filter` | bool | `true` | Enable EVS near-duplicate frame filtering. |
 | `frame_filter_threshold` | float, 0.0-1.0 | `0.95` | EVS similarity threshold. Higher keeps more frames; lower drops more near-duplicates. |
+
+Sampling parameter bugfix: `sampling_params_list` is now forwarded to the engine;
+earlier versions accepted this field but silently used deployment defaults instead.
+Each provided entry constructs a fresh `SamplingParams` for that stage in pipeline
+order; it is not merged with that stage's deployment defaults. Fields absent from a
+provided entry use `SamplingParams` constructor defaults. Only omitted trailing
+stages keep their deployment defaults. An omitted, `null`, or empty list keeps the
+engine defaults. Invalid sampling parameters return an `error` when the query is
+submitted.
+
+For example, `[{"temperature": 0.2, "max_tokens": 64}]` configures the thinker while
+the talker and code2wav retain their deployment defaults. With only
+`[{"temperature": 0.2}]`, the thinker's `max_tokens` and `top_p` use constructor
+defaults, not its YAML values.
 
 ### Legacy Aliases
 

@@ -612,6 +612,15 @@ class ZImageTransformer2DModel(CachedTransformer):
         Note: Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in diffusers.
     """
 
+    # Fused projections and their checkpoint shard names (mirrors
+    # stacked_params_mapping in load_weights). ``w13`` is the Z-Image FFN
+    # fusion of ``w1``/``w3``; declared here so quantized-checkpoint adapters
+    # can resolve shard keys without a framework-level default entry.
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+        "w13": ["w1", "w3"],
+    }
+
     _repeated_blocks = ["ZImageTransformerBlock"]
     _layerwise_offload_blocks_attrs = ["layers"]
 

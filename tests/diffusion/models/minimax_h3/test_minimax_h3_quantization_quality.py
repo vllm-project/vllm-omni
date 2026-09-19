@@ -175,7 +175,7 @@ def _generate_joint_output(omni, config: QualityTestConfig):
         pytest.param(
             _QUALITY_CONFIG,
             id=_QUALITY_CONFIG.id,
-            marks=hardware_marks(res={"cuda": _QUALITY_CONFIG.gpu}, num_cards=2),
+            marks=hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=2),
         )
     ],
 )
@@ -186,10 +186,15 @@ def test_minimax_h3_quantization_quality(config: QualityTestConfig):
     common_kwargs = {
         "model": model_ref,
         "enforce_eager": True,
-        "tensor_parallel_size": 2,
         # The fused BF16 baseline only fits on H100-80GB with encoder TP.
+        # This test loads the direct FL2VA diffusion pipeline (not the
+        # disaggregated two-stage MiniMax-H3 pipeline), so configure both the
+        # DiT world and the Qwen3-VL encoder TP explicitly.
+        "tensor_parallel_size": 2,
         "text_encoder_tp_size": 2,
         "vae_use_tiling": True,
+        # MiniMax H3's VAE is implemented by code shipped with the checkpoint.
+        "trust_remote_code": True,
     }
 
     omni_bl = Omni(**common_kwargs)
