@@ -1344,3 +1344,76 @@ them out into typed events before they reach a client.
   turn-based HTTP routes report "not available" in duplex mode. To use the
   ordinary online serving stack, select `session_mode: turn` as described in
   [Full Duplex](full_duplex_api.md#enable-full-duplex).
+
+## Client wire traces
+
+The public `DuplexClient` accepts an optional `DuplexTrace` for offline
+troubleshooting. Create one trace per client and export it after the session:
+
+```python
+import asyncio
+
+from vllm_omni.clients.duplex import DuplexClient
+from vllm_omni.clients.duplex_trace import DuplexTrace
+
+trace = DuplexTrace(max_events=4096)
+try:
+    async with DuplexClient(url, model=model, config=config, trace=trace) as client:
+        # Use your existing input and response loop here.
+        ...
+finally:
+    await asyncio.to_thread(trace.write_json, "duplex-trace.json")
+```
+
+`url`, `model`, and `config` are your existing connection settings. The trace
+adds no file I/O to the client's send/receive loop. `write_json()` is synchronous;
+use it after the event loop exits or call it through `asyncio.to_thread()` after
+the client has stopped recording, as above.
+
+The JSON snapshot contains:
+
+- `schema_version: 1` and `clock: "client_monotonic"`.
+- `events`: wire metadata with `index`, `elapsed_s`, `direction`, event type,
+  and available identifiers, sequence numbers, playback position, sample rate,
+  response status, or error code.
+- `total_events` and `dropped_events`: the recorder retains the newest
+  `max_events` records. Event counts and response milestones cover only those
+  retained records; a nonzero drop count means the trace is incomplete.
+- `event_counts`: counts keyed by direction and event type, such as
+  `receive:response.done`.
+- `responses`: first observed `created_s`, `first_audio_s`, `cancel_sent_s`,
+  and `done_s` for each explicitly identified response, plus terminal status
+  when supplied. Missing milestones remain absent. A cancel without an explicit
+  response ID stays in the event list and is not attributed to a guessed response.
+
+All times are seconds relative to the first recorded event. Send timestamps
+mark successful completion of the local WebSocket send; they do not acknowledge
+server acceptance. Failed sends are not recorded. Receive timestamps mark JSON
+decoding at the client, before replay deduplication. Resume handshake events and
+replayed wire events are included; the synthetic `connection.resumed` event is
+not. Counts therefore are not counts of unique responses. Malformed JSON and
+binary frames are outside this trace's scope.
+
+`first_audio_s` records receipt of the first audio-delta event, even if its
+payload is empty. It does not measure audible playback or server inference
+latency. Likewise, `cancel_sent_s` does not establish that cancellation succeeded;
+inspect the terminal event and subsequent wire events. The trace is diagnostic
+metadata, not a substitute for the benchmark's request metrics.
+
+Only selected scalar metadata is retained. Audio, images, text/transcripts,
+instructions, resume tokens, and free-form error messages are omitted. Strings
+longer than 256 characters are omitted rather than truncated, preserving the
+identity of retained response IDs. The resulting file still contains identifiers
+and event timing; it is not an anonymized report or a replayable model input.
+
+Inspect the result without connecting to a server:
+
+```python
+import json
+from pathlib import Path
+
+report = json.loads(Path("duplex-trace.json").read_text())
+print(report["dropped_events"], report["event_counts"])
+for response in report["responses"]:
+    print(response)
+```
