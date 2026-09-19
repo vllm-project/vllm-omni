@@ -304,6 +304,12 @@ _OMNI_MODELS = {
         "gepard_talker",
         "GepardTalkerForConditionalGeneration",
     ),
+    ## VibeVoice
+    "VibeVoiceForConditionalGeneration": (
+        "vibevoice",
+        "vibevoice",
+        "VibeVoiceForConditionalGeneration",
+    ),
     ## audio8_tts (Audio8 TTS Preview 0.6B)
     "Audio8TTSSlowARForConditionalGeneration": (
         "audio8_tts",

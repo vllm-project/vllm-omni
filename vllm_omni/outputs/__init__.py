@@ -54,7 +54,7 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
             to the orchestrator output processor.
     """
 
-    multimodal_outputs: list[dict[str, object]] | None = None
+    multimodal_outputs: list[dict[str, object] | None] | None = None
     inter_stage_outputs: list[dict[str, Any] | None] | None = None
     # IDs of requests whose KV cache has been extracted from GPU/NPU to CPU.
     # The Scheduler can safely free the block tables for these requests.
