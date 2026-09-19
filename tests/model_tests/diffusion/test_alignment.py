@@ -32,6 +32,7 @@ EXCLUDED_MODELS = [
     # dedicated MammothModa2 bridge/pipeline tests and real-checkpoint E2E.
     "MammothModa2DiTPipeline",
     "WanPipeline",
+    "SkyReelsV2Pipeline",
     "WanDMDPipeline",
     "WanVACEPipeline",
     "LTX2TwoStagePipeline",
