@@ -71,6 +71,11 @@ class ForwardContext:
     # runtime length all-gather. Pushed on split, popped on gather.
     _sp_equal_pad_stack: list[bool] = field(default_factory=list)
 
+    # Different sequence streams (e.g. video
+    # vs audio) can register their own keys so that their respective gather
+    # hooks trim the correct amount of padding without interfering with each other.
+    sp_pad_info: dict[str, tuple[int, int]] | None = None
+
     @property
     def sp_active(self) -> bool:
         """Returns True when SP attention parallelism should be enabled.
