@@ -1141,26 +1141,18 @@ def test_online_action_path_rejects_escape_from_trusted_root(escape_kind: str, t
         )
 
 
-def test_online_action_path_uses_environment_root_fallback(monkeypatch, tmp_path: Path) -> None:
+def test_online_action_path_ignores_removed_environment_root(monkeypatch, tmp_path: Path) -> None:
     module = _load_pipeline_module()
     root = tmp_path / "trusted"
-    action_dir = root / "forward"
-    action_dir.mkdir(parents=True)
+    (root / "forward").mkdir(parents=True)
     monkeypatch.setenv("VLLM_OMNI_LINGBOT_ACTION_ROOT", str(root))
-    resolved_actions = []
-    module.load_camera_trajectory = lambda action: (
-        resolved_actions.append(action) or _CameraTrajectory(torch.eye(4).repeat(9, 1, 1), torch.ones(9, 4))
-    )
 
-    request = _preprocess_request(
-        module,
-        sampling=_SamplingParams(extra_args={"action_path": "forward"}),
-        od_config=_od_config(model_config={}),
-    )
-
-    assert request.sampling_params.extra_args["_lingbot_camera_trajectory"] is not None
-    assert resolved_actions[0].root == root.resolve()
-    assert resolved_actions[0].relative == Path("forward")
+    with pytest.raises(ValueError, match="lingbot_action_root"):
+        _preprocess_request(
+            module,
+            sampling=_SamplingParams(extra_args={"action_path": "forward"}),
+            od_config=_od_config(model_config={}),
+        )
 
 
 def test_online_action_path_error_suppresses_path_bearing_filesystem_cause(tmp_path: Path) -> None:
@@ -1202,7 +1194,7 @@ def test_online_action_path_unknown_user_is_sanitized(source: str, tmp_path: Pat
 def test_action_path_requires_a_trusted_root_for_every_request() -> None:
     module = _load_pipeline_module()
 
-    with pytest.raises(ValueError, match="lingbot_action_root|VLLM_OMNI_LINGBOT_ACTION_ROOT"):
+    with pytest.raises(ValueError, match="lingbot_action_root"):
         _preprocess_request(module, od_config=_od_config(model_config={}))
 
 
