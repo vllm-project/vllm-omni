@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Copyright 2025 Alibaba Ovis-Image Team and The HuggingFace Team. All rights reserved.
 #
@@ -41,6 +41,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.ovis_image.ovis_image_transformer import OvisImageTransformer2DModel
+from vllm_omni.diffusion.models.ovis_image.quantization import prepare_ovis_text_encoder_fp8
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
@@ -189,6 +190,8 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMi
             local_files_only=local_files_only,
             torch_dtype=od_config.dtype,
         )
+
+        prepare_ovis_text_encoder_fp8(self.text_encoder, od_config.quantization_config, self._execution_device)
 
         self.vae = from_pretrained_with_prefetch(
             AutoencoderKL.from_pretrained,
