@@ -43,6 +43,18 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# torch.compile ``mode`` values accepted by ``diffusion_compile_mode``.
+# Mirrors torch._inductor.list_mode_options(); kept as an explicit frozenset so
+# a typo in a deploy YAML fails at config build rather than on the first request.
+DIFFUSION_COMPILE_MODES = frozenset(
+    {
+        "default",
+        "reduce-overhead",
+        "max-autotune",
+        "max-autotune-no-cudagraphs",
+    }
+)
+
 
 def normalize_omni_diffusion_kwargs(raw_kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize legacy diffusion kwargs before config construction."""
@@ -925,6 +937,9 @@ class OmniDiffusionConfig:
     # provide its own setup_compile() implementation.
     diffusion_compile_granularity: str = "regional"
     diffusion_compile_dynamic: bool = True
+    # torch.compile ``mode``. Applies both to the generic compilation path and
+    # to pipelines that implement their own setup_compile().
+    diffusion_compile_mode: str = "default"
 
     # Parallel weight loading (for faster diffusion model startup)
     enable_multithread_weight_load: bool = True
@@ -1147,6 +1162,11 @@ class OmniDiffusionConfig:
             )
         if not isinstance(self.diffusion_compile_dynamic, bool):
             raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
+        if self.diffusion_compile_mode not in DIFFUSION_COMPILE_MODES:
+            raise ValueError(
+                f"diffusion_compile_mode must be one of {sorted(DIFFUSION_COMPILE_MODES)}, "
+                f"got {self.diffusion_compile_mode!r}"
+            )
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
         if self.diffusion_kv_max_rows_per_request is not None and (
             type(self.diffusion_kv_max_rows_per_request) is not int or self.diffusion_kv_max_rows_per_request <= 0
