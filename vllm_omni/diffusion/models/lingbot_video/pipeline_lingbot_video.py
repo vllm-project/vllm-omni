@@ -317,13 +317,46 @@ class LingBotVideoPipeline(
 
     supports_step_execution: ClassVar[bool] = False
     max_outputs_per_prompt: ClassVar[int] = 1
+    default_num_inference_steps: ClassVar[int] = 40
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
 
+    @staticmethod
+    def _validate_cache_dit_configuration(od_config: OmniDiffusionConfig) -> None:
+        if str(getattr(od_config, "cache_backend", "none") or "none").lower() != "cache_dit":
+            return
+
+        parallel_config = od_config.parallel_config
+        unsupported = [
+            name
+            for enabled, name in (
+                (parallel_config.pipeline_parallel_size > 1, "pipeline parallelism"),
+                (parallel_config.tensor_parallel_size > 1, "tensor parallelism"),
+                (parallel_config.enable_expert_parallel, "expert parallelism"),
+                ((parallel_config.sequence_parallel_size or 1) > 1, "sequence parallelism"),
+                (parallel_config.cfg_parallel_size > 1, "CFG parallelism"),
+                (parallel_config.use_hsdp, "HSDP"),
+                (od_config.enable_cpu_offload, "CPU offload"),
+                (od_config.enable_layerwise_offload, "layerwise offload"),
+                (
+                    od_config.enable_distributed_layerwise_offload,
+                    "distributed layerwise offload",
+                ),
+            )
+            if enabled
+        ]
+        if unsupported:
+            raise ValueError(
+                "LingBot Cache-DiT does not support the following combinations: "
+                + ", ".join(unsupported)
+                + ". Use an unsharded, resident DiT stage."
+            )
+
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
         del prefix
+        self._validate_cache_dit_configuration(od_config)
         self.od_config = od_config
         self.device = get_local_device()
         self.vae_scale_factor_temporal = 4
@@ -382,6 +415,31 @@ class LingBotVideoPipeline(
         self.set_progress_bar_config(disable=bool(model_config.get("quiet_progress", True)))
         self.default_negative_prompt = DEFAULT_NEGATIVE_PROMPT
         self.default_image_negative_prompt = DEFAULT_NEGATIVE_PROMPT_IMAGE
+
+    def _validate_cache_dit_request(
+        self,
+        *,
+        guidance_scale: float,
+        batch_cfg: bool,
+        t_thresh: float | None,
+        is_dummy_run: bool,
+    ) -> None:
+        cache_backend = str(getattr(self.od_config, "cache_backend", "none") or "none").lower()
+        if is_dummy_run or cache_backend != "cache_dit":
+            return
+
+        unsupported = []
+        if guidance_scale <= 1.0:
+            unsupported.append("guidance_scale <= 1")
+        if batch_cfg:
+            unsupported.append("batch_cfg=true")
+        if t_thresh is not None:
+            unsupported.append("t_thresh")
+        if unsupported:
+            raise ValueError(
+                "LingBot Cache-DiT requires sequential two-pass CFG; "
+                "unsupported request options: " + ", ".join(unsupported)
+            )
 
     def to(self, *args, **kwargs):
         device, dtype, non_blocking, _ = torch._C._nn._parse_to(*args, **kwargs)
@@ -826,6 +884,12 @@ class LingBotVideoPipeline(
                 default_image_negative_prompt=self.default_image_negative_prompt,
                 default_shift=default_shift,
                 default_output_type=default_output_type,
+            )
+            self._validate_cache_dit_request(
+                guidance_scale=request_config.guidance_scale,
+                batch_cfg=bool(extra_args.get("batch_cfg", False)),
+                t_thresh=extra_args.get("t_thresh"),
+                is_dummy_run=request.is_dummy_run(),
             )
         except (TypeError, ValueError) as exc:
             raise OmniClientError(str(exc)) from exc
