@@ -49,6 +49,54 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
 
 See [`bagel.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/deploy/bagel.yaml) for the default two-stage deploy configuration.
 
+#### Optional AR image-encoder CUDA Graph
+
+The AR stage can use upstream vLLM's encoder CUDA Graph manager for
+`img2text`. It captures the fixed-resolution ViT, connector, and positional
+embedding addition. The released checkpoint resizes images to 980×980,
+producing 4900 tokens per image; graph budgets therefore control image batch
+capacity, not image resolution. This integration uses the vLLM 0.29 protocol
+and does not require capture axes.
+
+For example, capture capacities for one and two images on Stage 0:
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
+    --stage-overrides '{"0":{"compilation_config":{"cudagraph_mm_encoder":true,"encoder_cudagraph_token_budgets":[4900,9800],"encoder_cudagraph_max_vision_items_per_batch":2}}}'
+```
+
+Leave `cudagraph_mm_encoder` disabled to retain the existing eager path.
+The manager falls back to eager when one image exceeds every captured token
+budget. Different image dimensions are not additional supported graph tiers:
+the model requires its configured ViT input size. The `img2img` VAE/RoPE path
+and the single-stage diffusion pipeline are outside this encoder capture.
+
+Encoder latency depends on hardware and batch size; enabling graphs does
+not guarantee a speedup. To measure the encoder separately from the LM and
+serving stack, run from the repository root with a downloaded checkpoint:
+
+```bash
+python benchmarks/encoder/benchmark_bagel_encoder_cudagraph.py \
+    --model /path/to/BAGEL-7B-MoT \
+    --weights /path/to/BAGEL-7B-MoT/ema.safetensors \
+    --batch-sizes 1 2 --arm both --output encoder-screen.json
+```
+
+This loads only the ViT and connector, verifies eager/graph embeddings, and
+reports raw wall-clock samples including graph dispatch and copies. Use
+`--arm eager` and `--arm graph` in separate processes for independent
+measurements. These encoder-only results are not TTFT or serving throughput.
+
+The focused tests need the matching vLLM runtime. CPU tests do not load
+checkpoint weights; CUDA tests use a small SigLIP on one GPU:
+
+```bash
+pytest tests/model_executor/models/test_bagel_encoder_cudagraph.py \
+    -m 'core_model and cpu' --run-level core_model
+pytest tests/model_executor/models/test_bagel_encoder_cudagraph_gpu.py \
+    -m 'core_model and cuda' --run-level core_model
+```
+
 ### Single-Stage
 
 The DiT stage contains a full LLM, ViT, VAE, and tokenizer, so it can handle all modalities (text2img, img2img, img2text, text2text, think) without a separate Thinker stage:
