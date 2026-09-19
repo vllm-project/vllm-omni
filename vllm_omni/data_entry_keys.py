@@ -391,19 +391,31 @@ def _serialize_tensor(t: torch.Tensor) -> AdditionalInformationEntry:
     )
 
 
+_NAME_TO_TORCH_DTYPE: dict[str, torch.dtype] = {v: k for k, v in _DTYPE_TO_NAME.items()}
+
+
+def _resolve_torch_dtype(name: str) -> torch.dtype:
+    """Resolve a dtype name to a torch.dtype, falling back to getattr."""
+    dt = _NAME_TO_TORCH_DTYPE.get(name)
+    if dt is not None:
+        return dt
+    dt = getattr(torch, name, None)
+    if dt is not None and isinstance(dt, torch.dtype):
+        return dt
+    raise ValueError(f"Unsupported tensor dtype: {name}")
+
+
 def _deserialize_tensor(entry: AdditionalInformationEntry) -> torch.Tensor:
     dtype_name = entry.tensor_dtype or "float32"
-    dtype = getattr(torch, dtype_name, None)
-    if not isinstance(dtype, torch.dtype):
-        raise ValueError(f"Unsupported tensor dtype: {dtype_name}")
+    target_dtype = _resolve_torch_dtype(dtype_name)
 
     if entry.tensor_shape is None:
         raise ValueError("Tensor shape is required")
     if not entry.tensor_data:
-        return torch.empty(0, dtype=dtype).reshape(entry.tensor_shape)
+        return torch.empty(0, dtype=target_dtype).reshape(entry.tensor_shape)
 
     data = torch.frombuffer(bytearray(entry.tensor_data), dtype=torch.uint8)
-    return data.view(dtype).reshape(entry.tensor_shape)
+    return data.view(target_dtype).reshape(entry.tensor_shape)
 
 
 def serialize_payload(
