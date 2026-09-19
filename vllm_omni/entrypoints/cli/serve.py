@@ -891,6 +891,20 @@ class OmniServeCommand(CLISubcommand):
             help="Compatibility option; use layer_options.dit.resident_layers in new configurations.",
         )
         omni_config_group.add_argument(
+            "--dlo-chunk-size-mb",
+            type=int,
+            default=64,
+            help="Full-chunk target size in MiB for distributed layerwise offload "
+            "(each chunk is one host-to-device copy + AllGather unit).",
+        )
+        omni_config_group.add_argument(
+            "--dlo-attention-head-buckets",
+            type=int,
+            default=0,
+            help="Overlap attention AlltoAll with computation using this many head buckets "
+            "(0 disables; currently supports dense MiniMax H3 on NPU with DLO).",
+        )
+        omni_config_group.add_argument(
             "--host-weight-runtime-mode",
             choices=("disabled", "preferred", "required"),
             default="disabled",

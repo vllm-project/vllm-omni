@@ -51,6 +51,7 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
 )
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.engine.stage_engine_startup import _serialize_stage_config
 from vllm_omni.engine.stage_init_utils import build_legacy_engine_args_dict
@@ -1768,6 +1769,24 @@ def test_compact_offload_config_is_validated_during_projection():
                 "components": ["dit"],
             }
         )
+
+
+def test_dlo_chunk_size_survives_cli_and_deploy_into_structured_config():
+    cli_config = _from_pipeline_key("hunyuan_image3_dit", cli_overrides={"dlo_chunk_size_mb": 32})
+    assert cli_config.stage_by_id(0).diffusion_config.dlo_chunk_size_mb == 32
+
+    pipeline = _resolve_pipeline_or_skip("hunyuan_image3_dit")
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, dlo_chunk_size_mb=128)])
+    deploy_config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    assert deploy_config.stage_by_id(0).diffusion_config.dlo_chunk_size_mb == 128
+
+
+@pytest.mark.parametrize("chunk_size_mb", [0, -1])
+def test_dlo_chunk_size_rejects_non_positive_values(chunk_size_mb):
+    with pytest.raises(ValidationError):
+        omni_config_module._DiffusionConfigProjection(dlo_chunk_size_mb=chunk_size_mb)
+    with pytest.raises(ValueError, match="dlo_chunk_size_mb must be a positive integer"):
+        OmniDiffusionConfig(dlo_chunk_size_mb=chunk_size_mb)
 
 
 @pytest.mark.parametrize("pipeline_async", [True, False])
