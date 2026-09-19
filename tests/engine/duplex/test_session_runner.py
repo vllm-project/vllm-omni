@@ -162,7 +162,7 @@ class Harness:
 
     def deliver(
         self,
-        output: object,
+        output: Any,
         *,
         stage_id: int = 1,
         segment_finished: bool = False,
@@ -1033,7 +1033,7 @@ async def test_conversation_items_can_be_injected_and_deleted() -> None:
         await close_harness(h)
 
 
-def _stage_metrics_of(event: object) -> dict[str, dict[str, object]]:
+def _stage_metrics_of(event: DuplexEvent) -> dict[str, dict[str, object]]:
     """Per-stage engine metrics as the client reads them off one wire event."""
     payload = event.to_realtime()
     metadata = payload.get("metadata")
@@ -1191,5 +1191,61 @@ async def test_server_vad_speech_stopped_still_commits_a_turn_mode_session() -> 
         assert "input_audio_buffer.speech_stopped" in types(events)
         assert "input_audio_buffer.committed" in types(events)
         assert len(_final_submissions(h)) == 1, "the detector's stop commits the turn and starts the response"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_committed_turn_does_not_abort_the_next_commit() -> None:
+    """A concluded turn's failure stays with that turn.
+
+    The append tail keeps the last append task, and a completed failed task is
+    no longer in ``append_tasks``, so ``cancel_append_tasks`` can never clear
+    it. A plugin that only appends on commit (Qwen) never runs the
+    ``_start_append`` path that drops a failed predecessor either, so every
+    later commit inherited that ``False`` and answered ``commit_aborted`` for
+    the rest of the session.
+    """
+    h = await open_harness(auto_response=False)
+    try:
+        await h.run(append_audio())
+        h.port.fail_submit = RuntimeError("boom")
+        failed = await h.run(commands.Commit(create_response=True))
+        assert "error" in types(failed)
+        tail = h.runner.tasks.append_tail
+        assert tail is not None and tail.done() and await tail is False
+        assert h.session.state is DuplexSessionState.OPEN
+
+        h.port.fail_submit = None
+        await h.run(append_audio())
+        events = await h.run(commands.Commit(create_response=True))
+
+        assert [e.code for e in events if e.type == "error"] == []
+        assert "input_audio_buffer.committed" in types(events)
+        assert len(_final_submissions(h)) == 1, "the retried turn reaches the model"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_mid_utterance_append_still_aborts_the_commit_it_precedes() -> None:
+    """The commit that owns the same input is still refused.
+
+    Unlike a concluded turn, a failed append inside the utterance means the
+    commit's own audio is incomplete, so submitting it would answer a question
+    the user did not ask.
+    """
+    h = await open_harness()
+    try:
+        h.port.fail_submit = RuntimeError("boom")
+        await h.run(append_audio())
+        tail = h.runner.tasks.append_tail
+        assert tail is not None and await tail is False
+        assert h.runner.tasks.append_tail_final is False
+
+        events = await h.run(commands.Commit(event_id="evt-commit"))
+
+        assert [e.code for e in events if e.type == "error"] == ["commit_aborted"]
+        assert _final_submissions(h) == []
     finally:
         await close_harness(h)

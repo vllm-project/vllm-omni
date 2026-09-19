@@ -130,6 +130,10 @@ class ConversationHistory:
     unanswered_user_items: int = 0
     item_ids: dict[str, dict[str, object]] = field(default_factory=dict)
     history_item_placeholders: dict[str, dict[str, object]] = field(default_factory=dict)
+    #: Client item id -> ids this session stored on its behalf. A spoken item
+    #: carrying images is split in two, and the client only knows the id it
+    #: named, so deleting that one has to take the other with it.
+    derived_item_ids: dict[str, list[str]] = field(default_factory=dict)
     item_audio_text_marks: dict[str, list[DuplexAssistantAudioTextMark]] = field(default_factory=dict)
     pending_item_ids: dict[str, dict[str, object]] = field(default_factory=dict)
     pending_item_audio_text_marks: dict[str, list[DuplexAssistantAudioTextMark]] = field(default_factory=dict)
@@ -1059,7 +1063,21 @@ class DuplexEngineSession:
                 playback=self._playback_cursor_for_item_id(item_id),
             )
 
+    def link_derived_history_item(self, parent_item_id: str, derived_item_id: str) -> None:
+        """Record an item this session stored on a client item's behalf."""
+        if not parent_item_id or not derived_item_id or parent_item_id == derived_item_id:
+            return
+        derived = self._conversation.derived_item_ids.setdefault(parent_item_id, [])
+        if derived_item_id not in derived:
+            derived.append(derived_item_id)
+
     def delete_history_item(self, item_id: str) -> bool:
+        deleted = self._delete_one_history_item(item_id)
+        for derived_item_id in self._conversation.derived_item_ids.pop(item_id, []):
+            deleted = self._delete_one_history_item(derived_item_id) or deleted
+        return deleted
+
+    def _delete_one_history_item(self, item_id: str) -> bool:
         response_id = item_id.removeprefix("item_") if item_id.startswith("item_") else None
         message = self._conversation.item_ids.pop(item_id, None)
         self._conversation.item_audio_text_marks.pop(item_id, None)

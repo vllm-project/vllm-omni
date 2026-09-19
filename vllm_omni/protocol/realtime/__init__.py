@@ -103,6 +103,7 @@ from vllm_omni.protocol.realtime.items import (
     normalize_conversation_item,
     text_chars_for_audio_ms_from_marks,
     truncate_realtime_item_content,
+    validate_realtime_image_data_url,
     validate_realtime_item_truncate,
     validate_realtime_video_frames,
 )
@@ -153,6 +154,7 @@ __all__ = [
     "truncate_realtime_item_content",
     "validate_conversation_item_audio_formats",
     "validate_input_sample_rate_hz",
+    "validate_realtime_image_data_url",
     "validate_realtime_item_truncate",
     "validate_realtime_response_audio_formats",
     "validate_realtime_session_audio_formats",

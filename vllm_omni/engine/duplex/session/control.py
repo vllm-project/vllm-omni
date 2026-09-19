@@ -25,6 +25,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.config import DuplexConfigError, realtime_item_to_history_message
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
+from vllm_omni.engine.duplex.realtime_events import DERIVED_ITEM_PARENT_KEY
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
@@ -39,6 +40,7 @@ from vllm_omni.engine.duplex.turn_detection import (
     TurnDetectionResult,
     apply_turn_detection_result,
 )
+from vllm_omni.protocol.duplex import validate_realtime_image_data_url
 
 logger = init_logger(__name__)
 
@@ -288,6 +290,27 @@ class SessionControl:
         projector.apply_session_defaults(payload)
         self._out.emit({"type": "session.updated", "session": session.as_public_dict()})
 
+    def _reject_created_item(self, item_id: object, code: str, message: str) -> None:
+        """Refuse an item the projection layer has already acknowledged.
+
+        ``resolve_create_item`` answers a user message with
+        ``conversation.item.added`` / ``.created`` before this validation runs,
+        so a bare error would leave the client holding an item it can retrieve
+        but that no prompt will ever contain. Withdrawing it says which of the
+        two is true.
+        """
+        self._out.emit_error(code, message)
+        if not isinstance(item_id, str) or not item_id:
+            return
+        self._out.emit(
+            {
+                "type": "conversation.item.deleted",
+                "session_id": self._ctx.session.session_id,
+                "item_id": item_id,
+                "deleted": True,
+            }
+        )
+
     async def _on_conversation_item_create(self, event: dict[str, object]) -> None:
         session = self._ctx.session
         payload = event.get("payload")
@@ -324,6 +347,11 @@ class SessionControl:
             )
             return
         item_payload = item if isinstance(item, dict) else None
+        item_id = item.get("id") if isinstance(item, dict) else None
+        derived_from = item.get(DERIVED_ITEM_PARENT_KEY) if isinstance(item, dict) else None
+        # The images of a spoken item travel under an id this session made up.
+        # A refusal has to name the item the client knows about.
+        client_item_id = derived_from if isinstance(derived_from, str) else item_id
         raw_parts = item_payload.get("content", []) if item_payload is not None else []
         parts: list[object] = [part for part in raw_parts] if isinstance(raw_parts, list) else []
         images = [p for p in parts if isinstance(p, dict) and p.get("type") == "input_image"]
@@ -332,23 +360,19 @@ class SessionControl:
                 self._out.emit_error("invalid_image", "input_image is supported only in user messages")
                 return
             if not session.capabilities.supports_image_input:
-                self._out.emit_error("unsupported", "This model does not support input_image conversation items")
+                self._reject_created_item(
+                    client_item_id, "unsupported", "This model does not support input_image conversation items"
+                )
                 return
-            from vllm_omni.engine.duplex.realtime_commands import validate_realtime_video_frames
-
             urls: list[str] = []
             for part in images:
                 url = part.get("image_url")
-                if not isinstance(url, str) or not url.startswith(
-                    ("data:image/jpeg;base64,", "data:image/png;base64,")
-                ):
-                    self._out.emit_error("invalid_image", "input_image requires a JPEG or PNG base64 data URL")
-                    return
-                error = validate_realtime_video_frames([url.split(",", 1)[1]], None)
+                # Decoding is the point, so it does not run on the shared loop.
+                error = await self._ctx.services.offload(validate_realtime_image_data_url, url)
                 if error:
-                    self._out.emit_error("invalid_image", error)
+                    self._reject_created_item(client_item_id, "invalid_image", error)
                     return
-                urls.append(url)
+                urls.append(str(url))
             existing: list[str] = []
             for history_message in session.history:
                 content = history_message.get("content")
@@ -362,13 +386,17 @@ class SessionControl:
                     if isinstance(nested_url, str):
                         existing.append(nested_url)
             if len(existing) + len(urls) > 8 or sum(map(len, existing + urls)) > 4 * 1024 * 1024:
-                self._out.emit_error("input_backpressure", "Image context exceeds 8 images or 4 MiB; delete old items")
+                self._reject_created_item(
+                    client_item_id, "input_backpressure", "Image context exceeds 8 images or 4 MiB; delete old items"
+                )
                 return
         message = realtime_item_to_history_message(item)
-        item_id = item.get("id") if isinstance(item, dict) else None
         if message is not None:
             session.append_history_message(message)
             session.register_history_item(item_id if isinstance(item_id, str) else None, message)
+            if isinstance(derived_from, str) and isinstance(item_id, str):
+                # Deleting the item the client named has to take these with it.
+                session.link_derived_history_item(derived_from, item_id)
             if message.get("role") == "user":
                 # A later response.create may answer this without any audio.
                 session.notify_new_user_item()
@@ -376,7 +404,11 @@ class SessionControl:
             {
                 "type": "conversation.item.created",
                 "session_id": session.session_id,
-                "item": item,
+                # The parent link is how this session bookkeeps the split; the
+                # client is told about the item, not about the marker.
+                "item": {k: v for k, v in item.items() if k != DERIVED_ITEM_PARENT_KEY}
+                if isinstance(item, dict)
+                else item,
                 "created": message is not None,
             }
         )

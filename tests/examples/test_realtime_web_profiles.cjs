@@ -241,6 +241,29 @@ test('MiniCPM retains microphone upload while speaking and acknowledges speaker 
   assert.equal(app.ui.state().running, false);
 });
 
+test('a drain landing after the next response still acknowledges its own playback', async () => {
+  // The server commits MiniCPM playback on this ack, so a response that
+  // finishes draining after the next one started must not lose it.
+  const app = shell('minicpm-native');
+  await app.ui.startSession();
+  const player = app.nodes.find(n => n.name === 'fullduplex-pcm-playback');
+  await app.ui.handleEvent({ type: 'response.speak', response_id: 'a' });
+  await app.ui.handleEvent({ type: 'response.output_audio.delta', delta: 'AAAAAA==', response_id: 'a' });
+  // B opens while A is still queued; the worklet keeps reporting A's drain.
+  await app.ui.handleEvent({ type: 'response.speak', response_id: 'b' });
+  await app.ui.handleEvent({ type: 'response.output_audio.delta', delta: 'AAAAAA==', response_id: 'b' });
+  app.elements.get('playbackState').textContent = 'Playing';
+
+  player.port.onmessage({ data: { type: 'playback-drained', responseId: 'a', playedMs: 100 } });
+
+  const acks = app.sockets[0].sent.filter(m => m.type === 'playback.ack');
+  assert.deepEqual(acks.map(m => m.response_id), ['a']);
+  assert.equal(acks[0].played_ms, 100);
+  assert.equal(app.ui.state().assistantActive, true, 'the newer response stays active');
+  assert.equal(app.elements.get('playbackState').textContent, 'Playing', 'B still owns the UI state');
+  await app.ui.stopSession({ terminal: false });
+});
+
 test('VAD handshake errors remain visible after resource cleanup', async () => {
   const app = shell('qwen3-turn', 'vad', { error: { type: 'error', code: 'unsupported', error: 'Realtime API is not available' } });
   await app.ui.startSession();

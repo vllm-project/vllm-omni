@@ -501,6 +501,146 @@ async def test_image_limit_rejects_atomically_and_delete_reclaims_capacity():
         await h.manager.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_a_truncated_image_is_refused_instead_of_poisoning_every_later_turn():
+    """Admission decodes, because history does not get a second chance.
+
+    A header-only check admitted anything starting with the JPEG or PNG magic
+    bytes. The item then failed ``Image.open`` in ``plan_append`` on every
+    later turn that carried history, so a four-byte "PNG" cost the session
+    every commit that followed it.
+    """
+    from vllm_omni.engine.duplex.commands import CreateItem
+
+    h = await open_qwen()
+    try:
+        broken = {
+            "id": "broken_1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_image", "image_url": "data:image/png;base64,iVBORw=="}],
+        }
+        events = await h.run(CreateItem(item=broken))
+
+        wire = [e.to_realtime() for e in events]
+        assert [e["type"] for e in wire if e["type"] == "error"], "a truncated image must be reported"
+        assert [e.get("error", {}).get("code") for e in wire if e["type"] == "error"] == ["invalid_image"]
+        assert list(h.session.history) == [], "the item must not reach conversation history"
+
+        # The session still works: a normal turn goes through afterwards.
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        assert len(h.port.submissions) == 1
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_item_is_withdrawn_from_the_client_that_was_already_told_about_it():
+    """The acks are emitted before this validation, so a refusal has to undo them."""
+    from vllm_omni.engine.duplex.commands import CreateItem
+    from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
+
+    h = await open_qwen()
+    try:
+        for i in range(8):
+            await h.run(CreateItem(item=image_item(f"camera_{i}")))
+        events = await h.run(
+            translate_realtime_command({"type": "conversation.item.create", "item": image_item("overflow")})
+        )
+
+        wire = [e.to_realtime() for e in events]
+        assert [e["type"] for e in wire if e["type"] == "error"], "the ninth image is still refused"
+        deleted = [e for e in wire if e["type"] == "conversation.item.deleted"]
+        assert [e["item_id"] for e in deleted] == ["overflow"], "an acked item must not linger as retrievable"
+        assert "overflow" not in h.runner.out.projector.conversation_items
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_spoken_item_also_deletes_the_images_it_was_split_into():
+    """The client only knows the id it named.
+
+    A mixed audio-and-image item is stored as two, because the commit would
+    overwrite images registered under the spoken id. The derived half used to
+    outlive ``conversation.item.delete`` and keep counting against the image
+    budget for the rest of the session.
+    """
+    from vllm_omni.engine.duplex.commands import DeleteItem
+    from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
+
+    def mixed(item_id):
+        return {
+            "id": item_id,
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_image", "image_url": "data:image/jpeg;base64," + camera_frame()},
+                {"type": "input_audio", "audio": pcm16_base64(), "format": "pcm16", "sample_rate_hz": 16000},
+            ],
+        }
+
+    h = await open_qwen()
+    try:
+        await h.run(translate_realtime_command({"type": "conversation.item.create", "item": mixed("mixed_1")}))
+        assert _stored_image_urls(h), "the picture is stored under a derived id"
+
+        await h.run(DeleteItem(item_id="mixed_1"))
+
+        assert _stored_image_urls(h) == [], "deleting the item the client named must take its images"
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_client_named_image_item_is_not_overwritten_by_a_derived_one():
+    """``<id>_image`` is a guess, not a reserved name."""
+    from vllm_omni.engine.duplex.commands import CreateItem
+    from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
+
+    h = await open_qwen()
+    try:
+        # ``image_item`` carries the question as well as the picture, so the
+        # text is what shows whether this item survived intact.
+        await h.run(CreateItem(item=image_item("mine_image")))
+        assert _stored_texts(h) == ["What color is this?"]
+
+        item = {
+            "id": "mine",
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_image", "image_url": "data:image/jpeg;base64," + camera_frame()},
+                {"type": "input_audio", "audio": pcm16_base64(), "format": "pcm16", "sample_rate_hz": 16000},
+            ],
+        }
+        await h.run(translate_realtime_command({"type": "conversation.item.create", "item": item}))
+
+        assert _stored_texts(h) == ["What color is this?"], "the client's own item was overwritten by a derived one"
+        assert len(_stored_image_urls(h)) == 2
+    finally:
+        await h.manager.shutdown()
+
+
+def _stored_content(h, part_type):
+    return [
+        part
+        for message in h.session.history
+        if isinstance(message.get("content"), list)
+        for part in message["content"]
+        if isinstance(part, dict) and part.get("type") == part_type
+    ]
+
+
+def _stored_image_urls(h):
+    return [part["image_url"]["url"] for part in _stored_content(h, "image_url")]
+
+
+def _stored_texts(h):
+    return [part["text"] for part in _stored_content(h, "text")]
+
+
 def test_prompt_holds_stored_images_to_the_stage_limit():
     """The prompt is the last guard before ``limit_mm_per_prompt``.
 

@@ -375,11 +375,14 @@
 
   function playbackDrained(message) {
     const responseId = message.responseId || currentResponseId;
-    if (currentResponseId && responseId !== currentResponseId) return;
+    // A response that finishes playing after the next one has started still
+    // owes its ack: that ack is what commits its playback into history. Only
+    // the UI state belongs to the response currently on screen.
     if (profile.playbackAck) sendPlaybackAck(responseId, Number(message.playedMs) || 0);
+    if (message.underrunMs > 0) appendLog(`playback underrun ${message.underrunMs} ms`);
+    if (currentResponseId && responseId !== currentResponseId) return;
     setPlayback('Idle');
     playbackComplete = true;
-    if (message.underrunMs > 0) appendLog(`playback underrun ${message.underrunMs} ms`);
     if (!profile.halfDuplex && !profile.waitForResponseDone) responseComplete = true;
     finishResponseIfReady();
   }

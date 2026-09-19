@@ -99,6 +99,12 @@ if TYPE_CHECKING:
     from vllm_omni.engine.duplex.turn_detection import TurnDetectionResult
 
 
+#: Marks the image half of a spoken item with the client id it was split from,
+#: so the session can delete the two together. Internal to the engine: it is
+#: stripped before the item reaches the wire.
+DERIVED_ITEM_PARENT_KEY = "_derived_from_item_id"
+
+
 def _str_or_none(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
@@ -1384,6 +1390,14 @@ def _duplicate_function_call_output(state: RealtimeProjectionState, call_id: obj
     return matching_call, duplicate_output
 
 
+def _unused_derived_item_id(state: RealtimeProjectionState, item_id: str) -> str:
+    """An id for the image half of a spoken item that no client item owns."""
+    candidate = f"{item_id}_image"
+    while candidate in state.conversation_items:
+        candidate = f"{item_id}_image_{uuid4().hex[:8]}"
+    return candidate
+
+
 def resolve_create_item(state: RealtimeProjectionState, command: CreateItem) -> ResolvedControl:
     """Expand ``conversation.item.create`` the way the old translator did.
 
@@ -1505,10 +1519,16 @@ def resolve_create_item(state: RealtimeProjectionState, command: CreateItem) -> 
             # Images cannot ride it: the commit would overwrite them. So they
             # travel as their own item, stored ahead of the audio describing
             # them, under an id derived from the one the client named.
+            #
+            # The derivation is not a contract: a client may already own the
+            # name it produces, so an id in use is skipped rather than
+            # overwritten, and the parent is recorded so a later
+            # ``conversation.item.delete`` takes the images with it.
             image_item = dict(item)
-            image_item["id"] = f"{item_id}_image"
+            image_item["id"] = _unused_derived_item_id(state, item_id)
             image_item["status"] = "completed"
             image_item["content"] = list(image_parts)
+            image_item[DERIVED_ITEM_PARENT_KEY] = item_id
             payloads.append({**signal_payload, "payload": {"item": image_item}})
         payloads.extend([*audio_payloads, commit_payload])
         return ResolvedControl(payloads=payloads, events=ack_events)
@@ -1529,6 +1549,7 @@ def append_audio_payload(command: AppendAudio) -> dict[str, object]:
 
 
 __all__ = [
+    "DERIVED_ITEM_PARENT_KEY",
     "RealtimeProjectionState",
     "ResolvedCommit",
     "ResolvedControl",
