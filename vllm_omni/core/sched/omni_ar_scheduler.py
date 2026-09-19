@@ -783,6 +783,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         req_id = session.request_id
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
         outstanding_async_tokens = getattr(session, "num_output_placeholders", 0)
+        # Use the same confirmed span that upstream preserves when extending
+        # a session. The segment output list is cleared on a resumable stop,
+        # and, for an already queued append, can still include its terminator.
+        confirmed_end = session.num_computed_tokens - outstanding_async_tokens
+        segment_output_ids = list(session._all_token_ids[session.num_prompt_tokens : confirmed_end])
+        completed_terminator = (
+            session._all_token_ids[confirmed_end]
+            if session.num_prompt_tokens <= confirmed_end < len(session._all_token_ids)
+            else None
+        )
         # Seed the stale share in SCHEDULED-token units (see the segment-stop
         # site in update_from_output): num_in_flight_tokens matches what each
         # pre-replacement frame will drain, so the counter reaches exactly
@@ -829,6 +839,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if self.log_stats:
                     session.record_event(EngineCoreEventType.QUEUED)
                 return
+        if stage_id == 0 and self._prepare_minicpmo45_stage0_window(
+            session,
+            update,
+            segment_output_ids=segment_output_ids,
+            completed_terminator=completed_terminator,
+        ):
+            # The rebuilt prompt is bounded by the client's window settings,
+            # not by the model (a camera unit is hundreds of tokens), so it
+            # needs the same max_model_len check as a plain extension. The
+            # plan replaces the whole prompt, so the replacement length is the
+            # projection, not the session's current prompt plus an extension.
+            plan = update.model_intermediate_buffer["duplex"]["stage0_window"]
+            if self._streaming_update_overflows(session, update, projected_len=plan["replacement_prompt_len"]):
+                return
+            self._release_replaced_streaming_prompt_cache(session)
+            self._replace_streaming_session(session, update)
+            return
         streaming_prompt_payload = next(
             (
                 info
@@ -896,11 +923,178 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if hasattr(update, "model_intermediate_buffer"):
             session.model_intermediate_buffer = update.model_intermediate_buffer
 
+    @staticmethod
+    def _prepare_minicpmo45_stage0_window(
+        session: Request,
+        update: StreamingUpdate,
+        *,
+        segment_output_ids: list[int],
+        completed_terminator: int | None = None,
+    ) -> bool:
+        """Plan an official-style MiniCPM Stage-0 window at unit boundaries.
+
+        vLLM owns a paged KV cache, so deleting a middle span and rotating the
+        retained K tensors in place is not a safe model hook.  Instead, record
+        completed unit lengths in the scheduler and request a full prompt
+        replacement when a watermark fires.  The worker rebuilds matching
+        embeddings from its unit history, which recomputes RoPE at the new
+        contiguous positions.
+        """
+        info = getattr(update, "model_intermediate_buffer", None)
+        if not isinstance(info, dict):
+            return False
+        duplex = info.get("duplex")
+        if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+            return False
+        runtime_config = duplex.get("runtime_config")
+        runtime_config = runtime_config if isinstance(runtime_config, dict) else {}
+        window = runtime_config.get("duplex_window_config")
+        if not isinstance(window, dict):
+            return False
+        mode = window.get("sliding_window_mode", "off")
+        if mode == "off":
+            return False
+        if mode not in {"basic", "context"}:
+            return False
+
+        try:
+            seq = int(duplex.get("seq", 0) or 0)
+            preserve_len = int(runtime_config.get("duplex_first_append_context_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        if seq <= 1:
+            return False
+
+        # The sampled terminator is discarded by the normal session update and
+        # re-injected at the head of this append, followed by </unit>.
+        # generated_ids contains only the confirmed output span retained by
+        # the streaming update, excluding its final uncomputed sample.
+        generated_ids = segment_output_ids
+        # Sampler-side history can contain speculative or stale async output.
+        # The worker must rebuild from the same accepted ids used for lengths.
+        duplex["stage0_window"] = {"completed_token_ids": list(generated_ids)}
+        if completed_terminator is not None:
+            duplex["stage0_window"]["completed_terminator_token_id"] = int(completed_terminator)
+        base_len = int(getattr(session, "num_prompt_tokens", 0) or 0) + len(generated_ids)
+        boundary = base_len + 2
+        # A legitimate open_start of 0 (an empty context prefix) must not fall
+        # back to preserve_len, which would double-count the suffix below.
+        recorded_open_start = getattr(session, "_minicpmo45_window_open_start", None)
+        open_start = preserve_len if recorded_open_start is None else int(recorded_open_start)
+        unit_len = boundary - open_start
+        if unit_len <= 0:
+            return False
+
+        special_ids = {
+            int(token_id)
+            for token_id in runtime_config.get("duplex_window_special_token_ids", ())
+            if isinstance(token_id, int)
+        }
+        units = list(getattr(session, "_minicpmo45_window_units", ()))
+        units.append(
+            {
+                "length": unit_len,
+                "generated_token_ids": [int(token_id) for token_id in generated_ids if token_id not in special_ids],
+            }
+        )
+        projected_len = base_len + len(update.prompt_token_ids)
+        drop_count = 0
+        dropped_len = 0
+
+        if mode == "basic":
+            try:
+                high = int(window.get("basic_window_high_tokens", 8000))
+                low = int(window.get("basic_window_low_tokens", 6000))
+            except (TypeError, ValueError):
+                return False
+            if projected_len > high:
+                while units and projected_len - dropped_len > low:
+                    dropped_len += int(units[drop_count]["length"])
+                    drop_count += 1
+                    if drop_count >= len(units):
+                        break
+        else:
+            try:
+                max_units = int(window.get("context_max_units", 24))
+                previous_max = int(window.get("context_previous_max_tokens", 500))
+            except (TypeError, ValueError):
+                return False
+            drop_count = max(0, len(units) - max_units)
+            dropped_len = sum(int(unit["length"]) for unit in units[:drop_count])
+            previous = list(getattr(session, "_minicpmo45_window_previous_token_ids", ()))
+            for unit in units[:drop_count]:
+                previous.extend(unit["generated_token_ids"])
+            if len(previous) > previous_max:
+                previous = previous[-previous_max:]
+            marker = [
+                int(token_id)
+                for token_id in runtime_config.get("duplex_window_previous_marker_token_ids", ())
+                if isinstance(token_id, int)
+            ]
+            previous_with_marker = marker + previous if previous else []
+            old_previous_len = int(getattr(session, "_minicpmo45_window_previous_len", 0) or 0)
+            session._minicpmo45_window_previous_token_ids = previous
+            session._minicpmo45_window_previous_len = len(previous_with_marker)
+            projected_len += len(previous_with_marker) - old_previous_len
+
+        retained_units = units[drop_count:]
+        session._minicpmo45_window_units = retained_units
+        if drop_count == 0:
+            session._minicpmo45_window_open_start = boundary
+            return False
+
+        replacement_len = projected_len - dropped_len
+        if replacement_len <= 0:
+            return False
+        scheduler_token_id = runtime_config.get("duplex_scheduler_token_id", 0)
+        try:
+            scheduler_token_id = max(0, int(scheduler_token_id))
+        except (TypeError, ValueError):
+            scheduler_token_id = 0
+        update.prompt_token_ids = [scheduler_token_id] * replacement_len
+        meta = info.setdefault("meta", {})
+        if isinstance(meta, dict):
+            meta["replace_streaming_prompt"] = True
+        previous_ids = list(getattr(session, "_minicpmo45_window_previous_token_ids", ()))
+        # The worker embeds the marker ids the window plan carries: it must not
+        # re-tokenize the marker with its own tokenizer, which could differ
+        # from the ids this length is computed from.
+        marker_ids = [
+            int(token_id)
+            for token_id in runtime_config.get("duplex_window_previous_marker_token_ids", ())
+            if isinstance(token_id, int)
+        ]
+        duplex["stage0_window"] = {
+            "completed_token_ids": list(generated_ids),
+            "replace": True,
+            "mode": mode,
+            "drop_units": drop_count,
+            "dropped_tokens": dropped_len,
+            "previous_token_ids": previous_ids,
+            "previous_marker_token_ids": marker_ids,
+            "replacement_prompt_len": replacement_len,
+        }
+        if completed_terminator is not None:
+            duplex["stage0_window"]["completed_terminator_token_id"] = int(completed_terminator)
+        recorded_prefix_len = runtime_config.get("duplex_window_prefix_tokens")
+        prefix_len = preserve_len if recorded_prefix_len is None else int(recorded_prefix_len)
+        suffix_len = len(runtime_config.get("duplex_window_suffix_token_ids", ()) or ())
+        previous_len = int(getattr(session, "_minicpmo45_window_previous_len", 0) or 0)
+        new_preserve_len = prefix_len + previous_len + suffix_len if mode == "context" else preserve_len
+        session._minicpmo45_window_open_start = new_preserve_len + sum(int(unit["length"]) for unit in retained_units)
+        return True
+
     # Prefix of the stop_reason carried by the FinishReason.ERROR output, so the
     # serving side can map it to a stable error code.
     STREAMING_CONTEXT_OVERFLOW_STOP_REASON = "context_length_exceeded"
 
-    def _streaming_update_overflows(self, session: Request, update: StreamingUpdate) -> bool:
+    def _streaming_update_overflows(
+        self,
+        session: Request,
+        update: StreamingUpdate,
+        *,
+        projected_len: int | None = None,
+    ) -> bool:
         """Finish a streaming session whose next extension cannot fit the model.
 
         Upstream ``_update_request_as_session`` appends the update to the
@@ -925,6 +1119,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         finish to the next ``schedule()`` would leave the client waiting. The
         reason is emitted with the terminal output (see
         :meth:`_emit_streaming_context_overflow_outputs`).
+
+        ``projected_len`` overrides the extended-prompt projection for a caller
+        that replaces the prompt instead of growing it, such as the MiniCPM
+        Stage-0 window rebuild.
         """
         max_model_len = getattr(self, "max_model_len", None)
         if max_model_len is None:
@@ -935,8 +1133,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         new_tokens = len(update.prompt_token_ids or ())
         # The extended prompt is the current prompt plus the computed output
         # tokens upstream keeps, then the update: num_computed_tokens covers
-        # both when the prompt was fully computed.
-        projected = max(int(session.num_prompt_tokens), int(session.num_computed_tokens)) + new_tokens
+        # both when the prompt was fully computed. A caller that already knows
+        # the post-update prompt length (a window rebuild) passes it instead.
+        projected = (
+            max(int(session.num_prompt_tokens), int(session.num_computed_tokens)) + new_tokens
+            if projected_len is None
+            else int(projected_len)
+        )
         # Room for the tokens one step samples on top of the prompt (1 without
         # speculative decoding). __new__-built test schedulers carry no
         # num_sampled_tokens_per_step.
