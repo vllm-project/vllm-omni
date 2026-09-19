@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 import os
 from collections import OrderedDict
@@ -25,6 +26,8 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
+from vllm_omni.diffusion.distributed.autoencoders.wan_decoder_fast_path import install_wan_decoder_fast_path
+from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import install_wan_spatial_shard_decode
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
@@ -49,6 +52,7 @@ from vllm_omni.diffusion.models.lingbot_world.camera import (
 )
 from vllm_omni.diffusion.models.lingbot_world.dmd_block import ARBlockContext, LingBotDMDBlockRunner
 from vllm_omni.diffusion.models.lingbot_world.transformer import (
+    CameraModulationCache,
     CausalLingBotWorldTransformer3DModel,
     LingBotAttentionCache,
     LingBotTransformerCache,
@@ -85,8 +89,11 @@ logger = init_logger(__name__)
 # measured to hold.
 _STREAMING_DECODE_BYTES_PER_PIXEL_FP32 = 37832 * 1024 / (64 * 64)
 
+# The frame dimension the decoder is sharded along when the pipeline runs on
+# more than one Ulysses rank; see ``_install_sharded_vae_decode``.
+_VAE_SHARD_SPLIT_DIM = "width"
+
 if TYPE_CHECKING:
-    from diffusers.video_processor import VideoProcessor
     from tqdm.std import tqdm as TqdmProgressBar
 
     from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -147,6 +154,9 @@ class _LingBotRequestInputs:
     width: int
     num_frames: int
     num_latent_frames: int
+    # Request mode returns pixels through VideoProcessor in this type. Step execution (realtime sessions)
+    # returns every pixel type as ``(F, H, W, 3)`` uint8 frames, the layout the streaming endpoint muxes; only
+    # ``"latent"`` differs there. See ``_decode_chunk_to_pixels``.
     output_type: str
     max_sequence_length: int
     flow_shift: float
@@ -158,10 +168,20 @@ class _LingBotARSessionState:
     """Model-owned state; attention tensors remain runner-owned."""
 
     next_chunk_index: int = 0
-    prompt: str | None = None
+    # The umT5 embedding itself is reused by ``encode_prompt``'s own cache.
+    # ``text_cache_key`` does the same job for the runner-owned cross-attention
+    # K/V built from that embedding: it holds the (prompt, max_sequence_length,
+    # dtype) the K/V was built from and is only published after a successful
+    # build; ``text_cache_dirty`` is raised for the duration of a build, so a
+    # build that fails forces the next tick to invalidate whatever its prompt is.
+    text_cache_key: tuple[str, int, str] | None = None
+    text_cache_dirty: bool = False
     generator_state: torch.Tensor | None = None
     encoder_cache: list[torch.Tensor | None] | None = None
     pending_encoder_cache: list[torch.Tensor | None] | None = None
+    # The condition the encoder settles on once its history has stopped
+    # changing; see ``_next_condition_chunk``.
+    condition_fixed_point: torch.Tensor | None = None
     camera_tail: CameraTrajectory | None = None
     camera_pitch: float = 0.0
 
@@ -279,7 +299,91 @@ def _decode_source_image(image: PIL.Image.Image) -> PIL.Image.Image:
         raise ValueError(_SOURCE_IMAGE_ERROR) from None
 
 
+def _source_image_fingerprint(path: str | os.PathLike[str]) -> tuple[str, int, int, int, int, int]:
+    """Identify the bytes behind ``path``: the resolved path plus the stat fields that change when it is rewritten."""
+    resolved = os.path.realpath(os.fspath(path))
+    stat = os.stat(resolved)
+    return resolved, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def _encoder_caches_identical(
+    before: list[torch.Tensor | None] | None, after: list[torch.Tensor | None] | None
+) -> bool:
+    """Whether two encoder histories hold the same tensors bit for bit, slot by slot."""
+    if before is None or after is None or len(before) != len(after):
+        return False
+    for x, y in zip(before, after, strict=True):
+        if x is None or y is None:
+            if x is not y:
+                return False
+        elif x.shape != y.shape or x.dtype != y.dtype or not torch.equal(x, y):
+            return False
+    return True
+
+
+def _uint8_frames(video: torch.Tensor) -> np.ndarray:
+    """Turn one decoded block ``(1, 3, F, H, W)`` in ``[-1, 1]`` into ``(F, H, W, 3)`` uint8 on the host.
+
+    This is the arithmetic ``VideoProcessor.postprocess_video`` applies for
+    ``"np"`` and ``"pil"`` -- denormalise, widen to float32, scale by 255 and
+    round -- done on the device before the copy instead of on the host after
+    it. The bytes are identical to the PIL path; what changes is that the
+    frames cross to the host once, already in the layout and dtype the
+    streaming endpoint muxes, instead of as a float32 copy that is then
+    converted per frame while the next block waits.
+    """
+    # Same order of operations as VideoProcessor: denormalise and clamp in
+    # the decoder dtype, then widen, scale and round.
+    frames = (video[0] / 2 + 0.5).clamp(0, 1).permute(1, 2, 3, 0)
+    frames = frames.float().mul_(255).round_().to(torch.uint8)
+    return np.ascontiguousarray(frames.cpu().numpy())
+
+
+@functools.lru_cache(maxsize=1)
+def _decode_source_image_fingerprinted(fingerprint: tuple[str, int, int, int, int, int]) -> PIL.Image.Image:
+    """The decoded image behind ``fingerprint`` (resolved path plus the stat fields that change on rewrite).
+
+    One entry: a request-mode caller that replays the same source path decodes it once. The realtime tick
+    carries its image inline and never comes through here.
+    """
+    return _decode_source_image_file(fingerprint[0])
+
+
+def _vae_decode_fast_path(model_config: dict) -> str | None:
+    """Resolve ``lingbot_vae_decode_fast_path`` from the model config: ``None``, ``"exact"`` or ``"fused"``.
+
+    Off by default. ``true``/``exact`` installs the decoder's exact fast path after the decode dtype and the
+    spatial shard are configured (see ``wan_decoder_fast_path``): no output bit changes, only launches
+    disappear. ``fused`` adds the channels_last decoder with the fused RMSNorm+SiLU kernel, which is not
+    bit-exact and requires subjective video quality review before enabling.
+    """
+    value = model_config.get("lingbot_vae_decode_fast_path", False)
+    if isinstance(value, bool) or value is None:
+        return "exact" if value else None
+    name = str(value).strip().lower()
+    if name in ("", "0", "false", "no", "off", "none"):
+        return None
+    if name in ("1", "true", "yes", "on", "exact"):
+        return "exact"
+    if name == "fused":
+        return "fused"
+    raise ValueError(f"lingbot_vae_decode_fast_path must be off, exact or fused; got {value!r}")
+
+
 def _load_source_image(path: str | os.PathLike[str]) -> PIL.Image.Image:
+    """Decode the source image at ``path``, reusing the last decode while the file is unchanged.
+
+    Every caller gets its own copy, so a request that mutates its image cannot reach the next one. A path
+    that cannot be stat'ed goes straight to the uncached decode, which owns the validation error contract.
+    """
+    try:
+        fingerprint = _source_image_fingerprint(path)
+    except (OSError, TypeError, ValueError):
+        return _decode_source_image_file(path)
+    return _decode_source_image_fingerprinted(fingerprint).copy()
+
+
+def _decode_source_image_file(path: str | os.PathLike[str]) -> PIL.Image.Image:
     try:
         source_image = PIL.Image.open(path)
     except (OSError, SyntaxError, ValueError, PIL.Image.DecompressionBombError):
@@ -466,6 +570,9 @@ class LingBotWorldCausalDMDPipeline(
     """LingBot-World v2 I2V generation with a request-local causal cache."""
 
     supports_step_execution: ClassVar[bool] = True
+    # A realtime block is four probes and a commit over one prepared chunk
+    # state; nothing between those steps needs the serving scheduler.
+    supports_chunk_step_grouping: ClassVar[bool] = True
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -483,6 +590,7 @@ class LingBotWorldCausalDMDPipeline(
         super().__init__()
         del prefix
         _validate_parallel_config(od_config)
+        parallel_config = getattr(od_config, "parallel_config", None)
         self.od_config = od_config
         self.device = get_local_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
@@ -582,6 +690,16 @@ class LingBotWorldCausalDMDPipeline(
         self._streaming_decode_states: dict[str, StreamingDecodeState] = {}
         self._cached_streaming_decoder: WanStreamingDecoder | None = None
         self._streaming_decode_unsupported = False
+        self._vae_shard_split_dim: str | None = None
+        sequence_parallel_size = int(getattr(parallel_config, "sequence_parallel_size", 1) or 1)
+        if sequence_parallel_size > 1:
+            self._install_sharded_vae_decode(sequence_parallel_size)
+        fast_path_level = _vae_decode_fast_path(model_config)
+        if fast_path_level is not None:
+            # Install after sharding so its conv wrappers get persistent buffers. The VAE parameters
+            # already use the stage dtype, so no autocast parameter cast is needed.
+            counts = install_wan_decoder_fast_path(self.vae, conv_dtype=None, level=fast_path_level)
+            logger.info("LingBot World VAE decode fast path installed: %s", counts)
         self.setup_diffusion_pipeline_profiler(
             profiler_targets=[
                 "vae.encode",
@@ -620,12 +738,9 @@ class LingBotWorldCausalDMDPipeline(
             raise ValueError("LingBot AR-Diffusion cache needs a positive recent window after reserving sink frames.")
         condition_latent_frames = int(self.transformer.config.num_frames_per_block)
         condition_channels = self.vae_scale_factor_temporal + int(self.transformer.config.out_channels)
+        element_size = torch.empty((), dtype=self.transformer.dtype).element_size()
         condition_bytes_per_session = (
-            condition_channels
-            * condition_latent_frames
-            * latent_height
-            * latent_width
-            * torch.empty((), dtype=self.transformer.dtype).element_size()
+            condition_channels * condition_latent_frames * latent_height * latent_width * element_size
         )
         return ARDiffusionKVCacheSpec(
             num_layers=int(self.transformer.config.num_layers),
@@ -641,6 +756,9 @@ class LingBotWorldCausalDMDPipeline(
                 ARDiffusionCrossAttentionKVSpec(
                     self._AR_TEXT_CACHE,
                     _MAX_SEQUENCE_LENGTH,
+                    # Cross-attention keeps every local head on every rank rather than sharding heads across
+                    # the Ulysses group, so the text pool holds that many heads, not the self-attention share.
+                    num_kv_heads=int(self.transformer.blocks[0].cross_attn.num_local_heads),
                 ),
             ),
             model_owned_state_bytes_per_session=(
@@ -716,6 +834,7 @@ class LingBotWorldCausalDMDPipeline(
         if state is not None:
             state.encoder_cache = None
             state.pending_encoder_cache = None
+            state.condition_fixed_point = None
 
     def reset_ar_diffusion_session(self, session_id: str) -> None:
         self._release_condition_encoder_state(session_id)
@@ -969,6 +1088,50 @@ class LingBotWorldCausalDMDPipeline(
             )
         return condition
 
+    def _next_condition_chunk(
+        self,
+        inputs: _LingBotRequestInputs,
+        *,
+        start_frame: int,
+        session_state: _LingBotARSessionState,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, list[torch.Tensor | None]]:
+        """The session's condition for the block at ``start_frame``, encoding only while it still changes.
+
+        After a session's opening block the encoder is fed the same all-zero
+        pixel frames on every block, so the only thing that can make one
+        block's condition differ from the last is the encoder's own history.
+        The history is a causal cache with finite temporal reach, and once the
+        zero frames have flushed the source image out of it the encoder is at
+        a fixed point: identical input and identical state produce the same
+        output and the same state on every later block. That fixed point is
+        detected, not assumed after some number of blocks: a block whose
+        returned history is bit-identical to the history it was given is the
+        proof, and from then on the stored condition is returned and the
+        encoder is not run. Measured at 480x832 the encode is 178 ms of a
+        block and the fixed point arrives by the eleventh; the served
+        rollouts this was measured on (40 blocks) are then byte-identical.
+
+        The opening block resets the fixed point, so a session that restarts
+        from a new source image encodes again until it settles.
+        """
+        if start_frame == 0:
+            session_state.condition_fixed_point = None
+        elif session_state.condition_fixed_point is not None:
+            assert session_state.encoder_cache is not None
+            # The history is unchanged by construction; the pending copy is
+            # what post_decode commits, exactly as an encoded block's would be.
+            return session_state.condition_fixed_point.clone(), list(session_state.encoder_cache)
+        condition, pending_cache = self._prepare_condition_chunk(
+            inputs,
+            start_frame=start_frame,
+            encoder_cache=session_state.encoder_cache,
+            dtype=dtype,
+        )
+        if start_frame > 0 and _encoder_caches_identical(session_state.encoder_cache, pending_cache):
+            session_state.condition_fixed_point = condition.clone()
+        return condition, pending_cache
+
     @torch.no_grad()
     def _prepare_condition_chunk(
         self,
@@ -1138,10 +1301,8 @@ class LingBotWorldCausalDMDPipeline(
                 for block in self.transformer.blocks:
                     cross_attention = block.cross_attn
                     shape = (cross_attention.num_local_heads, cross_attention.head_dim)
-                    key = cross_attention.shard_kv_heads(
-                        cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(2, shape)
-                    )
-                    value = cross_attention.shard_kv_heads(cross_attention.v(projected_text).unflatten(2, shape))
+                    key = cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(2, shape)
+                    value = cross_attention.v(projected_text).unflatten(2, shape)
                     yield key, value
 
             state.populate_cross_attention(
@@ -1220,6 +1381,34 @@ class LingBotWorldCausalDMDPipeline(
             generator=generator,
             progress_bar=progress_bar,
         )
+
+    def _session_text_caches(
+        self,
+        prompt_embeds: torch.Tensor,
+        *,
+        prompt: str,
+        max_sequence_length: int,
+        session_state: _LingBotARSessionState,
+    ) -> list[LingBotAttentionCache]:
+        """Runner-owned cross-attention K/V for this tick, rebuilt when its inputs change.
+
+        The K/V is keyed by everything that defines the prompt embedding
+        (text, sequence length, dtype). The first build of a session needs no
+        invalidation (the runner state is empty); a key change does. The dirty
+        flag is raised for the duration of the build and cleared only after
+        ``_ar_text_caches`` returns, so a build that fails after invalidating
+        or partially writing the caches makes the next tick, whatever its
+        prompt, invalidate again instead of consuming partial K/V.
+        """
+        text_key = (prompt, int(max_sequence_length), str(prompt_embeds.dtype))
+        previous = session_state.text_cache_key
+        invalidate = session_state.text_cache_dirty or (previous is not None and previous != text_key)
+        session_state.text_cache_dirty = True
+        session_state.text_cache_key = None
+        caches = self._ar_text_caches(prompt_embeds, invalidate=invalidate)
+        session_state.text_cache_key = text_key
+        session_state.text_cache_dirty = False
+        return caches
 
     def encode_prompt(
         self,
@@ -1318,6 +1507,9 @@ class LingBotWorldCausalDMDPipeline(
         )
         dtype = self.transformer.dtype
         # Phase 1: turn all three user inputs into DiT-ready conditions.
+        # ``encode_prompt`` reuses an already-encoded prompt itself; the
+        # runner-owned cross-attention K/V is keyed the same way in
+        # ``_session_text_caches`` below.
         prompt_embeds = self.encode_prompt(
             inputs.prompt,
             max_sequence_length=inputs.max_sequence_length,
@@ -1327,10 +1519,10 @@ class LingBotWorldCausalDMDPipeline(
             condition = self._prepare_condition(inputs, dtype=dtype)
         else:
             assert session_state is not None
-            condition, pending_encoder_cache = self._prepare_condition_chunk(
+            condition, pending_encoder_cache = self._next_condition_chunk(
                 inputs,
                 start_frame=tick.chunk_index * block_frames,
-                encoder_cache=session_state.encoder_cache,
+                session_state=session_state,
                 dtype=dtype,
             )
         camera_pitch: float | None = None
@@ -1369,12 +1561,13 @@ class LingBotWorldCausalDMDPipeline(
             )
         else:
             assert session_state is not None
-            prompt_changed = session_state.prompt is not None and session_state.prompt != inputs.prompt
             if session_state.generator_state is not None:
                 inputs.generator.set_state(session_state.generator_state)
-            ar_cross_attention = self._ar_text_caches(
+            ar_cross_attention = self._session_text_caches(
                 prompt_embeds,
-                invalidate=prompt_changed,
+                prompt=inputs.prompt,
+                max_sequence_length=inputs.max_sequence_length,
+                session_state=session_state,
             )
         generated_blocks: list[torch.Tensor] = []
         total_steps = (inputs.num_latent_frames // block_frames) * len(LINGBOT_DMD_TIMESTEPS)
@@ -1410,7 +1603,6 @@ class LingBotWorldCausalDMDPipeline(
         cache = None
         if tick is not None:
             assert session_state is not None
-            session_state.prompt = inputs.prompt
             session_state.generator_state = inputs.generator.get_state()
             session_state.encoder_cache = pending_encoder_cache
             session_state.camera_tail = camera_tail
@@ -1459,6 +1651,48 @@ class LingBotWorldCausalDMDPipeline(
         tile_latent_min_height = int(getattr(self.vae, "tile_sample_min_height", None) or 0) // compression
         tile_latent_min_width = int(getattr(self.vae, "tile_sample_min_width", None) or 0) // compression
         return bool(latents.shape[-2] > tile_latent_min_height or latents.shape[-1] > tile_latent_min_width)
+
+    def _vae_shard_group(self) -> tuple[Any, int]:
+        """The Ulysses ranks the decoder is sharded across, and how many there are."""
+        from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+
+        group = get_sp_group().device_group
+        return group, torch.distributed.get_world_size(group=group)
+
+    def _install_sharded_vae_decode(self, sequence_parallel_size: int) -> None:
+        """Shard the Wan decoder across the Ulysses ranks along the width.
+
+        The DiT runs on ``sequence_parallel_size`` ranks, and the decode of
+        one AR block used to run on every one of them in full: each rank
+        decoded the whole frame so that its own ``post_decode`` could carry
+        on. Splitting the frame across those same ranks with halo exchange at
+        the convolution borders makes each decode a quarter of the work at
+        four ranks; every rank still ends the block with the assembled frame
+        because the gather is an all-gather, so nothing downstream changes.
+        The streaming decoder is unaffected: ``feat_cache``, ``feat_idx`` and
+        ``first_chunk`` pass straight through to the patched decoder, and the
+        per-session temporal cache shrinks by the same factor.
+
+        This is how a multi-rank deployment of this pipeline decodes; there is
+        no switch. ``vae_patch_parallel_size`` stays rejected because it would
+        make the registry set up the tiled distributed executor and force
+        tiling on a decoder that is already sharded. Width rather than height
+        because at 480x832 it is the longer side, so each rank keeps a
+        208-pixel shard against the same halo, and it is the split this was
+        measured on: 269.9 -> 98.7 ms per block on 4xH200. Numerically it is
+        not bit-exact against a single-rank decode: the halo-exchanged
+        convolutions accumulate in a different order at the shard borders
+        (max abs diff 0.0195 on [-1, 1] at 480x832).
+        """
+        group, world_size = self._vae_shard_group()
+        if world_size != sequence_parallel_size:
+            raise RuntimeError(
+                f"LingBot World sequence_parallel_size={sequence_parallel_size} but the Ulysses group has "
+                f"{world_size} ranks."
+            )
+        install_wan_spatial_shard_decode(self.vae, group, split_dim=_VAE_SHARD_SPLIT_DIM, dst=None)
+        self._vae_shard_split_dim = _VAE_SHARD_SPLIT_DIM
+        logger.info("LingBot World VAE decode sharded along %s across %d ranks.", _VAE_SHARD_SPLIT_DIM, world_size)
 
     def _streaming_decoder(self) -> WanStreamingDecoder | None:
         """The session-owned streaming decoder, or ``None`` on a VAE that cannot stream.
@@ -1509,10 +1743,14 @@ class LingBotWorldCausalDMDPipeline(
         if state is not None:
             state.release()
 
-    def _decode_chunk_to_pixels(
-        self, latents: torch.Tensor, *, output_type: str, session_id: str | None = None
-    ) -> torch.Tensor | np.ndarray | list[list[PIL.Image.Image]]:
+    def _decode_chunk_to_pixels(self, latents: torch.Tensor, *, session_id: str | None = None) -> np.ndarray:
         """Decode one AR block so streaming consumers receive pixels, not latents.
+
+        The block comes back as ``(F, H, W, 3)`` uint8 whatever pixel output
+        type the request named: the realtime endpoint muxes uint8 frames, so
+        ``"pil"`` and ``"np"`` only ever differed in how much work stood
+        between the decoder and those bytes. Only ``"latent"`` means
+        something else, and the caller keeps latents before reaching here.
 
         With a ``session_id`` the block is decoded through that session's own
         temporal cache, so chunk *N + 1* continues chunk *N*: the causal decoder
@@ -1539,7 +1777,7 @@ class LingBotWorldCausalDMDPipeline(
             video = self.vae.decode(vae_latents, return_dict=False)[0]
         else:
             video = self._streaming_decode_chunk(decoder, vae_latents, cast(str, session_id))
-        return self._video_processor().postprocess_video(video, output_type=output_type)
+        return _uint8_frames(video)
 
     def _streaming_decode_chunk(
         self, decoder: WanStreamingDecoder, vae_latents: torch.Tensor, session_id: str
@@ -1559,15 +1797,6 @@ class LingBotWorldCausalDMDPipeline(
             # so drop it here rather than at close.
             self._release_streaming_decode_state(session_id)
             raise
-
-    def _video_processor(self) -> VideoProcessor:
-        processor = getattr(self, "_cached_video_processor", None)
-        if processor is None:
-            from diffusers.video_processor import VideoProcessor
-
-            processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
-            self._cached_video_processor = processor
-        return processor
 
     def _require_bound_ar_state(self) -> None:
         if self._ar_diffusion_kv_state is None:
@@ -1661,10 +1890,10 @@ class LingBotWorldCausalDMDPipeline(
         session_state = self._ar_sessions[state.request_id]
         if session_state.next_chunk_index != state.chunk_index:
             raise ValueError("LingBot condition chunks must be contiguous within the session.")
-        condition, pending_encoder_cache = self._prepare_condition_chunk(
+        condition, pending_encoder_cache = self._next_condition_chunk(
             inputs,
             start_frame=start_frame,
-            encoder_cache=session_state.encoder_cache,
+            session_state=session_state,
             dtype=extra["dtype"],
         )
         previous = extra.get("camera_tail")
@@ -1711,6 +1940,12 @@ class LingBotWorldCausalDMDPipeline(
             raise ValueError("LingBot World requires the runner-provided torch.Generator.")
         extra["condition"] = condition
         extra["camera"] = camera
+        # One camera-modulation cache per block: the four probes and the
+        # commit below are separate scheduler steps, so the block runner
+        # cannot open the reuse window around them the way generate_block
+        # does around its own loop. Holding the cache here makes the window
+        # span exactly this block, per request.
+        extra["camera_cache"] = CameraModulationCache()
         extra["camera_tail"] = camera_tail
         extra["start_frame"] = start_frame
         extra["ar_cross_attention"] = self._ar_text_caches(
@@ -1769,6 +2004,7 @@ class LingBotWorldCausalDMDPipeline(
             start_frame=int(extra["start_frame"]),
             timestep_value=float(schedule[step_in_chunk][0]),
             step_index=step_in_chunk,
+            camera_cache=extra["camera_cache"],
         )
 
     def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
@@ -1811,6 +2047,7 @@ class LingBotWorldCausalDMDPipeline(
             cache=None,
             ar=self._ar_block_context(extra["ar_cross_attention"]),
             start_frame=int(extra["start_frame"]),
+            camera_cache=extra.pop("camera_cache"),
         )
         completed_chunk_index = state.chunk_index
         inputs: _LingBotRequestInputs = extra["inputs"]
@@ -1820,13 +2057,7 @@ class LingBotWorldCausalDMDPipeline(
         if inputs.output_type == "latent":
             payload: dict[str, Any] = {"latents": latents}
         else:
-            payload = {
-                "video": self._decode_chunk_to_pixels(
-                    latents,
-                    output_type=inputs.output_type,
-                    session_id=state.request_id,
-                )
-            }
+            payload = {"video": self._decode_chunk_to_pixels(latents, session_id=state.request_id)}
         output = {
             "payload": payload,
             "metadata": {
