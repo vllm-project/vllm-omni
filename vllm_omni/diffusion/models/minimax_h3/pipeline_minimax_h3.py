@@ -191,8 +191,28 @@ MINIMAX_H3_DIFFUSION_DOWNLOAD_PATTERNS = {
 
 def _resolve_minimax_h3_text_encoder_quant_config(
     quant_config: QuantizationConfig | None,
+    checkpoint_config: Mapping[str, Any] | None = None,
 ) -> QuantizationConfig | None:
     resolved = _resolve_component_quant_config(quant_config, "text_encoder")
+    if checkpoint_config is not None and checkpoint_config.get("quant_method") == "svdquant":
+        from vllm_omni.quantization.svdquant_config import DiffusionSVDQuantConfig
+
+        if checkpoint_config.get("activation_bits") != 16:
+            raise ValueError("MiniMax-H3 NVFP4 text encoder checkpoint must declare activation_bits=16")
+        # Only an encoder-local checkpoint may opt into serialized weights.
+        # A global transformer SVDQuant config still falls back to BF16.
+        disk_config = DiffusionSVDQuantConfig.from_config(dict(checkpoint_config))
+        if isinstance(resolved, DiffusionSVDQuantConfig) and resolved.activation_bits == 16:
+            if (
+                resolved.rank != disk_config.rank
+                or resolved.modules_to_not_convert != disk_config.modules_to_not_convert
+            ):
+                raise ValueError("MiniMax-H3 NVFP4 encoder config conflicts with checkpoint metadata")
+        elif resolved is not None and resolved.get_name() != "svdquant":
+            raise ValueError(
+                "MiniMax-H3 serialized NVFP4 encoder cannot be overridden with another quantization method"
+            )
+        return disk_config
     return _resolve_encoder_quant_config(resolved)
 
 
@@ -967,7 +987,12 @@ class MiniMaxH3Pipeline(
                 device=self.device,
                 load_model=rank < text_encoder_tp_size,
                 encoder_group=self.text_encoder_group,
-                quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
+                quant_config=_resolve_minimax_h3_text_encoder_quant_config(
+                    od_config.quantization_config,
+                    json.loads((model_path / "text_encoder" / "config.json").read_text(encoding="utf-8")).get(
+                        "quantization_config"
+                    ),
+                ),
             )
             if rank < text_encoder_tp_size:
                 self.weights_sources.append(

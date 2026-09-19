@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_SUPPORTED_CAPABILITIES = {(10, 3)}
+_SUPPORTED_CAPABILITIES = {(10, 0), (10, 3), (12, 0)}
 _COMPATIBLE_NVFP4_KERNELS = (
     CutlassNvFp4LinearKernel,
     FbgemmNvFp4LinearKernel,
@@ -80,7 +80,7 @@ def _assert_supported() -> None:
     if not _supports_capability(capability):
         device = current_platform.device_name
         sm = capability.to_int() if capability is not None else "unknown"
-        raise RuntimeError(f"SVDQuant NVFP4 is validated on SM103 only; got {device!r} (SM{sm})")
+        raise RuntimeError(f"SVDQuant NVFP4 requires SM100, SM103 or SM120; got {device!r} (SM{sm})")
 
 
 @functools.cache
@@ -98,12 +98,15 @@ def _nvfp4_kernel() -> NvFp4LinearKernel:
 class DiffusionSVDQuantConfig(QuantizationConfig):
     """Configuration for serialized NVFP4 W4A4 plus low-rank correction."""
 
+    is_checkpoint_quantized = True
+
     def __init__(
         self,
         rank: int = 32,
         precision: str = "nvfp4",
         act_unsigned: bool = False,
         modules_to_not_convert: list[str] | None = None,
+        activation_bits: int = 4,
     ) -> None:
         super().__init__()
         if rank <= 0:
@@ -115,11 +118,17 @@ class DiffusionSVDQuantConfig(QuantizationConfig):
         if act_unsigned:
             raise ValueError("Phase 1 SVDQuant does not support unsigned activations")
         self.rank = rank
+        if activation_bits not in (4, 16):
+            raise ValueError("SVDQuant activation_bits must be 4 or 16")
+        self.activation_bits = activation_bits
         self.precision = precision
         self.modules_to_not_convert = modules_to_not_convert or []
 
     def __repr__(self) -> str:
-        return f"DiffusionSVDQuantConfig(rank={self.rank}, precision={self.precision!r})"
+        return (
+            f"DiffusionSVDQuantConfig(rank={self.rank}, precision={self.precision!r}, "
+            f"activation_bits={self.activation_bits})"
+        )
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -131,7 +140,7 @@ class DiffusionSVDQuantConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 103
+        return 100
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:
@@ -144,6 +153,7 @@ class DiffusionSVDQuantConfig(QuantizationConfig):
             precision=config.get("precision", "nvfp4"),
             act_unsigned=config.get("act_unsigned", False),
             modules_to_not_convert=config.get("modules_to_not_convert"),
+            activation_bits=config.get("activation_bits", 4),
         )
 
     def get_quant_method(
@@ -311,6 +321,13 @@ class DiffusionSVDQuantLinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Adapt the canonical row-major checkpoint to vLLM's NVFP4 ABI."""
+        if self.quant_config.activation_bits == 16:
+            # Keep packed checkpoint weights resident. The reference W4A16
+            # path materializes only the current linear's dense weight.
+            logger.info_once(
+                "SVDQuant W4A16 uses per-call NVFP4 dequantization and BF16 GEMM; this is a reference path."
+            )
+            return
         qweight = layer.qweight
         wscales = layer.wscales
         del layer.qweight
@@ -380,23 +397,37 @@ class DiffusionSVDQuantLinearMethod(LinearMethodBase):
         # The residual branch consumes the original activation. Only the
         # four-bit base GEMM consumes the smoothed activation.
         smoothed = x_2d / layer.smooth_factor
-        out = _nvfp4_kernel().apply_weights(
-            layer=layer,
-            x=smoothed,
-            bias=None,
-        )
+        if self.quant_config.activation_bits == 16:
+            from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import dequantize_to_dtype
 
-        channel_scale = getattr(layer, "output_channel_scale", None)
+            weight = dequantize_to_dtype(
+                layer.qweight.view(torch.uint8),
+                layer.wscales.transpose(0, 1).contiguous(),
+                layer.wtscale.float(),
+                torch.bfloat16,
+                swizzle=False,
+            )
+            out = torch.nn.functional.linear(smoothed, weight)
+            del weight
+            channel_scale = layer.wcscales
+        else:
+            out = _nvfp4_kernel().apply_weights(layer=layer, x=smoothed, bias=None)
+            channel_scale = getattr(layer, "output_channel_scale", None)
+
+        del smoothed
+
         if channel_scale is not None:
             # Fused QKV can store independent Q/K/V outer scales. Apply them
             # explicitly until a vector-alpha GEMM epilogue is available.
             out.mul_(channel_scale)
 
         correction_input = torch.mm(x_2d, layer.proj_down)
-        out = torch.addmm(
+        # Reuse the base result instead of retaining two full M x N tensors.
+        torch.addmm(
             out,
             correction_input,
             layer.proj_up.transpose(0, 1),
+            out=out,
         )
         if bias is not None:
             out.add_(bias)
