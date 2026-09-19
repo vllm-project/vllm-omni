@@ -54,6 +54,7 @@ from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.chunked_video import decode_to_mp4
+from vllm_omni.diffusion.utils.media_utils import DEFAULT_VIDEO_CODEC
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
@@ -984,6 +985,7 @@ class Wan22Pipeline(
                     latents,
                     fps=resolve_wan_output_fps(common),
                     batch_frames=preencode_batch_frames,
+                    video_codec=(common.extra_args or {}).get("video_codec", DEFAULT_VIDEO_CODEC),
                     video_codec_options=resolve_wan_video_codec_options(common),
                 )
             else:

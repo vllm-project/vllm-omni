@@ -33,7 +33,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.models.interface import supports_chunked_vae_decode
-from vllm_omni.diffusion.utils.media_utils import ChunkedMP4Encoder
+from vllm_omni.diffusion.utils.media_utils import DEFAULT_VIDEO_CODEC, ChunkedMP4Encoder
 
 logger = init_logger(__name__)
 
@@ -303,7 +303,7 @@ class ChunkedVideoMP4Session:
     """Encode committed video chunks into one progressive MP4 per batch entry.
 
     Push finished ``BCTHW`` chunks as the producer commits them; each batch
-    entry gets its own bounded encoder, so host transfer and H.264 encoding
+    entry gets its own bounded encoder, so host transfer and video encoding
     overlap whatever the producer is still decoding.
 
     ``audio_waveforms`` holds one waveform per batch entry (``None`` for a
@@ -323,6 +323,7 @@ class ChunkedVideoMP4Session:
         audio_sample_rate: int | None = None,
         batch_frames: int = 1,
         max_pending: int = 2,
+        video_codec: str = DEFAULT_VIDEO_CODEC,
         video_codec_options: dict[str, str] | None = None,
         crop: tuple[int, int] | None = None,
         transfer_slots: int = 2,
@@ -335,6 +336,7 @@ class ChunkedVideoMP4Session:
         self._audio_sample_rate = audio_sample_rate
         self._batch_frames = batch_frames
         self._max_pending = max_pending
+        self._video_codec = video_codec
         self._video_codec_options = video_codec_options
         self._crop = crop
         self._transfer_slots = transfer_slots
@@ -428,6 +430,7 @@ class ChunkedVideoMP4Session:
                 audio_waveform=self._waveform_for(index, int(frames.shape[0])),
                 audio_sample_rate=self._audio_sample_rate,
                 max_pending=self._max_pending,
+                video_codec=self._video_codec,
                 video_codec_options=self._video_codec_options,
             )
             for index in range(int(frames.shape[0]))

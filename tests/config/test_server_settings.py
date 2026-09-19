@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for ServerSettings env-var parameterization."""
 
 import pytest
@@ -12,6 +12,7 @@ ENV_VARS = [
     "VLLM_OMNI_SERVER_STORAGE__PATH",
     "VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY",
     "VLLM_OMNI_SERVER_STORAGE__FILE_TTL",
+    "VLLM_OMNI_SERVER_STORAGE__PUBLIC_BASE_URL",
     "VLLM_OMNI_SERVER_STORAGE__TTL_SWEEP_INTERVAL",
     "VLLM_OMNI_STORAGE_PATH",
     "VLLM_OMNI_STORAGE_MAX_CONCURRENCY",
@@ -31,12 +32,14 @@ def test_defaults_when_no_env_set():
     assert storage.file_concurrency == 4
     assert storage.file_ttl is None
     assert storage.ttl_sweep_interval is None
+    assert storage.public_base_url is None
 
 
 def test_nested_env_vars_populate_storage(monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_SERVER_STORAGE__PATH", "/var/storage")
     monkeypatch.setenv("VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY", "8")
     monkeypatch.setenv("VLLM_OMNI_SERVER_STORAGE__FILE_TTL", "120")
+    monkeypatch.setenv("VLLM_OMNI_SERVER_STORAGE__PUBLIC_BASE_URL", "https://cdn.example.com/videos")
     monkeypatch.setenv("VLLM_OMNI_SERVER_STORAGE__TTL_SWEEP_INTERVAL", "30")
 
     storage = ServerSettings().storage
@@ -45,6 +48,7 @@ def test_nested_env_vars_populate_storage(monkeypatch):
     assert storage.file_concurrency == 8
     assert storage.file_ttl == 120
     assert storage.ttl_sweep_interval == 30
+    assert storage.public_base_url == "https://cdn.example.com/videos"
 
 
 def test_ttl_sweep_interval_defaults_when_ttl_set(monkeypatch):

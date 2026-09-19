@@ -195,6 +195,34 @@ def test_forward_delegates_denoising_to_diffuse(
     assert pipeline.scheduler.set_timesteps_calls == [(2, torch.device("cpu"), 5.0)]
 
 
+@pytest.mark.parametrize("codec", ["libx264", "libx265"])
+def test_forward_passes_codec_policy_to_chunked_decode(monkeypatch, codec) -> None:
+    module = importlib.import_module("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2")
+    pipeline = _make_pipeline()
+    pipeline.diffuse = lambda **kwargs: kwargs["latents"]
+    options = {"crf": "0"}
+    captured = {}
+
+    def decode(vae, latents, **kwargs):
+        captured.update(kwargs)
+        return [b"mp4"]
+
+    monkeypatch.setattr(module, "decode_to_mp4", decode)
+    sampling = OmniDiffusionSamplingParams(
+        output_type="np",
+        num_frames=1,
+        num_inference_steps=2,
+        guidance_scale=1.0,
+        extra_args={"preencode_mp4": True, "video_codec": codec, "video_codec_options": options},
+    )
+    request = OmniDiffusionRequest(prompt="prompt", sampling_params=sampling, request_id="codec")
+    outputs = pipeline.forward(DiffusionRequestBatch([request]))
+
+    assert outputs[0].output == [b"mp4"]
+    assert captured["video_codec"] == codec
+    assert captured["video_codec_options"] == options
+
+
 @pytest.mark.parametrize("solver", ["unipc", "euler"])
 def test_forward_passes_request_shift_without_mutating_scheduler_config(solver: str) -> None:
     pipeline = _make_pipeline()
