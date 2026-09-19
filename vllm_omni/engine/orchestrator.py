@@ -38,6 +38,7 @@ from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
@@ -211,6 +212,7 @@ class OrchestratorRequestState:
     session_owned: bool = False
     running_counter_registered: bool = False
     request_artifact_dirs: set[str] = field(default_factory=set)
+    native_kv_transfer_id: str | None = None
 
 
 @dataclass
@@ -1358,6 +1360,16 @@ class OrchestratorBase:
         try:
             await dispatch()
             return True
+        except NativeKVHandoffError as e:
+            await self._fail_request_client_error(
+                req_id,
+                stage_id,
+                str(e),
+                status_code=HTTPStatus.BAD_GATEWAY.value,
+                error_type="NativeKVHandoffError",
+                release_owners=True,
+            )
+            return False
         except StageUnavailableError as e:
             # No specific replica to evict: the stage already has no live
             # replica or the chosen slot was evicted. Fail just this request.
@@ -2188,12 +2200,13 @@ class OrchestratorBase:
                     req_id,
                     req_state,
                     diffusion_prompt,
-                    submit_kwargs={
-                        "kv_sender_info": self._build_kv_sender_info(
-                            list(getattr(next_client, "engine_input_source", None) or [src_stage_id]),
-                            request_id=req_id,
-                        )
-                    },
+                    submit_kwargs=self._diffusion_submit_kwargs(
+                        req_id,
+                        src_stage_id,
+                        next_client,
+                        req_state,
+                        output,
+                    ),
                     params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
                 )
             self._on_stage_submitted(
@@ -2447,12 +2460,12 @@ class OrchestratorBase:
             _t_submit_start = _time.perf_counter()
 
             if next_pool.stage_type == "diffusion":
-                submit_kwargs = {
-                    "kv_sender_info": self._build_kv_sender_info(
-                        list(getattr(next_pool.stage_client, "engine_input_source", None) or [next_stage_id - 1]),
-                        request_id=request_id,
-                    )
-                }
+                submit_kwargs = self._diffusion_submit_kwargs(
+                    request_id,
+                    next_stage_id - 1,
+                    next_pool.stage_client,
+                    req_state,
+                )
                 submitted = await self._dispatch_or_fail_request(
                     lambda: next_pool.submit_initial(
                         request_id,
@@ -2548,6 +2561,67 @@ class OrchestratorBase:
             )
 
         return True
+
+    def _maybe_attach_native_kv_transfer_params(
+        self,
+        req_state: OrchestratorRequestState,
+        prompt: Any,
+    ) -> None:
+        source_stage_id = 0
+        if source_stage_id + 1 > req_state.final_stage_id:
+            return
+        config = getattr(self.stage_pools[source_stage_id].stage_vllm_config, "kv_transfer_config", None)
+        if getattr(config, "kv_role", None) != "kv_producer":
+            return
+        if self.stage_pools[source_stage_id + 1].stage_type != "diffusion":
+            return
+
+        from vllm_omni.diffusion.diffusion_kv.kv_connector import build_source_kv_transfer_params, mint_transfer_id
+
+        transfer_id = mint_transfer_id(req_state.request_id)
+        req_state.native_kv_transfer_id = transfer_id
+        params = build_source_kv_transfer_params(
+            transfer_id=transfer_id,
+            remote_engine_id=None,
+            remote_bootstrap_addr=None,
+        )
+        for sampling in (req_state.sampling_params_list[source_stage_id], prompt.sampling_params):
+            sampling.extra_args = {**(sampling.extra_args or {}), "kv_transfer_params": params}
+
+    def _diffusion_submit_kwargs(
+        self,
+        request_id: str,
+        source_stage_id: int,
+        next_client: Any,
+        req_state: OrchestratorRequestState,
+        output: Any = None,
+    ) -> dict[str, Any]:
+        source_stage_ids = list(getattr(next_client, "engine_input_source", None) or [source_stage_id])
+        if req_state.native_kv_transfer_id is None:
+            return {"kv_sender_info": self._build_kv_sender_info(source_stage_ids, request_id=request_id)}
+        if output is None:
+            raise NativeKVHandoffError("Native KV handoff requires one completed AR source")
+        from vllm_omni.diffusion.diffusion_kv.kv_connector import (
+            bootstrap_addr_from_kv_transfer_config,
+            build_target_kv_transfer_params,
+        )
+
+        source = self.stage_pools[source_stage_id].get_bound_client(request_id)
+        config = getattr(getattr(source, "vllm_config", None), "kv_transfer_config", None)
+        if source is None or config is None:
+            raise NativeKVHandoffError(
+                f"Native KV handoff for {request_id}: bound AR replica or its KV configuration is unavailable"
+            )
+        params = getattr(output, "kv_transfer_params", None)
+        if not params or "num_transfer_tokens" not in params:
+            raise NativeKVHandoffError("AR source completed without native KV transfer metadata")
+        return {
+            "kv_transfer_params": build_target_kv_transfer_params(
+                source_params=params,
+                remote_engine_id=config.engine_id,
+                remote_bootstrap_addr=bootstrap_addr_from_kv_transfer_config(config),
+            )
+        }
 
     def _build_kv_sender_info(
         self,
@@ -2672,6 +2746,7 @@ class Orchestrator(OrchestratorBase):
             request_artifact_dirs=set(msg.request_artifact_dirs or ()),
         )
         self.request_states[request_id] = req_state
+        self._maybe_attach_native_kv_transfer_params(req_state, prompt)
         self._register_running_request(req_state)
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
         req_state.stage_submit_ts[stage_id] = _time.time()

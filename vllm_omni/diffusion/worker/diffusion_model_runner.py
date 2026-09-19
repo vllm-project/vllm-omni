@@ -193,14 +193,20 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.state_cache: dict[str, StepRequestState] = {}
 
         # Initialize KV cache manager for connector management.
-        self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
+        self.kv_transfer_manager = (
+            OmniKVTransferManager.from_od_config(od_config)
+            if getattr(od_config, "kv_transfer_config", None) is None
+            else None
+        )
+        self._kv_connector = None
 
         # Prefetch covers TP / SP / CFG-Parallel / HSDP.  Disabled when a CFG
         # companion KV collector is set (that KV is not backgrounded).
         has_cfg_companion_kv = getattr(od_config, "cfg_kv_collect_func", None) is not None
 
         self._kv_prefetch_enabled = (
-            bool(self.kv_transfer_manager.config.enable_kv_async_prefetch)
+            self.kv_transfer_manager is not None
+            and bool(self.kv_transfer_manager.config.enable_kv_async_prefetch)
             and not has_cfg_companion_kv
             and self.kv_transfer_manager.config.need_recv_cache
         )
@@ -471,6 +477,16 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         self.diffusion_kv_backend.initialize_kv_cache(kv_cache_config)
         self.kv_cache_config = self.diffusion_kv_backend.kv_cache_config
+        if getattr(self.od_config, "kv_transfer_config", None) is not None:
+            from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector
+
+            self._kv_connector = ActiveKVConnector(self.vllm_config, self.diffusion_kv_backend.kv_caches_by_layer)
+
+    def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput):
+        from vllm_omni.diffusion.diffusion_kv.kv_connector import wait_for_kv_load
+
+        timeout = self.od_config.kv_transfer_config.kv_connector_extra_config.get("transfer_timeout", 60.0)
+        return wait_for_kv_load(self._kv_connector, scheduler_output, timeout)
 
     def install_diffusion_kv_metadata(self, metadata: DiffusionKVMetadata) -> bool:
         return self.diffusion_kv_backend.install_diffusion_kv_metadata(metadata)
@@ -483,7 +499,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     ) -> int:
         return self.diffusion_kv_backend.get_diffusion_kv_row(request_id, sequence_id, context_id)
 
-    def remove_diffusion_kv_requests(self, request_ids: list[str]) -> int:
+    def remove_diffusion_kv_requests(self, request_ids: list[str | tuple[str, int]]) -> int:
         return self.diffusion_kv_backend.remove_diffusion_kv_requests(request_ids)
 
     def refresh_diffusion_kv_block_table_layout(self) -> None:
@@ -520,8 +536,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     DiffusionPagedAttentionRow(
                         request_id=request_metadata.request_id,
                         sequence_id=sequence.sequence_id,
-                        query_len=sequence.seq_len,
+                        query_len=sequence.seq_len - sequence.num_computed_tokens,
                         seq_len=sequence.seq_len,
+                        kv_start_pos=sequence.num_computed_tokens,
                     )
                 )
                 denoise_rows.append(
@@ -606,6 +623,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         kv_prefetch_job: KVPrefetchJob | None = None,
         use_prefetch: bool = False,
     ) -> None:
+        if self.kv_transfer_manager is None:
+            self._initialize_generator(req.sampling_params)
+            return
         # Receive AR KV. Single-request execution can use the prefetch path:
         # consume prior-forward payload, sync-fallback on miss; request-batch
         # execution keeps the synchronous per-request receive path.
@@ -770,6 +790,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         "Diffusion KV metadata count must match the request batch: "
                         f"metadata={len(diffusion_kv_metadata)}, requests={len(reqs)}"
                     )
+                for req, metadata in zip(reqs, diffusion_kv_metadata, strict=True):
+                    req.kv_computed_tokens = tuple(seq.num_computed_tokens for seq in metadata.sequences)
                 paged_metadata = self._build_paged_attention_metadata(diffusion_kv_metadata)
                 paged_kv_runtime, paged_kv_context = self.diffusion_kv_backend.activate_paged_attention_metadata(
                     paged_metadata
@@ -1018,13 +1040,18 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     kv_sender_info=sched_new_req.req.kv_sender_info,
                     prepared_layout=getattr(sched_new_req.req, "prepared_layout", None),
                 )
+                if sched_new_req.diffusion_kv_metadata is not None:
+                    new_state.extra["kv_computed_tokens"] = tuple(
+                        seq.num_computed_tokens for seq in sched_new_req.diffusion_kv_metadata.sequences
+                    )
                 state_req = copy.copy(sched_new_req.req)
                 state_req.sampling_params = new_state.sampling
-                self.kv_transfer_manager.receive_multi_kv_cache_distributed(
-                    state_req,
-                    cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
-                    target_device=self._target_device,
-                )
+                if self.kv_transfer_manager is not None:
+                    self.kv_transfer_manager.receive_multi_kv_cache_distributed(
+                        state_req,
+                        cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
+                        target_device=self._target_device,
+                    )
                 self.state_cache[request_id] = new_state
                 resolved.append(new_state)
 

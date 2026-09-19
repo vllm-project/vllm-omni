@@ -59,6 +59,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_hsdp_replicate_group,
     get_pp_group,
     get_sp_group,
+    get_world_group,
     init_distributed_environment,
     initialize_model_parallel,
     model_parallel_is_initialized,
@@ -116,7 +117,11 @@ def _all_gather_rank_values(value: Any) -> list[Any]:
     if not dist.is_available() or not dist.is_initialized():
         return [value]
     values: list[Any] = [None] * dist.get_world_size()
-    dist.all_gather_object(values, value)
+    # Object collectives are control-plane traffic. Using the default NCCL
+    # group serializes them through temporary CUDA tensors, adding pointless
+    # H2D/DtoH copies to every rank-wide status check. Reuse the world
+    # coordinator's Gloo group, as vLLM does for CPU metadata collectives.
+    dist.all_gather_object(values, value, group=get_world_group().cpu_group)
     return values
 
 
@@ -446,15 +451,13 @@ class DiffusionWorker:
                 raise RuntimeError("Diffusion KV memory snapshot was not captured before model loading")
             override = self.vllm_config.cache_config.kv_cache_memory_bytes
             if override:
-                # Match native vLLM: an explicit cache budget skips automatic
-                # capacity derivation, but still runs the maximum-shape model
-                # request so lazy kernels and communication buffers initialize.
-                self.model_runner.profile_run(profile_requests)
+                # Post-allocation warmup avoids retaining a second activation arena.
                 logger.info(
                     "Worker %d: Initial free memory %s GiB, reserved %s GiB memory for "
                     "Diffusion KV Cache as specified by kv_cache_memory_bytes config and "
                     "skipped automatic memory profiling. This does not respect the "
-                    "gpu_memory_utilization config. A profile warmup was still executed.",
+                    "gpu_memory_utilization config. Model kernels will be initialized by "
+                    "the post-allocation startup warmup.",
                     self.rank,
                     format_gib(self.init_snapshot.free_memory),
                     format_gib(int(override)),
@@ -466,6 +469,8 @@ class DiffusionWorker:
                 weights_memory=self.model_runner.model_memory_usage,
             ) as profile_result:
                 self.model_runner.profile_run(profile_requests)
+
+            current_omni_platform.empty_cache()
 
             available_memory = self.requested_memory - profile_result.non_kv_cache_memory
             if available_memory <= 0:
@@ -534,11 +539,17 @@ class DiffusionWorker:
         with self._maybe_get_memory_pool_context("kv_cache"):
             self.model_runner.set_kv_cache_config(kv_cache_config)
 
-    def remove_diffusion_kv_requests(self, request_ids: list[str]) -> int:
+    def remove_diffusion_kv_requests(self, request_ids: list[str | tuple[str, int]]) -> int:
         """Clear Worker-local rows without freeing Scheduler-owned blocks."""
 
         assert self.model_runner is not None, "Model runner not initialized"
         return self.model_runner.remove_diffusion_kv_requests(request_ids)
+
+    def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput):
+        return _run_and_gather_rank_values(
+            "Diffusion KV receive",
+            lambda: self.model_runner.prepare_kv_for_forward(scheduler_output),
+        )
 
     def init_lora_manager(self) -> None:
         """Initialize the LoRA manager for this worker."""
@@ -790,6 +801,15 @@ class DiffusionWorker:
         Args:
             level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
         """
+        # The config validator rejects sleep for the native paged path. Keep
+        # this worker-side guard precise as well: test doubles and legacy
+        # configs may expose arbitrary attributes through Mock/getattr.
+        if (
+            getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is DiffusionKVCacheMode.PAGED_SCHEDULER
+            and getattr(self.od_config, "kv_transfer_config", None) is not None
+        ):
+            raise ValueError("Cannot sleep while native KV connector memory is registered")
         CuMemAllocator = _get_cumem_allocator_class()
         allocator = CuMemAllocator.get_instance()
 
@@ -1254,7 +1274,11 @@ class WorkerProc:
 
         world_size = torch.distributed.get_world_size()
         statuses: list[dict[str, Any] | None] = [None] * world_size
-        torch.distributed.all_gather_object(statuses, status)
+        torch.distributed.all_gather_object(
+            statuses,
+            status,
+            group=get_world_group().cpu_group,
+        )
         missing_ranks = [rank for rank, rank_status in enumerate(statuses) if rank_status is None]
         if missing_ranks:
             logger.warning("RPC rank status gather returned missing entries for ranks: %s", missing_ranks)

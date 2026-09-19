@@ -1536,7 +1536,10 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         # Used to embed timestep information into the input sequence.
         self.timestep_emb = TimestepEmbedder(hidden_size=config.hidden_size)
 
-        tokenizer = get_tokenizer(vllm_config.model_config.tokenizer)
+        tokenizer = get_tokenizer(
+            vllm_config.model_config.tokenizer,
+            trust_remote_code=vllm_config.model_config.trust_remote_code,
+        )
         self._mrope_img_token_id = tokenizer.convert_tokens_to_ids("<img>")
         self._mrope_boi_token_id = tokenizer.convert_tokens_to_ids("<boi>")
         self._mrope_eoi_token_id = tokenizer.convert_tokens_to_ids("<eoi>")
