@@ -1,0 +1,52 @@
+[
+    {
+        "test_name": "test_minicpmo_4_5_stability_ready",
+        "description": "MiniCPM-o-4.5 ready deploy + seed-tts chat/audio stability (from perf test_minicpmo_4_5_ready)",
+        "mark": [
+            {
+                "hardware_marks": {
+                    "res": {
+                        "cuda": "H800"
+                    },
+                    "num_cards": 1
+                }
+            },
+            "local_model",
+            "omni"
+        ],
+        "server_params": {
+            "model": "openbmb/MiniCPM-o-4_5",
+            "extra_cli_args": [
+                "--deploy-config",
+                "vllm_omni/deploy/minicpmo_4_5.yaml",
+                "--trust-remote-code"
+            ]
+        },
+        "benchmark_params": [
+            {
+                "dataset_name": "seed-tts",
+                "dataset_path": "zhaochenyang20/seed-tts-eval",
+                "backend": "openai-chat-omni",
+                "endpoint": "/v1/chat/completions",
+                "duration_sec": 86400,
+                "max_concurrency": 1,
+                "num_prompts_per_batch": 50,
+                "no_oversample": true,
+                "disable_shuffle": true,
+                "trust_remote_code": true,
+                "seed_tts_locale": "en",
+                "extra_body": {
+                    "modalities": [
+                        "text",
+                        "audio"
+                    ],
+                    "chat_template_kwargs": {
+                        "enable_thinking": false,
+                        "use_tts_template": true
+                    }
+                },
+                "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration"
+            }
+        ]
+    }
+]
