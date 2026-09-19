@@ -7,18 +7,21 @@ over every block, stepwise execution calls ``probe_step`` / ``apply_transition``
 one denoise step at a time and ``commit_block_kv`` from ``post_decode`` -- so the
 math lives here once and cannot drift between the two modes.
 
-A block is four probes that must not touch KV, then one clean-x0 commit that
-does. Whether a call sees paged (session-bound) or request-local KV is decided
-by the ``ar`` argument, so this class never reaches back into the pipeline.
+By default a block is four probes followed by one clean-x0 KV commit.
+The experimental last-step reuse mode instead commits the fourth noisy probe.
+Whether a call sees paged (session-bound) or request-local KV is decided by
+the ``ar`` argument, so this class never reaches back into the pipeline.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from diffusers.utils.torch_utils import randn_tensor
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.models.lingbot_world.transformer import (
@@ -30,6 +33,9 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.models.lingbot_world.transformer import CausalLingBotWorldTransformer3DModel
     from vllm_omni.diffusion.models.progress_bar import TqdmProgressBar
     from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
+
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -58,6 +64,9 @@ class LingBotDMDBlockRunner:
         self.transformer = transformer
         self.device = device
         self.enforce_eager = enforce_eager
+        # Experimental approximation: cache x_t/t_last features instead of x0/t=0.
+        self.reuse_last_step_kv = os.environ.get("VLLM_OMNI_LINGBOT_REUSE_LAST_STEP_KV") == "1"
+        logger.info("LingBot experimental last-step KV reuse: %s", self.reuse_last_step_kv)
 
     # ── cache selection ──────────────────────────────────────────────────
 
@@ -112,8 +121,8 @@ class LingBotDMDBlockRunner:
     ) -> torch.Tensor:
         """Predict flow for one denoise step.
 
-        A probe never writes KV: only the clean x0 of a finished block may
-        enter the cache, which is ``commit_block_kv``'s job.
+        Normally only clean x0 enters KV. The experimental reuse mode commits
+        the final noisy probe instead; the fixed DMD schedule has four probes.
         """
         if not self.enforce_eager:
             torch.compiler.cudagraph_mark_step_begin()
@@ -122,14 +131,15 @@ class LingBotDMDBlockRunner:
         # Checkpoint channel contract:
         # [noise/x_t(16), temporal_mask(4), image_latent(16)] -> 36.
         model_input = torch.cat((current_latents.to(dtype=condition.dtype), condition), dim=1)
+        commit_probe = self.reuse_last_step_kv and step_index == 3
         flow_prediction = self.transformer(
             hidden_states=model_input,
             timestep=timestep,
             encoder_hidden_states=prompt_embeds,
             camera_hidden_states=camera,
-            cache=self._block_cache(condition=condition, cache=cache, ar=ar, commit_current=False),
+            cache=self._block_cache(condition=condition, cache=cache, ar=ar, commit_current=commit_probe),
             start_frame=start_frame,
-            update_cache=False,
+            update_cache=commit_probe,
         )
         if flow_prediction.shape != current_latents.shape:
             raise RuntimeError(
@@ -175,9 +185,14 @@ class LingBotDMDBlockRunner:
     ) -> None:
         """Write the finished block's clean x0 into KV and commit its pages.
 
-        The fifth transformer call of a block, deliberately not a denoise step:
-        on the stepwise path it belongs to ``post_decode()``.
+        By default this is the fifth transformer call, at t=0. Experimental
+        reuse only finalizes the pages written by the fourth probe. On the
+        stepwise path both modes finalize from ``post_decode()``.
         """
+        if self.reuse_last_step_kv:
+            if ar is not None:
+                ar.state.commit_paged_context(ar.branch)
+            return
         # Commit K/V only for the final clean block, never for noisy probes.
         cache_input = torch.cat((latents.to(dtype=condition.dtype), condition), dim=1)
         if not self.enforce_eager:
