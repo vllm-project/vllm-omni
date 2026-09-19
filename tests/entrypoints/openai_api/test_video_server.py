@@ -46,6 +46,7 @@ from vllm_omni.entrypoints.openai.video.generation.helpers import (
 )
 from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_extras import registry
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -727,7 +728,7 @@ def test_i2v_resize_policy_can_defer_to_pipeline(monkeypatch):
         return True
 
     monkeypatch.setattr(
-        "vllm_omni.entrypoints.openai.serving_video.should_preserve_reference_image_size",
+        "vllm_omni.model_extras.registry.should_preserve_reference_image_size",
         fake_policy,
     )
     handler = OmniOpenAIServingVideo.for_diffusion(
@@ -779,6 +780,89 @@ def test_i2v_minimax_h3_preserves_reference_geometry():
     assert input_image.size == (48, 32)
     sampling_params = engine.captured_sampling_params_list[0]
     assert (sampling_params.width, sampling_params.height) == (96, 64)
+
+
+def test_i2v_resize_hook_receives_raw_reference_image(monkeypatch):
+    engine = FakeAsyncOmni()
+    engine.get_diffusion_od_config = lambda: SimpleNamespace(
+        model="org/model",
+        model_class_name="HookPipeline",
+        revision="pinned-revision",
+    )
+    captured = {}
+
+    def fake_resizer(images, *, width, height, model=None, revision=None):
+        captured.update(size=images.size, width=width, height=height, model=model, revision=revision)
+        return images
+
+    monkeypatch.setitem(
+        registry._EXTRA_SPECS,
+        "HookPipeline",
+        {"reference_image_resizer": fake_resizer},
+    )
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        diffusion_engine=engine,
+        model_name="fallback/model",
+    )
+    image = Image.new("RGB", (48, 32))
+
+    asyncio.run(
+        handler._run_and_extract(
+            VideoGenerationRequest(prompt="A bear playing with yarn.", width=96, height=64),
+            "hook-owned-resize",
+            reference_image=ReferenceImage(image),
+        )
+    )
+
+    input_image = engine.captured_prompt["multi_modal_data"]["image"]
+    assert isinstance(input_image, Image.Image)
+    # The hook received the untouched reference image and chose to pass it through.
+    assert input_image.size == (48, 32)
+    assert captured == {
+        "size": (48, 32),
+        "width": 96,
+        "height": 64,
+        "model": "org/model",
+        "revision": "pinned-revision",
+    }
+
+
+def test_i2v_resize_policy_is_resolved_once_across_requests(monkeypatch):
+    # The review case: the policy lookup reads checkpoint metadata, so serving
+    # N requests must not resolve it N times.
+    engine = FakeAsyncOmni()
+    engine.get_diffusion_od_config = lambda: SimpleNamespace(
+        model="org/model",
+        model_class_name=None,
+        revision="pinned-revision",
+    )
+    lookups = []
+
+    def fake_resolve(model, revision=None):
+        lookups.append((model, revision))
+        return "HookPipeline"
+
+    monkeypatch.setattr("vllm_omni.diffusion.data.resolve_model_class_name", fake_resolve)
+    monkeypatch.setitem(
+        registry._EXTRA_SPECS,
+        "HookPipeline",
+        {"reference_image_resizer": lambda images, **kwargs: images},
+    )
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        diffusion_engine=engine,
+        model_name="fallback/model",
+    )
+
+    for index in range(3):
+        asyncio.run(
+            handler._run_and_extract(
+                VideoGenerationRequest(prompt="A bear playing with yarn.", width=96, height=64),
+                f"resolved-once-{index}",
+                reference_image=ReferenceImage(Image.new("RGB", (48, 32))),
+            )
+        )
+
+    assert lookups == [("org/model", "pinned-revision")]
 
 
 def test_i2v_extra_params_dimensions_preserve_input_image_geometry(test_client, mocker: MockerFixture):

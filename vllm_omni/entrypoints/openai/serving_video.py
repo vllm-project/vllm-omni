@@ -41,7 +41,8 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.metrics import count_video_frames
-from vllm_omni.model_extras import get_video_generation_defaults, should_preserve_reference_image_size
+from vllm_omni.model_extras import get_reference_image_resizer, get_video_generation_defaults
+from vllm_omni.model_extras.registry import BoundReferenceImageResizer
 from vllm_omni.model_extras.video_generation import VideoGenerationDefaults
 from vllm_omni.outputs.output_metadata import (
     DiffusionMetadataMapping,
@@ -195,14 +196,20 @@ class OmniOpenAIServingVideo:
             self._stage_configs = stage_configs
 
     @cached_property
-    def preserves_reference_image_size(self) -> bool:
-        """Return whether the active pipeline owns reference-image resizing."""
+    def _reference_image_resizer(self) -> BoundReferenceImageResizer:
+        """The active pipeline's reference-image resize policy.
+
+        Resolving the policy reads the checkpoint's metadata when the engine
+        config does not already name the pipeline class, so it is resolved once
+        and reused, the way the boolean gate it replaces was. Only applying the
+        policy is per request.
+        """
         od_config = self._resolve_diffusion_od_config()
         model_class_name = None if od_config is None else getattr(od_config, "model_class_name", None)
         model = getattr(od_config, "model", None) if od_config is not None else None
         model = model or self.model_name
         revision = getattr(od_config, "revision", None) if od_config is not None else None
-        return should_preserve_reference_image_size(
+        return get_reference_image_resizer(
             model_class_name,
             model=None if model is None else str(model),
             revision=revision,
@@ -331,19 +338,12 @@ class OmniOpenAIServingVideo:
                     status_code=HTTPStatus.BAD_REQUEST.value,
                     detail=f"This diffusion model supports {expected_duration:g}-second clips only.",
                 )
-        if (
-            input_image is not None
-            and vp.width is not None
-            and vp.height is not None
-            and not self.preserves_reference_image_size
-        ):
-            target_size = (vp.width, vp.height)
-            image_items = input_image if isinstance(input_image, list) else [input_image]
-            resized_images = [
-                image.resize(target_size, Image.Resampling.LANCZOS) if image.size != target_size else image
-                for image in image_items
-            ]
-            input_image = resized_images if isinstance(input_image, list) else resized_images[0]
+        if input_image is not None and vp.width is not None and vp.height is not None:
+            input_image = self._reference_image_resizer(
+                input_image,
+                width=vp.width,
+                height=vp.height,
+            )
         multi_modal_data: dict[str, Any] = {}
         if input_image is not None:
             multi_modal_data["image"] = input_image
