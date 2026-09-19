@@ -9,7 +9,7 @@
 - LoRA: `sensenova/SenseNova-U1.5-8B-MoT-LoRAs` (`SenseNova-U1.5-8B-MoT-LoRA-8step.safetensors`)
 - Task: text2img, img2img, img2text (visual understanding), text2text (chat)
 - Mode: Offline inference, Online serving (OpenAI-compatible API)
-- Maintainer: Community
+- Maintainer: @MrlixiangWE
 
 ## When to use this recipe
 
@@ -157,3 +157,11 @@ pytest -q tests/diffusion/models/sensenova_u1/
 - Each request captures its own graphs, and a think request captures twice because the sequence
   grows past the 512 bucket, so the capture cost is paid per request rather than once at
   startup.
+- Step execution is supported (`step_execution: true`), including for text output. Think and
+  text decoding run as a resumable prepare phase: the request returns to the scheduler after
+  each token instead of holding the worker for the whole loop. The paged cache above holds one
+  sequence, so step execution requires `max_num_seqs=1` and the pipeline rejects a larger value
+  at startup; until that cache moves to the shared manager, no other request can use the tokens
+  the loop gives back.
+- Sampled text output (`do_sample: true`) draws from a generator seeded with the request seed,
+  so repeating a request repeats its reply. Before this it drew from the global generator.

@@ -19,9 +19,10 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -63,6 +64,10 @@ from .sensenova_u1_transformer import (
     create_block_causal_mask,
     prepare_flash_kv_cache,
 )
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import StepRequestState
 
 logger = init_logger(__name__)
 
@@ -461,6 +466,40 @@ class SenseNovaU1DenoisingAdapter(nn.Module):
         return self.language_model(*args, **kwargs)
 
 
+@dataclass
+class _ARDecodeCursor:
+    """One request's position in an autoregressive decode loop.
+
+    The loop advances one token per ``step()`` call so it can be left and
+    resumed between two tokens. ``done`` is set by the stop rule, which differs
+    between the two loops and is why the rules stay here rather than in a
+    scheduler-side specification.
+    """
+
+    eos_token_id: int
+    t_idx: int
+    past_key_values: Any
+    decode: Any
+    max_steps: int
+    next_token: torch.Tensor | None = None
+    logits: torch.Tensor | None = None
+    think_end_token_id: int | None = None
+    do_sample: bool = False
+    temperature: float = 0.7
+    generator: torch.Generator | None = None
+    tokens: list[int] = field(default_factory=list)
+    steps_taken: int = 0
+    done: bool = False
+
+    @property
+    def finished(self) -> bool:
+        return self.done or self.steps_taken >= self.max_steps
+
+    @property
+    def steps_remaining(self) -> int:
+        return 0 if self.done else max(self.max_steps - self.steps_taken, 0)
+
+
 class SenseNovaU1Pipeline(
     nn.Module,
     SupportsComponentDiscovery,
@@ -483,6 +522,11 @@ class SenseNovaU1Pipeline(
 
     support_image_input = True
 
+    # Step execution, plus the optional companion for a prepare phase that is
+    # itself a decode loop: think, and text output, run inside prepare.
+    supports_step_execution: ClassVar[bool] = True
+    supports_resumable_prepare: ClassVar[bool] = True
+
     # CPU-offload protocol: language_model carries the denoising blocks; the
     # vision and FM modules are lightweight encoders pinned on GPU during the
     # diffusion loop. There is no separate VAE.
@@ -497,6 +541,7 @@ class SenseNovaU1Pipeline(
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
+        self._check_step_execution_config(od_config)
         self.od_config = od_config
         self.device = get_local_device()
         model_path = od_config.model
@@ -575,9 +620,51 @@ class SenseNovaU1Pipeline(
             ),
         ]
 
+        # The default targets name a VAE, a text encoder and a `diffuse` method,
+        # none of which this pipeline has. These are its own stages. Every entry
+        # but the last runs in both execution modes, so the two are comparable
+        # stage by stage; `denoise_step` exists only in step mode, where it
+        # wraps the same `_denoise_one` the request path calls directly.
         self.setup_diffusion_pipeline_profiler(
-            enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler
+            profiler_targets=[
+                "_t2i_prefix",
+                "_t2i_caches",
+                "_it2i_prefix",
+                "_it2i_caches",
+                "_begin_text_request",
+                "_think_step",
+                "_text_step",
+                "_finish_think",
+                "_denoise_one",
+                "_denoising_output",
+                # Keeps ``extract_diffusion_denoise_ms`` populated; the profiler
+                # reports this one as ``.diffuse``. Step mode only.
+                "denoise_step",
+            ],
+            enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler,
         )
+
+    @staticmethod
+    def _check_step_execution_config(od_config: OmniDiffusionConfig) -> None:
+        """Refuse a configuration the model-local decode cache cannot serve.
+
+        ``paged_decode.py`` holds one set of buffers behind an identity block
+        table, reused by whichever request fits them, because the pipeline has
+        served one sequence per forward. Under step execution two requests can
+        be inside their decode phase at the same time, and the second one's
+        ``load_prefix`` would overwrite the first one's prefix. The cache moves
+        to ``DiffusionKVCacheManager`` before this limit can be lifted.
+        """
+        if not bool(getattr(od_config, "step_execution", False)):
+            return
+        max_num_seqs = int(getattr(od_config, "max_num_seqs", 1) or 1)
+        if max_num_seqs > 1:
+            raise ValueError(
+                "The SenseNova-U1 pipeline supports max_num_seqs=1 under step execution: its "
+                "autoregressive decode runs on a model-local paged cache that holds one sequence "
+                "at a time; "
+                f"got max_num_seqs={max_num_seqs}."
+            )
 
     # -----------------------------------------------------------------------
     # Helpers
@@ -804,32 +891,50 @@ class SenseNovaU1Pipeline(
         )
         return outputs
 
-    def _generate_think(self, prefix_outputs, past_key_values, t_idx, max_think_tokens=1024):
-        eos_token_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-        think_end_token_id = self.tokenizer.convert_tokens_to_ids("</think>")
-        think_token_ids = []
-        next_token = torch.argmax(prefix_outputs.logits[:, -1, :], dim=-1)
-        decode = self._decode_context(past_key_values)
+    def _begin_think(self, prefix_outputs, past_key_values, t_idx, max_think_tokens=1024) -> _ARDecodeCursor:
+        """Seed the think cursor from the prefix logits, before the first token."""
+        return _ARDecodeCursor(
+            eos_token_id=self.tokenizer.convert_tokens_to_ids("<|im_end|>"),
+            think_end_token_id=self.tokenizer.convert_tokens_to_ids("</think>"),
+            t_idx=t_idx,
+            past_key_values=past_key_values,
+            max_steps=max_think_tokens,
+            next_token=torch.argmax(prefix_outputs.logits[:, -1, :], dim=-1),
+            decode=self._decode_context(past_key_values),
+        )
 
-        for _ in range(max_think_tokens):
-            token_item = next_token.item()
-            if token_item == eos_token_id:
-                break
-            if token_item == think_end_token_id:
-                outputs = self._ar_step(next_token, t_idx, past_key_values, decode)
-                past_key_values = outputs.past_key_values
-                t_idx += 1
-                think_token_ids.append(token_item)
-                break
+    def _think_step(self, cursor: _ARDecodeCursor) -> None:
+        """Advance the think loop by one token.
 
-            think_token_ids.append(token_item)
-            outputs = self._ar_step(next_token, t_idx, past_key_values, decode)
-            past_key_values = outputs.past_key_values
-            t_idx += 1
-            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1)
+        ``</think>`` takes one more step before it stops, so the token lands in
+        the KV cache and ``t_idx`` advances past it; ``<|im_end|>`` stops with
+        neither. The image tokens are positioned from ``t_idx``, so the two
+        rules are not interchangeable.
+        """
+        cursor.steps_taken += 1
+        token_item = cursor.next_token.item()
+        if token_item == cursor.eos_token_id:
+            cursor.done = True
+            return
+        if token_item == cursor.think_end_token_id:
+            outputs = self._ar_step(cursor.next_token, cursor.t_idx, cursor.past_key_values, cursor.decode)
+            cursor.past_key_values = outputs.past_key_values
+            cursor.t_idx += 1
+            cursor.tokens.append(token_item)
+            cursor.done = True
+            return
 
-        if decode is not None:
-            decode[0].to_dynamic_cache(past_key_values)
+        cursor.tokens.append(token_item)
+        outputs = self._ar_step(cursor.next_token, cursor.t_idx, cursor.past_key_values, cursor.decode)
+        cursor.past_key_values = outputs.past_key_values
+        cursor.t_idx += 1
+        cursor.next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1)
+
+    def _finish_think(self, cursor: _ARDecodeCursor):
+        """Write the decoded tokens back and append the image marker."""
+        past_key_values = cursor.past_key_values
+        if cursor.decode is not None:
+            cursor.decode[0].to_dynamic_cache(past_key_values)
 
         # Append "\n\n<img>" tokens to cache
         append_ids = self.tokenizer(
@@ -837,9 +942,9 @@ class SenseNovaU1Pipeline(
             return_tensors="pt",
             add_special_tokens=False,
         )["input_ids"].to(self.device)
-        t_idx = self._append_text_tokens_to_cache(past_key_values, t_idx, append_ids)
+        t_idx = self._append_text_tokens_to_cache(past_key_values, cursor.t_idx, append_ids)
 
-        think_text = self.tokenizer.decode(think_token_ids, skip_special_tokens=False)
+        think_text = self.tokenizer.decode(cursor.tokens, skip_special_tokens=False)
         return past_key_values, t_idx, think_text
 
     def _append_text_tokens_to_cache(self, cache, t_idx, input_ids):
@@ -873,7 +978,7 @@ class SenseNovaU1Pipeline(
     # Text generation (T2T / I2T)
     # -----------------------------------------------------------------------
 
-    def _generate_text(
+    def _begin_text(
         self,
         prefix_logits,
         past_key_values,
@@ -881,33 +986,57 @@ class SenseNovaU1Pipeline(
         max_tokens=512,
         do_sample=False,
         temperature=0.7,
-    ):
-        """Autoregressive text decoding seeded from prefix logits."""
-        eos_token_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-        generated_ids: list[int] = []
+        seed=None,
+        request_generator=None,
+    ) -> _ARDecodeCursor:
+        """Seed the text cursor from the prefix logits, before the first token."""
         # Same paged decode as the think loop. No write-back at the end: the
         # caller returns the decoded string and never reads the cache again,
         # unlike the think path, which hands it to the generation stage.
-        decode = self._decode_context(past_key_values)
+        generator = None
+        if do_sample and temperature > 0:
+            # The runner seeds `sampling_params.generator` when the request
+            # carries a seed and leaves it None otherwise; an unseeded request
+            # draws from the global RNG, as it did before step execution.
+            if request_generator is not None:
+                generator = request_generator
+            elif seed is not None:
+                # The draw happens on the logits, so the generator belongs to
+                # their device rather than to the pipeline's.
+                generator = torch.Generator(prefix_logits.device).manual_seed(int(seed))
+        return _ARDecodeCursor(
+            eos_token_id=self.tokenizer.convert_tokens_to_ids("<|im_end|>"),
+            t_idx=t_idx,
+            past_key_values=past_key_values,
+            decode=self._decode_context(past_key_values),
+            max_steps=max_tokens,
+            logits=prefix_logits[:, -1, :],
+            do_sample=do_sample,
+            temperature=temperature,
+            generator=generator,
+        )
 
-        logits = prefix_logits[:, -1, :]
-        for _ in range(max_tokens):
-            if do_sample and temperature > 0:
-                probs = torch.softmax(logits / temperature, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
-            else:
-                next_token = torch.argmax(logits, dim=-1)
+    def _text_step(self, cursor: _ARDecodeCursor) -> None:
+        """Advance the text loop by one token."""
+        cursor.steps_taken += 1
+        if cursor.do_sample and cursor.temperature > 0:
+            probs = torch.softmax(cursor.logits / cursor.temperature, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1, generator=cursor.generator).squeeze(-1)
+        else:
+            next_token = torch.argmax(cursor.logits, dim=-1)
 
-            token_id = next_token.item()
-            if token_id == eos_token_id:
-                break
-            generated_ids.append(token_id)
-            outputs = self._ar_step(next_token, t_idx, past_key_values, decode)
-            past_key_values = outputs.past_key_values
-            logits = outputs.logits[:, -1, :]
-            t_idx += 1
+        token_id = next_token.item()
+        if token_id == cursor.eos_token_id:
+            cursor.done = True
+            return
+        cursor.tokens.append(token_id)
+        outputs = self._ar_step(next_token, cursor.t_idx, cursor.past_key_values, cursor.decode)
+        cursor.past_key_values = outputs.past_key_values
+        cursor.logits = outputs.logits[:, -1, :]
+        cursor.t_idx += 1
 
-        return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+    def _finish_text(self, cursor: _ARDecodeCursor) -> str:
+        return self.tokenizer.decode(cursor.tokens, skip_special_tokens=True)
 
     def _build_chat_query(self, prompt, has_images=False):
         """Build a chat-style query (understanding mode, no ``<img>`` appended)."""
@@ -917,9 +1046,8 @@ class SenseNovaU1Pipeline(
             prompt = "<image>\n" + prompt
         return system_prompt + f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
 
-    @torch.inference_mode()
-    def _forward_text(self, p, input_images) -> DiffusionOutput:
-        """Text output path for text2text and img2text."""
+    def _begin_text_request(self, p, input_images) -> _ARDecodeCursor:
+        """Run the text-output prefill and return the cursor for its decode loop."""
         extra_args = p.extra_args
         max_tokens = int(extra_args.get("max_tokens", 512))
         do_sample = bool(extra_args.get("do_sample", False))
@@ -955,14 +1083,19 @@ class SenseNovaU1Pipeline(
         prefix_logits = outputs.logits
         t_idx = indexes[0].max().item()
 
-        text_output = self._generate_text(
+        return self._begin_text(
             prefix_logits,
             past_kv,
             t_idx,
             max_tokens=max_tokens,
             do_sample=do_sample,
             temperature=temperature,
+            seed=p.text_seed,
+            request_generator=p.text_generator,
         )
+
+    def _text_request_output(self, cursor: _ARDecodeCursor) -> DiffusionOutput:
+        text_output = self._finish_text(cursor)
         logger.info("Text generation: %d chars", len(text_output))
         return DiffusionOutput(
             output={
@@ -970,6 +1103,14 @@ class SenseNovaU1Pipeline(
                 "metadata": {"text": {"text_output": text_output}},
             },
         )
+
+    @torch.inference_mode()
+    def _forward_text(self, p, input_images) -> DiffusionOutput:
+        """Text output path for text2text and img2text."""
+        cursor = self._begin_text_request(p, input_images)
+        while not cursor.finished:
+            self._text_step(cursor)
+        return self._text_request_output(cursor)
 
     # -----------------------------------------------------------------------
     # Main forward (T2I / IT2I / T2T / I2T)
@@ -1008,6 +1149,10 @@ class SenseNovaU1Pipeline(
             cfg_interval=tuple(extra_args.get("cfg_interval", (0.0, 1.0))),
             batch_size=int(extra_args.get("batch_size", 1)),
             seed=int(req.sampling_params.seed) if req.sampling_params.seed is not None else 42,
+            # The image path needs a seed and falls back to 42; text sampling
+            # must not, or every unseeded request would draw the same tokens.
+            text_generator=req.sampling_params.generator,
+            text_seed=req.sampling_params.seed,
             think_mode=bool(extra_args.get("think", False)),
             t_eps=float(extra_args.get("t_eps", 0.02)),
         )
@@ -1309,10 +1454,8 @@ class SenseNovaU1Pipeline(
             return self._forward_it2i(p, input_images)
         return self._forward_t2i(p)
 
-    def _forward_t2i(self, p) -> DiffusionOutput:
-        """Text-to-image generation path."""
-        ns = self._init_noise_and_schedule(p)
-
+    def _t2i_prefix(self, p, ns) -> SimpleNamespace:
+        """Build both CFG branches and, in think mode, stop at the first token."""
         think_content = "<think>\n" if p.think_mode else "<think>\n\n</think>\n\n" + IMG_START_TOKEN
         query_cond = _build_t2i_query(p.prompt, system_message=SYSTEM_MESSAGE_FOR_GEN, append_text=think_content)
         query_uncond = _build_t2i_query("", append_text=IMG_START_TOKEN)
@@ -1325,7 +1468,13 @@ class SenseNovaU1Pipeline(
             ns.token_h, ns.token_w, indexes_uncond.shape[1], self.device
         )
 
-        think_text = ""
+        ctx = SimpleNamespace(
+            uncond_inputs=(input_ids_uncond, indexes_uncond, mask_uncond),
+            indexes_image_cond=indexes_image_cond,
+            indexes_image_uncond=indexes_image_uncond,
+            past_kv_cond=None,
+            cursor=None,
+        )
         if p.think_mode:
             outputs_cond = self.language_model(
                 input_ids=input_ids_cond,
@@ -1335,11 +1484,22 @@ class SenseNovaU1Pipeline(
             )
             past_kv_cond = outputs_cond.past_key_values
             t_index_cond = indexes_cond[0].max().item()
-            past_kv_cond, t_index_cond, think_text = self._generate_think(outputs_cond, past_kv_cond, t_index_cond)
+            ctx.cursor = self._begin_think(outputs_cond, past_kv_cond, t_index_cond)
+        else:
+            ctx.past_kv_cond, _ = self._t2i_prefix_forward(input_ids_cond, indexes_cond, mask_cond)
+        return ctx
+
+    def _t2i_caches(self, p, ns, ctx: SimpleNamespace):
+        """Finish the think loop, run the uncond prefix, and assemble the caches."""
+        think_text = ""
+        indexes_image_cond = ctx.indexes_image_cond
+        if ctx.cursor is not None:
+            past_kv_cond, t_index_cond, think_text = self._finish_think(ctx.cursor)
             indexes_image_cond = self._build_t2i_image_indexes(ns.token_h, ns.token_w, t_index_cond + 1, self.device)
         else:
-            past_kv_cond, _ = self._t2i_prefix_forward(input_ids_cond, indexes_cond, mask_cond)
+            past_kv_cond = ctx.past_kv_cond
 
+        input_ids_uncond, indexes_uncond, mask_uncond = ctx.uncond_inputs
         past_kv_uncond, _ = self._t2i_prefix_forward(input_ids_uncond, indexes_uncond, mask_uncond)
 
         self._expand_and_prepare_kv(past_kv_cond, ns.token_h * ns.token_w, p.batch_size)
@@ -1350,15 +1510,23 @@ class SenseNovaU1Pipeline(
             "idx_cond": indexes_image_cond,
             "mask_cond": {"full_attention": None},
             "uncond": past_kv_uncond,
-            "idx_uncond": indexes_image_uncond,
+            "idx_uncond": ctx.indexes_image_uncond,
             "mask_uncond": {"full_attention": None},
         }
+        return caches, think_text
+
+    def _forward_t2i(self, p) -> DiffusionOutput:
+        """Text-to-image generation path."""
+        ns = self._init_noise_and_schedule(p)
+        ctx = self._t2i_prefix(p, ns)
+        if ctx.cursor is not None:
+            while not ctx.cursor.finished:
+                self._think_step(ctx.cursor)
+        caches, think_text = self._t2i_caches(p, ns, ctx)
         return self._run_denoising_loop(ns, caches, p, think_text, is_it2i=False)
 
-    def _forward_it2i(self, p, input_images: list[Image.Image]) -> DiffusionOutput:
-        """Image-to-image (editing) generation path with dual CFG."""
-        ns = self._init_noise_and_schedule(p)
-
+    def _it2i_prefix(self, p, ns, input_images: list[Image.Image]) -> SimpleNamespace:
+        """Encode the input images, build every CFG branch, and stop at the first token."""
         pixel_values, grid_hw = self._prepare_input_images(input_images)
         images_info = {"grid_hw": grid_hw, "pixel_values": pixel_values}
         logger.info("img2img: %d input image(s), grid_hw=%s", len(input_images), grid_hw.tolist())
@@ -1396,8 +1564,20 @@ class SenseNovaU1Pipeline(
         else:
             embeds_uncond = idx_uncond = mask_uncond = None
 
+        ctx = SimpleNamespace(
+            needs_img_cond=needs_img_cond,
+            needs_uncond=needs_uncond,
+            img_cond_inputs=(embeds_img_cond, idx_img_cond, mask_img_cond),
+            uncond_inputs=(embeds_uncond, idx_uncond, mask_uncond),
+            pixel_values=pixel_values,
+            grid_hw=grid_hw,
+            cond_inputs=(embeds_cond, idx_cond, mask_cond),
+            past_kv_cond=None,
+            idx_image_cond=None,
+            cursor=None,
+        )
+
         # --- Prefix forwards to build KV caches ---
-        think_text = ""
         if p.think_mode:
             outputs_cond = self.language_model(
                 inputs_embeds=embeds_cond,
@@ -1407,11 +1587,22 @@ class SenseNovaU1Pipeline(
             )
             past_kv_cond = outputs_cond.past_key_values
             t_index_cond = idx_cond[0].max().item()
-            past_kv_cond, t_index_cond, think_text = self._generate_think(
-                outputs_cond,
-                past_kv_cond,
-                t_index_cond,
+            ctx.cursor = self._begin_think(outputs_cond, past_kv_cond, t_index_cond)
+        else:
+            ctx.past_kv_cond, _ = self._it2i_prefix_forward(embeds_cond, idx_cond, mask_cond)
+            ctx.idx_image_cond = self._build_t2i_image_indexes(
+                ns.token_h,
+                ns.token_w,
+                idx_cond[0].max().item() + 1,
+                self.device,
             )
+        return ctx
+
+    def _it2i_caches(self, p, ns, ctx: SimpleNamespace):
+        """Finish the think loop, run the remaining prefixes, and assemble the caches."""
+        think_text = ""
+        if ctx.cursor is not None:
+            past_kv_cond, t_index_cond, think_text = self._finish_think(ctx.cursor)
             idx_image_cond = self._build_t2i_image_indexes(
                 ns.token_h,
                 ns.token_w,
@@ -1419,13 +1610,8 @@ class SenseNovaU1Pipeline(
                 self.device,
             )
         else:
-            past_kv_cond, _ = self._it2i_prefix_forward(embeds_cond, idx_cond, mask_cond)
-            idx_image_cond = self._build_t2i_image_indexes(
-                ns.token_h,
-                ns.token_w,
-                idx_cond[0].max().item() + 1,
-                self.device,
-            )
+            past_kv_cond = ctx.past_kv_cond
+            idx_image_cond = ctx.idx_image_cond
 
         caches = {
             "cond": past_kv_cond,
@@ -1433,7 +1619,8 @@ class SenseNovaU1Pipeline(
             "mask_cond": {"full_attention": None},
         }
 
-        if needs_img_cond:
+        if ctx.needs_img_cond:
+            embeds_img_cond, idx_img_cond, mask_img_cond = ctx.img_cond_inputs
             past_kv_img_cond, _ = self._it2i_prefix_forward(embeds_img_cond, idx_img_cond, mask_img_cond)
             idx_image_img_cond = self._build_t2i_image_indexes(
                 ns.token_h,
@@ -1445,7 +1632,8 @@ class SenseNovaU1Pipeline(
             caches["idx_img_cond"] = idx_image_img_cond
             caches["mask_img_cond"] = {"full_attention": None}
 
-        if needs_uncond:
+        if ctx.needs_uncond:
+            embeds_uncond, idx_uncond, mask_uncond = ctx.uncond_inputs
             past_kv_uncond, _ = self._it2i_prefix_forward(embeds_uncond, idx_uncond, mask_uncond)
             idx_image_uncond = self._build_t2i_image_indexes(
                 ns.token_h,
@@ -1458,57 +1646,70 @@ class SenseNovaU1Pipeline(
             caches["mask_uncond"] = {"full_attention": None}
 
         # Free vision tensors
-        del pixel_values, grid_hw, embeds_cond, idx_cond, mask_cond
-        if embeds_img_cond is not None:
-            del embeds_img_cond, idx_img_cond, mask_img_cond
-        if embeds_uncond is not None:
-            del embeds_uncond, idx_uncond, mask_uncond
+        ctx.pixel_values = ctx.grid_hw = ctx.cond_inputs = None
+        ctx.img_cond_inputs = ctx.uncond_inputs = (None, None, None)
 
         # Expand all KV caches for batch
         for key in ("cond", "img_cond", "uncond"):
             if key in caches and not isinstance(caches[key], dict):
                 self._expand_and_prepare_kv(caches[key], ns.token_h * ns.token_w, p.batch_size)
 
+        return caches, think_text
+
+    def _forward_it2i(self, p, input_images: list[Image.Image]) -> DiffusionOutput:
+        """Image-to-image (editing) generation path with dual CFG."""
+        ns = self._init_noise_and_schedule(p)
+        ctx = self._it2i_prefix(p, ns, input_images)
+        if ctx.cursor is not None:
+            while not ctx.cursor.finished:
+                self._think_step(ctx.cursor)
+        caches, think_text = self._it2i_caches(p, ns, ctx)
         return self._run_denoising_loop(ns, caches, p, think_text, is_it2i=True)
 
-    def _run_denoising_loop(self, ns, caches, p, think_text="", is_it2i: bool = False) -> DiffusionOutput:
-        """Shared denoising loop for both T2I and IT2I."""
-        merge_size = self.merge_size
-        image_prediction = ns.image_prediction
+    def _denoise_one(self, image_prediction, ns, caches, p, step_i, is_it2i):
+        """One denoise forward. Returns the patchified latents and the velocity.
 
-        for step_i in range(p.num_steps):
-            t = ns.timesteps[step_i]
-            t_next = ns.timesteps[step_i + 1]
+        ``z`` is handed back rather than rebuilt in ``_advance_latents``: it is a
+        full-size copy of the image, and the Euler update needs exactly the one
+        the forward ran against.
+        """
+        t = ns.timesteps[step_i]
 
-            z = _patchify(image_prediction, self.patch_size * merge_size)
-            image_input = _patchify(image_prediction, self.patch_size, channel_first=True)
-            image_embeds = self._extract_feature(
-                image_input.view(p.batch_size * ns.grid_h * ns.grid_w, -1),
-                gen_model=True,
-                grid_hw=ns.grid_hw,
-            ).view(p.batch_size, ns.token_h * ns.token_w, -1)
+        z = _patchify(image_prediction, self.patch_size * self.merge_size)
+        image_input = _patchify(image_prediction, self.patch_size, channel_first=True)
+        image_embeds = self._extract_feature(
+            image_input.view(p.batch_size * ns.grid_h * ns.grid_w, -1),
+            gen_model=True,
+            grid_hw=ns.grid_hw,
+        ).view(p.batch_size, ns.token_h * ns.token_w, -1)
 
-            t_expanded = t.expand(p.batch_size * ns.token_h * ns.token_w)
-            timestep_embeddings = self.fm_modules["timestep_embedder"](t_expanded).view(
+        t_expanded = t.expand(p.batch_size * ns.token_h * ns.token_w)
+        timestep_embeddings = self.fm_modules["timestep_embedder"](t_expanded).view(
+            p.batch_size,
+            ns.token_h * ns.token_w,
+            -1,
+        )
+        if self.model_cfg.add_noise_scale_embedding:
+            ns_tensor = torch.full_like(t_expanded, ns.noise_scale / self.model_cfg.noise_scale_max_value)
+            ns_emb = self.fm_modules["noise_scale_embedder"](ns_tensor).view(
                 p.batch_size,
                 ns.token_h * ns.token_w,
                 -1,
             )
-            if self.model_cfg.add_noise_scale_embedding:
-                ns_tensor = torch.full_like(t_expanded, ns.noise_scale / self.model_cfg.noise_scale_max_value)
-                ns_emb = self.fm_modules["noise_scale_embedder"](ns_tensor).view(
-                    p.batch_size,
-                    ns.token_h * ns.token_w,
-                    -1,
-                )
-                timestep_embeddings = timestep_embeddings + ns_emb
-            image_embeds = image_embeds + timestep_embeddings
+            timestep_embeddings = timestep_embeddings + ns_emb
+        image_embeds = image_embeds + timestep_embeddings
 
-            v_pred = self._denoise(image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i)
-            z = z + (t_next - t) * v_pred
-            image_prediction = _unpatchify(z, self.patch_size * merge_size, p.image_size[1], p.image_size[0])
+        return z, self._denoise(image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i)
 
-        # Cleanup KV caches
+    def _advance_latents(self, z, ns, p, step_i, v_pred):
+        """Euler update for one flow-matching step."""
+        t = ns.timesteps[step_i]
+        t_next = ns.timesteps[step_i + 1]
+        z = z + (t_next - t) * v_pred
+        return _unpatchify(z, self.patch_size * self.merge_size, p.image_size[1], p.image_size[0])
+
+    def _denoising_output(self, caches, image_prediction, think_text="") -> DiffusionOutput:
+        """Release the KV caches and build the image output."""
         for key in ("cond", "uncond", "img_cond"):
             if key in caches and not isinstance(caches[key], dict):
                 clear_flash_kv_cache(caches[key])
@@ -1524,6 +1725,175 @@ class SenseNovaU1Pipeline(
                 "metadata": metadata,
             }
         )
+
+    def _run_denoising_loop(self, ns, caches, p, think_text="", is_it2i: bool = False) -> DiffusionOutput:
+        """Shared denoising loop for both T2I and IT2I."""
+        image_prediction = ns.image_prediction
+
+        for step_i in range(p.num_steps):
+            z, v_pred = self._denoise_one(image_prediction, ns, caches, p, step_i, is_it2i)
+            image_prediction = self._advance_latents(z, ns, p, step_i, v_pred)
+
+        return self._denoising_output(caches, image_prediction, think_text)
+
+    # -----------------------------------------------------------------------
+    # Step execution
+    # -----------------------------------------------------------------------
+
+    #: Key under which the request's step-execution context lives in
+    #: ``StepRequestState.extra``. The context is pipeline-private, which is
+    #: what ``extra`` is for.
+    _STEP_KEY: ClassVar[str] = "sensenova_step"
+
+    def _step_context(self, state: StepRequestState) -> SimpleNamespace:
+        step = state.extra.get(self._STEP_KEY)
+        if step is None:
+            raise ValueError(f"SenseNova request {state.request_id} has no step-execution context.")
+        return step
+
+    def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
+        """Run everything up to the first decoded token, then stop.
+
+        A request that thinks, and a request whose whole output is text, both
+        continue in ``prepare_step``. A request that does not think is ready for
+        ``denoise_step`` when this returns.
+        """
+        del kwargs
+        # ``step_execution`` can also be turned on after the pipeline is built,
+        # when ``streaming_output`` implies it, so the guard runs here as well.
+        self._check_step_execution_config(self.od_config)
+        if OmniDiffusionRequest.is_dummy_run_request_id(state.request_id):
+            self._warm_ar_decode()
+        p = self._parse_request(SimpleNamespace(prompts=[state.prompt], sampling_params=state.sampling))
+        input_images = self._extract_input_images(p.first_prompt)
+        modalities = p.first_prompt.get("modalities", []) if isinstance(p.first_prompt, dict) else []
+
+        if "text" in modalities:
+            step = SimpleNamespace(
+                mode="text",
+                p=p,
+                ns=None,
+                prefix=None,
+                caches=None,
+                think_text="",
+                output=None,
+                z=None,
+            )
+            step.cursor = self._begin_text_request(p, input_images)
+        else:
+            ns = self._init_noise_and_schedule(p)
+            prefix = self._it2i_prefix(p, ns, input_images) if input_images is not None else self._t2i_prefix(p, ns)
+            step = SimpleNamespace(
+                mode="it2i" if input_images is not None else "t2i",
+                p=p,
+                ns=ns,
+                prefix=prefix,
+                caches=None,
+                think_text="",
+                output=None,
+                z=None,
+                cursor=prefix.cursor,
+            )
+            # ``ns.timesteps`` holds num_steps + 1 boundaries; the request takes
+            # one step per interval, so the state carries the intervals and the
+            # pipeline keeps the schedule it reads t and t_next from.
+            state.latents = ns.image_prediction
+            state.timesteps = ns.timesteps[:-1]
+            state.step_index = 0
+            state.do_true_cfg = p.cfg_scale > 1
+            state.img_shapes = [p.image_size]
+
+        state.extra[self._STEP_KEY] = step
+        if step.cursor is None or step.cursor.finished:
+            # A request that asked for no tokens at all has an empty loop, and
+            # its prepare phase is over before it starts.
+            self._finish_prepare(state)
+        return state
+
+    def prepare_steps_remaining(self, state: StepRequestState) -> int | None:
+        """Tokens this request may still decode, or ``None`` once prepare is done."""
+        step = state.extra.get(self._STEP_KEY)
+        if step is None or step.cursor is None:
+            return None
+        return step.cursor.steps_remaining
+
+    def prepare_step(self, state: StepRequestState) -> None:
+        """Decode one token of the think or text loop."""
+        step = self._step_context(state)
+        cursor = step.cursor
+        if cursor is None or cursor.finished:
+            return
+        if step.mode == "text":
+            self._text_step(cursor)
+        else:
+            self._think_step(cursor)
+        if cursor.finished:
+            self._finish_prepare(state)
+
+    def _finish_prepare(self, state: StepRequestState) -> None:
+        """Consume the decode result and leave the request ready for its next phase."""
+        step = self._step_context(state)
+        if step.mode == "text":
+            step.output = self._text_request_output(step.cursor)
+        elif step.mode == "it2i":
+            step.caches, step.think_text = self._it2i_caches(step.p, step.ns, step.prefix)
+        else:
+            step.caches, step.think_text = self._t2i_caches(step.p, step.ns, step.prefix)
+        step.cursor = None
+        step.prefix = None
+
+    def denoise_step(
+        self,
+        input_batch: InputBatch,
+        *,
+        states: Sequence[StepRequestState] | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """One denoise forward per scheduled request, concatenated by row.
+
+        Each request keeps its own KV caches for the CFG branches, so the
+        forwards stay separate here; the rows line up with
+        ``InputBatch.latents`` because every request contributes as many rows as
+        its own latents have.
+        """
+        del kwargs
+        states = tuple(states if states is not None else input_batch.states)
+        if not states:
+            raise ValueError("SenseNova denoise_step requires at least one request state.")
+        predictions = []
+        for state in states:
+            step = self._step_context(state)
+            if step.caches is None:
+                raise ValueError(f"SenseNova request {state.request_id} reached denoise_step during prepare.")
+            step.z, prediction = self._denoise_one(
+                state.latents,
+                step.ns,
+                step.caches,
+                step.p,
+                state.step_index,
+                step.mode == "it2i",
+            )
+            predictions.append(prediction)
+        if len(predictions) == 1:
+            return predictions[0]
+        return torch.cat(predictions, dim=0)
+
+    def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
+        """One flow-matching update of this request's latents."""
+        del kwargs
+        step = self._step_context(state)
+        state.latents = self._advance_latents(step.z, step.ns, step.p, state.step_index, noise_pred)
+        step.z = None
+        state.step_index += 1
+
+    def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
+        """Build the output and release whatever this request still holds."""
+        del kwargs
+        step = self._step_context(state)
+        state.extra.pop(self._STEP_KEY, None)
+        if step.mode == "text":
+            return step.output
+        return self._denoising_output(step.caches, state.latents, step.think_text)
 
     # -----------------------------------------------------------------------
     # Weight loading

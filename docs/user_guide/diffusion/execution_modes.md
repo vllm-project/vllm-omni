@@ -109,7 +109,11 @@ set `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA` or configure
 `--max-num-seqs >1`. See the
 [HunyuanImage-3.0 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/HunyuanImage-3.0-Instruct.md)
 for its validated configuration. Helios supports single-request step execution only: use
-`--step-execution --max-num-seqs 1` for Helios. MiniMax H3 supports step-wise
+`--step-execution --max-num-seqs 1` for Helios. SenseNova-U1 and U1.5 support
+step execution for image, editing and text requests, also single-request only:
+the model-local paged decode cache holds one sequence, so the pipeline rejects
+`--max-num-seqs >1` at startup. Their think and text decode loops run one token
+per scheduler step, and a text request finishes inside the prepare phase. MiniMax H3 supports step-wise
 continuous batching by packing co-batched requests into one sequence that keeps
 a separate attention document per request; that layout needs a backend which
 honors the packed `cu_seqlens` metadata, so run it with
