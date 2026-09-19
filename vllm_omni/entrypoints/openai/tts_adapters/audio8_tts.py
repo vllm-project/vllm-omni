@@ -98,7 +98,7 @@ class Audio8TTSAdapter(ARTTSAdapter):
         server = self.ctx.server
         ref_audio_data = None
         if request.ref_audio is not None:
-            wav_list, sample_rate = await server._resolve_ref_audio(request.ref_audio)
+            wav_list, sample_rate, _ = await server._resolve_ref_audio(request.ref_audio)
             ref_audio_data = (wav_list, sample_rate)
         # Prompt building tokenizes and, for voice clone, allocates tensors; keep
         # it off the event loop via the server's single-worker TTS executor.

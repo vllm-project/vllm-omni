@@ -13,9 +13,14 @@ model (falling through to "unknown TTS model") instead of failing at startup.
 These tests pin the contract from both ends.
 """
 
+import asyncio
+from dataclasses import dataclass
+
 import pytest
 
+from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.tts_adapters import (
+    SpeechServingContext,
     all_tts_model_types,
     all_tts_stage_keys,
     detect_tts_model_type,
@@ -27,6 +32,15 @@ from vllm_omni.model_executor.models.audio8_tts.pipeline import AUDIO8_TTS_PIPEL
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 SLOW_AR_STAGE_KEY = "audio8_tts_slow_ar"
+
+
+@dataclass
+class _FakeSpeechServer:
+    _tts_executor: object | None = None
+
+    async def _resolve_ref_audio(self, ref_audio: str) -> tuple[list[float], int, str]:
+        assert ref_audio == "data:audio/wav;base64,UklGRg=="
+        return [0.0, 0.1], 44_100, "cache-key"
 
 
 def _pipeline_stage_keys() -> list[str]:
@@ -83,3 +97,21 @@ def test_apply_sampling_overrides_defaults_tts_local_seed_for_fast_ar():
     # No seed at all -> nothing injected (non-deterministic by request contract).
     out_unseeded = adapter.apply_sampling_overrides([SamplingParams(seed=None)], request)
     assert (out_unseeded[0].extra_args or {}).get("tts_local_seed") is None
+
+
+def test_build_accepts_ref_audio_resolver_cache_key(monkeypatch):
+    """The shared resolver returns a cache key in addition to audio and rate."""
+    adapter = Audio8TTSAdapter(SpeechServingContext(server=_FakeSpeechServer()))
+    request = OpenAICreateSpeechRequest(
+        input="Clone this voice.",
+        ref_audio="data:audio/wav;base64,UklGRg==",
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_build_prompt",
+        lambda request, ref_audio_data, has_inline_ref_audio: {"ref_audio_data": ref_audio_data},
+    )
+
+    prepared = asyncio.run(adapter.build(request, [], has_inline_ref_audio=True))
+
+    assert prepared.prompt["ref_audio_data"] == ([0.0, 0.1], 44_100)
