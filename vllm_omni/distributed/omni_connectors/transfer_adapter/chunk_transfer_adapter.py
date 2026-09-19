@@ -704,12 +704,22 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 # put succeeded, reported failure, or raised. Until this runs,
                 # the block below must not reclaim the generation either.
                 self._release_terminal_fence(external_req_id, sender_token)
+            cancelled_after_send = False
             with self._sender_state_lock:
                 if self._sender_tokens.get(external_req_id) is sender_token:
                     sender_token.in_flight = False
                     if sender_token.cancelled and not sender_token.terminal_pending:
+                        cancelled_after_send = True
                         self._sender_tokens.pop(external_req_id, None)
                         self._clear_sender_state_locked(external_req_id)
+            if cancelled_after_send and not is_terminal_task:
+                # Abort / finish_requests returned without waiting for put().
+                # Orchestrator reclaim may already have run, so unlink whatever
+                # this send just wrote. A terminal chunk is exempt: it is the
+                # downstream stage's only end-of-stream signal (#6670), so it
+                # has to outlive the abort and is reclaimed by the
+                # orchestrator once every stage is done with the request.
+                self._reclaim_sender_shm(external_req_id)
 
     def _release_terminal_fence(self, external_req_id: str, sender_token: _SenderGeneration) -> None:
         """Drop the terminal fence and run the cleanup it deferred.
@@ -956,8 +966,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         Called after a terminal chunk is sent or when the scheduler aborts the
         request before a terminal chunk can be produced. In-flight sends are
-        cancelled here and reclaim their own state in ``finally``; cleanup
-        never waits for connector I/O on the scheduler thread.
+        cancelled here and reclaim adapter state plus leftover SHM in
+        ``finally`` after ``put()`` returns; cleanup never waits for connector
+        I/O on the scheduler thread.
 
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
@@ -1001,6 +1012,42 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
             cached_ic.pop(external_req_id, None)
+
+    def _reclaim_sender_shm(self, external_req_id: str) -> None:
+        """Unlink SHM written by a cancelled in-flight ``put()``."""
+        connector = getattr(self, "connector", None)
+        cleanup = getattr(connector, "cleanup", None)
+        if cleanup is None:
+            return
+        try:
+            cleanup(external_req_id)
+        except Exception as e:
+            logger.warning("Cancelled in-flight send left SHM for %s unreclaimed: %s", external_req_id, e)
+
+    def release_shm_resources(self, request_id: str) -> int:
+        """Unlink inter-stage segments this request left unconsumed.
+
+        Safe only once every stage has finished with the request: the producer
+        keeps writing until its own request ends, and a consumer that stopped
+        early never drains the remainder. The orchestrator is the only party
+        that knows all stages are done, so it drives this (see
+        ``Orchestrator._cleanup_request_ids``); calling it from either stage's
+        own teardown would race the other side.
+
+        Returns the number of reclaimed segments -- a non-zero count means the
+        consumer stopped before draining the producer, which is worth alerting
+        on independently of the reclaim.
+        """
+        connector = getattr(self, "connector", None)
+        cleanup = getattr(connector, "cleanup", None)
+        if cleanup is None:
+            return 0
+        external_req_id = self.request_ids_mapping.get(request_id, request_id)
+        try:
+            return int(cleanup(external_req_id) or 0)
+        except Exception as e:
+            logger.debug("release_shm_resources(%s) failed: %s", request_id, e)
+            return 0
 
     def cleanup(
         self,

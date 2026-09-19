@@ -14,6 +14,7 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.metrics.stats import PrefillStats, PromptTokenStats
 from vllm.v1.request import Request, RequestStatus
 
+from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
@@ -2096,6 +2097,36 @@ def test_finish_requests_does_not_wait_for_inflight_send(build_adapter):
     assert first.external_req_id not in adapter.put_req_chunk
 
 
+def test_inflight_abort_reclaims_shm_after_put_returns(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-abort-shm", RequestStatus.WAITING, external_req_id="ext-abort-shm")
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct()
+    put_started = threading.Event()
+    release_put = threading.Event()
+
+    def blocking_put(**kwargs):
+        put_started.set()
+        release_put.wait(timeout=2)
+        return True, 1, {}
+
+    connector.put.side_effect = blocking_put
+    adapter.save_async(multimodal_output=None, request=request)
+    task = adapter._pending_save_reqs.popleft()
+    sender = threading.Thread(target=adapter._send_single_request, args=(task,))
+    sender.start()
+    assert put_started.wait(timeout=1)
+    adapter.finish_requests(
+        [request.request_id],
+        RequestStatus.FINISHED_ABORTED,
+        {request.request_id: request},
+    )
+    assert connector.cleanup.call_count == 0
+    release_put.set()
+    sender.join(timeout=1)
+    assert not sender.is_alive()
+    connector.cleanup.assert_called_with("ext-abort-shm")
+
+
 def test_cleanup_only_affects_target_request(build_adapter):
     """Cleanup for one request must not affect another request's state."""
     adapter, _ = build_adapter(stage_id=1)
@@ -2462,10 +2493,9 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
     adapter_mock.cleanup = lambda *a, **kw: cleanup_calls.append((a, kw))
     adapter_mock.save_async = lambda *a, **kw: save_calls.append((a, kw))
 
-    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
-
     scheduler = mocker.MagicMock()
     scheduler.chunk_transfer_adapter = adapter_mock
+    bind_omits_transfer_helpers(scheduler)
     scheduler.connector = None
     scheduler.perf_metrics = None
     scheduler.log_stats = False

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for SharedMemoryConnector focusing on TP / CFG / metadata fallback."""
 
 import os
@@ -201,7 +201,7 @@ class TestCleanup:
         connector.put("s0", "s1", "cleanup_req_42", data)
         assert "cleanup_req_42" in connector._pending_keys
 
-        connector.cleanup("req_42")
+        assert connector.cleanup("req_42") == 1
         assert "cleanup_req_42" not in connector._pending_keys
 
         result = connector.get("s0", "s1", "cleanup_req_42", metadata=None)
@@ -212,8 +212,13 @@ class TestCleanup:
         connector.put("s0", "s1", "consumed_req_99", data)
         connector.get("s0", "s1", "consumed_req_99", metadata=None)
 
-        connector.cleanup("req_99")
+        assert connector.cleanup("req_99") == 0
         assert "consumed_req_99" not in connector._pending_keys
+
+    def test_cleanup_does_not_count_missing_segment(self, connector):
+        connector._pending_keys.add("missing_req_1")
+        assert connector.cleanup("req_1") == 0
+        assert "missing_req_1" not in connector._pending_keys
 
     def test_close_cleans_all_pending(self, connector):
         for i in range(3):
