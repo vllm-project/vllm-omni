@@ -123,6 +123,8 @@ class OmniEngineBase:
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
     _enable_orch_monitor: bool = False
+    _standalone: bool = False
+    _standalone_stage_id: int | None = None
     _client_config: OmniClientConfig | None = None
     # Lazily created by get_output_blocking_async().
     _output_drain_executor: concurrent.futures.ThreadPoolExecutor | None = None
@@ -158,6 +160,11 @@ class OmniEngineBase:
         # --log-stats CLI flag set by the user via OmniBase.
         self._log_stats = log_stats
         self._enable_orch_monitor = bool(kwargs.pop("enable_orch_monitor", False))
+        self._standalone = bool(kwargs.pop("_standalone", False))
+        if self._standalone:
+            self._standalone_stage_id = int(kwargs.pop("stage_id")) if "stage_id" in kwargs else None
+        else:
+            self._standalone_stage_id = None
         self._client_config = client_config
 
         logger.info(f"[OmniEngine] Initializing with model {model}")
@@ -426,6 +433,8 @@ class OmniEngineBase:
             supported_tasks.add("generate")
         if any(meta.final_output_type == "audio" for meta in self.stage_metadata):
             supported_tasks.add("speech")
+        if self._standalone:
+            supported_tasks.add("generate")
         self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
 
     def _bootstrap_orchestrator(
@@ -934,6 +943,20 @@ class OmniEngineBase:
         # an orchestrator-level knob (read once at construction), so apply it here
         # rather than as a per-stage config field.
         self._apply_strategy_lb_policy(strategy_lb_policy, kwargs)
+
+        if self._standalone:
+            if self._standalone_stage_id is None:
+                raise ValueError("--standalone requires --stage-id")
+            from vllm_omni.entrypoints.utils import extract_standalone_stage_config
+
+            stage_configs = extract_standalone_stage_config(stage_configs, self._standalone_stage_id)
+            stage_cfg = stage_configs[0]
+            model_stage = getattr(stage_cfg, "engine_args", {}).get("model_stage", f"stage-{self._standalone_stage_id}")
+            logger.info(
+                "[Standalone] Booting stage %d (%s) as independent server",
+                self._standalone_stage_id,
+                model_stage,
+            )
 
         return cast(str, config_path), stage_configs
 
