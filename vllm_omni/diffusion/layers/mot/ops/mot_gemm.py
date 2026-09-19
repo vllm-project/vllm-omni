@@ -238,6 +238,7 @@ def _get_mot_pointers(
     cur_stride_bk = stride_bk_vae
     cur_stride_bn = stride_bn_vae
     M_limit = M_vae
+    is_vae = 1
 
     # Text Path
     if pid < num_pid_m_text * num_pid_n:
@@ -251,6 +252,7 @@ def _get_mot_pointers(
         cur_stride_bk = stride_bk_text
         cur_stride_bn = stride_bn_text
         M_limit = M_text
+        is_vae = 0
 
     # 3. Calculate Grid coordinates(grouping)
     cur_num_pid_m = tl.cdiv(M_limit, BLOCK_SIZE_M)
@@ -283,6 +285,7 @@ def _get_mot_pointers(
         offs_n,
         n_mask,  # N-dim info
         M_limit,  # Boundary
+        is_vae,  # Selected expert kind: 0=text, 1=VAE
         cur_b_ptr,
         cur_bias_ptr,  # Selected Pointers
         cur_scale_b_ptr,  # Selected Scale Pointer
@@ -533,7 +536,8 @@ def mot_unified_gemm_kernel(
     # Quant Control
     # 0=None, 1=W8A8, 2=W8A16, 3=W4A16
     QUANT_TYPE: tl.constexpr,
-    HAS_BIAS: tl.constexpr = False,
+    HAS_BIAS_TEXT: tl.constexpr = False,
+    HAS_BIAS_VAE: tl.constexpr = False,
 ):
     pid = tl.program_id(axis=0)
 
@@ -548,6 +552,7 @@ def mot_unified_gemm_kernel(
         offs_n,
         n_mask,
         M_limit,
+        is_vae,
         cur_b_ptr,
         cur_bias_ptr,
         cur_scale_b_ptr,
@@ -675,8 +680,12 @@ def mot_unified_gemm_kernel(
     # -----------------------------------------------------------
 
     # Bias Add
-    if HAS_BIAS:
+    if HAS_BIAS_TEXT or HAS_BIAS_VAE:
         bias = tl.load(cur_bias_ptr + offs_n, mask=n_mask, other=0.0)
+        if HAS_BIAS_TEXT and not HAS_BIAS_VAE:
+            bias = tl.where(is_vae == 0, bias, 0.0)
+        elif HAS_BIAS_VAE and not HAS_BIAS_TEXT:
+            bias = tl.where(is_vae == 1, bias, 0.0)
         c = c + bias[None, :]  # reshape to (1, BLOCK_SIZE_N)
 
     # Cast C into the output dtype
@@ -832,11 +841,8 @@ def invoke_mot_gemm(
     STRIDE_BK_IS_1 = (B_text.stride(0) == 1) and (B_vae.stride(0) == 1)
     STRIDE_BN_IS_1 = (B_text.stride(1) == 1) and (B_vae.stride(1) == 1)
 
-    # bias check
-    assert (bias_text is None) == (bias_vae is None), (
-        "Bias must be provided for both Text and VAE simultaneously, or neither."
-    )
-    has_bias = bias_text is not None
+    has_bias_text = bias_text is not None
+    has_bias_vae = bias_vae is not None
 
     # --- 3. Grid Calculation ---
     def grid(META):
@@ -853,7 +859,8 @@ def invoke_mot_gemm(
             "ACCUMULATOR_DTYPE": ACCUMULATOR_DTYPE,
             "COMPUTE_DTYPE": COMPUTE_DTYPE,
             "OUTPUT_DTYPE": OUTPUT_DTYPE,
-            "HAS_BIAS": has_bias,
+            "HAS_BIAS_TEXT": has_bias_text,
+            "HAS_BIAS_VAE": has_bias_vae,
             "EVEN_K": EVEN_K,
             "EVEN_N": EVEN_N,
             "STRIDE_AK_IS_1": STRIDE_AK_IS_1,
@@ -866,8 +873,17 @@ def invoke_mot_gemm(
     p_a_scale = A_scale if A_scale is not None else 0
     p_b_text_scale = B_text_scale if B_text_scale is not None else 0
     p_b_vae_scale = B_vae_scale if B_vae_scale is not None else 0
-    p_bias_text = bias_text if bias_text is not None else 0
-    p_bias_vae = bias_vae if bias_vae is not None else 0
+    # Triton requires both route-selected bias arguments to have a pointer
+    # type. Alias the missing route to the available tensor; its compile-time
+    # bias flag and runtime route mask keep it from being read for that route.
+    if bias_text is None:
+        p_bias_text = bias_vae if bias_vae is not None else 0
+    else:
+        p_bias_text = bias_text
+    if bias_vae is None:
+        p_bias_vae = bias_text if bias_text is not None else 0
+    else:
+        p_bias_vae = bias_vae
 
     # Quantization granularity
     stride_scale_a = 1 if A_per_channel_quant else 0
