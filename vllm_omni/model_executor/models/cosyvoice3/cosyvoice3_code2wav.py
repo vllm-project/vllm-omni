@@ -519,4 +519,5 @@ class CosyVoice3Code2Wav(nn.Module):
         }
         self.hift.load_state_dict(hift_state_dict, strict=True)
         self.hift.to(device).eval()
+        self.hift.remove_weight_norm()
         logger.info(f"Loaded hift weights from {hift_path}")

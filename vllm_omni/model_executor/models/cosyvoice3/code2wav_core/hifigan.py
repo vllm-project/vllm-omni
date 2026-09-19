@@ -11,14 +11,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy.signal import get_window
-from torch.nn import Conv1d, ConvTranspose1d
-from torch.nn.utils import remove_weight_norm
-
-try:
-    from torch.nn.utils.parametrizations import weight_norm
-except ImportError:
-    from torch.nn.utils import weight_norm
 from torch.distributions.uniform import Uniform
+from torch.nn import Conv1d, ConvTranspose1d
+from torch.nn.utils.parametrizations import weight_norm
+from torch.nn.utils.parametrize import is_parametrized, remove_parametrizations
 
 from vllm_omni.model_executor.models.common.snake_activation import Snake
 
@@ -94,8 +90,8 @@ class ResBlock(torch.nn.Module):
 
     def remove_weight_norm(self):
         for idx in range(len(self.convs1)):
-            remove_weight_norm(self.convs1[idx])
-            remove_weight_norm(self.convs2[idx])
+            remove_parametrizations(self.convs1[idx], "weight", leave_parametrized=True)
+            remove_parametrizations(self.convs2[idx], "weight", leave_parametrized=True)
 
 
 def _carry_phase_at_boundary(
@@ -571,17 +567,9 @@ class HiFTGenerator(nn.Module):
         self.f0_predictor = f0_predictor
 
     def remove_weight_norm(self):
-        for layer in self.ups:
-            remove_weight_norm(layer)
-        for block in self.resblocks:
-            block.remove_weight_norm()
-        remove_weight_norm(self.conv_pre)
-        remove_weight_norm(self.conv_post)
-        self.m_source.remove_weight_norm()
-        for layer in self.source_downs:
-            remove_weight_norm(layer)
-        for block in self.source_resblocks:
-            block.remove_weight_norm()
+        for module in self.modules():
+            if is_parametrized(module, "weight"):
+                remove_parametrizations(module, "weight", leave_parametrized=True)
 
     def _stft(self, x):
         if x.device.type == "npu":
