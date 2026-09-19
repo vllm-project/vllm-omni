@@ -2057,6 +2057,11 @@ class OmniGPUModelRunner(GPUModelRunner):
         **model_kwargs: dict[str, Any],
     ):
         """Inject omni-specific kwargs into forward and cache model output"""
+        # `logits_index` is optional runner metadata, not part of the
+        # GPUModelRunner/model forward contract. No Omni model forward consumes it.
+        # Keep it out of the forwarded kwargs while preserving it for
+        # model-specific Omni output conversion below.
+        logits_index = model_kwargs.pop("logits_index", None)
         model_kwargs_extra = self._build_model_kwargs_extra()
         update_decode_metadata = getattr(self.model, "update_decode_step_metadata", None)
         if getattr(self.model, "supports_omni_decode_step_metadata", False) and callable(update_decode_metadata):
@@ -2077,7 +2082,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             **model_kwargs_extra,
         )
         if not isinstance(model_output, (OmniOutput, IntermediateTensors)) and hasattr(self.model, "make_omni_output"):
-            model_output = self.model.make_omni_output(model_output, **model_kwargs, **model_kwargs_extra)
+            model_output = self.model.make_omni_output(
+                model_output, logits_index=logits_index, **model_kwargs, **model_kwargs_extra
+            )
         # Cache model output so later sample_tokens can consume multimodal results.
         self._omni_last_model_output = model_output
         return model_output

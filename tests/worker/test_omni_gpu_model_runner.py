@@ -130,6 +130,39 @@ def test_model_forward_passes_request_ids_to_decode_metadata(monkeypatch):
     assert received["req_ids"] == ["request-a", "request-b"]
 
 
+def test_model_forward_keeps_logits_index_out_of_base_forward(monkeypatch):
+    base_kwargs = {}
+    converter_kwargs = {}
+    converted = object()
+
+    def base_model_forward(*_args, **kwargs):
+        base_kwargs.update(kwargs)
+        return torch.zeros(1)
+
+    def make_omni_output(_model_output, **kwargs):
+        converter_kwargs.update(kwargs)
+        return converted
+
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(make_omni_output=make_omni_output)
+    runner._build_model_kwargs_extra = lambda: {"omni_extra": "value"}
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", base_model_forward)
+
+    logits_index = torch.tensor([1, 3])
+    result = OmniGPUModelRunner._model_forward(
+        runner,
+        input_ids=torch.ones(4, dtype=torch.long),
+        logits_index=logits_index,
+        sampling_metadata="sampling-metadata",
+    )
+
+    assert result is converted
+    assert "logits_index" not in base_kwargs
+    assert converter_kwargs["logits_index"] is logits_index
+    assert converter_kwargs["sampling_metadata"] == "sampling-metadata"
+    assert converter_kwargs["omni_extra"] == "value"
+
+
 class MiMoAudioForConditionalGeneration(torch.nn.Module):
     """Dummy model whose class name must exactly match the production check."""
 
