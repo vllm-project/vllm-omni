@@ -128,6 +128,7 @@ platforms:
         tensor_parallel_size: 4
         enforce_eager: true
         max_cudagraph_capture_size: 0
+        async_scheduling: false
         devices: "0,1,2,3"
       - stage_id: 1
         enforce_eager: true
@@ -135,5 +136,6 @@ platforms:
         devices: "4"
       - stage_id: 2
         gpu_memory_utilization: 0.3
+        enforce_eager: true
         max_cudagraph_capture_size: 0
         devices: "4"
