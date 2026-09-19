@@ -24,7 +24,10 @@ from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
-from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.core.sched.omni_scheduler_mixin import (
+    OmniSchedulerMixin,
+    accept_structured_output_tokens,
+)
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.outputs import OmniModelRunnerOutput
@@ -547,13 +550,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             if request.sampling_params is not None and request.sampling_params.num_logprobs is not None and logprobs:
                 new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
 
-            if new_token_ids and self.structured_output_manager.should_advance(request):
-                # NOTE: structured_output_request should not be None if
-                # use_structured_output, we have check above, so safe to ignore
-                # type warning
-                request.structured_output_request.grammar.accept_tokens(  # type: ignore[union-attr]  # noqa: E501
-                    req_id, new_token_ids
-                )
+            if new_token_ids:
+                # The generation scheduler keeps its pre-existing behaviour of
+                # advancing the grammar without turning a rejection into a
+                # terminal error; only the AR scheduler terminates the request.
+                accept_structured_output_tokens(self.structured_output_manager, request, new_token_ids)
 
             # spec_token_ids comes from the model runner output
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:

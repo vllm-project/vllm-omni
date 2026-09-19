@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for the AR sampled-token logprob contract."""
 
 from __future__ import annotations
@@ -133,7 +136,7 @@ def _make_scheduler_stub(requests: list[_Request]) -> SimpleNamespace:
         running=list(requests),
         waiting=_RequestQueue(),
         skipped_waiting=_RequestQueue(),
-        structured_output_manager=SimpleNamespace(should_advance=lambda _request: False),
+        structured_output_manager=SimpleNamespace(should_advance=lambda _request, new_token_ids=None: False),
         transfer_triggered_requests=set(),
         active_kv_transfers=set(),
         pending_stop_after_extraction=set(),
