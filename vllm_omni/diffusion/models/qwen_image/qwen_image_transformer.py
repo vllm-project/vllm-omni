@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from functools import lru_cache
 from math import prod
 from typing import TYPE_CHECKING, Any
@@ -39,6 +40,7 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
+from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -58,6 +60,74 @@ from vllm_omni.diffusion.layers.qwen_select01_modulation import (
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
+
+
+def _tensor_version(tensor: torch.Tensor) -> int | None:
+    try:
+        return tensor._version
+    except RuntimeError:
+        # Inference tensors do not expose version counters.
+        return None
+
+
+def _is_cuda_graph_capturing() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except RuntimeError:
+        # Fail closed when the CUDA runtime cannot report capture state.
+        return True
+
+
+@dataclass(eq=False)
+class _QwenImageModulationCacheKey:
+    timestep: torch.Tensor
+    timestep_version: int | None
+    guidance: torch.Tensor | None
+    guidance_version: int | None
+    additional_t_cond: torch.Tensor | None
+    additional_t_cond_version: int | None
+    hidden_dtype: torch.dtype
+    hidden_device: torch.device
+
+    def matches(self, other: _QwenImageModulationCacheKey) -> bool:
+        return (
+            self.timestep is other.timestep
+            and self.timestep_version == other.timestep_version
+            and self.guidance is other.guidance
+            and self.guidance_version == other.guidance_version
+            and self.additional_t_cond is other.additional_t_cond
+            and self.additional_t_cond_version == other.additional_t_cond_version
+            and self.hidden_dtype == other.hidden_dtype
+            and self.hidden_device == other.hidden_device
+        )
+
+
+def _make_qwen_image_modulation_cache_key(
+    timestep: torch.Tensor | None,
+    guidance: torch.Tensor | None,
+    additional_t_cond: torch.Tensor | None,
+    hidden_states: torch.Tensor,
+) -> _QwenImageModulationCacheKey | None:
+    if torch.compiler.is_compiling() or torch.is_grad_enabled() or _is_cuda_graph_capturing():
+        return None
+    if timestep is None or not isinstance(timestep, torch.Tensor):
+        return None
+    if guidance is not None and not isinstance(guidance, torch.Tensor):
+        return None
+    if additional_t_cond is not None and not isinstance(additional_t_cond, torch.Tensor):
+        return None
+    return _QwenImageModulationCacheKey(
+        timestep=timestep,
+        timestep_version=_tensor_version(timestep),
+        guidance=guidance,
+        guidance_version=None if guidance is None else _tensor_version(guidance),
+        additional_t_cond=additional_t_cond,
+        additional_t_cond_version=None if additional_t_cond is None else _tensor_version(additional_t_cond),
+        hidden_dtype=hidden_states.dtype,
+        hidden_device=hidden_states.device,
+    )
 
 
 def _qwen_image_qk_norm_rope(
@@ -844,6 +914,47 @@ class QwenImageTransformerBlock(nn.Module):
         )
 
         self.zero_cond_t = zero_cond_t
+        self._modulation_cache: (
+            tuple[
+                _QwenImageModulationCacheKey,
+                torch.Tensor,
+                torch.Tensor,
+            ]
+            | None
+        ) = None
+
+    def _get_modulation_params(
+        self,
+        temb: torch.Tensor,
+        cache_enabled: bool,
+        timestep: torch.Tensor | None,
+        guidance: torch.Tensor | None,
+        additional_t_cond: torch.Tensor | None,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cache_key = None
+        if cache_enabled and not self.training:
+            cache_key = _make_qwen_image_modulation_cache_key(
+                timestep,
+                guidance,
+                additional_t_cond,
+                hidden_states,
+            )
+
+        if cache_key is None:
+            self._modulation_cache = None
+        elif self._modulation_cache is not None and self._modulation_cache[0].matches(cache_key):
+            _, img_mod_params, txt_mod_params = self._modulation_cache
+            self._modulation_cache = None
+            return img_mod_params, txt_mod_params
+
+        img_mod_params = self.img_mod(temb)
+        txt_temb = torch.chunk(temb, 2, dim=0)[0] if self.zero_cond_t else temb
+        txt_mod_params = self.txt_mod(txt_temb)
+
+        if cache_key is not None:
+            self._modulation_cache = (cache_key, img_mod_params, txt_mod_params)
+        return img_mod_params, txt_mod_params
 
     def _modulate(self, mod_params):
         """Apply modulation to input tensor"""
@@ -861,14 +972,20 @@ class QwenImageTransformerBlock(nn.Module):
         joint_attention_kwargs: dict[str, Any] | None = None,
         modulate_index: list[int] | None = None,
         hidden_states_mask: torch.Tensor | None = None,
+        modulation_cache_enabled: bool = False,
+        modulation_timestep: torch.Tensor | None = None,
+        modulation_guidance: torch.Tensor | None = None,
+        modulation_additional_t_cond: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Get modulation parameters for both streams
-        img_mod_params = self.img_mod(temb)  # [B, 6*dim]
-
-        if self.zero_cond_t:
-            temb = torch.chunk(temb, 2, dim=0)[0]
-
-        txt_mod_params = self.txt_mod(temb)  # [B, 6*dim]
+        img_mod_params, txt_mod_params = self._get_modulation_params(
+            temb,
+            modulation_cache_enabled,
+            modulation_timestep,
+            modulation_guidance,
+            modulation_additional_t_cond,
+            hidden_states,
+        )
 
         # Split modulation parameters for norm1 and norm2
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
@@ -1181,6 +1298,15 @@ class QwenImageTransformer2DModel(CachedTransformer):
         if self.parallel_config.sequence_parallel_size > 1:
             get_forward_context().split_text_embed_in_sp = False
 
+        # Keep the raw inputs for the eager-only modulation cache. Building the
+        # key inside each block lets regional torch.compile fail closed.
+        modulation_timestep = timestep
+        modulation_guidance = guidance
+        modulation_additional_t_cond = additional_t_cond
+        modulation_cache_enabled = bool(getattr(self, "do_true_cfg", False)) and (
+            get_classifier_free_guidance_world_size() == 1
+        )
+
         # Prepare hidden_states and RoPE via ImageRopePrepare module
         # _sp_plan will shard hidden_states and vid_freqs together via split_output=True
         # txt_freqs is kept replicated for dual-stream attention
@@ -1261,6 +1387,10 @@ class QwenImageTransformer2DModel(CachedTransformer):
                 joint_attention_kwargs=attention_kwargs,
                 modulate_index=modulate_index,
                 hidden_states_mask=hidden_states_mask,
+                modulation_cache_enabled=modulation_cache_enabled,
+                modulation_timestep=modulation_timestep,
+                modulation_guidance=modulation_guidance,
+                modulation_additional_t_cond=modulation_additional_t_cond,
             )
 
         if self.zero_cond_t:
