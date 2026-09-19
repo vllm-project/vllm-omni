@@ -245,6 +245,8 @@ source_file_dependencies:
     - *minicpmo_4_5_duplex
     - tests/e2e/online_serving/test_minicpmo_4_5_duplex.py
     - tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py
+    - tests/e2e/online_serving/test_minicpmo_4_5_window.py
+    - tests/e2e/online_serving/helpers/minicpmo_window_e2e.py
     - tests/e2e/online_serving/test_duplex_client_live.py
     - tests/e2e/online_serving/test_minicpmo_realtime_duplex_drivers.py
     - tests/e2e/online_serving/helpers/minicpmo_realtime_duplex_scenarios.py

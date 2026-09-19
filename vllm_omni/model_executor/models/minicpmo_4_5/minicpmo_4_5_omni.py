@@ -105,6 +105,27 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             self.model = self.thinker
             self.talker = None
 
+            if getattr(getattr(vllm_config, "model_config", None), "session_mode", None) == "duplex":
+                from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+                    duplex_window_geometry,
+                    install_duplex_window_layers,
+                    validate_duplex_window_install,
+                )
+
+                geometry = duplex_window_geometry(
+                    prefix_tokens=96,
+                    window_tokens=6000,
+                    block_size=vllm_config.cache_config.block_size,
+                    max_model_len=vllm_config.model_config.max_model_len,
+                    high_watermark_tokens=8000,
+                )
+                install_duplex_window_layers(self.thinker, geometry=geometry)
+                validate_duplex_window_install(
+                    vllm_config.cache_config,
+                    vllm_config.model_config,
+                    geometry,
+                )
+
         elif self.model_stage == "tts":
             self.thinker = None
             # The Talker is always the runner-owned continuous codec producer.

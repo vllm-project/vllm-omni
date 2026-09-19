@@ -464,7 +464,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def _update_states(self, scheduler_output: SchedulerOutput) -> Callable | None:
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
         self._update_duplex_sampling_states(scheduler_output)
+        self._maybe_apply_stage0_reanchor()
         return deferred_state_corrections_fn
+
+    def _maybe_apply_stage0_reanchor(self) -> None:
+        """Apply in-place KV reanchor and rotation on worker before model forward."""
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+            MiniCPMO45DuplexWorkerHelper,
+        )
+
+        MiniCPMO45DuplexWorkerHelper.maybe_apply_reanchor(self)
 
     def _request_final_stage_id(self, req_id: str) -> int | None:
         info = self.model_intermediate_buffer.get(req_id)
