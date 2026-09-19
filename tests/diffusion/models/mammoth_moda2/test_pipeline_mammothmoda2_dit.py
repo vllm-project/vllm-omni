@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, TransformerConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.models.mammoth_moda2 import pipeline_mammothmoda2_dit
 from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import (
     MammothModa2DiTPipeline,
@@ -74,6 +75,7 @@ def test_root_weight_source_forwards_revision() -> None:
 
 
 def test_pipeline_declares_native_components_and_single_request_mode_only() -> None:
+    assert issubclass(MammothModa2DiTPipeline, CFGParallelMixin)
     assert MammothModa2DiTPipeline._dit_modules == ["gen_transformer"]
     assert MammothModa2DiTPipeline._encoder_modules == ["gen_image_condition_refiner"]
     assert MammothModa2DiTPipeline._vae_modules == ["gen_vae"]
@@ -284,12 +286,13 @@ def test_parse_request_synthesizes_dummy_ar_conditions() -> None:
     batch = _batch(
         request_id="dummy_req_id",
         prompt={"prompt": "dummy run"},
-        sampling=OmniDiffusionSamplingParams(height=512, width=512, seed=1, guidance_scale=0.0, num_inference_steps=2),
+        sampling=OmniDiffusionSamplingParams(height=512, width=512, seed=1, guidance_scale=9.0, num_inference_steps=2),
     )
     parsed = _pipeline_shell()._parse_request(batch)
     assert parsed.full_hidden_states.shape == (2, 8)
     assert parsed.full_token_ids == [0, 100]
     assert parsed.answer_start_index == 1
+    assert parsed.text_guidance_scale == 1.0
 
 
 @dataclass
@@ -377,6 +380,56 @@ def test_forward_returns_diffusion_output_with_request_sampling(mocker) -> None:
     assert captured["seed"] == 42
     assert scheduler.requested_steps == 2
     assert pipeline.gen_transformer.calls == 2
+
+
+def test_forward_dispatches_positive_and_negative_cfg_branches(mocker) -> None:
+    pipeline = _pipeline_shell()
+    pipeline.gen_transformer = _FakeTransformer()
+    pipeline.gen_image_condition_refiner = None
+    pipeline.gen_vae = _FakeVae()
+    pipeline.gen_freqs_cis = torch.zeros(1)
+    scheduler = _FakeScheduler()
+
+    module = "vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit"
+    mocker.patch(f"{module}.FlowMatchEulerDiscreteScheduler", return_value=scheduler)
+    mocker.patch(
+        f"{module}.randn_tensor",
+        side_effect=lambda shape, **kwargs: torch.zeros(
+            shape,
+            device=kwargs["device"],
+            dtype=kwargs["dtype"],
+        ),
+    )
+    cfg_dispatch = mocker.patch.object(
+        pipeline,
+        "predict_noise_maybe_with_cfg",
+        side_effect=lambda **kwargs: torch.zeros_like(kwargs["positive_kwargs"]["hidden_states"]),
+    )
+
+    pipeline.forward(
+        _batch(
+            sampling=OmniDiffusionSamplingParams(
+                height=32,
+                width=48,
+                seed=42,
+                guidance_scale=4.0,
+                num_inference_steps=2,
+            )
+        )
+    )
+
+    assert cfg_dispatch.call_count == 2
+    for call in cfg_dispatch.call_args_list:
+        assert call.kwargs["do_true_cfg"] is True
+        assert call.kwargs["true_cfg_scale"] == 4.0
+        assert call.kwargs["cfg_normalize"] is False
+        positive_kwargs = call.kwargs["positive_kwargs"]
+        negative_kwargs = call.kwargs["negative_kwargs"]
+        assert "ar_image_hidden_states" in positive_kwargs
+        assert "ar_image_attention_mask" in positive_kwargs
+        assert positive_kwargs["text_hidden_states"].shape[1] > 0
+        assert negative_kwargs["text_hidden_states"].shape == (1, 0, 8)
+        assert "ar_image_hidden_states" not in negative_kwargs
 
 
 def test_forward_rejects_missing_visual_tokens_before_model_access() -> None:
