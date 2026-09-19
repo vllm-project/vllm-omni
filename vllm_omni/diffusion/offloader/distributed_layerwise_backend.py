@@ -1018,6 +1018,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self.rank = 0
         self._blocks: list[list[nn.Module]] = []
         self._all_hook_groups: list[list[DistributedLayerwiseOffloadHook]] = []
+        # Encoder hook groups are a subset of ``_all_hook_groups``; the subset
+        # is tracked separately so host-registration can target them.
+        self._encoder_hook_groups: list[list[DistributedLayerwiseOffloadHook]] = []
         self._resident_blocks: list[nn.Module] = []
         self._resident_layer_group: PinnedResidentLayerGroup | None = None
         self._residency_pipeline_ref: weakref.ReferenceType[nn.Module] | None = None
@@ -1026,6 +1029,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._using_mmap = False
         self._using_rank_local_mmap = False
         self._using_registered_mmap = False
+        # Rank-local components whose host masters are already materialised by
+        # the ordinary loader are consumed in place instead of being copied
+        # into a second pinned buffer. Only the text encoder takes this path
+        # today; the DiT keeps its checkpoint views.
+        self._using_encoder_host_sources = False
         self.host_weight_plan = host_weight_plan
         self._host_weight_lease: HostWeightLease | None = None
         self._host_registration: HostRegistration | None = None
@@ -1428,6 +1436,16 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             return self.dp_group, self.dp_size, self.rank
         return None, 1, 0
 
+    def _text_encoder_reuses_host_sources(self) -> bool:
+        """Whether the rank-local text encoder can keep its loader-made CPU tensors.
+
+        The DiT already established that rank-local host sources are safe to
+        consume in this process. A single-rank encoder transport then reads the
+        exact tensors its own rank materialised, so the parallel pinned shard
+        copy only duplicates host memory and DLO setup time.
+        """
+        return self._using_rank_local_mmap and self._component_transport(TEXT_ENCODER_COMPONENT)[1] <= 1
+
     def _has_multirank_allgather(self) -> bool:
         components = self.config.components or frozenset({DIT_COMPONENT})
         return self.dp_size > 1 and any(self.config.uses_allgather(component) for component in components)
@@ -1445,10 +1463,18 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             raise ValueError("A distributed layerwise hook group requires at least two blocks")
 
         group, group_size, group_rank = self._component_transport(component)
+        # A loader-materialized rank-local component keeps its existing host
+        # masters; only the mmap-backed DiT needs the deferred mmap transforms.
+        rank_local_sources = (
+            self._using_encoder_host_sources
+            if component == TEXT_ENCODER_COMPONENT
+            else (self._using_rank_local_mmap if use_dit_mmap else False)
+        )
         hooks: list[DistributedLayerwiseOffloadHook] = []
         self._all_hook_groups.append(hooks)
         self._blocks.append(block_list)
         probes = {id(block): module_materialization_probe(block) for block in block_list}
+        dit_transforms = self._mmap_transforms_by_tensor_id if use_dit_mmap else None
         for block, next_block in zip(
             chain((block_list[-1],), block_list[:-1]),
             block_list,
@@ -1466,8 +1492,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     self.comm_stream,
                     self.config.pin_cpu_memory,
                     shared_buffers=[None, None],
-                    rank_local_mmap=self._using_rank_local_mmap if use_dit_mmap else False,
-                    tensor_transforms=self._mmap_transforms_by_tensor_id if use_dit_mmap else None,
+                    rank_local_mmap=rank_local_sources,
+                    tensor_transforms=dit_transforms if rank_local_sources else None,
                     materialization_probe_tensor=probes[id(block)],
                 )
             )
@@ -1496,7 +1522,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         module = component.module
         encoder_hooks: list[DistributedLayerwiseOffloadHook] = []
         for blocks in block_groups:
-            encoder_hooks.extend(self._install_hook_group(blocks, TEXT_ENCODER_COMPONENT))
+            group_hooks = self._install_hook_group(blocks, TEXT_ENCODER_COMPONENT)
+            self._encoder_hook_groups.append(group_hooks)
+            encoder_hooks.extend(group_hooks)
         # Track the module before placement, which may fail, so outer rollback
         # also removes its partially-installed block hooks and marker state.
         self._encoder_modules.append(module)
@@ -1712,13 +1740,13 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     "DLO consuming final-layout Host Weight Runtime lease %s",
                     self._host_weight_lease.provenance.resolution_id,
                 )
-            elif host_weight_plan.backing_kind == "checkpoint_mmap":
+            elif host_weight_plan.backing_kind == "checkpoint_mmap" and resolved.dits:
                 self._load_weights_via_mmap(
                     pipeline,
                     resolved.modules,
                     host_weight_plan,
                 )
-            else:
+            elif host_weight_plan.backing_kind != "checkpoint_mmap":
                 raise ValueError(f"Unsupported DLO host-weight backing: {host_weight_plan.backing_kind}")
             if self._using_rank_local_mmap:
                 logger.info(
@@ -1740,6 +1768,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     f"DLO received meta tensors without a loader-owned host-weight plan (first 5: {remaining_meta[:5]})"
                 )
             logger.info("DLO is using host tensors materialized by the ordinary loader")
+
+        # Loader-materialized rank-local masters are consumed in place. Decide
+        # that before component preparation installs the encoder hooks.
+        self._using_encoder_host_sources = self._text_encoder_reuses_host_sources()
 
         # Apply each selected encoder transfer while keeping explicit VAEs and
         # unselected components resident.
@@ -1798,6 +1830,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             self._residency_pipeline_ref = weakref.ref(pipeline)
 
         all_hooks = [hook for group in self._all_hook_groups for hook in group]
+        # Loader-materialized rank-local components stream through the same
+        # bounded host staging slots as the checkpoint views, so the two-slot
+        # budget has to cover the largest block of every rank-local component.
+        staging_hooks = [hook for hook in all_hooks if hook.rank_local_mmap]
         self._configure_hwr_transfer(all_hooks)
 
         if not self._all_hook_groups:
@@ -1816,13 +1852,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # language_model).  Groups execute sequentially, so 2 buffers suffice.
         unified_buffers = self._allocate_shared_buffers(all_hooks)
         allgather_hooks = [hook for hook in all_hooks if hook.dp_size > 1]
-        mmap_hooks = [hook for hook in all_hooks if hook.rank_local_mmap]
         unified_shard_buffers = self._allocate_shared_shard_buffers(allgather_hooks) if allgather_hooks else None
         unified_cpu_staging = None
         cpu_staging_events = None
-        if self._using_rank_local_mmap and not self._using_registered_mmap:
+        if staging_hooks and not self._using_registered_mmap:
             unified_cpu_staging = self._allocate_shared_cpu_staging_buffers(
-                mmap_hooks,
+                staging_hooks,
                 self._resident_layer_group,
             )
             cpu_staging_events = [None, None]
@@ -1838,6 +1873,28 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # that last wrote to that slot.  Group-first hooks use this to
         # skip sync-prefetch when the slot still contains their own data.
         shared_slot_group = [-1, -1]
+
+        # Fallback: a rank-local hook the registration pass did not cover still
+        # needs bounded staging. Allocate pageable slots for it rather than
+        # failing startup; the H2D copy stays correct, only its bandwidth drops.
+        unregistered = [hook for hook in staging_hooks if not hook.registered_mmap]
+        if unregistered and unified_cpu_staging is None:
+            logger.warning(
+                "%d rank-local hook(s) are not registration-backed; "
+                "allocating pageable host staging as a fallback",
+                len(unregistered),
+            )
+            unified_cpu_staging = self._allocate_shared_cpu_staging_buffers(
+                unregistered,
+                self._resident_layer_group,
+                pinned=False,
+            )
+            cpu_staging_events = [None, None]
+            if self._resident_layer_group is not None:
+                self._resident_layer_group._cpu_staging_buffers = [
+                    buffers for buffers in unified_cpu_staging if buffers is not None
+                ]
+                self._resident_layer_group._cpu_staging_events = cpu_staging_events
 
         for group_idx, group in enumerate(self._all_hook_groups):
             for hook in group:
@@ -2030,6 +2087,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         self._blocks.clear()
         self._all_hook_groups.clear()
+        self._encoder_hook_groups.clear()
         self._resident_blocks.clear()
         self._resident_layer_group = None
         self._encoder_modules.clear()
@@ -2041,6 +2099,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._using_mmap = False
         self._using_rank_local_mmap = False
         self._using_registered_mmap = False
+        self._using_encoder_host_sources = False
         self.enabled = False
         logger.info("Distributed layer-wise offloading disabled")
         if release_error is not None:
@@ -2089,8 +2148,14 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
     def _allocate_shared_cpu_staging_buffers(
         hooks: list[DistributedLayerwiseOffloadHook],
         resident_group: PinnedResidentLayerGroup | None = None,
+        *,
+        pinned: bool | None = None,
     ) -> list[dict[torch.dtype, torch.Tensor] | None]:
-        """Allocate two bounded host slots for rank-local mmap -> device copies."""
+        """Allocate two bounded host slots for rank-local mmap -> device copies.
+
+        ``pinned`` overrides the pinning policy taken from the hooks; the
+        pageable fallback uses it when the host cannot pin at all.
+        """
         max_sizes: dict[torch.dtype, int] = {}
         for hook in hooks:
             for dtype, metas in hook.metadata.items():
@@ -2103,6 +2168,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     max_sizes[dtype] = max(max_sizes.get(dtype, 0), total)
 
         pin_memory = hooks[0].pin_memory if hooks else bool(resident_group and resident_group.pin_memory)
+        if pinned is not None:
+            pin_memory = pinned
         shared_staging: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
         for slot in range(2):
             buffers: dict[torch.dtype, torch.Tensor] = {}

@@ -2517,6 +2517,127 @@ class _GenericDistributedEncoderPipeline(nn.Module):
         self.text_encoder = _PlainEncoder()
 
 
+class _MaterializedEncoderPipeline(nn.Module):
+    """Rank-local encoder whose weights the ordinary loader materialised on CPU."""
+
+    _offload_plan = OffloadPlan(
+        encoder_component_types={"text_encoder": "text_encoder"},
+        encoder_block_attrs={"text_encoder": ("encoder.block",)},
+    )
+
+    def __init__(self):
+        super().__init__()
+        self.transformer = _SingleBlockModel(num_blocks=2)
+        self.text_encoder = _WideEncoder()
+
+
+class _WideEncoder(nn.Module):
+    """Encoder whose blocks are wider than any DiT block in the fixture."""
+
+    def __init__(self):
+        super().__init__()
+        self.encoder = nn.Module()
+        self.encoder.block = nn.ModuleList([_WideBlock(), _WideBlock()])
+        self.final_norm = nn.Linear(2, 2)
+
+    def load_to_device(self):
+        return None
+
+    def offload_to_cpu(self):
+        return None
+
+
+class _WideBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(64, 64))
+
+
+def _materialized_encoder_backend():
+    """HWR-backed rank-local DLO, the topology the DP2 acceptance run uses."""
+    plan, carrier, lease = _fake_hwr_plan("phase-b-encoder-reuse")
+    backend = DistributedLayerwiseOffloadBackend(
+        OffloadConfig(
+            strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+            pin_cpu_memory=False,
+            dp_size=2,
+            dlo_transfers={"dit": "rank-local", "text_encoder": "rank-local"},
+        ),
+        torch.device("cpu"),
+        host_weight_plan=plan,
+    )
+    return backend, carrier, lease
+
+
+def _fail_pinned_staging(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make pinned host allocation fail the way a GPU-less host would."""
+    original = torch.empty
+
+    def guarded(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            raise RuntimeError("No CUDA GPUs are available")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(dist_backend_module.torch, "empty", guarded)
+
+
+def test_pageable_staging_fallback_covers_unregistered_rank_local_hooks(
+    patched_offload_runtime,
+    monkeypatch,
+):
+    """A rank-local hook without registration must degrade, not fail startup."""
+    pipeline = _MaterializedEncoderPipeline()
+    backend, _, _ = _materialized_encoder_backend()
+    _fail_pinned_staging(monkeypatch)
+
+    backend.enable(pipeline)
+
+    encoder_hooks = [hook for group in backend._encoder_hook_groups for hook in group]
+    assert encoder_hooks, "encoder block hooks were not installed"
+    for hook in encoder_hooks:
+        buffers = hook.cpu_staging_buffers
+        assert buffers, "fallback staging was not attached to the encoder hook"
+        for slot in buffers:
+            for dtype, metas in hook.metadata.items():
+                assert slot[dtype].numel() >= sum(meta["numel"] for meta in metas)
+    # the DiT still received staging for its own rank-local hooks
+    assert backend._all_hook_groups[0][0].cpu_staging_buffers is not None
+
+
+def test_materialized_encoder_uses_rank_local_host_sources(patched_offload_runtime):
+    """The loader-made encoder masters must not be copied into a parallel shard."""
+    pipeline = _MaterializedEncoderPipeline()
+    backend, _, _ = _materialized_encoder_backend()
+
+    backend.enable(pipeline)
+
+    encoder_hooks = [hook for group in backend._encoder_hook_groups for hook in group]
+    assert encoder_hooks, "encoder block hooks were not installed"
+    assert all(hook.rank_local_mmap for hook in encoder_hooks)
+    # Rank-local sources keep references to the loader's tensors, so no private
+    # pinned shard is materialised for any encoder block.
+    assert all(not hook.cpu_shards for hook in encoder_hooks)
+    assert all(hook.cpu_sources for hook in encoder_hooks)
+
+
+def test_bounded_staging_covers_encoder_blocks(patched_offload_runtime):
+    """The two host staging slots must fit the widest rank-local block."""
+    pipeline = _MaterializedEncoderPipeline()
+    backend, _, _ = _materialized_encoder_backend()
+
+    backend.enable(pipeline)
+
+    encoder_hook = backend._encoder_hook_groups[0][0]
+    buffers = encoder_hook.cpu_staging_buffers
+    assert buffers, "encoder hooks were not given bounded host staging"
+    for slot in buffers:
+        for dtype, metas in encoder_hook.metadata.items():
+            needed = sum(meta["numel"] for meta in metas)
+            assert slot[dtype].numel() >= needed
+    dit_hook = backend._all_hook_groups[0][0]
+    assert dit_hook.cpu_staging_buffers is not None
+
+
 class TestDistributedComponentSelection:
     def test_on_demand_only_encoder_cannot_claim_allgather(self, patched_offload_runtime):
         class Pipeline(nn.Module):
