@@ -43,6 +43,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
+    from vllm.multimodal.inputs import MultiModalKwargsItem, PlaceholderRange
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.outputs import RoutedExpertsLists
 else:
@@ -82,6 +83,19 @@ def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dic
 
 class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
     intermediate_tensors: IntermediateTensors | None
+
+    def _batch_mm_inputs_from_scheduler(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> tuple[list[str], list[tuple[str, "MultiModalKwargsItem"]], list[tuple[str, "PlaceholderRange"]]]:
+        hashes, inputs, lora_refs = super()._batch_mm_inputs_from_scheduler(scheduler_output)
+        if self.encoder_cudagraph_manager is None:
+            return hashes, inputs, lora_refs
+        # Precomputed embeddings have no encoder work. Give them a separate
+        # batching key so they bypass the pixel-only encoder graph manager.
+        inputs = [
+            (f"{modality}_embeds" if f"{modality}_embeds" in data else modality, data) for modality, data in inputs
+        ]
+        return hashes, inputs, lora_refs
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
