@@ -202,6 +202,18 @@ class PinnedModuleStager:
         self.cache_retention = cache_retention
 
     def _release_cache(self, *, force: bool = False) -> None:
+        # The eviction-path ``empty_cache`` is skipped on XPU. Returning the
+        # segments to the driver is not required for the freed HBM to be
+        # reusable -- the caching allocator already hands those blocks to the
+        # next allocation -- but on XPU it churns the addresses of the
+        # collective receive buffers allocated after it, and the XPU collective
+        # backend registers a non-reclaimable driver resource per distinct
+        # receive-buffer address, so device memory outside the PyTorch pool was
+        # observed growing across requests. The retention policy does not help
+        # here: it still releases whenever a bound trips or telemetry is
+        # missing. Forced releases (failure paths) keep their explicit flush.
+        if not force and current_omni_platform.is_xpu():
+            return
         if self.cache_retention is None:
             current_omni_platform.empty_cache()
         else:
