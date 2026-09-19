@@ -108,20 +108,18 @@ else:
                 # (for example, mismatched CUTLASS DSL and Quack builds). Treat
                 # that as unavailable so backend discovery can continue.
                 logger.debug("CuTe FlashAttention-4 is unavailable: %s", exc)
-    else:
-        # Candidate 2: FA3 from fa3-fwd PyPI package.
-        if flash_attn_func is None:
-            try:
-                from fa3_fwd_interface import flash_attn_func as _fa_func
-                from fa3_fwd_interface import flash_attn_varlen_func as _fa_varlen
+    # Candidate 2: vLLM's maintained FA2/FA3/FA4 dispatcher.
+    if flash_attn_varlen_func is None:
+        try:
+            from vllm.vllm_flash_attn import flash_attn_varlen_func as _fa_varlen
 
-                flash_attn_func = _fa_func
-                flash_attn_varlen_func = _fa_varlen
-            except (ImportError, ModuleNotFoundError):
-                pass
+            flash_attn_varlen_func = _fa_varlen
+        except (ImportError, ModuleNotFoundError):
+            pass
 
+    if not _is_blackwell():
         # Candidate 3: FA3 from a flash-attention source build.
-        if flash_attn_func is None:
+        if flash_attn_varlen_func is None:
             try:
                 from flash_attn_interface import flash_attn_func as _fa_func
                 from flash_attn_interface import flash_attn_varlen_func as _fa_varlen
@@ -132,7 +130,7 @@ else:
                 pass
 
         # Candidate 4: FA2 from the flash-attn package (multiple import paths).
-        if flash_attn_func is None:
+        if flash_attn_varlen_func is None:
             try:
                 from flash_attn import flash_attn_func as _fa_func
                 from flash_attn import flash_attn_varlen_func as _fa_varlen
@@ -142,7 +140,7 @@ else:
             except (ImportError, ModuleNotFoundError):
                 pass
 
-        if flash_attn_func is None:
+        if flash_attn_varlen_func is None:
             try:
                 from flash_attn.flash_attn_interface import flash_attn_func as _fa_func
                 from flash_attn.flash_attn_interface import flash_attn_varlen_func as _fa_varlen
@@ -152,14 +150,6 @@ else:
             except (ImportError, ModuleNotFoundError):
                 pass
 
-        # Candidate 5: vLLM's encapsulated Flash Attention dispatcher.
-        if flash_attn_varlen_func is None:
-            try:
-                from vllm.vllm_flash_attn import flash_attn_varlen_func as _fa_varlen
-
-                flash_attn_varlen_func = _fa_varlen
-            except (ImportError, ModuleNotFoundError):
-                pass
 
 # If no FA backend available, SDPA backend will be selected at the platform level
 # flash_attn_func and flash_attn_varlen_func will be None
@@ -249,6 +239,57 @@ def vllm_flash_attn_varlen_with_lse(
     return out, lse
 
 
+def vllm_flash_attn_dense_with_lse(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    softmax_scale: float | None = None,
+    softcap: float = 0.0,
+    causal: bool = False,
+    deterministic: bool = False,
+    fa_version: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run dense batched attention through vLLM's varlen FA dispatcher."""
+
+    batch_size, seqlen_q = q.shape[:2]
+    seqlen_k = k.shape[1]
+    q_flat = q.flatten(0, 1)
+    k_flat = k.flatten(0, 1)
+    v_flat = v.flatten(0, 1)
+    cu_seqlens_q = torch.arange(
+        0,
+        (batch_size + 1) * seqlen_q,
+        seqlen_q,
+        dtype=torch.int32,
+        device=q.device,
+    )
+    cu_seqlens_k = torch.arange(
+        0,
+        (batch_size + 1) * seqlen_k,
+        seqlen_k,
+        dtype=torch.int32,
+        device=k.device,
+    )
+    out, lse = vllm_flash_attn_varlen_with_lse(
+        q_flat,
+        k_flat,
+        v_flat,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        softmax_scale=softmax_scale,
+        softcap=softcap,
+        causal=causal,
+        deterministic=deterministic,
+        fa_version=fa_version,
+    )
+    out = out.unflatten(0, (batch_size, seqlen_q))
+    lse = lse.unflatten(1, (batch_size, seqlen_q)).permute(1, 0, 2)
+    return out, lse
+
+
 @lru_cache(maxsize=1)
 def is_flash_attn_installed() -> bool:
     """Return whether a Flash Attention backend package is importable.
@@ -256,18 +297,21 @@ def is_flash_attn_installed() -> bool:
     Shared by CUDA/ROCm/MUSA platforms.
     """
     try:
-        # Check for any FA backend: FA4 (flash_attn.cute), FA3
-        # (fa3_fwd_interface, flash_attn_interface), or FA2 (flash_attn).
-        if _is_blackwell():
-            return is_flash_attn_4_available()
+        # Check for optional standalone FA4 first on Blackwell.
+        if _is_blackwell() and is_flash_attn_4_available():
+            return True
 
-        # Try FA3 from fa3-fwd PyPI package
+        # vLLM ships its maintained FlashAttention dispatcher with CUDA builds.
         try:
-            import fa3_fwd_interface  # noqa: F401
+            from vllm.vllm_flash_attn import flash_attn_varlen_func  # noqa: F401
 
             return True
         except (ImportError, ModuleNotFoundError):
             pass
+
+        # Standalone FA2/FA3 packages below do not provide Blackwell kernels.
+        if _is_blackwell():
+            return False
 
         # Try FA3 from flash-attention source build
         try:
@@ -286,16 +330,8 @@ def is_flash_attn_installed() -> bool:
     except (ImportError, ModuleNotFoundError):
         pass
 
-    # Try vLLM's flash attention wrapper
-    try:
-        from vllm.vllm_flash_attn import (  # noqa: F401
-            flash_attn_varlen_func,
-        )
-
-        return True
-    except (ImportError, ModuleNotFoundError):
-        logger.warning("No Flash Attention implementation found")
-        return False
+    logger.warning("No Flash Attention implementation found")
+    return False
 
 
 def _index_first_axis(tensor, indices):

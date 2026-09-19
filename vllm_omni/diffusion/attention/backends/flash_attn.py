@@ -405,7 +405,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         if not HAS_FLASH_ATTN:
             raise ImportError(
                 "FlashAttentionBackend requires Flash Attention. "
-                "Please install one of: fa3-fwd, flash-attention, or flash-attn. "
+                "Please use a CUDA vLLM build or install flash-attention/flash-attn. "
                 "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
             )
 
