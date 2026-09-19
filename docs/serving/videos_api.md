@@ -116,7 +116,13 @@ request for execution.
 `DELETE /v1/videos/{video_id}` issues a bounded engine abort
 (`VLLM_OMNI_ABORT_TIMEOUT`, default 2s), then cancels the frontend
 task. Cancellation cleanup is also bounded and best-effort: it confirms
-the abort was queued, and the current request batch may still drain.
+the abort was submitted. MiniMax-H3 checks cancellation at model boundaries,
+including after each denoising step, and skips the remaining generation when
+cancelled. A device operation already in flight is allowed to finish.
+Parallel ranks agree before stopping; independent requests sharing a distributed
+AllGather offload wave can stop that wave early only when all its requests are
+cancelled, so a cancelled request cannot strand its live peers in a collective.
+Other pipelines may still drain their current request batch.
 The job is then re-read so a completed save is not orphaned.
 
 ### Synchronous Response

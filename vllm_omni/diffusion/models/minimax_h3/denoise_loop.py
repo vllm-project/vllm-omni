@@ -16,6 +16,7 @@ from typing import Any
 import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout, VideoTokenSpan
+from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_step_idx,
     set_forward_context_denoise_timestep,
@@ -310,6 +311,7 @@ def minimax_h3_denoise_loop(
 
     num_steps = len(sigmas_video) - 1
     for step in range(num_steps):
+        check_request_cancellation()
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
             s_v, s_v_next = sigmas_video[step], sigmas_video[step + 1]
@@ -361,6 +363,7 @@ def minimax_h3_denoise_loop(
                 audio_rows[~audio_update] = audio_anchor  # per-step audio ref reset
             if on_step is not None:
                 on_step(step, video_rows, audio_rows)
+            check_request_cancellation(synchronize=True)
 
     minimax_h3_publish_denoise_progress(None, None, None)
     return video_rows, audio_rows
