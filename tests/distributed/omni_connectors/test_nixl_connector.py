@@ -544,21 +544,31 @@ def test_source_endpoint_metadata_overrides_configured_sender(consumer, monkeypa
     assert queried == [("req-tp4-rank3", "10.0.0.3", PORT + 3 * 16)]
 
 
-def test_unknown_key_is_queried_once(producer, consumer, monkeypatch):
+@pytest.mark.parametrize("query_times_out", [False, True], ids=["not-found", "timeout"])
+def test_unknown_key_is_queried_once(producer, consumer, monkeypatch, query_times_out):
+    from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import _META_NOT_FOUND
+
     socket = consumer._get_req_socket(f"tcp://127.0.0.1:{PORT}")
-    send_count = 0
+    send_timeouts = []
     original_send = socket.send
 
     def count_send(message):
-        nonlocal send_count
-        send_count += 1
+        # A receive timeout closes the socket, so inspect it before receiving.
+        send_timeouts.append(socket.getsockopt(zmq.RCVTIMEO))
         return original_send(message)
 
     monkeypatch.setattr(socket, "send", count_send)
 
+    def recv():
+        if query_times_out:
+            raise zmq.Again()
+        return _META_NOT_FOUND
+
+    monkeypatch.setattr(socket, "recv", recv)
+
     assert consumer._resolve_metadata("never-published", None) is None
-    assert send_count == 1
-    assert socket.getsockopt(zmq.RCVTIMEO) == 10
+    assert send_timeouts == [10]
+    assert socket.closed is query_times_out
 
 
 @pytest.mark.usefixtures("reliable_claim_queries")
