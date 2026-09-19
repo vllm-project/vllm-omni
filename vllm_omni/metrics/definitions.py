@@ -99,6 +99,10 @@ MEDIAN_PEAK_MEMORY_MB = f"median_{PEAK_MEMORY_MB}"
 STD_PEAK_MEMORY_MB = f"std_{PEAK_MEMORY_MB}"
 PERCENTILES_PEAK_MEMORY_MB = f"percentiles_{PEAK_MEMORY_MB}"
 
+STAGE_DURATIONS_MEAN = "stage_durations_mean"
+STAGE_DURATIONS_P50 = "stage_durations_p50"
+STAGE_DURATIONS_P99 = "stage_durations_p99"
+
 # Stage snapshot / StageBenchmarkMetrics field names.
 TOTAL_OUTPUT = "total_output"
 TTFTS = "ttfts"

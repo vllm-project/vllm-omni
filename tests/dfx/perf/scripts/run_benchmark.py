@@ -50,12 +50,19 @@ if CONFIG_FILE_PATH is None:
     _all_configs = load_benchmark_configs(config_dir=_PERF_TESTS_DIR)
     BENCHMARK_CONFIGS = [cfg for cfg in _all_configs if not is_diffusion_perf_config(cfg)]
     print(
-        f"No --test-config-file: loaded {len(BENCHMARK_CONFIGS)} omni/tts case(s) from "
+        f"No --test-config-file: loaded {len(BENCHMARK_CONFIGS)} omni/tts/generation case(s) from "
         f"{_PERF_TESTS_DIR}/*.json (skipped {len(_all_configs) - len(BENCHMARK_CONFIGS)} diffusion; "
         f"use -m to filter, e.g. -m tts)"
     )
 else:
-    BENCHMARK_CONFIGS = load_benchmark_configs(CONFIG_FILE_PATH)
+    _loaded = load_benchmark_configs(CONFIG_FILE_PATH)
+    BENCHMARK_CONFIGS = [cfg for cfg in _loaded if not is_diffusion_perf_config(cfg)]
+    skipped = len(_loaded) - len(BENCHMARK_CONFIGS)
+    if skipped:
+        print(
+            f"--test-config-file: loaded {len(BENCHMARK_CONFIGS)} omni/tts/generation case(s); "
+            f"skipped {skipped} remaining diffusion case(s) (chat completions / custom jsonl)"
+        )
 
 DEPLOY_CONFIGS_DIR = Path(__file__).parent.parent / "deploy"
 server_to_benchmark_mapping = create_test_parameter_mapping(BENCHMARK_CONFIGS)
@@ -93,24 +100,107 @@ class _SingleActiveContext:
             stack.close()
 
 
+# OmniServer defaults for flags not already present in JSON ``serve_args`` /
+# ``extra_cli_args``. Add new (flag, value) pairs here rather than special-casing.
+_OMNI_DEFAULT_SERVER_ARGS: tuple[tuple[str, str], ...] = (
+    ("--stage-init-timeout", "600"),
+    ("--init-timeout", "900"),
+)
+
+
+def _cli_flag_names(cli_args: tuple[str, ...] | list[str]) -> set[str]:
+    """Return long-option names present in a flat CLI argv list."""
+    names: set[str] = set()
+    for item in cli_args:
+        token = str(item)
+        if not token.startswith("--"):
+            continue
+        names.add(token.split("=", 1)[0])
+    return names
+
+
+def _merge_omni_default_server_args(
+    extra_cli_args: tuple[str, ...] | list[str],
+    *,
+    use_omni: bool,
+    defaults: tuple[tuple[str, str], ...] = _OMNI_DEFAULT_SERVER_ARGS,
+) -> list[str]:
+    """Fill Omni defaults for flags not already set in JSON-derived CLI args.
+
+    JSON ``serve_args`` / ``extra_cli_args`` win; only missing flags are appended.
+    """
+    if not use_omni:
+        return []
+    present = _cli_flag_names(extra_cli_args)
+    args: list[str] = []
+    for flag, value in defaults:
+        if flag not in present:
+            args += [flag, value]
+    return args
+
+
+def _omni_server_env() -> dict[str, str]:
+    """Writable video/image storage for ``/v1/videos`` and related generation APIs."""
+    result_dir = Path(os.environ.get("BENCHMARK_DIR", "tests/dfx/perf/results"))
+    storage_path = Path(os.environ.get("VLLM_OMNI_STORAGE_PATH", str(result_dir / "storage")))
+    storage_path.mkdir(parents=True, exist_ok=True)
+    return {"VLLM_OMNI_STORAGE_PATH": str(storage_path)}
+
+
+def _resolve_offline_model(model: str) -> str:
+    """Resolve HF ids / MiniMax env overrides the same way as the diffusion runner."""
+    import huggingface_hub
+
+    from vllm_omni.transformers_utils.repo_utils import hf_api
+
+    if not model or os.path.isdir(model):
+        return model
+
+    model_env_overrides = {
+        "MiniMaxAI/MiniMax-H3": "VLLM_TEST_MINIMAX_H3_MODEL",
+        "MiniMaxAI/MiniMax-H3/FL2VA": "VLLM_TEST_MINIMAX_H3_FL2VA_MODEL",
+        "MiniMaxAI/MiniMax-H3/Ref2VA": "VLLM_TEST_MINIMAX_H3_REF2VA_MODEL",
+    }
+    env_name = model_env_overrides.get(model)
+    if env_name:
+        env_model = os.environ.get(env_name)
+        if env_model:
+            return env_model
+
+    parts = model.split("/")
+    if len(parts) >= 3:
+        repo_id = "/".join(parts[:2])
+        subfolder = "/".join(parts[2:])
+        snapshot_root = hf_api().snapshot_download(
+            repo_id,
+            allow_patterns=[f"{subfolder}/**"],
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+        )
+        return str(Path(snapshot_root) / subfolder)
+
+    if not huggingface_hub.constants.HF_HUB_OFFLINE:
+        return model
+    return hf_api().snapshot_download(model, local_files_only=True)
+
+
 @contextmanager
 def _start_omni_server(server_param):
     test_name, model, stage_config_path, stage_overrides, extra_cli_args, use_omni = server_param
+    extra = tuple(extra_cli_args or ())
+    model = _resolve_offline_model(model)
 
     print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
-    server_args: list[str] = []
-    if use_omni:
-        server_args += ["--stage-init-timeout", "600", "--init-timeout", "900"]
+    server_args: list[str] = _merge_omni_default_server_args(extra, use_omni=use_omni)
     # --deploy-config and --stage-overrides compose at the CLI (see vllm_omni/entrypoints/utils.py):
     # deploy-config sets the base; stage-overrides are applied on top. Both can be set.
     if stage_config_path:
         server_args = ["--deploy-config", stage_config_path] + server_args
     if stage_overrides:
         server_args = ["--stage-overrides", stage_overrides] + server_args
-    if extra_cli_args:
-        server_args = list(extra_cli_args) + server_args
-    with OmniServer(model, server_args, use_omni=use_omni) as server:
+    if extra:
+        server_args = list(extra) + server_args
+    with OmniServer(model, server_args, use_omni=use_omni, env_dict=_omni_server_env()) as server:
         server.test_name = test_name
         print("OmniServer started successfully")
         yield server
@@ -259,10 +349,23 @@ def test_performance_benchmark(omni_server, benchmark_params):
         "eval_phase",
         "trust_remote_code",
         "expected_duplex_audio_turns_per_session",
+        "name",
+        "enable_negative_prompt",
+        "random_request_config",
+        "num_input_images",
+        "warmup_requests",
+        "warmup_concurrency",
+        "warmup_num_inference_steps",
     }
+
+    param_keys = {str(key).replace("-", "_") for key in params}
+    if "model" not in param_keys:
+        args.extend(["--model", str(model)])
 
     for key, value in params.items():
         if key in exclude_keys or value is None:
+            continue
+        if key in {"extra_body", "extra-body"} and value == {}:
             continue
 
         arg_name = f"--{key.replace('_', '-')}"

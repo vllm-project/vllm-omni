@@ -205,15 +205,53 @@ def test_is_diffusion_perf_config():
     from tests.dfx.conftest import is_diffusion_perf_config
 
     assert not is_diffusion_perf_config(
-        {"test_name": "omni_a", "mark": [{"hardware_marks": {"res": {"cuda": "H100"}}}, "omni"]}
+        {
+            "test_name": "omni_a",
+            "mark": [{"hardware_marks": {"res": {"cuda": "H100"}}}, "omni"],
+            "benchmark_params": [{"dataset_name": "random", "endpoint": "/v1/chat/completions"}],
+        }
     )
     assert is_diffusion_perf_config(
         {
             "test_name": "diff_a",
             "server_type": "vllm-omni",
             "mark": [{"hardware_marks": {"res": {"cuda": "H100"}}}, "diffusion"],
+            "benchmark_params": [{"task": "t2i", "dataset": "random"}],
         }
     )
+    videos_cfg = {
+        "test_name": "diff_videos",
+        "server_type": "vllm-omni",
+        "mark": [{"hardware_marks": {"res": {"cuda": "H100"}}}, "diffusion"],
+        "benchmark_params": [{"task": "t2v", "dataset_name": "random", "endpoint": "/v1/videos"}],
+    }
+    assert not is_diffusion_perf_config(videos_cfg)
+    custom_edits_cfg = {
+        "test_name": "diff_custom_edits",
+        "server_type": "vllm-omni",
+        "benchmark_endpoint": "/v1/images/edits",
+        "benchmark_params": [{"dataset": "custom", "task": "ti2i"}],
+    }
+    assert is_diffusion_perf_config(custom_edits_cfg)
+
+
+def test_merge_omni_default_server_args_respects_json():
+    from tests.dfx.perf.scripts.run_benchmark import _merge_omni_default_server_args
+
+    extra = ("--stage-init-timeout", "1800", "--init-timeout", "1800", "--usp", "4")
+    assert _merge_omni_default_server_args(extra, use_omni=True) == []
+    assert _merge_omni_default_server_args((), use_omni=True) == [
+        "--stage-init-timeout",
+        "600",
+        "--init-timeout",
+        "900",
+    ]
+    assert _merge_omni_default_server_args((), use_omni=False) == []
+    # Only fill the missing default; keep JSON's other timeouts.
+    assert _merge_omni_default_server_args(("--stage-init-timeout=1800",), use_omni=True) == [
+        "--init-timeout",
+        "900",
+    ]
 
 
 def test_benchmark_param_id_suffix_from_task_eval_phase():
