@@ -411,8 +411,10 @@ def _stub_pipeline_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
             intrinsics=value.intrinsics[:num_frames],
         )
 
-    def build_plucker_embedding(value, *, height, width, target_height, target_width, device, dtype):
-        del target_height, target_width
+    def build_plucker_embedding(
+        value, *, height, width, target_height, target_width, device, dtype, translation_scale=None
+    ):
+        del target_height, target_width, translation_scale
         frames = value.poses.shape[0]
         data = torch.arange(frames * 6 * height * width, device=device, dtype=torch.float32)
         return data.reshape(frames, 6, height, width).to(dtype=dtype)
@@ -1783,6 +1785,7 @@ def test_first_typed_yaw_action_uses_pre_action_identity_anchor(
         target_width=16,
         device=torch.device("cpu"),
         dtype=torch.float32,
+        translation_scale=None,  # None for camera_actions / action_script input (using max-norm)
     )[1:]
 
     assert not torch.equal(action_embedding, neutral_embedding)
@@ -2015,6 +2018,7 @@ def test_stepwise_failed_chunk_releases_pending_encoder_on_close(monkeypatch: py
     transformer.raise_on_call = 1
     with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
         pipeline.prepare_encode(state)
+        pipeline.prepare_next_chunk(state)
         session = pipeline._ar_sessions[state.request_id]
         assert session.encoder_cache is None and session.pending_encoder_cache is not None
         with pytest.raises(RuntimeError, match="forced transformer failure"):
@@ -2037,6 +2041,7 @@ def test_stateful_condition_rejects_tiled_encoder(monkeypatch: pytest.MonkeyPatc
             state = _stepwise_state()
             with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
                 pipeline.prepare_encode(state)
+                pipeline.prepare_next_chunk(state)
     assert pipeline.vae.encoder.inputs == []
     assert all(s.encoder_cache is None and s.pending_encoder_cache is None for s in pipeline._ar_sessions.values())
 
@@ -2168,11 +2173,14 @@ def _stepwise_state(
 def _run_stepwise(pipeline, state):
     outputs = []
     pipeline.prepare_encode(state)
+    pipeline.prepare_next_chunk(state)
     while not state.request_denoise_completed:
         noise = pipeline.denoise_step(None, states=[state])
         pipeline.step_scheduler(state, noise)
         if state.chunk_denoise_completed:
             outputs.append(pipeline.post_decode(state))
+            if not state.request_denoise_completed:
+                pipeline.prepare_next_chunk(state)
     return outputs
 
 
@@ -2186,6 +2194,7 @@ def _stepwise_chunks(pipeline, state, ar_state):
     """
     with pipeline.bind_ar_diffusion_state(state.request_id, ar_state):
         pipeline.prepare_encode(state)
+        pipeline.prepare_next_chunk(state)
     while not state.request_denoise_completed:
         output = None
         with pipeline.bind_ar_diffusion_state(state.request_id, ar_state):
@@ -2193,6 +2202,8 @@ def _stepwise_chunks(pipeline, state, ar_state):
             pipeline.step_scheduler(state, noise)
             if state.chunk_denoise_completed:
                 output = pipeline.post_decode(state)
+                if not state.request_denoise_completed:
+                    pipeline.prepare_next_chunk(state)
         if output is not None:
             yield output
 
@@ -2463,6 +2474,31 @@ def test_stepwise_chunks_continue_one_sessions_temporal_decode(monkeypatch) -> N
     assert pipeline.vae._feat_map == ["module-owned"]
 
 
+def test_peek_chunk_media_matches_streaming_decoder_frame_counts(monkeypatch) -> None:
+    """Camera timelines must track the streaming decoder's 9-then-12 media counts."""
+    module = _load_pipeline_module()
+    _capture_video_processor(monkeypatch)
+    pipeline = _streaming_pipeline(module)
+    state = _stepwise_state(num_frames=21)
+    state.sampling.output_type = "np"
+    state.sampling.fps = 16.0
+    fake = _FakeARState(state.request_id)
+
+    with pipeline.bind_ar_diffusion_state(state.request_id, fake):
+        pipeline.prepare_encode(state)
+        first = pipeline.peek_chunk_media(state)
+        assert (first.num_media_frames, first.fps, first.num_latent_frames) == (9, 16.0, 3)
+
+        pipeline.prepare_next_chunk(state)
+        while not state.chunk_denoise_completed:
+            noise = pipeline.denoise_step(None, states=[state])
+            pipeline.step_scheduler(state, noise)
+        pipeline.post_decode(state)
+
+        second = pipeline.peek_chunk_media(state)
+        assert (second.num_media_frames, second.fps, second.num_latent_frames) == (12, 16.0, 3)
+
+
 def test_streaming_decode_state_is_owned_by_the_session(monkeypatch) -> None:
     """Decoder state is keyed by request id and released with the AR session."""
     module = _load_pipeline_module()
@@ -2599,6 +2635,7 @@ def test_streaming_decode_receives_rescaled_latents(monkeypatch) -> None:
 
     with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
         pipeline.prepare_encode(state)
+        pipeline.prepare_next_chunk(state)
         while not state.chunk_denoise_completed:
             pipeline.step_scheduler(state, pipeline.denoise_step(None, states=[state]))
         model_space = state.latents.clone()
