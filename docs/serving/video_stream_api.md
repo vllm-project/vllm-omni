@@ -67,6 +67,7 @@ Queries stride-sample the buffered frames, keeping the last frame, then exclude 
 | `num_frames` | integer, 1-128 | `4` | Number of buffered frames sampled for each query. |
 | `max_frames` | integer, 1-256 | `50` | Maximum retained frame buffer size. Oldest frames are evicted first. |
 | `system_prompt` | string or null | null | Optional custom system prompt. |
+| `max_history_turns` | integer >= 1 or null | `1` | Completed user/assistant turns included as text in each new prompt. `null` includes all retained turns. |
 | `use_audio_in_video` | bool | `true` | Include streamed audio chunks in multimodal video understanding when audio is present. |
 | `sampling_params_list` | list or null | null | Optional per-stage parameter dictionaries. Each provided entry replaces that stage's deployment sampling settings. |
 | `enable_frame_filter` | bool | `true` | Enable EVS near-duplicate frame filtering. |
@@ -85,6 +86,26 @@ For example, `[{"temperature": 0.2, "max_tokens": 64}]` configures the thinker w
 the talker and code2wav retain their deployment defaults. With only
 `[{"temperature": 0.2}]`, the thinker's `max_tokens` and `top_p` use constructor
 defaults, not its YAML values.
+
+### Conversation History
+
+By default, each query includes only the most recent completed user/assistant
+turn. To include the two most recent turns, set `"max_history_turns": 2` in the
+initial `session.config` message. Set it to `null` to include all retained turns:
+
+```json
+{"type": "session.config", "max_history_turns": null}
+```
+
+The system prompt and current query are always included independently of this
+limit. Earlier messages contribute only text; their images and audio are not
+replayed. The current frame and audio buffers follow their existing rules.
+
+This setting selects history for the model prompt. It does not limit the session's
+stored history or reserve KV cache across queries. Larger histories consume more
+context and remain subject to the model's context limit; the server does not
+automatically trim them to a token budget. Omitting the field keeps the existing
+one-turn behavior. Speech quality with longer context remains model-dependent.
 
 ### Legacy Aliases
 
