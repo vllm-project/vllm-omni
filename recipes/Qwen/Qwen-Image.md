@@ -7,7 +7,8 @@
 - Vendor: Qwen
 - Model: `Qwen/Qwen-Image`
 - Task: Text-to-image generation
-- Mode: Online serving with optional step-wise continuous batching
+- Mode: Online serving with optional step-wise continuous batching; offline
+  inference on Intel Arc BMG (XPU)
 - Maintainer: Community
 
 ## When to use this recipe
@@ -25,11 +26,14 @@ the benchmark assets already bundled in this repository.
   [`examples/online_serving/text_to_image/README.md`](../../examples/online_serving/text_to_image/README.md)
 - Related benchmark:
   [`benchmarks/diffusion/diffusion_benchmark_serving.py`](../../benchmarks/diffusion/diffusion_benchmark_serving.py)
+- Offline inference example used by the Intel Arc BMG section:
+  [`examples/offline_inference/text_to_image/text_to_image.py`](../../examples/offline_inference/text_to_image/text_to_image.py)
 
 ## Hardware Support
 
-This recipe currently documents one CUDA GPU serving configuration. Extend it
-with more hardware sections as community validation lands.
+This recipe documents CUDA GPU serving configurations and one Intel Arc BMG
+(XPU) offline-inference configuration. Extend it with more hardware sections as
+community validation lands.
 
 ## GPU
 
@@ -235,3 +239,38 @@ CUTLASS was the fastest validated backend for this checkpoint.
 - The benchmark table intentionally reports Qwen-Image-2512 as
   concurrency-1 request-level data; do not compare it directly with an online
   HTTP concurrency benchmark.
+
+### 1x Intel Arc BMG GPU (XPU)
+
+#### Environment
+
+- OS: Linux
+- Python: 3.10+
+- Driver / runtime: Intel XPU environment with one Arc BMG GPU (~32 GiB free)
+- vLLM version: Match the repository requirements for your checkout
+- vLLM-Omni version or commit: Use the commit you are deploying from
+
+#### Command
+
+This configuration runs the offline text-to-image example with bf16 weights and
+layerwise offload to stay inside a single-card memory budget:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model Qwen/Qwen-Image \
+  --prompt "a cup of coffee on the table" \
+  --num-inference-steps 50 \
+  --enable-layerwise-offload \
+  --enforce-eager \
+  --output qwen_image_output.png
+```
+
+#### Verification
+
+Confirm `qwen_image_output.png` is written and looks coherent for the prompt.
+
+#### Notes
+
+- `--enable-layerwise-offload` streams transformer blocks between host and
+  device, which is what keeps the 20B model inside a ~32 GiB card.
+- `--enforce-eager` skips graph capture, which is the validated path on XPU.
