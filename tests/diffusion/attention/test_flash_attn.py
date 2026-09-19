@@ -916,3 +916,36 @@ if __name__ == "__main__":
         raise RuntimeError("CUDA is not available")
     print("\n" + "=" * 60)
     print("Test suite completed!")
+
+
+def test_dense_varlen_fallback_requests_the_resolved_fa_version(monkeypatch):
+    """The dense fallback must ask for the FA version the platform resolves to.
+
+    When no dense ``flash_attn_func`` is installed, ``forward_cuda`` falls back to
+    ``_forward_varlen_dense``. vLLM's bundled ``flash_attn_varlen_func`` defaults to
+    ``DEFAULT_FA_VERSION`` (2), so a call that omits ``fa_version`` silently runs FA2
+    even on a device where FA3 is available and selected -- a large regression that
+    produces no error and no warning.
+    """
+    captured = {}
+
+    def fake_varlen(**kwargs):
+        captured.update(kwargs)
+        q = kwargs["q"]
+        return torch.zeros_like(q)
+
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen)
+    monkeypatch.setattr(fa, "resolve_vllm_flash_attn_version", lambda requested=None: 3)
+
+    impl = FlashAttentionImpl.__new__(FlashAttentionImpl)
+    impl.causal = False
+    impl.softmax_scale = 0.5
+    impl.fa_deterministic = False
+
+    q = torch.randn(1, 8, 2, 16)
+    impl._forward_varlen_dense(q, q, q)
+
+    assert captured.get("fa_version") == 3, (
+        "dense varlen fallback omitted fa_version, so vLLM's default of "
+        f"{getattr(fa, 'DEFAULT_FA_VERSION', 2)} would be used instead of the resolved version"
+    )
