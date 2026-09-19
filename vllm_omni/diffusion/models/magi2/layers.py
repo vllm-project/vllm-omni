@@ -19,7 +19,11 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vllm_omni.diffusion.layers.swiglu7 import SwiGLU7
+
 from .parallel import Magi2ParallelGroup, get_magi2_tp_group
+
+_swiglu7_op = SwiGLU7()
 
 
 def swiglu7(
@@ -30,12 +34,11 @@ def swiglu7(
 ) -> torch.Tensor:
     """Released GPT-OSS-style clamped SwiGLU activation."""
 
-    out_dtype = x.dtype if out_dtype is None else out_dtype
-    x = x.to(torch.float32)
-    gate, linear = x[..., ::2], x[..., 1::2]
-    gate = gate.clamp(max=limit)
-    linear = linear.clamp(min=-limit, max=limit)
-    return (gate * torch.sigmoid(alpha * gate) * (linear + 1.0)).to(out_dtype)
+    # Keep the native expression visible to torch.compile while dispatching
+    # the fused CustomOp for eager inference.
+    if not torch.compiler.is_compiling():
+        return _swiglu7_op(x, alpha, limit, out_dtype)
+    return _swiglu7_op.forward_native(x, alpha, limit, out_dtype)
 
 
 class ModalityDispatcher:
