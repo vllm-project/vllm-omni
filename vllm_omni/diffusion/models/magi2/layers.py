@@ -386,7 +386,12 @@ class MHCHandler:
         self._check_multi(streams)
         alpha, bias, logits = alpha_bias_logits
         coefficients = torch.sigmoid(alpha * self.matmul_scale * logits + bias.unsqueeze(0))
-        return torch.einsum("tn,tnc->tc", coefficients.to(out_dtype or streams.dtype), streams)
+        coefficients = coefficients.to(out_dtype or streams.dtype)
+        if self.num_streams > 1 and coefficients.shape == streams.shape[:2]:
+            # Keep a matrix contraction; low-precision elementwise products
+            # followed by sum would introduce an extra rounding boundary.
+            return torch.bmm(coefficients.unsqueeze(1), streams).squeeze(1)
+        return torch.einsum("tn,tnc->tc", coefficients, streams)
 
     def compute_post_residual(
         self,
