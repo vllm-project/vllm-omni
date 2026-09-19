@@ -244,9 +244,12 @@ class SequenceParallelSplitHook(ModelHook):
             else:
                 raise ValueError(f"Failed to update parameter '{name}' after sharding.")
 
-        # Store kwargs for post_forward to resolve text lengths
-        self._last_kwargs = kwargs
-        self._last_args = tuple(args_list)
+        # Output splitting only needs integer text lengths. Saving args/kwargs
+        # here would keep full hidden-state inputs alive after output sharding,
+        # including when the module raises before post_forward can run.
+        for spm in self.metadata.values():
+            if isinstance(spm, SequenceParallelPartialInput) and spm.split_output:
+                self._resolve_text_len(spm, args_list, kwargs)
 
         return tuple(args_list), kwargs
 
@@ -275,7 +278,7 @@ class SequenceParallelSplitHook(ModelHook):
                 raise ValueError(f"Index {index} out of bounds for output of length {len(output_list)}.")
 
             original = output_list[index]
-            output_list[index] = self._prepare_sp_input(original, spm, self._last_args, self._last_kwargs)
+            output_list[index] = self._prepare_sp_input(original, spm)
             if output_list[index] is not original:
                 actually_sharded = True
                 equal_rank_seq_lens &= isinstance(spm, SequenceParallelInput) and spm.auto_pad
@@ -376,9 +379,15 @@ class SequenceParallelSplitHook(ModelHook):
         if isinstance(sp_input, SequenceParallelInput):
             # Full split with optional auto-padding
             if sp_input.auto_pad:
-                return self._shard_with_auto_pad(x, sp_input.split_dim)
-            _maybe_validate_strict_divisibility(dim=sp_input.split_dim, seq_len=x.size(sp_input.split_dim))
-            return sp_shard(x, sp_input.split_dim, validate=False)
+                shard = self._shard_with_auto_pad(x, sp_input.split_dim)
+            else:
+                _maybe_validate_strict_divisibility(dim=sp_input.split_dim, seq_len=x.size(sp_input.split_dim))
+                shard = sp_shard(x, sp_input.split_dim, validate=False)
+            # contiguous() may be a no-op for a single-batch sequence slice;
+            # clone explicitly to release its full (possibly padded) backing.
+            if sp_input.clone_shard and shard is not x:
+                return shard.clone(memory_format=torch.contiguous_format)
+            return shard
         elif isinstance(sp_input, SequenceParallelPartialInput):
             # Partial split: keep text portion, split image portion
             text_len = self._resolve_text_len(sp_input, args, kwargs)

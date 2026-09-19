@@ -224,6 +224,9 @@ class SequenceParallelInput:
             valid vs padding positions. The mask is stored in ForwardContext.
             Note: Ring attention does not support attention mask, so auto_pad
             should only be used with Ulysses SP.
+        clone_shard: If True, give a sharded tensor its own contiguous storage
+            so it does not retain the full input allocation. Applies to both
+            padded and unpadded splits; a single-rank input is returned unchanged.
 
     Example:
         # Split hidden_states along sequence dimension (dim 1)
@@ -240,12 +243,13 @@ class SequenceParallelInput:
     expected_dims: int | None = None
     split_output: bool = False
     auto_pad: bool = False
+    clone_shard: bool = False
 
     def __repr__(self) -> str:
         return (
             f"SequenceParallelInput(split_dim={self.split_dim}, "
             f"expected_dims={self.expected_dims}, split_output={self.split_output}, "
-            f"auto_pad={self.auto_pad})"
+            f"auto_pad={self.auto_pad}, clone_shard={self.clone_shard})"
         )
 
 
