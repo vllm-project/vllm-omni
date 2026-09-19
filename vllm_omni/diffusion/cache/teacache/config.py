@@ -62,6 +62,14 @@ _MODEL_COEFFICIENTS = {
         -12.281286412689623,
         1.0733905006198015,
     ],
+    # Calculated GLM-Image Coefficient
+    "GlmImageTransformer2DModel": [
+        -6071.632298241158,
+        1837.6579251847247,
+        -172.12278847677337,
+        7.159036598427308,
+        -0.07853601464946189,
+    ],
     # HunyuanImage3 pipeline coefficients
     # Calibrated via polyfit on 3920 data points (80 prompts × 49 steps).
     # Maps time_embed rel_l1 (range ~0.12-0.54) to output rel_l1 (range ~0.01-0.53).
