@@ -2085,6 +2085,20 @@ def test_inject_kv_stage_info_infers_receiver_tp_topology():
     assert stage1.engine_args["omni_kv_config"]["rank_mapping"] == {"from_tp": 4, "to_tp": 2}
 
 
+def test_resolve_bagel_stage_configs_isolates_fp8_to_diffusion_stage():
+    from vllm_omni.config.config_factory import StageConfigFactory
+    from vllm_omni.model_executor.models.bagel.pipeline import BAGEL_PIPELINE
+
+    resolution = StageConfigFactory._resolve_legacy_from_registry(
+        BAGEL_PIPELINE,
+        {"diffusion_quantization_config": "fp8"},
+    )
+    stage_configs = [stage.to_omegaconf() for stage in resolution.stage_configs]
+
+    assert "quantization_config" not in stage_configs[0].engine_args
+    assert stage_configs[1].engine_args.diffusion_quantization_config == "fp8"
+
+
 def test_inject_kv_stage_info_updates_typed_connector_config():
     from vllm_omni.config.omni_config import (
         OmniStageConnectorConfig,

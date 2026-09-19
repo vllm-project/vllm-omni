@@ -47,8 +47,12 @@ AutoRound paths when available.
 
 ### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
 
-Online quantization must be routed to the intended stage. BAGEL and GLM-Image
-need model-specific validation before they are listed as supported targets.
+Online quantization must be routed to the intended stage.
+
+- BAGEL online FP8 is validated on the diffusion stage via
+  `diffusion_quantization_config="fp8"`. The Thinker stage stays BF16.
+- GLM-Image still needs model-specific quality validation before it is listed
+  as a supported target.
 
 ## Configuration
 
