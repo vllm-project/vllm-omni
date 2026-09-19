@@ -2,14 +2,16 @@
 
 This opt-in topology runs the Qwen3-VL text encoder, video VAE encoder, and
 audio WVAE encoder together in a vLLM stage. It sends their conditioning
-payload over NIXL to an encoder-free diffusion stage. The standard MiniMax H3 recipes
+payload over shared memory by default, or opt-in NIXL, to an encoder-free
+diffusion stage. The standard MiniMax H3 recipes
 remain single-stage and continue to run all components inside the diffusion
 pipeline.
 
 ## Full encoder payload
 
-Both the standard and Turbo builtin deployments use `NixlConnector` with the
-UCX backend for the stage 0 → stage 1 edge. Stage 0 is the sender and stage 1
+Both the standard and Turbo builtin deployments use `SharedMemoryConnector`
+for the same-host stage 0 → stage 1 edge. The corresponding `_nixl.yaml`
+overlays opt into `NixlConnector` with the UCX backend. Stage 0 is the sender and stage 1
 is the receiver. The producer hook `encoder2diffusion_full_payload` validates
 the complete conditioning and packages it under `encoder_output`; the diffusion
 stage declares `stage_input_payload_keys: [encoder_output]`.
@@ -114,25 +116,25 @@ has not been validated** here; these examples are not a tested multi-node
 launch procedure. CPU wiring and payload-contract tests do not establish native
 NIXL, GPU, Turbo-weight, or cross-node execution success.
 
-## Optional SharedMemory configuration
+## Optional NIXL configuration
 
-For same-host use without NIXL, both builtin deployment files also declare
-`shared_memory_connector` (`SharedMemoryConnector`). In a local copy of the
-chosen deployment, change **both** edge references:
+The base deployments above use `SharedMemoryConnector` and require same-host
+shared-memory access. To use NIXL instead, select the standard overlay:
 
-```yaml
-# Merge these fields into the existing stages; retain their other settings.
-stages:
-  - stage_id: 0
-    output_connectors:
-      to_stage_1: shared_memory_connector
-  - stage_id: 1
-    input_connectors:
-      from_stage_0: shared_memory_connector
+```bash
+vllm-omni serve MiniMaxAI/MiniMax-H3 \
+  --omni \
+  --deploy-config vllm_omni/deploy/minimax_h3_disaggregated_nixl.yaml
 ```
 
-Pass that complete deployment through `--deploy-config`. Do not change only
-one end of the edge. The encoder roles, `model_loaded` flags, hooks, and full
+For Turbo, use
+`--deploy-config vllm_omni/deploy/minimax_h3_disaggregated_turbo_nixl.yaml`
+with the LoRA options shown below. Both overlays require NIXL and a working
+UCX backend; see [NIXL installation](../../docs/design/feature/omni_connectors/nixl_connector.md#installation).
+Initialization failures do not automatically fall back to shared memory.
+
+Each overlay inherits its base deployment and switches **both** edge
+references to NIXL. The encoder roles, `model_loaded` flags, hooks, and full
 `encoder_output` schema stay unchanged. The processor also retains support for
 an inline full-conditioning handoff when supplied; stage 1 still does not fall
 back to local encoders. SharedMemory requires same-host shared-memory access
