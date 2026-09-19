@@ -1149,6 +1149,7 @@ class OmniDiffusionConfig:
             materialize_legacy_offload_flags,
         )
 
+        self.stage_input_payload_keys = tuple(self.stage_input_payload_keys)
         if self.diffusion_compile_granularity not in {"regional", "full"}:
             raise ValueError(
                 "diffusion_compile_granularity must be 'regional' or 'full', "

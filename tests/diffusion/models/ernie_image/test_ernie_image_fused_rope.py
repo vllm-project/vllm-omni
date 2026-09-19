@@ -6,6 +6,7 @@ import torch
 from vllm.triton_utils import HAS_TRITON
 
 from vllm_omni.diffusion.models.ernie_image.ernie_image_transformer import _apply_rotary_emb
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cuda, pytest.mark.diffusion]
 
@@ -37,6 +38,7 @@ def _inputs(shape: tuple[int, int, int, int]):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="Fused RoPE requires NVIDIA CUDA")
 @pytest.mark.parametrize(
     "shape",
     [
@@ -62,6 +64,7 @@ def test_fused_qk_rope_is_bit_exact(shape):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="Fused RoPE requires NVIDIA CUDA")
 def test_launch_failure_disables_runtime_key(monkeypatch):
     from vllm_omni.diffusion.models.ernie_image import fused_rope
 
@@ -83,6 +86,23 @@ def test_launch_failure_disables_runtime_key(monkeypatch):
             assert fused_rope.try_fused_qk_rotary_emb(query, key, freqs_cos, freqs_sin) is None
     assert launch_count == 1
     assert len(fused_rope._FAILED_KEYS) == 1
+
+
+def test_non_cuda_platform_does_not_launch_fused_kernel(monkeypatch):
+    from vllm_omni.diffusion.models.ernie_image import fused_rope
+
+    monkeypatch.setattr(fused_rope, "HAS_TRITON", True)
+    monkeypatch.setattr(fused_rope.current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+
+    def unexpected_launch(*args):
+        raise AssertionError("non-CUDA platforms must remain on the native path")
+
+    monkeypatch.setattr(fused_rope, "_launch_fused_qk_rotary_emb", unexpected_launch)
+    query = torch.zeros((1, 1, 1, 128), dtype=torch.bfloat16)
+    freqs = torch.zeros((1, 1, 64), dtype=torch.float32)
+    assert fused_rope.try_fused_qk_rotary_emb(query, query, freqs, freqs) is None
+    assert not fused_rope._FAILED_KEYS
 
 
 def test_failed_runtime_key_cache_is_bounded():
