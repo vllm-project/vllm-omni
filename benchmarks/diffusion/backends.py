@@ -335,6 +335,30 @@ async def async_request_v1_videos(
     output = RequestFuncOutput()
     output.start_time = time.perf_counter()
 
+    files = dict(input.extra_body)
+    if input.prompt:
+        files.setdefault("prompt", input.prompt)
+    if input.width and input.height:
+        files.setdefault("height", input.height)
+        files.setdefault("width", input.width)
+    if input.num_frames:
+        files.setdefault("num_frames", input.num_frames)
+    if input.num_inference_steps:
+        files.setdefault("num_inference_steps", input.num_inference_steps)
+    if input.seed is not None:
+        files.setdefault("seed", input.seed)
+    if input.fps:
+        files.setdefault("fps", input.fps)
+
+    form = aiohttp.FormData()
+    for k, v in files.items():
+        if isinstance(v, str):
+            form.add_field(k, v)
+        elif isinstance(v, (dict, list)):
+            form.add_field(k, json.dumps(v))
+        else:
+            form.add_field(k, str(v))
+
     image_file = None
     job_id = None
     try:
