@@ -92,6 +92,43 @@ class MixinHost(OmniConnectorModelRunnerMixin):
     pass
 
 
+def test_stage_payload_recv_spec_preserves_external_id_edge_and_handle():
+    sender = {"host": "10.0.0.1", "zmq_port": "50071"}
+    assert MixinHost._stage_payload_recv_spec("external", "2", "5", 3, sender) == (
+        "2",
+        "5",
+        "external_2_3",
+        {"source_host": "10.0.0.1", "source_port": 50071},
+    )
+    metadata = {"schema_version": 1}
+    handle = {"key": "explicit", "from_stage": 7, "to_stage": 9, "metadata": metadata}
+    assert MixinHost._stage_payload_recv_spec("external", "2", "5", sender_info=sender, handle=handle) == (
+        "7",
+        "9",
+        "explicit",
+        metadata,
+    )
+
+
+def test_synchronous_payload_init_borrows_connector_without_threads_or_kv_mutation():
+    host = MixinHost()
+    connector = MockConnector()
+    manager = SimpleNamespace(connector=connector, kv_recv_key_builder=object())
+    original_state = vars(manager).copy()
+    with patch.object(host, "_create_connector", side_effect=AssertionError("duplicate connector")):
+        host.init_omni_connectors(_make_model_config(), manager, synchronous=True)
+    assert host._omni_connector_initialized
+    assert host._recv_thread is None
+    assert host._save_thread is None
+    assert host._pending_load_reqs == {}
+    assert vars(manager) == original_state
+    connector.put("2", "5", "external_2_0", {"value": 7})
+    assert host.recv_stage_payload("external", "2", "5") == {"value": 7}
+    with patch.object(connector, "close") as close:
+        host.shutdown_omni_connectors()
+        close.assert_not_called()
+
+
 class _FakeTPGroup:
     def __init__(self, *, world_size: int, rank_in_group: int, follower_result: Any = None):
         self.world_size = world_size
