@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import torch
 from vllm.triton_utils import tl, triton
@@ -235,13 +235,13 @@ def triton_qk_norm_rope(
         key.stride(1),
         key.stride(2),
         key.stride(3),
-        cos_t.stride(0),
+        0 if cos_t.shape[0] == 1 else cos_t.stride(0),
         cos_t.stride(1),
         cos_t.stride(2),
-        cos_h.stride(0),
+        0 if cos_h.shape[0] == 1 else cos_h.stride(0),
         cos_h.stride(1),
         cos_h.stride(2),
-        cos_w.stride(0),
+        0 if cos_w.shape[0] == 1 else cos_w.stride(0),
         cos_w.stride(1),
         cos_w.stride(2),
         head_q=head_q,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Correctness tests for Sensenova-U1 Triton kernels.
 
@@ -17,6 +17,7 @@ import torch
 
 pytestmark = [
     pytest.mark.core_model,
+    pytest.mark.cuda,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
 ]
 
@@ -166,7 +167,16 @@ def reference_kernel(
     return query, key
 
 
-def make_input(seq_len: int, dtype: torch.dtype, device: torch.device, seed: int, batch_size: int = B) -> KernelInput:
+def make_input(
+    seq_len: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    seed: int,
+    batch_size: int = B,
+    rope_batch: int | None = None,
+) -> KernelInput:
+    if rope_batch is None:
+        rope_batch = batch_size
     gen = torch.Generator(device=device)
     gen.manual_seed(seed + seq_len)
 
@@ -183,8 +193,8 @@ def make_input(seq_len: int, dtype: torch.dtype, device: torch.device, seed: int
 
     # Match Qwen3RotaryEmbedding: emb = torch.cat((freqs, freqs), dim=-1).
     def make_rope_pair(dim: int) -> tuple[torch.Tensor, torch.Tensor]:
-        cos_half = torch.randn(batch_size, seq_len, dim // 2, device=device, dtype=dtype, generator=gen)
-        sin_half = torch.randn(batch_size, seq_len, dim // 2, device=device, dtype=dtype, generator=gen)
+        cos_half = torch.randn(rope_batch, seq_len, dim // 2, device=device, dtype=dtype, generator=gen)
+        sin_half = torch.randn(rope_batch, seq_len, dim // 2, device=device, dtype=dtype, generator=gen)
         return torch.cat((cos_half, cos_half), dim=-1), torch.cat((sin_half, sin_half), dim=-1)
 
     cos_t, sin_t = make_rope_pair(T_DIM)
@@ -246,3 +256,19 @@ def test_batched_rope_matches_reference(batch_size, shared_positions, dtype):
     tolerance = 1e-5 if dtype == torch.float32 else 3e-2
     for got, want in zip(actual, expected, strict=True):
         torch.testing.assert_close(got, want, atol=tolerance, rtol=tolerance)
+
+
+@triton_available
+@pytest.mark.parametrize("seq_len", [1, 7, 32])
+@pytest.mark.parametrize("rope_batch", [1, 2])
+@pytest.mark.parametrize(
+    ("dtype", "atol", "rtol"),
+    [(torch.float32, 1e-5, 1e-5), (torch.bfloat16, 3e-2, 3e-2)],
+)
+def test_fused_qk_norm_rope_batched(seq_len: int, rope_batch: int, dtype: torch.dtype, atol: float, rtol: float):
+    data = make_input(seq_len, dtype=dtype, device=DEVICE, seed=SEED, batch_size=2, rope_batch=rope_batch)
+    ref_q, ref_k = reference_kernel(*data.args())
+    out_q, out_k = triton_qk_norm_rope(*data.args(), EPS)
+
+    torch.testing.assert_close(out_q, ref_q, atol=atol, rtol=rtol)
+    torch.testing.assert_close(out_k, ref_k, atol=atol, rtol=rtol)
