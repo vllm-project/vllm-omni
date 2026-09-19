@@ -970,9 +970,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 next_text_offset = text_offset
 
             last_hidden = hs.get("last")
-            if not isinstance(last_hidden, torch.Tensor):
-                raise RuntimeError("Missing hidden_states['last'] in additional_information; postprocess must run.")
-            past_hidden_list.append(last_hidden.to(device=device, dtype=dtype).reshape(1, -1))
+            if isinstance(last_hidden, torch.Tensor):
+                past_hidden = last_hidden.to(device=device, dtype=dtype).reshape(1, -1)
+            else:
+                # Match scalar preprocess(): EOS / async-scheduling races can
+                # arrive before postprocess has written last; zeros are filtered
+                # downstream the same way as the single-request path.
+                past_hidden = torch.zeros_like(text_step)
+            past_hidden_list.append(past_hidden)
             text_step_list.append(text_step)
 
             info_update: dict[str, Any] = {

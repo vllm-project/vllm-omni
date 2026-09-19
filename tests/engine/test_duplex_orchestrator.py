@@ -55,6 +55,7 @@ def _build(
     stages: int = 1,
     running_counter: FakeRunningCounter | None = None,
     runtime_config: DuplexSessionRuntimeConfig | None = None,
+    plugin=None,
 ) -> tuple[DuplexOrchestrator, list[FakeStageClient], asyncio.Queue, asyncio.Queue]:
     clients = [FakeStageClient(stage_type="llm", final_output=index == stages - 1) for index in range(stages)]
     pools = _build_stage_pools(
@@ -70,7 +71,7 @@ def _build(
         rpc_async_queue=rpc_q,
         stage_pools=pools,
         running_counter=running_counter,
-        plugin=MiniCPMO45DuplexPlugin(_encode_audio),
+        plugin=plugin or MiniCPMO45DuplexPlugin(_encode_audio),
         duplex_session_config=runtime_config or DuplexSessionRuntimeConfig(reaper_interval_s=0.01),
         model_config=None,
     )
@@ -209,6 +210,18 @@ async def test_open_preregisters_the_stage0_request_and_close_releases_it() -> N
     assert orchestrator.session_manager.runner_for_request_id(request_id) is None
     assert counter.value == 0
     assert orchestrator.session_manager.active_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_aura_ephemeral_preregister_disables_streaming() -> None:
+    from vllm_omni.model_executor.models.aura_omni.duplex.plugin import AuraDuplexPlugin
+
+    orchestrator, _, rpc_q, _ = _build(plugin=AuraDuplexPlugin(_encode_audio))
+    result = await _open(orchestrator, rpc_q)
+    assert result.ok is True
+    request_state = next(iter(orchestrator.request_states.values()))
+    assert request_state.streaming.enabled is False
+    await orchestrator.session_manager.shutdown()
 
 
 @pytest.mark.asyncio
@@ -388,6 +401,31 @@ async def test_forward_failure_closes_the_owning_session() -> None:
     # The stage failure is reported before the session expires, never after.
     assert types.index("error") < types.index("session.expired")
     assert types[-1] == "session.expired"
+
+
+@pytest.mark.asyncio
+async def test_aura_forward_failure_keeps_the_session() -> None:
+    from vllm_omni.model_executor.models.aura_omni.duplex.plugin import AuraDuplexPlugin
+
+    orchestrator, clients, rpc_q, output_q = _build(stages=2, plugin=AuraDuplexPlugin(_encode_audio))
+    await _open(orchestrator, rpc_q)
+    request_id = next(iter(orchestrator.request_states))
+    await _submit(orchestrator, _append_audio())
+    request_state = orchestrator.request_states[request_id]
+    session = orchestrator.session_manager.get(SESSION_ID)
+    assert session is not None
+
+    absorbed = await orchestrator._handle_forward_failure(request_id, 1, request_state, ValueError("stale talker"))
+    await _settle(orchestrator)
+
+    assert absorbed is True
+    assert request_id not in orchestrator.request_states
+    assert SESSION_ID in orchestrator.session_manager.runners
+    assert session.state != DuplexSessionState.CLOSED
+    types = [message.event.type for message in [output_q.get_nowait() for _ in range(output_q.qsize())]]
+    assert "error" in types
+    assert "session.expired" not in types
+    await orchestrator.session_manager.shutdown()
 
 
 @pytest.mark.asyncio

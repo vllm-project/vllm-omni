@@ -247,11 +247,19 @@ class DuplexSessionRunner:
     ) -> bool:
         """Accept one stage output (orchestrator loop); return True when it must not be forwarded."""
         decision: DuplexOutputDecision | None = None
+        project = False
         if stage_id < context.final_stage_id:
             decision = self.model.decide_output(stage_id, output, context)
+            # Optional mid-pipeline projection: client sees this stage; TTS still runs.
+            if decision is None:
+                project = self.model.project_intermediate_output(stage_id, output, context)
+        if self.session.capabilities.supports_overlapped_commit and self.model.release_overlapped_commit(
+            stage_id, output, context
+        ):
+            self.run.overlapped_commit_released = True
         consume = decision is not None or stage_id >= context.final_stage_id
         project_intermediate = self.plugin.projects_intermediate_outputs and stage_id == 0
-        if not consume and not project_intermediate:
+        if not consume and not project and not project_intermediate:
             # Stage0 text without a direct decision feeds the TTS stage as before.
             # Its metrics still have to reach the client: before sessions moved
             # into the engine the orchestrator published them as a standalone
@@ -274,10 +282,15 @@ class DuplexSessionRunner:
                 decision=decision,
             )
         )
+        # Projection-only must still forward to the next stage (return False).
         return consume
 
-    def on_stage_failure(self, stage_id: int, exc: BaseException) -> None:
-        """A stage rejected this session's request: fail the active response now.
+    def on_stage_failure(self, stage_id: int, exc: BaseException, *, request_id: str | None = None) -> None:
+        """A stage rejected this session's request: fail the owning response.
+
+        Under overlapped input the failing request may belong to a draining
+        older response; resolve via ``response_id_for_request`` before falling
+        back to ``active_response_id``.
 
         Runs synchronously on the loop (no mailbox hop): the orchestrator
         expires the session right after this call, so a queued item could be
@@ -292,21 +305,32 @@ class DuplexSessionRunner:
             "runtime_data_plane_stream_failed",
             f"Stage-{stage_id} input processor failed: {type(exc).__name__}: {exc}",
         )
-        response_id = session.active_response_id
-        if response_id is not None:
+        draining_response_id = (
+            session.response_id_for_request(request_id)
+            if isinstance(request_id, str) and session.is_draining_request(request_id)
+            else None
+        )
+        response_id = draining_response_id or session.active_response_id
+        if response_id is None:
+            return
+        if draining_response_id is not None:
+            session.clear_draining_for_response(draining_response_id)
+            if isinstance(request_id, str):
+                session.request_resources.pop((stage_id, request_id), None)
+        elif response_id == session.active_response_id:
             session.end_response(commit_text=False)
-            self.emit(
-                {
-                    "type": "response.done",
-                    "session_id": session.session_id,
-                    "response_id": response_id,
-                    "epoch": session.epoch,
-                    "committed": False,
-                    "status": "failed",
-                    "status_details": {"type": "failed", "reason": "runtime_data_plane_stream_failed"},
-                    "playback": session.playback.as_dict(),
-                }
-            )
+        self.emit(
+            {
+                "type": "response.done",
+                "session_id": session.session_id,
+                "response_id": response_id,
+                "epoch": session.epoch,
+                "committed": False,
+                "status": "failed",
+                "status_details": {"type": "failed", "reason": "runtime_data_plane_stream_failed"},
+                "playback": session.playback.as_dict(),
+            }
+        )
 
     @property
     def closed_emitted(self) -> bool:
@@ -458,7 +482,8 @@ class DuplexSessionRunner:
             if isinstance(item, Commit):
                 session.release_pending_turn()
             elif isinstance(item, AppendAudio):
-                session.release_input_bytes(len(item.audio))
+                admission = len(item.audio) + sum(len(frame) for frame in item.video_frames)
+                session.release_input_bytes(admission)
             return
         await self._on_command(item)
 
@@ -514,9 +539,11 @@ class DuplexSessionRunner:
         session = self.session
         projector = self._require_projector()
         if isinstance(command, AppendAudio):
-            # The manager reserved the wire size at admission; the handler
-            # re-reserves the decoded size around its PCM reservation.
-            session.release_input_bytes(len(command.audio))
+            # The manager reserved the wire size (audio + video) at admission.
+            # Release that full amount as the command leaves the mailbox; the
+            # handler re-reserves whatever the input buffer actually retains.
+            admission = len(command.audio) + sum(len(frame) for frame in command.video_frames)
+            session.release_input_bytes(admission)
             await self._on_append_audio(command.payload())
         elif isinstance(command, AppendText):
             session.mark_user_input_activity()
@@ -761,9 +788,19 @@ class DuplexSessionRunner:
         model_state = self.model_state
         session.mark_user_input_activity()
         audio = event.get("audio") or event.get("data")
-        if not isinstance(audio, str):
-            self._emit_error("bad_event", "input_audio_buffer.append requires audio")
+        video_frames_raw = event.get("video_frames")
+        video_frames = (
+            [frame for frame in video_frames_raw if isinstance(frame, str) and frame]
+            if isinstance(video_frames_raw, list)
+            else []
+        )
+        has_audio = isinstance(audio, str) and bool(audio)
+        has_video = bool(video_frames)
+        modality_error = session.capabilities.validate_append_modalities(has_audio=has_audio, has_video=has_video)
+        if modality_error is not None:
+            self._emit_error("invalid_input_modality", modality_error)
             return
+        video_only = has_video and not has_audio
         if not session.capabilities.supports_barge_in and overlap_policy.event_requests_barge_in(event):
             self._emit_events([helpers.barge_in_unsupported_error()])
             event = dict(event)
@@ -775,54 +812,77 @@ class DuplexSessionRunner:
         fmt = event.get("format") if isinstance(event.get("format"), str) else "pcm16"
         sr_raw = event.get("sample_rate_hz") or event.get("sample_rate")
         sample_rate_hz = sr_raw if isinstance(sr_raw, int | float) else 16000
-        try:
-            converted: tuple[object, object, int | float | None] = await self.offload(
-                convert_input_audio_with_rate,
-                audio,
-                fmt,
-                sample_rate_hz=sample_rate_hz,
-            )
-        except ValueError as exc:
-            self._emit_error("bad_event", str(exc))
-            return
-        audio, fmt, converted_rate = converted
-        if converted_rate is not None:
-            sample_rate_hz = converted_rate
-        if isinstance(fmt, str) and fmt.lower() in {"pcm16", "pcm_s16le", "s16le"}:
-            self._emit_error("bad_audio", "input_audio_buffer.append pcm16 audio could not be decoded")
-            return
-        event["audio"] = audio
-        event["format"] = fmt
-        event["sample_rate_hz"] = sample_rate_hz
         client_force_listen = bool(event.get("force_listen", False))
-        vad_result = await self.control.run_turn_detection(event)
-        if (
-            vad_result is not None
-            and not session.capabilities.supports_core_resumable_request
-            and not client_force_listen
-        ):
-            # VAD's force_listen hint controls native model decoding. Committed
-            # turn models already buffer speech; it must not suppress barge-in.
-            event.pop("force_listen", None)
+        if video_only:
+            # No PCM to decode; frames alone are the turn content.
+            fmt = "pcm_f32le"
+            event = dict(event)
+            event.pop("audio", None)
+            event.pop("data", None)
+            event["format"] = fmt
+            event["sample_rate_hz"] = sample_rate_hz
+            event["is_speech"] = False
+            event["video_frames"] = video_frames
+            vad_result = None
+        else:
+            try:
+                converted: tuple[object, object, int | float | None] = await self.offload(
+                    convert_input_audio_with_rate,
+                    audio,
+                    fmt,
+                    sample_rate_hz=sample_rate_hz,
+                )
+            except ValueError as exc:
+                self._emit_error("bad_event", str(exc))
+                return
+            audio, fmt, converted_rate = converted
+            if converted_rate is not None:
+                sample_rate_hz = converted_rate
+            if isinstance(fmt, str) and fmt.lower() in {"pcm16", "pcm_s16le", "s16le"}:
+                self._emit_error("bad_audio", "input_audio_buffer.append pcm16 audio could not be decoded")
+                return
+            event["audio"] = audio
+            event["format"] = fmt
+            event["sample_rate_hz"] = sample_rate_hz
+            vad_result = await self.control.run_turn_detection(event)
+            if (
+                vad_result is not None
+                and not session.capabilities.supports_core_resumable_request
+                and not client_force_listen
+            ):
+                # VAD's force_listen hint controls native model decoding. Committed
+                # turn models already buffer speech; it must not suppress barge-in.
+                event.pop("force_listen", None)
         projector = self._require_projector()
-        self._emit_events(note_input_append(projector, event, vad_result=vad_result))
+        self._emit_events(
+            note_input_append(
+                projector,
+                event,
+                vad_result=vad_result,
+                allows_video_without_audio=session.capabilities.allows_video_without_audio(),
+            )
+        )
         if self.run.closing or session.state != DuplexSessionState.OPEN:
             return
 
         force_listen = bool(event.get("force_listen", False))
         payload: dict[str, object] = {
             "type": "audio",
-            "audio": audio,
-            "format": fmt,
-            "sample_rate_hz": sample_rate_hz,
             "force_listen": force_listen,
         }
-        video_frames = event.get("video_frames")
-        if isinstance(video_frames, list):
-            frames = [frame for frame in video_frames if isinstance(frame, str) and frame]
-            if frames:
-                payload["video_frames"] = frames
-        payload["is_speech"] = overlap_policy.input_looks_like_speech(self.session, event, payload)
+        if video_only:
+            payload["format"] = fmt
+            payload["sample_rate_hz"] = sample_rate_hz
+            payload["is_speech"] = False
+        else:
+            payload["audio"] = audio
+            payload["format"] = fmt
+            payload["sample_rate_hz"] = sample_rate_hz
+        if video_frames:
+            payload["video_frames"] = video_frames
+        payload["is_speech"] = (
+            False if video_only else overlap_policy.input_looks_like_speech(self.session, event, payload)
+        )
         auto_responds = self._session_auto_responds()
         defer_append = False
         buffer_overlap_audio = True
@@ -862,16 +922,21 @@ class DuplexSessionRunner:
                 defer_append = False
         elif not auto_responds and not overlap_policy.input_looks_like_speech(self.session, event, payload):
             # Turn-mode only: skip silent chunks so they don't open a response.
-            self.emit(
-                {
-                    "type": "response.listen",
-                    "session_id": session.session_id,
-                    "epoch": session.epoch,
-                    "reason": "silence_or_noise",
-                }
-            )
-            self._maybe_schedule_vad_commit(vad_result)
-            return
+            # Vision-carrying silent appends must still buffer when the model
+            # allows video without required audio.
+            frames = payload.get("video_frames")
+            has_vision = isinstance(frames, list) and any(isinstance(frame, str) and frame for frame in frames)
+            if not (has_vision and session.capabilities.allows_video_without_audio()):
+                self.emit(
+                    {
+                        "type": "response.listen",
+                        "session_id": session.session_id,
+                        "epoch": session.epoch,
+                        "reason": "silence_or_noise",
+                    }
+                )
+                self._maybe_schedule_vad_commit(vad_result)
+                return
         if overlap_policy.should_force_listen_for_auto_response_overlap(event, payload, auto_responds=auto_responds):
             payload["force_listen"] = True
         if not buffer_overlap_audio:
@@ -883,6 +948,7 @@ class DuplexSessionRunner:
             self.session, event, payload
         )
         raw_audio_bytes = helpers.audio_payload_size_bytes(payload)
+        pending_before = model_state.audio_buffer.pending_byte_count
         try:
             if not session.reserve_input_bytes(
                 raw_audio_bytes,
@@ -904,6 +970,19 @@ class DuplexSessionRunner:
             self._emit_error("bad_event", str(exc))
             return
         if pcm_reservation is None:
+            # Commit-only buffers (AURA) accumulate in place and return None.
+            # Undo the speculative audio reserve and re-apply the exact pending
+            # delta so retained video frames are counted (and later released).
+            session.release_input_bytes(raw_audio_bytes)
+            pending_delta = model_state.audio_buffer.pending_byte_count - pending_before
+            if pending_delta > 0 and not session.reserve_input_bytes(
+                pending_delta,
+                limit=int(self.manager.runtime_config.max_pending_input_bytes_per_session),
+            ):
+                self._emit_error("input_backpressure", "Duplex session pending input exceeds server limit")
+                return
+            if pending_delta < 0:
+                session.release_input_bytes(-pending_delta)
             self._maybe_schedule_vad_commit(vad_result)
             return
         if pcm_reservation.byte_count == 0:
@@ -1345,6 +1424,8 @@ class DuplexSessionRunner:
         old_request_id = session.active_request_id
         old_response_id = session.active_response_id
         committed_ms = session.playback.committed_ms
+        # Barge-in / cancel aborts prior TTS; clear overlapped-input release.
+        self.run.overlapped_commit_released = False
         committed_message = session.end_response(
             commit_text=self.model.should_commit_response_to_history(session, old_response_id),
             playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
@@ -1465,6 +1546,15 @@ class DuplexSessionRunner:
         if commit_reservation is not None:
             commit_reservation.commit()
         if flushed is None:
+            # Non-speech residual: prepare_commit refused a Stage0 unit. Clear
+            # the PCM and its byte reservation so silence does not leak into
+            # the next turn (MiniCPM-o / auto-response silent commit).
+            if event_type in {"input.commit", "input_audio_buffer.commit"} and not model_state.speech_since_commit:
+                pending_bytes = model_state.audio_buffer.pending_byte_count
+                model_state.audio_buffer.clear()
+                if pending_bytes:
+                    session.release_input_bytes(pending_bytes)
+                model_state.input_since_commit = False
             return False
         if overlap_policy.should_force_listen_for_short_commit(self.session, event, flushed):
             flushed = dict(flushed)
@@ -1760,14 +1850,22 @@ class DuplexSessionRunner:
                 event_id=event.get("realtime_event_id"),
             )
             return
-        if event_type == "input_audio_buffer.commit" and event.get("is_speech") is False:
-            self._commit_silent_input()
-            return
         should_create_response = (
             event_type == "response.create"
             or bool(event.get("response_create", event_type == "input.commit"))
             or (event_type == "input_audio_buffer.commit" and self._session_auto_responds())
         )
+        # Pure silence with nothing buffered: drop and keep listening.
+        # Pending silent+video (or an explicit create_response) must flush.
+        if event_type == "input_audio_buffer.commit" and event.get("is_speech") is False:
+            has_pending_turn = (
+                model_state.input_since_commit
+                or model_state.audio_buffer.has_pending()
+                or model_state.committed_audio_payload is not None
+            )
+            if not has_pending_turn:
+                self._commit_silent_input()
+                return
         precreate_response_requested = event_type == "response.create" or bool(
             event.get("response_create", event_type == "input.commit")
         )
@@ -1808,32 +1906,41 @@ class DuplexSessionRunner:
                 )
             )
             if commit_action is CommitAction.DEFER_ACTIVE_RESPONSE:
-                if session.overlap_speech_ms <= session.config.overlap_short_ack_ms:
-                    self._discard_short_overlap_ack()
-                    return
-
-                if self._defer_commit_behind_active_response(
-                    event,
-                    realtime_item_id=realtime_item_id,
-                    should_create_response=should_create_response,
-                    precreate_response_requested=precreate_response_requested,
+                if not helpers.next_commit_allowed(
+                    self.session,
+                    self.tasks,
+                    overlapped_commit_released=self.run.overlapped_commit_released,
                 ):
-                    return
+                    if session.overlap_speech_ms <= session.config.overlap_short_ack_ms:
+                        self._discard_short_overlap_ack()
+                        return
+
+                    if self._defer_commit_behind_active_response(
+                        event,
+                        realtime_item_id=realtime_item_id,
+                        should_create_response=should_create_response,
+                        precreate_response_requested=precreate_response_requested,
+                    ):
+                        return
             if commit_action is CommitAction.START_AUTO_RESPONSE:
                 await self._commit_and_start_auto_response(event, realtime_item_id=realtime_item_id)
                 return
         if event_type == "response.create":
             await self._start_response_from_committed_audio()
             return
-        if not helpers.response_in_progress(self.session, self.tasks) and await self._flush_and_submit_committed_turn(
+        if helpers.next_commit_allowed(
+            self.session,
+            self.tasks,
+            overlapped_commit_released=self.run.overlapped_commit_released,
+        ) and await self._flush_and_submit_committed_turn(
             event,
             event_type=event_type,
             realtime_item_id=realtime_item_id,
             should_create_response=should_create_response,
         ):
             return
-        # Nothing flushed (or a response is still in progress): acknowledge the
-        # commit without starting a new response.
+        # Nothing flushed (or a response is still in progress without
+        # overlapped-input release): acknowledge without starting a new response.
         had_uncommitted_audio = (
             model_state.input_since_commit
             or model_state.audio_buffer.has_pending()

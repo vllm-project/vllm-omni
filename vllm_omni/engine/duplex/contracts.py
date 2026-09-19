@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
 
+import regex as re
+
 
 @dataclass(frozen=True, slots=True)
 class DuplexFence:
@@ -78,6 +80,9 @@ class DuplexStageSubmission:
     context: DuplexStageRequestContext
     prompt: Mapping[str, object]
     already_submitted: bool
+    # True: resume/update an existing stage0 id. False: open a new ephemeral id.
+    # Distinct from DuplexCapabilities.supports_core_resumable_request.
+    resumable: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prompt", MappingProxyType(dict(self.prompt)))
@@ -157,6 +162,23 @@ def duplex_resource_request_id(fence: DuplexFence, role: str) -> str:
     return f"duplex-s.{encoded_session_id}.e.{fence.epoch}.r.{role}"
 
 
+def duplex_ephemeral_stage_request_id(fence: DuplexFence, *, stage_id: int) -> str:
+    """Turn-scoped Stage request id for non-resumable (ephemeral) duplex models."""
+    return duplex_resource_request_id(fence, f"stage{stage_id}-turn{fence.turn_id}")
+
+
+# Main format ``stage{N}-turn{T}``; also accept legacy PR ``stage{N}_t{T}``.
+_EPHEMERAL_TURN_IN_REQUEST_ID = re.compile(r"\.r\.stage\d+(?:-turn|_t)(\d+)$")
+
+
+def duplex_turn_id_from_request_id(request_id: str | None) -> int | None:
+    """Parse ephemeral ``…r.stage{N}-turn{T}`` (or legacy ``_t{T}``) ids."""
+    if not isinstance(request_id, str):
+        return None
+    match = _EPHEMERAL_TURN_IN_REQUEST_ID.search(request_id)
+    return int(match.group(1)) if match else None
+
+
 def duplex_resource_request_belongs_to_session(request_id: str, session_id: str) -> bool:
     """Return whether a current-format resource request belongs to a session."""
     parts = request_id.split(".")
@@ -187,6 +209,8 @@ __all__ = [
     "DuplexStageSubmission",
     "DuplexStageSubmissionResult",
     "duplex_data_plane_request_info",
+    "duplex_ephemeral_stage_request_id",
+    "duplex_turn_id_from_request_id",
     "duplex_resource_request_belongs_to_session",
     "duplex_resource_request_id",
 ]

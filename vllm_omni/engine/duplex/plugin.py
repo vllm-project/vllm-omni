@@ -237,6 +237,40 @@ class DuplexModelPlugin(ABC):
         output: object,
     ) -> DuplexOutputDecision | None: ...
 
+    def project_intermediate_output(
+        self,
+        *,
+        stage_id: int,
+        output: object,
+        context: object,
+    ) -> bool:
+        """Return True to project this intermediate stage to the client.
+
+        Unlike ``decide_output``, projecting does **not** short-circuit the
+        pipeline: the stage output is still forwarded to the next stage.
+        Default is off. Orthogonal to ``projects_intermediate_outputs``
+        (Qwen3 Stage0); this hook is per-stage.
+        """
+        del stage_id, output, context
+        return False
+
+    def release_overlapped_commit(
+        self,
+        *,
+        stage_id: int,
+        segment_finished: bool,
+        output: object,
+        context: object,
+    ) -> bool:
+        """Return True when the next user commit may start while prior TTS drains.
+
+        The plugin chooses when that is safe. The runner must not hard-code a
+        stage id. Default off. Unlike barge-in, this path must not cancel the
+        old TTS.
+        """
+        del stage_id, segment_finished, output, context
+        return False
+
     # ---- session policy (was ServingRuntimeAdapter) ----
 
     @abstractmethod

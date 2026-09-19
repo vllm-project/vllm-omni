@@ -5,7 +5,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const root = path.resolve(__dirname, '../../examples/online_serving/realtime_web/app/static');
 const context = vm.createContext({ URL });
-for (const name of ['common', 'minicpm_native', 'qwen3_turn']) {
+for (const name of ['common', 'minicpm_native', 'qwen3_turn', 'aura_ptt']) {
   vm.runInContext(fs.readFileSync(path.join(root, `profiles/${name}.js`), 'utf8'), context);
 }
 const profiles = context.OmniRealtimeProfiles;
@@ -132,15 +132,16 @@ function shell(profileName, adapter = 'stt', options = {}) {
     atob: (value) => Buffer.from(value, 'base64').toString('binary'),
   });
   ctx.window = ctx;
-  for (const name of ['common', 'minicpm_native', 'qwen3_turn']) {
+  for (const name of ['common', 'minicpm_native', 'qwen3_turn', 'aura_ptt']) {
     vm.runInContext(fs.readFileSync(path.join(root, `profiles/${name}.js`), 'utf8'), ctx);
   }
   // Expose closure controls only in the test VM; production has no test API.
   const source = fs.readFileSync(path.join(root, 'app.js'), 'utf8').replace(/\}\)\(\);\s*$/, `
     globalThis.testUI = { startSession, stopSession, handleEvent, playbackDrained,
-      microphoneUploadEnabled, flushCapture,
+      microphoneUploadEnabled, flushCapture, setPttHeld,
       capture() { pendingCapture.push(new Int16Array([100, 200])); },
-      state() { return { running, connectionReady, assistantActive }; }
+      setPendingFrame(frame) { cameraPendingFrame = frame; if (profile.stickyCamera) cameraLastFrame = frame; },
+      state() { return { running, connectionReady, assistantActive, pttHeld }; }
     };
   })();`);
   vm.runInContext(source, ctx);
@@ -174,6 +175,7 @@ test('shared shell STT sends final commit and starts a fresh second turn only af
   assert.equal(app.ui.microphoneUploadEnabled(), true);
   assert.equal(app.elements.get('cameraButton').hidden, true);
   assert.equal(app.sockets.flatMap(s => s.sent).some(e => e.type === 'playback.ack'), false);
+  assert.equal(app.elements.get('pttButton').hidden, true);
   await app.ui.stopSession({ terminal: false });
 });
 
@@ -230,6 +232,8 @@ test('an interrupted response disarms the turn watchdog it left armed', async ()
 test('MiniCPM retains microphone upload while speaking and acknowledges speaker drain', async () => {
   const app = shell('minicpm-native');
   await app.ui.startSession();
+  assert.equal(app.elements.get('pttButton').hidden, true);
+  assert.equal(app.elements.get('sendTurnButton').hidden, true);
   await app.ui.handleEvent({ type: 'response.speak', response_id: 'native-r1' });
   assert.equal(app.ui.microphoneUploadEnabled(), true);
   await app.ui.handleEvent({ type: 'response.output_audio.delta', delta: 'AAAAAA==', response_id: 'native-r1' });
@@ -409,4 +413,78 @@ test('the camera retires its oldest image instead of exhausting the session budg
   // A new call reopens the budget; stale ids from the old one must not linger.
   assert.equal(plain(p.initialMessages(config, 'x')).length > 0, true);
   assert.equal(plain(p.imageMessages('JPEG')).length, 1);
+});
+
+test('AURA PTT profile sets duplex, is_speech append, commit on release, and shell flags', () => {
+  const aura = profiles['aura-ptt']();
+  const url = new URL(aura.url({ ...config, model: 'aurateam/AURA' }, 'http://localhost/'));
+  assert.equal(url.searchParams.get('duplex'), '1');
+  assert.equal(url.searchParams.get('model'), 'aurateam/AURA');
+  assert.equal(aura.pushToTalk, true);
+  assert.equal(aura.clientCommit, false);
+  assert.equal(aura.camera, true);
+  assert.equal(aura.stickyCamera, true);
+  assert.equal(aura.visionFollowWhileSpeaking, true);
+  assert.equal(aura.halfDuplex, false);
+  assert.equal(aura.playbackAck, true);
+  assert.equal(aura.append('PCM', 'JPEG', { isSpeech: true }).is_speech, true);
+  assert.equal(aura.append('PCM', 'JPEG', { isSpeech: false }).is_speech, false);
+  assert.equal(aura.append('PCM', 'JPEG', { isSpeech: false }).video_frames[0], 'JPEG');
+  assert.deepEqual(plain(aura.commitMessages()), [
+    { type: 'input_audio_buffer.commit', create_response: true },
+  ]);
+  assert.equal(aura.ack('r1', 50).type, 'playback.ack');
+  const [update] = aura.initialMessages({}, 'Be brief');
+  assert.equal(update.session.instructions, 'Be brief');
+  assert.equal(update.session.extra_body.auto_response, true);
+});
+
+test('AURA shell holds speech until PTT and vision-follows while speaking', async () => {
+  const app = shell('aura-ptt');
+  await app.ui.startSession();
+  assert.equal(app.elements.get('pttButton').hidden, false);
+  assert.equal(app.elements.get('sendTurnButton').hidden, true);
+  assert.equal(app.elements.get('cameraButton').hidden, false);
+  assert.equal(app.ui.microphoneUploadEnabled(), false);
+
+  app.ui.capture();
+  app.ui.flushCapture();
+  assert.equal(app.sockets[0].sent.some(e => e.type === 'input_audio_buffer.append'), false);
+
+  app.ui.setPttHeld(true);
+  assert.equal(app.ui.microphoneUploadEnabled(), true);
+  app.ui.setPendingFrame('FRAME1');
+  app.ui.capture();
+  app.ui.flushCapture();
+  const speech = app.sockets[0].sent.find(e => e.type === 'input_audio_buffer.append');
+  assert.equal(speech.is_speech, true);
+  assert.equal(speech.video_frames[0], 'FRAME1');
+
+  app.ui.setPttHeld(false);
+  assert.equal(app.sockets[0].sent.at(-1).type, 'input_audio_buffer.commit');
+  assert.equal(app.ui.state().pttHeld, false);
+
+  await app.ui.handleEvent({ type: 'response.created', response: { id: 'aura-r1' } });
+  app.ui.setPendingFrame('FRAME2');
+  app.ui.flushCapture();
+  const follow = app.sockets[0].sent.filter(e => e.type === 'input_audio_buffer.append').at(-1);
+  assert.equal(follow.is_speech, false);
+  assert.equal(follow.video_frames[0], 'FRAME2');
+  assert.equal(app.sockets[0].sent.at(-1).type, 'input_audio_buffer.commit');
+  await app.ui.stopSession({ terminal: false });
+});
+
+test('AURA sticky camera reuses the last frame on speech without a fresh pending', async () => {
+  const app = shell('aura-ptt');
+  await app.ui.startSession();
+  app.ui.setPendingFrame('STICKY');
+  app.ui.setPttHeld(true);
+  app.ui.capture();
+  app.ui.flushCapture();
+  assert.equal(app.sockets[0].sent.at(-1).video_frames[0], 'STICKY');
+  // Pending cleared; sticky last frame still available for the next speech flush.
+  app.ui.capture();
+  app.ui.flushCapture();
+  assert.equal(app.sockets[0].sent.at(-1).video_frames[0], 'STICKY');
+  await app.ui.stopSession({ terminal: false });
 });

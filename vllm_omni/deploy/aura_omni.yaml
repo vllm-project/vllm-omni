@@ -1,12 +1,20 @@
 # AURA Omni deploy profile: Qwen3-ASR -> AURA/Qwen3-VL -> Qwen3-TTS Talker -> Code2Wav.
 #
+# Primary online path is Realtime duplex (`/v1/realtime?duplex=1`).
+# The aura_omni pipeline declares duplex_plugin; DuplexOmniEngine requires
+# session_mode: duplex (same pattern as MiniCPM-o duplex deploys).
+#
 # Pass `--deploy-config vllm_omni/deploy/aura_omni.yaml` and point the parent
 # `--model` at any local placeholder repo if needed; each stage overrides its
 # own model below.
 pipeline: aura_omni
-# AURA has a semantic ASR -> AURA -> TTS dependency. Do not prewarm downstream
-# stages before AURA text is converted into Qwen3-TTS metadata by aura2tts.
-async_chunk: false
+session_mode: duplex
+duplex_session:
+  max_sessions: 1
+# Stage2→3 codec handoff needs async_chunk under duplex (Talker/Code2Wav).
+# Keep async_chunk=true for the Realtime path; do not rely on turn-based
+# chat/completions as the primary online serve mode for this profile.
+async_chunk: true
 
 connectors:
   connector_of_shared_memory:
@@ -18,7 +26,8 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 25
       codec_left_context_frames: 72
-      initial_codec_chunk_frames: 1
+      # initial=1 can stall Code2Wav on the first undersized chunk under duplex.
+      initial_codec_chunk_frames: 8
       decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
 
 stages:

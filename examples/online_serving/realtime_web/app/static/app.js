@@ -5,6 +5,7 @@
   const profile = window.OmniRealtimeProfiles[config.profile || 'minicpm-native'](config);
   const callButton = document.getElementById('callButton');
   const sendTurnButton = document.getElementById('sendTurnButton');
+  const pttButton = document.getElementById('pttButton');
   const muteButton = document.getElementById('muteButton');
   const cameraButton = document.getElementById('cameraButton');
   const cameraPreview = document.getElementById('cameraPreview');
@@ -28,6 +29,7 @@
   const ECHO_GUARD_MS = 300;
   const INITIAL_PLAYBACK_BUFFER_MS = 400;
   const SESSION_CLOSE_TIMEOUT_MS = 1000;
+  const SILENT_PCM_SAMPLES = 160;
 
   const PROMPT_PRESETS = profile.presets;
   document.title = profile.title;
@@ -37,6 +39,7 @@
   document.getElementById('policyLabel').textContent = profile.policy;
   cameraButton.hidden = !profile.camera;
   sendTurnButton.hidden = !profile.clientCommit;
+  pttButton.hidden = !profile.pushToTalk;
   promptPreset.replaceChildren();
   for (const name of [...Object.keys(PROMPT_PRESETS), 'custom']) {
     const option = document.createElement('option');
@@ -64,6 +67,8 @@
   let cameraStream = null;
   let cameraTimer = null;
   let cameraPendingFrame = null;
+  let cameraLastFrame = null;
+  let pttHeld = false;
   const cameraCanvas = document.createElement('canvas');
   let playbackRate = OUTPUT_RATE;
   let pendingCapture = [];
@@ -310,11 +315,31 @@
   }
 
   function microphoneUploadEnabled() {
-    return running && connectionReady && !muted && (!profile.halfDuplex || !assistantActive);
+    if (!running || !connectionReady || muted) return false;
+    if (profile.pushToTalk) return pttHeld;
+    return !profile.halfDuplex || !assistantActive;
   }
 
   function flushCapture() {
-    if (!socket || socket.readyState !== WebSocket.OPEN || pendingCapture.length === 0) return;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+
+    // AURA only: vision-follow while TTS plays (silent PCM + frame + commit).
+    if (profile.pushToTalk && profile.visionFollowWhileSpeaking
+        && !pttHeld && assistantActive && cameraPendingFrame) {
+      const frame = cameraPendingFrame;
+      cameraPendingFrame = null;
+      const silent = new Int16Array(SILENT_PCM_SAMPLES);
+      socket.send(JSON.stringify(profile.append(int16ToBase64(silent), frame, { isSpeech: false })));
+      for (const event of profile.commitMessages()) socket.send(JSON.stringify(event));
+      return;
+    }
+
+    if (profile.pushToTalk && !pttHeld) {
+      pendingCapture = [];
+      return;
+    }
+
+    if (pendingCapture.length === 0) return;
     if (!microphoneUploadEnabled()) {
       pendingCapture = [];
       return;
@@ -328,9 +353,32 @@
     }
     pendingCapture = [];
     const pcm = resampleInt16(merged, captureRate, profile.inputSampleRate || INPUT_RATE);
-    const appendEvent = profile.append(int16ToBase64(pcm), cameraPendingFrame);
+    const frame = cameraPendingFrame || (profile.stickyCamera ? cameraLastFrame : null);
     cameraPendingFrame = null;
+    const appendEvent = profile.pushToTalk
+      ? profile.append(int16ToBase64(pcm), frame, { isSpeech: true })
+      : profile.append(int16ToBase64(pcm), frame);
     socket.send(JSON.stringify(appendEvent));
+  }
+
+  function setPttHeld(held) {
+    if (!profile.pushToTalk || !running || pttHeld === held) return;
+    if (held) {
+      pttHeld = true;
+      pttButton.classList.toggle('is-active', true);
+      pttButton.textContent = 'Release to send';
+      setModel('Talking');
+      appendLog('PTT down');
+      return;
+    }
+    // Flush remaining speech while still held, then commit.
+    flushCapture();
+    for (const event of profile.commitMessages()) socket.send(JSON.stringify(event));
+    pttHeld = false;
+    pttButton.classList.toggle('is-active', false);
+    pttButton.textContent = 'Hold to talk';
+    setModel(profile.waiting);
+    appendLog('PTT up · commit');
   }
 
   function beginAssistant(responseId) {
@@ -633,6 +681,7 @@
       await openSocket();
       running = true;
       muted = false;
+      pttHeld = false;
       assistantActive = false;
       sendTimer = window.setInterval(flushCapture, profile.sendIntervalMs || SEND_INTERVAL_MS);
       startClock();
@@ -641,6 +690,7 @@
       muteButton.disabled = false;
       cameraButton.disabled = !profile.camera;
       sendTurnButton.disabled = !profile.clientCommit;
+      pttButton.disabled = !profile.pushToTalk;
       setConnection('Connected', 'online');
       setModel(profile.waiting);
       appendLog('session started');
@@ -674,7 +724,10 @@
         if (connectionReady && socket?.readyState === WebSocket.OPEN) {
           for (const event of profile.imageMessages(frame)) socket.send(JSON.stringify(event));
         }
-      } else cameraPendingFrame = frame;
+      } else {
+        cameraPendingFrame = frame;
+        if (profile.stickyCamera) cameraLastFrame = frame;
+      }
     };
     // Do not make the first spoken turn race a one-second timer.
     captureCameraFrame();
@@ -692,6 +745,7 @@
     }
     cameraStream = null;
     cameraPendingFrame = null;
+    cameraLastFrame = null;
     cameraPreview.srcObject = null;
     cameraPreview.style.display = 'none';
     cameraButton.textContent = 'Camera';
@@ -740,6 +794,10 @@
     turnSubmitted = false;
     assistantTextChannel = null;
     sendTurnButton.disabled = true;
+    pttHeld = false;
+    pttButton.disabled = true;
+    pttButton.classList.remove('is-active');
+    pttButton.textContent = 'Hold to talk';
     running = false;
     assistantActive = false;
     pendingCapture = [];
@@ -814,6 +872,23 @@
     sendTurnButton.disabled = true;
     setModel('Thinking');
     appendLog('turn submitted');
+  });
+  const pttDown = (event) => {
+    event.preventDefault();
+    setPttHeld(true);
+  };
+  const pttUp = (event) => {
+    event.preventDefault();
+    setPttHeld(false);
+  };
+  pttButton.addEventListener('pointerdown', pttDown);
+  pttButton.addEventListener('pointerup', pttUp);
+  pttButton.addEventListener('pointercancel', pttUp);
+  pttButton.addEventListener('pointerleave', () => {
+    if (pttHeld) setPttHeld(false);
+  });
+  window.addEventListener('pointerup', () => {
+    if (pttHeld) setPttHeld(false);
   });
   muteButton.addEventListener('click', toggleMute);
   clearLogButton.addEventListener('click', () => {

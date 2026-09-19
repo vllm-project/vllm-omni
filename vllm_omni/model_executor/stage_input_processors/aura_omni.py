@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+import regex as re
 import soundfile as sf
 
 from vllm_omni.inputs.data import OmniTokensPrompt
@@ -155,15 +156,229 @@ def _vision_multimodal_data(multi_modal_data: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in multi_modal_data.items() if key in {"image", "video"}}
 
 
-def _aura_prompt(system_prompt: str, transcript: str, multi_modal_data: dict[str, Any]) -> str:
+def _aura_prompt(
+    system_prompt: str,
+    transcript: str,
+    multi_modal_data: dict[str, Any],
+    history_prefix: str = "",
+) -> str:
     vision = _vision_placeholder(multi_modal_data)
     query = transcript.strip()
     user_body = f"{vision}{query}" if query else vision
     return (
         f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        f"{history_prefix}"
         f"<|im_start|>user\n{user_body}<|im_end|>\n"
         "<|im_start|>assistant\n"
     )
+
+
+def _strip_assistant_text(text: str) -> str:
+    """Remove think wrappers and ChatML specials before TTS / client text.
+
+    Stage1 uses ``skip_special_tokens=False`` so ``<|silent|>`` / ``<|im_end|>``
+    remain visible for silent detection; strip ChatML markers (not silent)
+    before spoken TTS / transcript emission.
+    """
+    cleaned = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL | re.IGNORECASE)
+    # Drop an unclosed leading think block if the model is still inside it.
+    cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = cleaned.replace("</think>", "")
+    cleaned = re.sub(r"<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>", "", cleaned)
+    return cleaned.strip()
+
+
+def is_effectively_silent(text: str | None) -> bool:
+    """True for empty / whitespace-only / exact ``<|silent|>`` Stage1 text."""
+    if not isinstance(text, str):
+        return False
+    stripped = _strip_assistant_text(text)
+    return not stripped or stripped == SILENT_TEXT
+
+
+# Native AURA sentence boundaries for incremental Stage1→TTS handoff.
+# Same rule as AURA_026 ``aura2tts_async_chunk``. Duplex applies it in the
+# orchestrator (not SHM ``from_stage_1``, which clears Talker text).
+_NATIVE_TTS_SENT_ENDS = frozenset("。！？；.!?;\n")
+_NATIVE_TTS_COMMA_ENDS = frozenset("，,")
+_NATIVE_TTS_MIN_CHARS = 10
+_NATIVE_TTS_MIN_EMIT_CHARS = 30
+
+
+def _sentence_tts_enabled() -> bool:
+    """Emit TTS per sentence while Stage1 still generates.
+
+    Default on. Disable with ``VLLM_AURA_SENTENCE_TTS=0``.
+    """
+    raw = (os.environ.get("VLLM_AURA_SENTENCE_TTS") or "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _sentence_tts_min_emit_chars() -> int:
+    """Minimum content chars before a mid-generation TTS handoff."""
+    raw = (os.environ.get("VLLM_AURA_SENTENCE_TTS_MIN_CHARS") or "").strip()
+    if not raw:
+        return _NATIVE_TTS_MIN_EMIT_CHARS
+    try:
+        return max(1, min(200, int(raw)))
+    except ValueError:
+        return _NATIVE_TTS_MIN_EMIT_CHARS
+
+
+def _tts_content_char_count(text: str) -> int:
+    """Count alphanumeric / CJK content chars (ignore punctuation/whitespace)."""
+    return sum(1 for ch in text if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+
+
+def _pop_native_tts_sentence(buf: str) -> tuple[str | None, str]:
+    """Pop one sentence from ``buf``; return (sentence_or_None, rest)."""
+    if not buf:
+        return None, buf
+    split_pos = -1
+    for i, ch in enumerate(buf):
+        if ch in _NATIVE_TTS_SENT_ENDS:
+            split_pos = i + 1
+            break
+        if ch in _NATIVE_TTS_COMMA_ENDS and i + 1 >= _NATIVE_TTS_MIN_CHARS:
+            split_pos = i + 1
+            break
+    if split_pos < 0:
+        return None, buf
+    sentence = buf[:split_pos]
+    rest = buf[split_pos:]
+    if not sentence.strip():
+        return _pop_native_tts_sentence(rest)
+    return sentence, rest
+
+
+def _pop_emit_ready_tts_text(
+    buf: str,
+    min_chars: int | None = None,
+) -> tuple[str | None, str]:
+    """Pop sentences until content length >= ``min_chars``."""
+    if min_chars is None:
+        min_chars = _sentence_tts_min_emit_chars()
+    parts: list[str] = []
+    rest = buf
+    while True:
+        sentence, rest = _pop_native_tts_sentence(rest)
+        if sentence is None:
+            break
+        parts.append(sentence)
+        if _tts_content_char_count("".join(parts)) >= min_chars:
+            return "".join(parts), rest
+    if not parts:
+        return None, buf
+    return None, "".join(parts) + rest
+
+
+def _tool_marker_pending(text: str) -> bool:
+    lowered = text.lower()
+    return "<tool_call" in lowered or "</tool_call" in lowered
+
+
+def next_duplex_sentence_chunk(state: dict[str, Any], raw_text: str, *, finished: bool) -> str | None:
+    """Return the next Talker sentence, or None when this output must not start TTS.
+
+    ``state`` is per Stage1 request and is mutated. Stage1 finish flushes any
+    leftover even under the min-char floor. Silent, an unclosed ``<think>``,
+    and tool markers do not emit mid-generation. A silent finish returns None
+    so the legacy full-text path can drop TTS.
+    """
+    if not _sentence_tts_enabled():
+        return None
+    raw = raw_text or ""
+    already = int(state.get("emits", 0))
+    if already == 0 and (is_silent_text_prefix(raw) or is_effectively_silent(raw)):
+        return None
+    think_open = "<think>" in raw.lower() and "</think>" not in raw.lower()
+    tool_pending = _tool_marker_pending(raw)
+    if (think_open or tool_pending) and not finished:
+        return None
+
+    text = _strip_assistant_text(raw)
+    if is_effectively_silent(text) and already == 0:
+        return None
+
+    emitted_prefix = str(state.get("emitted_prefix", ""))
+    pending = str(state.get("pending", ""))
+    if text.startswith(emitted_prefix):
+        new_tail = text[len(emitted_prefix) :]
+    else:
+        new_tail = text
+        pending = ""
+        emitted_prefix = ""
+    if new_tail:
+        pending = pending + new_tail
+        emitted_prefix = text
+        state["emitted_prefix"] = emitted_prefix
+
+    if not finished:
+        sentence, pending = _pop_emit_ready_tts_text(pending)
+        state["pending"] = pending
+        if sentence is None:
+            return None
+        state["emits"] = already + 1
+        state["last"] = sentence.strip()
+        return state["last"]
+
+    state["pending"] = ""
+    remainder = _strip_assistant_text(pending).strip()
+    if not remainder or is_effectively_silent(remainder):
+        return None
+    state["emits"] = already + 1
+    state["last"] = remainder
+    return remainder
+
+
+def commit_duplex_stage1_history(additional_info: dict[str, Any], text: str) -> None:
+    """Commit one Stage1 turn into duplex SessionHistory, if this prompt owns one."""
+    if additional_info.get("aura_tts_partial"):
+        return
+    session_id = additional_info.get("session_id") or additional_info.get("aura_session_id")
+    if not (additional_info.get("aura_duplex") and isinstance(session_id, str) and session_id):
+        return
+    from vllm_omni.model_executor.models.aura_omni.duplex.history import (
+        get_or_create_session_history,
+    )
+
+    get_or_create_session_history(session_id).commit_turn(text or SILENT_TEXT)
+
+
+def is_silent_text_prefix(text: str | None) -> bool:
+    """True while streamed text is still a prefix of ``<|silent|>``.
+
+    Holds Stage1 transcript deltas until the turn finishes (or diverges), so
+    partial ``<|sil`` fragments do not leak before a silent short-circuit.
+    """
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return True
+    return SILENT_TEXT.startswith(stripped)
+
+
+def _normalize_asr_transcript(transcript: str) -> str:
+    """Strip Qwen3-ASR markup wrappers so AURA sees plain user text.
+
+    Observed Stage0 text looks like:
+      ``language Chinese<asr_text>出现《古韵》这本书的时候，提醒我。``
+    """
+    text = (transcript or "").strip()
+    if not text:
+        return ""
+    marker = "<asr_text>"
+    if marker in text:
+        text = text.split(marker, 1)[1].strip()
+    # Drop a leading ``language <lang>`` line if still present.
+    if text.lower().startswith("language "):
+        parts = text.split(None, 2)
+        if len(parts) >= 3:
+            text = parts[2].strip()
+        elif len(parts) == 2:
+            text = ""
+    return text
 
 
 def asr2aura(
@@ -178,7 +393,10 @@ def asr2aura(
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
         system_prompt = _first_value(additional_info.get("aura_system_prompt"), DEFAULT_AURA_SYSTEM_PROMPT)
-        transcript = _extract_text(source_output)
+        transcript = _normalize_asr_transcript(_extract_text(source_output))
+        # Vision-follow: placeholder zeros may ASR into noise; trust client is_speech.
+        if additional_info.get("is_speech") is False:
+            transcript = ""
         multi_modal_data = {}
         source_multi_modal_data = src_prompt.get("multi_modal_data") or {}
         if isinstance(source_multi_modal_data, dict):
@@ -188,9 +406,34 @@ def asr2aura(
             multi_modal_data.update(deferred_multi_modal_data)
         multi_modal_data = _vision_multimodal_data(multi_modal_data)
 
+        history_prefix = ""
+        session_id = additional_info.get("session_id") or additional_info.get("aura_session_id")
+        if additional_info.get("aura_duplex") and isinstance(session_id, str) and session_id:
+            from vllm_omni.model_executor.models.aura_omni.duplex.history import (
+                get_or_create_session_history,
+            )
+
+            history = get_or_create_session_history(session_id)
+            # Vision-only turns have empty ASR; keep a short marker so
+            # SessionHistory still records the user side of proactive follow-ups.
+            history.begin_user_turn(transcript if transcript else "[vision]")
+            history_prefix = history.render_prefix()
+
         next_input: dict[str, Any] = {
-            "prompt": _aura_prompt(str(system_prompt), transcript, multi_modal_data),
+            "prompt": _aura_prompt(
+                str(system_prompt),
+                transcript,
+                multi_modal_data,
+                history_prefix=history_prefix,
+            ),
         }
+        if isinstance(session_id, str) and session_id:
+            next_input.setdefault("additional_information", {})
+            # Preserve session id for aura2tts history commit.
+            info = dict(additional_info)
+            info["session_id"] = session_id
+            info["aura_duplex"] = bool(additional_info.get("aura_duplex"))
+            next_input["additional_information"] = info
         if requires_multimodal_data:
             next_input["multi_modal_data"] = multi_modal_data
         if src_prompt.get("mm_processor_kwargs") is not None:
@@ -322,12 +565,14 @@ def aura2tts(
     prompt_by_request_id = _source_prompt_by_request_id(source_outputs, prompt)
     next_inputs: list[OmniTokensPrompt] = []
     for idx, source_output in enumerate(source_outputs):
-        text = _extract_text(source_output).strip()
-        if not text or text == SILENT_TEXT:
-            continue
-
+        raw_text = _extract_text(source_output).strip()
+        text = _strip_assistant_text(raw_text)
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
+        commit_duplex_stage1_history(additional_info, text or SILENT_TEXT)
+
+        if is_effectively_silent(text):
+            continue
         task_type = _first_value(additional_info.get("tts_task_type"), "Base")
         language = _first_value(additional_info.get("tts_language"), "English")
         instruct = _first_value(additional_info.get("tts_instruct"), "")
@@ -383,6 +628,10 @@ def aura2tts(
             OmniTokensPrompt(
                 prompt_token_ids=[0] * prompt_len,
                 additional_information=tts_info,
+                # Prefer runner data-plane so Talker preprocess still sees
+                # text if legacy additional_information is wiped (e.g. a
+                # mistaken Stage2 chunk-receiver edge).
+                model_intermediate_buffer=dict(tts_info),
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
             )

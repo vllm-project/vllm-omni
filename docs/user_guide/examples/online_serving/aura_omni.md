@@ -6,8 +6,13 @@
 ASR -> AURA -> Qwen3-TTS Talker -> Code2Wav
 ```
 
-Qwen3-TTS remains two engine stages so the pipeline reuses the existing native
-Talker and Code2Wav implementation.
+**Primary online path:** Realtime duplex at `/v1/realtime?duplex=1`.
+
+The default deploy profile (`vllm_omni/deploy/aura_omni.yaml`) sets
+`session_mode: duplex`. The `aura_omni` pipeline declares `duplex_plugin`, and
+`DuplexOmniEngine` requires that mode (same pattern as MiniCPM-o duplex
+deploys). Do not treat turn-based `chat/completions` as the primary AURA
+online serve path with this profile.
 
 ```bash
 vllm serve aurateam/AURA \
@@ -17,18 +22,18 @@ vllm serve aurateam/AURA \
   --trust-remote-code
 ```
 
-Configure local checkpoints by editing per-stage `model` values in
-`vllm_omni/deploy/aura_omni.yaml`. The deploy file sets
-`pipeline: aura_omni`, so the four-stage topology is used even if the
-command-line `--model` points at one of the component checkpoints.
+Configure local checkpoints by editing per-stage `model` values in the deploy
+YAML. The file sets `pipeline: aura_omni`, so the four-stage topology is used
+even if the command-line `--model` points at one component checkpoint.
 
-Send requests with `"model": "aurateam/AURA"`. The ASR, AURA, and Qwen3-TTS
-checkpoint paths are internal stage models from the deploy YAML, not the
-OpenAI-facing served model name.
+For a local-weight smoke serve + WS client:
 
-The AURA stage can emit `<|silent|>`. Silent outputs are treated as a gate:
-they produce no Qwen3-TTS Talker input, so no audio is synthesized for that
-turn.
+```bash
+bash examples/online_serving/aura_omni/run_duplex_smoke_serve.sh
+python examples/online_serving/aura_omni/smoke_duplex_realtime_client.py
+```
+
+Silent Stage1 outputs (`<|silent|>` / id `151669`) skip TTS for that turn.
 
 ## GPU Utilization Recommendation
 
@@ -40,26 +45,20 @@ VRAM each stage can reserve. Start with this split for a single GPU:
 - Stage 2 (Qwen3-TTS Talker): `0.20`
 - Stage 3 (Qwen3-TTS Code2Wav): `0.20`
 
-## TTS Modes
+## TTS modes (stage extras)
 
-`aura_omni` can pass AURA text to Qwen3-TTS in two task modes:
+When the duplex session supplies TTS extras, AURA text can feed Qwen3-TTS as:
 
-- `Base`: voice clone from `tts_ref_audio` with ICL enabled in the AURA
-  pipeline. Provide both `tts_ref_audio` and `tts_ref_text`. Set
-  `tts_x_vector_only_mode=true` to disable ICL and use speaker embedding only.
-- `CustomVoice`: predefined speaker mode. Use a Qwen3-TTS CustomVoice
-  checkpoint for stages 2 and 3 in `aura_omni.yaml`, then pass
-  `tts_task_type=CustomVoice` and `tts_speaker`.
+- `Base`: voice clone from `tts_ref_audio` (optional x-vector-only mode)
+- `CustomVoice`: predefined speaker (`tts_speaker`) with a CustomVoice checkpoint
+  on stages 2 and 3
 
-By default, AURA responses are passed to Qwen3-TTS as text. Set
-`additional_information.tts_pass_token_ids=true` to pass AURA-generated
-assistant token ids directly instead. Even when token passthrough is disabled,
-the stage processor uses AURA token ids when available to estimate the Talker
-prefill length, so scheduling does not rely on raw character length.
+Optional `tts_pass_token_ids` passes AURA assistant token ids into Talker
+instead of detokenized text.
 
-The example client exposes this as:
+## Turn-based examples (not primary)
 
-```bash
-python examples/online_serving/aura_omni/openai_chat_completion_client.py \
-  --tts-pass-token-ids
-```
+`examples/online_serving/aura_omni/` still contains chat-completions, curl, and
+Gradio helpers from the older turn-based online path. They are **not** the
+supported primary path for the duplex deploy profile; use the Realtime duplex
+smoke client for online verification.

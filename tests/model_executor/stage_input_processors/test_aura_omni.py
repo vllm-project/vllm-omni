@@ -10,6 +10,7 @@ from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
 )
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     SILENT_TEXT,
+    _normalize_asr_transcript,
     asr2aura,
     aura2tts,
 )
@@ -196,3 +197,73 @@ def test_aura2tts_passes_token_ids_to_qwen3_tts_when_enabled():
 
 def test_aura2tts_drops_silent_response():
     assert aura2tts([_source_output(SILENT_TEXT)]) == []
+    assert aura2tts([_source_output(f"{SILENT_TEXT}<|im_end|>")]) == []
+
+
+def test_aura2tts_strips_im_end_from_spoken_text():
+    prompt = {
+        "additional_information": {
+            "tts_ref_audio": ["ref.wav"],
+            "tts_ref_text": ["Reference transcript sample."],
+        }
+    }
+    [tts_input] = aura2tts([_source_output("你好。<|im_end|>")], prompt=[prompt])
+    assert tts_input["additional_information"]["text"] == ["你好。"]
+
+
+def test_aura2tts_does_not_treat_chinese_silence_as_special_token():
+    # [沉默] is not <|silent|>; prompt/session must instruct the real token.
+    prompt = {
+        "additional_information": {
+            "tts_ref_audio": ["ref.wav"],
+            "tts_ref_text": ["Reference transcript sample."],
+        }
+    }
+    assert len(aura2tts([_source_output("[沉默]")], prompt=[prompt])) == 1
+
+
+def test_normalize_asr_transcript_strips_qwen3_asr_markup() -> None:
+    raw = "language Chinese<asr_text>出现《古韵》这本书的时候，提醒我。"
+    assert _normalize_asr_transcript(raw) == "出现《古韵》这本书的时候，提醒我。"
+    assert _normalize_asr_transcript("出现古韵这本书的时候提醒我。") == "出现古韵这本书的时候提醒我。"
+
+
+def test_next_duplex_sentence_chunk_batches_until_min_chars(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VLLM_AURA_SENTENCE_TTS", raising=False)
+    monkeypatch.delenv("VLLM_AURA_SENTENCE_TTS_MIN_CHARS", raising=False)
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        next_duplex_sentence_chunk,
+    )
+
+    state: dict[str, object] = {}
+    first = "甲" * 12 + "。"
+    assert next_duplex_sentence_chunk(state, first, finished=False) is None
+    second = first + "乙" * 20 + "。"
+    chunk = next_duplex_sentence_chunk(state, second, finished=False)
+    assert chunk is not None
+    assert chunk.startswith("甲" * 12)
+    assert "乙" * 20 in chunk
+
+
+def test_next_duplex_sentence_chunk_holds_think_silent_and_flushes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS", "1")
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        next_duplex_sentence_chunk,
+    )
+
+    assert next_duplex_sentence_chunk({}, "<think>still thinking", finished=False) is None
+    assert next_duplex_sentence_chunk({}, "<|silent|>", finished=True) is None
+    assert next_duplex_sentence_chunk({}, '<tool_call>{"a":1}</tool_call>', finished=False) is None
+
+    state: dict[str, object] = {}
+    assert next_duplex_sentence_chunk(state, "你好。", finished=False) is None
+    assert next_duplex_sentence_chunk(state, "你好。", finished=True) == "你好。"
+
+
+def test_next_duplex_sentence_chunk_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS", "0")
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        next_duplex_sentence_chunk,
+    )
+
+    assert next_duplex_sentence_chunk({}, "甲" * 40 + "。", finished=False) is None

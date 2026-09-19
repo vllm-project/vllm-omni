@@ -160,7 +160,8 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 fence=req_state.stage_fences.get(stage_id, req_state.fence),
             ),
             final_stage_id=req_state.final_stage_id,
-            segment_finished=req_state.streaming.enabled and segment.finished,
+            segment_finished=bool(getattr(output, "finished", False))
+            or (req_state.streaming.enabled and segment.finished),
             segment_token_ids=tuple(segment.token_ids),
             segment_output_metadata=segment.output_metadata,
         )
@@ -181,13 +182,16 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
     ) -> bool:
         if not req_state.session_owned:
             return False
+        # Resumable resident Stage0: stage failure closes the session.
+        # Ephemeral turn-commit: free this turn's stages without tearing down WS.
+        close_session = self.plugin.capabilities(max_sessions=1).supports_core_resumable_request
         runner = self.session_manager.runner_for_request_id(req_id)
         if runner is not None:
-            runner.on_stage_failure(next_stage_id, exc)
+            runner.on_stage_failure(next_stage_id, exc, request_id=req_id)
         await self._cleanup_request_ids(
             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
             abort=True,
-            release_owners=True,
+            release_owners=close_session,
         )
         return True
 
@@ -247,6 +251,19 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 raise RuntimeError(f"stage {pool.stage_id} has no live replica")
             defaults.append(client.default_sampling_params)
         return tuple(defaults)
+
+    def _stage_receives_async_chunks(self, stage_id: int) -> bool:
+        """Whether a stage's connector supplies its runtime inputs.
+
+        Stages with a custom orchestrator input processor must be fed via
+        process_engine_inputs, not zero-prewarm + connector chunks. Codec edges
+        without a custom processor still use async chunk transport.
+        """
+        pool = self.stage_pools[stage_id]
+        client = getattr(pool, "stage_client", None)
+        if client is not None and getattr(client, "custom_process_input_func", None) is not None:
+            return False
+        return super()._stage_receives_async_chunks(stage_id)
 
     @staticmethod
     def _sync_bridge_state(
@@ -326,9 +343,11 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         request_state = self.request_states.get(context.request_id)
         if not isinstance(request_state, DuplexOrchestratorRequestState):
             raise RuntimeError(f"duplex request was not preregistered: {context.request_id}")
-        if self.plugin.capabilities(
-            max_sessions=self.duplex_session_config.max_sessions
-        ).supports_core_resumable_request:
+        request_state.streaming.enabled = submission.resumable
+        # Keep raw Stage0 prompt (additional_information / multi_modal_data) for
+        # stage input processors via process_engine_inputs.
+        request_state.prompt = dict(submission.prompt)
+        if submission.resumable:
             request = build_engine_core_request_from_tokens(
                 request_id=context.request_id,
                 prompt=dict(submission.prompt),
@@ -349,10 +368,14 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             )
             if self.request_states.get(context.request_id) is not request_state:
                 raise RuntimeError("duplex request cancelled during input preprocessing")
-            request_state.prompt = dict(submission.prompt)
         request.external_req_id = request.request_id
+        mm_features = getattr(request, "mm_features", None)
+        if mm_features is not None:
+            request_state.mm_features = mm_features
         pool = self.stage_pools[context.stage_id]
         if submission.already_submitted:
+            if not submission.resumable:
+                raise RuntimeError(f"ephemeral duplex request cannot submit_update: {context.request_id}")
             replica_id = await pool.submit_update(context.request_id, request_state, request)
         else:
             replica_id = await pool.submit_initial(context.request_id, request_state, request, prompt_text=None)
@@ -377,6 +400,19 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             stage_id=context.stage_id,
             replica_id=replica_id,
         )
+
+    async def _route_output(
+        self,
+        stage_id: int,
+        replica_id: int,
+        output: Any,
+        req_state: OrchestratorRequestState,
+        stage_metrics: Any,
+    ) -> None:
+        forward_partial = getattr(self.plugin, "forward_partial_stage_output", None)
+        if forward_partial is not None:
+            await forward_partial(self, stage_id, replica_id, output, req_state)
+        await super()._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
     async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None:
         await self._cleanup_request_ids(request_ids, abort=abort)

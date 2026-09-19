@@ -1158,6 +1158,7 @@ def note_input_append(
     payload: dict[str, object],
     *,
     vad_result: TurnDetectionResult | None = None,
+    allows_video_without_audio: bool = False,
 ) -> list[DuplexEvent]:
     """Update the input-buffer projection for one appended chunk; returns typed events.
 
@@ -1170,9 +1171,18 @@ def note_input_append(
     audio = payload.get("audio")
     looks_like_speech = bool(vad_result.is_speech) if vad_result is not None else payload.get("is_speech") is not False
     has_audio = isinstance(audio, str) and bool(audio)
-    state.input_audio_buffer_has_audio = state.input_audio_buffer_has_audio or (looks_like_speech and has_audio)
+    video_frames = payload.get("video_frames")
+    has_video = isinstance(video_frames, list) and any(isinstance(frame, str) and frame for frame in video_frames)
+    # Vision-carrying silent appends are real turn content only when the model
+    # allows video without required audio. Without this gate, turn-mode
+    # camera sessions would treat silent+frames as buffer content and open a response.
+    state.input_audio_buffer_has_audio = (
+        state.input_audio_buffer_has_audio
+        or (looks_like_speech and has_audio)
+        or (has_video and allows_video_without_audio)
+    )
     state.input_audio_buffer_had_non_speech = state.input_audio_buffer_had_non_speech or (
-        not looks_like_speech and has_audio
+        not looks_like_speech and has_audio and not (has_video and allows_video_without_audio)
     )
     events: list[DuplexEvent] = []
     stop_ms: object = payload.get("audio_end_ms", payload.get("audio_ms", 0))
