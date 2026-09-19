@@ -4,9 +4,9 @@
 
 from __future__ import annotations
 
-import time
 from typing import TYPE_CHECKING, cast
 
+from vllm_omni.diffusion.interaction.types import synchronized_monotonic_time
 from vllm_omni.diffusion.models.interface import SupportsInteractionApply
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
@@ -44,7 +44,7 @@ class InteractionMixin:
 
         merged = self._interaction_coordinator.apply_at_chunk_boundary(
             state,
-            boundary_at=time.monotonic(),
+            boundary_at=synchronized_monotonic_time(),
             num_frames=num_frames,
             fps=fps,
         )

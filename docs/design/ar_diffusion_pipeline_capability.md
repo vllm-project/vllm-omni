@@ -4,9 +4,6 @@
 > `experimental/ar_diffusion` contract. It follows the ownership and lifecycle
 > direction in [#5137](https://github.com/vllm-project/vllm-omni/issues/5137),
 > but it is not yet part of the stable module-design hierarchy.
->
-> The end-to-end request, identity, failure, and memory contracts are documented
-> in [Realtime AR-Diffusion sessions](feature/realtime_ar_diffusion.md).
 
 `ARDiffusionEngine` is an opt-in diffusion backend for pipelines that keep
 autoregressive attention KV across requests. The engine only selects
@@ -26,8 +23,8 @@ The runner binds an `ARDiffusionKVState` only around one runner invocation
 (`execute_model` or `execute_stepwise`). The pipeline may use it during that
 context but must not retain it. Scratch and committed pages stay on the
 runner-owned session object, so unbinding does not drop an in-flight stepwise
-chunk. Tick-mode sessions survive subsequent requests with the same
-`session_id`. On the stepwise path the session id is the request id and is
+chunk. Request-mode sessions survive subsequent requests with the same
+`extra_args["session_id"]`. On the stepwise path the session id is the request id and is
 released when that request finishes or fails. Request reset, explicit close,
 LRU eviction, and forward exceptions all release runner-owned KV and call the
 pipeline's reset/close lifecycle hook. Cross-attention KV is allocated lazily

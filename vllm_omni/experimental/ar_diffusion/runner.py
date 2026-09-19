@@ -25,7 +25,6 @@ from vllm_omni.experimental.ar_diffusion.capability import (
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
-from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -240,14 +239,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         return state
 
     @staticmethod
-    def _request_session(
-        req: OmniDiffusionRequest,
-    ) -> tuple[str, dict, ARDiffusionTickRequest | None]:
+    def _request_session(req: OmniDiffusionRequest) -> tuple[str, dict]:
         extra_args = req.sampling_params.extra_args or {}
-        tick = ARDiffusionTickRequest.from_extra_args(extra_args)
-        if tick is not None:
-            return tick.session_id, extra_args, tick
-        return str(extra_args.get("session_id") or "default"), extra_args, None
+        return str(extra_args.get("session_id") or "default"), extra_args
 
     @contextmanager
     def _bound_ar_session(
@@ -292,8 +286,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         A stepwise request that runs to completion is closed as soon as its
         final chunk is emitted; an aborted one never produces that output, so
         its KV would otherwise linger until LRU eviction. Session ids equal
-        request ids on this path, and tick sessions are keyed by their own ids,
-        so the membership check leaves them untouched.
+        request ids on this path, and request-mode sessions are keyed by their
+        own ``extra_args["session_id"]``, so the membership check leaves them
+        untouched.
         """
         for request_id in getattr(scheduler_output, "finished_req_ids", None) or ():
             self._stepwise_chunk_started.pop(request_id, None)
@@ -315,9 +310,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         if self._ar_diffusion_capability is None:
             raise RuntimeError("AR-Diffusion capability missing after KV cache initialization")
 
-        session_id, extra_args, tick = self._request_session(req)
-        reset = tick.reset if tick is not None else bool(extra_args.get("reset", False))
-        close_session = tick.close_session if tick is not None else bool(extra_args.get("close_session", False))
+        session_id, extra_args = self._request_session(req)
+        reset = bool(extra_args.get("reset", False))
+        close_session = bool(extra_args.get("close_session", False))
         if reset:
             self.reset_session(session_id)
         started = time.perf_counter()

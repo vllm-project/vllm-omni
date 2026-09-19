@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import ClassVar, Self
+from typing import ClassVar
+
+from typing_extensions import Self
 
 from vllm_omni.diffusion.interaction.types import (
     InteractionChunkMetadata,
@@ -26,6 +28,11 @@ class InteractionHandler(ABC):
     # When True, chunk-boundary apply needs ``ChunkMediaSpec`` (num_frames/fps)
     # Those information are useful when interaction handler needs interpolation/integration on a frame-by-frame basis
     needs_chunk_media: ClassVar[bool] = False
+    # When True, the coordinator skips ``apply_at_chunk_boundary`` until a session
+    # exists (normally created on the first enqueue). When False, every chunk
+    # boundary runs apply even with no prior enqueue so the handler can create
+    # its session and materialize default chunk data (e.g. identity camera hold).
+    lazy_initialize_session: ClassVar[bool] = True
 
     @classmethod
     def from_pipeline(cls, pipeline: object) -> Self:
@@ -36,6 +43,21 @@ class InteractionHandler(ABC):
         """
         del pipeline
         return cls()
+
+    @abstractmethod
+    def validate_payload(
+        self,
+        state: StepRequestState,
+        *,
+        event_id: str,
+        payload: InteractionPayload,
+        transition_chunks: int | None,
+    ) -> None:
+        """Validate a modality payload without mutating request state.
+
+        Used by ``InteractionCoordinator.enqueue_parts`` so composite events
+        fail before any track is queued.
+        """
 
     @abstractmethod
     def enqueue(

@@ -9,7 +9,7 @@ registered here.
 Deliberately no ``default_deploy_config_name``: model-type inference matches
 this checkpoint by name, so a default would silently retarget every ``Omni``
 and ``AsyncOmni`` caller that passes no deploy config (the offline replay
-example, the tick example) onto the stepwise serving topology. Stepwise
+example) onto the stepwise serving topology. Stepwise
 serving stays opt-in through
 ``--deploy-config vllm_omni/deploy/lingbot_world_v2_stepwise.yaml``.
 """

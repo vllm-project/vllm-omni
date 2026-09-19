@@ -7,7 +7,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -134,6 +134,27 @@ class ARDiffusionKVCacheSpec:
     @property
     def cross_attention_lengths(self) -> dict[str, int]:
         return {cache.name: cache.num_tokens for cache in self.cross_attention}
+
+
+@dataclass(frozen=True)
+class ARDiffusionChunkMetadata:
+    """Identity metadata returned with one generated AR block.
+
+    Streamed under ``output["metadata"]["ar_diffusion"]`` so a client can
+    correlate each chunk with its rollout. On the stepwise path the request is
+    the session, so ``session_id == request_id``.
+    """
+
+    session_id: str
+    request_id: str
+    chunk_index: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "request_id": self.request_id,
+            "chunk_index": self.chunk_index,
+        }
 
 
 @runtime_checkable

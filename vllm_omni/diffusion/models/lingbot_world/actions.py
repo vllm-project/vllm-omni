@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Realtime keyboard controls for LingBot World 2.0."""
+"""Keyboard camera controls for LingBot World 2.0."""
 
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
-from typing import Any, TypeAlias
+from collections.abc import Iterable, Sequence
+from typing import TypeAlias
 
 import numpy as np
 import torch
@@ -15,16 +14,8 @@ import torch
 from vllm_omni.diffusion.models.lingbot_world.camera import (
     CameraTrajectory,
 )
-from vllm_omni.experimental.ar_diffusion.session import (
-    ARDiffusionPreparedControls,
-    ARDiffusionSessionEvent,
-)
-from vllm_omni.experimental.ar_diffusion.tick_protocol import (
-    ARDiffusionControlInput,
-)
 
-LINGBOT_CAMERA_ACTION_SCHEMA = "lingbot.camera_actions.v1"
-LINGBOT_CAMERA_TRAJECTORY_SCHEMA = "lingbot.camera_trajectory.v1"
+LINGBOT_CONTROLLER_TRANSLATION_UNIT = 0.05
 _ACTION_ORDER = ("w", "a", "s", "d", "i", "j", "k", "l")
 _VALID_ACTIONS = frozenset(_ACTION_ORDER)
 _REFERENCE_HEIGHT = 480
@@ -51,11 +42,6 @@ LingBotCameraActionFrames: TypeAlias = tuple[tuple[str, ...], ...]
 LingBotCameraActionScript: TypeAlias = tuple[LingBotCameraActionFrames, ...]
 
 
-def as_camera_action_frames(value: Iterable[Iterable[str]]) -> LingBotCameraActionFrames:
-    """Restore the tuple form of one chunk's per-latent-frame key states."""
-    return tuple(tuple(frame) for frame in value)
-
-
 def as_camera_action_script(value: Iterable[Iterable[Iterable[str]]]) -> LingBotCameraActionScript:
     """Restore the tuple form of a whole request's script.
 
@@ -63,31 +49,13 @@ def as_camera_action_script(value: Iterable[Iterable[Iterable[str]]]) -> LingBot
     validated script comes back as lists; this rebuilds the hashable tuple form
     without re-running validation.
     """
-    return tuple(as_camera_action_frames(chunk) for chunk in value)
+    return tuple(tuple(tuple(frame) for frame in chunk) for chunk in value)
 
 
 def _normalize_frames(value: object, *, field: str) -> LingBotCameraActionFrames:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         raise ValueError(f"{field} must be a sequence of per-frame action lists.")
     return tuple(_normalize_actions(actions, field=f"{field}[{index}]") for index, actions in enumerate(value))
-
-
-def parse_lingbot_camera_action_frames(
-    data: Mapping[str, Any],
-    *,
-    expected_frames: int,
-) -> LingBotCameraActionFrames:
-    """Validate the chunk-sized payload emitted by the session reducer."""
-
-    if data.get("mode") != "frames":
-        raise ValueError("lingbot.camera_actions.v1 model ticks require mode='frames'.")
-    frames = _normalize_frames(data.get("frames"), field="camera action frames")
-    if len(frames) != expected_frames:
-        raise ValueError(
-            "lingbot.camera_actions.v1 must contain exactly one action list per "
-            f"latent frame; expected {expected_frames}, got {len(frames)}."
-        )
-    return frames
 
 
 def parse_lingbot_camera_action_script(
@@ -112,149 +80,6 @@ def parse_lingbot_camera_action_script(
             )
         chunks.append(frames)
     return tuple(chunks)
-
-
-@dataclass(frozen=True)
-class _LingBotCameraReducerState:
-    mode: str | None = None
-    held_actions: tuple[str, ...] = ()
-    script_frames: tuple[tuple[str, ...], ...] = ()
-
-
-class LingBotCameraControlReducer:
-    """Sample live state/script controls into one LingBot AR block.
-
-    State mode preserves held keys across chunks and guarantees a one-frame
-    pulse when a press and release both arrive before the next chunk. Script
-    mode is a finite FIFO padded with neutral frames after exhaustion.
-    """
-
-    def __init__(self, *, frames_per_block: int = 3) -> None:
-        if isinstance(frames_per_block, bool) or not isinstance(frames_per_block, int) or frames_per_block <= 0:
-            raise ValueError("frames_per_block must be a positive integer.")
-        self._frames_per_block = frames_per_block
-        self._state = _LingBotCameraReducerState()
-
-    @staticmethod
-    def _state_transitions(data: Mapping[str, Any]) -> tuple[tuple[str, ...], ...]:
-        transitions = data.get("transitions")
-        if not isinstance(transitions, Sequence) or isinstance(transitions, (str, bytes)) or not transitions:
-            raise ValueError("LingBot state-mode camera actions require non-empty transitions.")
-        normalized: list[tuple[str, ...]] = []
-        previous_timestamp: int | None = None
-        for index, transition in enumerate(transitions):
-            if not isinstance(transition, Mapping):
-                raise ValueError("Each LingBot camera state transition must be a mapping.")
-            timestamp = transition.get("client_ts_ms")
-            if timestamp is not None:
-                if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
-                    raise ValueError("client_ts_ms must be a non-negative integer when provided.")
-                if previous_timestamp is not None and timestamp < previous_timestamp:
-                    raise ValueError("client_ts_ms values must be monotonic within one event.")
-                previous_timestamp = timestamp
-            normalized.append(
-                _normalize_actions(
-                    transition.get("actions"),
-                    field=f"camera state transitions[{index}].actions",
-                )
-            )
-        return tuple(normalized)
-
-    @staticmethod
-    def _script(data: Mapping[str, Any]) -> tuple[tuple[str, ...], ...]:
-        return _normalize_frames(data.get("frames"), field="camera action script frames")
-
-    def prepare(
-        self,
-        *,
-        current_controls: Mapping[str, ARDiffusionControlInput],
-        events: Sequence[ARDiffusionSessionEvent],
-        chunk_index: int,
-    ) -> ARDiffusionPreparedControls:
-        del chunk_index
-        controls = {
-            track: control
-            for track, control in current_controls.items()
-            if not (track == "camera" and control.schema == LINGBOT_CAMERA_ACTION_SCHEMA)
-        }
-        state = self._state
-        pending_transitions: tuple[tuple[str, ...], ...] = ()
-
-        for event in events:
-            for control in event.controls:
-                if control.track != "camera" or control.schema != LINGBOT_CAMERA_ACTION_SCHEMA:
-                    controls[control.track] = control
-                    if control.track == "camera":
-                        state = _LingBotCameraReducerState()
-                        pending_transitions = ()
-                    continue
-
-                mode = control.data.get("mode")
-                controls.pop("camera", None)
-                if mode == "script":
-                    state = _LingBotCameraReducerState(
-                        mode="script",
-                        script_frames=self._script(control.data),
-                    )
-                    pending_transitions = ()
-                elif mode == "state":
-                    transitions = self._state_transitions(control.data)
-                    if state.mode != "state":
-                        state = _LingBotCameraReducerState(mode="state")
-                    else:
-                        state = _LingBotCameraReducerState(
-                            mode="state",
-                            held_actions=state.held_actions,
-                        )
-                    pending_transitions += transitions
-                else:
-                    raise ValueError("lingbot.camera_actions.v1 events require mode='state' or mode='script'.")
-
-        if state.mode == "script":
-            frames = state.script_frames[: self._frames_per_block]
-            frames += ((),) * (self._frames_per_block - len(frames))
-            state = _LingBotCameraReducerState(
-                mode="script",
-                script_frames=state.script_frames[self._frames_per_block :],
-            )
-        elif state.mode == "state":
-            final_actions = pending_transitions[-1] if pending_transitions else state.held_actions
-            pulse = next(
-                (actions for actions in reversed(pending_transitions) if actions),
-                None,
-            )
-            if pulse is not None and pulse != final_actions:
-                frames = (pulse,) + (final_actions,) * (self._frames_per_block - 1)
-            else:
-                frames = (final_actions,) * self._frames_per_block
-            state = _LingBotCameraReducerState(
-                mode="state",
-                held_actions=final_actions,
-            )
-        else:
-            frames = ()
-
-        if frames:
-            controls["camera"] = ARDiffusionControlInput(
-                track="camera",
-                schema=LINGBOT_CAMERA_ACTION_SCHEMA,
-                data={
-                    "mode": "frames",
-                    "frames": [list(actions) for actions in frames],
-                },
-            )
-        return ARDiffusionPreparedControls(
-            controls=tuple(controls[track] for track in sorted(controls)),
-            private_state=state,
-        )
-
-    def commit(self, prepared: ARDiffusionPreparedControls) -> None:
-        if not isinstance(prepared.private_state, _LingBotCameraReducerState):
-            raise TypeError("LingBot reducer prepared state has an unexpected type.")
-        self._state = prepared.private_state
-
-    def reset(self) -> None:
-        self._state = _LingBotCameraReducerState()
 
 
 def _rotation_matrix(axis: str, angle: float) -> np.ndarray:
@@ -282,7 +107,7 @@ def integrate_lingbot_camera_actions(
     """Convert latent-frame WASD/IJKL controls to cumulative C2W poses.
 
     Calibration and motion constants intentionally match SGLang's LingBot
-    adapter: movement 0.05, pitch 4 degrees, yaw 6 degrees, pitch clamp 85
+    adapter: movement 0.05 (LINGBOT_CONTROLLER_TRANSLATION_UNIT), pitch 4 degrees, yaw 6 degrees, pitch clamp 85
     degrees, and target-resolution focal lengths of 500 pixels.
     """
 
@@ -325,13 +150,31 @@ def integrate_lingbot_camera_actions(
             right /= right_norm + 1e-6
 
         movement = np.zeros(3, dtype=np.float64)
-        movement += forward * 0.05 * (("w" in actions) - ("s" in actions))
-        movement += right * 0.05 * (("d" in actions) - ("a" in actions))
+        movement += forward * LINGBOT_CONTROLLER_TRANSLATION_UNIT * (("w" in actions) - ("s" in actions))
+        movement += right * LINGBOT_CONTROLLER_TRANSLATION_UNIT * (("d" in actions) - ("a" in actions))
+        # Keep the cumulative controller pose in FP64 between chunks, matching
+        # SGLang's NumPy integration and avoiding long-session drift.
         current_pose = np.eye(4, dtype=np.float64)
         current_pose[:3, :3] = new_rotation
         current_pose[:3, 3] = translation + movement
         poses.append(current_pose)
 
+    trajectory = camera_trajectory_from_absolute_pose(torch.from_numpy(np.stack(poses)), width=width, height=height)
+    return trajectory, current_pitch
+
+
+def camera_trajectory_from_absolute_pose(
+    poses: torch.Tensor,
+    *,
+    width: int,
+    height: int,
+) -> CameraTrajectory:
+    if width <= 0 or height <= 0:
+        raise ValueError("camera action resolution must be positive.")
+    if poses.ndim != 3 or poses.shape[-2:] != (4, 4):
+        raise ValueError(f"absolute camera poses must have shape [frames, 4, 4], got {tuple(poses.shape)}.")
+    if poses.shape[0] == 0:
+        raise ValueError("absolute camera poses must not be empty.")
     # build_plucker_embedding expects intrinsics in the 832x480 reference
     # coordinate system. These values become SGLang's [500, 500, W/2, H/2]
     # after that function scales them to the requested resolution.
@@ -342,9 +185,7 @@ def integrate_lingbot_camera_actions(
         _REFERENCE_HEIGHT / 2,
     )
     trajectory = CameraTrajectory(
-        # Keep the cumulative controller pose in FP64 between chunks, matching
-        # SGLang's NumPy integration and avoiding long-session drift.
-        poses=torch.from_numpy(np.stack(poses)),
+        poses=poses,
         intrinsics=torch.tensor(reference_intrinsics, dtype=torch.float32).repeat(len(poses), 1),
     )
-    return trajectory, current_pitch
+    return trajectory
