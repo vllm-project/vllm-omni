@@ -518,5 +518,18 @@ class CosyVoice3Code2Wav(nn.Module):
             k.replace("generator.", ""): v for k, v in torch.load(hift_path, map_location=device).items()
         }
         self.hift.load_state_dict(hift_state_dict, strict=True)
-        self.hift.to(device).eval()
+        self.hift.to(device)
+        # Inference weights are frozen: fold g*v/||v|| once here instead of
+        # recomputing it in every convolution on every streamed chunk.
+        # Must stay after load_state_dict: folding rewrites the state_dict
+        # keys (parametrizations.weight.original0/1 -> weight), so this is a
+        # one-time post-load transform. A second load_weights() with the
+        # original checkpoint fails the strict load_state_dict loudly; no
+        # in-tree path reloads (sleep/wake restores physical pages, and
+        # level-2 wake is NotImplementedError in async_omni.py).
+        folded = self.hift.remove_weight_norm()
+        logger.info("Folded %d weight-norm layers in HiFT generator", folded)
+        if folded == 0:
+            logger.warning("HiFT generator had no weight-norm layers to fold; check config drift")
+        self.hift.eval()
         logger.info(f"Loaded hift weights from {hift_path}")
