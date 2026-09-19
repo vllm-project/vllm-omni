@@ -84,6 +84,19 @@ class OmniGPUModelRunner(GPUModelRunner):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Newer vLLM versions handle XD-RoPE through the M-RoPE buffers and no
+        # longer set this attribute (vllm-project/vllm#56078); the separate
+        # XD-RoPE path stays for versions that still provide it. The read sites
+        # keep their own getattr for runners built with object.__new__ in tests;
+        # this default is what covers the ones that do not, including the two
+        # NPU runners that inherit this constructor.
+        parent_set_the_flag = hasattr(self, "uses_xdrope_dim")
+        self.uses_xdrope_dim = getattr(self, "uses_xdrope_dim", 0)
+        if not parent_set_the_flag:
+            logger.info_once(
+                "This vLLM does not expose uses_xdrope_dim, so the separate XD-RoPE "
+                "position path stays off; such versions fold it into M-RoPE."
+            )
         self.model_intermediate_buffer: dict[str, dict[str, Any]] = {}
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
