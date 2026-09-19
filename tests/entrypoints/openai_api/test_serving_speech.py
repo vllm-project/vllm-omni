@@ -58,6 +58,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
 )
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_supported_speakers
 from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import MingTTSAdapter
+from vllm_omni.entrypoints.openai.tts_adapters.omnivoice import OmniVoiceAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter, Qwen3TTSCodecLimitError
 from vllm_omni.entrypoints.openai.tts_adapters.voxtral import VoxtralTTSAdapter
 from vllm_omni.entrypoints.serve.utils import errors as serve_errors
@@ -751,7 +752,7 @@ class TestSpeechAPI:
             diffusion_engine=engine_client,
             model_name="test-model",
         )
-        assert server._adapter is None
+        assert isinstance(server._adapter, OmniVoiceAdapter)
 
         response = await server.create_speech(OpenAICreateSpeechRequest(input="test-input", voice="test-voice"))
 
