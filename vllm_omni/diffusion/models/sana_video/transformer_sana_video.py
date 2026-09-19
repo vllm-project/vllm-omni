@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2025 The HuggingFace Team and SANA-Video Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -38,6 +41,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_sequence_parallel_world_size,
     get_sp_group,
 )
+from vllm_omni.diffusion.layers.sana_rms_norm import exact_sana_rms_norm
 
 
 def validate_sana_video_parallel_config(parallel_config) -> None:
@@ -168,6 +172,9 @@ class SanaRMSNorm(nn.Module):
                 self.bias = nn.Parameter(torch.zeros(self.dim))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.weight is not None and self.bias is None:
+            return exact_sana_rms_norm(hidden_states, self.weight, self.eps)
+
         input_dtype = hidden_states.dtype
         variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
