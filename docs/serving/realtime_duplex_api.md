@@ -948,6 +948,10 @@ deferred commit during an active response (`event.response_create_deferred`)
 {"type": "conversation.item.truncated", "item_id": "item_resp_01", "content_index": 0, "audio_end_ms": 1850, "event": {"…": "…"}}
 ```
 
+After this acknowledgement, `conversation.item.retrieve` returns the truncated
+transcript. Without text/audio alignment marks, its prefix is estimated from
+the requested position and audio duration; this is not exact word alignment.
+
 #### Response lifecycle
 
 `C→S response.create`

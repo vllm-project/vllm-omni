@@ -767,7 +767,8 @@ class MossTTSCodecDecoder(nn.Module):
         )
 
         codec.eval()
-        if device.type != "cpu":
+        # The v1 quantizer emits FP32 tensors, so its decoder must remain FP32.
+        if device.type != "cpu" and isinstance(codec, MossAudioTokenizerV2Model):
             codec.decoder.to(dtype=torch.bfloat16)
         attention_backend = getattr(self.vllm_config.model_config.hf_config, "codec_attention_backend", "sdpa")
         if attention_backend != "sdpa":

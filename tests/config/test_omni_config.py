@@ -95,6 +95,20 @@ def _from_pipeline_key(
     )
 
 
+def test_mammothmoda2_diffusion_stage_projects_native_backend_config() -> None:
+    config = _from_pipeline_key(
+        "mammoth_moda2",
+        cli_overrides={"model": "/models/MammothModa2-Preview"},
+    )
+    stage = config.stage_by_id(1)
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.diffusion_config.model_class_name == "MammothModa2DiTPipeline"
+    assert stage.diffusion_config.model == "/models/MammothModa2-Preview"
+    assert stage.diffusion_config.step_execution is False
+    assert stage.scheduler_config.max_num_seqs == 1
+    assert stage.connector_config.omni_kv_config == {"need_recv_cache": False}
+
+
 def test_minimax_h3_text_encoder_tp_targets_only_structured_stage_zero() -> None:
     config = _from_pipeline_key(
         "minimax_h3_disaggregated",
@@ -259,6 +273,30 @@ def test_from_pipeline_config_applies_cli_overrides_without_stage_config_runtime
     assert stage0.scheduler_config.max_num_seqs == 7
     assert stage1.parallel_config.tensor_parallel_size == 2
     assert stage1.runtime_config.num_gpus == stage1.parallel_config.world_size
+
+
+def test_diffusion_cli_parallel_overrides_beat_nested_deploy_parallel_config():
+    """Flat CLI parallel flags override the deploy YAML's nested parallel_config.
+
+    Regression for the NPU nightly failure (#7778): hunyuan_image3_dit.yaml's
+    platform section sets nested parallel_config.tensor_parallel_size=4 while
+    the perf tests pass --tensor-parallel-size 2. The flat CLI value must win,
+    mirroring StageConfig.to_omegaconf, or the stage demands more devices than
+    the machine has (tp=4 x usp=2 = 8 on a 4-card box).
+    """
+    omni_config = VllmOmniConfig.from_pipeline_config(
+        _resolve_pipeline_or_skip("hunyuan_image3_dit"),
+        user_deploy_config=DeployConfig(
+            stages=[StageDeployConfig(stage_id=0, engine_extras={"parallel_config": {"tensor_parallel_size": 4}})]
+        ),
+        cli_overrides={"tensor_parallel_size": 2, "ulysses_degree": 2},
+    )
+
+    stage = omni_config.stage_by_id(0)
+
+    assert stage.parallel_config.tensor_parallel_size == 2
+    assert stage.parallel_config.ulysses_degree == 2
+    assert stage.parallel_config.world_size == 4
 
 
 @pytest.mark.parametrize(
