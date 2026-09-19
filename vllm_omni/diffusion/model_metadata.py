@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,8 @@ class DiffusionModelMetadata:
     supported_control_upload_types: tuple[str, ...] = ()
     attention_mask_free: bool = False
     final_output_type: str | None = None
+    # Head-sharded MoE uses SP-local groups, not vLLM FusedMoE rank folding.
+    expert_parallel_style: Literal["vllm", "head"] = "vllm"
 
 
 # FLUX.2 Klein supports up to four reference images.
