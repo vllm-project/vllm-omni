@@ -382,6 +382,14 @@ retains both registration and lease for retry/process teardown. Preferred mode
 then uses the runner's fresh canonical retry; required mode propagates the
 failure.
 
+Final worker shutdown calls the backend's terminal `shutdown()` operation. DLO
+waits for pending transfers, discards streamed and resident block storage, removes
+hooks, unregisters host memory, and closes mmap leases. It does not reconstruct
+CPU weights or run restoration AllGather collectives, so exiting does not require
+RAM for the complete model. A failed drain preserves transport backing for retry;
+a shut-down backend cannot be enabled again. Explicit `disable()` outside terminal
+shutdown retains its reusable-model contract and restores the CPU weights.
+
 #### PR2 and PR3 promotion gates
 
 - Warm hit performs zero ordinary DiT materialization and zero producer calls.

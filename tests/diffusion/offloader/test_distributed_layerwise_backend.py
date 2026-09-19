@@ -1095,9 +1095,11 @@ def test_hwr_registration_budget_validation_is_transport_scoped():
             validate_dlo_host_registration_options(**options)
 
 
+@pytest.mark.parametrize("cleanup_method", ["disable", "shutdown"])
 def test_unregistration_precedes_lease_close_and_retries_failures(
     monkeypatch: pytest.MonkeyPatch,
     patched_offload_runtime,
+    cleanup_method,
 ):
     dist_backend_module._ACTIVE_HWR_REGISTRATIONS.clear()
     events: list[str] = []
@@ -1127,12 +1129,12 @@ def test_unregistration_precedes_lease_close_and_retries_failures(
     monkeypatch.setattr(current_omni_platform, "synchronize", lambda: None)
 
     with pytest.raises(HostRegistrationCleanupError, match="failed to unregister"):
-        backend.disable()
+        getattr(backend, cleanup_method)()
     assert not lease.closed
     assert backend._host_registration is not None
     assert dist_backend_module._ACTIVE_HWR_REGISTRATIONS == [(backend._host_registration, lease)]
 
-    backend.disable()
+    getattr(backend, cleanup_method)()
 
     assert lease.closed
     assert backend._host_registration is None
@@ -2832,3 +2834,81 @@ class TestDistributedComponentSelection:
 
         with pytest.raises(ValueError, match="not declared replicated"):
             resolve_offload_plan(StubEncoderPipeline(), config)
+
+
+@pytest.mark.parametrize("resident_layers", [0, 1])
+def test_shutdown_discards_mmap_weights_without_restoring(resident_layers, patched_offload_runtime, monkeypatch):
+    pipeline, backend, _, lease = _hwr_backend()
+    backend.config.dlo_resident_layers = resident_layers
+    backend.enable(pipeline)
+    backend.load_resident_layers()
+    hooks = [hook for group in backend._all_hook_groups for hook in group]
+    hooks[0].prefetch_layer(0)
+    blocks = [block for group in backend._blocks for block in group]
+    events = []
+    monkeypatch.setattr(current_omni_platform, "synchronize", lambda: events.append("drain"))
+    monkeypatch.setattr(
+        dist_backend_module,
+        "restore_tensor_storage",
+        lambda *a, **kw: pytest.fail("shutdown must not allocate a restored weight"),
+    )
+    close = lease.close
+
+    def close_lease():
+        assert events == ["drain"]
+        assert all(p.numel() == 0 for p in pipeline.transformer.parameters())
+        events.append("close")
+        close()
+
+    monkeypatch.setattr(lease, "close", close_lease)
+    backend.shutdown()
+    assert events == ["drain", "close"]
+    assert lease.closed
+    assert not backend.enabled
+    assert not backend._all_hook_groups
+    assert backend._resident_layer_group is None
+    assert all(block._hook_registry.get_hook("distributed_layerwise_offload") is None for block in blocks)
+    backend.shutdown()
+    assert events == ["drain", "close"]
+    with pytest.raises(RuntimeError, match="shut down"):
+        backend.enable(pipeline)
+
+
+def test_shutdown_skips_allgather_restore(patched_offload_runtime, monkeypatch):
+    backend = DistributedLayerwiseOffloadBackend(
+        OffloadConfig(strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE, dp_size=2),
+        torch.device("cpu"),
+    )
+    block = nn.Linear(2, 2)
+    block.register_buffer("state", torch.ones(3))
+    hook = Mock(dp_size=2, next_block=block)
+    backend._all_hook_groups = [[hook]]
+    backend._blocks = [[block]]
+    backend.enabled = True
+    restore_collective = Mock(side_effect=AssertionError("unexpected restore collective"))
+    monkeypatch.setattr(dist, "all_gather_into_tensor", restore_collective)
+    backend.shutdown()
+    hook.restore_next_block_to_cpu.assert_not_called()
+    restore_collective.assert_not_called()
+    assert all(t.numel() == 0 for t in [*block.parameters(), *block.buffers()])
+
+
+def test_shutdown_drain_failure_keeps_mapping_for_retry(patched_offload_runtime, monkeypatch):
+    pipeline, backend, _, lease = _hwr_backend()
+    backend.enable(pipeline)
+    hooks = backend._all_hook_groups
+    monkeypatch.setattr(current_omni_platform, "synchronize", Mock(side_effect=RuntimeError("drain failed")))
+    with pytest.raises(RuntimeError, match="drain failed"):
+        backend.shutdown()
+    assert not lease.closed
+    assert backend._all_hook_groups is hooks
+    monkeypatch.setattr(current_omni_platform, "synchronize", lambda: None)
+    # A cleanup retry must remain terminal, even through the ordinary entrypoint.
+    monkeypatch.setattr(
+        dist_backend_module,
+        "restore_tensor_storage",
+        lambda *a, **kw: pytest.fail("retry must not restore discarded weights"),
+    )
+    backend.disable()
+    assert lease.closed
+    assert not backend.enabled

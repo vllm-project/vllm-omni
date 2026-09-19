@@ -22,6 +22,7 @@ import threading
 import time
 import weakref
 from collections.abc import Sequence
+from functools import partial
 from itertools import chain
 from typing import Any
 
@@ -1031,6 +1032,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._host_registration: HostRegistration | None = None
         self._mmap_transforms_by_tensor_id: dict[int, Any] = {}
         self._poisoned_reason: str | None = None
+        self._shutdown_requested = False
 
     def load_resident_layers(self) -> None:
         """Load the model-declared leading blocks for the denoise stage."""
@@ -1912,6 +1914,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             pass
 
     def _disable(self, *, restore_allgather_weights: bool) -> None:
+        discard_weights = self._shutdown_requested
         has_open_lease = self._host_weight_lease is not None and not self._host_weight_lease.closed
         has_registration = self._host_registration is not None
         has_carrier = (
@@ -1944,6 +1947,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # device buffers, including the ordinary rank-local path.
         sync_error = run_cleanup_steps([("synchronizing pending DLO transfers", current_omni_platform.synchronize)])
 
+        if discard_weights and sync_error is not None:
+            # Keep all transport backing alive until a retry can drain it.
+            raise sync_error
+
         unique_hooks: list[DistributedLayerwiseOffloadHook] = []
         seen_blocks: set[int] = set()
         for hook in chain.from_iterable(self._all_hook_groups):
@@ -1955,7 +1962,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         allgather_hooks = [hook for hook in unique_hooks if hook.dp_size > 1]
         rank_local_hooks = [hook for hook in unique_hooks if hook.dp_size <= 1]
         skipped_allgather = bool(allgather_hooks) and not restore_allgather_weights
-        if skipped_allgather:
+        if skipped_allgather and not discard_weights:
             # Startup rollback cannot safely enter a collective that a failed
             # peer may never reach. Those blocks cannot be reconstructed, so
             # make accidental reuse explicit instead of accepting zero weights.
@@ -1965,15 +1972,27 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             )
 
         collective_error = None
-        if restore_allgather_weights:
+        if restore_allgather_weights and not discard_weights:
             # Run collective-bearing restores before any rank-local operation:
             # a local failure must never keep this rank out of a later AllGather.
             collective_error = run_cleanup_steps(
                 ("restoring an AllGather block", hook.restore_next_block_to_cpu) for hook in allgather_hooks
             )
-        rank_local_error = run_cleanup_steps(
-            ("restoring a rank-local block", hook.restore_next_block_to_cpu) for hook in rank_local_hooks
-        )
+        if discard_weights:
+            # Shutdown must not materialize the full model or enter a restore
+            # collective. Detach placeholders/device views before closing the
+            # host mappings; only the bounded transport buffers remain alive.
+            rank_local_error = run_cleanup_steps(
+                (
+                    "discarding an offloaded block",
+                    partial(clear_tensor_storage, chain(hook.next_block.parameters(), hook.next_block.buffers())),
+                )
+                for hook in unique_hooks
+            )
+        else:
+            rank_local_error = run_cleanup_steps(
+                ("restoring a rank-local block", hook.restore_next_block_to_cpu) for hook in rank_local_hooks
+            )
         removal_error = run_cleanup_steps(
             (
                 "removing a distributed block hook",
@@ -1994,9 +2013,18 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         if self._resident_layer_group is not None:
             # Resident layers are always rank-local (the public parser rejects
             # resident DiT layers combined with AllGather).
-            resident_error = run_cleanup_steps(
-                [("restoring resident DLO blocks", self._resident_layer_group.restore_to_cpu)]
-            )
+            if discard_weights:
+                resident_error = run_cleanup_steps(
+                    (
+                        "discarding a resident DLO block",
+                        partial(clear_tensor_storage, chain(block.parameters(), block.buffers())),
+                    )
+                    for block in self._resident_blocks
+                )
+            else:
+                resident_error = run_cleanup_steps(
+                    [("restoring resident DLO blocks", self._resident_layer_group.restore_to_cpu)]
+                )
 
         lifecycle_error = next(
             (
@@ -2048,6 +2076,15 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
     def disable(self) -> None:
         self._disable(restore_allgather_weights=True)
+
+    def shutdown(self) -> None:
+        """Drain and release transport storage without reconstructing weights."""
+        self._shutdown_requested = True
+        self._poisoned_reason = (
+            "Distributed layerwise offload has been shut down; "
+            "recreate the backend and reload the pipeline before retrying"
+        )
+        self._disable(restore_allgather_weights=False)
 
     @staticmethod
     def _allocate_shared_buffers(
