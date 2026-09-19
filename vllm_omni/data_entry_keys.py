@@ -107,6 +107,13 @@ class OmniPayloadMeta(TypedDict, total=False):
     audio_seed: int
     token_role_ids: torch.Tensor
     minimax_h3_prepared_reference_videos: str
+    # Kimi-Audio prepared-request configuration, written by
+    # prepare_kimi_audio_inputs and read back by the stage input processors
+    # and the AR stage when rehydrating the dual-stream layout.
+    special_tokens: dict[str, int]
+    output_type: str
+    audio_token_offset: int
+    audio_vocab_size: int
 
 
 class OmniPayload(TypedDict, total=False):
@@ -221,6 +228,10 @@ class MetaStruct(_StructBase):
     audio_seed: int | None = None
     token_role_ids: torch.Tensor | None = None
     minimax_h3_prepared_reference_videos: str | None = None
+    special_tokens: dict[str, int] | None = None
+    output_type: str | None = None
+    audio_token_offset: int | None = None
+    audio_vocab_size: int | None = None
 
 
 class OmniPayloadStruct(_StructBase):

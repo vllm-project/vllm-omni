@@ -1,6 +1,7 @@
 # Copyright 2022 The OpenAI Authors and The HuggingFace Inc. team. All rights reserved.
 #               2025 Zhipu AI Inc (authors: CogAudio Group Members)
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """WhisperVQEncoder: HF WhisperEncoder + VQ codebook + inter-layer pooling.
 
 Built on standard ``WhisperConfig``.  VQ-specific parameters are patched onto
@@ -105,12 +106,30 @@ class WhisperVQEncoder(WhisperEncoder):
     * ``quantize_vocab_size``  -- int | None
     * ``quantize_position``    -- int (0-based layer index)
     * ``quantize_encoder_only`` -- bool
+    * ``encoder_causal_convolution`` -- bool
+
+    ``causal_block_size`` and ``preserve_padding`` opt into GLM-4-Voice's
+    block attention and padded-frame pooling. Existing GLM-TTS callers keep
+    their padding-only attention and valid-frame pooling by default.
     """
 
-    def __init__(self, config: WhisperConfig):
+    def __init__(
+        self,
+        config: WhisperConfig,
+        *,
+        causal_block_size: int | None = None,
+        preserve_padding: bool = False,
+    ):
         super().__init__(config)
         embed_dim = config.d_model
         max_source_positions = config.max_source_positions
+        self._causal_convolution = bool(getattr(config, "encoder_causal_convolution", False))
+        if self._causal_convolution:
+            self.conv1.padding = self.conv2.padding = (0,)
+        if causal_block_size is not None and causal_block_size <= 0:
+            raise ValueError("causal_block_size must be positive")
+        self._causal_block_size = causal_block_size
+        self._preserve_padding = preserve_padding
 
         # Truncate layers when quantize_encoder_only is set.
         qpos = int(getattr(config, "quantize_position", 0) or 0)
@@ -176,7 +195,11 @@ class WhisperVQEncoder(WhisperEncoder):
         **_: Any,
     ) -> QuantizedBaseModelOutput:
         batch_size, _, _ = input_features.shape
+        if self._causal_convolution:
+            input_features = F.pad(input_features, (self.conv1.dilation[0] * (self.conv1.kernel_size[0] - 1), 0))
         hidden_states = F.gelu(self.conv1(input_features))
+        if self._causal_convolution:
+            hidden_states = F.pad(hidden_states, (self.conv2.dilation[0] * (self.conv2.kernel_size[0] - 1), 0))
         hidden_states = F.gelu(self.conv2(hidden_states))
         hidden_states = hidden_states.permute(0, 2, 1)
         seq_len = int(hidden_states.shape[1])
@@ -185,11 +208,13 @@ class WhisperVQEncoder(WhisperEncoder):
         hidden_states = hidden_states + pos_embed
 
         valid_mask = self._downsample_attention_mask(attention_mask, batch_size, seq_len, hidden_states.device)
-        hidden_states = hidden_states.masked_fill(~valid_mask.unsqueeze(-1), 0)
+        if not self._preserve_padding:
+            hidden_states = hidden_states.masked_fill(~valid_mask.unsqueeze(-1), 0)
 
         quantized_token_ids = None
+        block_size = self._causal_block_size
+        layer_mask = self._make_layer_attention_mask(valid_mask, hidden_states.dtype, block_size)
         for idx, layer in enumerate(self.layers):
-            layer_mask = self._make_layer_attention_mask(valid_mask, hidden_states.dtype)
             layer_outputs = layer(
                 hidden_states,
                 attention_mask=layer_mask,
@@ -197,17 +222,24 @@ class WhisperVQEncoder(WhisperEncoder):
                 output_attentions=False,
             )
             hidden_states = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
-            hidden_states = hidden_states.masked_fill(~valid_mask.unsqueeze(-1), 0)
+            if not self._preserve_padding:
+                hidden_states = hidden_states.masked_fill(~valid_mask.unsqueeze(-1), 0)
 
             if idx + 1 == self._pooling_position and self.pooling_layer is not None:
                 hidden_states, valid_mask = self._apply_pooling(hidden_states, valid_mask)
+                if block_size is not None:
+                    block_size //= int(self.config.pooling_kernel_size)
+                    if block_size == 0:
+                        raise ValueError("causal_block_size must cover at least one pooled frame")
+                layer_mask = self._make_layer_attention_mask(valid_mask, hidden_states.dtype, block_size)
 
             if idx + 1 == self._quantize_position and self.codebook is not None:
                 hidden_states, quantized_token_ids = self._apply_vq(hidden_states, valid_mask)
 
         if self.layer_norm is not None:
             hidden_states = self.layer_norm(hidden_states)
-            hidden_states = hidden_states.masked_fill(~valid_mask.unsqueeze(-1), 0)
+            if not self._preserve_padding:
+                hidden_states = hidden_states.masked_fill(~valid_mask.unsqueeze(-1), 0)
 
         return QuantizedBaseModelOutput(
             last_hidden_state=hidden_states,
@@ -238,14 +270,26 @@ class WhisperVQEncoder(WhisperEncoder):
         return downsampled[:, :seq_len]
 
     @staticmethod
-    def _make_layer_attention_mask(valid_mask: Tensor, dtype: torch.dtype) -> Tensor:
+    def _make_layer_attention_mask(valid_mask: Tensor, dtype: torch.dtype, block_size: int | None = None) -> Tensor:
         min_value = torch.finfo(dtype).min
+        if block_size is not None:
+            blocks = torch.arange(valid_mask.shape[1], device=valid_mask.device) // block_size
+            allowed = (blocks[:, None] >= blocks[None, :])[None, :, :] & valid_mask[:, None, :]
+            return ((1.0 - allowed.to(dtype)) * min_value).unsqueeze(1)
         additive = torch.zeros(valid_mask.shape, dtype=dtype, device=valid_mask.device)
         additive = additive.masked_fill(~valid_mask, min_value)
         return additive[:, None, None, :]
 
     def _apply_pooling(self, hidden_states: Tensor, valid_mask: Tensor) -> tuple[Tensor, Tensor]:
+        assert self.pooling_layer is not None
         k = int(self.config.pooling_kernel_size)  # type: ignore[attr-defined]
+        if self._preserve_padding:
+            # GLM-4-Voice pools the full padded sequence. Padded query frames
+            # have encoder outputs and contribute to the last valid token.
+            segment_t = hidden_states.transpose(1, 2)
+            if segment_t.shape[-1] % k:
+                segment_t = F.pad(segment_t, (0, k - segment_t.shape[-1] % k))
+            return self.pooling_layer(segment_t).transpose(1, 2), valid_mask[:, ::k]
         pooled_segments: list[Tensor] = []
         pooled_masks: list[Tensor] = []
         for batch_idx in range(int(hidden_states.shape[0])):
@@ -271,6 +315,12 @@ class WhisperVQEncoder(WhisperEncoder):
         return output, output_mask
 
     def _apply_vq(self, hidden_states: Tensor, valid_mask: Tensor) -> tuple[Tensor, Tensor | None]:
+        assert self.codebook is not None
+        if self._preserve_padding:
+            quantized, indices, _ = vector_quantize(hidden_states, self.codebook.weight)
+            if self.embed_positions2 is not None:
+                quantized = quantized + self.embed_positions2.weight[: hidden_states.shape[1]]
+            return quantized, indices.reshape(hidden_states.shape[:2])
         output = hidden_states.clone()
         token_ids = torch.full(
             (hidden_states.shape[0], hidden_states.shape[1]),

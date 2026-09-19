@@ -157,6 +157,9 @@ _OMNI_MODELS = {
         "qwen3_tts_talker",
         "Qwen3TTSTalkerForConditionalGeneration",
     ),
+    "KimiAudioForConditionalGeneration": ("kimi_audio", "kimi_audio", "KimiAudioForConditionalGeneration"),
+    "KimiAudioARStage": ("kimi_audio", "kimi_audio_ar_stage", "KimiAudioARStage"),
+    "KimiAudioDecoder": ("kimi_audio", "kimi_audio_decoder", "KimiAudioDecoder"),
     "Qwen3TTSTalkerForConditionalGeneration": (
         "qwen3_tts",
         "qwen3_tts_talker",
