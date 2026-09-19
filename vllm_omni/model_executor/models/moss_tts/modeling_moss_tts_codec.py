@@ -783,7 +783,7 @@ class MossTTSCodecDecoder(nn.Module):
             logger.info("Enabled Triton masked attention for the streaming codec decoder")
         build_decode_lut = getattr(codec.quantizer, "build_decode_lut", None)
         if callable(build_decode_lut):
-            lut_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+            lut_dtype = torch.bfloat16 if device.type in ("cuda", "npu") else torch.float32
             build_decode_lut(self._n_vq, dtype=lut_dtype)
             lut = codec.quantizer._decode_lut
             logger.info(
