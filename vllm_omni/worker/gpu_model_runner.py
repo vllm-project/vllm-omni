@@ -44,6 +44,7 @@ from vllm_omni.platforms import current_omni_platform
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.outputs import RoutedExpertsLists
+    from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
     xgr_torch_compile = LazyLoader(
@@ -890,6 +891,42 @@ class OmniGPUModelRunner(GPUModelRunner):
             return correct_spec_decode_token_counts
         else:
             return None
+
+    @torch.inference_mode()
+    def _create_encoder_cudagraph_manager(self) -> "EncoderCudaGraphManager | None":
+        """Use the Omni manager, which runs eager when a batch exceeds the capture.
+
+        Upstream decides here whether encoder graphs apply at all; keeping that
+        call means the gating and the one-time initialization stay in one place.
+        A manager this override cannot extend is returned unchanged and logged,
+        because the eager fallback is then not installed: upstream's own
+        behaviour is the right degraded state, and this runs inside
+        ``profile_cudagraph_memory`` before the cleanup that frees the
+        profiling KV cache, so raising here would leave the worker unusable.
+        """
+        from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
+
+        from vllm_omni.worker.encoder_cudagraph import OmniEncoderCudaGraphManager, upstream_contract_mismatch
+
+        manager = super()._create_encoder_cudagraph_manager()
+        if manager is None or isinstance(manager, OmniEncoderCudaGraphManager):
+            return manager
+        if type(manager) is not EncoderCudaGraphManager:
+            logger.warning(
+                "Encoder CUDA graphs use %s, so a batch that exceeds the captured buffers still raises.",
+                type(manager).__name__,
+            )
+            return manager
+        mismatch = upstream_contract_mismatch()
+        if mismatch:
+            logger.warning(
+                "Encoder CUDA graph fallback not installed: %s. A batch that exceeds the "
+                "captured buffers will raise, as it does upstream.",
+                mismatch,
+            )
+            return manager
+        manager.__class__ = OmniEncoderCudaGraphManager
+        return manager
 
     @torch.inference_mode()
     def extract_multimodal_outputs(
