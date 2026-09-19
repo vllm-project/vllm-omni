@@ -1,0 +1,17 @@
+base_config: minimax_h3_disaggregated_turbo.yaml
+
+connectors:
+  nixl_connector:
+    name: NixlConnector
+    extra:
+      host: "auto"
+      zmq_port: 50071
+      backends: ["UCX"]
+
+stages:
+  - stage_id: 0
+    output_connectors:
+      to_stage_1: nixl_connector
+  - stage_id: 1
+    input_connectors:
+      from_stage_0: nixl_connector

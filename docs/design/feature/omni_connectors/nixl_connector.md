@@ -46,6 +46,15 @@ provides a matching torch-xpu, UCX with Level Zero support, and NIXL runtime.
 
 ## Configuration
 
+MiniMax-H3's default disaggregated and Turbo deploy configs use shared memory
+for same-host transfer. To opt into NIXL, select
+`vllm_omni/deploy/minimax_h3_disaggregated_nixl.yaml` or
+`vllm_omni/deploy/minimax_h3_disaggregated_turbo_nixl.yaml` with
+`--stage-configs-path`. These overlays inherit the corresponding model and
+parallel settings and switch both ends of the stage edge. They require NIXL
+and a working UCX backend; initialization failures do not automatically fall
+back to shared memory.
+
 ```yaml
 connectors:
   nixl_connector:

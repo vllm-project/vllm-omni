@@ -1646,19 +1646,26 @@ stages:
     )
     @pytest.mark.parametrize("shared_memory", [False, True], ids=["nixl", "shared_memory"])
     def test_minimax_h3_deploy_connector_wiring_and_roles(self, deploy_name, shared_memory):
-        import yaml
-
+        from vllm_omni.config.stage_config import resolve_deploy_yaml
         from vllm_omni.distributed.omni_connectors.utils.initialization import load_omni_transfer_config
         from vllm_omni.engine.stage_init_utils import get_stage_connector_spec
 
-        config = yaml.safe_load(Path(get_deploy_config_path(deploy_name)).read_text())
+        base_config = resolve_deploy_yaml(get_deploy_config_path(deploy_name))
+        if not shared_memory:
+            deploy_name = deploy_name.replace(".yaml", "_nixl.yaml")
+        deploy_path = get_deploy_config_path(deploy_name)
+        config = resolve_deploy_yaml(deploy_path)
         assert config["async_chunk"] is False
-        assert config["stages"][0]["output_connectors"] == {"to_stage_1": "nixl_connector"}
-        assert config["stages"][1]["input_connectors"] == {"from_stage_0": "nixl_connector"}
-        if shared_memory:
-            # The optional same-host profile must switch BOTH ends of the edge.
-            config["stages"][0]["output_connectors"]["to_stage_1"] = "shared_memory_connector"
-            config["stages"][1]["input_connectors"]["from_stage_0"] = "shared_memory_connector"
+        connector_name = "shared_memory_connector" if shared_memory else "nixl_connector"
+        assert set(config["connectors"]) == {connector_name}
+        assert config["stages"][0]["output_connectors"] == {"to_stage_1": connector_name}
+        assert config["stages"][1]["input_connectors"] == {"from_stage_0": connector_name}
+        load_deploy_config(deploy_path)
+        for base_stage, stage in zip(base_config["stages"], config["stages"], strict=True):
+            edge_keys = {"input_connectors", "output_connectors"}
+            assert {key: value for key, value in stage.items() if key not in edge_keys} == {
+                key: value for key, value in base_stage.items() if key not in edge_keys
+            }
         transfer = load_omni_transfer_config(config_dict=config)
         assert transfer is not None
         assert set(transfer.connectors) == {("0", "1")}

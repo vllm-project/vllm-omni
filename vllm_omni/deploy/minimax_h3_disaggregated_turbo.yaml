@@ -5,12 +5,6 @@ trust_remote_code: true
 distributed_executor_backend: mp
 
 connectors:
-  nixl_connector:
-    name: NixlConnector
-    extra:
-      host: "auto"
-      zmq_port: 50071
-      backends: ["UCX"]
   shared_memory_connector:
     name: SharedMemoryConnector
 
@@ -21,7 +15,7 @@ stages:
     gpu_memory_utilization: 0.6
     tensor_parallel_size: 2
     output_connectors:
-      to_stage_1: nixl_connector
+      to_stage_1: shared_memory_connector
     hf_overrides:
       minimax_h3_encoder_components:
         text_encoder:
@@ -46,7 +40,7 @@ stages:
       ulysses_degree: 4
       vae_patch_parallel_size: 4
     input_connectors:
-      from_stage_0: nixl_connector
+      from_stage_0: shared_memory_connector
     default_sampling_params:
       seed: 42
       num_inference_steps: 5
