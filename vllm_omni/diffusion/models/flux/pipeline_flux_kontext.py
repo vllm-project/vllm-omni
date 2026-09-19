@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # This implementation is heavily inspired by the diffusers project.
 # Original implementation: https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/flux/pipeline_flux_kontext.py
@@ -33,6 +33,7 @@ from vllm_omni.diffusion.models.flux import (
 from vllm_omni.diffusion.models.flux.flux_pipeline_mixin import FluxPipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.models.t5_encoder.quantization import prepare_t5_fp8
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -126,6 +127,8 @@ class FluxKontextPipeline(
             subfolder="text_encoder_2",
             local_files_only=local_files_only,
         ).to(self._execution_device)
+
+        prepare_t5_fp8(self.text_encoder_2, od_config.quantization_config, "text_encoder_2")
 
         self.tokenizer = CLIPTokenizer.from_pretrained(
             model,
