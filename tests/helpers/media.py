@@ -734,9 +734,13 @@ def _select_whisper_device() -> str:
 
 # Populated in the transcription worker, not in the pytest process.
 _WHISPER_MODELS: dict[str, Any] = {}
+# Pinned on the first ``whisper.load_model`` in this worker. Later sizes reuse
+# it so a CPU fallback cannot be mixed with a later GPU load in the same pool.
+_WHISPER_LOADED_DEVICE: str | None = None
 
 
 def _get_whisper_model(model_size: str) -> Any:
+    global _WHISPER_LOADED_DEVICE
     model = _WHISPER_MODELS.get(model_size)
     if model is None:
         import whisper
@@ -744,7 +748,10 @@ def _get_whisper_model(model_size: str) -> Any:
         # The device is picked on first load and the model stays on it for the
         # worker's lifetime: the current server or runner fixture instance, or
         # the test module for callers that transcribe without those fixtures.
-        device = _select_whisper_device()
+        device = _WHISPER_LOADED_DEVICE
+        if device is None:
+            device = _select_whisper_device()
+            _WHISPER_LOADED_DEVICE = device
         with _serialize_whisper_model_download(model_size):
             model = whisper.load_model(model_size, device=device)
         _WHISPER_MODELS[model_size] = model
@@ -753,7 +760,7 @@ def _get_whisper_model(model_size: str) -> Any:
 
 def _whisper_transcribe_in_current_process(
     output_path: str, model_size: str = "small", language: str | None = None
-) -> str:
+) -> tuple[str, str]:
     model = _get_whisper_model(model_size)
     text = model.transcribe(
         output_path,
@@ -764,7 +771,7 @@ def _whisper_transcribe_in_current_process(
         # language: callers include non-English audio tests.
         language=language,
     )["text"]
-    return text or ""
+    return text or "", _WHISPER_LOADED_DEVICE or "cpu"
 
 
 # Serializes a whole submit->result->cleanup on the parent side, so at most one
@@ -775,6 +782,62 @@ _TRANSCRIBER_CALL_LOCK = threading.Lock()
 # Guards the _TRANSCRIBER pointer itself.
 _TRANSCRIBER_LOCK = threading.Lock()
 _TRANSCRIBER: concurrent.futures.ProcessPoolExecutor | None = None
+# Parent-side record of sizes this worker has successfully loaded, plus the
+# device the child reported. Sizes recorded before a result would credit VRAM
+# while the model might still be on CPU.
+_TRANSCRIBER_MODEL_SIZES: set[str] = set()
+_TRANSCRIBER_DEVICE: str | None = None
+
+# Empirical GPU footprint for ``whisper.load_model`` (weights + CUDA context),
+# not host checkpoint size. large-v3 measured ~10.8 GiB on H100/H800.
+_WHISPER_VRAM_GIB = {
+    "tiny": 1.0,
+    "base": 1.5,
+    "small": 2.5,
+    "medium": 5.5,
+    "large": 11.0,
+    "large-v1": 11.0,
+    "large-v2": 11.0,
+    "large-v3": 11.0,
+    "large-v3-turbo": 4.0,
+    "turbo": 4.0,
+}
+_WHISPER_VRAM_GIB_DEFAULT = 11.0
+
+
+def _accelerator_index_from_device(device: str | None) -> int | None:
+    """Logical device index for ``cuda:1`` / ``npu:0``; ``None`` for CPU or unknown."""
+    if device is None:
+        return None
+    name = device.strip().lower()
+    if not name or name == "cpu":
+        return None
+    if ":" in name:
+        suffix = name.rsplit(":", 1)[1]
+        if suffix.isdigit():
+            return int(suffix)
+    return None
+
+
+def whisper_resident_device_index() -> int | None:
+    """Logical accelerator index holding Whisper, or ``None`` if it is not on GPU."""
+    with _TRANSCRIBER_LOCK:
+        if _TRANSCRIBER is None:
+            return None
+        device = _TRANSCRIBER_DEVICE
+    return _accelerator_index_from_device(device)
+
+
+def whisper_resident_vram_gib() -> float:
+    """Estimated VRAM (GiB) held by the living Whisper worker, or 0 if none / CPU."""
+    with _TRANSCRIBER_LOCK:
+        if _TRANSCRIBER is None:
+            return 0.0
+        device = _TRANSCRIBER_DEVICE
+        sizes = frozenset(_TRANSCRIBER_MODEL_SIZES)
+    if _accelerator_index_from_device(device) is None:
+        return 0.0
+    return sum(_WHISPER_VRAM_GIB.get(size, _WHISPER_VRAM_GIB_DEFAULT) for size in sizes)
 
 
 def _get_transcriber() -> concurrent.futures.ProcessPoolExecutor:
@@ -792,11 +855,13 @@ def _discard_transcriber(executor: concurrent.futures.ProcessPoolExecutor) -> No
     Identity-checked so a stale reference can never shut down a newer worker that
     was installed after ``executor`` was replaced.
     """
-    global _TRANSCRIBER
+    global _TRANSCRIBER, _TRANSCRIBER_DEVICE
     with _TRANSCRIBER_LOCK:
         if _TRANSCRIBER is not executor:
             return
         _TRANSCRIBER = None
+        _TRANSCRIBER_MODEL_SIZES.clear()
+        _TRANSCRIBER_DEVICE = None
     # Joining the worker can block; do it outside the lock.
     executor.shutdown(wait=True)
 
@@ -812,10 +877,12 @@ def release_audio_transcriber() -> None:
     Takes the call lock, so it waits for any in-flight transcription to finish
     rather than shutting the worker down underneath it.
     """
-    global _TRANSCRIBER
+    global _TRANSCRIBER, _TRANSCRIBER_DEVICE
     with _TRANSCRIBER_CALL_LOCK:
         with _TRANSCRIBER_LOCK:
             executor, _TRANSCRIBER = _TRANSCRIBER, None
+            _TRANSCRIBER_MODEL_SIZES.clear()
+            _TRANSCRIBER_DEVICE = None
         if executor is not None:
             executor.shutdown(wait=True)
 
@@ -837,13 +904,18 @@ def convert_audio_file_to_text(output_path: str, model_size: str = "small", lang
     and its resident model -- is torn down, and a dead worker
     (``BrokenProcessPool``) is additionally retried once.
     """
+    global _TRANSCRIBER_DEVICE
     with _TRANSCRIBER_CALL_LOCK:
         for attempt in range(2):
             executor = _get_transcriber()
             try:
-                return executor.submit(
+                text, device = executor.submit(
                     _whisper_transcribe_in_current_process, output_path, model_size, language
                 ).result()
+                with _TRANSCRIBER_LOCK:
+                    _TRANSCRIBER_MODEL_SIZES.add(model_size)
+                    _TRANSCRIBER_DEVICE = device
+                return text
             except BrokenProcessPool:
                 _discard_transcriber(executor)
                 if attempt == 1:
@@ -882,4 +954,6 @@ __all__ = [
     "get_asset_path",
     "preprocess_text",
     "release_audio_transcriber",
+    "whisper_resident_device_index",
+    "whisper_resident_vram_gib",
 ]
