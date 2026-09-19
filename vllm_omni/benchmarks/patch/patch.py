@@ -785,13 +785,13 @@ def _guess_mime_type(path: str) -> str:
     return mime or "application/octet-stream"
 
 
-def _iter_image_edit_inputs(value: Any) -> Iterable[Any]:
+def _iter_image_reference_inputs(value: Any) -> Iterable[Any]:
     """Yield image references from benchmark multimodal content."""
     if value is None:
         return
     if isinstance(value, list):
         for item in value:
-            yield from _iter_image_edit_inputs(item)
+            yield from _iter_image_reference_inputs(item)
         return
     if not isinstance(value, dict):
         yield value
@@ -810,7 +810,38 @@ def _iter_image_edit_inputs(value: Any) -> Iterable[Any]:
 
     for key in ("image", "images"):
         if key in value:
-            yield from _iter_image_edit_inputs(value[key])
+            yield from _iter_image_reference_inputs(value[key])
+
+
+def _iter_video_reference_inputs(value: Any) -> Iterable[str]:
+    """Yield video references from benchmark multimodal content.
+
+    ``random-mm`` video buckets arrive as OpenAI chat parts
+    ``{"type": "video_url", "video_url": {"url": ...}}``. The videos API
+    expects ``video_reference`` with a string ``video_url``.
+    """
+    if value is None:
+        return
+    if isinstance(value, list):
+        for item in value:
+            yield from _iter_video_reference_inputs(item)
+        return
+    if not isinstance(value, dict):
+        return
+
+    if value.get("type") == "video_url":
+        video_url = value.get("video_url")
+        if isinstance(video_url, dict):
+            url = video_url.get("url")
+            if isinstance(url, str) and url:
+                yield url
+        elif isinstance(video_url, str) and video_url:
+            yield video_url
+        return
+
+    for key in ("video", "videos"):
+        if key in value:
+            yield from _iter_video_reference_inputs(value[key])
 
 
 def _add_image_edit_input_to_form(form: aiohttp.FormData, image_input: Any) -> None:
@@ -1275,6 +1306,12 @@ def _is_structured_image_reference(reference: Mapping[str, object]) -> bool:
     return has_url or has_file_id
 
 
+def _is_structured_video_reference(reference: Mapping[str, object]) -> bool:
+    """True for API video_reference objects ({"video_url": "..."})."""
+    video_url = reference.get("video_url")
+    return isinstance(video_url, str) and bool(video_url)
+
+
 def _add_video_reference_to_form(form: aiohttp.FormData, reference: object) -> bool:
     if isinstance(reference, dict) and "bytes" in reference:
         form.add_field(
@@ -1289,9 +1326,16 @@ def _add_video_reference_to_form(form: aiohttp.FormData, reference: object) -> b
         form.add_field("image_reference", json.dumps(dict(reference)))
         return True
 
+    if isinstance(reference, Mapping) and _is_structured_video_reference(reference):
+        form.add_field("video_reference", json.dumps(dict(reference)))
+        return True
+
     if isinstance(reference, list):
         if reference and all(isinstance(item, Mapping) and _is_structured_image_reference(item) for item in reference):
             form.add_field("image_reference", json.dumps([dict(item) for item in reference]))
+            return True
+        if reference and all(isinstance(item, Mapping) and _is_structured_video_reference(item) for item in reference):
+            form.add_field("video_reference", json.dumps([dict(item) for item in reference]))
             return True
         raise ValueError(
             "Unsupported image_reference list; expected non-empty list of "
@@ -1299,6 +1343,9 @@ def _add_video_reference_to_form(form: aiohttp.FormData, reference: object) -> b
         )
 
     if isinstance(reference, str):
+        if reference.startswith("data:video"):
+            form.add_field("video_reference", json.dumps({"video_url": reference}))
+            return True
         if reference.startswith(("data:image", "http://", "https://")):
             form.add_field("image_reference", json.dumps({"image_url": reference}))
             return True
@@ -1344,8 +1391,9 @@ def _add_video_extra_body_to_form(
         "height",
         "poll_interval_s",
         "poll_timeout_s",
-        # Handled only by _add_video_reference_to_form (upload / JSON image_url).
+        # Handled only by _add_video_reference_to_form (upload / JSON image_url / video_url).
         "image_reference",
+        "video_reference",
         "input_reference",
         *_VIDEO_FORM_FIELDS,
     }
@@ -1875,15 +1923,25 @@ async def async_request_openai_videos_omni(
         form.add_field("size", str(request_body["size"]))
     _add_video_extra_body_to_form(form, extra_body, request_body)
 
-    reference_added = False
-    for reference in _iter_image_edit_inputs(request_func_input.multi_modal_content):
+    image_reference_added = False
+    for reference in _iter_image_reference_inputs(request_func_input.multi_modal_content):
         if _add_video_reference_to_form(form, reference):
-            reference_added = True
+            image_reference_added = True
             break
-    if not reference_added:
+    if not image_reference_added:
         image_reference = extra_body.get("image_reference")
         if image_reference is not None:
             _add_video_reference_to_form(form, image_reference)
+
+    video_reference_added = False
+    for reference in _iter_video_reference_inputs(request_func_input.multi_modal_content):
+        if _add_video_reference_to_form(form, reference):
+            video_reference_added = True
+            break
+    if not video_reference_added:
+        video_reference = extra_body.get("video_reference")
+        if video_reference is not None:
+            _add_video_reference_to_form(form, video_reference)
 
     headers = {
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
@@ -1993,7 +2051,7 @@ async def async_request_openai_image_edits_omni(
     _add_image_edit_extra_body_to_form(form, extra_body)
 
     try:
-        image_inputs = list(_iter_image_edit_inputs(request_func_input.multi_modal_content))
+        image_inputs = list(_iter_image_reference_inputs(request_func_input.multi_modal_content))
         if not image_inputs:
             raise ValueError(
                 "openai-image-edits-omni requires image multimodal content. "
@@ -2712,7 +2770,12 @@ async def async_request_openai_realtime_duplex(
         output.ttft = (metric_mean(session_metrics.get("ttft_ms")) or 0.0) / 1000.0
         output.audio_ttfp = (metric_mean(session_metrics.get("ttfp_ms")) or 0.0) / 1000.0
         output.audio_rtf = metric_mean(session_metrics.get("rtf")) or 0.0
-        output.audio_duration = sum(float(metric.get("audio_duration_ms") or 0.0) for metric in turn_metrics) / 1000.0
+        audio_duration_ms = 0.0
+        for metric in turn_metrics:
+            duration_ms = metric.get("audio_duration_ms")
+            if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool):
+                audio_duration_ms += duration_ms
+        output.audio_duration = audio_duration_ms / 1000.0
         output.audio_frames = int(output.audio_duration * _SEED_TTS_OUTPUT_SAMPLE_RATE_HZ)
         output.latency = request_finished_at - output.start_time
         output.tts_turn_pcm_bytes = turn_pcm_bytes

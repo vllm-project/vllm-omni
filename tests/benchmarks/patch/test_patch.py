@@ -30,6 +30,7 @@ from vllm_omni.benchmarks.patch.patch import (
     _attach_seed_tts_to_request_func_input,
     _build_benchmark_session,
     _extract_stage_durations_from_payload,
+    _iter_video_reference_inputs,
     _omni_request_timeout_s,
     async_request_openai_chat_omni_completions,
     async_request_openai_image_edits_omni,
@@ -1544,6 +1545,34 @@ def test_video_structured_image_reference_serialized_to_form(reference: object, 
     payload = next(value for name, value in captured if name == "image_reference")
     assert isinstance(payload, (str, bytes, bytearray))
     assert json.loads(payload) == reference
+
+
+def test_video_reference_urls_from_random_mm_content(mocker: MockerFixture) -> None:
+    """random-mm video_url parts use the same form helper as image_reference."""
+    import aiohttp
+
+    content = [
+        {
+            "type": "video_url",
+            "video_url": {"url": "data:video/mp4;base64,AAAA"},
+        }
+    ]
+    urls = list(_iter_video_reference_inputs(content))
+    assert urls == ["data:video/mp4;base64,AAAA"]
+
+    captured: list[tuple[str, object]] = []
+    real_add_field = aiohttp.FormData.add_field
+
+    def tracking_add_field(self, name, value=None, **kwargs):
+        captured.append((str(name), value))
+        return real_add_field(self, name, value, **kwargs)
+
+    mocker.patch.object(aiohttp.FormData, "add_field", tracking_add_field)
+    form = aiohttp.FormData()
+    assert _add_video_reference_to_form(form, urls[0]) is True
+    payload = next(value for name, value in captured if name == "video_reference")
+    assert isinstance(payload, (str, bytes, bytearray))
+    assert json.loads(payload) == {"video_url": "data:video/mp4;base64,AAAA"}
 
 
 def test_video_unsupported_image_reference_raises() -> None:
