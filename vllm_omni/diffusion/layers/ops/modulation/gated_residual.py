@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Shared gated-residual operator for diffusion transformer blocks."""
 
@@ -53,7 +53,8 @@ if HAS_TRITON:
         gate = tl.load(gate_ptr + gate_offsets, mask=mask).to(tl.float32)
 
         # Match ``branch * gate`` followed by the residual add. The explicit
-        # cast preserves the intermediate rounding of eager fp16/bf16 math.
+        # cast and enable_fp_fusion=False on the launch preserve the
+        # intermediate rounding of eager fp16/bf16 math.
         gated_branch = (branch * gate).to(product_dtype).to(tl.float32)
         tl.store(output_ptr + offsets, residual + gated_branch, mask=mask)
 
@@ -62,11 +63,7 @@ def _eager_gated_residual(
     residual: torch.Tensor,
     branch: torch.Tensor,
     gate: torch.Tensor,
-    gate_mode: int,
-    rows_per_batch: int,
-    gate_row_stride: int,
 ) -> torch.Tensor:
-    del gate_mode, rows_per_batch, gate_row_stride
     return residual + branch * gate
 
 
@@ -105,7 +102,7 @@ def _gated_residual_impl(
     gate_row_stride: int,
 ) -> torch.Tensor:
     if not _fused_cuda_supported(residual, branch, gate, gate_mode):
-        return _eager_gated_residual(residual, branch, gate, gate_mode, rows_per_batch, gate_row_stride)
+        return _eager_gated_residual(residual, branch, gate)
 
     output = torch.empty_like(residual)
     rows = residual.numel() // residual.shape[-1]
@@ -126,6 +123,7 @@ def _gated_residual_impl(
         product_dtype=product_dtype,
         block_size=block_size,
         num_warps=8,
+        enable_fp_fusion=False,
     )
     return output
 
@@ -190,9 +188,24 @@ def gated_residual(
 ) -> torch.Tensor:
     """Return ``residual + branch * gate`` with a fused CUDA fast path.
 
-    The fast path supports fp16 and bf16 activations with a gate shared
-    globally, per batch item, or per token. Other broadcastable layouts use
-    the eager reference implementation.
+    ``residual`` and ``branch`` must have the same non-scalar shape. All
+    inputs must be floating-point tensors, and ``gate`` must broadcast to
+    that shape without expanding it. The result is newly allocated with
+    ``residual.shape``; no input is mutated.
+
+    The CUDA fast path supports contiguous fp16/bf16 activations, matching
+    input dtypes/devices, and hidden sizes from 1 through 16384. Gates may
+    be shared globally, per batch item, or per token, including strided
+    modulation views with a contiguous last dimension. The product is
+    rounded to the input dtype before addition, matching eager PyTorch.
+
+    Other inputs use the eager expression with PyTorch's dtype promotion
+    and broadcasting. When grad is enabled and any input requires grad,
+    the eager path preserves autograd. The CUDA custom op supports
+    ``torch.compile`` for inference; it has no backward registration.
+
+    Invalid shapes raise ``ValueError``; non-floating-point inputs raise
+    ``TypeError``. Native arithmetic and CUDA launch errors propagate.
     """
     if residual.shape != branch.shape:
         raise ValueError(f"residual and branch must have the same shape, got {residual.shape} and {branch.shape}")
@@ -207,6 +220,11 @@ def gated_residual(
         raise ValueError(f"gate shape {gate.shape} is not broadcastable to residual shape {residual.shape}") from error
     if broadcast_shape != tuple(residual.shape):
         raise ValueError(f"gate shape {gate.shape} broadcasts beyond residual shape {residual.shape}")
+
+    # The custom op has no backward formula. Dispatch to native PyTorch
+    # before entering it so that autograd can record both operations.
+    if torch.is_grad_enabled() and (residual.requires_grad or branch.requires_grad or gate.requires_grad):
+        return _eager_gated_residual(residual, branch, gate)
 
     gate_mode, rows_per_batch, gate_row_stride = _gate_layout(residual, gate)
     if not _fused_cuda_supported(residual, branch, gate, gate_mode):
