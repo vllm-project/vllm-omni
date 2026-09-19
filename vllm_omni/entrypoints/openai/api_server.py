@@ -128,6 +128,7 @@ from vllm_omni.entrypoints.openai.images.helpers import (
     _check_max_generated_image_size,
     _choose_output_format,
     _extract_images_from_result,
+    _generated_size_str,
     _get_max_edit_input_images,
     _load_input_images,
     _update_if_not_none,
@@ -2001,8 +2002,9 @@ def _build_image_generation_response(
             peak_memory_mb=peak_memory_mb,
         ),
     }
-    if request.size is not None:
-        response_kwargs["size"] = request.size
+    size = _generated_size_str(images, request.size)
+    if size is not None:
+        response_kwargs["size"] = size
     response = ImageGenerationResponse(**response_kwargs)
     if request.response_format == ResponseFormat.FILE:
         return response.stream_response()
@@ -2427,6 +2429,8 @@ async def edit_images(
 
         _update_if_not_none(gen_params, "width", width)
         _update_if_not_none(gen_params, "height", height)
+        gen_params.width_not_provided = size_was_auto
+        gen_params.height_not_provided = size_was_auto
 
         # 3.4 Add optional parameters ONLY if provided
         _update_if_not_none(gen_params, "num_inference_steps", num_inference_steps)
@@ -2579,7 +2583,7 @@ async def edit_images(
             created=int(time.time()),
             data=image_data,
             output_format=output_format,
-            size=size_str,
+            size=_generated_size_str(images, size_str),
             cot_output=cot_output,
             metrics=_build_image_response_metrics(
                 response_metrics=response_metrics,
