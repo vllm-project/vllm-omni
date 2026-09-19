@@ -137,6 +137,21 @@ def test_bounded_tail_after_complete_answer_passes():
     )
 
 
+def test_minicpmo_mix_runaway_repetition_still_fails():
+    # #7630, Buildkite 15299 lines 1472-1475: 49 copies in the answer,
+    # 112 in the transcript. This is not a bounded noise tail and must not
+    # be hidden by relaxing the shared audio/text similarity gate.
+    prefix = "A black background with some colorful patterns appears, accompanied by a voice saying "
+    expected = prefix + '"' + " ".join(["test"] * 49)
+    transcript = prefix + ", ".join(["test"] * 112)
+    response = SimpleNamespace(success=True, text_content=expected, audio_content=transcript, audio_bytes=None)
+
+    assert assertions.cosine_similarity_text(transcript, expected) == pytest.approx(0.675451892050252)
+    assert not assertions._transcript_has_bounded_tail(transcript, expected)
+    with pytest.raises(AssertionError, match=assertions.AUDIO_MISMATCH_MESSAGE):
+        assertions.assert_omni_response(response, {"modalities": ["text", "audio"]}, "advanced_model")
+
+
 def test_bounded_tail_exact_match_passes():
     assert assertions._transcript_has_bounded_tail(
         "The squares in this image are black.",
