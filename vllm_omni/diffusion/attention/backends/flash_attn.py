@@ -31,8 +31,31 @@ def _get_npu_compressed_causal_mask(device: torch.device) -> torch.Tensor:
 
 class FlashAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
-    supports_piecewise_spans: bool = True
     supports_paged_kv: bool = True
+
+    @classmethod
+    def supports_piecewise_spans(cls) -> bool:
+        # Only forward_cuda dispatches piecewise_attn; ROCm / MUSA reach it through
+        # the default forward_hip / forward_musa delegation. forward_xpu and the NPU
+        # forwards ignore full_attn_spans, so claiming support there made models skip
+        # mask construction and silently run unmasked attention.
+        return current_omni_platform.is_cuda() or current_omni_platform.is_rocm() or current_omni_platform.is_musa()
+
+    @classmethod
+    def supports_dense_attention_mask(cls) -> bool:
+        # False on XPU: forward_xpu's only mask route is _forward_varlen_masked, which
+        # asserts a 2D [batch, seq] padding mask, and there is no piecewise path to
+        # carry the pattern instead. NPU hands 4D masks straight to
+        # aclnnFlashAttentionScore.
+        #
+        # True on the CUDA family is narrower than it looks: forward_cuda honors a >2D
+        # mask only via piecewise_attn, i.e. only when the model also supplies
+        # full_attn_spans (HunyuanImage3 does). A >2D mask *without* spans still hits
+        # the 2D assert there -- a loud pre-existing failure that lingbot_video and
+        # glm_image can reach on CUDA. Returning False would fix those by rerouting
+        # them to SDPA, but it would also drag HunyuanImage3 off piecewise_attn onto
+        # SDPA on CUDA, so that fix needs the metadata and is left to a follow-up.
+        return not current_omni_platform.is_xpu()
 
     @classmethod
     def supports_packed_mask_free(cls) -> bool:
