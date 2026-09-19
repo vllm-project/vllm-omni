@@ -26,8 +26,8 @@ compilation, quantization, parallelism, and offload are not enabled by this
 recipe.
 
 Image size, seed, guidance, and denoising steps use the standard diffusion
-request fields. `cfg_range` remains a MammothModa2-specific `extra_body`
-parameter. For compatibility, the runtime also accepts the former
+request fields. `cfg_range` and `cfg_execution_mode` remain MammothModa2-specific
+`extra_body` parameters. For compatibility, the runtime also accepts the former
 `text_guidance_scale` and `num_inference_steps` keys in `extra_body`; when
 present and non-null, those keys take precedence over the standard fields.
 
@@ -148,12 +148,15 @@ The standard diffusion request fields are `height`, `width`, `seed`,
 `guidance_scale`, and `num_inference_steps`; use their corresponding CLI flags
 shown above. `--height` and `--width` must be multiples of 16.
 
-`cfg_range` is the only recommended MammothModa2 field in `--extra-body`; it
-sets the relative step range `[start, end]` over which CFG is applied (default
-`[0.0, 1.0]`). For compatibility, `text_guidance_scale` and
-`num_inference_steps` remain accepted `extra_body` aliases and, when non-null,
-take precedence over the standard request fields. Model extras are filtered
-against the declared `extra_body_params` (see
+`cfg_range` and `cfg_execution_mode` are the recommended MammothModa2 fields in
+`--extra-body`. `cfg_range` sets the relative step range `[start, end]` over
+which CFG is applied (default `[0.0, 1.0]`). `cfg_execution_mode` is
+`"sequential"` (default) or opt-in `"packed"` for Preview; see
+[Opt-in packed CFG for Preview](#opt-in-packed-cfg-for-preview). For
+compatibility, `text_guidance_scale` and `num_inference_steps` remain accepted
+`extra_body` aliases and, when non-null, take precedence over the standard
+request fields. Model extras are filtered against the declared
+`extra_body_params` (see
 [`vllm_omni/model_extras/mammothmodal2_preview.py`](../../vllm_omni/model_extras/mammothmodal2_preview.py)),
 so unknown MammothModa2 extras may be dropped.
 
@@ -265,6 +268,37 @@ python3 examples/offline_inference/text_to_image/text_to_image.py \
 The first request took 85.224 seconds. The AR stage generated 4,161 visual tokens in 72.996 seconds, and the DiT stage took 12.163 seconds. AR weight loading used 21.4 GiB and took 8.250 seconds. DiT weight loading used 5.49 GiB and took 1.824 seconds. The largest one second whole device memory sample was 106.57 GiB, including the AR KV cache reserved by the 0.5 memory setting.
 
 The output was a valid 1024 by 1024 RGB PNG.
+
+## Opt-in packed CFG for Preview
+
+Preview can execute its positive and negative CFG branches in one internal
+batch. To enable it in the Preview command above, add `cfg_execution_mode` to
+the `--extra-body` value alongside `cfg_range`, keeping guidance and step count
+on the standard flags:
+
+```bash
+  --guidance-scale 4.0 \
+  --num-inference-steps 50 \
+  --extra-body '{"cfg_range": [0.0, 1.0], "cfg_execution_mode": "packed"}'
+```
+
+Omitting `cfg_execution_mode`, or setting it to `"sequential"`, retains the
+sequential reference. Packed execution applies only when guidance is active:
+the scale is greater than 1 and the step fraction `i / num_steps` is within
+the inclusive `cfg_range`. Other steps use one positive-branch forward. A
+range that covers no actual step, such as `[1.0, 1.0]`, does not pack conditions.
+
+The initial evaluation scope is MammothModa2-Preview text-to-image with one
+request, one DiT device, eager execution, and diffusion caching disabled.
+The two internal branch rows belong to the same request. Dev and nested image
+embedders are explicitly unsupported in packed mode and raise an error; use
+`"sequential"` for Dev. Other execution combinations need separate qualification.
+
+BF16 packed execution can produce different latent trajectories and generated
+images from sequential execution, including with the same seed. Evaluate the
+generated results and memory use on your target workload before choosing this
+mode. No image-quality acceptance threshold or performance gain is established
+by enabling the option.
 
 ## MammothModa2-Dev unified inference
 
