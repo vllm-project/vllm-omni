@@ -3,15 +3,13 @@
 
 """CPU regression tests for MammothModa2 DiT quantization configuration wiring."""
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.config import set_current_diffusion_config
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.models.mammoth_moda2 import pipeline_mammothmoda2_dit as pipeline_module
 from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import Transformer2DModel
 from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
@@ -121,10 +119,15 @@ def test_pipeline_propagates_quant_config_to_all_dit_projections(monkeypatch, ti
         gen_axes_dim_rope=[2, 2, 4],
         gen_axes_lens=[8, 8, 8],
     )
-    vllm_config = SimpleNamespace(model_config=SimpleNamespace(hf_config=hf_config), quant_config=quant_config)
+    od_config = OmniDiffusionConfig(
+        model="/models/MammothModa2-Preview",
+        model_class_name="MammothModa2DiTPipeline",
+        tf_model_config=TransformerConfig.from_dict(hf_config.to_dict()),
+        quantization_config=quant_config,
+    )
     # Only the unrelated VAE is stubbed; keep the complete pipeline ->
     # transformer -> block -> linear constructor chain real.
     monkeypatch.setattr(pipeline_module.AutoencoderKL, "from_config", lambda config: torch.nn.Identity())
-    pipeline = pipeline_module.MammothModa2DiTPipeline(vllm_config=vllm_config, prefix=prefix)
+    pipeline = pipeline_module.MammothModa2DiTPipeline(od_config=od_config, prefix=prefix)
     transformer_prefix = f"{prefix}.gen_transformer" if prefix else "gen_transformer"
     _assert_quantized_projections(pipeline.gen_transformer, quant_config, transformer_prefix)
