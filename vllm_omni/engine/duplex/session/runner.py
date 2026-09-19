@@ -1368,7 +1368,8 @@ class DuplexSessionRunner:
             active_task.cancel()
             try:
                 await asyncio.wait_for(asyncio.gather(active_task, return_exceptions=True), timeout=0.25)
-            except TimeoutError:
+            # asyncio.TimeoutError is not the builtin TimeoutError before Python 3.11.
+            except (TimeoutError, asyncio.TimeoutError):
                 pass
         if notify:
             self.emit(
