@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
+from unittest.mock import patch
 
 import pytest
 import torch
+from diffusers.configuration_utils import FrozenDict
 from torch import nn
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, TransformerConfig
@@ -15,8 +17,12 @@ from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import (
     _root_weight_source,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_executor.stage_input_processors.mammoth_moda2 import ar2diffusion
+from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -26,6 +32,10 @@ def _raw_config() -> dict:
         "model_type": "mammothmoda2",
         "llm_config": {
             "model_type": "mammothmoda2_qwen2_5_vl",
+            "image_token_id": 900,
+            "video_token_id": 901,
+            "vision_start_token_id": 902,
+            "vision_end_token_id": 903,
             "text_config": {
                 "model_type": "mammothmoda2_qwen2_5_vl_text",
                 "hidden_size": 8,
@@ -81,25 +91,10 @@ def test_pipeline_declares_native_components_and_single_request_mode_only() -> N
     assert MammothModa2DiTPipeline.supports_step_execution is False
 
 
-def test_mammoth_postprocess_denormalizes_nonnegative_raw_vae_output() -> None:
-    factory = getattr(pipeline_mammothmoda2_dit, "get_mammoth_moda2_post_process_func", None)
-    assert factory is not None
-
-    images = factory(_od_config())(torch.zeros(1, 3, 2, 2))
-
-    assert len(images) == 1
-    assert images[0].getpixel((0, 0)) == (128, 128, 128)
-
-
-def test_mammoth_postprocess_is_registered() -> None:
-    from vllm_omni.diffusion.registry import _DIFFUSION_POST_PROCESS_FUNCS
-
-    assert _DIFFUSION_POST_PROCESS_FUNCS["MammothModa2DiTPipeline"] == "get_mammoth_moda2_post_process_func"
-
-
-def test_root_weight_source_rejects_missing_model_path() -> None:
+@pytest.mark.parametrize("model", [None, ""])
+def test_root_weight_source_rejects_missing_model_path(model: str | None) -> None:
     config = _od_config()
-    config.model = None
+    config.model = model
     with pytest.raises(ValueError, match="model path"):
         _root_weight_source(config)
 
@@ -153,6 +148,70 @@ def test_parse_request_uses_standard_sampling_fields() -> None:
     assert parsed.answer_start_index == 2
 
 
+@pytest.mark.parametrize(
+    ("seed", "guidance", "steps", "extra_args", "expected"),
+    [
+        pytest.param(123, 4.5, 7, {"cfg_range": [0.2, 0.8]}, (4.5, 7, (0.2, 0.8)), id="standard"),
+        pytest.param(
+            9,
+            3.0,
+            5,
+            {"text_guidance_scale": 6.0, "num_inference_steps": 11, "cfg_range": [0.0, 0.5]},
+            (6.0, 11, (0.0, 0.5)),
+            id="model-specific-overrides",
+        ),
+        pytest.param(0, 0.0, 3, {"cfg_range": [0.0, 0.0]}, (0.0, 3, (0.0, 0.0)), id="explicit-zero-controls"),
+    ],
+)
+def test_ar2diffusion_request_batch_preserves_sampling_controls(
+    seed: int,
+    guidance: float,
+    steps: int,
+    extra_args: dict[str, float | int | list[float]],
+    expected: tuple[float, int, tuple[float, float]],
+) -> None:
+    """Keep AR conditioning and separately serialized DiT controls together.
+
+    Exercise the real adapter, client serializer, request normalization, batch,
+    and parser with CPU tensors; this does not run an AR model or DiT inference.
+    """
+    hidden_states = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+    completion = MultimodalCompletionOutput(
+        index=0,
+        text="",
+        token_ids=[100, 101, 102],
+        cumulative_logprob=None,
+        logprobs=None,
+        finish_reason="stop",
+        multimodal_output=MultimodalPayload(tensors={"latent": hidden_states}),
+    )
+    # The AR output processor supplies this field; the last token has no state.
+    completion.cumulative_token_ids = [100, 101, 102]
+    source = OmniRequestOutput(request_id="req-bridge", prompt_token_ids=[10, 11], outputs=[completion])
+    diffusion_prompt = ar2diffusion(
+        [source], [{"prompt": "a cat", "mm_processor_kwargs": {"target_h": 32, "target_w": 48}}]
+    )
+    sampling = OmniDiffusionSamplingParams(
+        seed=seed, guidance_scale=guidance, num_inference_steps=steps, extra_args=extra_args
+    )
+    # The orchestrator passes stage params independently of the adapter prompt.
+    serialized = StageDiffusionClient._sampling_params_to_dict(sampling)
+    request = OmniDiffusionRequest(
+        request_id=source.request_id,
+        prompt=diffusion_prompt,
+        sampling_params=OmniDiffusionSamplingParams(**serialized),
+    )
+    parsed = _pipeline_shell()._parse_request(DiffusionRequestBatch(requests=[request]))
+
+    assert parsed.request_id == source.request_id
+    assert parsed.seed == seed
+    assert (parsed.text_guidance_scale, parsed.num_inference_steps, parsed.cfg_range) == expected
+    assert (parsed.height, parsed.width) == (32, 48)
+    assert parsed.full_token_ids == [10, 11, 100, 101]
+    assert parsed.answer_start_index == 2
+    torch.testing.assert_close(parsed.full_hidden_states, hidden_states, rtol=0, atol=0)
+
+
 def test_parse_request_prefers_legacy_sampling_overrides() -> None:
     sampling = OmniDiffusionSamplingParams(
         guidance_scale=3.0,
@@ -164,35 +223,6 @@ def test_parse_request_prefers_legacy_sampling_overrides() -> None:
     assert parsed.text_guidance_scale == 6.0
     assert parsed.num_inference_steps == 11
     assert parsed.cfg_range == (0.0, 0.5)
-
-
-def test_parse_request_falls_back_to_request_level_sampling_values() -> None:
-    prompt = _batch().prompts[0]
-    prompt["additional_information"].update(
-        text_guidance_scale=[1.5],
-        num_inference_steps=[3],
-        cfg_range=[0.25, 0.75],
-    )
-
-    parsed = _pipeline_shell()._parse_request(_batch(prompt=prompt, sampling=OmniDiffusionSamplingParams()))
-
-    assert parsed.text_guidance_scale == 1.5
-    assert parsed.num_inference_steps == 3
-    assert parsed.cfg_range == (0.25, 0.75)
-
-
-def test_parse_request_standard_fields_precede_request_level_fallbacks() -> None:
-    prompt = _batch().prompts[0]
-    prompt["additional_information"].update(
-        text_guidance_scale=[1.5],
-        num_inference_steps=[3],
-    )
-    sampling = OmniDiffusionSamplingParams(guidance_scale=4.0, num_inference_steps=7)
-
-    parsed = _pipeline_shell()._parse_request(_batch(prompt=prompt, sampling=sampling))
-
-    assert parsed.text_guidance_scale == 4.0
-    assert parsed.num_inference_steps == 7
 
 
 def test_parse_request_rejects_multiple_requests_and_outputs() -> None:
@@ -293,12 +323,7 @@ def test_parse_request_synthesizes_dummy_ar_conditions() -> None:
 
 
 @dataclass
-class _FakeTransformerConfig:
-    in_channels: int = 4
-
-
-@dataclass
-class _FakeTimeCaptionEmbed:
+class _TimeCaptionEmbeddingStub:
     image_embedder: nn.Module | None = None
 
 
@@ -306,8 +331,8 @@ class _FakeTransformer(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.anchor = nn.Parameter(torch.zeros(1))
-        self.config = _FakeTransformerConfig()
-        self.time_caption_embed = _FakeTimeCaptionEmbed()
+        self.config = FrozenDict(in_channels=4)
+        self.time_caption_embed = _TimeCaptionEmbeddingStub()
         self.calls = 0
 
     def forward(self, *, hidden_states, **kwargs):
@@ -315,17 +340,11 @@ class _FakeTransformer(nn.Module):
         return torch.zeros_like(hidden_states)
 
 
-@dataclass
-class _FakeVaeConfig:
-    scaling_factor: float | None = None
-    shift_factor: float | None = None
-
-
 class _FakeVae(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.anchor = nn.Parameter(torch.zeros(1))
-        self.config = _FakeVaeConfig()
+        self.config = FrozenDict(scaling_factor=None, shift_factor=None)
 
     def decode(self, latents, return_dict=False):
         assert return_dict is False
@@ -346,7 +365,7 @@ class _FakeScheduler:
         return (latents - model_pred,)
 
 
-def test_forward_returns_diffusion_output_with_request_sampling(mocker) -> None:
+def test_forward_returns_diffusion_output_with_request_sampling() -> None:
     pipeline = _pipeline_shell()
     pipeline.gen_transformer = _FakeTransformer()
     pipeline.gen_image_condition_refiner = None
@@ -361,15 +380,17 @@ def test_forward_returns_diffusion_output_with_request_sampling(mocker) -> None:
         return torch.zeros(shape, device=device, dtype=dtype)
 
     module = "vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit"
-    mocker.patch(f"{module}.FlowMatchEulerDiscreteScheduler", return_value=scheduler)
-    mocker.patch(f"{module}.randn_tensor", side_effect=fake_randn_tensor)
-    result = pipeline.forward(
-        _batch(
-            sampling=OmniDiffusionSamplingParams(
-                height=32, width=48, seed=42, guidance_scale=1.0, num_inference_steps=2
+    with (
+        patch(f"{module}.FlowMatchEulerDiscreteScheduler", return_value=scheduler),
+        patch(f"{module}.randn_tensor", side_effect=fake_randn_tensor),
+    ):
+        result = pipeline.forward(
+            _batch(
+                sampling=OmniDiffusionSamplingParams(
+                    height=32, width=48, seed=42, guidance_scale=1.0, num_inference_steps=2
+                )
             )
         )
-    )
 
     assert isinstance(result, DiffusionOutput)
     assert result.output.shape == (1, 3, 32, 48)
@@ -390,3 +411,48 @@ def test_forward_rejects_missing_visual_tokens_before_model_access() -> None:
     }
     with pytest.raises(ValueError, match="no visual-token hidden states.*req-empty"):
         _pipeline_shell().forward(_batch(request_id="req-empty", prompt=prompt))
+
+
+def test_mammoth_postprocess_denormalizes_nonnegative_raw_vae_output() -> None:
+    factory = getattr(pipeline_mammothmoda2_dit, "get_mammoth_moda2_post_process_func", None)
+    assert factory is not None
+
+    images = factory(_od_config())(torch.zeros(1, 3, 2, 2))
+
+    assert len(images) == 1
+    assert images[0].getpixel((0, 0)) == (128, 128, 128)
+
+
+def test_mammoth_postprocess_is_registered() -> None:
+    from vllm_omni.diffusion.registry import _DIFFUSION_POST_PROCESS_FUNCS
+
+    assert _DIFFUSION_POST_PROCESS_FUNCS["MammothModa2DiTPipeline"] == "get_mammoth_moda2_post_process_func"
+
+
+def test_parse_request_falls_back_to_request_level_sampling_values() -> None:
+    prompt = _batch().prompts[0]
+    prompt["additional_information"].update(
+        text_guidance_scale=[1.5],
+        num_inference_steps=[3],
+        cfg_range=[0.25, 0.75],
+    )
+
+    parsed = _pipeline_shell()._parse_request(_batch(prompt=prompt, sampling=OmniDiffusionSamplingParams()))
+
+    assert parsed.text_guidance_scale == 1.5
+    assert parsed.num_inference_steps == 3
+    assert parsed.cfg_range == (0.25, 0.75)
+
+
+def test_parse_request_standard_fields_precede_request_level_fallbacks() -> None:
+    prompt = _batch().prompts[0]
+    prompt["additional_information"].update(
+        text_guidance_scale=[1.5],
+        num_inference_steps=[3],
+    )
+    sampling = OmniDiffusionSamplingParams(guidance_scale=4.0, num_inference_steps=7)
+
+    parsed = _pipeline_shell()._parse_request(_batch(prompt=prompt, sampling=sampling))
+
+    assert parsed.text_guidance_scale == 4.0
+    assert parsed.num_inference_steps == 7

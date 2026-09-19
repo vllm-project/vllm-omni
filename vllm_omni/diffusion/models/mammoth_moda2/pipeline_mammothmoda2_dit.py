@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -19,7 +20,10 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload, resolve_offload_strategy
+from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.outputs.output_metadata import DiffusionPostprocessRawOutput
 from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
 
 from .mammothmoda2_dit_model import SimpleQFormerImageRefiner, Transformer2DModel
@@ -36,12 +40,16 @@ def _first_request_value(value: object) -> object:
 
 
 def get_mammoth_moda2_post_process_func(
-    _od_config: OmniDiffusionConfig,
-):
+    od_config: OmniDiffusionConfig,
+) -> Callable[[torch.Tensor], DiffusionPostprocessRawOutput]:
+    if od_config.output_type not in ("pil", "np", "pt"):
+        raise ValueError("MammothModa2 returns decoded images; output_type must be pil, np or pt.")
     image_processor = VaeImageProcessor()
 
-    def post_process_func(images: torch.Tensor):
-        return image_processor.postprocess(images)
+    def post_process_func(images: torch.Tensor) -> DiffusionPostprocessRawOutput:
+        # The VAE returns BCHW in [-1, 1]. Convert once at the shared runtime's
+        # postprocess boundary, not in each distributed worker or the example.
+        return image_processor.postprocess(images, output_type=od_config.output_type)
 
     return post_process_func
 
@@ -65,6 +73,66 @@ def _root_weight_source(
         prefix="",
         fall_back_to_pt=True,
     )
+
+
+def _validate_experimental_dlo_runtime(od_config: OmniDiffusionConfig, config: Mammothmoda2Config) -> bool:
+    enabled = od_config.extras.get("mammoth_experimental_dlo", False)
+    if type(enabled) is not bool:
+        raise ValueError("mammoth_experimental_dlo must be a bool")
+    policy = resolve_offload(od_config)
+    if not enabled:
+        if policy.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE:
+            raise ValueError("MammothModa2 distributed offload requires extras.mammoth_experimental_dlo=true")
+        return False
+    if policy.strategy is not OffloadStrategy.DISTRIBUTED_LAYER_WISE:
+        raise ValueError("mammoth_experimental_dlo requires the distributed layerwise offload backend")
+    if getattr(config.llm_config, "model_type", "") != "mammothmoda2_qwen2_5_vl":
+        raise ValueError("Experimental MammothModa2 DLO is limited to Preview text-to-image, not Dev")
+    if od_config.step_execution or od_config.max_num_seqs != 1:
+        raise ValueError("Experimental MammothModa2 DLO requires request mode with max_num_seqs=1")
+    if not od_config.enforce_eager or od_config.cache_backend != "none" or od_config.quantization_config is not None:
+        raise ValueError("Experimental MammothModa2 DLO requires eager execution without cache or quantization")
+    if policy.components != frozenset({"dit"}) or policy.resident_layers:
+        raise ValueError("Experimental MammothModa2 DLO requires dit-only offload with resident_layers=0")
+    if od_config.host_weight_runtime_mode != "disabled" or od_config.lora_path:
+        raise ValueError("Experimental MammothModa2 DLO does not support Host Weight Runtime or LoRA")
+    parallel = od_config.parallel_config
+    if parallel.use_hsdp or any(
+        getattr(parallel, field) != 1
+        for field in (
+            "data_parallel_size",
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+            "cfg_parallel_size",
+            "ring_degree",
+            "allgather_degree",
+            "vae_patch_parallel_size",
+            "text_encoder_tp_size",
+        )
+    ):
+        raise ValueError("Experimental MammothModa2 DLO requires DP=TP=PP=CFG=1, Ulysses-only SP and no HSDP")
+    if config.gen_dit_config is None or int(config.gen_dit_config.get("num_layers", 26)) < 2:
+        raise ValueError("Experimental MammothModa2 DLO requires at least two main transformer layers")
+    return True
+
+
+def _validate_sequence_parallel_runtime(od_config: OmniDiffusionConfig, config: Mammothmoda2Config) -> None:
+    experimental_dlo = _validate_experimental_dlo_runtime(od_config, config)
+    if od_config.parallel_config.sequence_parallel_size == 1:
+        return
+    if getattr(config.llm_config, "model_type", "") != "mammothmoda2_qwen2_5_vl":
+        raise ValueError("MammothModa2 sequence parallelism is limited to Preview text-to-image, not Dev.")
+    if od_config.step_execution or od_config.max_num_seqs != 1:
+        raise ValueError("MammothModa2 SP requires request mode with max_num_seqs=1.")
+    if (
+        not od_config.enforce_eager
+        or od_config.cache_backend != "none"
+        or od_config.quantization_config is not None
+        or (resolve_offload_strategy(od_config) is not OffloadStrategy.NONE and not experimental_dlo)
+    ):
+        raise ValueError(
+            "MammothModa2 SP requires eager execution without cache acceleration, quantization or offload."
+        )
 
 
 @dataclass(frozen=True)
@@ -94,6 +162,10 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
     _dit_modules: ClassVar[list[str]] = ["gen_transformer"]
     _encoder_modules: ClassVar[list[str]] = ["gen_image_condition_refiner"]
     _vae_modules: ClassVar[list[str]] = ["gen_vae"]
+    # One circular ring, executed for every conditional/unconditional pass.
+    # Auxiliary refiners and VAE remain resident; no encoder/mmap capability
+    # or leading-resident-layer lifecycle is claimed by this experiment.
+    _offload_plan: ClassVar[OffloadPlan] = OffloadPlan(block_attrs={"gen_transformer": ("layers",)})
 
     supports_request_batch = False
     supports_step_execution = False
@@ -112,6 +184,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         self.od_config = od_config
         self.device = get_local_device()
         self.config = _build_mammoth_config(od_config)
+        _validate_sequence_parallel_runtime(od_config, self.config)
         self.weights_sources = [_root_weight_source(od_config)]
 
         # --- Build DiT / VAE modules (names must match checkpoint keys) ---
@@ -333,7 +406,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         image_cond = full_hidden_states[image_mask].contiguous()
         return text_cond, image_cond
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         request = self._parse_request(req)
         text_cond, image_cond = self._split_ar_conditions(
@@ -350,7 +423,9 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             )
 
         # Move to model device/dtype.
-        model_device = next(self.parameters()).device
+        # Offload can replace parameter storage with CPU placeholders. The
+        # execution device is a runtime property, not a weight-residency probe.
+        model_device = self.device
         if self.gen_image_condition_refiner is not None:
             target_dtype = next(self.gen_image_condition_refiner.parameters()).dtype
         else:

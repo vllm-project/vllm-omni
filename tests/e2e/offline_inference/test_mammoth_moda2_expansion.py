@@ -4,9 +4,8 @@
 """
 End-to-end test for MammothModa2 text-to-image generation.
 
-Verifies that the AR->DiT pipeline produces a valid PIL image. When an
-optional golden fixture is present, the test also compares fixed pixel samples;
-the portable golden/stability oracle remains tracked in #7090.
+Verifies that the AR->DiT pipeline produces a postprocessed PIL image. Pixel
+values are compared with a golden reference when one is explicitly supplied.
 
 Model Hub repo id: ``bytedance-research/MammothModa2-Preview``.
 Deploy config: ``get_deploy_config_path("mammoth_moda2.yaml")`` -> ``vllm_omni/deploy/mammoth_moda2.yaml``
@@ -21,10 +20,9 @@ import json
 import os
 from pathlib import Path
 
-import numpy as np
 import pytest
 import torch
-from PIL import Image
+from PIL import Image, ImageChops
 from vllm.sampling_params import SamplingParams
 
 from tests.helpers.mark import hardware_test
@@ -33,6 +31,8 @@ from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.transformers_utils.repo_utils import hf_api
+
+pytestmark = pytest.mark.advanced_model
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -48,7 +48,7 @@ T2I_DEPLOY_CONFIG = get_deploy_config_path("mammoth_moda2.yaml")
 
 _OMNI_RUNNER_PARAM = (MODEL_PATH, T2I_DEPLOY_CONFIG)
 
-# Optional golden pixel reference file. Set UPDATE_GOLDEN=1 to regenerate.
+# Golden pixel reference file.  Set UPDATE_GOLDEN=1 to regenerate.
 _GOLDEN_T2I_PATH = Path(__file__).parent / "fixtures" / "mammoth_moda2_t2i_golden.json"
 # Fixed sampling coordinates: (channel, row_fraction, col_fraction)
 # Covers corners, centre, and mid-edges across all 3 channels.
@@ -72,7 +72,9 @@ _PIXEL_SAMPLE_COORDS = [
 # Helpers
 # ---------------------------------------------------------------------------
 def _load_t2i_gen_config(repo_id: str) -> dict:
-    weights_dir = Path(hf_api().snapshot_download(repo_id))
+    weights_dir = Path(repo_id)
+    if not weights_dir.is_dir():
+        weights_dir = Path(hf_api().snapshot_download(repo_id))
     cfg_path = weights_dir / "t2i_generation_config.json"
     if not cfg_path.exists():
         pytest.skip(f"t2i_generation_config.json not found at {cfg_path}")
@@ -89,17 +91,14 @@ def _format_t2i_prompt(user_prompt: str, ar_width: int, ar_height: int) -> str:
     )
 
 
-def _sample_pixels(img_tensor: torch.Tensor) -> list[float]:
-    """Sample pixel values at fixed fractional coordinates from a (C, H, W) tensor."""
-    t = img_tensor.float().clamp(0.0, 1.0)
-    if t.ndim == 4:
-        t = t[0]  # unbatch
-    C, H, W = t.shape
+def _sample_pixels(image: Image.Image) -> list[float]:
+    """Sample normalized RGB values after the shared VAE postprocess boundary."""
+    width, height = image.size
     values = []
     for c, rh, rw in _PIXEL_SAMPLE_COORDS:
-        ri = min(int(rh * (H - 1)), H - 1)
-        ci = min(int(rw * (W - 1)), W - 1)
-        values.append(round(float(t[c, ri, ci]), 6))
+        ri = min(int(rh * (height - 1)), height - 1)
+        ci = min(int(rw * (width - 1)), width - 1)
+        values.append(round(image.getpixel((ci, ri))[c] / 255.0, 6))
     return values
 
 
@@ -113,35 +112,23 @@ def _iter_images(outputs: list[object]):
                 yield from images
 
 
-def _pil_to_tensor(image: Image.Image) -> torch.Tensor:
-    array = np.asarray(image, dtype=np.float32) / 255.0
-    return torch.from_numpy(array).permute(2, 0, 1)
-
-
 @pytest.mark.cpu
 def test_diffusion_output_exposes_images_at_top_level():
-    image = Image.new("RGB", (16, 16), "black")
+    image = torch.zeros((3, 16, 16))
     output = OmniRequestOutput.from_diffusion(request_id="diffusion-test", images=[image])
 
     assert output.outputs == []
     assert list(_iter_images([output])) == [image]
 
 
-@pytest.mark.slow
-@pytest.mark.diffusion
-@pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True)
-@hardware_test(res={"cuda": "H100"})
-def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
-    """
-    End-to-end text-to-image generation with MammothModa2 (AR -> DiT).
+@pytest.mark.cpu
+def test_golden_sampling_uses_postprocessed_rgb_values():
+    image = Image.new("RGB", (16, 16), (0, 127, 255))
+    assert _sample_pixels(image) == [0.0] * 4 + [round(127 / 255, 6)] * 4 + [1.0] * 4
 
-    Verifies:
-      - Omni pipeline initialises with the two-stage YAML config.
-      - DiT stage outputs one RGB PIL image at the requested size.
-      - When the optional fixture exists, fixed pixel samples match its golden
-        reference (regenerate with ``UPDATE_GOLDEN=1``).
-    """
-    gen_cfg = _load_t2i_gen_config(MODEL_PATH)
+
+def _generate_t2i(omni_runner: OmniRunner, prompt_text: str, seed: int = 42):
+    gen_cfg = _load_t2i_gen_config(omni_runner.model_name)
     eol_token_id = int(gen_cfg["eol_token_id"])
     visual_start = int(gen_cfg["visual_token_start_id"])
     visual_end = int(gen_cfg["visual_token_end_id"])
@@ -150,7 +137,6 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
     ar_height, ar_width = height // _AR_PATCH_SIZE, width // _AR_PATCH_SIZE
     expected_grid_tokens = ar_height * (ar_width + 1)
 
-    prompt_text = "A cat sitting on a laptop keyboard"
     formatted_prompt = _format_t2i_prompt(prompt_text, ar_width, ar_height)
 
     omni = omni_runner.omni
@@ -163,7 +149,7 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
     dit_sampling = OmniDiffusionSamplingParams(
         height=height,
         width=width,
-        seed=42,
+        seed=seed,
         guidance_scale=1.0,
         num_inference_steps=2,
         extra_args={"cfg_range": [0.0, 1.0]},
@@ -196,6 +182,26 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
         )
     )
 
+    return outputs
+
+
+@pytest.mark.slow
+@pytest.mark.diffusion
+@pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True)
+@hardware_test(res={"cuda": "H100"})
+def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
+    """
+    End-to-end text-to-image generation with MammothModa2 (AR -> DiT).
+
+    Verifies:
+      - Omni pipeline initialises with the two-stage YAML config.
+      - Shared postprocessing returns a PIL RGB image with the correct size.
+      - A fixed set of pixel values matches a golden reference
+        (regenerate with ``UPDATE_GOLDEN=1``).
+    """
+    width, height = 256, 256
+    outputs = _generate_t2i(omni_runner, "A cat sitting on a laptop keyboard")
+
     assert len(outputs) > 0, "Pipeline produced no outputs"
 
     images = list(_iter_images(outputs))
@@ -206,7 +212,7 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
     assert image.mode == "RGB"
     assert image.size == (width, height)
 
-    sampled = _sample_pixels(_pil_to_tensor(image))
+    sampled = _sample_pixels(image)
 
     if os.environ.get("UPDATE_GOLDEN"):
         _GOLDEN_T2I_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -216,3 +222,83 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
         golden = json.loads(_GOLDEN_T2I_PATH.read_text())["pixels"]
         for i, (got, exp) in enumerate(zip(sampled, golden)):
             assert abs(got - exp) < 1e-4, f"Pixel {i} mismatch: got {got}, expected {exp}"
+
+
+_DLO_RUNNER_PARAMS = [
+    pytest.param(
+        (
+            MODEL_PATH,
+            T2I_DEPLOY_CONFIG,
+            {
+                "dtype": "bfloat16",
+                "stage_overrides": {
+                    "0": {
+                        "devices": "0,1",
+                        "tensor_parallel_size": 2,
+                        # Optional AR memory relief when sharing smaller GPUs with DiT.
+                        "cpu_offload_gb": float(os.environ.get("MAMMOTH_AR_CPU_OFFLOAD_GB", "0")),
+                        "cpu_offload_params": ["mlp"],
+                        "max_num_seqs": 1,
+                        "max_model_len": 2048,
+                        "gpu_memory_utilization": 0.65,
+                        "skip_mm_profiling": True,
+                        "limit_mm_per_prompt": {"image": 0, "video": 0},
+                    },
+                    "1": {
+                        "devices": "0,1",
+                        "ulysses_degree": 2,
+                        "ulysses_mode": "advanced_uaa",
+                        "enable_distributed_layerwise_offload": True,
+                        "dlo_use_allgather": use_allgather,
+                        "extras": {"mammoth_experimental_dlo": True},
+                        "worker_extension_cls": (
+                            "benchmarks.mammoth_moda2.qualification_worker.QualificationWorkerExtension"
+                        ),
+                    },
+                },
+            },
+        ),
+        "allgather" if use_allgather else "ring",
+        id="allgather" if use_allgather else "ring",
+    )
+    for use_allgather in (False, True)
+]
+
+
+@pytest.mark.slow
+@pytest.mark.full_model
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@pytest.mark.parametrize("omni_runner,dlo_mode", _DLO_RUNNER_PARAMS, indirect=["omni_runner"])
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
+def test_mammothmoda2_dlo_repeated_t2i_e2e(omni_runner: OmniRunner, dlo_mode: str, tmp_path: Path):
+    """Full checkpoint AR -> DiT -> VAE, reusing the same DLO backend across requests."""
+    replies = omni_runner.omni.engine.collective_rpc(
+        "qualification_runtime_all_ranks", args=(dlo_mode,), stage_ids=[1], timeout=60
+    )
+    assert len(replies) == 1 and len(replies[0]) == 1
+    runtime = [replies[0][0]]
+    assert len(runtime[0]) == 2
+    assert {rank["rank"] for rank in runtime[0]} == {0, 1}
+    (tmp_path / "runtime.json").write_text(json.dumps(runtime, indent=2))
+    images = []
+    for index, prompt in enumerate(
+        (
+            "A cat sitting on a laptop keyboard",
+            "A red boat on a blue lake",
+            "A cat sitting on a laptop keyboard",
+        )
+    ):
+        outputs = _generate_t2i(omni_runner, prompt)
+        generated = list(_iter_images(outputs))
+        assert len(generated) == 1
+        image = generated[0]
+        assert isinstance(image, Image.Image) and image.mode == "RGB" and image.size == (256, 256)
+        assert any(low != high for low, high in image.getextrema()), "Output image is constant"
+        image.save(tmp_path / f"request-{index}.png")
+        images.append(image)
+    # A different intervening request must not leak conditioning or stale weights
+    # into the next fixed-seed request. Allow one level of RGB rounding noise.
+    difference = ImageChops.difference(images[0], images[2])
+    assert max(high for _, high in difference.getextrema()) <= 1
+    assert ImageChops.difference(images[0], images[1]).getbbox() is not None
