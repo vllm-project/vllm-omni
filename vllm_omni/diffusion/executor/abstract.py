@@ -126,6 +126,16 @@ class DiffusionExecutor(ABC):
         """
         return None
 
+    def drop_output(self, async_output_id: str) -> None:
+        """Reclaim an async output that will never be waited on (e.g. an
+        aborted request).
+
+        Only executors with an async output path (result pump) cache outputs
+        that a consumer must later claim; executors without one have nothing to
+        reclaim and can keep the default no-op implementation.
+        """
+        return None
+
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         """Collect rank-local native specs after every Worker loads its model."""
 
