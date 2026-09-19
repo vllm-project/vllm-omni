@@ -38,6 +38,9 @@ class SPDXStatus(Enum):
     MISSING_BOTH = "missing_both"  # Completely missing
 
 
+# The statuses add_header knows how to repair; anything else is a no-op.
+_REWRITABLE_STATUSES = frozenset({SPDXStatus.MISSING_BOTH, SPDXStatus.MISSING_COPYRIGHT, SPDXStatus.MISSING_LICENSE})
+
 LICENSE_TEXT = "SPDX-License-Identifier: Apache-2.0"
 COPYRIGHT_TEXT = "SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project"
 FILE_STYLES = {
@@ -114,6 +117,13 @@ def check_spdx_header_status(file_path):
 
 def add_header(file_path, status):
     """Add or supplement SPDX header based on status"""
+    if status not in _REWRITABLE_STATUSES:
+        # COMPLETE and EMPTY have nothing to rewrite. Returning here matters:
+        # the body below truncates before it branches, so falling through with
+        # an unhandled status would empty an already-compliant file. main()
+        # only dispatches the MISSING_* statuses, but the signature accepts
+        # any of them.
+        return
     style = file_style(file_path)
     license_line, copyright_line = spdx_header(style)
     stale_copyright_line = legacy_copyright_line(style)
@@ -124,6 +134,18 @@ def add_header(file_path, status):
         file.truncate()
 
         if status == SPDXStatus.MISSING_BOTH:
+            # A file can carry the stale upstream copyright line without the
+            # license line, which reads as MISSING_BOTH. Rewrite that line in
+            # place and add only the license line above it -- prepending a whole
+            # header would leave two conflicting SPDX-FileCopyrightText lines,
+            # and the next run reads that as COMPLETE, so the conflict sticks.
+            for i, line in enumerate(lines):
+                if line.strip() == stale_copyright_line:
+                    lines[i] = f"{copyright_line}\n"
+                    lines.insert(i, f"{license_line}\n")
+                    file.writelines(lines)
+                    return
+
             # Completely missing, add complete header
             insertion_index = header_insertion_index(style, lines)
             file.writelines(lines[:insertion_index])
