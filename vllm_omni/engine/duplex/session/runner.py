@@ -340,7 +340,7 @@ class DuplexSessionRunner:
             return
         self._begin_close(reason)
         self.model_state.audio_buffer.clear()
-        session.release_all_input_bytes()
+        session.release_buffered_input_bytes()
         self.model_state.input_since_commit = False
         self.model_state.speech_since_commit = False
         self.model_state.clear_committed_audio()
@@ -458,7 +458,7 @@ class DuplexSessionRunner:
             if isinstance(item, Commit):
                 session.release_pending_turn()
             elif isinstance(item, AppendAudio):
-                session.release_input_bytes(len(item.audio))
+                session.release_input_bytes(len(item.audio), queued=True)
             return
         await self._on_command(item)
 
@@ -516,7 +516,7 @@ class DuplexSessionRunner:
         if isinstance(command, AppendAudio):
             # The manager reserved the wire size at admission; the handler
             # re-reserves the decoded size around its PCM reservation.
-            session.release_input_bytes(len(command.audio))
+            session.release_input_bytes(len(command.audio), queued=True)
             await self._on_append_audio(command.payload())
         elif isinstance(command, AppendText):
             session.mark_user_input_activity()
@@ -619,7 +619,7 @@ class DuplexSessionRunner:
         session = self.session
         model_state = self.model_state
         model_state.audio_buffer.clear()
-        session.release_all_input_bytes()
+        session.release_buffered_input_bytes()
         model_state.input_since_commit = False
         model_state.speech_since_commit = False
         model_state.clear_committed_audio()
@@ -1237,7 +1237,7 @@ class DuplexSessionRunner:
         playback_was_active = helpers.assistant_playback_active(self.session)
         if event_type in {"input.cancel", "barge_in"}:
             model_state.audio_buffer.clear()
-            session.release_all_input_bytes()
+            session.release_buffered_input_bytes()
             model_state.input_since_commit = False
             model_state.speech_since_commit = False
             model_state.clear_committed_audio()
@@ -1584,7 +1584,7 @@ class DuplexSessionRunner:
         session = self.session
         model_state = self.model_state
         model_state.audio_buffer.clear()
-        session.release_all_input_bytes()
+        session.release_buffered_input_bytes()
         model_state.input_since_commit = False
         model_state.speech_since_commit = False
         model_state.clear_committed_audio()
@@ -1718,7 +1718,7 @@ class DuplexSessionRunner:
         model_state.input_since_commit = False
         model_state.speech_since_commit = False
         model_state.audio_buffer.clear()
-        session.release_all_input_bytes()
+        session.release_buffered_input_bytes()
         model_state.clear_committed_audio()
         self.emit(
             {

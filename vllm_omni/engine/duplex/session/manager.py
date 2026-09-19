@@ -287,7 +287,7 @@ class DuplexSessionManager:
             return
         if isinstance(command, AppendAudio):
             limit = int(self.runtime_config.max_pending_input_bytes_per_session)
-            if not session.reserve_input_bytes(len(command.audio), limit=limit):
+            if not session.reserve_input_bytes(len(command.audio), limit=limit, queued=True):
                 self.emit(
                     session,
                     self._error_event(

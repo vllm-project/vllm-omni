@@ -509,6 +509,95 @@ async def test_clear_input_drops_buffered_audio() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("committed", [False, True])
+async def test_clear_input_preserves_queued_append_byte_reservations(monkeypatch, committed) -> None:
+    h = await open_harness(
+        auto_response=False,
+        runtime_config=DuplexSessionRuntimeConfig(max_pending_input_bytes_per_session=64_000),
+    )
+    blocked = asyncio.Event()
+    resume = asyncio.Event()
+    on_command = h.runner._on_command
+
+    async def pause_queued_append(command):
+        if command.event_id == "queued":
+            blocked.set()
+            await resume.wait()
+        await on_command(command)
+
+    try:
+        await h.run(append_audio(samples=8000))
+        if committed:
+            await h.run(commands.Commit(create_response=False))
+            assert h.runner.model_state.committed_audio_reserved_bytes == 32_000
+        assert h.session.pending_input_bytes == 32_000
+        monkeypatch.setattr(h.runner, "_on_command", pause_queued_append)
+        h.submit(commands.ClearInput())
+        h.submit(append_audio(samples=8000, event_id="queued"))
+        assert h.session.pending_input_bytes == 64_000
+        await asyncio.wait_for(blocked.wait(), timeout=2.0)
+
+        # Only the old buffer was cleared; the later append still owns its budget.
+        assert h.session.pending_input_bytes == 32_000
+        assert not h.runner.model_state.audio_buffer.has_pending()
+        assert h.runner.model_state.committed_audio_reserved_bytes == 0
+        h.submit(append_audio(samples=10_000, event_id="over-limit"))
+        events = await h.settle()
+        assert any(
+            event.type == "error" and event.code == "input_backpressure" and event.related_event_id == "over-limit"
+            for event in events
+        )
+
+        resume.set()
+        await h.settle()
+        assert h.session.pending_input_bytes == 32_000
+        assert h.runner.model_state.audio_buffer.pending_byte_count == 32_000
+        await h.run(commands.ClearInput())
+        assert h.session.pending_input_bytes == 0
+    finally:
+        resume.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_cleared_in_flight_append_cannot_release_later_audio(monkeypatch) -> None:
+    h = await open_harness()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    processed = asyncio.Event()
+    submit = h.port.submit
+    on_command = h.runner._on_command
+
+    async def blocked_submit(submission):
+        started.set()
+        await release.wait()
+        return await submit(submission)
+
+    async def observe_command(command):
+        await on_command(command)
+        if command.event_id == "later":
+            processed.set()
+
+    monkeypatch.setattr(h.port, "submit", blocked_submit)
+    monkeypatch.setattr(h.runner, "_on_command", observe_command)
+    try:
+        h.submit(append_audio())
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        assert h.session.pending_input_bytes == 64_000
+        h.submit(commands.ClearInput())
+        h.submit(append_audio(samples=8000, event_id="later"))
+        await asyncio.wait_for(processed.wait(), timeout=2.0)
+        assert h.session.pending_input_bytes == 32_000
+        release.set()
+        await h.settle()
+        assert h.session.pending_input_bytes == 32_000
+        assert h.runner.model_state.audio_buffer.pending_byte_count == 32_000
+    finally:
+        release.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_commit_without_audio_is_rejected() -> None:
     h = await open_harness()
     try:
