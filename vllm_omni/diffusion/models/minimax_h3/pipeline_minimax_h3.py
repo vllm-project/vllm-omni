@@ -108,6 +108,12 @@ from .denoise_loop import (
 from .encoder import MiniMaxH3Qwen3VLEncoder
 from .fasth3 import FastH3WeightFusion, resolve_fasth3_fusion
 from .fasth3_checkpoint import FastH3CheckpointSpec
+from .latent_mask import (
+    MiniMaxH3LatentEdit,
+    minimax_h3_audio_edit_masks,
+    minimax_h3_prepare_edit_rows,
+    minimax_h3_video_edit_masks,
+)
 from .lora import TurboSpec, load_minimax_h3_turbo_lora
 from .minimax_h3_transformer import (
     MiniMaxH3Attention,
@@ -259,6 +265,12 @@ _MINIMAX_H3_DENOISE_INPUT_KEYS = (
     "audio_condition_lengths",
     "keyframe_frame_indices",
     "pad_seq_len",
+    "video_edit_clean_rows",
+    "video_edit_mask_rows",
+    "video_edit_restore_mask_rows",
+    "audio_edit_clean_rows",
+    "audio_edit_mask_rows",
+    "audio_edit_restore_mask_rows",
 )
 
 # ``StepRequestState.extra`` keys owned by the step-execution path.
@@ -271,6 +283,8 @@ _STEP_COND_ANCHOR = "minimax_h3_cond_anchor"
 _STEP_AUDIO_ANCHOR = "minimax_h3_audio_anchor"
 _STEP_SHAPE = "minimax_h3_shape"
 _STEP_TRANSFORMER = "minimax_h3_transformer"
+_STEP_VIDEO_EDIT = "minimax_h3_video_edit"
+_STEP_AUDIO_EDIT = "minimax_h3_audio_edit"
 
 
 def _minimax_h3_step_schedule(state: StepRequestState) -> dict[str, float]:
@@ -395,6 +409,27 @@ def get_minimax_h3_post_process_func(
 ):
     del od_config
     return _minimax_h3_post_process
+
+
+def _expose_padded_audio_tail(
+    source_audio_t: int,
+    *,
+    target_audio_t: int,
+    mask_rows: torch.Tensor,
+    restore_mask_rows: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mark the encoder-padded audio tail for generation."""
+    if not 0 < source_audio_t <= target_audio_t:
+        raise ValueError(f"source_audio_t must be in [1, {target_audio_t}]")
+    expected_shape = (2 * target_audio_t,)
+    if tuple(mask_rows.shape) != expected_shape or tuple(restore_mask_rows.shape) != expected_shape:
+        raise ValueError(f"audio edit masks must have shape {expected_shape}")
+    model_mask = mask_rows.reshape(2, target_audio_t).clone()
+    restore_mask = restore_mask_rows.reshape(2, target_audio_t).clone()
+    if source_audio_t < target_audio_t:
+        model_mask[:, source_audio_t:] = 1.0
+        restore_mask[:, source_audio_t:] = 1.0
+    return model_mask.reshape(-1), restore_mask.reshape(-1)
 
 
 def _resolve_minimax_h3_num_outputs(value: Any) -> int:
@@ -1469,6 +1504,12 @@ class MiniMaxH3Pipeline(
         audio_condition_lengths: list[int] | None = None,
         keyframe_frame_indices: list[int] | None = None,
         pad_seq_len: int | None = None,
+        video_edit_clean_rows: torch.Tensor | None = None,
+        video_edit_mask_rows: torch.Tensor | None = None,
+        video_edit_restore_mask_rows: torch.Tensor | None = None,
+        audio_edit_clean_rows: torch.Tensor | None = None,
+        audio_edit_mask_rows: torch.Tensor | None = None,
+        audio_edit_restore_mask_rows: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         """Build the packed layout, initial rows, anchors, and sigma schedules.
 
@@ -1577,6 +1618,41 @@ class MiniMaxH3Pipeline(
             full_audio[branch.audio_update_mask] = initial_audio
             initial_audio = full_audio
 
+        video_edit = None
+        video_edit_values = (video_edit_clean_rows, video_edit_mask_rows, video_edit_restore_mask_rows)
+        if any(value is None for value in video_edit_values) and any(value is not None for value in video_edit_values):
+            raise ValueError("video edit clean, model-mask, and restore-mask rows must be provided together")
+        if (
+            video_edit_clean_rows is not None
+            and video_edit_mask_rows is not None
+            and video_edit_restore_mask_rows is not None
+        ):
+            target_noise = initial_video[branch.update_mask].to(device=self.device, dtype=torch.float32)
+            clean = video_edit_clean_rows.to(device=self.device, dtype=torch.float32)
+            video_edit = MiniMaxH3LatentEdit.from_rows(
+                clean,
+                MINIMAX_H3_IMGVID_COND_TIMESTEP * clean + (1.0 - MINIMAX_H3_IMGVID_COND_TIMESTEP) * target_noise,
+                video_edit_mask_rows,
+                video_edit_restore_mask_rows,
+            )
+
+        audio_edit = None
+        audio_edit_values = (audio_edit_clean_rows, audio_edit_mask_rows, audio_edit_restore_mask_rows)
+        if any(value is None for value in audio_edit_values) and any(value is not None for value in audio_edit_values):
+            raise ValueError("audio edit clean, model-mask, and restore-mask rows must be provided together")
+        if (
+            audio_edit_clean_rows is not None
+            and audio_edit_mask_rows is not None
+            and audio_edit_restore_mask_rows is not None
+        ):
+            clean = audio_edit_clean_rows.to(device=self.device, dtype=torch.float32)
+            audio_edit = MiniMaxH3LatentEdit.from_rows(
+                clean,
+                clean,
+                audio_edit_mask_rows,
+                audio_edit_restore_mask_rows,
+            )
+
         video_sigmas = minimax_h3_time_shift_sigmas(
             num_steps=num_steps,
             shift_scale=video_shift,
@@ -1601,6 +1677,8 @@ class MiniMaxH3Pipeline(
             ),
             "sigmas_video": video_sigmas,
             "sigmas_audio": audio_sigmas,
+            "video_edit": video_edit,
+            "audio_edit": audio_edit,
         }
 
     def _unpack_denoised_rows(
@@ -1659,6 +1737,12 @@ class MiniMaxH3Pipeline(
         audio_condition_lengths: list[int] | None = None,
         keyframe_frame_indices: list[int] | None = None,
         pad_seq_len: int | None = None,
+        video_edit_clean_rows: torch.Tensor | None = None,
+        video_edit_mask_rows: torch.Tensor | None = None,
+        video_edit_restore_mask_rows: torch.Tensor | None = None,
+        audio_edit_clean_rows: torch.Tensor | None = None,
+        audio_edit_mask_rows: torch.Tensor | None = None,
+        audio_edit_restore_mask_rows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         inputs = self._build_denoise_inputs(
             task=task,
@@ -1683,6 +1767,12 @@ class MiniMaxH3Pipeline(
             audio_condition_lengths=audio_condition_lengths,
             keyframe_frame_indices=keyframe_frame_indices,
             pad_seq_len=pad_seq_len,
+            video_edit_clean_rows=video_edit_clean_rows,
+            video_edit_mask_rows=video_edit_mask_rows,
+            video_edit_restore_mask_rows=video_edit_restore_mask_rows,
+            audio_edit_clean_rows=audio_edit_clean_rows,
+            audio_edit_mask_rows=audio_edit_mask_rows,
+            audio_edit_restore_mask_rows=audio_edit_restore_mask_rows,
         )
         branch = inputs["branch"]
         transformer = self._transformer_for_task(task)
@@ -1700,6 +1790,8 @@ class MiniMaxH3Pipeline(
                     device=self.device,
                     imgvid_cond_noise_aug_for_inference=(MINIMAX_H3_IMGVID_COND_TIMESTEP),
                     audio_cond_noise_aug_for_inference=(MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
+                    video_edit=inputs["video_edit"],
+                    audio_edit=inputs["audio_edit"],
                     on_step=lambda step, video, audio: progress.update(),
                 )
 
@@ -1910,7 +2002,14 @@ class MiniMaxH3Pipeline(
         if world_size == 1:
             assert conditioning is not None
             return conditioning
-        tensor_names = ("visual_condition", "audio_condition")
+        tensor_names = (
+            "visual_condition",
+            "audio_condition",
+            "video_edit_clean_rows",
+            "video_edit_mask",
+            "audio_edit_clean_rows",
+            "audio_edit_mask",
+        )
         header = [None]
         if rank == 0:
             assert conditioning is not None
@@ -2100,6 +2199,50 @@ class MiniMaxH3Pipeline(
         visual_shapes = list(conditioning.visual_condition_shapes) or None
         audio_lengths = list(conditioning.audio_condition_lengths) or None
 
+        latent_edit: dict[str, torch.Tensor | None] = {
+            "video_edit_clean_rows": None,
+            "video_edit_mask_rows": None,
+            "video_edit_restore_mask_rows": None,
+            "audio_edit_clean_rows": None,
+            "audio_edit_mask_rows": None,
+            "audio_edit_restore_mask_rows": None,
+        }
+        try:
+            if conditioning.video_edit_clean_rows is not None:
+                if conditioning.video_edit_mask is None:
+                    raise ValueError("MiniMax H3 video edit rows require a mask")
+                video_mask = minimax_h3_video_edit_masks(
+                    conditioning.video_edit_mask,
+                    latent_t=conditioning.latent_t,
+                    latent_h=conditioning.height // 16,
+                    latent_w=conditioning.width // 16,
+                )
+                latent_edit.update(
+                    video_edit_clean_rows=conditioning.video_edit_clean_rows,
+                    video_edit_mask_rows=video_mask.model_mask_rows,
+                    video_edit_restore_mask_rows=video_mask.restore_mask_rows,
+                )
+            if conditioning.audio_edit_clean_rows is not None:
+                if conditioning.audio_edit_mask is None:
+                    raise ValueError("MiniMax H3 audio edit rows require a mask")
+                audio_mask = minimax_h3_audio_edit_masks(
+                    conditioning.audio_edit_mask,
+                    audio_t=conditioning.audio_t,
+                )
+                model_mask, restore_mask = _expose_padded_audio_tail(
+                    conditioning.audio_edit_source_t,
+                    target_audio_t=conditioning.audio_t,
+                    mask_rows=audio_mask.model_mask_rows,
+                    restore_mask_rows=audio_mask.restore_mask_rows,
+                )
+                latent_edit.update(
+                    audio_edit_clean_rows=conditioning.audio_edit_clean_rows,
+                    audio_edit_mask_rows=model_mask,
+                    audio_edit_restore_mask_rows=restore_mask,
+                )
+        except ValueError as exc:
+            raise OmniClientError(str(exc)) from exc
+
         base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
         quality_plan = self._quality_policy.resolve(
             quality=sampling.quality,
@@ -2152,6 +2295,7 @@ class MiniMaxH3Pipeline(
                 if extra.get("preencode_mp4", False)
                 else None
             ),
+            **latent_edit,
         }
 
     @staticmethod
@@ -2319,6 +2463,8 @@ class MiniMaxH3Pipeline(
                 _STEP_AUDIO_ANCHOR: audio_anchor,
                 _STEP_SIGMAS_VIDEO: sigmas_video,
                 _STEP_SIGMAS_AUDIO: sigmas_audio,
+                _STEP_VIDEO_EDIT: inputs.get("video_edit"),
+                _STEP_AUDIO_EDIT: inputs.get("audio_edit"),
                 _STEP_SHAPE: {
                     "height": context["height"],
                     "width": context["width"],
@@ -2352,11 +2498,39 @@ class MiniMaxH3Pipeline(
         batch_states = list(states if states is not None else input_batch.states)
 
         branches = [state.extra[_STEP_BRANCH] for state in batch_states]
-        video_rows = [state.latents for state in batch_states]
-        audio_rows = [state.extra[_STEP_AUDIO_ROWS] for state in batch_states]
         schedules = [_minimax_h3_step_schedule(state) for state in batch_states]
         transformers = [state.extra[_STEP_TRANSFORMER] for state in batch_states]
         mixed_transformers = len({id(transformer) for transformer in transformers}) > 1
+
+        video_rows: list[torch.Tensor] = []
+        audio_rows: list[torch.Tensor] = []
+        video_target_timesteps: list[torch.Tensor | None] = []
+        audio_target_timesteps: list[torch.Tensor | None] = []
+        for state, branch, schedule in zip(batch_states, branches, schedules, strict=True):
+            video_edit = state.extra.get(_STEP_VIDEO_EDIT)
+            request_video, request_video_timesteps = minimax_h3_prepare_edit_rows(
+                state.latents,
+                branch.update_mask_dev,
+                video_edit,
+                schedule["t_video"],
+                schedule["imgvid_cond_timestep"],
+                sigma=schedule["sigma_video"],
+            )
+            video_target_timesteps.append(request_video_timesteps)
+            video_rows.append(request_video)
+
+            state_audio = state.extra[_STEP_AUDIO_ROWS]
+            audio_edit = state.extra.get(_STEP_AUDIO_EDIT)
+            request_audio, request_audio_timesteps = minimax_h3_prepare_edit_rows(
+                state_audio,
+                branch.audio_update_mask_dev,
+                audio_edit,
+                schedule["t_audio"],
+                schedule["audio_ref_cond_timestep"],
+                sigma=schedule["sigma_audio"],
+            )
+            audio_target_timesteps.append(request_audio_timesteps)
+            audio_rows.append(request_audio)
 
         # Both execution modes must publish denoise progress for step-gated
         # attention features. Requests can differ in both step index and sigma
@@ -2403,6 +2577,8 @@ class MiniMaxH3Pipeline(
                     t_audio=schedules[index]["t_audio"],
                     imgvid_cond_timestep=schedules[index]["imgvid_cond_timestep"],
                     audio_ref_cond_timestep=schedules[index]["audio_ref_cond_timestep"],
+                    video_target_timesteps=video_target_timesteps[index],
+                    audio_target_timesteps=audio_target_timesteps[index],
                 )
                 request_video, request_audio = transformers[index](**forward_kwargs)
                 video_parts.append(request_video)
@@ -2418,6 +2594,8 @@ class MiniMaxH3Pipeline(
                 t_audio=[schedule["t_audio"] for schedule in schedules],
                 imgvid_cond_timesteps=[schedule["imgvid_cond_timestep"] for schedule in schedules],
                 audio_ref_cond_timesteps=[schedule["audio_ref_cond_timestep"] for schedule in schedules],
+                video_target_timesteps=video_target_timesteps,
+                audio_target_timesteps=audio_target_timesteps,
             )
             logger.debug(
                 "MiniMax H3 denoise step: %d request(s) packed into %d rows",
@@ -2451,11 +2629,19 @@ class MiniMaxH3Pipeline(
         audio_anchor = state.extra[_STEP_AUDIO_ANCHOR]
         device = video_rows.device
 
-        x0_video = minimax_h3_rf_v_to_x0(
-            video_rows[update],
-            noise_pred.float()[update],
-            torch.tensor(schedule["t_video"], dtype=torch.float32, device=device),
-        )
+        video_edit = state.extra.get(_STEP_VIDEO_EDIT)
+        if video_edit is None:
+            x0_video = minimax_h3_rf_v_to_x0(
+                video_rows[update],
+                noise_pred.float()[update],
+                torch.tensor(schedule["t_video"], dtype=torch.float32, device=device),
+            )
+        else:
+            x0_video = video_edit.x0(
+                video_edit.model_rows(video_rows[update]),
+                noise_pred.float()[update],
+                schedule["t_video"],
+            )
         new_video = minimax_h3_euler_eta0_step(
             video_rows[update],
             x0_video,
@@ -2467,11 +2653,19 @@ class MiniMaxH3Pipeline(
         if cond_anchor is not None:
             video_rows[~update] = cond_anchor  # per-step imgvid cond reset
 
-        x0_audio = minimax_h3_rf_v_to_x0(
-            audio_rows[audio_update],
-            audio_noise_pred.float()[audio_update],
-            torch.tensor(schedule["t_audio"], dtype=torch.float32, device=device),
-        )
+        audio_edit = state.extra.get(_STEP_AUDIO_EDIT)
+        if audio_edit is None:
+            x0_audio = minimax_h3_rf_v_to_x0(
+                audio_rows[audio_update],
+                audio_noise_pred.float()[audio_update],
+                torch.tensor(schedule["t_audio"], dtype=torch.float32, device=device),
+            )
+        else:
+            x0_audio = audio_edit.x0(
+                audio_edit.model_rows(audio_rows[audio_update]),
+                audio_noise_pred.float()[audio_update],
+                schedule["t_audio"],
+            )
         new_audio = minimax_h3_euler_eta0_step(
             audio_rows[audio_update],
             x0_audio,

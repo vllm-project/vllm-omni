@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import subprocess
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -9,13 +10,80 @@ import torch
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
+    MINIMAX_H3_ENCODER_LAYOUT_KEY,
+    STAGE_SCHEMA_VERSION,
     MiniMaxH3EncoderConditioning,
     MiniMaxH3EncoderMediaConditioning,
     MiniMaxH3EncoderMediaInput,
 )
+from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
+    _canonical_audio_edit_mask,
+    _canonical_video_edit_mask,
+)
 from vllm_omni.model_executor.stage_input_processors.minimax_h3 import encoder2diffusion
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_edit_mask_boundary_canonicalizes_supported_request_shapes() -> None:
+    video_token = torch.arange(168, dtype=torch.float32).reshape(7, 4, 6) / 168
+    video_full = video_token.repeat_interleave(2, dim=1).repeat_interleave(2, dim=2)
+    video_kwargs = {"latent_t": 7, "latent_h": 8, "latent_w": 12}
+    for value in (video_token.flatten()[None, None], video_token[None], video_full[None]):
+        torch.testing.assert_close(_canonical_video_edit_mask(value, **video_kwargs), video_full)
+    torch.testing.assert_close(
+        _canonical_video_edit_mask(torch.tensor([[[0.25]]]), **video_kwargs),
+        torch.full((7, 8, 12), 0.25),
+    )
+
+    audio_temporal = torch.arange(37, dtype=torch.float32) / 37
+    audio_full = audio_temporal.repeat(2, 1)
+    for value in (audio_temporal[None, None], audio_full.flatten()[None], audio_full[None]):
+        torch.testing.assert_close(_canonical_audio_edit_mask(value, audio_t=37), audio_full)
+    torch.testing.assert_close(
+        _canonical_audio_edit_mask(torch.tensor([[[0.25]]]), audio_t=37),
+        torch.full((2, 37), 0.25),
+    )
+
+
+@pytest.mark.parametrize(
+    ("canonicalize", "value", "kwargs", "message"),
+    [
+        (_canonical_video_edit_mask, [True], {"latent_t": 7, "latent_h": 8, "latent_w": 12}, "booleans"),
+        (_canonical_audio_edit_mask, float("nan"), {"audio_t": 37}, "finite"),
+        (_canonical_audio_edit_mask, 10**400, {"audio_t": 37}, "finite"),
+        (_canonical_audio_edit_mask, 1.01, {"audio_t": 37}, r"\[0, 1\]"),
+        (_canonical_video_edit_mask, [0.0, 0.5], {"latent_t": 7, "latent_h": 8, "latent_w": 12}, "shape"),
+    ],
+)
+def test_edit_mask_boundary_rejects_invalid_values(canonicalize, value, kwargs, message) -> None:
+    from vllm_omni.errors import OmniClientError
+
+    with pytest.raises(OmniClientError, match=message):
+        canonicalize(value, **kwargs)
+
+
+def test_encoder_elides_all_generate_masks_but_requires_sources(monkeypatch) -> None:
+    from vllm_omni.errors import OmniClientError
+    from vllm_omni.model_executor.models.minimax_h3 import encoder_processing as processing
+
+    monkeypatch.setattr(processing, "resolve_minimax_h3_shape", lambda *_args: (64, 96, 22, 7, 37))
+    sampling = SimpleNamespace(extra_args={"task": "t2va"})
+    prepared = processing.prepare_encoder_inputs(
+        {
+            "prompt": "generate",
+            "multi_modal_data": {"video_noise_mask": 1.0, "audio_noise_mask": 1.0},
+        },
+        sampling,
+    )
+    assert prepared.media.video_edit is None
+    assert prepared.media.audio_edit is None
+
+    with pytest.raises(OmniClientError, match="video_noise_mask requires source_video"):
+        processing.prepare_encoder_inputs(
+            {"prompt": "edit", "multi_modal_data": {"video_noise_mask": 0.5}},
+            sampling,
+        )
 
 
 def test_pipeline_owns_three_encoders_then_dit_and_decoders() -> None:
@@ -276,6 +344,43 @@ def test_prepare_encoder_inputs_keeps_reference_audio_budgets_separate(monkeypat
 
 
 @pytest.mark.parametrize(
+    ("source_key", "mask_key", "mask_shape", "decoder"),
+    [
+        ("source_video", "video_noise_mask", (7, 4, 6), "prepare_edit_video"),
+        ("source_audio", "audio_noise_mask", (37,), "load_audio_file"),
+        ("source_video", "audio_noise_mask", (37,), "load_video_audio"),
+    ],
+)
+def test_prepare_encoder_inputs_maps_corrupt_edit_media_to_client_error(
+    monkeypatch,
+    source_key,
+    mask_key,
+    mask_shape,
+    decoder,
+) -> None:
+    from vllm_omni.errors import OmniClientError
+    from vllm_omni.model_executor.models.minimax_h3 import encoder_processing as processing
+
+    def fail_decode(*_args, **_kwargs):
+        raise subprocess.CalledProcessError(1, ["ffmpeg"])
+
+    monkeypatch.setattr(processing, "resolve_minimax_h3_shape", lambda *_args: (64, 96, 22, 7, 37))
+    monkeypatch.setattr(processing, decoder, fail_decode)
+
+    with pytest.raises(OmniClientError, match=f"could not decode {source_key}"):
+        processing.prepare_encoder_inputs(
+            {
+                "prompt": "edit",
+                "multi_modal_data": {
+                    source_key: "corrupt.media",
+                    mask_key: torch.zeros(mask_shape),
+                },
+            },
+            SimpleNamespace(extra_args={"task": "t2va"}),
+        )
+
+
+@pytest.mark.parametrize(
     ("embedded_lengths", "standalone_lengths", "valid"),
     [((400,), (400,), True), ((320, 320), (400,), False), ((400,), (320, 320), False)],
 )
@@ -339,7 +444,7 @@ def test_encode_media_keeps_audio_budgets_and_component_residency_separate(
     assert scopes == [video_vae, audio_vae]
 
 
-def test_encoder_output_reuses_encoder_handoff_and_round_trips() -> None:
+def test_encoder_output_reuses_encoder_handoff_and_round_trips(monkeypatch) -> None:
     expected = MiniMaxH3EncoderConditioning(
         hidden_states=torch.randn(3, 5120, dtype=torch.bfloat16),
         token_tags=torch.tensor([1, 0, 1], dtype=torch.int64),
@@ -349,7 +454,14 @@ def test_encoder_output_reuses_encoder_handoff_and_round_trips() -> None:
         num_frames=17,
         latent_t=5,
         audio_t=10,
+        video_edit_clean_rows=torch.zeros(5 * 8 * 14, 96),
+        video_edit_mask=torch.zeros(5, 16, 28),
     )
+
+    def fail_value_scan(*_args, **_kwargs):
+        raise AssertionError("wire must trust encoder-boundary value validation")
+
+    monkeypatch.setattr(torch, "isfinite", fail_value_scan)
 
     source = SimpleNamespace(
         finished=True,
@@ -366,8 +478,19 @@ def test_encoder_output_reuses_encoder_handoff_and_round_trips() -> None:
     assert result is not None
     payload = result["additional_information"]["encoder_output"]
     actual = MiniMaxH3EncoderConditioning.from_omni_payload(payload)
+    monkeypatch.undo()
     torch.testing.assert_close(actual.hidden_states, expected.hidden_states)
     torch.testing.assert_close(actual.token_tags, expected.token_tags)
+    torch.testing.assert_close(actual.video_edit_mask, expected.video_edit_mask)
+
+    layout = payload["kv_metadata"][MINIMAX_H3_ENCODER_LAYOUT_KEY]
+    assert int(layout[1]) == STAGE_SCHEMA_VERSION
+    legacy_layout = layout.clone()
+    legacy_layout[1] = STAGE_SCHEMA_VERSION - 1
+    payload["kv_metadata"][MINIMAX_H3_ENCODER_LAYOUT_KEY] = legacy_layout
+
+    with pytest.raises(ValueError, match=rf"unsupported MiniMax H3 encoder wire schema 1:{STAGE_SCHEMA_VERSION - 1}"):
+        MiniMaxH3EncoderConditioning.from_omni_payload(payload)
 
 
 def test_encoder_releases_workspace_after_cpu_payload(monkeypatch) -> None:

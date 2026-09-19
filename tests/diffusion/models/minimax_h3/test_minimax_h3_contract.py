@@ -1100,6 +1100,7 @@ def test_minimax_h3_advertises_the_official_ref2va_image_limit():
     from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
     assert get_diffusion_model_metadata("MiniMaxH3Pipeline").max_multimodal_image_inputs == 9
+    assert get_diffusion_model_metadata("MiniMaxH3Pipeline").supports_latent_mask_editing
 
 
 def test_text_attention_routes_local_gqa_heads_through_sdpa_helper(monkeypatch):
