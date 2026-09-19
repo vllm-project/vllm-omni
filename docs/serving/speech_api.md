@@ -303,14 +303,28 @@ curl -X POST http://localhost:8091/v1/audio/voices \
 ## Streaming Text Input (WebSocket)
 
 The `/v1/audio/speech/stream` WebSocket endpoint accepts text incrementally.
-By default (`split_granularity=none`) it buffers until `input.done` and
-synthesizes that flush as **one** TTS request, which keeps long-form timbre
-stable. Set `split_granularity` to `sentence` or `clause` to emit a request
-at each detected boundary (lower time-to-first-audio for STT/LLM pipelines).
+Its default `buffered` mode synthesizes all text received before `input.done` as
+one request. For the supported Qwen3-TTS Chinese/English scope, M1
+`commitment` mode can instead start an independent request whenever the
+semantic-readiness policy marks a boundary after accumulated raw text.
 
-> Note: `stream_audio` only changes how **audio bytes** are framed (one WAV/PCM
-> payload vs chunked PCM). Text segmentation is controlled separately by
-> `split_granularity`.
+!!! important
+    Commitment mode is not a general sentence detector. Its strong-terminator
+    boundaries say only that the configured finite policy no longer needs to
+    withhold a recognized lexical or special-text suffix. A released segment
+    may be shorter or longer than a linguistic sentence. Every segment is
+    synthesized as a new one-shot request; model and acoustic state are not
+    continued from the preceding segment.
+
+Text transport and audio transport are separate choices. `input.text` always
+arrives incrementally. `stream_audio=false` sends one binary audio frame per
+synthesis request; `stream_audio=true` sends one or more PCM chunks per
+request.
+
+In buffered mode, `split_granularity="sentence"` or `"clause"` enables the
+linguistic splitter and emits requests before EOF. Commitment mode requires
+`split_granularity="none"` because only the readiness policy may decide its
+irreversible boundaries.
 
 ### WebSocket Protocol
 
@@ -319,42 +333,146 @@ Client -> Server:
 | Message | Description |
 | --------- | ------------- |
 | `{"type": "session.config", ...}` | Session configuration (first message; may be resent between utterances to change it) |
-| `{"type": "input.text", "text": "..."}` | Text chunk |
-| `{"type": "input.done"}` | End of utterance: flushes the buffer and keeps the connection open |
-| `{"type": "session.close"}` | End of connection |
+| `{"type": "input.text", "text": "..."}` | Text chunk. It is accumulated in `buffered` mode or fed to the readiness policy in `commitment` mode. |
+| `{"type": "input.done"}` | End-of-input for the current utterance. It flushes buffered text or closes and flushes the commitment policy, waits for submitted work, and keeps the connection open. |
+| `{"type": "session.close"}` | Close the connection. In `commitment` mode it cancels active and queued synthesis. In `buffered` mode it discards text not yet submitted, but a close frame cannot be handled while a request is generating, including requests from the linguistic splitter. There is no separate `input.cancel` message. |
 
 Server -> Client:
 
 | Message | Description |
 | --------- | ------------- |
-| `{"type": "audio.start", "utterance_index": 0, "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000}` | Audio generation starting for the buffered input |
+| `{"type": "audio.start", "utterance_index": 0, "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000}` | Audio generation is starting for one request. In commitment mode, `sentence_text` is the raw committed segment and `sentence_index` is its zero-based ordinal; the legacy field names do not assert that it is a sentence. |
 | Binary frame | Raw audio bytes (one or more PCM chunks when `stream_audio=true`) |
-| `{"type": "audio.done", "utterance_index": 0, "sentence_index": 0, "total_bytes": 96000, "error": false}` | Audio complete for the buffered input |
-| `{"type": "session.done", "utterance_index": 0, "total_sentences": N}` | Flushed utterance complete |
-| `{"type": "error", "message": "..."}` | Non-fatal error |
+| `{"type": "audio.done", "utterance_index": 0, "sentence_index": 0, "total_bytes": 96000, "error": false}` | The corresponding request is complete. `error=true` means it failed. |
+| `{"type": "session.done", "utterance_index": 0, "total_sentences": N}` | Terminal marker after `input.done`/EOF and all started requests have settled. It is not a success indicator. `total_sentences` is the number of requests that emitted `audio.start`, despite the compatibility name. |
+| `{"type": "error", "message": "..."}` | A protocol, limit, validation, or generation error. Some protocol errors are recoverable; a segment failure terminates the current utterance. |
+
+No additional acknowledgment, boundary, or cancellation event is introduced
+for M1. Events for a given utterance are emitted in segment order.
+
+### Buffered and Commitment Modes
+
+`text_input_mode` in `session.config` selects the input policy:
+
+- `buffered` (default) preserves the existing behavior. The server stores all
+  `input.text` chunks and, on `input.done`, strips the outer whitespace and
+  submits the non-empty result as one TTS request. Arbitrary punctuation inside
+  the buffer does not split it into sentences when `split_granularity="none"`
+  (the default). Selecting `sentence` or `clause` instead enables the existing
+  linguistic splitter, which may submit requests before `input.done`.
+- `commitment` feeds each chunk to the `zh_en_special_v1` semantic-readiness
+  policy. When that policy reports `boundary_after`, the server submits all raw
+  source accumulated since the preceding boundary as a new, independent TTS
+  request. `input.done` is explicit EOF: it releases any remaining suffix
+  exactly once and then waits until all started segments have settled before
+  sending `session.done`.
+
+The readiness policy does not normalize text. It withholds recognized,
+unfinished Chinese/English special-text suffixes, including supported numbers,
+units, symbols, and ASCII words or abbreviations, so a transport packet seam is
+not itself treated as a safe boundary. The Qwen3-TTS frontend receives each raw
+released segment and performs its normal per-request tokenization and text
+normalization.
+
+`zh_en_special_v1` is deliberately finite. It is not a general language model,
+sentence segmenter, pronunciation oracle, or comprehensive text-normalization
+system. Unrecognized ambiguous text can be released immediately, and a
+recognized prefix can be held longer than necessary. Clients must not infer
+prosodic or sentence meaning from the boundaries.
+
+For M1, `boundary_after` is exposed only after a confirmed strong terminator:
+`.`, `!`, `?`, `。`, `！`, `？`, `…`, or a newline. A terminator that might
+still belong to an unfinished decimal, address, abbreviation, or other
+recognized atom remains pending until following input disambiguates it.
+Consecutive terminators such as `...` or `?!` form one boundary rather than
+punctuation-only requests. A terminator run at the current transport frontier
+remains pending until a following non-terminator or EOF confirms the whole run.
+Commas and transport packet seams do not create boundaries. EOF always flushes
+the remaining non-whitespace source, even without a strong terminator;
+whitespace-only segments are not synthesized.
+
+M1 commitment mode has these availability constraints:
+
+- the loaded model must be Qwen3-TTS;
+- `language` must be explicitly `Chinese` or `English`; `Auto` and every other
+  language are rejected; and
+- each segment is an independent request. There is no scheduler, connector,
+  Talker, Code2Wav, codec, KV-cache, or acoustic-state inheritance between
+  segments, so seamless cross-segment prosody is not guaranteed.
+
+Independent segments can introduce audible prosody discontinuities and repeat
+prefill, scheduling, and cleanup work. Use the default buffered mode with
+`split_granularity="none"` when whole-utterance continuity matters more than
+early audio. M1 does not claim a throughput improvement or acoustic continuity.
+
+The adapter's `TextCommitmentCapabilities` declares its profile, supported
+languages, independent-segment/context behavior, audio streaming, timestamps,
+and retry support. The handler checks these capabilities before accepting the
+session. Qwen3-TTS advertises independent segments without inherited context
+or segment retries; timestamps still require a configured forced aligner.
+Commitment requires `split_granularity="none"` so its released text cannot be
+split again by a different boundary policy.
+
+Other models and languages remain supported through `buffered` mode. M1 does
+not implement the planned M2 rho/CAPS or capacity-based hard-cut policies,
+resumable scheduler requests, dummy EOF tokens, connector changes, codec
+ramping, or M3 Talker/Code2Wav state inheritance and acoustic continuity.
+
+### Boundaries, Limits, and Failure
+
+The commitment policy preserves source order and losslessly partitions input
+into released raw spans plus at most one pending suffix. Released non-whitespace
+source is never revised, removed, duplicated, or merged into a later request.
+EOF is a boundary even when the pending suffix would otherwise remain
+ambiguous.
+
+The implementation bounds all request-local accumulation:
+
+- at most 4,096 characters may remain unresolved in the readiness policy;
+- the utterance may contain at most 128 Ki characters across all
+  `input.text` messages; and
+- at most eight ready segments may wait in the synthesis queue.
+
+When the segment queue is full, an independent segment producer waits for
+capacity while the WebSocket receive loop remains able to process control
+frames such as `session.close`. Segments already accepted from `input.text`
+are staged in source order, with their accumulated text bounded by the 128 Ki
+character utterance limit. The server does not drop, reorder, merge, or force-release
+text to relieve backpressure. Exceeding a text limit fails the current
+utterance.
+
+If synthesis of a segment fails, the server reports `error`, marks that
+segment's `audio.done` with `error=true`, prevents later queued segments from
+starting, and waits for `input.done`. EOF then emits `session.done` so the
+connection can return to idle. That event is only an utterance boundary; use
+`error` and `audio.done.error` to determine success. In commitment mode, client
+disconnect and `session.close` abort active generation, discard unsubmitted or
+queued work, and do not emit `session.done`.
 
 ### Flushing vs. Closing
 
 `input.done` is a flush, not a disconnect. The server synthesizes the buffered
-text, emits `session.done`, and then waits on the same connection for the next
-utterance, so a client that speaks repeatedly (for example one driven by an
+text or finishes the commitment stream, emits terminal `session.done` after
+started work has settled, and then waits on the same connection for the next
+utterance. A client that speaks repeatedly (for example one driven by an
 upstream LLM) pays the WebSocket handshake once instead of once per utterance.
 
 - The session config is sticky. Send `input.text` again straight after
   `session.done` to reuse it, or send another `session.config` first to change
-  voice, format, or reference audio. A `session.config` sent in the middle of
-  an utterance is rejected so no pending input is silently dropped and so a
-  split utterance cannot end up half in one voice and half in another.
-- An utterance is the flush unit, not a linguistic one: it is one `input.done`
-  cycle. `utterance_index` counts those flushes across the connection, so it
-  tells you which `input.done` a frame belongs to. `sentence_index` counts the
-  TTS requests inside one flush and so pairs with `total_sentences`: with the
-  default `split_granularity=none` that is always `sentence_index: 0` of
-  `total_sentences: 1` (or `0` for an empty buffer), while `sentence` or
-  `clause` counts the linguistic units actually synthesized.
+  voice, format, reference audio, or `text_input_mode`. A `session.config` sent
+  while an utterance is buffered, committing, or draining is rejected so no
+  pending input is silently dropped.
+- An utterance is the `input.done` unit, not a linguistic one.
+  `utterance_index` identifies end-of-input cycles across the connection. In
+  `buffered` mode with `split_granularity="none"`, a non-empty utterance has one request, so it
+  reports `sentence_index: 0` and `total_sentences: 1`. In `commitment` mode
+  those compatibility fields count the ordered independent segments within
+  the same utterance.
 - End the connection with `session.close`, or by closing the socket. An idle
-  connection is still closed after the server's idle timeout, which now also
-  applies to the gap between utterances.
+  connection is still closed after the server's idle timeout, including gaps
+  between utterances and unresolved-input periods with no committed work.
+  Queued or in-flight commitment synthesis is server generation time, not
+  client idle time; a fresh idle window starts when that work settles.
 
 ### Session Config Parameters
 
@@ -362,7 +480,8 @@ All REST API parameters are supported, plus:
 
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |
-| `stream_audio` | bool | false | Stream one or more PCM chunks for each TTS request over WebSocket |
+| `stream_audio` | bool | false | Stream one or more PCM chunks for each synthesis request over WebSocket |
+| `text_input_mode` | `"buffered"` or `"commitment"` | `"buffered"` | Select whole-utterance buffering or M1 semantic-readiness commitment. Commitment requires Qwen3-TTS and explicit `language="Chinese"` or `"English"`. |
 | `split_granularity` | string | `"none"` | `"none"`: one request per `input.done`. `"sentence"`: split on `.!?` plus CJK `。！？…`, Indic danda `।॥`, and Arabic `؟`. `"clause"`: also split on `,;，；،؛`. |
 | `seed` | integer | null | Forwarded to the speech engine for this session |
 
