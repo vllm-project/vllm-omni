@@ -36,6 +36,7 @@ from vllm_omni.model_executor.models.moss_tts.moss_codec_cudagraph import (
     MossTTSCUDAGraphCodecWrapper,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
 
 logger = init_logger(__name__)
 
@@ -269,8 +270,15 @@ class MossTTSCodecDecoder(nn.Module):
         self._stream_req_slots: dict[str, int] = {}
         self._async_chunk = bool(getattr(self.vllm_config.model_config, "async_chunk", False))
         self._streaming_graph_batch_sizes = self._streaming_graph_batch_sizes_from_compilation_config()
+        ramp = parse_chunk_ramp(self._connector_extra(), steady=self._stream_chunk_frames)
+        if ramp:
+            self._stream_max_step_frames = max(self._stream_max_step_frames, *ramp)
         self._streaming_graph_frame_sizes = sorted(
-            {frames for frames in (self._initial_stream_chunk_frames, self._stream_chunk_frames) if frames > 0}
+            {
+                frames
+                for frames in (self._initial_stream_chunk_frames, self._stream_chunk_frames, *(ramp or []))
+                if frames > 0
+            }
         )
 
     # ------------------------------------------------------------------
@@ -641,16 +649,17 @@ class MossTTSCodecDecoder(nn.Module):
             else:
                 self._stream_req_slots.pop(request_id, None)
 
-    def _connector_int(self, name: str, default: int = 0) -> int:
+    def _connector_extra(self) -> dict:
         model_cfg = getattr(self.vllm_config, "model_config", None)
         connector_cfg = getattr(model_cfg, "stage_connector_config", None)
         if isinstance(connector_cfg, dict):
             extra_cfg: dict | None = connector_cfg.get("extra", connector_cfg)
         else:
             extra_cfg = getattr(connector_cfg, "extra", None)
-        if isinstance(extra_cfg, dict) and name in extra_cfg:
-            return int(extra_cfg[name])
-        return default
+        return extra_cfg if isinstance(extra_cfg, dict) else {}
+
+    def _connector_int(self, name: str, default: int = 0) -> int:
+        return int(self._connector_extra().get(name, default))
 
     def _streaming_graph_batch_sizes_from_compilation_config(self) -> list[int]:
         if getattr(self.vllm_config.model_config, "enforce_eager", True):

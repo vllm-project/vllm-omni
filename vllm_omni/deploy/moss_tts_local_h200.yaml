@@ -12,6 +12,9 @@ connectors:
       connector_get_max_wait: 300
       initial_codec_chunk_frames: 1
       codec_chunk_frames: 15
+      # Optional gradual startup chunks; trades extra codec calls for less underrun.
+      # Overrides initial_codec_chunk_frames; the last entry matches steady chunks.
+      # codec_chunk_ramp: [1, 2, 4, 8, 15]
       codec_left_context_frames: 0
 
 stages:
