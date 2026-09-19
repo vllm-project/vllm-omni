@@ -151,9 +151,18 @@ pytest -q tests/diffusion/models/sensenova_u1/
   a captured CUDA graph. It falls back to the ordinary cache when the device or the bundled
   `flash_attn_varlen_func` cannot support it; set `VLLM_OMNI_SENSENOVA_PAGED_DECODE=0` to force
   that fallback.
+- Decode graphs are captured at startup, not per request. The readiness warmup pre-grows the
+  paged cache to a bucket chosen to cover the common text-to-image think path (2048: a think
+  prefix of a few hundred tokens plus the 1024-step think loop) and captures one graph there;
+  think and text requests land inside that bucket and replay it without capturing, across the
+  old 512/1024 boundaries. A request past it -- a long prompt, or an image edit with think,
+  where image tokens push prefix plus think loop over 2048 -- still captures lazily on its
+  first run, as does the first request after
+  a sleep-level-2 wake, which drops the captures along with the memory they recorded. Dynamic
+  LoRA serving never reuses a capture: a wrapper in the module tree disables the stash for
+  every request.
 - The first request after startup costs about 0.7 s more than the steady state whether the paged
   path is on or off. Measured on one A800 with the inductor, triton and vLLM compile caches all
-  cleared, median of three runs: 718 ms above steady with the path on, 679 ms with it off.
-- Each request captures its own graphs, and a think request captures twice because the sequence
-  grows past the 512 bucket, so the capture cost is paid per request rather than once at
-  startup.
+  cleared, before decode graphs moved to readiness: median of three runs, 718 ms above steady
+  with the path on, 679 ms with it off. The compile share of that still lands on the first
+  request; the capture share no longer does.

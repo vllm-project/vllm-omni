@@ -51,6 +51,7 @@ from vllm_omni.transformers_utils.configs.sensenova_u1 import (
 )
 
 from .paged_decode import (
+    READINESS_DECODE_WARM_BUCKET,
     DecodeGraphRunner,
     PagedDecodeCache,
     dynamic_lora_wrappers_present,
@@ -745,7 +746,10 @@ class SenseNovaU1Pipeline(
         measured, that left about 40 MiB of device memory behind on every
         request and re-captured every time. Reuse rests on the same thing the
         paged path already rests on -- one sequence in flight per pipeline
-        forward.
+        forward. The stash may also be the one ``_warm_paged_decode_graphs``
+        built at readiness, already grown to ``READINESS_DECODE_WARM_BUCKET`` and
+        captured there, in which case serving below that bucket replays without
+        capturing at all.
         """
         if os.environ.get("VLLM_OMNI_SENSENOVA_PAGED_DECODE", "1") != "1":
             return None
@@ -1281,17 +1285,71 @@ class SenseNovaU1Pipeline(
         deploy config compiles for decode lands on the first real request
         instead of on readiness. Warmup is best effort and must not fail startup.
         """
+        prefill_cache = None
         try:
             lm = self.language_model
             device = torch.device(self.device)
             ids = torch.zeros(1, 2, dtype=torch.long, device=device)
             idx = torch.zeros(3, 2, dtype=torch.long, device=device)
             prefill = lm(input_ids=ids, indexes=idx, use_cache=True)
+            prefill_cache = prefill.past_key_values
             nxt = torch.zeros(1, 1, dtype=torch.long, device=device)
             nidx = torch.tensor([[2], [0], [0]], dtype=torch.long, device=device)
-            lm(input_ids=nxt, indexes=nidx, past_key_values=prefill.past_key_values, use_cache=True)
+            lm(input_ids=nxt, indexes=nidx, past_key_values=prefill_cache, use_cache=True)
         except Exception as exc:  # pragma: no cover - warmup is best effort
             logger.warning("Autoregressive decode warmup skipped: %s", exc)
+        self._warm_paged_decode_graphs(prefill_cache)
+
+    def _warm_paged_decode_graphs(self, prefill_cache) -> None:
+        """Pre-capture the decode graph at readiness, up to ``READINESS_DECODE_WARM_BUCKET``.
+
+        Left lazy, the first think request pays for its own captures -- one per
+        bucket boundary its sequence crosses, about 0.7 s across the 512 and
+        1024 ones, which medians hide and its P100 carries. A cache pre-grown to
+        ``READINESS_DECODE_WARM_BUCKET`` ends that: attention reads the live
+        ``seqused`` at replay, so the one graph captured against the synthetic
+        warmup prefix serves every sequence in the bucket, and serving finds
+        the stash
+        through ``_decode_context`` without ever growing the cache below that
+        bucket. Requests past it, dynamic-LoRA serving and the sleep-level-2
+        release all keep today's lazy capture. Best effort, like the warmup
+        around it.
+        """
+        try:
+            lm = self.language_model
+            device = torch.device(self.device)
+            if os.environ.get("VLLM_OMNI_SENSENOVA_PAGED_DECODE", "1") != "1":
+                return
+            head_dim = lm.model.layers[0].self_attn.head_dim
+            if not paged_decode_supported(device, head_dim):
+                return
+            if dynamic_lora_wrappers_present(lm):
+                return
+            if prefill_cache is None or not prefill_cache.layers:
+                return
+            layer0 = prefill_cache.layers[0]
+            if layer0.keys is None:
+                return
+            cache = PagedDecodeCache.from_dynamic_cache(
+                prefill_cache,
+                len(lm.model.layers),
+                device,
+                layer0.keys.dtype,
+                min_length=READINESS_DECODE_WARM_BUCKET,
+            )
+            if cache is None:
+                return
+            runner = DecodeGraphRunner(lm, cache, device)
+            cache.set_length(cache.length + 1)
+            runner.step(0, cache.length - 1)
+            self._paged_decode = (cache, runner)
+            logger.info(
+                "Captured decode graph at readiness for bucket %d (%d capture)",
+                cache.bucket,
+                runner.captures,
+            )
+        except Exception as exc:  # pragma: no cover - warmup is best effort
+            logger.warning("Decode graph warmup skipped: %s", exc)
 
     @torch.inference_mode()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
