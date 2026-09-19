@@ -161,7 +161,7 @@ class SemanticCodebook(nn.Module):
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dtype.is_floating_point, f"Input should be floats, got {x.dtype}"
         B, D, T = x.shape
-        x = rearrange(x, "b d t -> b t d").view(B * T, D)
+        x = rearrange(x, "b d t -> b t d").reshape(B * T, D)
         embedding = self.embedding.to(x.device)
         distances = torch.cdist(x, embedding, p=2)  # (B*T, V)
         codes = distances.argmin(dim=-1).view(B, 1, T)
@@ -602,7 +602,7 @@ class Attention(nn.Module):
         else:
             output = self._native_attention(xq, xk, xv)
 
-        output = output.view(bsz, seqlen, self.n_local_heads * self.args.head_dim)
+        output = output.reshape(bsz, seqlen, self.n_local_heads * self.args.head_dim)
         return self.wo(output).squeeze(0)
 
 
