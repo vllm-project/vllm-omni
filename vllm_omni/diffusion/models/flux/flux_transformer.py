@@ -52,12 +52,9 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 logger = init_logger(__name__)
 
 # Joint-sequence token count (B * (txt + img)) below which the attention
-# blocks keep their eager RMSNorm -> cat -> RoPE chain. FLUX.1's own H200
-# sweep (full-depth forward, txt 512, img 256^2..1024^2, B = 1 and 2, eager
-# and regionally compiled) had the fused path ahead at every size, by the
-# most (-25..-29%) below ~1k image tokens where the eager chain is
-# launch-bound, so fuse by default and keep the gate for
-# VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS overrides.
+# blocks keep their eager RMSNorm -> cat -> RoPE chain. FLUX.1's H200 sweep
+# (256^2..1024^2, B = 1/2, eager and compiled) had the fused path ahead at
+# every size, so fuse by default; VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS overrides.
 _FUSED_MIN_TOKENS = 0
 
 
