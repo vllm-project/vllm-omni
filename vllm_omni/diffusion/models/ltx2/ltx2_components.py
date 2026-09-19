@@ -30,6 +30,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+from vllm_omni.quantization.component_config import resolve_component_quant_config
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
 if TYPE_CHECKING:
@@ -42,6 +43,7 @@ from .ltx2_transformer import (
     apply_split_rotary_emb,
     to_ltx_padding_mask,
 )
+from .quantization import prepare_gemma3_fp8
 from .vae.decoder import (
     LTX25_NATIVE_ARTIFACT_REVISION,
     LTX25_NATIVE_DIFFUSION_DECODER_FILENAME,
@@ -672,6 +674,7 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
             dtype=dtype,
             revision=revision,
         )
+    prepare_gemma3_fp8(pipeline.text_encoder, od_config.quantization_config, pipeline.device)
     pipeline.connectors = _load_component(
         LTX2TextConnectors,
         model,
@@ -853,6 +856,7 @@ def create_transformer_from_config(
     quant_config: QuantizationConfig | None = None,
 ) -> LTX2VideoTransformer3DModel:
     """Construct the shared LTX transformer from a Diffusers config."""
+    quant_config = resolve_component_quant_config(quant_config, "transformer")
     if not config and quant_config is None:
         return LTX2VideoTransformer3DModel()
 
