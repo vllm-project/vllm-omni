@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen3-TTS pipeline: Talker (text → RVQ codec) → Code2Wav (codec → audio).
 
 Chunked vs end-to-end mode is dispatched from ``deploy.async_chunk``.
@@ -10,6 +10,10 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+
+# Talker stop token single-sourced in the shared constants module (also used
+# by qwen3_omni / aura_omni pipelines).
+from vllm_omni.model_executor.stage_input_processors._constants import QWEN3_CODEC_EOS_TOKEN_ID
 from vllm_omni.outputs.output_modality import (
     TensorAccumulationStrategy,
     register_key_accumulation_strategy,
@@ -44,7 +48,7 @@ QWEN3_TTS_PIPELINE = PipelineConfig(
             custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
             sampling_constraints={
                 "detokenize": False,
-                "stop_token_ids": [2150],
+                "stop_token_ids": [QWEN3_CODEC_EOS_TOKEN_ID],
             },
         ),
         StagePipelineConfig(

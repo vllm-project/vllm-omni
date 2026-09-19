@@ -1237,6 +1237,89 @@ def test_send_single_request_personaplex_pending_frame_is_not_segment_boundary(
     assert sent_payload.meta.is_segment_finished.item() is False
 
 
+def test_send_single_request_passes_new_token_ids_to_processor(build_adapter, monkeypatch):
+    """A producer that accepts ``new_token_ids`` receives the step's tokens
+    through the production ``_send_single_request`` path (#6801 P1 #1).  The
+    signature cache (``_processor_accepts_step_tokens``) must be initialized in
+    ``__init__`` before the base class starts the save thread; without it every
+    send raised AttributeError that ``_send_single_request_for_generation``
+    swallowed, silently dropping the chunk.
+    """
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-new-tokens", RequestStatus.WAITING, external_req_id="ext-new-tokens")
+
+    seen_kwargs = {}
+
+    def new_tokens_processor(**kwargs):
+        seen_kwargs.update(kwargs)
+        return OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.tensor([1, 2, 3], dtype=torch.long)),
+        )
+
+    adapter.custom_process_next_stage_input_func = new_tokens_processor
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+
+    adapter._send_single_request(
+        {
+            "multimodal_output": None,
+            "request": request,
+            "is_finished": False,
+            "is_segment_finished": False,
+            "new_token_ids": (7, 8, 9),
+        }
+    )
+
+    assert seen_kwargs["new_token_ids"] == (7, 8, 9)
+    assert connector.put.called
+    sent_payload = connector.put.call_args.kwargs["data"]
+    assert sent_payload.meta.finished.item() is False
+
+
+def test_send_single_request_normal_chunk_flushes_processor(build_adapter, monkeypatch):
+    """A non-terminal chunk with a producer that does **not** accept
+    ``new_token_ids`` must still reach the wire (#6801 P1 #1).  Before the
+    cache re-initialization the ``_accepts_new_token_ids`` probe raised
+    AttributeError on every call, the processor was never invoked, and the
+    ordinary chunk was silently dropped at the ``payload_data is None`` guard.
+    """
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-normal-chunk", RequestStatus.WAITING, external_req_id="ext-normal-chunk")
+
+    processor_calls = []
+
+    def plain_processor(transfer_manager, multimodal_output, request, is_finished):
+        processor_calls.append(
+            {
+                "transfer_manager": transfer_manager,
+                "multimodal_output": multimodal_output,
+                "request": request,
+                "is_finished": is_finished,
+            }
+        )
+        return OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.tensor([4, 5], dtype=torch.long)),
+        )
+
+    adapter.custom_process_next_stage_input_func = plain_processor
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+
+    adapter._send_single_request(
+        {
+            "multimodal_output": None,
+            "request": request,
+            "is_finished": False,
+            "is_segment_finished": False,
+        }
+    )
+
+    assert len(processor_calls) == 1
+    assert processor_calls[0]["is_finished"] is False
+    assert connector.put.called
+    sent_payload = connector.put.call_args.kwargs["data"]
+    assert sent_payload.meta.finished.item() is False
+    assert sent_payload.meta.is_segment_finished.item() is False
+
+
 def test_personaplex_sender_cleanup_drops_delayed_frame_state(build_adapter):
     from vllm_omni.model_executor.stage_input_processors.personaplex import (
         talker2code2wav_async_chunk,

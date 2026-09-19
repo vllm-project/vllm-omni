@@ -46,6 +46,47 @@ def test_thinker2talker_skips_unfinished() -> None:
     assert thinker2talker_token_only([out]) == []
 
 
+def test_thinker2talker_via_process_engine_inputs_uses_configured_talker_len() -> None:
+    """The stage client's ``_stage_hf_config`` reaches the legacy c2pos
+    processor as the 4th positional ``next_stage_hf_config`` so the native
+    talker placeholder is sized to ``talker_init_len`` (#6801 P1 #2).  Before
+    the fix ``ctx.streaming_context`` (None) was passed instead and the
+    placeholder fell back to one token.
+    """
+    from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
+
+    client = object.__new__(StageEngineCoreClient)
+    client.custom_process_input_func = thinker2talker_token_only
+    client.requires_multimodal_data = False
+    client._stage_hf_config = SimpleNamespace(use_native_talker=True, talker_init_len=37)
+    client.vllm_config = SimpleNamespace(model_config=SimpleNamespace())
+
+    source_outputs = [_thinker_output(prompt_len=5, generated=[7, 8, 9, 10])]
+    talker_inputs = client.process_engine_inputs(source_outputs, prompt=None)
+
+    [talker_input] = talker_inputs
+    assert talker_input["prompt_token_ids"] == [0] * 37
+
+
+def test_thinker2talker_via_process_engine_inputs_falls_back_without_config() -> None:
+    """Without ``_stage_hf_config`` the legacy processor keeps its one-token
+    placeholder fallback, preserving backward-compatible semantics (#6801).
+    """
+    from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
+
+    client = object.__new__(StageEngineCoreClient)
+    client.custom_process_input_func = thinker2talker_token_only
+    client.requires_multimodal_data = False
+    client._stage_hf_config = None
+    client.vllm_config = SimpleNamespace(model_config=SimpleNamespace())
+
+    source_outputs = [_thinker_output(prompt_len=5, generated=[7, 8, 9, 10])]
+    talker_inputs = client.process_engine_inputs(source_outputs, prompt=None)
+
+    [talker_input] = talker_inputs
+    assert talker_input["prompt_token_ids"] == [0]
+
+
 def test_full_payload_trims_prompt_region_rows() -> None:
     # Rows correspond to timeline steps t=1..T-1; with prompt_len P the NeMo
     # trim keeps rows for t >= P, i.e. row index P-1 onward.

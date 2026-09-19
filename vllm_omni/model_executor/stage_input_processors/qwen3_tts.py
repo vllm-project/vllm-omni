@@ -17,6 +17,7 @@ from vllm_omni.data_entry_keys import (
     OmniPayloadStruct,
     to_dict,
 )
+from vllm_omni.model_executor.stage_input_processors import _common
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
     AdaptiveChunkController,
     compute_adaptive_emit,
@@ -64,20 +65,6 @@ def _qwen3_tts_degenerate_finished_payload():
     }
 
 
-def _extract_last_frame(multimodal_output: OmniPayload | dict[str, Any]) -> torch.Tensor | None:
-    audio_codes = multimodal_output.get("codes", {}).get("audio")
-    if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
-        return None
-    if audio_codes.ndim == 2:
-        frame = audio_codes[-1]
-        if frame.numel() == 0 or not bool(frame.any().item()):
-            return None
-        return frame.to(torch.long).reshape(-1)
-    if audio_codes.ndim == 1:
-        return audio_codes.to(torch.long).reshape(-1)
-    raise ValueError(f"Invalid audio_codes shape for Qwen3-TTS async_chunk: {tuple(audio_codes.shape)}")
-
-
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
     multimodal_output: OmniPayload | dict[str, Any] | None,
@@ -92,7 +79,10 @@ def talker2code2wav_async_chunk(
         transfer_manager.request_payload = request_payload
 
     if isinstance(multimodal_output, Mapping):
-        frame = _extract_last_frame(multimodal_output)
+        frame = _common.extract_last_codec_frame(
+            multimodal_output,
+            validate="any",
+        )
         if frame is not None:
             codec_codes = frame.cpu().tolist()
             transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
