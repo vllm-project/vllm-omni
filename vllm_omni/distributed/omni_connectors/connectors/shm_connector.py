@@ -3,6 +3,7 @@
 
 import fcntl
 import os
+import time
 from multiprocessing import shared_memory as shm_pkg
 from typing import Any
 
@@ -13,6 +14,79 @@ from .base import OmniConnectorBase
 
 logger = get_connector_logger(__name__)
 
+_LOCK_FILE_PREFIX = "shm_"
+_LOCK_FILE_SUFFIX = "_lockfile.lock"
+_STALE_LOCK_GRACE_SECONDS = 60.0  # seconds; young lock files are never touched
+_swept_this_process: bool = False
+
+
+def _sweep_stale_lock_files(grace: float | None = None) -> int:
+    """Best-effort removal of orphan lock files whose segment is already gone.
+
+    Runs once per process (see ``SharedMemoryConnector.__init__``).  A lock file
+    only guards one transfer; its segment is unlinked by the receiving read or
+    by ``resource_tracker`` when the owner process dies, so a lock file whose
+    segment no longer exists is garbage.  Uses a check–lock–recheck–unlink
+    protocol so a concurrent creator/reader can never lose its lock:
+
+    1. prefilter: lock older than *grace* (mtime; young files may sit in the
+       creator's ``open() -> flock()`` window) and segment absent
+    2. ``os.open(path, O_RDONLY)`` (read-only: never truncates or refreshes
+       mtime) + ``flock(LOCK_EX | LOCK_NB)`` — fails while a critical section
+       holds it (``flock`` needs no write access, unlike ``fcntl`` locks)
+    3. recheck under the lock: segment still absent, mtime still past grace,
+       path still resolves to the locked inode, owned by this uid
+    4. ``os.remove`` while still holding the lock, then ``close`` releases it
+    """
+    if grace is None:
+        grace = _STALE_LOCK_GRACE_SECONDS
+    removed = 0
+    try:
+        names = os.listdir("/dev/shm")
+    except OSError:
+        return 0
+    for name in names:
+        if not (name.startswith(_LOCK_FILE_PREFIX) and name.endswith(_LOCK_FILE_SUFFIX)):
+            continue
+        key = name[len(_LOCK_FILE_PREFIX) : -len(_LOCK_FILE_SUFFIX)]
+        if not key:
+            continue
+        path = f"/dev/shm/{name}"
+        try:
+            if time.time() - os.stat(path).st_mtime < grace:
+                continue
+        except OSError:
+            continue
+        if os.path.exists(f"/dev/shm/{key}"):
+            continue
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            continue
+        try:
+            st_fd = os.fstat(fd)
+            st_path = os.stat(path)  # ENOENT: already removed, goal reached
+            if (
+                st_fd.st_ino == st_path.st_ino
+                and st_fd.st_dev == st_path.st_dev
+                and st_fd.st_uid == os.geteuid()
+                and time.time() - st_path.st_mtime >= grace
+                and not os.path.exists(f"/dev/shm/{key}")
+            ):
+                os.remove(path)
+                removed += 1
+                logger.debug("swept stale SHM lock file %s", path)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    return removed
+
 
 class SharedMemoryConnector(OmniConnectorBase):
     """Key-addressed local shared-memory connector.
@@ -22,6 +96,18 @@ class SharedMemoryConnector(OmniConnectorBase):
     remote-transport metadata such as ``source_host`` / ``source_port``
     (that is the RDMA connector's job).  When such metadata is passed in,
     the connector silently falls back to key-based lookup.
+
+    Lock-file lifecycle contract: the zero-byte lock file
+    ``/dev/shm/shm_{key}_lockfile.lock`` has no lifecycle of its own — it
+    exists exactly while its segment does.  It is removed on the successful
+    receiving read, on a failed read whose segment is already gone, on a
+    failed ``put()`` (the segment never came to life), and by
+    ``cleanup()`` / ``close()`` for keys still tracked in ``_pending_keys``.
+    Abnormally terminated processes leave lock files behind once their
+    segments are reaped by ``resource_tracker``; the first connector
+    constructed in a new process sweeps such orphans
+    (``_sweep_stale_lock_files``).  ``_pending_keys`` is bookkeeping for
+    ``cleanup()`` / ``close()`` only.
     """
 
     def __init__(self, config: dict[str, Any]):
@@ -33,6 +119,10 @@ class SharedMemoryConnector(OmniConnectorBase):
             "gets": 0,
             "bytes_transferred": 0,
         }
+        global _swept_this_process
+        if not _swept_this_process:
+            _swept_this_process = True  # set first: the sweep is idempotent anyway
+            _sweep_stale_lock_files()
 
     def put(
         self,
@@ -48,7 +138,16 @@ class SharedMemoryConnector(OmniConnectorBase):
             lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
             with open(lock_file, "wb+") as lockf:
                 fcntl.flock(lockf, fcntl.LOCK_EX)
-                meta = shm_write_bytes(payload, name=put_key)
+                try:
+                    meta = shm_write_bytes(payload, name=put_key)
+                except BaseException:
+                    # The segment never came to life, so the lock file guarding
+                    # it must not either — remove it while we still hold it.
+                    try:
+                        os.remove(lock_file)
+                    except OSError:
+                        pass
+                    raise
                 fcntl.flock(lockf, fcntl.LOCK_UN)
 
             # meta contains {'name': ..., 'size': ...}
@@ -79,10 +178,15 @@ class SharedMemoryConnector(OmniConnectorBase):
             logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
             return None
         finally:
-            if deserialized:
+            # The lock file has no lifecycle of its own: once the segment is
+            # gone (consumed by this read, or already reaped elsewhere) the
+            # lock guarding it must go too.  A failed read with the segment
+            # still alive keeps the lock — the transfer can be retried.
+            seg_gone = not os.path.exists(f"/dev/shm/{shm_handle['name']}")
+            if deserialized or seg_gone:
                 try:
                     os.remove(lock_file)
-                except FileNotFoundError:
+                except OSError:
                     pass
 
     def _get_by_key(self, get_key: str) -> tuple[Any, int] | None:
