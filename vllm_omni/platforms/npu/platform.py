@@ -289,6 +289,27 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         return find_spec("mindiesd") is not None
 
     @classmethod
+    def build_diffusion_usp_executor(
+        cls,
+        parallel_config: Any,
+        sp_group: Any,
+    ) -> Any | None:
+        """Build the Ascend unified sequence-parallel executor when enabled."""
+
+        if not getattr(parallel_config, "enable_usp", False):
+            return None
+
+        from vllm_omni.platforms.npu.usp import AscendUSPExecutor
+
+        return AscendUSPExecutor(
+            sp_group=sp_group,
+            ulysses_degree=int(getattr(parallel_config, "ulysses_degree", 1)),
+            ring_degree=int(getattr(parallel_config, "ring_degree", 1)),
+            allgather_degree=int(getattr(parallel_config, "allgather_degree", 1)),
+            ulysses_mode=str(getattr(parallel_config, "ulysses_mode", "strict")),
+        )
+
+    @classmethod
     def supports_torch_inductor(cls) -> bool:
         return False
 
