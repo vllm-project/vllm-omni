@@ -165,7 +165,7 @@ def test_inventory_matches_reviewed_snapshot_counts():
     category_counts = Counter(item.category for item in ENVIRONMENT_VARIABLE_INVENTORY.values())
     assert category_counts == {
         EnvironmentVariableCategory.PUBLIC_OMNI: 28,
-        EnvironmentVariableCategory.INHERITED_VLLM: 20,
+        EnvironmentVariableCategory.INHERITED_VLLM: 21,
         EnvironmentVariableCategory.PLATFORM_EXTERNAL: 27,
         EnvironmentVariableCategory.MODEL_SPECIFIC: 65,
         EnvironmentVariableCategory.BENCHMARK_TRANSITIONAL: 20,
