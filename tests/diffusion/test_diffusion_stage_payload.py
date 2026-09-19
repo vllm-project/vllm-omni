@@ -54,6 +54,7 @@ def _make_runner(connector, *, payload_keys=("text_encoder_output",), recv_stage
     runner._local_rank = 0
     runner.pipeline = None
     runner.kv_transfer_manager = _FakeKVTransferManager(connector, recv_stages=recv_stages)
+    runner.init_omni_connectors(runner.od_config, runner.kv_transfer_manager, synchronous=True)
     return runner
 
 
@@ -63,6 +64,7 @@ def _make_sender(connector, *, payload_keys=("prompt_embeds",), send_stages=("0"
     runner.device = torch.device("cpu")
     runner.pipeline = None
     runner.kv_transfer_manager = _FakeKVTransferManager(connector, send_stages=send_stages)
+    runner.init_omni_connectors(runner.od_config, runner.kv_transfer_manager, synchronous=True)
     return runner
 
 
@@ -134,14 +136,16 @@ def test_receive_retries_until_producer_publishes(monkeypatch):
 
 
 def test_receive_retry_budget_preserves_inline_payload(monkeypatch):
-    from vllm_omni.diffusion.worker import diffusion_model_runner
+    from vllm_omni.distributed.omni_connectors.model_runner import omni_connector_payload_transport
 
     clock = [0.0]
 
     def advance(duration):
         clock[0] += duration
 
-    monkeypatch.setattr(diffusion_model_runner, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=advance))
+    monkeypatch.setattr(
+        omni_connector_payload_transport, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=advance)
+    )
     connector = _FakeConnector(None)
     runner = _make_runner(connector)
     inline = _conditioning()
@@ -197,14 +201,15 @@ def test_failed_transfer_falls_back_to_the_inline_prompt(connector):
     )
 
 
-def test_sender_info_is_applied_before_the_connector_is_used():
+def test_legacy_sender_info_is_passed_as_request_metadata():
     connector = _FakeConnector(_conditioning())
     runner = _make_runner(connector)
     req = _make_request({"prompt": "a cat"}, kv_sender_info={0: {"host": "10.0.0.1", "zmq_port": 50171}})
 
     runner._maybe_recv_stage_payload(req)
 
-    assert runner.kv_transfer_manager.sender_info_calls == [({0: {"host": "10.0.0.1", "zmq_port": 50171}}, "0")]
+    assert runner.kv_transfer_manager.sender_info_calls == []
+    assert connector.calls[0][3] == {"source_host": "10.0.0.1", "source_port": 50171}
 
 
 def test_payload_sender_info_overrides_kv_sender_info_for_full_payloads():
@@ -218,7 +223,29 @@ def test_payload_sender_info_overrides_kv_sender_info_for_full_payloads():
 
     runner._maybe_recv_stage_payload(req)
 
-    assert runner.kv_transfer_manager.sender_info_calls == [({"host": "10.0.0.1", "zmq_port": 50071}, "0")]
+    assert runner.kv_transfer_manager.sender_info_calls == []
+    assert connector.calls[0][3] == {"source_host": "10.0.0.1", "source_port": 50071}
+
+
+def test_synchronous_receive_keeps_endpoints_request_scoped_and_uses_external_ids():
+    connector = _FakeConnector(_conditioning())
+    runner = _make_runner(connector, recv_stages=("2", "5"))
+    for index in range(2):
+        request = _make_request(
+            {},
+            request_id=f"internal-{index}",
+            payload_sender_info={"host": f"10.0.0.{index + 1}", "zmq_port": 50071 + index},
+        )
+        request.external_req_id = f"external-{index}"
+        runner._maybe_recv_stage_payload(request)
+        assert "text_encoder_output" in request.prompt["additional_information"]
+    assert connector.calls == [
+        ("2", "5", "external-0_2_0", {"source_host": "10.0.0.1", "source_port": 50071}),
+        ("2", "5", "external-1_2_0", {"source_host": "10.0.0.2", "source_port": 50072}),
+    ]
+    assert runner.kv_transfer_manager.sender_info_calls == []
+    assert runner._pending_load_reqs == {}
+    assert runner._get_req_chunk == {}
 
 
 def test_tp_payload_is_fetched_once_by_leader_and_broadcast_to_followers():

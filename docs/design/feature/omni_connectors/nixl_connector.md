@@ -106,6 +106,33 @@ Parameters:
   finishes cleanup after completion; no second call is required.
   `VLLM_OMNI_NIXL_XFER_TIMEOUT_S` overrides it.
 
+### Diffusion worker integration
+
+Diffusion initializes `OmniConnectorModelRunnerMixin` in synchronous mode,
+borrowing its KV transfer manager's lazy connector. This mode creates no second
+connector, starts no receive/save threads, and leaves KV key builders and
+sharding callbacks unchanged. Connector lifetime remains with the manager.
+
+The shared `recv_stage_payload` entry point and asynchronous `_poll_single_request`
+use the same key and endpoint metadata builder. Diffusion passes its actual
+incoming edge and external request ID; explicit transfer handles take precedence.
+Sender endpoints are passed per request, without mutating KV sender state.
+Diffusion-specific prompt merging, output handles and device placement live in
+`diffusion/worker/stage_payload.py`.
+
+Diffusion supplies ordered TP and SP groups to the shared payload fanout.
+Only the rank leading both groups reads the connector. Each subsequent broadcast
+uses its own group-local rank zero, including ranks that received the payload
+from the preceding group. Tensor payloads use tensor-dictionary broadcasts rather
+than serializing the full payload as a Python object. Receive misses still reach
+the same collectives before falling back to the inline prompt.
+
+`GroupCoordinator.broadcast_tensor_dict` preserves the group-local source for
+`broadcast_object` while passing the mapped global source to PyTorch tensor
+collectives. For subgroup `[1, 3]`, local source `0` maps to global source `1`;
+passing `1` back to `broadcast_object` would incorrectly select global rank `3`.
+The nonzero-subgroup regression covers both sender and receiver behavior.
+
 ### Source ownership and failure limits
 
 Claims and expiry use the same lock. Completion identifies both a payload
