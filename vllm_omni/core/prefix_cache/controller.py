@@ -409,11 +409,12 @@ class StagingBufferPool:
         self._closed = False
 
     def _buf(self, key: str, width: int, dtype: torch.dtype, pin: bool) -> torch.Tensor:
-        buf = self._bufs.get(key)
-        if buf is None or buf.shape[-1] != width or buf.dtype != dtype:
-            buf = torch.empty((self.depth * self.capacity, width), dtype=dtype, pin_memory=pin)
-            self._bufs[key] = buf
-        return buf
+        with self._slot_free_condition:
+            buf = self._bufs.get(key)
+            if buf is None or buf.shape[-1] != width or buf.dtype != dtype:
+                buf = torch.empty((self.depth * self.capacity, width), dtype=dtype, pin_memory=pin)
+                self._bufs[key] = buf
+            return buf
 
     def claim(self, holder: StagingBufferHolder, timeout: float) -> int:
         """Grab a free slot for `holder`. Waits until one is free, then
@@ -451,6 +452,14 @@ class StagingBufferPool:
     def views(self, slot: int, key: str, n: int, width: int, dtype: torch.dtype, pin: bool) -> torch.Tensor:
         base = slot * self.capacity
         return self._buf(key, width, dtype, pin)[base : base + n]
+
+    def memory_stats(self) -> tuple[int, int]:
+        """Return allocated staging-buffer bytes and the pinned subset."""
+        with self._slot_free_condition:
+            tensors = list(self._bufs.values())
+        total_bytes = sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+        pinned_bytes = sum(tensor.numel() * tensor.element_size() for tensor in tensors if tensor.is_pinned())
+        return total_bytes, pinned_bytes
 
 
 @dataclass
@@ -573,6 +582,10 @@ class OmniPrefixCacheController:
     def in_flight_tasks(self) -> int:
         """Registered tasks not yet drained (diagnostics only)."""
         return len(self._tasks)
+
+    def staging_memory_stats(self) -> tuple[int, int]:
+        """Return reusable host-staging bytes and the pinned subset."""
+        return self._staging_pool.memory_stats()
 
     # ------------------------------------------------------------------ submit
 

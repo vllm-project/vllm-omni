@@ -605,6 +605,9 @@ async def test_run_two_stage_llm(orchestrator_factory) -> None:
         assert output_msg.stage_id == 1
         assert output_msg.finished is True
         assert output_msg.engine_outputs.request_id == "req-llm"
+        pipeline_timings = output_msg.metrics.pipeline_timings
+        assert pipeline_timings["input_processing_0_to_1_ms"] > 0
+        assert pipeline_timings["transfer_0_to_1_ms"] >= pipeline_timings["input_processing_0_to_1_ms"]
         assert "req-llm" not in orchestrator_fixture.orchestrator.request_states
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)

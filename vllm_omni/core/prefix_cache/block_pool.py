@@ -67,6 +67,21 @@ class PrefixBlockPool:
     def keys(self) -> set[TensorName]:
         return set(self._caches.keys())
 
+    def memory_stats(self) -> tuple[dict[TensorName, int], int]:
+        """Return per-key storage bytes and the pinned subset."""
+        cache_bytes = {key: tensor.numel() * tensor.element_size() for key, tensor in self._caches.items()}
+        pinned_bytes = sum(
+            tensor.numel() * tensor.element_size() for tensor in self._caches.values() if tensor.is_pinned()
+        )
+        return cache_bytes, pinned_bytes
+
+    def key_metadata(self, key: TensorName) -> tuple[int, str] | None:
+        """Return feature width and dtype for an allocated key."""
+        tensor = self._caches.get(key)
+        if tensor is None:
+            return None
+        return int(tensor.shape[-1]), str(tensor.dtype)
+
     def _flat(self, key: str) -> torch.Tensor:
         cache = self._caches[key]
         return cache.view(-1, cache.shape[-1])

@@ -7,6 +7,7 @@
 - [Overview](#overview)
 - [High-Level Approach](#high-level-approach)
 - [Example](#example)
+- [Numerical Behavior](#numerical-behavior)
 - [What About Multimodal Inputs?](#what-about-multimodal-inputs)
 - [Implementation](#implementation)
 - [Related Files](#related-files)
@@ -133,6 +134,21 @@ Since we have the block indices / slot mappings from the kv cache manager, we ca
 
 Finally, to pass the full hidden states and multimodal outputs to the next stage, we simply concatenate the cached contents with the corresponding new tensors computed from the current forward call.
 
+### Numerical Behavior
+
+Hidden states restored from the prefix tensor cache are the values stored
+during the original computation. However, the uncached tail is recomputed
+with a shorter query sequence than a full prefill. Floating-point attention
+kernels, especially with BF16 inputs, can therefore produce results that are
+numerically close but not bitwise identical to those from a full prefill.
+
+Prefix caching preserves token-to-hidden-state alignment and reconstructs the
+complete logical sequence; it does not guarantee bitwise equivalence of the
+recomputed tail or the resulting concatenated hidden states. Models with
+downstream stages that are sensitive to these differences should validate
+output quality with model-appropriate tolerances before enabling prefix
+caching.
+
 ### What About Multimodal Inputs?
 
 It's also useful to consider the case about how Omni prefix caching is handled when we have multimodal inputs that don't cleanly end on block boundaries, as well as how this works with multimodal encoder caching in vLLM. For example:
@@ -165,7 +181,7 @@ Because we have multimodal data in a scheduled span that isn't fully precomputed
 
 When we pass our multimodal tensors to the language model component in the same stage, we'll then expect the same outputs, because the prefix caching behaviors in vLLM-Omni / vLLM match, so the LLM will use vLLM's KV cache manager's prefix caching to correctly handle the attention information for `Block 1` while calculating the outputs for `Block 2`, giving us the correct results for processing `Block 2` with the context of `Block 1`.
 
-Finally, we look up the output hidden states/multimodal tensors corresponding to the prefix cache hit `Block 1` and concatenate it with the forward pass result to get the final result, which is expected to be identical to the full hidden states when prefix caching is disabled.
+Finally, we look up the output hidden states/multimodal tensors corresponding to the prefix cache hit `Block 1` and concatenate them with the forward pass result. This reconstructs the complete, token-aligned sequence, subject to the numerical behavior described above.
 
 ### Implementation
 
