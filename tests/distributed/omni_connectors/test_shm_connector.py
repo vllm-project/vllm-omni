@@ -444,8 +444,13 @@ class TestLockFileLifecycle:
 
     def test_sweep_runs_once_per_process(self, monkeypatch):
         calls = []
+
+        def _counting_sweep(*args, **kwargs):
+            calls.append(1)
+            return 0
+
         monkeypatch.setattr(shm_conn_module, "_swept_this_process", False)
-        monkeypatch.setattr(shm_conn_module, "_sweep_stale_lock_files", lambda *a, **k: calls.append(1) or 0)
+        monkeypatch.setattr(shm_conn_module, "_sweep_stale_lock_files", _counting_sweep)
 
         SharedMemoryConnector({})
         SharedMemoryConnector({})

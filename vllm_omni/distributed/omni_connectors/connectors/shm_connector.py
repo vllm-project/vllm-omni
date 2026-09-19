@@ -3,7 +3,6 @@
 
 import fcntl
 import os
-import re
 import time
 from multiprocessing import shared_memory as shm_pkg
 from typing import Any
@@ -15,7 +14,8 @@ from .base import OmniConnectorBase
 
 logger = get_connector_logger(__name__)
 
-_LOCK_FILE_RE = re.compile(r"^shm_(.+)_lockfile\.lock$")
+_LOCK_FILE_PREFIX = "shm_"
+_LOCK_FILE_SUFFIX = "_lockfile.lock"
 _STALE_LOCK_GRACE_SECONDS = 60.0  # seconds; young lock files are never touched
 _swept_this_process: bool = False
 
@@ -46,10 +46,11 @@ def _sweep_stale_lock_files(grace: float | None = None) -> int:
     except OSError:
         return 0
     for name in names:
-        m = _LOCK_FILE_RE.match(name)
-        if not m:
+        if not (name.startswith(_LOCK_FILE_PREFIX) and name.endswith(_LOCK_FILE_SUFFIX)):
             continue
-        key = m.group(1)
+        key = name[len(_LOCK_FILE_PREFIX) : -len(_LOCK_FILE_SUFFIX)]
+        if not key:
+            continue
         path = f"/dev/shm/{name}"
         try:
             if time.time() - os.stat(path).st_mtime < grace:
