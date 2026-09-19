@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from https://github.com/hao-ai-lab/FastVideo
 # Originally from https://github.com/huggingface/diffusers/blob/v0.31.0/src/diffusers/schedulers/scheduling_unipc_multistep.py
 # Convert unipc for flow matching
@@ -24,6 +24,34 @@ from diffusers.utils import deprecate
 
 from vllm_omni.diffusion.models.schedulers.base import BaseScheduler
 from vllm_omni.diffusion.utils.flow_matching import safe_linalg_solve
+
+
+def _small_solve(matrix: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    """Solve 1x1/2x2 systems in closed form; delegate larger systems.
+
+    Uses Cramer's rule for small systems and ``safe_linalg_solve`` otherwise.
+    Exactly singular systems raise ``LinAlgError`` instead of returning inf/nan.
+    Dtype and device follow the inputs; the delegated path retains its
+    platform-specific fallback.
+    """
+    n = matrix.shape[-1]
+    if n == 1:
+        det = matrix[0, 0]
+        if det == 0:
+            raise torch.linalg.LinAlgError("singular 1x1 system in UniPC coefficient solve")
+        return (rhs[0] / det).reshape(1)
+    if n == 2:
+        m00, m01 = matrix[0, 0], matrix[0, 1]
+        m10, m11 = matrix[1, 0], matrix[1, 1]
+        det = m00 * m11 - m01 * m10
+        if det == 0:
+            raise torch.linalg.LinAlgError("singular 2x2 system in UniPC coefficient solve")
+        r0, r1 = rhs[0], rhs[1]
+        # Cramer's rule: x0 = |r0 m01; r1 m11| / det, x1 = |m00 r0; m10 r1| / det.
+        x0 = (r0 * m11 - m01 * r1) / det
+        x1 = (m00 * r1 - r0 * m10) / det
+        return torch.stack([x0, x1])
+    return safe_linalg_solve(matrix, rhs)
 
 
 class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
@@ -291,12 +319,14 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
                 "is now handled via an internal counter `self.step_index`",
             )
 
-        sigma = self.sigmas[self.step_index].to(sample.device)
+        # Keep sigma on CPU: PyTorch broadcasts a CPU 0-d scalar against device
+        # tensors without an explicit transfer.
+        sigma = self.sigmas[self.step_index]
         alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma)
 
         if self.predict_x0:
             if self.config.prediction_type == "flow_prediction":
-                sigma_t = sigma.to(sample.device)
+                sigma_t = sigma
                 x0_pred = sample - sigma_t * model_output
             else:
                 raise ValueError(
@@ -374,12 +404,17 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             return x_t
 
         device = sample.device
-        sigma_t, sigma_s0 = (
-            self.sigmas[self.step_index + 1].to(device),
-            self.sigmas[self.step_index].to(device),
+        # Keep the sigma -> alpha/lambda -> h/rk/b scalar chain on CPU to avoid
+        # device-to-host synchronization when building the coefficient tensors.
+        # The derived scalars retain self.sigmas' float32 dtype. CPU 0-d scalars
+        # broadcast against device tensors; einsum coefficients need an explicit
+        # transfer because its operands must share a device.
+        sigma_t_c, sigma_s0_c = (
+            self.sigmas[self.step_index + 1],
+            self.sigmas[self.step_index],
         )
-        alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
-        alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
+        alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t_c)
+        alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0_c)
 
         lambda_t = torch.log(alpha_t) - torch.log(sigma_t)
         lambda_s0 = torch.log(alpha_s0) - torch.log(sigma_s0)
@@ -391,15 +426,17 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         for i in range(1, order):
             si = self.step_index - i
             mi = model_output_list[-(i + 1)]
-            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si].to(device))
+            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si])
             lambda_si = torch.log(alpha_si) - torch.log(sigma_si)
             rk = (lambda_si - lambda_s0) / h
             rks.append(rk)
             assert mi is not None
+            # Dividing device tensors by a CPU 0-d scalar preserves their device.
             D1s.append((mi - m0) / rk)
 
-        rks.append(1.0)
-        rks = torch.tensor(rks, device=device)
+        rks.append(torch.ones((), dtype=h.dtype))
+        # Stack host scalars without a device-to-host readback.
+        rks = torch.stack(rks)
 
         R = []
         b = []
@@ -424,7 +461,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             h_phi_k = h_phi_k / hh - 1 / factorial_i
 
         R = torch.stack(R)
-        b = torch.tensor(b, device=device)
+        b = torch.stack(b)  # CPU stack of CPU scalars; was torch.tensor(device=...)
 
         if D1s is not None and len(D1s) > 0:
             D1s = torch.stack(D1s, dim=1)
@@ -432,7 +469,8 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
                 rhos_p = torch.tensor([0.5], dtype=x.dtype, device=device)
             else:
                 assert isinstance(R, torch.Tensor)
-                rhos_p = safe_linalg_solve(R[:-1, :-1], b[:-1]).to(device).to(x.dtype)
+                # Move the host solve result to the device for einsum.
+                rhos_p = _small_solve(R[:-1, :-1], b[:-1]).to(device=device, dtype=x.dtype)
         else:
             D1s = None
 
@@ -506,12 +544,13 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         model_t = this_model_output
 
         device = this_sample.device
-        sigma_t, sigma_s0 = (
-            self.sigmas[self.step_index].to(device),
-            self.sigmas[self.step_index - 1].to(device),
+        # Keep this scalar chain on CPU, as in the predictor.
+        sigma_t_c, sigma_s0_c = (
+            self.sigmas[self.step_index],
+            self.sigmas[self.step_index - 1],
         )
-        alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
-        alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
+        alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t_c)
+        alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0_c)
 
         lambda_t = torch.log(alpha_t) - torch.log(sigma_t)
         lambda_s0 = torch.log(alpha_s0) - torch.log(sigma_s0)
@@ -523,15 +562,15 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         for i in range(1, order):
             si = self.step_index - (i + 1)
             mi = model_output_list[-(i + 1)]
-            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si].to(device))
+            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si])
             lambda_si = torch.log(alpha_si) - torch.log(sigma_si)
             rk = (lambda_si - lambda_s0) / h
             rks.append(rk)
             assert mi is not None
             D1s.append((mi - m0) / rk)
 
-        rks.append(1.0)
-        rks = torch.tensor(rks, device=device)
+        rks.append(torch.ones((), dtype=h.dtype))
+        rks = torch.stack(rks)
 
         R = []
         b = []
@@ -556,7 +595,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             h_phi_k = h_phi_k / hh - 1 / factorial_i
 
         R = torch.stack(R)
-        b = torch.tensor(b, device=device)
+        b = torch.stack(b)
 
         if D1s is not None and len(D1s) > 0:
             D1s = torch.stack(D1s, dim=1)
@@ -566,7 +605,8 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         if order == 1:
             rhos_c = torch.tensor([0.5], dtype=x.dtype, device=device)
         else:
-            rhos_c = safe_linalg_solve(R, b).to(device).to(x.dtype)
+            # Solve coefficients on CPU; einsum below consumes them on the device.
+            rhos_c = _small_solve(R, b).to(device=device, dtype=x.dtype)
 
         if self.predict_x0:
             x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0
