@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -19,7 +20,9 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.outputs.output_metadata import DiffusionPostprocessRawOutput
 from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
 
 from .mammothmoda2_dit_model import SimpleQFormerImageRefiner, Transformer2DModel
@@ -36,12 +39,16 @@ def _first_request_value(value: object) -> object:
 
 
 def get_mammoth_moda2_post_process_func(
-    _od_config: OmniDiffusionConfig,
-):
+    od_config: OmniDiffusionConfig,
+) -> Callable[[torch.Tensor], DiffusionPostprocessRawOutput]:
+    if od_config.output_type not in ("pil", "np", "pt"):
+        raise ValueError("MammothModa2 returns decoded images; output_type must be pil, np or pt.")
     image_processor = VaeImageProcessor()
 
-    def post_process_func(images: torch.Tensor):
-        return image_processor.postprocess(images)
+    def post_process_func(images: torch.Tensor) -> DiffusionPostprocessRawOutput:
+        # The VAE returns BCHW in [-1, 1]. Convert once at the shared runtime's
+        # postprocess boundary, not in each distributed worker or the example.
+        return image_processor.postprocess(images, output_type=od_config.output_type)
 
     return post_process_func
 
@@ -65,6 +72,24 @@ def _root_weight_source(
         prefix="",
         fall_back_to_pt=True,
     )
+
+
+def _validate_sequence_parallel_runtime(od_config: OmniDiffusionConfig, config: Mammothmoda2Config) -> None:
+    if od_config.parallel_config.sequence_parallel_size == 1:
+        return
+    if getattr(config.llm_config, "model_type", "") != "mammothmoda2_qwen2_5_vl":
+        raise ValueError("MammothModa2 sequence parallelism is limited to Preview text-to-image, not Dev.")
+    if od_config.step_execution or od_config.max_num_seqs != 1:
+        raise ValueError("MammothModa2 SP requires request mode with max_num_seqs=1.")
+    if (
+        not od_config.enforce_eager
+        or od_config.cache_backend != "none"
+        or od_config.quantization_config is not None
+        or resolve_offload_strategy(od_config) is not OffloadStrategy.NONE
+    ):
+        raise ValueError(
+            "MammothModa2 SP requires eager execution without cache acceleration, quantization or offload."
+        )
 
 
 @dataclass(frozen=True)
@@ -112,6 +137,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         self.od_config = od_config
         self.device = get_local_device()
         self.config = _build_mammoth_config(od_config)
+        _validate_sequence_parallel_runtime(od_config, self.config)
         self.weights_sources = [_root_weight_source(od_config)]
 
         # --- Build DiT / VAE modules (names must match checkpoint keys) ---

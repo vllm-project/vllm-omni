@@ -23,7 +23,8 @@ The first integration intentionally supports one request and one image per
 forward only (`max_num_seqs: 1`, `num_outputs_per_prompt: 1`). Request-level
 batching, step execution, continuous batching, cache acceleration,
 compilation, quantization, parallelism, and offload are not enabled by this
-recipe.
+recipe by default. An experimental two-rank Preview DiT Ulysses configuration
+is described below; it does not change the single-rank default.
 
 Image size, seed, guidance, and denoising steps use the standard diffusion
 request fields. `cfg_range` remains a MammothModa2-specific `extra_body`
@@ -227,6 +228,116 @@ The candidate's shared runtime reported 372.02 ms p50 per denoising step and a
 both revisions produced valid, prompt-aligned 1024x1024 RGB images. The small
 latency differences are regression evidence, not a statistically significant
 speedup claim.
+
+### Experimental Preview DiT Ulysses SP=2
+
+This opt-in path splits only the main joint-transformer sequence. Q-Former,
+text/noise refiners, sequential CFG, scheduler and VAE remain replicated.
+Preview has 21 query heads and 7 KV heads with head dimension 120, so degree
+two requires `ulysses_mode: advanced_uaa`; strict even-head partitioning is
+not valid. Shared Ulysses temporarily pads the head groups and restores the
+original output heads. Sequence padding is removed before image extraction.
+
+The initial scope is Preview text-to-image, request mode, one request and
+one output image, with eager execution and no cache acceleration,
+quantization or offload. Ring, TP/PP/DP, HSDP, expert/CFG/VAE parallelism,
+step execution and Dev text-to-image are not supported with this SP path.
+The AR-only Preview/Dev understanding topology is unchanged.
+
+The following BF16 offline configuration completed a one-prompt Preview E2E smoke
+on two A100-SXM4-80GB GPUs with NVLink NV4. AR shares GPU 0 with DiT rank 0;
+DiT rank 1 uses GPU 1. This is not a general capacity or performance guarantee:
+SP does not shard model weights or the replicated refiners/VAE. Keep the
+default deploy config unchanged and save this opt-in config separately as
+`mammoth-sp2.yaml`:
+
+```yaml
+async_chunk: false
+pipeline: mammoth_moda2
+trust_remote_code: true
+distributed_executor_backend: mp
+dtype: bfloat16
+enable_prefix_caching: false
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    max_model_len: 8192
+    gpu_memory_utilization: 0.35
+    enforce_eager: true
+  - stage_id: 1
+    devices: "0,1"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.3
+    enforce_eager: true
+    ulysses_degree: 2
+    ulysses_mode: advanced_uaa
+    diffusion_attention_backend: TORCH_SDPA
+    engine_extras:
+      dtype: bfloat16
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 VLLM_WORKER_MULTIPROC_METHOD=spawn \
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model ./MammothModa2-Preview --deploy-config ./mammoth-sp2.yaml \
+  --ulysses-degree 2 --ulysses-mode advanced_uaa --enforce-eager \
+  --prompt "A red ceramic teapot on a wooden table beside a small green plant, soft morning light, detailed product photograph." \
+  --height 1024 --width 1024 --seed 42 --num-inference-steps 50 \
+  --guidance-scale 4.0 --extra-body '{"text_guidance_scale":4.0,"cfg_range":[0.0,1.0]}' \
+  --output ./mammoth-sp2.png
+```
+
+Pass the Ulysses flags explicitly: the shared example's command-line defaults
+also enter config resolution. For the SP=1 control, change stage 1's devices
+to `"0"`, set its `ulysses_degree` to 1, and pass `--ulysses-degree 1`.
+For the FP32 DiT control, keep AR in BF16 and change only stage 1's
+`engine_extras.dtype` to `float32`. BF16 `FLASH_ATTN` is a separately tested
+backend; compare SP=1 and SP=2 with the same backend.
+
+The correctness control below uses two CUDA devices, real NCCL collectives,
+released 2520/21/7/120 head geometry with reduced depth, FP32 SDPA math,
+BF16 SDPA and BF16 FlashAttention. The BF16 controls also compare against
+FP32 computation with the same quantized weights and inputs.
+A separate tiny native pipeline replay exercises the constructor, registry
+hooks, Q-Former, DiT, sequential CFG, request-level seed handling, scheduler and
+VAE with synthetic AR conditioning. It tests explicit/default-seed A/B/A
+requests; it is not a released-conditioning or full-checkpoint E2E test.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 OMP_NUM_THREADS=4 python -m pytest -q \
+  tests/diffusion/distributed/test_mammothmoda2_ulysses.py
+```
+
+The full-weight qualification used Preview revision
+`ef5a5e41dbf0de1ef6275586b7580f0d4248b4c6`, vLLM 0.28.0, Torch 2.13.0+cu130,
+Transformers 5.14.1, Diffusers 0.40.0, Python 3.12.3 and driver 580.159.03.
+An earlier FP32 DiT control completed both SP=1 and SP=2 and saved 1024x1024
+RGB PNG images. AR token IDs matched; saved channel values differed by at
+most one 8-bit level (mean absolute difference 0.005415).
+
+The BF16 fixed-conditioning replay uses one real AR payload, identical
+initial noise, conditions and masks, 50 steps, seed 42 and guidance 4. Each
+configuration runs one observed warmup and three uninstrumented measured
+requests. Both SDPA and FlashAttention preserve exact self-repeat; observed
+denoiser predictions and VAE inputs agree exactly across ranks.
+SP=1 and SP=2 are not bit-identical: normalized
+RGB mean absolute error is 0.001682 for SDPA and 0.001817 for FlashAttention;
+PSNR is 51.03/47.57 dB and SSIM is 0.9961/0.9950 respectively. These are
+single-prompt numerical/visual controls, not broad image-quality certification.
+Selected late-step predictions differ more than the final decoded image;
+the benchmark preserves those tensors instead of claiming trajectory equality.
+
+Preview and Dev text/image-understanding A/B/A controls produced identical
+text, token IDs and stop reasons before and after the SP changes (12 requests
+per revision). This preserves existing Dev end-marker formatting; it is not
+an understanding-accuracy benchmark or Dev text-to-image validation.
+
+For exact capture, replay and understanding commands, see
+[the qualification tools](../../benchmarks/mammoth_moda2/README.md).
+Keep code, weights, backend, dtype, inputs and sampling fixed in paired runs.
+SP replicates weights and VAE, so do not infer peak-memory or GPU-cost savings
+from a reduction in DiT latency.
 
 ### 1x AMD MI300X, MammothModa2 Preview (pre-migration baseline)
 
