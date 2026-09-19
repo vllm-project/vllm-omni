@@ -18,6 +18,27 @@ This placement is one point in the design space being discussed in the
 If that RFC establishes a suitable shared tier for any of these operations,
 migration can be handled separately without weakening the current contract.
 
+## Layout
+
+Hardware-specific kernels live in per-hardware subpackages, mirroring the
+`hunyuan_image3/layers/{native,nvidia}/` convention:
+
+```text
+ops/vae/
+├── __init__.py      installer: contract validation and forward patching
+├── dispatch.py      capability allowlist; the only selection point
+└── nvidia/          CUDA + Triton kernels (inline NVIDIA PTX, ROCm excluded)
+    ├── qk_norm_rope.py
+    └── scaled_residual.py
+```
+
+There is no `native/` package here: the reference implementation of the H3 VAE
+is the modeling code shipped inside the checkpoint (loaded via
+`trust_remote_code`), so the default path is simply the unpatched remote
+module. `ops/vae/nvidia/` names where kernels run, and is distinct from
+`minimax_h3/npu/` at the model root, which records where the native-layout
+LoRA artifacts were produced (that loader runs on any platform).
+
 ## Current boundary
 
 The VAE installer validates the official model structure before making any
