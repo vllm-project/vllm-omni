@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Gradio demo for VoxCPM2 TTS with gapless streaming audio playback.
 
 Uses a custom AudioWorklet-based player for gap-free streaming
@@ -8,7 +11,7 @@ the audio clock rate.
 
 Usage:
     # Start the vLLM server first:
-    vllm serve openbmb/VoxCPM2 --omni --host 0.0.0.0 --port 8000
+    vllm serve openbmb/VoxCPM2 --omni --host 0.0.0.0 --port 8000 --served-model-name voxcpm2 openbmb/VoxCPM2
 
     # Then launch the demo:
     python gradio_demo.py --api-base http://localhost:8000
