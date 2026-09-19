@@ -20,6 +20,7 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SeedTTSSampleRequest,
     SeedTTSTextSampleRequest,
 )
+from vllm_omni.benchmarks.patch import patch
 from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
     _add_video_extra_body_to_form,
@@ -29,6 +30,8 @@ from vllm_omni.benchmarks.patch.patch import (
     _attach_seed_tts_to_request_func_input,
     _build_benchmark_session,
     _omni_request_timeout_s,
+    _record_client_queue_time,
+    _report_values_metric,
     async_request_openai_chat_omni_completions,
     async_request_openai_image_edits_omni,
     async_request_openai_image_generations_omni,
@@ -1222,6 +1225,80 @@ async def test_prompt_len_assigned_from_usage(mocker: MockerFixture):
     )
 
 
+_TOKENLESS_TTFT_ERROR = "Never received a valid chunk to calculate TTFT.This response will be marked as failed!"
+
+
+@pytest.mark.asyncio
+async def test_chat_omni_trailing_usage_does_not_extend_e2e_latency(mocker: MockerFixture):
+    """Trailing usage-only SSE must not advance E2E past the last content chunk."""
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=10,
+        output_len=20,
+    )
+    chunks = [
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"content": "Hello"}}],
+                "modality": "text",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+            }
+        ),
+        create_sse_chunk(
+            {
+                "choices": [],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+            }
+        ),
+        b"data: [DONE]\n\n",
+    ]
+    mock_response = MockResponse(200, chunks, delay_between_chunks=0.03)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert output.success is True
+    # Three delayed chunks (text, usage, [DONE]). E2E must stop at the first
+    # content chunk (~0.03s), not include the trailing usage delay (~0.06s).
+    assert output.latency == pytest.approx(0.03, abs=0.015)
+    assert output.ttft == pytest.approx(output.latency, abs=0.005)
+
+
+@pytest.mark.asyncio
+async def test_chat_omni_http_200_without_content_is_tokenless_failure(mocker: MockerFixture):
+    """HTTP 200 with only usage / [DONE] is a failed request, matching upstream."""
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=10,
+        output_len=20,
+    )
+    chunks = [
+        create_sse_chunk(
+            {
+                "choices": [],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 0, "total_tokens": 10},
+            }
+        ),
+        b"data: [DONE]\n\n",
+    ]
+    mock_response = MockResponse(200, chunks)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert output.success is False
+    assert output.error == _TOKENLESS_TTFT_ERROR
+    assert output.latency == pytest.approx(0.0)
+
+
 class TestOmniRequestTimeout:
     """``--omni-request-timeout-s`` precedence: explicit value > 900 s default."""
 
@@ -1552,6 +1629,85 @@ def test_video_unsupported_image_reference_raises() -> None:
         _add_video_reference_to_form(form, {"not_a_supported_key": "x"})
     with pytest.raises(ValueError, match="Unsupported image_reference"):
         _add_video_reference_to_form(form, "/tmp/does-not-exist-ref.png")
+
+
+def test_get_samples_forwards_upstream_multimodal_backends_kwarg(mocker: MockerFixture) -> None:
+    """The patched ``datasets.get_samples`` must stay call-compatible upstream.
+
+    Upstream ``vllm.benchmarks.datasets.get_samples`` takes a keyword-only
+    ``multimodal_backends`` (``vllm/benchmarks/throughput.py`` passes it) and
+    ``patch.py`` rebinds that symbol module-wide, so a non-omni request must
+    forward the keyword to the original implementation instead of raising
+    ``TypeError`` or silently dropping it.
+    """
+    calls: list[tuple[Namespace, object, dict]] = []
+
+    def fake_get_samples_old(args, tokenizer, **kwargs):
+        calls.append((args, tokenizer, kwargs))
+        return ["delegated"]
+
+    mocker.patch.object(patch, "get_samples_old", fake_get_samples_old)
+
+    args = Namespace(
+        dataset_name="random",
+        backend="vllm-chat",
+        dataset_path=None,
+        hf_name=None,
+    )
+    sentinel = object()
+    mm_backends = ("openai-chat", "openai-audio")
+
+    assert patch.get_samples(args, sentinel, multimodal_backends=mm_backends) == ["delegated"]
+    assert calls == [(args, sentinel, {"multimodal_backends": mm_backends})]
+    # No upstream kwargs: unchanged legacy delegate call.
+    assert patch.get_samples(args, sentinel) == ["delegated"]
+    assert calls[-1] == (args, sentinel, {})
+
+
+def test_record_client_queue_time_uses_request_start_time() -> None:
+    """``client_queue_time`` is the wait for the client concurrency slot."""
+    output = MixRequestFuncOutput()
+    output.start_time = 10.25
+
+    _record_client_queue_time(output, 10.0)
+
+    assert output.client_queue_time == pytest.approx(0.25)
+
+
+def test_report_values_metric_requires_opt_in_and_records_stats(capsys: pytest.CaptureFixture) -> None:
+    """List-valued metrics are opt-in via --percentile-metrics, like upstream."""
+    result: dict = {}
+    values = [0.0, 1.0, 2.0, 3.0]
+
+    _report_values_metric(
+        result,
+        "client_queue_time",
+        "Client Queue Time",
+        "Client-side Queueing",
+        values,
+        ["ttft", "tpot", "itl"],
+        [50.0],
+    )
+    assert result == {}
+    assert capsys.readouterr().out == ""
+
+    _report_values_metric(
+        result,
+        "client_queue_time",
+        "Client Queue Time",
+        "Client-side Queueing",
+        values,
+        ["client_queue_time"],
+        [50.0],
+    )
+    printed = capsys.readouterr().out
+    assert "Client-side Queueing" in printed
+    assert "Mean Client Queue Time (ms):" in printed
+    # Values are reported in ms (upstream multiplies the raw seconds by 1000).
+    assert result["mean_client_queue_time_ms"] == pytest.approx(1500.0)
+    assert result["median_client_queue_time_ms"] == pytest.approx(1500.0)
+    assert result["p50_client_queue_time_ms"] == pytest.approx(1500.0)
+    assert "std_client_queue_time_ms" in result
 
 
 if __name__ == "__main__":

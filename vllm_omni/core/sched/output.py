@@ -1,5 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from dataclasses import dataclass, field, fields
 
+from vllm.multimodal.utils import strip_covered_mm_data
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
 
@@ -49,6 +53,7 @@ class OmniNewRequestData(NewRequestData):
         request: Request,
         block_ids: tuple[list[int], ...],
         prefill_token_ids: list[int] | None = None,
+        uses_mrope: bool = False,
     ) -> "OmniNewRequestData":
         """Create OmniNewRequestData from a Request object.
 
@@ -56,6 +61,9 @@ class OmniNewRequestData(NewRequestData):
             request: Request object to convert
             block_ids: Tuple of block ID lists for KV cache allocation
             prefill_token_ids: Optional prefill token IDs for v2 model runner
+            uses_mrope: Whether the model uses M-RoPE; M-RoPE keeps CPU-side
+                metadata of prefix-cache-covered items (upstream parity,
+                ``NewRequestData.from_request``).
 
         Returns:
             OmniNewRequestData instance with data from the request
@@ -64,7 +72,14 @@ class OmniNewRequestData(NewRequestData):
             req_id=request.request_id,
             external_req_id=getattr(request, "external_req_id", None),
             prompt_token_ids=request.prompt_token_ids,
-            mm_features=request.mm_features,
+            # Upstream drops the payload of mm items already covered by the
+            # prefix cache (they never reach an encoder again). Mirror it so the
+            # omni override cannot ship strictly more data than upstream.
+            mm_features=strip_covered_mm_data(
+                request.mm_features,
+                request.num_computed_tokens,
+                uses_mrope=uses_mrope,
+            ),
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,
             block_ids=block_ids,

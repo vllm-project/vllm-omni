@@ -60,6 +60,7 @@ class OmniRenderer:
                 {},
                 mm_processor_kwargs=prompt["mm_processor_kwargs"],
                 mm_uuids=prompt.get("multi_modal_uuids"),
+                media_io_kwargs=prompt.get("media_io_kwargs"),
                 skip_mm_cache=skip_mm_cache,
             )
         else:
@@ -74,6 +75,7 @@ class OmniRenderer:
                 {},
                 mm_processor_kwargs=prompt["mm_processor_kwargs"],
                 mm_uuids=prompt.get("multi_modal_uuids"),
+                media_io_kwargs=prompt.get("media_io_kwargs"),
                 skip_mm_cache=skip_mm_cache,
             )
         else:

@@ -11,7 +11,7 @@
 # transformers_keys_to_ignore_compat (vllm_omni/model_executor/models/utils.py).
 # Floor is 5.13.0 so transformers.integrations.hub_kernels LayerRepository
 # entries always pass version=/revision= required by kernels>=0.16 (#6971).
-transformers >= 5.13.0, < 5.15
+transformers >= 5.10.4
 av>=14.0.0
 omegaconf>=2.3.0
 diffusers==0.40.0

@@ -115,6 +115,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
+        session_id: str | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
@@ -124,6 +125,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         Coordinates multi-stage pipeline execution. Processes the prompt
         through all stages in the pipeline and yields outputs as they become
         available.
+
+        ``session_id`` is accepted for EngineClient protocol compatibility
+        and is not duplex-session plumbing.
 
         **Diffusion batching:**
         Diffusion stages accept only a single prompt per request.  Passing a

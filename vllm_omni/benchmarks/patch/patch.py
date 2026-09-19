@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import io
 import json
+import math
 import mimetypes
 import os
 import random
@@ -428,7 +429,14 @@ def _daily_omni_repo_from_args(args) -> str | None:
     return None
 
 
-def get_samples(args, tokenizer):
+def get_samples(args, tokenizer, **kwargs):
+    """Omni override of ``vllm.benchmarks.datasets.get_samples``.
+
+    ``**kwargs`` mirrors upstream's keyword-only arguments (today
+    ``multimodal_backends``, passed by ``vllm/benchmarks/throughput.py``) so that
+    any upstream caller reaching this patched replacement keeps working; they are
+    forwarded to the original implementation on every delegate path.
+    """
     # Daily-Omni: explicit dataset name, or hf + matching path/hf-name
     is_daily_omni = args.dataset_name == "daily-omni" or (
         args.dataset_name == "hf" and _daily_omni_repo_from_args(args) is not None
@@ -453,7 +461,7 @@ def get_samples(args, tokenizer):
 
     if not is_omni_backend and not is_omni_dataset:
         # Not an omni-related request, delegate to original implementation
-        return get_samples_old(args, tokenizer)
+        return get_samples_old(args, tokenizer, **kwargs)
 
     if is_omniinteract:
         dataset_path = getattr(args, "dataset_path", None)
@@ -704,7 +712,7 @@ def get_samples(args, tokenizer):
         )
         return input_requests
     else:
-        return get_samples_old(args, tokenizer)
+        return get_samples_old(args, tokenizer, **kwargs)
 
 
 datasets.get_samples = get_samples
@@ -1388,6 +1396,7 @@ async def async_request_openai_chat_omni_completions(
         st = time.perf_counter()
         output.start_time = st
         most_recent_timestamp = st
+        last_content_timestamp: float | None = None
         timestamp = st
         audio_generate_time = 0.0
         output.itl = []
@@ -1444,6 +1453,7 @@ async def async_request_openai_chat_omni_completions(
                                 if isinstance(usage, dict):
                                     completion_tokens = _apply_usage_to_output(output, usage)
 
+                                content_received = False
                                 if choices := data.get("choices"):
                                     modality = data.get("modality")
                                     choice = choices[0]
@@ -1475,13 +1485,19 @@ async def async_request_openai_chat_omni_completions(
                                                 token_delta=token_delta,
                                                 most_recent_timestamp=most_recent_timestamp,
                                             )
+                                            content_received = True
                                         if has_text_content:
                                             generated_text += content
+                                            content_received = True
                                     elif modality == "audio":
+                                        # Audio-only streams are valid even when a chunk
+                                        # has empty payload (existing chat-omni tests).
+                                        content_received = True
                                         if output.audio_ttfp == 0.0:
                                             output.audio_ttfp = timestamp - st
                                         audio_generate_time = timestamp - st
                                         if content:
+                                            content_received = True
                                             audio_bytes = base64.b64decode(content)
                                             if response_format == "wav":
                                                 try:
@@ -1497,6 +1513,7 @@ async def async_request_openai_chat_omni_completions(
                                                             wav_inconsistent_chunk_count += 1
                                                             if first_inconsistent_wav_params is None:
                                                                 first_inconsistent_wav_params = params
+                                                            last_content_timestamp = timestamp
                                                             continue
                                                         wav_pcm_buffer.extend(
                                                             wav_reader.readframes(wav_reader.getnframes())
@@ -1507,6 +1524,7 @@ async def async_request_openai_chat_omni_completions(
                                                 audio_bytes_buffer.extend(audio_bytes)
                                     elif modality == "image":
                                         output.image_count += 1
+                                        content_received = True
                                         content_image_ms = _image_generation_ms_from_content(content)
                                         if content_image_ms > 0:
                                             output.image_generation_time_ms += content_image_ms
@@ -1519,12 +1537,15 @@ async def async_request_openai_chat_omni_completions(
                                 ) = _image_metrics_from_stage_metrics(data.get("metrics"))
                                 if metrics_image_count > output.image_count:
                                     output.image_count = metrics_image_count
+                                    content_received = True
                                 if metrics_image_ms > output.image_generation_time_ms:
                                     output.image_generation_time_ms = metrics_image_ms
                                 if metrics_image_pixels > output.image_pixels:
                                     output.image_pixels = metrics_image_pixels
                                 if metrics_denoise_step_ms > output.denoise_step_latency_ms:
                                     output.denoise_step_latency_ms = metrics_denoise_step_ms
+                                if content_received:
+                                    last_content_timestamp = timestamp
 
                     if wav_inconsistent_chunk_count > 0:
                         logger.warning(
@@ -1536,7 +1557,7 @@ async def async_request_openai_chat_omni_completions(
                             first_inconsistent_wav_params,
                         )
 
-                    output.latency = timestamp - st
+                    output.latency = (last_content_timestamp or st) - st
                     output.generated_text = generated_text
                     if output.output_tokens > 1 and not any(
                         isinstance(value, int | float)
@@ -1620,7 +1641,13 @@ async def async_request_openai_chat_omni_completions(
                                     output.tts_output_pcm_bytes = (waveform * 32767).astype(np.int16).tobytes()
                             except Exception as ex:
                                 logger.warning("seed_tts WER PCM export failed: %s", ex)
-                    output.success = True
+                    if last_content_timestamp is not None:
+                        output.success = True
+                    else:
+                        output.success = False
+                        output.error = (
+                            "Never received a valid chunk to calculate TTFT.This response will be marked as failed!"
+                        )
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -2740,6 +2767,51 @@ def _merge_overrides(base: dict | None, overrides: dict | None) -> dict | None:
     return merged
 
 
+def _record_client_queue_time(output: RequestFuncOutput, request_arrival_time: float) -> None:
+    """Record how long a request waited for the client-side concurrency slot.
+
+    Ported from upstream vLLM (``limited_request_func``): ``start_time`` is set by
+    the request function once the request is actually sent, so it stays the
+    throughput anchor, while the delay between scheduling and sending is kept
+    separately as the client-side queue time.
+    """
+    output.client_queue_time = output.start_time - request_arrival_time
+
+
+def _report_values_metric(
+    result: dict[str, Any],
+    metric_attribute_name: str,
+    metric_name: str,
+    metric_header: str,
+    values: list[float],
+    selected_percentile_metrics: list[str],
+    selected_percentiles: list[float],
+) -> None:
+    """Report a metric that is only available as a per-request value list.
+
+    Upstream vLLM computes client queue time statistics from the raw outputs
+    instead of ``BenchmarkMetrics``; this mirrors its list-valued branch of
+    ``process_one_metric`` (opt-in via ``--percentile-metrics``, values in ms).
+    """
+    if metric_attribute_name not in selected_percentile_metrics:
+        return
+    mean = np.mean(values or 0) * 1000
+    median = np.median(values or 0) * 1000
+    std = np.std(values or 0) * 1000
+    percentiles = [(p, np.percentile(values or 0, p) * 1000) for p in selected_percentiles]
+
+    print("{s:{c}^{n}}".format(s=metric_header, n=50, c="-"))
+    print("{:<40} {:<10.2f}".format(f"Mean {metric_name} (ms):", mean))
+    print("{:<40} {:<10.2f}".format(f"Median {metric_name} (ms):", median))
+    result[f"mean_{metric_attribute_name}_ms"] = mean
+    result[f"median_{metric_attribute_name}_ms"] = median
+    result[f"std_{metric_attribute_name}_ms"] = std
+    for p, value in percentiles:
+        p_word = str(int(p)) if int(p) == p else str(p)
+        print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name} (ms):", value))
+        result[f"p{p_word}_{metric_attribute_name}_ms"] = value
+
+
 async def benchmark(
     task_type: TaskType,
     endpoint_type: str,
@@ -2900,9 +2972,13 @@ async def benchmark(
 
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
 
-    async def limited_request_func(request_func_input, session, pbar):
+    async def limited_request_func(request_func_input, session, pbar, request_arrival_time):
         async with semaphore:
-            return await request_func(request_func_input=request_func_input, session=session, pbar=pbar)
+            output = await request_func(request_func_input=request_func_input, session=session, pbar=pbar)
+        # Preserve start_time as the time the request was sent (throughput math
+        # relies on it); record the client-side semaphore delay separately.
+        _record_client_queue_time(output, request_arrival_time)
+        return output
 
     # Ported from upstream vLLM v0.27.0 (vllm/benchmarks/serve.py), which added
     # the probe_request_rate background probe; this file is the patched copy of
@@ -2991,8 +3067,16 @@ async def benchmark(
         _attach_daily_omni_to_request_func_input(request, request_func_input)
         _attach_seed_tts_to_request_func_input(request, request_func_input)
         _attach_omniinteract_to_request_func_input(request, request_func_input)
+        request_arrival_time = time.perf_counter()
         tasks.append(
-            asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
+            asyncio.create_task(
+                limited_request_func(
+                    request_func_input=request_func_input,
+                    session=session,
+                    pbar=pbar,
+                    request_arrival_time=request_arrival_time,
+                )
+            )
         )
     outputs: list[MixRequestFuncOutput] = await asyncio.gather(*tasks)
 
@@ -3072,6 +3156,8 @@ async def benchmark(
             "output_lens": actual_output_lens,
             "ttfts": [measured_ttft(output) for output in outputs],
             "itls": [output.itl for output in outputs],
+            "latencies": [output.latency for output in outputs],
+            "queue_times": [output.client_queue_time for output in outputs],
             "generated_texts": [output.generated_text for output in outputs],
             "errors": [output.error for output in outputs],
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
@@ -3096,6 +3182,8 @@ async def benchmark(
             "input_sequence_throughput": metrics.input_sequence_throughput,
             "total_token_throughput": metrics.total_token_throughput,
             "input_lens": [output.prompt_len for output in outputs],
+            "latencies": [output.latency for output in outputs],
+            "queue_times": [output.client_queue_time for output in outputs],
             "errors": [output.error for output in outputs],
         }
     # Plain-vLLM backends (e.g. the vLLM-text perf config) return upstream
@@ -3222,6 +3310,31 @@ async def benchmark(
     else:
         result_percentile_metrics.append("e2el")
         process_one_metric("e2el")
+
+    # Client queue time is only defined when requests wait for a concurrency
+    # slot; upstream reports it from the raw outputs, not from BenchmarkMetrics.
+    if max_concurrency is not None:
+        queue_times = [output.client_queue_time for output in outputs if output.success]
+        _report_values_metric(
+            result,
+            "client_queue_time",
+            "Client Queue Time",
+            "Client-side Queueing",
+            queue_times,
+            selected_percentile_metrics,
+            selected_percentiles,
+        )
+        if not math.isinf(request_rate):
+            e2els_including_queue = [output.latency + output.client_queue_time for output in outputs if output.success]
+            _report_values_metric(
+                result,
+                "e2el_including_client_queue",
+                "E2EL incl. Client Queue",
+                "Queue-inclusive End-to-end Latency",
+                e2els_including_queue,
+                selected_percentile_metrics,
+                selected_percentiles,
+            )
 
     if profile:
         print("Stopping profiler...")

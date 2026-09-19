@@ -66,6 +66,42 @@ def test_process_inputs_routes_no_media_processor_kwargs(renderer, kwargs, token
         {},
         mm_processor_kwargs=kwargs,
         mm_uuids=None,
+        media_io_kwargs=None,
+        skip_mm_cache=False,
+    )
+
+
+def test_process_inputs_forwards_media_io_kwargs_on_no_media_path(renderer):
+    """#54241: OmniRenderer's no-media mm_processor_kwargs path must forward
+    media_io_kwargs so they participate in multimodal hashes."""
+    processor = object.__new__(InputProcessor)
+    processor.renderer = renderer
+    processor.model_config = renderer.model_config
+    processor.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            data_parallel_size_local=1,
+            local_engines_only=False,
+        )
+    )
+    processor._validate_params = Mock()
+    processor._validate_lora = Mock()
+    processor._validate_model_inputs = Mock()
+    media_io_kwargs = {"image": {"num_frames": 8}}
+    prompt: dict[str, object] = {
+        "prompt_token_ids": [1, 2, 3],
+        "mm_processor_kwargs": {"target_h": 512},
+        "media_io_kwargs": media_io_kwargs,
+        "cache_salt": "salt",
+    }
+    request = processor.process_inputs("image-request", prompt, PoolingParams(), ("embed",))
+    assert request.prompt_token_ids == [1, 2, 3, 99]
+    renderer._process_multimodal.assert_called_once_with(
+        [1, 2, 3],
+        {},
+        mm_processor_kwargs={"target_h": 512},
+        mm_uuids=None,
+        media_io_kwargs=media_io_kwargs,
         skip_mm_cache=False,
     )
 

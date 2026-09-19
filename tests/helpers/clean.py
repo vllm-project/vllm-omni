@@ -68,10 +68,15 @@ def wait_for_gpu_memory_to_clear(
     timeout_s: float = 120,
 ) -> None:
     assert threshold_bytes is not None or threshold_ratio is not None
-    devices = get_physical_device_indices(devices)
+    # ``devices`` are logical CUDA ordinals (0..N-1 after CUDA_VISIBLE_DEVICES
+    # remap). Physical IDs are display-only — feeding them to
+    # ``platform.device()`` raises "invalid device ordinal" and the rebase
+    # watchdog treats that cleanup note as a fatal kill.
+    logical_devices = list(devices)
+    display_devices = get_physical_device_indices(logical_devices)
     start_time = time.time()
 
-    device_list = ", ".join(str(d) for d in devices)
+    device_list = ", ".join(str(d) for d in display_devices)
     if threshold_bytes is not None:
         condition_str = f"Memory usage ≤ {threshold_bytes / 2**30:.2f} GiB"
 
@@ -93,11 +98,11 @@ def wait_for_gpu_memory_to_clear(
         return (total_bytes - free_bytes) / 2**30, total_bytes / 2**30
 
     while True:
-        output_raw = {d: get_mem_gib(d) for d in devices}
-        output = {
-            d: f"{used:.1f}GiB/{total:.1f}GiB ({(used / total) * 100 if total > 0 else 0:.1f}%)"
-            for d, (used, total) in output_raw.items()
-        }
+        output_raw = {d: get_mem_gib(d) for d in logical_devices}
+        output = {}
+        for logical, display in zip(logical_devices, display_devices, strict=False):
+            used, total = output_raw[logical]
+            output[display] = f"{used:.1f}GiB/{total:.1f}GiB ({(used / total) * 100 if total > 0 else 0:.1f}%)"
 
         print("[Device Memory Status] Current usage:")
         for device_id, mem_info in output.items():
@@ -114,7 +119,7 @@ def wait_for_gpu_memory_to_clear(
             raise ValueError(
                 f"[Device Memory Timeout] Device(s) {device_list} still don't meet memory condition after {dur_s:.1f} seconds\n"
                 f"Condition: {condition_str}\n"
-                f"Current status:\n" + "\n".join(f"  Device {d}: {output[d]}" for d in devices)
+                f"Current status:\n" + "\n".join(f"  Device {d}: {info}" for d, info in output.items())
             )
 
         gc.collect()

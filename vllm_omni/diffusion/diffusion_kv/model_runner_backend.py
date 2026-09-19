@@ -257,7 +257,6 @@ class DiffusionKVModelRunnerBackend:
         # Native metadata builders size per-row buffers from max_num_seqs.
         # A diffusion public request can occupy several sequence/context rows.
         scheduler_config.max_num_seqs = max_num_reqs
-        kv_caches: list[torch.Tensor | list[torch.Tensor]] = []
         previous_adapter_caches = {
             layer_name: adapter.kv_cache for layer_name, adapter in self._kv_cache_layer_adapters.items()
         }
@@ -289,19 +288,20 @@ class DiffusionKVModelRunnerBackend:
                     layers=self._kv_cache_layer_adapters,
                     resolve_row=self._resolve_paged_attention_row,
                 )
-                # vLLM 0.29 reads the resolved physical layout when allocating,
-                # and dropped attn_groups/cache_dtype from the signature.
+                # f2aad6aa70 (#56888): first arg is forward_context; caches
+                # are returned as a dict instead of appended to a runner list.
                 adopt_kv_cache_layout(self.vllm_config, kv_cache_config)
                 for layer_adapter in self._kv_cache_layer_adapters.values():
                     assert_backend_layout_supported(self.vllm_config, getattr(layer_adapter, "attn_backend", None))
-                init_kv_cache(
-                    kv_caches,
+                kv_caches_dict = init_kv_cache(
                     self.vllm_config.compilation_config.static_forward_context,
                     kv_cache_config,
                     self.device,
                     kernel_block_sizes,
                     self.vllm_config,
+                    block_tables=block_tables,
                 )
+                kv_caches = list(kv_caches_dict.values())
         except Exception:
             scheduler_config.max_num_seqs = max_num_seqs
             for layer_name, previous_cache in previous_adapter_caches.items():

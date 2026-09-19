@@ -1,8 +1,20 @@
-# Target vLLM version: v0.29.0 (tag @ 98dff2a81d74).
-# Use the matching release image and its coherent CUDA/PyTorch/FlashInfer
-# runtime. Do not reinstall a commit wheel or repair dependencies on top of
-# an older base image at a release boundary. For a future unreleased target,
-# restore an explicit wheel pin and validate its complete runtime stack.
+# Target vLLM version: v0.30.0 branch @ f2aad6aa7074 (releases/v0.30.0).
+# UNRELEASED TARGET — the reinstall block below is restored per the note this
+# header carried at the v0.29.0 release boundary: there is no v0.30.0 tag and
+# no vllm/vllm-openai:v0.30.0 image yet, so CI rides the newest published
+# release image (v0.29.0) and reinstalls vLLM from the pinned commit wheel.
+#
+# The repair steps that follow are LIGHTER this cycle than in 0.27/0.28,
+# because the base image and the target wheel agree on torch: v0.29.0 and
+# f2aad6aa7 both specify torch 2.13.0 / torchaudio 2.11.0 / torchvision
+# 0.28.0, so the torch pin below is the no-op ordering guard its comment
+# describes rather than a version migration. The only runtime delta is
+# FlashInfer 0.6.18 -> 0.6.18.post1 (upstream requirements/cuda.txt at the
+# pin); jit-cache moves with it to avoid a version mismatch.
+#
+# When v0.30.0 is tagged and its official image ships, DELETE this block and
+# drop back to the release-boundary form: base tag v0.30.0, no wheel pin, no
+# dependency repair. Do not leave a commit wheel riding a release image.
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai
 ARG VLLM_BASE_TAG=v0.29.0
 
@@ -42,6 +54,83 @@ ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0
 # Do NOT use a non-editable install here — that copies an empty stub into
 # site-packages and breaks ``import vllm_omni.entrypoints``.
 RUN uv pip install --system -e ".[dev]"
+
+# Install vLLM (CUDA 13.0 build) from the precompiled wheel at the pinned
+# commit. Must use a direct URL because the wheel carries a PEP 440 local
+# version identifier (e.g. +gf2aad6aa7.cu130) which pip/uv refuse to install
+# from a PEP 503 index. The cu130 index lives at /<commit>/cu130/vllm/ while
+# the wheel files themselves sit at the top level /<commit>/<wheel>.
+ENV VLLM_PRECOMPILED_WHEEL_COMMIT=f2aad6aa70749ccc4604d31d6f8a04c6728c3361
+# Keep the base image's CUDA toolkit libs on the loader path. This does NOT by
+# itself guarantee libnvJitLink.so.13 resolves — that is handled by the
+# ldconfig step below, which is a no-op when the base image already provides it.
+ENV LD_LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib:${LD_LIBRARY_PATH}
+RUN VLLM_WHEEL_URL=$(python3 -c "import urllib.request,re; \
+    from urllib.parse import urljoin, quote; \
+    index_url='https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/cu130/vllm/'; \
+    html=urllib.request.urlopen(index_url).read().decode(); \
+    m=re.search(r'href=\"([^\"]*x86_64\.whl)\"',html); \
+    assert m, f'No x86_64 vLLM wheel found at {index_url}'; \
+    print(quote(urljoin(index_url,m.group(1)), safe=':/+%'))") && \
+    echo "Installing vLLM from: ${VLLM_WHEEL_URL}" && \
+    uv pip install --system --force-reinstall "${VLLM_WHEEL_URL}"
+
+# Pin torch BEFORE flashinfer. Versions mirror vLLM requirements/cuda.txt at
+# VLLM_PRECOMPILED_WHEEL_COMMIT.
+#
+# The ordering is the load-bearing part, not the version. This cycle the base
+# image already ships these exact versions, so the pin is a guard; it is kept
+# because the ordering is what stops FlashInfer from binding its compiled
+# artifacts (and its bundled TVM FFI runtime) to a torch that a later vLLM
+# reinstall removes. During the 0.27 rebase that mistake produced a C++ abort
+# during engine-core init and took out 21 CI jobs on build #2947.
+RUN uv pip install --system --force-reinstall \
+    "torch==2.13.0" "torchaudio==2.11.0" "torchvision==0.28.0" \
+    --torch-backend cu130
+
+# No --upgrade here: with torch already at its pinned version, --upgrade is what
+# would drag it forward again and reintroduce the mismatch this ordering fixes.
+RUN uv pip install --system \
+        "flashinfer-python==0.6.18.post1" \
+        "flashinfer-cubin==0.6.18.post1" \
+        --extra-index-url https://flashinfer.ai/whl/
+
+RUN uv pip install --system \
+    "flashinfer-jit-cache==0.6.18.post1" \
+    --index-url https://flashinfer.ai/whl/cu130
+
+# Fail the build here rather than at engine-core init if anything above moved
+# torch off its pin. The previous failure mode was a C++ terminate inside a
+# worker subprocess, surfacing only as "Failed core proc(s): {}" — an empty
+# set, hours into the test run.
+RUN python3 -c "import torch, sys; \
+    want='2.13.0'; got=torch.__version__.split('+')[0]; \
+    sys.exit(0) if got==want else sys.exit(f'torch pin drifted: want {want}, got {torch.__version__}')" && \
+    python3 -c "import deep_ep_cpp" 2>/dev/null \
+      && echo 'deep_ep_cpp imports cleanly' \
+      || echo 'WARNING: deep_ep_cpp not importable (non-fatal; vLLM treats deep_ep as optional)'
+
+# CUDA 13 JIT linker: libnvJitLink.so.13 comes from the nvidia-nvjitlink
+# package that the cu130 torch/vllm wheels pull into site-packages. Its lib dir
+# is not on the dynamic-loader path, so bitsandbytes / torch.compile worker
+# subprocesses fail to dlopen it. Locate the installed lib and register its dir
+# with ldconfig (system-wide, survives subprocess env resets). Only fall back to
+# the pip wheel (correct name: nvidia-nvjitlink-cu13, NOT
+# nvidia-cuda-nvjitlink-cu13, which does not exist) if torch did not bring it in.
+RUN NVJITLINK_LIB="$(find / -name 'libnvJitLink.so.13*' 2>/dev/null | head -1)" && \
+    if [ -z "$NVJITLINK_LIB" ]; then \
+        uv pip install --system "nvidia-nvjitlink-cu13" && \
+        NVJITLINK_LIB="$(find / -name 'libnvJitLink.so.13*' 2>/dev/null | head -1)"; \
+    fi && \
+    test -n "$NVJITLINK_LIB" && \
+    dirname "$NVJITLINK_LIB" > /etc/ld.so.conf.d/nvjitlink-cu13.conf && \
+    ldconfig && \
+    echo "Registered ${NVJITLINK_LIB} with ldconfig"
+
+# Re-pin numpy LAST. numba is still 0.65.0 at this pin and the generated CUDA
+# test lock resolves numpy 2.2.6. This must be the final dependency operation
+# so the wheel and FlashInfer installs cannot clobber it.
+RUN uv pip install --system "numpy==2.2.6"
 
 # The final stage just copies the working dir on top of the
 # dependencies image. This uses --link so that we can skip

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for generation streaming session replacement.
 
 These tests pin the behavior of `_update_request_as_session` against
@@ -130,7 +133,7 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
     sched.running = [session]
     sched.waiting = MagicMock()
     sched.skipped_waiting = MagicMock()
-    sched.structured_output_manager.should_advance.return_value = False
+    sched.structured_output_manager.accept_tokens.return_value = True
     # Async scheduling can observe the segment boundary in the next schedule()
     # before this model output is applied and defer the same request for finish.
     # update_from_output() must not re-arm the resumable request twice.

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from dataclasses import MISSING, field
 from typing import Any
 
@@ -38,8 +41,9 @@ class OmniModelArchConfigConvertor(ModelArchConfigConvertorBase):
         hf_config,
         hf_text_config,
         stage_config_name: str | None = None,
+        revision: str | None = None,
     ):
-        super().__init__(hf_config, hf_text_config)
+        super().__init__(hf_config, hf_text_config, revision)
         self.stage_config_name = stage_config_name
 
     def get_quantization_config(self):
@@ -208,8 +212,9 @@ class OmniModelConfig(ModelConfig):
                 self.hf_config,
                 self.hf_text_config,
                 stage_config_name=self.hf_config_name,
+                revision=getattr(self, "revision", None),
             )
-            return convertor.convert()
+            return convertor.convert(supports_multimodal=self._supports_multimodal_for_mm_prefix())
         return super().get_model_arch_config()
 
     def draw_hf_text_config(self):
