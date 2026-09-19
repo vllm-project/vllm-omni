@@ -709,6 +709,56 @@ def test_component_discovery_uses_official_checkpoint_contract() -> None:
     assert module._loader_state.prefetch_calls == [("checkpoint", ("tokenizer", "text_encoder", "vae"), False)]
 
 
+def _ulysses_config(size: int):
+    parallel_config = _od_config().parallel_config
+    parallel_config.sequence_parallel_size = size
+    parallel_config.ulysses_degree = size
+    return _od_config(parallel_config=parallel_config)
+
+
+def _record_shard_install(monkeypatch, module, *, world_size: int):
+    """Stand in for the Ulysses group and the decoder patch; return what the install was asked for."""
+    installs: list[dict] = []
+    group = object()
+
+    def install(vae, group_arg, split_dim, *, dst):
+        installs.append({"vae": vae, "group": group_arg, "split_dim": split_dim, "dst": dst})
+
+    monkeypatch.setattr(module, "install_wan_spatial_shard_decode", install)
+    monkeypatch.setattr(module.LingBotWorldCausalDMDPipeline, "_vae_shard_group", lambda self: (group, world_size))
+    return installs, group
+
+
+def test_a_multi_rank_deployment_shards_the_decoder_across_the_ulysses_ranks(monkeypatch) -> None:
+    """No switch: running the DiT on several Ulysses ranks is what shards the decode across them."""
+    module = _load_pipeline_module()
+    installs, group = _record_shard_install(monkeypatch, module, world_size=2)
+
+    pipeline = module.LingBotWorldCausalDMDPipeline(od_config=_ulysses_config(2))
+
+    # Along the width, and assembled on every rank: each rank's post_decode consumes the frame.
+    assert installs == [{"vae": pipeline.vae, "group": group, "split_dim": "width", "dst": None}]
+    assert pipeline._vae_shard_split_dim == "width"
+
+
+def test_a_single_rank_deployment_leaves_the_decoder_alone(monkeypatch) -> None:
+    module = _load_pipeline_module()
+    installs, _ = _record_shard_install(monkeypatch, module, world_size=1)
+
+    pipeline = module.LingBotWorldCausalDMDPipeline(od_config=_ulysses_config(1))
+
+    assert installs == [] and pipeline._vae_shard_split_dim is None
+
+
+def test_vae_shard_refuses_a_group_of_the_wrong_size(monkeypatch) -> None:
+    module = _load_pipeline_module()
+    installs, _ = _record_shard_install(monkeypatch, module, world_size=4)
+
+    with pytest.raises(RuntimeError, match="sequence_parallel_size=2 but the Ulysses group has 4 ranks"):
+        module.LingBotWorldCausalDMDPipeline(od_config=_ulysses_config(2))
+    assert installs == []
+
+
 @pytest.mark.parametrize(
     ("field", "value", "feature"),
     [
@@ -730,8 +780,9 @@ def test_unsupported_parallel_modes_fail_before_component_loading(field: str, va
     assert module._loader_state.prefetch_calls == []
 
 
-def test_pure_ulysses_parallel_config_is_supported() -> None:
+def test_pure_ulysses_parallel_config_is_supported(monkeypatch) -> None:
     module = _load_pipeline_module()
+    _record_shard_install(monkeypatch, module, world_size=2)
     parallel_config = _od_config().parallel_config
     parallel_config.sequence_parallel_size = 2
     parallel_config.ulysses_degree = 2

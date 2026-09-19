@@ -718,20 +718,29 @@ def _decoder_upsample_count(decoder: nn.Module) -> int:
     return count
 
 
-def install_wan_spatial_shard_decode(vae: Any, group: dist.ProcessGroup, split_dim: str = "height") -> None:
+def install_wan_spatial_shard_decode(
+    vae: Any,
+    group: dist.ProcessGroup,
+    split_dim: str = "height",
+    *,
+    dst: int | None = 0,
+) -> None:
     """Patch ``vae.decoder`` once for spatially-sharded decode.
 
     This mutates the already-loaded decoder in place by swapping its spatial
     convolutions/padding for halo-exchanging variants and wrapping
     ``decoder.forward``. The patch is permanent for the lifetime of the VAE
     instance and is applied only once (subsequent calls are no-ops). A given
-    instance is bound to a single ``split_dim``; switching between
-    ``"height"`` and ``"width"`` requires a fresh VAE instance and raises here
-    otherwise.
+    instance is bound to a single ``split_dim`` and ``dst``; switching either
+    requires a fresh VAE instance and raises here otherwise.
 
-    Only group-relative rank 0 assembles the final decoded frame, mirroring the
-    distributed tiled-decode ``broadcast_result=False`` contract; the other ranks
-    take part in the collectives but return an empty placeholder.
+    With ``dst=0`` (the default) only group-relative rank 0 assembles the
+    final decoded frame, mirroring the distributed tiled-decode
+    ``broadcast_result=False`` contract; the other ranks take part in the
+    collectives but return an empty placeholder. ``dst=None`` lets every rank
+    keep the assembled frame, for a caller whose every rank goes on to
+    consume the decoded pixels; the gather is an all-gather either way, so
+    this costs no extra communication.
     """
     _spatial_dim(split_dim)
     if getattr(vae, "_vllm_omni_wan_spatial_shard_installed", False):
@@ -740,6 +749,12 @@ def install_wan_spatial_shard_decode(vae: Any, group: dist.ProcessGroup, split_d
             raise ValueError(
                 "Wan spatial-shard VAE decoder was already patched for "
                 f"{installed_split_dim!r} split; create a fresh VAE instance to use {split_dim!r} split."
+            )
+        installed_dst = getattr(vae, "_vllm_omni_wan_spatial_shard_dst", 0)
+        if installed_dst != dst:
+            raise ValueError(
+                "Wan spatial-shard VAE decoder was already patched to assemble on "
+                f"{installed_dst!r}; create a fresh VAE instance to assemble on {dst!r}."
             )
         return
     decoder = getattr(vae, "decoder", None)
@@ -781,11 +796,12 @@ def install_wan_spatial_shard_decode(vae: Any, group: dist.ProcessGroup, split_d
             out = orig_forward(x, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk)
         finally:
             _SPATIAL_SHARD_CONTEXT.reset(token)
-        return gather_and_trim_extent(out, expected_extent=expected_extent, split_dim=split_dim, group=group, dst=0)
+        return gather_and_trim_extent(out, expected_extent=expected_extent, split_dim=split_dim, group=group, dst=dst)
 
     decoder.forward = MethodType(_forward, decoder)
     vae._vllm_omni_wan_spatial_shard_installed = True
     vae._vllm_omni_wan_spatial_shard_split_dim = split_dim
+    vae._vllm_omni_wan_spatial_shard_dst = dst
     logger.info("Installed Wan VAE %s-sharded decode.", split_dim)
 
 
