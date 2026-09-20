@@ -265,7 +265,7 @@ def test_resolve_fl2va_model_ref(tmp_path, monkeypatch):
         assert allow_patterns == ["FL2VA/**"]
         return str(tmp_path)
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
     assert _resolve_fl2va_model_ref() == str(fl2va_root)
 
 

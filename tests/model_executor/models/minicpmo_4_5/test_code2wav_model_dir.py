@@ -23,15 +23,15 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _no_hub(monkeypatch):
+def _no_hub(monkeypatch, tmp_path):
     def _fail(*args, **kwargs):  # pragma: no cover - must not be reached
         raise AssertionError("snapshot_download must not be called here")
 
-    patch_hf_snapshot_download(monkeypatch, _fail)
+    patch_hf_snapshot_download(monkeypatch, _fail, hf_home=tmp_path)
 
 
 def test_local_directory_is_returned_unchanged(tmp_path, monkeypatch):
-    _no_hub(monkeypatch)
+    _no_hub(monkeypatch, tmp_path)
     assert _resolve_model_dir(str(tmp_path)) == str(tmp_path)
 
 
@@ -44,7 +44,7 @@ def test_repo_id_resolves_via_snapshot_download(tmp_path, monkeypatch):
         calls["allow_patterns"] = allow_patterns
         return str(tmp_path / "snapshot")
 
-    patch_hf_snapshot_download(monkeypatch, _fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, _fake_snapshot_download, hf_home=tmp_path)
     resolved = _resolve_model_dir("openbmb/MiniCPM-o-4_5", revision="abc123")
     assert resolved == str(tmp_path / "snapshot")
     assert calls["model_ref"] == "openbmb/MiniCPM-o-4_5"
@@ -52,18 +52,18 @@ def test_repo_id_resolves_via_snapshot_download(tmp_path, monkeypatch):
     assert calls["allow_patterns"] == ["assets/*"]
 
 
-def test_snapshot_download_failure_propagates(monkeypatch):
+def test_snapshot_download_failure_propagates(monkeypatch, tmp_path):
     def _raise(*args, **kwargs):
         raise FileNotFoundError("offline and not cached")
 
-    patch_hf_snapshot_download(monkeypatch, _raise)
+    patch_hf_snapshot_download(monkeypatch, _raise, hf_home=tmp_path)
     with pytest.raises(FileNotFoundError):
         _resolve_model_dir("openbmb/MiniCPM-o-4_5")
 
 
-def test_init_with_fake_path_does_not_resolve(monkeypatch):
+def test_init_with_fake_path_does_not_resolve(monkeypatch, tmp_path):
     """Mirrors the CPU-test construction: fake model path, no ``revision``."""
-    _no_hub(monkeypatch)
+    _no_hub(monkeypatch, tmp_path)
     config = SimpleNamespace(
         model_config=SimpleNamespace(
             model="/fake/model",
@@ -75,8 +75,8 @@ def test_init_with_fake_path_does_not_resolve(monkeypatch):
     assert model._default_prompt_wav == "/fake/model/assets/HT_ref_audio.wav"
 
 
-def test_default_prompt_wav_follows_resolved_model_path(monkeypatch):
-    _no_hub(monkeypatch)
+def test_default_prompt_wav_follows_resolved_model_path(monkeypatch, tmp_path):
+    _no_hub(monkeypatch, tmp_path)
     config = SimpleNamespace(
         model_config=SimpleNamespace(
             model="openbmb/MiniCPM-o-4_5",

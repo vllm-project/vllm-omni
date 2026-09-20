@@ -1580,7 +1580,7 @@ def test_build_engine_args_pulls_stage_subdirs_missing_from_cached_snapshot(monk
         _make_snapshot(snapshot, ["language_model"])
         return str(snapshot)
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1609,7 +1609,7 @@ def test_build_engine_args_skips_hub_call_when_cached_snapshot_is_complete(monke
         assert kwargs.get("local_files_only"), "warm cache must not reach the Hub"
         return str(snapshot)
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1646,7 +1646,7 @@ def test_build_engine_args_redownloads_a_partial_subdir(monkeypatch, tmp_path):
         _make_snapshot(snapshot, ["language_model"])
         return str(snapshot)
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1692,7 +1692,7 @@ def test_build_engine_args_redownloads_when_index_lists_missing_shards(monkeypat
             (partial / "model-00002-of-00002.safetensors").write_text("x")
         return str(snapshot)
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1727,7 +1727,7 @@ def test_build_engine_args_redownloads_shards_without_their_index(monkeypatch, t
                 (partial / shard).write_text("x")
         return str(snapshot)
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1758,7 +1758,7 @@ def test_build_engine_args_redownloads_a_tokenizer_folder_without_vocabulary(mon
             _make_snapshot(snapshot, ["tokenizer"])
         return str(snapshot)
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1786,7 +1786,7 @@ def test_build_engine_args_forwards_revision_and_download_dir(monkeypatch, tmp_p
         seen.append(kwargs)
         return str(snapshot)
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1823,7 +1823,7 @@ def test_build_engine_args_resolves_tokenizer_revision_separately(monkeypatch, t
             return str(tokenizer_snapshot)
         return str(model_snapshot)
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1863,7 +1863,7 @@ def test_build_engine_args_resolves_root_tokenizer_revision_separately(monkeypat
             return str(tokenizer_snapshot)
         return str(model_snapshot)
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1895,7 +1895,7 @@ def test_build_engine_args_fails_closed_when_subdir_cannot_be_downloaded(monkeyp
             return str(snapshot)
         raise OSError("offline")
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,
@@ -1908,14 +1908,14 @@ def test_build_engine_args_fails_closed_when_subdir_cannot_be_downloaded(monkeyp
         build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
 
 
-def test_build_engine_args_fails_closed_on_cold_cache_instead_of_joining_repo_id(monkeypatch):
+def test_build_engine_args_fails_closed_on_cold_cache_instead_of_joining_repo_id(monkeypatch, tmp_path):
     """With nothing cached, the stage must not join a subdir onto the repo id."""
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
     def fake_snapshot_download(repo_id, **kwargs):
         raise OSError("offline")
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     stage_cfg = types.SimpleNamespace(
         stage_id=0,

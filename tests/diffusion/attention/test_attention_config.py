@@ -42,6 +42,14 @@ from vllm_omni.diffusion.data import (
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
+@pytest.fixture(autouse=True)
+def _clear_inherited_attention_backend(monkeypatch):
+    # Weekly CPU exports DIFFUSION_ATTENTION_BACKEND; OmniDiffusionConfig
+    # treats that as an explicit default so auto-backend cases break.
+    # Tests that setenv the same variable still work: this fixture runs first.
+    monkeypatch.delenv("DIFFUSION_ATTENTION_BACKEND", raising=False)
+
+
 class TestAttentionSpec:
     def test_construct_no_skip_softmax(self):
         spec = AttentionSpec(backend="FLASH_ATTN")
@@ -415,10 +423,6 @@ class TestBuildAttentionConfig:
 
 class TestOmniDiffusionConfigAttentionParsing:
     """Test OmniDiffusionConfig attention shorthand and structured config."""
-
-    @pytest.fixture(autouse=True)
-    def _clear_inherited_attention_backend(self, monkeypatch):
-        monkeypatch.delenv("DIFFUSION_ATTENTION_BACKEND", raising=False)
 
     def test_diffusion_attention_backend_sets_default(self):
         config = OmniDiffusionConfig.from_kwargs(diffusion_attention_backend="SAGE_ATTN")
@@ -946,12 +950,6 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
 
 
 class TestOptInFloat32Fallback:
-    @pytest.fixture(autouse=True)
-    def _clear_inherited_attention_backend(self, monkeypatch):
-        # Weekly CPU exports DIFFUSION_ATTENTION_BACKEND; OmniDiffusionConfig
-        # treats that as an explicit default and these auto-backend cases break.
-        monkeypatch.delenv("DIFFUSION_ATTENTION_BACKEND", raising=False)
-
     @staticmethod
     def _make_attention(monkeypatch, *, backend=None, allow=True, kv_cache_dtype=None):
         events, state = [], {}

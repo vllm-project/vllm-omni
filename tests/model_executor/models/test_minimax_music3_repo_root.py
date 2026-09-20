@@ -55,7 +55,7 @@ def test_resolve_repo_root_resolves_a_hub_id_to_a_local_snapshot(monkeypatch, tm
         seen.append(kwargs)
         return str(root)
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     assert resolve_repo_root("MiniMaxAI/MiniMax-Music3") == root
     # Cache-first, and only the component folders.
@@ -74,7 +74,7 @@ def test_resolve_repo_root_falls_back_to_the_hub_when_the_cache_is_incomplete(mo
             raise OSError("incomplete snapshot")
         return str(root)
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     assert resolve_repo_root("MiniMaxAI/MiniMax-Music3") == root
     assert len(calls) == 2
@@ -96,7 +96,7 @@ def test_resolve_repo_root_retries_online_when_the_local_lookup_returns_a_partia
             _make_root(snapshot)
         return str(snapshot)
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     assert resolve_repo_root("MiniMaxAI/MiniMax-Music3") == snapshot
     assert [bool(call.get("local_files_only")) for call in calls] == [True, False]
@@ -115,17 +115,17 @@ def test_resolve_repo_root_redownloads_weightless_marker_dirs(monkeypatch, tmp_p
             _make_root(snapshot)
         return str(snapshot)
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     assert resolve_repo_root("MiniMaxAI/MiniMax-Music3") == snapshot
     assert any(not call.get("local_files_only") for call in calls)
 
 
-def test_resolve_repo_root_reports_the_original_reference_when_unresolvable(monkeypatch):
+def test_resolve_repo_root_reports_the_original_reference_when_unresolvable(monkeypatch, tmp_path):
     def fake_snapshot_download(repo_id, **kwargs):
         raise OSError("offline")
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     with pytest.raises(FileNotFoundError, match="MiniMaxAI/MiniMax-Music3"):
         resolve_repo_root("MiniMaxAI/MiniMax-Music3")
@@ -148,7 +148,7 @@ def test_resolve_repo_root_downloads_components_for_a_cold_cache_model_subdir(mo
         _make_root(snapshot)
         return str(snapshot)
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     assert resolve_repo_root(str(snapshot / "language_model")) == snapshot
     assert seen == ["MiniMaxAI/MiniMax-Music3"]
@@ -160,7 +160,7 @@ def test_resolve_repo_root_does_not_guess_a_repo_id_for_plain_directories(monkey
     def fake_snapshot_download(repo_id, **kwargs):
         raise AssertionError("must not reach the Hub for a plain directory")
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     plain = tmp_path / "language_model"
     plain.mkdir()
@@ -188,7 +188,7 @@ def test_resolve_repo_root_rejects_a_snapshot_missing_condition_encoder(monkeypa
             _make_root(snapshot)
         return str(snapshot)
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     assert resolve_repo_root(str(snapshot)) == snapshot
     assert repaired == ["MiniMaxAI/MiniMax-Music3"]
@@ -214,7 +214,7 @@ def test_resolve_repo_root_rejects_a_partial_shard_run(monkeypatch, tmp_path):
                 (partial / f"{stem}-0000{index}-of-00003.safetensors").write_bytes(b"x")
         return str(snapshot)
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     assert resolve_repo_root(str(snapshot)) == snapshot
     assert repaired == ["MiniMaxAI/MiniMax-Music3"]
@@ -234,7 +234,7 @@ def test_resolve_repo_root_threads_revision_and_download_dir(monkeypatch, tmp_pa
         _make_root(snapshot)
         return str(snapshot)
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     assert resolve_repo_root("MiniMaxAI/MiniMax-Music3", revision="abc123", download_dir="/tmp/hub-cache") == snapshot
     assert calls
@@ -257,7 +257,7 @@ def test_resolve_repo_root_reuses_the_snapshot_revision_from_the_cache_path(monk
         _make_root(snapshot)
         return str(snapshot)
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     assert resolve_repo_root(str(snapshot / "language_model")) == snapshot
     assert calls
@@ -284,7 +284,7 @@ def test_resolve_repo_root_accepts_shard_names_the_loader_can_read(monkeypatch, 
     def fake_snapshot_download(repo_id, **kwargs):
         raise AssertionError("must not reach the Hub for readable weights")
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     assert resolve_repo_root(str(root)) == root
 
@@ -308,7 +308,7 @@ def test_resolve_repo_root_still_rejects_a_partial_run_beside_an_extra_file(monk
             (partial / f"{stem}-0000{index}-of-00003.safetensors").write_bytes(b"x")
         return str(root)
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
 
     with pytest.raises(FileNotFoundError, match="components are incomplete"):
         resolve_repo_root(str(root))

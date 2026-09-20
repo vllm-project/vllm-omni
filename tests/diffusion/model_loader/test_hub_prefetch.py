@@ -11,13 +11,13 @@ from vllm_omni.diffusion.model_loader import hub_prefetch
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
-def test_prefetch_subfolders_propagates_revision(monkeypatch):
+def test_prefetch_subfolders_propagates_revision(monkeypatch, tmp_path):
     calls = []
 
     def fake_snapshot_download(**kwargs):
         calls.append(kwargs)
 
-    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download)
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
     monkeypatch.setattr(hub_prefetch, "_repo_prefetch_lock", lambda _model: contextlib.nullcontext())
 
     hub_prefetch.prefetch_subfolders(
