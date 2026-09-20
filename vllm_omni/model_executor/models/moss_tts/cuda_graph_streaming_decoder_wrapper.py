@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 OpenMOSS and the vLLM-Omni team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
@@ -30,11 +33,10 @@ logger = init_logger(__name__)
     }
 )
 class _MossStreamingDecodeCompileAdapter(nn.Module):
-    """Expose the BF16 codec streaming hot path to vLLM compile.
+    """Expose the codec streaming hot path to vLLM compile.
 
-    The dtype is part of the class identity intentionally: vLLM's AOT cache
-    drops runtime guards, so an artifact traced with the old FP32 decoder
-    weights must never be reused after the decoder is materialized as BF16.
+    The wrapper preserves the codec dtype: v1 decodes in FP32 to match its
+    quantizer output, while v2 uses BF16.
     """
 
     def __init__(self, codec: nn.Module, *, vllm_config: VllmConfig) -> None:

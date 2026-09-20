@@ -29,6 +29,7 @@ from vllm_omni.config.omni_config import (
     OmniStageSchedulerConfig,
     VllmOmniARStageConfig,
     VllmOmniConfig,
+    extract_diffusion_stage_config_kwargs,
 )
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
 from vllm_omni.config.stage_config import (
@@ -567,7 +568,9 @@ def test_engine_args_consume_stage_diffusion_attention_shorthand(tmp_path):
         assert engine_args.get("diffusion_attention_backend") is None
         assert isinstance(engine_args["diffusion_attention_config"], AttentionConfig)
         assert engine_args["diffusion_attention_config"].default.backend == "TORCH_SDPA"
-        od_config = OmniDiffusionConfig.from_kwargs(**engine_args)
+        od_config = OmniDiffusionConfig.from_kwargs(
+            **extract_diffusion_stage_config_kwargs(engine_args, stage_id=2, include_engine_adapter_metadata=True)
+        )
         assert od_config.diffusion_attention_config.default.backend == "TORCH_SDPA"
 
 
@@ -600,7 +603,9 @@ def test_engine_args_apply_cli_attention_shorthand_over_yaml_config(tmp_path, ya
         attention_config = engine_args["diffusion_attention_config"]
         assert attention_config.default.backend == "TORCH_SDPA"
         assert attention_config.per_role["cross"].backend == "SAGE_ATTN"
-        od_config = OmniDiffusionConfig.from_kwargs(**engine_args)
+        od_config = OmniDiffusionConfig.from_kwargs(
+            **extract_diffusion_stage_config_kwargs(engine_args, stage_id=2, include_engine_adapter_metadata=True)
+        )
         assert od_config.diffusion_attention_config.default.backend == "TORCH_SDPA"
 
 
