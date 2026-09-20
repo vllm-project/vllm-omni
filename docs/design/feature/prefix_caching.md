@@ -42,6 +42,7 @@ The main focus of vLLM-Omni's approach to prefix caching stage outputs is to bui
 With this in mind, consider the set of blocks in a 2D layout, where the row represents the index of blocks being considered, and the columns represent the slots corresponding to tokens within each block. Since we know the `num_blocks` and `block_size` from our kv cache config, if we want to cache a tensor with feature size `D`, we can preallocate a CPU tensor of size `(num_blocks, block_size, D)`, and use the same block index and slot mapping to retrieve the corresponding feature vector.
 
 Host footprint: each cached key costs `num_blocks × block_size × D × dtype_bytes` of **pinned** CPU memory (pinned so device→host can overlap compute), allocated on the first `save_outputs` that sees the key — the first real request pays the `cudaHostAlloc`. Measured on a Qwen3-Omni deployment: thinker `__hidden_states__` `[15092, 16, 2048]` bf16 ≈ 0.92 GiB (plus the same again for each `hidden_states.layer_*` key a model exposes), Qwen3-TTS talker `codes.audio` `[16180, 16, 16]` ≈ 33 MiB. Budget host RAM for the stage accordingly.
+
 ### Example
 
 !!! note "Note 3"
@@ -189,7 +190,8 @@ Cache identity includes token IDs, reference-image content and VAE random state,
 plus model/layout and LoRA context. The same image with different prompts can
 reuse the common leading blocks; it does not imply that every image span or CFG
 branch is interchangeable. Disabling prefix caching skips cache-identity hashing;
-`dense_legacy` remains the default.
+`dense_legacy` remains the default. Enabling prefix caching with a mode other than
+`paged_scheduler` raises a configuration error; switch modes or disable caching.
 
 The current scope is local DiT reuse, not AR-imported KV or missing-page-only
 cross-stage transfer. Prefix-hit accuracy has been exercised with TP4, SP1 and
@@ -213,10 +215,13 @@ Warmups are excluded from latency and request throughput. This measures full-pre
 reuse, not the earlier distinct-prompt workload; its results must be reported separately.
 
 `tests/e2e/accuracy/test_hunyuan_image3_prefix_cache_accuracy.py` uses the same input
-at 50 steps with two seeds. It also changes the prompt to check partial hits,
-verifies actual reference-image reuse and query slicing, and compares generated
-outputs with the matching uncached outputs. Input images are not accuracy goldens;
-the existing AR-to-DiT golden test remains unchanged.
+at CFG 2.5, 50 steps and seed 42, comparing all modes against the existing official
+Instruct output image and IT2I thresholds (CLIP ≥90, SSIM ≥0.26, PSNR ≥12.5).
+A different prompt warms the cache; the original prompt then exercises partial
+and repeated hits, with reference-image reuse and query slicing verified.
+Only outputs for the original prompt are scored. The golden comes from AR-to-DiT;
+this single-DiT quality check does not establish identical conditioning between
+the pipelines. The existing AR-to-DiT test remains unchanged.
 
 ### Implementation
 

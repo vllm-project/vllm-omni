@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import requests
 from PIL import Image
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -325,6 +326,27 @@ def test_image_edit_client_uses_openai_image_edit_endpoint(monkeypatch, num_imag
     assert captured["data"]["seed"] == "42"
     assert captured["data"]["bot_task"] == "think_recaption"
     assert captured["data"]["sys_type"] == "en_unified"
+
+
+@pytest.mark.parametrize("status_code", [400, 500])
+def test_image_edit_client_preserves_server_error_detail(mocker, status_code):
+    response = requests.Response()
+    response.status_code = status_code
+    response._content = b'{"error": "image input limit exceeded"}'
+    post = mocker.patch("benchmarks.accuracy.common.requests.post", return_value=response)
+    client = VllmOmniImageClient(base_url="http://127.0.0.1:8093")
+
+    with pytest.raises(requests.HTTPError, match="image input limit exceeded") as exc:
+        client.generate_image_edit(
+            model="test-model",
+            prompt="edit this image",
+            images=Image.new("RGB", (2, 2)),
+            width=512,
+            height=512,
+        )
+
+    assert exc.value.response is response
+    post.assert_called_once()
 
 
 def test_text_to_image_client_forwards_output_compression(monkeypatch):

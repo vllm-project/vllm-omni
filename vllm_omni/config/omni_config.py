@@ -990,6 +990,11 @@ class _DiffusionConfigProjection:
             )
 
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
+        if self.enable_prefix_caching and self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+            raise ValueError(
+                "enable_prefix_caching=True requires diffusion_kv_mode='paged_scheduler'; "
+                "set diffusion_kv_mode='paged_scheduler' or disable enable_prefix_caching"
+            )
         if (
             self.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
             and self.diffusion_kv_max_rows_per_request is None

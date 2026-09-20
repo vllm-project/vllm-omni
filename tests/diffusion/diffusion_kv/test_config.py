@@ -21,6 +21,42 @@ def test_dense_legacy_is_default() -> None:
     assert config.diffusion_kv_mode is DiffusionKVCacheMode.DENSE_LEGACY
 
 
+@pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
+@pytest.mark.parametrize("mode", [None, "dense_legacy", DiffusionKVCacheMode.DENSE_LEGACY])
+def test_prefix_caching_rejects_non_paged_mode(config_cls, mode) -> None:
+    kwargs = {} if mode is None else {"diffusion_kv_mode": mode}
+    with pytest.raises(
+        ValueError,
+        match="set diffusion_kv_mode='paged_scheduler' or disable enable_prefix_caching",
+    ):
+        config_cls.from_kwargs(enable_prefix_caching=True, **kwargs)
+
+
+@pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
+def test_prefix_caching_accepts_paged_scheduler(config_cls) -> None:
+    config = config_cls.from_kwargs(
+        diffusion_kv_mode="paged_scheduler",
+        diffusion_kv_max_rows_per_request=2,
+        enable_prefix_caching=True,
+    )
+
+    assert config.enable_prefix_caching is True
+    assert config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
+
+
+@pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
+@pytest.mark.parametrize("mode", ["dense_legacy", "paged_scheduler"])
+def test_disabled_prefix_caching_accepts_both_modes(config_cls, mode) -> None:
+    config = config_cls.from_kwargs(
+        diffusion_kv_mode=mode,
+        diffusion_kv_max_rows_per_request=2,
+        enable_prefix_caching=False,
+    )
+
+    assert config.enable_prefix_caching is False
+    assert config.diffusion_kv_mode.value == mode
+
+
 def test_paged_worker_local_is_rejected_until_implemented() -> None:
     with pytest.raises(ValueError, match="reserved but not implemented"):
         OmniDiffusionConfig.from_kwargs(diffusion_kv_mode="paged_worker_local")

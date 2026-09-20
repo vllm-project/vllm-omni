@@ -1485,7 +1485,12 @@ def test_diffusion_config_preserves_existing_coercion_hooks():
 def test_diffusion_projection_retains_prefix_caching(enabled):
     projection = omni_config_module._DiffusionConfigProjection
     assert projection.from_kwargs().enable_prefix_caching is False
-    assert projection.from_kwargs(enable_prefix_caching=enabled).enable_prefix_caching is enabled
+    config = projection.from_kwargs(
+        diffusion_kv_mode="paged_scheduler",
+        diffusion_kv_max_rows_per_request=2,
+        enable_prefix_caching=enabled,
+    )
+    assert config.enable_prefix_caching is enabled
 
 
 @pytest.mark.parametrize(

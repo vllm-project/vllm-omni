@@ -1187,6 +1187,11 @@ class OmniDiffusionConfig:
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
         if not isinstance(self.enable_prefix_caching, bool):
             raise TypeError("enable_prefix_caching must be a bool")
+        if self.enable_prefix_caching and self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+            raise ValueError(
+                "enable_prefix_caching=True requires diffusion_kv_mode='paged_scheduler'; "
+                "set diffusion_kv_mode='paged_scheduler' or disable enable_prefix_caching"
+            )
         if self.diffusion_kv_max_rows_per_request is not None and (
             type(self.diffusion_kv_max_rows_per_request) is not int or self.diffusion_kv_max_rows_per_request <= 0
         ):
@@ -1679,6 +1684,7 @@ class OmniDiffusionConfig:
                         or DiffusionModelRegistry._try_load_model_cls(architecture) is not None
                     ):
                         self.model_class_name = architecture
+                    self.update_multimodal_support()
                 else:
                     raise
 
