@@ -2,13 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
-MiniMax-H3 T2V stability: OmniServer (diffusion) + ``diffusion_benchmark_serving.py`` / ``v1/videos``.
+MiniCPM-o-4.5 stability: OmniServer + ``vllm bench serve --omni`` for a fixed duration.
 
-Configuration: ``tests/dfx/stability/tests/test_minimax_h3.json``.
-
-``--lora-path`` is resolved like e2e FastH3 / Buildkite ``test-merge.yml``:
-set ``VLLM_TEST_MINIMAX_H3_FASTH3_LORA`` to the adapter file, or populate the local
-HF cache for ``FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA``.
+Configuration: ``tests/dfx/stability/tests/test_minicpmo_4_5.json``.
 """
 
 from __future__ import annotations
@@ -23,33 +19,16 @@ from tests.dfx.conftest import (
     create_unique_server_pytest_params,
     load_configs,
 )
-from tests.dfx.stability.helpers import _run_one_diffusion_batch, run_stability_benchmark_loop
-from tests.e2e.online_serving.minimax_h3._common import FASTH3_LORA
-from tests.helpers.mark import hardware_marks
+from tests.dfx.stability.helpers import _run_one_vllm_bench_batch, run_stability_benchmark_loop
 
 STABILITY_DIR = Path(__file__).resolve().parent.parent
 DEPLOY_CONFIGS_DIR = STABILITY_DIR / "deploy"
-CONFIG_FILE_PATH = str(STABILITY_DIR / "tests" / "test_minimax_h3.json")
+CONFIG_FILE_PATH = str(STABILITY_DIR / "tests" / "test_minicpmo_4_5.json")
 DEFAULT_NUM_PROMPTS_PER_BATCH = 20
-STABILITY_SERVER_TIMEOUT_ARGS = ["--stage-init-timeout", "1800", "--init-timeout", "1800"]
-
-# Runtime marks also come from JSON via create_unique_server_pytest_params;
-# keep a helper call here so pre-commit check-mark sees a hardware mark.
-_H800_FOUR_CARD_MARKS = hardware_marks(res={"cuda": "H800"}, num_cards=4)  # noqa: F841
-
-
-def _inject_fasth3_lora_path(configs: list[dict]) -> list[dict]:
-    """Fill serve_args.lora-path from VLLM_TEST_MINIMAX_H3_FASTH3_LORA / HF cache."""
-    if not FASTH3_LORA:
-        return configs
-    for config in configs:
-        serve_args = config.setdefault("server_params", {}).setdefault("serve_args", {})
-        serve_args["lora-path"] = FASTH3_LORA
-    return configs
-
+STABILITY_SERVER_TIMEOUT_ARGS = ["--stage-init-timeout", "600"]
 
 try:
-    BENCHMARK_CONFIGS = _inject_fasth3_lora_path(load_configs(CONFIG_FILE_PATH))
+    BENCHMARK_CONFIGS = load_configs(CONFIG_FILE_PATH)
 except FileNotFoundError:
     BENCHMARK_CONFIGS = []
 
@@ -58,15 +37,10 @@ server_to_benchmark_mapping = create_test_parameter_mapping(BENCHMARK_CONFIGS) i
 benchmark_indices = create_benchmark_indices(BENCHMARK_CONFIGS, server_to_benchmark_mapping)
 
 
-@pytest.mark.slow
-@pytest.mark.diffusion
-@pytest.mark.skipif(
-    FASTH3_LORA is None,
-    reason="set VLLM_TEST_MINIMAX_H3_FASTH3_LORA or populate the local HF cache",
-)
+# Pytest marks (hardware, local_model, slow, omni) come from test_minicpmo_4_5.json.
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @pytest.mark.parametrize("stability_benchmark_params", benchmark_indices, indirect=True)
-def test_stability_minimax_h3(omni_server, stability_benchmark_params):
+def test_stability_minicpmo_4_5(omni_server, stability_benchmark_params):
     test_name = stability_benchmark_params["test_name"]
     params = stability_benchmark_params["params"]
     duration_sec = params.get("duration_sec", 300)
@@ -90,7 +64,7 @@ def test_stability_minimax_h3(omni_server, stability_benchmark_params):
         max_concurrency=max_concurrency,
         result_dir=str(STABILITY_DIR),
         num_prompts_per_batch=num_prompts_per_batch,
-        run_one_batch=_run_one_diffusion_batch,
+        run_one_batch=_run_one_vllm_bench_batch,
     )
 
     assert result.get("failed", 0) == 0, f"[{test_name}] Failed requests detected: {result.get('errors', [])}"

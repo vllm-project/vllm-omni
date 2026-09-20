@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-
 """
-MiniCPM-o-4.5 stability: OmniServer + ``vllm bench serve --omni`` for a fixed duration.
+HunyuanVideo-1.5 I2V stability: OmniServer (diffusion) + ``diffusion_benchmark_serving.py`` / ``v1/videos``.
 
-Configuration: ``tests/dfx/stability/tests/test_minicpmo_4_5.json``.
+Configuration: ``tests/dfx/stability/tests/test_hunyuanvideo15.json``.
 """
 
 from __future__ import annotations
@@ -19,18 +18,13 @@ from tests.dfx.conftest import (
     create_unique_server_pytest_params,
     load_configs,
 )
-from tests.dfx.stability.helpers import _run_one_vllm_bench_batch, run_stability_benchmark_loop
-from tests.helpers.mark import hardware_marks
+from tests.dfx.stability.helpers import _run_one_diffusion_batch, run_stability_benchmark_loop
 
 STABILITY_DIR = Path(__file__).resolve().parent.parent
 DEPLOY_CONFIGS_DIR = STABILITY_DIR / "deploy"
-CONFIG_FILE_PATH = str(STABILITY_DIR / "tests" / "test_minicpmo_4_5.json")
-DEFAULT_NUM_PROMPTS_PER_BATCH = 20
-STABILITY_SERVER_TIMEOUT_ARGS = ["--stage-init-timeout", "600"]
-
-# Runtime marks also come from JSON via create_unique_server_pytest_params;
-# keep a helper call here so pre-commit check-mark sees a hardware mark.
-_H800_ONE_CARD_MARKS = hardware_marks(res={"cuda": "H800"}, num_cards=1)  # noqa: F841
+CONFIG_FILE_PATH = str(STABILITY_DIR / "tests" / "test_hunyuanvideo15.json")
+DEFAULT_NUM_PROMPTS_PER_BATCH = 50
+STABILITY_SERVER_TIMEOUT_ARGS = ["--stage-init-timeout", "600", "--init-timeout", "900"]
 
 try:
     BENCHMARK_CONFIGS = load_configs(CONFIG_FILE_PATH)
@@ -42,11 +36,10 @@ server_to_benchmark_mapping = create_test_parameter_mapping(BENCHMARK_CONFIGS) i
 benchmark_indices = create_benchmark_indices(BENCHMARK_CONFIGS, server_to_benchmark_mapping)
 
 
-@pytest.mark.slow
-@pytest.mark.omni
+# Pytest marks (hardware, local_model, slow, diffusion) come from test_hunyuanvideo15.json.
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @pytest.mark.parametrize("stability_benchmark_params", benchmark_indices, indirect=True)
-def test_stability_minicpmo_4_5(omni_server, stability_benchmark_params):
+def test_stability_hunyuanvideo15(omni_server, stability_benchmark_params):
     test_name = stability_benchmark_params["test_name"]
     params = stability_benchmark_params["params"]
     duration_sec = params.get("duration_sec", 300)
@@ -70,7 +63,7 @@ def test_stability_minicpmo_4_5(omni_server, stability_benchmark_params):
         max_concurrency=max_concurrency,
         result_dir=str(STABILITY_DIR),
         num_prompts_per_batch=num_prompts_per_batch,
-        run_one_batch=_run_one_vllm_bench_batch,
+        run_one_batch=_run_one_diffusion_batch,
     )
 
     assert result.get("failed", 0) == 0, f"[{test_name}] Failed requests detected: {result.get('errors', [])}"

@@ -12,6 +12,7 @@
                 }
             },
             "local_model",
+            "slow",
             "omni"
         ],
         "server_params": {

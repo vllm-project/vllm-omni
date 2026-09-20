@@ -11,6 +11,7 @@
                 }
             },
             "local_model",
+            "slow",
             "diffusion"
         ],
         "server_params": {
@@ -49,6 +50,7 @@
                 }
             },
             "local_model",
+            "slow",
             "diffusion"
         ],
         "server_params": {

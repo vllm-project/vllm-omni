@@ -599,14 +599,14 @@ def _write_job_timeouts_manifest(jobs_dir: Path, job_timeouts: dict[str, int]) -
 
 # Fixed stability scripts (when stability is selected); MODEL_TYPES narrows which run.
 STABILITY_CASES: list[tuple[str, str, tuple[str, ...]]] = [
-    ("stability_qwen3_omni", "tests/dfx/stability/scripts/test_stability_qwen3_omni.py", ("omni",)),
-    ("stability_qwen3_tts", "tests/dfx/stability/scripts/test_stability_qwen3_tts.py", ("tts",)),
-    ("stability_minicpmo_4_5", "tests/dfx/stability/scripts/test_stability_minicpmo_4_5.py", ("omni",)),
-    ("stability_qwen_image", "tests/dfx/stability/scripts/test_stability_qwen_image.py", ("diffusion",)),
-    ("stability_wan22", "tests/dfx/stability/scripts/test_stability_wan22.py", ("diffusion",)),
-    ("stability_hunyuan_image", "tests/dfx/stability/scripts/test_stability_hunyuan_image.py", ("diffusion",)),
-    ("stability_minimax_h3", "tests/dfx/stability/scripts/test_stability_minimax_h3.py", ("diffusion",)),
-    ("stability_hunyuanvideo15", "tests/dfx/stability/scripts/test_stability_hunyuanvideo15.py", ("diffusion",)),
+    ("stability_qwen3_omni", "tests/dfx/stability/scripts/run_stability_qwen3_omni.py", ("omni",)),
+    ("stability_qwen3_tts", "tests/dfx/stability/scripts/run_stability_qwen3_tts.py", ("tts",)),
+    ("stability_minicpmo_4_5", "tests/dfx/stability/scripts/run_stability_minicpmo_4_5.py", ("omni",)),
+    ("stability_qwen_image", "tests/dfx/stability/scripts/run_stability_qwen_image.py", ("diffusion",)),
+    ("stability_wan22", "tests/dfx/stability/scripts/run_stability_wan22.py", ("diffusion",)),
+    ("stability_hunyuan_image", "tests/dfx/stability/scripts/run_stability_hunyuan_image.py", ("diffusion",)),
+    ("stability_minimax_h3", "tests/dfx/stability/scripts/run_stability_minimax_h3.py", ("diffusion",)),
+    ("stability_hunyuanvideo15", "tests/dfx/stability/scripts/run_stability_hunyuanvideo15.py", ("diffusion",)),
 ]
 
 
