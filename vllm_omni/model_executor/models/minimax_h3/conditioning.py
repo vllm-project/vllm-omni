@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
 from typing import Any
@@ -123,7 +124,7 @@ class MiniMaxH3TextConditioning:
 
 MINIMAX_H3_ENCODER_REQUEST_KEY = "minimax_h3_encoder_request"
 MINIMAX_H3_ENCODER_LAYOUT_KEY = "minimax_h3_encoder_layout"
-STAGE_SCHEMA_VERSION = 1
+STAGE_SCHEMA_VERSION = 2
 _ENCODER_WIRE_SCHEMA_ID = 1
 
 _TASK_TO_CODE = {"t2va": 1, "fl2va": 2, "ref2va": 3}
@@ -142,6 +143,104 @@ _INTEGER_DTYPES = frozenset(
 _VIDEO_CONDITION_WIDTH = 96
 _AUDIO_CONDITION_WIDTH = 32
 _AUDIO_CONDITION_CHANNELS = 2
+
+
+def _validate_edit_mask_structure(
+    mask: torch.Tensor,
+    *,
+    name: str,
+    shape: tuple[int, ...],
+) -> None:
+    """Validate only the internal tensor contract after encoder-boundary parsing."""
+    if mask.dtype != torch.float32 or tuple(mask.shape) != shape:
+        raise ValueError(f"MiniMax H3 {name} edit mask must be FP32 with shape {shape}")
+    _validate_contiguous_strided_layout(f"{name} edit mask", mask)
+
+
+def _validate_edit_tensors(
+    clean_rows: torch.Tensor | None,
+    raw_mask: torch.Tensor | None,
+    *,
+    name: str,
+    width: int,
+    mask_shape: tuple[int, ...],
+) -> int:
+    values = (clean_rows, raw_mask)
+    if all(value is None for value in values):
+        return 0
+    if clean_rows is None or raw_mask is None:
+        raise ValueError(f"MiniMax H3 {name} edit requires clean rows and a raw mask tensor")
+    if clean_rows.dtype != torch.float32 or clean_rows.ndim != 2 or clean_rows.shape[1] != width:
+        raise ValueError(f"MiniMax H3 {name} edit rows must be FP32 with shape [rows, {width}]")
+    row_count = int(clean_rows.shape[0])
+    if row_count <= 0:
+        raise ValueError(f"MiniMax H3 {name} edit rows must not be empty")
+    _validate_edit_mask_structure(raw_mask, name=name, shape=mask_shape)
+    if raw_mask.device != clean_rows.device:
+        raise ValueError(f"MiniMax H3 {name} edit tensors must share one device")
+    _validate_contiguous_strided_layout(f"{name} edit rows", clean_rows)
+    return row_count
+
+
+def _packed_vector_rows(value: torch.Tensor, *, width: int) -> torch.Tensor:
+    flat = value.reshape(-1)
+    padding = (-int(flat.numel())) % width
+    if padding:
+        flat = torch.cat((flat, flat.new_zeros(padding)))
+    return flat.reshape(-1, width)
+
+
+def _pack_condition_slot(
+    condition: torch.Tensor | None,
+    clean_rows: torch.Tensor | None,
+    raw_mask: torch.Tensor | None,
+    *,
+    width: int,
+) -> torch.Tensor:
+    if clean_rows is None:
+        return condition if condition is not None else torch.empty((0,), dtype=torch.float32)
+    if raw_mask is None:
+        raise ValueError("MiniMax H3 edit rows require a raw mask tensor")
+    values = [clean_rows, _packed_vector_rows(raw_mask, width=width)]
+    if condition is not None:
+        values.insert(0, condition)
+    return torch.cat(values).contiguous()
+
+
+def _unpack_condition_slot(
+    value: torch.Tensor,
+    *,
+    condition_rows: int,
+    edit_rows: int,
+    mask_shape: tuple[int, ...],
+    width: int,
+    name: str,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    mask_values = math.prod(mask_shape) if mask_shape else int(edit_rows > 0)
+    mask_wire_rows = (mask_values + width - 1) // width
+    expected_rows = condition_rows + edit_rows + mask_wire_rows
+    if expected_rows == 0:
+        if value.dtype != torch.float32 or tuple(value.shape) != (0,):
+            raise ValueError(f"MiniMax H3 empty {name} condition slot must be FP32 with shape [0]")
+        return None, None, None
+    if value.dtype != torch.float32 or value.ndim != 2 or tuple(value.shape) != (expected_rows, width):
+        raise ValueError(
+            f"MiniMax H3 packed {name} condition must be FP32 with shape "
+            f"[{expected_rows}, {width}], got {value.dtype} {tuple(value.shape)}"
+        )
+    cursor = 0
+    condition = value[:condition_rows].contiguous() if condition_rows else None
+    cursor += condition_rows
+    if edit_rows == 0:
+        return condition, None, None
+    clean_rows = value[cursor : cursor + edit_rows].contiguous()
+    cursor += edit_rows
+    raw_mask = value[cursor : cursor + mask_wire_rows].reshape(-1)[:mask_values].clone()
+    if mask_shape:
+        raw_mask = raw_mask.reshape(mask_shape)
+    else:
+        raw_mask = raw_mask.reshape(())
+    return condition, clean_rows, raw_mask
 
 
 def _wire_layout(payload: Mapping[str, Any]) -> torch.Tensor:
@@ -259,6 +358,10 @@ class MiniMaxH3EncoderMediaInput:
     video_audios: tuple[tuple[torch.Tensor, int] | None, ...] = ()
     audios: tuple[tuple[torch.Tensor, int], ...] = ()
     keyframe_frame_indices: tuple[int, ...] = ()
+    video_edit: torch.Tensor | None = None
+    video_edit_mask: torch.Tensor | None = None
+    audio_edit: tuple[torch.Tensor, int] | None = None
+    audio_edit_mask: torch.Tensor | None = None
 
     @classmethod
     def from_mm_tensors(
@@ -331,6 +434,37 @@ class MiniMaxH3EncoderMediaInput:
             if waveform.ndim not in (1, 2):
                 raise ValueError("MiniMax H3 audio must have shape [samples] or [channels, samples]")
             audios.append((waveform, sample_rate))
+
+        video_edit = None
+        video_edit_mask = None
+        if bool(metadata.get("has_video_edit", False)):
+            if cursor + 2 > len(tensors):
+                raise ValueError("MiniMax H3 encoder video edit input is truncated")
+            video_edit, video_edit_mask = tensors[cursor : cursor + 2]
+            cursor += 2
+            if tuple(video_edit.shape) != (num_frames, height, width, 3):
+                raise ValueError(
+                    "MiniMax H3 encoder video edit must have shape "
+                    f"[{num_frames}, {height}, {width}, 3], got {tuple(video_edit.shape)}"
+                )
+            _validate_edit_mask_structure(
+                video_edit_mask,
+                name="video",
+                shape=(latent_t, height // 16, width // 16),
+            )
+
+        audio_edit = None
+        audio_edit_mask = None
+        audio_edit_sample_rate = int(metadata.get("audio_edit_sample_rate", 0))
+        if audio_edit_sample_rate:
+            if cursor + 2 > len(tensors):
+                raise ValueError("MiniMax H3 encoder audio edit input is truncated")
+            waveform, audio_edit_mask = tensors[cursor : cursor + 2]
+            cursor += 2
+            if waveform.ndim not in (1, 2) or audio_edit_sample_rate <= 0:
+                raise ValueError("MiniMax H3 encoder audio edit requires a waveform and positive sample rate")
+            _validate_edit_mask_structure(audio_edit_mask, name="audio", shape=(2, audio_t))
+            audio_edit = (waveform, audio_edit_sample_rate)
         if cursor != len(tensors):
             raise ValueError(f"MiniMax H3 encoder media input has {len(tensors) - cursor} trailing tensors")
         return cls(
@@ -345,6 +479,10 @@ class MiniMaxH3EncoderMediaInput:
             video_audios=tuple(video_audios),
             audios=tuple(audios),
             keyframe_frame_indices=tuple(int(value) for value in metadata.get("keyframe_frame_indices", ())),
+            video_edit=video_edit,
+            video_edit_mask=video_edit_mask,
+            audio_edit=audio_edit,
+            audio_edit_mask=audio_edit_mask,
         )
 
     def to_mm_tensors(self) -> list[torch.Tensor]:
@@ -362,6 +500,28 @@ class MiniMaxH3EncoderMediaInput:
         audio_items = [item for item in self.video_audios if item is not None] + list(self.audios)
         if any(waveform.ndim not in (1, 2) or int(sample_rate) <= 0 for waveform, sample_rate in audio_items):
             raise ValueError("MiniMax H3 encoder audio must have a waveform and positive sample rate")
+        video_edit_values = (self.video_edit, self.video_edit_mask)
+        if any(value is not None for value in video_edit_values):
+            if self.video_edit is None or self.video_edit_mask is None:
+                raise ValueError("MiniMax H3 encoder video edit requires a source and mask")
+            if tuple(self.video_edit.shape) != (self.num_frames, self.height, self.width, 3):
+                raise ValueError(
+                    "MiniMax H3 encoder video edit must have shape "
+                    f"[{self.num_frames}, {self.height}, {self.width}, 3], got {tuple(self.video_edit.shape)}"
+                )
+            _validate_edit_mask_structure(
+                self.video_edit_mask,
+                name="video",
+                shape=(self.latent_t, self.height // 16, self.width // 16),
+            )
+        audio_edit_values = (self.audio_edit, self.audio_edit_mask)
+        if any(value is not None for value in audio_edit_values):
+            if self.audio_edit is None or self.audio_edit_mask is None:
+                raise ValueError("MiniMax H3 encoder audio edit requires a source and mask")
+            waveform, sample_rate = self.audio_edit
+            if waveform.ndim not in (1, 2) or int(sample_rate) <= 0:
+                raise ValueError("MiniMax H3 encoder audio edit requires a waveform and positive sample rate")
+            _validate_edit_mask_structure(self.audio_edit_mask, name="audio", shape=(2, self.audio_t))
         tensors = [*self.images, *self.videos]
         for item in self.video_audios:
             if item is None:
@@ -369,10 +529,18 @@ class MiniMaxH3EncoderMediaInput:
             waveform, _sample_rate = item
             tensors.append(waveform)
         tensors.extend(waveform for waveform, _sample_rate in self.audios)
+        if self.video_edit is not None:
+            if self.video_edit_mask is None:
+                raise ValueError("MiniMax H3 encoder video edit requires a mask")
+            tensors.extend((self.video_edit, self.video_edit_mask))
+        if self.audio_edit is not None:
+            if self.audio_edit_mask is None:
+                raise ValueError("MiniMax H3 encoder audio edit requires a mask")
+            tensors.extend((self.audio_edit[0], self.audio_edit_mask))
         return tensors
 
     def to_metadata(self) -> dict[str, Any]:
-        return {
+        metadata = {
             "task": self.task,
             "height": self.height,
             "width": self.width,
@@ -387,6 +555,11 @@ class MiniMaxH3EncoderMediaInput:
             "audio_sample_rates": [sample_rate for _waveform, sample_rate in self.audios],
             "keyframe_frame_indices": list(self.keyframe_frame_indices),
         }
+        if self.video_edit is not None:
+            metadata["has_video_edit"] = True
+        if self.audio_edit is not None:
+            metadata["audio_edit_sample_rate"] = int(self.audio_edit[1])
+        return metadata
 
 
 @dataclass(frozen=True)
@@ -403,6 +576,11 @@ class MiniMaxH3EncoderMediaConditioning:
     audio_condition_lengths: tuple[int, ...] = ()
     ref_blocks: tuple[dict[str, Any], ...] = ()
     keyframe_frame_indices: tuple[int, ...] = ()
+    video_edit_clean_rows: torch.Tensor | None = None
+    video_edit_mask: torch.Tensor | None = None
+    audio_edit_clean_rows: torch.Tensor | None = None
+    audio_edit_mask: torch.Tensor | None = None
+    audio_edit_source_t: int = 0
 
     def to_omni_components(
         self,
@@ -418,7 +596,33 @@ class MiniMaxH3EncoderMediaConditioning:
             self.audio_condition,
             self.audio_condition_lengths,
         )
-        empty = torch.empty((0,), dtype=torch.float32)
+        video_mask_shape = (self.latent_t, self.height // 16, self.width // 16)
+        audio_mask_shape = (2, self.audio_t)
+        video_edit_rows = _validate_edit_tensors(
+            self.video_edit_clean_rows,
+            self.video_edit_mask,
+            name="video",
+            width=_VIDEO_CONDITION_WIDTH,
+            mask_shape=video_mask_shape,
+        )
+        audio_edit_rows = _validate_edit_tensors(
+            self.audio_edit_clean_rows,
+            self.audio_edit_mask,
+            name="audio",
+            width=_AUDIO_CONDITION_WIDTH,
+            mask_shape=audio_mask_shape,
+        )
+        expected_video_rows = self.latent_t * (self.height // 32) * (self.width // 32)
+        if video_edit_rows not in (0, expected_video_rows):
+            raise ValueError(f"MiniMax H3 video edit has {video_edit_rows} rows, expected {expected_video_rows}")
+        expected_audio_rows = self.audio_t * _AUDIO_CONDITION_CHANNELS
+        if audio_edit_rows not in (0, expected_audio_rows):
+            raise ValueError(f"MiniMax H3 audio edit has {audio_edit_rows} rows, expected {expected_audio_rows}")
+        if audio_edit_rows == 0:
+            if self.audio_edit_source_t != 0:
+                raise ValueError("MiniMax H3 audio_edit_source_t requires audio edit rows")
+        elif not 0 < self.audio_edit_source_t <= self.audio_t:
+            raise ValueError(f"MiniMax H3 audio_edit_source_t must be in [1, {self.audio_t}]")
         ref_rows = _ref_block_rows(self.ref_blocks)
         layout = [
             _ENCODER_WIRE_SCHEMA_ID,
@@ -433,14 +637,27 @@ class MiniMaxH3EncoderMediaConditioning:
             len(self.audio_condition_lengths),
             len(ref_rows),
             len(self.keyframe_frame_indices),
+            video_edit_rows,
+            audio_edit_rows,
+            self.audio_edit_source_t,
         ]
         layout.extend(item for shape in self.visual_condition_shapes for item in shape)
         layout.extend(self.audio_condition_lengths)
         layout.extend(item for row in ref_rows for item in row)
         layout.extend(self.keyframe_frame_indices)
         return (
-            self.visual_condition if self.visual_condition is not None else empty,
-            self.audio_condition if self.audio_condition is not None else empty,
+            _pack_condition_slot(
+                self.visual_condition,
+                self.video_edit_clean_rows,
+                self.video_edit_mask,
+                width=_VIDEO_CONDITION_WIDTH,
+            ),
+            _pack_condition_slot(
+                self.audio_condition,
+                self.audio_edit_clean_rows,
+                self.audio_edit_mask,
+                width=_AUDIO_CONDITION_WIDTH,
+            ),
             torch.tensor(layout, dtype=torch.int64),
         )
 
@@ -461,6 +678,11 @@ class MiniMaxH3EncoderConditioning:
     audio_condition_lengths: tuple[int, ...] = ()
     ref_blocks: tuple[dict[str, Any], ...] = ()
     keyframe_frame_indices: tuple[int, ...] = ()
+    video_edit_clean_rows: torch.Tensor | None = None
+    video_edit_mask: torch.Tensor | None = None
+    audio_edit_clean_rows: torch.Tensor | None = None
+    audio_edit_mask: torch.Tensor | None = None
+    audio_edit_source_t: int = 0
 
     @classmethod
     def from_components(
@@ -509,11 +731,16 @@ class MiniMaxH3EncoderConditioning:
         if layout.dtype not in _INTEGER_DTYPES or layout.ndim != 1:
             raise ValueError("MiniMax H3 encoder layout must be a one-dimensional integer tensor")
         values = [int(item) for item in layout.detach().cpu().tolist()]
-        if len(values) < 12:
+        if len(values) < 2:
+            raise ValueError("MiniMax H3 encoder layout header is truncated")
+        schema_id, version = values[:2]
+        if schema_id != _ENCODER_WIRE_SCHEMA_ID or version != STAGE_SCHEMA_VERSION:
+            raise ValueError(f"unsupported MiniMax H3 encoder wire schema {schema_id}:{version}")
+        if len(values) < 15:
             raise ValueError("MiniMax H3 encoder layout header is truncated")
         (
-            schema_id,
-            version,
+            _schema_id,
+            _version,
             task_code,
             height,
             width,
@@ -524,9 +751,10 @@ class MiniMaxH3EncoderConditioning:
             audio_count,
             ref_count,
             keyframe_count,
-        ) = values[:12]
-        if schema_id != _ENCODER_WIRE_SCHEMA_ID or version != STAGE_SCHEMA_VERSION:
-            raise ValueError(f"unsupported MiniMax H3 encoder wire schema {schema_id}:{version}")
+            video_edit_rows,
+            audio_edit_rows,
+            audio_edit_source_t,
+        ) = values[:15]
         task = _CODE_TO_TASK.get(task_code)
         if task is None:
             raise ValueError(f"unsupported MiniMax H3 wire task code {task_code!r}")
@@ -534,10 +762,12 @@ class MiniMaxH3EncoderConditioning:
             raise ValueError("MiniMax H3 encoder wire dimensions must be positive")
         if min(visual_count, audio_count, ref_count, keyframe_count) < 0:
             raise ValueError("MiniMax H3 encoder layout counts must be non-negative")
-        expected_size = 12 + 3 * visual_count + audio_count + 5 * ref_count + keyframe_count
+        if min(video_edit_rows, audio_edit_rows, audio_edit_source_t) < 0:
+            raise ValueError("MiniMax H3 encoder edit layout values must be non-negative")
+        expected_size = 15 + 3 * visual_count + audio_count + 5 * ref_count + keyframe_count
         if len(values) != expected_size:
             raise ValueError(f"MiniMax H3 encoder layout has {len(values)} integers, expected {expected_size}")
-        cursor = 12
+        cursor = 15
         visual_shapes = tuple(
             tuple(values[cursor + 3 * index : cursor + 3 * (index + 1)]) for index in range(visual_count)
         )
@@ -548,14 +778,55 @@ class MiniMaxH3EncoderConditioning:
         cursor += 5 * ref_count
         ref_blocks_tensor = torch.tensor(ref_rows, dtype=torch.int64).reshape(-1, 5)
         keyframe_frame_indices = tuple(values[cursor : cursor + keyframe_count])
-        visual_condition = visual if visual.numel() else None
-        audio_condition = audio if audio.numel() else None
+        video_mask_shape = (latent_t, height // 16, width // 16) if video_edit_rows else ()
+        audio_mask_shape = (2, audio_t) if audio_edit_rows else ()
+        visual_condition_rows = sum(t * (h // 2) * (w // 2) for t, h, w in visual_shapes)
+        audio_condition_rows = _AUDIO_CONDITION_CHANNELS * sum(audio_lengths)
+        visual_condition, video_edit_clean_rows, video_edit_mask = _unpack_condition_slot(
+            visual,
+            condition_rows=visual_condition_rows,
+            edit_rows=video_edit_rows,
+            mask_shape=video_mask_shape,
+            width=_VIDEO_CONDITION_WIDTH,
+            name="visual",
+        )
+        audio_condition, audio_edit_clean_rows, audio_edit_mask = _unpack_condition_slot(
+            audio,
+            condition_rows=audio_condition_rows,
+            edit_rows=audio_edit_rows,
+            mask_shape=audio_mask_shape,
+            width=_AUDIO_CONDITION_WIDTH,
+            name="audio",
+        )
         _validate_condition_tensors(
             visual_condition,
             visual_shapes,
             audio_condition,
             audio_lengths,
         )
+        _validate_edit_tensors(
+            video_edit_clean_rows,
+            video_edit_mask,
+            name="video",
+            width=_VIDEO_CONDITION_WIDTH,
+            mask_shape=(latent_t, height // 16, width // 16),
+        )
+        _validate_edit_tensors(
+            audio_edit_clean_rows,
+            audio_edit_mask,
+            name="audio",
+            width=_AUDIO_CONDITION_WIDTH,
+            mask_shape=(2, audio_t),
+        )
+        expected_video_edit_rows = latent_t * (height // 32) * (width // 32)
+        if video_edit_rows not in (0, expected_video_edit_rows):
+            raise ValueError(f"MiniMax H3 video edit has {video_edit_rows} rows, expected {expected_video_edit_rows}")
+        if audio_edit_rows not in (0, audio_t * _AUDIO_CONDITION_CHANNELS):
+            raise ValueError(f"MiniMax H3 audio edit has {audio_edit_rows} rows, expected {audio_t * 2}")
+        if (audio_edit_rows == 0 and audio_edit_source_t != 0) or (
+            audio_edit_rows and not 0 < audio_edit_source_t <= audio_t
+        ):
+            raise ValueError("MiniMax H3 encoder audio edit source length is inconsistent")
         return cls(
             hidden_states=text.hidden_states,
             token_tags=text.token_tags,
@@ -571,6 +842,11 @@ class MiniMaxH3EncoderConditioning:
             audio_condition_lengths=audio_lengths,
             ref_blocks=_decode_ref_blocks(ref_blocks_tensor),
             keyframe_frame_indices=keyframe_frame_indices,
+            video_edit_clean_rows=video_edit_clean_rows,
+            video_edit_mask=video_edit_mask,
+            audio_edit_clean_rows=audio_edit_clean_rows,
+            audio_edit_mask=audio_edit_mask,
+            audio_edit_source_t=audio_edit_source_t,
         )
 
     def to_omni_payload(self) -> dict[str, Any]:
@@ -593,6 +869,11 @@ class MiniMaxH3EncoderConditioning:
             audio_condition_lengths=self.audio_condition_lengths,
             ref_blocks=self.ref_blocks,
             keyframe_frame_indices=self.keyframe_frame_indices,
+            video_edit_clean_rows=self.video_edit_clean_rows,
+            video_edit_mask=self.video_edit_mask,
+            audio_edit_clean_rows=self.audio_edit_clean_rows,
+            audio_edit_mask=self.audio_edit_mask,
+            audio_edit_source_t=self.audio_edit_source_t,
         ).to_omni_components()
         return {
             "hidden_states": {"output": text.hidden_states},
