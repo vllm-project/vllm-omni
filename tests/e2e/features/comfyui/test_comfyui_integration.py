@@ -156,6 +156,7 @@ H3_MODEL_PARAMS = MiniMaxH3ModelSpecificParams(
         "type": "minimax_h3",
         "audio_flow_shift": 3.0,
         "flow_shift": 12.0,
+        "sample_solver": "auto",
     }
 )
 
@@ -435,6 +436,7 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
             _assert_model_param_values(received, {"task": "t2va", "aspect_ratio": "1:1"})
             assert "flow_shift" not in received.extra_args
             assert "audio_flow_shift" not in received.extra_args
+            assert "sample_solver" not in received.extra_args
         elif sampling_case.kind is SamplingKind.VIDEO_REF2VA_IMAGE_AUDIO:
             assert len(received_sampling_params_list) == 1
             assert isinstance(prompt, dict)
@@ -460,6 +462,7 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
                     "audio_flow_shift": 3.0,
                 },
             )
+            assert "sample_solver" not in received_sampling_params_list[0].extra_args
         elif sampling_case.kind in (SamplingKind.VIDEO_REF2VA_MULTI_VIDEO, SamplingKind.VIDEO_REF2VA_MIXED):
             assert len(received_sampling_params_list) == 1
             assert isinstance(prompt, dict)
@@ -501,6 +504,7 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
                     "audio_flow_shift": 3.0,
                 },
             )
+            assert "sample_solver" not in received_sampling_params_list[0].extra_args
         else:
             raise AssertionError(f"Unknown sampling case: {sampling_case.kind}")
 

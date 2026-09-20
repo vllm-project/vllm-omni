@@ -72,7 +72,8 @@
       },
       "widgets_values": [
         3.0,
-        12.0
+        12.0,
+        "auto"
       ],
       "title": "Base H3 params"
     },
@@ -292,7 +293,8 @@
       },
       "widgets_values": [
         3.0,
-        6.0
+        6.0,
+        "auto"
       ],
       "title": "Turbo H3 params"
     },

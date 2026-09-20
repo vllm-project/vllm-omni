@@ -137,8 +137,9 @@ from .packed_tokens import (
 )
 from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy
 from .scheduling_minimax_h3_euler_ancestral import (
-    minimax_h3_euler_eta0_step,
+    minimax_h3_normalize_sample_solver,
     minimax_h3_rf_v_to_x0,
+    minimax_h3_sample_step,
 )
 from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
@@ -273,6 +274,7 @@ _MINIMAX_H3_DENOISE_INPUT_KEYS = (
     "audio_edit_clean_rows",
     "audio_edit_mask_rows",
     "audio_edit_restore_mask_rows",
+    "sample_solver",
 )
 
 # ``StepRequestState.extra`` keys owned by the step-execution path.
@@ -287,6 +289,9 @@ _STEP_SHAPE = "minimax_h3_shape"
 _STEP_TRANSFORMER = "minimax_h3_transformer"
 _STEP_VIDEO_EDIT = "minimax_h3_video_edit"
 _STEP_AUDIO_EDIT = "minimax_h3_audio_edit"
+_STEP_SAMPLE_SOLVER = "minimax_h3_sample_solver"
+_STEP_OLD_X0_VIDEO = "minimax_h3_old_x0_video"
+_STEP_OLD_X0_AUDIO = "minimax_h3_old_x0_audio"
 
 
 def _minimax_h3_step_schedule(state: StepRequestState) -> dict[str, float]:
@@ -1573,6 +1578,7 @@ class MiniMaxH3Pipeline(
         audio_edit_clean_rows: torch.Tensor | None = None,
         audio_edit_mask_rows: torch.Tensor | None = None,
         audio_edit_restore_mask_rows: torch.Tensor | None = None,
+        sample_solver: str = "euler",
     ) -> dict[str, Any]:
         """Build the packed layout, initial rows, anchors, and sigma schedules.
 
@@ -1742,6 +1748,7 @@ class MiniMaxH3Pipeline(
             "sigmas_audio": audio_sigmas,
             "video_edit": video_edit,
             "audio_edit": audio_edit,
+            "sample_solver": minimax_h3_normalize_sample_solver(sample_solver),
         }
 
     def _unpack_denoised_rows(
@@ -1806,6 +1813,7 @@ class MiniMaxH3Pipeline(
         audio_edit_clean_rows: torch.Tensor | None = None,
         audio_edit_mask_rows: torch.Tensor | None = None,
         audio_edit_restore_mask_rows: torch.Tensor | None = None,
+        sample_solver: str = "euler",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         inputs = self._build_denoise_inputs(
             task=task,
@@ -1836,6 +1844,7 @@ class MiniMaxH3Pipeline(
             audio_edit_clean_rows=audio_edit_clean_rows,
             audio_edit_mask_rows=audio_edit_mask_rows,
             audio_edit_restore_mask_rows=audio_edit_restore_mask_rows,
+            sample_solver=sample_solver,
         )
         branch = inputs["branch"]
         transformer = self._transformer_for_task(task)
@@ -1855,6 +1864,7 @@ class MiniMaxH3Pipeline(
                     audio_cond_noise_aug_for_inference=(MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
                     video_edit=inputs["video_edit"],
                     audio_edit=inputs["audio_edit"],
+                    sample_solver=inputs["sample_solver"],
                     on_step=lambda step, video, audio: progress.update(),
                 )
 
@@ -2242,6 +2252,10 @@ class MiniMaxH3Pipeline(
         sampling: Any,
     ) -> dict[str, Any]:
         extra = sampling.extra_args or {}
+        try:
+            sample_solver = minimax_h3_normalize_sample_solver(extra.get("sample_solver"))
+        except ValueError as exc:
+            raise OmniClientError(str(exc)) from exc
         requested_task = extra.get("task")
         if requested_task is not None and str(requested_task).lower() != conditioning.task:
             raise OmniClientError(
@@ -2370,6 +2384,7 @@ class MiniMaxH3Pipeline(
             "video_shift": float(extra.get("flow_shift", self.default_video_shift)),
             "audio_shift": float(extra.get("audio_flow_shift", self.default_audio_shift)),
             "base_schedule": base_schedule,
+            "sample_solver": sample_solver,
             "num_outputs": _resolve_minimax_h3_num_outputs(sampling.num_outputs_per_prompt),
             "preencode_mp4": bool(extra.get("preencode_mp4", False)),
             "preencode_batch_frames": (
@@ -2557,6 +2572,9 @@ class MiniMaxH3Pipeline(
                 _STEP_SIGMAS_AUDIO: sigmas_audio,
                 _STEP_VIDEO_EDIT: inputs.get("video_edit"),
                 _STEP_AUDIO_EDIT: inputs.get("audio_edit"),
+                _STEP_SAMPLE_SOLVER: inputs.get("sample_solver", "euler"),
+                _STEP_OLD_X0_VIDEO: None,
+                _STEP_OLD_X0_AUDIO: None,
                 _STEP_SHAPE: {
                     "height": context["height"],
                     "width": context["width"],
@@ -2705,7 +2723,7 @@ class MiniMaxH3Pipeline(
         return video_velocity
 
     def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
-        """Apply one Euler-eta0 update to this request's video and audio rows."""
+        """Apply one solver update to this request's video and audio rows."""
         del kwargs
         # denoise_step() stages the audio half of this step's velocity; popping
         # it keeps a second step_scheduler() call from reusing a stale one.
@@ -2734,12 +2752,17 @@ class MiniMaxH3Pipeline(
                 noise_pred.float()[update],
                 schedule["t_video"],
             )
-        new_video = minimax_h3_euler_eta0_step(
+        sample_solver = state.extra.get(_STEP_SAMPLE_SOLVER, "euler")
+        new_video = minimax_h3_sample_step(
             video_rows[update],
             x0_video,
+            state.extra.get(_STEP_OLD_X0_VIDEO),
+            sample_solver=sample_solver,
+            sigma_prev=(state.extra[_STEP_SIGMAS_VIDEO][state.step_index - 1] if state.step_index > 0 else None),
             sigma_curr=schedule["sigma_video"],
             sigma_next=schedule["sigma_video_next"],
         )
+        state.extra[_STEP_OLD_X0_VIDEO] = x0_video
         video_rows = video_rows.clone()
         video_rows[update] = new_video
         if cond_anchor is not None:
@@ -2758,12 +2781,16 @@ class MiniMaxH3Pipeline(
                 audio_noise_pred.float()[audio_update],
                 schedule["t_audio"],
             )
-        new_audio = minimax_h3_euler_eta0_step(
+        new_audio = minimax_h3_sample_step(
             audio_rows[audio_update],
             x0_audio,
+            state.extra.get(_STEP_OLD_X0_AUDIO),
+            sample_solver=sample_solver,
+            sigma_prev=(state.extra[_STEP_SIGMAS_AUDIO][state.step_index - 1] if state.step_index > 0 else None),
             sigma_curr=schedule["sigma_audio"],
             sigma_next=schedule["sigma_audio_next"],
         )
+        state.extra[_STEP_OLD_X0_AUDIO] = x0_audio
         audio_rows = audio_rows.clone()
         audio_rows[audio_update] = new_audio
         if audio_anchor is not None:

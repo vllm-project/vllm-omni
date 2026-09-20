@@ -1178,6 +1178,7 @@ four-step adapter keeps its original sampling and fixed-top-k behavior.
 | `duration` | Workload-specific | Decimal seconds in `extra_params`; converted to H3-compatible frame count |
 | `fps` | `24` | H3 output FPS is fixed |
 | `num_inference_steps` | `50` | Matches the reference accuracy workloads |
+| `extra_params.sample_solver` | `euler` | `euler` keeps the reference behavior; `res_multistep` enables deterministic second-order RES sampling |
 | `flow_shift` | `12` | Video sigma shift |
 | `audio_flow_shift` | `3` | Audio sigma shift, passed in `extra_params` |
 | `seed` | Task-specific | Use a fixed value for reproducibility |
@@ -1186,6 +1187,38 @@ four-step adapter keeps its original sampling and fixed-top-k behavior.
 | `num_outputs_per_prompt` | `1` | 1–10; async API returns every output |
 | `start_time_seconds` | `0` | Reference-video segment start; use a list in `extra_params` for multiple videos |
 | `width`, `height` | Multiples of 32 | Output aspect ratio must be between 1:4 and 4:1 |
+
+### Sampling solver
+
+MiniMax H3 uses deterministic Euler sampling by default. To use the same
+second-order exponential multistep update exposed as `res_multistep` in
+ComfyUI, set `sample_solver` in `extra_params`:
+
+```bash
+curl -sS -X POST "${API_URL}" \
+  -F 'prompt=A red fox runs through fresh snow, with crisp footsteps and winter wind.' \
+  -F 'width=1344' \
+  -F 'height=768' \
+  -F 'aspect_ratio=16:9' \
+  -F 'fps=24' \
+  -F 'num_inference_steps=21' \
+  -F 'flow_shift=12' \
+  -F 'seed=42' \
+  -F 'extra_params={"task":"t2va","duration":5.0,"audio_flow_shift":3.0,"sample_solver":"res_multistep"}' \
+  -o h3-res-multistep.mp4
+```
+
+The solver reuses the preceding denoised estimate separately for video and
+audio. Its first step and final step to zero use Euler, matching ComfyUI's
+deterministic (`eta=0`) RES implementation. Keep the seed, shape, duration,
+flow shifts, and step count fixed when comparing it with Euler. Distilled
+Turbo/FastH3 artifacts retain their own required step counts and sigma
+schedules.
+
+For the base H3 schedule, `num_inference_steps` retains the existing
+sigma-point convention: 21 sigma points bound 20 denoiser evaluations. The
+example therefore performs exactly 20 solver updates. This differs from UIs
+that label the number of denoiser evaluations directly as `steps`.
 
 ## ComfyUI Frontend
 

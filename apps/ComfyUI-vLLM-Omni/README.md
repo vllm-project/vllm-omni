@@ -223,6 +223,10 @@ optional Turbo sampling, H3 parameters, and Remote LoRA nodes. See the
 settings, and saved-video/audio validation. Set Remote LoRA’s `local_path` to
 the downloaded Turbo artifact on your server before enabling Turbo.
 
+The MiniMax-H3 Video Params node exposes **sample_solver**. Its default
+**auto** value omits the field so the server uses Euler; explicit **euler** and
+**res_multistep** selections are forwarded through `extra_params`.
+
 #### H3 video upscale (WF-07)
 
 The **vLLM-Omni MiniMax H3 Video Upscale** template generates video remotely, upscales it with SeedVR2, and saves the original and upscaled videos with the generated audio and FPS. See [workflow setup](docs/wf07-h3-upscale.md).

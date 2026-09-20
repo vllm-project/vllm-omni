@@ -741,6 +741,23 @@ def test_distilled_forward_accepts_the_matching_explicit_step_count():
     assert diffuse_calls[0]["num_steps"] == 4
 
 
+def test_sample_solver_reaches_denoise_loop_and_rejects_unknown_values():
+    from vllm_omni.errors import OmniClientError
+
+    diffuse_calls: list[dict[str, Any]] = []
+    pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": None, "ref2va": None})
+    request = _t2va_batch(num_inference_steps=20)
+    request.sampling_params.extra_args["sample_solver"] = "res_multistep"
+
+    pipeline.forward(request)
+
+    assert diffuse_calls[0]["sample_solver"] == "res_multistep"
+
+    request.sampling_params.extra_args["sample_solver"] = "heun"
+    with pytest.raises(OmniClientError, match="unsupported MiniMax H3 sample_solver"):
+        pipeline.forward(request)
+
+
 def test_distilled_forward_rejects_a_mismatched_explicit_step_count():
     from vllm_omni.errors import OmniClientError
 

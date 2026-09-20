@@ -38,7 +38,15 @@ The template uses 1344×768, 24 FPS, seed 1101 and **duration** 5.167 seconds
 | Inference steps | 50 | 5 (4 forwards) |
 | Video flow shift | 12 | 6 |
 | Audio flow shift | 3 | 3 |
+| Sample solver | auto (server-default Euler) | auto (server-default Euler) |
 | Remote LoRA | Disconnected | Connected, scale 1 |
+
+The **sample_solver** menu is part of the MiniMax-H3 Video Params node. Keep
+**auto** to omit the request field and use the server default, which is Euler.
+Choose **euler** or **res_multistep** only when the request should explicitly
+override that default. RES multistep is currently intended for base H3; leave
+Turbo and FastH3 on **auto** unless that deployment has been validated with a
+different solver.
 
 For Turbo, use the **Diffusers-layout** artifact from
 [lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo):

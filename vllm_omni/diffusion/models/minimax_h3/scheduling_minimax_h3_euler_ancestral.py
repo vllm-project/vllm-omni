@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 import math
 from typing import Any
 
 import torch
+
+MINIMAX_H3_SAMPLE_SOLVERS = frozenset({"euler", "res_multistep"})
 
 
 def _require_finite_tensor(tensor: torch.Tensor, name: str) -> None:
@@ -102,6 +105,104 @@ def minimax_h3_euler_eta0_step(
     return out
 
 
+def minimax_h3_normalize_sample_solver(value: object | None) -> str:
+    """Return the canonical H3 solver name, preserving Euler as the default."""
+    solver = "euler" if value is None else str(value).strip().lower()
+    if solver not in MINIMAX_H3_SAMPLE_SOLVERS:
+        supported = ", ".join(sorted(MINIMAX_H3_SAMPLE_SOLVERS))
+        raise ValueError(f"unsupported MiniMax H3 sample_solver={value!r}; expected one of: {supported}")
+    return solver
+
+
+def minimax_h3_res_multistep_eta0_step(
+    state: torch.Tensor,
+    denoised: torch.Tensor,
+    old_denoised: torch.Tensor | None,
+    *,
+    sigma_prev: float | None,
+    sigma_curr: float,
+    sigma_next: float,
+) -> torch.Tensor:
+    """Apply ComfyUI's deterministic RES two-step exponential update.
+
+    RES multistep needs the previous model estimate, so its first step is
+    Euler. ComfyUI also uses Euler for the final jump to zero. ``eta=0`` keeps
+    the update deterministic and makes it suitable for H3's existing sampler.
+    """
+    sigma_curr = _validate_sigma(sigma_curr, "sigma_curr")
+    sigma_next = _validate_sigma(sigma_next, "sigma_next")
+    if old_denoised is None or sigma_prev is None or sigma_next == 0.0:
+        return minimax_h3_euler_eta0_step(
+            state,
+            denoised,
+            sigma_curr=sigma_curr,
+            sigma_next=sigma_next,
+        )
+    if state.shape != denoised.shape or state.shape != old_denoised.shape:
+        raise ValueError(
+            "state, denoised, and old_denoised shapes must match, got "
+            f"{state.shape}, {denoised.shape}, and {old_denoised.shape}"
+        )
+    if not all(torch.is_floating_point(tensor) for tensor in (state, denoised, old_denoised)):
+        raise ValueError("state, denoised, and old_denoised must be floating point tensors")
+    _require_finite_tensor(state, "state")
+    _require_finite_tensor(denoised, "denoised")
+    _require_finite_tensor(old_denoised, "old_denoised")
+    sigma_prev = _validate_sigma(sigma_prev, "sigma_prev")
+    if sigma_prev == 0.0 or sigma_curr == 0.0:
+        raise ValueError("RES multistep requires positive sigma_prev and sigma_curr")
+
+    # t(sigma) = -log(sigma), matching ComfyUI's sample_res_multistep.
+    h = math.log(sigma_curr / sigma_next)
+    c2 = math.log(sigma_curr / sigma_prev) / h
+    if not math.isfinite(h) or h <= 0.0 or not math.isfinite(c2) or c2 == 0.0:
+        raise ValueError(
+            "RES multistep requires a strictly descending, non-repeating sigma schedule; "
+            f"got sigma_prev={sigma_prev}, sigma_curr={sigma_curr}, sigma_next={sigma_next}"
+        )
+    phi1 = math.expm1(-h) / -h
+    phi2 = (phi1 - 1.0) / -h
+    b1 = phi1 - phi2 / c2
+    b2 = phi2 / c2
+
+    compute_dtype = torch.float32 if state.dtype in (torch.float16, torch.bfloat16) else state.dtype
+    out = math.exp(-h) * state.to(dtype=compute_dtype) + h * (
+        b1 * denoised.to(dtype=compute_dtype) + b2 * old_denoised.to(dtype=compute_dtype)
+    )
+    out = out.to(dtype=state.dtype)
+    _require_finite_tensor(out, "res_multistep_eta0_step output")
+    return out
+
+
+def minimax_h3_sample_step(
+    state: torch.Tensor,
+    denoised: torch.Tensor,
+    old_denoised: torch.Tensor | None,
+    *,
+    sample_solver: str,
+    sigma_prev: float | None,
+    sigma_curr: float,
+    sigma_next: float,
+) -> torch.Tensor:
+    """Advance one H3 sample with the selected deterministic solver."""
+    solver = minimax_h3_normalize_sample_solver(sample_solver)
+    if solver == "euler":
+        return minimax_h3_euler_eta0_step(
+            state,
+            denoised,
+            sigma_curr=sigma_curr,
+            sigma_next=sigma_next,
+        )
+    return minimax_h3_res_multistep_eta0_step(
+        state,
+        denoised,
+        old_denoised,
+        sigma_prev=sigma_prev,
+        sigma_curr=sigma_curr,
+        sigma_next=sigma_next,
+    )
+
+
 class MiniMaxH3EulerAncestralEta0SchedulerAdapter:
     def __init__(self, **config: Any) -> None:
         if config:
@@ -173,7 +274,11 @@ class MiniMaxH3EulerAncestralEta0SchedulerAdapter:
 EntryClass = MiniMaxH3EulerAncestralEta0SchedulerAdapter
 
 __all__ = [
+    "MINIMAX_H3_SAMPLE_SOLVERS",
     "MiniMaxH3EulerAncestralEta0SchedulerAdapter",
     "minimax_h3_euler_eta0_step",
+    "minimax_h3_normalize_sample_solver",
     "minimax_h3_rf_v_to_x0",
+    "minimax_h3_res_multistep_eta0_step",
+    "minimax_h3_sample_step",
 ]

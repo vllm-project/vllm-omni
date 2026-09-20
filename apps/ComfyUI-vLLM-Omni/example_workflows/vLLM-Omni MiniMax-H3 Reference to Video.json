@@ -412,6 +412,15 @@
             "name": "flow_shift"
           },
           "link": null
+        },
+        {
+          "localized_name": "sample_solver",
+          "name": "sample_solver",
+          "type": "COMBO",
+          "widget": {
+            "name": "sample_solver"
+          },
+          "link": null
         }
       ],
       "outputs": [
@@ -429,7 +438,8 @@
       },
       "widgets_values": [
         3.0,
-        12.0
+        12.0,
+        "auto"
       ],
       "title": "H3 video/audio flow shifts"
     },

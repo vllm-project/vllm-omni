@@ -8,7 +8,7 @@ from comfy_api.input import AudioInput, VideoInput
 
 from .utils.api_client import VLLMOmniClient
 from .utils.logger import get_logger
-from .utils.models import lookup_model_spec
+from .utils.models import MINIMAX_H3_SAMPLE_SOLVER_OPTIONS, lookup_model_spec
 from .utils.types import (
     MAX_REFERENCE_AUDIOS,
     MAX_REFERENCE_IMAGES,
@@ -954,6 +954,16 @@ class VLLMOmniMiniMaxH3Params:
                 "flow_shift": (
                     "FLOAT",
                     {"default": 12.0, "min": 0.0, "max": 100.0, "step": 0.1},
+                ),
+                "sample_solver": (
+                    list(MINIMAX_H3_SAMPLE_SOLVER_OPTIONS),
+                    {
+                        "default": "auto",
+                        "tooltip": (
+                            "auto uses the server default (Euler). Explicit Euler or RES multistep "
+                            "is sent through extra_params."
+                        ),
+                    },
                 ),
             }
         }

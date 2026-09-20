@@ -3,8 +3,8 @@
 """MiniMax H3 cfg-distilled full denoise loop.
 
 Per step, the positive presentation is forwarded exactly once. Video and audio
-target rows chain through the Euler-eta0 update while visual and audio condition
-rows stay pinned to their noised step-0 anchors.
+target rows chain through the selected deterministic solver while visual and
+audio condition rows stay pinned to their noised step-0 anchors.
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ from vllm_omni.platforms import current_omni_platform
 
 from .latent_mask import MiniMaxH3LatentEdit, minimax_h3_prepare_edit_rows
 from .scheduling_minimax_h3_euler_ancestral import (
-    minimax_h3_euler_eta0_step,
     minimax_h3_rf_v_to_x0,
+    minimax_h3_sample_step,
 )
 
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
@@ -331,6 +331,7 @@ def minimax_h3_denoise_loop(
     audio_cond_noise_aug_for_inference: float = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
     on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
+    sample_solver: str = "euler",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -364,6 +365,8 @@ def minimax_h3_denoise_loop(
         audio_edit = audio_edit.to(device=device, dtype=torch.float32)
 
     num_steps = len(sigmas_video) - 1
+    old_x0_video: torch.Tensor | None = None
+    old_x0_audio: torch.Tensor | None = None
     for step in range(num_steps):
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
@@ -422,7 +425,16 @@ def minimax_h3_denoise_loop(
                     mv_video_t,
                     t_v,
                 )
-            new_target = minimax_h3_euler_eta0_step(video_rows[update], x0_video, sigma_curr=s_v, sigma_next=s_v_next)
+            new_target = minimax_h3_sample_step(
+                video_rows[update],
+                x0_video,
+                old_x0_video,
+                sample_solver=sample_solver,
+                sigma_prev=sigmas_video[step - 1] if step > 0 else None,
+                sigma_curr=s_v,
+                sigma_next=s_v_next,
+            )
+            old_x0_video = x0_video
             video_rows = video_rows.clone()
             video_rows[update] = new_target
             if cond_anchor is not None:
@@ -440,9 +452,16 @@ def minimax_h3_denoise_loop(
                     mv_audio_t,
                     t_a,
                 )
-            new_audio = minimax_h3_euler_eta0_step(
-                audio_rows[audio_update], x0_audio, sigma_curr=s_a, sigma_next=s_a_next
+            new_audio = minimax_h3_sample_step(
+                audio_rows[audio_update],
+                x0_audio,
+                old_x0_audio,
+                sample_solver=sample_solver,
+                sigma_prev=sigmas_audio[step - 1] if step > 0 else None,
+                sigma_curr=s_a,
+                sigma_next=s_a_next,
             )
+            old_x0_audio = x0_audio
             audio_rows = audio_rows.clone()
             audio_rows[audio_update] = new_audio
             if audio_anchor is not None:

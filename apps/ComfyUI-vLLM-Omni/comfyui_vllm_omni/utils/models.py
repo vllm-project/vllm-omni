@@ -46,6 +46,8 @@ MINIMAX_H3_ASPECT_RATIOS = {
     "9:16": 9.0 / 16.0,
 }
 
+MINIMAX_H3_SAMPLE_SOLVER_OPTIONS = ("auto", "euler", "res_multistep")
+
 
 def _nearest_minimaxh3_aspect_ratio(width: int, height: int) -> str:
     """Pick the supported named ratio closest to the requested frame size."""
@@ -71,6 +73,19 @@ def _minimaxh3_params_builder(
     for key in ("audio_flow_shift",):
         if key in params:
             merged_extra_params[key] = params.pop(key)
+
+    sample_solver = params.pop("sample_solver", "auto")
+    if not isinstance(sample_solver, str):
+        raise ValueError("MiniMax-H3 sample_solver must be a string")
+    sample_solver = sample_solver.strip().lower()
+    if sample_solver not in MINIMAX_H3_SAMPLE_SOLVER_OPTIONS:
+        choices = ", ".join(MINIMAX_H3_SAMPLE_SOLVER_OPTIONS)
+        raise ValueError(f"Unsupported MiniMax-H3 sample_solver {sample_solver!r}; expected one of: {choices}")
+    # ``auto`` is a ComfyUI-only sentinel. Omitting the field preserves the
+    # server default (Euler) and remains compatible with older H3 servers.
+    if sample_solver != "auto":
+        merged_extra_params["sample_solver"] = sample_solver
+
     if params:
         logger.warning("Unused MiniMax-H3 model params ignored: %s", sorted(params))
 

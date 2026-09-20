@@ -94,7 +94,17 @@ def _sigmas(num_points: int, shift: float) -> list[float]:
     return minimax_h3_time_shift_sigmas(num_steps=num_points, shift_scale=shift)
 
 
-def _make_state(request_id: str, model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio):
+def _make_state(
+    request_id: str,
+    model,
+    branch,
+    video_rows,
+    audio_rows,
+    sigmas_video,
+    sigmas_audio,
+    *,
+    sample_solver: str = "euler",
+):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
     from vllm_omni.diffusion.worker.utils import StepRequestState
 
@@ -112,6 +122,9 @@ def _make_state(request_id: str, model, branch, video_rows, audio_rows, sigmas_v
         mod._STEP_AUDIO_ANCHOR: None,
         mod._STEP_SIGMAS_VIDEO: sigmas_video,
         mod._STEP_SIGMAS_AUDIO: sigmas_audio,
+        mod._STEP_SAMPLE_SOLVER: sample_solver,
+        mod._STEP_OLD_X0_VIDEO: None,
+        mod._STEP_OLD_X0_AUDIO: None,
     }
     return state
 
@@ -130,7 +143,8 @@ def _step_pipeline(model, *, packed_batch_supported: bool = True):
     return pipeline
 
 
-def test_step_execution_matches_request_mode_denoise_loop():
+@pytest.mark.parametrize("sample_solver", ["euler", "res_multistep"])
+def test_step_execution_matches_request_mode_denoise_loop(sample_solver):
     """Stepping through the contract must reproduce the request-mode loop."""
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
     from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
@@ -149,10 +163,20 @@ def test_step_execution_matches_request_mode_denoise_loop():
         sigmas_video=sigmas_video,
         sigmas_audio=sigmas_audio,
         device=torch.device("cpu"),
+        sample_solver=sample_solver,
     )
 
     pipeline = _step_pipeline(model)
-    state = _make_state("req-0", model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio)
+    state = _make_state(
+        "req-0",
+        model,
+        branch,
+        video_rows,
+        audio_rows,
+        sigmas_video,
+        sigmas_audio,
+        sample_solver=sample_solver,
+    )
     input_batch = SimpleNamespace(states=(state,))
 
     steps = 0

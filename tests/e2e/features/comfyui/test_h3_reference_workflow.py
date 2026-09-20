@@ -52,7 +52,12 @@ def test_reference_workflow_matches_omni_node_interfaces(workflow):
         schema = cls.INPUT_TYPES()
         inputs = {**schema.get("required", {}), **schema.get("optional", {})}
         for input_ in node["inputs"]:
-            assert input_["type"] == inputs[input_["name"]][0]
+            expected_type = inputs[input_["name"]][0]
+            # ComfyUI serializes a list-backed dropdown as the generic COMBO
+            # type rather than embedding all choices in the workflow input.
+            if isinstance(expected_type, list):
+                expected_type = "COMBO"
+            assert input_["type"] == expected_type
         assert tuple(output["type"] for output in node["outputs"]) == cls.RETURN_TYPES
         expected_widgets = len(schema.get("required", {}))
         if "seed" in schema.get("required", {}):
@@ -95,7 +100,7 @@ def test_reference_workflow_defaults_and_portable_assets(workflow):
     assert (num_frames - 5) % 17 == 0
     assert 4 <= values[7] <= 15
     assert by_type["VLLMOmniDiffusionSampling"]["widgets_values"] == [1, 50, 1.0, 1.0, False, False, 42, "fixed"]
-    assert by_type["VLLMOmniMiniMaxH3Params"]["widgets_values"] == [3.0, 12.0]
+    assert by_type["VLLMOmniMiniMaxH3Params"]["widgets_values"] == [3.0, 12.0, "auto"]
     assert by_type["VLLMOmniRemoteLoRA"]["widgets_values"][0] == ""
     for kind in ("LoadImage", "LoadVideo", "LoadAudio"):
         filename = by_type[kind]["widgets_values"][0]
