@@ -70,11 +70,13 @@ def image_to_base64_data_url(image: Image.Image) -> str:
 
 def audio_to_base64_data_url(audio_np: np.ndarray, sample_rate: int) -> str:
     if audio_np.dtype != np.int16:
-        if audio_np.dtype in (np.float32, np.float64):
-            audio_np = np.clip(audio_np, -1.0, 1.0)
-            audio_np = (audio_np * 32767).astype(np.int16)
+        if np.issubdtype(audio_np.dtype, np.floating):
+            audio_f = np.clip(audio_np.astype(np.float64), -1.0, 1.0)
         else:
-            audio_np = audio_np.astype(np.int16)
+            # Integer PCM uses the full dtype range as full scale; pydub pads
+            # 24-bit sources to int32, so a bare astype(int16) would wrap.
+            audio_f = audio_np.astype(np.float64) / (1 << (np.iinfo(audio_np.dtype).bits - 1))
+        audio_np = np.clip(audio_f * 32768, -32768, 32767).astype(np.int16)
     buf = io.BytesIO()
     sf.write(buf, audio_np, sample_rate, format="WAV")
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
