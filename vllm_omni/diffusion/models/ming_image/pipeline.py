@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 _DESIGN_PIPELINE = "MingImageDiffusionPipeline"
 _LAYERED_PIPELINE = "MingImageLayeredDiffusionPipeline"
+_VENDOR_TRANSFORMER_CLASS = "DiffusionTransformer"
 
 
 def _validate_variant_config(
@@ -56,6 +57,13 @@ def _validate_variant_config(
         raise ValueError(
             "Ming-Image model_index.json must declare "
             f"{_DESIGN_PIPELINE!r} or {_LAYERED_PIPELINE!r}, got {declared_pipeline!r}."
+        )
+    declared_transformer = getattr(transformer_config, "_class_name", None)
+    if declared_transformer != _VENDOR_TRANSFORMER_CLASS:
+        raise ValueError(
+            "Ming-Image transformer/config.json must preserve the vendor "
+            f"_class_name={_VENDOR_TRANSFORMER_CLASS!r}, got {declared_transformer!r}. "
+            "vLLM-Omni loads those weights through MingImageTransformer2DModel."
         )
     is_layer_decomposition = declared_pipeline == _LAYERED_PIPELINE
     expected_padding = "learned" if is_layer_decomposition else "zero_masked"

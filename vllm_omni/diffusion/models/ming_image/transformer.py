@@ -11,7 +11,10 @@ from vllm_omni.diffusion.models.z_image.z_image_transformer import ZImageTransfo
 
 
 class MingImageTransformer2DModel(ZImageTransformer2DModel):
-    """Read Ming-specific request conditions without duplicating the DiT."""
+    """Runtime adapter for vendor DiffusionTransformer checkpoints.
+
+    This adapter reuses the shared Z-Image DiT and injects Ming-specific request conditions.
+    """
 
     def forward(
         self,
