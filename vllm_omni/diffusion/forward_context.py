@@ -48,6 +48,8 @@ class ForwardContext:
     total_denoise_steps: int | None = None
     # Per-request reference latent for img2img DiT models (e.g. Ming)
     ref_latent: torch.Tensor | None = None
+    # Per-request projected direct-VLM condition (e.g., Ming-Image). For now for bsz 1.
+    direct_condition: torch.Tensor | None = None
     # whether to split the text embed in sequence parallel, if True, the text embed will be split in sequence parallel
 
     # Sequence Parallel padding support
@@ -377,3 +379,9 @@ def set_forward_context_ref_latent(ref_latent: torch.Tensor | None) -> None:
     """
     if _forward_context is not None:
         _forward_context.ref_latent = ref_latent
+
+
+def set_forward_context_direct_condition(direct_condition: torch.Tensor | None) -> None:
+    """Set the projected direct-VLM condition on the active context."""
+    if _forward_context is not None:
+        _forward_context.direct_condition = direct_condition
