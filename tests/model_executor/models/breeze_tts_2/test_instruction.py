@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 
 import pytest
+from vllm import SamplingParams
 
 from vllm_omni.entrypoints.openai.tts_adapters.breeze_tts_2 import BreezeTTS2Adapter
 from vllm_omni.model_executor.models.breeze_tts_2.prompt_builder import (
@@ -133,3 +134,24 @@ def test_non_greedy_sampling_overrides_are_rejected():
     assert "greedy" in adapter.validate(_request({"top_p": 0.9}))
     assert "greedy" in adapter.validate(_request({"top_k": 50}))
     assert "temperature must be a number" in adapter.validate(_request({"temperature": "warm"}))
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), "invalid"])
+def test_invalid_repetition_penalties_are_rejected(value):
+    assert "repetition_penalty" in _adapter().validate(_request({"repetition_penalty": value}))
+
+
+@pytest.mark.parametrize("value", [0.9, 1.0, 1.1, "1.2"])
+@pytest.mark.parametrize("max_new_tokens", [None, 32])
+def test_repetition_penalty_override_reaches_standard_sampling_metadata(value, max_new_tokens):
+    adapter = _adapter()
+    request = _request({"repetition_penalty": value}, max_new_tokens=max_new_tokens)
+    original = [SamplingParams(max_tokens=128, repetition_penalty=1.1)]
+
+    assert adapter.validate(request) is None
+    updated = adapter.apply_sampling_overrides(original, request)
+
+    assert updated[0].repetition_penalty == float(value)
+    assert updated[0].max_tokens == (128 if max_new_tokens is None else max_new_tokens)
+    assert original[0].repetition_penalty == 1.1
+    assert original[0].max_tokens == 128

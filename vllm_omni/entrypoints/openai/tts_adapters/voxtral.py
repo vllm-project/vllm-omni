@@ -99,9 +99,10 @@ class VoxtralTTSAdapter(ARTTSAdapter):
     ) -> PreparedRequest:
         # Cache encoder_loaded property to avoid RPC call on every request with ref_audio
         if self._encoder_loaded is None:
-            loaded = await self.ctx.server.engine_client.collective_rpc("encoder_loaded")
-            #  Flatten results before checking if encoder loaded property is set
-            self._encoder_loaded = any(sum(loaded, []))
+            result = await self.ctx.server.engine_client.collective_rpc("encoder_loaded")
+            self._encoder_loaded = any(
+                bool(x) for r in result if not isinstance(r, dict) for x in (r if isinstance(r, list) else [r])
+            )
 
         prompt = await self._build_prompt_async(request)
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="voxtral_tts")

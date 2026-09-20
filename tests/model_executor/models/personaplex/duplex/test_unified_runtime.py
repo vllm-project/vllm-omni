@@ -8,6 +8,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
+from vllm_omni.engine.duplex.runtime import (
+    DuplexInputMode,
+)
+from vllm_omni.entrypoints.duplex.runtime_adapter import (
+    ServingRuntimeConfigError,
+)
 
 from tests.e2e.online_serving import personaplex_realtime_duplex as e2e_driver
 from vllm_omni.config.stage_config import (
@@ -15,12 +21,6 @@ from vllm_omni.config.stage_config import (
     merge_pipeline_deploy,
 )
 from vllm_omni.engine.duplex.messages import DuplexFence
-from vllm_omni.engine.duplex.runtime import (
-    DuplexInputMode,
-)
-from vllm_omni.entrypoints.duplex.runtime_adapter import (
-    ServingRuntimeConfigError,
-)
 from vllm_omni.model_executor.models.personaplex.duplex.config import DEFAULT_PERSONA
 from vllm_omni.model_executor.models.personaplex.duplex.data_plane import (
     PersonaPlexDataPlaneContext,

@@ -173,3 +173,26 @@ def test_bounded_tail_allows_ratio_bound_for_long_answers():
     # Twenty expected words allow up to max(2, ceil(0.2 * 20)) = 4 tail words.
     assert assertions._transcript_has_bounded_tail(four_word_tail, expected)
     assert not assertions._transcript_has_bounded_tail(five_word_tail, expected)
+
+
+def test_speech_timestamp_header_is_required_and_decoded():
+    import time
+
+    import httpx
+    from openai._legacy_response import HttpxBinaryResponseContent
+
+    from tests.helpers.client import OnlineOmniClient
+
+    client = object.__new__(OnlineOmniClient)
+    request = {"word_timestamps": True}
+    for headers in ({}, {"X-Word-Timestamps": '[{"word":"Hello","start_ms":0,"end_ms":300}]'}):
+        response = client._process_non_stream_audio_speech_response(
+            HttpxBinaryResponseContent(httpx.Response(200, content=b"audio", headers=headers)),
+            wall_start=time.perf_counter(),
+        )
+        if headers:
+            assert_audio_speech_response(response, request)
+            assert response.word_timestamps == [{"word": "Hello", "start_ms": 0, "end_ms": 300}]
+        else:
+            with pytest.raises(AssertionError, match="X-Word-Timestamps"):
+                assert_audio_speech_response(response, request)

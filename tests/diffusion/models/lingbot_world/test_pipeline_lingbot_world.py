@@ -2711,3 +2711,125 @@ def test_registry_and_model_exports_resolve_official_pipeline_class_name() -> No
     assert "from .pipeline import" in lingbot_init
     assert '"LingBotWorldCausalDMDPipeline"' in lingbot_init
     assert '"CausalLingBotWorldTransformer3DModel"' in lingbot_init
+
+
+# ---------------------------------------------------------------------------
+# a prompt is encoded once, whichever path asks for it
+# ---------------------------------------------------------------------------
+def _counting_text_encoder(pipeline) -> list[str]:
+    """Give ``pipeline`` its real encode_prompt over stubs that record each encode."""
+    del pipeline.encode_prompt  # _pipeline() replaces it; these tests need the real one
+    encoded: list[str] = []
+
+    def tokenizer(texts, **kwargs):
+        del kwargs
+        encoded.extend(texts)
+        return SimpleNamespace(
+            input_ids=torch.arange(512).view(1, 512),
+            attention_mask=torch.ones(1, 512, dtype=torch.long),
+        )
+
+    def text_encoder(input_ids, attention_mask):
+        del input_ids, attention_mask
+        return SimpleNamespace(last_hidden_state=torch.full((1, 512, 8), float(len(encoded))))
+
+    pipeline.tokenizer = tokenizer
+    pipeline.text_encoder = text_encoder
+    return encoded
+
+
+def test_the_text_encoder_runs_once_per_distinct_prompt() -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    encoded = _counting_text_encoder(pipeline)
+
+    def encode(prompt, *, length=512, dtype=torch.float32):
+        return pipeline.encode_prompt(prompt, max_sequence_length=length, dtype=dtype)
+
+    first = encode("move through the room")
+    assert encode("move through the room") is first
+    # The key is the text the tokenizer actually sees, so spacing alone is not new.
+    assert encode("  move   through the room ") is first
+    assert encoded == ["move through the room"]
+
+    encode("enter the snowy valley")
+    # dtype and sequence length change the tensor, so each is its own entry.
+    encode("move through the room", dtype=torch.float16)
+    encode("move through the room", length=256)
+    assert encoded == [
+        "move through the room",
+        "enter the snowy valley",
+        "move through the room",
+        "move through the room",
+    ]
+
+
+def test_the_prompt_encode_cache_is_bounded() -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    encoded = _counting_text_encoder(pipeline)
+    size = module._PROMPT_EMBEDS_CACHE_SIZE
+
+    for index in range(size + 1):
+        pipeline.encode_prompt(f"prompt {index}", max_sequence_length=512, dtype=torch.float32)
+    assert len(pipeline._prompt_embeds_cache) == size
+
+    # The oldest entry was the one evicted, so it is the one encoded again.
+    pipeline.encode_prompt("prompt 0", max_sequence_length=512, dtype=torch.float32)
+    pipeline.encode_prompt(f"prompt {size}", max_sequence_length=512, dtype=torch.float32)
+    assert encoded == [f"prompt {index}" for index in range(size + 1)] + ["prompt 0"]
+
+
+def test_realtime_ticks_reuse_the_encode_and_still_invalidate_on_a_prompt_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+    pipeline._ar_diffusion_kv_state = object()
+    encoded = _counting_text_encoder(pipeline)
+    invalidations: list[bool] = []
+
+    def ar_text_caches(prompt_embeds, *, invalidate):
+        del prompt_embeds
+        invalidations.append(invalidate)
+        return [SimpleNamespace()]
+
+    monkeypatch.setattr(pipeline, "_ar_text_caches", ar_text_caches)
+    monkeypatch.setattr(
+        pipeline,
+        "_generate_block",
+        lambda **kwargs: torch.randn((1, 16, 3, 2, 2), generator=kwargs["generator"]),
+    )
+
+    for chunk_index in range(3):
+        pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=chunk_index))))
+    switched = _prompt()
+    switched["prompt"] = "enter the snowy valley"
+    pipeline(
+        _request(
+            sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=3, prompt=switched["prompt"])),
+            prompt=switched,
+        )
+    )
+
+    assert encoded == ["move through the room", "enter the snowy valley"]
+    # A new prompt must still drop the cross-attention K/V built from the old one.
+    assert invalidations == [False, False, False, True]
+
+
+def test_stepwise_requests_with_the_same_prompt_share_one_encode() -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module, transformer=_RecordingTransformer())
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+    encoded = _counting_text_encoder(pipeline)
+
+    states = [_stepwise_state(request_id=request_id, num_frames=21) for request_id in ("req-a", "req-b")]
+    for state in states:
+        with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
+            pipeline.prepare_encode(state)
+
+    assert encoded == ["move through the room"]
+    assert states[0].prompt_embeds is states[1].prompt_embeds

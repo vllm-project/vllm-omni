@@ -11,7 +11,6 @@ import torch.nn as nn
 
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
-    _apply_qwen_image_rotary_emb,
     _qwen_image_qk_norm_rope,
 )
 
@@ -73,22 +72,28 @@ def _make_input(
     return QwenImageQKInput(q=q, k=k, norm_q=norm_q, norm_k=norm_k, freqs=freqs)
 
 
-def _reference(data: QwenImageQKInput) -> tuple[torch.Tensor, torch.Tensor]:
+def _eager_rotary(data: QwenImageQKInput) -> tuple[torch.Tensor, torch.Tensor]:
     q = data.norm_q(data.q)
     k = data.norm_k(data.k)
-    if data.q.device.type == "cuda":
-        return (
-            _apply_qwen_image_rotary_emb(q, data.freqs),
-            _apply_qwen_image_rotary_emb(k, data.freqs),
-        )
-
     rope = RotaryEmbedding(is_neox_style=False)
     cos = data.freqs.real.to(data.q.dtype)
     sin = data.freqs.imag.to(data.q.dtype)
     return rope(q, cos, sin), rope(k, cos, sin)
 
 
-def _run(data: QwenImageQKInput) -> tuple[torch.Tensor, torch.Tensor]:
+def _fp32_complex_rotary(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """Local copy of the old CUDA helper; fused kernel still tracks this math."""
+    paired = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+    return torch.view_as_real(paired * freqs.unsqueeze(1)).flatten(3).to(x.dtype)
+
+
+def _fused_kernel_reference(data: QwenImageQKInput) -> tuple[torch.Tensor, torch.Tensor]:
+    q = data.norm_q(data.q)
+    k = data.norm_k(data.k)
+    return _fp32_complex_rotary(q, data.freqs), _fp32_complex_rotary(k, data.freqs)
+
+
+def _run(data: QwenImageQKInput, *, use_fused: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
     return _qwen_image_qk_norm_rope(
         data.q,
         data.k,
@@ -97,6 +102,7 @@ def _run(data: QwenImageQKInput) -> tuple[torch.Tensor, torch.Tensor]:
         data.freqs,
         RotaryEmbedding(is_neox_style=False),
         EPS,
+        use_fused=use_fused,
     )
 
 
@@ -110,8 +116,8 @@ def test_qwen_image_qk_norm_rope_cuda_fp32_fallback_matches_reference():
         packed_qkv_view=True,
     )
 
-    actual_q, actual_k = _run(data)
-    expected_q, expected_k = _reference(data)
+    actual_q, actual_k = _run(data, use_fused=False)
+    expected_q, expected_k = _eager_rotary(data)
 
     torch.testing.assert_close(actual_q, expected_q, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(actual_k, expected_k, atol=1e-5, rtol=1e-5)
@@ -127,8 +133,8 @@ def test_qwen_image_qk_norm_rope_cuda_fp16_fallback_matches_reference():
         packed_qkv_view=True,
     )
 
-    actual_q, actual_k = _run(data)
-    expected_q, expected_k = _reference(data)
+    actual_q, actual_k = _run(data, use_fused=False)
+    expected_q, expected_k = _eager_rotary(data)
 
     torch.testing.assert_close(actual_q, expected_q, atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(actual_k, expected_k, atol=1e-3, rtol=1e-3)
@@ -150,7 +156,7 @@ def test_qwen_image_fused_qk_norm_rope_cuda_matches_fp32_rope_reference(
     )
 
     actual_q, actual_k = _run(data)
-    expected_q, expected_k = _reference(data)
+    expected_q, expected_k = _fused_kernel_reference(data)
 
     torch.testing.assert_close(actual_q, expected_q, atol=0.0625, rtol=0.02)
     torch.testing.assert_close(actual_k, expected_k, atol=0.0625, rtol=0.02)

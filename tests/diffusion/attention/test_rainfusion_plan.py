@@ -133,18 +133,17 @@ def test_invalid_ref2va_video_spans_fall_back_to_dense():
     assert make_impl()._resolve_plan(AttentionMetadata(extra={"max_seqlen_q": 12000}, video_layout=layout)) is None
 
 
-def test_validate_available_rejects_legacy_mindiesd(monkeypatch):
+def test_validate_available_accepts_single_video_mindiesd(monkeypatch):
     mindiesd = types.ModuleType("mindiesd")
 
     def sparse_attention(query, key, value, **kwargs):
         return query
 
-    mindiesd.sparse_attention = sparse_attention
+    monkeypatch.setattr(mindiesd, "sparse_attention", sparse_attention, raising=False)
     monkeypatch.setitem(sys.modules, "mindiesd", mindiesd)
     monkeypatch.setattr("importlib.util.find_spec", lambda _: object())
 
-    with pytest.raises(ValueError, match="video_spans"):
-        RainFusionAttentionBackend.validate_available()
+    RainFusionAttentionBackend.validate_available()
 
 
 def test_validate_available_accepts_new_mindiesd(monkeypatch):
@@ -153,7 +152,7 @@ def test_validate_available_accepts_new_mindiesd(monkeypatch):
     def sparse_attention(query, key, value, *, video_spans=None, **kwargs):
         return query
 
-    mindiesd.sparse_attention = sparse_attention
+    monkeypatch.setattr(mindiesd, "sparse_attention", sparse_attention, raising=False)
     monkeypatch.setitem(sys.modules, "mindiesd", mindiesd)
     monkeypatch.setattr("importlib.util.find_spec", lambda _: object())
 
@@ -300,22 +299,21 @@ def _fake_mindiesd_module():
     import types
 
     fake = types.ModuleType("mindiesd")
-    fake.sparse_attention = lambda *args, **kwargs: None
+    setattr(fake, "sparse_attention", lambda *args, **kwargs: None)
     return fake
 
 
 def test_precision_non_bf16_requires_mindiesd_support():
-    """precision != bf16 against a mindiesd lacking the kwarg must raise RuntimeError."""
+    """Unsupported sparse precision must fail before any operator executes."""
     import sys
 
     impl = make_impl(precision="mix")
-    sys.modules["mindiesd"] = _fake_mindiesd_module()
-    try:
+    with mock.patch.dict(sys.modules, {"mindiesd": _fake_mindiesd_module()}):
         with mock.patch.object(rainfusion_attn, "_mindiesd_supports_precision", return_value=False):
-            with pytest.raises(RuntimeError, match="requires MindIE-SD"):
-                impl._forward_sparse_npu(None, None, None, None)
-    finally:
-        sys.modules.pop("mindiesd", None)
+            with pytest.raises(ValueError, match="explicitly support precision"):
+                impl._forward_sparse_npu(
+                    None, None, None, RainFusionPlan(prefix_len=0, used_len=8, latent_shape=[2, 2, 2])
+                )
 
 
 def test_precision_non_bf16_passes_gate_when_supported():
@@ -323,8 +321,7 @@ def test_precision_non_bf16_passes_gate_when_supported():
     import sys
 
     impl = make_impl(precision="mix")
-    sys.modules["mindiesd"] = _fake_mindiesd_module()
-    try:
+    with mock.patch.dict(sys.modules, {"mindiesd": _fake_mindiesd_module()}):
         with mock.patch.object(rainfusion_attn, "_mindiesd_supports_precision", return_value=True):
             # q/k/v shapes: [B, S, N, D]; plan geometry must match S.
             q = torch.randn(1, 8, 4, 128)
@@ -332,5 +329,3 @@ def test_precision_non_bf16_passes_gate_when_supported():
             # The gate must pass; the fake mindiesd returns None so no crash.
             out = impl._forward_sparse_npu(q, q, q, plan)
             assert out is None
-    finally:
-        sys.modules.pop("mindiesd", None)

@@ -41,3 +41,8 @@ pydantic-settings>=2.0.0
 gguf>=0.10.0
 # Required for running the Cosmos3 model with guardrails enabled (default behavior).
 cosmos-guardrail>=0.3.1
+# Required for CosyVoice3 (get_window/resample_poly). >=1.18.0 requires
+# Python >=3.12, breaking base installs on the project's supported 3.10/3.11;
+# these are long-stable APIs with no version-specific need for 1.18.
+scipy>=1.11.0
+s3tokenizer==0.3.0

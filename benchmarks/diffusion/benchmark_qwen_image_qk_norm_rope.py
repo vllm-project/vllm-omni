@@ -22,9 +22,7 @@ from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     _fused_cuda_supported,
     fused_qk_norm_rope,
 )
-from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
-    _apply_qwen_image_rotary_emb,
-)
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 
 def _parse_args() -> argparse.Namespace:
@@ -87,10 +85,10 @@ def _native(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     q = F.rms_norm(q, (q.shape[-1],), q_weight, eps)
     k = F.rms_norm(k, (k.shape[-1],), k_weight, eps)
-    return (
-        _apply_qwen_image_rotary_emb(q, freqs),
-        _apply_qwen_image_rotary_emb(k, freqs),
-    )
+    rope = RotaryEmbedding(is_neox_style=False)
+    cos = freqs.real.to(q.dtype)
+    sin = freqs.imag.to(q.dtype)
+    return rope(q, cos, sin), rope(k, cos, sin)
 
 
 def _fused(

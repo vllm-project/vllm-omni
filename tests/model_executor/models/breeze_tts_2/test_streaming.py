@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import copy
 from collections import defaultdict
 from types import SimpleNamespace
 
@@ -20,7 +21,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 class _TransferManager:
     def __init__(self, chunk_frames: int = 4):
         self.connector = SimpleNamespace(config={"breeze_codec_chunk_frames": chunk_frames})
-        self.code_prompt_token_ids = defaultdict(list)
+        self.code_prompt_token_ids: defaultdict[str, list[torch.Tensor]] = defaultdict(list)
 
 
 class _Request:
@@ -120,7 +121,8 @@ def test_stateful_codec_rejects_partial_frame_chunk():
     assert decoder.calls == []
 
 
-def test_stateful_codec_terminal_marker_pops_state_without_decoding():
+@pytest.mark.parametrize("token_counts", [(4, 0), (0, 4), (0, 4, 0, 8, 0)])
+def test_stateful_codec_terminal_marker_pops_state_without_decoding(token_counts):
     decoder = _Decoder()
     codec = object.__new__(BreezeTTS2MimiCodec)
     codec._async_chunk = True
@@ -128,24 +130,114 @@ def test_stateful_codec_terminal_marker_pops_state_without_decoding():
     codec._codebook_size = 8
     codec._sample_rate = 24_000
     codec._audio_tokenizer = SimpleNamespace(model=SimpleNamespace(decoder=decoder))
-    codec._decoder_state_cache = {"scheduler-live": {}, "scheduler-done": {}}
+    request_ids = [f"scheduler-{index}" for index in range(len(token_counts))]
+    codec._decoder_state_cache = {request_id: {} for request_id in request_ids}
 
     output = codec.forward(
-        torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        torch.arange(sum(token_counts), dtype=torch.long) % codec._codebook_size,
         runtime_additional_information=[
             # Plain ``finished`` covers the fallback for direct in-process
             # callers that do not go through the connector receiver.
-            {"meta": {"request_id": "live", "finished": False}},
-            {"meta": {"request_id": "done", "finished": True}},
+            {"meta": {"finished": count == 0}}
+            for count in token_counts
         ],
-        seq_token_counts=[4, 0],
-        request_ids=["scheduler-live", "scheduler-done"],
+        seq_token_counts=token_counts,
+        request_ids=request_ids,
     )
 
-    # The empty terminal marker decodes nothing and releases its state; the
-    # live request still decodes its own chunk.
+    # Empty terminal markers release their state without consuming an output
+    # slot belonging to another request, regardless of their batch position.
     assert len(decoder.calls) == 1
-    assert decoder.calls[0][0][0] == 1
-    assert [item.numel() for item in output.multimodal_outputs["model_outputs"]] == [1920, 0]
-    assert list(codec._decoder_state_cache) == ["scheduler-live"]
-    assert codec._decoder_state_cache["scheduler-live"]["prefix_frames"] == 0
+    assert decoder.calls[0][0][0] == sum(count > 0 for count in token_counts)
+    assert [item.numel() for item in output.multimodal_outputs["model_outputs"]] == [
+        count // codec._num_codebooks * 1920 for count in token_counts
+    ]
+    live_request_ids = [request_id for request_id, count in zip(request_ids, token_counts) if count]
+    assert list(codec._decoder_state_cache) == live_request_ids
+    assert all(codec._decoder_state_cache[request_id]["prefix_frames"] == 0 for request_id in live_request_ids)
+
+
+@pytest.mark.parametrize("configured_chunk_frames", [None, 4])
+def test_stateful_codec_advances_decoder_cache_after_sliding_window(monkeypatch, tmp_path, configured_chunk_frames):
+    from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_tokenizer import Qwen3TTSTokenizer
+    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
+        Qwen3TTSTokenizerV2DecoderConfig,
+    )
+    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+        Qwen3TTSTokenizerV2Decoder,
+    )
+
+    torch.manual_seed(0)
+    config = Qwen3TTSTokenizerV2DecoderConfig(
+        codebook_size=32,
+        hidden_size=16,
+        latent_dim=16,
+        codebook_dim=16,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_quantizers=2,
+        decoder_dim=32,
+        upsample_rates=(2,),
+        upsampling_ratios=(2,),
+        sliding_window=72,
+    )
+    decoder = Qwen3TTSTokenizerV2Decoder(config).eval()
+    # Codebooks initialize to zeros before checkpoint loading; populate them
+    # so different codec IDs produce distinguishable cached frame histories.
+    with torch.no_grad():
+        for name, parameter in decoder.quantizer.named_parameters():
+            if name.endswith("embedding_sum"):
+                parameter.normal_()
+    tokenizer = SimpleNamespace(model=SimpleNamespace(decoder=decoder, get_output_sample_rate=lambda: 24_000))
+    monkeypatch.setattr(Qwen3TTSTokenizer, "from_pretrained", lambda *args, **kwargs: tokenizer)
+    connector_extra = {} if configured_chunk_frames is None else {"breeze_codec_chunk_frames": configured_chunk_frames}
+    chunk_frames = configured_chunk_frames or 8
+    codec = object.__new__(BreezeTTS2MimiCodec)
+    codec.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(stage_connector_config={"extra": connector_extra}),
+        device_config=SimpleNamespace(device="cpu"),
+    )
+    codec._tokenizer_path = tmp_path / "audio_tokenizer"
+    codec._audio_tokenizer = None
+    codec._async_chunk = True
+    codec._num_codebooks = config.num_quantizers
+    codec._codebook_size = config.codebook_size
+    codec._decoder_state_cache = {}
+    codec.load_weights(iter(()))
+
+    # At least two chunks after the decoder's rolling window expose a stale
+    # cache even when the first padded chunk still produces plausible audio.
+    total_frames = config.sliding_window + 2 * chunk_frames
+    tail_frames = 3
+    codes = torch.randint(0, config.codebook_size, (1, config.num_quantizers, total_frames + tail_frames))
+    for end in range(chunk_frames, total_frames + 1, chunk_frames):
+        flat = codes[0, :, end - chunk_frames : end].reshape(-1)
+        codec.forward(
+            flat,
+            runtime_additional_information=[{"meta": {"stream_finished": False}}],
+            seq_token_counts=[flat.numel()],
+            request_ids=["scheduler-live"],
+        )
+        state = codec._decoder_state_cache["scheduler-live"]
+        assert state["suffix_frames"] == min(end - chunk_frames, config.sliding_window) + chunk_frames
+        with torch.inference_mode():
+            expected_quantized = decoder.quantizer.decode(codes[..., max(0, end - config.sliding_window) : end])
+        torch.testing.assert_close(state["suffix_quantized"], expected_quantized)
+
+    # A short terminal chunk must emit only its real frames, then release
+    # state. Its waveform should agree with the unpadded single-request path.
+    with torch.inference_mode():
+        expected_tail = decoder.chunked_decode(codes[..., -tail_frames:], caches=copy.deepcopy(state))
+    flat_tail = codes[0, :, -tail_frames:].reshape(-1)
+    output = codec.forward(
+        flat_tail,
+        runtime_additional_information=[{"meta": {"stream_finished": True}}],
+        seq_token_counts=[flat_tail.numel()],
+        request_ids=["scheduler-live"],
+    )
+    waveform = output.multimodal_outputs["model_outputs"][0]
+    assert waveform.numel() == tail_frames * decoder.total_upsample
+    torch.testing.assert_close(waveform, expected_tail.reshape(-1), atol=1e-5, rtol=1e-4)
+    assert codec._decoder_state_cache == {}

@@ -25,6 +25,7 @@ class OmniServingCapability(Enum):
 
     COMPLETIONS = RouteTarget("/v1/completions", frozenset({"POST"}))
     CHAT_COMPLETIONS = RouteTarget("/v1/chat/completions", frozenset({"POST"}))
+    IMAGE_EDITS = RouteTarget("/v1/images/edits", frozenset({"POST"}))
 
     @property
     def path(self) -> str:

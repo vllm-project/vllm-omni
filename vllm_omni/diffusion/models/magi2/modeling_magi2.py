@@ -670,11 +670,9 @@ def _is_magi2_transformer_layer(_name: str, module: nn.Module) -> bool:
 class Magi2PreviewTransformer(nn.Module):
     """Native preview DiT with the released checkpoint hierarchy."""
 
-    # ``block`` must remain the registered child name because it is part of the
-    # released checkpoint hierarchy.  The ``layers`` property below exposes its
-    # ModuleList through the standard layerwise-offload contract without
-    # changing the registered module names.
-    _layerwise_offload_blocks_attrs = ["layers"]
+    # ``block`` is the registered child module containing the repeated
+    # layers, exposed as the streamable blocks container for layerwise offload.
+    _layerwise_offload_blocks_attrs = ["block"]
     _hsdp_shard_conditions = [_is_magi2_transformer_layer]
     _hsdp_preserve_parameter_dtypes = True
     _EP_SHARDED_SUFFIXES = (
@@ -704,7 +702,7 @@ class Magi2PreviewTransformer(nn.Module):
 
     @property
     def layers(self) -> nn.ModuleList:
-        """Expose Preview layers to the shared offload block discovery API."""
+        """Expose Preview layers for direct access and compatibility."""
 
         return self.block.layers
 

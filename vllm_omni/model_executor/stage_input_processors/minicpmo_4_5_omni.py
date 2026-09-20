@@ -16,7 +16,10 @@ from vllm_omni.engine.duplex.intermediate import (
     set_tts_handoff,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
-from vllm_omni.model_executor.models.minicpmo_4_5 import MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
+from vllm_omni.model_executor.models.minicpmo_4_5 import (
+    MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
+    MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
 
 logger = logging.getLogger(__name__)
@@ -690,9 +693,6 @@ def _native_duplex_data_plane_metadata(streaming_context) -> dict[str, object] |
     session_id = duplex_state.get("session_id")
     if isinstance(session_id, str) and session_id:
         metadata["session_id"] = session_id
-    incarnation = duplex_state.get("incarnation")
-    if isinstance(incarnation, int):
-        metadata["incarnation"] = incarnation
     epoch = duplex_state.get("epoch")
     if isinstance(epoch, int):
         metadata["epoch"] = epoch
@@ -1013,7 +1013,11 @@ def llm2tts(
             handoff_meta = model_intermediate_buffer.setdefault("meta", {})
             handoff_meta["next_stage_prompt_len"] = condition_length
             if is_native_duplex_handoff:
-                handoff_meta["next_stage_generation_tokens"] = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
+                handoff_meta["next_stage_generation_tokens"] = (
+                    MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS
+                    if native_turn_end_handoff
+                    else MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
+                )
                 bridge_states = getattr(_streaming_context, "bridge_states", None)
                 handoff_state = bridge_states.get("minicpmo45_tts_handoff") if isinstance(bridge_states, dict) else None
                 if not isinstance(handoff_state, dict) or handoff_state.get("request_id") != str(llm_output.request_id):

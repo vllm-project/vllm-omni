@@ -9,26 +9,39 @@ steps:
   steps:
     - label: "Simple · Model Executor Test · Shard %N/%t"
       agent_pool: mi300_1
-      parallelism: 2
+      parallelism: 3
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
+      timeout_in_minutes: 90
       commands:
         - export VLLM_ROCM_USE_AITER=0
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
-        - "pytest -sv tests/model_executor -m 'core_model and cpu' --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
+        - "pytest -sv tests/model_executor -m 'core_model and cpu and not omni' --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
 
-    - label: "Simple · Diffusion Test"
+    - label: "Simple · Omni Processor Test"
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
+      timeout_in_minutes: 60
+      commands:
+        - export VLLM_ROCM_USE_AITER=0
+        - "pytest -sv tests/model_executor/models/test_omni_processing.py -m 'core_model and cpu and omni'"
+
+    - label: "Simple · Diffusion Test · Shard %N/%t"
+      agent_pool: mi300_1
+      parallelism: 4
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 45
       commands:
         - export VLLM_ROCM_USE_AITER=0
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
-        - "pytest -sv tests/diffusion -m 'core_model and cpu'  --ignore=tests/diffusion/cache/test_teacache_extractors.py"
+        - "pytest -sv tests/diffusion -m 'core_model and cpu' --ignore=tests/diffusion/cache/test_teacache_extractors.py --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
 
     - label: "Simple · Engine&Entrypoints Test"
       agent_pool: mi300_1
@@ -69,6 +82,27 @@ steps:
 
 - group: ":card_index_dividers: Diffusion Test"
   steps:
+    # Keep real FlashAttention execution out of the CPU-marked Simple lane.
+    # AITER may need to build several kernels on a cold worker, so run one
+    # pytest worker with job-local build directories and a bounded timeout.
+    - label: "ROCm · FlashAttention/AITER GPU Coverage"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      timeout_in_minutes: 60
+      commands:
+        - export VLLM_ROCM_USE_AITER=1
+        - export AITER_JIT_DIR="/tmp/vllm-omni-aiter-$$BUILDKITE_JOB_ID"
+        - export TORCH_EXTENSIONS_DIR="/tmp/vllm-omni-torch-extensions-$$BUILDKITE_JOB_ID"
+        - mkdir -p "$$AITER_JIT_DIR" "$$TORCH_EXTENSIONS_DIR"
+        - >-
+          timeout --signal=TERM --kill-after=2m 55m
+          pytest -s -v -n 1
+          tests/diffusion/attention/
+          -m 'core_model and rocm and MI325 and cards_1'
+          --run-level "core_model"
+
     - label: "Diffusion · Batch Test"
       agent_pool: mi300_1
       depends_on: amd-build
@@ -299,6 +333,12 @@ steps:
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
+      # A ROCm hardware hang aborts the interpreter with 134. Let Buildkite
+      # create one fresh pod instead of retrying on the poisoned GPU process.
+      retry:
+        automatic:
+          - exit_status: 134
+            limit: 1
       commands:
         - pytest -s -v tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py -m "slow" --run-level "core_model"
 

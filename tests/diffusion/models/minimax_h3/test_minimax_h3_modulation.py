@@ -6,10 +6,11 @@ import torch
 from vllm.triton_utils import HAS_TRITON
 
 from tests.helpers.mark import hardware_marks
-from vllm_omni.diffusion.attention.ops.minimax_h3_modulation import (
+from vllm_omni.diffusion.layers.indexed_modulation import (
     _MAX_1D_GRID_SIZE,
     _iter_row_chunks,
     _launch_row_chunks,
+    _use_hopper_bf16_affine_semantics,
     indexed_gate,
     indexed_gate_rms_norm_scale_shift,
     indexed_scale_shift_,
@@ -190,3 +191,55 @@ def test_fused_modulation_preserves_bf16_residual_boundary() -> None:
     )
 
     assert torch.equal(modulated_out, expected)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 9,
+    reason="SM90-specific precision path",
+)
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+def test_hopper_fused_modulation_matches_pytorch_reference() -> None:
+    torch.manual_seed(42)
+    rows, hidden_size, conditions = 128, 3072, 4
+    residual = torch.randn(rows, hidden_size, device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn(conditions, hidden_size, device="cuda", dtype=torch.bfloat16)
+    branch = torch.randn(rows, hidden_size, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
+    shift = torch.randn(conditions, hidden_size, device="cuda", dtype=torch.bfloat16)
+    scale = torch.randn(conditions, hidden_size, device="cuda", dtype=torch.bfloat16)
+    indices = torch.arange(rows, device="cuda") % conditions
+    eps = 1e-6
+
+    reference_residual = (residual + gate.index_select(0, indices) * branch).to(torch.bfloat16)
+    normalized = reference_residual.float()
+    variance = normalized.pow(2).mean(-1, keepdim=True)
+    normalized = (weight.float() * (normalized * torch.rsqrt(variance + eps))).to(torch.bfloat16)
+    reference_modulated = (normalized * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)).to(
+        torch.bfloat16
+    )
+
+    actual_residual, actual_modulated = indexed_gate_rms_norm_scale_shift(
+        residual,
+        gate,
+        branch,
+        weight,
+        shift,
+        scale,
+        indices,
+        eps,
+    )
+
+    torch.testing.assert_close(actual_residual, reference_residual, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(actual_modulated, reference_modulated, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_hopper_precision_dispatch_is_architecture_scoped(monkeypatch) -> None:
+    tensor = torch.empty(0, device="cuda")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (9, 0))
+    assert _use_hopper_bf16_affine_semantics(tensor)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (10, 3))
+    assert not _use_hopper_bf16_affine_semantics(tensor)

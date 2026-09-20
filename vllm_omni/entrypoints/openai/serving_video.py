@@ -53,6 +53,30 @@ logger = init_logger(__name__)
 
 _VIDEO_RESPONSE_FRAME_CONVERSION_WORKERS = 8
 
+
+def _config_value(config: Any, key: str, default: Any = None) -> Any:
+    if isinstance(config, Mapping):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _stage_diffusion_model_class_name(stage_config: Any) -> str | None:
+    """Resolve a stage's diffusion class across typed and legacy shapes."""
+    diffusion_config = _config_value(stage_config, "diffusion_config")
+    model_class_name = _config_value(diffusion_config, "model_class_name")
+    if model_class_name:
+        return str(model_class_name)
+
+    model_config = _config_value(stage_config, "model_config")
+    model_arch = _config_value(model_config, "model_arch") or _config_value(stage_config, "model_arch")
+    if model_arch:
+        return str(model_arch)
+
+    engine_args = _config_value(stage_config, "engine_args", {})
+    model_class_name = _config_value(engine_args, "model_class_name")
+    return str(model_class_name) if model_class_name else None
+
+
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
@@ -195,18 +219,7 @@ class OmniOpenAIServingVideo:
         model_class_name = getattr(od_config, "model_class_name", None)
         model_archs = [model_class_name]
         for stage_config in self.stage_configs or ():
-            stage_get = (
-                stage_config.get if isinstance(stage_config, Mapping) else lambda key: getattr(stage_config, key, None)
-            )
-            engine_args = stage_get("engine_args") or {}
-            model_archs.extend(
-                (
-                    stage_get("model_arch"),
-                    engine_args.get("model_class_name")
-                    if isinstance(engine_args, Mapping)
-                    else getattr(engine_args, "model_class_name", None),
-                )
-            )
+            model_archs.append(_stage_diffusion_model_class_name(stage_config))
         metadata_capability = any(
             get_diffusion_model_metadata(model_arch).supports_mixed_reference_inputs for model_arch in model_archs
         )
@@ -223,18 +236,7 @@ class OmniOpenAIServingVideo:
         od_config = self._resolve_diffusion_od_config()
         model_archs = [None if od_config is None else getattr(od_config, "model_class_name", None)]
         for stage_config in self.stage_configs or ():
-            stage_get = (
-                stage_config.get if isinstance(stage_config, Mapping) else lambda key: getattr(stage_config, key, None)
-            )
-            engine_args = stage_get("engine_args") or {}
-            model_archs.extend(
-                (
-                    stage_get("model_arch"),
-                    engine_args.get("model_class_name")
-                    if isinstance(engine_args, Mapping)
-                    else getattr(engine_args, "model_class_name", None),
-                )
-            )
+            model_archs.append(_stage_diffusion_model_class_name(stage_config))
 
         supported: set[str] = set()
         for model_arch in model_archs:

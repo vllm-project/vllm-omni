@@ -15,40 +15,68 @@ capability gates, see the [Realtime Duplex API guide](realtime_duplex_api.md).
 
 | Endpoint | Protocol | Recommended use |
 | --- | --- | --- |
-| `WS /v1/realtime?duplex=1` | OpenAI Realtime-style event projection | Applications and browser clients |
-| `WS /v1/duplex` | Native vLLM-Omni duplex events | Runtime integration and low-level testing |
-
-Both endpoints use the same duplex engine and require the same model-side
-adapter. Prefer the Realtime projection unless the native lifecycle events are
-specifically required.
+| `WS /v1/realtime?duplex=1` | OpenAI Realtime-style events (the normative contract) | Applications and browser clients |
+| `WS /v1/duplex` | Alias of `/v1/realtime?duplex=1` (same protocol, same handler) | Clients that prefer a dedicated path |
+| Python: `DuplexOmni` / `InlineDuplexClient` | Typed commands and events in-process | Embedding the model without a server |
 
 ## Enable Full Duplex
 
-The route becomes usable only when the deployment configuration explicitly
-sets:
+A model is served full duplex when its registered pipeline declares a
+`duplex_plugin` (the model's `DuplexModelPlugin`) and its deploy configuration
+sets `session_mode: duplex`. `vllm serve --omni` constructs `DuplexOmni`
+instead of `AsyncOmni`. It serves
+`/v1/realtime?duplex=1` (and its alias `/v1/duplex`),
+`POST /v1/chat/completions`, `/v1/models` and `/health`; every other
+turn-based HTTP route (speech, batch, embeddings, video, ...) answers "not
+available". Set `session_mode: turn` to select the ordinary online serving
+stack instead. The model's supported tasks and endpoint restrictions still apply.
+
+`/v1/chat/completions` is the ordinary chat service running on the duplex
+engine: a request is a turn-based generation on the same stages, served
+alongside the live websocket sessions, with the request options the chat
+service supports. It is wired only when the model's plugin declares
+`DuplexCapabilities.supports_chat_completions`; on any other duplex model the
+route reports "not available". A model that should not serve the route at all
+lists it in the deploy configuration's `endpoint_restrictions`.
+
+The deploy configuration of such a model must agree:
 
 ```yaml
 session_mode: duplex
 ```
 
-The selected model pipeline must also provide a duplex serving adapter.
-Model-native deployments configure the corresponding engine runtime extension
-and control plane as part of their registered pipeline.
+A duplex-capable model must explicitly set `session_mode` to `duplex` or `turn`
+in its deploy configuration, possibly through `base_config` inheritance.
+Missing or invalid values fail at startup. The default MiniCPM-o deployment
+continues to use duplex mode.
+
+To run MiniCPM-o 4.5 with the turn-based engine:
+
+```bash
+vllm serve openbmb/MiniCPM-o-4_5 --omni \
+  --deploy-config vllm_omni/deploy/minicpmo_4_5_turn.yaml \
+  --trust-remote-code \
+  --port 8091
+```
+
+This profile inherits the default model and stage settings and overrides only
+`session_mode`. It supports ordinary HTTP requests without creating a duplex
+session handler. Mode selection happens at startup; a WebSocket query parameter
+does not switch engines. The Python `Omni` / `AsyncOmni` APIs are unchanged.
 
 !!! warning
 
-    `WS /v1/duplex` fails with `Duplex API is not available` when duplex is not
-    enabled. By contrast, `/v1/realtime?duplex=1` falls back to the ordinary
-    turn-based realtime handler when no duplex handler exists. Confirm that
+    On a deployment that is *not* duplex, `WS /v1/duplex` fails with
+    `Duplex API is not available` and `/v1/realtime?duplex=1` falls back to the
+    ordinary turn-based realtime handler. Confirm that
     `session.created.session.capabilities` is present before treating the
     connection as full duplex.
 
-The current unified-runtime integrations are:
-
-- MiniCPM-o 4.5, using `vllm_omni/deploy/minicpmo_4_5.yaml`
-  (`session_mode: duplex`);
-- PersonaPlex, whose default `vllm_omni/deploy/personaplex.yaml` enables duplex;
-- Nemotron VoiceChat, via its registered duplex plugin package.
+**MiniCPM-o 4.5** (`vllm_omni/deploy/minicpmo_4_5.yaml`) is the only model
+served over this endpoint today. PersonaPlex and Nemotron VoiceChat still carry
+their pre-framework duplex code: their pipelines declare no `duplex_plugin`, so
+they run turn-based until the follow-up PRs port them to the plugin contract
+(RFC [vllm-omni#7181](https://github.com/vllm-project/vllm-omni/issues/7181)).
 
 JoyVL is a separate HTTP interaction orchestrator and does not use these
 WebSocket endpoints. See [Standalone Experimental Servers](standalone_servers.md).
@@ -101,22 +129,23 @@ deferred, treated as a short acknowledgement, or used to interrupt output.
 The `session.created` payload includes capability fields such as
 `supports_barge_in`, `supports_playback_ack`, `supports_multi_session`,
 `supports_session_resume`, and `chunk_period_ms`. Treat this payload as the
-runtime contract.
+runtime contract and branch on the flags, never on the model name: a model
+that supports native overlapping speech may still advertise
+`supports_barge_in=false` when destructive output interruption and model-state
+rewind are not validated for it. Capacity and session-resume behavior also
+depend on the selected deployment configuration. The per-model table lives in
+the [Realtime Duplex API guide](realtime_duplex_api.md#capability-negotiation-by-model).
 
-For example, PersonaPlex supports native overlapping speech but currently
-advertises `supports_barge_in=false`; destructive output interruption and
-model-state rewind have not been validated for that integration. Capacity and
-session-resume behavior also depend on the selected deployment configuration.
+## Python API
 
-## Native Protocol
+`vllm_omni.entrypoints.duplex_omni.DuplexOmni` runs the same engine-resident
+sessions in-process: `open_session()` returns a `DuplexSessionHandle` whose
+`submit()` takes typed `DuplexCommand` objects and whose `events()` yields
+typed `DuplexEvent` objects (each with a `to_realtime()` wire rendering).
+`vllm_omni.clients.inline_duplex.InlineDuplexClient` exposes that handle
+behind the `DuplexClient` API. See the
+[Realtime Duplex API guide](realtime_duplex_api.md#using-the-python-api).
 
-`WS /v1/duplex` exposes lower-level lifecycle names including
-`session.create`, `input_audio_buffer.append`, `turn.signal`, `playback.ack`,
-and `session.close`. It returns native session, input, response, overlap, and
-error events. This protocol is experimental and may evolve with the runtime;
-applications should use the provided Realtime client where possible.
-
-See the [MiniCPM-o example](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/minicpmo),
-[PersonaPlex example](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/personaplex),
+See the [MiniCPM-o example](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/minicpmo)
 and the [full-duplex runtime design](../design/fullduplex.md)
 for model-specific validation and architecture details.
