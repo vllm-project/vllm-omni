@@ -77,6 +77,7 @@ class _ForwardContextLike(Protocol):
 class VoxCPM2PreprocessInput(TypedDict, total=False):
     additional_information: dict[str, Any]
     request_id: str
+    _omni_seed: int | None
     text_token_ids: list[list[int]]
     reference_audio: object
     ref_audio: object
@@ -250,6 +251,10 @@ def _encode_raw_audio(
 @dataclasses.dataclass
 class _RequestState:
     request_id: str
+    # Per-request CFM noise generator, seeded once from the request's seed at
+    # first prefill chunk (runner passes it as ``_omni_seed``). None means the
+    # request carried no seed and draws noise from the global RNG stream.
+    cfm_generator: torch.Generator | None = None
     curr_embed_for_next: torch.Tensor | None = None
     prev_feat_embed: torch.Tensor | None = None
     curr_prefix_feat_cond: torch.Tensor | None = None
@@ -1655,8 +1660,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         with _NvtxRange("voxcpm2.cfm.graph_copy_cond"):
             graph.cond.copy_(cond)
         with _NvtxRange("voxcpm2.cfm.graph_noise"):
-            if self._deterministic_cfm_noise:
-                self._fill_deterministic_cfm_noise(state, graph.noise)
+            if self._has_deterministic_cfm_noise(state):
+                self._fill_deterministic_cfm_noise_for_state(state, graph.noise)
             else:
                 graph.noise.normal_()
         with _NvtxRange("voxcpm2.cfm.graph_replay"):
@@ -1878,6 +1883,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 g.prefix_feat_cond[last : last + 1].expand(graph_size - num_reqs, -1, -1)
             )
         g.cfm_noise.normal_()
+        # Seeded rows overwrite their slice from their own generator, so the
+        # noise a seeded request sees does not depend on batch composition.
+        for i, state in enumerate(states[:num_reqs]):
+            if state.cfm_generator is not None:
+                g.cfm_noise[i : i + 1].normal_(generator=state.cfm_generator)
         self._perf.stop("unified.copy_inputs")
 
         self._perf.start("unified.replay")
@@ -2320,14 +2330,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         with _NvtxRange("voxcpm2.cfm"):
             if self._cfm_buffers is not None:
                 if self._enable_cfm_cuda_graph and dit_h.device.type == current_omni_platform.device_type:
-                    if self._deterministic_cfm_noise and not self._enable_cfm_prealloc_output:
+                    if self._has_deterministic_cfm_noise(state) and not self._enable_cfm_prealloc_output:
                         graph = self._get_cfm_cuda_graph(dit_h, cond)
                         with _NvtxRange("voxcpm2.cfm.graph_copy_mu"):
                             graph.mu.copy_(dit_h)
                         with _NvtxRange("voxcpm2.cfm.graph_copy_cond"):
                             graph.cond.copy_(cond)
                         with _NvtxRange("voxcpm2.cfm.graph_noise"):
-                            self._fill_deterministic_cfm_noise(state, graph.noise)
+                            self._fill_deterministic_cfm_noise_for_state(state, graph.noise)
                         with _NvtxRange("voxcpm2.cfm.graph_replay"):
                             graph.graph.replay()
                         with _NvtxRange("voxcpm2.cfm.graph_output_clone"):
@@ -2335,9 +2345,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     if not self._enable_cfm_prealloc_output:
                         return self._run_cfm_cuda_graph(dit_h, cond).transpose(1, 2)
                     return self._run_cfm_cuda_graph_to_state_buffer(state, dit_h, cond)
-                if self._deterministic_cfm_noise:
+                if self._has_deterministic_cfm_noise(state):
                     noise = self._cfm_buffers.noise[: dit_h.shape[0]]
-                    self._fill_deterministic_cfm_noise(state, noise)
+                    self._fill_deterministic_cfm_noise_for_state(state, noise)
                     return _optimized_solve_euler_with_noise(
                         self.tts.feat_decoder,
                         dit_h,
@@ -2368,6 +2378,23 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 n_timesteps=self._inference_timesteps,
                 cfg_value=self._cfg_value,
             ).transpose(1, 2)
+
+    def _has_deterministic_cfm_noise(self, state: _RequestState) -> bool:
+        """Whether this request's CFM noise is drawn deterministically."""
+        return state.cfm_generator is not None or self._deterministic_cfm_noise
+
+    def _fill_deterministic_cfm_noise_for_state(self, state: _RequestState, out: torch.Tensor) -> None:
+        """Deterministically fill ``out`` for a request with deterministic noise.
+
+        A request-level seed wins: the noise stream is a pure function of the
+        seed, so identical text + seed reproduces byte-identical audio
+        regardless of batch composition or request id. The replay-only
+        ``deterministic_cfm_noise`` hash applies otherwise.
+        """
+        if state.cfm_generator is not None:
+            out.normal_(generator=state.cfm_generator)
+        else:
+            self._fill_deterministic_cfm_noise(state, out)
 
     def _fill_deterministic_cfm_noise(self, state: _RequestState, out: torch.Tensor) -> None:
         """Fill CFM noise deterministically for benchmark replay only."""
@@ -2413,10 +2440,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         batched_cond = torch.cat(conds, dim=0)
         b = batched_dit_h.shape[0]
 
-        if self._deterministic_cfm_noise and self._cfm_buffers is not None:
+        any_seeded = any(state.cfm_generator is not None for state, _, _ in batch)
+        if (self._deterministic_cfm_noise or any_seeded) and self._cfm_buffers is not None:
             noise = self._cfm_buffers.noise[:b]
             for i, (state, _, _) in enumerate(batch):
-                self._fill_deterministic_cfm_noise(state, noise[i : i + 1])
+                if self._has_deterministic_cfm_noise(state):
+                    self._fill_deterministic_cfm_noise_for_state(state, noise[i : i + 1])
+                else:
+                    noise[i : i + 1].normal_()
         else:
             noise = torch.randn(
                 b,
@@ -2554,10 +2585,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             with _NvtxRange("voxcpm2.dit_proj"):
                 dit_h = dit_proj(lm_h, batch_out)
             cond = pfc.transpose(1, 2).contiguous()
-            if self._deterministic_cfm_noise and self._cfm_buffers is not None:
+            any_seeded = any(state.cfm_generator is not None for state in states)
+            if (self._deterministic_cfm_noise or any_seeded) and self._cfm_buffers is not None:
                 noise = self._cfm_buffers.noise[: dit_h.size(0)]
                 for i, state in enumerate(states):
-                    self._fill_deterministic_cfm_noise(state, noise[i : i + 1])
+                    if self._has_deterministic_cfm_noise(state):
+                        self._fill_deterministic_cfm_noise_for_state(state, noise[i : i + 1])
+                    else:
+                        noise[i : i + 1].normal_()
                 pred_feat = _optimized_solve_euler_with_noise(
                     self.tts.feat_decoder,
                     dit_h,
@@ -3104,6 +3139,15 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 state.precomputed_stop_logits = None
                 state.precomputed_is_stopping = None
                 state.last_audio_patch_gpu = None
+                # SamplingParams.seed reaches vLLM's own sampler but never the
+                # CFM noise draws below, so a seeded request threads its seed
+                # into a dedicated generator here (same pattern as gepard).
+                state.cfm_noise_step = 0
+                state.cfm_generator = None
+                seed = info_dict.get("_omni_seed")
+                if seed is not None:
+                    state.cfm_generator = torch.Generator(device=self._device)
+                    state.cfm_generator.manual_seed(int(seed))
                 if not hasattr(state, "pending_audio_chunks_gpu"):
                     state.pending_audio_chunks_gpu = []
                 if not hasattr(state, "pending_audio_copies"):
