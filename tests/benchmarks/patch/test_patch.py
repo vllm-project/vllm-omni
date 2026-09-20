@@ -1570,9 +1570,10 @@ def test_video_reference_urls_from_random_mm_content(mocker: MockerFixture) -> N
     mocker.patch.object(aiohttp.FormData, "add_field", tracking_add_field)
     form = aiohttp.FormData()
     assert _add_video_reference_to_form(form, urls[0]) is True
-    payload = next(value for name, value in captured if name == "video_reference")
-    assert isinstance(payload, (str, bytes, bytearray))
-    assert json.loads(payload) == {"video_url": "data:video/mp4;base64,AAAA"}
+    uploaded = next(value for name, value in captured if name == "input_references")
+    assert uploaded == base64.b64decode("AAAA")
+    assert "input_reference" not in [name for name, _ in captured]
+    assert "video_reference" not in [name for name, _ in captured]
 
 
 def test_video_unsupported_image_reference_raises() -> None:

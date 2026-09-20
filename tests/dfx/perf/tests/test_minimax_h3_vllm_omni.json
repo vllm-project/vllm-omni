@@ -202,7 +202,7 @@
           "video": 1
         },
         "random_mm_bucket_config": {
-          "(768, 1344, 209)": 1.0
+          "(480, 832, 209)": 1.0
         },
         "extra_body": {
           "width": 1344,

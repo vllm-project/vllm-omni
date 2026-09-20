@@ -1327,6 +1327,10 @@ def _add_video_reference_to_form(form: aiohttp.FormData, reference: object) -> b
         return True
 
     if isinstance(reference, Mapping) and _is_structured_video_reference(reference):
+        video_url = reference.get("video_url")
+        # Inline data URLs are too large for a text form field (1MB part limit).
+        if isinstance(video_url, str) and video_url.startswith("data:video"):
+            return _add_video_reference_to_form(form, video_url)
         form.add_field("video_reference", json.dumps(dict(reference)))
         return True
 
@@ -1344,7 +1348,25 @@ def _add_video_reference_to_form(form: aiohttp.FormData, reference: object) -> b
 
     if isinstance(reference, str):
         if reference.startswith("data:video"):
-            form.add_field("video_reference", json.dumps({"video_url": reference}))
+            header, _, payload = reference.partition(",")
+            if not payload:
+                raise ValueError(f"Unsupported video data URL: {reference[:64]!r}")
+            try:
+                video_bytes = base64.b64decode(payload)
+            except (ValueError, TypeError) as exc:
+                raise ValueError("video data URL is not valid base64") from exc
+            mime = header[len("data:") :].split(";", 1)[0] or "video/mp4"
+            suffix = ".mp4" if mime.endswith("mp4") else ".bin"
+            form.add_field(
+                # Plural field persists the container to disk. Singular
+                # ``input_reference`` would decode every frame in the API
+                # process and trip Starlette / MiniMax size limits on
+                # random-mm videos.
+                "input_references",
+                video_bytes,
+                filename=f"benchmark-reference{suffix}",
+                content_type=mime,
+            )
             return True
         if reference.startswith(("data:image", "http://", "https://")):
             form.add_field("image_reference", json.dumps({"image_url": reference}))
@@ -1395,6 +1417,7 @@ def _add_video_extra_body_to_form(
         "image_reference",
         "video_reference",
         "input_reference",
+        "input_references",
         *_VIDEO_FORM_FIELDS,
     }
     for key, value in extra_body.items():
