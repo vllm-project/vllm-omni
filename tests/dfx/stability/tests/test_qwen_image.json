@@ -66,11 +66,11 @@
                 "num_prompts_per_batch": 50,
                 "width": {
                     "min": 512,
-                    "max": 1536
+                    "max": 1000
                 },
                 "height": {
                     "min": 512,
-                    "max": 1536
+                    "max": 1000
                 },
                 "num_inference_steps": 50,
                 "enable_negative_prompt": true
