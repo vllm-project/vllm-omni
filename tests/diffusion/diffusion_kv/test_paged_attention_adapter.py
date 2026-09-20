@@ -1176,9 +1176,15 @@ def test_row_contract_rejects_invalid_identity_or_span(kwargs: dict, message: st
         DiffusionPagedAttentionRow(**values)
 
 
+@pytest.mark.parametrize("pcp_size", [1, 2])
+@pytest.mark.parametrize("selection_fails", [False, True])
 def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads(
     monkeypatch: pytest.MonkeyPatch,
+    pcp_size: int,
+    selection_fails: bool,
 ) -> None:
+    from vllm.v1.attention import selector
+
     selected_backends = []
     specialized_backends = []
     impl_cls = Mock(return_value=SimpleNamespace(forward=Mock(), do_kv_cache_update=Mock()))
@@ -1191,23 +1197,29 @@ def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads
 
     original_backend_per_kind = {"full": object()}
     config = SimpleNamespace(
-        attention_config=SimpleNamespace(backend=None, backend_per_kind=original_backend_per_kind),
-        parallel_config=SimpleNamespace(prefill_context_parallel_size=2),
+        attention_config=SimpleNamespace(backend=None, backend_per_kind=original_backend_per_kind, use_non_causal=True),
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp_size, decode_context_parallel_size=1),
         model_config=SimpleNamespace(dtype=torch.float16),
-        cache_config=SimpleNamespace(cache_dtype="auto"),
+        cache_config=SimpleNamespace(cache_dtype="auto", user_specified_block_size=False),
+        kv_transfer_config=None,
+        speculative_config=None,
     )
 
-    def select_backend(**_kwargs):
-        selected_backends.append(
-            (
-                config.attention_config.backend,
-                config.attention_config.backend_per_kind,
-                config.parallel_config.prefill_context_parallel_size,
-            )
-        )
+    def select_backend(*, backend, attn_selector_config, num_heads):
+        # Exercise the real 0.29 selector, replacing only platform resolution.
+        # Ulysses has already gathered tokens and sharded heads before the
+        # native kernel; the MoE PCP mapping must not request PCP attention.
+        assert not attn_selector_config.use_pcp
+        assert not attn_selector_config.use_dcp
+        assert attn_selector_config.use_non_causal
+        assert num_heads == 4
+        selected_backends.append((backend, config.attention_config.backend_per_kind))
+        if selection_fails:
+            raise ValueError("test backend unavailable")
         return native_backend
 
-    monkeypatch.setattr(adapter_module, "get_attn_backend", select_backend)
+    monkeypatch.setattr("vllm.config.get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(selector, "_cached_get_attn_backend", select_backend)
     monkeypatch.setattr(adapter_module, "set_current_vllm_config", lambda _config: nullcontext())
     monkeypatch.setattr(
         adapter_module.current_omni_platform,
@@ -1223,7 +1235,7 @@ def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads
         non_causal=True,
     )
 
-    native_layer = adapter_module.DiffusionPagedAttentionLayerAdapter(
+    kwargs = dict(
         layer_name="layer-0",
         layer=layer,
         spec=spec,
@@ -1231,12 +1243,21 @@ def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads
         device=torch.device("cpu"),
         ulysses_degree=2,
     )
+    if selection_fails:
+        with pytest.raises(ValueError, match="test backend unavailable"):
+            adapter_module.DiffusionPagedAttentionLayerAdapter(**kwargs)
+    else:
+        native_layer = adapter_module.DiffusionPagedAttentionLayerAdapter(**kwargs)
 
-    assert selected_backends == [(adapter_module.AttentionBackendEnum.FLASH_ATTN, {}, 2)]
-    assert specialized_backends == [(native_backend, 2)]
+    assert selected_backends == [(adapter_module.AttentionBackendEnum.FLASH_ATTN, {})]
     assert config.attention_config.backend is None
     assert config.attention_config.backend_per_kind is original_backend_per_kind
-    assert config.parallel_config.prefill_context_parallel_size == 2
+    assert config.parallel_config.prefill_context_parallel_size == pcp_size
+    if selection_fails:
+        assert not specialized_backends
+        impl_cls.assert_not_called()
+        return
+    assert specialized_backends == [(native_backend, 2)]
     assert native_layer.num_heads == 4
     assert native_layer.num_kv_heads == 2
     assert native_layer.spec.num_kv_heads == 2
