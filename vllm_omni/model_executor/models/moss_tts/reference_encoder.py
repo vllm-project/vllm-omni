@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Reference-audio encoding + speaker cache for the MOSS-TTS-family talker.
 
 This lives in the model package (not the shared serving layer) so all
@@ -360,6 +363,18 @@ class MossReferenceEncoder:
         await self._batcher.aclose()
 
 
+class MossRealtimeReferenceEncoder(MossReferenceEncoder):
+    """Use the realtime codec with the shared reference cache and batcher."""
+
+    def _encode_prepared(self, prepared: list[torch.Tensor]) -> list[torch.Tensor]:
+        with torch.no_grad():
+            encoded = self._processor.batch_encode([wav.squeeze(0) for wav in prepared], num_quantizers=self._n_vq)
+        return [
+            encoded.audio_codes[:, i, : int(length.item())].transpose(0, 1).contiguous()
+            for i, length in enumerate(encoded.audio_codes_lengths)
+        ]
+
+
 def build_reference_encoder(
     processor: Any,
     *,
@@ -369,9 +384,17 @@ def build_reference_encoder(
     """Build the per-server encoder for a MOSS-TTS ``variant``.
 
     Derives the encode geometry (``n_vq`` and the working sample rate) from the
-    upstream processor's ``model_config`` so the variant knowledge stays in the
-    model package rather than in ``serving_speech.py``.
+    upstream processor's ``model_config``; Realtime takes its codec directly
+    and uses 16 codebooks at 24 kHz. Variant knowledge stays in the model package.
     """
+    if variant == "realtime":
+        return MossRealtimeReferenceEncoder(
+            processor,
+            variant=variant,
+            n_vq=16,
+            sr_target=24000,
+            speaker_cache=speaker_cache,
+        )
     n_vq = int(getattr(processor.model_config, "n_vq", 32))
     # Local-v1.5 encodes reference audio at a fixed 24 kHz working rate
     # regardless of its 48 kHz stereo *output* codec -- mirrors the offline

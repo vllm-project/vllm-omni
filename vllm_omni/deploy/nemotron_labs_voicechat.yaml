@@ -25,8 +25,6 @@ async_chunk: false
 connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
-    extra:
-      shm_threshold_bytes: 65536
 
 stages:
   - stage_id: 0  # thinker: speech -> frame-locked text (final text output)

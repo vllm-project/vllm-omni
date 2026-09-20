@@ -1328,10 +1328,18 @@ class TestDeployConfigLoading:
         stages = merge_pipeline_deploy(pipeline, deploy)
 
         assert deploy.session_mode == "duplex"
-        assert deploy.active_stream_window == max_sessions
+        # ``0`` disables the limiter: the configured session/stage capacity is
+        # what bounds the pipeline. Any positive window serializes concurrent
+        # audio first-packet generation (measured: TTFP -23% at 0 vs 4 on
+        # L20X, 128 requests / concurrency 8).
+        assert deploy.active_stream_window == 0
         assert deploy.duplex_session.max_sessions == max_sessions
         assert [stage.session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
         assert [stage.to_omegaconf().session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
+        assert stages[0].yaml_extras["default_sampling_params"]["stop_token_ids"] == [
+            151704,
+            151645,
+        ]
 
     def test_load_minicpmo_default_deploy_config(self):
         deploy_path = Path(get_deploy_config_path("minicpmo_4_5.yaml"))
@@ -1554,7 +1562,10 @@ stages:
         monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda _engine_args: None)
 
         deploy = load_deploy_config(get_deploy_config_path("minimax_h3_disaggregated.yaml"))
-        assert deploy.stages[1].engine_extras["model_loaded"] == {"text_encoder": False}
+        assert deploy.stages[1].engine_extras["model_loaded"] == {
+            "text_encoder": False,
+            "vae_encoder": False,
+        }
         stages = merge_pipeline_deploy(OMNI_PIPELINES["minimax_h3_disaggregated"], deploy)
         resolved = [stage_init_utils.build_engine_args_dict(stage.to_omegaconf(), str(model_root)) for stage in stages]
 
@@ -1579,12 +1590,20 @@ stages:
         deploy = load_deploy_config(Path(get_deploy_config_path("minimax_h3_disaggregated.yaml")))
         stages = merge_pipeline_deploy(pipeline, deploy)
 
-        assert stages[0].yaml_engine_args["model_arch"] == "MiniMaxH3TextEncoder"
+        assert stages[0].yaml_engine_args["model_arch"] == "MiniMaxH3Encoder"
         assert stages[1].yaml_engine_args["model_arch"] == "MiniMaxH3Pipeline"
         assert stages[0].yaml_runtime["num_replicas"] == 1
         assert stages[1].yaml_runtime["num_replicas"] == 1
-        assert stages[1].yaml_engine_args["model_loaded"] == {"text_encoder": False}
+        assert stages[1].yaml_engine_args["model_loaded"] == {
+            "text_encoder": False,
+            "vae_encoder": False,
+        }
         assert stages[0].yaml_engine_args["max_num_seqs"] == 1
+        assert stages[0].yaml_engine_args["hf_overrides"]["minimax_h3_encoder_components"] == {
+            "text_encoder": {"parallel_mode": "tp"},
+            "video_vae": {"parallel_mode": "patch"},
+            "audio_vae": {"parallel_mode": "leader"},
+        }
         assert stages[0].yaml_engine_args["model_path_resolver"].endswith(".resolve_minimax_h3_model_root")
         assert stages[1].yaml_engine_args["model_path_resolver"].endswith(".resolve_minimax_h3_diffusion_model_path")
         parallel = stages[1].yaml_engine_args["parallel_config"]
@@ -1596,6 +1615,9 @@ stages:
 
         turbo = load_deploy_config(Path(get_deploy_config_path("minimax_h3_disaggregated_turbo.yaml")))
         turbo_stages = merge_pipeline_deploy(pipeline, turbo)
+        assert turbo_stages[0].yaml_engine_args["model_arch"] == stages[0].yaml_engine_args["model_arch"]
+        assert turbo_stages[1].yaml_engine_args["model_loaded"] == stages[1].yaml_engine_args["model_loaded"]
+        assert turbo_stages[0].yaml_engine_args["hf_overrides"] == stages[0].yaml_engine_args["hf_overrides"]
         turbo_sampling = turbo_stages[1].yaml_extras["default_sampling_params"]
         assert turbo_sampling["num_inference_steps"] == 5
         assert turbo_sampling["extra_args"] == {"flow_shift": 6.0, "audio_flow_shift": 3.0}
@@ -2583,6 +2605,35 @@ class TestPlatformOverrides:
         assert rocm.stages[0].enforce_eager is None
         assert rocm.stages[1].enforce_eager is True
 
+    @pytest.mark.parametrize("deploy_name", ["qwen3_tts.yaml", "qwen3_tts_high_concurrency.yaml"])
+    @pytest.mark.parametrize("platform", ["cuda", "npu", "rocm"])
+    def test_qwen3_tts_default_code2wav_dtype_is_bf16(self, deploy_name, platform):
+        deploy = load_deploy_config(Path(get_deploy_config_path(deploy_name)))
+        deploy = _apply_platform_overrides(deploy, platform=platform)
+        stages = merge_pipeline_deploy(resolve_pipeline_config("qwen3_tts"), deploy)
+
+        assert stages[1].yaml_engine_args["dtype"] == "bfloat16"
+
+    @pytest.mark.parametrize("deploy_name", ["qwen3_tts.yaml", "qwen3_tts_high_concurrency.yaml"])
+    @pytest.mark.parametrize("platform", ["cuda", "npu"])
+    @pytest.mark.parametrize("dtype", ["float32", "bfloat16", "float16"])
+    def test_qwen3_tts_propagates_explicit_code2wav_dtype(self, deploy_name, platform, dtype):
+        deploy = load_deploy_config(Path(get_deploy_config_path(deploy_name)))
+        deploy.stages[1].engine_extras["dtype"] = dtype
+        deploy = _apply_platform_overrides(deploy, platform=platform)
+        stages = merge_pipeline_deploy(resolve_pipeline_config("qwen3_tts"), deploy)
+
+        assert stages[1].yaml_engine_args["dtype"] == dtype
+
+    def test_moss_tts_rocm_disables_codec_cudagraph(self):
+        deploy_path = Path(get_deploy_config_path("moss_tts.yaml"))
+
+        base = load_deploy_config(deploy_path)
+        assert base.stages[1].enforce_eager is False
+
+        rocm = _apply_platform_overrides(base, platform="rocm")
+        assert rocm.stages[1].enforce_eager is True
+
     def test_higgs_audio_v3_rocm_uses_triton_attention(self):
         deploy_path = Path(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
 
@@ -2645,6 +2696,13 @@ class TestPlatformOverrides:
             replica_stages = merge_pipeline_deploy(pipeline, replica)
             # Explicit null clears the inherited single-GPU 2 GiB CUDA cap.
             assert replica_stages[1].yaml_engine_args.get("kv_cache_memory_bytes") is None
+
+    def test_fish_speech_npu_uses_ascend_kv_block_size(self):
+        deploy_path = Path(get_deploy_config_path("fish_qwen3_omni.yaml"))
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+
+        assert deploy.stages[0].engine_extras["block_size"] == 128
 
     def test_npu_overrides(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
@@ -3212,7 +3270,7 @@ class TestSentinelDefaultPrecedence:
 
 
 class TestSamplingConstraintsPrecedence:
-    """Test that pipeline sampling_constraints override deploy defaults."""
+    """Test scalar constraint precedence and additive required stop tokens."""
 
     def test_constraints_win(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
@@ -3231,6 +3289,47 @@ class TestSamplingConstraintsPrecedence:
         assert stages[0].yaml_extras["default_sampling_params"]["detokenize"] is True
         # Pipeline says stop_token_ids=[2150] for talker
         assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [2150]
+
+    def test_required_stop_tokens_extend_yaml_defaults(self, tmp_path):
+        pipeline = PipelineConfig(
+            model_type="required_stop_tokens",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="thinker",
+                    final_output=True,
+                    sampling_constraints={
+                        "detokenize": True,
+                        "stop_token_ids": [151704, 151645],
+                    },
+                ),
+            ),
+        )
+        deploy_path = tmp_path / "required-stop-tokens.yaml"
+        deploy_path.write_text(
+            """
+stages:
+  - stage_id: 0
+    default_sampling_params:
+      max_tokens: 7
+      stop_token_ids: [100, 151704]
+""",
+            encoding="utf-8",
+        )
+
+        legacy_stage = merge_pipeline_deploy(pipeline, load_deploy_config(deploy_path))[0]
+        structured_stage = VllmOmniConfig.from_pipeline_config(
+            pipeline,
+            deploy_config_path=str(deploy_path),
+        ).stage_by_id(0)
+        expected = {
+            "max_tokens": 7,
+            "detokenize": True,
+            "stop_token_ids": [100, 151704, 151645],
+        }
+
+        assert legacy_stage.yaml_extras["default_sampling_params"] == expected
+        assert structured_stage.model_config.default_sampling_params == expected
 
 
 class TestPipelineConfigResolvers:

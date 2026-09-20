@@ -758,6 +758,7 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
         tokenizer = self.info.get_tokenizer()
         processor = self.info.get_hf_processor()
         audio_token_id = tokenizer.get_vocab()[processor.audio_token]
+        video_token_id = tokenizer.get_vocab()[processor.video_token]
 
         result_placeholders = dict(placeholders)
         audio_placeholders = []
@@ -765,7 +766,10 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
 
         audio_idx = 0
         for video_idx, video_placeholder in enumerate(placeholders["video"]):
-            audio_is_embed = torch.tensor(video_placeholder.tokens) == audio_token_id
+            placeholder_tokens = torch.tensor(video_placeholder.tokens)
+            audio_is_embed = placeholder_tokens == audio_token_id
+            # Audio boundary tokens keep their text embeddings.
+            video_is_embed = placeholder_tokens == video_token_id
 
             if video_use_audio_in_video[video_idx]:
                 audio_placeholder = PlaceholderFeaturesInfo(
@@ -783,7 +787,7 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
                 item_idx=video_idx,
                 start_idx=video_placeholder.start_idx,
                 tokens=video_placeholder.tokens,
-                is_embed=~audio_is_embed,
+                is_embed=video_is_embed,
             )
             video_placeholders.append(video_placeholder_with_mask)
 
@@ -1326,14 +1330,12 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         if multimodal_embeddings is None or is_multimodal is None:
             return super().embed_input_ids(input_ids)
 
-        inputs_embeds = self._embed_text_input_ids(
-            input_ids,
-            self.get_language_model().embed_input_ids,
-            is_multimodal=is_multimodal,
-        )
-
         if len(multimodal_embeddings) == 0:
-            return inputs_embeds
+            return self._embed_text_input_ids(
+                input_ids,
+                self.get_language_model().embed_input_ids,
+                is_multimodal=is_multimodal,
+            )
 
         # Check for audio-in-video: interleaved video and audio tokens
         # in the multimodal region. Only use the interleaved path when
@@ -1341,6 +1343,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         video_token_id = self.config.video_token_index
         audio_token_id = self.config.audio_token_index
 
+        # The interleaving check reads scalar positions in a Python loop.
+        # Keep its masks on CPU to avoid repeated CUDA synchronization.
         input_ids_cpu = input_ids.cpu()
         is_video = is_multimodal & (input_ids_cpu == video_token_id)
         is_audio = is_multimodal & (input_ids_cpu == audio_token_id)

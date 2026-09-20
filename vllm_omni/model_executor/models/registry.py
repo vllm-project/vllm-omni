@@ -142,11 +142,6 @@ _OMNI_MODELS = {
         "mammoth_moda2",
         "MammothModa2Qwen3ForCausalLM",
     ),
-    "MammothModa2DiTPipeline": (
-        "mammoth_moda2",
-        "pipeline_mammothmoda2_dit",
-        "MammothModa2DiTPipeline",
-    ),
     "MammothModa2ForConditionalGeneration": (
         "mammoth_moda2",
         "mammoth_moda2",
@@ -476,10 +471,10 @@ _OMNI_MODELS = {
         "qwen3_vl",
         "AuraQwen3VLForConditionalGeneration",
     ),
-    "MiniMaxH3TextEncoder": (
+    "MiniMaxH3Encoder": (
         "minimax_h3",
-        "text_encoder",
-        "MiniMaxH3TextEncoder",
+        "encoder",
+        "MiniMaxH3Encoder",
     ),
     ## MiniMax-Music3 (text-to-music; AR talker -> flow-matching acoustic decoder)
     "MiniMaxMusic3TalkerForConditionalGeneration": (
@@ -491,6 +486,16 @@ _OMNI_MODELS = {
         "minimax_music3",
         "acoustic",
         "MiniMaxMusic3AcousticForConditionalGeneration",
+    ),
+    "BreezeForConditionalGeneration": (
+        "breeze_tts_2",
+        "modeling_breeze_tts_2_talker",
+        "BreezeTTS2TalkerForGeneration",
+    ),
+    "BreezeTTS2MimiCodec": (
+        "breeze_tts_2",
+        "modeling_breeze_tts_2_codec",
+        "BreezeTTS2MimiCodec",
     ),
 }
 
