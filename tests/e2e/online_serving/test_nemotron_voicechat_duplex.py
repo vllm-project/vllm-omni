@@ -29,7 +29,16 @@ _SERVER_ENV: dict[str, str] = {"VLLM_OMNI_INPUT_WAIT_TIMEOUT_S": str(SERVER_INPU
 if TOKENIZER:
     _SERVER_ENV["NEMOTRON_VOICECHAT_LLM_PATH"] = TOKENIZER
 
-pytestmark = [pytest.mark.full_model, pytest.mark.omni]
+pytestmark = [
+    pytest.mark.full_model,
+    pytest.mark.omni,
+    # Since #7413 a duplex-capable model is served by the duplex engine only when
+    # its pipeline declares a duplex_plugin. The Nemotron VoiceChat pipeline does
+    # not, so the server starts the turn engine and the /v1/realtime websocket
+    # falls through to vllm's speech-to-text realtime handler, which rejects the
+    # native duplex client's session.update ("Missing required field: model").
+    pytest.mark.skip(reason="Nemotron VoiceChat is not served by the duplex engine yet (no duplex_plugin)"),
+]
 
 
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)

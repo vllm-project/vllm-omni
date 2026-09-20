@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import json
 from shutil import rmtree
 
@@ -12,7 +15,7 @@ def tiny_model_paths(request, run_level, tmp_path_factory):
     """Build or download the tiny models for the selected tests.
 
     At core_model level, builds tiny models via the builder function.
-    At advanced_model / full_model level, uses the real HF model path.
+    At advanced_model / full_model level, uses the real HF model path or asset resolver.
 
     NOTE: this is session scoped to avoid churn in tiny model creation,
     but will ensure all the tiny models you need are created for the selected tests
@@ -45,7 +48,11 @@ def tiny_model_paths(request, run_level, tmp_path_factory):
                             built_paths.append(path)
                         else:
                             print(f"Run level is {run_level}; {model_name} will use the full model")
-                            path = settings.model
+                            if callable(settings.model):
+                                path = settings.model()
+                                built_paths.append(path)
+                            else:
+                                path = settings.model
                         model_paths[model_name] = path
                 data_file.write_text(json.dumps(model_paths))
 

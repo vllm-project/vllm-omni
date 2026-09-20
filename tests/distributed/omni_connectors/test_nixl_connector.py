@@ -317,6 +317,7 @@ def copying_native_agent(consumer, monkeypatch):
 
 
 @pytest.mark.parametrize("case", ["empty", "all_empty", "mixed", "scalar", "structured_empty", "structured_mixed"])
+@pytest.mark.usefixtures("reliable_claim_queries")
 def test_zero_byte_leaves_roundtrip_without_native_descriptors(producer, consumer, copying_native_agent, case):
     empty = torch.empty((2, 0, 3), dtype=torch.float64)
     other = torch.empty((0,), dtype=torch.int64)

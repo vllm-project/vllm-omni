@@ -159,6 +159,18 @@ def test_validate_available_accepts_new_mindiesd(monkeypatch):
     RainFusionAttentionBackend.validate_available()
 
 
+def test_prefix_kv_slicing_contract_is_pinned():
+    # Regression pin for the #5543 packed-padding crash: reverting the flag
+    # would pass CI while reintroducing the ValueError for non-64-aligned
+    # requests. Both halves of the contract must hold together — the impl
+    # trims [real, pad] packed tensors to the valid prefix itself (so it may
+    # advertise prefix slicing) and it never reads attn_mask (so it must keep
+    # refusing one), which is what lets the model skip materializing the
+    # padding mask that _assert_metadata_compatible would reject.
+    assert RainFusionAttentionBackend.supports_prefix_kv_slicing is True
+    assert RainFusionAttentionBackend.supports_attention_mask() is False
+
+
 @pytest.mark.parametrize("grid", [(4, 24, 40), (1, 24, 40)])
 def test_short_video_stays_dense(grid):
     assert make_impl()._resolve_plan(make_metadata(grid)) is None

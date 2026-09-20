@@ -7,7 +7,7 @@ from __future__ import annotations
 import functools
 import json
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +18,10 @@ from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 from vllm.transformers_utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction
-from vllm_omni.config.omni_config import VllmOmniConfig
+from vllm_omni.config.omni_config import (
+    VllmOmniConfig,
+    normalize_and_validate_diffusion_engine_ingress_kwargs,
+)
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
@@ -645,6 +648,14 @@ class StageConfigFactory:
         kwargs: dict[str, Any],
     ) -> tuple[dict[str, Any], DiffusionParallelConfig, dict[str, Any], str]:
         """Normalize inputs shared by typed and compatibility diffusion builders."""
+        # Preserve the default builder's explicit top-level override of model
+        # extras before the strict same-source alias validator runs.
+        if kwargs.get("auxiliary_text_encoder") is not None:
+            kwargs = dict(kwargs)
+            extras = dict(kwargs.get("extras") or {})
+            extras.pop("auxiliary_text_encoder", None)
+            kwargs["extras"] = extras
+        kwargs = normalize_and_validate_diffusion_engine_ingress_kwargs(kwargs, stage_id=0)
         raw_sampling_params = kwargs.get("default_sampling_params")
         if isinstance(raw_sampling_params, str):
             try:
@@ -659,7 +670,15 @@ class StageConfigFactory:
         parallel_config = DiffusionParallelConfig.from_stage_overrides(kwargs)
         if kwargs.get("num_gpus") is not None:
             parallel_config.resolve_data_parallel_size(int(kwargs["num_gpus"]))
-        engine_args = OmniDiffusionConfig.normalize_init_kwargs(kwargs)
+        # Ingress keeps the engine spelling; canonicalize it before filtering
+        # to terminal diffusion fields. Conflicts were validated at ingress.
+        quantization = kwargs.pop("quantization", None)
+        if quantization is not None:
+            kwargs["quantization_config"] = quantization
+        diffusion_config_fields = frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
+        engine_args = OmniDiffusionConfig.normalize_init_kwargs(
+            {name: value for name, value in kwargs.items() if name in diffusion_config_fields}
+        )
 
         extras = dict(engine_args.get("extras") or {})
         for key, default in (

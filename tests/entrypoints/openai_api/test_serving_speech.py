@@ -1859,6 +1859,53 @@ class TestTTSMethods:
         assert prompt_a["additional_information"]["ref_audio_cache_key"] == "key_aaa"
         assert prompt_b["additional_information"]["ref_audio_cache_key"] == "key_bbb"
 
+    @pytest.mark.asyncio
+    async def test_higgs_v2_cache_salt_changes_for_same_shaped_reference_audio(self, speech_server, mocker):
+        """Higgs v2 must salt identical placeholder prompts by resolved audio content."""
+        build_voice_clone_prompt = mocker.patch(
+            "vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_tokenizer.build_voice_clone_prompt"
+        )
+        build_voice_clone_prompt.side_effect = lambda _processor, _input, wav, _sr, _ref_text: {
+            "prompt_token_ids": [1, 151700, 151700, 2],
+            "audio_input_ids": torch.tensor([[100 if wav[0] < 0.5 else 900, 2], [3, 4]], dtype=torch.long),
+            "audio_input_ids_mask": torch.ones(2, dtype=torch.bool),
+        }
+
+        speech_server._tts_model_type = "higgs_audio_v2"
+        speech_server._adapter = speech_server._get_tts_adapter()
+        speech_server._adapter._resolve_higgs_audio_v2_processor = mocker.AsyncMock(return_value=object())
+
+        req_a = OpenAICreateSpeechRequest(
+            input="hello",
+            ref_audio="file:///data/spk.wav",
+            ref_text="transcript",
+        )
+        req_b = OpenAICreateSpeechRequest(
+            input="hello",
+            ref_audio="file:///data/spk.wav",
+            ref_text="transcript",
+        )
+        speech_server._adapter._resolve_ref_audio = mocker.AsyncMock(
+            side_effect=[([0.1] * 48000, 24000, "key_aaa"), ([0.9] * 48000, 24000, "key_bbb")]
+        )
+
+        prompt_a = await speech_server._adapter._build_higgs_audio_v2_params(req_a)
+        prompt_b = await speech_server._adapter._build_higgs_audio_v2_params(req_b)
+
+        assert prompt_a["prompt_token_ids"] == [1, 151700, 151700, 2]
+        assert prompt_a["prompt_token_ids"] == prompt_b["prompt_token_ids"]
+        assert (
+            prompt_a["additional_information"]["audio_input_ids"].shape
+            == prompt_b["additional_information"]["audio_input_ids"].shape
+        )
+        assert not torch.equal(
+            prompt_a["additional_information"]["audio_input_ids"],
+            prompt_b["additional_information"]["audio_input_ids"],
+        )
+        assert prompt_a["cache_salt"] != prompt_b["cache_salt"]
+        assert prompt_a["additional_information"]["ref_audio_cache_key"] == "key_aaa"
+        assert prompt_b["additional_information"]["ref_audio_cache_key"] == "key_bbb"
+
     # ── MossReferenceEncoder: speaker cache invalidation ──
 
     @pytest.mark.asyncio

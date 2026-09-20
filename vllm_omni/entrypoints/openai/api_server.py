@@ -168,6 +168,7 @@ from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import (
+    LatentEditInput,
     OmniOpenAIServingVideo,
     ReferenceAudio,
     ReferenceImage,
@@ -2623,6 +2624,7 @@ async def create_video(
         ReferenceVideo | None,
         ReferenceAudio | None,
         str | None,
+        LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> VideoResponse:
     """Create an asynchronous video generation job.
@@ -2638,6 +2640,7 @@ async def create_video(
         reference_video,
         reference_audio,
         control_path,
+        latent_edit_input,
     ) = ctx
     ref = video_response_from_request(effective_model_name, request)
     await VIDEO_STORE.upsert(ref.id, ref)
@@ -2651,6 +2654,7 @@ async def create_video(
             reference_audio,
             control_path,
             app_state=raw_request.app.state,
+            latent_edit_input=latent_edit_input,
         )
     )
     await VIDEO_TASKS.upsert(ref.id, task)
@@ -2676,6 +2680,7 @@ async def create_video_sync(
         ReferenceVideo | None,
         ReferenceAudio | None,
         str | None,
+        LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> Response:
     """Synchronous video generation endpoint.
@@ -2695,6 +2700,7 @@ async def create_video_sync(
         reference_video,
         reference_audio,
         control_path,
+        latent_edit_input,
     ) = ctx
     request_id = f"video_sync-{random_uuid()}"
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
@@ -2708,6 +2714,7 @@ async def create_video_sync(
                     reference_image=reference_image,
                     reference_video=reference_video,
                     reference_audio=reference_audio,
+                    latent_edit_input=latent_edit_input,
                 ),
                 timeout=VIDEO_SYNC_TIMEOUT_S,
             ),
@@ -2731,7 +2738,7 @@ async def create_video_sync(
             detail=f"Video generation failed: {str(exc)}",
         ) from exc
     finally:
-        _cleanup_video_references(reference_video, reference_audio, control_path)
+        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
     inference_time_s = time.perf_counter() - started_at
 
     return Response(

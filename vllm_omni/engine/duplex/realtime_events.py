@@ -1362,7 +1362,6 @@ def resolve_truncate_item(state: RealtimeProjectionState, command: TruncateItem)
             payloads=[], events=[error_event("bad_event", truncate_error, event_id=command.event_id)]
         )
     state.item_truncation_cursors[command.item_id] = (command.content_index, command.audio_end_ms)
-    truncate_realtime_item_content(item, content_index=command.content_index, audio_end_ms=command.audio_end_ms)
     ack_payload: dict[str, object] = {
         "type": "playback.ack",
         "item_id": command.item_id,
