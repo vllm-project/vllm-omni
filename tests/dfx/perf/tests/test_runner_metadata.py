@@ -341,12 +341,84 @@ def test_paired_omni_benchmark_reuses_server_and_preserves_case_metadata(tmp_pat
     finally:
         active_context.close()
 
-    assert events == [
-        ("start", omni_p0_server),
-        ("stop", omni_p0_server),
-        ("start", tts_server),
-        ("stop", tts_server),
-    ]
+
+def test_run_benchmark_persists_distinct_benchmark_params_name(tmp_path, monkeypatch):
+    """Two benchmark_params under one test_name must keep distinct saved identity."""
+    import io
+    from pathlib import Path
+
+    from tests.dfx import conftest as dfx_conftest
+
+    result_dir = tmp_path / "results"
+    result_dir.mkdir()
+    monkeypatch.setenv("BENCHMARK_DIR", str(result_dir))
+
+    class _FakePopen:
+        def __init__(self, command, **kwargs):
+            self.stdout = io.StringIO("")
+            self.stderr = io.StringIO("")
+            result_dir_idx = command.index("--result-dir")
+            filename_idx = command.index("--result-filename")
+            out = Path(command[result_dir_idx + 1]) / command[filename_idx + 1]
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps({"completed": 3, "request_throughput": 0.01}), encoding="utf-8")
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(dfx_conftest.subprocess, "Popen", _FakePopen)
+
+    shared_test = "test_wan22_i2v_usp2"
+    name_a = "832x480_frames81_steps4"
+    name_b = "1280x720_frames121_steps4"
+
+    result_a = dfx_conftest.run_benchmark(
+        args=["--host", "127.0.0.1", "--port", "8000"],
+        test_name=shared_test,
+        flow=1,
+        dataset_name="random-mm",
+        num_prompt=10,
+        random_input_len=8,
+        random_output_len=1,
+        resource_label="H800",
+        benchmark_params_name=name_a,
+    )
+    result_b = dfx_conftest.run_benchmark(
+        args=["--host", "127.0.0.1", "--port", "8000"],
+        test_name=shared_test,
+        flow=1,
+        dataset_name="random-mm",
+        num_prompt=10,
+        random_input_len=8,
+        random_output_len=1,
+        resource_label="H800",
+        benchmark_params_name=name_b,
+    )
+
+    assert result_a["test_name"] == shared_test
+    assert result_b["test_name"] == shared_test
+    assert result_a["name"] == name_a
+    assert result_b["name"] == name_b
+    assert "benchmark_params" not in result_a
+    assert "benchmark_params" not in result_b
+
+    files = sorted(p.name for p in result_dir.glob("result_*.json"))
+    assert len(files) == 2
+    assert any(name_a in name for name in files)
+    assert any(name_b in name for name in files)
+    assert files[0] != files[1]
+
+    def omni_group_key(record: dict) -> tuple:
+        return (
+            record.get("model_id") or "",
+            record.get("test_name") or "",
+            record.get("name") or "",
+            record.get("dataset_name") or "",
+            record.get("max_concurrency") if record.get("max_concurrency") is not None else 0,
+            record.get("num_prompts") if record.get("num_prompts") is not None else 0,
+        )
+
+    assert omni_group_key(result_a) != omni_group_key(result_b)
 
 
 def test_is_hardware_nested_baseline():

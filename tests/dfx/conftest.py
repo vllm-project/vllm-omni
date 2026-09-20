@@ -660,6 +660,7 @@ def run_benchmark(
     random_output_len: Any | None = None,
     resource_label: str | None = None,
     num_warmups: int = 2,
+    benchmark_params_name: str | None = None,
 ) -> dict[str, Any]:
     """Run one ``vllm bench serve --omni`` iteration and return parsed metrics.
 
@@ -668,15 +669,35 @@ def run_benchmark(
     maps keep every hardware bucket, but each metric is reduced to the value for
     this concurrency / request-rate step. If the benchmark exits without writing a
     result file, ``result_omni_template.json`` is used as a fallback.
+
+    ``benchmark_params_name`` (the ``name`` field from ``benchmark_params``) is
+    persisted in the result JSON and filename so multiple generation configs
+    under one ``test_name`` stay distinguishable (e.g. Wan USP2 832x480 vs
+    1280x720).
     """
     current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
     ri = _safe_filename_token(random_input_len)
     ro = _safe_filename_token(random_output_len)
     hw = resource_label_for_filename(resource_label)
+    name_token = _safe_filename_token(benchmark_params_name) if benchmark_params_name else ""
+    if name_token == "na":
+        name_token = ""
+    name_parts = [f"result_{test_name}"]
     if hw:
-        result_filename = f"result_{test_name}_{hw}_{dataset_name}_{flow}_{num_prompt}_in{ri}_out{ro}_{current_dt}.json"
-    else:
-        result_filename = f"result_{test_name}_{dataset_name}_{flow}_{num_prompt}_in{ri}_out{ro}_{current_dt}.json"
+        name_parts.append(hw)
+    if name_token:
+        name_parts.append(name_token)
+    name_parts.extend(
+        [
+            str(dataset_name),
+            str(flow),
+            str(num_prompt),
+            f"in{ri}",
+            f"out{ro}",
+            current_dt,
+        ]
+    )
+    result_filename = "_".join(name_parts) + ".json"
     if "--result-filename" in args:
         print(f"The result file will be overwritten by {result_filename}")
     command = (
@@ -746,6 +767,9 @@ def run_benchmark(
     if random_output_len is not None:
         result["random_output_len"] = random_output_len
     result["Hardware"] = hardware_json_value(resource_label)
+    result["test_name"] = test_name
+    if benchmark_params_name:
+        result["name"] = benchmark_params_name
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     return result

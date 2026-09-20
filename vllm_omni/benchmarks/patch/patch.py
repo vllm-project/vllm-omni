@@ -786,7 +786,13 @@ def _guess_mime_type(path: str) -> str:
 
 
 def _iter_image_reference_inputs(value: Any) -> Iterable[Any]:
-    """Yield image references from benchmark multimodal content."""
+    """Yield image references from benchmark multimodal content.
+
+    ``random-mm`` image buckets arrive as OpenAI chat parts
+    ``{"type": "image_url", "image_url": {"url": ...}}``. Yield
+    ``{"image_url": url}`` so the form helper keeps an explicit image
+    type (symmetric with ``_iter_video_reference_inputs``).
+    """
     if value is None:
         return
     if isinstance(value, list):
@@ -802,10 +808,10 @@ def _iter_image_reference_inputs(value: Any) -> Iterable[Any]:
         image_url = value.get("image_url")
         if isinstance(image_url, dict):
             url = image_url.get("url")
-            if url:
-                yield url
-        elif image_url:
-            yield image_url
+            if isinstance(url, str) and url:
+                yield {"image_url": url}
+        elif isinstance(image_url, str) and image_url:
+            yield {"image_url": image_url}
         return
 
     for key in ("image", "images"):
@@ -813,12 +819,14 @@ def _iter_image_reference_inputs(value: Any) -> Iterable[Any]:
             yield from _iter_image_reference_inputs(value[key])
 
 
-def _iter_video_reference_inputs(value: Any) -> Iterable[str]:
-    """Yield video references from benchmark multimodal content.
+def _iter_video_reference_inputs(value: Any) -> Iterable[dict[str, str]]:
+    """Yield structured video references from benchmark multimodal content.
 
     ``random-mm`` video buckets arrive as OpenAI chat parts
-    ``{"type": "video_url", "video_url": {"url": ...}}``. The videos API
-    expects ``video_reference`` with a string ``video_url``.
+    ``{"type": "video_url", "video_url": {"url": ...}}``. Yield
+    ``{"video_url": url}`` so ``_add_video_reference_to_form`` keeps the
+    video branch (HTTP(S) bare strings would otherwise become
+    ``image_reference``).
     """
     if value is None:
         return
@@ -834,9 +842,9 @@ def _iter_video_reference_inputs(value: Any) -> Iterable[str]:
         if isinstance(video_url, dict):
             url = video_url.get("url")
             if isinstance(url, str) and url:
-                yield url
+                yield {"video_url": url}
         elif isinstance(video_url, str) and video_url:
-            yield video_url
+            yield {"video_url": video_url}
         return
 
     for key in ("video", "videos"):
@@ -853,6 +861,12 @@ def _add_image_edit_input_to_form(form: aiohttp.FormData, image_input: Any) -> N
             content_type="image/png",
         )
         return
+
+    if isinstance(image_input, Mapping) and _is_structured_image_reference(image_input):
+        image_url = image_input.get("image_url")
+        if isinstance(image_url, str) and image_url:
+            _add_image_edit_input_to_form(form, image_url)
+            return
 
     if isinstance(image_input, str):
         if image_input.startswith(("data:image", "http://", "https://")):

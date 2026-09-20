@@ -401,6 +401,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
             num_warmups=_resolve_num_warmups(params, default=2),
+            benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
         )
         assert_result(result, params, num_prompt)
 
@@ -419,5 +420,6 @@ def test_performance_benchmark(omni_server, benchmark_params):
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
             num_warmups=_resolve_num_warmups(params, default=max(2, int(concurrency))),
+            benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
         )
         assert_result(result, params, num_prompt)
