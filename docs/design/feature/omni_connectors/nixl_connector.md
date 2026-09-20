@@ -1,5 +1,8 @@
 # NixlConnector
 
+For the reusable model-runner API, illustrated control flow, deadline semantics,
+and failure/ownership contracts, see [Cross-Stage Payload Transport](stage_payload.md).
+
 ## When to Use
 
 Multi-node or intra-node stage transfer over NIXL, which brokers RDMA/shared-memory
@@ -125,7 +128,13 @@ Only the rank leading both groups reads the connector. Each subsequent broadcast
 uses its own group-local rank zero, including ranks that received the payload
 from the preceding group. Tensor payloads use tensor-dictionary broadcasts rather
 than serializing the full payload as a Python object. Receive misses still reach
-the same collectives before falling back to the inline prompt.
+the same collectives. Inline fallback is allowed only when all required payload
+keys remain present; otherwise each rank raises an explicit payload error.
+
+The synchronous path passes one monotonic deadline to `get_with_deadline()` for
+discovery and DMA completion waits, rather than calling the ordinary `get()`
+with its potentially much longer transfer timeout. Native calls, serialization,
+and distributed collectives are not preemptible by this deadline.
 
 `GroupCoordinator.broadcast_tensor_dict` preserves the group-local source for
 `broadcast_object` while passing the mapped global source to PyTorch tensor
@@ -146,9 +155,12 @@ DMA descriptors or registrations.
 After a lost metadata response, retries on the same consumer thread reuse the
 claim ID for that endpoint, key and requested generation until a reply arrives.
 This makes claim acquisition idempotent; subsequent independent reads still get
-distinct claims. Callers must retry on the same thread to recover that ownership.
-A metadata query abandoned without retry, lost completion ACK, or abandoned
-consumer can retain a claim indefinitely. NIXL 1.3 cannot prove remote cancellation, so neither TTL nor
+distinct claims. Callers retry on the same thread and call `abandon_get()` when
+giving up. Synchronous stage payload receive does this automatically. Background
+recovery reacquires the same claim solely to acknowledge it, without issuing a
+READ. Lost completion ACKs are retried against the exact payload generation.
+A permanently unreachable or dead consumer can still retain a claim indefinitely.
+NIXL 1.3 cannot prove remote cancellation, so neither TTL nor
 `cleanup()` frees those allocations. Producer `close()` rejects new work and
 retains its agent, listener and claimed allocations; the background closer finishes
 teardown after claims drain. Permanently abandoned claims remain until process
