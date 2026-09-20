@@ -46,10 +46,13 @@ hardware support for the MXFP4 format in general.
 | AMD ROCm (gfx950 / MI355X) | ✅ | ❌ | ❌ | ❌ |
 | Other AMD architectures | ❌ | ❌ | ❌ | ❌ |
 | NVIDIA GPU | ❌ | ❌ | ❌ | ❌ |
-| Intel XPU | ❌ | ❌ | ❌ | ❌ |
+| Intel XPU | ✅ | ❌ | ❌ | ❌ |
 
 Legend: `✅` supported by the implementation, `❌` unsupported.
 ROCm uses the existing AITER online path and requires `mxfp4_scale_alg=0`.
+XPU uses vLLM's own online MXFP4 method and requires `mxfp4_scale_alg=0`; on XPU,
+pre-quantized checkpoints are served as AutoRound MXFP4 through the INC path
+(`quant_method="auto-round"`, `data_type="mx_fp"`) rather than by `mxfp4` offline mode.
 
 ## Model Type Support
 
