@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from https://github.com/hao-ai-lab/FastVideo
 # Originally from https://github.com/huggingface/diffusers/blob/v0.31.0/src/diffusers/schedulers/scheduling_unipc_multistep.py
 # Convert unipc for flow matching
@@ -14,6 +14,7 @@ providing faster convergence than simple Euler methods while maintaining quality
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -24,6 +25,20 @@ from diffusers.utils import deprecate
 
 from vllm_omni.diffusion.models.schedulers.base import BaseScheduler
 from vllm_omni.diffusion.utils.flow_matching import safe_linalg_solve
+
+
+@dataclass(frozen=True)
+class _StepCoefficients:
+    """Schedule-only coefficients; tensors are read-only and contain no sample history."""
+
+    alpha_t: torch.Tensor
+    sigma_t: torch.Tensor
+    alpha_s0: torch.Tensor
+    sigma_s0: torch.Tensor
+    h_phi_1: torch.Tensor
+    b_h: torch.Tensor
+    rks: tuple[torch.Tensor, ...]
+    rhos: torch.Tensor | None
 
 
 class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
@@ -124,6 +139,8 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         self._step_index: int | None = None
         self._begin_index: int | None = None
         self.this_order: int = 1
+        self._solver_plan: dict[tuple[int, int, bool], _StepCoefficients] = {}
+        self._solver_plan_key: tuple | None = None
 
         # Move sigmas to CPU to reduce GPU/CPU communication
         self.sigmas = self.sigmas.to("cpu")
@@ -204,7 +221,11 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         timesteps = sigmas * self.config.num_train_timesteps
         sigmas = np.concatenate([sigmas, [sigma_last]]).astype(np.float32)
 
-        self.sigmas = torch.from_numpy(sigmas)
+        new_sigmas = torch.from_numpy(sigmas)
+        if not torch.equal(self.sigmas, new_sigmas):
+            self._solver_plan.clear()
+            self._solver_plan_key = None
+        self.sigmas = new_sigmas
         self.timesteps = torch.from_numpy(timesteps).to(device=device, dtype=torch.int64)
 
         self.num_inference_steps = len(timesteps)
@@ -326,6 +347,143 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
 
             return epsilon
 
+    def _build_step_coefficients(
+        self, index: int, order: int, corrector: bool, device: torch.device, dtype: torch.dtype
+    ) -> _StepCoefficients:
+        """Build one interval on the original device, preserving scalar evaluation order."""
+        sigma_t, sigma_s0 = (
+            self.sigmas[index + 1].to(device),
+            self.sigmas[index].to(device),
+        )
+        alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
+        alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
+
+        lambda_t = torch.log(alpha_t) - torch.log(sigma_t)
+        lambda_s0 = torch.log(alpha_s0) - torch.log(sigma_s0)
+
+        h = lambda_t - lambda_s0
+
+        rks = []
+        for i in range(1, order):
+            si = index - i
+            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si].to(device))
+            lambda_si = torch.log(alpha_si) - torch.log(sigma_si)
+            rk = (lambda_si - lambda_s0) / h
+            rks.append(rk)
+
+        history_rks = tuple(rks)
+        rks.append(1.0)
+        rks = torch.tensor(rks, device=device)
+
+        R = []
+        b = []
+
+        hh = -h if self.predict_x0 else h
+        h_phi_1 = torch.expm1(hh)
+        h_phi_k = h_phi_1 / hh - 1
+
+        factorial_i = 1
+
+        if self.config.solver_type == "bh1":
+            B_h = hh
+        elif self.config.solver_type == "bh2":
+            B_h = torch.expm1(hh)
+        else:
+            raise NotImplementedError()
+
+        for i in range(1, order + 1):
+            R.append(torch.pow(rks, i - 1))
+            b.append(h_phi_k * factorial_i / B_h)
+            factorial_i *= i + 1
+            h_phi_k = h_phi_k / hh - 1 / factorial_i
+
+        R = torch.stack(R)
+        b = torch.tensor(b, device=device)
+
+        if corrector:
+            rhos = (
+                torch.tensor([0.5], dtype=dtype, device=device)
+                if order == 1
+                else safe_linalg_solve(R, b).to(device).to(dtype)
+            )
+        elif order == 1:
+            rhos = None
+        elif order == 2:
+            rhos = torch.tensor([0.5], dtype=dtype, device=device)
+        else:
+            rhos = safe_linalg_solve(R[:-1, :-1], b[:-1]).to(device).to(dtype)
+        return _StepCoefficients(alpha_t, sigma_t, alpha_s0, sigma_s0, h_phi_1, B_h, history_rks, rhos)
+
+    def _prepare_solver_plan(self, sample: torch.Tensor) -> None:
+        """Cache one schedule per scheduler, leaving multistep history request-local.
+
+        Build after the starting index and sample dtype/device are known. Only
+        CPU/CUDA samples, CPU-resident strictly decreasing schedules of at most
+        128 steps, and orders 1–3 are planned. Other configurations evaluate
+        coefficients on demand.
+        """
+        if (
+            self.solver_p is not None
+            or self.config.solver_order not in (1, 2, 3)
+            or self.sigmas.device.type != "cpu"
+            or sample.device.type not in ("cpu", "cuda")
+            or len(self.timesteps) > 128
+        ):
+            self._solver_plan.clear()
+            self._solver_plan_key = None
+            return
+        key = (
+            sample.device,
+            sample.dtype,
+            self.predict_x0,
+            self.config.solver_type,
+            self.config.solver_order,
+            self.config.lower_order_final,
+            tuple(self.disable_corrector),
+            self.step_index,
+            tuple(self.sigmas.tolist()),
+            torch.get_default_dtype(),
+        )
+        if key == self._solver_plan_key:
+            return
+        self._solver_plan.clear()
+        self._solver_plan_key = None
+        sigmas = self.sigmas
+        if not (
+            torch.isfinite(sigmas).all()
+            and (sigmas[:-1] > 0).all()
+            and (sigmas < 1).all()
+            and (sigmas >= 0).all()
+            and (sigmas[:-1] > sigmas[1:]).all()
+        ):
+            return
+        assert self.step_index is not None
+        plan: dict[tuple[int, int, bool], _StepCoefficients] = {}
+        previous_order = 1
+        for index in range(self.step_index, len(self.timesteps)):
+            order = min(self.config.solver_order, index - self.step_index + 1)
+            if self.config.lower_order_final:
+                order = min(order, len(self.timesteps) - index)
+            if index > self.step_index and index - 1 not in self.disable_corrector:
+                plan[index - 1, previous_order, True] = self._build_step_coefficients(
+                    index - 1, previous_order, True, sample.device, sample.dtype
+                )
+            plan[index, order, False] = self._build_step_coefficients(index, order, False, sample.device, sample.dtype)
+            previous_order = order
+        self._solver_plan = plan
+        self._solver_plan_key = key
+
+    def _step_coefficients(self, index: int, order: int, corrector: bool, sample: torch.Tensor) -> _StepCoefficients:
+        """Read a planned interval, or evaluate an unsupported/direct update on demand."""
+        coefficients = self._solver_plan.get((index, order, corrector))
+        if (
+            coefficients is None
+            or self._solver_plan_key is None
+            or self._solver_plan_key[:2] != (sample.device, sample.dtype)
+        ):
+            return self._build_step_coefficients(index, order, corrector, sample.device, sample.dtype)
+        return coefficients
+
     def multistep_uni_p_bh_update(
         self,
         model_output: torch.Tensor,
@@ -373,68 +531,12 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             x_t = self.solver_p.step(model_output, s0, x).prev_sample
             return x_t
 
-        device = sample.device
-        sigma_t, sigma_s0 = (
-            self.sigmas[self.step_index + 1].to(device),
-            self.sigmas[self.step_index].to(device),
-        )
-        alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
-        alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
-
-        lambda_t = torch.log(alpha_t) - torch.log(sigma_t)
-        lambda_s0 = torch.log(alpha_s0) - torch.log(sigma_s0)
-
-        h = lambda_t - lambda_s0
-
-        rks = []
-        D1s: list[Any] | None = []
-        for i in range(1, order):
-            si = self.step_index - i
-            mi = model_output_list[-(i + 1)]
-            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si].to(device))
-            lambda_si = torch.log(alpha_si) - torch.log(sigma_si)
-            rk = (lambda_si - lambda_s0) / h
-            rks.append(rk)
-            assert mi is not None
-            D1s.append((mi - m0) / rk)
-
-        rks.append(1.0)
-        rks = torch.tensor(rks, device=device)
-
-        R = []
-        b = []
-
-        hh = -h if self.predict_x0 else h
-        h_phi_1 = torch.expm1(hh)
-        h_phi_k = h_phi_1 / hh - 1
-
-        factorial_i = 1
-
-        if self.config.solver_type == "bh1":
-            B_h = hh
-        elif self.config.solver_type == "bh2":
-            B_h = torch.expm1(hh)
-        else:
-            raise NotImplementedError()
-
-        for i in range(1, order + 1):
-            R.append(torch.pow(rks, i - 1))
-            b.append(h_phi_k * factorial_i / B_h)
-            factorial_i *= i + 1
-            h_phi_k = h_phi_k / hh - 1 / factorial_i
-
-        R = torch.stack(R)
-        b = torch.tensor(b, device=device)
-
-        if D1s is not None and len(D1s) > 0:
-            D1s = torch.stack(D1s, dim=1)
-            if order == 2:
-                rhos_p = torch.tensor([0.5], dtype=x.dtype, device=device)
-            else:
-                assert isinstance(R, torch.Tensor)
-                rhos_p = safe_linalg_solve(R[:-1, :-1], b[:-1]).to(device).to(x.dtype)
-        else:
-            D1s = None
+        coefficients = self._step_coefficients(self.step_index, order, False, sample)
+        alpha_t, sigma_t = coefficients.alpha_t, coefficients.sigma_t
+        alpha_s0, sigma_s0 = coefficients.alpha_s0, coefficients.sigma_s0
+        h_phi_1, B_h, rhos_p = coefficients.h_phi_1, coefficients.b_h, coefficients.rhos
+        differences = [(model_output_list[-(i + 2)] - m0) / rk for i, rk in enumerate(coefficients.rks)]
+        D1s = torch.stack(differences, dim=1) if differences else None
 
         if self.predict_x0:
             x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0
@@ -505,68 +607,12 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         x_t = this_sample
         model_t = this_model_output
 
-        device = this_sample.device
-        sigma_t, sigma_s0 = (
-            self.sigmas[self.step_index].to(device),
-            self.sigmas[self.step_index - 1].to(device),
-        )
-        alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
-        alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
-
-        lambda_t = torch.log(alpha_t) - torch.log(sigma_t)
-        lambda_s0 = torch.log(alpha_s0) - torch.log(sigma_s0)
-
-        h = lambda_t - lambda_s0
-
-        rks = []
-        D1s: list[Any] | None = []
-        for i in range(1, order):
-            si = self.step_index - (i + 1)
-            mi = model_output_list[-(i + 1)]
-            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si].to(device))
-            lambda_si = torch.log(alpha_si) - torch.log(sigma_si)
-            rk = (lambda_si - lambda_s0) / h
-            rks.append(rk)
-            assert mi is not None
-            D1s.append((mi - m0) / rk)
-
-        rks.append(1.0)
-        rks = torch.tensor(rks, device=device)
-
-        R = []
-        b = []
-
-        hh = -h if self.predict_x0 else h
-        h_phi_1 = torch.expm1(hh)
-        h_phi_k = h_phi_1 / hh - 1
-
-        factorial_i = 1
-
-        if self.config.solver_type == "bh1":
-            B_h = hh
-        elif self.config.solver_type == "bh2":
-            B_h = torch.expm1(hh)
-        else:
-            raise NotImplementedError()
-
-        for i in range(1, order + 1):
-            R.append(torch.pow(rks, i - 1))
-            b.append(h_phi_k * factorial_i / B_h)
-            factorial_i *= i + 1
-            h_phi_k = h_phi_k / hh - 1 / factorial_i
-
-        R = torch.stack(R)
-        b = torch.tensor(b, device=device)
-
-        if D1s is not None and len(D1s) > 0:
-            D1s = torch.stack(D1s, dim=1)
-        else:
-            D1s = None
-
-        if order == 1:
-            rhos_c = torch.tensor([0.5], dtype=x.dtype, device=device)
-        else:
-            rhos_c = safe_linalg_solve(R, b).to(device).to(x.dtype)
+        coefficients = self._step_coefficients(self.step_index - 1, order, True, this_sample)
+        alpha_t, sigma_t = coefficients.alpha_t, coefficients.sigma_t
+        alpha_s0, sigma_s0 = coefficients.alpha_s0, coefficients.sigma_s0
+        h_phi_1, B_h, rhos_c = coefficients.h_phi_1, coefficients.b_h, coefficients.rhos
+        differences = [(model_output_list[-(i + 2)] - m0) / rk for i, rk in enumerate(coefficients.rks)]
+        D1s = torch.stack(differences, dim=1) if differences else None
 
         if self.predict_x0:
             x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0
@@ -635,6 +681,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
 
         if self.step_index is None:
             self._init_step_index(timestep)
+            self._prepare_solver_plan(sample)
 
         use_corrector = (
             self.step_index > 0 and self.step_index - 1 not in self.disable_corrector and self.last_sample is not None
