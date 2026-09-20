@@ -22,6 +22,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, TypeVar
 
+from vllm.logger import init_logger
+
 if TYPE_CHECKING:
     from vllm.outputs import RequestOutput
 
@@ -31,11 +33,14 @@ if TYPE_CHECKING:
         DuplexStagePort,
     )
     from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexModelSessionState
+    from vllm_omni.engine.duplex.session.context_history import DuplexContextHistory
     from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
     from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
     from vllm_omni.metrics.stats import StageRequestStats
 
 _OffloadT = TypeVar("_OffloadT")
+
+logger = init_logger(__name__)
 
 
 @dataclass(slots=True)
@@ -92,6 +97,7 @@ class DuplexSessionContext:
     tasks: DuplexSessionTasks
     run: DuplexRunState
     services: RunnerServices
+    history: DuplexContextHistory | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -138,7 +144,13 @@ class DuplexSessionTasks:
         try:
             await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout_s)
         except TimeoutError:
-            pass
+            survivors = [task for task in tasks if not task.done()]
+            if survivors:
+                logger.warning(
+                    "%s duplex append task(s) did not finish within %.2fs of cancellation",
+                    len(survivors),
+                    timeout_s,
+                )
         if cancelled_tail is not None and self.append_tail is cancelled_tail:
             self.append_tail = None
         return True

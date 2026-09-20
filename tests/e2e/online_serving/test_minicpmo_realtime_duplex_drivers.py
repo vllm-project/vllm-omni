@@ -2330,3 +2330,22 @@ def test_realtime_duplex_demo_writes_audio_per_response(tmp_path):
         with wave.open(str(tmp_path / f"response_{index:02d}.wav"), "rb") as wf:
             assert wf.getframerate() == 24000
             assert wf.readframes(wf.getnframes()) == expected
+
+
+def test_realtime_duplex_finite_video_keeps_streaming_audio_after_last_frame():
+    demo = _load_demo_module()
+    ws = _RecordingWebSocket(demo)
+    asyncio.run(
+        demo._send_pcm16(
+            ws,
+            b"\x01\x00" * (demo.PCM16_SAMPLE_RATE * 4),
+            chunk_ms=200,
+            realtime_delay=False,
+            frames_b64=["f0", "f1"],
+            repeat_last_video_frame=False,
+        )
+    )
+    assert _sent_video_frames(ws.messages) == [["f0"], ["f1"]]
+    assert len(ws.messages) == 20
+    assert ws.messages[-1]["audio_end_ms"] == 4000
+    assert "video_frames" not in ws.messages[-1]

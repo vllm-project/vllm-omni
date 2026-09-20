@@ -70,6 +70,7 @@ from vllm_omni.engine.duplex.events import (
 from vllm_omni.engine.duplex.plugin import (
     DuplexModelPlugin,
     DuplexModelSessionState,
+    DuplexRuntimeConfigError,
     PcmAppendReservation,
 )
 from vllm_omni.engine.duplex.realtime_events import (
@@ -204,6 +205,21 @@ class DuplexSessionRunner:
             schedule_silence_continuation=self._schedule_silence_continuation,
             abort_request=self._abort_request_background,
         )
+        policy = plugin.context_policy(session.runtime_config)
+        if policy is not None:
+            from vllm_omni.engine.duplex.session.context_history import DuplexContextHistory
+
+            self.ctx.history = DuplexContextHistory(
+                self.ctx,
+                policy,
+                out=self.out,
+                model=self.model,
+                max_tokens=min(
+                    int(getattr(model_config, "max_model_len", None) or policy.max_tokens), policy.max_tokens
+                ),
+                wait_for_append_tail=self._wait_for_append_tail,
+                close_from_runtime=self._close_from_runtime,
+            )
         self.control = SessionControl(
             self.ctx,
             self.out,
@@ -246,9 +262,13 @@ class DuplexSessionRunner:
         context: DuplexOutputContext,
     ) -> bool:
         """Accept one stage output (orchestrator loop); return True when it must not be forwarded."""
+        if self.ctx.history is not None and self.ctx.history.observe(stage_id, request_id, output, context):
+            return True
         decision: DuplexOutputDecision | None = None
         if stage_id < context.final_stage_id:
             decision = self.model.decide_output(stage_id, output, context)
+        if decision is not None and decision.ends_model_turn:
+            self.session.complete_model_turn(context.identity.fence.turn_id)
         consume = decision is not None or stage_id >= context.final_stage_id
         project_intermediate = self.plugin.projects_intermediate_outputs and stage_id == 0
         if not consume and not project_intermediate:
@@ -275,6 +295,40 @@ class DuplexSessionRunner:
             )
         )
         return consume
+
+    def on_request_error(self, stage_id: int, request_id: str, error: str) -> None:
+        """A scheduler-side failure retired one of this session's stage requests.
+
+        Session-owned requests never surface as processed terminal outputs, so
+        without this hook the journal would wait out its full completion
+        timeout while the client sees nothing. Wake waiters and close the
+        session immediately, like any other runtime fault.
+        """
+        session = self.session
+        if session.state == DuplexSessionState.CLOSED:
+            return
+        if self.ctx.history is not None:
+            self.ctx.history.fail_pending(DuplexRuntimeConfigError(error, code="context_output_failed"))
+        self._emit_error(
+            "runtime_input_failed",
+            f"Stage-{stage_id} request {request_id} failed: {error}",
+        )
+        response_id = session.active_response_id
+        if response_id is not None:
+            session.end_response(commit_text=False)
+            self.emit(
+                {
+                    "type": "response.done",
+                    "session_id": session.session_id,
+                    "response_id": response_id,
+                    "epoch": session.epoch,
+                    "committed": False,
+                    "status": "failed",
+                    "status_details": {"type": "failed", "reason": "runtime_input_failed"},
+                    "playback": session.playback.as_dict(),
+                }
+            )
+        self.spawn(self._close_from_runtime("runtime_input_failed"), name="duplex-request-error-close")
 
     def on_stage_failure(self, stage_id: int, exc: BaseException) -> None:
         """A stage rejected this session's request: fail the active response now.
@@ -550,6 +604,12 @@ class DuplexSessionRunner:
         elif isinstance(command, CancelInput | BargeIn):
             await self._on_cancel(command.payload())
         elif isinstance(command, SignalTurn):
+            if command.event in {"input.context.append", "input.context.replace", "input.context.get"}:
+                if self.ctx.history is None:
+                    self._emit_error("context_input_unsupported", "This model does not support context editing")
+                else:
+                    await self.ctx.history.handle(command.event, dict(command.signal_payload))
+                return
             if command.event == "conversation.item.retrieve":
                 self._emit_events(
                     retrieve_item_events(
@@ -718,7 +778,7 @@ class DuplexSessionRunner:
             old_response_id = session.active_response_id
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, old_response_id, committed_ms)
-            new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+            new_epoch, old_playback = self._advance_barge_in_epoch()
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -736,7 +796,7 @@ class DuplexSessionRunner:
             old_epoch = session.epoch
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, session.last_response_id, committed_ms)
-            new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+            new_epoch, old_playback = self._advance_barge_in_epoch()
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -1077,6 +1137,8 @@ class DuplexSessionRunner:
         expected_epoch: int | None,
         expected_model_turn_id: int | None,
     ) -> bool:
+        if self.ctx.history is not None and self.ctx.history.changing:
+            return False
         session = self.session
         model_state = self.model_state
         self._clear_completed_pending_silence()
@@ -1254,7 +1316,7 @@ class DuplexSessionRunner:
             old_response_id = session.active_response_id
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, old_response_id, committed_ms)
-            new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+            new_epoch, old_playback = self._advance_barge_in_epoch()
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -1272,7 +1334,7 @@ class DuplexSessionRunner:
             old_epoch = session.epoch
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, session.last_response_id, committed_ms)
-            new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+            new_epoch, old_playback = self._advance_barge_in_epoch()
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -1291,7 +1353,7 @@ class DuplexSessionRunner:
             old_response_id = session.active_response_id
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, old_response_id, committed_ms)
-            new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+            new_epoch, old_playback = self._advance_barge_in_epoch()
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -1358,7 +1420,7 @@ class DuplexSessionRunner:
         # The epoch bump is the atomic part: from here on every model output
         # and append of the old epoch is dropped by the stale-epoch filter in
         # ``emit`` / the append tail, whatever the awaits below interleave with.
-        new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+        new_epoch, old_playback = self._advance_barge_in_epoch()
         if old_request_id is not None:
             # Release projector/parser cursors so cancelled epochs do not
             # accumulate until the whole session closes.
@@ -1395,10 +1457,16 @@ class DuplexSessionRunner:
             if notify and self.session.state != DuplexSessionState.CLOSED:
                 self.model.send_runtime_error("runtime_abort_failed", exc)
 
+    def _advance_barge_in_epoch(self) -> tuple[int, dict[str, int]]:
+        result = helpers.advance_barge_in_epoch(self.session)
+        if self.ctx.history is not None:
+            self.ctx.history.synchronize_epoch()
+        return result
+
     def _cancel_pending_input(self, *, reason: str) -> None:
         session = self.session
         cancelled = session.cancel_pending_input()
-        helpers.advance_barge_in_epoch(session)
+        self._advance_barge_in_epoch()
         self.emit(
             {
                 "type": "input.cancelled",

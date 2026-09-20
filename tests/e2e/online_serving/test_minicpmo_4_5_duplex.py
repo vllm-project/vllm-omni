@@ -23,7 +23,9 @@ from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
     validated_input_wav,
 )
 from tests.e2e.online_serving.helpers.minicpmo_realtime_duplex_scenarios import (
+    _receive_protocol_events,
     _ref_audio_data_url,
+    _run_protocol_smoke,
     run_demo,
 )
 from tests.e2e.online_serving.run_minicpmo_realtime_duplex_multi_session import (
@@ -65,53 +67,6 @@ def _assert_session_metrics(metrics: object, *, expected_count: int) -> None:
     assert ttft_ms is not None and ttft_ms >= 0
     assert ttfp_ms is not None and ttfp_ms >= 0
     assert rtf is not None and rtf >= 0
-
-
-async def _receive_protocol_events(ws, required_types: set[str], *, timeout_s: float) -> list[dict[str, object]]:
-    async def receive() -> list[dict[str, object]]:
-        events: list[dict[str, object]] = []
-        seen: set[str] = set()
-        while not required_types.issubset(seen):
-            raw = await ws.recv()
-            if not isinstance(raw, str):
-                continue
-            event = json.loads(raw)
-            if not isinstance(event, dict):
-                continue
-            events.append(event)
-            event_type = event.get("type")
-            if event_type == "error":
-                raise AssertionError(f"WebSocket protocol smoke received an error: {event}")
-            if isinstance(event_type, str):
-                seen.add(event_type)
-        return events
-
-    return await asyncio.wait_for(receive(), timeout=timeout_s)
-
-
-async def _run_protocol_smoke(*, url: str, model: str, ref_audio: Path) -> list[dict[str, object]]:
-    websocket_url = build_realtime_url(url, model, autostart=False)
-    async with websockets.connect(websocket_url, max_size=64 * 1024 * 1024) as ws:
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "session.update",
-                    "session": {
-                        "model": model,
-                        "modalities": ["audio", "text"],
-                        "ref_audio": _ref_audio_data_url(str(ref_audio)),
-                    },
-                }
-            )
-        )
-        events = await _receive_protocol_events(
-            ws,
-            {"session.created", "session.updated"},
-            timeout_s=60,
-        )
-        await ws.send(json.dumps({"type": "session.close"}))
-        events.extend(await _receive_protocol_events(ws, {"session.closed"}, timeout_s=60))
-    return events
 
 
 async def _run_text_only_response_create(

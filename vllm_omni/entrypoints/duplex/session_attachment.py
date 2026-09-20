@@ -283,6 +283,15 @@ class DuplexSessionAttachmentRegistry:
             async with self._lock:
                 if self._sessions.get(session_id) is not state:
                     raise KeyError(f"unknown duplex attachment session: {session_id}")
+                event = payload.get("event")
+                if (
+                    payload.get("type") == "duplex.input.context.replaced"
+                    and isinstance(event, dict)
+                    and event.get("duplicate") is False
+                ):
+                    # A reconnect cursor before physical context replacement
+                    # cannot replay speech/tool events from the retired epoch.
+                    state.journal.acknowledge(state.journal.last_sequence)
                 entry = state.journal.record(payload) if journal else None
                 attachment = state.attachment
                 wire_payload = dict(entry.payload) if entry is not None else dict(payload)

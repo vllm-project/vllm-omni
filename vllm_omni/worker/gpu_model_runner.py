@@ -39,7 +39,7 @@ from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.model_local_kv import collect_model_local_kv_specs
-from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.output_templates import ModelInputError, OmniOutput
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -541,6 +541,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             else None
         )
         for req_id in scheduler_output.finished_req_ids:
+            getattr(self, "_omni_failed_input_requests", {}).pop(req_id, None)
             self.requests.pop(req_id, None)
             self.model_intermediate_buffer.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
@@ -1612,6 +1613,59 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             device=device,
         )
 
+    @staticmethod
+    def _suppress_failed_input_samples(errors, req_id_to_index, sampled_token_ids, invalid_req_indices):
+        """Mask failures both before and after deferred async token materialization."""
+        for req_id in errors:
+            index = req_id_to_index.get(req_id)
+            if index is None:
+                continue
+            if index not in invalid_req_indices:
+                invalid_req_indices.append(index)
+            # Async bookkeeping leaves this list empty. Its output wrapper
+            # applies invalid_req_indices after the device-to-host copy.
+            if index < len(sampled_token_ids):
+                sampled_token_ids[index] = []
+
+    def _mask_failed_input_logits(self, logits: torch.Tensor | None) -> None:
+        failures = getattr(self, "_omni_failed_input_requests", {})
+        if logits is None or not failures:
+            return
+        for row, req_id in enumerate(self.input_batch.req_ids):
+            if req_id in failures:
+                # Failed rows have masked KV writes. Never feed possible NaNs
+                # from their unwritten slots to the batched sampler.
+                logits[row].zero_()
+
+    def _mask_failed_input_kv_slots(self, errors, req_ids, slot_mappings_by_group):
+        """Mask failed rows with PAD_SLOT_ID; per-layer mappings share storage."""
+        query_start = self.query_start_loc.cpu
+        if callable(query_start):
+            query_start = query_start()
+        for index, req_id in enumerate(req_ids):
+            if req_id not in errors:
+                continue
+            start, end = int(query_start[index]), int(query_start[index + 1])
+            for slots in slot_mappings_by_group.values():
+                slots[start:end].fill_(-1)
+
+    def _preprocess_request(self, req_id, input_ids, input_embeds, req_infos, errors):
+        failures = getattr(self, "_omni_failed_input_requests", None)
+        if failures is None:
+            failures = self._omni_failed_input_requests = dict[str, str]()
+        try:
+            if req_id in failures:
+                raise ModelInputError(failures[req_id])
+            return self.model.preprocess(input_ids=input_ids, input_embeds=input_embeds, **req_infos)
+        except ModelInputError as exc:
+            if req_id not in failures:
+                logger.warning("Request-local model input failure for %s: %s", req_id, exc)
+            # Keep this failure latched until scheduler terminal cleanup. Async
+            # lookahead must not continue a request awaiting its error reply.
+            failures[req_id] = errors[req_id] = str(exc)
+            template = input_embeds if input_embeds is not None else self.model.embed_input_ids(input_ids)
+            return input_ids, torch.zeros_like(template), {}
+
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1628,6 +1682,8 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             ``has_preprocess`` code path below, so the upstream change is
             deliberately not ported.
         """
+        model_input_errors: dict[str, str] = {}
+        scheduler_output.model_input_errors = model_input_errors
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         is_first_rank = get_pp_group().is_first_rank
         is_encoder_decoder = self.model_config.is_encoder_decoder
@@ -1852,10 +1908,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 flush_decode_batch()
 
                 embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
-                req_input_ids, req_embeds, update_dict = self.model.preprocess(
-                    input_ids=preprocess_input_ids[s:e],
-                    input_embeds=embed_slice,
-                    **req_infos,
+                req_input_ids, req_embeds, update_dict = self._preprocess_request(
+                    req_id,
+                    preprocess_input_ids[s:e],
+                    embed_slice,
+                    req_infos,
+                    model_input_errors,
                 )
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(

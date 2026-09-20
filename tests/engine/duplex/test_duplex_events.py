@@ -361,15 +361,14 @@ def test_projection_of_the_main_internal_event_sequence():
     assert closed[0].to_realtime()["reason"] == "client_close"
 
 
-def test_projection_of_output_audio_buffer_clear_emits_cleared_before_terminals():
+@pytest.mark.parametrize("reason", ["output_audio_buffer_clear", "context_replaced", "model_interrupt"])
+def test_projection_of_output_audio_buffer_clear_emits_cleared_before_terminals(reason):
     state = RealtimeProjectionState(session_id="duplex-clear")
     pcm = base64.b64encode(b"\x00\x10" * 8).decode("ascii")
     project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
     project_internal_event(state, {"type": "response.output_audio.delta", "response_id": "resp_1", "audio": pcm})
 
-    cleared = project_internal_event(
-        state, {"type": "audio.cancelled", "reason": "output_audio_buffer_clear", "committed_ms": 250}
-    )
+    cleared = project_internal_event(state, {"type": "audio.cancelled", "reason": reason, "committed_ms": 250})
 
     assert _types(cleared)[:2] == ["output_audio_buffer.cleared", "response.output_audio.done"]
     assert cleared[0].response_id == "resp_1"
