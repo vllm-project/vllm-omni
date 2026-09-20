@@ -15,14 +15,16 @@ import json
 import pytest
 from openai.types.chat.chat_completion_audio import ChatCompletionAudio as OpenAIChatCompletionAudio
 from vllm.entrypoints.openai.chat_completion.protocol import (
-    ChatCompletionResponse,
     ChatCompletionResponseChoice,
     ChatMessage,
 )
 from vllm.entrypoints.serve.engine.protocol import UsageInfo
 
 from vllm_omni.entrypoints.openai.protocol.audio import AudioChunkMetadata
-from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponseChoice
+from vllm_omni.entrypoints.openai.protocol.chat_completion import (
+    OmniChatCompletionResponse,
+    OmniChatCompletionResponseChoice,
+)
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -74,7 +76,7 @@ class TestMergeAudioChoices:
         """The exact #7376 symptom: two choices with index=0 in one response."""
         merged = serving_chat._merge_audio_choices([_text_choice(0, "hello")], [_audio_choice(0)])
 
-        response = ChatCompletionResponse(
+        response = OmniChatCompletionResponse(
             id="chatcmpl-7376",
             created=0,
             model="test-model",
@@ -86,6 +88,7 @@ class TestMergeAudioChoices:
         assert indexes == [0]
         assert serialized["choices"][0]["message"]["content"] == "hello"
         assert serialized["choices"][0]["message"]["audio"]["data"] == "Zm9v"
+        assert serialized["choices"][0]["audio_metadata"]["format"] == "wav"
 
     def test_audio_only_request_keeps_standalone_choice(self, serving_chat):
         merged = serving_chat._merge_audio_choices([], [_audio_choice(0)])
