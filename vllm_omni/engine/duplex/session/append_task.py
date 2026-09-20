@@ -53,8 +53,11 @@ class AppendAttempt:
     retained_committed_payload: dict[str, object] | None
     #: Response reserved before submission, to be failed if submission does not happen.
     precreated_response_id: str | None
+    #: Commits timing state once the runtime accepts the append (before any
+    #: returned output event can clear the continuation chain).
+    on_append_accepted: Callable[[float], None] | None = None
     #: Last chance to call the append off, checked once the predecessor is done.
-    before_append: Callable[[], bool] | None
+    before_append: Callable[[], bool] | None = None
 
     # ------------------------------------------------------------------ #
     # Compensation                                                       #
@@ -107,8 +110,7 @@ class AppendAttempt:
             try:
                 predecessor_ok = await predecessor
             except asyncio.CancelledError:
-                current = asyncio.current_task()
-                if current is not None and current.cancelling():
+                if helpers.task_is_cancelling(asyncio.current_task()):
                     raise
                 predecessor_ok = False
             except Exception:
@@ -140,6 +142,7 @@ class AppendAttempt:
                 ),
                 final=self.final,
                 expected_epoch=self.epoch,
+                on_append_accepted=self.on_append_accepted,
             )
             if append_ok:
                 model_state.context_locked = True
@@ -155,8 +158,10 @@ class AppendAttempt:
                 self.ctx.run.runtime_closed = True
                 return False
             if not emitted_response and session.epoch == self.epoch:
-                if session.active_request_id == helpers.stage0_request_id(session, self.epoch):
-                    session.clear_request(self.request_id)
+                # Only if the session still points at this append's request:
+                # ``clear_request`` compares before it clears, and the id
+                # carries a turn suffix when the core request is not resumable.
+                session.clear_request(self.request_id)
                 if self.final:
                     self.out.emit_events([session.signal_turn(DuplexTurnEventType.USER_STARTED.value)])
             return append_ok

@@ -13,6 +13,7 @@ from diffusers.loaders.lora_conversion_utils import (
 from safetensors.torch import load_file
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_from_pipeline
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
@@ -118,6 +119,22 @@ def _prepare_lora_delta(
     used_keys.add(lora_a_key)
     used_keys.add(lora_b_key)
     return delta, used_keys
+
+
+def _resolve_lora_compute_device() -> torch.device | None:
+    """Return the local accelerator device if actually usable, else None.
+
+    get_local_device() may return cuda:N/npu:N even when no physical device is
+    present, so probe with a tiny allocation before trusting the lookup.
+    """
+    try:
+        dev = get_local_device()
+        if dev.type != "cpu":
+            torch.empty(1, device=dev)
+            return dev
+    except Exception:
+        pass
+    return None
 
 
 def _load_lora_state_dict(
@@ -270,6 +287,9 @@ class LoraLoaderMixin:
             for param_name, weight_name, _ in module.stacked_params_mapping:
                 param_to_weight_names[param_name].append(weight_name)
 
+        # Resolve the accelerator fallback once, outside the parameter loop.
+        accel_dev = _resolve_lora_compute_device()
+
         for name, params in module.named_parameters(prefix):
             is_bias = False
             if name.endswith(".bias"):
@@ -280,7 +300,7 @@ class LoraLoaderMixin:
             else:
                 continue
 
-            compute_dev = params.device if params.device.type != "cpu" else None
+            compute_dev = params.device if params.device.type != "cpu" else accel_dev
             delta, used_keys = _prepare_lora_delta(
                 state_dict,
                 base_key,
@@ -324,6 +344,9 @@ class LoraLoaderMixin:
             for param_name, weight_name, _ in module.stacked_params_mapping:
                 param_to_weight_names[param_name].append(weight_name)
 
+        # Resolve the accelerator fallback once, outside the parameter loop.
+        accel_dev = _resolve_lora_compute_device()
+
         for name, param in module.named_parameters(prefix):
             is_bias = False
             if name.endswith(".bias"):
@@ -334,7 +357,7 @@ class LoraLoaderMixin:
             else:
                 continue
 
-            compute_dev = param.device if param.device.type != "cpu" else None
+            compute_dev = param.device if param.device.type != "cpu" else accel_dev
             delta, used_keys = _prepare_lora_delta(
                 state_dict,
                 base_key,

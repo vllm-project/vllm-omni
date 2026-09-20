@@ -15,6 +15,12 @@ carries the input-side bookkeeping the old input translator kept (input buffer
 flags, conversation items, response-id fallbacks); the ``resolve_*`` /
 ``note_*`` helpers give the runner the same behaviour for the corresponding
 commands.
+
+What is *not* here is the model- and runtime-agnostic half of the codec ---
+audio format negotiation, conversation-item shape and truncation, transcript
+extraction, audio conversion. That lives in ``vllm_omni.protocol.realtime`` so
+a non-duplex Realtime surface can use it without the duplex session; this
+module is the duplex consumer of it (RFC #6592 P0a).
 """
 
 from __future__ import annotations
@@ -24,7 +30,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
-from vllm_omni.engine.duplex.audio import convert_output_audio
 from vllm_omni.engine.duplex.commands import (
     AppendAudio,
     CancelResponse,
@@ -74,10 +79,11 @@ from vllm_omni.engine.duplex.events import (
     TranscriptDone,
     error_event,
 )
-from vllm_omni.engine.duplex.realtime_commands import (
+from vllm_omni.engine.duplex.realtime_commands import build_append_audio
+from vllm_omni.protocol.duplex import (
     RealtimeInputDefaults,
     apply_realtime_session_defaults,
-    build_append_audio,
+    convert_output_audio,
     copy_realtime_input_hints,
     input_looks_like_speech,
     input_transcript_from_item,
@@ -321,7 +327,7 @@ def _response_done_output_item(
         )
     if text:
         content.append(_response_item_text_content_part(text=text))
-    item = {
+    item: dict[str, object] = {
         "id": item_id,
         "object": "realtime.item",
         "type": "message",
@@ -790,7 +796,7 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         item_id = _response_item_id(state, response_id)
         modalities = event.get("modalities")
         has_audio_modality = not isinstance(modalities, list) or "audio" in modalities
-        item = {
+        item: dict[str, object] = {
             "id": item_id,
             "object": "realtime.item",
             "type": "message",
@@ -894,13 +900,13 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         item_id = (
             event_item_id if isinstance(event_item_id, str) and event_item_id else _pop_pending_commit_item_id(state)
         )
-        item = state.conversation_items.get(item_id)
-        events = []
-        if item is None:
+        committed_item = state.conversation_items.get(item_id)
+        commit_events: list[DuplexEvent] = []
+        if committed_item is None:
             message = event.get("message")
             no_response = event.get("no_response") is True
             is_speech = event.get("is_speech")
-            item = {
+            created_commit_item: dict[str, object] = {
                 "id": item_id,
                 "object": "realtime.item",
                 "type": "message",
@@ -912,17 +918,18 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
                     else _user_item_content_from_duplex_message(message)
                 ),
             }
-            state.conversation_items[item_id] = item
-            events.extend(_conversation_item_added_events(state, item))
-        item["status"] = "completed"
-        events.append(
+            committed_item = created_commit_item
+            state.conversation_items[item_id] = committed_item
+            commit_events.extend(_conversation_item_added_events(state, committed_item))
+        committed_item["status"] = "completed"
+        commit_events.append(
             InputCommitted(previous_item_id=_previous_item_id(state, item_id), item_id=item_id, details=event)
         )
-        transcription_event = _input_audio_transcription_completed_event(item_id, item)
+        transcription_event = _input_audio_transcription_completed_event(item_id, committed_item)
         if transcription_event is not None:
-            events.append(transcription_event)
-        events.append(_conversation_item_done_event(state, item))
-        return events
+            commit_events.append(transcription_event)
+        commit_events.append(_conversation_item_done_event(state, committed_item))
+        return commit_events
     if event_type == "input.cancelled":
         return [InputCleared()]
     if event_type == "audio.cancelled":
@@ -945,9 +952,9 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
             item_id = _response_item_id(state, response_id)
             committed_audio_ms = max(0, int(committed_ms))
             state.item_truncation_cursors[item_id] = (0, committed_audio_ms)
-            item = state.conversation_items.get(item_id)
-            if item is not None:
-                truncate_realtime_item_content(item, content_index=0, audio_end_ms=committed_audio_ms)
+            cancelled_item = state.conversation_items.get(item_id)
+            if cancelled_item is not None:
+                truncate_realtime_item_content(cancelled_item, content_index=0, audio_end_ms=committed_audio_ms)
         events.extend(_realtime_audio_done_events(state, event, response_id))
         events.extend(
             _realtime_response_terminal_events(
@@ -962,48 +969,49 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
             state.active_response_id = None
         return events
     if event_type == "conversation.item.created":
-        item = event.get("item")
-        if isinstance(item, dict) and isinstance(item.get("id"), str):
-            item_id = str(item["id"])
-            already_known = item_id in state.conversation_items
-            state.conversation_items[item_id] = item
+        created_raw = event.get("item")
+        if isinstance(created_raw, dict) and isinstance(created_raw.get("id"), str):
+            created_item_id = str(created_raw["id"])
+            created_item = cast("dict[str, object]", created_raw)
+            already_known = created_item_id in state.conversation_items
+            state.conversation_items[created_item_id] = created_item
             if already_known:
-                if item.get("status") == "completed":
-                    return [_conversation_item_done_event(state, item)]
+                if created_item.get("status") == "completed":
+                    return [_conversation_item_done_event(state, created_item)]
                 return []
-            events = _conversation_item_added_events(state, item)
-            if item.get("status") == "completed":
-                events.append(_conversation_item_done_event(state, item))
-            return events
-        return [ItemCreated(item=item if isinstance(item, Mapping) else {})]
+            created_events = _conversation_item_added_events(state, created_item)
+            if created_item.get("status") == "completed":
+                created_events.append(_conversation_item_done_event(state, created_item))
+            return created_events
+        return [ItemCreated(item=created_raw if isinstance(created_raw, Mapping) else {})]
     if event_type == "conversation.item.deleted":
-        item_id = event.get("item_id")
-        if isinstance(item_id, str):
-            _remove_conversation_item(state, item_id)
-        return [ItemDeleted(item_id=_str_or_none(item_id), details=event)]
+        deleted_item_id = event.get("item_id")
+        if isinstance(deleted_item_id, str):
+            _remove_conversation_item(state, deleted_item_id)
+        return [ItemDeleted(item_id=_str_or_none(deleted_item_id), details=event)]
     if event_type == "conversation.item.truncated":
-        item_id = event.get("item_id")
+        truncated_item_id = event.get("item_id")
         audio_end_ms = event.get("audio_end_ms")
         content_index = event.get("content_index", 0)
-        if isinstance(item_id, str):
-            item = state.conversation_items.get(item_id)
-            if item is not None:
+        if isinstance(truncated_item_id, str):
+            truncated_item = state.conversation_items.get(truncated_item_id)
+            if truncated_item is not None:
                 truncate_realtime_item_content(
-                    item,
+                    truncated_item,
                     content_index=_int_or(content_index),
                     audio_end_ms=_int_or(audio_end_ms),
                 )
         return [
             ItemTruncated(
-                item_id=_str_or_none(item_id),
+                item_id=_str_or_none(truncated_item_id),
                 content_index=_int_or(content_index),
                 audio_end_ms=_int_or(audio_end_ms),
                 details=event,
             )
         ]
     if event_type == "conversation.item.retrieved":
-        item = event.get("item")
-        return [ItemRetrieved(item=item if isinstance(item, Mapping) else {})]
+        retrieved_item = event.get("item")
+        return [ItemRetrieved(item=retrieved_item if isinstance(retrieved_item, Mapping) else {})]
     if event_type == "response.output_item.done":
         response_id = event.get("response_id")
         return _realtime_response_terminal_events(
@@ -1038,7 +1046,7 @@ def _function_call_done_events(state: RealtimeProjectionState, event: dict[str, 
         arguments = str(arguments)
     response_id = f"resp_{uuid4().hex}"
     item_id = f"item_{uuid4().hex}"
-    item = {
+    item: dict[str, object] = {
         "id": item_id,
         "object": "realtime.item",
         "type": "function_call",
@@ -1354,7 +1362,6 @@ def resolve_truncate_item(state: RealtimeProjectionState, command: TruncateItem)
             payloads=[], events=[error_event("bad_event", truncate_error, event_id=command.event_id)]
         )
     state.item_truncation_cursors[command.item_id] = (command.content_index, command.audio_end_ms)
-    truncate_realtime_item_content(item, content_index=command.content_index, audio_end_ms=command.audio_end_ms)
     ack_payload: dict[str, object] = {
         "type": "playback.ack",
         "item_id": command.item_id,
@@ -1425,7 +1432,7 @@ def resolve_create_item(state: RealtimeProjectionState, command: CreateItem) -> 
                 ],
             )
     ack_events = register_user_item(state, item) if item_type == "message" and role == "user" else []
-    signal_payload = {
+    signal_payload: dict[str, object] = {
         "type": "turn.signal",
         "event": "conversation.item.create",
         "payload": {"item": item},
@@ -1438,12 +1445,15 @@ def resolve_create_item(state: RealtimeProjectionState, command: CreateItem) -> 
     if not isinstance(content, list):
         return ResolvedControl(payloads=[], events=ack_events)
     text_chunks: list[str] = []
+    image_parts: list[Mapping[str, object]] = []
     audio_payloads: list[dict[str, object]] = []
     for part in content:
         if not isinstance(part, dict):
             continue
         if part.get("type") in {"input_text", "text"} and isinstance(part.get("text"), str):
             text_chunks.append(str(part["text"]))
+        if part.get("type") == "input_image":
+            image_parts.append(part)
         if part.get("type") in {"input_audio", "audio"}:
             audio = part.get("audio") or part.get("data")
             if not isinstance(audio, str) or not audio:
@@ -1488,12 +1498,28 @@ def resolve_create_item(state: RealtimeProjectionState, command: CreateItem) -> 
         }
         if transcript:
             commit_payload["transcript"] = transcript
-        return ResolvedControl(payloads=[*audio_payloads, commit_payload], events=ack_events)
-    if not text_chunks:
+        payloads: list[dict[str, object]] = []
+        if image_parts:
+            # The audio leaves as buffered appends that the commit seals, and
+            # that commit registers *this* item id against the spoken message.
+            # Images cannot ride it: the commit would overwrite them. So they
+            # travel as their own item, stored ahead of the audio describing
+            # them, under an id derived from the one the client named.
+            image_item = dict(item)
+            image_item["id"] = f"{item_id}_image"
+            image_item["status"] = "completed"
+            image_item["content"] = list(image_parts)
+            payloads.append({**signal_payload, "payload": {"item": image_item}})
+        payloads.extend([*audio_payloads, commit_payload])
+        return ResolvedControl(payloads=payloads, events=ack_events)
+    if not text_chunks and not image_parts:
         return ResolvedControl(payloads=[], events=ack_events)
-    text_item = dict(item)
-    text_item["status"] = "completed"
-    signal_payload["payload"] = {"item": text_item}
+    # An image is content in its own right, not a decoration on text. Dropping
+    # the payload here would still ack the item to the client, so the picture
+    # would be silently missing from every prompt that followed.
+    stored_item = dict(item)
+    stored_item["status"] = "completed"
+    signal_payload["payload"] = {"item": stored_item}
     return ResolvedControl(payloads=[signal_payload], events=ack_events)
 
 

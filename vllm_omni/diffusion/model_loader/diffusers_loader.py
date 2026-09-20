@@ -679,10 +679,21 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         with set_default_torch_dtype(self.od_config.dtype):
             if self.parallel_config.use_hsdp:
                 model = self._load_model_with_hsdp(
-                    target_device=device, load_format=load_format, custom_pipeline_name=custom_pipeline_name
+                    target_device=device,
+                    load_format=load_format,
+                    custom_pipeline_name=custom_pipeline_name,
+                    offload_after_quant=offload_after_quant,
                 )
             else:
-                model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=False)
+                # The model is headed back to host memory right after online
+                # quantization, so over-wide NPU-unquantizable fallback weights
+                # load straight into host memory instead of round-tripping
+                # through the accelerator (~24 GiB startup peak on MiniMax H3).
+                from vllm_omni.quantization.int8_config import load_unquantizable_fallback_on_cpu
+
+                fallback_ctx = load_unquantizable_fallback_on_cpu() if offload_after_quant else contextlib.nullcontext()
+                with fallback_ctx:
+                    model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=False)
 
                 resolved_offload = resolve_offload(self.od_config)
                 distributed_offload = resolved_offload.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
@@ -721,8 +732,9 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     if unsupported_methods:
                         raise ValueError(
                             "DLO+AllGather supports online quantization only for "
-                            "per-tensor FP8, INT8, and MXFP8 linears; unsupported "
-                            f"online methods: {', '.join(sorted(unsupported_methods))}. "
+                            "per-tensor FP8, INT8, and MXFP8 linears "
+                            "(host-loaded unquantized fallback layers are also allowed); "
+                            f"unsupported online methods: {', '.join(sorted(unsupported_methods))}. "
                             "Use rank-local transfer for the affected component or "
                             "disable online quantization."
                         )
@@ -930,6 +942,11 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         scale, packing, or aliasing layouts (e.g. dual-scale fp4 pairs,
         swizzled or NZ hardware formats) and remain fail-closed until
         validated.
+
+        ``UnquantizedHostLinearMethod`` is also allowed: it backs layers too
+        wide for npu_quant_matmul, loads their weights straight into host
+        memory, and its runtime layout is a plain contiguous bf16 weight —
+        identical to the ordinary unquantized path DLO already shards.
         """
         from vllm.model_executor.layers.quantization.online.fp8 import (
             Fp8PerTensorOnlineLinearMethod,
@@ -938,6 +955,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         from vllm_omni.quantization.int8_config import (
             Int8OnlineLinearMethod,
             NPUInt8OnlineLinearMethod,
+            UnquantizedHostLinearMethod,
         )
 
         try:
@@ -959,6 +977,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             Fp8PerTensorOnlineLinearMethod,
             Int8OnlineLinearMethod,
             NPUInt8OnlineLinearMethod,
+            UnquantizedHostLinearMethod,
             *mxfp8_online_methods,
         )
 
@@ -1208,6 +1227,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         target_device: torch.device,
         load_format: str = "default",
         custom_pipeline_name: str | type[nn.Module] | None = None,
+        offload_after_quant: bool = False,
     ) -> nn.Module:
         """Load model with HSDP sharding for inference.
 
@@ -1231,40 +1251,54 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # mapping (QKV fusion, etc.).
         if load_format == "diffusers":
             raise ValueError("HSDP is not supported with the diffusers adapter load format")
-        model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=True)
-        world_size = 1
-        rank = 0
-        if torch.distributed.is_initialized():
-            world_size = torch.distributed.get_world_size()
-            rank = torch.distributed.get_rank()
+        # Same host-fallback bound as the ordinary path: with a quant config the
+        # HSDP path initializes on the accelerator (hsdp_defer_to_cpu=False), so
+        # over-wide NPU-unquantizable fallback weights would otherwise round-trip
+        # through the device before apply_hsdp_to_model shards them. Loading them
+        # straight into host memory keeps the load-time device peak at the
+        # quantizable layers alone; sharding then distributes the fallback like
+        # any other parameter. Broadcast loading excludes online quantization
+        # already, so the context below only ever matters on the ordinary
+        # per-rank branch -- but spanning both is harmless.
+        from vllm_omni.quantization.int8_config import load_unquantizable_fallback_on_cpu
 
-        has_online_quant = self._has_online_quant(model) or (
-            self.quant_config is not None and not getattr(self.quant_config, "is_checkpoint_quantized", False)
-        )
-        enable_broadcast = bool(getattr(self.od_config, "enable_broadcast_weight_load", False)) and world_size > 1
+        fallback_ctx = load_unquantizable_fallback_on_cpu() if offload_after_quant else contextlib.nullcontext()
+        with fallback_ctx:
+            model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=True)
+            world_size = 1
+            rank = 0
+            if torch.distributed.is_initialized():
+                world_size = torch.distributed.get_world_size()
+                rank = torch.distributed.get_rank()
 
-        if enable_broadcast and has_online_quant:
-            logger.info(
-                "Worker %d: Online quantization detected; falling back to ordinary per-rank weight loading for HSDP",
-                rank,
+            has_online_quant = self._has_online_quant(model) or (
+                self.quant_config is not None and not getattr(self.quant_config, "is_checkpoint_quantized", False)
             )
-            enable_broadcast = False
+            enable_broadcast = bool(getattr(self.od_config, "enable_broadcast_weight_load", False)) and world_size > 1
 
-        if enable_broadcast:
-            if rank == 0:
+            if enable_broadcast and has_online_quant:
+                logger.info(
+                    "Worker %d: Online quantization detected; falling back to ordinary "
+                    "per-rank weight loading for HSDP",
+                    rank,
+                )
+                enable_broadcast = False
+
+            if enable_broadcast:
+                if rank == 0:
+                    self.load_weights(model)
+                    self._maybe_fuse_distilled_lora(model)
+                self._broadcast_model_weights(model, target_device=target_device, src_rank=0)
+                if (
+                    rank != 0
+                    and getattr(self.od_config, "lora_backend", None) in (LoRABackend.DISTILL, "distill")
+                    and getattr(self.od_config, "lora_path", None)
+                    and hasattr(model, "load_lora_weights")
+                ):
+                    setattr(model, "lora_is_fused", True)
+            else:
                 self.load_weights(model)
                 self._maybe_fuse_distilled_lora(model)
-            self._broadcast_model_weights(model, target_device=target_device, src_rank=0)
-            if (
-                rank != 0
-                and getattr(self.od_config, "lora_backend", None) in (LoRABackend.DISTILL, "distill")
-                and getattr(self.od_config, "lora_path", None)
-                and hasattr(model, "load_lora_weights")
-            ):
-                setattr(model, "lora_is_fused", True)
-        else:
-            self.load_weights(model)
-            self._maybe_fuse_distilled_lora(model)
 
         # Quantization methods must finish while parameters are ordinary local
         # tensors. Some post-load transforms use operations (for example,

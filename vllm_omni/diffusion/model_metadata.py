@@ -22,6 +22,10 @@ class DiffusionModelMetadata:
     supports_timeline_guides: bool = False
     attention_mask_free: bool = False
     final_output_type: str | None = None
+    # Whether ``/v1/videos`` accepts source media plus per-token video/audio
+    # noise masks for latent initialization. Unknown pipelines must remain
+    # opted out so uploaded files never reach a model that cannot consume them.
+    supports_latent_mask_editing: bool = False
 
 
 # FLUX.2 Klein supports up to four reference images.
@@ -58,6 +62,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         max_multimodal_image_inputs=9,
         supports_mixed_reference_inputs=True,
         supports_timeline_guides=True,
+        supports_latent_mask_editing=True,
         final_output_type="video",
         # H3 represents alignment padding as a second packed sequence.  The
         # packed TRTLLM backend consumes cu_seqlens and isolates that padding.
@@ -73,6 +78,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         max_multimodal_image_inputs=9,
         supports_mixed_reference_inputs=True,
         supports_timeline_guides=True,
+        supports_latent_mask_editing=True,
         final_output_type="video",
         attention_mask_free=True,
     ),

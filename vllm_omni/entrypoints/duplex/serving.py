@@ -36,7 +36,6 @@ from vllm_omni.engine.duplex.events import (
     SessionResyncRequired,
 )
 from vllm_omni.engine.duplex.messages import DuplexSessionError
-from vllm_omni.engine.duplex.realtime_commands import RealtimeInputDefaults
 from vllm_omni.entrypoints.duplex.realtime_input import RealtimeEnvelope, parse_resume_request
 from vllm_omni.entrypoints.duplex.session_attachment import (
     DuplexJournalGapError,
@@ -52,6 +51,7 @@ from vllm_omni.entrypoints.duplex.websocket import (
     receive_text_with_timeout,
 )
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni, DuplexSessionHandle
+from vllm_omni.protocol.duplex import RealtimeInputDefaults
 
 logger = init_logger(__name__)
 

@@ -135,6 +135,11 @@ class RainFusionPlan:
 class RainFusionAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
     supported_platforms: tuple[str, ...] = ("npu",)
+    # The impl trims [real, pad] packed tensors to the valid prefix with
+    # [:, :used] itself, so models may run the padded layout without
+    # materializing a padding mask (a forward that carries one anyway falls
+    # back dense in _resolve_plan).
+    supports_prefix_kv_slicing: bool = True
 
     @classmethod
     def validate_available(cls) -> None:
@@ -146,8 +151,10 @@ class RainFusionAttentionBackend(AttentionBackend):
             from mindiesd import sparse_attention
         except ImportError as exc:
             raise ValueError(_MISSING_MINDIESD) from exc
-        if not _supports_video_spans(sparse_attention):
-            raise ValueError(_INCOMPATIBLE_MINDIESD)
+        if not callable(sparse_attention):
+            raise ValueError(_MISSING_MINDIESD)
+        # Single-video Wan only needs the legacy geometry. Check video_spans
+        # when a forward actually carries multiple videos.
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
@@ -173,6 +180,8 @@ class RainFusionAttentionImpl(AttentionImpl):
     so a model can select this backend unconditionally. MindIE-SD handles an
     irregular video tail internally, retaining it outside the sparse blocks.
     """
+
+    _supported_kv_cache_dtypes = {"npu": {"fp8", "mxfp4"}}
 
     def __init__(
         self,
@@ -222,6 +231,8 @@ class RainFusionAttentionImpl(AttentionImpl):
     def _validate_parallel_config(self) -> None:
         config = get_current_diffusion_config_or_none()
         parallel_config = getattr(config, "parallel_config", None)
+        if getattr(parallel_config, "allgather_degree", 1) > 1:
+            raise ValueError("RAINFUSION_ATTN requires full Q/K/V sequences; AllGather-KV SP is unsupported.")
         ring_degree = getattr(parallel_config, "ring_degree", 1)
         if ring_degree > 1:
             # Ring gives each rank a slice of the sequence, so block selection
@@ -262,7 +273,9 @@ class RainFusionAttentionImpl(AttentionImpl):
         plan = self._resolve_plan(attn_metadata)
         if plan is None:
             return self.dense_fallback.forward_npu(query, key, value, attn_metadata)
-        return self._forward_sparse_npu(query, key, value, plan)
+        if query.ndim != 4 or key.shape != query.shape or value.shape != query.shape or plan.used_len > query.shape[1]:
+            raise ValueError("RainFusion video geometry must fit identical full-sequence BSND Q/K/V tensors.")
+        return self._forward_sparse_npu(query, key, value, plan, attn_metadata)
 
     def _resolve_plan(self, attn_metadata: AttentionMetadata | None) -> RainFusionPlan | None:
         """Return the rf_v2 geometry, or None when this forward must stay dense."""
@@ -271,18 +284,17 @@ class RainFusionAttentionImpl(AttentionImpl):
             return None
         if self.layer_idx is not None and self.layer_idx in rf.skip_layers:
             return None
+        step_idx = total_steps = None
         if is_forward_context_available():
             step_idx = get_forward_context().denoise_step_idx
             total_steps = get_forward_context().total_denoise_steps
-            if step_idx is not None and step_idx < rf.start_step:
+        if (rf.start_step and step_idx is None) or (rf.end_step and (step_idx is None or total_steps is None)):
+            return None
+        if step_idx is not None:
+            if step_idx < rf.start_step:
                 return None
             # Tail fallback: keep the last ``end_step`` denoise steps dense.
-            if (
-                rf.end_step > 0
-                and step_idx is not None
-                and total_steps is not None
-                and step_idx >= total_steps - rf.end_step
-            ):
+            if rf.end_step > 0 and total_steps is not None and step_idx >= total_steps - rf.end_step:
                 return None
         if self.qkv_layout is None:
             # The sparse path reads the sequence off dim 1, which the tensors alone
@@ -308,7 +320,16 @@ class RainFusionAttentionImpl(AttentionImpl):
                 "model must publish AttentionMetadata.video_layout for the sequence to be sparsified."
             )
             return None
-        max_seqlen_q = attn_metadata.extra.get("max_seqlen_q")
+
+        # The sparse Runtime constructs its own block mask. It cannot preserve
+        # an arbitrary caller-supplied mask or piecewise visibility constraints.
+        mask = attn_metadata.attn_mask
+        padding_only = layout.used_len is not None
+        if attn_metadata.full_attn_spans is not None or (
+            mask is not None and not (padding_only and mask.ndim == 2 and mask.dtype == torch.bool)
+        ):
+            return None
+        max_seqlen_q = attn_metadata.extra.get("max_seqlen_q", layout.used_len)
         if max_seqlen_q is None:
             logger.warning_once(
                 "RAINFUSION_ATTN staying dense: attention metadata is missing max_seqlen_q, so the "
@@ -459,31 +480,56 @@ class RainFusionAttentionImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         plan: RainFusionPlan,
+        attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         try:
             from mindiesd import sparse_attention
         except ImportError:
             raise ImportError(_MISSING_MINDIESD)
-        if self.rainfusion.precision != "bf16" and not _mindiesd_supports_precision():
-            raise RuntimeError(
-                f"block_sparse.precision={self.rainfusion.precision!r} requires MindIE-SD "
-                "with sparse_attention(precision=...) support; the installed mindiesd "
-                "silently ignores it and would run the BF16 path. Install a compatible "
-                "MindIE-SD release or use precision='bf16'."
+        if plan.video_spans is not None and not _supports_video_spans(sparse_attention):
+            raise ValueError(_INCOMPATIBLE_MINDIESD)
+        extra = attn_metadata.extra if attn_metadata else {}
+        requested = extra.get("kv_cache_dtype", self.rainfusion.precision)
+        reason = None
+        if requested in ("float", "bf16"):
+            precision = "bf16"
+        else:
+            precision = requested
+            if requested not in ("fp8", "mxfp4", "mix"):
+                reason = f"sparse {requested} is not supported"
+            elif not _mindiesd_supports_precision():
+                reason = "MindIE-SD sparse_attention must explicitly support precision"
+            elif plan.video_spans is not None:
+                reason = "quantized multi-video RainFusion is not supported"
+            elif requested in ("fp8", "mxfp4") and query.shape[0] != 1:
+                reason = "quantized Wan BSA requires batch size 1"
+            elif requested in ("fp8", "mxfp4") and (query.shape[-1] < 64 or query.shape[-1] & (query.shape[-1] - 1)):
+                reason = "BSA Hadamard rotations require a power-of-two head dimension of at least 64"
+        if reason is not None:
+            raise ValueError(
+                f"RainFusion precision {requested!r} is unavailable: {reason}. "
+                "Set diffusion_kv_cache_dtype or block_sparse.precision to a method supported by the installed "
+                "MindIE-SD, or disable attention quantization. Automatic precision fallback is not performed."
             )
 
+        logger.info_once("RainFusion uses MindIE-SD sparse attention, precision=%s.", precision)
         used = plan.used_len
-        q, k, v = (tensor[:, :used] for tensor in (query, key, value))
+        # Split query once: the valid prefix drives the kernel, the padding
+        # tail is reused verbatim as the output padding below. All views,
+        # zero-copy. split_with_sizes always yields both parts, including an
+        # empty tail when the sequence needs no padding.
+        q, q_pad = torch.split(query, [used, query.shape[1] - used], dim=1)
+        k, v = key[:, :used], value[:, :used]
         # Ulysses has already gathered the full sequence onto this rank and split
         # the heads, so read the head count off the tensor rather than num_heads.
         common_kwargs: dict[str, object] = {
             "scale": self.softmax_scale,
             "head_num": query.shape[-2],
             "input_layout": _INPUT_LAYOUT,
-            "inner_precise": _INNER_PRECISE,
+            "inner_precise": 4 if precision != "bf16" else _INNER_PRECISE,
             "block_size": _BLOCK_SIZE,
             "sparsity": self.rainfusion.sparsity,
-            "precision": self.rainfusion.precision,
+            "precision": precision,
         }
         if plan.video_spans is not None:
             out = sparse_attention(
@@ -497,7 +543,9 @@ class RainFusionAttentionImpl(AttentionImpl):
         else:
             assert plan.prefix_len is not None and plan.latent_shape is not None
             common_kwargs.update(
-                sparse_type="rf_v2",
+                # rf_v2 ignores precision on non-A5 devices. Select the explicit
+                # quantized high-level path so mask/rearrangement remain in MindIE.
+                sparse_type="rf_v3" if precision != "bf16" else "rf_v2",
                 txt_len=plan.prefix_len,
                 latent_shape_q=plan.latent_shape,
                 latent_shape_k=plan.latent_shape,
@@ -505,6 +553,9 @@ class RainFusionAttentionImpl(AttentionImpl):
             out = sparse_attention(q, k, v, **common_kwargs)
         if used == query.shape[1]:
             return out
-        padded = torch.zeros_like(query)
-        padded[:, :used] = out
-        return padded
+        # Only the first ``used`` rows are read back downstream, so the padding
+        # payload is free. Reuse the query tail split off above instead of
+        # zeroing a fresh buffer: a single cat write, no extra allocation, and
+        # always finite values (uninitialized memory could hold NaN bit
+        # patterns).
+        return torch.cat([out, q_pad], dim=1)

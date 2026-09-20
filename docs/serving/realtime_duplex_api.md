@@ -768,7 +768,10 @@ events with `server_event_seq > 40` are replayed in order)
 ```
 
 with camera frames (omni video; rides the append that closes a 1 s model
-unit; each entry is a **bare** base64 JPEG/PNG — no `data:` URL prefix)
+unit; each entry is a **bare** base64 JPEG/PNG — no `data:` URL prefix).
+Only a model whose Stage 0 interleaves a frame track at unit boundaries takes
+this field; a turn model has no such boundary and rejects it, expecting
+`conversation.item.create` with `input_image` content instead.
 
 ```json
 {
@@ -944,6 +947,10 @@ deferred commit during an active response (`event.response_create_deferred`)
 ```json
 {"type": "conversation.item.truncated", "item_id": "item_resp_01", "content_index": 0, "audio_end_ms": 1850, "event": {"…": "…"}}
 ```
+
+After this acknowledgement, `conversation.item.retrieve` returns the truncated
+transcript. Without text/audio alignment marks, its prefix is estimated from
+the requested position and audio duration; this is not exact word alignment.
 
 #### Response lifecycle
 

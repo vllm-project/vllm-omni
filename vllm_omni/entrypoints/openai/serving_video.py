@@ -21,7 +21,7 @@ from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
-from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+from vllm_omni.diffusion.model_metadata import DiffusionModelMetadata, get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.media_utils import count_mp4_frames, normalize_preencode_batch_frames
 from vllm_omni.entrypoints.async_omni import ABORT_TIMEOUT_S, AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.videos import (
@@ -109,6 +109,17 @@ class ReferenceAudio:
 
 
 @dataclass
+class LatentEditInput:
+    """Request-scoped source media and masks for latent-mask editing."""
+
+    source_video: str | None = None
+    source_audio: str | None = None
+    video_noise_mask: Any | None = None
+    audio_noise_mask: Any | None = None
+    cleanup_paths: tuple[str, ...] = ()
+
+
+@dataclass
 class VideoGenerationArtifacts:
     """Normalized outputs and profiler metadata extracted from one request."""
 
@@ -172,6 +183,15 @@ class OmniOpenAIServingVideo:
             return get_od_config()
         return getattr(self._engine_client, "od_config", None)
 
+    def _resolve_diffusion_metadata(
+        self,
+    ) -> tuple[OmniDiffusionConfig | SimpleNamespace | None, tuple[DiffusionModelMetadata, ...]]:
+        """Resolve capability metadata from the runtime and diffusion stages."""
+        od_config = self._resolve_diffusion_od_config()
+        model_archs = [None if od_config is None else getattr(od_config, "model_class_name", None)]
+        model_archs.extend(_stage_diffusion_model_class_name(stage) for stage in self.stage_configs or ())
+        return od_config, tuple(get_diffusion_model_metadata(model_arch) for model_arch in model_archs)
+
     def _resolve_video_generation_defaults(
         self,
         request: VideoGenerationRequest,
@@ -213,31 +233,15 @@ class OmniOpenAIServingVideo:
             revision=revision,
         )
 
-    def _candidate_model_archs(self, od_config: Any) -> list[str | None]:
-        """Collect every model-arch name that can carry capability metadata.
-
-        Split-stage deployments name the diffusion pipeline in a stage config
-        rather than in the resolved ``od_config``, so capability lookups must
-        consider both. Unknown names resolve to the metadata defaults.
-        """
-        model_archs: list[str | None] = [None if od_config is None else getattr(od_config, "model_class_name", None)]
-        for stage_config in self.stage_configs or ():
-            model_archs.append(_stage_diffusion_model_class_name(stage_config))
-        return model_archs
-
     @property
     def supports_mixed_reference_inputs(self) -> bool:
         """Return whether the configured diffusion model accepts mixed refs."""
-        od_config = self._resolve_diffusion_od_config()
+        od_config, metadata = self._resolve_diffusion_metadata()
         if od_config is None:
             return False
 
         capability = getattr(od_config, "supports_mixed_reference_inputs", None)
-        metadata_capability = any(
-            get_diffusion_model_metadata(model_arch).supports_mixed_reference_inputs
-            for model_arch in self._candidate_model_archs(od_config)
-        )
-        return capability is True or metadata_capability
+        return capability is True or any(item.supports_mixed_reference_inputs for item in metadata)
 
     @property
     def supports_timeline_guides(self) -> bool:
@@ -247,16 +251,18 @@ class OmniOpenAIServingVideo:
         name, so every H3 alias that shares the guide contract is accepted and
         other pipelines keep rejecting guides.
         """
-        od_config = self._resolve_diffusion_od_config()
+        od_config, metadata = self._resolve_diffusion_metadata()
         if od_config is None:
             return False
 
         capability = getattr(od_config, "supports_timeline_guides", None)
-        metadata_capability = any(
-            get_diffusion_model_metadata(model_arch).supports_timeline_guides
-            for model_arch in self._candidate_model_archs(od_config)
-        )
-        return capability is True or metadata_capability
+        return capability is True or any(item.supports_timeline_guides for item in metadata)
+
+    @property
+    def supports_latent_mask_editing(self) -> bool:
+        """Return whether the configured diffusion model accepts latent edits."""
+        _, metadata = self._resolve_diffusion_metadata()
+        return any(item.supports_latent_mask_editing for item in metadata)
 
     @property
     def supported_control_upload_types(self) -> frozenset[str]:
@@ -266,12 +272,11 @@ class OmniOpenAIServingVideo:
         generic video API isolated from model-specific controls unless a model
         explicitly opts into the ``control_path`` contract in metadata.
         """
-        od_config = self._resolve_diffusion_od_config()
-        model_archs = self._candidate_model_archs(od_config)
+        _, metadata = self._resolve_diffusion_metadata()
 
         supported: set[str] = set()
-        for model_arch in model_archs:
-            supported.update(get_diffusion_model_metadata(model_arch).supported_control_upload_types)
+        for item in metadata:
+            supported.update(item.supported_control_upload_types)
         return frozenset(supported)
 
     @classmethod
@@ -316,6 +321,7 @@ class OmniOpenAIServingVideo:
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
         on_started: Callable[[], Awaitable[None]] | None = None,
+        latent_edit_input: LatentEditInput | None = None,
     ) -> VideoGenerationArtifacts:
         """Run the generation pipeline and extract video/audio/profiler outputs."""
         if request.extra_params and any(
@@ -402,6 +408,19 @@ class OmniOpenAIServingVideo:
             multi_modal_data["video"] = input_video
         if reference_audio is not None:
             multi_modal_data["audio"] = reference_audio.path
+        if latent_edit_input is not None:
+            multi_modal_data.update(
+                {
+                    key: value
+                    for key, value in {
+                        "source_video": latent_edit_input.source_video,
+                        "source_audio": latent_edit_input.source_audio,
+                        "video_noise_mask": latent_edit_input.video_noise_mask,
+                        "audio_noise_mask": latent_edit_input.audio_noise_mask,
+                    }.items()
+                    if value is not None
+                }
+            )
         if multi_modal_data:
             prompt["multi_modal_data"] = multi_modal_data
         if vp.width is not None and vp.height is not None:
@@ -546,6 +565,7 @@ class OmniOpenAIServingVideo:
         reference_image: ReferenceImage | None = None,
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
+        latent_edit_input: LatentEditInput | None = None,
     ) -> VideoGenerationResponse:
         artifacts = await self._run_and_extract(
             request,
@@ -553,6 +573,7 @@ class OmniOpenAIServingVideo:
             reference_image=reference_image,
             reference_video=reference_video,
             reference_audio=reference_audio,
+            latent_edit_input=latent_edit_input,
         )
 
         video_codec_options = {"preset": "ultrafast", "threads": "0"}
@@ -598,6 +619,7 @@ class OmniOpenAIServingVideo:
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
         on_started: Callable[[], Awaitable[None]] | None = None,
+        latent_edit_input: LatentEditInput | None = None,
     ) -> tuple[bytes, dict[str, float], float, VideoAction | None, dict[str, object]]:
         """Generate a video and return raw MP4 bytes, bypassing base64 encoding."""
         artifacts = await self._run_and_extract(
@@ -607,6 +629,7 @@ class OmniOpenAIServingVideo:
             reference_video=reference_video,
             reference_audio=reference_audio,
             on_started=on_started,
+            latent_edit_input=latent_edit_input,
         )
         if len(artifacts.videos) > 1:
             logger.warning(

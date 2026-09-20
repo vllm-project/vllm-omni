@@ -408,8 +408,11 @@ class DuplexSessionManager:
         return configured
 
     @staticmethod
-    def stage_request_id(fence: DuplexFence, *, stage_id: int) -> str:
-        return duplex_resource_request_id(fence, f"stage{stage_id}")
+    def stage_request_id(fence: DuplexFence, *, stage_id: int, resumable: bool = True) -> str:
+        role = f"stage{stage_id}"
+        if not resumable:
+            role += f"-turn{fence.turn_id}"
+        return duplex_resource_request_id(fence, role)
 
     def ensure_stage_request(
         self,
@@ -422,7 +425,9 @@ class DuplexSessionManager:
         if stage_id >= self.stage_port.stage_count:
             return None
         effective_fence = fence or session.fence
-        request_id = self.stage_request_id(effective_fence, stage_id=stage_id)
+        request_id = self.stage_request_id(
+            effective_fence, stage_id=stage_id, resumable=session.capabilities.supports_core_resumable_request
+        )
         session.reserve_stage_request(stage_id, request_id, fence=effective_fence)
         context = DuplexStageRequestContext(
             request_id=request_id,

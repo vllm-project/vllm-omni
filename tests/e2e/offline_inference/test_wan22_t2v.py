@@ -6,6 +6,7 @@ import pytest
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OfflineOmniClient
 from vllm_omni.config.omni_config import VllmOmniDiffusionStageConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 MODEL = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
@@ -21,17 +22,19 @@ def test_structured_diffusion_config_reaches_runtime(omni_runner) -> None:
     """The default WAN resolver launches the typed diffusion config itself."""
     omni = omni_runner.omni
     resolved_stages = omni.engine.stage_configs
+    stage_clients = omni.engine.stage_clients
     assert len(resolved_stages) == 1
+    assert len(stage_clients) == 1
     stage_config = resolved_stages[0]
+    od_config = stage_clients[0].od_config
 
     assert isinstance(stage_config, VllmOmniDiffusionStageConfig)
+    assert isinstance(od_config, OmniDiffusionConfig)
     assert stage_config.stage_id == 0
     assert stage_config.model_stage == "dit"
     assert stage_config.final_output_type == "video"
 
     assert omni.engine.stage_vllm_configs == [None]
-    od_config = omni.get_diffusion_od_config()
-    assert od_config is not None
     assert od_config.stage_id == 0
     assert od_config.model == MODEL
     assert od_config.model_class_name == "WanPipeline"

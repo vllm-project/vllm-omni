@@ -152,6 +152,37 @@ def test_omni_serve_accepts_explicit_model(argv: list[str], mocker: MockerFixtur
     cmd.validate(args)
 
 
+@pytest.mark.parametrize(
+    "model_class,exists,native",
+    [
+        ("AnimaPipeline", True, True),
+        ("AnimaModularPipeline", True, True),
+        ("AnimaPipeline", False, False),
+        ("FluxPipeline", True, False),
+        (None, True, False),
+    ],
+)
+def test_serve_native_checkpoint_validation(model_class, exists, native, tmp_path, mocker):
+    checkpoint = tmp_path / "anima.safetensors"
+    if exists:
+        checkpoint.touch()
+    argv = ["serve", str(checkpoint), "--omni"]
+    if model_class is not None:
+        argv.extend(["--model-class-name", model_class])
+    args = _parse_serve_args(argv)
+    detect_model = mocker.patch("vllm_omni.diffusion.utils.hf_utils.is_diffusion_model", return_value=False)
+    validate_llm = mocker.patch("vllm_omni.entrypoints.cli.serve.validate_parsed_serve_args")
+
+    OmniServeCommand().validate(args)
+
+    if native:
+        detect_model.assert_not_called()
+        validate_llm.assert_not_called()
+    else:
+        detect_model.assert_called_once_with(str(checkpoint))
+        validate_llm.assert_called_once_with(args)
+
+
 def test_serve_parser_accepts_strategy_config() -> None:
     """``--strategy-config`` must parse onto the ``strategy_config`` dest and be
     forwarded as an explicit kwarg so the engine can overlay the strategy."""
@@ -215,14 +246,23 @@ def test_tracking_namespace_is_picklable_for_spawned_api_workers() -> None:
     assert restored._omni_stage_client_configs == args._omni_stage_client_configs
 
 
-def test_serve_validate_rejects_multiple_api_servers_for_diffusion(mocker: MockerFixture) -> None:
+@pytest.mark.parametrize("native_checkpoint", [False, True])
+def test_serve_validate_rejects_multiple_api_servers_for_diffusion(
+    mocker: MockerFixture, tmp_path, native_checkpoint: bool
+) -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand")
     cmd = OmniServeCommand()
     cmd.subparser_init(subparsers)
-    args = parser.parse_args(["serve", "fake-diffusion-model", "--omni", "--api-server-count", "2"])
+    argv = ["serve", "fake-diffusion-model", "--omni", "--api-server-count", "2"]
+    if native_checkpoint:
+        checkpoint = tmp_path / "anima.safetensors"
+        checkpoint.touch()
+        argv[1] = str(checkpoint)
+        argv.extend(["--model-class-name", "AnimaPipeline"])
+    args = parser.parse_args(argv)
 
-    mocker.patch("vllm_omni.diffusion.utils.hf_utils.is_diffusion_model", return_value=True)
+    mocker.patch("vllm_omni.diffusion.utils.hf_utils.is_diffusion_model", return_value=not native_checkpoint)
     validate = mocker.patch("vllm_omni.entrypoints.cli.serve.validate_parsed_serve_args")
 
     with pytest.raises(ValueError, match="not supported for diffusion"):

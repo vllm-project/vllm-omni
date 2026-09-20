@@ -47,6 +47,7 @@ from argparse import Namespace
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -575,7 +576,7 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     Fails if HTTP requests lose ``request_timestamp``, or WebSocket scopes
     start getting stamped / mutated incorrectly.
     """
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
     def fake_build_openai_app(args, supported_tasks):
         return FastAPI()
@@ -603,8 +604,8 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), _minimal_args())
     middleware = captured["served_app"]
 
-    http_scope = {"type": "http", "state": {}}
-    ws_scope = {"type": "websocket"}
+    http_scope: dict[str, Any] = {"type": "http", "state": {}}
+    ws_scope: dict[str, Any] = {"type": "websocket"}
 
     async def _receive():
         return {"type": "http.disconnect"}
@@ -931,11 +932,10 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
     engine = _FakeEngineClient(stage_configs=[stage])
 
     def _for_diffusion_factory(label: str):
-        @classmethod
         def _factory(cls, *args, **kwargs):
             return _marker(label)
 
-        return _factory
+        return classmethod(_factory)
 
     monkeypatch.setattr(api_server.OmniOpenAIServingChat, "for_diffusion", _for_diffusion_factory("chat"))
     monkeypatch.setattr(api_server.OmniOpenAIServingChatBatch, "for_diffusion", _for_diffusion_factory("chat_batch"))
@@ -976,13 +976,11 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch) -> 
     speech_kwargs = {}
 
     def _for_diffusion_factory(label: str):
-        @classmethod
         def _factory(cls, *args, **kwargs):
             return _marker(label)
 
-        return _factory
+        return classmethod(_factory)
 
-    @classmethod
     def _speech_factory(cls, *args, **kwargs):
         speech_kwargs.update(kwargs)
         return _marker("speech")
@@ -996,7 +994,7 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch) -> 
     )
     monkeypatch.setattr(api_server.OmniOpenAIServingVideo, "for_diffusion", _for_diffusion_factory("video"))
     monkeypatch.setattr(api_server.OmniStreamingVideoOutputHandler, "__init__", lambda self, *a, **k: None)
-    monkeypatch.setattr(api_server.OmniOpenAIServingSpeech, "for_diffusion", _speech_factory)
+    monkeypatch.setattr(api_server.OmniOpenAIServingSpeech, "for_diffusion", classmethod(_speech_factory))
     monkeypatch.setattr(
         api_server.ServingRealtimeRobotOpenPI,
         "create_policy_server",
