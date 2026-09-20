@@ -352,20 +352,44 @@ class _PendingAudioCopy:
 # ===================================================================
 
 
+class _TimingEvent(Protocol):
+    def record(self) -> None: ...
+
+    def elapsed_time(self, end_event: _TimingEvent) -> float: ...
+
+
 class _PerfTimer:
-    __slots__ = ("_enabled", "_timers", "_counts", "_starts", "_pairs")
+    __slots__ = (
+        "_enabled",
+        "_device_module",
+        "_timers",
+        "_counts",
+        "_starts",
+        "_pairs",
+    )
 
     def __init__(self, enabled: bool = False):
         self._enabled = enabled
+        self._device_module = None
+        if enabled:
+            device_module = torch.get_device_module(current_omni_platform.get_torch_device())
+            if not hasattr(device_module, "Event"):
+                logger.warning_once(
+                    "VoxCPM2 profiler disabled: the current device does not provide accelerator timing events"
+                )
+                self._enabled = False
+            else:
+                self._device_module = device_module
         self._timers: dict[str, float] = {}
         self._counts: dict[str, int] = {}
-        self._starts: dict[str, torch.cuda.Event] = {}
-        self._pairs: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+        self._starts: dict[str, _TimingEvent] = {}
+        self._pairs: list[tuple[str, _TimingEvent, _TimingEvent]] = []
 
     def start(self, name: str) -> None:
         if not self._enabled:
             return
-        evt = torch.cuda.Event(enable_timing=True)
+        assert self._device_module is not None
+        evt = self._device_module.Event(enable_timing=True)
         evt.record()
         self._starts[name] = evt
 
@@ -373,7 +397,8 @@ class _PerfTimer:
         if not self._enabled or name not in self._starts:
             return
         start_evt = self._starts.pop(name)
-        end_evt = torch.cuda.Event(enable_timing=True)
+        assert self._device_module is not None
+        end_evt = self._device_module.Event(enable_timing=True)
         end_evt.record()
         self._pairs.append((name, start_evt, end_evt))
 
@@ -382,7 +407,18 @@ class _PerfTimer:
             return
         torch.accelerator.synchronize()
         for name, s, e in self._pairs:
-            self._timers[name] = self._timers.get(name, 0.0) + s.elapsed_time(e)
+            try:
+                elapsed_ms = s.elapsed_time(e)
+            except RuntimeError as error:
+                # An event recorded during accelerator graph capture may not
+                # own a runtime recorder. Profiling must not fail inference.
+                logger.warning_once(
+                    "VoxCPM2 profiler discarded invalid event pair %r: %s",
+                    name,
+                    error,
+                )
+                continue
+            self._timers[name] = self._timers.get(name, 0.0) + elapsed_ms
             self._counts[name] = self._counts.get(name, 0) + 1
         self._pairs.clear()
 
@@ -1198,14 +1234,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._feat_encoder_for_unified_capture = compiled
         return compiled
 
-    def _setup_torch_compile(self) -> None:
-        if not self._enable_torch_compile:
+    def _setup_execution_optimizations(self) -> None:
+        if getattr(self, "_eager_optimizations_applied", False):
             return
         tts = self.tts
         estimator = tts.feat_decoder.estimator
-        if hasattr(estimator, "_compiled"):
-            return
-
         targets: list[str] = []
         cfg = self._runtime_config
 
@@ -1224,6 +1257,24 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         if cfg.enable_loc_dit_zero_dt_cache and not getattr(tts.feat_decoder, "mean_mode", False):
             if _install_locdit_zero_dt_cache(estimator):
                 targets.append("LocDiT zero-dt embedding cache")
+
+        # The rewrites above are regular eager PyTorch operations. Ascend does
+        # not support TorchInductor, but still benefits from fused projections
+        # and the cached delta-time embedding.
+        self._eager_optimizations_applied = True
+        if targets:
+            logger.info("VoxCPM2: eager optimizations applied to: %s", ", ".join(targets))
+        if self._enable_torch_compile:
+            self._setup_torch_compile()
+
+    def _setup_torch_compile(self) -> None:
+        tts = self.tts
+        estimator = tts.feat_decoder.estimator
+        if hasattr(estimator, "_compiled"):
+            return
+
+        targets: list[str] = []
+        cfg = self._runtime_config
 
         external_cfm_capture = self._enable_cfm_cuda_graph or self._enable_unified_decode_graph
         if cfg.enable_loc_dit_layer_nvtx:
@@ -1684,8 +1735,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         dtype = self._side_dtype
 
         self._setup_cfm_buffers()
-        if self._enable_torch_compile:
-            self._setup_torch_compile()
+        self._setup_execution_optimizations()
         self.model.precompute_fused_qkv()
         self.residual_model.precompute_fused_qkv()
 
@@ -2391,8 +2441,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._perf.start("prefill_tail_batch")
         tts = self.tts
         self._setup_cfm_buffers()
-        if self._enable_torch_compile:
-            self._setup_torch_compile()
+        self._setup_execution_optimizations()
 
         dit_hs: list[torch.Tensor] = []
         conds: list[torch.Tensor] = []
@@ -2477,8 +2526,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._perf.stop("prefill.dit_proj")
 
         self._setup_cfm_buffers()
-        if self._enable_torch_compile:
-            self._setup_torch_compile()
+        self._setup_execution_optimizations()
 
         pred_feat = self._run_cfm_for_state(state, dit_h, prefix_feat_cond.transpose(1, 2).contiguous())
 
