@@ -19,11 +19,22 @@ from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+# The talker follows the engine dtype (``vllm_config.model_config.dtype``);
+# on a GPU without bfloat16 support ``--dtype float16`` is the only option, so
+# every dtype-sensitive path below runs under both. See
+# test_qwen3_tts_embedding_dtype.py for the constructor-level invariant.
+EMBEDDING_DTYPES = pytest.mark.parametrize(
+    "embedding_dtype",
+    [torch.bfloat16, torch.float16],
+    ids=["bf16", "fp16"],
+)
+
 
 def _make_minimal_talker(
     tts_pad_embed: torch.Tensor | None = None,
     *,
     build_prompt_embeds=None,
+    embedding_dtype: torch.dtype = torch.bfloat16,
 ):
     """Construct a bare ``Qwen3TTSTalkerForConditionalGeneration`` for preprocess tests.
 
@@ -33,18 +44,21 @@ def _make_minimal_talker(
     stub :class:`Qwen3TTSPromptEmbedsBuilder` with a configurable
     ``build_prompt_embeds`` (defaults to raising, since most preprocess
     tests don't exercise the builder).
+
+    ``embedding_dtype`` stands in for what the real ``__init__`` derives from
+    ``vllm_config.model_config.dtype``; tests parametrized with
+    ``EMBEDDING_DTYPES`` pass ``torch.float16`` to cover fp16-only GPUs.
     """
     model = Qwen3TTSTalkerForConditionalGeneration.__new__(Qwen3TTSTalkerForConditionalGeneration)
     model.talker_config = SimpleNamespace(codec_pad_id=7, num_code_groups=16)
-    model._embedding_dtype = torch.bfloat16
+    model._embedding_dtype = embedding_dtype
     if tts_pad_embed is None:
-        tts_pad_embed = torch.zeros((1, 4), dtype=torch.bfloat16)
+        tts_pad_embed = torch.zeros((1, 4), dtype=embedding_dtype)
     model._tts_pad_embed = tts_pad_embed
 
     def _default_raise(**_kwargs):
         raise AssertionError("build_prompt_embeds was not stubbed in this test")
 
-    model._embedding_dtype = torch.bfloat16
     model._prompt_builder = SimpleNamespace(
         build_prompt_embeds=build_prompt_embeds if build_prompt_embeds is not None else _default_raise,
     )
@@ -56,6 +70,7 @@ def _make_minimal_builder(
     config: SimpleNamespace | None = None,
     talker_config: SimpleNamespace | None = None,
     tts_pad_embed: torch.Tensor | None = None,
+    embedding_dtype: torch.dtype = torch.bfloat16,
 ):
     """Construct a bare :class:`Qwen3TTSPromptEmbedsBuilder` instance.
 
@@ -86,16 +101,15 @@ def _make_minimal_builder(
     builder._codec_embed = lambda ids: torch.zeros((*ids.shape, 4), device=ids.device)
     builder._residual_code_embeddings = lambda: []
     builder._speaker_encoder = None
-    builder._embedding_dtype = torch.bfloat16
+    builder._embedding_dtype = embedding_dtype
     builder._tts_pad_embed_buffer = (
-        tts_pad_embed if tts_pad_embed is not None else torch.zeros((1, 4), dtype=torch.bfloat16)
+        tts_pad_embed if tts_pad_embed is not None else torch.zeros((1, 4), dtype=embedding_dtype)
     )
     builder._encode_ref_audio_batch_fn = lambda wavs, sr, *, device: (_ for _ in ()).throw(
         AssertionError("encode_ref_audio_batch_fn not stubbed")
     )
     builder._speaker_cache = None
     builder._text_tokenizer = None
-    builder._embedding_dtype = torch.bfloat16
     builder._ref_audio_artifact_cache_max_entries = 256
     builder._ref_audio_artifact_cache = OrderedDict()
     builder._resampler_cache = OrderedDict()
@@ -103,7 +117,8 @@ def _make_minimal_builder(
     return builder
 
 
-def test_single_token_prefill_uses_prefill_path():
+@EMBEDDING_DTYPES
+def test_single_token_prefill_uses_prefill_path(embedding_dtype):
     full_prompt_embeds = torch.arange(12, dtype=torch.float32).reshape(3, 4)
     trailing_text = torch.ones((2, 4), dtype=torch.float32)
     ref_code = torch.arange(32, dtype=torch.long).reshape(2, 16)
@@ -111,7 +126,10 @@ def test_single_token_prefill_uses_prefill_path():
     def fake_build_prompt_embeds(*, task_type, info_dict):
         return full_prompt_embeds, trailing_text, 2, ref_code
 
-    model = _make_minimal_talker(build_prompt_embeds=fake_build_prompt_embeds)
+    model = _make_minimal_talker(
+        build_prompt_embeds=fake_build_prompt_embeds,
+        embedding_dtype=embedding_dtype,
+    )
 
     input_ids = torch.tensor([123], dtype=torch.long)
     out_ids, out_embeds, update = model.preprocess(
@@ -125,7 +143,8 @@ def test_single_token_prefill_uses_prefill_path():
     )
 
     assert out_ids.tolist() == [7]
-    assert torch.equal(out_embeds.cpu(), full_prompt_embeds[:1].to(torch.bfloat16))
+    assert out_embeds.dtype is embedding_dtype
+    assert torch.equal(out_embeds.cpu(), full_prompt_embeds[:1].to(embedding_dtype))
     assert update["meta"]["talker_prefill_offset"] == 1
     assert update["meta"]["talker_text_offset"] == 0
     assert update["meta"]["ref_code_len"] == 2
@@ -138,14 +157,18 @@ def test_single_token_prefill_uses_prefill_path():
     assert update["codes"]["audio"].shape == (1, 16)
 
 
-def test_single_token_prefill_can_be_inferred_from_token_progress():
+@EMBEDDING_DTYPES
+def test_single_token_prefill_can_be_inferred_from_token_progress(embedding_dtype):
     full_prompt_embeds = torch.arange(8, dtype=torch.float32).reshape(2, 4)
     trailing_text = torch.ones((1, 4), dtype=torch.float32)
 
     def fake_build_prompt_embeds(*, task_type, info_dict):
         return full_prompt_embeds, trailing_text, None, None
 
-    model = _make_minimal_talker(build_prompt_embeds=fake_build_prompt_embeds)
+    model = _make_minimal_talker(
+        build_prompt_embeds=fake_build_prompt_embeds,
+        embedding_dtype=embedding_dtype,
+    )
 
     out_ids, out_embeds, update = model.preprocess(
         input_ids=torch.tensor([123], dtype=torch.long),
@@ -157,13 +180,15 @@ def test_single_token_prefill_can_be_inferred_from_token_progress():
     )
 
     assert out_ids.tolist() == [7]
-    assert torch.equal(out_embeds.cpu(), full_prompt_embeds[:1].to(torch.bfloat16))
+    assert out_embeds.dtype is embedding_dtype
+    assert torch.equal(out_embeds.cpu(), full_prompt_embeds[:1].to(embedding_dtype))
     assert update["meta"]["talker_prefill_offset"] == 1
 
 
-def test_decode_advances_trailing_text_by_offset_without_rewriting_tail():
-    tts_pad = torch.full((1, 4), -1.0, dtype=torch.bfloat16)
-    model = _make_minimal_talker(tts_pad_embed=tts_pad)
+@EMBEDDING_DTYPES
+def test_decode_advances_trailing_text_by_offset_without_rewriting_tail(embedding_dtype):
+    tts_pad = torch.full((1, 4), -1.0, dtype=embedding_dtype)
+    model = _make_minimal_talker(tts_pad_embed=tts_pad, embedding_dtype=embedding_dtype)
 
     def fake_embed_input_ids(input_ids):
         return input_ids.to(torch.float32).reshape(1, 1, 1).expand(1, 1, 4)
@@ -185,17 +210,21 @@ def test_decode_advances_trailing_text_by_offset_without_rewriting_tail():
     )
 
     assert out_ids.tolist() == [123]
-    assert torch.equal(out_embeds.cpu(), torch.full((1, 4), 123.0, dtype=torch.bfloat16))
+    assert out_embeds.dtype is embedding_dtype
+    assert torch.equal(out_embeds.cpu(), torch.full((1, 4), 123.0, dtype=embedding_dtype))
     assert "hidden_states" not in update
     assert update["meta"]["talker_text_offset"] == 2
     past_hidden, text_step = update["mtp_inputs"]
-    assert torch.equal(past_hidden.cpu(), last_hidden.reshape(1, -1).to(torch.bfloat16))
-    assert torch.equal(text_step.cpu(), trailing_text[1:2].to(torch.bfloat16))
+    assert past_hidden.dtype is embedding_dtype
+    assert text_step.dtype is embedding_dtype
+    assert torch.equal(past_hidden.cpu(), last_hidden.reshape(1, -1).to(embedding_dtype))
+    assert torch.equal(text_step.cpu(), trailing_text[1:2].to(embedding_dtype))
 
 
-def test_decode_advances_trailing_text_offset_across_multiple_steps():
-    tts_pad = torch.full((1, 4), -1.0, dtype=torch.bfloat16)
-    model = _make_minimal_talker(tts_pad_embed=tts_pad)
+@EMBEDDING_DTYPES
+def test_decode_advances_trailing_text_offset_across_multiple_steps(embedding_dtype):
+    tts_pad = torch.full((1, 4), -1.0, dtype=embedding_dtype)
+    model = _make_minimal_talker(tts_pad_embed=tts_pad, embedding_dtype=embedding_dtype)
 
     def fake_embed_input_ids(input_ids):
         return input_ids.to(torch.float32).reshape(1, 1, 1).expand(1, 1, 4)
@@ -224,16 +253,18 @@ def test_decode_advances_trailing_text_offset_across_multiple_steps():
             state_tail = update["hidden_states"]["trailing_text"]
         meta = update["meta"]
 
-    assert torch.equal(seen_steps[0], trailing_text[0:1].to(torch.bfloat16))
-    assert torch.equal(seen_steps[1], trailing_text[1:2].to(torch.bfloat16))
-    assert torch.equal(seen_steps[2], tts_pad.to(torch.bfloat16))
+    assert all(step.dtype is embedding_dtype for step in seen_steps)
+    assert torch.equal(seen_steps[0], trailing_text[0:1].to(embedding_dtype))
+    assert torch.equal(seen_steps[1], trailing_text[1:2].to(embedding_dtype))
+    assert torch.equal(seen_steps[2], tts_pad.to(embedding_dtype))
     assert meta["talker_text_offset"] == 0
     assert state_tail.numel() == 0
 
 
-def test_decode_compacts_long_trailing_text_after_large_offset():
-    tts_pad = torch.full((1, 4), -1.0, dtype=torch.bfloat16)
-    model = _make_minimal_talker(tts_pad_embed=tts_pad)
+@EMBEDDING_DTYPES
+def test_decode_compacts_long_trailing_text_after_large_offset(embedding_dtype):
+    tts_pad = torch.full((1, 4), -1.0, dtype=embedding_dtype)
+    model = _make_minimal_talker(tts_pad_embed=tts_pad, embedding_dtype=embedding_dtype)
 
     def fake_embed_input_ids(input_ids):
         return input_ids.to(torch.float32).reshape(1, 1, 1).expand(1, 1, 4)
@@ -254,13 +285,15 @@ def test_decode_compacts_long_trailing_text_after_large_offset():
         _omni_prompt_len=2,
     )
 
-    assert torch.equal(update["mtp_inputs"][1].cpu(), trailing_text[64:65].to(torch.bfloat16))
+    assert update["mtp_inputs"][1].dtype is embedding_dtype
+    assert torch.equal(update["mtp_inputs"][1].cpu(), trailing_text[64:65].to(embedding_dtype))
     assert update["meta"]["talker_text_offset"] == 0
     assert torch.equal(update["hidden_states"]["trailing_text"], trailing_text[65:])
 
 
-def test_decode_replay_span_embeds_all_tokens_without_mutating_decode_state():
-    model = _make_minimal_talker()
+@EMBEDDING_DTYPES
+def test_decode_replay_span_embeds_all_tokens_without_mutating_decode_state(embedding_dtype):
+    model = _make_minimal_talker(embedding_dtype=embedding_dtype)
 
     def fake_embed_input_ids(input_ids):
         return input_ids.to(torch.float32).reshape(-1, 1, 1).expand(-1, 1, 4)
@@ -282,16 +315,18 @@ def test_decode_replay_span_embeds_all_tokens_without_mutating_decode_state():
     )
 
     assert out_ids.tolist() == [101, 202, 303]
+    assert out_embeds.dtype is embedding_dtype
     assert torch.equal(
         out_embeds.cpu(),
-        torch.tensor([[101.0] * 4, [202.0] * 4, [303.0] * 4], dtype=torch.bfloat16),
+        torch.tensor([[101.0] * 4, [202.0] * 4, [303.0] * 4], dtype=embedding_dtype),
     )
     assert update == {"meta": {"codec_streaming": True}}
 
 
-def test_decode_batch_preprocess_matches_decode_state_updates():
-    tts_pad = torch.full((1, 4), -1.0, dtype=torch.bfloat16)
-    model = _make_minimal_talker(tts_pad_embed=tts_pad)
+@EMBEDDING_DTYPES
+def test_decode_batch_preprocess_matches_decode_state_updates(embedding_dtype):
+    tts_pad = torch.full((1, 4), -1.0, dtype=embedding_dtype)
+    model = _make_minimal_talker(tts_pad_embed=tts_pad, embedding_dtype=embedding_dtype)
 
     def fake_embed_input_ids(input_ids):
         return input_ids.to(torch.float32).reshape(-1, 1, 1).expand(-1, 1, 4)
@@ -321,10 +356,13 @@ def test_decode_batch_preprocess_matches_decode_state_updates():
     )
 
     assert out_ids.tolist() == [101, 202]
-    assert torch.equal(out_embeds.cpu(), torch.tensor([[101.0] * 4, [202.0] * 4], dtype=torch.bfloat16))
-    assert torch.equal(past_hidden.cpu(), torch.stack([last_a, last_b]).to(torch.bfloat16))
-    assert torch.equal(text_step[0].cpu(), trailing_a[1].to(torch.bfloat16))
-    assert torch.equal(text_step[1].cpu(), tts_pad.reshape(-1).to(torch.bfloat16))
+    assert out_embeds.dtype is embedding_dtype
+    assert past_hidden.dtype is embedding_dtype
+    assert text_step.dtype is embedding_dtype
+    assert torch.equal(out_embeds.cpu(), torch.tensor([[101.0] * 4, [202.0] * 4], dtype=embedding_dtype))
+    assert torch.equal(past_hidden.cpu(), torch.stack([last_a, last_b]).to(embedding_dtype))
+    assert torch.equal(text_step[0].cpu(), trailing_a[1].to(embedding_dtype))
+    assert torch.equal(text_step[1].cpu(), tts_pad.reshape(-1).to(embedding_dtype))
     assert updates[0]["meta"]["talker_text_offset"] == 2
     assert updates[0]["meta"]["codec_streaming"] is True
     assert "hidden_states" not in updates[0]

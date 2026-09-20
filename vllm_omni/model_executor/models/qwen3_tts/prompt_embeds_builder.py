@@ -334,6 +334,11 @@ class Qwen3TTSPromptEmbedsBuilder:
         ref_audio_artifact_cache_max_entries: Upper bound on the SHA1
             keyed LRU cache of per-ref-audio ``(ref_code, ref_spk_embedding)``
             artifacts. ``0`` disables the cache.
+        embedding_dtype: dtype the assembled prompt embeddings are produced
+            in. Required, with no default on purpose: it must match the
+            engine's configured model dtype, otherwise the runner's
+            ``inputs_embeds`` buffer and these embeddings disagree (fatal on
+            fp16-only GPUs forced to ``--dtype float16``).
     """
 
     def __init__(
@@ -349,6 +354,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         speaker_encoder: nn.Module,
         tts_pad_embed: torch.Tensor,
         encode_ref_audio_batch: Callable[..., list[torch.Tensor]],
+        embedding_dtype: torch.dtype,
         speaker_cache: Any | None = None,
         ref_audio_artifact_cache_max_entries: int = 256,
     ):
@@ -363,7 +369,12 @@ class Qwen3TTSPromptEmbedsBuilder:
         self._tts_pad_embed_buffer = tts_pad_embed
         self._encode_ref_audio_batch_fn = encode_ref_audio_batch
         self._speaker_cache = speaker_cache
-        self._embedding_dtype = torch.bfloat16
+        # Prefill prompt embeddings must agree with the engine's configured
+        # dtype; the talker passes ``vllm_config.model_config.dtype`` in. No
+        # default here on purpose: a bfloat16 default is the very footgun this
+        # argument exists to remove, and it would silently come back for any
+        # future caller that forgets to pass the engine dtype.
+        self._embedding_dtype = embedding_dtype
 
         self._text_tokenizer: Any | None = None
 
