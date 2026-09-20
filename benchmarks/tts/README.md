@@ -294,6 +294,66 @@ benchmarks/tts/
 └── model_configs.yaml         Model registry (supported tasks + extra body)
 ```
 
+## NPU anti-alias FIR microbenchmark
+
+`bench_antialias_chunking.py` benchmarks the shared `UpSample1d` module
+without downloading checkpoints or starting a server. It uses synthetic tensors
+and the production Kaiser-sinc filters, not captured model workloads. This is a
+module-level benchmark, not evidence of end-to-end model speedups.
+`DownSample1d` is intentionally unchanged: splitting its ordinary convolution
+can increase latency even when splitting the transposed convolution is useful.
+
+The experimental `VLLM_OMNI_NPU_ANTIALIAS_MAX_CONV_LENGTH` setting bounds the
+input length of each upsampling depthwise FIR transposed convolution, including
+overlap. It is read once when each `UpSample1d` is constructed. The default is `0` (disabled); a
+positive value must be at least the filter's kernel size. Non-integer, negative,
+or too-small values raise `ValueError` on NPU. Other platforms ignore the
+setting. Kernels shorter than the stride retain the native path. Set the
+variable before constructing the model or starting its worker processes.
+
+Chunking targets long-input performance cliffs in Ascend convolution backends
+(including depthwise 1D FIRs lowered to `Conv3DTransposeV2`). It is not a general
+`ConvTranspose3d` replacement. A cap of `6144` is a starting point for evaluation,
+not a universal optimum across devices, shapes, dtypes, or CANN versions. Short
+inputs keep a single convolution. The implementation preserves global padding
+and cropping; it does not pad individual chunks at their internal boundaries.
+
+In an installed vLLM-Omni NPU environment, from the repository root:
+
+```bash
+python benchmarks/tts/bench_antialias_chunking.py \
+    --device npu:0 --dtype float32 --channels 32 128 \
+    --lengths 512 6144 8192 12288 49152 --max-conv-length 6144 \
+    --warmup 20 --iterations 100 --repeats 5 --output fir-results.json
+```
+
+Repeat for the actual convolution dtype, including `float16` or `bfloat16` if
+used. Each native/chunked case runs in a separate process; failures and timeouts
+are recorded and never treated as speedups. The script checks outputs against a
+CPU reference and reports median synchronized wall time, per-repeat timings,
+errors, device, runtime versions and the imported public module name. Record
+the installed CANN version alongside the report when it is not exported as
+`CANN_VERSION`. Timing includes padding, casts, slicing, convolution,
+concatenation and cropping. Device setup, input creation and correctness checks
+are outside the timed region. Both sides explicitly use `jit_compile=False`
+and `torch.npu.conv.allow_hf32=False` so FP32 CPU-reference comparisons do not
+include HF32 approximation error. These settings affect only benchmark child
+processes, not production model execution. Profiling should be done separately.
+
+Correctness tests, with no model weights required:
+
+```bash
+pytest tests/model_executor/models/common/test_alias_free_activation.py
+pytest tests/model_executor/models/common/test_alias_free_activation_npu.py
+```
+
+The CPU suite covers boundary impulses, non-contiguous tensors, odd kernels,
+multiple strides/batches, disabled and non-NPU paths, strict input-length caps,
+and checkpoint compatibility. The NPU suite checks actual public-module
+execution and dtype preservation. Numeric equivalence is tested with dtype-
+appropriate tolerances; bitwise equality across backends is not promised.
+No model end-to-end or graph-capture performance is claimed by this benchmark.
+
 ## Related
 
 - Upstream seed-tts-eval integration: vllm-project/vllm-omni#2558
