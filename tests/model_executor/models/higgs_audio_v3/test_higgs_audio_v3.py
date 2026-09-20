@@ -1398,10 +1398,14 @@ class TestLoadWeightsEnforcement:
 
 
 class TestStageInputProcessor:
+    def _common(self):
+        from vllm_omni.model_executor.stage_input_processors import _common
+
+        return _common
+
     def test_revert_delay_pattern(self):
-        from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
-            _revert_delay_pattern,
-        )
+        c = self._common()
+        _NUM_CODEBOOKS = 8
 
         # 8 codebooks, 3 real frames -> delayed shape [8, 3+8-1=10]
         Q, T = 8, 3
@@ -1409,31 +1413,27 @@ class TestStageInputProcessor:
         for i in range(Q):
             for t in range(T):
                 delayed[i, i + t] = i * 100 + t  # Real codes at shifted positions
-        result = _revert_delay_pattern(delayed)
+        result = c.revert_delay_pattern(delayed, expected_codebooks=_NUM_CODEBOOKS, allow_short=False)
         assert result.shape == (Q, T)
         for i in range(Q):
             for t in range(T):
                 assert result[i, t].item() == i * 100 + t
 
     def test_revert_delay_pattern_rejects_wrong_codebooks(self):
-        from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
-            _revert_delay_pattern,
-        )
+        c = self._common()
 
         # 7 codebooks should be rejected
         codes = torch.zeros(7, 20)
         with pytest.raises(ValueError, match="Expected exactly 8 codebook rows"):
-            _revert_delay_pattern(codes)
+            c.revert_delay_pattern(codes, expected_codebooks=8, allow_short=False)
 
     def test_revert_delay_pattern_rejects_too_few_frames(self):
-        from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
-            _revert_delay_pattern,
-        )
+        c = self._common()
 
         # 8 codebooks but only 5 frames (need at least 8)
         codes = torch.zeros(8, 5)
         with pytest.raises(ValueError, match="Not enough frames"):
-            _revert_delay_pattern(codes)
+            c.revert_delay_pattern(codes, expected_codebooks=8, allow_short=False)
 
     def test_talker2code2wav_skips_too_few_frames_without_crashing(self):
         from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
@@ -1453,9 +1453,8 @@ class TestStageInputProcessor:
         assert result[0]["prompt_token_ids"] == []
 
     def test_filter_real_code_frames(self):
-        from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
-            _filter_real_code_frames,
-        )
+        c = self._common()
+        _NUM_REAL_CODES = 1024
 
         # 8 codebooks, 4 frames
         codes = torch.tensor(
@@ -1470,7 +1469,7 @@ class TestStageInputProcessor:
                 [107, 207, 1024, 307],
             ]
         )
-        result = _filter_real_code_frames(codes)
+        result = c.filter_real_code_frames(codes, num_real_codes=_NUM_REAL_CODES, layout="codebooks_first")
         # Frame 2 (column 2) has BOC in all codebooks -> filtered out
         assert result.shape == (8, 3)
         assert result[0, 0].item() == 100

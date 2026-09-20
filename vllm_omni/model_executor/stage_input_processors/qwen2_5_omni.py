@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import logging
 
 import torch
@@ -12,6 +15,7 @@ from vllm_omni.data_entry_keys import (
     to_dict,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors import _common
 
 logger = logging.getLogger(__name__)
 
@@ -241,19 +245,9 @@ def thinker2talker_full_payload(
         )
         return None
 
-    def _ensure_list(x):
-        if x is None:
-            return []
-        if hasattr(x, "_x"):
-            # vLLM wraps cached token-id lists in ConstantList-like objects.
-            return list(x._x)
-        if isinstance(x, list):
-            return list(x)
-        return list(x)
-
-    prompt_token_ids = _ensure_list(getattr(request, "prompt_token_ids", None))
-    output_token_ids = _ensure_list(getattr(request, "output_token_ids", None))
-    all_token_ids = _ensure_list(getattr(request, "all_token_ids", None) or [])
+    prompt_token_ids = _common.ensure_list_unchanged(getattr(request, "prompt_token_ids", None))
+    output_token_ids = _common.ensure_list_unchanged(getattr(request, "output_token_ids", None))
+    all_token_ids = _common.ensure_list_unchanged(getattr(request, "all_token_ids", None) or [])
     if not all_token_ids:
         all_token_ids = list(prompt_token_ids) + list(output_token_ids)
 

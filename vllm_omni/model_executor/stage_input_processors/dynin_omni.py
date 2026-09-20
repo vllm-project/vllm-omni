@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import json
@@ -8,6 +11,7 @@ from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors import _common
 
 logger = init_logger(__name__)
 
@@ -16,25 +20,6 @@ def _to_prompt_dict(prompt_item: OmniTokensPrompt | TextPrompt | str | None) -> 
     if isinstance(prompt_item, dict):
         return prompt_item
     return {}
-
-
-def _to_token_id_list(value: Any) -> list[int]:
-    if isinstance(value, torch.Tensor):
-        value = value.detach().to("cpu")
-        if value.ndim == 0:
-            return [int(value.item())]
-        if value.ndim > 1:
-            value = value[0]
-        return [int(x) for x in value.tolist()]
-    if isinstance(value, list):
-        if not value:
-            return []
-        if isinstance(value[0], list):
-            return [int(x) for x in value[0]]
-        return [int(x) for x in value]
-    if value is None:
-        return []
-    return [int(value)]
 
 
 def _to_int(value: Any, default: int = 0) -> int:
@@ -104,9 +89,9 @@ def _bridge_tokens(
         output = source_output.outputs[0]
         mm_out = getattr(output, "multimodal_output", None) or {}
 
-        token_ids = _to_token_id_list(mm_out.get("token_ids"))
+        token_ids = _common.to_token_id_list(mm_out.get("token_ids"))
         if not token_ids:
-            token_ids = _to_token_id_list(mm_out.get("text_tokens"))
+            token_ids = _common.to_token_id_list(mm_out.get("text_tokens"))
         if not token_ids:
             token_ids = list(output.cumulative_token_ids or [])
         if not token_ids:
@@ -175,11 +160,11 @@ def _build_full_payload(pooling_output: dict[str, Any] | None, request: Any) -> 
     if not isinstance(pooling_output, dict):
         pooling_output = {}
 
-    token_ids = _to_token_id_list(pooling_output.get("token_ids"))
+    token_ids = _common.to_token_id_list(pooling_output.get("token_ids"))
     if not token_ids:
-        token_ids = _to_token_id_list(pooling_output.get("text_tokens"))
+        token_ids = _common.to_token_id_list(pooling_output.get("text_tokens"))
     if not token_ids and request is not None:
-        token_ids = _to_token_id_list(getattr(request, "output_token_ids", None))
+        token_ids = _common.to_token_id_list(getattr(request, "output_token_ids", None))
     if not token_ids:
         logger.warning(
             "dynin_omni._build_full_payload: no token_ids found in pooling_output "
@@ -234,9 +219,9 @@ def _token_only_from_source(source_outputs: list[Any]) -> list[OmniTokensPrompt]
     for source_output in source_outputs:
         output = source_output.outputs[0]
         mm_out = getattr(output, "multimodal_output", None) or {}
-        token_ids = _to_token_id_list(mm_out.get("token_ids"))
+        token_ids = _common.to_token_id_list(mm_out.get("token_ids"))
         if not token_ids:
-            token_ids = _to_token_id_list(mm_out.get("text_tokens"))
+            token_ids = _common.to_token_id_list(mm_out.get("text_tokens"))
         if not token_ids:
             token_ids = list(getattr(output, "token_ids", []) or [])
         if not token_ids:

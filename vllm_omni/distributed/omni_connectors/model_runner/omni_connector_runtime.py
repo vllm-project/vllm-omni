@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import importlib
 import inspect
 import os
 import threading
@@ -21,6 +20,10 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
 )
 from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_connector_spec
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import get_local_tp_rank, get_omni_replica_id
+from vllm_omni.model_executor.stage_input_processors import (
+    ProcessorValidationError,
+    resolve_processor,
+)
 
 logger = init_logger("vllm_omni.worker.omni_connector_model_runner_mixin")
 
@@ -577,18 +580,19 @@ class _OmniConnectorRuntimeMixin:
                 continue
             tried.add(func_path)
             try:
-                module_path, func_name = func_path.rsplit(".", 1)
-                module = importlib.import_module(module_path)
-                func = getattr(module, func_name, None)
-                if callable(func):
-                    if not cls._is_connector_payload_builder(func):
-                        logger.debug(
-                            "Skipping incompatible connector payload hook %s; signature=%s",
-                            func_path,
-                            inspect.signature(func),
-                        )
-                        continue
-                    return func_path, func
+                # Resolve through the registry with the full-payload producer
+                # contract.  is_finished is optional here (missing only warns);
+                # a structurally incompatible candidate is skipped so the
+                # fallback chain keeps working.
+                spec = resolve_processor(func_path, expected_kind="producer_full_payload")
+                return spec.path, spec.fn
+            except ProcessorValidationError as exc:
+                logger.debug(
+                    "Skipping incompatible connector payload hook %s: %s",
+                    func_path,
+                    exc,
+                )
+                continue
             except Exception:
                 logger.warning("Failed to load custom func: %s", func_path, exc_info=True)
 

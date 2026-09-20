@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Stage input processor for Fish Speech S2 Pro: Slow AR → DAC Decoder."""
 
 from collections.abc import Mapping
@@ -10,6 +13,7 @@ from vllm_omni.data_entry_keys import (
     MetaStruct,
     OmniPayloadStruct,
 )
+from vllm_omni.model_executor.stage_input_processors import _common
 
 
 def _get_connector_extra(transfer_manager: Any) -> dict[str, Any]:
@@ -92,28 +96,6 @@ def _select_backlog_chunk_size(
     return backlog_chunk_size
 
 
-def _extract_last_frame(multimodal_output: dict[str, Any]) -> torch.Tensor | None:
-    """Extract the last frame of audio codes from the multimodal output."""
-    audio_codes = multimodal_output.get("audio_codes")
-    if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
-        return None
-    if audio_codes.ndim == 2:
-        frame = audio_codes[-1]
-        valid = multimodal_output.get("audio_code_valid")
-        if isinstance(valid, torch.Tensor) and valid.numel() > 0:
-            is_valid = bool(valid.reshape(-1)[-1].item())
-        elif valid is not None:
-            is_valid = bool(valid)
-        else:
-            is_valid = bool(frame.any().item())
-        if frame.numel() == 0 or not is_valid:
-            return None
-        return frame.to(device="cpu", dtype=torch.long).reshape(-1)
-    if audio_codes.ndim == 1:
-        return audio_codes.to(device="cpu", dtype=torch.long).reshape(-1)
-    raise ValueError(f"Invalid audio_codes shape for Fish Speech async_chunk: {tuple(audio_codes.shape)}")
-
-
 def slow_ar_to_dac_decoder_async_chunk(
     transfer_manager: Any,
     multimodal_output: dict[str, Any] | None,
@@ -131,7 +113,13 @@ def slow_ar_to_dac_decoder_async_chunk(
     cfg = _get_connector_extra(transfer_manager)
 
     if isinstance(multimodal_output, Mapping):
-        frame = _extract_last_frame(multimodal_output)
+        frame = _common.extract_last_codec_frame(
+            multimodal_output,
+            key_path=("audio_codes",),
+            validate="valid_mask",
+            to_cpu=True,
+            to_long=True,
+        )
         if frame is not None:
             transfer_manager.code_prompt_token_ids[request_id].append(frame.detach())
     elif not finished:

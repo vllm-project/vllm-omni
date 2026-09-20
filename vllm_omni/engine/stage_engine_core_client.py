@@ -9,7 +9,6 @@ Directly inherits from vLLM's AsyncMPClient to reuse EngineCore architecture.
 
 from __future__ import annotations
 
-import inspect
 import os
 import socket
 from typing import TYPE_CHECKING, Any
@@ -149,6 +148,10 @@ class StageEngineCoreClientBase(StageClientBase):
             self.prompt_transform_func = metadata.prompt_transform_func
             self.prompt_expand_func = metadata.prompt_expand_func
             self.custom_process_input_func = metadata.custom_process_input_func
+            # Raw ``sync_process_input_func`` path so the orchestrator can
+            # resolve the async-chunk prewarm placeholder builder
+            # (``build_prewarm_placeholder``) at prewarm time.
+            self.sync_process_input_func = metadata.sync_process_input_func
 
         self.engine_outputs: Any = None
         self.client_addresses = dict(client_addresses or {})
@@ -433,53 +436,31 @@ class StageEngineCoreClientBase(StageClientBase):
         and the original prompt.
         """
         if self.custom_process_input_func is not None:
-            return self._call_custom_process_input(source_outputs, prompt, streaming_context)
+            # Dispatch through the shared contract layer, replacing the ad-hoc
+            # arity probe (`len(signature.parameters) >= 4`)
+            from vllm_omni.model_executor.stage_input_processors._dispatch import (
+                OrchestratorInputContext,
+                invoke_orchestrator_processor,
+            )
+
+            ctx = OrchestratorInputContext(
+                prompt=prompt,
+                requires_multimodal_data=self.requires_multimodal_data,
+                streaming_context=streaming_context,
+                target_model_config=getattr(getattr(self, "vllm_config", None), "model_config", None),
+                next_stage_hf_config=getattr(self, "_stage_hf_config", None),
+            )
+            return invoke_orchestrator_processor(
+                self.custom_process_input_func,
+                source_outputs,
+                ctx,
+            )
 
         if not self.engine_input_source:
             raise ValueError(f"engine_input_source empty for stage {self.stage_id}")
+        # The default path below is itself a C0-shape processor; it is kept out of
+        # the contract dispatch to preserve its exact fallback semantics unchanged.
         return _default_process_engine_inputs(source_outputs, prompt, self.requires_multimodal_data)
-
-    def _call_custom_process_input(
-        self,
-        source_outputs: list[Any],
-        prompt: Any,
-        streaming_context: Any | None,
-    ) -> list[OmniTokensPrompt]:
-        """Call a stage input processor with its explicitly requested context."""
-        processor = self.custom_process_input_func
-        assert processor is not None
-        signature = inspect.signature(processor)
-        extra_kwargs: dict[str, Any] = {}
-        if "next_stage_hf_config" in signature.parameters:
-            # Let a processor size the next stage's prompt from that
-            # stage's model config (e.g. a talker whose engine positions
-            # must cover a speaker-prompt prefill).
-            extra_kwargs["next_stage_hf_config"] = self._stage_hf_config
-        target_model_config = signature.parameters.get("target_model_config")
-        if target_model_config is not None:
-            # The JoyAI bridge needs the Talker tokenizer and model config
-            # to calculate the exact prompt length.
-            if target_model_config.kind is not inspect.Parameter.KEYWORD_ONLY:
-                raise TypeError("target_model_config must be a keyword-only parameter")
-            extra_kwargs["target_model_config"] = self.vllm_config.model_config
-        # Match the context parameter by name, including the
-        # underscore-prefixed spelling some processors use (e.g.
-        # MiniCPM-o's ``llm2tts(..., _streaming_context)``), so bridge
-        # state keeps flowing to them.
-        if "streaming_context" in signature.parameters or "_streaming_context" in signature.parameters:
-            return processor(
-                source_outputs,
-                prompt,
-                self.requires_multimodal_data,
-                streaming_context,
-                **extra_kwargs,
-            )
-        return processor(
-            source_outputs,
-            prompt,
-            self.requires_multimodal_data,
-            **extra_kwargs,
-        )
 
     async def collective_rpc_async(
         self,

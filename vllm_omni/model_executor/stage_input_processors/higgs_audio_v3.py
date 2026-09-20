@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage-input processor for higgs-audio v3: Talker -> Code2Wav.
 
 Two adapters:
@@ -33,6 +33,7 @@ from vllm_omni.data_entry_keys import (
     OmniPayloadStruct,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors import _common
 
 __all__ = ["talker2code2wav", "talker2code2wav_async_chunk"]
 
@@ -56,43 +57,6 @@ def _empty_code2wav_prompt() -> Any:
         mm_processor_kwargs=None,
         additional_information=None,
     )
-
-
-def _revert_delay_pattern(audio_codes_qt: torch.Tensor) -> torch.Tensor:
-    """Reverse the MusicGen-style delay pattern.
-
-    Input shape: [num_codebooks, seq_len + num_codebooks - 1].
-    Output shape: [num_codebooks, seq_len].
-
-    For each codebook i, extract delayed[i, i : i + seq_len] to remove
-    the i leading BOC pads and Q-1-i trailing EOC entries.
-    """
-    if audio_codes_qt.ndim != 2:
-        raise ValueError(f"_revert_delay_pattern expects [Q, T] input; got {tuple(audio_codes_qt.shape)}")
-    q, t = audio_codes_qt.shape
-    if q != _NUM_CODEBOOKS:
-        raise ValueError(f"Expected exactly {_NUM_CODEBOOKS} codebook rows, got {q}. Input shape: [{q}, {t}]")
-    if t < q:
-        raise ValueError(f"Not enough frames to revert delay pattern: T={t} < Q={q}")
-    seq_len = t - q + 1
-    out_l = []
-    for i in range(q):
-        out_l.append(audio_codes_qt[i : i + 1, i : seq_len + i])
-    return torch.cat(out_l, dim=0)
-
-
-def _filter_real_code_frames(audio_codes_qt: torch.Tensor) -> torch.Tensor:
-    """Keep only frames where ALL codebook values are in [0, 1023].
-
-    Input shape: [num_codebooks, num_frames].
-    Called AFTER delay pattern reversal.
-    """
-    if audio_codes_qt.numel() == 0:
-        return audio_codes_qt
-    # Transpose to [num_frames, num_codebooks] for per-frame filtering
-    frames = audio_codes_qt.t()
-    valid = (frames >= 0).all(dim=1) & (frames < _NUM_REAL_CODES).all(dim=1)
-    return frames[valid].t().contiguous()
 
 
 def talker2code2wav(
@@ -138,7 +102,7 @@ def talker2code2wav(
 
         # Step 1: Revert delay pattern
         try:
-            codes_qt = _revert_delay_pattern(codes_qt)
+            codes_qt = _common.revert_delay_pattern(codes_qt, expected_codebooks=_NUM_CODEBOOKS, allow_short=False)
         except ValueError as exc:
             logger.warning("Skipping invalid Higgs Audio v3 code sequence for Stage 1: %s", exc)
             code2wav_inputs.append(_empty_code2wav_prompt())
@@ -338,7 +302,7 @@ def talker2code2wav_async_chunk(
 
     codes_qt = torch.tensor(window_rows, dtype=torch.long).t().contiguous()
     try:
-        de_delayed = _revert_delay_pattern(codes_qt)
+        de_delayed = _common.revert_delay_pattern(codes_qt, expected_codebooks=_NUM_CODEBOOKS, allow_short=False)
     except ValueError:
         logger.warning(
             "async_chunk: insufficient frames for delay pattern reversal "

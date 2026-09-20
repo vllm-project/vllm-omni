@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen2.5-Omni pipeline topology (frozen).
 
 Stage 0: Thinker  — multimodal understanding + text generation
@@ -12,6 +12,9 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+
+# Talker codec end token id (8294) single-sourced in the stage input processor.
+from vllm_omni.model_executor.stage_input_processors.qwen2_5_omni import TALKER_CODEC_END_TOKEN_ID
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.qwen2_5_omni"
 
@@ -45,7 +48,7 @@ QWEN2_5_OMNI_PIPELINE = PipelineConfig(
             custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
             sampling_constraints={
                 "detokenize": True,
-                "stop_token_ids": [8294],
+                "stop_token_ids": [TALKER_CODEC_END_TOKEN_ID],
             },
             requires_full_payload_input=True,
         ),
