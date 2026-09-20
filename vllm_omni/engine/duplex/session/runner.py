@@ -1128,6 +1128,25 @@ class DuplexSessionRunner:
                 expected_model_turn_id=expected_model_turn_id,
             )
         ):
+            # The planned continuation is stale — a real append landed during
+            # our wait, or the response opened under a new owner (model-turn
+            # continuation -> response continuation). Dropping unconditionally
+            # loses the auto-response invariant that the answer's current
+            # segment can still be closed by a follow-up silence unit. If the
+            # answer is still open and nothing else is queued, re-arm with the
+            # fresh state so ``response.done`` will eventually be emitted
+            # (issue #7729).
+            if (
+                not self.run.closing
+                and session.state == DuplexSessionState.OPEN
+                and session.active_response_id is not None
+                and model_state.pending_silence_task is None
+                and not self._real_input_waiting()
+            ):
+                self.spawn(
+                    self.model.maybe_continue_response(expected_epoch=session.epoch),
+                    name="duplex-continue",
+                )
             return False
 
         def _still_valid() -> bool:
