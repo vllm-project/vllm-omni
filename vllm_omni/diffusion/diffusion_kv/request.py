@@ -113,8 +113,6 @@ class DiffusionKVRequest:
         self.shared_prefix_boundary = 0
         # Opaque request-scoped parameters consumed by an upstream KVConnector.
         self.kv_transfer_params = kv_transfer_params
-        # Mooncake derives the remote-load length from this list. PR0 carries
-        # the field without creating a placeholder or starting a load.
         self.prompt_token_ids = prompt_token_ids
 
     @property

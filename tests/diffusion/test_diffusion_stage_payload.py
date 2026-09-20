@@ -445,6 +445,32 @@ def test_payload_reaches_full_tp_sp_grid_once(monkeypatch, delivered):
         assert 1 < len(connector.calls) <= 41
 
 
+def test_native_kv_runner_keeps_synchronous_payload_transport(monkeypatch):
+    from unittest.mock import Mock
+
+    from vllm_omni.diffusion.worker import diffusion_model_runner as runner_module
+
+    connector = _FakeConnector(_conditioning())
+    manager = _FakeKVTransferManager(connector)
+    config = SimpleNamespace(stage_input_payload_keys=("text_encoder_output",), stage_id=1, kv_transfer_config=object())
+    monkeypatch.setattr(runner_module.OmniKVTransferManager, "from_od_config", lambda config: manager)
+    monkeypatch.setattr(runner_module, "DiffusionKVModelRunnerBackend", Mock())
+    runner = DiffusionModelRunner(SimpleNamespace(), config, torch.device("cpu"))
+    runner._initialize_generator = Mock()
+    request = _make_request({"prompt": "a cat"})
+    request.sampling_params = SimpleNamespace()
+
+    runner._prepare_request_for_forward(request, od_config=config)
+
+    assert runner.kv_transfer_manager is None
+    assert runner._kv_transfer_manager is manager
+    assert runner._kv_connector is None
+    assert not runner._kv_prefetch_enabled
+    assert len(connector.calls) == 1
+    assert "text_encoder_output" in request.prompt["additional_information"]
+    runner._initialize_generator.assert_called_once_with(request.sampling_params)
+
+
 def test_step_mode_receives_payload_before_kv_and_reuses_cached_state():
     connector = _FakeConnector(_conditioning())
     runner = _make_runner(connector)
@@ -459,7 +485,7 @@ def test_step_mode_receives_payload_before_kv_and_reuses_cached_state():
 
     runner.kv_transfer_manager.receive_multi_kv_cache_distributed = receive_kv
     scheduled = SimpleNamespace(
-        scheduled_new_reqs=[SimpleNamespace(request_id=request.request_id, req=request)],
+        scheduled_new_reqs=[SimpleNamespace(request_id=request.request_id, req=request, diffusion_kv_metadata=None)],
         scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
     )
     states, new_ids = runner._update_states(scheduled)

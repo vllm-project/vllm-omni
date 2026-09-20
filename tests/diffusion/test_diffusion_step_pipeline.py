@@ -788,6 +788,65 @@ class TestRunner:
         assert runner.pipeline.denoise_calls == 0
         assert runner.state_cache == {}
 
+    def test_peer_prepare_encode_failure_skips_interaction_session_initialization(self, monkeypatch):
+        """One rank's failure in ``_prepare_batch_inputs -> prepare_encode`` must be handled before all ranks initialize interaction sessions.
+
+        ``maybe_prepare_initial_session`` calls ``synchronized_monotonic_time()``
+        (a broadcast). If this rank's ``prepare_encode`` succeeded while a peer
+        failed, entering that broadcast while the peer enters the failure
+        all-reduce would hang.
+        """
+        from unittest.mock import MagicMock
+
+        from vllm_omni.diffusion.interaction.types import ChunkMediaSpec, InteractionChunkMetadata
+
+        class _InteractionStepPipeline(_StepPipeline):
+            def __init__(self):
+                super().__init__()
+                self.prepare_next_chunk_calls = 0
+
+            def peek_chunk_media(self, state):
+                del state
+                return ChunkMediaSpec(num_media_frames=8, fps=16.0, num_latent_frames=8)
+
+            def apply_interaction_at_chunk_boundary(self, state):
+                del state
+
+            def prepare_next_chunk(self, state):
+                del state
+                self.prepare_next_chunk_calls += 1
+
+        runner = _make_runner()
+        pipeline = _InteractionStepPipeline()
+        runner.pipeline = pipeline
+        coordinator = MagicMock()
+        coordinator.maybe_prepare_initial_session.return_value = InteractionChunkMetadata(
+            started_event_ids=[],
+            active_event_ids=[],
+            completed_event_ids=[],
+        )
+        runner._interaction_coordinator = coordinator
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        # Peer failed during prepare_encode; this rank's local encode succeeds.
+        monkeypatch.setattr(
+            model_runner_module,
+            "_dit_any_rank_failed",
+            lambda local_failed: True,
+        )
+
+        req = _make_step_request(num_inference_steps=1)
+        result = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req))
+
+        output = result.get_request_output("req-1")
+        assert output.finished is True
+        assert output.result is not None
+        assert "another DiT rank" in (output.result.error or "")
+        assert pipeline.prepare_calls == 1
+        coordinator.maybe_prepare_initial_session.assert_not_called()
+        assert pipeline.prepare_next_chunk_calls == 0
+        assert pipeline.denoise_calls == 0
+        assert runner.state_cache == {}
+
     def test_receives_kv_payload_before_prepare_encode(self, monkeypatch):
         runner = _make_runner()
         captured: dict[str, object] = {}

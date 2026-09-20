@@ -1029,6 +1029,16 @@ class DuplexEngineSession:
             last_message, audio_text_marks, _ = response_snapshot
             self._conversation.pending_item_ids[item_id] = copy.deepcopy(last_message)
             self._conversation.pending_item_input_commit_seqs[item_id] = response_snapshot[2]
+            playback = self._playback_cursor_for_item_id(item_id)
+            if (
+                item_id in self._conversation.history_item_placeholders
+                and playback is not None
+                and playback.text_requires_complete_audio
+            ):
+                # Keep the assistant turn between its user inputs even when
+                # unaligned audio cannot establish any heard text. A later
+                # full playback ACK fills this same slot from the snapshot.
+                self._store_history_item_message(item_id, _object_dict(role="assistant", content=""))
             if audio_text_marks:
                 self._conversation.pending_item_audio_text_marks[item_id] = list(copy.deepcopy(audio_text_marks))
             pending_audio_ms = self._conversation.pending_truncations_ms.get(item_id)
@@ -1073,10 +1083,10 @@ class DuplexEngineSession:
             self._conversation.assistant_response_snapshots.pop(response_id, None)
         if message is None:
             return pending is not None or removed_placeholder
-        try:
-            self._conversation.messages.remove(message)
-        except ValueError:
-            pass
+        # Distinct response items can have identical (including empty) content.
+        self._conversation.messages = [
+            candidate for candidate in self._conversation.messages if candidate is not message
+        ]
         return True
 
     def truncate_history_item(
@@ -1167,10 +1177,9 @@ class DuplexEngineSession:
         if changed and self._message_text_len(message) <= 0:
             self._conversation.item_ids.pop(item_id, None)
             self._conversation.item_audio_text_marks.pop(item_id, None)
-            try:
-                self._conversation.messages.remove(message)
-            except ValueError:
-                pass
+            self._conversation.messages = [
+                candidate for candidate in self._conversation.messages if candidate is not message
+            ]
             if item_id.startswith("item_"):
                 self._conversation.assistant_response_snapshots.pop(item_id.removeprefix("item_"), None)
         elif changed and item_id.startswith("item_"):

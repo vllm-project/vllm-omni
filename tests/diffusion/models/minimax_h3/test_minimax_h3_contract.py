@@ -150,7 +150,10 @@ def test_local_encoder_modes_preserve_validated_text_and_unified_handoff(task, t
         num_inference_steps=2,
         extra_args={"task": task, "aspect_ratio": "1:1"},
     )
-    conditioning = pipeline._prepare_local_conditioning(prompt, sampling, require_external_text=text_key is not None)
+    conditioning, window_embeddings = pipeline._prepare_local_conditioning(
+        prompt, sampling, require_external_text=text_key is not None
+    )
+    assert window_embeddings is None
     assert pipeline.encode_prompt.call_count == int(text_key is None)
     assert pipeline.video_vae.encode_image.call_count == int(task != "t2va")
     restored = MiniMaxH3EncoderConditioning.from_omni_payload(conditioning.to_omni_payload())
@@ -571,6 +574,23 @@ def test_encoder_task_validation_and_transformer_routing():
     assert pipeline._resolve_task(None, {"image": object()}) == "fl2va"
     assert pipeline._resolve_task(None, {"audio": object()}) == "ref2va"
     assert pipeline._resolve_task(None, {"video": object()}) == "ref2va"
+    assert pipeline._resolve_task(None, {"audio": object()}, audio_mode="lock_source") == "t2va"
+    assert (
+        pipeline._resolve_task(
+            None,
+            {"image": object(), "audio": object()},
+            audio_mode="lock_source",
+        )
+        == "fl2va"
+    )
+    assert (
+        pipeline._resolve_task(
+            None,
+            {"video": object(), "audio": object()},
+            audio_mode="lock_source",
+        )
+        == "ref2va"
+    )
     fl2v_spec = _turbo_spec("minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors")
     ref2v_spec = _turbo_spec("minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors")
     assert pipeline._resolve_task("fl2va", {"image": object()}, turbo_spec=fl2v_spec) == "fl2va"
@@ -580,9 +600,21 @@ def test_encoder_task_validation_and_transformer_routing():
     assert pipeline._resolve_task("t2va") == "t2va"
     assert pipeline._resolve_task("fl2va") == "fl2va"
     assert pipeline._resolve_task("ref2va") == "ref2va"
+    pipeline.partition = "fl2va"
+    pipeline.supported_tasks = frozenset({"t2va", "fl2va"})
+    assert pipeline._resolve_task(None, {"audio": object()}, audio_mode="lock_source") == "t2va"
+    assert (
+        pipeline._resolve_task(
+            None,
+            {"image": object(), "audio": object()},
+            audio_mode="lock_source",
+        )
+        == "fl2va"
+    )
     pipeline.partition = "ref2va"
     pipeline.supported_tasks = frozenset({"ref2va"})
     assert pipeline._resolve_task("ref2va") == "ref2va"
+    assert pipeline._resolve_task(None, {"audio": object()}, audio_mode="lock_source") == "ref2va"
 
     pipeline.partition = "combined"
     pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
@@ -3405,3 +3437,19 @@ def test_peer_vae_rank_post_decode_reaches_post_processing(monkeypatch):
 
     assert output.output == (b"", None)
     assert mod._minimax_h3_post_process(output.output)["video"] == [b""]
+
+
+@pytest.mark.parametrize("duration", [60, 75])
+def test_long_video_shape_requires_explicit_opt_in(duration):
+    from vllm_omni.errors import OmniClientError
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.model_executor.models.minimax_h3.encoder_processing import resolve_minimax_h3_shape
+
+    sampling = OmniDiffusionSamplingParams(width=960, height=544, fps=24, extra_args={"duration": duration})
+    with pytest.raises(OmniClientError, match="15"):
+        resolve_minimax_h3_shape("ref2va", sampling, None)
+    sampling.extra_args["long_video"] = True
+    _, _, frames, video_t, audio_t = resolve_minimax_h3_shape("ref2va", sampling, None)
+    assert frames >= duration * 24 and frames % 17 == 5
+    assert video_t == (frames - 5) // 17 * 5 + 2
+    assert audio_t == round(frames / 24 * 40)

@@ -50,13 +50,13 @@ class DiffusionStagePayloadMixin(OmniConnectorModelRunnerMixin):
         expected_keys = tuple(getattr(self.od_config, "stage_input_payload_keys", ()) or ())
         if not isinstance(handle, dict) and not expected_keys:
             return
-        from_stage, to_stage = self.kv_transfer_manager.recv_stages
+        from_stage, to_stage = self._kv_transfer_manager.recv_stages
         if not isinstance(handle, dict) and (from_stage is None or to_stage is None):
             raise RuntimeError(f"Stage {self.od_config.stage_id} expects a payload but has no incoming edge")
         sender_info = getattr(req, "payload_sender_info", None) or getattr(req, "kv_sender_info", None)
         if isinstance(sender_info, dict):
             sender_stage = handle.get("from_stage", from_stage) if isinstance(handle, dict) else from_stage
-            sender_info = self.kv_transfer_manager._resolve_sender_info(sender_info, sender_stage)
+            sender_info = self._kv_transfer_manager._resolve_sender_info(sender_info, sender_stage)
         payload = self.recv_stage_payload(
             getattr(req, "external_req_id", None) or req.request_id,
             str(from_stage),
@@ -90,7 +90,7 @@ class DiffusionStagePayloadMixin(OmniConnectorModelRunnerMixin):
         payload_keys = tuple(getattr(self.od_config, "stage_output_payload_keys", ()) or ())
         if not payload_keys:
             return
-        from_stage, to_stage = self.kv_transfer_manager.send_stages
+        from_stage, to_stage = self._kv_transfer_manager.send_stages
         if not from_stage or not to_stage:
             logger.warning("Stage %s declares payload keys but has no outgoing edge", self.od_config.stage_id)
             return

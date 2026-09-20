@@ -227,7 +227,8 @@ class TestWorkerWrapperBaseDelegation:
         wrapper.worker.shutdown.assert_called_once()
         assert result is None
 
-    def test_worker_shutdown_disables_offloader_before_distributed_teardown(self, mocker: MockerFixture):
+    @pytest.mark.parametrize("native_kv", [False, True])
+    def test_worker_shutdown_disables_offloader_before_distributed_teardown(self, mocker: MockerFixture, native_kv):
         events: list[str] = []
         offload_backend = mocker.Mock()
         offload_backend.disable.side_effect = lambda: events.append("offload")
@@ -240,12 +241,14 @@ class TestWorkerWrapperBaseDelegation:
         worker = DiffusionWorker.__new__(DiffusionWorker)
         worker.model_runner = SimpleNamespace(
             offload_backend=offload_backend,
-            kv_transfer_manager=kv_manager,
+            kv_transfer_manager=None if native_kv else kv_manager,
+            _kv_transfer_manager=kv_manager,
         )
 
         worker.shutdown()
 
         assert events == ["offload", "kv", "distributed"]
+        kv_manager.close.assert_called_once_with()
         destroy.assert_called_once_with()
 
 
