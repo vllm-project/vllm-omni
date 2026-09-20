@@ -18,6 +18,7 @@ from torch import nn
 import vllm_omni.diffusion.models.lingbot_world.dmd_block as lingbot_dmd_block
 import vllm_omni.diffusion.models.lingbot_world.pipeline as lingbot_pipeline
 from tests.diffusion.models.wan2_2.conftest import noop_progress_bar
+from vllm_omni.diffusion.interaction.modality_handlers.camera import CameraSession
 from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
 from vllm_omni.diffusion.models.lingbot_world.actions import (
     integrate_lingbot_camera_actions,
@@ -2472,6 +2473,39 @@ def test_stepwise_chunks_continue_one_sessions_temporal_decode(monkeypatch) -> N
     # the shared VAE keeps for it is untouched.
     assert pipeline.vae.decode_inputs == []
     assert pipeline.vae._feat_map == ["module-owned"]
+
+
+def test_prepare_next_chunk_rejects_live_camera_with_scripted_paths() -> None:
+    """Scripted/cached camera must not silently ignore mid-generation camera events."""
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module, transformer=_RecordingTransformer())
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+
+    # Scenario 1, input pre-scripted camera trajectory via action_script
+    state = _stepwise_state(num_frames=21)
+    with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
+        pipeline.prepare_encode(state)
+        assert state.extra.get("camera_action_script") is not None
+        state.interaction_sessions["camera"] = CameraSession(has_received_input=True)
+        with pytest.raises(ValueError, match="camera_action_script"):
+            pipeline.prepare_next_chunk(state)
+
+    # Scenario 2, input pre-scripted camera trajectory via embedding cache
+    poses = torch.eye(4).repeat(21, 1, 1)
+    trajectory = _CameraTrajectory(
+        poses=poses,
+        intrinsics=torch.tensor([[100.0, 100.0, 8.0, 8.0]]).repeat(21, 1),
+    )
+    state = _stepwise_state(num_frames=21)
+    state.sampling.extra_args["_lingbot_camera_trajectory"] = trajectory
+    state.sampling.extra_args.pop("_lingbot_camera_action_script")
+    with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):  # pyright: ignore[reportArgumentType]
+        pipeline.prepare_encode(state)
+        assert state.extra.get("camera_embedding_cache") is not None
+        state.interaction_sessions["camera"] = CameraSession(has_received_input=True)
+        with pytest.raises(ValueError, match="camera_embedding_cache"):
+            pipeline.prepare_next_chunk(state)
 
 
 def test_peek_chunk_media_matches_streaming_decoder_frame_counts(monkeypatch) -> None:

@@ -97,6 +97,8 @@ class CameraSession(InteractionSession):
     target_source: CameraPose | None = None
     # Absolute C2W poses ``[num_latent_frames, 4, 4]`` for the most recent chunk.
     last_absolute_poses: torch.Tensor | None = None
+    # Since a camera session is not lazily initialized, use this field to mark that a client enqueue is ever received.
+    has_received_input: bool = False
 
 
 class SE3DeltaCameraHandler(InteractionHandler):
@@ -181,6 +183,7 @@ class SE3DeltaCameraHandler(InteractionHandler):
         session = state.interaction_sessions.setdefault("camera", CameraSession())
         assert isinstance(session, CameraSession)
         with session.lock:
+            session.has_received_input = True
             session.pending_events.append(
                 QueuedCameraEvent(
                     event_id=event_id,

@@ -1692,6 +1692,12 @@ class LingBotWorldCausalDMDPipeline(
         previous = extra.get("camera_tail")
 
         if extra.get("camera_action_script") is not None:
+            if (
+                (camera_session := state.interaction_sessions.get("camera"))
+                and isinstance(camera_session, CameraSession)
+                and camera_session.has_received_input
+            ):
+                raise ValueError("Cannot use mid-generation camera interaction together with camera_action_script; ")
             chunk_actions = extra["camera_action_script"][state.chunk_index]
             action_trajectory, camera_pitch = integrate_lingbot_camera_actions(
                 chunk_actions,
@@ -1715,9 +1721,12 @@ class LingBotWorldCausalDMDPipeline(
                 previous=previous,
             )
         elif extra.get("camera_embedding_cache") is not None:
-            # Prefer the full-trajectory cache (action_path / request-mode replay)
-            # over live interaction so stepwise serving does not silently drop
-            # a precomputed path when the camera modality is registered.
+            if (
+                (camera_session := state.interaction_sessions.get("camera"))
+                and isinstance(camera_session, CameraSession)
+                and camera_session.has_received_input
+            ):
+                raise ValueError("Cannot use mid-generation camera interaction together with camera_embedding_cache; ")
             trajectory = extra["camera_trajectory_cache"]
             camera = extra["camera_embedding_cache"][:, :, start_frame:stop_frame]
             camera_tail = CameraTrajectory(
