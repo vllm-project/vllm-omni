@@ -1389,7 +1389,7 @@ def normalize_and_validate_diffusion_engine_ingress_kwargs(
         | orchestrator_field_names()
         # Coordination fields also live on the typed orchestrator config, not
         # all of them are present on the CLI-only OrchestratorArgs dataclass.
-        | frozenset(config_field.name for config_field in fields(VllmOmniOrchestratorConfig))
+        | frozenset(config_field.name for config_field in fields(cast(Any, VllmOmniOrchestratorConfig)))
     )
     allowed_fields = stage_consumed_fields | externally_consumed_fields
     validate_omni_diffusion_kwargs(normalized, allowed_fields, stage_id=stage_id)

@@ -8,7 +8,7 @@ import json
 import math
 import os
 from collections.abc import Iterable, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import fields, replace
 from itertools import groupby
 from pathlib import Path
@@ -108,6 +108,12 @@ from .denoise_loop import (
 from .encoder import MiniMaxH3Qwen3VLEncoder
 from .fasth3 import FastH3WeightFusion, resolve_fasth3_fusion
 from .fasth3_checkpoint import FastH3CheckpointSpec
+from .latent_mask import (
+    MiniMaxH3LatentEdit,
+    minimax_h3_audio_edit_masks,
+    minimax_h3_prepare_edit_rows,
+    minimax_h3_video_edit_masks,
+)
 from .lora import TurboSpec, load_minimax_h3_turbo_lora
 from .minimax_h3_transformer import (
     MiniMaxH3Attention,
@@ -138,9 +144,11 @@ from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
     minimax_h3_time_shift_sigmas,
 )
-from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
+from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE, _VideoVAEPartProxy
 
 if TYPE_CHECKING:
+    from PIL import Image
+
     from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import StepRequestState
 
@@ -259,6 +267,12 @@ _MINIMAX_H3_DENOISE_INPUT_KEYS = (
     "audio_condition_lengths",
     "keyframe_frame_indices",
     "pad_seq_len",
+    "video_edit_clean_rows",
+    "video_edit_mask_rows",
+    "video_edit_restore_mask_rows",
+    "audio_edit_clean_rows",
+    "audio_edit_mask_rows",
+    "audio_edit_restore_mask_rows",
 )
 
 # ``StepRequestState.extra`` keys owned by the step-execution path.
@@ -271,6 +285,8 @@ _STEP_COND_ANCHOR = "minimax_h3_cond_anchor"
 _STEP_AUDIO_ANCHOR = "minimax_h3_audio_anchor"
 _STEP_SHAPE = "minimax_h3_shape"
 _STEP_TRANSFORMER = "minimax_h3_transformer"
+_STEP_VIDEO_EDIT = "minimax_h3_video_edit"
+_STEP_AUDIO_EDIT = "minimax_h3_audio_edit"
 
 
 def _minimax_h3_step_schedule(state: StepRequestState) -> dict[str, float]:
@@ -376,12 +392,20 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
 
 def _prepare_minimax_h3_video_output(video: torch.Tensor) -> torch.Tensor:
     """Quantize decoded frames in place before worker-to-engine transfer."""
-    video = video.detach().float()
+    video = video.detach()
+    if video.dtype == torch.uint8:
+        # Streaming decode already quantized and clamped; only the transfer
+        # layout remains.
+        return video.permute(0, 2, 3, 4, 1).contiguous()
+    video = video.float()
     video.clamp_(0, 1).mul_(255).round_()
-    return video.permute(0, 2, 3, 4, 1).to(
-        dtype=torch.uint8,
-        memory_format=torch.contiguous_format,
-    )
+    permuted = video.permute(0, 2, 3, 4, 1)
+    out = torch.empty(permuted.shape, dtype=torch.uint8, device=video.device)
+    # copy_ fuses the layout change and the cast into one kernel;
+    # ``.to(dtype=uint8, memory_format=contiguous_format)`` materializes a
+    # contiguous FP32 intermediate first (~4.2GB for a 15s clip).
+    out.copy_(permuted)
+    return out
 
 
 def _register_dlo_component_cache(cache: BoundedAllocatorCache, *components: Any) -> None:
@@ -395,6 +419,27 @@ def get_minimax_h3_post_process_func(
 ):
     del od_config
     return _minimax_h3_post_process
+
+
+def _expose_padded_audio_tail(
+    source_audio_t: int,
+    *,
+    target_audio_t: int,
+    mask_rows: torch.Tensor,
+    restore_mask_rows: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mark the encoder-padded audio tail for generation."""
+    if not 0 < source_audio_t <= target_audio_t:
+        raise ValueError(f"source_audio_t must be in [1, {target_audio_t}]")
+    expected_shape = (2 * target_audio_t,)
+    if tuple(mask_rows.shape) != expected_shape or tuple(restore_mask_rows.shape) != expected_shape:
+        raise ValueError(f"audio edit masks must have shape {expected_shape}")
+    model_mask = mask_rows.reshape(2, target_audio_t).clone()
+    restore_mask = restore_mask_rows.reshape(2, target_audio_t).clone()
+    if source_audio_t < target_audio_t:
+        model_mask[:, source_audio_t:] = 1.0
+        restore_mask[:, source_audio_t:] = 1.0
+    return model_mask.reshape(-1), restore_mask.reshape(-1)
 
 
 def _resolve_minimax_h3_num_outputs(value: Any) -> int:
@@ -1342,6 +1387,15 @@ class MiniMaxH3Pipeline(
     @contextmanager
     def _component_on_device(self, component: nn.Module):
         if getattr(self, "_model_cpu_offload_modules", None):
+            # Sequential offload hooks whole modules (enable_omni_model_cpu_offload
+            # registers them on the discovered components, e.g. the real
+            # video_vae). Split-residency proxies carry no hook, so unwrap to the
+            # hooked module before entering the context — whole-module movement
+            # has no half-residency benefit anyway. The check is a type check, not
+            # getattr: Mock components auto-create any attribute, which would
+            # unwrap them to a child mock and break scope tracking.
+            if isinstance(component, _VideoVAEPartProxy):
+                component = component.sequential_offload_target
             with sequential_offload_component(component):
                 yield
             return
@@ -1380,6 +1434,50 @@ class MiniMaxH3Pipeline(
     def _is_output_owner_rank() -> bool:
         """Whether this rank's output is returned by the diffusion executor."""
         return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+
+    def _encode_visual_conditions(
+        self,
+        images: list[Image.Image],
+        prepared_videos: list[dict[str, Any]] | None,
+        *,
+        video_count: int,
+    ) -> tuple[torch.Tensor | None, list[tuple[int, int, int]]]:
+        rows: list[torch.Tensor] = []
+        shapes: list[tuple[int, int, int]] = []
+        _, rank, _ = _dit_rank_world()
+        # Keep image and video references in one residency window when both
+        # appear in a request; otherwise the video branch would reload the VAE.
+        # Encoding touches only the CNN encoder half, so the 9GB ViT decoder
+        # stays off the device for the whole window.
+        needs_video_vae = video_count > 0 or (rank == 0 and bool(images))
+        video_vae_context = (
+            self._component_on_device(self.video_vae.encoder_component) if needs_video_vae else nullcontext()
+        )
+        with video_vae_context:
+            if images:
+                image_rows = None
+                if rank == 0:
+                    image_rows = torch.cat([self.video_vae.encode_image(image) for image in images])
+                rows.append(
+                    _broadcast_tensor(
+                        image_rows,
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                )
+                shapes.extend((1, image.height // 16, image.width // 16) for image in images)
+            if video_count:
+                video_rows, video_shapes = self._encode_video_conditions_resident(
+                    prepared_videos,
+                    count=video_count,
+                )
+                rows.append(video_rows)
+                shapes.extend(video_shapes)
+        # The latents are extracted; the encode's input/staging pages are idle
+        # and must not stay mapped through the denoise and decode peaks.
+        if needs_video_vae:
+            self._release_stage_cache()
+        return (torch.cat(rows) if rows else None), shapes
 
     def _offload_model_cpu_stage_output(self, tensor: torch.Tensor) -> torch.Tensor:
         """Release a decoded output's storage before a later seed reloads the DiT.
@@ -1469,6 +1567,12 @@ class MiniMaxH3Pipeline(
         audio_condition_lengths: list[int] | None = None,
         keyframe_frame_indices: list[int] | None = None,
         pad_seq_len: int | None = None,
+        video_edit_clean_rows: torch.Tensor | None = None,
+        video_edit_mask_rows: torch.Tensor | None = None,
+        video_edit_restore_mask_rows: torch.Tensor | None = None,
+        audio_edit_clean_rows: torch.Tensor | None = None,
+        audio_edit_mask_rows: torch.Tensor | None = None,
+        audio_edit_restore_mask_rows: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         """Build the packed layout, initial rows, anchors, and sigma schedules.
 
@@ -1577,6 +1681,41 @@ class MiniMaxH3Pipeline(
             full_audio[branch.audio_update_mask] = initial_audio
             initial_audio = full_audio
 
+        video_edit = None
+        video_edit_values = (video_edit_clean_rows, video_edit_mask_rows, video_edit_restore_mask_rows)
+        if any(value is None for value in video_edit_values) and any(value is not None for value in video_edit_values):
+            raise ValueError("video edit clean, model-mask, and restore-mask rows must be provided together")
+        if (
+            video_edit_clean_rows is not None
+            and video_edit_mask_rows is not None
+            and video_edit_restore_mask_rows is not None
+        ):
+            target_noise = initial_video[branch.update_mask].to(device=self.device, dtype=torch.float32)
+            clean = video_edit_clean_rows.to(device=self.device, dtype=torch.float32)
+            video_edit = MiniMaxH3LatentEdit.from_rows(
+                clean,
+                MINIMAX_H3_IMGVID_COND_TIMESTEP * clean + (1.0 - MINIMAX_H3_IMGVID_COND_TIMESTEP) * target_noise,
+                video_edit_mask_rows,
+                video_edit_restore_mask_rows,
+            )
+
+        audio_edit = None
+        audio_edit_values = (audio_edit_clean_rows, audio_edit_mask_rows, audio_edit_restore_mask_rows)
+        if any(value is None for value in audio_edit_values) and any(value is not None for value in audio_edit_values):
+            raise ValueError("audio edit clean, model-mask, and restore-mask rows must be provided together")
+        if (
+            audio_edit_clean_rows is not None
+            and audio_edit_mask_rows is not None
+            and audio_edit_restore_mask_rows is not None
+        ):
+            clean = audio_edit_clean_rows.to(device=self.device, dtype=torch.float32)
+            audio_edit = MiniMaxH3LatentEdit.from_rows(
+                clean,
+                clean,
+                audio_edit_mask_rows,
+                audio_edit_restore_mask_rows,
+            )
+
         video_sigmas = minimax_h3_time_shift_sigmas(
             num_steps=num_steps,
             shift_scale=video_shift,
@@ -1601,6 +1740,8 @@ class MiniMaxH3Pipeline(
             ),
             "sigmas_video": video_sigmas,
             "sigmas_audio": audio_sigmas,
+            "video_edit": video_edit,
+            "audio_edit": audio_edit,
         }
 
     def _unpack_denoised_rows(
@@ -1659,6 +1800,12 @@ class MiniMaxH3Pipeline(
         audio_condition_lengths: list[int] | None = None,
         keyframe_frame_indices: list[int] | None = None,
         pad_seq_len: int | None = None,
+        video_edit_clean_rows: torch.Tensor | None = None,
+        video_edit_mask_rows: torch.Tensor | None = None,
+        video_edit_restore_mask_rows: torch.Tensor | None = None,
+        audio_edit_clean_rows: torch.Tensor | None = None,
+        audio_edit_mask_rows: torch.Tensor | None = None,
+        audio_edit_restore_mask_rows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         inputs = self._build_denoise_inputs(
             task=task,
@@ -1683,6 +1830,12 @@ class MiniMaxH3Pipeline(
             audio_condition_lengths=audio_condition_lengths,
             keyframe_frame_indices=keyframe_frame_indices,
             pad_seq_len=pad_seq_len,
+            video_edit_clean_rows=video_edit_clean_rows,
+            video_edit_mask_rows=video_edit_mask_rows,
+            video_edit_restore_mask_rows=video_edit_restore_mask_rows,
+            audio_edit_clean_rows=audio_edit_clean_rows,
+            audio_edit_mask_rows=audio_edit_mask_rows,
+            audio_edit_restore_mask_rows=audio_edit_restore_mask_rows,
         )
         branch = inputs["branch"]
         transformer = self._transformer_for_task(task)
@@ -1700,6 +1853,8 @@ class MiniMaxH3Pipeline(
                     device=self.device,
                     imgvid_cond_noise_aug_for_inference=(MINIMAX_H3_IMGVID_COND_TIMESTEP),
                     audio_cond_noise_aug_for_inference=(MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
+                    video_edit=inputs["video_edit"],
+                    audio_edit=inputs["audio_edit"],
                     on_step=lambda step, video, audio: progress.update(),
                 )
 
@@ -1768,6 +1923,26 @@ class MiniMaxH3Pipeline(
             raise ValueError("MiniMax H3 chunked MP4 encoding currently expects one output per decoder")
         return videos[0]
 
+    def _release_stage_cache(self) -> None:
+        """Return idle allocator pages to the device at stage boundaries.
+
+        The bounded component cache releases only past its idle-cache bound
+        (>25% of device capacity), which on large devices lets a finished
+        stage's freed activations -- the DiT's denoise buffers, an encode
+        input, a decoded frame tensor -- stay physically mapped across the
+        next stage's peak. Forcing the release at a boundary is exact (only
+        free pages are returned; live tensors are untouched) and costs one
+        remap per later allocation.
+        """
+        cache = getattr(self, "_dlo_component_cache", None)
+        if cache is not None:
+            try:
+                cache.release_if_needed(force=True)
+            except BaseException:
+                logger.exception("Failed to release retained allocator cache at stage boundary")
+            return
+        current_omni_platform.empty_cache()
+
     def decode(
         self,
         video_latent: torch.Tensor,
@@ -1776,7 +1951,11 @@ class MiniMaxH3Pipeline(
         height: int,
         width: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        with self._component_on_device(self.video_vae):
+        # Denoise just ended: its freed activation pages must not stay mapped
+        # through the VAE decode peak. Decoding needs only the ViT decoder
+        # half of the VAE, so the CNN encoder stays off the device.
+        self._release_stage_cache()
+        with self._component_on_device(self.video_vae.decoder_component):
             with current_omni_platform.create_autocast_context(
                 device_type=self.device.type,
                 dtype=torch.float16,
@@ -1914,7 +2093,14 @@ class MiniMaxH3Pipeline(
         if world_size == 1:
             assert conditioning is not None
             return conditioning
-        tensor_names = ("visual_condition", "audio_condition")
+        tensor_names = (
+            "visual_condition",
+            "audio_condition",
+            "video_edit_clean_rows",
+            "video_edit_mask",
+            "audio_edit_clean_rows",
+            "audio_edit_mask",
+        )
         header = [None]
         if rank == 0:
             assert conditioning is not None
@@ -2110,6 +2296,50 @@ class MiniMaxH3Pipeline(
         visual_shapes = list(conditioning.visual_condition_shapes) or None
         audio_lengths = list(conditioning.audio_condition_lengths) or None
 
+        latent_edit: dict[str, torch.Tensor | None] = {
+            "video_edit_clean_rows": None,
+            "video_edit_mask_rows": None,
+            "video_edit_restore_mask_rows": None,
+            "audio_edit_clean_rows": None,
+            "audio_edit_mask_rows": None,
+            "audio_edit_restore_mask_rows": None,
+        }
+        try:
+            if conditioning.video_edit_clean_rows is not None:
+                if conditioning.video_edit_mask is None:
+                    raise ValueError("MiniMax H3 video edit rows require a mask")
+                video_mask = minimax_h3_video_edit_masks(
+                    conditioning.video_edit_mask,
+                    latent_t=conditioning.latent_t,
+                    latent_h=conditioning.height // 16,
+                    latent_w=conditioning.width // 16,
+                )
+                latent_edit.update(
+                    video_edit_clean_rows=conditioning.video_edit_clean_rows,
+                    video_edit_mask_rows=video_mask.model_mask_rows,
+                    video_edit_restore_mask_rows=video_mask.restore_mask_rows,
+                )
+            if conditioning.audio_edit_clean_rows is not None:
+                if conditioning.audio_edit_mask is None:
+                    raise ValueError("MiniMax H3 audio edit rows require a mask")
+                audio_mask = minimax_h3_audio_edit_masks(
+                    conditioning.audio_edit_mask,
+                    audio_t=conditioning.audio_t,
+                )
+                model_mask, restore_mask = _expose_padded_audio_tail(
+                    conditioning.audio_edit_source_t,
+                    target_audio_t=conditioning.audio_t,
+                    mask_rows=audio_mask.model_mask_rows,
+                    restore_mask_rows=audio_mask.restore_mask_rows,
+                )
+                latent_edit.update(
+                    audio_edit_clean_rows=conditioning.audio_edit_clean_rows,
+                    audio_edit_mask_rows=model_mask,
+                    audio_edit_restore_mask_rows=restore_mask,
+                )
+        except ValueError as exc:
+            raise OmniClientError(str(exc)) from exc
+
         base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
         quality_plan = self._quality_policy.resolve(
             quality=sampling.quality,
@@ -2162,6 +2392,7 @@ class MiniMaxH3Pipeline(
                 if extra.get("preencode_mp4", False)
                 else None
             ),
+            **latent_edit,
         }
 
     @staticmethod
@@ -2209,6 +2440,11 @@ class MiniMaxH3Pipeline(
                 # loop rebinds it. post_decode() rebinds for the same reason.
                 video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
                 videos.append(video)
+                # The FP32 decoded frames are quantized into the appended uint8
+                # tensor; drop the reference and return the idle pages instead of
+                # holding them through the next output's denoise/decode.
+                del video
+                self._release_stage_cache()
                 audios.append(audio)
         if videos and isinstance(videos[0], bytes):
             video = videos[0] if len(videos) == 1 else videos
@@ -2329,6 +2565,8 @@ class MiniMaxH3Pipeline(
                 _STEP_AUDIO_ANCHOR: audio_anchor,
                 _STEP_SIGMAS_VIDEO: sigmas_video,
                 _STEP_SIGMAS_AUDIO: sigmas_audio,
+                _STEP_VIDEO_EDIT: inputs.get("video_edit"),
+                _STEP_AUDIO_EDIT: inputs.get("audio_edit"),
                 _STEP_SHAPE: {
                     "height": context["height"],
                     "width": context["width"],
@@ -2362,11 +2600,39 @@ class MiniMaxH3Pipeline(
         batch_states = list(states if states is not None else input_batch.states)
 
         branches = [state.extra[_STEP_BRANCH] for state in batch_states]
-        video_rows = [state.latents for state in batch_states]
-        audio_rows = [state.extra[_STEP_AUDIO_ROWS] for state in batch_states]
         schedules = [_minimax_h3_step_schedule(state) for state in batch_states]
         transformers = [state.extra[_STEP_TRANSFORMER] for state in batch_states]
         mixed_transformers = len({id(transformer) for transformer in transformers}) > 1
+
+        video_rows: list[torch.Tensor] = []
+        audio_rows: list[torch.Tensor] = []
+        video_target_timesteps: list[torch.Tensor | None] = []
+        audio_target_timesteps: list[torch.Tensor | None] = []
+        for state, branch, schedule in zip(batch_states, branches, schedules, strict=True):
+            video_edit = state.extra.get(_STEP_VIDEO_EDIT)
+            request_video, request_video_timesteps = minimax_h3_prepare_edit_rows(
+                state.latents,
+                branch.update_mask_dev,
+                video_edit,
+                schedule["t_video"],
+                schedule["imgvid_cond_timestep"],
+                sigma=schedule["sigma_video"],
+            )
+            video_target_timesteps.append(request_video_timesteps)
+            video_rows.append(request_video)
+
+            state_audio = state.extra[_STEP_AUDIO_ROWS]
+            audio_edit = state.extra.get(_STEP_AUDIO_EDIT)
+            request_audio, request_audio_timesteps = minimax_h3_prepare_edit_rows(
+                state_audio,
+                branch.audio_update_mask_dev,
+                audio_edit,
+                schedule["t_audio"],
+                schedule["audio_ref_cond_timestep"],
+                sigma=schedule["sigma_audio"],
+            )
+            audio_target_timesteps.append(request_audio_timesteps)
+            audio_rows.append(request_audio)
 
         # Both execution modes must publish denoise progress for step-gated
         # attention features. Requests can differ in both step index and sigma
@@ -2413,6 +2679,8 @@ class MiniMaxH3Pipeline(
                     t_audio=schedules[index]["t_audio"],
                     imgvid_cond_timestep=schedules[index]["imgvid_cond_timestep"],
                     audio_ref_cond_timestep=schedules[index]["audio_ref_cond_timestep"],
+                    video_target_timesteps=video_target_timesteps[index],
+                    audio_target_timesteps=audio_target_timesteps[index],
                 )
                 request_video, request_audio = transformers[index](**forward_kwargs)
                 video_parts.append(request_video)
@@ -2428,6 +2696,8 @@ class MiniMaxH3Pipeline(
                 t_audio=[schedule["t_audio"] for schedule in schedules],
                 imgvid_cond_timesteps=[schedule["imgvid_cond_timestep"] for schedule in schedules],
                 audio_ref_cond_timesteps=[schedule["audio_ref_cond_timestep"] for schedule in schedules],
+                video_target_timesteps=video_target_timesteps,
+                audio_target_timesteps=audio_target_timesteps,
             )
             logger.debug(
                 "MiniMax H3 denoise step: %d request(s) packed into %d rows",
@@ -2461,11 +2731,19 @@ class MiniMaxH3Pipeline(
         audio_anchor = state.extra[_STEP_AUDIO_ANCHOR]
         device = video_rows.device
 
-        x0_video = minimax_h3_rf_v_to_x0(
-            video_rows[update],
-            noise_pred.float()[update],
-            torch.tensor(schedule["t_video"], dtype=torch.float32, device=device),
-        )
+        video_edit = state.extra.get(_STEP_VIDEO_EDIT)
+        if video_edit is None:
+            x0_video = minimax_h3_rf_v_to_x0(
+                video_rows[update],
+                noise_pred.float()[update],
+                torch.tensor(schedule["t_video"], dtype=torch.float32, device=device),
+            )
+        else:
+            x0_video = video_edit.x0(
+                video_edit.model_rows(video_rows[update]),
+                noise_pred.float()[update],
+                schedule["t_video"],
+            )
         new_video = minimax_h3_euler_eta0_step(
             video_rows[update],
             x0_video,
@@ -2477,11 +2755,19 @@ class MiniMaxH3Pipeline(
         if cond_anchor is not None:
             video_rows[~update] = cond_anchor  # per-step imgvid cond reset
 
-        x0_audio = minimax_h3_rf_v_to_x0(
-            audio_rows[audio_update],
-            audio_noise_pred.float()[audio_update],
-            torch.tensor(schedule["t_audio"], dtype=torch.float32, device=device),
-        )
+        audio_edit = state.extra.get(_STEP_AUDIO_EDIT)
+        if audio_edit is None:
+            x0_audio = minimax_h3_rf_v_to_x0(
+                audio_rows[audio_update],
+                audio_noise_pred.float()[audio_update],
+                torch.tensor(schedule["t_audio"], dtype=torch.float32, device=device),
+            )
+        else:
+            x0_audio = audio_edit.x0(
+                audio_edit.model_rows(audio_rows[audio_update]),
+                audio_noise_pred.float()[audio_update],
+                schedule["t_audio"],
+            )
         new_audio = minimax_h3_euler_eta0_step(
             audio_rows[audio_update],
             x0_audio,
@@ -2528,6 +2814,7 @@ class MiniMaxH3Pipeline(
                 width=shape["width"],
             )
             video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
+            self._release_stage_cache()
         return DiffusionOutput(
             output=(video, audio),
             post_process_func=get_minimax_h3_post_process_func(self.od_config),

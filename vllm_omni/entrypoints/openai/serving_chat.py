@@ -3142,13 +3142,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             engine_prompt["mm_processor_kwargs"] = mm_processor_kwargs
         if engine_prompt_data is not None:
             engine_prompt["multi_modal_data"] = engine_prompt_data
-            # Provide multi_modal_uuids so that newer vLLM versions can
-            # validate multi_modal_data / multi_modal_uuids consistency.
-            # Generate one uuid per image when the value is a list (multi-image inputs).
-            engine_prompt["multi_modal_uuids"] = {
-                k: [f"img-{k}-{i}" for i in range(len(v))] if isinstance(v, list) else [f"img-{k}-0"]
-                for k, v in engine_prompt_data.items()
-            }
 
         comprehension_idx = None
         for idx, stage in enumerate(stage_configs):
