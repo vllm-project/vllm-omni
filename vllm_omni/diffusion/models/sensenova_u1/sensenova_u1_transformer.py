@@ -326,7 +326,6 @@ class SenseNovaU1Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             prefix=f"{prefix}.attn",
         )
-        self.attn.attention = self.attn.sdpa_fallback
 
     @staticmethod
     def _align_mask_dtype(mask: torch.Tensor | None, query: torch.Tensor) -> torch.Tensor | None:
@@ -334,6 +333,51 @@ class SenseNovaU1Attention(nn.Module):
         if mask is None or not mask.is_floating_point() or mask.dtype == query.dtype:
             return mask
         return mask.to(query.dtype)
+
+    @staticmethod
+    def _plain_causal_spans(
+        attention_mask: torch.Tensor | None,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> list[list[tuple[int, int]]] | None:
+        """Represent an exact additive causal mask with piecewise metadata.
+
+        FlashAttention cannot consume SenseNova's four-dimensional additive
+        mask directly.  An empty full-attention span list is equivalent only
+        when the mask is precisely a lower-triangular causal matrix.  All
+        other masks retain their SDPA path below.
+        """
+        if (
+            attention_mask is None
+            or attention_mask.ndim != 4
+            or query.shape[1] != key.shape[1]
+            or attention_mask.shape[-2:] != (query.shape[1], key.shape[1])
+            or attention_mask.shape[0] not in (1, query.shape[0])
+        ):
+            return None
+        expected = torch.ones(
+            (query.shape[1], key.shape[1]),
+            dtype=torch.bool,
+            device=attention_mask.device,
+        ).tril()
+        allowed = attention_mask.eq(0)
+        additive = (attention_mask == 0) | torch.isneginf(attention_mask)
+        if not bool(additive.all()) or not bool((allowed == expected).all()):
+            return None
+        return [[] for _ in range(query.shape[0])]
+
+    def _attn_metadata(
+        self,
+        attention_mask: torch.Tensor | None,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> AttentionMetadata | None:
+        if attention_mask is None:
+            return None
+        spans = self._plain_causal_spans(attention_mask, query, key)
+        if spans is not None and self.attn.attn_backend.supports_piecewise_spans:
+            return AttentionMetadata(full_attn_spans=spans)
+        return AttentionMetadata(attn_mask=attention_mask)
 
     def _run_attn(
         self,
@@ -347,7 +391,9 @@ class SenseNovaU1Attention(nn.Module):
         k = key_bhsd.transpose(1, 2).contiguous()
         v = value_bhsd.transpose(1, 2).contiguous()
         attention_mask = self._align_mask_dtype(attention_mask, q)
-        attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
+        attn_metadata = self._attn_metadata(attention_mask, q, k)
+        if attn_metadata is not None and attn_metadata.attn_mask is not None:
+            return self.attn.sdpa_fallback.forward(q, k, v, attn_metadata)
         return self.attn(q, k, v, attn_metadata)
 
     def _run_attn_bshd(
@@ -359,7 +405,9 @@ class SenseNovaU1Attention(nn.Module):
     ) -> torch.Tensor:
         """Run unified attention with [B, S, H, D] inputs. Returns [B, S, H, D]."""
         attention_mask = self._align_mask_dtype(attention_mask, query_bshd)
-        attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
+        attn_metadata = self._attn_metadata(attention_mask, query_bshd, key_bshd)
+        if attn_metadata is not None and attn_metadata.attn_mask is not None:
+            return self.attn.sdpa_fallback.forward(query_bshd, key_bshd, value_bshd, attn_metadata)
         return self.attn(query_bshd, key_bshd, value_bshd, attn_metadata)
 
     def _project_and_rope(self, hidden_states, position_embeddings, qkv_proj, q_norm, k_norm, q_norm_hw, k_norm_hw):
