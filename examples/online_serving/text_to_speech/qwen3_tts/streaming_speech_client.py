@@ -116,12 +116,43 @@ def timestamp_words_text(timestamps: list[dict] | None) -> str:
     return " ".join(str(item.get("word", "")) for item in timestamps if item.get("word"))
 
 
+def simulate_stt_units(text: str) -> list[str]:
+    """Split text into token-sized pieces for ``--simulate-stt``.
+
+    Space-delimited text is split into words, which is roughly one LLM token
+    each. Text containing CJK cannot use that rule because CJK is not written
+    with spaces, so each CJK character becomes its own piece (also roughly one
+    token) while runs of other characters are kept together.
+    """
+    if not any("一" <= c <= "鿿" for c in text):
+        words = text.split(" ")
+        # Keep the separating space on all but the last word so that
+        # "".join(units) reproduces the original text.
+        return [w + (" " if i < len(words) - 1 else "") for i, w in enumerate(words)]
+
+    units: list[str] = []
+    pending = ""
+    for c in text:
+        if "一" <= c <= "鿿":
+            if pending:
+                units.append(pending)
+                pending = ""
+            units.append(c)
+        else:
+            pending += c
+    if pending:
+        units.append(pending)
+    return units
+
+
 async def send_utterance(ws, text: str, simulate_stt: bool, stt_delay: float) -> None:
     """Send one utterance's text, then input.done to flush it."""
     if simulate_stt:
-        words = text.split(" ")
-        for i, word in enumerate(words):
-            chunk = word + (" " if i < len(words) - 1 else "")
+        # Feed the text in token-sized pieces and let the server's
+        # split_granularity do the segmentation. Splitting on punctuation here
+        # would duplicate the server's job and make it impossible to tell which
+        # layer is responsible for the boundaries.
+        for chunk in simulate_stt_units(text):
             await ws.send(
                 json.dumps(
                     {
