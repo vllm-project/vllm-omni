@@ -14,6 +14,12 @@ HANDLE_KEY = DiffusionModelRunner._STAGE_PAYLOAD_HANDLE_KEY
 
 
 class _FakeConnector:
+    def abandon_get(self, get_key):
+        pass
+
+    def get_with_deadline(self, from_stage, to_stage, get_key, metadata=None, *, deadline):
+        return self.get(from_stage, to_stage, get_key, metadata)
+
     def __init__(self, payload=None, *, raises=False, put_result=(True, 128, {"schema_version": 1})):
         self._payload = payload
         self._raises = raises
@@ -37,6 +43,10 @@ class _FakeConnector:
 
 
 class _FakeKVTransferManager:
+    from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
+
+    _resolve_sender_info = OmniKVTransferManager._resolve_sender_info
+
     def __init__(self, connector, recv_stages=("0", "1"), send_stages=("0", "1")):
         self.connector = connector
         self.recv_stages = recv_stages
@@ -248,6 +258,26 @@ def test_synchronous_receive_keeps_endpoints_request_scoped_and_uses_external_id
     assert runner._get_req_chunk == {}
 
 
+@pytest.mark.parametrize("stage_key", [2, "2"])
+@pytest.mark.parametrize("use_handle", [False, True])
+def test_sender_map_selects_actual_source_stage(stage_key, use_handle):
+    connector = _FakeConnector(_conditioning())
+    runner = _make_runner(connector, recv_stages=("0" if use_handle else "2", "5"))
+    prompt = {}
+    if use_handle:
+        prompt[HANDLE_KEY] = {"key": "explicit", "from_stage": "2", "to_stage": "5"}
+    request = _make_request(
+        prompt,
+        payload_sender_info={
+            "0": {"host": "wrong", "zmq_port": 50000},
+            stage_key: {"host": "right", "zmq_port": 50002},
+        },
+    )
+    runner._maybe_recv_stage_payload(request)
+    assert connector.calls[0][0:2] == ("2", "5")
+    assert connector.calls[0][3] == {"source_host": "right", "source_port": 50002}
+
+
 def test_tp_payload_is_fetched_once_by_leader_and_broadcast_to_followers():
     connector = _FakeConnector(_conditioning())
     state = {}
@@ -310,8 +340,10 @@ def test_tp_payload_miss_is_broadcast_without_follower_connector_access():
     follower._local_rank = 1
     follower._get_local_tp_group = lambda: _FakeTPGroup(1)
 
-    leader._maybe_recv_stage_payload(_make_request({"prompt": "a cat"}))
-    follower._maybe_recv_stage_payload(_make_request({"prompt": "a cat"}))
+    with pytest.raises(RuntimeError, match="Stage payload unavailable"):
+        leader._maybe_recv_stage_payload(_make_request({"prompt": "a cat"}))
+    with pytest.raises(RuntimeError, match="Stage payload unavailable"):
+        follower._maybe_recv_stage_payload(_make_request({"prompt": "a cat"}))
 
     assert 1 < len(connector.calls) <= 41
 
@@ -360,7 +392,8 @@ def test_missing_incoming_edge_is_reported_not_fetched():
     runner = _make_runner(connector, recv_stages=(None, None))
     req = _make_request({"prompt": "a cat"})
 
-    runner._maybe_recv_stage_payload(req)
+    with pytest.raises(RuntimeError, match="no incoming edge"):
+        runner._maybe_recv_stage_payload(req)
 
     assert connector.calls == []
     assert "additional_information" not in req.prompt
@@ -399,13 +432,13 @@ def test_payload_reaches_full_tp_sp_grid_once(monkeypatch, delivered):
             monkeypatch.setattr(parallel_state, "get_sp_group", lambda: sp_group)
             request = _make_request({"prompt": "a cat"})
 
-            runner._maybe_recv_stage_payload(request)
-
             if delivered:
+                runner._maybe_recv_stage_payload(request)
                 output = request.prompt["additional_information"]["text_encoder_output"]
                 assert torch.equal(output["hidden_states"], connector._payload["text_encoder_output"]["hidden_states"])
             else:
-                assert "additional_information" not in request.prompt
+                with pytest.raises(RuntimeError, match="Stage payload unavailable"):
+                    runner._maybe_recv_stage_payload(request)
     if delivered:
         assert len(connector.calls) == 1
     else:
@@ -453,6 +486,25 @@ def test_non_dict_prompt_is_left_alone():
 
     assert connector.calls == []
     assert req.prompt == "a cat"
+
+
+@pytest.mark.parametrize("request_id", ["dummy_req_id", "dummy_req_id/profile"])
+def test_warmup_never_receives_or_publishes_payload(request_id):
+    connector = _FakeConnector(raises=True)
+    request = _make_request({}, request_id=request_id)
+    receiver = _make_runner(connector)
+    receiver._maybe_recv_stage_payload(request)
+    sender = _make_sender(connector)
+    sender._maybe_send_stage_payload([request], [_make_output(prompt_embeds=torch.ones(1))])
+    assert connector.calls == []
+    assert connector.put_calls == []
+
+
+@pytest.mark.parametrize("inline", [{}, {"text_encoder_output": None}])
+def test_failed_transfer_requires_complete_inline_payload(inline):
+    runner = _make_runner(_FakeConnector(raises=True))
+    with pytest.raises(RuntimeError, match="missing keys.*text_encoder_output"):
+        runner._maybe_recv_stage_payload(_make_request({"additional_information": inline}))
 
 
 def test_send_puts_declared_keys_and_attaches_a_handle():

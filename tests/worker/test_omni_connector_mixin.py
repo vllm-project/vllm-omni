@@ -60,6 +60,13 @@ class MockConnector:
     def close(self):
         pass
 
+    def get_with_deadline(self, from_stage, to_stage, get_key, metadata=None, *, deadline):
+        self.last_deadline = deadline
+        return self.get(from_stage, to_stage, get_key, metadata)
+
+    def abandon_get(self, get_key):
+        self.abandoned_key = get_key
+
 
 def _make_model_config(
     stage_id: int = 0,
@@ -124,6 +131,8 @@ def test_synchronous_payload_init_borrows_connector_without_threads_or_kv_mutati
     assert vars(manager) == original_state
     connector.put("2", "5", "external_2_0", {"value": 7})
     assert host.recv_stage_payload("external", "2", "5") == {"value": 7}
+    assert isinstance(connector.last_deadline, float)
+    assert connector.abandoned_key == "external_2_0"
     with patch.object(connector, "close") as close:
         host.shutdown_omni_connectors()
         close.assert_not_called()

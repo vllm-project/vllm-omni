@@ -1025,6 +1025,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     prompt=sched_new_req.req.prompt,
                     kv_sender_info=sched_new_req.req.kv_sender_info,
                     prepared_layout=getattr(sched_new_req.req, "prepared_layout", None),
+                    external_req_id=getattr(sched_new_req.req, "external_req_id", None),
                 )
                 state_req = copy.copy(sched_new_req.req)
                 state_req.sampling_params = new_state.sampling
@@ -1344,6 +1345,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                 if self.od_config.streaming_output
                                 else req.denoise_completed
                             )
+                            if finished and result is not None:
+                                self._maybe_send_stage_payload([req], [result])
                             runner_output_list.append(
                                 RunnerOutput(
                                     request_id=req.request_id,

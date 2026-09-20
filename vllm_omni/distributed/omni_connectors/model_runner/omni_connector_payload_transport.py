@@ -278,7 +278,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     ) -> Any:
         """Synchronously receive one payload, then fan out on the model thread.
 
-        The retry budget bounds repeated misses, not a blocking connector call.
+        The same monotonic deadline covers discovery and backend transfer waits.
         This path does not register work with the asynchronous poller.
         """
         from_stage, to_stage, get_key, metadata = self._stage_payload_recv_spec(
@@ -293,7 +293,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 deadline = time.monotonic() + retry_seconds
                 try:
                     while True:
-                        result = self._recv_full_payload_result(connector, from_stage, to_stage, get_key, metadata)
+                        result = connector.get_with_deadline(from_stage, to_stage, get_key, metadata, deadline=deadline)
                         if result is not None:
                             break
                         remaining = deadline - time.monotonic()
@@ -302,9 +302,14 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                         time.sleep(min(0.05, remaining))
                 except Exception as exc:
                     logger.warning("Stage payload get failed for %s: %s", get_key, exc)
+                finally:
+                    try:
+                        connector.abandon_get(get_key)
+                    except Exception as exc:
+                        logger.warning("Stage payload claim retirement failed for %s: %s", get_key, exc)
         payload = self._broadcast_tp_payload_packet(result[0] if result else None, tensor_payload=True)
         if payload is None and self.is_data_transfer_rank():
-            logger.warning("Stage payload %s was not delivered; falling back to the inline prompt", get_key)
+            logger.warning("Stage payload %s was not delivered; caller must validate inline fallback", get_key)
         return payload
 
     def _apply_staged_payloads_locked(self, staged_payloads: dict[str, Any]) -> None:
@@ -1086,19 +1091,19 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         handle: dict[str, Any] | None = None,
     ) -> tuple[str, str, str | None, dict[str, Any] | None]:
         """Resolve a connector-independent request key and transfer metadata."""
-        if isinstance(handle, dict):
-            return (
-                str(handle.get("from_stage", from_stage)),
-                str(handle.get("to_stage", to_stage)),
-                handle.get("key"),
-                handle.get("metadata"),
-            )
         metadata = None
         if isinstance(sender_info, dict):
             host = sender_info.get("host")
             port = sender_info.get("zmq_port")
             if host and port:
                 metadata = {"source_host": str(host), "source_port": int(port)}
+        if isinstance(handle, dict):
+            return (
+                str(handle.get("from_stage", from_stage)),
+                str(handle.get("to_stage", to_stage)),
+                handle.get("key"),
+                handle.get("metadata") or metadata,
+            )
         return str(from_stage), str(to_stage), f"{external_req_id}_{from_stage}_{chunk_id}", metadata
 
     def _poll_single_request(self, req_id: str) -> bool:

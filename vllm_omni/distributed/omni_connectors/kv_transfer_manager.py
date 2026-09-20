@@ -1365,6 +1365,16 @@ class OmniKVTransferManager:
                 logger.exception("Failed to shut down KV prefetch executor")
             self._prefetch_executor = None
 
+    def close(self) -> None:
+        """Stop prefetch work before closing the connector owned by this manager."""
+        try:
+            self.shutdown_prefetch()
+        finally:
+            connector = self._connector
+            self._connector = False
+            if connector:
+                connector.close()
+
     @staticmethod
     def _record_stream_for_prefetched(data: dict[str, Any]) -> None:
         """``record_stream(current_stream)`` on GPU tensors in *data*.

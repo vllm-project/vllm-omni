@@ -984,7 +984,7 @@ class DiffusionWorker:
                         offload_backend.disable()
                 finally:
                     if mgr is not None:
-                        mgr.shutdown_prefetch()
+                        mgr.close()
         finally:
             try:
                 shutdown_kv_connector()

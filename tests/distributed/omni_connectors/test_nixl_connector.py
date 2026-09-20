@@ -576,6 +576,89 @@ def test_unknown_key_is_queried_once(producer, consumer, monkeypatch, force_time
         assert socket.closed
 
 
+@pytest.mark.usefixtures("reliable_claim_queries")
+def test_deadline_get_retains_active_dma_then_releases(producer, consumer, ownership_copying_agent, monkeypatch):
+    producer.put("0", "1", "deadline-read", torch.ones(2))
+    consumer._stop_event.set()
+    consumer._transfer_wakeup.set()
+    consumer._transfer_thread.join(timeout=2)
+    state = ["PROC"]
+    monkeypatch.setattr(consumer._agent, "check_xfer_state", lambda handle: state[0])
+    started = time.monotonic()
+    assert consumer.get_with_deadline("0", "1", "deadline-read", deadline=started + 0.03) is None
+    assert time.monotonic() - started < 0.5
+    assert producer._pending["deadline-read"].claims
+    assert producer._agent.registered
+    assert consumer._agent.registered
+    assert consumer._deferred_transfers
+    state[0] = "DONE"
+    consumer._reap_deferred_transfers()
+    assert not producer._pending
+    assert not producer._agent.registered
+    assert not consumer._agent.registered
+    assert not consumer._deferred_transfers
+
+
+def test_receive_deadline_overrides_dma_timeout(consumer, monkeypatch):
+    monkeypatch.setattr(consumer._agent, "check_xfer_state", lambda handle: "PROC", raising=False)
+    consumer._transfer_timeout_s = 300
+    consumer._req_local.deadline = time.monotonic() + 0.02
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError):
+            consumer._wait_for_transfer(1, "bounded")
+        assert time.monotonic() - started < 0.5
+    finally:
+        consumer._req_local.deadline = None
+
+
+@pytest.mark.parametrize("closing", [False, True])
+def test_abandoned_metadata_query_recovers_same_claim_without_read(producer, consumer, monkeypatch, closing):
+    from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import _GET_META_MSG
+
+    consumer._stop_event.set()
+    consumer._transfer_wakeup.set()
+    consumer._transfer_thread.join(timeout=2)
+    producer.put("0", "1", "abandoned-query", torch.ones(1))
+    messages = []
+
+    def send(message):
+        messages.append(message)
+
+    def receive():
+        reply = producer._handle_handshake_message(messages[-1])
+        if len(messages) == 1:
+            raise zmq.Again()
+        return reply
+
+    socket = types.SimpleNamespace(send=send, recv=receive)
+    monkeypatch.setattr(consumer, "_get_req_socket", lambda *args: socket)
+    monkeypatch.setattr(consumer, "_invalidate_req_socket", lambda *args: None)
+    assert consumer.get_with_deadline("0", "1", "abandoned-query", deadline=time.monotonic() + 1) is None
+    assert not consumer._abandoned_queries
+    consumer.abandon_get("abandoned-query")
+    claim = next(iter(producer._pending["abandoned-query"].claims))
+    if closing:
+        producer._closing = True
+    consumer._reap_deferred_transfers()
+    assert not consumer._abandoned_queries
+    assert not producer._pending
+    claims = [
+        msgspec.msgpack.decode(message[len(_GET_META_MSG) :])["claim_id"]
+        for message in messages
+        if message.startswith(_GET_META_MSG)
+    ]
+    assert claims == [claim, claim]
+
+
+def test_expired_ack_is_deferred_instead_of_raising(consumer):
+    consumer._req_local.deadline = time.monotonic() - 1
+    try:
+        assert consumer._notify_transfer_done("expired", {"source_host": "127.0.0.1", "source_port": PORT}) is False
+    finally:
+        consumer._req_local.deadline = None
+
+
 @pytest.mark.parametrize("direct", [False, True])
 @pytest.mark.parametrize("lost_replies", [1, 3])
 def test_lost_metadata_reply_retry_releases_source(producer, consumer, monkeypatch, direct, lost_replies):

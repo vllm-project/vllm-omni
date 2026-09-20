@@ -1641,7 +1641,8 @@ def test_from_pipeline_config_rejects_reserved_diffusion_kv_mode(tmp_path):
 
 
 @pytest.mark.parametrize("source", ["default", "topology", "deploy", "stage-cli"])
-def test_diffusion_stage_payload_keys_roundtrip(source):
+@pytest.mark.parametrize("key_container", [list, tuple])
+def test_diffusion_stage_payload_keys_roundtrip(source, key_container):
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
 
@@ -1678,6 +1679,8 @@ def test_diffusion_stage_payload_keys_roundtrip(source):
     diffusion_kwargs = omni_config_module.extract_diffusion_stage_config_kwargs(
         engine_args, stage_id=restored_stage.stage_id, include_engine_adapter_metadata=True
     )
+    for name in topology_keys:
+        diffusion_kwargs[name] = key_container(diffusion_kwargs[name])
     od_config = OmniDiffusionConfig.from_kwargs(**diffusion_kwargs)
 
     for name, keys in expected.items():

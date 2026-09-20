@@ -232,7 +232,7 @@ class TestWorkerWrapperBaseDelegation:
         offload_backend = mocker.Mock()
         offload_backend.disable.side_effect = lambda: events.append("offload")
         kv_manager = mocker.Mock()
-        kv_manager.shutdown_prefetch.side_effect = lambda: events.append("kv")
+        kv_manager.close.side_effect = lambda: events.append("kv")
         destroy = mocker.patch(
             "vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env",
             side_effect=lambda: events.append("distributed"),

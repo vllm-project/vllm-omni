@@ -41,6 +41,8 @@ class DiffusionStagePayloadMixin(OmniConnectorModelRunnerMixin):
         return tuple(groups)
 
     def _maybe_recv_stage_payload(self, req: OmniDiffusionRequest) -> None:
+        if OmniDiffusionRequest.is_dummy_run_request_id(req.request_id):
+            return
         prompt = getattr(req, "prompt", None)
         if not isinstance(prompt, dict):
             return
@@ -50,11 +52,11 @@ class DiffusionStagePayloadMixin(OmniConnectorModelRunnerMixin):
             return
         from_stage, to_stage = self.kv_transfer_manager.recv_stages
         if not isinstance(handle, dict) and (from_stage is None or to_stage is None):
-            logger.warning("Stage %s expects a payload but has no incoming edge", self.od_config.stage_id)
-            return
+            raise RuntimeError(f"Stage {self.od_config.stage_id} expects a payload but has no incoming edge")
         sender_info = getattr(req, "payload_sender_info", None) or getattr(req, "kv_sender_info", None)
-        if isinstance(sender_info, dict) and "host" not in sender_info:
-            sender_info = sender_info.get(0, sender_info.get("0"))
+        if isinstance(sender_info, dict):
+            sender_stage = handle.get("from_stage", from_stage) if isinstance(handle, dict) else from_stage
+            sender_info = self.kv_transfer_manager._resolve_sender_info(sender_info, sender_stage)
         payload = self.recv_stage_payload(
             getattr(req, "external_req_id", None) or req.request_id,
             str(from_stage),
@@ -62,13 +64,16 @@ class DiffusionStagePayloadMixin(OmniConnectorModelRunnerMixin):
             sender_info=sender_info,
             handle=handle if isinstance(handle, dict) else None,
         )
-        if not isinstance(payload, dict):
-            return
-        target_device = self._target_device or self.device
         additional = prompt.setdefault("additional_information", {})
-        for name, value in payload.items():
-            if not expected_keys or name in expected_keys:
-                additional[name] = _to_device(value, target_device)
+        if isinstance(payload, dict):
+            target_device = self._target_device or self.device
+            for name, value in payload.items():
+                if not expected_keys or name in expected_keys:
+                    additional[name] = _to_device(value, target_device)
+        required_keys = expected_keys or (handle.get("payload_keys", ()) if isinstance(handle, dict) else ())
+        missing = [name for name in required_keys if additional.get(name) is None]
+        if missing or (isinstance(handle, dict) and not required_keys and not isinstance(payload, dict)):
+            raise RuntimeError(f"Stage payload unavailable for {req.request_id}; missing keys: {missing}")
 
     def _maybe_send_stage_payload(
         self,
@@ -80,6 +85,8 @@ class DiffusionStagePayloadMixin(OmniConnectorModelRunnerMixin):
         Pipelines must gather sharded outputs before calling this adapter.
         Every rank publishes the same handle and drops only transferred keys.
         """
+        if all(OmniDiffusionRequest.is_dummy_run_request_id(req.request_id) for req in reqs):
+            return
         payload_keys = tuple(getattr(self.od_config, "stage_output_payload_keys", ()) or ())
         if not payload_keys:
             return
@@ -92,6 +99,8 @@ class DiffusionStagePayloadMixin(OmniConnectorModelRunnerMixin):
             connector = self._stage_payload_connector()
             if connector is not None:
                 for req, output in zip(reqs, outputs):
+                    if OmniDiffusionRequest.is_dummy_run_request_id(req.request_id):
+                        continue
                     custom = getattr(output, "custom_output", None)
                     if not isinstance(custom, dict):
                         continue
