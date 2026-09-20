@@ -5,6 +5,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
+
 from vllm_omni.model_executor.models.common import alias_free_activation as fir
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]

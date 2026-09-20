@@ -4,6 +4,7 @@
 
 import pytest
 import torch
+
 from tests.model_executor.models.common.test_alias_free_activation import ENV, native_resample
 from vllm_omni.model_executor.models.common import alias_free_activation as fir
 
