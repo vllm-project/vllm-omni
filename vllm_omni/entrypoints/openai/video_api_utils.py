@@ -861,6 +861,7 @@ def _encode_prepared_video_bytes_legacy(
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
+    backend: str = "pyav",
 ) -> bytes:
     """Encode validated frames through the compatibility path used before planar encoding."""
     from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
@@ -872,6 +873,7 @@ def _encode_prepared_video_bytes_legacy(
         fps=float(fps),
         audio_sample_rate=audio_sample_rate or DEFAULT_AUDIO_SAMPLE_RATE,
         video_codec_options=video_codec_options,
+        backend=backend,
     )
 
 
@@ -881,6 +883,7 @@ def _encode_video_bytes_legacy(
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
+    backend: str = "pyav",
 ) -> bytes:
     """Encode through the compatibility path used before planar encoding."""
     frames, frame_shape, common_dtype = _prepare_video_frames(video)
@@ -892,6 +895,7 @@ def _encode_video_bytes_legacy(
         audio=audio,
         audio_sample_rate=_resolve_audio_sample_rate(audio, audio_sample_rate),
         video_codec_options=video_codec_options,
+        backend=backend,
     )
 
 
@@ -903,6 +907,7 @@ def _encode_video_bytes(
     video_codec_options: dict[str, str] | None = None,
     frame_converter: _PlanarFrameConverter | None = None,
     enable_borrowed_frames: bool = False,
+    backend: str = "pyav",
 ) -> bytes:
     """Encode through the opt-in borrowed RGB, direct planar or legacy path."""
     from vllm_omni.diffusion.utils.media_utils import mux_av_video_audio_bytes
@@ -911,6 +916,29 @@ def _encode_video_bytes(
     # input is reported before any muxer is opened.
     frames, frame_shape, common_dtype = _prepare_video_frames(video)
     effective_audio_sample_rate = _resolve_audio_sample_rate(audio, audio_sample_rate) if audio is not None else None
+    if backend == "ffmpeg":
+        _log_video_encoding_path(
+            selected_path="ffmpeg",
+            frames=frames,
+            frame_shape=frame_shape,
+            common_dtype=common_dtype,
+            fps=fps,
+            audio=audio,
+            audio_sample_rate=effective_audio_sample_rate,
+            effective_frame_conversion_workers=0,
+        )
+        return _encode_prepared_video_bytes_legacy(
+            frames,
+            frame_shape,
+            common_dtype,
+            fps,
+            audio=audio,
+            audio_sample_rate=effective_audio_sample_rate,
+            video_codec_options=video_codec_options,
+            backend=backend,
+        )
+    if backend != "pyav":
+        raise ValueError(f"Unsupported video encoder backend: {backend}")
     if (
         enable_borrowed_frames
         and common_dtype == np.dtype(np.uint8)
@@ -1112,6 +1140,7 @@ def encode_video_base64(
     video_codec_options: dict[str, str] | None = None,
     frame_converter: _PlanarFrameConverter | None = None,
     enable_borrowed_frames: bool = False,
+    backend: str = "pyav",
 ) -> str:
     """Encode a video (frames/array/tensor) to base64 MP4."""
     video_bytes = _encode_video_bytes(
@@ -1121,6 +1150,7 @@ def encode_video_base64(
         audio_sample_rate=audio_sample_rate,
         video_codec_options=video_codec_options,
         frame_converter=frame_converter,
+        backend=backend,
         **({"enable_borrowed_frames": True} if enable_borrowed_frames else {}),
     )
     return base64.b64encode(video_bytes).decode("utf-8")
