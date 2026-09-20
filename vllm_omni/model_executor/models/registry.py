@@ -423,6 +423,11 @@ _OMNI_MODELS = {
         "ming_flash_omni_thinker",
         "MingFlashOmniThinkerForConditionalGeneration",
     ),
+    "MingImageForConditionalGeneration": (
+        "ming_image",
+        "model",
+        "MingImageForConditionalGeneration",
+    ),
     "MingFlashOmniTalkerForConditionalGeneration": (
         "ming_flash_omni",
         "ming_flash_omni_talker",

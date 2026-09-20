@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The vLLM-Omni team.
 # Copyright 2024 ANT Group and the HuggingFace Inc. team.
 #
@@ -18,7 +19,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from transformers import AutoFeatureExtractor, AutoProcessor
+from transformers import AutoFeatureExtractor, AutoProcessor, AutoTokenizer, Qwen2VLImageProcessor
 from transformers.feature_extraction_utils import BatchFeature, FeatureExtractionMixin
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
@@ -479,6 +480,87 @@ class MingFlashOmniProcessor(ProcessorMixin):
         if video_processor is not None:
             names += video_processor.model_input_names
         return list(dict.fromkeys(names))
+
+
+class MingImageProcessor(ProcessorMixin):
+    """Image-only Bailing processor used by Ming-Image ckpts.
+
+    Equivalent to Qwen2-VL preprocessing. Construct the upstream component explicitly
+    in case model repo auto_map points at files that are not bundled in the ckpt.
+    """
+
+    attributes = ["image_processor", "tokenizer"]
+    image_processor_class = "Qwen2VLImageProcessor"
+    tokenizer_class = "AutoTokenizer"
+
+    def __init__(self, image_processor=None, tokenizer=None, merge_size: int = 2, **kwargs):
+        if image_processor is None or tokenizer is None:
+            raise ValueError("MingImageProcessor requires image_processor and tokenizer.")
+        self.spatial_merge_size = int(getattr(image_processor, "merge_size", merge_size))
+        self.image_token = PLACEHOLDER_IMAGE_TOKEN_IN_TEXT
+        super().__init__(image_processor=image_processor, tokenizer=tokenizer, **kwargs)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
+        image_processor = Qwen2VLImageProcessor.from_pretrained(
+            pretrained_model_name_or_path,
+            *args,
+            **kwargs,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path,
+            *args,
+            **kwargs,
+        )
+        return cls(image_processor=image_processor, tokenizer=tokenizer)
+
+    def __call__(self, text, images=None, **kwargs) -> BatchFeature:
+        if isinstance(text, str):
+            text = [text]
+        data: dict[str, Any] = {}
+        if images is not None:
+            image_outputs = self.image_processor(
+                images=images,
+                return_tensors="pt",
+                **kwargs.get("images_kwargs", {}),
+            )
+            data.update(image_outputs)
+            text = self._expand_image_tokens(text, image_outputs["image_grid_thw"])
+        data.update(
+            self.tokenizer(
+                text,
+                return_tensors="pt",
+                **kwargs.get("text_kwargs", {}),
+            )
+        )
+        return BatchFeature(data=data)
+
+    def _expand_image_tokens(self, text: list[str], image_grid_thw: torch.Tensor) -> list[str]:
+        num_patches = image_grid_thw.prod(dim=1) // (self.spatial_merge_size**2)
+        image_index = 0
+        expanded: list[str] = []
+        for sample in text:
+            for _ in range(sample.count(self.image_token)):
+                replacement = (
+                    DEFAULT_IM_START_TOKEN
+                    + DEFAULT_IMAGE_PATCH_TOKEN * int(num_patches[image_index].item())
+                    + DEFAULT_IM_END_TOKEN
+                    + "\n"
+                )
+                sample = sample.replace(self.image_token, replacement, 1)
+                image_index += 1
+            expanded.append(sample)
+        return expanded
+
+    def batch_decode(self, *args, **kwargs):
+        return self.tokenizer.batch_decode(*args, **kwargs)
+
+    def decode(self, *args, **kwargs):
+        return self.tokenizer.decode(*args, **kwargs)
+
+    @property
+    def model_input_names(self):
+        return list(dict.fromkeys(self.tokenizer.model_input_names + self.image_processor.model_input_names))
 
 
 # transformers >= 5.x requires the config *class* (not a string) as the first
