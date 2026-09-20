@@ -62,11 +62,7 @@ async def test_disabled_warmup_sends_no_requests(diffusion_benchmark, warmup_arg
     assert pairs == []
 
 
-@pytest.mark.parametrize("warmup_prompt", [None, "warmup-only edit"])
-async def test_successful_warmups_preserve_request_output_pairs(
-    diffusion_benchmark, warmup_args, input_requests, warmup_prompt
-):
-    warmup_args.warmup_prompt = warmup_prompt
+async def test_successful_warmups_preserve_request_output_pairs(diffusion_benchmark, warmup_args, input_requests):
     outputs = [RequestFuncOutput(success=True, latency=0.5), RequestFuncOutput(success=True, latency=1.0)]
     pending_outputs = iter(outputs)
 
@@ -75,25 +71,21 @@ async def test_successful_warmups_preserve_request_output_pairs(
 
     pairs = await diffusion_benchmark._run_warmups(input_requests, warmup_args, None, successful_request)
 
-    expected_prompts = [warmup_prompt] * 2 if warmup_prompt is not None else ["first", "second"]
-    assert [request.prompt for request, _ in pairs] == expected_prompts
+    assert [request.prompt for request, _ in pairs] == ["first", "second"]
     assert [request.num_inference_steps for request, _ in pairs] == [4, 4]
     assert [output for _, output in pairs] == outputs
     assert [request.num_inference_steps for request in input_requests] == [20, 20]
-    assert [request.prompt for request in input_requests] == ["first", "second"]
 
 
 @pytest.mark.parametrize("failed_count", [1, 2], ids=["partial-failure", "all-failed"])
-@pytest.mark.parametrize("warmup_prompt", [None, "warmup-only edit"])
 @pytest.mark.parametrize(
     "error",
     ["HTTP 503: private prompt rejected", "Cannot connect to https://test.local/?token=private"],
     ids=["http-error", "transport-error"],
 )
 async def test_failed_warmups_abort_without_exposing_response_errors(
-    diffusion_benchmark, warmup_args, input_requests, failed_count, warmup_prompt, error
+    diffusion_benchmark, warmup_args, input_requests, failed_count, error
 ):
-    warmup_args.warmup_prompt = warmup_prompt
     outputs = iter(
         [RequestFuncOutput(success=False, error=error) for _ in range(failed_count)]
         + [RequestFuncOutput(success=True) for _ in range(2 - failed_count)]

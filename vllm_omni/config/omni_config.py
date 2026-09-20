@@ -773,6 +773,7 @@ class _DiffusionConfigProjection:
     video_output_transport: object = field(default_factory=dict)
     enable_cache_dit_summary: bool = False
     diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
+    enable_prefix_caching: bool = False
     diffusion_kv_max_rows_per_request: int | None = Field(default=None, ge=1, strict=True)
     enable_prompt_embed_cache: bool = False
     prompt_embed_cache_size: int = Field(default=32, ge=1)
@@ -1052,6 +1053,7 @@ _DIFFUSION_SHARED_CONFIG_FIELDS = frozenset(
         "dist_timeout",
         "model_config",
         "quantization_config",
+        "enable_prefix_caching",
     }
 )
 _DIFFUSION_RUNTIME_CONFIG_FIELDS = frozenset(
@@ -1701,6 +1703,7 @@ def _build_diffusion_stage_config(
         engine.diffusion,
         model=common_kwargs["model_config"].model,
         quantization_config=common_kwargs["quantization_config"],
+        enable_prefix_caching=bool(common_kwargs["cache_config"].enable_prefix_caching),
     )
     return cast(
         VllmOmniDiffusionStageConfig,
@@ -1955,8 +1958,11 @@ def _build_diffusion_config_projection(
     *,
     model: str | None,
     quantization_config: _QuantizationConfigType,
+    enable_prefix_caching: bool,
 ) -> _DiffusionConfigProjection:
     diffusion_kwargs = engine.to_kwargs()
+    # Mirror the resolved cache setting, including deploy/CLI precedence.
+    diffusion_kwargs["enable_prefix_caching"] = enable_prefix_caching
     diffusion_kwargs["stage_id"] = topology.stage_id
     diffusion_kwargs["model_arch"] = _first_defined(
         diffusion_kwargs.get("model_arch"),

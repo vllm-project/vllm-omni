@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import json
 import os
 import re
@@ -92,6 +95,8 @@ def _mark_names(mark_field: Any) -> set[str]:
 
 def is_diffusion_perf_config(cfg: dict[str, Any]) -> bool:
     """True for perf JSON cases intended for ``run_diffusion_benchmark.py``."""
+    if cfg.get("benchmark_runner") == "vllm-bench":
+        return False
     if cfg.get("server_type") is not None:
         return True
     return "diffusion" in _mark_names(cfg.get("mark"))

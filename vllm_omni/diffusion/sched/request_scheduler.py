@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
     RequestBatchSamplingParamsKey,
+    SchedulerRequestState,
     _AdmissionWaitDecision,
 )
 
@@ -32,7 +33,7 @@ def _normalize_explicit_sample_solver(value: object | None) -> str | None:
     return str(value).strip().lower()
 
 
-def _normalize_explicit_flow_shift(value: object | None) -> float | None:
+def _normalize_explicit_flow_shift(value: float | str | None) -> float | None:
     """Normalize an explicitly provided flow shift without selecting a default."""
     if value is None:
         return None
@@ -58,6 +59,18 @@ def build_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> Re
 
 class RequestScheduler(BaseScheduler):
     """Scheduler for static request waves, including admission coalescing."""
+
+    def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:
+        if not super()._can_schedule_waiting(state):
+            return False
+        manager = self._diffusion_kv_manager
+        if not self._running or manager is None or not manager.has_request(state.request_id):
+            return True
+        # The request-level runner uses one first-step query boundary per wave.
+        # The Manager already aligns all CFG sequences within each request.
+        current = manager.get_metadata(self._running[0]).sequences[0].cached_prefix_len
+        candidate = manager.get_metadata(state.request_id).sequences[0].cached_prefix_len
+        return candidate == current
 
     def get_admission_wait_decision(
         self,

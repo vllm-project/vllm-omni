@@ -1,6 +1,5 @@
 # Automatic Prefix Caching in Omni Models
 
-
 ---
 
 ## Table of Contents
@@ -9,6 +8,7 @@
 - [High-Level Approach](#high-level-approach)
 - [Example](#example)
 - [What About Multimodal Inputs?](#what-about-multimodal-inputs)
+- [Diffusion KV Prefix Caching](#diffusion-kv-prefix-caching)
 
 ---
 
@@ -24,9 +24,10 @@ vLLM implements automatic prefix caching for managing its kv-cache, which is bes
 - Model / stage specific multimodal data
 
 !!! note "Note 1"
-    This document describes vLLM-Omni's mechanism for caching tensor outputs that are meant to be passed between stages, when requests have common prefixes, similar to the way in which vLLM has prefix caching for the kv-cache. This works in conjunction with vLLM's multimodal encoder caching, but is distinct. See the final section for a concrete example for how they tie together in practice.
+    The following sections describe caching tensor outputs passed between AR stages. This is distinct from multimodal encoder caching and from [diffusion KV prefix caching](#diffusion-kv-prefix-caching), which reuses GPU KV pages inside a diffusion stage.
 
 ### High-Level Approach
+
 !!! note "Note 2"
     Prior to reading this section, it's recommended to take a look at the design documents in vLLM for [Automatic Prefix Caching](https://docs.vllm.ai/en/latest/features/automatic_prefix_caching/), which will make some of the concepts more clear.
 
@@ -38,10 +39,10 @@ The main focus of vLLM-Omni's approach to prefix caching stage outputs is to bui
 
 With this in mind, consider the set of blocks in a 2D layout, where the row represents the index of blocks being considered, and the columns represent the slots corresponding to tokens within each block. Since we know the `num_blocks` and `block_size` from our kv cache config, if we want to cache a tensor with feature size `D`, we can preallocate a CPU tensor of size `(num_blocks, block_size, D)`, and use the same block index and slot mapping to retrieve the corresponding feature vector.
 
-
 ### Example
+
 !!! note "Note 3"
-    Prefix caching in vLLM-Omni currently is only supported on AutoRegressive stages with one kv-cache group. Configure it with the pipeline-wide `enable_prefix_caching` field in the deploy config.
+    The stage-output tensor cache described here supports AutoRegressive stages with one kv-cache group. Configure it with the pipeline-wide `enable_prefix_caching` field in the deploy config. Diffusion KV caching has the separate requirements below.
 
 The way in which vLLM-Omni ties into vLLM's prefix caching is best understood by example. Say that we have the following:
 
@@ -56,7 +57,7 @@ The prefix cache flow is then outlined below.
 
 2. Say we process the request `The quick brown fox was tired and slept beneath the shady tree`, which is 12 tokens and evenly divides into 3 blocks as shown below.
 
-```
+```text
          [  The quick brown fox  ] [  was tired and slept ] [beneath the shady tree ]
 Block 1: |<--- block tokens ---->|
 Block 2: |<------- prefix ------>| |<--- block tokens --->|
@@ -65,10 +66,9 @@ Block 3: |<------------------ prefix -------------------->| |<--- block tokens -
 
 When the request processes, we inspect the multimodal outputs and identify the `mm_feature` tensor, which will be of shape `(seq_len, feature_dim)`, i.e., `(12, 16)` in this example. We note that the first axis is dependent on the `seq_len` and add a new cache_tensor of shape `(num_blocks, block_size, feature_dim)` to our multimodal cache for tensors.
 
+1. If we lay out the cache as a 2D tensor of shape (`num_blocks`, `block_size`), we'll have something like the following:
 
-3. If we lay out the cache as a 2D tensor of shape (`num_blocks`, `block_size`), we'll have something like the following:
-
-```
+```text
 0: [  The quick brown fox  ]
 1: [  was tired and slept  ]
 2: [beneath the shady tree ]
@@ -78,7 +78,8 @@ When the request processes, we inspect the multimodal outputs and identify the `
 ```
 
 Or, if we flatten it down to 1D,
-```
+
+```text
 0: The
 1: quick
 2: brown
@@ -90,7 +91,8 @@ Or, if we flatten it down to 1D,
 ```
 
 which we can think of as row indices into the hidden states tensor if we view it as the 2D shape `(num_blocks x block_size, feature_dim)`. That is, the analogous flattened (from 3D -> 2D) mapping of the cache for hidden states becomes the following.
-```
+
+```text
 0: <hidden states vector of len 2 corresponding to 'The'>
 1: <hidden states vector of len 2 corresponding to 'quick'>
 2: <hidden states vector of len 2 corresponding to 'brown'>
@@ -103,10 +105,9 @@ which we can think of as row indices into the hidden states tensor if we view it
 
 Similarly, for the multimodal outputs cache, the flattened coordinates are the same, but the `mm_feature` maps to vectors of length `16` instead of the hidden size of `2`. Note that in practice, we may have multiple  multimodal output tensors per forward pass, which may have different names and different feature dimensions.
 
+1. Now, say that we receive a new request `The quick brown fox jumped over the dog`.
 
-4. Now, say that we receive a new request `The quick brown fox jumped over the dog`.
-
-```
+```text
          [  The quick brown fox  ] [  jumped over the dog ]
 Block 1: |<--- block tokens ---->|
 Block 2: |<------- prefix ------>| |<--- block tokens --->|
@@ -116,7 +117,7 @@ Here, we will have a cache hit for `Block 1` which will be detected by vLLM base
 
 Since we have the block indices / slot mappings from the kv cache manager, we can simply mirror the mappings and leverage the same indices for the cached hidden states and multimodal outputs. This allows us to look up the correct tensors from our externally maintained 3D caches.
 
-```
+```text
 0: [  The quick brown fox  ] < already in the cache
 1: [  was tired and slept  ]
 2: [beneath the shady tree ]
@@ -129,11 +130,11 @@ Since we have the block indices / slot mappings from the kv cache manager, we ca
 
 Finally, to pass the full hidden states and multimodal outputs to the next stage, we simply concatenate the cached contents with the corresponding new tensors computed from the current forward call.
 
-
 ### What About Multimodal Inputs?
+
 It's also useful to consider the case about how Omni prefix caching is handled when we have multimodal inputs that don't cleanly end on block boundaries, as well as how this works with multimodal encoder caching in vLLM. For example:
 
-```
+```text
          [   Im0  Im1  Im2  Im3  ] [ Im4  Im5 foo <empty> ]
 Block 1: |<--- block tokens ---->|
 Block 2: |<------- prefix ------>| |<--- block tokens --->|
@@ -147,9 +148,9 @@ In reality, this isn't a big problem for correctness, because vLLM also maintain
 - The hash describing the image data starting at position 0 and with length 6
 - In vLLM's encoder cache, a mapping from the image hash above to the encoder output
 
-
 To understand what happens, say we get the following input as a second request:
-```
+
+```text
          [   Im0  Im1  Im2  Im3  ] [  Im4  Im5 bar  baz  ]
 Block 1: |<--- block tokens ---->|
 Block 2: |<------- prefix ------>| |<--- block tokens --->|
@@ -162,3 +163,54 @@ Because we have multimodal data in a scheduled span that isn't fully precomputed
 When we pass our multimodal tensors to the language model component in the same stage, we'll then expect the same outputs, because the prefix caching behaviors in vLLM-Omni / vLLM match, so the LLM will use vLLM's KV cache manager's prefix caching to correctly handle the attention information for `Block 1` while calculating the outputs for `Block 2`, giving us the correct results for processing `Block 2` with the context of `Block 1`.
 
 Finally, we look up the output hidden states/multimodal tensors corresponding to the prefix cache hit `Block 1` and concatenate it with the forward pass result to get the final result, which is expected to be identical to the full hidden states when prefix caching is disabled.
+
+### Diffusion KV Prefix Caching
+
+HunyuanImage3's standalone DiT pipeline can reuse stable text/reference-image KV
+across requests. Enable it on the diffusion stage in the deploy config:
+
+```yaml
+pipeline: hunyuan_image3_dit
+stages:
+  - stage_id: 0
+    diffusion_kv_mode: paged_scheduler
+    enable_prefix_caching: true
+```
+
+The Scheduler uses vLLM's native `KVCacheManager` to look up and retain complete
+prefix blocks. The Worker owns the GPU pages and block tables. On a hit, the first
+denoise forward computes only the uncached query suffix while attending to both
+cached and new KV. Dynamic target-image KV is never published as a reusable prefix.
+
+Cache identity includes token IDs, reference-image content and VAE random state,
+plus model/layout and LoRA context. The same image with different prompts can
+reuse the common leading blocks; it does not imply that every image span or CFG
+branch is interchangeable. Disabling prefix caching skips cache-identity hashing;
+`dense_legacy` remains the default.
+
+The current scope is local DiT reuse, not AR-imported KV or missing-page-only
+cross-stage transfer. Prefix-hit accuracy has been exercised with TP4, SP1 and
+CFGP1; SP>1 and other combinations still require validation. See the
+[diffusion compatibility notes](../../user_guide/diffusion_features.md#diffusion-kv-prefix-caching).
+
+#### Shared-reference benchmark
+
+From the repository root, use the unified `vllm bench serve --omni` test runner:
+
+```bash
+pytest tests/dfx/perf/scripts/run_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_hunyuan_image3_prefix_caching.json
+```
+
+Run GPU tests through your environment's GPU scheduler. The suite reuses the
+two-image IT2I accuracy input on a single DiT stage, comparing dense, paged without
+prefix caching, and paged with prefix caching. Each mode runs two ordinary upstream
+warmups followed by eight identical requests at CFG 2.5, 8 denoise steps and seed 42.
+Warmups are excluded from latency and request throughput. This measures full-prefix
+reuse, not the earlier distinct-prompt workload; its results must be reported separately.
+
+`tests/e2e/accuracy/test_hunyuan_image3_prefix_cache_accuracy.py` uses the same input
+at 50 steps with two seeds. It also changes the prompt to check partial hits,
+verifies actual reference-image reuse and query slicing, and compares generated
+outputs with the matching uncached outputs. Input images are not accuracy goldens;
+the existing AR-to-DiT golden test remains unchanged.

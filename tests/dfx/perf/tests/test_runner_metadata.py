@@ -214,6 +214,39 @@ def test_is_diffusion_perf_config():
             "mark": [{"hardware_marks": {"res": {"cuda": "H100"}}}, "diffusion"],
         }
     )
+    assert not is_diffusion_perf_config({"benchmark_runner": "vllm-bench", "mark": ["diffusion"]})
+
+
+def test_prefix_benchmark_uses_unified_runner(monkeypatch):
+    from pathlib import Path
+
+    from tests.dfx.conftest import is_diffusion_perf_config, load_benchmark_configs
+    from tests.dfx.perf.scripts import run_benchmark
+
+    configs = load_benchmark_configs(str(Path(__file__).with_name("test_hunyuan_image3_prefix_caching.json")))
+    assert len(configs) == 3
+    assert all(not is_diffusion_perf_config(config) for config in configs)
+    assert all(config["benchmark_params"] == configs[0]["benchmark_params"] for config in configs)
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", configs)
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        assert "--name" not in kwargs["args"]
+        assert "--warmup-dataset-path" not in kwargs["args"]
+        assert "tests/assets/hunyuan_image3/it2i.jsonl" in kwargs["args"]
+        assert kwargs["num_warmups"] == 2
+        return {"completed": 8}
+
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    for config in configs:
+        for params in config["benchmark_params"]:
+            run_benchmark.test_performance_benchmark(
+                SimpleNamespace(host="localhost", port=8000, model="test-model"),
+                {"test_name": config["test_name"], "params": params},
+            )
+    assert len(calls) == 3
 
 
 def test_benchmark_param_id_suffix_from_task_eval_phase():

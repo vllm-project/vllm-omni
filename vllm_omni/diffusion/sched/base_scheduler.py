@@ -164,7 +164,8 @@ class BaseScheduler(ABC):
 
             diffusion_kv_metadata: DiffusionKVMetadata | None = None
             if self._diffusion_kv_manager is not None:
-                if self._diffusion_kv_manager.has_request(request_id):
+                already_reserved = self._diffusion_kv_manager.has_request(request_id)
+                if already_reserved:
                     diffusion_kv_metadata = self._diffusion_kv_manager.get_metadata(request_id)
                 else:
                     try:
@@ -190,6 +191,13 @@ class BaseScheduler(ABC):
                     if allocation is None:
                         break
                     diffusion_kv_metadata = allocation
+
+                # Prefix compatibility is known only after the native lookup.
+                # Defer a different boundary without publishing uncomputed KV.
+                if not self._can_schedule_waiting(state):
+                    if not already_reserved:
+                        self._diffusion_kv_manager.free_request(request_id)
+                    break
 
             self._waiting.popleft()
             was_new_request = state.status == DiffusionRequestStatus.WAITING

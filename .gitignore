@@ -246,9 +246,8 @@ datasets/
 !tests/dfx/perf/tests/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
 *.jsonl
-# Small, checked-in inputs for the Hunyuan prefix-cache regression benchmark.
-!tests/dfx/perf/fixtures/hunyuan_image3_prefix_params.json
-!tests/dfx/perf/fixtures/hunyuan_image3_prefix_edits.jsonl
+# Shared Hunyuan IT2I input for accuracy tests and vllm bench.
+!tests/assets/hunyuan_image3/it2i.jsonl
 *.parquet
 
 # Output files
