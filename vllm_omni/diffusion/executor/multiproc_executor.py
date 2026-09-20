@@ -1038,10 +1038,18 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             try_set_exception(pending, _dropped_output_error(async_output_id))
             self._remember_dropped(async_output_id)
         elif not pending.done():
+            # Concurrent cancellation can still race between ``.done()`` and
+            # ``set_result/set_exception``. The helpers swallow the resulting
+            # ``InvalidStateError`` and report ``False`` so we can still
+            # record the id as dropped — the waiter was popped from
+            # ``_output_futures`` above, so without this a subsequent
+            # ``wait_output_ready`` would allocate a fresh Future and hang.
             if exc is not None:
-                try_set_exception(pending, exc)
+                delivered = try_set_exception(pending, exc)
             else:
-                try_set_result(pending, result)
+                delivered = try_set_result(pending, result)
+            if not delivered:
+                self._remember_dropped(async_output_id)
         else:
             # Waiter already cancelled or resolved. Do not re-cache the delivered
             # tensors, but remember the id so a later ``wait_output_ready`` on

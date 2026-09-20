@@ -841,6 +841,57 @@ class TestDropOutput:
         with pytest.raises(RuntimeError, match="was dropped"):
             second_late.result(timeout=0)
 
+    def test_cancel_between_done_check_and_set_result_records_dropped(self):
+        """Race: consumer cancels the Future between the pump's ``.done()``
+        check and the actual ``set_result``.
+
+        Reproduces Gaohan123's 09-19 P2: ``try_set_result`` catches the
+        ``InvalidStateError`` silently, but the waiter has already been
+        popped from ``_output_futures`` by ``_finish_output``. Without
+        recording the id as dropped, a subsequent ``wait_output_ready``
+        allocates a fresh Future that can never complete.
+        """
+
+        class _RaceCancellingFuture(concurrent.futures.Future):
+            """Future that mimics a consumer cancelling in the tiny window
+            between ``pending.done()`` and ``pending.set_result(...)``."""
+
+            def set_result(self, result):
+                self.cancel()  # race lands here — mid-branch cancel
+                super().set_result(result)  # raises InvalidStateError
+
+            def set_exception(self, exc):
+                self.cancel()
+                super().set_exception(exc)
+
+        executor = _make_executor()
+        racy = _RaceCancellingFuture()
+        with executor._futures_lock:
+            executor._output_futures["aid-race"] = racy
+
+        # Simulate the pump delivery: at entry .done() is False, then the
+        # concurrent cancel lands, then set_result raises InvalidStateError.
+        with executor._futures_lock:
+            executor._finish_output("aid-race", DiffusionOutput(output="lost"), None)
+
+        assert racy.cancelled()
+        with executor._futures_lock:
+            # The waiter has been popped and the id must be recorded as dropped.
+            assert "aid-race" not in executor._output_futures
+            assert "aid-race" not in executor._completed_outputs
+            assert "aid-race" in executor._dropped_output_ids
+
+        # Late wait_output_ready must fail fast, not allocate a fresh Future.
+        late = executor.wait_output_ready("aid-race")
+        assert late.done()
+        with pytest.raises(RuntimeError, match="was dropped"):
+            late.result(timeout=0)
+        # And a second late wait must also fail fast (LRU stays populated).
+        late2 = executor.wait_output_ready("aid-race")
+        assert late2.done()
+        with pytest.raises(RuntimeError, match="was dropped"):
+            late2.result(timeout=0)
+
     def test_batch_split_drop_placeholder_discards_member(self):
         """_deliver_batch_split applies the same contract: a dropped member is
         discarded (never cached), a live member is resolved directly."""
