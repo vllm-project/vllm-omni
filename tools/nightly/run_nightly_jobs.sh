@@ -49,8 +49,8 @@
 #     Otherwise -m defaults to H800. PYTEST_MARK is rejected unless stability is enabled.
 #     model_type: omni → qwen3_omni + minicpmo_4_5; tts → qwen3_tts;
 #                 diffusion → qwen_image + wan22 + hunyuan_image + minimax_h3 + hunyuanvideo15; all → all eight
-#     stability_minimax_h3 also exports VLLM_TEST_MINIMAX_H3_FASTH3_LORA (same as test-merge.yml)
-#     before pytest, otherwise collection skipif skips the case.
+#     stability_minimax_h3: download FastH3 LoRA only when VLLM_TEST_MINIMAX_H3_FASTH3_LORA is unset,
+#     then export before pytest (collection skipif needs the path).
 #     LABEL_SUBSTR: if set, script path / job key / filename must contain it
 #
 # Requirements: bash, python3, PyYAML (pip install pyyaml)
@@ -620,16 +620,19 @@ STABILITY_DEFAULT_PYTEST_MARK = "H800"
 
 # Extra shell lines before pytest. MiniMax-H3 FastH3 skipif reads
 # VLLM_TEST_MINIMAX_H3_FASTH3_LORA at collection; merge CI downloads the same way.
-_FASTH3_LORA_EXPORT = (
-    "export VLLM_TEST_MINIMAX_H3_FASTH3_LORA=$(python3 -c "
+_FASTH3_LORA_DOWNLOAD = (
+    'VLLM_TEST_MINIMAX_H3_FASTH3_LORA="$(python3 -c '
     "'from huggingface_hub import hf_hub_download; "
     "print(hf_hub_download(repo_id=\"FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA\", "
-    "filename=\"dense-datafree/adapter_model.safetensors\"))')"
+    "filename=\"dense-datafree/adapter_model.safetensors\"))')\""
 )
 STABILITY_JOB_PRELUDE: dict[str, list[str]] = {
     "stability_minimax_h3": [
         "if [ -f vllm_omni/diffusion/models/minimax_h3/fasth3.py ]; then",
-        f"  {_FASTH3_LORA_EXPORT}",
+        '  if [ -z "${VLLM_TEST_MINIMAX_H3_FASTH3_LORA:-}" ]; then',
+        f"    {_FASTH3_LORA_DOWNLOAD}",
+        "  fi",
+        "  export VLLM_TEST_MINIMAX_H3_FASTH3_LORA",
         "fi",
     ],
 }
