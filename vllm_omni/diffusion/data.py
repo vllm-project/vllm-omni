@@ -804,10 +804,16 @@ def uses_diffusers_adapter(od_config: object) -> bool:
 @dataclass
 class VideoOutputTransportConfig:
     enable_device_postprocess: bool = False
+    enable_registered_shm: bool = False
+    enable_borrowed_frames: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.enable_device_postprocess, bool):
             raise TypeError("enable_device_postprocess must be a bool")
+        if not isinstance(self.enable_registered_shm, bool):
+            raise TypeError("enable_registered_shm must be a bool")
+        if not isinstance(self.enable_borrowed_frames, bool):
+            raise TypeError("enable_borrowed_frames must be a bool")
 
 
 @dataclass
@@ -1756,10 +1762,15 @@ class DiffusionOutput:
     # Internal control-plane event emitted on first scheduler admission.
     request_started: bool = False
 
-    # Typed video-media contract. Declared last so the pre-existing positional
+    # Typed video-media contract. Appended so the pre-existing positional
     # constructor order (output, trajectory_timesteps, ...) that out-of-tree
     # pipelines rely on is preserved. Mutually exclusive with ``output``.
     media: DiffusionMediaOutput | None = None
+
+    # Compatibility adapter for joint (video, audio) outputs that have not
+    # migrated to typed media. Only this tuple entry is eligible for video
+    # transport optimizations; unmarked legacy outputs retain their old path.
+    video_output_index: int | None = None
 
     def __post_init__(self) -> None:
         if self.media is not None and not isinstance(self.media, DiffusionMediaOutput):
