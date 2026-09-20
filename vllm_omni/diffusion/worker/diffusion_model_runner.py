@@ -1054,38 +1054,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         error_outputs: list[RunnerOutput] = []
         for state in states:
             if state.request_id in new_request_ids:
-                # Everything that runs before ``_dit_any_rank_failed`` must be
-                # inside the try: an exception in ``_initialize_generator`` or
+                # Everything that requires rank-synchronization must be called
+                # inside a try, record the exception and handle with `_dit_any_rank_failed`.
+                # Reason (example): An exception in ``_initialize_generator`` or
                 # ``clear_pipeline_stage_durations`` on one rank would skip the
                 # all-reduce here while every peer proceeds into it, and the
                 # peers then hang on the NCCL collective until timeout.
-                per_req_exc: BaseException | None = None
-                try:
-                    self._initialize_generator(state.sampling)
-                    clear_pipeline_stage_durations(pipeline)
-                    # encode
-                    pipeline.prepare_encode(state)
-                    # Before chunk-0: some interactions (e.g., camera) need initial session data.
-                    if supports_interaction_apply(pipeline) and state.chunk_index == 0:
-                        pipe = cast(SupportsInteractionApply, pipeline)
-                        assert self._interaction_coordinator is not None, "Model not loaded. Call load_model() first."
-                        state.interaction_chunk_metadata = self._interaction_coordinator.maybe_prepare_initial_session(
-                            state, pipe
-                        )
-                        pipe.prepare_next_chunk(state)
-                    merge_stage_durations(
-                        state,
-                        consume_pipeline_stage_durations(pipeline),
-                    )
-                except Exception as exc:
-                    per_req_exc = exc
-                # Pipelines that do rank-0-only work (e.g. MiniMax H3
-                # reference-video prep) must broadcast per-request failures
-                # internally so downstream collectives stay in step; even so,
-                # cross-check that every DiT rank agrees so a rank-local error
-                # (or a future pipeline that omits the guard) does not leave
-                # the process group half-way through a new request.
-                if _dit_any_rank_failed(per_req_exc is not None):
+                def _abort_prep_failure(per_req_exc: BaseException | None) -> None:
                     self.state_cache.pop(state.request_id, None)
                     if per_req_exc is None:
                         per_req_exc = RuntimeError(
@@ -1105,6 +1080,41 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             result=DiffusionOutput.from_exception(per_req_exc),
                         )
                     )
+
+                per_req_exc: BaseException | None = None
+                try:
+                    self._initialize_generator(state.sampling)
+                    clear_pipeline_stage_durations(pipeline)
+                    pipeline.prepare_encode(state)
+                except Exception as exc:
+                    per_req_exc = exc
+                # Pipelines that do rank-0-only work (e.g. MiniMax H3
+                # reference-video prep) must broadcast per-request failures
+                # internally so downstream collectives stay in step; even so,
+                # cross-check that every DiT rank agrees so a rank-local error
+                # (or a future pipeline that omits the guard) does not leave
+                # the process group half-way through a new request.
+                if _dit_any_rank_failed(per_req_exc is not None):
+                    _abort_prep_failure(per_req_exc)
+                    continue
+                # If the pipeline supports interaction, the interaction session initialization also needs to call
+                # synchronized_monotonic_time(). Wrap in another try-block to not block on prepare_encode failures.
+                try:
+                    if supports_interaction_apply(pipeline) and state.chunk_index == 0:
+                        pipe = cast(SupportsInteractionApply, pipeline)
+                        assert self._interaction_coordinator is not None, "Model not loaded. Call load_model() first."
+                        state.interaction_chunk_metadata = self._interaction_coordinator.maybe_prepare_initial_session(
+                            state, pipe
+                        )
+                        pipe.prepare_next_chunk(state)
+                    merge_stage_durations(
+                        state,
+                        consume_pipeline_stage_durations(pipeline),
+                    )
+                except Exception as exc:
+                    per_req_exc = exc
+                if _dit_any_rank_failed(per_req_exc is not None):
+                    _abort_prep_failure(per_req_exc)
                     continue
             prepared_states.append(state)
 
