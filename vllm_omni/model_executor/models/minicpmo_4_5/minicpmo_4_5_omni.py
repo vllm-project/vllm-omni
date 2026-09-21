@@ -634,6 +634,37 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             return model_outputs
         return self.talker.make_omni_output(model_outputs, **kwargs)
 
+    # 第 8 项（K 步多帧解码）在 runner 侧的四个转发（2026-09-21 迁移补齐）。
+    # 基线的这四个方法就写在这个外层包装类上，迁移时整段漏掉。runner 只看得见这个
+    # 包装类（`_model_forward` 里 talker_multiframe.applies / is_multi_token_decode /
+    # 以及 `ensure_stop_token_vocab` 的判定全部是 `getattr(model, ...)`），所以：
+    #   · 缺 `supports_multi_frame_decode` → 判定静默取到 False → 多帧循环永不进入，
+    #     且连"拒绝原因"都不打日志（applies 那条分支是静默返回 0）；
+    #   · 缺 take/set_batch_stop_logits → 每帧的 stop 行拿不到；
+    #   · 缺 merge_frame_outputs → 多帧结果无法合并。
+    # 后果：K 步的投机配置已经进了引擎（vLLM 层在做投机解码），但 runner 侧的多帧
+    # 循环不进入、循环里的词表宽度修正（ensure_stop_token_vocab）也不执行，
+    # 于是拒绝采样器按宽度 0 消费、AIV 越界（507035）、stage-1 引擎崩、音频全空。
+    @property
+    def supports_multi_frame_decode(self) -> bool:
+        # 这些方法在两类 stage 上都在，只有 Talker（tts）能走多帧，故按 stage 判定。
+        return self.model_stage == "tts"
+
+    def take_batch_stop_logits(self):
+        if self.model_stage != "tts":
+            return None
+        return self.talker.take_batch_stop_logits()
+
+    def set_batch_stop_logits(self, logits) -> None:
+        if self.model_stage != "tts":
+            return
+        self.talker.set_batch_stop_logits(logits)
+
+    def merge_frame_outputs(self, frame_outputs, frame_stop_logits):
+        if self.model_stage != "tts":
+            return frame_outputs
+        return self.talker.merge_frame_outputs(frame_outputs, frame_stop_logits)
+
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
         # Handle OmniOutput type
         if isinstance(hidden_states, OmniOutput):

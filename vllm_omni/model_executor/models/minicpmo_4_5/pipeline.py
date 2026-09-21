@@ -20,6 +20,35 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni"
 MINICPMO45_REFERENCE_AUDIO_KEY = "_minicpmo45_reference_audio"
 
 
+_CODEC_EOS_TOKEN_ID = 6561  # tts_config.num_audio_tokens - 1
+
+
+def _talker_stop_token_ids() -> list[int]:
+    """Stage 1's stop token, matching the head that will actually run.
+
+    Two shapes exist for the Talker's vLLM-level head:
+
+    * K-frame loop off -- ``compute_logits`` is the real 6562-wide codec head,
+      so the sampled id *is* a codec id and the codec EOS (6561) is the stop;
+    * K-frame loop on -- ``compute_logits`` collapses to the two-wide
+      continue/stop row, so the only sampleable ids are 0 and 1 and the codec
+      EOS can never appear at this level (the model samples codec ids inside
+      the loop and forwards them to stage 2 itself).
+
+    Pinning this to [6561] regardless is what made every K-step request run to
+    ``max_tokens``: the model did emit the stop marker, ``check_stop`` compared
+    it against 6561, and the request kept its slot until the context ran out.
+
+    Asked per construction so both this file and the deploy loader read the
+    same predicate; the env the answer depends on is set before any of this is
+    imported.
+    """
+    from vllm_omni.config.stage_config import talker_multiframe_armed
+    from vllm_omni.platforms.npu.worker.talker_multiframe import STOP_TOKEN_ID
+
+    return [STOP_TOKEN_ID] if talker_multiframe_armed() else [_CODEC_EOS_TOKEN_ID]
+
+
 MINICPMO_4_5_PIPELINE = PipelineConfig(
     model_type="minicpmo_4_5",
     default_deploy_config_name="minicpmo_4_5.yaml",
@@ -67,9 +96,10 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             async_chunk_process_next_stage_input_func=f"{_PROC}.tts2code2wav_async_chunk",
             sampling_constraints={
                 "detokenize": False,
-                # MiniCPM-o 4.5 codec EOS is tts_config.num_audio_tokens - 1.
-                # Same pattern as Qwen3 talker's stop_token_ids: [2150].
-                "stop_token_ids": [6561],
+                # The stop id has to be one the vLLM-level head can actually
+                # emit, and that head changes shape when the K-frame loop is
+                # armed -- see _talker_stop_token_ids.
+                "stop_token_ids": _talker_stop_token_ids(),
             },
         ),
         StagePipelineConfig(

@@ -28,6 +28,7 @@ from vllm.config import LoadConfig as VllmLoadConfig
 from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
+from vllm.config import SpeculativeConfig as VllmSpeculativeConfig
 from vllm.config.utils import config
 from vllm.engine.arg_utils import EngineArgs as VllmEngineArgs
 from vllm.logger import init_logger
@@ -293,6 +294,7 @@ class _StageEngineValues:
     diffusion: _DiffusionEngineOverrides
     compilation_config: Mapping[str, Any] | VllmCompilationConfig | None
     profiler_config: Mapping[str, Any] | VllmProfilerConfig | None
+    speculative_config: Mapping[str, Any] | VllmSpeculativeConfig | None
 
 
 @dataclass(frozen=True)
@@ -1211,7 +1213,17 @@ _SCHEDULER_ENGINE_FIELDS = frozenset(_SchedulerEngineOverrides.__annotations__)
 _POOLING_ENGINE_FIELDS = frozenset(_PoolingEngineOverrides.__annotations__)
 _CONNECTOR_ENGINE_FIELDS = frozenset(_ConnectorEngineOverrides.__annotations__)
 _RUNTIME_ENGINE_FIELDS = frozenset(_RuntimeEngineOverrides.__annotations__)
-_DIRECT_VLLM_CONFIG_ENGINE_FIELDS = frozenset({"compilation_config", "profiler_config"})
+# 迁移补齐（2026-09-21）：这三者的共同性质是"vllm 自己的配置对象，原样交给 vllm"，
+# 不参与本层的结构化解包。`speculative_config` 原先不在名单里，导致迁移过来的
+# stage-1 多帧（K 步）接线无法加载：`stage_config.py` 的
+# `_apply_minicpmo_talker_multiframe_default` 会给 stage 1 注入一个
+# speculative_config（vLLM 靠 `spec_token_ids` 才知道请求一次推进 K 个 token），
+# 而这里的字段归属校验会把 stage 1 的覆盖块整块判为非法，启动即 ValueError：
+#   "Stage 1 (llm_ar) has explicit engine argument(s) with no structured config owner"
+# 它与此前已在册的两项同类（都是直接透传 vllm 配置对象），故一并列入。
+_DIRECT_VLLM_CONFIG_ENGINE_FIELDS = frozenset(
+    {"compilation_config", "profiler_config", "speculative_config"}
+)
 _LLM_LOAD_ENGINE_FIELDS = _LOAD_ENGINE_FIELDS | frozenset(_LOAD_CONFIG_ENGINE_FIELD_MAP.values())
 _LLM_CACHE_ENGINE_FIELDS = _CACHE_ENGINE_FIELDS | frozenset(_CACHE_CONFIG_ENGINE_FIELD_MAP.values())
 _LLM_SCHEDULER_ENGINE_FIELDS = _SCHEDULER_ENGINE_FIELDS | frozenset(_SCHEDULER_CONFIG_ENGINE_FIELD_MAP.values())
@@ -1573,6 +1585,10 @@ def _stage_engine_values(
         diffusion=_DiffusionEngineOverrides(_select_engine_overrides(diffusion_kwargs, _DIFFUSION_STAGE_ENGINE_FIELDS)),
         compilation_config=_copy_value(engine.get("compilation_config")),
         profiler_config=_copy_value(engine.get("profiler_config")),
+        # 迁移补齐：与上两项同类（vllm 的配置对象，原样透传）。缺少这一格时，
+        # deploy 配置里的 speculative_config 会静默消失（不报错），K 步与 stage-0
+        # ngram 都会失去效果 —— 表现为引擎日志里 speculative_config=None。
+        speculative_config=_copy_value(engine.get("speculative_config")),
     )
 
 
@@ -1636,6 +1652,12 @@ class BaseVllmOmniStageConfig:
     parallel_config: OmniStageParallelConfig = field(default_factory=OmniStageParallelConfig)
     compilation_config: VllmCompilationConfig | None = None
     profiler_config: VllmProfilerConfig | None = None
+    # 注意形状：vLLM 的 `create_speculative_config` 是按**字典**消费这个值的
+    # （内部会 `.items()` / `.update()` / 再构造 SpeculativeConfig）。这里若标成
+    # `VllmSpeculativeConfig | None`，pydantic 会把配置里的字典提前转成对象，
+    # 于是 vLLM 那一步会炸 "SpeculativeConfig object has no attribute 'items'"。
+    # 因此保留 Mapping 形状，让 vLLM 自己去转。
+    speculative_config: Mapping[str, Any] | None = None
     quantization_config: _QuantizationConfigType = None
 
     @property
@@ -1798,6 +1820,7 @@ def _build_common_stage_config_kwargs(
             "parallel_config": parallel_config,
             "compilation_config": _copy_value(engine.compilation_config),
             "profiler_config": _copy_value(engine.profiler_config),
+            "speculative_config": _copy_value(engine.speculative_config),
             "quantization_config": _copy_value(quantization_config),
         },
         input_proc,

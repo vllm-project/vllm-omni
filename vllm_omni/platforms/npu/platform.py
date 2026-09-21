@@ -59,6 +59,9 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         from vllm_ascend.utils import adapt_patch
 
         from vllm_omni.platforms.npu._310p import apply_patches as apply_310p_patches
+        from vllm_omni.platforms.npu.ascend_warmup_patch import (
+            apply_ascend_warmup_patch,
+        )
         from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav import (
             apply_minicpmo_4_5_code2wav_patch,
         )
@@ -74,6 +77,9 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         apply_qwen3_tts_patches()
         apply_qwen3_tts_tokenizer_v2_patch()
         apply_310p_patches()
+        # 第 8 项支撑（910C 部署防护）：K 步 Triton rejection/penalties 的
+        # warmup 守卫必须在 ascend 内核 warmup 之前装好。
+        apply_ascend_warmup_patch()
 
     @classmethod
     def set_device(cls, device: torch.device) -> None:

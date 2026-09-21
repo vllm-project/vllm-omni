@@ -1157,8 +1157,14 @@ def _project_omni_stage_engine_args(
         ):
             engine_args.update(_project_upstream_config_fields(config, field_map))
 
-    for name in ("compilation_config", "profiler_config"):
-        value = getattr(stage_config, name)
+    # 迁移补齐（2026-09-21）：这一格与上面两项同类 —— 都是 vllm 自己的配置对象，
+    # 从 stage 配置原样搬进引擎参数。原先只搬 compilation_config / profiler_config，
+    # 于是 deploy 配置里的 speculative_config（stage-0 的 ngram 投机、以及
+    # stage_config.py 给 stage-1 注入的 K 步投机）会在这一步静默消失，不报错，
+    # 只在引擎侧表现为 `speculative_config=None`；K 步与 ngram 都会失去效果。
+    # 用 getattr(..., None) 兜底，避免个别 stage 配置类型没有该字段时炸掉。
+    for name in ("compilation_config", "profiler_config", "speculative_config"):
+        value = getattr(stage_config, name, None)
         if value is not None:
             engine_args[name] = copy.deepcopy(value)
 

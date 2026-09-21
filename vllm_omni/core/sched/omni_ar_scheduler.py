@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
@@ -31,6 +32,77 @@ from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
 
 logger = init_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# K 步记账 trace（默认关）
+#
+#   VLLM_OMNI_MINICPMO_KSTEP_ACCOUNT_TRACE=1
+#
+# 回答的问题：模型已经在发 row_stop，为什么请求不停？记每一步每个请求"被接受的
+# token 值"——若它恒为 0（continue），说明 stop 行没有变成请求 token 表里的 1，
+# check_stop(stop_token_ids=[1]) 永远不会触发，请求就会一路走到 max_model_len。
+# 契约：诊断永不抛异常。
+# ---------------------------------------------------------------------------
+_KSTEP_ACCOUNT_TRACE_ENV = "VLLM_OMNI_MINICPMO_KSTEP_ACCOUNT_TRACE"
+_KSTEP_ACCOUNT_TRACE: dict = {"lines": 0, "reqs": {}, "off": False}
+
+
+def kstep_account_trace_enabled() -> bool:
+    """Off unless the env turns it on; latched off for good after a failure."""
+    if _KSTEP_ACCOUNT_TRACE["off"]:
+        return False
+    raw = os.environ.get(_KSTEP_ACCOUNT_TRACE_ENV, "").strip().lower()
+    return bool(raw) and raw not in ("0", "false", "no", "off")
+
+
+def _trace_kstep_account(
+    req_id, spec_len, generated, computed, total, prompt_len, status, sampling=None
+) -> None:
+    """One line per request per step; first 24 steps of each request, then 1 in 16."""
+    state = _KSTEP_ACCOUNT_TRACE
+    if state["off"]:
+        return
+    try:
+        key = str(req_id)
+        seen = state["reqs"].get(key, 0)
+        state["reqs"][key] = seen + 1
+        gen_len = len(generated or [])
+        # Invariant I2/I5: a step with drafts must hand the request
+        # spec_len + 1 tokens (the bonus plus every accepted draft). A short
+        # row means frames the model produced were dropped on the way to the
+        # request -- always log it, whatever the stride.
+        partial = bool(spec_len) and gen_len != spec_len + 1
+        interesting = seen < 24 or seen % 16 == 0 or partial
+        nonzero = [int(t) for t in (generated or []) if int(t) != 0]
+        if not interesting and not nonzero:
+            return
+        if state["lines"] >= 400:
+            return
+        state["lines"] += 1
+        logger.info(
+            "[kstep-acct] req=%s step=%d spec_len=%s gen=%s partial=%s nonzero=%s computed=%s tokens=%s "
+            "prompt=%s status=%s stop_ids=%s eos=%s min=%s max=%s ignore_eos=%s",
+            key[:12],
+            seen,
+            spec_len,
+            gen_len,
+            int(partial),
+            nonzero[:6],
+            computed,
+            total,
+            prompt_len,
+            status,
+            list(getattr(sampling, "stop_token_ids", None) or []),
+            getattr(sampling, "eos_token_id", None),
+            getattr(sampling, "min_tokens", None),
+            getattr(sampling, "max_tokens", None),
+            getattr(sampling, "ignore_eos", None),
+        )
+    except Exception as exc:  # pragma: no cover - diagnostics never raise
+        state["off"] = True
+        logger.warning("[kstep-acct] trace disabled after failure: %r", exc)
+
+
 
 
 def _should_emit_engine_output(
@@ -337,6 +409,142 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if stop_after_transfer and req_id in self.requests_needing_kv_transfer:
             self.pending_stop_after_extraction.add(req_id)
 
+    # Env var shared with stage_config._apply_minicpmo_talker_multiframe_default;
+    # keep the name in sync there.
+    _TALKER_FRAMES_ENV = "VLLM_OMNI_MINICPMO_TALKER_FRAMES"
+
+    def _talker_kstep_armed(self) -> bool:
+        """True when this scheduler drives the Talker K-frame decode.
+
+        Mirrors `_apply_minicpmo_talker_multiframe_default`: the Talker stage
+        gets an injected n-gram config with exactly frames-1 draft tokens.
+        Matching that fingerprint keeps both sides reading the same env var.
+        The text stage's explicit n-gram config (15 draft tokens by default)
+        does not match, so this stays a no-op there.
+        """
+        cache = getattr(self, "_omni_talker_kstep_cache", None)
+        if cache is None:
+            # vLLM's Scheduler does not expose speculative_config as an
+            # attribute and SchedulerConfig has no num_speculative_tokens
+            # either, so the canonical engine-side source is vllm_config.
+            # Reading anything else silently yields 0 drafts and this whole
+            # guard never arms -- exactly the bug that survived the 11:47
+            # crash fix.
+            spec = getattr(self, "speculative_config", None)
+            if spec is None:
+                vllm_cfg = getattr(self, "vllm_config", None)
+                spec = getattr(vllm_cfg, "speculative_config", None) if vllm_cfg is not None else None
+            num_spec = 0
+            is_ngram = True
+            if spec is not None:
+                num_spec = getattr(spec, "num_speculative_tokens", 0) or 0
+                is_ngram = getattr(spec, "method", "ngram") == "ngram"
+            try:
+                frames = int(os.environ.get(self._TALKER_FRAMES_ENV, "8") or 8)
+            except ValueError:
+                frames = 8
+            armed = is_ngram and frames > 1 and num_spec == frames - 1
+            cache = self._omni_talker_kstep_cache = armed
+        return cache
+
+    def _log_kstep_guard_view(self, verdict: str, widths: set[int], states: list, dropped: int = 0) -> None:
+        """Diagnostic view of what the K-step guard judged this step.
+
+        Rate-limited but never silenced on the interesting steps: the 12:39
+        crash landed on a step whose one-shot guard log had already been
+        consumed, which hid exactly the state the guard passed. Diagnostics
+        must never raise either -- this one must not kill the engine.
+        """
+        count = getattr(self, "_omni_kstep_guard_view_count", 0) + 1
+        self._omni_kstep_guard_view_count = count
+        if count > 20 and count % 50 != 0:
+            return
+        try:
+            logger.info(
+                "[K-guard] #%d %s: waiting=%d widths=%s dropped=%d "
+                "states=(id, computed, prompt_len, total, spec_len, delta)=%s",
+                count,
+                verdict,
+                len(self.waiting),
+                sorted(widths),
+                dropped,
+                states,
+            )
+        except Exception as exc:  # never let the diagnostic kill the engine
+            logger.info("[K-guard] #%d %s (view failed: %r)", count, verdict, exc)
+
+    def _drop_talker_drafts_if_prefill_pending(self) -> None:
+        """Keep the Talker's K-frame decode out of steps with uneven spans.
+
+        The Talker multi-frame loop requires uniform decode spans, and the
+        runner refuses anything else (better a crash than a silently wrong
+        codec stream). What matters is the number of rows vLLM is about to
+        schedule per request -- not the request's spec_token_ids length:
+
+        * a plain decode is scheduled ``1 + num_spec_tokens`` rows (the
+          continuation placeholders, re-armed every step);
+        * a request carrying a streaming (or chunked) input chunk keeps its
+          own token count, e.g. 7 rows for a 7-token chunk;
+        * a decode that cannot fit the padded width (near max_model_len)
+          falls back to a single row.
+
+        Any mix of those in one step produces non-uniform spans, even in a
+        pure decode batch with no prefill in sight. Rather than dying at
+        the runner, drop the continuation drafts for this round: every
+        decode row schedules a single token next step, the step takes the
+        single-frame path, and the next propose re-arms the K frames.
+        Continuation drafts are stateless, so dropping them is free.
+        """
+        if not self._talker_kstep_armed():
+            return
+        num_spec = int(getattr(self, "num_spec_tokens", 0) or 0)
+        max_len = getattr(self, "max_model_len", None)
+        try:
+            max_len = int(max_len) if max_len is not None else None
+        except (TypeError, ValueError):
+            max_len = None
+        prefill_pending = bool(self.waiting)
+        widths: set[int] = set()
+        states: list = []
+        for req in self.running:
+            computed = int(req.num_computed_tokens)
+            prompt_len = len(req.prompt_token_ids)
+            total = int(getattr(req, "num_tokens", prompt_len))
+            delta = total - computed
+            spec_len = len(req.spec_token_ids or [])
+            states.append(
+                (str(getattr(req, "request_id", "?"))[:12], computed, prompt_len, total, spec_len, delta)
+            )
+            if computed < prompt_len:
+                prefill_pending = True
+                continue
+            if delta <= 0:
+                # Nothing scheduled for this request; it owns no rows.
+                continue
+            if delta == 1:
+                can_pad = max_len is None or computed + 1 + num_spec + 1 <= max_len
+                widths.add(1 + num_spec if (num_spec > 0 and can_pad) else 1)
+            else:
+                widths.add(delta)
+        uneven = len(widths) > 1
+        if not prefill_pending and not uneven:
+            if not widths and states:
+                # Running requests exist but none yields a row width: the step
+                # schedules no decode rows at all. Rare enough to be interesting.
+                self._log_kstep_guard_view("pass-no-decode-widths", widths, states)
+            return
+        dropped = 0
+        for req in self.running:
+            if req.spec_token_ids:
+                req.spec_token_ids = []
+                dropped += 1
+        self._log_kstep_guard_view(
+            f"drop ({'prefill pending' if prefill_pending else 'uneven spans'})",
+            widths,
+            states,
+            dropped=dropped,
+        )
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
@@ -347,6 +555,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._process_pending_omni_inputs(model_mode="ar")
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
+        # Talker K-frame guard: a step whose decode spans would be uneven
+        # (mixed prefill+decode rows, or a first-step decode joining a
+        # steady-state K-step request) must not carry the K-step drafts --
+        # the multi-frame loop requires uniform decode spans and the runner
+        # refuses the rest.
+        self._drop_talker_drafts_if_prefill_pending()
+
         original_waiting = None
         if self._should_defer_waiting_admission():
             original_waiting = waiting
@@ -463,6 +678,22 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
+            if num_tokens_scheduled <= 0:
+                # P17 SCHED0 diagnostic: a zero-token schedule entry used to
+                # die on the bare assert below with no context, which is what
+                # made the K-step stall so expensive to scope. Report WHICH
+                # request and in what state first; the assert still fires.
+                _r = self.requests.get(req_id)
+                _spec = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+                logger.error(
+                    "SCHED0 zero-token schedule: req=%s n=%s spec_tokens=%s status=%s "
+                    "num_computed=%s num_output_placeholders=%s finished=%s all_entries=%s",
+                    req_id, num_tokens_scheduled, _spec,
+                    getattr(_r, "status", None), getattr(_r, "num_computed_tokens", None),
+                    getattr(_r, "num_output_placeholders", None),
+                    None if _r is None else _r.is_finished(),
+                    dict(list(num_scheduled_tokens.items())[:8]),
+                )
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
             if request is not None:
@@ -495,6 +726,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 continue
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
+            if kstep_account_trace_enabled():
+                _trace_kstep_account(
+                    req_id,
+                    len(scheduler_output.scheduled_spec_decode_tokens.get(req_id) or []),
+                    generated_token_ids,
+                    int(request.num_computed_tokens),
+                    int(request.num_tokens),
+                    len(getattr(request, "prompt_token_ids", None) or []),
+                    getattr(request, "status", None),
+                    getattr(request, "sampling_params", None),
+                )
 
             stale_async_tokens = int(getattr(request, "async_tokens_to_discard", 0) or 0)
             async_output_is_stale = bool(generated_token_ids and stale_async_tokens > 0)
@@ -556,6 +798,52 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
+            elif scheduled_spec_token_ids and sampled_token_ids:
+                # P17 layer C: this request had drafts scheduled but its row
+                # came back with no generated tokens while the step itself
+                # sampled (a logprob-contract failure emptied the row above,
+                # the rejection sampler dropped every token, ...). The draft
+                # tokens were counted as computed but none of them will ever
+                # produce output, so roll them back -- otherwise the next
+                # step schedules a negative count and the engine stalls.
+                # NOTE the guard on `scheduled_spec_token_ids`: upstream takes
+                # it from `.get(req_id)` and a request with no drafts this
+                # step gets None -- an empty row without drafts is normal
+                # (a non-final prefill chunk produces no tokens) and upstream
+                # skips it; the guard above keeps that path intact.
+                # A prefill-chunk row is different: the chunk's prompt tokens
+                # did land in the KV cache, so only the D drafts roll back
+                # (the case entry_02 measured; the base token stays advanced).
+                # A pure-decode row that came back empty rolls the base token
+                # back too -- schedule() optimistically advanced all scheduled
+                # tokens and not one of them produced output.
+                _drafts = len(scheduled_spec_token_ids)
+                _scheduled = num_tokens_scheduled
+                _prev_computed = request.num_computed_tokens - _scheduled
+                _prompt_len = (
+                    len(request.prompt_token_ids)
+                    if getattr(request, "prompt_token_ids", None) is not None
+                    else 0
+                )
+                _is_prefill_row = _prev_computed < _prompt_len
+                _rollback = _drafts if _is_prefill_row else min(_scheduled, _drafts + 1)
+                logger.error(
+                    "K-step: request %s returned an empty row on a %s step "
+                    "(scheduled=%s drafts=%s computed=%s prompt_len=%s); "
+                    "rolling back %s. An empty decode row is never expected "
+                    "from the verify path -- this log is the stall signature.",
+                    req_id,
+                    "prefill" if _is_prefill_row else "decode",
+                    _scheduled,
+                    _drafts,
+                    request.num_computed_tokens,
+                    _prompt_len,
+                    _rollback,
+                )
+                if request.num_computed_tokens >= _rollback:
+                    request.num_computed_tokens -= _rollback
+                if request.num_output_placeholders >= _rollback:
+                    request.num_output_placeholders -= _rollback
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:
@@ -876,7 +1164,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             session.async_tokens_to_discard = 1
             session.num_computed_tokens -= session.num_output_placeholders
             session.num_output_placeholders = 0
-            session.spec_token_ids = []
+        # P17 layer B: clear stale drafts unconditionally, not only under
+        # async scheduling. With async off -- which the K-step vehicle
+        # requires -- a draft proposed before the segment boundary survived
+        # into the next segment's prefill; the runner discards prefill rows
+        # that are not the final chunk, so that row produced no token
+        # forever and the request either tripped a negative num_new_tokens
+        # or livelocked until it timed out.
+        session.spec_token_ids = []
         stage_id = self.vllm_config.model_config.stage_id
 
         update_infos = (

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import os
 import re
 import warnings
 from collections.abc import Callable, Mapping
@@ -779,6 +780,192 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
     return merged
 
 
+_MINICPMO_TALKER_FRAMES_ENV = "VLLM_OMNI_MINICPMO_TALKER_FRAMES"
+# K = codec frames one stage-1 execute_model produces. 8 is the conservative
+# starting point on 910C/A3; K=16 measures a further -6.9% at a higher TTFP
+# cost, so the ceiling stays reachable through the environment.
+_MINICPMO_TALKER_FRAMES = 8
+# Same TND ceiling as stage 0: at most 16 query positions per sequence.
+_MINICPMO_TALKER_FRAMES_MAX = 16
+_MINICPMO_FRAMES_OFF = ("0", "1", "off", "false", "no")
+
+
+_SOC_ENV_VARS = ("SOC_VERSION", "ASCEND_SOC_VERSION")
+
+
+def _soc_name_from_env() -> str:
+    """SoC identifier from the launch environment. Never touches the device.
+
+    Asking torch_npu for the device name here would initialise the NPU in
+    whichever process loads the deploy config -- the API server -- and that
+    process would then hold device memory it has no use for, which shows up as
+    an extra entry in npu-smi. CANN launch environments already export the
+    revision: ``ascend910b1`` on a 910B box, ``ascend910_9391`` on 910C.
+    """
+    for variable in _SOC_ENV_VARS:
+        value = os.environ.get(variable, "").strip().lower()
+        if value:
+            return value
+    return ""
+
+
+def _npu_soc_allows_talker_multiframe() -> bool:
+    """False on the 910B family, whose rejection verifier cannot take K rows.
+
+    Judged from the environment only, so loading a deploy config never
+    initialises a device. An unidentifiable SoC is treated as "not allowed":
+    the cost of leaving the frame loop off is a slower run, while speccing a
+    910B faults its rejection kernel. Setting ``VLLM_OMNI_MINICPMO_TALKER_FRAMES``
+    explicitly overrides this (see the caller).
+    """
+    name = _soc_name_from_env()
+    if not name:
+        logger.info(
+            "[minicpmo] SoC not identified from %s; leaving the Talker "
+            "multi-frame loop off. Set %s to force it on.",
+            "/".join(_SOC_ENV_VARS),
+            _MINICPMO_TALKER_FRAMES_ENV,
+        )
+        return False
+    return not name.startswith("ascend910b")
+
+
+def talker_frames_per_step() -> int:
+    """Codec frames one stage-1 `execute_model` produces. 1 disables it.
+
+    Deliberately read from the environment on every call rather than cached:
+    the stage config and the model runner agree through this one function and
+    are built at different times in different processes.
+    """
+    raw = os.environ.get(_MINICPMO_TALKER_FRAMES_ENV, "").strip().lower()
+    if not raw:
+        return _MINICPMO_TALKER_FRAMES
+    if raw in _MINICPMO_FRAMES_OFF:
+        return 1
+    try:
+        frames = int(raw)
+    except ValueError:
+        logger.warning(
+            "[minicpmo] %s=%r is not an integer; using the code default %d",
+            _MINICPMO_TALKER_FRAMES_ENV,
+            raw,
+            _MINICPMO_TALKER_FRAMES,
+        )
+        return _MINICPMO_TALKER_FRAMES
+    if frames < 1:
+        return 1
+    return min(frames, _MINICPMO_TALKER_FRAMES_MAX)
+
+
+def talker_multiframe_armed() -> bool:
+    """Whether the Talker K-frame loop will run in this process.
+
+    One source of truth for the three places that must agree: the deploy-config
+    injection below (does stage 1 get the speculative_config), the model's own
+    gate, and stage 1's stop-token constraint. The last one is not obvious: when
+    the loop is armed the vLLM-level head collapses to the two-wide
+    continue/stop row (``compute_logits``), so the only ids that can be sampled
+    are 0 and 1 and the codec EOS becomes unreachable *at that level*. A
+    ``stop_token_ids`` the head can never emit means `check_stop` never fires
+    and the request runs to ``max_tokens`` -- the loop keeps paying for a
+    request that already finished at the codec level.
+
+    An explicit ``VLLM_OMNI_MINICPMO_TALKER_FRAMES`` is an operator decision and
+    arms regardless of the SoC, exactly as the loader below does. Everything
+    else is the SoC gate's answer, and an unidentified SoC counts as "no".
+    """
+    if talker_frames_per_step() <= 1:
+        return False
+    if os.environ.get(_MINICPMO_TALKER_FRAMES_ENV, "").strip():
+        return True
+    return _npu_soc_allows_talker_multiframe()
+
+
+def _apply_minicpmo_talker_multiframe_default(deploy: "DeployConfig") -> None:
+    """Let the Talker produce K codec frames per scheduler step on 910C/A3.
+
+    A stage-1 decode step is dominated by per-*step* host work rather than per
+    frame, so running K frames inside one `execute_model` pays that host cost
+    once (measured on 910C/A3: ~2.9 ms of host around a 0.83 ms device forward,
+    over ~118 frames per request). The frames are *sequential* -- frame k+1 is
+    conditioned on the codec token sampled at frame k -- so this is not
+    speculative decoding and the runner runs its own inner loop. vLLM still
+    has to know the request advanced by K tokens, because that is what grows
+    the block table and KV slots the loop writes into, and `spec_token_ids` is
+    V1's only mechanism for that; hence a speculative_config that carries the
+    count. The n-gram proposer is never consulted: `propose_draft_token_ids`
+    returns the Talker's `continue` token K-1 times, so verification is exact
+    by construction.
+
+    `async_scheduling` comes off with it. vLLM refuses async scheduling next
+    to an n-gram proposer ("only supported with EAGLE/MTP/Draft Model/NGram
+    GPU/DSpark"), which is the same reason stage 0 carries the flag, and a
+    synchronous scheduler costs less here than the K-fold host saving returns.
+
+    Left off entirely on the 910B family: its rejection verifier trips a
+    vector-core limit on spec-width rows, so the baseline there stays exactly
+    as the deploy config describes it.
+    """
+    frames = talker_frames_per_step()
+    if frames <= 1:
+        return
+    explicit = os.environ.get(_MINICPMO_TALKER_FRAMES_ENV, "").strip() != ""
+    if not talker_multiframe_armed():
+        logger.info(
+            "[minicpmo] Talker multi-frame decode left off: the SoC either "
+            "cannot verify spec-width rows (910B family limit) or was not "
+            "identified. Deploy on 910C/A3, or set %s explicitly to force it.",
+            _MINICPMO_TALKER_FRAMES_ENV,
+        )
+        return
+    if explicit:
+        # An explicit request is an operator decision: arm it and let the
+        # model-side gate make the final call on the live device.
+        logger.info(
+            "[minicpmo] %s is set explicitly; arming K=%d without the SoC check",
+            _MINICPMO_TALKER_FRAMES_ENV,
+            frames,
+        )
+    for stage in deploy.stages:
+        if stage.stage_id != 1:
+            continue
+        if stage.engine_extras.get("speculative_config") is not None:
+            # An explicit config wins; this default only fills a gap.
+            logger.info(
+                "[minicpmo] stage 1 carries an explicit speculative_config; "
+                "leaving it and its async_scheduling flag untouched",
+            )
+            return
+        stage.engine_extras["speculative_config"] = {
+            "method": "ngram",
+            "num_speculative_tokens": frames - 1,
+            "prompt_lookup_min": 1,
+            "prompt_lookup_max": 1,
+        }
+        stage.async_scheduling = False
+        logger.info(
+            "[minicpmo] stage 1 multi-frame decode on (%d codec frames per "
+            "step, synchronous scheduler); set %s=1 to override",
+            frames,
+            _MINICPMO_TALKER_FRAMES_ENV,
+        )
+
+
+def _apply_minicpmo_perf_defaults(deploy: "DeployConfig", config_path: object = None) -> None:
+    """Apply MiniCPM-o perf code-defaults, scoped to this deploy config on NPU."""
+    if config_path is None or "minicpmo" not in str(config_path).lower():
+        return
+    try:
+        from vllm_omni.platforms import current_omni_platform
+
+        device_name = getattr(current_omni_platform, "device_name", None)
+    except Exception:
+        return
+    if (device_name or "").lower() != "npu":
+        return
+    _apply_minicpmo_talker_multiframe_default(deploy)
+
+
 def load_deploy_config(path: str | Path) -> DeployConfig:
     """Load a deploy YAML (with optional base_config inheritance)."""
     raw_dict = resolve_deploy_yaml(path)
@@ -821,7 +1008,9 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     ):
         if name in raw_dict:
             kwargs[name] = raw_dict[name]
-    return DeployConfig(**kwargs)
+    deploy = DeployConfig(**kwargs)
+    _apply_minicpmo_perf_defaults(deploy, path)
+    return deploy
 
 
 class PlatformOverrides(NamedTuple):
