@@ -45,8 +45,8 @@ distilled Turbo and Edit-Turbo checkpoints run the four-step DMD path through
 
 This recipe documents supported configurations for CUDA GPU serving. The native
 pipeline supports single-GPU inference and classifier-free-guidance (CFG)
-parallelism. CPU offload, cache acceleration, and other multi-GPU dimensions
-remain unsupported (see Notes).
+parallelism. Cache-DiT acceleration is supported on a single GPU. CPU offload
+and other multi-GPU dimensions remain unsupported (see Notes).
 
 ## GPU
 
@@ -112,8 +112,33 @@ curl -s http://localhost:8091/v1/chat/completions \
 - **Recommended settings:** `num_inference_steps=28`-`50`, `guidance_scale=4.0`.
   The model's maximum native resolution is 2K.
 - **Known limitations (not yet supported):** CPU offload
-  (`--enable-cpu-offload` / `--enable-layerwise-offload`), Cache-DiT
-  (`--cache-backend cache_dit`), and TP / SP / HSDP multi-GPU parallelism.
+  (`--enable-cpu-offload` / `--enable-layerwise-offload`) and TP / SP / HSDP
+  multi-GPU parallelism.
+
+#### Cache-DiT acceleration
+
+Cache-DiT caches intermediate results in Boogu's double-stream and
+single-stream Transformer blocks. Enable it on a single-GPU server with:
+
+```bash
+vllm serve Boogu/Boogu-Image-0.1-Base \
+  --omni \
+  --port 8091 \
+  --cache-backend cache_dit \
+  --cache-config \
+  '{"max_warmup_steps":4,"max_continuous_cached_steps":6,"residual_diff_threshold":0.12}'
+```
+
+The pipeline selects a safe cache profile at each request boundary:
+
+| Request path | Transformer predictions per step | Cache behavior |
+| --- | ---: | --- |
+| CFG off (`guidance_scale=1`) | 1 | Single-pass cache |
+| Base text CFG | 2 | Separate positive/negative CFG caches |
+
+Cache-DiT is currently limited to one GPU for Boogu. Combining
+`--cache-backend cache_dit` with `--cfg-parallel-size > 1` is rejected during
+startup. Other cache backends remain unsupported.
 
 ### 2 x H100 (CFG parallel, Base T2I)
 
