@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for the ``num_waiting_for_streaming_input`` resync placed in
 ``OmniARScheduler.finish_requests`` / ``OmniGenerationScheduler.finish_requests``
 and in ``OmniARScheduler.schedule``.
@@ -128,6 +131,7 @@ def test_ar_schedule_resyncs_before_delegating_upstream(monkeypatch: pytest.Monk
     scheduler.skipped_waiting = []
     scheduler.num_waiting_for_streaming_input = 1  # leaked by the status rewrite
     scheduler.policy = "fcfs"
+    scheduler.max_num_running_reqs = 8
 
     seen: dict[str, int] = {}
 
