@@ -6,6 +6,7 @@ aggregation cadence with ``OMNI_STEP_PROF_FLUSH`` (totals between dumps,
 default 200). Thread-safe; spans are keyed per thread so nested/overlapping
 regions in the engine loop stay correct.
 """
+
 from __future__ import annotations
 
 import os

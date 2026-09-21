@@ -516,9 +516,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                 model_output = talker_multiframe.run(
                     model=self.model,
                     run_model=run_model,
-                    after_forward=lambda: self._update_full_graph_params_if_needed(
-                        forward_context, graph_tokens
-                    ),
+                    after_forward=lambda: self._update_full_graph_params_if_needed(forward_context, graph_tokens),
                     inputs_embeds=inputs_embeds,
                     input_ids=input_ids,
                     frames=frames,

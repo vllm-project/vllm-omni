@@ -58,9 +58,7 @@ def restore_native_rejection_sampler() -> None:
         import vllm.v1.sample.rejection_sampler as rs
     except ImportError:  # pragma: no cover - vllm core moved the module
         return
-    spec = importlib.util.spec_from_file_location(
-        "_vllm_rejection_sampler_native", rs.__file__
-    )
+    spec = importlib.util.spec_from_file_location("_vllm_rejection_sampler_native", rs.__file__)
     if spec is None or spec.loader is None:  # pragma: no cover
         return
     native = importlib.util.module_from_spec(spec)

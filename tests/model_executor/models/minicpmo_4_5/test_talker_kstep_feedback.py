@@ -40,9 +40,7 @@ def _make_talker(*, k_step_frames: int, scripted_samples: list[int]):
     zeros while real codec rows are not -- a sharp contrast for asserting
     which id got embedded.
     """
-    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(
-        MiniCPMO45OmniTTSForConditionalGeneration
-    )
+    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
     nn.Module.__init__(model)
     model._k_step_frames = k_step_frames
     model.supports_multi_frame_decode = k_step_frames > 0
@@ -205,14 +203,14 @@ def test_guard_arms_from_vllm_config_and_drops_drafts_for_a_running_chunk(monkey
     # vLLM pads to 1+7 rows. Both spec_token_ids lists look innocent ([] and
     # 7 placeholders), so the guard must predict row widths from
     # num_tokens - num_computed_tokens instead.
-    from types import SimpleNamespace as NS
+    from types import SimpleNamespace
 
     from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 
     monkeypatch.setenv(_TALKER_FRAMES_ENV, "8")
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched._omni_talker_kstep_cache = None
-    sched.vllm_config = NS(speculative_config=NS(method="ngram", num_speculative_tokens=7))
+    sched.vllm_config = SimpleNamespace(speculative_config=SimpleNamespace(method="ngram", num_speculative_tokens=7))
     assert sched._talker_kstep_armed() is True
     sched.num_spec_tokens = 7
     sched.max_model_len = 40960
@@ -398,16 +396,12 @@ def test_kstep_min_tokens_neutralization_clears_the_censor_list():
     untouched = _MinTokensLogitsProcessor({0: (50, [0], {1})})
     untouched.__class__ = type("SomeOtherProcessor", (object,), {})  # 非目标处理器
 
-    talker_multiframe.neutralize_kstep_min_tokens(
-        SimpleNamespace(non_argmax_invariant=[untouched, censor])
-    )
+    talker_multiframe.neutralize_kstep_min_tokens(SimpleNamespace(non_argmax_invariant=[untouched, censor]))
     assert censor.min_toks == {}
     assert untouched.min_toks == {0: (50, [0], {1})}
 
     # 空名单 / 怪输入都不能炸。
-    talker_multiframe.neutralize_kstep_min_tokens(
-        SimpleNamespace(non_argmax_invariant=[])
-    )
+    talker_multiframe.neutralize_kstep_min_tokens(SimpleNamespace(non_argmax_invariant=[]))
     talker_multiframe.neutralize_kstep_min_tokens(None)
 
 
@@ -421,11 +415,7 @@ def test_kstep_bookkeeping_trace_is_total(monkeypatch):
     runner = SimpleNamespace(
         input_batch=SimpleNamespace(
             sampling_metadata=SimpleNamespace(
-                logitsprocs=SimpleNamespace(
-                    non_argmax_invariant=[
-                        _MinTokensLogitsProcessor({0: (50, [0, 0], {1})})
-                    ]
-                )
+                logitsprocs=SimpleNamespace(non_argmax_invariant=[_MinTokensLogitsProcessor({0: (50, [0, 0], {1})})])
             )
         )
     )

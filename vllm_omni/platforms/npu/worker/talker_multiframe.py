@@ -56,9 +56,10 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Any, Callable
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
@@ -163,8 +164,7 @@ def _prof_summary(steps: int, frames_total: int, last_frames: int, *, detail: bo
         replay_per_frame = _PROF_REPLAY_MS / frames_total if frames_total else 0.0
         after_per_frame = _PROF_AFTER_MS / frames_total if frames_total else 0.0
         synced = (
-            f" synced_frame_ms={_PROF_SYNCED_MS / _PROF_SYNCED_FRAMES:.3f}"
-            f" (n={_PROF_SYNCED_FRAMES})"
+            f" synced_frame_ms={_PROF_SYNCED_MS / _PROF_SYNCED_FRAMES:.3f} (n={_PROF_SYNCED_FRAMES})"
             if _PROF_SYNCED_FRAMES
             else ""
         )
@@ -210,7 +210,7 @@ def _prof_disabled(reason: str) -> None:
     os.environ[_PROF_ENV] = "0"
 
 
-def _prof_step_begin(frames: int) -> "_StepProf | None":
+def _prof_step_begin(frames: int) -> _StepProf | None:
     """``None`` when off -- and then ``run()`` takes no timer at all."""
     try:
         if not prof_enabled():
@@ -221,7 +221,7 @@ def _prof_step_begin(frames: int) -> "_StepProf | None":
         return None
 
 
-def _prof_frame(prof: "_StepProf", frame: int, t0: float, t1: float, t2: float, t3: float) -> None:
+def _prof_frame(prof: _StepProf, frame: int, t0: float, t1: float, t2: float, t3: float) -> None:
     """Book one replay. ``replay``/``after`` are enqueue times; ``synced`` is the
     frame's real wall clock (drained after the replay), and the gap between them
     is the device side of the account."""
@@ -242,7 +242,7 @@ def _prof_frame(prof: "_StepProf", frame: int, t0: float, t1: float, t2: float, 
         _prof_disabled("frame")
 
 
-def _prof_step_end(prof: "_StepProf | None", step_start: float) -> None:
+def _prof_step_end(prof: _StepProf | None, step_start: float) -> None:
     if prof is None:
         return
     try:
@@ -256,6 +256,8 @@ def _prof_step_end(prof: "_StepProf | None", step_start: float) -> None:
             _prof_summary(_PROF_STEPS, _PROF_FRAMES, prof.frames, detail=prof.detail)
     except Exception:
         _prof_disabled("step_end")
+
+
 # ---------------------------------------------------------------------------
 # Stop-row forensics for the multi-frame loop (off by default).
 #
@@ -328,7 +330,7 @@ def trace_kstep_bookkeeping(runner: Any, valid_sampled_token_ids: Any, logits: A
         if isinstance(valid_sampled_token_ids, list):
             carried: Any = [list(row) for row in valid_sampled_token_ids[:4]]
         else:
-            carried = "<%s>" % type(valid_sampled_token_ids).__name__
+            carried = f"<{type(valid_sampled_token_ids).__name__}>"
 
         masks: list[Any] = []
         sampling_metadata = getattr(getattr(runner, "input_batch", None), "sampling_metadata", None)
@@ -603,7 +605,7 @@ def begin_narrow_step(
     positions: Any,
     inputs_embeds: Any,
     spans: list[tuple[int, int]],
-) -> "NarrowStep | None":
+) -> NarrowStep | None:
     """Point the forward context at the one-query graph, or decline.
 
     Declines -- and the caller falls back to the wide replay -- whenever the
@@ -631,7 +633,7 @@ def begin_narrow_step(
         return None
     seq_lens = fixed_kv_decode.captured_seq_lens(rows)
     if seq_lens is None:
-        return _decline("no one-query graph captured for %d rows" % rows)
+        return _decline(f"no one-query graph captured for {rows} rows")
     metadata = getattr(forward_context, "attn_metadata", None)
     if isinstance(metadata, dict):
         metadata = next(iter(metadata.values()), None)
@@ -669,13 +671,9 @@ def begin_narrow_step(
         # back, and the captured key has it set. What this step is has not
         # changed -- it is one token per request against a graph captured for
         # exactly that -- only which graph replays it.
-        forward_context.batch_descriptor = dataclasses.replace(
-            descriptor, num_tokens=rows, num_reqs=rows, uniform=True
-        )
+        forward_context.batch_descriptor = dataclasses.replace(descriptor, num_tokens=rows, num_reqs=rows, uniform=True)
     else:
-        forward_context.batch_descriptor = BatchDescriptor(
-            num_tokens=rows, num_reqs=rows, uniform=True
-        )
+        forward_context.batch_descriptor = BatchDescriptor(num_tokens=rows, num_reqs=rows, uniform=True)
     # The dispatcher builds its lookup descriptor from its own query length --
     # 4 at runtime, which is right for the step -- so it finds no key for the
     # narrow capture and hands back NONE, and the wrapper then runs the model
@@ -696,7 +694,7 @@ def begin_narrow_step(
     return narrow
 
 
-def end_narrow_step(forward_context: Any, narrow: "NarrowStep | None") -> None:
+def end_narrow_step(forward_context: Any, narrow: NarrowStep | None) -> None:
     if narrow is None:
         return
     forward_context.batch_descriptor = narrow.saved_descriptor
@@ -727,7 +725,7 @@ def run(
     frames: int,
     model_kwargs: dict[str, Any],
     model_kwargs_extra: dict[str, Any],
-    narrow: "NarrowStep | None" = None,
+    narrow: NarrowStep | None = None,
 ) -> Any:
     """Run ``frames`` codec frames and return the merged step output.
 
@@ -756,9 +754,7 @@ def run(
             if frame == 0:
                 _compact_frame_zero_embeddings(inputs_embeds, spans)
             else:
-                _write_frame_embeddings(
-                    model, inputs_embeds, input_ids, spans, infos, frame, narrow=narrow
-                )
+                _write_frame_embeddings(model, inputs_embeds, input_ids, spans, infos, frame, narrow=narrow)
         elif frame > 0:
             _write_frame_embeddings(model, inputs_embeds, input_ids, spans, infos, frame)
         t0 = perf_counter() if step_prof is not None else 0.0
@@ -791,9 +787,7 @@ def run(
 
     if not _LOGGED_ENGAGE:
         _LOGGED_ENGAGE = True
-        logger.info(
-            "[minicpmo] multi-frame Talker decode engaged: %d codec frames per step", frames
-        )
+        logger.info("[minicpmo] multi-frame Talker decode engaged: %d codec frames per step", frames)
     if stop_trace_enabled():
         _trace_stop_rows(frame_stop_logits)
     merged = model.merge_frame_outputs(frame_outputs, frame_stop_logits)
@@ -801,9 +795,7 @@ def run(
         # (frames, rows, hidden) -> (rows * frames, hidden), request-major --
         # the layout `logits_indices` reads. OmniOutput is a NamedTuple.
         merged = merged._replace(
-            text_hidden_states=torch.stack(frame_hidden, dim=1).reshape(
-                -1, frame_hidden[0].shape[-1]
-            )
+            text_hidden_states=torch.stack(frame_hidden, dim=1).reshape(-1, frame_hidden[0].shape[-1])
         )
     # Whole step, frames + merge: this is the number to compare against the
     # scheduler's step cadence.
@@ -827,7 +819,7 @@ def _write_frame_embeddings(
     spans: list[tuple[int, int]],
     infos: list[dict[str, Any]],
     frame: int,
-    narrow: "NarrowStep | None" = None,
+    narrow: NarrowStep | None = None,
 ) -> None:
     """Put frame ``frame``'s decode embedding into the row the graph reads.
 

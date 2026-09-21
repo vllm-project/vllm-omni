@@ -1221,9 +1221,7 @@ _RUNTIME_ENGINE_FIELDS = frozenset(_RuntimeEngineOverrides.__annotations__)
 # stage-1 override block with a startup ValueError ("Stage 1 (llm_ar) has
 # explicit engine argument(s) with no structured config owner"). It joins the
 # two pass-through fields already listed.
-_DIRECT_VLLM_CONFIG_ENGINE_FIELDS = frozenset(
-    {"compilation_config", "profiler_config", "speculative_config"}
-)
+_DIRECT_VLLM_CONFIG_ENGINE_FIELDS = frozenset({"compilation_config", "profiler_config", "speculative_config"})
 _LLM_LOAD_ENGINE_FIELDS = _LOAD_ENGINE_FIELDS | frozenset(_LOAD_CONFIG_ENGINE_FIELD_MAP.values())
 _LLM_CACHE_ENGINE_FIELDS = _CACHE_ENGINE_FIELDS | frozenset(_CACHE_CONFIG_ENGINE_FIELD_MAP.values())
 _LLM_SCHEDULER_ENGINE_FIELDS = _SCHEDULER_ENGINE_FIELDS | frozenset(_SCHEDULER_CONFIG_ENGINE_FIELD_MAP.values())

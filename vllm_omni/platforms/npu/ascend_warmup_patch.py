@@ -152,9 +152,7 @@ def apply_ascend_warmup_patch() -> None:
         # re-exports ``kernel_warmup`` as a package attribute, so
         # ``from ... import kernel_warmup`` yields the function and every
         # ``getattr`` below would silently miss.
-        warmup_module = importlib.import_module(
-            "vllm_ascend.model_executor.warmup.kernel_warmup"
-        )
+        warmup_module = importlib.import_module("vllm_ascend.model_executor.warmup.kernel_warmup")
     except Exception as error:  # pragma: no cover - non-ascend builds
         logger.warning("[npu] Ascend warmup patch not applied: %s", error)
         return

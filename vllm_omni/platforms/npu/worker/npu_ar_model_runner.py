@@ -45,13 +45,13 @@ from vllm_ascend.utils import enable_sp, global_stream
 from vllm_ascend.worker.model_runner_v1 import graph_capture
 
 from vllm_omni.data_entry_keys import flatten_payload
-from vllm_omni.utils.step_prof import span, tic, toc
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
+from vllm_omni.utils.step_prof import span, tic, toc
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
@@ -223,19 +223,16 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 # tensor, and `tensor or []` raises the ambiguous-truth error.
                 if isinstance(valid_sampled_token_ids, list):
                     rows = valid_sampled_token_ids
-                    _desc = "rows=%s types=%s lens=%s head=%s" % (
-                        len(rows),
-                        [type(r).__name__ for r in rows[:8]],
-                        [len(r) for r in rows[:8] if isinstance(r, list)],
-                        repr(rows)[:400],
+                    _desc = (
+                        f"rows={len(rows)}"
+                        f" types={[type(r).__name__ for r in rows[:8]]}"
+                        f" lens={[len(r) for r in rows[:8] if isinstance(r, list)]}"
+                        f" head={repr(rows)[:400]}"
                     )
                 else:
                     seen = valid_sampled_token_ids
                     shape = tuple(seen.shape) if hasattr(seen, "shape") else "?"
-                    _desc = "rows=<%s shape=%s>" % (
-                        type(seen).__name__,
-                        shape,
-                    )
+                    _desc = f"rows=<{type(seen).__name__} shape={shape}>"
                 logger.error(
                     "[kstep] no drafts emitted: frames=%s num_reqs=%s %s",
                     frames,

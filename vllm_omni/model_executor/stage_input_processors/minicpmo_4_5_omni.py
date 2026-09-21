@@ -353,9 +353,7 @@ def tts2code2wav_async_chunk(
     # chunk_frames. When unset, first_window == chunk_frames and behavior is
     # unchanged.
     first_window = (
-        _initial_chunk_frames(transfer_manager, chunk_frames)
-        if int(record["chunk_seq"]) == 0
-        else chunk_frames
+        _initial_chunk_frames(transfer_manager, chunk_frames) if int(record["chunk_seq"]) == 0 else chunk_frames
     )
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))

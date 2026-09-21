@@ -56,9 +56,7 @@ def kstep_account_trace_enabled() -> bool:
     return bool(raw) and raw not in ("0", "false", "no", "off")
 
 
-def _trace_kstep_account(
-    req_id, spec_len, generated, computed, total, prompt_len, status, sampling=None
-) -> None:
+def _trace_kstep_account(req_id, spec_len, generated, computed, total, prompt_len, status, sampling=None) -> None:
     """One line per request per step; first 24 steps of each request, then 1 in 16."""
     state = _KSTEP_ACCOUNT_TRACE
     if state["off"]:
@@ -102,8 +100,6 @@ def _trace_kstep_account(
     except Exception as exc:  # pragma: no cover - diagnostics never raise
         state["off"] = True
         logger.warning("[kstep-acct] trace disabled after failure: %r", exc)
-
-
 
 
 def _should_emit_engine_output(
@@ -513,9 +509,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             total = int(getattr(req, "num_tokens", prompt_len))
             delta = total - computed
             spec_len = len(req.spec_token_ids or [])
-            states.append(
-                (str(getattr(req, "request_id", "?"))[:12], computed, prompt_len, total, spec_len, delta)
-            )
+            states.append((str(getattr(req, "request_id", "?"))[:12], computed, prompt_len, total, spec_len, delta))
             if computed < prompt_len:
                 prefill_pending = True
                 continue
@@ -689,8 +683,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 logger.error(
                     "SCHED0 zero-token schedule: req=%s n=%s spec_tokens=%s status=%s "
                     "num_computed=%s num_output_placeholders=%s finished=%s all_entries=%s",
-                    req_id, num_tokens_scheduled, _spec,
-                    getattr(_r, "status", None), getattr(_r, "num_computed_tokens", None),
+                    req_id,
+                    num_tokens_scheduled,
+                    _spec,
+                    getattr(_r, "status", None),
+                    getattr(_r, "num_computed_tokens", None),
                     getattr(_r, "num_output_placeholders", None),
                     None if _r is None else _r.is_finished(),
                     dict(list(num_scheduled_tokens.items())[:8]),
@@ -822,9 +819,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 _scheduled = num_tokens_scheduled
                 _prev_computed = request.num_computed_tokens - _scheduled
                 _prompt_len = (
-                    len(request.prompt_token_ids)
-                    if getattr(request, "prompt_token_ids", None) is not None
-                    else 0
+                    len(request.prompt_token_ids) if getattr(request, "prompt_token_ids", None) is not None else 0
                 )
                 _is_prefill_row = _prev_computed < _prompt_len
                 _rollback = _drafts if _is_prefill_row else min(_scheduled, _drafts + 1)

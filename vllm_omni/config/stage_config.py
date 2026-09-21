@@ -821,8 +821,7 @@ def _npu_soc_allows_talker_multiframe() -> bool:
     name = _soc_name_from_env()
     if not name:
         logger.info(
-            "[minicpmo] SoC not identified from %s; leaving the Talker "
-            "multi-frame loop off. Set %s to force it on.",
+            "[minicpmo] SoC not identified from %s; leaving the Talker multi-frame loop off. Set %s to force it on.",
             "/".join(_SOC_ENV_VARS),
             _MINICPMO_TALKER_FRAMES_ENV,
         )
@@ -881,7 +880,7 @@ def talker_multiframe_armed() -> bool:
     return _npu_soc_allows_talker_multiframe()
 
 
-def _apply_minicpmo_talker_multiframe_default(deploy: "DeployConfig") -> None:
+def _apply_minicpmo_talker_multiframe_default(deploy: DeployConfig) -> None:
     """Let the Talker produce K codec frames per scheduler step on 910C/A3.
 
     A stage-1 decode step is dominated by per-*step* host work rather than per
@@ -951,7 +950,7 @@ def _apply_minicpmo_talker_multiframe_default(deploy: "DeployConfig") -> None:
         )
 
 
-def _apply_minicpmo_perf_defaults(deploy: "DeployConfig", config_path: object = None) -> None:
+def _apply_minicpmo_perf_defaults(deploy: DeployConfig, config_path: object = None) -> None:
     """Apply MiniCPM-o perf code-defaults, scoped to this deploy config on NPU."""
     if config_path is None or "minicpmo" not in str(config_path).lower():
         return

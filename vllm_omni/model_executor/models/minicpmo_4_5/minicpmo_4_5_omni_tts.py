@@ -12,9 +12,10 @@ Pipeline:
   5. Next decode embeds that id with emb_code and emits it to Code2Wav
 """
 
-from collections.abc import Iterable, Mapping, Sequence
 import os
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
+
 try:
     import torch_npu  # noqa: F401  (NPU platform guarantee)
 except Exception:  # pragma: no cover
@@ -30,8 +31,8 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.llama import LlamaModel
 from vllm.model_executor.models.utils import maybe_prefix
-from vllm.v1.sample.sampler import Sampler
 from vllm.v1.outputs import SamplerOutput
+from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.engine.duplex.intermediate import get_tts_handoff
 from vllm_omni.model_executor.models.minicpmo_4_5 import (
@@ -39,7 +40,6 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
-    MIN_TOKENS_TO_KEEP,
     TalkerCodecDeviceState,
     TalkerCodecSampleResult,
     codec_sample_result,
@@ -341,7 +341,6 @@ def resolve_codec_sampling_params(
     return resolved
 
 
-
 # ---------------------------------------------------------------------------
 # Per-frame trace for the multi-frame loop (off by default; complements the
 # per-step timers in talker_multiframe).
@@ -355,9 +354,9 @@ def resolve_codec_sampling_params(
 # engine down: on any error they disable themselves and log one warning.
 # ---------------------------------------------------------------------------
 _KSTEP_FRAME_TRACE_ENV = "VLLM_OMNI_MINICPMO_KSTEP_FRAME_TRACE"
-_KSTEP_FRAME_TRACE_LINES = 128   # max printed lines
-_KSTEP_FRAME_TRACE_HEAD = 16     # first N frames printed one by one (frame-order check)
-_KSTEP_FRAME_TRACE_STRIDE = 16   # then one line every N frames (covers ~1800 frames)
+_KSTEP_FRAME_TRACE_LINES = 128  # max printed lines
+_KSTEP_FRAME_TRACE_HEAD = 16  # first N frames printed one by one (frame-order check)
+_KSTEP_FRAME_TRACE_STRIDE = 16  # then one line every N frames (covers ~1800 frames)
 _KSTEP_FRAME_TRACE: dict[str, Any] = {"reqs": {}, "lines": 0, "off": False}
 
 
@@ -397,9 +396,7 @@ def _trace_kstep_frame(model: Any, **fields: Any) -> None:
         return
     try:
         device_states = getattr(model, "_request_codec_device_states", None)
-        device_state = (
-            device_states.get(fields.get("request_id")) if isinstance(device_states, dict) else None
-        )
+        device_state = device_states.get(fields.get("request_id")) if isinstance(device_states, dict) else None
         device_step = int(device_state.step.reshape(-1)[0].item()) if device_state is not None else -1
         state["lines"] += 1  # cap printed lines only; per-request windows count separately
         logger.info(
@@ -435,6 +432,7 @@ def _codec_int_param(state: Any, key: str, fallback: int) -> int:
     """
     value = state.get(key) if isinstance(state, Mapping) else None
     return int(fallback if value is None else value)
+
 
 class _MiniCPMTTSProjector(nn.Module):
     """Checkpoint-compatible hidden-state projector used by MiniCPMTTS."""
@@ -492,9 +490,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # block wins key by key, then the checkpoint's tts_config, then the
             # module fallbacks. The multi-frame path reads the resolved values
             # straight off the model.
-            yaml_codec = getattr(
-                getattr(vllm_config, "model_config", None), "codec_sampling_params", None
-            )
+            yaml_codec = getattr(getattr(vllm_config, "model_config", None), "codec_sampling_params", None)
             resolved = resolve_codec_sampling_params(yaml_codec, tts_config)
             self._codec_seed = resolved["seed"]
             self._codec_temperature = resolved["temperature"]
@@ -557,9 +553,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         try:
             import torch_npu
 
-            return str(
-                torch_npu.npu.get_device_name(torch_npu.npu.current_device())
-            )
+            return str(torch_npu.npu.get_device_name(torch_npu.npu.current_device()))
         except Exception:
             return ""
 
@@ -620,9 +614,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             try:
                 frames = int(raw)
             except ValueError:
-                raise ValueError(
-                    f"OMNI_K_STEP must be an integer frame count (>=2), got {raw!r}"
-                ) from None
+                raise ValueError(f"OMNI_K_STEP must be an integer frame count (>=2), got {raw!r}") from None
             explicit = "forced"
         else:
             frames = talker_frames_per_step()
@@ -1305,17 +1297,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         per_frame_codes = [output.multimodal_outputs["codes"]["audio"] for output in frame_outputs]
         num_reqs = len(per_frame_codes[0])
-        codec_deltas = [
-            torch.cat([frame[index] for frame in per_frame_codes], dim=0) for index in range(num_reqs)
-        ]
+        codec_deltas = [torch.cat([frame[index] for frame in per_frame_codes], dim=0) for index in range(num_reqs)]
 
         meta_outputs: dict[str, Any] = {}
         for key in frame_outputs[0].multimodal_outputs["meta"]:
             per_frame = [output.multimodal_outputs["meta"][key] for output in frame_outputs]
             if key == "finished":
                 meta_outputs[key] = [
-                    self._merge_frame_finished([frame[index] for frame in per_frame])
-                    for index in range(num_reqs)
+                    self._merge_frame_finished([frame[index] for frame in per_frame]) for index in range(num_reqs)
                 ]
             else:
                 # Duplex metadata is per request and constant across the step's
@@ -1349,7 +1338,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             device_states = {}
             self._request_codec_device_states = device_states
         device_state = device_states.get(request_id)
-        new_segment = device_state is None
         if device_state is None:
             request_states = getattr(self, "_request_audio_states", {})
             request_state = request_states.get(request_id, {})
@@ -1494,7 +1482,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._batch_stop_logits = logits
 
     @staticmethod
-
     def _merge_frame_finished(flags: list[torch.Tensor]) -> torch.Tensor:
         """OR the per-frame terminal flags without forcing a device sync.
 
@@ -1876,16 +1863,19 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if (
             isinstance(freq_rows, list)
             and len(freq_rows) == logits.shape[0]
-            and all(isinstance(f, torch.Tensor) and f.device == logits.device and f.numel() == logits.shape[-1] for f in freq_rows)
+            and all(
+                isinstance(f, torch.Tensor) and f.device == logits.device and f.numel() == logits.shape[-1]
+                for f in freq_rows
+            )
             and bool((penalties.reshape(-1) != 1.0).any())
         ):
             # Incremental histogram: freq rows are maintained on device by
             # make_omni_output (+1 append / -1 evict), identical to a full
             # scatter_add rebuild of the sliding window.
             freqs = torch.stack([f.to(dtype=torch.float32) for f in freq_rows], dim=0)
-            alpha = torch.pow(
-                penalties.to(device=logits.device, dtype=torch.float32).reshape(-1, 1), freqs
-            ).to(dtype=logits.dtype)
+            alpha = torch.pow(penalties.to(device=logits.device, dtype=torch.float32).reshape(-1, 1), freqs).to(
+                dtype=logits.dtype
+            )
             logits = torch.where(logits < 0, logits * alpha, logits / alpha)
             return logits, replace(sampling_metadata, repetition_penalties=torch.ones_like(penalties))
         logits = _apply_batched_repetition_penalty(
