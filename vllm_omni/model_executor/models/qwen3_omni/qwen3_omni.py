@@ -179,6 +179,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         # vLLM run with no talker stage downstream, so no one consumes captured
         # thinker layers and the forward must return what stock vLLM expects.
         self.is_staged_run = getattr(vllm_config.model_config, "model_stage", None) is not None
+        self._returns_tuple = self.model_stage == "thinker" and self.is_staged_run
 
         if self.model_stage == "thinker":
             self.use_async_omni_output = True

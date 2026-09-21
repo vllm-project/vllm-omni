@@ -1,0 +1,18 @@
+# Opt-in CUDA Model Runner V2 profile. The base profile retains V1.
+base_config: qwen3_tts.yaml
+model_runner: v2
+
+platforms:
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  rocm:
+    model_runner: v1
+  musa:
+    model_runner: v1
+
+stages:
+  - stage_id: 0
+    # Bound per-step prefill work, matching the high-concurrency TTS profile.
+    max_num_batched_tokens: 512

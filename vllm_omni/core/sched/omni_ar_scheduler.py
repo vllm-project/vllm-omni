@@ -33,6 +33,21 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 logger = init_logger(__name__)
 
 
+def _should_emit_engine_output(
+    model_config: Any,
+    *,
+    stopped: bool,
+    has_control: bool,
+) -> bool:
+    if stopped or has_control:
+        return True
+    return not (
+        bool(getattr(model_config, "use_v2_model_runner", False))
+        and bool(getattr(model_config, "async_chunk", False))
+        and not bool(getattr(model_config, "final_output", False))
+    )
+
+
 class SampledLogprobContractError(RuntimeError):
     """The model runner returned unusable sampled-token logprobs."""
 
@@ -83,6 +98,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     used as a base class for the OmniARAsyncScheduler and holds most of the
     core scheduling logic.
     """
+
+    max_num_running_reqs: int
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -200,9 +217,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         finished_status: RequestStatus,
     ) -> list[Request]:
         """Finish requests and discard any incomplete KV-wait timing."""
+        cleanup_ids: Iterable[str]
         if isinstance(request_ids, str):
             cleanup_ids = (request_ids,)
-            finish_request_ids: str | tuple[str, ...] | None = request_ids
+            finish_request_ids: str | Iterable[str] | None = request_ids
         elif request_ids is None:
             cleanup_ids = ()
             finish_request_ids = None
@@ -329,15 +347,22 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._process_pending_omni_inputs(model_mode="ar")
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
-
         original_waiting = None
         if self._should_defer_waiting_admission():
             original_waiting = waiting
             self.waiting = create_request_queue(self.policy)
 
+        original_max_num_running_reqs = self.max_num_running_reqs
+        async_chunk_transport = self._async_chunk_transport_enabled()
+        reserved_running_slots = (
+            self._get_async_chunk_reserved_running_slots() if async_chunk_transport and self.use_v2_model_runner else 0
+        )
+        if reserved_running_slots:
+            self.max_num_running_reqs = max(0, original_max_num_running_reqs - reserved_running_slots)
         try:
             scheduler_output = super().schedule(throttle_prefills)
         finally:
+            self.max_num_running_reqs = original_max_num_running_reqs
             if original_waiting is not None:
                 deferred_waiting = list(self.waiting)
                 if deferred_waiting:
@@ -441,7 +466,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
             if request is not None:
-                # vLLM 0.26: settle the in-flight tokens counted in schedule().
+                # Settle the in-flight tokens counted in schedule().
                 # Must happen before the skips below — failed-KV-load and
                 # already-finished requests were incremented too, and the two
                 # readers (allocate_slots, _connector_finished) clamp with
@@ -609,6 +634,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             confirmed_num_computed_tokens = None
             boundary_generation = None
+            # Capture before resumable stop handling can clear token history.
+            output_token_ids: Any = getattr(request, "output_token_ids", None)
+            if output_token_ids is None:
+                output_token_ids = getattr(request, "_output_token_ids", ())
+            num_generation_tokens = len(output_token_ids)
             if stopped:
                 if self.chunk_transfer_adapter is not None:
                     confirmed_num_computed_tokens = self.chunk_transfer_adapter._confirmed_num_computed_tokens(request)
@@ -627,6 +657,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 is_segment_finished = not finished
                 if finished:
                     request.resumable = False
+                    if self._native_data_plane:
+                        self._pending_data_plane_terminal_req_ids.add(req_id)
                 if not finished:
                     # for streaming input request only
                     if self.chunk_transfer_adapter:
@@ -683,7 +715,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
+            has_stage_output = (
+                bool(new_token_ids)
+                or mm_output is not None
+                or pooler_output is not None
+                or kv_transfer_params
+                or stopped
+            )
+            if has_stage_output and _should_emit_engine_output(
+                self.vllm_config.model_config,
+                stopped=stopped,
+                has_control=kv_transfer_params is not None,
+            ):
                 OmniSchedulerMixin._append_request_output(
                     self,
                     outputs,
@@ -702,6 +745,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     num_nans_in_logits=request.num_nans_in_logits,
                     is_segment_finished=is_segment_finished,
                     new_prompt_len_snapshot=self._new_prompt_len_snapshot.get(req_id),
+                    num_generation_tokens=num_generation_tokens,
                 )
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
@@ -877,7 +921,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # This streaming update has already been dequeued. Report the
                 # permanent contract failure so the next scheduling pass
                 # finishes only this request instead of crashing EngineCore.
-                self.chunk_transfer_adapter.record_receive_failure(req_id, str(exc))
+                if self.chunk_transfer_adapter is not None:
+                    self.chunk_transfer_adapter.record_receive_failure(req_id, str(exc))
                 return
             if replaced is not None:
                 if replaced:

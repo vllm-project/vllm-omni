@@ -192,6 +192,8 @@ class OrchestratorRequestState:
     final_stage_id: int = -1
     final_output_stage_ids: set[int] = field(default_factory=set)
     finished_final_output_stage_ids: set[int] = field(default_factory=set)
+    finished_stage_ids: set[int] = field(default_factory=set)
+    pending_final_output: OutputMessage | None = None
 
     # Wall-clock timestamp when the client-facing engine request was accepted.
     request_timestamp: float = 0.0
@@ -763,20 +765,21 @@ class OrchestratorBase:
                     float(kv_wait_s),
                 )
             req_state = self.request_states.get(getattr(eco, "request_id", None))
-            if req_state is None or not req_state.streaming.enabled:
+            if req_state is None:
                 continue
-            segment_finished = bool(getattr(eco, "is_segment_finished", False))
-            raw_mm = self._completion_multimodal_output(eco, None)
-            req_state.streaming.segments[stage_id] = StreamingSegmentState(
-                finished=segment_finished,
-                token_ids=(self._coerce_int_list(getattr(eco, "new_token_ids", None)) if segment_finished else []),
-                output_metadata=(dict(raw_mm) if segment_finished and isinstance(raw_mm, dict) else {}),
-            )
-            req_state.streaming.new_prompt_len_snapshot = getattr(
-                eco,
-                "new_prompt_len_snapshot",
-                None,
-            )
+            if req_state.streaming.enabled:
+                segment_finished = bool(getattr(eco, "is_segment_finished", False))
+                raw_mm = self._completion_multimodal_output(eco, None)
+                req_state.streaming.segments[stage_id] = StreamingSegmentState(
+                    finished=segment_finished,
+                    token_ids=(self._coerce_int_list(getattr(eco, "new_token_ids", None)) if segment_finished else []),
+                    output_metadata=(dict(raw_mm) if segment_finished and isinstance(raw_mm, dict) else {}),
+                )
+                req_state.streaming.new_prompt_len_snapshot = getattr(
+                    eco,
+                    "new_prompt_len_snapshot",
+                    None,
+                )
             if await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state):
                 raw_terminal_request_ids.add(req_state.request_id)
             await self._report_duplex_session_request_error(stage_id, replica_id, eco, req_state)
@@ -1506,18 +1509,19 @@ class OrchestratorBase:
         ``is_segment_finished=False``, but vLLM's output processor may remove the
         request state before that EngineCoreOutput is processed.
 
-        Only update ``finished_final_output_stage_ids`` here. Request cleanup stays
-        in ``_route_output`` so downstream async-chunk stages can still deliver
-        outputs after stage-0 session end.
+        Record raw stage completion here. Client completion is
+        resolved after this raw batch passes through the output processor, so a
+        real processed output wins over the swallowed-terminal fallback.
         """
         if getattr(eco, "finish_reason", None) is None:
             return False
         if getattr(eco, "is_segment_finished", False):
             return False
 
+        req_state.finished_stage_ids.add(stage_id)
         final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
         if stage_id not in final_output_stage_ids:
-            return False
+            return True
         req_state.finished_final_output_stage_ids.add(stage_id)
         return True
 
@@ -1570,16 +1574,23 @@ class OrchestratorBase:
         replica_id: int,
         request_ids: set[str],
     ) -> None:
-        """Finish streaming requests whose raw terminal had no processed output."""
+        """Finish requests whose raw terminal had no processed output."""
         pool = self.stage_pools[stage_id]
-        if not pool.final_output:
-            return
-
         for request_id in request_ids:
             req_state = self.request_states.get(request_id)
             if req_state is None or req_state.session_owned:
                 continue
-
+            pending = req_state.pending_final_output
+            if pending is not None:
+                if set(req_state.stage_submit_ts).issubset(req_state.finished_stage_ids):
+                    req_state.pending_final_output = None
+                    await self.output_async_queue.put(pending)
+                    await self._cleanup_request_ids([request_id, *self._cfg_tracker.cleanup_parent(request_id)])
+                # A real terminal output is pending; do not replace it with
+                # the swallowed-output fallback before upstream completion.
+                continue
+            if not pool.final_output:
+                continue
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
             if not final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids):
                 continue
@@ -1653,27 +1664,41 @@ class OrchestratorBase:
             await self._cleanup_request_ids([req_id])
             return
 
+        if finished and not segment_finished:
+            req_state.finished_stage_ids.add(stage_id)
+
         request_finished = False
         if finished and self.stage_pools[stage_id].final_output and not segment_finished:
             req_state.finished_final_output_stage_ids.add(stage_id)
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
             request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
         if req_state.session_owned:
-            # Session-owned outputs are delivered to their session through
-            # ``_intercept_stage_output`` below, never to a request queue.
+            # Session-owned outputs are delivered through the session interceptor.
             pass
         elif self.stage_pools[stage_id].final_output:
-            await self.output_async_queue.put(
-                OutputMessage(
-                    request_id=req_id,
-                    stage_id=stage_id,
-                    replica_id=replica_id,
-                    engine_outputs=output,
-                    metrics=stage_metrics,
-                    finished=request_finished,
-                    stage_submit_ts=submit_ts,
-                )
+            message = OutputMessage(
+                request_id=req_id,
+                stage_id=stage_id,
+                replica_id=replica_id,
+                engine_outputs=output,
+                metrics=stage_metrics,
+                finished=request_finished,
+                stage_submit_ts=submit_ts,
             )
+            if (
+                request_finished
+                and self.async_chunk
+                and not req_state.streaming.enabled
+                and not set(req_state.stage_submit_ts).issubset(req_state.finished_stage_ids)
+            ):
+                # Direct chunk delivery can finish the decoder before the
+                # upstream engine's terminal output/metrics reaches this loop.
+                # Keep request state until those messages are routed, otherwise
+                # the frontend publishes incomplete usage and loses stop reasons.
+                req_state.pending_final_output = message
+                request_finished = False
+            else:
+                await self.output_async_queue.put(message)
         elif stage_metrics is not None:
             await self.output_async_queue.put(
                 StageMetricsMessage(
@@ -1740,6 +1765,12 @@ class OrchestratorBase:
                         is_streaming_session=True,
                         is_final_update=True,
                     )
+
+        pending = req_state.pending_final_output
+        if pending is not None and set(req_state.stage_submit_ts).issubset(req_state.finished_stage_ids):
+            req_state.pending_final_output = None
+            await self.output_async_queue.put(pending)
+            request_finished = True
 
         if request_finished and not req_state.session_owned:
             await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
@@ -2483,8 +2514,6 @@ class OrchestratorBase:
                     operation="async-chunk prewarm",
                 )
             else:
-                import copy
-
                 from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
 
                 try:
@@ -2507,7 +2536,9 @@ class OrchestratorBase:
 
                 original_prompt = req_state.prompt
                 if isinstance(original_prompt, dict):
-                    base_input = copy.deepcopy(original_prompt)
+                    from vllm_omni.engine.request_snapshot import copy_request_snapshot
+
+                    base_input = copy_request_snapshot(original_prompt)
                 else:
                     base_input = {}
 

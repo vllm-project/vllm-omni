@@ -356,6 +356,94 @@ def test_attention_wrapper_rejects_spatial_extent_change(monkeypatch: pytest.Mon
         wan_spatial_shard._SPATIAL_SHARD_CONTEXT.reset(token)
 
 
+def _reference_conv_input(conv, x, cache_x):
+    """The conv input the previous implementation built: cat, F.pad, then halo_exchange."""
+    padding = list(conv._padding)
+    if cache_x is not None and padding[4] > 0:
+        x = torch.cat([cache_x, x], dim=2)
+        padding[4] -= cache_x.shape[2]
+    x = torch.nn.functional.pad(x, padding)
+    x_padded, _, _ = wan_spatial_shard.halo_exchange(
+        x, group=object(), halo_size=conv.halo_size, split_dim=conv.split_dim
+    )
+    return x_padded, x.shape[conv.split_tensor_dim]
+
+
+def _dist_conv(split_dim, kernel=(3, 3, 3), padding=(1, 1, 1)):
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
+
+    torch.manual_seed(0)
+    source = WanCausalConv3d(3, 4, kernel, padding=padding)
+    return source, wan_spatial_shard.WanDistCausalConv3d(source, object(), split_dim=split_dim)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("split_dim", ["width", "height"])
+@pytest.mark.parametrize("with_cache", [False, True])
+def test_single_pass_conv_input_matches_cat_pad_halo_on_one_rank(monkeypatch, split_dim, with_cache):
+    """One rank, halo-bearing kernel: same bytes as the previous cat -> F.pad -> halo_exchange path."""
+    monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (0, 1))
+    _, conv = _dist_conv(split_dim)
+    x = torch.randn(1, 3, 2, 6, 8)
+    cache_x = torch.randn(1, 3, 2, 6, 8) if with_cache else None
+
+    expected, expected_extent = _reference_conv_input(conv, x, cache_x)
+    got, got_extent = conv._assemble_input(x, cache_x)
+
+    assert got.shape == expected.shape and got_extent == expected_extent
+    assert torch.equal(got, expected)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_single_pass_conv_rejects_cache_longer_than_causal_padding():
+    _, conv = _dist_conv("width")
+    with pytest.raises(AssertionError, match="temporal cache exceeds"):
+        conv._assemble_input(torch.randn(1, 3, 2, 6, 8), torch.randn(1, 3, 3, 6, 8))
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("split_dim", ["width", "height"])
+def test_single_pass_conv_without_a_halo_matches_the_stock_causal_conv(monkeypatch, split_dim):
+    """A kernel with no spatial extent along the split (the temporal conv) needs no halo and equals the stock conv."""
+    monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (0, 1))
+    source, conv = _dist_conv(split_dim, kernel=(3, 1, 1), padding=(1, 0, 0))
+    x = torch.randn(1, 3, 2, 6, 8)
+    cache_x = torch.randn(1, 3, 2, 6, 8)
+
+    assert torch.equal(conv(x, cache_x), source(x, cache_x))
+    assert torch.equal(conv(x, None), source(x, None))
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("split_dim", ["width", "height"])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("kernel,padding", [((3, 3, 3), (1, 1, 1)), ((3, 1, 1), (0, 0, 0))])
+def test_single_pass_conv_input_matches_cat_pad_halo_on_two_ranks(monkeypatch, split_dim, rank, kernel, padding):
+    """Same bytes as cat -> F.pad -> halo_exchange, halos included, on either rank of a pair."""
+    monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (rank, 2))
+
+    def fake_p2p(*, rank, world_size, group, top_row_ref, bottom_row_ref, recv_top_buf, recv_bottom_buf):
+        # A neighbour's halo is whatever it sent; stand in with a marker derived from our own edge so
+        # both the reference and the single-pass path see the same exchange. Global edges stay zero.
+        recv_top_buf.copy_(top_row_ref * 0 + 7.0) if rank > 0 else recv_top_buf.zero_()
+        recv_bottom_buf.copy_(bottom_row_ref * 0 + 9.0) if rank < world_size - 1 else recv_bottom_buf.zero_()
+
+    monkeypatch.setattr(wan_spatial_shard, "_halo_exchange_p2p", fake_p2p)
+    _, conv = _dist_conv(split_dim, kernel=kernel, padding=padding)
+    x = torch.randn(1, 3, 1, 6, 8)
+    cache_x = torch.randn(1, 3, 2, 6, 8)
+
+    expected, expected_extent = _reference_conv_input(conv, x, cache_x)
+    got, got_extent = conv._assemble_input(x, cache_x)
+
+    assert got.shape == expected.shape and got_extent == expected_extent
+    assert torch.equal(got, expected)
+
+
 @pytest.mark.core_model
 @pytest.mark.cpu
 def test_halo_exchange_single_rank_noop(monkeypatch: pytest.MonkeyPatch):

@@ -50,8 +50,10 @@ from vllm_omni.config.stage_config import (
     StageDeployConfig,
     StageExecutionType,
     StagePipelineConfig,
+    _apply_platform_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
+    resolve_deploy_yaml,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.engine.stage_engine_startup import _serialize_stage_config
@@ -789,6 +791,67 @@ def test_joyai_code2wav_waits_for_full_payload():
     assert code2wav.model_config.requires_full_payload_input is True
 
 
+@pytest.mark.parametrize("model_runner", ["v1", "v2"])
+def test_deploy_model_runner_selection_propagates_to_every_stage(tmp_path: Path, model_runner: str):
+    deploy_path = tmp_path / "qwen3_tts_runner.yaml"
+    deploy_path.write_text(
+        f"""\
+pipeline: qwen3_tts
+model_runner: {model_runner}
+async_chunk: true
+stages:
+  - stage_id: 0
+  - stage_id: 1
+"""
+    )
+
+    deploy = load_deploy_config(deploy_path)
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    legacy_stages = merge_pipeline_deploy(pipeline, deploy)
+    structured = _from_pipeline_key("qwen3_tts", deploy_config_path=str(deploy_path))
+    expect_v2 = model_runner == "v2"
+
+    assert deploy.model_runner == model_runner
+    assert all(stage.yaml_engine_args["use_v2_model_runner"] is expect_v2 for stage in legacy_stages)
+    assert all(stage.model_config.use_v2_model_runner is expect_v2 for stage in structured.stage_configs)
+
+
+@pytest.mark.parametrize("platform", ["npu", "xpu"])
+def test_mrv2_fails_fast_on_platforms_without_native_workers(platform: str):
+    with pytest.raises(NotImplementedError, match="Model Runner V2"):
+        _apply_platform_overrides(DeployConfig(model_runner="v2"), platform=platform)
+
+
+@pytest.mark.parametrize(
+    ("default_name", "mrv2_name"),
+    [
+        ("qwen3_tts.yaml", "qwen3_tts_mrv2.yaml"),
+        (
+            "qwen3_tts_high_concurrency.yaml",
+            "qwen3_tts_high_concurrency_mrv2.yaml",
+        ),
+    ],
+)
+def test_qwen3_mrv2_profiles_are_explicit_opt_in(default_name: str, mrv2_name: str):
+    assert load_deploy_config(_DEPLOY_DIR / default_name).model_runner == "v1"
+    assert load_deploy_config(_DEPLOY_DIR / mrv2_name).model_runner == "v2"
+
+
+def test_qwen3_tts_mrv2_retunes_do_not_change_default_mrv1_profile():
+    default = resolve_deploy_yaml(_DEPLOY_DIR / "qwen3_tts_high_concurrency.yaml")
+    mrv2 = resolve_deploy_yaml(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2.yaml")
+    default_extra = default["connectors"]["connector_of_shared_memory"]["extra"]
+    mrv2_extra = mrv2["connectors"]["connector_of_shared_memory"]["extra"]
+
+    # B2 batch stays consistent with the graph buckets; V1 profile untouched.
+    assert default_extra["decode_batch_max_size"] == 1
+    assert mrv2_extra["decode_batch_max_size"] == 2
+    assert mrv2_extra["decode_cudagraph_batch_sizes"] == [1, 2]
+    assert mrv2_extra["code_predictor_prefix_graphs"] is False
+    assert mrv2["stages"][1]["enforce_eager"] is False
+    assert default["stages"][1]["enforce_eager"] is True
+
+
 def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
     assert not hasattr(BaseVllmOmniStageConfig, "from_stage_config")
     assert not hasattr(BaseVllmOmniStageConfig, "to_legacy_stage_config")
@@ -885,9 +948,11 @@ def test_sub_config_fields_match_structured_scopes():
         "limit_mm_per_prompt",
         "interleave_mm_strings",
         "media_io_kwargs",
+        "final_output",
         "active_stream_window",
         "session_mode",
         "duplex_max_sessions",
+        "use_v2_model_runner",
         "enable_sleep_mode",
         "default_sampling_params",
         "subtalker_sampling_params",
@@ -896,6 +961,7 @@ def test_sub_config_fields_match_structured_scopes():
         "custom_voice_dir",
         "task_type",
         "codec_frame_rate_hz",
+        "supports_native_mrv2_data_plane",
         "enforce_eager",
         "max_cudagraph_capture_size",
         "enable_flashinfer_autotune",
