@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from pytest_mock import MockerFixture
+from vllm.entrypoints.serve import create_error_response
 from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
 
 from vllm_omni.config.stage_config import StagePipelineConfig
@@ -33,7 +34,6 @@ from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler
 from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
 from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 from vllm_omni.entrypoints.openai import api_server as api_server_module
-from vllm_omni.entrypoints.openai import errors as openai_errors
 from vllm_omni.entrypoints.openai import serving_speech as serving_speech_module
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol.audio import (
@@ -3875,6 +3875,7 @@ def _make_api_server_request(handler, *, method: str = "POST", path: str = "/v1/
     app = FastAPI()
     app.state.openai_serving_speech = handler
     app.state.api_server_count = 1
+    app.state.serving_tokenization = None
     scope = {
         "type": "http",
         "app": app,
@@ -3887,23 +3888,6 @@ def _make_api_server_request(handler, *, method: str = "POST", path: str = "/v1/
         "scheme": "http",
     }
     return Request(scope)
-
-
-def _patch_api_server_base(mocker: MockerFixture):
-    def _fake_create_error_response(message, err_type="BadRequestError", status_code=400, param=None):
-        return ErrorResponse(
-            error=ErrorInfo(
-                message=message,
-                type=err_type,
-                param=param,
-                code=getattr(status_code, "value", status_code),
-            )
-        )
-
-    fake_base = mocker.MagicMock()
-    fake_base.create_error_response.side_effect = _fake_create_error_response
-    mocker.patch.object(openai_errors, "base", return_value=fake_base)
-    return fake_base
 
 
 def _assert_openai_error_response(
@@ -3921,8 +3905,7 @@ def _assert_openai_error_response(
     assert message in body["error"]["message"]
 
 
-def test_api_server_list_voices_without_speech_handler_returns_404(mocker: MockerFixture):
-    _patch_api_server_base(mocker)
+def test_api_server_list_voices_without_speech_handler_returns_404():
     raw_request = _make_api_server_request(None, method="GET")
 
     response = asyncio.run(api_server_module.list_voices(raw_request))
@@ -3933,7 +3916,6 @@ def test_api_server_list_voices_without_speech_handler_returns_404(mocker: Mocke
 
 
 def test_api_server_upload_voice_value_error_returns_400(mocker: MockerFixture):
-    _patch_api_server_base(mocker)
     handler = mocker.MagicMock()
     handler.upload_voice = mocker.AsyncMock(side_effect=ValueError("Unsupported MIME type: audio/x-m4a"))
     raw_request = _make_api_server_request(handler)
@@ -3951,8 +3933,7 @@ def test_api_server_upload_voice_value_error_returns_400(mocker: MockerFixture):
     _assert_openai_error_response(response, status_code=400, message="Unsupported MIME type")
 
 
-def test_api_server_upload_voice_without_speech_handler_returns_404(mocker: MockerFixture):
-    _patch_api_server_base(mocker)
+def test_api_server_upload_voice_without_speech_handler_returns_404():
     raw_request = _make_api_server_request(None)
 
     response = asyncio.run(
@@ -3968,8 +3949,50 @@ def test_api_server_upload_voice_without_speech_handler_returns_404(mocker: Mock
     )
 
 
+@pytest.mark.parametrize("has_speech_handler", [True, False])
+@pytest.mark.parametrize("method", ["GET", "POST", "DELETE"])
+def test_voice_routes_without_tokenization(mocker: MockerFixture, method: str, has_speech_handler: bool):
+    handler = mocker.MagicMock() if has_speech_handler else None
+    if handler is not None:
+        handler._get_available_voices.return_value = []
+        handler.uploaded_speakers = {}
+        handler.delete_voice = mocker.AsyncMock(return_value=False)
+    app = _make_api_server_request(handler).app
+    app.add_api_route("/v1/audio/voices", api_server_module.list_voices, methods=["GET"])
+    app.add_api_route("/v1/audio/voices", api_server_module.upload_voice, methods=["POST"])
+    app.add_api_route("/v1/audio/voices/{name}", api_server_module.delete_voice, methods=["DELETE"])
+
+    with TestClient(app) as client:
+        if method == "POST":
+            response = client.post(
+                "/v1/audio/voices",
+                files={"consent": (None, "cons_test"), "name": (None, "probe")},
+            )
+        elif method == "DELETE":
+            response = client.delete("/v1/audio/voices/missing")
+        else:
+            response = client.get("/v1/audio/voices")
+
+    if not has_speech_handler:
+        status_code, err_type, message = 404, "NotFoundError", "The model does not support Speech API"
+    elif method == "POST":
+        status_code, err_type, message = (
+            400,
+            "BadRequestError",
+            "Either 'audio_sample' or 'speaker_embedding' must be provided",
+        )
+    elif method == "DELETE":
+        status_code, err_type, message = 404, "NotFoundError", "Voice 'missing' not found"
+    else:
+        assert response.status_code == 200
+        assert response.json() == {"voices": [], "uploaded_voices": []}
+        return
+
+    assert response.status_code == status_code
+    assert response.json() == {"error": {"message": message, "type": err_type, "param": None, "code": status_code}}
+
+
 def test_api_server_upload_voice_without_input_returns_400(mocker: MockerFixture):
-    _patch_api_server_base(mocker)
     raw_request = _make_api_server_request(mocker.MagicMock())
 
     response = asyncio.run(
@@ -3986,7 +4009,6 @@ def test_api_server_upload_voice_without_input_returns_400(mocker: MockerFixture
 
 
 def test_api_server_upload_voice_with_audio_and_embedding_returns_400(mocker: MockerFixture):
-    _patch_api_server_base(mocker)
     raw_request = _make_api_server_request(mocker.MagicMock())
 
     response = asyncio.run(
@@ -4003,7 +4025,6 @@ def test_api_server_upload_voice_with_audio_and_embedding_returns_400(mocker: Mo
 
 
 def test_api_server_upload_voice_exception_returns_500(mocker: MockerFixture):
-    _patch_api_server_base(mocker)
     handler = mocker.MagicMock()
     handler.upload_voice = mocker.AsyncMock(side_effect=RuntimeError("disk failed"))
     raw_request = _make_api_server_request(handler)
@@ -4032,7 +4053,6 @@ def test_api_server_upload_voice_with_no_adapter(
     tmp_path: Path,
 ):
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
-    _patch_api_server_base(mocker)
     engine_client = mocker.MagicMock()
     engine_client.errored = False
     engine_client.stage_configs = []
@@ -4059,8 +4079,7 @@ def test_api_server_upload_voice_with_no_adapter(
     assert response.status_code == 200
 
 
-def test_api_server_delete_voice_without_speech_handler_returns_404(mocker: MockerFixture):
-    _patch_api_server_base(mocker)
+def test_api_server_delete_voice_without_speech_handler_returns_404():
     raw_request = _make_api_server_request(None, method="DELETE", path="/v1/audio/voices/probe")
 
     response = asyncio.run(api_server_module.delete_voice("probe", raw_request))
@@ -4071,7 +4090,6 @@ def test_api_server_delete_voice_without_speech_handler_returns_404(mocker: Mock
 
 
 def test_api_server_delete_voice_value_error_returns_400(mocker: MockerFixture):
-    _patch_api_server_base(mocker)
     handler = mocker.MagicMock()
     handler.delete_voice = mocker.AsyncMock(side_effect=ValueError("Invalid voice name"))
     raw_request = _make_api_server_request(handler, method="DELETE", path="/v1/audio/voices/probe")
@@ -4082,7 +4100,6 @@ def test_api_server_delete_voice_value_error_returns_400(mocker: MockerFixture):
 
 
 def test_api_server_delete_voice_not_found_returns_404(mocker: MockerFixture):
-    _patch_api_server_base(mocker)
     handler = mocker.MagicMock()
     handler.delete_voice = mocker.AsyncMock(return_value=False)
     raw_request = _make_api_server_request(handler, method="DELETE", path="/v1/audio/voices/missing")
@@ -4098,7 +4115,6 @@ def test_api_server_delete_voice_not_found_returns_404(mocker: MockerFixture):
 
 
 def test_api_server_delete_voice_exception_returns_500(mocker: MockerFixture):
-    _patch_api_server_base(mocker)
     handler = mocker.MagicMock()
     handler.delete_voice = mocker.AsyncMock(side_effect=RuntimeError("disk failed"))
     raw_request = _make_api_server_request(handler, method="DELETE", path="/v1/audio/voices/probe")
@@ -4113,10 +4129,9 @@ def test_api_server_delete_voice_exception_returns_500(mocker: MockerFixture):
     )
 
 
-def test_api_server_create_speech_without_handler_returns_404(mocker: MockerFixture):
-    fake_base = _patch_api_server_base(mocker)
+def test_api_server_create_speech_without_handler_returns_404():
     raw_request = _make_api_server_request(None, path="/v1/audio/speech")
-    raw_request.app.state.serving_tokenization = fake_base
+    raw_request.app.state.serving_tokenization = SimpleNamespace(create_error_response=create_error_response)
     request = OpenAICreateSpeechRequest(input="Hello")
 
     response = asyncio.run(api_server_module.create_speech(request, raw_request))
@@ -4126,10 +4141,9 @@ def test_api_server_create_speech_without_handler_returns_404(mocker: MockerFixt
     )
 
 
-def test_api_server_create_speech_batch_without_handler_returns_404(mocker: MockerFixture):
-    fake_base = _patch_api_server_base(mocker)
+def test_api_server_create_speech_batch_without_handler_returns_404():
     raw_request = _make_api_server_request(None, path="/v1/audio/speech/batch")
-    raw_request.app.state.serving_tokenization = fake_base
+    raw_request.app.state.serving_tokenization = SimpleNamespace(create_error_response=create_error_response)
     request = BatchSpeechRequest(items=[SpeechBatchItem(input="hi")])
 
     response = asyncio.run(api_server_module.create_speech_batch(request, raw_request))
@@ -4194,11 +4208,10 @@ def test_api_server_create_speech_batch_omits_null_fields(mocker: MockerFixture)
     assert errored["error"] == "Input text cannot be empty"
 
 
-def test_api_server_create_audio_generate_without_handler_returns_404(mocker: MockerFixture):
-    fake_base = _patch_api_server_base(mocker)
+def test_api_server_create_audio_generate_without_handler_returns_404():
     raw_request = _make_api_server_request(None, path="/v1/audio/generate")
     raw_request.app.state.openai_serving_audio_generate = None
-    raw_request.app.state.serving_tokenization = fake_base
+    raw_request.app.state.serving_tokenization = SimpleNamespace(create_error_response=create_error_response)
     request = OpenAICreateAudioGenerateRequest(input="a bird singing")
 
     response = asyncio.run(api_server_module.create_audio_generate(request, raw_request))

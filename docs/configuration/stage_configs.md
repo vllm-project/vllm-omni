@@ -293,19 +293,25 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/depl
 
 ## Qwen3-TTS with Model Runner V2
 
-Qwen3-TTS can opt into the native CUDA Model Runner V2 pipeline on vLLM
-0.29.0. Select one of these deployment profiles:
+Qwen3-TTS runs the native CUDA Model Runner V2 pipeline by default on vLLM
+0.29.0. MRV2 is an experimental feature for this model: the bundled default
+profile selects it on CUDA only, and its scheduler and delivery paths are
+still being qualified. Set `model_runner: v1` in a copy of the deploy config
+to opt out; the `platforms:` sections of `qwen3_tts.yaml` keep V1 on NPU, XPU,
+ROCm and MUSA. Select one of these deployment profiles:
 
 | Profile | Runner | Code2Wav graph batches | Intended use |
 | --- | --- | --- | --- |
-| `qwen3_tts.yaml` | V1 | Existing defaults | Existing deployment / regression control |
-| `qwen3_tts_mrv2.yaml` | V2 | B1 | Native runner validation |
+| `qwen3_tts.yaml` | V2 (default) | Existing defaults | Shipped default; experimental |
+| `qwen3_tts_mrv2.yaml` | V2 | B1 | Explicit MRV2 profile (same runner selection as the default) |
 | `qwen3_tts_high_concurrency_mrv2.yaml` | V2 | B1, B2 | Opt-in throughput tuning |
 | `qwen3_tts_high_concurrency_mrv2_b4.yaml` | V2 | B1, B2, B3, B4 | Experimental throughput / buffered playback |
+| `qwen3_tts_high_concurrency.yaml` | V1 | Existing defaults | V1 high-concurrency control |
 
 ```bash
+# MRV2 is the default; pass a copy with `model_runner: v1` to force V1.
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni \
-  --deploy-config vllm_omni/deploy/qwen3_tts_mrv2.yaml
+  --deploy-config /path/to/qwen3_tts_v1.yaml
 ```
 
 The V2 profiles bound Talker prefill to 512 tokens per step and select the

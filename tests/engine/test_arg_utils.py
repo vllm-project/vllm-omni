@@ -22,6 +22,7 @@ from pydantic import ValidationError
 from transformers import PretrainedConfig, Qwen3OmniMoeConfig
 from vllm.engine.arg_utils import EngineArgs
 
+from tests.helpers.mock import patch_hf_snapshot_download
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.stage_init_utils import build_engine_args_dict
@@ -296,7 +297,7 @@ def test_remote_tokenizer_subfolder_download_does_not_report_failure(tmp_path, m
     baseline_config = Mock()
     warning = mocker.patch("vllm_omni.engine.arg_utils.logger.warning")
 
-    monkeypatch.setattr("huggingface_hub.HfApi.snapshot_download", lambda *args, **kwargs: str(tmp_path))
+    patch_hf_snapshot_download(monkeypatch, lambda *args, **kwargs: str(tmp_path), hf_home=tmp_path)
     monkeypatch.setattr(OmniEngineArgs, "_patch_empty_hf_config", lambda *args, **kwargs: None)
     monkeypatch.setattr(EngineArgs, "create_model_config", lambda _self: baseline_config)
     monkeypatch.setattr(
