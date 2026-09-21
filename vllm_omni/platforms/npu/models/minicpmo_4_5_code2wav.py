@@ -164,7 +164,6 @@ def _patched_estimator_step(
         if has_mask:
             kwargs["attn_mask"] = rest[0]
         return kwargs
-
     if cnn_cache is None:
         return graph_runner.run(
             "cfm_estimator",
