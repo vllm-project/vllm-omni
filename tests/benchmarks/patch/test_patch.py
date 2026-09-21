@@ -22,6 +22,7 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
 )
 from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
+    _add_combined_video_form_references,
     _add_video_extra_body_to_form,
     _add_video_reference_to_form,
     _apply_image_metrics_from_payload,
@@ -1515,8 +1516,7 @@ def test_video_local_image_reference_not_forwarded_as_raw_extra_field(tmp_path, 
     "reference",
     [
         {"image_url": "https://example.com/ref.png"},
-        {"file_id": "file-abc"},
-        [{"image_url": "https://example.com/a.png"}, {"file_id": "file-xyz"}],
+        [{"image_url": "https://example.com/a.png"}, {"image_url": "https://example.com/b.png"}],
     ],
 )
 def test_video_structured_image_reference_serialized_to_form(reference: object, mocker: MockerFixture) -> None:
@@ -1546,6 +1546,19 @@ def test_video_structured_image_reference_serialized_to_form(reference: object, 
     payload = next(value for name, value in captured if name == "image_reference")
     assert isinstance(payload, (str, bytes, bytearray))
     assert json.loads(payload) == reference
+
+
+def test_video_file_id_reference_is_rejected() -> None:
+    """file_id is unsupported on the server and must not be sent as image_reference."""
+    import aiohttp
+
+    form = aiohttp.FormData()
+    with pytest.raises(ValueError, match="file_id is not supported yet"):
+        _add_video_reference_to_form(form, {"file_id": "file-abc"})
+    with pytest.raises(ValueError, match="file_id is not supported yet"):
+        _add_video_reference_to_form(form, [{"image_url": "https://example.com/a.png"}, {"file_id": "file-xyz"}])
+    with pytest.raises(ValueError, match="file_id is not supported yet"):
+        _add_combined_video_form_references(form, None, {"video_reference": {"file_id": "file-vid"}})
 
 
 def test_image_reference_urls_from_random_mm_content(mocker: MockerFixture) -> None:
@@ -1653,6 +1666,38 @@ def test_video_reference_https_url_from_random_mm_content(mocker: MockerFixture)
     payload = next(value for name, value in captured if name == "video_reference")
     assert isinstance(payload, (str, bytes, bytearray))
     assert json.loads(payload) == {"video_url": "https://example.com/ref.mp4"}
+
+
+def test_image_and_inline_video_use_combined_reference_fields(mocker: MockerFixture) -> None:
+    """Image plus data:video must be image_reference + video_reference, not input_references."""
+    import aiohttp
+
+    content = [
+        {"type": "image_url", "image_url": {"url": "https://example.com/ref.png"}},
+        {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAA"}},
+    ]
+    captured: list[tuple[str, object]] = []
+    real_add_field = aiohttp.FormData.add_field
+
+    def tracking_add_field(self, name, value=None, **kwargs):
+        captured.append((str(name), value))
+        return real_add_field(self, name, value, **kwargs)
+
+    mocker.patch.object(aiohttp.FormData, "add_field", tracking_add_field)
+    form = aiohttp.FormData()
+    _add_combined_video_form_references(form, content)
+
+    field_names = [name for name, _ in captured]
+    assert field_names.count("image_reference") == 1
+    assert field_names.count("video_reference") == 1
+    assert "input_references" not in field_names
+    assert "input_reference" not in field_names
+    image_payload = next(value for name, value in captured if name == "image_reference")
+    video_payload = next(value for name, value in captured if name == "video_reference")
+    assert isinstance(image_payload, (str, bytes, bytearray))
+    assert isinstance(video_payload, (str, bytes, bytearray))
+    assert json.loads(image_payload) == {"image_url": "https://example.com/ref.png"}
+    assert json.loads(video_payload) == {"video_url": "data:video/mp4;base64,AAAA"}
 
 
 def test_video_unsupported_image_reference_raises() -> None:

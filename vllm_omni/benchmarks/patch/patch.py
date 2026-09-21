@@ -1312,12 +1312,9 @@ def _video_frames_from_payload(data: Mapping[str, object], request_body: Mapping
 
 
 def _is_structured_image_reference(reference: Mapping[str, object]) -> bool:
-    """True for API image_reference objects ({image_url}/{file_id})."""
+    """True for API image_reference objects ({"image_url": "..."})."""
     image_url = reference.get("image_url")
-    file_id = reference.get("file_id")
-    has_url = isinstance(image_url, str) and bool(image_url)
-    has_file_id = isinstance(file_id, str) and bool(file_id)
-    return has_url or has_file_id
+    return isinstance(image_url, str) and bool(image_url)
 
 
 def _is_structured_video_reference(reference: Mapping[str, object]) -> bool:
@@ -1326,7 +1323,18 @@ def _is_structured_video_reference(reference: Mapping[str, object]) -> bool:
     return isinstance(video_url, str) and bool(video_url)
 
 
-def _add_video_reference_to_form(form: aiohttp.FormData, reference: object) -> bool:
+def _add_video_reference_to_form(
+    form: aiohttp.FormData,
+    reference: object,
+    *,
+    upload_inline_video: bool = True,
+) -> bool:
+    candidates = reference if isinstance(reference, list) else [reference]
+    for item in candidates:
+        if isinstance(item, Mapping):
+            file_id = item.get("file_id")
+            if isinstance(file_id, str) and file_id:
+                raise ValueError("file_id is not supported yet")
     if isinstance(reference, dict) and "bytes" in reference:
         form.add_field(
             "input_reference",
@@ -1343,7 +1351,10 @@ def _add_video_reference_to_form(form: aiohttp.FormData, reference: object) -> b
     if isinstance(reference, Mapping) and _is_structured_video_reference(reference):
         video_url = reference.get("video_url")
         # Inline data URLs are too large for a text form field (1MB part limit).
-        if isinstance(video_url, str) and video_url.startswith("data:video"):
+        # Skip the upload when an image_reference is also present: ``input_references``
+        # cannot be combined with ``image_reference`` (HTTP 400). The server accepts
+        # ``image_reference`` together with ``video_reference``.
+        if upload_inline_video and isinstance(video_url, str) and video_url.startswith("data:video"):
             return _add_video_reference_to_form(form, video_url)
         form.add_field("video_reference", json.dumps(dict(reference)))
         return True
@@ -1355,10 +1366,7 @@ def _add_video_reference_to_form(form: aiohttp.FormData, reference: object) -> b
         if reference and all(isinstance(item, Mapping) and _is_structured_video_reference(item) for item in reference):
             form.add_field("video_reference", json.dumps([dict(item) for item in reference]))
             return True
-        raise ValueError(
-            "Unsupported image_reference list; expected non-empty list of "
-            '{"image_url": "..."} and/or {"file_id": "..."} objects.'
-        )
+        raise ValueError('Unsupported image_reference list; expected non-empty list of {"image_url": "..."} objects.')
 
     if isinstance(reference, str):
         if reference.startswith("data:video"):
@@ -1400,9 +1408,35 @@ def _add_video_reference_to_form(form: aiohttp.FormData, reference: object) -> b
 
     raise ValueError(
         "Unsupported image_reference; expected upload bytes, local path/URL string, "
-        'or {"image_url": "..."} / {"file_id": "..."} object '
+        'or {"image_url": "..."} object '
         f"(got {type(reference).__name__})."
     )
+
+
+def _add_combined_video_form_references(
+    form: aiohttp.FormData,
+    multi_modal_content: Any,
+    extra_body: Mapping[str, Any] | None = None,
+) -> None:
+    """Serialize image and video refs using a server-accepted field pair.
+
+    ``image_reference`` may be combined with ``video_reference``. ``input_references``
+    must be sent alone, so an inline ``data:video`` is uploaded only when no image
+    reference is present.
+    """
+    extra_body = extra_body or {}
+    image_refs = list(_iter_image_reference_inputs(multi_modal_content))
+    video_refs = list(_iter_video_reference_inputs(multi_modal_content))
+    if not image_refs and extra_body.get("image_reference") is not None:
+        image_refs = [extra_body["image_reference"]]
+    if not video_refs and extra_body.get("video_reference") is not None:
+        video_refs = [extra_body["video_reference"]]
+
+    upload_inline_video = not image_refs
+    if image_refs:
+        _add_video_reference_to_form(form, image_refs[0])
+    if video_refs:
+        _add_video_reference_to_form(form, video_refs[0], upload_inline_video=upload_inline_video)
 
 
 def _add_video_extra_body_to_form(
@@ -1960,25 +1994,7 @@ async def async_request_openai_videos_omni(
         form.add_field("size", str(request_body["size"]))
     _add_video_extra_body_to_form(form, extra_body, request_body)
 
-    image_reference_added = False
-    for reference in _iter_image_reference_inputs(request_func_input.multi_modal_content):
-        if _add_video_reference_to_form(form, reference):
-            image_reference_added = True
-            break
-    if not image_reference_added:
-        image_reference = extra_body.get("image_reference")
-        if image_reference is not None:
-            _add_video_reference_to_form(form, image_reference)
-
-    video_reference_added = False
-    for reference in _iter_video_reference_inputs(request_func_input.multi_modal_content):
-        if _add_video_reference_to_form(form, reference):
-            video_reference_added = True
-            break
-    if not video_reference_added:
-        video_reference = extra_body.get("video_reference")
-        if video_reference is not None:
-            _add_video_reference_to_form(form, video_reference)
+    _add_combined_video_form_references(form, request_func_input.multi_modal_content, extra_body)
 
     headers = {
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
