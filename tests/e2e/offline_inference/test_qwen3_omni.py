@@ -13,6 +13,7 @@ import os
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 import pytest
+from vllm import SamplingParams
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_video
@@ -111,24 +112,36 @@ def test_structured_multistage_config_reaches_runtime(omni_runner, offline_clien
     assert code2wav_vllm.scheduler_config.async_scheduling is False
 
     # Sampling defaults are consumed from StageClient metadata, rather than
-    # from either the resolver output or VllmConfig.
+    # from either the resolver output or VllmConfig. These literals mirror
+    # vllm_omni/deploy/qwen3_omni_moe.yaml exactly.
     expected_sampling = (
         {"temperature": 0.0, "max_tokens": 2048},
         {"temperature": 0.9, "top_k": 50, "max_tokens": 4096, "repetition_penalty": 1.05},
         {
             "temperature": 0.0,
             "top_p": 1.0,
+            # Deploy YAML literal. The resolver check below compares it verbatim;
+            # the runtime check normalizes it through SamplingParams, which turns
+            # the greedy-sampling sentinel -1 into 0.
             "top_k": -1,
             "max_tokens": 65536,
             "repetition_penalty": 1.1,
         },
     )
     assert len(engine.default_sampling_params_list) == len(expected_sampling)
-    for runtime_params, expected in zip(engine.default_sampling_params_list, expected_sampling, strict=True):
-        # SamplingParams normalization may add backend defaults (for example
-        # ``detokenize=True``). Verify deploy-owned values without rejecting
-        # those non-lossy normalized fields.
-        assert all(getattr(runtime_params, name) == value for name, value in expected.items())
+    for stage, runtime_params, expected in zip(
+        resolved_stages, engine.default_sampling_params_list, expected_sampling, strict=True
+    ):
+        # The resolver keeps the deploy values verbatim; the pipeline only adds
+        # its own ``detokenize`` / ``stop_token_ids`` constraints on top.
+        assert expected.items() <= (stage.model_config.default_sampling_params or {}).items()
+        # The runtime object is a SamplingParams built from those values, so it
+        # carries vLLM's normalization: greedy sampling (temperature 0) stores
+        # top_k=0, top_p=1.0 and min_p=0.0 even when the YAML spells the
+        # disabled top_k as -1, and backend defaults such as ``detokenize=True``
+        # appear. Compare against the same normalization, not the raw literals.
+        normalized = SamplingParams(**expected)
+        assert all(getattr(runtime_params, name) == getattr(normalized, name) for name in expected)
 
     if current_omni_platform.is_cuda():
         assert thinker_vllm.model_config.enforce_eager is False

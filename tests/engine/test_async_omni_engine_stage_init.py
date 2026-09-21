@@ -2395,13 +2395,20 @@ def test_dist_stage_runtime_applies_local_dp_to_stage_config(typed):
 
 
 @pytest.mark.parametrize("num_replicas", [1, 2, 3])
-def test_typed_diffusion_replicas_share_one_config_between_planning_and_launch(mocker, num_replicas):
+@pytest.mark.parametrize("kv_owner", [None, "connector_config", "diffusion_config"])
+def test_typed_diffusion_replicas_share_one_config_between_planning_and_launch(mocker, num_replicas, kv_owner):
     from vllm_omni.config.config_factory import StageConfigFactory
     from vllm_omni.engine import stage_runtime as runtime_module
 
     stage = StageConfigFactory.create_typed_default_diffusion(
         "generic-diffusion", {"model_class_name": "QwenImagePipeline"}
     ).stage_configs[0]
+    if kv_owner is not None:
+        from vllm.config import KVTransferConfig
+
+        getattr(stage, kv_owner).kv_transfer_config = KVTransferConfig(
+            kv_connector="MooncakeConnector", kv_role="kv_consumer", engine_id="dit"
+        )
     devices = ",".join(str(i) for i in range(num_replicas))
     stage.runtime_config.devices = devices
     stage.runtime_config.num_replicas = num_replicas
@@ -2432,11 +2439,114 @@ def test_typed_diffusion_replicas_share_one_config_between_planning_and_launch(m
         for i, plan in enumerate(replicas):
             assert plan.metadata.runtime_cfg is plan.stage_cfg.runtime_config
             assert plan.stage_cfg.runtime_config.devices == str(i)
-            if num_replicas > 1:
+            if num_replicas > 1 or kv_owner is not None:
                 assert plan.stage_cfg is not stage
+            if kv_owner is not None:
+                from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+                assert getattr(stage, kv_owner).kv_transfer_config.engine_id == "dit"
+                engine_args = build_engine_args_dict_from_omni_stage_config(plan.stage_cfg, "dummy-model")
+                assert engine_args["kv_transfer_config"].engine_id == f"dit-s0-r{i}"
             assert runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=1) is client
             assert launch.call_args.kwargs["stage_config"] is plan.stage_cfg
             assert launch.call_args.kwargs["metadata"] is plan.metadata
             assert launch.call_args.kwargs["use_inline"] is (num_replicas == 1)
 
     assert launch.call_count == 2 * num_replicas
+
+
+@pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
+@pytest.mark.parametrize("num_replicas", [1, 2])
+def test_native_kv_producer_replica_identity_and_bootstrap_are_isolated(mocker, typed, num_replicas):
+    from vllm.config import KVTransferConfig
+
+    from vllm_omni.config.omni_config import VllmOmniARStageConfig
+    from vllm_omni.config.stage_config import StagePipelineConfig
+    from vllm_omni.engine import stage_runtime as runtime_module
+
+    kv_config = KVTransferConfig(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        engine_id="ar",
+        kv_ip="127.0.0.1",
+        kv_connector_extra_config={"bootstrap_port": 9100},
+    )
+    if typed:
+        stage = VllmOmniARStageConfig(stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="ar"))
+        stage.connector_config.kv_transfer_config = kv_config
+        runtime_cfg = stage.runtime_config
+    else:
+        runtime_cfg = OmegaConf.create({"devices": "0,1", "env": {"KEEP": "value"}})
+        stage = types.SimpleNamespace(stage_id=0, engine_args={"kv_transfer_config": kv_config}, runtime=runtime_cfg)
+        metadata = _make_llm_metadata(0)
+        mocker.patch.object(
+            runtime_module,
+            "extract_legacy_stage_metadata",
+            side_effect=lambda cfg: types.SimpleNamespace(**{**metadata.__dict__, "runtime_cfg": cfg.runtime}),
+        )
+    runtime_cfg.devices = "0,1"
+    runtime_cfg.env = {"KEEP": "value"}
+    runtime = StageRuntime(
+        stage_configs=[stage],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        async_chunk=False,
+    )
+    mocker.patch.object(runtime_module, "get_stage_connector_spec", return_value={})
+    mocker.patch.object(runtime_module, "resolve_omni_kv_config_for_stage", return_value=(None, None, None))
+    for builder in ("build_engine_args_dict", "build_engine_args_dict_from_omni_stage_config"):
+        mocker.patch.object(runtime_module, builder, return_value={})
+    mocker.patch.object(
+        runtime_module,
+        "build_vllm_config",
+        return_value=(types.SimpleNamespace(kv_transfer_config=kv_config), object),
+    )
+
+    for _ in range(2):
+        plans = runtime._build_logical_stage_init_plans(None, [num_replicas], {})
+        for i, replica in enumerate(plans[0].replicas):
+            config = replica.stage_vllm_config.kv_transfer_config
+            assert config.engine_id == f"ar-s0-r{i}"
+            assert config.kv_connector_extra_config["bootstrap_addr"] == f"http://127.0.0.1:{9100 + i}"
+            assert dict(replica.metadata.runtime_cfg.env) == {
+                "KEEP": "value",
+                "VLLM_MOONCAKE_BOOTSTRAP_PORT": str(9100 + i),
+            }
+            if typed:
+                assert replica.metadata.runtime_cfg is replica.stage_cfg.runtime_config
+        assert kv_config.engine_id == "ar"
+        assert kv_config.kv_connector_extra_config == {"bootstrap_port": 9100}
+        assert dict(runtime_cfg.env) == {"KEEP": "value"}
+
+
+@pytest.mark.parametrize(
+    "roles, sources, async_chunk, valid",
+    [
+        (["kv_producer", "kv_consumer"], [0], False, True),
+        (["kv_producer", "kv_consumer"], [0], True, False),
+        ([None, "kv_consumer"], [0], False, False),
+        (["kv_producer", None], [0], False, False),
+        ([None, "kv_producer", "kv_consumer"], [1], False, False),
+        (["kv_producer", "kv_consumer"], [1], False, False),
+        ([None, None], [0], False, True),
+    ],
+)
+def test_native_kv_topology_rejects_silent_legacy_fallback(roles, sources, async_chunk, valid):
+    plans = []
+    for stage_id, role in enumerate(roles):
+        diffusion = stage_id == len(roles) - 1
+        config = types.SimpleNamespace(kv_role=role) if role else None
+        replica = types.SimpleNamespace(
+            metadata=types.SimpleNamespace(stage_type="diffusion" if diffusion else "llm", engine_input_source=sources),
+            stage_vllm_config=None if diffusion else types.SimpleNamespace(kv_transfer_config=config),
+            stage_cfg=types.SimpleNamespace(engine_args={"kv_transfer_config": config}),
+        )
+        plans.append(types.SimpleNamespace(stage_id=stage_id, replicas=[replica]))
+    runtime = object.__new__(StageRuntime)
+    runtime._async_chunk = async_chunk
+    if valid:
+        runtime._validate_native_kv_topology(plans)
+    else:
+        with pytest.raises(ValueError, match="two-stage"):
+            runtime._validate_native_kv_topology(plans)
