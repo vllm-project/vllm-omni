@@ -282,15 +282,44 @@ def test_encoder_task_validation_and_transformer_routing():
     assert pipeline._resolve_task(None, {"image": object()}) == "fl2va"
     assert pipeline._resolve_task(None, {"audio": object()}) == "ref2va"
     assert pipeline._resolve_task(None, {"video": object()}) == "ref2va"
+    assert pipeline._resolve_task(None, {"audio": object()}, audio_mode="lock_source") == "t2va"
+    assert (
+        pipeline._resolve_task(
+            None,
+            {"image": object(), "audio": object()},
+            audio_mode="lock_source",
+        )
+        == "fl2va"
+    )
+    assert (
+        pipeline._resolve_task(
+            None,
+            {"video": object(), "audio": object()},
+            audio_mode="lock_source",
+        )
+        == "ref2va"
+    )
     fl2v_spec = _turbo_spec("minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors")
     ref2v_spec = _turbo_spec("minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors")
     assert pipeline._resolve_task("fl2va", {"image": object()}, turbo_spec=fl2v_spec) == "fl2va"
     with pytest.raises(OmniClientError, match="serves"):
         pipeline._resolve_task("ref2va", {}, turbo_spec=fl2v_spec)
     assert pipeline._resolve_task("ref2va", {"image": object()}, turbo_spec=ref2v_spec) == "ref2va"
+    pipeline.partition = "fl2va"
+    pipeline.supported_tasks = frozenset({"t2va", "fl2va"})
+    assert pipeline._resolve_task(None, {"audio": object()}, audio_mode="lock_source") == "t2va"
+    assert (
+        pipeline._resolve_task(
+            None,
+            {"image": object(), "audio": object()},
+            audio_mode="lock_source",
+        )
+        == "fl2va"
+    )
     pipeline.partition = "ref2va"
     pipeline.supported_tasks = frozenset({"ref2va"})
     assert pipeline._resolve_task("ref2va") == "ref2va"
+    assert pipeline._resolve_task(None, {"audio": object()}, audio_mode="lock_source") == "ref2va"
 
     pipeline.partition = "combined"
     pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
@@ -3139,3 +3168,19 @@ def test_video_codec_options_are_normalized_for_the_encoder():
     assert normalize_video_codec_options(None) is None
     with pytest.raises(ValueError, match="video_codec_options"):
         normalize_video_codec_options("preset=ultrafast")
+
+
+@pytest.mark.parametrize("duration", [60, 75])
+def test_long_video_shape_requires_explicit_opt_in(duration):
+    from vllm_omni.errors import OmniClientError
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.model_executor.models.minimax_h3.encoder_processing import resolve_minimax_h3_shape
+
+    sampling = OmniDiffusionSamplingParams(width=960, height=544, fps=24, extra_args={"duration": duration})
+    with pytest.raises(OmniClientError, match="15"):
+        resolve_minimax_h3_shape("ref2va", sampling, None)
+    sampling.extra_args["long_video"] = True
+    _, _, frames, video_t, audio_t = resolve_minimax_h3_shape("ref2va", sampling, None)
+    assert frames >= duration * 24 and frames % 17 == 5
+    assert video_t == (frames - 5) // 17 * 5 + 2
+    assert audio_t == round(frames / 24 * 40)
