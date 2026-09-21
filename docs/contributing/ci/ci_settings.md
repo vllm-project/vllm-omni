@@ -13,8 +13,8 @@ Canonical layout (prefer these paths for new changes):
 ├── common/                          # Shared across platforms
 │   ├── scripts/
 │   │   ├── skip_ci.py               # skip-ci decision (docs / skip-mark / CI YAML paths)
-│   │   ├── upload_pipeline.py       # Bootstrap + test-pipeline uploader (CUDA/NPU)
-│   │   └── resolve_skip_ci.sh       # Shell helpers for AMD/Intel bootstrap
+│   │   ├── upload_pipeline.py       # Bootstrap + test-pipeline uploader (CUDA/NPU/AMD)
+│   │   └── resolve_skip_ci.sh       # Shell helpers for Intel bootstrap
 │   ├── ci_mirror_hardwares.yml      # CUDA/NPU hardware presets (referenced by name only)
 │   └── ci_source_file_dependencies.yml  # L2–L5 path-prefix presets (referenced by name only)
 ├── cuda/                            # Primary NVIDIA CUDA CI
@@ -33,13 +33,17 @@ Canonical layout (prefer these paths for new changes):
 │   ├── test-npu-nightly.yml         # L4
 │   └── scripts/
 ├── amd/
+│   ├── pipeline.yml                 # Bootstrap entry (hook upload)
+│   ├── bootstrap-upload-steps.yml   # Image build + AMD child uploader
 │   ├── test-amd-ready.yml           # L2 job definitions (template input)
 │   ├── test-amd-merge.yml           # L3 job definitions
 │   ├── test-amd-nightly.yml         # Nightly full-model jobs (experimental)
 │   ├── test-template-amd-omni.j2    # Renders final pipeline.yaml
 │   └── scripts/
-│       ├── bootstrap-amd-omni.sh    # Entry: skip-ci → Jinja → upload
-│       └── run-amd-test.sh          # Wraps pytest inside ROCm docker
+│       ├── bootstrap-amd-omni.sh    # Compatibility entry for bootstrap upload
+│       ├── build-ci-image.sh        # Registry-cached ROCm image build
+│       ├── select_test_suites.py    # Ready/merge/nightly suite selection
+│       └── run-amd-test.sh          # Runs pytest in native ROCm pods
 ├── intel/
 │   ├── pipeline-intel.yml           # Static Intel XPU pipeline
 │   └── scripts/
@@ -65,7 +69,7 @@ Canonical layout (prefer these paths for new changes):
 | -------- | ---------------- | -------------- | ---------------- | -------------------- |
 | **CUDA** | `cuda/pipeline.yml` | `test-ready.yml`, `test-merge.yml`, `test-nightly.yml`, `test-weekly.yml` | `upload_pipeline.py --upload` (expands uploader-only keys) | omit `mirror_hardwares` (from `-m`) / preset string + `MIRROR_HW` |
 | **NPU** | `npu/pipeline-npu.yml` | `test-npu-ready.yml`, `test-npu-nightly.yml` | `upload_pipeline.py --upload` | `mirror_hardwares: a2b3_npu_1` / `a2b3_npu_4` / `a3_npu_2` |
-| **AMD** | `amd/scripts/bootstrap-amd-omni.sh` | `test-amd-ready.yml`, `test-amd-merge.yml`, `test-amd-nightly.yml` | Jinja (`test-template-amd-omni.j2`) → `pipeline upload` | `agent_pool` + `mirror_hardwares: [amdproduction]` (array, template filter) |
+| **AMD** | `amd/pipeline.yml` | `test-amd-ready.yml`, `test-amd-merge.yml`, `test-amd-nightly.yml` | `upload_pipeline.py --amd --upload` + Jinja | `agent_pool` + `mirror_hardwares: [amdproduction]` (array, template filter) |
 | **Intel** | `intel/scripts/bootstrap-intel-omni.sh` | `intel/pipeline-intel.yml` (steps inline) | Direct `pipeline upload` | Inline `agents.queue` on each step |
 
 ## Platform configuration style
@@ -170,13 +174,13 @@ Canonical layout (prefer these paths for new changes):
 
 === "AMD"
 
-    **Bootstrap:** [`amd/scripts/bootstrap-amd-omni.sh`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/scripts/bootstrap-amd-omni.sh)—skip-ci, diff filtering, Jinja render, then `buildkite-agent pipeline upload`.
+    **Bootstrap:** [`amd/pipeline.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/pipeline.yml) runs `upload_pipeline.py --upload .buildkite/amd/bootstrap-upload-steps.yml`. The shared uploader injects skip-ci conditions, then the child steps build the registry-cached ROCm image and run `upload_pipeline.py --amd --upload` to select, render, and upload the native MI300 jobs. `amd/scripts/bootstrap-amd-omni.sh` is a compatibility entry for the same bootstrap upload.
 
     **Test YAML (data):** `amd/test-amd-ready.yml` (L2 / `ready`), `test-amd-merge.yml` (L3 / `merge-test` and ordinary `main`), and experimental `test-amd-nightly.yml` (`full_model` / `nightly-test` or `main` with `NIGHTLY=1`). Multiple PR tier labels combine their suites behind one image build. PR builds that reach the bootstrap without a tier label retain the legacy ready-suite fallback. `DEBUG_TEST_YAML` accepts `ready`, `merge`, and `nightly` as an explicit override. During nightly burn-in every AMD nightly leaf is non-blocking.
 
     **Trigger boundary:** AMD label handling has two layers. First, the external `vllm-omni-amd-ci` Buildkite pipeline condition decides whether a GitHub label event creates a build. Only after that build starts does this repository's bootstrap inspect all current PR labels and select the ready, merge, nightly, or combined suites. Repository-side selection therefore cannot start AMD CI by itself. AMD-only nightly validation uses both `amd-test` and `nightly-test`: the external condition should accept an event for either label only when the complete PR label set contains both. `amd-test` admits the AMD pipeline, while `nightly-test` makes the bootstrap select `NIGHTLY_TESTS:test-amd-nightly.yml`. Existing `ready` / `merge-test` behavior and non-PR `main` / scheduled builds remain separate. For PR builds without a `DEBUG_TEST_YAML` override, an unreadable label set fails the bootstrap instead of silently selecting the wrong tier. Debug overrides skip label lookup and are validated directly; invalid values, including whitespace-only values, fail the bootstrap. Until the paired-label condition is configured, use an authorized manual Buildkite build with `DEBUG_TEST_YAML=nightly` and verify that the bootstrap reports only the nightly suite.
 
-    **Rendering:** [`test-template-amd-omni.j2`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/test-template-amd-omni.j2) wraps data steps with `amd-build` image build and `amd_<agent_pool>` queues. Do **not** hand-edit generated `pipeline.yaml`.
+    **Rendering:** [`test-template-amd-omni.j2`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/test-template-amd-omni.j2) wraps data steps with `amd_<agent_pool>` queues. Every rendered job depends on the bootstrap `image-build` step. Do **not** hand-edit generated `pipeline.yaml`.
 
     **Hardware in YAML:** `agent_pool` (for example `mi325_1`) plus `mirror_hardwares: [amdproduction]` (array—Buildkite template filter, not the CUDA/NPU uploader preset mechanism).
 
@@ -218,8 +222,8 @@ PR diffs drive **two independent skip layers**. Both read changed files from git
 
 | Layer | Script | When | What is skipped | Where you configure |
 | ----- | ------ | ---- | --------------- | ------------------- |
-| **Bootstrap** | [`skip_ci.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/skip_ci.py) + [`upload_pipeline.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/upload_pipeline.py) | Before child test pipelines upload (`cuda/pipeline.yml`, `npu/pipeline-npu.yml`, AMD/Intel bootstraps) | Entire default CI, or whole L2/L3 upload for a platform | Whitelists in `skip_ci.py`; bootstrap `if` injected by step `key` in `upload_pipeline.py` |
-| **Step filter** | [`upload_pipeline.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/upload_pipeline.py) | While uploading CUDA L2–L5 YAML | Individual Buildkite steps inside `test-ready.yml` / `test-merge.yml` / `test-nightly.yml` / `test-weekly.yml` | `source_file_dependencies` key on each step (presets in `ci_source_file_dependencies.yml`) |
+| **Bootstrap** | [`skip_ci.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/skip_ci.py) + [`upload_pipeline.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/upload_pipeline.py) | Before child test pipelines upload (CUDA/NPU/AMD checked-in entries, Intel bootstrap) | Entire default CI, or whole L2/L3 upload for a platform | Whitelists in `skip_ci.py`; bootstrap `if` injected by step `key` in `upload_pipeline.py` |
+| **Step filter** | [`upload_pipeline.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/upload_pipeline.py) | While uploading CUDA/NPU/AMD test YAML | Individual Buildkite test steps | `source_file_dependencies` key on each step (presets in `ci_source_file_dependencies.yml`) |
 
 **Changed files** (both layers):
 
@@ -233,7 +237,7 @@ Label triggers (`ready`, `merge-test`) are unchanged—diff-aware logic only red
 
 #### Bootstrap skip {#bootstrap-skip}
 
-[`skip_ci.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/skip_ci.py) classifies the git diff into buckets (docs / qualifying skip-mark / whitelisted L2·L3·L4/L5 YAML / other), then picks one decision path. CUDA/NPU apply that decision by injecting Buildkite `if` on `bootstrap-upload-steps.yml` step keys; AMD/Intel call `gate_bootstrap_ci <platform> <l2|l3>`.
+[`skip_ci.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/skip_ci.py) classifies the git diff into buckets (docs / qualifying skip-mark / whitelisted L2·L3·L4/L5 YAML / other), then picks one decision path. CUDA/NPU/AMD apply that decision by injecting Buildkite `if` on `bootstrap-upload-steps.yml` step keys; Intel calls `gate_bootstrap_ci <platform> <l2|l3>`.
 
 ##### Decision overview
 
@@ -246,7 +250,7 @@ Label triggers (`ready`, `merge-test`) are unchanged—diff-aware logic only red
 | Non-qualifying skip-mark and no CI YAML | normal CI | all on |
 | Diff unavailable | normal CI | all on |
 
-**`skip_all` exceptions:** For CUDA/NPU, PR labels (`nightly-test`, `merge-test`, `weekly-test`, `ready`, …) do **not** revive jobs under `skip_all`; on `main`, scheduled `NIGHTLY=1` still builds the image and uploads L4, while `WEEKLY=1` or `NON_CRITICAL=1` still builds the image and uploads L5 (CUDA). `WEEKLY=1` on `main` also uploads L2/L3 with `--e2e`. AMD applies `skip_ci.py gate` only to selected ready/merge specs, so an explicitly selected AMD nightly spec (`nightly-test`, `NIGHTLY=1`, or a nightly debug override) remains runnable even for a docs-only diff.
+**`skip_all` exceptions:** For CUDA/NPU, PR labels (`nightly-test`, `merge-test`, `weekly-test`, `ready`, …) do **not** revive jobs under `skip_all`; on `main`, scheduled `NIGHTLY=1` still builds the image and uploads L4, while `WEEKLY=1` or `NON_CRITICAL=1` still builds the image and uploads L5 (CUDA). `WEEKLY=1` on `main` also uploads L2/L3 with `--e2e`. AMD bootstrap conditions keep an explicitly selected nightly spec (`nightly-test` or `NIGHTLY=1`) runnable even for a docs-only diff.
 
 **Yaml-gated nightly/weekly:** L4/L5 upload steps keep their normal label / `NIGHTLY` / `WEEKLY` / `NON_CRITICAL` conditions (for example PR `nightly-test` still uploads nightly). Only L2/L3 upload steps are matrix-gated.
 
@@ -307,13 +311,14 @@ Docs/skip-mark mixed with any row below follows the same matrix.
 | --- | --- |
 | **CUDA** | `upload_pipeline.py` injects `if` by step `key` (`image-build`, `upload-ready-pipeline`, `upload-merge-pipeline`, …) from `is_run(cuda, l2/l3)` |
 | **NPU** | Same injection; no merge upload step (L3 always off in bootstrap) |
-| **AMD / Intel** | `gate_bootstrap_ci <platform> <l2\|l3>` exits 0 when `skip_all` or that target is off |
+| **AMD** | Same injection; one `upload-amd-pipeline` step selects all runnable suites and preserves the unlabeled ready fallback |
+| **Intel** | `gate_bootstrap_ci intel <l2\|l3>` exits 0 when `skip_all` or that target is off |
 
 Unit coverage: `tests/buildkite/test_skip_ci.py`.
 
 #### Step filtering {#step-filtering}
 
-CUDA **L2** (`.buildkite/cuda/test-ready.yml`), **L3** (`.buildkite/cuda/test-merge.yml`), **L4** (`.buildkite/cuda/test-nightly.yml`), **L5** (`.buildkite/cuda/test-weekly.yml`), and NPU **L4** (`.buildkite/npu/test-npu-nightly.yml`). Bootstrap upload entry: `upload_pipeline.py --upload .buildkite/cuda/bootstrap-upload-steps.yml` (or `npu/bootstrap-upload-steps.yml`).
+CUDA **L2** (`.buildkite/cuda/test-ready.yml`), **L3** (`.buildkite/cuda/test-merge.yml`), **L4** (`.buildkite/cuda/test-nightly.yml`), **L5** (`.buildkite/cuda/test-weekly.yml`), NPU **L4** (`.buildkite/npu/test-npu-nightly.yml`), and AMD ready/merge/nightly YAML. Bootstrap upload entries use `upload_pipeline.py --upload <platform>/bootstrap-upload-steps.yml`; AMD child rendering uses `--amd`.
 
 **When filtering applies:** **PR label** uploads (`ready`, `merge-test`, `nightly-test`, `weekly-test`) and **post-merge `main` L3** (`test-merge.yml`). Scheduled **`main` + env** uploads that pass `--all` (`NIGHTLY=1`, `WEEKLY=1` / `NON_CRITICAL=1`) or `--e2e` (`WEEKLY=1` on L2/L3) keep every selected job and still strip the key. If **no** job-key prefix matches the diff, a change to the pipeline YAML being uploaded, or any path under the `source_filter_fallback` key in `ci_source_file_dependencies.yml`, keeps every job in that upload. `source_filter_fallback` is not a job key — do not attach it to a step. When any job-key prefix already matches, normal filtering wins (the fallback does not expand the selection).
 

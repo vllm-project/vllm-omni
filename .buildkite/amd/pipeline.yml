@@ -1,0 +1,9 @@
+# Hook uploads this entry YAML; upload_pipeline.py --upload reads the
+# bootstrap-upload-steps.yml file and applies shared skip-ci gating.
+steps:
+  - label: ":github: Resolve skip-ci & upload AMD pipeline"
+    key: upload-ci-pipeline
+    commands:
+      - "python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/amd/bootstrap-upload-steps.yml"
+    agents:
+      queue: "cpu_queue_premerge"

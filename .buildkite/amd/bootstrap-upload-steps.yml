@@ -1,0 +1,31 @@
+# Uploaded by upload_pipeline.py --upload.
+# AMD tests run natively in MI300 Kubernetes pods; only image construction
+# runs on the CPU queue with Docker available.
+steps:
+  - label: ":docker: Build AMD test image"
+    key: image-build
+    commands:
+      - "bash .buildkite/amd/scripts/build-ci-image.sh"
+    env:
+      DOCKER_BUILDKIT: "1"
+      PYTORCH_ROCM_ARCH: "gfx942"
+      ROCM_CI_IMAGE_REGISTRY: "rocm/vllm-omni"
+    retry:
+      automatic:
+        - exit_status: -1
+          limit: 2
+        - exit_status: -10
+          limit: 2
+        - exit_status: 128
+          limit: 2
+        - exit_status: 1
+          limit: 1
+    agents:
+      queue: "amd-cpu"
+
+  - label: "Upload AMD Test Pipeline"
+    depends_on: image-build
+    key: upload-amd-pipeline
+    command: python3 .buildkite/common/scripts/upload_pipeline.py --amd --upload
+    agents:
+      queue: "cpu_queue_premerge"

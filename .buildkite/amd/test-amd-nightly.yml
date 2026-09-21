@@ -19,9 +19,16 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
+        artifact_paths:
+          - qwen3-omni-ci/*.log
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-          - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
+          - export AMD_CI_TEST_TARGET="tests/e2e/online_serving/test_qwen3_omni_expansion.py"
+          - export AMD_CI_TEST_MARKER="full_model and rocm and MI325 and cards_2"
+          - export AMD_CI_LOG_PREFIX="nightly-function-expansion"
+          - export AMD_CI_ARTIFACT_LOG_DIR="qwen3-omni-ci"
+          - export AMD_CI_TEST_TIMEOUT="165m"
+          - bash .buildkite/amd/scripts/run-amd-test-with-diagnostics.sh
 
       - label: "Qwen3-Omni Accuracy"
         agent_pool: mi300_2
@@ -31,18 +38,32 @@ steps:
         timeout_in_minutes: 180
         artifact_paths:
           - tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json
+          - qwen3-omni-ci/*.log
         commands:
           - export SEED_TTS_WER_EVAL=1
           # PyTorch ROCm uses the torch.cuda device namespace.
           - export SEED_TTS_EVAL_DEVICE=cuda:1
-          - pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
+          - export AMD_CI_TEST_TARGET="tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py"
+          - export AMD_CI_TEST_MARKER="full_model and rocm and MI325 and cards_2"
+          - export AMD_CI_LOG_PREFIX="nightly-accuracy"
+          - export AMD_CI_ARTIFACT_LOG_DIR="qwen3-omni-ci"
+          - export AMD_CI_TEST_TIMEOUT="165m"
+          - bash .buildkite/amd/scripts/run-amd-test-with-diagnostics.sh
           # Native tests run from the image copy under /app/vllm-omni, while
           # Buildkite's artifact hook searches the checkout workspace.
           - |
-            if [[ "$$PWD" != "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}" ]]; then
-              artifact_dir="$${BUILDKITE_BUILD_CHECKOUT_PATH}/tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc"
-              mkdir -p "$$artifact_dir"
-              cp -v tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json "$$artifact_dir/"
+            source_dir="tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc"
+            artifact_dir="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/$$source_dir"
+            shopt -s nullglob
+            accuracy_results=("$$source_dir"/*.json)
+            shopt -u nullglob
+            if (( $${#accuracy_results[@]} == 0 )); then
+              echo "Accuracy test produced no JSON results in $$source_dir." >&2
+              exit 1
+            fi
+            mkdir -p "$$artifact_dir"
+            if [[ "$$(cd "$$source_dir" && pwd -P)" != "$$(cd "$$artifact_dir" && pwd -P)" ]]; then
+              cp -v "$${accuracy_results[@]}" "$$artifact_dir/"
             fi
 
       - label: "Qwen3-Omni Documentation Examples"
@@ -51,9 +72,16 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 120
+        artifact_paths:
+          - qwen3-omni-ci/*.log
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-          - pytest -s -v tests/examples/online_serving/test_qwen3_omni.py -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
+          - export AMD_CI_TEST_TARGET="tests/examples/online_serving/test_qwen3_omni.py"
+          - export AMD_CI_TEST_MARKER="full_model and rocm and MI325 and cards_2"
+          - export AMD_CI_LOG_PREFIX="nightly-documentation"
+          - export AMD_CI_ARTIFACT_LOG_DIR="qwen3-omni-ci"
+          - export AMD_CI_TEST_TIMEOUT="105m"
+          - bash .buildkite/amd/scripts/run-amd-test-with-diagnostics.sh
 
       - label: "Qwen3-Omni AITER-on Smoke"
         agent_pool: mi300_2
@@ -61,6 +89,13 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 90
+        artifact_paths:
+          - qwen3-omni-ci/*.log
         commands:
           - export VLLM_ROCM_USE_AITER=1
-          - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py::test_text_to_text_audio_001 -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
+          - export AMD_CI_TEST_TARGET="tests/e2e/online_serving/test_qwen3_omni_expansion.py::test_text_to_text_audio_001"
+          - export AMD_CI_TEST_MARKER="full_model and rocm and MI325 and cards_2"
+          - export AMD_CI_LOG_PREFIX="nightly-aiter-smoke"
+          - export AMD_CI_ARTIFACT_LOG_DIR="qwen3-omni-ci"
+          - export AMD_CI_TEST_TIMEOUT="75m"
+          - bash .buildkite/amd/scripts/run-amd-test-with-diagnostics.sh

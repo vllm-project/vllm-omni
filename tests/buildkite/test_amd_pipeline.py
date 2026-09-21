@@ -13,6 +13,9 @@ AMD_MERGE_PIPELINE = Path(".buildkite/amd/test-amd-merge.yml")
 AMD_NIGHTLY_PIPELINE = Path(".buildkite/amd/test-amd-nightly.yml")
 AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
 AMD_TEMPLATE = Path(".buildkite/amd/test-template-amd-omni.j2")
+AMD_DIAGNOSTIC_RUNNER = Path(
+    ".buildkite/amd/scripts/run-amd-test-with-diagnostics.sh",
+)
 
 
 def _find_step(label: str, pipeline_path: Path = AMD_MERGE_PIPELINE) -> dict:
@@ -47,14 +50,37 @@ def test_qwen3_tts_base_preserves_advanced_model_arguments() -> None:
 
 def test_qwen3_accuracy_defers_artifact_path_expansion() -> None:
     step = _find_step("Qwen3-Omni Accuracy", AMD_NIGHTLY_PIPELINE)
-    staging_command = next(command for command in step["commands"] if "artifact_dir=" in command)
+    staging_command = next(command for command in step["commands"] if "accuracy_results=" in command)
 
     # Dynamic pipelines are interpolated once during upload. Double dollars
     # preserve these variables for the GPU job's runtime shell.
-    assert '"$$PWD"' in staging_command
-    assert '"$${BUILDKITE_BUILD_CHECKOUT_PATH:?}"' in staging_command
+    assert "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}" in staging_command
     assert '"$$artifact_dir"' in staging_command
-    assert step["artifact_paths"] == ["tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json"]
+    assert "shopt -s nullglob" in staging_command
+    assert "Accuracy test produced no JSON results" in staging_command
+    assert step["artifact_paths"] == [
+        "tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json",
+        "qwen3-omni-ci/*.log",
+    ]
+
+
+def test_qwen3_nightly_stages_distinct_diagnostic_logs() -> None:
+    runner = AMD_DIAGNOSTIC_RUNNER.read_text(encoding="utf-8")
+
+    assert "*-collection.log" in runner
+    assert "*-metadata.log" in runner
+    assert "BUILDKITE_BUILD_CHECKOUT_PATH" in runner
+    assert "pytest.log" not in runner
+
+    for label in (
+        "Qwen3-Omni Function Expansion",
+        "Qwen3-Omni Accuracy",
+        "Qwen3-Omni Documentation Examples",
+        "Qwen3-Omni AITER-on Smoke",
+    ):
+        step = _find_step(label, AMD_NIGHTLY_PIPELINE)
+        assert "qwen3-omni-ci/*.log" in step["artifact_paths"]
+        assert any("run-amd-test-with-diagnostics.sh" in command for command in step["commands"])
 
 
 def test_ready_diffusion_cpu_suite_is_sharded() -> None:

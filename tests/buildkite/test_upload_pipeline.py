@@ -22,12 +22,16 @@ from upload_pipeline import (  # noqa: E402
     _render_bootstrap_pipeline,
     _render_test_pipeline,
     _resolve_source_file_dependencies,
+    _select_amd_suites,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 CUDA_BOOTSTRAP_STEPS = Path(".buildkite/cuda/bootstrap-upload-steps.yml")
 NIGHTLY_YAML = Path(".buildkite/cuda/test-nightly.yml")
+AMD_BOOTSTRAP_STEPS = Path(".buildkite/amd/bootstrap-upload-steps.yml")
+AMD_BOOTSTRAP_SCRIPT = Path(".buildkite/amd/scripts/bootstrap-amd-omni.sh")
+AMD_TEMPLATE = Path(".buildkite/amd/test-template-amd-omni.j2")
 BOOTSTRAP_STEPS_TEMPLATE = """steps:
   - key: image-build
   - key: upload-ready-pipeline
@@ -141,6 +145,96 @@ def test_yaml_gated_l2_still_enables_image_via_ready_base() -> None:
     rendered = _render([".buildkite/cuda/test-ready.yml"])
     assert 'build.pull_request.labels includes "ready"' in rendered
     assert "if: true" not in rendered
+
+
+def test_amd_bootstrap_conditions_and_command_use_shared_uploader() -> None:
+    rendered = _render_bootstrap_pipeline(
+        AMD_BOOTSTRAP_STEPS.read_text(encoding="utf-8"),
+        decision=resolve_ci_decision(["docs/foo.md"]),
+        path=AMD_BOOTSTRAP_STEPS,
+    )
+    doc = yaml.safe_load(rendered)
+    by_key = {step["key"]: step for step in doc["steps"]}
+    assert "image-build" in by_key
+    assert "upload-amd-pipeline" in by_key
+    assert by_key["image-build"]["if"] == by_key["upload-amd-pipeline"]["if"]
+    assert 'labels includes "nightly-test"' in by_key["upload-amd-pipeline"]["if"]
+    assert "build-ci-image.sh" in by_key["image-build"]["commands"][0]
+    assert "common/scripts/upload_pipeline.py" in by_key["upload-amd-pipeline"]["command"]
+    assert "--amd" in by_key["upload-amd-pipeline"]["command"]
+    assert "if: false" not in rendered
+
+
+def test_amd_compatibility_entry_uploads_bootstrap_steps() -> None:
+    script = AMD_BOOTSTRAP_SCRIPT.read_text(encoding="utf-8")
+    assert "--upload .buildkite/amd/bootstrap-upload-steps.yml" in script
+    assert "--amd" not in script
+
+
+def test_amd_ready_yaml_gate_includes_unlabeled_pr_fallback() -> None:
+    rendered = _render_bootstrap_pipeline(
+        AMD_BOOTSTRAP_STEPS.read_text(encoding="utf-8"),
+        decision=resolve_ci_decision([".buildkite/amd/test-amd-ready.yml"]),
+        path=AMD_BOOTSTRAP_STEPS,
+    )
+    doc = yaml.safe_load(rendered)
+    by_key = {step["key"]: step for step in doc["steps"]}
+    condition = by_key["upload-amd-pipeline"]["if"]
+    assert by_key["image-build"]["if"] == condition
+    assert 'build.branch != "main"' in condition
+    assert 'labels includes "nightly-test"' in condition
+
+
+def test_amd_docs_only_keeps_scheduled_nightly_image_build() -> None:
+    rendered = _render_bootstrap_pipeline(
+        AMD_BOOTSTRAP_STEPS.read_text(encoding="utf-8"),
+        decision=resolve_ci_decision(["docs/foo.md"]),
+        path=AMD_BOOTSTRAP_STEPS,
+    )
+    doc = yaml.safe_load(rendered)
+    by_key = {step["key"]: step for step in doc["steps"]}
+    condition = by_key["image-build"]["if"]
+
+    assert condition == by_key["upload-amd-pipeline"]["if"]
+    assert 'build.branch == "main"' in condition
+    assert 'build.env("NIGHTLY") == "1"' in condition
+
+
+def test_amd_debug_override_skips_pr_label_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BUILDKITE_BRANCH", "feature")
+    monkeypatch.setenv("DEBUG_TEST_YAML", "nightly")
+    monkeypatch.setattr(
+        "upload_pipeline._amd_pr_labels",
+        lambda: pytest.fail("debug override requested PR labels"),
+    )
+
+    assert _select_amd_suites() == ("nightly",)
+
+
+def test_amd_rendering_preserves_native_hardware_metadata() -> None:
+    rendered = _render_test_pipeline(
+        {
+            "steps": [
+                {
+                    "label": "AMD native",
+                    "mirror_hardwares": ["amdproduction"],
+                    "commands": ["pytest -m 'full_model and rocm'"],
+                },
+            ],
+        },
+        changed_files=None,
+        platform="amd",
+    )
+    step = rendered["steps"][0]
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert "agents" not in step
+
+
+def test_amd_template_uses_bootstrap_image() -> None:
+    template = AMD_TEMPLATE.read_text(encoding="utf-8")
+    assert 'key: "amd-build"' not in template
+    assert "depends_on: amd-build" not in template
+    assert template.count("depends_on: image-build") == 2
 
 
 def test_mirror_hardwares_l4_1_expands_to_agents_and_plugins(monkeypatch: pytest.MonkeyPatch) -> None:
