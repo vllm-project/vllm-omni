@@ -1,14 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unified OmniConnector and KV cache transfer management."""
 
 import enum
-import json
-import struct
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -19,6 +17,11 @@ from vllm_omni.diffusion.sched.interface import KVPrefetchJob
 from vllm_omni.platforms import current_omni_platform
 
 from .factory import OmniConnectorFactory
+from .kv_transfer_payload import (
+    KV_PAYLOAD_CONTRACT_KEY,
+    KV_PAYLOAD_CONTRACT_VERSION,
+    KVCacheTransferData,
+)
 from .utils.config import TRANSFER_ENGINE_CONNECTOR_NAMES, ConnectorSpec
 from .utils.env import expand_env_int
 from .utils.initialization import KV_RANK_PORT_STRIDE
@@ -100,29 +103,6 @@ class _TransferTopoConfig:
 # Placeholder for the heavy primary KV in the side-payload dict; receiver swaps in the rebuilt object from the blob.
 _KV_PLACEHOLDER = "__kv_placeholder__"
 
-_SAFE_TORCH_DTYPES = {
-    name: dtype
-    for name in (
-        "bool",
-        "uint8",
-        "int8",
-        "int16",
-        "int32",
-        "int64",
-        "float16",
-        "float32",
-        "float64",
-        "bfloat16",
-        "complex64",
-        "complex128",
-        "float8_e4m3fn",
-        "float8_e4m3fnuz",
-        "float8_e5m2",
-        "float8_e5m2fnuz",
-    )
-    if isinstance((dtype := getattr(torch, name, None)), torch.dtype)
-}
-
 
 @dataclass
 class OmniKVCacheConfig:
@@ -140,209 +120,6 @@ class OmniKVCacheConfig:
     to_tp: int = 1
     enable_kv_async_prefetch: bool = False
     kv_prefetch_min_free_mem_ratio: float = 0.0
-
-
-@dataclass
-class KVCacheTransferData:
-    """Container for KV cache transfer data."""
-
-    request_id: str
-    layer_blocks: dict[str, Any]
-    block_ids: list[int]
-    metadata: dict[str, Any]
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary for serialization."""
-        return asdict(self)
-
-    def _build_tensors_desc(self, *, cpu: bool) -> tuple[list[dict[str, Any]], list, int, torch.device | None]:
-        """Iterate layer blocks and build tensor descriptors + data chunks.
-
-        Returns ``(tensors_desc, chunks, total_bytes, device)``.
-        *chunks* contains ``bytes`` when *cpu* is True, flat uint8 GPU tensors otherwise.
-        """
-        tensors_desc: list[dict[str, Any]] = []
-        chunks: list = []
-        data_offset = 0
-        device = None
-
-        for cache_name in ("key_cache", "value_cache"):
-            for layer_idx, tensor in enumerate(self.layer_blocks.get(cache_name, [])):
-                if tensor is None:
-                    tensors_desc.append({"n": f"{cache_name}_{layer_idx}", "x": True})
-                    continue
-                t = tensor.detach().contiguous()
-                if cpu:
-                    t = t.cpu()
-                elif device is None and getattr(t.device, "type", "cpu") != "cpu":
-                    device = t.device
-                nbytes = t.numel() * t.element_size()
-                tensors_desc.append(
-                    {
-                        "n": f"{cache_name}_{layer_idx}",
-                        "i": layer_idx,
-                        "d": str(t.dtype).removeprefix("torch."),
-                        "s": list(t.shape),
-                        "o": data_offset,
-                        "b": nbytes,
-                    }
-                )
-                chunks.append(t.view(torch.uint8).numpy().tobytes() if cpu else t.view(torch.uint8).flatten())
-                data_offset += nbytes
-
-        return tensors_desc, chunks, data_offset, device
-
-    def _build_header_bytes(self, tensors_desc: list[dict[str, Any]]) -> bytes:
-        header = json.dumps(
-            {
-                "rid": self.request_id,
-                "bids": self.block_ids,
-                "meta": self.metadata,
-                "td": tensors_desc,
-                "nl": len(self.layer_blocks.get("key_cache", [])),
-            },
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return struct.pack(">I", len(header)) + header
-
-    def to_bytes(self) -> bytes:
-        """Convert to compact binary format for fast transfer."""
-        tensors_desc, chunks, _, _ = self._build_tensors_desc(cpu=True)
-        return b"".join([self._build_header_bytes(tensors_desc)] + chunks)
-
-    def to_gpu_tensor(self) -> torch.Tensor:
-        """Convert to a packed device tensor for raw-data connectors."""
-        tensors_desc, chunks, data_offset, device = self._build_tensors_desc(cpu=False)
-        if device is None:
-            raise RuntimeError("No device tensors found, use to_bytes() instead")
-        header_prefix = self._build_header_bytes(tensors_desc)
-        output = torch.empty(len(header_prefix) + data_offset, dtype=torch.uint8, device=device)
-        output[: len(header_prefix)].copy_(torch.frombuffer(bytearray(header_prefix), dtype=torch.uint8))
-        pos = len(header_prefix)
-        for t_flat in chunks:
-            n = t_flat.numel()
-            output[pos : pos + n].copy_(t_flat)
-            pos += n
-        return output
-
-    @staticmethod
-    def _load_header_from_memoryview(raw_mv: memoryview) -> tuple[dict[str, Any], memoryview]:
-        if len(raw_mv) < 4:
-            raise ValueError("Corrupted KV payload: missing 4-byte header length")
-
-        header_len = struct.unpack(">I", raw_mv[:4])[0]
-        if header_len > len(raw_mv) - 4:
-            raise ValueError(f"Corrupted KV payload: header_len={header_len} exceeds buffer size={len(raw_mv)}")
-
-        return json.loads(bytes(raw_mv[4 : 4 + header_len])), raw_mv[4 + header_len :]
-
-    @staticmethod
-    def _load_header_from_tensor(tensor: torch.Tensor) -> tuple[dict[str, Any], int]:
-        if tensor.dtype != torch.uint8 or tensor.dim() != 1:
-            raise ValueError("Packed device KV payload must be a 1-D uint8 tensor")
-
-        total_bytes = int(tensor.numel())
-        if total_bytes < 4:
-            raise ValueError("Corrupted KV payload: missing 4-byte header length")
-
-        header_len = struct.unpack(">I", tensor[:4].cpu().numpy().tobytes())[0]
-        if header_len > total_bytes - 4:
-            raise ValueError(f"Corrupted KV payload: header_len={header_len} exceeds buffer size={total_bytes}")
-
-        header_bytes = tensor[4 : 4 + header_len].cpu().numpy().tobytes()
-        return json.loads(header_bytes), 4 + header_len
-
-    @staticmethod
-    def _validate_tensor_span(name: str, info: dict[str, Any], tensor_data_bytes: int) -> tuple[int, int]:
-        offset = info["o"]
-        nbytes = info["b"]
-        if offset < 0 or nbytes < 0 or offset + nbytes > tensor_data_bytes:
-            raise ValueError(
-                f"Corrupted KV payload tensor span for {name}: "
-                f"offset={offset}, bytes={nbytes}, tensor_data_bytes={tensor_data_bytes}"
-            )
-        return offset, nbytes
-
-    @staticmethod
-    def _resolve_torch_dtype(dtype_name: Any) -> torch.dtype:
-        torch_dtype = _SAFE_TORCH_DTYPES.get(str(dtype_name))
-        if torch_dtype is None:
-            raise ValueError(f"Unsupported dtype in KV payload: {dtype_name}")
-        return torch_dtype
-
-    @staticmethod
-    def _resolve_layer_idx(info: dict[str, Any], num_layers: int) -> int:
-        layer_idx = info.get("i")
-        if layer_idx is None:
-            name = info.get("n")
-            if isinstance(name, str) and name.startswith("key_cache_"):
-                layer_idx = int(name.removeprefix("key_cache_"))
-            elif isinstance(name, str) and name.startswith("value_cache_"):
-                layer_idx = int(name.removeprefix("value_cache_"))
-            else:
-                raise ValueError(f"Invalid KV tensor name in payload: {name}")
-
-        if not isinstance(layer_idx, int):
-            raise ValueError(f"Invalid layer index in KV payload: {layer_idx}")
-        if layer_idx < 0 or layer_idx >= num_layers:
-            raise ValueError(f"Invalid layer index in KV payload: {layer_idx} (num_layers={num_layers})")
-        return layer_idx
-
-    @staticmethod
-    def _populate_caches(header: dict[str, Any], get_tensor: callable) -> dict[str, Any]:
-        """Shared deserialization loop for both CPU and GPU paths."""
-        num_layers = header["nl"]
-        key_cache: list[torch.Tensor | None] = [None] * num_layers
-        value_cache: list[torch.Tensor | None] = [None] * num_layers
-
-        for info in header["td"]:
-            if info.get("x"):
-                continue
-            name: str = info["n"]
-            torch_dtype = KVCacheTransferData._resolve_torch_dtype(info["d"])
-            t = get_tensor(info).view(torch_dtype).reshape(info["s"])
-            layer_idx = KVCacheTransferData._resolve_layer_idx(info, num_layers)
-            if name.startswith("key_cache_"):
-                key_cache[layer_idx] = t
-            elif name.startswith("value_cache_"):
-                value_cache[layer_idx] = t
-
-        return {
-            "request_id": header["rid"],
-            "layer_blocks": {"key_cache": key_cache, "value_cache": value_cache},
-            "block_ids": header["bids"],
-            "metadata": header["meta"],
-        }
-
-    @staticmethod
-    def from_bytes(raw: "bytes | bytearray | memoryview") -> dict[str, Any]:
-        """Reconstruct KV cache data from the packed bytes format."""
-        raw_mv = memoryview(raw) if not isinstance(raw, memoryview) else raw
-        header, tensor_data_mv = KVCacheTransferData._load_header_from_memoryview(raw_mv)
-        data_len = len(tensor_data_mv)
-
-        def _get(info: dict) -> torch.Tensor:
-            offset, nbytes = KVCacheTransferData._validate_tensor_span(info["n"], info, data_len)
-            return torch.frombuffer(tensor_data_mv, dtype=torch.uint8, offset=offset, count=nbytes)
-
-        return KVCacheTransferData._populate_caches(header, _get)
-
-    @staticmethod
-    def from_bytes_device(tensor: torch.Tensor) -> dict[str, Any]:
-        """Reconstruct KV cache data from a packed device tensor."""
-        header, data_start = KVCacheTransferData._load_header_from_tensor(tensor)
-        data_len = int(tensor.numel()) - data_start
-
-        def _get(info: dict) -> torch.Tensor:
-            offset, nbytes = KVCacheTransferData._validate_tensor_span(info["n"], info, data_len)
-            return tensor[data_start + offset : data_start + offset + nbytes].clone()
-
-        return KVCacheTransferData._populate_caches(header, _get)
-
-    @staticmethod
-    def from_bytes_gpu(tensor: torch.Tensor) -> dict[str, Any]:
-        """Compatibility alias for callers using the old GPU-specific name."""
-        return KVCacheTransferData.from_bytes_device(tensor)
 
 
 class OmniKVTransferManager:
@@ -1059,12 +836,29 @@ class OmniKVTransferManager:
             cache_dtype: Data type of the cache
             custom_metadata: Optional custom metadata to include
 
-        Note: If key/value block counts differ, extraction uses only the overlapping
-        block range. Extra key/value blocks are ignored, so returned KV may be partial.
-
         Returns:
             KVCacheTransferData if extraction successful, None otherwise
         """
+        if block_size <= 0:
+            logger.warning("Request %s has invalid KV block size %s", req_id, block_size)
+            return None
+        if seq_len <= 0:
+            logger.warning("Request %s has invalid KV sequence length %s", req_id, seq_len)
+            return None
+
+        required_block_count = (seq_len + block_size - 1) // block_size
+        if len(block_ids) < required_block_count:
+            logger.warning(
+                "Request %s needs %s KV blocks for seq_len=%s and block_size=%s, but only %s block IDs were provided",
+                req_id,
+                required_block_count,
+                seq_len,
+                block_size,
+                len(block_ids),
+            )
+            return None
+        required_block_ids = block_ids[:required_block_count]
+
         num_layers = len(kv_caches)
         key_cache: list[torch.Tensor | None] = [None] * num_layers
         value_cache: list[torch.Tensor | None] = [None] * num_layers
@@ -1072,47 +866,62 @@ class OmniKVTransferManager:
         for layer_idx, layer_kv in enumerate(kv_caches):
             kv_pair = normalize_layer_kv(layer_kv, req_id=req_id, layer_idx=layer_idx, block_size=block_size)
             if kv_pair is None:
-                continue
+                logger.warning(
+                    "Rejecting incomplete KV extraction for request %s: layer %s could not be normalized",
+                    req_id,
+                    layer_idx,
+                )
+                return None
             key_blocks, value_blocks = kv_pair
 
+            available_blocks = min(key_blocks.shape[0], value_blocks.shape[0])
             if key_blocks.shape[0] != value_blocks.shape[0]:
                 logger.warning(
-                    f"Layer {layer_idx} for request {req_id} has mismatched KV block counts: "
-                    f"key={key_blocks.shape[0]}, value={value_blocks.shape[0]}; using shared range"
+                    "Layer %s for request %s has mismatched KV block counts: key=%s, value=%s",
+                    layer_idx,
+                    req_id,
+                    key_blocks.shape[0],
+                    value_blocks.shape[0],
                 )
 
-            # Validate block IDs - shape: [num_blocks, block_size, n_heads, head_dim]
-            max_block = min(key_blocks.shape[0], value_blocks.shape[0]) - 1
-            valid_ids = [bid for bid in block_ids if 0 <= bid <= max_block]
-            if not valid_ids:
-                continue
+            invalid_ids = [block_id for block_id in required_block_ids if not 0 <= block_id < available_blocks]
+            if invalid_ids:
+                logger.warning(
+                    "Rejecting incomplete KV extraction for request %s: layer %s cannot provide block IDs %s "
+                    "(available blocks=%s)",
+                    req_id,
+                    layer_idx,
+                    invalid_ids,
+                    available_blocks,
+                )
+                return None
 
             # Extract and reshape: [n_blocks, block_size, n_heads, head_dim]
             # -> [seq_len, n_heads, head_dim]
-            selected_k = key_blocks[valid_ids]
-            selected_v = value_blocks[valid_ids]
+            selected_k = key_blocks[required_block_ids]
+            selected_v = value_blocks[required_block_ids]
             flat_k = selected_k.flatten(0, 1)
             flat_v = selected_v.flatten(0, 1)
-            if seq_len < flat_k.shape[0]:
-                flat_k = flat_k[:seq_len]
-                flat_v = flat_v[:seq_len]
+            flat_k = flat_k[:seq_len]
+            flat_v = flat_v[:seq_len]
 
             key_cache[layer_idx] = flat_k.detach().contiguous()
             value_cache[layer_idx] = flat_v.detach().contiguous()
 
-        if not any(k is not None for k in key_cache):
+        if not key_cache:
             return None
 
         return KVCacheTransferData(
             request_id=req_id,
             layer_blocks={"key_cache": key_cache, "value_cache": value_cache},
-            block_ids=block_ids,
+            block_ids=required_block_ids,
             metadata={
+                **(custom_metadata or {}),
                 "block_size": block_size,
                 "num_layers": num_layers,
                 "dtype": str(cache_dtype),
                 "seq_len": seq_len,
-                **(custom_metadata or {}),
+                KV_PAYLOAD_CONTRACT_KEY: KV_PAYLOAD_CONTRACT_VERSION,
             },
         )
 
@@ -1493,6 +1302,12 @@ class OmniKVTransferManager:
                     else:
                         data = raw_data
 
+                    try:
+                        KVCacheTransferData.validate_payload_contract(data, request_id)
+                    except ValueError as exc:
+                        raise KVPrefetchConsumeError(
+                            f"Invalid KV payload for {request_id} (payload already consumed)"
+                        ) from exc
                     received_payloads[get_key] = (data, size)
                     pending_pairs.remove((get_key, from_rank))
 
@@ -1501,12 +1316,29 @@ class OmniKVTransferManager:
                     link_ms = (time.perf_counter() - link_start) * 1000
                     ordered_payloads = [received_payloads[key][0] for key, _ in recv_key_pairs]
                     total_size = sum(received_payloads[key][1] for key, _ in recv_key_pairs)
+                    require_contract = any(
+                        isinstance(payload.get("metadata"), dict) and KV_PAYLOAD_CONTRACT_KEY in payload["metadata"]
+                        for payload in ordered_payloads
+                    )
 
-                    if len(ordered_payloads) == 1:
-                        data = ordered_payloads[0]
-                    else:
-                        data = merge_received_rank_shards(ordered_payloads, merger=self.kv_payload_merger)
-                    data = slice_received_rank_shard(data, topo, slicer=self.kv_payload_slicer)
+                    merged_data: dict[str, Any] | None = (
+                        ordered_payloads[0]
+                        if len(ordered_payloads) == 1
+                        else merge_received_rank_shards(ordered_payloads, merger=self.kv_payload_merger)
+                    )
+                    sliced_data = slice_received_rank_shard(merged_data, topo, slicer=self.kv_payload_slicer)
+                    try:
+                        KVCacheTransferData.validate_payload_contract(
+                            sliced_data,
+                            request_id,
+                            require_contract=require_contract,
+                        )
+                    except ValueError as exc:
+                        raise KVPrefetchConsumeError(
+                            f"Invalid merged KV payload for {request_id} (payload already consumed)"
+                        ) from exc
+                    assert isinstance(sliced_data, dict)
+                    data = sliced_data
 
                     needs_clone = bool(deferred_memory)
                     try:
