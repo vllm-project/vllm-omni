@@ -539,7 +539,7 @@ def test_tensor_parallel_size_none_is_handled():
     engine_args = OmegaConf.create({"stage_id": 0, "engine_args": {"tensor_parallel_size": None}})
     args = build_engine_args_dict(
         engine_args,
-        model="snu-aidas/Dynin-Omni",
+        model="Qwen/Qwen2-VL-2B-Instruct",
     )
     assert isinstance(args, dict)
     assert "tensor_parallel_size" not in args

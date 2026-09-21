@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, cast
 from transformers import AutoModel, AutoTokenizer
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from vllm.inputs import tokens_input
+from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
@@ -26,6 +27,8 @@ from vllm_omni.model_executor.models.moss_tts.realtime_prompt import build_realt
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+
+logger = init_logger(__name__)
 
 
 class _MossTTSAdapterBase(ARTTSAdapter):
@@ -50,7 +53,9 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         return self.ctx.server._speaker_cache
 
     async def _resolve_ref_audio(self, ref_audio: str):
-        return await self.ctx.server._resolve_ref_audio(ref_audio)
+        if self._moss_variant is None:  # Nano sends lists through engine IPC.
+            return await self.ctx.server._resolve_ref_audio(ref_audio)
+        return await self.ctx.server._resolve_ref_audio_array(ref_audio)
 
     def _voice_created_at(self, voice: str) -> int:
         return self.ctx.server._voice_created_at(voice)
@@ -143,13 +148,81 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             return "voice_generator"
         return "tts"
 
+    def _codec_stage_devices(self) -> str | None:
+        """Read the runtime ``devices`` entry of this pipeline's codec stage.
+
+        The codec (code2wav) stage is the final stage of every MOSS pipeline
+        (``moss_tts_local_codec`` / ``moss_tts_codec``); prefer a stage whose
+        ``model_stage`` mentions "codec", else anchor on the last stage. The
+        runtime mapping accepts the resolved ``runtime_config`` object, the
+        omegaconf ``runtime`` mapping, and the legacy ``yaml_runtime`` dict.
+        """
+        stages = list(getattr(self.engine_client, "stage_configs", None) or ())
+        if not stages:
+            return None
+        codec_stages = [s for s in stages if "codec" in str(getattr(s, "model_stage", "") or "")]
+        anchor = codec_stages[-1] if codec_stages else stages[-1]
+        for attr in ("runtime_config", "runtime", "yaml_runtime"):
+            runtime_cfg = getattr(anchor, attr, None)
+            if runtime_cfg is None:
+                continue
+            devices = (
+                runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
+            )
+            if devices is not None and str(devices).strip():
+                return str(devices)
+        devices = getattr(anchor, "devices", None)
+        return str(devices) if devices is not None and str(devices).strip() else None
+
+    def _resolve_ref_encoder_device(self):
+        """Pick the device of the API-process reference-audio encoder.
+
+        The encoder follows the code2wav stage onto its first GPU: the stage
+        worker remaps its ``devices`` entry through ``CUDA_VISIBLE_DEVICES``
+        and sees it as logical index 0, while replica launch restores the
+        parent environment, so the same index names the same physical GPU in
+        this process. When the stage pins no devices the stage worker and the
+        encoder both default to the first visible GPU. Falls back to CPU when
+        CUDA is unavailable or the stage device is not parseable.
+        """
+        import torch  # local to avoid pulling torch at module import time
+
+        if not torch.cuda.is_available():
+            return torch.device("cpu")
+        devices_str = self._codec_stage_devices()
+        if devices_str is None:
+            # No explicit pinning: the stage worker lands on the first visible
+            # GPU (vLLM picks cuda:0 of the un-remapped environment).
+            return torch.device("cuda", 0)
+        first = devices_str.split(",")[0].strip()
+        if not first:
+            return torch.device("cuda", 0)
+        if first == "cpu":
+            return torch.device("cpu")
+        if not first.isdigit():
+            logger.warning("MOSS ref encoder: codec stage devices %r not parseable; keeping CPU", devices_str)
+            return torch.device("cpu")
+        index = int(first)
+        device_count = torch.accelerator.device_count()
+        if index >= device_count:
+            logger.warning(
+                "MOSS ref encoder: codec stage device cuda:%d out of range (%d visible); keeping CPU",
+                index,
+                device_count,
+            )
+            return torch.device("cpu")
+        return torch.device("cuda", index)
+
     def _get_moss_processor(self):
         """Lazily load the upstream MOSS-TTS processor once per server.
 
         Cached on ``self._moss_processor_cache``. The processor owns its own
-        audio_tokenizer (~1.6 B params); we keep it on CPU so it doesn't
-        compete with the talker (~8 GiB) and codec (~7 GiB) for our 96 GiB
-        GPU — per-request ref-audio encoding is fast enough on CPU.
+        audio_tokenizer (~1.6 B params) used for per-request reference-audio
+        encoding; it is placed on the code2wav stage's GPU (see
+        ``_resolve_ref_encoder_device``) so cold encodes run on device instead
+        of paying a CPU forward per request. Note this memory is charged to
+        the API process, outside each stage's ``gpu_memory_utilization``
+        budget — keep some headroom on the codec GPU.
         """
         cached = getattr(self, "_moss_processor_cache", None)
         if cached is not None:
@@ -159,7 +232,9 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         model_id = self.engine_client.model_config.model
         proc = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
         if hasattr(proc, "audio_tokenizer"):
-            proc.audio_tokenizer = proc.audio_tokenizer.to("cpu").eval()
+            device = self._resolve_ref_encoder_device()
+            proc.audio_tokenizer = proc.audio_tokenizer.to(device).eval()
+            logger.info("MOSS reference-audio encoder (audio_tokenizer) placed on %s", device)
         self._moss_processor_cache = proc
         return proc
 
@@ -188,16 +263,13 @@ class _MossTTSAdapterBase(ARTTSAdapter):
                     ),
                 )
             )
-            codec = (
-                AutoModel.from_pretrained(
-                    codec_path,
-                    trust_remote_code=True,
-                )
-                # Reference encoding runs in the API process. Keep the codec on CPU
-                # so it does not reserve accelerator memory outside the model workers.
-                .to("cpu")
-                .eval()
+            codec = AutoModel.from_pretrained(
+                codec_path,
+                trust_remote_code=True,
             )
+            # Reference encoding runs in the API process; follow the codec
+            # (code2wav) stage's GPU like the processor path above.
+            codec = codec.to(self._resolve_ref_encoder_device()).eval()
             cached = (tokenizer, processor, codec)
             self._moss_realtime_components = cached
             return cached

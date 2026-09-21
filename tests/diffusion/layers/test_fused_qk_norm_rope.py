@@ -406,9 +406,11 @@ def test_pack_qk_norm_rope_table_skips_under_sequence_parallel(monkeypatch):
             mod.pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.bfloat16, min_tokens=0, sequence_parallel_size=sp_size)
             is None
         )
-    for sp_size in (None, 0, 1):
+    for inactive_sp_size in (None, 0, 1):
         assert (
-            mod.pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.bfloat16, min_tokens=0, sequence_parallel_size=sp_size)
+            mod.pack_qk_norm_rope_table(
+                cos, sin, 1, dtype=torch.bfloat16, min_tokens=0, sequence_parallel_size=inactive_sp_size
+            )
             is not None
         )
 
@@ -488,3 +490,43 @@ def test_pack_qk_norm_rope_table_identity_rows(monkeypatch):
     # Identity rows count toward the gate: 2 * (5 + 3) = 16 tokens.
     assert mod.pack_qk_norm_rope_table(cos, sin, 2, dtype=torch.bfloat16, min_tokens=17, identity_rows=3) is None
     assert mod.pack_qk_norm_rope_table(cos, sin, 2, dtype=torch.bfloat16, min_tokens=16, identity_rows=3) is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAS_TRITON, reason="CUDA and Triton required")
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_fused_qk_norm_rope_large_storage_offsets(interleaved):
+    """Only three tokens, but the last row lies beyond signed 32-bit indexing."""
+    from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
+
+    # 4 GiB of backing storage; initialize only the three small visible rows.
+    q = torch.empty_strided((3, 1, 128), (2**30, 128, 1), device="cuda", dtype=torch.bfloat16)
+    q.fill_(1)
+    weight = torch.ones(128, device="cuda", dtype=torch.bfloat16)
+    table = torch.zeros(3, 96, device="cuda", dtype=torch.bfloat16)
+    table[:, :48] = 1
+    actual = fused_qk_norm_rope(q, q, weight, weight, table, _EPS, interleaved=interleaved)
+    for value in actual:
+        torch.testing.assert_close(value, torch.ones_like(value))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAS_TRITON, reason="CUDA and Triton required")
+@pytest.mark.parametrize("interleaved", [False, True])
+@pytest.mark.parametrize("large_stream", [0, 1])
+def test_fused_joint_qkv_norm_rope_large_storage_offsets(interleaved, large_stream):
+    """Both input streams must retain 64-bit addressing for Q, K, and V."""
+    from vllm_omni.diffusion.layers.fused_qk_norm_rope import _launch_fused_joint_qkv_norm_rope
+
+    # As in the single-stream regression, touch only three rows of a 4 GiB view.
+    large = torch.empty_strided((1, 3, 1, 128), (3 * 2**30, 2**30, 128, 1), device="cuda", dtype=torch.bfloat16)
+    large.fill_(1)
+    small = torch.ones((1, 2, 1, 128), device="cuda", dtype=torch.bfloat16)
+    q0, q1 = (large, small) if large_stream == 0 else (small, large)
+    weight = torch.ones(128, device="cuda", dtype=torch.bfloat16)
+    table = torch.zeros(5, 96, device="cuda", dtype=torch.bfloat16)
+    table[:, :48] = 1
+    actual = _launch_fused_joint_qkv_norm_rope(
+        q0, q0, q0, q1, q1, q1, weight, weight, weight, weight, table, _EPS, interleaved=interleaved
+    )
+    for value in actual:
+        assert value.shape == (1, 5, 1, 128)
+        torch.testing.assert_close(value, torch.ones_like(value), atol=0, rtol=0)
