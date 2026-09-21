@@ -48,6 +48,13 @@ stages:
     # Leave headroom on the shared GPU for Talker KV + concurrent Code2Wav.
     gpu_memory_utilization: 0.55
     enforce_eager: false
+    # 第 2 项（图模式 + 前缀缓存 + stage2 去 eager）—— "前缀缓存"部分。
+    # 顶层 enable_prefix_caching 保持 false（双工安全），这里给 stage0 单独打开，
+    # 让 stage0 的重复前缀得以复用。
+    # 该项另两部分 main 上已有，无需迁移：图模式（enable_hift_graph /
+    # enable_cfm_graph）、stage2 去 eager（code2wav_enable_npu_graph）。
+    # 收益（旧代码实测口径，仅方向参考）：-22.0% / -3.9% / +1.1%（三档）。
+    enable_prefix_caching: true
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
     devices: "0"
