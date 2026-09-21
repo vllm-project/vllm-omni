@@ -55,6 +55,16 @@ stages:
     # enable_cfm_graph）、stage2 去 eager（code2wav_enable_npu_graph）。
     # 收益（旧代码实测口径，仅方向参考）：-22.0% / -3.9% / +1.1%（三档）。
     enable_prefix_caching: true
+    # 第 3 项（stage0 ngram 投机，k=14）：N-gram speculative decoding。
+    # async_scheduling 必须保持 false —— vLLM 的 VllmConfig 校验拒绝
+    # "async_scheduling + ngram proposer" 这个组合。
+    # 收益（旧代码实测口径，仅方向参考）：RTF -11.8% / -3.7% / -5.9%（三档）、TTFT -69%。
+    async_scheduling: false
+    speculative_config:
+      method: ngram
+      num_speculative_tokens: 14
+      prompt_lookup_min: 1
+      prompt_lookup_max: 1
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
     devices: "0"
