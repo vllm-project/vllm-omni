@@ -14,6 +14,8 @@ call time) so ``tests/core`` keeps loading the package without vLLM.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 from vllm_omni.core.prefix_cache.adapter import (
@@ -186,6 +188,15 @@ class PrefixCacheRunnerMixin:
         if self.omni_prefix_cache is not None and self._prefix_cache_write_layout is not None:
             self.omni_prefix_cache.abort_prepared_step()
         self._prefix_cache_write_layout = None
+
+    @contextmanager
+    def _prefix_cache_prepared_step_guard(self) -> Iterator[None]:
+        """Abort pre-forward read plans if work before save raises."""
+        try:
+            yield
+        except BaseException:
+            self._prefix_cache_abort_prepared_step()
+            raise
 
     def _prefix_cache_materialize(
         self, step_id: int | None, req_ids: list[str]

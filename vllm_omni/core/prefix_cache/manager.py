@@ -910,13 +910,14 @@ class OmniPrefixCacheManager:
             live_plans = [plan for plans in self._hit_plans.values() for plan in plans.values()]
             for ctx in ctxs:
                 self._dispose_ctx_read_plans(ctx)
-            for plan in live_plans:
-                self._close_read_plan(plan)
+            self._dispose_read_plans(self._hit_plans, self._hit_prefetch)
         self._prefetch_pool.shutdown(wait=True, cancel_futures=True)
         for ctx in ctxs:
             for plans in ctx.hit_plans.values():
                 for plan in plans.values():
                     self._close_read_plan(plan)
+        for plan in live_plans:
+            self._close_read_plan(plan)
         self._prefetch_queue.clear()
         self._controller.shutdown()
 

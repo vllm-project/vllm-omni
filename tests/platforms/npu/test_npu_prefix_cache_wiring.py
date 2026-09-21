@@ -26,9 +26,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
 from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
-from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -74,6 +74,33 @@ def test_execute_model_state_keeps_prefix_cache_sid_last():
     ]
     gpu_fields = _named_tuple_fields(_GPU_RUNNER, "ExecuteModelState")
     assert gpu_fields[-1] == "prefix_cache_step_id"
+
+
+def test_both_runners_guard_post_forward_work_through_prefix_cache_save():
+    """Exceptions after forward but before save must abort prepared reads."""
+    for path in (_GPU_RUNNER, _NPU_RUNNER):
+        tree = ast.parse(path.read_text())
+        guarded_save = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.With, ast.AsyncWith)):
+                continue
+            guards = [
+                item.context_expr.func.attr
+                for item in node.items
+                if isinstance(item.context_expr, ast.Call)
+                and isinstance(item.context_expr.func, ast.Attribute)
+            ]
+            if "_prefix_cache_prepared_step_guard" not in guards:
+                continue
+            calls = {
+                child.func.attr
+                for child in ast.walk(node)
+                if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
+            }
+            if {"extract_multimodal_outputs", "_prefix_cache_save_step"} <= calls:
+                guarded_save = True
+                break
+        assert guarded_save, f"post-forward prefix-cache save is not exception-guarded in {path}"
 
 
 class _FakeView:

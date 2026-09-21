@@ -1698,6 +1698,73 @@ def test_cancelled_prefetch_releases_read_lease(cleanup):
         assert stopped.is_set()
 
 
+def test_shutdown_keeps_running_live_prefetch_lease(monkeypatch):
+    """A pre-save live plan keeps its lease until its running fetch exits."""
+    mgr, view = make_manager()
+    _hold_writes(mgr)
+    writer = run_step(mgr, view, {"writer": ([0], 0, 4)}, hidden_values={"writer": 7.0})
+    mgr.materialize(writer, ["writer"])
+
+    entered = threading.Event()
+    resume = threading.Event()
+    real_execute = mgr._execute_read_plan
+
+    def blocked_execute(plan):
+        entered.set()
+        assert resume.wait(2.0)
+        return real_execute(plan)
+
+    monkeypatch.setattr(mgr, "_execute_read_plan", blocked_execute)
+    view.order = ["hit"]
+    view.req_blocks["hit"] = [0, 2]
+    view.computed["hit"] = 4
+    view.step_slot_mapping = view.slots_for("hit", 4, 5)
+    sched_out = FakeSchedOut(
+        new_reqs=[FakeNewReq("hit", num_computed_tokens=4, block_ids=[[0, 2]])],
+        num_scheduled={"hit": 1},
+    )
+    adapter = mgr._test_adapter
+    mgr.new_step_starts(adapter.translate_scheduler_output(sched_out))
+    layout = adapter.build_write_layout(view, num_scheduled_tokens=sched_out.num_scheduled_tokens)
+    mgr.prepare_read_plans(layout)
+    future = mgr._hit_prefetch["hit"][HIDDEN_KEY]
+    plan = mgr._hit_plans["hit"][HIDDEN_KEY]
+    assert entered.wait(2.0) and plan.leases
+
+    for task in list(mgr._controller._tasks.values()):
+        if not task.done.is_set():
+            mgr._controller._scatter(task)
+
+    disposing_live = threading.Event()
+    real_dispose = mgr._dispose_read_plans
+
+    def observed_dispose(plans, futures):
+        real_dispose(plans, futures)
+        if plans is mgr._hit_plans:
+            disposing_live.set()
+
+    monkeypatch.setattr(mgr, "_dispose_read_plans", observed_dispose)
+    stopped = threading.Event()
+
+    def stop():
+        mgr.shutdown()
+        stopped.set()
+
+    thread = threading.Thread(target=stop, daemon=True)
+    thread.start()
+    assert disposing_live.wait(2.0)
+    assert not stopped.is_set()
+    for slot, holder in plan.leases:
+        assert holder in mgr._controller._staging_pool._busy[slot]
+
+    resume.set()
+    future.result(timeout=2.0)
+    thread.join(timeout=2.0)
+    assert stopped.is_set()
+    for slot, holder in plan.leases:
+        assert holder not in mgr._controller._staging_pool._busy[slot]
+
+
 def test_read_plan_prefetch_toggle_has_identical_sparse_results():
     """Prefetch is only an early execution of the same producer-bound plan."""
     policy = ModelCachePolicy(needs_full_hidden_states=True, deferred_keys=frozenset({"sparse"}))
