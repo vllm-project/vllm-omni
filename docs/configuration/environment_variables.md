@@ -70,6 +70,7 @@ The lifecycle labels used below are:
 | `OMNI_DIFFUSION_PROMPT_EMBED_CACHE_SIZE` | Positive integer; default `32` entries | Each diffusion runner; resolved during model setup | A valid environment value overrides the explicit cache size. A non-integer logs a warning; a non-positive value is ignored. | Experimental |
 | `OMNI_DIFFUSION_SESSION_STATE_MANAGER` | Boolean with the same accepted spellings as the prompt cache; default disabled | Experimental diffusion session manager; model setup | A recognized environment value overrides the explicit enable setting. An unrecognized value is ignored. | Experimental |
 | `OMNI_DIFFUSION_SESSION_STATE_MANAGER_MAX_SESSIONS` | Positive integer; default `64` | Experimental diffusion session manager; model setup | A valid environment value overrides the explicit maximum. A non-integer logs a warning; a non-positive value is ignored. | Experimental |
+| `VLLM_OMNI_AR_DIFFUSION_KV_GATHER` | `1` enables; default `0` (off) | AR-diffusion KV manager at allocation and attention at dispatch; set before worker startup | Only the exact value `1` enables contiguous KV gathering. History staging additionally requires `ARDiffusionKVConfig.reuse_history_staging`. | Experimental |
 
 Backend names for `DIFFUSION_ATTENTION_BACKEND` are the members of
 `DiffusionAttentionBackendEnum`, such as `FLASH_ATTN`, `TORCH_SDPA`,

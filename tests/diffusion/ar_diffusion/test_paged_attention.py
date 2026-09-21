@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for AR-Diffusion paged self-attention contexts."""
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ from vllm_omni.experimental.ar_diffusion.kv_cache import (
     ar_diffusion_paged_attention,
     paged_write_attn,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache import paged_attention as paged_attention_module
+from vllm_omni.experimental.ar_diffusion.kv_cache.config import KV_GATHER_ENV
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -32,8 +35,12 @@ POS = "positive"
 NEG = "negative"
 
 
-def make_state(*, num_layers=1, window_chunks=2, dtype=torch.float32, device=torch.device("cpu")):
-    cfg = ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=window_chunks)
+def make_state(
+    *, num_layers=1, window_chunks=2, dtype=torch.float32, device=torch.device("cpu"), reuse_history_staging=False
+):
+    cfg = ARDiffusionKVConfig(
+        enable=True, chunk_size=BLOCK, window_chunks=window_chunks, reuse_history_staging=reuse_history_staging
+    )
     kv = ARDiffusionKVCache(
         cfg,
         num_layers=num_layers,
@@ -236,6 +243,86 @@ def test_paged_attention_matches_dense_reference_cpu(history_chunks, action_len,
     assert st.adapter(POS).completed_chunks == before + (1 if commit_current else 0)
 
 
+@pytest.mark.parametrize("history_chunks", [0, 1, 2, 3])
+def test_staged_reuse_refreshes_the_current_blocks_at_their_live_offset(monkeypatch, history_chunks):
+    """A second probe of the same AR block restages its current K/V where the table actually holds it.
+
+    The padded table always ends in at least one action-capacity block, and while the window is still
+    growing in unused window capacity too, so "the last current_blocks entries" is padding. The refresh
+    has to start right after the visible history: empty (window growing), partial, full, and after a slide.
+    """
+    monkeypatch.setenv(KV_GATHER_ENV, "1")
+    device = torch.device("cpu")
+    dtype = torch.float32
+    kv, st = make_state(dtype=dtype, device=device, window_chunks=2, reuse_history_staging=True)
+    if history_chunks:
+        _commit_video_span(kv, st, kv_branch=POS, n_chunks=history_chunks, dtype=dtype, device=device)
+
+    ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)[0].forward_ctx
+    ctx.ensure_video_slots(device)
+    key_cache, value_cache = kv.key_cache(0), kv.value_cache(0)
+
+    def probe(step: int):
+        # Each probe of the block writes new current K/V, then stages.
+        kv._k_pools[0][ctx.current_video_slot_mapping] = torch.full((BLOCK, N_HEADS, HEAD_DIM), float(step))
+        kv._v_pools[0][ctx.current_video_slot_mapping] = torch.full((BLOCK, N_HEADS, HEAD_DIM), -float(step))
+        # Store the metadata on the context the way prepare() does.
+        (ctx.block_table, ctx.query_start_loc, ctx.seq_lens, ctx.max_query_len, ctx.max_seq_len) = (
+            ctx.build_block_table(action_len=0, query_len=BLOCK, device=device)
+        )
+        block_table, max_seq_len = ctx.block_table, ctx.max_seq_len
+        ctx._prepare_history_staging(0)
+        n_blocks = max_seq_len // BLOCK
+        block_ids = block_table[0, :n_blocks].to(torch.long)
+        stage_k, stage_v = ctx.history_staging(0)
+        paged_attention_module._stage_window(
+            stage_k,
+            stage_v,
+            key_cache,
+            value_cache,
+            block_ids,
+            n_blocks,
+            BLOCK,
+            first_block=ctx.stage_first_block if ctx.reuse_history else 0,
+        )
+        full_k = key_cache.index_select(0, block_ids).reshape(n_blocks * BLOCK, N_HEADS, HEAD_DIM)
+        full_v = value_cache.index_select(0, block_ids).reshape(n_blocks * BLOCK, N_HEADS, HEAD_DIM)
+        return stage_k, stage_v, full_k, full_v, n_blocks
+
+    stage_k, stage_v, full_k, full_v, n_blocks = probe(1)
+    assert ctx.reuse_history is False
+    assert torch.equal(stage_k, full_k) and torch.equal(stage_v, full_v)
+
+    stage_k, stage_v, full_k, full_v, n_blocks = probe(2)
+    assert ctx.reuse_history is True
+    visible_history_blocks = min(history_chunks, 2 - 1)  # window of 2 blocks minus the current one
+    assert ctx.stage_first_block == visible_history_blocks
+    # The padded table is wider than the live window, so the end-of-table guess is not the offset.
+    assert n_blocks - 1 != ctx.stage_first_block
+    assert torch.equal(stage_k, full_k) and torch.equal(stage_v, full_v)
+
+
+@pytest.mark.parametrize("gather_enabled", [False, True])
+def test_staging_is_only_allocated_for_the_gather_path(monkeypatch, gather_enabled):
+    if gather_enabled:
+        monkeypatch.setenv(KV_GATHER_ENV, "1")
+    else:
+        monkeypatch.delenv(KV_GATHER_ENV, raising=False)
+    device = torch.device("cpu")
+    kv, st = make_state(device=device, reuse_history_staging=True)
+    # The manager owns the pairs and allocates them only when their consumer is on.
+    assert bool(kv.history_staging) is gather_enabled
+    ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)[0].forward_ctx
+    ctx.ensure_video_slots(device)
+    (ctx.block_table, ctx.query_start_loc, ctx.seq_lens, ctx.max_query_len, ctx.max_seq_len) = ctx.build_block_table(
+        action_len=0, query_len=BLOCK, device=device
+    )
+    ctx._prepare_history_staging(0)
+    assert ctx.staging_enabled is gather_enabled
+    stage_k, _ = ctx.history_staging(0)
+    assert (stage_k is not None) is gather_enabled
+
+
 @pytest.mark.skipif(not _gpu_flash_attn_usable(), reason="usable GPU FlashAttention is required")
 @pytest.mark.parametrize("history_chunks", [1, 3])
 @pytest.mark.parametrize("action_len", [0, 3])
@@ -376,13 +463,27 @@ def test_custom_op_registration_idempotent():
     assert hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn")
 
 
-def test_custom_op_compiles_fullgraph_without_recompile_on_value_change():
+def test_custom_op_mutable_arguments_cannot_be_elided_as_defaults():
+    # Older PyTorch ADInplaceOrView handlers index positional mutable inputs
+    # directly. Default-valued trailing inputs can disappear before that handler.
+    schema = torch.ops.vllm_omni.ar_diffusion_paged_write_attn.default._schema
+    mutable = [arg for arg in schema.arguments if arg.alias_info is not None and arg.alias_info.is_write]
+    assert {arg.name for arg in mutable} == {"key_pool", "value_pool", "stage_key", "stage_value"}
+    assert all(not arg.has_default_value() for arg in mutable)
+
+
+@pytest.mark.parametrize("reuse_history_staging", [False, True])
+def test_custom_op_compiles_fullgraph_without_recompile_on_value_change(monkeypatch, reuse_history_staging):
     """The op must trace as one opaque node: fullgraph OK, and changed tensor
     VALUES (new slots / block ids) must not trigger recompilation."""
     import torch._dynamo
 
     device = torch.device("cpu")
-    kv, st = make_state(num_layers=2, window_chunks=2)
+    monkeypatch.setenv(KV_GATHER_ENV, "1")
+    kv, st = make_state(num_layers=2, window_chunks=2, reuse_history_staging=reuse_history_staging)
+    if reuse_history_staging:
+        # Hold the host-side staging offset fixed while table/slot values change.
+        _commit_video_span(kv, st, kv_branch=POS, n_chunks=2, dtype=torch.float32, device=device)
 
     def run_one_forward(commit):
         contexts = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=commit)
@@ -391,9 +492,8 @@ def test_custom_op_compiles_fullgraph_without_recompile_on_value_change():
         q = torch.randn(BLOCK, N_HEADS, HEAD_DIM)
         k = torch.randn(BLOCK, N_HEADS, HEAD_DIM)
         v = torch.randn(BLOCK, N_HEADS, HEAD_DIM)
-        # Both layers through ONE compiled fn: layer_idx is a tensor, so a
-        # different layer must NOT recompile (all 40 DiT blocks share the
-        # block-forward code object in production).
+        # Both layers use one compiled function; the tensor-valued layer index
+        # must not specialize it.
         for layer_ctx in contexts:
             out = compiled(layer_ctx.to_layer_inputs(), q, k, v)
         st.commit_paged_context(POS)
@@ -419,3 +519,52 @@ def test_custom_op_compiles_fullgraph_without_recompile_on_value_change():
         # Leave a clean dynamo state for later suites in the same pytest process
         # (e.g. model_executor transformers models).
         torch._dynamo.reset()
+
+
+@pytest.mark.skipif(not _gpu_flash_attn_usable(), reason="usable GPU FlashAttention is required")
+@pytest.mark.parametrize("history_chunks", [0, 1, 3])
+@pytest.mark.parametrize("action_len", [0, 3])
+def test_contiguous_kv_gather_path_matches_paged_path_gpu(monkeypatch, history_chunks, action_len):
+    """VLLM_OMNI_AR_DIFFUSION_KV_GATHER=1 gathers the visible blocks and runs varlen FA3 without a block table.
+
+    Covers an empty, partial and full window plus a partially filled action block:
+    the gather reads the tail-padding null block, so its (zeroed) rows must be masked.
+    """
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.float16
+    kv, st = make_state(dtype=dtype, device=device, window_chunks=2)
+    if history_chunks:
+        _commit_video_span(kv, st, kv_branch=POS, n_chunks=history_chunks, dtype=dtype, device=device)
+
+    layer_ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)[0]
+    ctx = layer_ctx.forward_ctx
+    current_k = torch.randn(1, BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    current_v = torch.randn(1, BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    action_k = action_v = None
+    if action_len:
+        action_k = torch.randn(1, action_len, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+        action_v = torch.randn(1, action_len, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    query = torch.randn(1, BLOCK + action_len, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    ctx.prepare(device=device, action_len=action_len, query_len=query.shape[1])
+    inputs = layer_ctx.to_layer_inputs()
+
+    def run() -> torch.Tensor:
+        return paged_write_attn(
+            inputs,
+            query[0],
+            current_k[0],
+            current_v[0],
+            action_k[0] if action_len else None,
+            action_v[0] if action_len else None,
+            HEAD_DIM**-0.5,
+        ).unsqueeze(0)
+
+    monkeypatch.delenv(KV_GATHER_ENV, raising=False)
+    paged = run()
+    monkeypatch.setenv(KV_GATHER_ENV, "1")
+    gathered = run()
+    assert torch.isfinite(gathered).all()
+    # Same kernel family on the same K/V: only accumulation order differs.
+    torch.testing.assert_close(gathered, paged, rtol=2e-3, atol=2e-3)

@@ -31,6 +31,7 @@ from vllm_omni.diffusion.offloader.module_residency import (
     BoundedAllocatorCache,
     PinnedModuleStager,
 )
+from vllm_omni.platforms import current_omni_platform
 
 from .chunked_decode import decode_h3_chunks
 from .ops import install_h3_vae_optimizations
@@ -56,15 +57,19 @@ def _minimax_h3_keyframe_encode_context(
         yield
         return
 
-    # The official keyframe latent uses cuDNN's TF32 convolution path. The
-    # default non-deterministic algorithm can select numerically different
-    # reductions on H100s, and the difference is amplified by the denoiser.
-    # Pin both the algorithm and math mode for this sensitive encode only.
+    # Deterministic cuDNN algorithms can still use reduced-precision TF32.
+    # On Hopper, TF32 can shift the keyframe latent enough to push I2VA below
+    # the reference accuracy thresholds. Use FP32 convolutions for this
+    # sensitive encode only; preserve the existing math mode elsewhere.
+    allow_tf32 = True
+    if current_omni_platform.is_cuda():
+        capability = current_omni_platform.get_device_capability(device.index or 0)
+        allow_tf32 = capability is None or capability.major != 9
     with torch.backends.cudnn.flags(
         enabled=True,
         benchmark=False,
         deterministic=True,
-        allow_tf32=True,
+        allow_tf32=allow_tf32,
     ):
         yield
 
