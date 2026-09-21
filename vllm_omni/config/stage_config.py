@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import functools
-import os
 import re
 import warnings
 from collections.abc import Callable, Mapping
@@ -829,8 +828,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     ):
         if name in raw_dict:
             kwargs[name] = raw_dict[name]
-    deploy = DeployConfig(**kwargs)
-    return deploy
+    return DeployConfig(**kwargs)
 
 
 class PlatformOverrides(NamedTuple):

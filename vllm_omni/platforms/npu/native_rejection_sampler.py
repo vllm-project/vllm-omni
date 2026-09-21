@@ -5,20 +5,17 @@
 
 vllm-ascend module-patches vllm's ``rejection_sample`` (and its two helpers)
 onto Triton kernels (``vllm_ascend/patch/worker/patch_rejection_sampler.py``).
-On the 910_93 vector core those kernels fault: the 02:38 run pinned acl
-507035 on their warmup, which is why ``rejection_sampler`` sits in the
-warmup skip set. The skip moves the fault to the first request -- every
-verify then JIT-compiles the kernel family on the fly, and both stages
-stall there: stage 0 verifies the n-gram drafts of every decode step, and
-stage 1 verifies the always-``continue`` drafts behind the K-step
-block-table growth.
+On the 910_93 vector core those kernels fault (acl 507035). Left alone, every
+verify JIT-compiles the kernel family on the fly and both stages stall there:
+stage 0 verifies the n-gram drafts of every decode step, and stage 1 verifies
+the always-``continue`` drafts behind the K-step block-table growth.
 
 The torch-native implementation the patch replaces is pure tensor ops and
 exact for both callers, so this module reloads vllm's own sampler source
 into a fresh module object and re-points the three names at the pre-patch
-functions. Scoped to the same SoC that skips the warmup; the 910B baseline
-keeps the Triton kernels it has been measured with -- except when the Talker
-K-step is explicitly armed there. That is the one path whose spec width the
+functions. Scope: the 910_93 family always; the 910B baseline keeps the
+Triton kernels it has been measured with -- except when the Talker K-step is
+explicitly armed there. That is the one path whose spec width the
 910B kernels cannot take (aivec 507035 on every one of the 8 combos tried),
 so the restore on a 910B is tied to exactly that arming, never to the SoC
 alone: the stock baseline (no arming env) keeps its sampler byte-for-byte.
@@ -27,9 +24,41 @@ alone: the stock baseline (no arming env) keeps its sampler byte-for-byte.
 import importlib.util
 import logging
 
-from vllm_omni.platforms.npu.ascend_warmup_patch import _kstep_armed, _probe_soc_name
-
 logger = logging.getLogger(__name__)
+
+
+def _probe_soc_name() -> str:
+    """torch_npu device name, or "" when it cannot be read yet."""
+    try:
+        import torch_npu
+
+        try:
+            device = torch_npu.npu.current_device()
+        except Exception:
+            device = 0
+        return str(torch_npu.npu.get_device_name(device))
+    except Exception:
+        return ""
+
+
+def _kstep_armed() -> bool:
+    """Whether this worker runs the Talker multi-frame decode.
+
+    Read off the engine's speculative_config, which the deploy YAML's stage-1
+    block provides; an unreadable config counts as not armed.
+    """
+    try:
+        from vllm.config import get_current_vllm_config_or_none
+
+        cfg = get_current_vllm_config_or_none()
+    except Exception:
+        return False
+    spec = getattr(cfg, "speculative_config", None) if cfg is not None else None
+    if spec is None:
+        return False
+    method = getattr(spec, "method", None)
+    num_spec = getattr(spec, "num_speculative_tokens", 0) or 0
+    return method == "ngram" and num_spec > 0
 
 _RESTORED = False
 _RESTORE_SOC_PREFIXES = ("ascend910_93", "ascend910c")

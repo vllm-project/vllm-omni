@@ -3,14 +3,9 @@
 
 from vllm.v1.worker.workspace import init_workspace_manager
 
-from vllm_omni.platforms.npu.ascend_warmup_patch import apply_ascend_warmup_patch
 from vllm_omni.platforms.npu.worker.base import OmniNPUWorkerBase
 from vllm_omni.platforms.npu.worker.npu_generation_model_runner import NPUGenerationModelRunner
 from vllm_omni.worker.mixins import OmniWorkerMixin
-
-# See npu_ar_worker: install before the worker is used, so the guard is in
-# place when the ascend Triton kernel warmup runs later in this process.
-apply_ascend_warmup_patch()
 
 
 class NPUGenerationWorker(OmniWorkerMixin, OmniNPUWorkerBase):

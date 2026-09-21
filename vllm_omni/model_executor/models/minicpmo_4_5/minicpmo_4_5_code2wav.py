@@ -281,10 +281,6 @@ class MiniCPMO45Code2Wav(nn.Module):
             raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be >= 0")
         if self._initial_batch_size and self._initial_batch_size < self._min_batch_size:
             raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be 0 or >= code2wav_min_batch_size")
-        # Force stage 2 to decode a single row per batch so CFM deterministically
-        # takes the even path (equal-length rows -> graph replay) instead of the
-        # ragged eager chain for mixed-length batches. Numerics are unchanged
-        # (even is an existing code path).
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
         self._prompt_wav_override = extra.get("prompt_wav")
         self._default_prompt_normalized: tuple[str, str] | None = None
