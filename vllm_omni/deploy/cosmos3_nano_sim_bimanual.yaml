@@ -22,6 +22,8 @@ stages:
       # Experimental: batch frame-causal clean K/V refreshes. Keep framewise
       # until checkpoint-level quality and performance have been validated.
       clean_commit_mode: framewise  # framewise | batched
+      # Fresh full-video requests only; Wan decode starts before clean refresh.
+      overlap_vae_decode: false
       ar_diffusion_kv_config:
         gpu_memory_fraction: 0.35
         warmup_cudagraph: false

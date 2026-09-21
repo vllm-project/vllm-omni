@@ -30,6 +30,7 @@ from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_inputs import prepare_action_values
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import Cosmos3NanoSimBimanualManifest, deploy_option
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.decode_overlap import CausalDecodeQueue
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
     Cosmos3NanoSimBimanualGeometry,
     Cosmos3NanoSimBimanualResolutionPolicy,
@@ -190,11 +191,15 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     _ar_diffusion_kv_state = None
     _bound_session_id: str | None = None
     clean_commit_mode: str = "framewise"
+    overlap_vae_decode: bool = False
+    _decode_queue: CausalDecodeQueue | None = None
+    _vae_decode_stream: torch.cuda.Stream | None = None
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__(od_config=od_config, prefix=prefix)
         self.manifest = Cosmos3NanoSimBimanualManifest.from_od_config(od_config)
         self.clean_commit_mode = deploy_option(od_config, "clean_commit_mode", "framewise")
+        self.overlap_vae_decode = bool(deploy_option(od_config, "overlap_vae_decode", False))
         if self.clean_commit_mode not in {"framewise", "batched"}:
             raise ValueError("clean_commit_mode must be 'framewise' or 'batched'")
         self.resolution_policy = _resolution_policy(od_config, self.manifest)
@@ -1021,7 +1026,15 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         try:
-            return self._forward_impl(req)
+            try:
+                return self._forward_impl(req)
+            finally:
+                # Drain before dropping/resetting session-owned VAE features,
+                # including when generation or decode submission raises.
+                queue = getattr(self, "_decode_queue", None)
+                if queue is not None:
+                    queue.close()
+                    self._decode_queue = None
         except ARDiffusionRequestRejectedError:
             # Admission rejection: guaranteed to be raised before any session
             # or KV side effect, so the session (and its paid-for history)
@@ -1271,6 +1284,17 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         # The shared output builder still owns media and guardrail routing.
         stream_video = not tick and state_was_new and sp.output_type != "latent"
         decoded_chunks: list[torch.Tensor] = []
+        overlap_decode = (
+            stream_video and getattr(self, "overlap_vae_decode", False) and torch.device(self.device).type == "cuda"
+        )
+        if overlap_decode:
+            # Reuse the stream across requests so library workspaces and warmup
+            # belong to the same stream as measured/steady-state inference.
+            if self._vae_decode_stream is None:
+                self._vae_decode_stream = torch.cuda.Stream(device=self.device)
+            self._decode_queue = CausalDecodeQueue(
+                lambda chunk: self._decode_live_latents(state, chunk), self.device, stream=self._vae_decode_stream
+            )
 
         def retain_output(chunk: torch.Tensor) -> None:
             if stream_video:
@@ -1286,6 +1310,8 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 frame_start=0,
                 frame_end=1,
             )
+            if overlap_decode:
+                self._decode_queue.submit(initial_latent)
             if target_frame > 1 or not terminal_request:
                 with self._timed_tick_stage(
                     tick_durations,
@@ -1305,7 +1331,8 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                         null_action=bool(initial_null),
                     )
             state.append_chunk(initial_latent, frame_start=0, retain_latent=not tick and not stream_video)
-            retain_output(initial_latent)
+            if not overlap_decode:
+                retain_output(initial_latent)
             del initial_latent
 
         generation_start = state.next_frame_idx
@@ -1365,6 +1392,8 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                     generator=noise_generator,
                 ).to(self.dtype)
 
+            if overlap_decode:
+                self._decode_queue.submit(clean_chunk)
             action_count = self.manifest.action_tokens_per_frame
             with self._timed_tick_stage(
                 tick_durations,
@@ -1412,9 +1441,12 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                             null_action=local_idx in null_action_indexes,
                         )
             state.append_chunk(clean_chunk, frame_start=chunk_start, retain_latent=not tick and not stream_video)
-            retain_output(clean_chunk)
+            if not overlap_decode:
+                retain_output(clean_chunk)
             del clean_chunk
 
+        if overlap_decode:
+            decoded_chunks = self._decode_queue.finish()
         if not request_latent_chunks and not decoded_chunks:
             raise RuntimeError("Cosmos3-Nano-Sim-Bimanual request produced no new latent frames.")
         request_latents = torch.cat(request_latent_chunks, dim=2) if request_latent_chunks else None
