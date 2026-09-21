@@ -163,6 +163,22 @@ def _codec_config(transfer_manager: Any) -> tuple[int, int]:
     return chunk_frames, left_context_frames
 
 
+def _initial_chunk_frames(transfer_manager: Any, chunk_frames: int) -> int:
+    """第 13 项（2026-09-20 实测采纳）：首个 payload 的窗口帧数。
+
+    读 connector extra 里的 ``initial_codec_chunk_frames``；未配置、非正数、
+    或不小于稳态 ``codec_chunk_frames`` 时一律回落成稳态值（等价于本项关闭）。
+    """
+    connector = getattr(transfer_manager, "connector", None)
+    raw_config = getattr(connector, "config", {}) or {}
+    config = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
+    config = config if isinstance(config, dict) else {}
+    value = int(config.get("initial_codec_chunk_frames", 0) or 0)
+    if value <= 0 or value >= chunk_frames:
+        return chunk_frames
+    return value
+
+
 def _request_intermediate_section(request: object, section: str) -> dict[str, object]:
     merged: dict[str, object] = {}
     for attribute in ("additional_information", "model_intermediate_buffer"):
@@ -331,15 +347,23 @@ def tts2code2wav_async_chunk(
     request_finished = getattr(request, "is_finished", None)
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
+    # 第 13 项（2026-09-20 实测采纳）：首块窗口。首个 payload（此时 chunk_seq 还是 0）
+    # 用 initial_codec_chunk_frames，之后的 payload 回到稳态 chunk_frames；
+    # 未配置时 first_window == chunk_frames，行为与改动前逐位一致。
+    first_window = (
+        _initial_chunk_frames(transfer_manager, chunk_frames)
+        if int(record["chunk_seq"]) == 0
+        else chunk_frames
+    )
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
-    if not flush_pending and len(pending) < chunk_frames:
+    if not flush_pending and len(pending) < first_window:
         return None
 
     hold_short_unit = (
         native_duplex and flush_pending and not last_chunk and 0 < len(pending) < _MINICPMO45_MIN_STREAM_BODY_FRAMES
     )
-    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else chunk_frames)
+    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else first_window)
     new_codes = pending[:new_token_count]
     del pending[:new_token_count]
     codec_start = int(state["codec_end"])
