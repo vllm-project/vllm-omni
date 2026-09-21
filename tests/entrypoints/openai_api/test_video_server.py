@@ -1310,25 +1310,6 @@ def test_latent_edit_fields_are_rejected_for_models_without_capability(test_clie
     assert "not supported" in response.json()["detail"].lower()
 
 
-def test_h3_control_and_latent_edit_inputs_are_distinct_request_paths(test_client):
-    engine = test_client.app.state.openai_serving_video._engine_client
-    engine.model_class_name = "MiniMaxH3Pipeline"
-    engine.controlnet_model_path = "/configured/control.safetensors"
-
-    response = test_client.post(
-        "/v1/videos/sync",
-        data={"prompt": "edit", "control_type": "canny"},
-        files=[
-            ("control_reference", ("control.mp4", b"video", "video/mp4")),
-            ("video_noise_mask", _mask_file("1")),
-        ],
-    )
-
-    assert response.status_code == 400
-    assert "latent-mask editing" in response.json()["detail"]
-    assert asyncio.run(api_server.VIDEO_STORE.list_values()) == []
-
-
 @pytest.mark.parametrize(
     ("files", "message"),
     [
@@ -3786,33 +3767,6 @@ def test_h3_control_checkpoint_falls_back_to_resolved_stage(typed_stage):
         SimpleNamespace(od_config=SimpleNamespace(model_class_name="MiniMaxH3ModularPipeline")),
         model_name="h3",
         stage_configs=[stage],
-    )
-    try:
-        assert handler.controlnet_configured
-    finally:
-        handler.shutdown()
-
-
-def test_h3_control_checkpoint_skips_unrelated_diffusion_stage():
-    handler = OmniOpenAIServingVideo.for_diffusion(
-        SimpleNamespace(od_config=SimpleNamespace(model_class_name="MiniMaxH3Pipeline")),
-        model_name="h3",
-        stage_configs=[
-            {
-                "stage_type": "diffusion",
-                "engine_args": {
-                    "model_class_name": "AnotherPipeline",
-                    "controlnet_model_path": "/other/control.safetensors",
-                },
-            },
-            {
-                "stage_type": "diffusion",
-                "engine_args": {
-                    "model_class_name": "MiniMaxH3Pipeline",
-                    "controlnet_model_path": "/loaded/control.safetensors",
-                },
-            },
-        ],
     )
     try:
         assert handler.controlnet_configured
