@@ -27,6 +27,7 @@ from pydantic import ValidationError
 from pytest_mock import MockerFixture
 from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
 
+from vllm_omni.config.stage_config import StagePipelineConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler
 from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
@@ -1039,6 +1040,38 @@ class TestTTSMethods:
             asyncio.run(server._prepare_speech_generation(request))
         server.shutdown()
 
+    def test_prepare_speech_rejects_typed_non_tts_omni_model(self, mocker: MockerFixture):
+        """Typed Qwen3-Omni stages must hit the same talker guard as legacy stages."""
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.tts_max_instructions_length = None
+        mock_engine_client.stage_configs = [
+            SimpleNamespace(
+                stage_pipeline_config=StagePipelineConfig(stage_id=index, model_stage=model_stage),
+                model_config=SimpleNamespace(model_arch=None),
+                worker_type=worker_type,
+            )
+            for index, (model_stage, worker_type) in enumerate(
+                (
+                    ("thinker", "ar"),
+                    ("talker", "ar"),
+                    ("code2wav", "generation"),
+                )
+            )
+        ]
+
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+        request = OpenAICreateSpeechRequest(input="Hello world")
+        with pytest.raises(ValueError, match="only supported for dedicated TTS models"):
+            asyncio.run(server._prepare_speech_generation(request))
+        server.shutdown()
+
     def test_estimate_prompt_len_fallback(self, speech_server):
         """Test prompt length estimation falls back to 2048 when model is unavailable."""
         tts_params = {"text": ["Hello"], "task_type": ["CustomVoice"]}
@@ -1559,7 +1592,8 @@ class TestTTSMethods:
 
         assert first[1] == 24000
         assert second[1] == 24000
-        assert first[0] is second[0]
+        assert first[0] == second[0]
+        assert first[0] is not second[0]
         assert first[0][0] == pytest.approx(float(wav[0]), abs=1e-4)
         cache_key = first[2]
         assert speech_server._get_resolved_ref_audio_artifact_key(
@@ -1822,6 +1856,53 @@ class TestTTSMethods:
         assert prompt_a["prompt_token_ids"] == [1, 151700, 151700, 2]
         assert prompt_a["prompt_token_ids"] == prompt_b["prompt_token_ids"]
         assert prompt_a["additional_information"]["audio_placeholder_positions"].tolist() == [1, 2]
+        assert prompt_a["cache_salt"] != prompt_b["cache_salt"]
+        assert prompt_a["additional_information"]["ref_audio_cache_key"] == "key_aaa"
+        assert prompt_b["additional_information"]["ref_audio_cache_key"] == "key_bbb"
+
+    @pytest.mark.asyncio
+    async def test_higgs_v2_cache_salt_changes_for_same_shaped_reference_audio(self, speech_server, mocker):
+        """Higgs v2 must salt identical placeholder prompts by resolved audio content."""
+        build_voice_clone_prompt = mocker.patch(
+            "vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_tokenizer.build_voice_clone_prompt"
+        )
+        build_voice_clone_prompt.side_effect = lambda _processor, _input, wav, _sr, _ref_text: {
+            "prompt_token_ids": [1, 151700, 151700, 2],
+            "audio_input_ids": torch.tensor([[100 if wav[0] < 0.5 else 900, 2], [3, 4]], dtype=torch.long),
+            "audio_input_ids_mask": torch.ones(2, dtype=torch.bool),
+        }
+
+        speech_server._tts_model_type = "higgs_audio_v2"
+        speech_server._adapter = speech_server._get_tts_adapter()
+        speech_server._adapter._resolve_higgs_audio_v2_processor = mocker.AsyncMock(return_value=object())
+
+        req_a = OpenAICreateSpeechRequest(
+            input="hello",
+            ref_audio="file:///data/spk.wav",
+            ref_text="transcript",
+        )
+        req_b = OpenAICreateSpeechRequest(
+            input="hello",
+            ref_audio="file:///data/spk.wav",
+            ref_text="transcript",
+        )
+        speech_server._adapter._resolve_ref_audio = mocker.AsyncMock(
+            side_effect=[([0.1] * 48000, 24000, "key_aaa"), ([0.9] * 48000, 24000, "key_bbb")]
+        )
+
+        prompt_a = await speech_server._adapter._build_higgs_audio_v2_params(req_a)
+        prompt_b = await speech_server._adapter._build_higgs_audio_v2_params(req_b)
+
+        assert prompt_a["prompt_token_ids"] == [1, 151700, 151700, 2]
+        assert prompt_a["prompt_token_ids"] == prompt_b["prompt_token_ids"]
+        assert (
+            prompt_a["additional_information"]["audio_input_ids"].shape
+            == prompt_b["additional_information"]["audio_input_ids"].shape
+        )
+        assert not torch.equal(
+            prompt_a["additional_information"]["audio_input_ids"],
+            prompt_b["additional_information"]["audio_input_ids"],
+        )
         assert prompt_a["cache_salt"] != prompt_b["cache_salt"]
         assert prompt_a["additional_information"]["ref_audio_cache_key"] == "key_aaa"
         assert prompt_b["additional_information"]["ref_audio_cache_key"] == "key_bbb"
@@ -3793,6 +3874,7 @@ def test_api_server_create_speech_wraps_error_response_status(mocker: MockerFixt
 def _make_api_server_request(handler, *, method: str = "POST", path: str = "/v1/audio/voices") -> Request:
     app = FastAPI()
     app.state.openai_serving_speech = handler
+    app.state.api_server_count = 1
     scope = {
         "type": "http",
         "app": app,
@@ -4954,89 +5036,6 @@ class TestMingFlashOmniTTSServing:
         assert prompt["additional_information"]["voice_name"] == "test"
 
 
-@pytest.fixture
-def dots_tts_server(mocker: MockerFixture):
-    mocker.patch(
-        "vllm_omni.entrypoints.openai.tts_adapters.base.load_supported_speakers",
-        return_value=set(),
-    )
-    mocker.patch(
-        "vllm_omni.entrypoints.openai.tts_adapters.base.load_codec_frame_rate",
-        return_value=None,
-    )
-
-    mock_engine_client = mocker.MagicMock()
-    mock_engine_client.errored = False
-    mock_engine_client.model_config = mocker.MagicMock(
-        model="dots-studio/dots.tts-soar",
-    )
-    mock_engine_client.default_sampling_params_list = [
-        SimpleNamespace(max_tokens=2048, min_tokens=None, extra_args=None)
-    ]
-    mock_engine_client.tts_batch_max_items = 32
-    mock_engine_client.generate = mocker.MagicMock(return_value="generator")
-    mock_engine_client.stage_configs = [
-        SimpleNamespace(
-            engine_args=SimpleNamespace(model_stage="latent_generator", model_arch="DotsTTSForConditionalGeneration"),
-            tts_args={},
-        )
-    ]
-
-    mock_models = mocker.MagicMock()
-    mock_models.is_base_model.return_value = True
-
-    return OmniOpenAIServingSpeech(
-        engine_client=mock_engine_client,
-        models=mock_models,
-        request_logger=mocker.MagicMock(),
-    )
-
-
-class TestDotsTTSServing:
-    def test_dots_tts_prompt_validation(self, dots_tts_server):
-        request = OpenAICreateSpeechRequest(input="Hello", ref_text="Reference transcript")
-        error = dots_tts_server._validate_tts_request(request)
-        assert error is not None
-        assert "ref_text" in error
-
-        request = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
-        error = dots_tts_server._validate_tts_request(request)
-        assert error is not None
-        assert "ref_audio" in error
-
-        request = OpenAICreateSpeechRequest(input="Hello", voice="test")
-        error = dots_tts_server._validate_tts_request(request)
-        assert error is not None
-        assert "voice" in error
-
-        request = OpenAICreateSpeechRequest(input="Hello", speaker_embedding=[1, 2, 3])
-        error = dots_tts_server._validate_tts_request(request)
-        assert error is not None
-        assert "speaker_embedding" in error
-
-        request = OpenAICreateSpeechRequest(input="Hello", x_vector_only_mode=True)
-        error = dots_tts_server._validate_tts_request(request)
-        assert error is not None
-        assert "x_vector_only_mode" in error
-
-    def test_dots_tts_adapter_awaits_async_prompt_builder(self, dots_tts_server, mocker: MockerFixture):
-        build_prompt_async = mocker.patch.object(
-            dots_tts_server._adapter,
-            "_build_prompt_async",
-            new=mocker.AsyncMock(return_value={"prompt_token_ids": [1, 2, 3]}),
-        )
-        request = OpenAICreateSpeechRequest(input="Hello")
-        asyncio.run(dots_tts_server._prepare_speech_generation(request))
-        build_prompt_async.assert_awaited_once_with("Hello")
-
-    def test_dots_tts_adapter_apply_sampling_overrides(self, dots_tts_server, mocker: MockerFixture):
-        mocker.patch.object(dots_tts_server._adapter, "build", return_value=PreparedRequest(prompt="Hello"))
-        request = OpenAICreateSpeechRequest(input="Hello", max_new_tokens=10)
-        asyncio.run(dots_tts_server._prepare_speech_generation(request))
-        sampling_params_list = dots_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"]
-        assert sampling_params_list[0].max_tokens == 10
-
-
 class TestTTSAsyncOffloading:
     """Tests for event-loop-safe offloading of blocking TTS operations."""
 
@@ -5432,7 +5431,7 @@ class TestTTSAsyncOffloading:
         ref_audio = "data:audio/wav;base64,same"
         qwen3_tts_server._put_resolved_ref_audio(
             hashlib.sha1(ref_audio.encode("utf-8")).hexdigest(),
-            wav_list,
+            np.asarray(wav_list, dtype=np.float32),
             24000,
             artifact_key,
         )
@@ -5468,9 +5467,9 @@ class TestTTSAsyncOffloading:
         qwen3_tts_server._ref_audio_resolve_cache_max_entries = 1
         qwen3_tts_server._ref_audio_resolve_cache_max_bytes = 1_000_000
 
-        qwen3_tts_server._put_resolved_ref_audio("ref-a", [0.0] * 8, 24000, "artifact-a")
+        qwen3_tts_server._put_resolved_ref_audio("ref-a", np.zeros(8, dtype=np.float32), 24000, "artifact-a")
         qwen3_tts_server._ref_audio_model_artifact_ready.add(("artifact-a", False))
-        qwen3_tts_server._put_resolved_ref_audio("ref-b", [0.0] * 8, 24000, "artifact-b")
+        qwen3_tts_server._put_resolved_ref_audio("ref-b", np.zeros(8, dtype=np.float32), 24000, "artifact-b")
 
         assert ("artifact-a", False) not in qwen3_tts_server._ref_audio_model_artifact_ready
         assert "artifact-b" in {entry[3] for entry in qwen3_tts_server._ref_audio_resolve_cache.values()}
@@ -5717,7 +5716,7 @@ class TestTTSAsyncOffloading:
     def test_qwen3_xvector_ready_artifact_does_not_enable_icl_artifact_only(self, qwen3_tts_server):
         # An x-vector-only artifact (speaker embedding, no ref_code) must not enable
         # the artifact-only path for a later ICL request with the same ref_audio (#5049).
-        qwen3_tts_server._put_resolved_ref_audio("ref-a", [0.0] * 8, 24000, "artifact-a")
+        qwen3_tts_server._put_resolved_ref_audio("ref-a", np.zeros(8, dtype=np.float32), 24000, "artifact-a")
         qwen3_tts_server._track_ref_audio_artifact_warmup("req-xvec", "artifact-a", x_vector_only=True)
         qwen3_tts_server._mark_ref_audio_artifact_ready_for_request("req-xvec")
 
@@ -5725,7 +5724,7 @@ class TestTTSAsyncOffloading:
         assert qwen3_tts_server._adapter._qwen3_tts_can_use_ref_audio_artifact_only(icl_params, "artifact-a") is False
 
     def test_qwen3_xvector_ready_artifact_still_reusable_by_xvector_request(self, qwen3_tts_server):
-        qwen3_tts_server._put_resolved_ref_audio("ref-a", [0.0] * 8, 24000, "artifact-a")
+        qwen3_tts_server._put_resolved_ref_audio("ref-a", np.zeros(8, dtype=np.float32), 24000, "artifact-a")
         qwen3_tts_server._track_ref_audio_artifact_warmup("req-xvec", "artifact-a", x_vector_only=True)
         qwen3_tts_server._mark_ref_audio_artifact_ready_for_request("req-xvec")
 
@@ -5733,7 +5732,7 @@ class TestTTSAsyncOffloading:
         assert qwen3_tts_server._adapter._qwen3_tts_can_use_ref_audio_artifact_only(xvec_params, "artifact-a") is True
 
     def test_qwen3_icl_ready_artifact_enables_icl_artifact_only(self, qwen3_tts_server):
-        qwen3_tts_server._put_resolved_ref_audio("ref-a", [0.0] * 8, 24000, "artifact-a")
+        qwen3_tts_server._put_resolved_ref_audio("ref-a", np.zeros(8, dtype=np.float32), 24000, "artifact-a")
         qwen3_tts_server._track_ref_audio_artifact_warmup("req-icl", "artifact-a", x_vector_only=False)
         qwen3_tts_server._mark_ref_audio_artifact_ready_for_request("req-icl")
 

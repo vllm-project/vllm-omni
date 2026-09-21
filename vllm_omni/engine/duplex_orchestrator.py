@@ -12,6 +12,8 @@ and applies the session-owned policy.
 
 from __future__ import annotations
 
+import asyncio
+import threading
 import time as _time
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
@@ -20,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import init_logger
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
     DuplexOutputContext,
@@ -77,6 +80,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
+        self._prompt_processing_lock = threading.Lock()
         self.plugin = plugin
         self.duplex_session_config = duplex_session_config
         self.session_manager = DuplexSessionManager(
@@ -288,7 +292,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 fence=context.fence,
                 config_generation=context.config_generation,
             )
-            request_state.streaming.enabled = True
+            request_state.streaming.enabled = self.plugin.capabilities(
+                max_sessions=self.duplex_session_config.max_sessions
+            ).supports_core_resumable_request
             self.request_states[context.request_id] = request_state
         elif isinstance(request_state, DuplexOrchestratorRequestState):
             if request_state.config_generation != context.config_generation:
@@ -301,18 +307,49 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         self._sync_bridge_state(request_state, context)
         self.session_manager.register_request(context.request_id, context.session_id)
 
+    def _upgrade_processed_stage_request(self, request, raw_prompt):
+        request = super()._upgrade_processed_stage_request(request, raw_prompt)
+        if not self.plugin.capabilities(
+            max_sessions=self.duplex_session_config.max_sessions
+        ).supports_core_resumable_request and not isinstance(request, OmniEngineCoreRequest):
+            request = OmniEngineCoreRequest.from_request(request)
+        return request
+
+    def _process_turn_prompt(self, *args, **kwargs):
+        # Input processors own mutable caches. Hold a thread lock even if the
+        # awaiting session is cancelled while its preprocessing is still running.
+        with self._prompt_processing_lock:
+            return self._build_next_stage_request(*args, **kwargs)
+
     async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
         context = submission.context
         request_state = self.request_states.get(context.request_id)
         if not isinstance(request_state, DuplexOrchestratorRequestState):
             raise RuntimeError(f"duplex request was not preregistered: {context.request_id}")
-        request = build_engine_core_request_from_tokens(
-            request_id=context.request_id,
-            prompt=dict(submission.prompt),
-            params=context.stage_sampling_params,
-            model_config=self.stage_pools[context.stage_id].stage_vllm_config.model_config,
-            resumable=True,
-        )
+        if self.plugin.capabilities(
+            max_sessions=self.duplex_session_config.max_sessions
+        ).supports_core_resumable_request:
+            request = build_engine_core_request_from_tokens(
+                request_id=context.request_id,
+                prompt=dict(submission.prompt),
+                params=context.stage_sampling_params,
+                model_config=self.stage_pools[context.stage_id].stage_vllm_config.model_config,
+                resumable=True,
+            )
+        else:
+            # Use the ordinary multimodal input processor for turn-model plugins.
+            # Its CPU preprocessing runs off the session/orchestrator event loop.
+            request = await asyncio.to_thread(
+                self._process_turn_prompt,
+                context.request_id,
+                context.stage_id,
+                dict(submission.prompt),
+                context.stage_sampling_params,
+                resumable=False,
+            )
+            if self.request_states.get(context.request_id) is not request_state:
+                raise RuntimeError("duplex request cancelled during input preprocessing")
+            request_state.prompt = dict(submission.prompt)
         request.external_req_id = request.request_id
         pool = self.stage_pools[context.stage_id]
         if submission.already_submitted:

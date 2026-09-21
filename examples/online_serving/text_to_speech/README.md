@@ -13,7 +13,7 @@ For the full list of supported architectures across all modalities, see
 ## Supported Models
 
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker tags (`S0`..`S9`, default `S0`) | — |
 | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | uploaded audio voice only; no presets | ✓ |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
@@ -27,7 +27,6 @@ For the full list of supported architectures across all modalities, see
 | OmniVoice | `k2-fsa/OmniVoice` | ✓ | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
-| dots.tts | `dots-studio/dots.tts-soar` | — (text-only) | ✓ (PCM stream) | — (default placeholder only) | — |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
 
 CosyVoice3 is intentionally absent: no online example exists for it yet. See its [offline section](../../offline_inference/text_to_speech/README.md#cosyvoice3) instead.
@@ -142,42 +141,6 @@ python examples/online_serving/text_to_speech/gepard/speech_client.py \
 - Unsupported: `speed`, `extra_params` (including `temperature`/`top_p`/`top_k`), `ref_audio`, `ref_text`, `speaker_embedding`, `task_type`, `instructions`, `language`, and `word_timestamps`.
 - Concurrent requests at `max_num_seqs: 4` are supported. Native-AR recompute preemption is a known limitation of this architecture (a request that is preempted mid-generation can resume incorrectly); keep concurrency at or below `max_num_seqs` and treat preemption as out of scope until the platform fix lands.
 - Optional comparison against the upstream Gepard reference server needs Blackwell/Hopper + CUDA 13 + Postgres and is not part of CI.
-
-## dots.tts
-
-Single-stage, text-only TTS at 48 kHz. The current integration supports
-no-reference synthesis; voice cloning, reference audio, named voices, and
-precomputed speaker embeddings are not supported yet.
-
-### Launch
-
-```bash
-vllm serve dots-studio/dots.tts-soar --omni --trust-remote-code --port 8091
-```
-
-### Sending requests
-
-```bash
-# Non-streaming WAV
-curl -X POST http://localhost:8091/v1/audio/speech \
-    -H "Content-Type: application/json" \
-    -d '{
-        "input": "Hello, this is a dots TTS online-serving test.",
-        "voice": "default",
-        "response_format": "wav"
-    }' --output output.wav
-
-# Streaming 48 kHz mono PCM
-curl -X POST http://localhost:8091/v1/audio/speech \
-    -H "Content-Type: application/json" \
-    -d '{
-        "input": "Hello, this is a streaming dots TTS test.",
-        "voice": "default",
-        "stream": true,
-        "stream_format": "audio",
-        "response_format": "pcm"
-    }' --no-buffer | play -t raw -r 48000 -e signed -b 16 -c 1 -
-```
 
 ---
 
@@ -781,6 +744,20 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni --port 8091
 ./qwen3_tts/run_server.sh Base
 ```
 
+For a local deployment with multiple API frontend processes sharing one set
+of TTS stage engines, add `--api-server-count`:
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+    --omni --api-server-count 2 --port 8091
+```
+
+This mode supports local EngineCore stages only; headless or remote stage
+deployments are not supported. Runtime voice upload and deletion are disabled
+with multiple API frontends because their registries are process-local.
+Built-in voices, inline `ref_audio`, and voices restored from `custom_voice_dir`
+at startup are supported.
+
 ### Executor backend
 
 Single-GPU serves now default to the uniproc executor (lower IPC overhead, the Base cloning use case from [#2603](https://github.com/vllm-project/vllm-omni/issues/2603) / [#2604](https://github.com/vllm-project/vllm-omni/pull/2604)). `vllm_omni/deploy/qwen3_tts.yaml` is the only Qwen3-TTS deploy config; pass `--deploy-config <path>` to override.
@@ -834,6 +811,10 @@ For Qwen3-TTS, uploaded voices are Base voice-cloning inputs and require a Base
 checkpoint. When a request names an uploaded voice, the server infers
 `task_type="Base"`. Built-in presets such as `vivian` and `ryan` remain
 CustomVoice speakers and require a CustomVoice checkpoint.
+
+The runtime upload and delete routes require a single API frontend; with
+`--api-server-count > 1`, use inline `ref_audio` or restore precomputed voices
+from `custom_voice_dir` at startup.
 
 ### Precomputed custom voices
 

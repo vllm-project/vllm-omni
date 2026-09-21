@@ -720,7 +720,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     def warmup_compile(self) -> None:
         """Warm up compiled text/image/VAE paths before timed inference."""
-        if not torch.cuda.is_available():
+        if not torch.accelerator.is_available():
             return
 
         state = self.state
@@ -801,12 +801,12 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         latents: tuple[torch.Tensor, torch.Tensor],
         do_true_cfg: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Post-step sync: .contiguous() + cuda.synchronize()"""
+        """Post-step sync: .contiguous() + accelerator stream synchronize"""
         latents = tuple(t.contiguous() for t in latents)
         if do_true_cfg and get_classifier_free_guidance_world_size() > 1:
-            device = next((t.device for t in latents if t.is_cuda), None)
+            device = next((t.device for t in latents if t.device.type != "cpu"), None)
             if device is not None:
-                torch.cuda.current_stream(device).synchronize()
+                torch.accelerator.current_stream(device).synchronize()
         return latents
 
     # -----------------------------------------------------------------------

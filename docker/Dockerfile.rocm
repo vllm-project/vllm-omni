@@ -2,7 +2,11 @@
 # docker/Dockerfile.ci. A stale base image can build successfully while failing
 # at runtime when vLLM-Omni imports APIs added by the newer vLLM release.
 ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.29.0
-FROM ${BASE_IMAGE} AS base
+
+# Keep the dependency-heavy portion independent from the source tree. The
+# registry cache is keyed on these inputs, while the final source copy can be
+# linked onto the cached image without materializing its large ROCm layers.
+FROM ${BASE_IMAGE} AS deps
 
 # NOTE: REMINDER to vLLM-Omni rebase maintainer
 # BASE_IMAGE pins the default prebuilt runtime when USE_NIGHTLY_BUILD=0.
@@ -64,9 +68,24 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Step 3: Copy vllm-omni code and install without uv
-RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
-COPY . ${COMMON_WORKDIR}/vllm-omni
+# Step 3: Install project dependencies against a placeholder package tree.
+# The editable install keeps resolving imports from this directory after the
+# final COPY --link replaces the placeholder with the real source tree.
+WORKDIR ${COMMON_WORKDIR}/vllm-omni
+RUN mkdir -p vllm_omni && touch vllm_omni/__init__.py
+COPY pyproject.toml setup.py ./
+COPY requirements/ requirements/
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0
+
+RUN uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" \
+        --no-cache-dir -e ".[dev]" --no-build-isolation && \
+    python3 -m pip uninstall -y onnxruntime && \
+    python3 -m pip install --no-cache-dir --force-reinstall --no-deps \
+        "onnxruntime-rocm>=1.22.2" && \
+    python3 -c "import importlib.metadata as m; import onnxruntime as ort; assert 'ROCMExecutionProvider' in ort.get_available_providers(), ort.get_available_providers(); assert m.version('onnxruntime-rocm'); assert not any(d.metadata['Name'] == 'onnxruntime' for d in m.distributions())" && \
+    python3 -c "from torchcodec.decoders import VideoDecoder"
+
+RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 # This is a workaround to ensure pytest exits with the correct status code in CI tests.
 RUN printf '%s\n' \
@@ -85,19 +104,13 @@ RUN printf '%s\n' \
     '    os._exit(_exit_code)' \
     > ${COMMON_WORKDIR}/vllm-omni/conftest.py
 
-# Some optional dependencies pull in the CPU ONNX Runtime distribution. The
-# CPU and ROCm wheels own the same import path and cannot coexist, so remove
-# the CPU wheel and reinstall the ROCm wheel after dependency resolution.
-RUN cd ${COMMON_WORKDIR}/vllm-omni && \
-    uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" \
-        --no-cache-dir ".[dev]" --no-build-isolation && \
-    python3 -m pip uninstall -y onnxruntime && \
-    python3 -m pip install --no-cache-dir --force-reinstall --no-deps \
-        "onnxruntime-rocm>=1.22.2" && \
-    python3 -c "import importlib.metadata as m; import onnxruntime as ort; assert 'ROCMExecutionProvider' in ort.get_available_providers(), ort.get_available_providers(); assert m.version('onnxruntime-rocm'); assert not any(d.metadata['Name'] == 'onnxruntime' for d in m.distributions())" && \
-    python3 -c "from torchcodec.decoders import VideoDecoder"
-
-RUN ln -sf /usr/bin/python3 /usr/bin/python
+# Keep source changes in one lightweight linked layer. Do not add RUN, COPY, or
+# ADD instructions that depend on the resulting filesystem after this point;
+# doing so would force BuildKit to download and extract the cached ROCm layers.
+FROM deps AS base
+ARG COMMON_WORKDIR=/app
+WORKDIR ${COMMON_WORKDIR}/vllm-omni
+COPY --link . .
 
 FROM base AS test
 

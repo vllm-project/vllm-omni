@@ -17,6 +17,8 @@ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.config.omni_config import VllmOmniConfig
+from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import StageConfig
 from vllm_omni.engine.async_omni_engine import StageRuntimeInfo
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
@@ -202,6 +204,49 @@ def _make_base():
     return obj
 
 
+@pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
+def test_resolve_sampling_params_list_preserves_stage_constraints(typed):
+    from vllm_omni.config.omni_config import VllmOmniARStageConfig
+    from vllm_omni.config.stage_config import StagePipelineConfig
+
+    base = _make_base()
+    base.engine.num_stages = 1
+    base.default_sampling_params_list = [SamplingParams(max_tokens=1000, detokenize=False, stop_token_ids=[42])]
+    if typed:
+        stage = VllmOmniARStageConfig(
+            stage_pipeline_config=StagePipelineConfig(
+                stage_id=0,
+                model_stage="dummy-model",
+                sampling_constraints={"detokenize": False, "stop_token_ids": [42]},
+            )
+        )
+    else:
+        stage = StageConfig(
+            stage_id=0,
+            model_stage="dummy-model",
+            sampling_constraints={"detokenize": False, "stop_token_ids": [42]},
+        ).to_omegaconf()
+    base.engine.stage_configs = [stage]
+    base.sampling_constraints_list = base._get_sampling_constraints_list(base.engine.stage_configs)
+    assert base.sampling_constraints_list == [{"detokenize": False, "stop_token_ids": [42]}]
+
+    resolved_defaults = base.resolve_sampling_params_list(None)
+    assert resolved_defaults[0].stop_token_ids == [42]
+
+    caller_params = SamplingParams(seed=1234, max_tokens=7, detokenize=True, stop_token_ids=[7])
+    resolved = base.resolve_sampling_params_list(caller_params)
+
+    assert resolved[0] is not caller_params
+    assert resolved[0].seed == 1234
+    assert resolved[0].max_tokens == 7
+    assert resolved[0].detokenize is False
+    assert resolved[0].stop_token_ids == [7, 42]
+    assert 7 in resolved[0]._all_stop_token_ids
+    assert 42 in resolved[0]._all_stop_token_ids
+    assert caller_params.detokenize is True
+    assert caller_params.stop_token_ids == [7]
+
+
 def test_resolve_sampling_params_list_merges_required_stop_tokens():
     base = _make_base()
     base.engine.num_stages = 1
@@ -219,22 +264,13 @@ def test_resolve_sampling_params_list_merges_required_stop_tokens():
     base.sampling_constraints_list = base._get_sampling_constraints_list(base.engine.stage_configs)
     assert base.sampling_constraints_list == [{"detokenize": False, "stop_token_ids": required_stop_ids}]
 
-    resolved_defaults = base.resolve_sampling_params_list(None)
 
-    assert resolved_defaults[0].stop_token_ids == [99, 151704, 151645]
+def test_sampling_constraints_are_forwarded_by_typed_stage_configs():
+    config = VllmOmniConfig.from_pipeline_config(OMNI_PIPELINES["qwen3_tts"])
 
-    caller_params = SamplingParams(seed=1234, max_tokens=7, detokenize=True, stop_token_ids=[100, 151704])
+    constraints = OmniBase._get_sampling_constraints_list(config.stage_configs)
 
-    resolved = base.resolve_sampling_params_list(caller_params)
-
-    assert resolved[0] is not caller_params
-    assert resolved[0].seed == 1234
-    assert resolved[0].max_tokens == 7
-    assert resolved[0].detokenize is False
-    assert resolved[0].stop_token_ids == [100, 151704, 151645]
-    assert {100, 151704, 151645}.issubset(resolved[0]._all_stop_token_ids)
-    assert caller_params.detokenize is True
-    assert caller_params.stop_token_ids == [100, 151704]
+    assert constraints == [dict(stage.stage_pipeline_config.sampling_constraints) for stage in config.stage_configs]
 
 
 @pytest.mark.parametrize("use_defaults", [False, True])

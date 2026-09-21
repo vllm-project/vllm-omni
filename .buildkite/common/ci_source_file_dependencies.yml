@@ -23,6 +23,16 @@ x-qwen3-tts: &qwen3_tts
   - vllm_omni/entrypoints/openai/serving_speech.py
   - vllm_omni/entrypoints/openai/tts_adapters/
   - vllm_omni/engine/stage_pool.py
+  - vllm_omni/worker_v2/
+  - vllm_omni/core/sched/
+  - vllm_omni/distributed/omni_connectors/
+  - vllm_omni/config/stage_config.py
+  - vllm_omni/config/omni_config.py
+  - vllm_omni/engine/orchestrator.py
+  - vllm_omni/engine/stage_engine_core_proc.py
+  - vllm_omni/deploy/qwen3_tts_mrv2.yaml
+  - vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2.yaml
+  - vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2_b4.yaml
 
 x-minicpmo-4-5: &minicpmo_4_5
   - vllm_omni/engine/async_omni_engine.py
@@ -44,6 +54,7 @@ x-minicpmo-4-5-duplex: &minicpmo_4_5_duplex
   - vllm_omni/entrypoints/duplex/
   - vllm_omni/entrypoints/duplex_omni.py
   - vllm_omni/entrypoints/async_omni_base.py
+  - vllm_omni/protocol/
   - vllm_omni/clients/
   - vllm_omni/outputs/duplex.py
   - vllm_omni/model_executor/duplex_sampling.py
@@ -99,6 +110,7 @@ x-hunyuan-image3: &hunyuan_image3
 
 x-minimax-h3: &minimax_h3
   - vllm_omni/diffusion/models/minimax_h3/
+  - vllm_omni/diffusion/layers/indexed_modulation.py
 
 x-hunyuan-video: &hunyuan_video
   - vllm_omni/diffusion/models/hunyuan_video/
@@ -259,6 +271,7 @@ source_file_dependencies:
     - tests/entrypoints/test_duplex_omni.py
     - tests/entrypoints/openai_api/test_duplex_api_server.py
     - tests/model_executor/models/minicpmo_4_5/duplex/
+    - tests/protocol/
 
   omni_minicpmo_4_5_duplex_perf:
     - *minicpmo_4_5

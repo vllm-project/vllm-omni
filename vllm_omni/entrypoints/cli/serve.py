@@ -8,13 +8,16 @@ Supports both multi-stage LLM models (e.g., Qwen2.5-Omni) and
 diffusion models (e.g., Qwen-Image) through the same CLI interface.
 """
 
+from __future__ import annotations
+
 import argparse
+import contextlib
 import json
 import math
 import os
 import signal
 from types import FrameType
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import uvloop
 from vllm.entrypoints.cli.types import CLISubcommand
@@ -22,10 +25,19 @@ from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed
 from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.registry import resolve_native_single_file
 from vllm_omni.entrypoints.cli.logo import log_logo
-from vllm_omni.entrypoints.openai.api_server import omni_run_server
-from vllm_omni.entrypoints.utils import parse_stage_overrides
+from vllm_omni.entrypoints.openai.api_server import (
+    omni_run_server,
+    run_omni_api_server_worker_proc,
+)
+from vllm_omni.entrypoints.utils import parse_stage_overrides, prepare_stage_config_inputs
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
+
+if TYPE_CHECKING:
+    from vllm.v1.utils import APIServerProcessManager
+
+    from vllm_omni.engine.stage_runtime import StageEngineLaunch, StageRuntime
 
 logger = init_logger(__name__)
 
@@ -141,6 +153,8 @@ class OmniServeCommand(CLISubcommand):
 
         if args.headless:
             run_headless(args)
+        elif (getattr(args, "api_server_count", None) or 1) > 1:
+            run_multi_api_server_omni(args)
         else:
             uvloop.run(omni_run_server(args))
 
@@ -198,6 +212,39 @@ class OmniServeCommand(CLISubcommand):
         if getattr(args, "omni_replica_address", None) is not None and not args.headless:
             raise ValueError("--omni-replica-address requires --headless to be set")
 
+        api_server_count = getattr(args, "api_server_count", None)
+        if api_server_count is not None and api_server_count < 1 and not args.headless:
+            raise ValueError("--api-server-count must be >= 1 unless --headless is set")
+        if args.headless and api_server_count is not None and api_server_count > 0:
+            raise ValueError("--api-server-count cannot be used with --headless")
+        if api_server_count is not None and api_server_count > 1:
+            distributed_args = (
+                "stage_id",
+                "omni_master_address",
+                "omni_master_port",
+                "omni_replica_address",
+            )
+            if any(getattr(args, name, None) is not None for name in distributed_args):
+                raise ValueError(
+                    "--api-server-count > 1 cannot be combined with stage-based "
+                    "or distributed stage arguments (--stage-id/--omni-master-* / "
+                    "--omni-replica-address)"
+                )
+            if getattr(args, "omni_dp_size_local", 1) != 1:
+                raise ValueError("--api-server-count > 1 requires --omni-dp-size-local=1")
+            if getattr(args, "worker_backend", "multi_process") != "multi_process":
+                raise ValueError("--api-server-count > 1 requires --worker-backend=multi_process")
+            if getattr(args, "enable_fault_tolerance", False):
+                raise ValueError("--api-server-count > 1 cannot be combined with --enable-fault-tolerance")
+            if getattr(args, "enable_elastic_ep", False):
+                raise ValueError("--api-server-count > 1 cannot be combined with --enable-elastic-ep")
+            if getattr(args, "enable_sleep_mode", False):
+                raise ValueError("--api-server-count > 1 cannot be combined with --enable-sleep-mode")
+            from vllm import envs as vllm_envs
+
+            if getattr(vllm_envs, "VLLM_ALLOW_RUNTIME_LORA_UPDATING", False):
+                raise ValueError("--api-server-count > 1 cannot be combined with VLLM_ALLOW_RUNTIME_LORA_UPDATING")
+
         # --omni-dp-size-local is process-local. A value other than 1 only
         # makes sense when this process owns a stage (head or headless).
         omni_dp_size_local = getattr(args, "omni_dp_size_local", None)
@@ -221,7 +268,6 @@ class OmniServeCommand(CLISubcommand):
                 "data_parallel_rpc_port": "--data-parallel-rpc-port",
                 "data_parallel_start_rank": "--data-parallel-start-rank",
                 "data_parallel_backend": "--data-parallel-backend",
-                "api_server_count": "--api-server-count",
                 "enable_expert_parallel": "--enable-expert-parallel",
             }
             offenders = sorted(flag for dest, flag in prohibited_with_omni.items() if dest in explicit_cli_keys)
@@ -260,7 +306,10 @@ class OmniServeCommand(CLISubcommand):
         from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
 
         model = getattr(args, "model_tag", None) or getattr(args, "model", None)
-        if model and is_diffusion_model(model):
+        native_single_file = resolve_native_single_file(getattr(args, "model_class_name", None))
+        if model and ((native_single_file is not None and os.path.isfile(model)) or is_diffusion_model(model)):
+            if api_server_count is not None and api_server_count > 1:
+                raise ValueError("--api-server-count > 1 is not supported for diffusion models")
             logger.info("Detected diffusion model: %s", model)
             return
         validate_parsed_serve_args(args)
@@ -590,6 +639,16 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--custom-pipeline-args",
+            dest="custom_pipeline_args",
+            type=json.loads,
+            default=None,
+            help=(
+                "JSON object passed to native/custom diffusion pipelines. "
+                'Only args containing "pipeline_class" trigger custom pipeline re-initialization.'
+            ),
+        )
+        omni_config_group.add_argument(
             "--usp",
             "--ulysses-degree",
             dest="ulysses_degree",
@@ -894,7 +953,8 @@ class OmniServeCommand(CLISubcommand):
             "--diffusion-kv-cache-dtype",
             type=str,
             default=None,
-            help="Diffusion attention KV cache dtype (e.g. fp8). Separate from vLLM --kv-cache-dtype.",
+            help="Diffusion Q/K/V precision: fp8, mxfp8, mxfp4, or float (NPU). "
+            "Separate from vLLM --kv-cache-dtype. Use --diffusion-attention-config for per-role fallback.",
         )
         omni_config_group.add_argument(
             "--diffusion-kv-cache-skip-steps",
@@ -1027,6 +1087,207 @@ class OmniServeCommand(CLISubcommand):
         return serve_parser
 
 
+def _build_multi_api_stage_runtime(args: TrackingNamespace, num_api_servers: int) -> StageRuntime:
+    """Resolve the local EngineCore stages that the parent process owns."""
+    from vllm_omni.config.resolver import resolve_omni_config
+    from vllm_omni.engine.stage_runtime import StageRuntime
+
+    kwargs = args.get_explicit_kwargs_dict()
+    model = kwargs.pop("model", None) or args.model
+
+    trust_remote_code = kwargs.get("trust_remote_code")
+    if trust_remote_code is False:
+        trust_remote_code = None
+    config_inputs = prepare_stage_config_inputs(
+        model,
+        kwargs,
+        trust_remote_code=trust_remote_code,
+        snapshot_model=True,
+    )
+    model = config_inputs.model
+    kwargs = config_inputs.kwargs
+    resolved = resolve_omni_config(
+        model,
+        cli_overrides=kwargs,
+        trust_remote_code=config_inputs.trust_remote_code,
+        deploy_config_path=config_inputs.deploy_config_path,
+        stage_overrides=config_inputs.stage_overrides,
+        strategy_config_path=config_inputs.strategy_config_path,
+    )
+
+    config_path = resolved.config_path
+    stage_configs = list(resolved.stage_configs)
+
+    sleep_stages = [
+        int(getattr(stage_config, "stage_id", stage_index))
+        for stage_index, stage_config in enumerate(stage_configs)
+        if bool(
+            getattr(
+                getattr(stage_config, "model_config", getattr(stage_config, "engine_args", None)),
+                "enable_sleep_mode",
+                False,
+            )
+        )
+    ]
+    if sleep_stages:
+        raise ValueError(
+            "--api-server-count > 1 cannot be combined with sleep mode; "
+            f"disable enable_sleep_mode for stage(s) {sleep_stages}"
+        )
+
+    async_chunk = any(
+        bool(
+            getattr(
+                getattr(stage, "connector_config", None),
+                "async_chunk",
+                getattr(getattr(stage, "engine_args", None), "async_chunk", False),
+            )
+        )
+        for stage in stage_configs
+    )
+    return StageRuntime(
+        stage_configs=stage_configs,
+        model=model,
+        config_path=config_path,
+        stage_init_timeout=int(getattr(args, "stage_init_timeout", 300)),
+        parallel_stage_init=bool(getattr(args, "parallel_stage_init", False)),
+        async_chunk=async_chunk,
+        tokenizer=getattr(args, "tokenizer", None),
+        log_stats=not bool(getattr(args, "disable_log_stats", False)),
+    )
+
+
+def _wait_for_multi_api_server_completion(
+    api_server_manager: APIServerProcessManager,
+    engine_launch: StageEngineLaunch,
+) -> None:
+    """Wait until API workers complete or any shared stage engine fails."""
+    from multiprocessing import connection
+
+    api_processes = list(api_server_manager.processes)
+    engine_processes = [
+        process
+        for resources in engine_launch.resources
+        if resources.manager is not None
+        for process in resources.manager.processes
+    ]
+    api_by_sentinel = {process.sentinel: process for process in api_processes}
+    engine_by_sentinel = {process.sentinel: process for process in engine_processes}
+
+    while api_by_sentinel:
+        ready = connection.wait([*api_by_sentinel, *engine_by_sentinel])
+        for sentinel in ready:
+            if sentinel in engine_by_sentinel:
+                process = engine_by_sentinel[sentinel]
+                raise RuntimeError(
+                    f"Shared stage engine process {process.name} (PID: {process.pid}) "
+                    f"exited with code {process.exitcode}"
+                )
+            process = api_by_sentinel.pop(sentinel)
+            if process.exitcode != 0:
+                raise RuntimeError(
+                    f"API server process {process.name} (PID: {process.pid}) exited with code {process.exitcode}"
+                )
+
+
+def _start_api_server_process_manager(
+    *,
+    cleanup_timeout: float,
+    **manager_kwargs: object,
+) -> APIServerProcessManager:
+    """Construct vLLM's manager with rollback for a partial ``__init__``.
+
+    ``APIServerProcessManager`` starts workers one by one in ``__init__`` and
+    installs its finalizer only after every ``Process.start`` succeeds. Keep a
+    reference to the partially initialized object so workers started before a
+    later failure are still terminated.
+    """
+    from vllm.v1.utils import APIServerProcessManager, shutdown
+
+    manager = APIServerProcessManager.__new__(APIServerProcessManager)
+    try:
+        APIServerProcessManager.__init__(manager, **manager_kwargs)
+    except BaseException:
+        try:
+            for pipe in getattr(manager, "_address_pipes", ()):
+                with contextlib.suppress(Exception):
+                    pipe.close()
+            # A Process whose start() raised is still present in the upstream
+            # manager's list, but calling is_alive() on it raises because it
+            # has no Popen object. Only hand successfully started children to
+            # vLLM's shutdown helper.
+            started_processes = [process for process in getattr(manager, "processes", ()) if process.pid is not None]
+            if started_processes:
+                shutdown(started_processes, timeout=cleanup_timeout)
+        except Exception:
+            logger.exception("Failed to clean up partially started API server processes")
+        raise
+    return manager
+
+
+def run_multi_api_server_omni(args: TrackingNamespace) -> None:
+    """Launch API subprocesses that share one set of local stage engines."""
+    from vllm.entrypoints.openai.api_server import setup_server
+    from vllm.v1.metrics.prometheus import setup_multiprocess_prometheus
+
+    num_api_servers = int(args.api_server_count)
+    if num_api_servers < 2:
+        raise ValueError(f"api_server_count must be >= 2, got {num_api_servers}")
+
+    setup_multiprocess_prometheus()
+    shutdown_requested = False
+
+    def signal_handler(signum: int, frame: FrameType | None) -> None:
+        nonlocal shutdown_requested
+        logger.debug("Received %d signal.", signum)
+        if not shutdown_requested:
+            shutdown_requested = True
+            raise SystemExit
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    listen_address, sock = setup_server(args, reuse_port=True)
+    stage_runtime = None
+    api_server_manager = None
+    engine_launch = None
+    try:
+        stage_runtime = _build_multi_api_stage_runtime(args, num_api_servers)
+        with stage_runtime.launch_stage_engines(num_api_servers) as engine_launch:
+            args._omni_stage_client_configs = engine_launch.client_configs
+            primary_addresses = engine_launch.resources[0].addresses
+            if primary_addresses is None:
+                raise RuntimeError("Primary stage engine returned no addresses")
+            timeout = float(getattr(args, "shutdown_timeout", 5) or 5)
+            api_server_manager = _start_api_server_process_manager(
+                cleanup_timeout=timeout,
+                listen_address=listen_address,
+                sock=sock,
+                args=args,
+                num_servers=num_api_servers,
+                input_addresses=primary_addresses.inputs,
+                output_addresses=primary_addresses.outputs,
+                target_server_fn=run_omni_api_server_worker_proc,
+            )
+            engine_launch.watched_frontend_processes.extend(api_server_manager.processes)
+            actual_inputs, actual_outputs = api_server_manager.gather_actual_addresses()
+            primary_addresses.inputs = actual_inputs
+            primary_addresses.outputs = actual_outputs
+
+        _wait_for_multi_api_server_completion(api_server_manager, engine_launch)
+    finally:
+        timeout = float(getattr(args, "shutdown_timeout", 5) or 5)
+        if api_server_manager is not None:
+            api_server_manager.shutdown(timeout=timeout)
+        if engine_launch is not None:
+            engine_launch.shutdown()
+        if stage_runtime is not None:
+            stage_runtime.shutdown()
+        sock.close()
+        if shutdown_requested:
+            logger.info("Shared API server shutdown completed")
+
+
 def run_headless(args: TrackingNamespace) -> None:
     """Run a single stage in headless mode.
 
@@ -1048,6 +1309,7 @@ def run_headless(args: TrackingNamespace) -> None:
     )
     from vllm_omni.engine.stage_init_utils import (
         build_engine_args_dict,
+        build_engine_args_dict_from_omni_stage_config,
         build_vllm_config,
         get_stage_connector_spec,
         inject_omni_kv_connector_config,
@@ -1074,15 +1336,6 @@ def run_headless(args: TrackingNamespace) -> None:
 
     # Filter down to a dict of things explicitly requested by the user
     args_dict = args.get_explicit_kwargs_dict()
-    # This controls only the API-process WebSocket and is not a stage-engine option.
-    args_dict.pop("robot_openpi_idle_timeout", None)
-    # This CLI-only negative alias is consumed below when selecting the
-    # launcher log_stats value; it is not a per-stage config override.
-    args_dict.pop("disable_log_stats", None)
-
-    deploy_config_path = args_dict.pop("deploy_config", None)
-    strategy_config_path = args_dict.pop("strategy_config", None)
-    stage_overrides = args_dict.pop("stage_overrides", None)
 
     # ``--replica-id`` is deprecated and ignored — replica ids are
     # auto-assigned by ``OmniMasterServer`` so headless processes carry
@@ -1098,15 +1351,21 @@ def run_headless(args: TrackingNamespace) -> None:
         )
         args_dict.pop("replica_id")
 
-    resolved = resolve_omni_config(
+    config_inputs = prepare_stage_config_inputs(
         model,
+        args_dict,
         # store_true cannot express an explicit False: absent maps to None
         # ("not specified") so the deploy yaml's per-stage value applies.
         trust_remote_code=getattr(args, "trust_remote_code", None) or None,
+    )
+    args_dict = config_inputs.kwargs
+    resolved = resolve_omni_config(
+        model,
+        trust_remote_code=config_inputs.trust_remote_code,
         cli_overrides=args_dict,
-        deploy_config_path=deploy_config_path,
-        stage_overrides=stage_overrides,
-        strategy_config_path=strategy_config_path,
+        deploy_config_path=config_inputs.deploy_config_path,
+        stage_overrides=config_inputs.stage_overrides,
+        strategy_config_path=config_inputs.strategy_config_path,
     )
     config_path = resolved.config_path
     stage_configs = list(resolved.stage_configs)
@@ -1141,21 +1400,21 @@ def run_headless(args: TrackingNamespace) -> None:
     stage_connector_spec = get_stage_connector_spec(
         omni_transfer_config=omni_transfer_config,
         stage_id=stage_id,
-        async_chunk=bool(stage_cfg.engine_args.get("async_chunk", False)),
+        async_chunk=bool(
+            getattr(getattr(stage_cfg, "connector_config", None), "async_chunk", None)
+            if hasattr(stage_cfg, "connector_config")
+            else stage_cfg.engine_args.get("async_chunk", False)
+        ),
     )
 
-    # ``runtime_cfg`` is mostly inherited from the parent's
-    # CUDA_VISIBLE_DEVICES; when ``--omni-dp-size-local > 1`` we additionally
-    # bracket each replica's spawn below with setup_stage_devices so they
-    # don't all stack on cuda:0 (see ``per_replica_devices`` above).
-    # Headless startup still supplies the legacy OmegaConf stage shape through
-    # the stable adapter entry point. The implementation switches only when
-    # RFC #4021 threads structured stage configs through the launch plan.
-    engine_args_dict = build_engine_args_dict(
-        stage_cfg,
-        model,
-        stage_connector_spec=stage_connector_spec,
-        cli_tokenizer=getattr(args, "tokenizer", None),
+    engine_args_dict = (
+        build_engine_args_dict_from_omni_stage_config(
+            stage_cfg, model, stage_connector_spec=stage_connector_spec, cli_tokenizer=getattr(args, "tokenizer", None)
+        )
+        if hasattr(stage_cfg, "connector_config")
+        else build_engine_args_dict(
+            stage_cfg, model, stage_connector_spec=stage_connector_spec, cli_tokenizer=getattr(args, "tokenizer", None)
+        )
     )
 
     inject_omni_kv_connector_config(engine_args_dict, omni_kv_connector, stage_id)

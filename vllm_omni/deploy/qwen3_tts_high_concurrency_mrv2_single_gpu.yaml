@@ -1,0 +1,23 @@
+# Opt-in single-GPU throughput profile, measured on H200 at concurrency 128
+# with Qwen3-TTS-12Hz-1.7B-Base. Warm the full pipeline before benchmarking.
+# B8 uses more graph memory than B4; this is not a low-latency profile.
+# MPS is optional and is not enabled by this file.
+#
+# vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni \
+#   --deploy-config vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2_single_gpu.yaml
+base_config: qwen3_tts_high_concurrency_mrv2.yaml
+
+connectors:
+  connector_of_shared_memory:
+    extra:
+      decode_batch_max_size: 8
+      decode_cudagraph_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8]
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 128
+  - stage_id: 1
+    devices: "0"
+    # Admission candidates are grouped by codec phase before B8 execution.
+    max_num_seqs: 32

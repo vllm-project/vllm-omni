@@ -13,14 +13,16 @@ Functions, not a component, because there is nothing here to own.
 
 from __future__ import annotations
 
+import asyncio
 import binascii
 from typing import TYPE_CHECKING
 
 import pybase64 as base64
 
 from vllm_omni.engine.duplex.config import DuplexPlaybackCommitPolicy
-from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_request_id
+from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.events import ErrorEvent, OverlapDecision, error_event
+from vllm_omni.engine.duplex.plugin import payload_turn_id
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -29,13 +31,38 @@ if TYPE_CHECKING:
     from vllm_omni.engine.duplex.session.engine_session import DuplexCommittedInput, DuplexEngineSession
 
 
+def task_is_cancelling(task: asyncio.Task[object] | None) -> bool:
+    """True when *task* has a pending cancellation (Python 3.11+ ``Task.cancelling``)."""
+    if task is None:
+        return False
+    cancelling = getattr(task, "cancelling", None)
+    return bool(cancelling()) if callable(cancelling) else False
+
+
 # --------------------------------------------------------------------------- #
 # Questions about the session                                                 #
 # --------------------------------------------------------------------------- #
 
 
-def stage0_request_id(session: DuplexEngineSession, epoch: int) -> str:
-    return duplex_resource_request_id(DuplexFence(session.session_id, epoch=epoch), "stage0")
+def append_fence(session: DuplexEngineSession, payload: object, *, epoch: int | None = None) -> DuplexFence:
+    """The fence one append is submitted under.
+
+    A model without a resumable core request gets one stage request per turn,
+    so the turn this resolves to is part of the request id. The runner names
+    that id when it queues the append and the model channel names it again
+    when it submits, and the two must not disagree --- otherwise the session
+    binds a request id it never submitted.
+    """
+    turn_id = payload_turn_id(payload)
+    if turn_id is None:
+        turn_id = session.active_response_turn_id
+    if turn_id is None:
+        turn_id = session.turn_id
+    return DuplexFence(
+        session.session_id,
+        epoch=session.epoch if epoch is None else epoch,
+        turn_id=turn_id,
+    )
 
 
 def response_in_progress(session: DuplexEngineSession, tasks: DuplexSessionTasks) -> bool:

@@ -130,7 +130,7 @@ async def run_client(
                                 "prefix_padding_ms": 300,
                                 "silence_duration_ms": 500,
                                 "create_response": True,
-                                "interrupt_response": False,
+                                "interrupt_response": True,
                             },
                         }
                     },
@@ -233,6 +233,7 @@ async def run_client(
                 continue
 
             if event_type == "response.done" and server_vad:
+                await ws.send(json.dumps({"type": "session.close"}))
                 break
 
             if event_type == "error":
