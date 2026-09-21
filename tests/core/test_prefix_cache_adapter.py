@@ -19,10 +19,17 @@ class FakeView:
         return torch.tensor([20, 21, 7], dtype=torch.long)
 
 
-def output(*, new=(), resumed=(), finished=(), aborted=()):
+def output(*, new=(), resumed=(), finished=(), aborted=(), cached=None):
+    cached = cached or {}
     return SimpleNamespace(
         scheduled_new_reqs=list(new),
-        scheduled_cached_reqs=SimpleNamespace(resumed_req_ids=set(resumed)),
+        scheduled_cached_reqs=SimpleNamespace(
+            resumed_req_ids=set(resumed),
+            req_ids=list(cached.get("req_ids", resumed)),
+            num_computed_tokens=list(cached.get("num_computed_tokens", ())),
+            new_block_ids=list(cached.get("new_block_ids", ())),
+            num_output_tokens=list(cached.get("num_output_tokens", ())),
+        ),
         finished_req_ids=set(finished),
         aborted_req_ids=set(aborted),
     )
@@ -51,6 +58,53 @@ def test_resume_and_abort_require_explicit_sources():
     ]
     events = adapter.translate_scheduler_output(output(finished={"x"}))
     assert events[0].kind is PrefixCacheEventKind.FINISHED
+
+
+def test_resumed_event_snapshots_cached_request_payload():
+    adapter = PrefixCacheSchedulerAdapter()
+    events = adapter.translate_scheduler_output(
+        output(
+            resumed={"r"},
+            cached={
+                "req_ids": ["other", "r"],
+                "num_computed_tokens": [3, 8],
+                "new_block_ids": [[[1]], [[4, 5]]],
+                "num_output_tokens": [1, 6],
+            },
+        )
+    )
+    event = events[0]
+    assert (event.kind, event.req_id, event.hit_start, event.hit_end) == (
+        PrefixCacheEventKind.RESUMED,
+        "r",
+        0,
+        8,
+    )
+    assert event.block_ids == ((4, 5),)
+    assert event.scheduled_tokens == 0
+    assert event.num_output_tokens == 6
+
+
+def test_resumed_block_snapshot_is_immutable():
+    blocks = [[7, 8]]
+    adapter = PrefixCacheSchedulerAdapter()
+    event = adapter.translate_scheduler_output(
+        output(
+            resumed={"r"},
+            cached={"req_ids": ["r"], "new_block_ids": [blocks], "num_computed_tokens": [8]},
+        )
+    )[0]
+    blocks[0][0] = 99
+    assert event.block_ids == ((7, 8),)
+
+
+def test_same_id_terminal_and_new_is_started():
+    adapter = PrefixCacheSchedulerAdapter()
+    adapter.translate_scheduler_output(output(new=[SimpleNamespace(req_id="r")]))
+    events = adapter.translate_scheduler_output(
+        output(new=[SimpleNamespace(req_id="r")], finished={"r"})
+    )
+    assert [event.kind for event in events] == [PrefixCacheEventKind.STARTED, PrefixCacheEventKind.FINISHED]
 
 
 def test_write_layout_uses_post_order_batch_and_slots():
