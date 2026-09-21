@@ -85,14 +85,8 @@ def _probe_soc_name() -> str:
 def _kstep_armed() -> bool:
     """Whether this worker runs the Talker multi-frame decode.
 
-    Preferred source is the engine's speculative_config, which the deploy
-    YAML's stage-1 block provides. The warmup guard runs before the engine
-    hands the runner that config, so fall back to the deploy layer, which
-    ``stage_config`` records when the YAML is parsed: both answer the same
-    question, and answering "not armed" there would run the rejection-sampler
-    Triton warmup this guard exists to skip, faulting the 910B vector core
-    (acl 507035) during capture. An unreadable answer still counts as not
-    armed, so the baseline warmup never changes by accident.
+    Prefers the engine's speculative_config. The warmup guard runs before the
+    engine hands the runner that config, so fall back to the deploy layer.
     """
     try:
         from vllm.config import get_current_vllm_config_or_none
@@ -121,13 +115,11 @@ def _skipped_names() -> set[str]:
         return {part.strip() for part in raw.split(",") if part.strip()}
     soc = _probe_soc_name()
     if soc.startswith("Ascend910B"):
-        # On this family the rejection-sampler Triton warmup faults the vector
-        # core (acl 507035) whenever the K-step is armed, and the worker cannot
-        # tell yet at warmup time: the engine hands the runner its vllm_config
-        # only after ``load_model``, and a deploy-layer record does not survive
-        # the spawn that starts these stage processes. Skipping is the safe
-        # side on both paths -- the torch-native sampler serves the armed path,
-        # and the stock path merely JITs that kernel on its first request.
+        # This warmup faults the vector core (acl 507035) on this family, and the
+        # worker cannot tell at warmup time whether the K-step is armed (spawned
+        # process, engine config not handed over yet). Skip either way: the armed
+        # path uses the torch-native sampler, the stock path only JITs the kernel
+        # on its first request.
         return {"rejection_sampler"}
     return set(_DEFAULT_SKIP)
 

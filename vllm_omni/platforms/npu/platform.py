@@ -63,10 +63,8 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         argument that grows each step. On the small Talker decoder that rebind is
         ~38% of its busy time. Scoped by ``max_model_len`` (Talker 4096 engages,
         Thinker 32768 does not). ``VLLM_OMNI_FIXED_KV_DECODE=0`` restores stock.
-
-        The one-query capture this backend exists for is what makes the 910B
-        family work at all: the stock builder faults its vector core on
-        spec-width rows, so without this route there the K-step cannot capture.
+        The 910B family also needs it to capture at all: the stock builder
+        faults there on spec-width rows.
         """
         resolved = super().get_attn_backend_cls(selected_backend, attn_selector_config, num_heads)
         if resolved != "vllm_ascend.attention.attention_v1.AscendAttentionBackend":

@@ -785,30 +785,20 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
 # model-side gate accepts.
 _MINICPMO_TALKER_FRAMES_MAX = 16
 
-# Frames the deploy layer declared for stage 1's Talker multi-frame decode,
-# recorded when a deploy config is parsed. A reader in the same process that
-# runs before the engine hands the runner its vllm_config -- the warmup guard
-# is one -- sees the same decision here. Stage workers are spawned, so they do
-# NOT inherit it: the guard on that side decides without asking, see
+# Stage 1's declared frame count, recorded when a deploy config is parsed.
+# Same-process readers that run before the engine hands the runner its
+# vllm_config see it here; spawned stage workers do not, see
 # ascend_warmup_patch._skipped_names.
 _resolved_talker_frames: int = 1
 
 
 def talker_frames_per_step() -> int:
-    """Codec frames one stage-1 step produces, per the last deploy config parsed.
-
-    1 means the deploy layer did not ask for the multi-frame loop.
-    """
+    """Codec frames one stage-1 step produces; 1 when the deploy layer asked for none."""
     return _resolved_talker_frames
 
 
 def _record_talker_frames(stages: list[StageDeployConfig]) -> None:
-    """Remember stage 1's declared frame count for out-of-band readers.
-
-    Stage 1 carries the multi-frame decode as an n-gram speculative_config
-    whose ``num_speculative_tokens`` is K - 1, so the deploy YAML is the only
-    place the decision is written down.
-    """
+    """Record stage 1's frame count (its n-gram ``num_speculative_tokens`` is K - 1)."""
     global _resolved_talker_frames
     for stage in stages:
         if stage.stage_id != 1:
