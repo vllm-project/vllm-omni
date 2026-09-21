@@ -31,6 +31,7 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     _wrapped_slice,
 )
 from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -334,6 +335,10 @@ def test_incremental_hift_matches_reference_for_voiced_f0(config):
 
 @pytest.mark.parametrize("config", CONFIGS)
 @pytest.mark.parametrize("first_len,step_len", [(10, 6), (10, 3), (20, 3), (10, 1)])
+@pytest.mark.skipif(
+    current_omni_platform.is_rocm(),
+    reason="exhaustive CPU reference matrix exceeds the AMD CI time budget",
+)
 def test_incremental_hift_matches_reference_for_voiced_f0_small_chunks(config, first_len, step_len):
     """Same as test_incremental_hift_matches_reference_for_voiced_f0, but with small,
     sub-receptive-field chunk sizes (down to 1 mel frame) instead of the uniform

@@ -24,6 +24,18 @@ def _launch_row_chunks(kernel, rows: int, device_type: str, *args, **kwargs) -> 
         kernel[(chunk_rows,)](*args, row_offset, **kwargs)
 
 
+def _use_hopper_bf16_affine_semantics(x: torch.Tensor) -> bool:
+    """Use the unfused AdaLN dtype boundaries on Hopper.
+
+    The fused FP32 modulation path is stable on Blackwell, but the SM90
+    kernel can accumulate enough extra precision in the repeated RMSNorm and
+    AdaLN operations to move the 50-step I2VA result below its CI threshold.
+    Keep the existing path on other architectures until their numerical
+    baselines are independently validated.
+    """
+    return x.device.type == "cuda" and torch.cuda.get_device_capability(x.device)[0] == 9
+
+
 @triton.jit
 def _indexed_scale_shift_kernel(
     output_ptr,
@@ -102,6 +114,7 @@ def _rms_norm_indexed_scale_shift_kernel(
     stride_scale_row,
     stride_indices,
     row_offset,
+    use_bf16_affine: tl.constexpr,
     block_n: tl.constexpr,
 ):
     row = tl.program_id(0) + row_offset
@@ -112,13 +125,20 @@ def _rms_norm_indexed_scale_shift_kernel(
     x = tl.load(x_ptr + row * stride_x_row + columns, mask=mask, other=0.0).to(tl.float32)
     weight = tl.load(weight_ptr + columns, mask=mask, other=0.0).to(tl.float32)
     variance = tl.sum(x * x, axis=0) / hidden_size
-    normalized = x * tl.rsqrt(variance + eps) * weight
-
-    shift = tl.load(shift_ptr + index * stride_shift_row + columns, mask=mask, other=0.0).to(tl.float32)
-    scale = tl.load(scale_ptr + index * stride_scale_row + columns, mask=mask, other=0.0).to(tl.float32)
+    if use_bf16_affine:
+        # Match the unfused RMSNorm output consumed by AdaLN on Hopper.
+        normalized = (x * tl.rsqrt(variance + eps) * weight).to(tl.bfloat16)
+        shift = tl.load(shift_ptr + index * stride_shift_row + columns, mask=mask, other=0.0)
+        scale = tl.load(scale_ptr + index * stride_scale_row + columns, mask=mask, other=0.0)
+        output = normalized * (scale + 1.0) + shift
+    else:
+        normalized = x * tl.rsqrt(variance + eps) * weight
+        shift = tl.load(shift_ptr + index * stride_shift_row + columns, mask=mask, other=0.0).to(tl.float32)
+        scale = tl.load(scale_ptr + index * stride_scale_row + columns, mask=mask, other=0.0).to(tl.float32)
+        output = normalized * (1.0 + scale) + shift
     tl.store(
         output_ptr + row * hidden_size + columns,
-        normalized * (1.0 + scale) + shift,
+        output,
         mask=mask,
     )
 
@@ -143,6 +163,7 @@ def _indexed_gate_rms_norm_scale_shift_kernel(
     stride_scale_row,
     stride_indices,
     row_offset,
+    use_bf16_affine: tl.constexpr,
     block_n: tl.constexpr,
 ):
     row = tl.program_id(0) + row_offset
@@ -159,12 +180,20 @@ def _indexed_gate_rms_norm_scale_shift_kernel(
 
     weight = tl.load(weight_ptr + columns, mask=mask, other=0.0).to(tl.float32)
     variance = tl.sum(updated * updated, axis=0) / hidden_size
-    normalized = updated * tl.rsqrt(variance + eps) * weight
-    shift = tl.load(shift_ptr + index * stride_shift_row + columns, mask=mask, other=0.0).to(tl.float32)
-    scale = tl.load(scale_ptr + index * stride_scale_row + columns, mask=mask, other=0.0).to(tl.float32)
+    if use_bf16_affine:
+        # Match the unfused RMSNorm output consumed by AdaLN on Hopper.
+        normalized = (updated * tl.rsqrt(variance + eps) * weight).to(tl.bfloat16)
+        shift = tl.load(shift_ptr + index * stride_shift_row + columns, mask=mask, other=0.0)
+        scale = tl.load(scale_ptr + index * stride_scale_row + columns, mask=mask, other=0.0)
+        output = normalized * (scale + 1.0) + shift
+    else:
+        normalized = updated * tl.rsqrt(variance + eps) * weight
+        shift = tl.load(shift_ptr + index * stride_shift_row + columns, mask=mask, other=0.0).to(tl.float32)
+        scale = tl.load(scale_ptr + index * stride_scale_row + columns, mask=mask, other=0.0).to(tl.float32)
+        output = normalized * (1.0 + scale) + shift
     tl.store(
         modulated_out_ptr + row * hidden_size + columns,
-        normalized * (1.0 + scale) + shift,
+        output,
         mask=mask,
     )
 
@@ -271,6 +300,7 @@ def rms_norm_indexed_scale_shift(
             shift.stride(0),
             scale.stride(0),
             indices.stride(0),
+            use_bf16_affine=_use_hopper_bf16_affine_semantics(x),
             block_n=triton.next_power_of_2(hidden_size),
             num_warps=8,
         )
@@ -324,6 +354,7 @@ def indexed_gate_rms_norm_scale_shift(
             shift.stride(0),
             scale.stride(0),
             indices.stride(0),
+            use_bf16_affine=_use_hopper_bf16_affine_semantics(residual),
             block_n=triton.next_power_of_2(hidden_size),
             num_warps=8,
         )
