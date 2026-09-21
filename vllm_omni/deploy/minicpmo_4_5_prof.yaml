@@ -46,23 +46,9 @@ stages:
     gpu_memory_utilization: 0.40
     enforce_eager: false
     # Stage-level prefix caching override; the top level stays false for duplex safety.
+    # Stage-0 n-gram speculative decoding is intentionally not enabled here: vLLM
+    # rejects prefix caching together with speculative decoding.
     enable_prefix_caching: true
-    # Stage-0 n-gram speculative decoding (part of the validated set). 15 is the
-    # base config's value and is also what `stage0_tail_draft.applies()` keys on
-    # (`num_speculative_tokens == 15`): any other width silently switches the
-    # stage-0 tail-draft path off, which measured 22-37% worse TTFT on 910B3.
-    # A 14-vs-15 A/B there moved RTF by -4.5% / -7.5% / +9.3% (c1/c4/c8 --
-    # inconsistent, near the drift band), so the width itself is not the point;
-    # keeping the tail draft enabled is.
-    # It coexists with prefix caching as long as async_scheduling stays false --
-    # the validated set ran exactly this pair. (The base config keeps it off,
-    # following the upstream fix in fff0b0f8b.)
-    async_scheduling: false
-    speculative_config:
-      method: ngram
-      num_speculative_tokens: 15
-      prompt_lookup_min: 1
-      prompt_lookup_max: 1
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
     devices: "0"
