@@ -46,9 +46,19 @@ stages:
     gpu_memory_utilization: 0.40
     enforce_eager: false
     # Stage-level prefix caching override; the top level stays false for duplex safety.
-    # Stage-0 n-gram speculative decoding is intentionally not enabled here: vLLM
-    # rejects prefix caching together with speculative decoding.
     enable_prefix_caching: true
+    # Stage-0 n-gram speculative decoding (part of the validated set). 15 is the
+    # base config's value: a 14-vs-15 A/B on 910B3 came out inside the run-to-run
+    # drift band (c1 -4.5%, c4 -7.5%, c8 +9.3%), so the two are equivalent.
+    # It coexists with prefix caching as long as async_scheduling stays false --
+    # the validated set ran exactly this pair. (The base config keeps it off,
+    # following the upstream fix in fff0b0f8b.)
+    async_scheduling: false
+    speculative_config:
+      method: ngram
+      num_speculative_tokens: 15
+      prompt_lookup_min: 1
+      prompt_lookup_max: 1
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
     devices: "0"
