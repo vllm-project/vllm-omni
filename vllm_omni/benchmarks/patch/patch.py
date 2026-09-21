@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlparse
 
 import aiohttp
 import numpy as np
@@ -906,13 +907,41 @@ def _guess_mime_type(path: str) -> str:
     return mime or "application/octet-stream"
 
 
+_IMAGE_REFERENCE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".heic", ".heif"})
+_VIDEO_REFERENCE_SUFFIXES = frozenset({".mp4", ".mov", ".webm", ".mkv", ".m4v"})
+
+
+def _string_reference_kind(reference: str) -> str | None:
+    """Classify a bare reference string as image, video, or file.
+
+    ``data:image`` / ``data:video`` carry their type in the URL. Bare http(s)
+    URLs use the path extension. An existing local path is a file upload, not
+    an image or a video URL.
+    """
+    if reference.startswith("data:image"):
+        return "image"
+    if reference.startswith("data:video"):
+        return "video"
+    if reference.startswith(("http://", "https://")):
+        suffix = Path(urlparse(reference).path).suffix.lower()
+        if suffix in _VIDEO_REFERENCE_SUFFIXES:
+            return "video"
+        if suffix in _IMAGE_REFERENCE_SUFFIXES:
+            return "image"
+        return None
+    local_path = reference.removeprefix("file://")
+    if local_path and os.path.exists(local_path):
+        return "file"
+    return None
+
+
 def _iter_image_reference_inputs(value: Any) -> Iterable[Any]:
     """Yield image references from benchmark multimodal content.
 
     ``random-mm`` image buckets arrive as OpenAI chat parts
     ``{"type": "image_url", "image_url": {"url": ...}}``. Yield
-    ``{"image_url": url}`` so the form helper keeps an explicit image
-    type (symmetric with ``_iter_video_reference_inputs``).
+    ``{"image_url": url}`` so the form helper keeps an explicit image type.
+    Bare video strings are left for ``_iter_video_reference_inputs``.
     """
     if value is None:
         return
@@ -921,6 +950,8 @@ def _iter_image_reference_inputs(value: Any) -> Iterable[Any]:
             yield from _iter_image_reference_inputs(item)
         return
     if not isinstance(value, dict):
+        if isinstance(value, str) and _string_reference_kind(value) == "video":
+            return
         yield value
         return
 
@@ -944,10 +975,9 @@ def _iter_video_reference_inputs(value: Any) -> Iterable[dict[str, str]]:
     """Yield structured video references from benchmark multimodal content.
 
     ``random-mm`` video buckets arrive as OpenAI chat parts
-    ``{"type": "video_url", "video_url": {"url": ...}}``. Yield
-    ``{"video_url": url}`` so ``_add_video_reference_to_form`` keeps the
-    video branch (HTTP(S) bare strings would otherwise become
-    ``image_reference``).
+    ``{"type": "video_url", "video_url": {"url": ...}}``, or as a bare
+    ``data:video`` / video http(s) string. Yield ``{"video_url": url}`` so the
+    form helper keeps the video branch.
     """
     if value is None:
         return
@@ -956,6 +986,8 @@ def _iter_video_reference_inputs(value: Any) -> Iterable[dict[str, str]]:
             yield from _iter_video_reference_inputs(item)
         return
     if not isinstance(value, dict):
+        if isinstance(value, str) and _string_reference_kind(value) == "video":
+            yield {"video_url": value}
         return
 
     if value.get("type") == "video_url":
@@ -1444,12 +1476,112 @@ def _is_structured_video_reference(reference: Mapping[str, object]) -> bool:
     return isinstance(video_url, str) and bool(video_url)
 
 
+_VIDEO_REFERENCE_JSON_MAX_BYTES = 1024 * 1024
+
+
+def _data_video_json_exceeds_text_limit(video_url: str) -> bool:
+    """True when a data:video URL would exceed the ~1MB multipart text-part limit."""
+    if not video_url.startswith("data:video"):
+        return False
+    encoded = json.dumps({"video_url": video_url}).encode("utf-8")
+    return len(encoded) > _VIDEO_REFERENCE_JSON_MAX_BYTES
+
+
+def _add_data_video_upload(form: aiohttp.FormData, video_url: str) -> bool:
+    """Upload one inline video as ``input_references`` instead of a JSON text part."""
+    header, _, payload = video_url.partition(",")
+    if not payload:
+        raise ValueError(f"Unsupported video data URL: {video_url[:64]!r}")
+    try:
+        video_bytes = base64.b64decode(payload)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("video data URL is not valid base64") from exc
+    mime = header[len("data:") :].split(";", 1)[0] or "video/mp4"
+    suffix = ".mp4" if mime.endswith("mp4") else ".bin"
+    form.add_field(
+        "input_references",
+        video_bytes,
+        filename=f"benchmark-reference{suffix}",
+        content_type=mime,
+    )
+    return True
+
+
+def _file_bytes_as_data_url(raw: bytes, mime: str) -> str:
+    encoded = base64.b64encode(raw).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def _image_reference_json_value(reference: object) -> object:
+    """Turn an image file into a JSON ``image_reference`` when it must share a form.
+
+    ``input_reference`` cannot be combined with ``video_reference``. Image URLs
+    stay URLs. Upload bytes and local image files become ``data:image`` URLs.
+    """
+    if isinstance(reference, Mapping) and "bytes" in reference and not _is_structured_image_reference(reference):
+        raw = reference["bytes"]
+        if not isinstance(raw, (bytes, bytearray)):
+            raise ValueError(f"image reference bytes must be bytes (got {type(raw).__name__}).")
+        content_type = reference.get("content_type", "image/png")
+        if not isinstance(content_type, str) or not content_type.startswith("image/"):
+            content_type = "image/png"
+        return {"image_url": _file_bytes_as_data_url(bytes(raw), content_type.split(";", 1)[0])}
+    if isinstance(reference, str):
+        kind = _string_reference_kind(reference)
+        if kind == "image":
+            return {"image_url": reference}
+        if kind == "file":
+            local_path = reference.removeprefix("file://")
+            mime = _guess_mime_type(local_path)
+            if not mime.startswith("image/"):
+                mime = "image/png"
+            with open(local_path, "rb") as handle:
+                return {"image_url": _file_bytes_as_data_url(handle.read(), mime)}
+    return reference
+
+
+def _video_reference_json_value(reference: object) -> object:
+    """Turn a video file into a JSON ``video_reference`` when it must share a form.
+
+    ``input_reference`` cannot be combined with ``image_reference``. Video URLs
+    stay URLs. Local video files become ``data:video`` URLs.
+    """
+    if isinstance(reference, Mapping) and "bytes" in reference and not _is_structured_video_reference(reference):
+        raw = reference["bytes"]
+        if not isinstance(raw, (bytes, bytearray)):
+            raise ValueError(f"video reference bytes must be bytes (got {type(raw).__name__}).")
+        content_type = reference.get("content_type", "video/mp4")
+        if not isinstance(content_type, str) or not content_type.startswith("video/"):
+            content_type = "video/mp4"
+        return {"video_url": _file_bytes_as_data_url(bytes(raw), content_type.split(";", 1)[0])}
+    if isinstance(reference, str):
+        kind = _string_reference_kind(reference)
+        if kind == "video":
+            return {"video_url": reference}
+        if kind == "file":
+            local_path = reference.removeprefix("file://")
+            mime = _guess_mime_type(local_path)
+            if not mime.startswith("video/"):
+                mime = "video/mp4"
+            with open(local_path, "rb") as handle:
+                return {"video_url": _file_bytes_as_data_url(handle.read(), mime)}
+    return reference
+
+
 def _add_video_reference_to_form(
     form: aiohttp.FormData,
     reference: object,
     *,
     upload_inline_video: bool = True,
 ) -> bool:
+    """Encode one reference: image URL, video URL, or file upload.
+
+    Image URLs use ``image_reference``. Video URLs use ``video_reference``.
+    A lone ``data:video`` whose JSON text exceeds 1MB is uploaded as
+    ``input_references``. Local paths and raw bytes use ``input_reference``.
+    ``upload_inline_video`` must be false when an image is on the same form:
+    ``input_references`` cannot be combined with ``image_reference``.
+    """
     candidates = reference if isinstance(reference, list) else [reference]
     for item in candidates:
         if isinstance(item, Mapping):
@@ -1471,12 +1603,8 @@ def _add_video_reference_to_form(
 
     if isinstance(reference, Mapping) and _is_structured_video_reference(reference):
         video_url = reference.get("video_url")
-        # Inline data URLs are too large for a text form field (1MB part limit).
-        # Skip the upload when an image_reference is also present: ``input_references``
-        # cannot be combined with ``image_reference`` (HTTP 400). The server accepts
-        # ``image_reference`` together with ``video_reference``.
-        if upload_inline_video and isinstance(video_url, str) and video_url.startswith("data:video"):
-            return _add_video_reference_to_form(form, video_url)
+        if upload_inline_video and isinstance(video_url, str) and _data_video_json_exceeds_text_limit(video_url):
+            return _add_data_video_upload(form, video_url)
         form.add_field("video_reference", json.dumps(dict(reference)))
         return True
 
@@ -1487,37 +1615,25 @@ def _add_video_reference_to_form(
         if reference and all(isinstance(item, Mapping) and _is_structured_video_reference(item) for item in reference):
             form.add_field("video_reference", json.dumps([dict(item) for item in reference]))
             return True
-        raise ValueError('Unsupported image_reference list; expected non-empty list of {"image_url": "..."} objects.')
+        raise ValueError(
+            "Unsupported reference list; expected non-empty list of "
+            '{"image_url": "..."} or {"video_url": "..."} objects.'
+        )
 
     if isinstance(reference, str):
-        if reference.startswith("data:video"):
-            header, _, payload = reference.partition(",")
-            if not payload:
-                raise ValueError(f"Unsupported video data URL: {reference[:64]!r}")
-            try:
-                video_bytes = base64.b64decode(payload)
-            except (ValueError, TypeError) as exc:
-                raise ValueError("video data URL is not valid base64") from exc
-            mime = header[len("data:") :].split(";", 1)[0] or "video/mp4"
-            suffix = ".mp4" if mime.endswith("mp4") else ".bin"
-            form.add_field(
-                # Plural field persists the container to disk. Singular
-                # ``input_reference`` would decode every frame in the API
-                # process and trip Starlette / MiniMax size limits on
-                # random-mm videos.
-                "input_references",
-                video_bytes,
-                filename=f"benchmark-reference{suffix}",
-                content_type=mime,
-            )
-            return True
-        if reference.startswith(("data:image", "http://", "https://")):
+        kind = _string_reference_kind(reference)
+        if kind == "image":
             form.add_field("image_reference", json.dumps({"image_url": reference}))
             return True
-        local_path = reference.removeprefix("file://")
-        if os.path.exists(local_path):
-            with open(local_path, "rb") as f:
-                reference_bytes = f.read()
+        if kind == "video":
+            if upload_inline_video and _data_video_json_exceeds_text_limit(reference):
+                return _add_data_video_upload(form, reference)
+            form.add_field("video_reference", json.dumps({"video_url": reference}))
+            return True
+        if kind == "file":
+            local_path = reference.removeprefix("file://")
+            with open(local_path, "rb") as handle:
+                reference_bytes = handle.read()
             form.add_field(
                 "input_reference",
                 reference_bytes,
@@ -1525,11 +1641,16 @@ def _add_video_reference_to_form(
                 content_type=_guess_mime_type(local_path),
             )
             return True
-        raise ValueError(f"Unsupported image_reference path or URL: {reference!r}")
+        if reference.startswith(("http://", "https://")):
+            raise ValueError(
+                "Bare http(s) reference needs an image or video extension "
+                f"({', '.join(sorted(_IMAGE_REFERENCE_SUFFIXES | _VIDEO_REFERENCE_SUFFIXES))}); "
+                f"got {reference!r}."
+            )
+        raise ValueError(f"Unsupported reference path or URL: {reference!r}")
 
     raise ValueError(
-        "Unsupported image_reference; expected upload bytes, local path/URL string, "
-        'or {"image_url": "..."} object '
+        "Unsupported reference; expected image URL, video URL, upload bytes, or a local file "
         f"(got {type(reference).__name__})."
     )
 
@@ -1541,9 +1662,12 @@ def _add_combined_video_form_references(
 ) -> None:
     """Serialize image and video refs using a server-accepted field pair.
 
-    ``image_reference`` may be combined with ``video_reference``. ``input_references``
-    must be sent alone, so an inline ``data:video`` is uploaded only when no image
-    reference is present.
+    Alone, each reference uses its own field: image URL → ``image_reference``,
+    video URL → ``video_reference``, file → ``input_reference``. A lone inline
+    video whose JSON text exceeds 1MB is uploaded as ``input_references``.
+    Together, that upload cannot be combined with ``image_reference``, so both
+    sides stay on the JSON fields. A file paired with the other media is rewritten
+    as a data URL of the matching type.
     """
     extra_body = extra_body or {}
     image_refs = list(_iter_image_reference_inputs(multi_modal_content))
@@ -1553,11 +1677,26 @@ def _add_combined_video_form_references(
     if not video_refs and extra_body.get("video_reference") is not None:
         video_refs = [extra_body["video_reference"]]
 
-    upload_inline_video = not image_refs
+    if image_refs and video_refs:
+        for raw in (image_refs[0], video_refs[0]):
+            candidates = raw if isinstance(raw, list) else [raw]
+            for item in candidates:
+                if isinstance(item, Mapping):
+                    file_id = item.get("file_id")
+                    if isinstance(file_id, str) and file_id:
+                        raise ValueError("file_id is not supported yet")
+        _add_video_reference_to_form(form, _image_reference_json_value(image_refs[0]))
+        _add_video_reference_to_form(
+            form,
+            _video_reference_json_value(video_refs[0]),
+            upload_inline_video=False,
+        )
+        return
+
     if image_refs:
         _add_video_reference_to_form(form, image_refs[0])
     if video_refs:
-        _add_video_reference_to_form(form, video_refs[0], upload_inline_video=upload_inline_video)
+        _add_video_reference_to_form(form, video_refs[0])
 
 
 def _add_video_extra_body_to_form(

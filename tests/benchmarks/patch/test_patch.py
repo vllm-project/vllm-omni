@@ -1606,7 +1606,7 @@ def test_image_reference_urls_from_random_mm_content(mocker: MockerFixture) -> N
 
 
 def test_video_reference_urls_from_random_mm_content(mocker: MockerFixture) -> None:
-    """random-mm data:video_url parts upload via input_references."""
+    """random-mm data:video_url parts stay on video_reference."""
     import aiohttp
 
     content = [
@@ -1628,11 +1628,15 @@ def test_video_reference_urls_from_random_mm_content(mocker: MockerFixture) -> N
     mocker.patch.object(aiohttp.FormData, "add_field", tracking_add_field)
     form = aiohttp.FormData()
     assert _add_video_reference_to_form(form, refs[0]) is True
-    uploaded = next(value for name, value in captured if name == "input_references")
-    assert uploaded == base64.b64decode("AAAA")
-    assert "input_reference" not in [name for name, _ in captured]
-    assert "video_reference" not in [name for name, _ in captured]
-    assert "image_reference" not in [name for name, _ in captured]
+
+    field_names = [name for name, _ in captured]
+    assert field_names.count("video_reference") == 1
+    assert "input_references" not in field_names
+    assert "input_reference" not in field_names
+    assert "image_reference" not in field_names
+    payload = next(value for name, value in captured if name == "video_reference")
+    assert isinstance(payload, (str, bytes, bytearray))
+    assert json.loads(payload) == {"video_url": "data:video/mp4;base64,AAAA"}
 
 
 def test_video_reference_https_url_from_random_mm_content(mocker: MockerFixture) -> None:
@@ -1668,6 +1672,55 @@ def test_video_reference_https_url_from_random_mm_content(mocker: MockerFixture)
     assert json.loads(payload) == {"video_url": "https://example.com/ref.mp4"}
 
 
+@pytest.mark.parametrize(
+    ("reference", "field_name", "expected"),
+    [
+        ("data:image/png;base64,AAAA", "image_reference", {"image_url": "data:image/png;base64,AAAA"}),
+        ("data:video/mp4;base64,AAAA", "video_reference", {"video_url": "data:video/mp4;base64,AAAA"}),
+        ("https://example.com/ref.png", "image_reference", {"image_url": "https://example.com/ref.png"}),
+        ("https://example.com/ref.mp4", "video_reference", {"video_url": "https://example.com/ref.mp4"}),
+    ],
+)
+def test_bare_reference_string_uses_matching_json_field(
+    reference: str,
+    field_name: str,
+    expected: dict[str, str],
+    mocker: MockerFixture,
+) -> None:
+    """Image and video URLs use matching JSON fields; neither is a file upload."""
+    import aiohttp
+
+    captured: list[tuple[str, object]] = []
+    real_add_field = aiohttp.FormData.add_field
+
+    def tracking_add_field(self, name, value=None, **kwargs):
+        captured.append((str(name), value))
+        return real_add_field(self, name, value, **kwargs)
+
+    mocker.patch.object(aiohttp.FormData, "add_field", tracking_add_field)
+    assert _add_video_reference_to_form(aiohttp.FormData(), reference) is True
+    assert [name for name, _ in captured] == [field_name]
+    payload = captured[0][1]
+    assert isinstance(payload, (str, bytes, bytearray))
+    assert json.loads(payload) == expected
+
+
+def test_bare_video_string_is_not_collected_as_image() -> None:
+    content = ["https://example.com/ref.mp4", "data:video/mp4;base64,AAAA"]
+    assert list(_iter_image_reference_inputs(content)) == []
+    assert list(_iter_video_reference_inputs(content)) == [
+        {"video_url": "https://example.com/ref.mp4"},
+        {"video_url": "data:video/mp4;base64,AAAA"},
+    ]
+
+
+def test_bare_http_without_media_extension_is_rejected() -> None:
+    import aiohttp
+
+    with pytest.raises(ValueError, match="image or video extension"):
+        _add_video_reference_to_form(aiohttp.FormData(), "https://example.com/ref")
+
+
 def test_image_and_inline_video_use_combined_reference_fields(mocker: MockerFixture) -> None:
     """Image plus data:video must be image_reference + video_reference, not input_references."""
     import aiohttp
@@ -1700,13 +1753,127 @@ def test_image_and_inline_video_use_combined_reference_fields(mocker: MockerFixt
     assert json.loads(video_payload) == {"video_url": "data:video/mp4;base64,AAAA"}
 
 
+def test_image_url_and_bare_data_video_string_use_json_fields(mocker: MockerFixture) -> None:
+    """Image URL plus a bare data:video string must not upload input_references."""
+    import aiohttp
+
+    content = [{"type": "image_url", "image_url": {"url": "https://example.com/ref.png"}}]
+    extra_body = {"video_reference": "data:video/mp4;base64,AAAA"}
+    captured: list[tuple[str, object]] = []
+    real_add_field = aiohttp.FormData.add_field
+
+    def tracking_add_field(self, name, value=None, **kwargs):
+        captured.append((str(name), value))
+        return real_add_field(self, name, value, **kwargs)
+
+    mocker.patch.object(aiohttp.FormData, "add_field", tracking_add_field)
+    form = aiohttp.FormData()
+    _add_combined_video_form_references(form, content, extra_body)
+
+    field_names = [name for name, _ in captured]
+    assert field_names.count("image_reference") == 1
+    assert field_names.count("video_reference") == 1
+    assert "input_references" not in field_names
+    assert "input_reference" not in field_names
+    image_payload = next(value for name, value in captured if name == "image_reference")
+    video_payload = next(value for name, value in captured if name == "video_reference")
+    assert isinstance(image_payload, (str, bytes, bytearray))
+    assert isinstance(video_payload, (str, bytes, bytearray))
+    assert json.loads(image_payload) == {"image_url": "https://example.com/ref.png"}
+    assert json.loads(video_payload) == {"video_url": "data:video/mp4;base64,AAAA"}
+
+    captured.clear()
+    assert _add_video_reference_to_form(form, "data:video/mp4;base64,AAAA") is True
+    assert [name for name, _ in captured] == ["video_reference"]
+
+
+def _oversized_data_video_url() -> str:
+    """data:video whose JSON text part is larger than 1MB."""
+    return "data:video/mp4;base64," + ("A" * (1024 * 1024))
+
+
+def test_oversized_data_video_uploads_as_input_references(mocker: MockerFixture) -> None:
+    """A lone data:video over the 1MB text limit is uploaded, not sent as JSON."""
+    import aiohttp
+
+    video_url = _oversized_data_video_url()
+    captured: list[tuple[str, object]] = []
+    real_add_field = aiohttp.FormData.add_field
+
+    def tracking_add_field(self, name, value=None, **kwargs):
+        captured.append((str(name), value))
+        return real_add_field(self, name, value, **kwargs)
+
+    mocker.patch.object(aiohttp.FormData, "add_field", tracking_add_field)
+    assert _add_video_reference_to_form(aiohttp.FormData(), {"video_url": video_url}) is True
+    uploaded = next(value for name, value in captured if name == "input_references")
+    assert uploaded == base64.b64decode("A" * (1024 * 1024))
+    field_names = [name for name, _ in captured]
+    assert "video_reference" not in field_names
+    assert "image_reference" not in field_names
+
+
+def test_oversized_data_video_with_image_stays_json(mocker: MockerFixture) -> None:
+    """input_references cannot be combined with image_reference, even for a large video."""
+    import aiohttp
+
+    content = [{"type": "image_url", "image_url": {"url": "https://example.com/ref.png"}}]
+    extra_body = {"video_reference": _oversized_data_video_url()}
+    captured: list[tuple[str, object]] = []
+    real_add_field = aiohttp.FormData.add_field
+
+    def tracking_add_field(self, name, value=None, **kwargs):
+        captured.append((str(name), value))
+        return real_add_field(self, name, value, **kwargs)
+
+    mocker.patch.object(aiohttp.FormData, "add_field", tracking_add_field)
+    _add_combined_video_form_references(aiohttp.FormData(), content, extra_body)
+    field_names = [name for name, _ in captured]
+    assert "image_reference" in field_names
+    assert "video_reference" in field_names
+    assert "input_references" not in field_names
+
+
+def test_image_upload_bytes_and_structured_video_use_json_fields(mocker: MockerFixture) -> None:
+    """Image upload bytes plus a video URL must not use singular input_reference."""
+    import aiohttp
+
+    image_bytes = base64.b64decode(_MIN_PNG_B64)
+    extra_body = {
+        "image_reference": {"bytes": image_bytes, "content_type": "image/png"},
+        "video_reference": {"video_url": "https://example.com/ref.mp4"},
+    }
+    captured: list[tuple[str, object]] = []
+    real_add_field = aiohttp.FormData.add_field
+
+    def tracking_add_field(self, name, value=None, **kwargs):
+        captured.append((str(name), value))
+        return real_add_field(self, name, value, **kwargs)
+
+    mocker.patch.object(aiohttp.FormData, "add_field", tracking_add_field)
+    form = aiohttp.FormData()
+    _add_combined_video_form_references(form, None, extra_body)
+
+    field_names = [name for name, _ in captured]
+    assert field_names.count("image_reference") == 1
+    assert field_names.count("video_reference") == 1
+    assert "input_reference" not in field_names
+    assert "input_references" not in field_names
+    image_payload = next(value for name, value in captured if name == "image_reference")
+    video_payload = next(value for name, value in captured if name == "video_reference")
+    assert isinstance(image_payload, (str, bytes, bytearray))
+    assert isinstance(video_payload, (str, bytes, bytearray))
+    assert json.loads(image_payload) == {"image_url": f"data:image/png;base64,{_MIN_PNG_B64}"}
+    assert json.loads(video_payload) == {"video_url": "https://example.com/ref.mp4"}
+
+
 def test_video_unsupported_image_reference_raises() -> None:
     import aiohttp
 
     form = aiohttp.FormData()
-    with pytest.raises(ValueError, match="Unsupported image_reference"):
+    with pytest.raises(ValueError, match="Unsupported reference"):
         _add_video_reference_to_form(form, {"not_a_supported_key": "x"})
-    with pytest.raises(ValueError, match="Unsupported image_reference"):
+    with pytest.raises(ValueError, match="Unsupported reference"):
         _add_video_reference_to_form(form, "/tmp/does-not-exist-ref.png")
 
 
