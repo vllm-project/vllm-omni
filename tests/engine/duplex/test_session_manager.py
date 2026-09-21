@@ -1311,9 +1311,11 @@ async def test_control_queue_preserves_cancellation(stop: str) -> None:
         else:
             release.set()
         await asyncio.wait_for(asyncio.gather(predecessor, tail, return_exceptions=True), timeout=1.0)
-        if stop == "failure":
+        if stop in {"failure", "predecessor"}:
             assert ran == ["next"]
             assert not tail.cancelled()
+            if stop == "predecessor":
+                assert predecessor.cancelled()
         else:
             assert predecessor.cancelled()
             assert tail.cancelled()

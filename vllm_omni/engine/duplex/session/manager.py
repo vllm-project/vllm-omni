@@ -214,10 +214,9 @@ class DuplexSessionManager:
 
         async def run_ordered() -> None:
             if predecessor is not None:
-                try:
-                    await predecessor
-                except Exception:
-                    pass
+                # A predecessor's failure/cancellation must not poison the queue.
+                # Cancelling this task still cancels the gather and propagates.
+                await asyncio.gather(predecessor, return_exceptions=True)
             await operation()
 
         task = asyncio.create_task(run_ordered(), name=name)
