@@ -58,7 +58,6 @@ import dataclasses
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
-from time import perf_counter
 from typing import Any
 
 import torch
@@ -67,291 +66,6 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _LOGGED_ENGAGE = False
-
-# ---------------------------------------------------------------------------
-# Per-step/per-frame timers for the multi-frame loop (off by default; when off,
-# run() takes no timers at all).
-#
-#   VLLM_OMNI_MINICPMO_KSTEP_PROF=1        enable
-#   VLLM_OMNI_MINICPMO_KSTEP_PROF_STEPS=3  sample the first N steps with a device sync
-#   VLLM_OMNI_MINICPMO_KSTEP_PROF_EVERY=25 print a cumulative summary every N steps
-#
-# Purpose: split one K-frame step's wall time between host enqueue (replay/
-# after_forward, asynchronous) and device execution (synced, measured after an
-# explicit synchronize). Diagnostics never raise: on any error they turn
-# themselves off permanently and log one warning.
-# ---------------------------------------------------------------------------
-_PROF_ENV = "VLLM_OMNI_MINICPMO_KSTEP_PROF"
-_PROF_STEPS_ENV = "VLLM_OMNI_MINICPMO_KSTEP_PROF_STEPS"
-_PROF_EVERY_ENV = "VLLM_OMNI_MINICPMO_KSTEP_PROF_EVERY"
-_PROF_OFF = ("0", "false", "no", "off")
-_PROF_STEPS_DEFAULT = 3
-_PROF_EVERY_DEFAULT = 25
-
-
-class _StepProf:
-    """One step's timers. Never raises: profiling is best-effort by contract."""
-
-    __slots__ = ("frames", "replay_ms", "after_ms", "detail")
-
-    def __init__(self, frames: int, *, detail: bool) -> None:
-        self.frames = frames
-        self.replay_ms = 0.0
-        self.after_ms = 0.0
-        self.detail = detail
-
-
-def prof_enabled() -> bool:
-    """Off unless the env explicitly turns it on (``1``/``true``/``yes``/``on``)."""
-    try:
-        raw = os.environ.get(_PROF_ENV, "").strip().lower()
-        return bool(raw) and raw not in _PROF_OFF
-    except Exception:  # pragma: no cover - env is a dict lookup, but be total
-        return False
-
-
-def _prof_steps() -> int:
-    try:
-        raw = os.environ.get(_PROF_STEPS_ENV, "").strip()
-        steps = int(raw) if raw else _PROF_STEPS_DEFAULT
-    except Exception:
-        steps = _PROF_STEPS_DEFAULT
-    return max(steps, 0)
-
-
-def _prof_every() -> int:
-    try:
-        raw = os.environ.get(_PROF_EVERY_ENV, "").strip()
-        every = int(raw) if raw else _PROF_EVERY_DEFAULT
-    except Exception:
-        every = _PROF_EVERY_DEFAULT
-    return max(every, 1)
-
-
-def _prof_sync() -> None:
-    """Best-effort device drain; no-op on a build without the op."""
-    for fn in (
-        getattr(getattr(torch, "npu", None), "synchronize", None),
-        getattr(getattr(torch, "cuda", None), "synchronize", None),
-    ):
-        if callable(fn):
-            try:
-                fn()
-                return
-            except Exception:
-                return
-
-
-def _prof_frame_line(step: int, frame: int, replay_ms: float, after_ms: float, synced_ms: float) -> None:
-    try:
-        logger.info(
-            "[kstep-prof] step=%d frame=%d replay_ms=%.3f after_forward_ms=%.3f synced_frame_ms=%s",
-            step,
-            frame,
-            replay_ms,
-            after_ms,
-            f"{synced_ms:.3f}" if synced_ms >= 0.0 else "n/a",
-        )
-    except Exception:
-        pass
-
-
-def _prof_summary(steps: int, frames_total: int, last_frames: int, *, detail: bool) -> None:
-    """One cumulative line: per-step/per-frame wall time, host enqueue vs device execution."""
-    try:
-        per_step = _PROF_TOTAL_MS / steps if steps else 0.0
-        per_frame = _PROF_TOTAL_MS / frames_total if frames_total else 0.0
-        replay_per_frame = _PROF_REPLAY_MS / frames_total if frames_total else 0.0
-        after_per_frame = _PROF_AFTER_MS / frames_total if frames_total else 0.0
-        synced = (
-            f" synced_frame_ms={_PROF_SYNCED_MS / _PROF_SYNCED_FRAMES:.3f} (n={_PROF_SYNCED_FRAMES})"
-            if _PROF_SYNCED_FRAMES
-            else ""
-        )
-        logger.info(
-            "[kstep-prof] steps=%d frames=%d last_step_frames=%d step_ms=%.2f frame_ms=%.3f "
-            "replay_enqueue_ms_per_frame=%.3f after_forward_ms_per_frame=%.3f (totals: %.3f/%.3f)%s%s",
-            steps,
-            frames_total,
-            last_frames,
-            per_step,
-            per_frame,
-            replay_per_frame,
-            after_per_frame,
-            _PROF_REPLAY_MS,
-            _PROF_AFTER_MS,
-            synced,
-            "  [per-frame lines above]" if detail else "",
-        )
-    except Exception:
-        pass
-
-
-_PROF_WARNED = False
-_PROF_STEPS = 0
-_PROF_FRAMES = 0
-_PROF_REPLAY_MS = 0.0
-_PROF_AFTER_MS = 0.0
-_PROF_TOTAL_MS = 0.0
-_PROF_SYNCED_MS = 0.0
-_PROF_SYNCED_FRAMES = 0
-
-
-def _prof_disabled(reason: str) -> None:
-    """Turn the profiling off for the rest of the process, once."""
-    global _PROF_WARNED
-    if _PROF_WARNED:
-        return
-    _PROF_WARNED = True
-    try:
-        logger.warning("[kstep-prof] disabled after failure: %s", reason)
-    except Exception:
-        pass
-    os.environ[_PROF_ENV] = "0"
-
-
-def _prof_step_begin(frames: int) -> _StepProf | None:
-    """``None`` when off -- and then ``run()`` takes no timer at all."""
-    try:
-        if not prof_enabled():
-            return None
-        return _StepProf(frames, detail=_PROF_STEPS < _prof_steps())
-    except Exception:
-        _prof_disabled("step_begin")
-        return None
-
-
-def _prof_frame(prof: _StepProf, frame: int, t0: float, t1: float, t2: float, t3: float) -> None:
-    """Book one replay. ``replay``/``after`` are enqueue times; ``synced`` is the
-    frame's real wall clock (drained after the replay), and the gap between them
-    is the device side of the account."""
-    try:
-        global _PROF_SYNCED_MS, _PROF_SYNCED_FRAMES
-        replay_ms = (t1 - t0) * 1000.0
-        after_ms = (t2 - t1) * 1000.0
-        prof.replay_ms += replay_ms
-        prof.after_ms += after_ms
-        synced_ms = -1.0
-        if prof.detail and t3:
-            synced_ms = (t3 - t0) * 1000.0
-            _PROF_SYNCED_MS += synced_ms
-            _PROF_SYNCED_FRAMES += 1
-        if prof.detail:
-            _prof_frame_line(_PROF_STEPS + 1, frame, replay_ms, after_ms, synced_ms)
-    except Exception:
-        _prof_disabled("frame")
-
-
-def _prof_step_end(prof: _StepProf | None, step_start: float) -> None:
-    if prof is None:
-        return
-    try:
-        global _PROF_STEPS, _PROF_FRAMES, _PROF_REPLAY_MS, _PROF_AFTER_MS, _PROF_TOTAL_MS
-        _PROF_STEPS += 1
-        _PROF_FRAMES += prof.frames
-        _PROF_REPLAY_MS += prof.replay_ms
-        _PROF_AFTER_MS += prof.after_ms
-        _PROF_TOTAL_MS += (perf_counter() - step_start) * 1000.0
-        if prof.detail or _PROF_STEPS % _prof_every() == 0:
-            _prof_summary(_PROF_STEPS, _PROF_FRAMES, prof.frames, detail=prof.detail)
-    except Exception:
-        _prof_disabled("step_end")
-
-
-# ---------------------------------------------------------------------------
-# Stop-row forensics for the multi-frame loop (off by default).
-#
-#   VLLM_OMNI_MINICPMO_KSTEP_STOP_TRACE=1
-#
-# Answers one question: does the model actually emit stop rows within the K
-# frames of a step? Rows present but the request still runs to max_tokens means
-# the loss is in vLLM's spec bookkeeping; no rows at all means it is in the
-# multi-frame sampling/state path. Prints the first 50 steps, then goes quiet.
-# Never raises.
-# ---------------------------------------------------------------------------
-_STOP_TRACE_ENV = "VLLM_OMNI_MINICPMO_KSTEP_STOP_TRACE"
-_STOP_TRACE_STEPS = 50
-_STOP_TRACE_COUNT = 0
-
-
-def stop_trace_enabled() -> bool:
-    """Off unless the env explicitly turns it on (``1``/``true``/``yes``/``on``)."""
-    try:
-        raw = os.environ.get(_STOP_TRACE_ENV, "").strip().lower()
-        return bool(raw) and raw not in _PROF_OFF
-    except Exception:  # pragma: no cover - env is a dict lookup, but be total
-        return False
-
-
-def _trace_stop_rows(frame_stop_logits: list[torch.Tensor]) -> None:
-    """One line per step: how many of each request's K frames carry a stop row."""
-    global _STOP_TRACE_COUNT
-    try:
-        if _STOP_TRACE_COUNT >= _STOP_TRACE_STEPS:
-            return
-        _STOP_TRACE_COUNT += 1
-        flags = torch.stack([row.argmax(dim=-1) for row in frame_stop_logits], dim=1)
-        logger.info(
-            "[kstep-stop] step=%d frames=%d stops_per_req=%s",
-            _STOP_TRACE_COUNT,
-            len(frame_stop_logits),
-            flags.sum(dim=1).cpu().tolist(),
-        )
-    except Exception as exc:
-        logger.warning("[kstep-stop] trace disabled after failure: %r", exc)
-        os.environ[_STOP_TRACE_ENV] = "0"
-
-
-_STOP_KB_COUNT = 0
-
-
-def trace_kstep_bookkeeping(runner: Any, valid_sampled_token_ids: Any, logits: Any) -> None:
-    """Stop trace, layer 2: what survives spec bookkeeping.
-
-    Two facts are printed together so the loss point is unambiguous:
-
-    * ``carried`` -- tokens the rejection sampler handed to the request (first
-      4 requests). A 1 means the stop token reached the request's own token
-      table; then only the engine-side finish check remains. All zeros with no
-      1 means the stop disappeared earlier.
-    * ``min_toks`` -- requests still on the MinTokens mask list, with the output
-      length it sees: ``(index, min_tokens, len(output_token_ids),
-      sorted(stop_ids))``. While a request is on this list its stop columns are
-      -inf; if ``len(output_token_ids)`` never grows, the entry is never
-      cleared and the request can never stop.
-
-    Never raises: on error it only disables itself.
-    """
-    global _STOP_KB_COUNT
-    try:
-        if _STOP_KB_COUNT >= _STOP_TRACE_STEPS:
-            return
-        _STOP_KB_COUNT += 1
-        if isinstance(valid_sampled_token_ids, list):
-            carried: Any = [list(row) for row in valid_sampled_token_ids[:4]]
-        else:
-            carried = f"<{type(valid_sampled_token_ids).__name__}>"
-
-        masks: list[Any] = []
-        sampling_metadata = getattr(getattr(runner, "input_batch", None), "sampling_metadata", None)
-        for proc in getattr(getattr(sampling_metadata, "logitsprocs", None), "non_argmax_invariant", None) or []:
-            min_toks = getattr(proc, "min_toks", None)
-            if isinstance(min_toks, dict) and min_toks:
-                masks.append(
-                    [
-                        (index, int(min_tok), len(out_ids), sorted(stop_ids))
-                        for index, (min_tok, out_ids, stop_ids) in list(min_toks.items())[:4]
-                    ]
-                )
-        logger.info(
-            "[kstep-stop] carried=%s min_toks=%s logits=%s",
-            carried,
-            masks,
-            tuple(getattr(logits, "shape", ()) or ()),
-        )
-    except Exception as exc:
-        logger.warning("[kstep-stop] bookkeeping trace disabled after failure: %r", exc)
-        os.environ[_STOP_TRACE_ENV] = "0"
 
 
 def neutralize_kstep_min_tokens(logitsprocs: Any) -> None:
@@ -394,9 +108,6 @@ _LOGGED_BLOCK: str | None = None
 _LOGGED_NARROW = False
 _LOGGED_NARROW_BLOCK: str | None = None
 
-_NARROW_ENV = "VLLM_OMNI_MINICPMO_NARROW_REPLAY"
-_NARROW_OFF = frozenset({"0", "off", "false", "no"})
-_NARROW_ON = frozenset({"1", "on", "true", "yes"})
 # SoC families whose one-query capture is known to fault. The 910_93 part
 # trips a vector-core error (acl 507035) inside the packaged codec operator
 # while that graph is being captured, so the narrow path stays off there
@@ -414,19 +125,10 @@ _NARROW_SOC_LOGGED: str | None = None
 def _narrow_soc_allows() -> bool:
     """Whether this part may capture the one-query graph by default.
 
-    An explicit ``VLLM_OMNI_MINICPMO_NARROW_REPLAY=1/on`` always wins, and an
-    explicit ``0/off`` always loses. With no setting the answer depends on the
-    part: the environment is consulted first (the same variables the deploy
-    config reads, so both sides agree), and the device name is the fallback for
-    a worker launched without them.
+    Judged from the part: the CANN-exported SoC code first, the device name as
+    the fallback for a worker launched without them.
     """
     global _NARROW_SOC_LOGGED
-
-    raw = os.environ.get(_NARROW_ENV, "").strip().lower()
-    if raw in _NARROW_ON:
-        return True
-    if raw in _NARROW_OFF:
-        return False
 
     name = ""
     for variable in ("SOC_VERSION", "ASCEND_SOC_VERSION"):
@@ -584,10 +286,9 @@ class NarrowStep:
 def narrow_replay_enabled(runner: Any) -> bool:
     """Whether this worker should capture and replay the one-query graph.
 
-    Off with ``VLLM_OMNI_MINICPMO_NARROW_REPLAY=off``, which restores the
-    K-query captures and the wide replay. On a part whose one-query capture is
-    known to fault (``_NARROW_BLOCKED_SOC_PREFIXES``) it is off as well unless
-    explicitly enabled, so the capture can never brick a deployment.
+    Off on a part whose one-query capture is known to fault
+    (``_NARROW_BLOCKED_SOC_PREFIXES``), so a capture can never brick a
+    deployment; those parts keep the K-query captures and the wide replay.
     """
     if not _narrow_soc_allows():
         return False
@@ -738,9 +439,6 @@ def run(
     spans = model_kwargs_extra["request_token_spans"]
     infos = model_kwargs_extra["model_intermediate_buffer"]
 
-    step_prof = _prof_step_begin(frames)
-    step_start = perf_counter() if step_prof is not None else 0.0
-
     frame_outputs = []
     frame_stop_logits = []
     frame_hidden = []
@@ -757,16 +455,8 @@ def run(
                 _write_frame_embeddings(model, inputs_embeds, input_ids, spans, infos, frame, narrow=narrow)
         elif frame > 0:
             _write_frame_embeddings(model, inputs_embeds, input_ids, spans, infos, frame)
-        t0 = perf_counter() if step_prof is not None else 0.0
         hidden = run_model()
-        t1 = perf_counter() if step_prof is not None else 0.0
         after_forward()
-        t2 = perf_counter() if step_prof is not None else 0.0
-        if step_prof is not None and step_prof.detail:
-            _prof_sync()
-        t3 = perf_counter() if step_prof is not None else 0.0
-        if step_prof is not None:
-            _prof_frame(step_prof, frame, t0, t1, t2, t3)
         frame_kwargs = dict(model_kwargs_extra)
         frame_kwargs["request_token_spans"] = (
             list(narrow.spans)
@@ -788,8 +478,6 @@ def run(
     if not _LOGGED_ENGAGE:
         _LOGGED_ENGAGE = True
         logger.info("[minicpmo] multi-frame Talker decode engaged: %d codec frames per step", frames)
-    if stop_trace_enabled():
-        _trace_stop_rows(frame_stop_logits)
     merged = model.merge_frame_outputs(frame_outputs, frame_stop_logits)
     if narrow is not None and frame_hidden:
         # (frames, rows, hidden) -> (rows * frames, hidden), request-major --
@@ -797,9 +485,6 @@ def run(
         merged = merged._replace(
             text_hidden_states=torch.stack(frame_hidden, dim=1).reshape(-1, frame_hidden[0].shape[-1])
         )
-    # Whole step, frames + merge: this is the number to compare against the
-    # scheduler's step cadence.
-    _prof_step_end(step_prof, step_start)
     return merged
 
 

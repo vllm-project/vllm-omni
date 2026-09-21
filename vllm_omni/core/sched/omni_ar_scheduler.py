@@ -33,74 +33,6 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 
 logger = init_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Multi-frame bookkeeping trace (off by default).
-#
-#   VLLM_OMNI_MINICPMO_KSTEP_ACCOUNT_TRACE=1
-#
-# Question it answers: the model already emits stop rows, so why does the
-# request not finish? It logs each request's accepted token values per step --
-# if they stay 0 (continue), the stop row never became a 1 in the request's
-# token table and check_stop(stop_token_ids=[1]) never fires, so the request
-# runs to max_model_len. Diagnostics never raise.
-# ---------------------------------------------------------------------------
-_KSTEP_ACCOUNT_TRACE_ENV = "VLLM_OMNI_MINICPMO_KSTEP_ACCOUNT_TRACE"
-_KSTEP_ACCOUNT_TRACE: dict = {"lines": 0, "reqs": {}, "off": False}
-
-
-def kstep_account_trace_enabled() -> bool:
-    """Off unless the env turns it on; latched off for good after a failure."""
-    if _KSTEP_ACCOUNT_TRACE["off"]:
-        return False
-    raw = os.environ.get(_KSTEP_ACCOUNT_TRACE_ENV, "").strip().lower()
-    return bool(raw) and raw not in ("0", "false", "no", "off")
-
-
-def _trace_kstep_account(req_id, spec_len, generated, computed, total, prompt_len, status, sampling=None) -> None:
-    """One line per request per step; first 24 steps of each request, then 1 in 16."""
-    state = _KSTEP_ACCOUNT_TRACE
-    if state["off"]:
-        return
-    try:
-        key = str(req_id)
-        seen = state["reqs"].get(key, 0)
-        state["reqs"][key] = seen + 1
-        gen_len = len(generated or [])
-        # Invariant I2/I5: a step with drafts must hand the request
-        # spec_len + 1 tokens (the bonus plus every accepted draft). A short
-        # row means frames the model produced were dropped on the way to the
-        # request -- always log it, whatever the stride.
-        partial = bool(spec_len) and gen_len != spec_len + 1
-        interesting = seen < 24 or seen % 16 == 0 or partial
-        nonzero = [int(t) for t in (generated or []) if int(t) != 0]
-        if not interesting and not nonzero:
-            return
-        if state["lines"] >= 400:
-            return
-        state["lines"] += 1
-        logger.info(
-            "[kstep-acct] req=%s step=%d spec_len=%s gen=%s partial=%s nonzero=%s computed=%s tokens=%s "
-            "prompt=%s status=%s stop_ids=%s eos=%s min=%s max=%s ignore_eos=%s",
-            key[:12],
-            seen,
-            spec_len,
-            gen_len,
-            int(partial),
-            nonzero[:6],
-            computed,
-            total,
-            prompt_len,
-            status,
-            list(getattr(sampling, "stop_token_ids", None) or []),
-            getattr(sampling, "eos_token_id", None),
-            getattr(sampling, "min_tokens", None),
-            getattr(sampling, "max_tokens", None),
-            getattr(sampling, "ignore_eos", None),
-        )
-    except Exception as exc:  # pragma: no cover - diagnostics never raise
-        state["off"] = True
-        logger.warning("[kstep-acct] trace disabled after failure: %r", exc)
-
 
 def _should_emit_engine_output(
     model_config: Any,
@@ -437,31 +369,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             cache = self._omni_talker_kstep_cache = is_talker and is_ngram and num_spec > 0
         return cache
 
-    def _log_kstep_guard_view(self, verdict: str, widths: set[int], states: list, dropped: int = 0) -> None:
-        """Diagnostic view of what the K-step guard judged this step.
-
-        Rate-limited but never silenced on the interesting steps: the 12:39
-        crash landed on a step whose one-shot guard log had already been
-        consumed, which hid exactly the state the guard passed. Diagnostics
-        must never raise either -- this one must not kill the engine.
-        """
-        count = getattr(self, "_omni_kstep_guard_view_count", 0) + 1
-        self._omni_kstep_guard_view_count = count
-        if count > 20 and count % 50 != 0:
-            return
-        try:
-            logger.info(
-                "[K-guard] #%d %s: waiting=%d widths=%s dropped=%d "
-                "states=(id, computed, prompt_len, total, spec_len, delta)=%s",
-                count,
-                verdict,
-                len(self.waiting),
-                sorted(widths),
-                dropped,
-                states,
-            )
-        except Exception as exc:  # never let the diagnostic kill the engine
-            logger.info("[K-guard] #%d %s (view failed: %r)", count, verdict, exc)
 
     def _drop_talker_drafts_if_prefill_pending(self) -> None:
         """Keep the Talker's K-frame decode out of steps with uneven spans.
@@ -516,22 +423,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 widths.add(delta)
         uneven = len(widths) > 1
         if not prefill_pending and not uneven:
-            if not widths and states:
-                # Running requests exist but none yields a row width: the step
-                # schedules no decode rows at all. Rare enough to be interesting.
-                self._log_kstep_guard_view("pass-no-decode-widths", widths, states)
             return
-        dropped = 0
         for req in self.running:
             if req.spec_token_ids:
                 req.spec_token_ids = []
-                dropped += 1
-        self._log_kstep_guard_view(
-            f"drop ({'prefill pending' if prefill_pending else 'uneven spans'})",
-            widths,
-            states,
-            dropped=dropped,
-        )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
@@ -717,17 +612,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 continue
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
-            if kstep_account_trace_enabled():
-                _trace_kstep_account(
-                    req_id,
-                    len(scheduler_output.scheduled_spec_decode_tokens.get(req_id) or []),
-                    generated_token_ids,
-                    int(request.num_computed_tokens),
-                    int(request.num_tokens),
-                    len(getattr(request, "prompt_token_ids", None) or []),
-                    getattr(request, "status", None),
-                    getattr(request, "sampling_params", None),
-                )
 
             stale_async_tokens = int(getattr(request, "async_tokens_to_discard", 0) or 0)
             async_output_is_stale = bool(generated_token_ids and stale_async_tokens > 0)

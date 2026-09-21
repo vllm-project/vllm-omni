@@ -49,7 +49,6 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
-from vllm_omni.utils.step_prof import span as _prof_span
 
 logger = init_logger(__name__)
 
@@ -341,85 +340,6 @@ def resolve_codec_sampling_params(
     return resolved
 
 
-# ---------------------------------------------------------------------------
-# Per-frame trace for the multi-frame loop (off by default; complements the
-# per-step timers in talker_multiframe).
-#
-#   VLLM_OMNI_MINICPMO_KSTEP_FRAME_TRACE=1  enable
-#   prints at most _KSTEP_FRAME_TRACE_FRAMES frames, then goes quiet
-#
-# Answers what the per-step timers cannot: whether the model's own sampler
-# reaches EOS inside the K loop, and whether each frame is fed the previous
-# frame's sampled code (frame-order invariant). Diagnostics never take the
-# engine down: on any error they disable themselves and log one warning.
-# ---------------------------------------------------------------------------
-_KSTEP_FRAME_TRACE_ENV = "VLLM_OMNI_MINICPMO_KSTEP_FRAME_TRACE"
-_KSTEP_FRAME_TRACE_LINES = 128  # max printed lines
-_KSTEP_FRAME_TRACE_HEAD = 16  # first N frames printed one by one (frame-order check)
-_KSTEP_FRAME_TRACE_STRIDE = 16  # then one line every N frames (covers ~1800 frames)
-_KSTEP_FRAME_TRACE: dict[str, Any] = {"reqs": {}, "lines": 0, "off": False}
-
-
-def kstep_frame_trace_enabled() -> bool:
-    """Off unless the env turns it on; latched off for good after a failure."""
-    if _KSTEP_FRAME_TRACE["off"]:
-        return False
-    raw = os.environ.get(_KSTEP_FRAME_TRACE_ENV, "").strip().lower()
-    return bool(raw) and raw not in ("0", "false", "no", "off")
-
-
-def _trace_kstep_frame(model: Any, **fields: Any) -> None:
-    """One line per codec frame while the multi-frame loop owns sampling.
-
-    Logs what the *model* decided: the code each frame took as its input (the
-    previous frame's sample, per the contract), what it sampled, whether that
-    was the codec EOS, and where the sampler's own step counter stood. The first
-    ``HEAD`` frames are logged one per line (that is what verifies the frame
-    chain), then one line every ``STRIDE`` frames so the window still covers the
-    frames where EOS first becomes eligible -- `min_tokens` masks it before
-    then, so a head-only trace can never see a stop. An EOS sample is always
-    logged regardless of the stride. Never raises: a failure disables the trace
-    for good.
-    """
-    state = _KSTEP_FRAME_TRACE
-    if state["off"]:
-        return
-    reqs = state["reqs"]
-    request_id = str(fields.get("request_id"))
-    seen = reqs.get(request_id, 0)
-    reqs[request_id] = seen + 1
-    is_eos = bool(fields.get("is_eos"))
-    interesting = seen < _KSTEP_FRAME_TRACE_HEAD or (
-        seen >= _KSTEP_FRAME_TRACE_HEAD and (seen - _KSTEP_FRAME_TRACE_HEAD) % _KSTEP_FRAME_TRACE_STRIDE == 0
-    )
-    if not is_eos and (not interesting or state["lines"] >= _KSTEP_FRAME_TRACE_LINES):
-        return
-    try:
-        device_states = getattr(model, "_request_codec_device_states", None)
-        device_state = device_states.get(fields.get("request_id")) if isinstance(device_states, dict) else None
-        device_step = int(device_state.step.reshape(-1)[0].item()) if device_state is not None else -1
-        state["lines"] += 1  # cap printed lines only; per-request windows count separately
-        logger.info(
-            "[kstep-frame] frame=%d req=%s step=%s->%s device_step=%s in_code=%s row=%s "
-            "sampled=%s is_eos=%s limit=%s finished=%s ctx=%s min=%s max=%s",
-            seen,
-            str(fields.get("request_id"))[:12],
-            fields.get("step_before"),
-            fields.get("step_after"),
-            device_step,
-            fields.get("prev_code"),
-            fields.get("row"),
-            fields.get("sampled_id"),
-            fields.get("is_eos"),
-            fields.get("reached_limit"),
-            fields.get("finished"),
-            fields.get("ctx_len"),
-            fields.get("min_tokens"),
-            fields.get("max_tokens"),
-        )
-    except Exception as exc:  # pragma: no cover - diagnostics never raise
-        state["off"] = True
-        logger.warning("[kstep-frame] trace disabled after failure: %r", exc)
 
 
 def _codec_int_param(state: Any, key: str, fallback: int) -> int:
@@ -1151,22 +1071,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             reached_limit = int(state["step"]) >= _codec_int_param(state, "max_tokens", self._codec_max_tokens)
             finished = is_eos or reached_limit
             state["finished"] = finished
-            if self._k_step_frames > 0 and kstep_frame_trace_enabled():
-                _trace_kstep_frame(
-                    self,
-                    request_id=request_id,
-                    step_before=step,
-                    step_after=int(state["step"]),
-                    prev_code=prev_code,
-                    row=int(end) - 1,
-                    sampled_id=sampled_id,
-                    is_eos=is_eos,
-                    reached_limit=reached_limit,
-                    finished=finished,
-                    ctx_len=int(codes.numel()) if isinstance(codes, torch.Tensor) else -1,
-                    min_tokens=min_tokens,
-                    max_tokens=max_tokens,
-                )
             # MiniCPMTTS.generate_chunk consumes the boundary sample but
             # returns only codes that were fed into the retained KV state.
             if not is_eos and not reached_limit:
@@ -1744,11 +1648,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             and logits.shape[-1] == 2
             and not getattr(sampling_metadata, "max_num_logprobs", None)
         ):
-            with _prof_span("tts_sampler"):
-                return SamplerOutput(
-                    sampled_token_ids=logits.argmax(dim=-1, keepdim=True).to(torch.int32),
-                    logprobs_tensors=None,
-                )
+            return SamplerOutput(
+                sampled_token_ids=logits.argmax(dim=-1, keepdim=True).to(torch.int32),
+                logprobs_tensors=None,
+            )
         prompt_ids = getattr(sampling_metadata, "prompt_token_ids", None)
         if isinstance(logits, torch.Tensor) and isinstance(prompt_ids, torch.Tensor):
             # Copy rather than mutate: the runner may hand us the input batch's
@@ -1757,15 +1660,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 sampling_metadata,
                 prompt_token_ids=blank_scheduler_prompt_for_penalties(prompt_ids, logits.shape[-1]),
             )
-        with _prof_span("tts_penalty"):
-            logits, sampling_metadata = self._apply_codec_repetition_penalty(logits, sampling_metadata)
+        logits, sampling_metadata = self._apply_codec_repetition_penalty(logits, sampling_metadata)
         prewarped = _maybe_prewarp_top_k_top_p(logits, sampling_metadata)
         if prewarped is not None:
             logits, sampling_metadata = prewarped
         force_eos = self._pending_force_eos_rows
         self._pending_force_eos_rows = None
-        with _prof_span("tts_sampler"):
-            output = Sampler()(logits, sampling_metadata)
+        output = Sampler()(logits, sampling_metadata)
         return self._force_eos_on_sampled_ids(output, force_eos)
 
     def _force_eos_on_sampled_ids(self, output: Any, force_eos: list[bool] | None) -> Any:

@@ -51,7 +51,6 @@ from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
-from vllm_omni.utils.step_prof import span, tic, toc
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
@@ -423,7 +422,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         scheduler_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> OmniModelRunnerOutput | IntermediateTensors | None:
-        tic("em_total")
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = self.routed_experts_capturer
             if capturer is not None and hasattr(capturer, "finalize_pending_copy"):
@@ -773,10 +771,9 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         ):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
-            with span("em_forward"):
-                hidden_states = self._model_forward(
-                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-                )
+            hidden_states = self._model_forward(
+                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+            )
         with record_function_or_nullcontext("post process"):
             #  -------------------------------------- Omni-new -------------------------------------------------
             # [Omni] Map pending ropes metadata to req_ids.
@@ -904,7 +901,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if self.vllm_config.model_config.enable_return_routed_experts and hasattr(self, "_positions_cpu"):
             self._omni_routed_experts_d2h(scheduler_output)
 
-        toc("em_total")
         return None
 
     def _sample(
@@ -912,7 +908,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         logits: torch.Tensor | None,
         spec_decode_metadata: Any,
     ):
-        tic("em_sample")
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
             model_sample = getattr(self.model, "sample", None)
@@ -939,22 +934,18 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     requests=getattr(self, "requests", None),
                 )
                 if sampler_output is not None:
-                    toc("em_sample")
                     return sampler_output
-            toc("em_sample")
             return self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
 
-        toc("em_sample")
         return super()._sample(logits, spec_decode_metadata)
 
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
-        tic("st_total")
         profiling_chunk_config = self.ascend_config.scheduler_config.profiling_chunk_config
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
@@ -1109,13 +1100,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             spec_decode_metadata,
         )
 
-        if getattr(self.model, "supports_multi_frame_decode", False):
-            from vllm_omni.platforms.npu.worker import talker_multiframe
-
-            if talker_multiframe.stop_trace_enabled():
-                talker_multiframe.trace_kstep_bookkeeping(
-                    self, valid_sampled_token_ids, logits
-                )
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
@@ -1374,7 +1358,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
         if not self.use_async_scheduling:
-            toc("st_total")
             return model_runner_output
         async_output = AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
@@ -1389,7 +1372,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             async_output.sampled_token_ids_cpu,
             async_output.async_copy_ready_event,
         )
-        toc("st_total")
         return async_output
 
     #  -------------------------------------- Omni-new -------------------------------------------------
