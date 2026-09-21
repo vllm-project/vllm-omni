@@ -716,10 +716,13 @@ class SenseNovaU1Model(nn.Module):
             causal_mask_mapping = attention_mask
 
         hidden_states = inputs_embeds
+        # [3, S] broadcasts one request's positions across its images. A
+        # request batch carries [3, B, S], retaining each prefix's true offset.
+        position_ids = indexes.unsqueeze(1) if indexes.ndim == 2 else indexes
         position_embeddings = (
-            self.rotary_emb(hidden_states, indexes[0].unsqueeze(0)),
-            self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0)),
-            self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0)),
+            self.rotary_emb(hidden_states, position_ids[0]),
+            self.rotary_emb_hw(hidden_states, position_ids[1]),
+            self.rotary_emb_hw(hidden_states, position_ids[2]),
         )
         for layer in self.layers:
             hidden_states = layer(

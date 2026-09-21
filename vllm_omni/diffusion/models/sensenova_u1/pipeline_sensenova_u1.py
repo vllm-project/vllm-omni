@@ -28,6 +28,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torchvision.transforms as T
+from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
@@ -46,11 +47,13 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.transformers_utils.configs.sensenova_u1 import (
     SenseNovaU1Config,
 )
 
+from .batching import denoise_options, image_count, merge_conditioning, request_condition_key, request_mode
 from .paged_decode import (
     DecodeGraphRunner,
     PagedDecodeCache,
@@ -416,6 +419,21 @@ def _to_pil(batch):
     return [Image.fromarray(a) for a in arr]
 
 
+def get_sensenova_u1_pre_process_func(od_config: OmniDiffusionConfig):
+    def pre_process_func(request: OmniDiffusionRequest):
+        if not od_config.step_execution:
+            request.sampling_params.num_outputs_per_prompt = image_count(request.sampling_params)
+            key = request_condition_key(request.prompt, request.sampling_params)
+            # Text output remains a serial AR path. Image requests can combine
+            # different think lengths after each one's prefix has been saved.
+            if request_mode(request.prompt) == "text":
+                key += (request.request_id,)
+            request.batch_compatibility_key = key
+        return request
+
+    return pre_process_func
+
+
 def get_sensenova_u1_post_process_func(od_config: OmniDiffusionConfig):
     def post_process_func(x):
         return x
@@ -526,6 +544,7 @@ class SenseNovaU1Pipeline(
     # itself a decode loop: think, and text output, run inside prepare.
     supports_step_execution: ClassVar[bool] = True
     supports_resumable_prepare: ClassVar[bool] = True
+    supports_request_batch: ClassVar[bool] = True
 
     # CPU-offload protocol: language_model carries the denoising blocks; the
     # vision and FM modules are lightweight encoders pinned on GPU during the
@@ -1142,19 +1161,15 @@ class SenseNovaU1Pipeline(
             extra_args=extra_args,
             image_size=(width, height),
             num_steps=int(req.sampling_params.num_inference_steps or 50),
-            cfg_scale=float(extra_args.get("cfg_scale", 4.0)),
-            img_cfg_scale=float(extra_args.get("img_cfg_scale", 1.0)),
-            cfg_norm=str(extra_args.get("cfg_norm", "none")),
-            timestep_shift=float(extra_args.get("timestep_shift", 3.0)),
-            cfg_interval=tuple(extra_args.get("cfg_interval", (0.0, 1.0))),
-            batch_size=int(extra_args.get("batch_size", 1)),
+            **denoise_options(req.sampling_params),
+            batch_size=image_count(req.sampling_params),
+            image_generator=req.sampling_params.generator,
             seed=int(req.sampling_params.seed) if req.sampling_params.seed is not None else 42,
             # The image path needs a seed and falls back to 42; text sampling
             # must not, or every unseeded request would draw the same tokens.
             text_generator=req.sampling_params.generator,
             text_seed=req.sampling_params.seed,
             think_mode=bool(extra_args.get("think", False)),
-            t_eps=float(extra_args.get("t_eps", 0.02)),
         )
 
     def _extract_input_images(self, first_prompt):
@@ -1236,8 +1251,12 @@ class SenseNovaU1Pipeline(
                 noise_scale = math.sqrt(noise_scale)
         noise_scale = min(noise_scale, self.model_cfg.noise_scale_max_value)
 
-        generator = torch.Generator(self.device).manual_seed(p.seed)
-        image_prediction = noise_scale * torch.randn(
+        generator = getattr(p, "image_generator", None)
+        if generator is None:
+            generator = torch.Generator(self.device).manual_seed(p.seed)
+        if isinstance(generator, list) and len(generator) != p.batch_size:
+            raise ValueError("SenseNova generator lists must match num_outputs_per_prompt")
+        image_prediction = noise_scale * randn_tensor(
             (p.batch_size, 3, p.image_size[1], p.image_size[0]),
             device=self.device,
             dtype=self.od_config.dtype,
@@ -1404,12 +1423,13 @@ class SenseNovaU1Pipeline(
             v_pred = v_pred * (norm_c / (norm_v + 1e-8)).clamp(0, 1.0)
         return v_pred
 
-    def _expand_and_prepare_kv(self, kv, token_hw, batch_size):
+    def _expand_and_prepare_kv(self, kv, token_hw, batch_size, *, prepare_flash=True):
         """Expand KV cache for batch and prepare flash attention buffers."""
         for layer in kv.layers:
             layer.keys = layer.keys.expand(batch_size, *layer.keys.shape[1:])
             layer.values = layer.values.expand(batch_size, *layer.values.shape[1:])
-        prepare_flash_kv_cache(kv, current_len=token_hw, batch_size=batch_size)
+        if prepare_flash:
+            prepare_flash_kv_cache(kv, current_len=token_hw, batch_size=batch_size)
 
     @staticmethod
     def _is_warmup_request(req) -> bool:
@@ -1439,9 +1459,11 @@ class SenseNovaU1Pipeline(
             logger.warning("Autoregressive decode warmup skipped: %s", exc)
 
     @torch.inference_mode()
-    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         if self._is_warmup_request(req):
             self._warm_ar_decode()
+        if len(req.prompts) > 1:
+            return self._forward_request_batch(req)
         p = self._parse_request(req)
 
         input_images = self._extract_input_images(p.first_prompt)
@@ -1449,10 +1471,69 @@ class SenseNovaU1Pipeline(
         is_text_output = "text" in modalities
 
         if is_text_output:
-            return self._forward_text(p, input_images)
+            return [self._forward_text(p, input_images)]
         if input_images is not None:
-            return self._forward_it2i(p, input_images)
-        return self._forward_t2i(p)
+            return [self._forward_it2i(p, input_images)]
+        return [self._forward_t2i(p)]
+
+    def _forward_request_batch(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        """Finish each AR prefix, then run one dense denoise batch per CFG branch.
+
+        A prefix is written back from the model-local decode buffer before the
+        next request can load it. This does not enable interleaved AR prepare.
+        """
+        keys = [
+            (build_request_batch_sampling_params_key(r), request_condition_key(r.prompt, r.sampling_params))
+            for r in req.requests
+        ]
+        if any(key != keys[0] for key in keys[1:]):
+            raise ValueError("SenseNova request batch requires compatible image, schedule, CFG and LoRA settings")
+        mode = request_mode(req.prompts[0])
+        if mode == "text":
+            raise ValueError("SenseNova text output supports one request per forward")
+        if getattr(self.od_config, "cache_backend", "none") not in (None, "none"):
+            raise ValueError("SenseNova request batching requires cache_backend='none'")
+
+        params = [self._parse_request(DiffusionRequestBatch([r])) for r in req.requests]
+        counts = [p.batch_size for p in params]
+        states, prefixes, texts = [], [], []
+        caches = {}
+        try:
+            for p in params:
+                ns = self._init_noise_and_schedule(p)
+                images = self._extract_input_images(p.first_prompt)
+                ctx = self._it2i_prefix(p, ns, images) if mode == "it2i" else self._t2i_prefix(p, ns)
+                if ctx.cursor is not None:
+                    while not ctx.cursor.finished:
+                        self._think_step(ctx.cursor)
+                make_caches = self._it2i_caches if mode == "it2i" else self._t2i_caches
+                prefix, text = make_caches(p, ns, ctx, prepare_flash=False)
+                states.append(ns)
+                prefixes.append(prefix)
+                texts.append(text)
+            caches = merge_conditioning(prefixes, counts, states[0].token_h * states[0].token_w)
+            prefixes.clear()
+            del prefix, ctx
+            p = SimpleNamespace(**vars(params[0]))
+            p.batch_size = sum(counts)
+            ns = SimpleNamespace(**vars(states[0]))
+            ns.grid_hw = torch.cat([state.grid_hw for state in states])
+            image_prediction = torch.cat([state.image_prediction for state in states])
+            ns.image_prediction = None
+            states.clear()
+            for step_i in range(p.num_steps):
+                z, velocity = self._denoise_one(image_prediction, ns, caches, p, step_i, mode == "it2i")
+                image_prediction = self._advance_latents(z, ns, p, step_i, velocity)
+            outputs = []
+            start = 0
+            for count, text in zip(counts, texts, strict=True):
+                outputs.append(self._denoising_output({}, image_prediction[start : start + count], text))
+                start += count
+            return outputs
+        finally:
+            for branch in ("cond", "uncond", "img_cond"):
+                if branch in caches:
+                    clear_flash_kv_cache(caches[branch])
 
     def _t2i_prefix(self, p, ns) -> SimpleNamespace:
         """Build both CFG branches and, in think mode, stop at the first token."""
@@ -1489,7 +1570,7 @@ class SenseNovaU1Pipeline(
             ctx.past_kv_cond, _ = self._t2i_prefix_forward(input_ids_cond, indexes_cond, mask_cond)
         return ctx
 
-    def _t2i_caches(self, p, ns, ctx: SimpleNamespace):
+    def _t2i_caches(self, p, ns, ctx: SimpleNamespace, *, prepare_flash=True):
         """Finish the think loop, run the uncond prefix, and assemble the caches."""
         think_text = ""
         indexes_image_cond = ctx.indexes_image_cond
@@ -1502,8 +1583,8 @@ class SenseNovaU1Pipeline(
         input_ids_uncond, indexes_uncond, mask_uncond = ctx.uncond_inputs
         past_kv_uncond, _ = self._t2i_prefix_forward(input_ids_uncond, indexes_uncond, mask_uncond)
 
-        self._expand_and_prepare_kv(past_kv_cond, ns.token_h * ns.token_w, p.batch_size)
-        self._expand_and_prepare_kv(past_kv_uncond, ns.token_h * ns.token_w, p.batch_size)
+        self._expand_and_prepare_kv(past_kv_cond, ns.token_h * ns.token_w, p.batch_size, prepare_flash=prepare_flash)
+        self._expand_and_prepare_kv(past_kv_uncond, ns.token_h * ns.token_w, p.batch_size, prepare_flash=prepare_flash)
 
         caches = {
             "cond": past_kv_cond,
@@ -1598,7 +1679,7 @@ class SenseNovaU1Pipeline(
             )
         return ctx
 
-    def _it2i_caches(self, p, ns, ctx: SimpleNamespace):
+    def _it2i_caches(self, p, ns, ctx: SimpleNamespace, *, prepare_flash=True):
         """Finish the think loop, run the remaining prefixes, and assemble the caches."""
         think_text = ""
         if ctx.cursor is not None:
@@ -1652,7 +1733,9 @@ class SenseNovaU1Pipeline(
         # Expand all KV caches for batch
         for key in ("cond", "img_cond", "uncond"):
             if key in caches and not isinstance(caches[key], dict):
-                self._expand_and_prepare_kv(caches[key], ns.token_h * ns.token_w, p.batch_size)
+                self._expand_and_prepare_kv(
+                    caches[key], ns.token_h * ns.token_w, p.batch_size, prepare_flash=prepare_flash
+                )
 
         return caches, think_text
 
@@ -1715,7 +1798,7 @@ class SenseNovaU1Pipeline(
                 clear_flash_kv_cache(caches[key])
 
         images = _to_pil(image_prediction)
-        img = images[0] if images else None
+        img = images[0] if len(images) == 1 else images
         metadata = {}
         if think_text:
             metadata["text"] = {"think_text": think_text}

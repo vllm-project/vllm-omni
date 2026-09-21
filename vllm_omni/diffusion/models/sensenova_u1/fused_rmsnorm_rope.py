@@ -189,6 +189,13 @@ def triton_qk_norm_rope(
     batch_size, seq_len, head_q, head_dim = q.shape
     head_k = k.shape[2]
 
+    # A shared [1, S, D] table must use a zero batch stride in the kernel;
+    # otherwise multi-image requests read beyond its storage. Per-row tables
+    # already have a real batch dimension and retain their original strides.
+    cos_t, sin_t, cos_h, sin_h, cos_w, sin_w = (
+        table.expand(batch_size, -1, -1) for table in (cos_t, sin_t, cos_h, sin_h, cos_w, sin_w)
+    )
+
     query = torch.empty((batch_size, head_q, seq_len, head_dim), device=q.device, dtype=q.dtype)
     key = torch.empty((batch_size, head_k, seq_len, head_dim), device=k.device, dtype=k.dtype)
     grid = (

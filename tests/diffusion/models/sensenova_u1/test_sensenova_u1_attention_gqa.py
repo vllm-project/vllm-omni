@@ -136,6 +136,28 @@ def test_prefill_still_gets_a_causal_mask():
     assert mask[0, 0, 2, 1] == 0.0
 
 
+@pytest.mark.parametrize("batched", [False, True])
+def test_model_preserves_request_specific_rope_positions(batched):
+    host = _ModelHost(_MaskProbe())
+    positions = []
+
+    def rope(hidden_states, ids):
+        positions.append(ids)
+        return hidden_states, hidden_states
+
+    host.rotary_emb = host.rotary_emb_hw = rope
+    indexes = torch.arange(3 * 2 * 4).reshape(3, 2, 4) if batched else torch.arange(12).reshape(3, 4)
+    host.forward(
+        inputs_embeds=torch.zeros(2, 4, 8),
+        indexes=indexes,
+        attention_mask={"full_attention": None},
+        image_gen_indicators=torch.ones(2, 4, dtype=torch.bool),
+    )
+    for axis, actual in enumerate(positions):
+        expected = indexes[axis] if batched else indexes[axis].unsqueeze(0)
+        torch.testing.assert_close(actual, expected)
+
+
 # ---------------------------------------------------------------------------
 # The decode path changes which SDPA kernel runs, so it is not bit-identical to
 # what it replaced. "Different" would be a regression if the new result were

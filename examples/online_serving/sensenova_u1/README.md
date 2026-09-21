@@ -30,6 +30,39 @@ vllm serve SenseNova/SenseNova-U1-8B-MoT --omni --port 8091 \
     --tensor-parallel-size 2
 ```
 
+### Request-mode image batching (B2 draft)
+
+This draft is stacked on B1 (#7730), commit `8c971ea1c6ee`.
+Keep `step_execution=False` (the default), use `cache_backend="none"`,
+and set `max_num_seqs` above one to admit compatible image requests together.
+`request_batch_max_wait_ms` can provide a short admission window for arrivals
+to coalesce. These are engine settings, not per-request image counts.
+
+The pipeline prepares each request's prefix/think to completion in sequence,
+saves its KV, then fuses the denoise forwards across requests. Variable-length
+prefixes are padded and masked, with each request retaining its original RoPE
+positions and seeded noise. This uses dense denoise KV; it does not introduce
+interleaved AR prepare or Scheduler-owned AR KV rows.
+
+Requests must agree on output dimensions, image count, denoise schedule, CFG
+settings, LoRA and the scheduler's other compatibility fields. T2I and IT2I
+are separate groups. Prompts, seeds and think lengths may differ. Text output
+is scheduled as singleton requests. Multi-request batches with cache
+acceleration are rejected by the pipeline.
+
+For multiple images per prompt, use `OmniDiffusionSamplingParams`'s
+`num_outputs_per_prompt=M`. The legacy `extra_args["batch_size"]` remains an
+alias when the standard count is one; conflicting non-default counts are
+rejected. Every request returns all its images in order, along with its own
+think metadata. With `N` compatible requests, the denoise batch has `N * M`
+rows; account for the corresponding activation and padded-KV memory.
+
+B1's step-mode `max_num_seqs=1` restriction is unchanged. Request batching
+does not make the shared paged AR decode allocation safe for interleaved
+prepare. A single-rank full-checkpoint smoke test covers fused request batches
+and `N=2, M=2` output routing. Production-resolution image-quality,
+throughput and multi-rank validation remain draft acceptance work.
+
 ## Send Requests
 
 ```bash

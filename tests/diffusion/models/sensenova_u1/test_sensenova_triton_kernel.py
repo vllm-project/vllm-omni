@@ -166,15 +166,15 @@ def reference_kernel(
     return query, key
 
 
-def make_input(seq_len: int, dtype: torch.dtype, device: torch.device, seed: int) -> KernelInput:
+def make_input(seq_len: int, dtype: torch.dtype, device: torch.device, seed: int, batch_size: int = B) -> KernelInput:
     gen = torch.Generator(device=device)
     gen.manual_seed(seed + seq_len)
 
     # Match real model layout: q/k/v are views split from fused qkv.
-    qkv = torch.randn(B, seq_len, QKV_DIM, device=device, dtype=dtype, generator=gen)
+    qkv = torch.randn(batch_size, seq_len, QKV_DIM, device=device, dtype=dtype, generator=gen)
     q, k, _v = qkv.split([H_Q * HEAD_DIM, H_K * HEAD_DIM, H_K * HEAD_DIM], dim=-1)
-    q = q.view(B, seq_len, H_Q, HEAD_DIM)
-    k = k.view(B, seq_len, H_K, HEAD_DIM)
+    q = q.view(batch_size, seq_len, H_Q, HEAD_DIM)
+    k = k.view(batch_size, seq_len, H_K, HEAD_DIM)
 
     q_norm_weight = torch.randn(T_DIM, device=device, dtype=dtype, generator=gen)
     k_norm_weight = torch.randn(T_DIM, device=device, dtype=dtype, generator=gen)
@@ -183,8 +183,8 @@ def make_input(seq_len: int, dtype: torch.dtype, device: torch.device, seed: int
 
     # Match Qwen3RotaryEmbedding: emb = torch.cat((freqs, freqs), dim=-1).
     def make_rope_pair(dim: int) -> tuple[torch.Tensor, torch.Tensor]:
-        cos_half = torch.randn(B, seq_len, dim // 2, device=device, dtype=dtype, generator=gen)
-        sin_half = torch.randn(B, seq_len, dim // 2, device=device, dtype=dtype, generator=gen)
+        cos_half = torch.randn(batch_size, seq_len, dim // 2, device=device, dtype=dtype, generator=gen)
+        sin_half = torch.randn(batch_size, seq_len, dim // 2, device=device, dtype=dtype, generator=gen)
         return torch.cat((cos_half, cos_half), dim=-1), torch.cat((sin_half, sin_half), dim=-1)
 
     cos_t, sin_t = make_rope_pair(T_DIM)
@@ -230,3 +230,19 @@ def test_fused_qk_norm_rope_matches_reference(seq_len: int, dtype: torch.dtype, 
 
     assert_close_with_error_stats(out_q, ref_q, name="query", atol=atol, rtol=rtol)
     assert_close_with_error_stats(out_k, ref_k, name="key", atol=atol, rtol=rtol)
+
+
+@triton_available
+@pytest.mark.parametrize("batch_size", [2, 4])
+@pytest.mark.parametrize("shared_positions", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_batched_rope_matches_reference(batch_size, shared_positions, dtype):
+    data = make_input(9, dtype=dtype, device=DEVICE, seed=SEED, batch_size=batch_size)
+    args = data.args()
+    if shared_positions:
+        args = args[:6] + tuple(table[:1] for table in args[6:])
+    expected = reference_kernel(*args)
+    actual = triton_qk_norm_rope(*args, EPS)
+    tolerance = 1e-5 if dtype == torch.float32 else 3e-2
+    for got, want in zip(actual, expected, strict=True):
+        torch.testing.assert_close(got, want, atol=tolerance, rtol=tolerance)
