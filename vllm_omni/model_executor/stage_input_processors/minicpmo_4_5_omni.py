@@ -164,10 +164,11 @@ def _codec_config(transfer_manager: Any) -> tuple[int, int]:
 
 
 def _initial_chunk_frames(transfer_manager: Any, chunk_frames: int) -> int:
-    """第 13 项（2026-09-20 实测采纳）：首个 payload 的窗口帧数。
+    """First-payload window size in frames.
 
-    读 connector extra 里的 ``initial_codec_chunk_frames``；未配置、非正数、
-    或不小于稳态 ``codec_chunk_frames`` 时一律回落成稳态值（等价于本项关闭）。
+    Reads ``initial_codec_chunk_frames`` from the connector extra; falls back to
+    the steady-state value when absent, non-positive, or not smaller than the
+    steady ``codec_chunk_frames`` (which means the feature is off).
     """
     connector = getattr(transfer_manager, "connector", None)
     raw_config = getattr(connector, "config", {}) or {}
@@ -347,9 +348,10 @@ def tts2code2wav_async_chunk(
     request_finished = getattr(request, "is_finished", None)
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
-    # 第 13 项（2026-09-20 实测采纳）：首块窗口。首个 payload（此时 chunk_seq 还是 0）
-    # 用 initial_codec_chunk_frames，之后的 payload 回到稳态 chunk_frames；
-    # 未配置时 first_window == chunk_frames，行为与改动前逐位一致。
+    # First-payload window: the payload with chunk_seq == 0 uses
+    # initial_codec_chunk_frames; later payloads return to the steady
+    # chunk_frames. When unset, first_window == chunk_frames and behavior is
+    # unchanged.
     first_window = (
         _initial_chunk_frames(transfer_manager, chunk_frames)
         if int(record["chunk_seq"]) == 0

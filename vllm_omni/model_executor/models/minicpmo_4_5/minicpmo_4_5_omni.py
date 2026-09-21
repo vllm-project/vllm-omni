@@ -634,20 +634,22 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             return model_outputs
         return self.talker.make_omni_output(model_outputs, **kwargs)
 
-    # 第 8 项（K 步多帧解码）在 runner 侧的四个转发（2026-09-21 迁移补齐）。
-    # 基线的这四个方法就写在这个外层包装类上，迁移时整段漏掉。runner 只看得见这个
-    # 包装类（`_model_forward` 里 talker_multiframe.applies / is_multi_token_decode /
-    # 以及 `ensure_stop_token_vocab` 的判定全部是 `getattr(model, ...)`），所以：
-    #   · 缺 `supports_multi_frame_decode` → 判定静默取到 False → 多帧循环永不进入，
-    #     且连"拒绝原因"都不打日志（applies 那条分支是静默返回 0）；
-    #   · 缺 take/set_batch_stop_logits → 每帧的 stop 行拿不到；
-    #   · 缺 merge_frame_outputs → 多帧结果无法合并。
-    # 后果：K 步的投机配置已经进了引擎（vLLM 层在做投机解码），但 runner 侧的多帧
-    # 循环不进入、循环里的词表宽度修正（ensure_stop_token_vocab）也不执行，
-    # 于是拒绝采样器按宽度 0 消费、AIV 越界（507035）、stage-1 引擎崩、音频全空。
+    # Runner-side forwards for multi-frame decode. The baseline declares these
+    # four methods on this outer wrapper class; the runner only ever sees the
+    # wrapper (talker_multiframe.applies / is_multi_token_decode /
+    # ensure_stop_token_vocab all resolve through getattr(model, ...)), so
+    # without them:
+    #   * missing supports_multi_frame_decode -> the check silently reads False,
+    #     the multi-frame loop never runs and no reason is logged;
+    #   * missing take/set_batch_stop_logits -> per-frame stop rows unavailable;
+    #   * missing merge_frame_outputs -> multi-frame results cannot be merged.
+    # The speculative config alone is not enough: the runner-side loop and its
+    # vocab-width correction (ensure_stop_token_vocab) stay dormant, the
+    # rejection sampler consumes width-0 rows, AIV goes out of bounds (507035)
+    # and the stage-1 engine dies with empty audio.
     @property
     def supports_multi_frame_decode(self) -> bool:
-        # 这些方法在两类 stage 上都在，只有 Talker（tts）能走多帧，故按 stage 判定。
+        # Present on both stage kinds; only the Talker (tts) path uses it.
         return self.model_stage == "tts"
 
     def take_batch_stop_logits(self):

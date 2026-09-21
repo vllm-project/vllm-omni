@@ -68,16 +68,17 @@ logger = init_logger(__name__)
 _LOGGED_ENGAGE = False
 
 # ---------------------------------------------------------------------------
-# K 步逐帧计时（默认关，关掉时 run() 里一个 timer 都不取）
+# Per-step/per-frame timers for the multi-frame loop (off by default; when off,
+# run() takes no timers at all).
 #
-#   VLLM_OMNI_MINICPMO_KSTEP_PROF=1        打开
-#   VLLM_OMNI_MINICPMO_KSTEP_PROF_STEPS=3  前 N 个 step 逐帧打点并做设备同步取样
-#   VLLM_OMNI_MINICPMO_KSTEP_PROF_EVERY=25 每 N 个 step 打一行累计摘要
+#   VLLM_OMNI_MINICPMO_KSTEP_PROF=1        enable
+#   VLLM_OMNI_MINICPMO_KSTEP_PROF_STEPS=3  sample the first N steps with a device sync
+#   VLLM_OMNI_MINICPMO_KSTEP_PROF_EVERY=25 print a cumulative summary every N steps
 #
-# 要回答的问题只有一个：一步 8 帧的墙钟时间，到底花在 host 入队（replay/after_forward）
-# 还是花在设备执行上。replay/after_forward 是入队耗时（异步），synced 是在其后加一次
-# 设备同步测到的真实帧耗时 —— 两者相差多少，就是设备侧的账。
-# 诊断代码永不许抛异常：任何异常只把本 profiling 永久关掉并记一条 warning。
+# Purpose: split one K-frame step's wall time between host enqueue (replay/
+# after_forward, asynchronous) and device execution (synced, measured after an
+# explicit synchronize). Diagnostics never raise: on any error they turn
+# themselves off permanently and log one warning.
 # ---------------------------------------------------------------------------
 _PROF_ENV = "VLLM_OMNI_MINICPMO_KSTEP_PROF"
 _PROF_STEPS_ENV = "VLLM_OMNI_MINICPMO_KSTEP_PROF_STEPS"
@@ -155,7 +156,7 @@ def _prof_frame_line(step: int, frame: int, replay_ms: float, after_ms: float, s
 
 
 def _prof_summary(steps: int, frames_total: int, last_frames: int, *, detail: bool) -> None:
-    """累计一行：每步/每帧墙钟，以及 host 入队与设备执行各自的账。"""
+    """One cumulative line: per-step/per-frame wall time, host enqueue vs device execution."""
     try:
         per_step = _PROF_TOTAL_MS / steps if steps else 0.0
         per_frame = _PROF_TOTAL_MS / frames_total if frames_total else 0.0
@@ -256,13 +257,15 @@ def _prof_step_end(prof: "_StepProf | None", step_start: float) -> None:
     except Exception:
         _prof_disabled("step_end")
 # ---------------------------------------------------------------------------
-# K 步 stop 取证（默认关）
+# Stop-row forensics for the multi-frame loop (off by default).
 #
 #   VLLM_OMNI_MINICPMO_KSTEP_STOP_TRACE=1
 #
-# 只回答一个问题：一步 K 帧里，模型到底有没有产出 stop 行。有 stop 行而请求
-# 仍跑到 max_tokens，丢在 vLLM 的 spec 记账侧；一行都没有，丢在多帧的采样/状态
-# 传递侧。前 50 步各打一行，之后静默。诊断组件永不抛异常。
+# Answers one question: does the model actually emit stop rows within the K
+# frames of a step? Rows present but the request still runs to max_tokens means
+# the loss is in vLLM's spec bookkeeping; no rows at all means it is in the
+# multi-frame sampling/state path. Prints the first 50 steps, then goes quiet.
+# Never raises.
 # ---------------------------------------------------------------------------
 _STOP_TRACE_ENV = "VLLM_OMNI_MINICPMO_KSTEP_STOP_TRACE"
 _STOP_TRACE_STEPS = 50
@@ -279,7 +282,7 @@ def stop_trace_enabled() -> bool:
 
 
 def _trace_stop_rows(frame_stop_logits: list[torch.Tensor]) -> None:
-    """每步一行：每个请求的 K 帧里各有几帧的 stop 行是 stop。"""
+    """One line per step: how many of each request's K frames carry a stop row."""
     global _STOP_TRACE_COUNT
     try:
         if _STOP_TRACE_COUNT >= _STOP_TRACE_STEPS:
@@ -301,20 +304,21 @@ _STOP_KB_COUNT = 0
 
 
 def trace_kstep_bookkeeping(runner: Any, valid_sampled_token_ids: Any, logits: Any) -> None:
-    """[kstep-stop] 第二层：stop 走完 spec 记账之后还剩什么。
+    """Stop trace, layer 2: what survives spec bookkeeping.
 
-    两条事实一起打，一次就能把"stop 去哪了"钉死在某一层：
+    Two facts are printed together so the loss point is unambiguous:
 
-    * ``carried`` -- rejection sampler 交给请求的 token 序列（前 4 个请求）。
-      里面有 1 说明 stop 进了请求自己的 token 表，后面就只剩 engine 侧的结束判定；
-      一排 0 而没有 1 说明 stop 在到这里之前就没了。
-    * ``min_toks`` -- vLLM 的 MinTokens 处理器里还有哪些请求在 mask 名单上，
-      以及它看到的 output 长度（``(index, min_tokens, len(output_token_ids),
-      sorted(stop_ids))``）。**只要某个请求还在这张名单上，它的 stop 列就是
-      -inf**；如果 ``len(output_token_ids)`` 始终不涨，这张名单就永远不会被
-      清掉，请求也就永远停不下来。
+    * ``carried`` -- tokens the rejection sampler handed to the request (first
+      4 requests). A 1 means the stop token reached the request's own token
+      table; then only the engine-side finish check remains. All zeros with no
+      1 means the stop disappeared earlier.
+    * ``min_toks`` -- requests still on the MinTokens mask list, with the output
+      length it sees: ``(index, min_tokens, len(output_token_ids),
+      sorted(stop_ids))``. While a request is on this list its stop columns are
+      -inf; if ``len(output_token_ids)`` never grows, the entry is never
+      cleared and the request can never stop.
 
-    诊断组件永不抛异常：出错只关掉自己。
+    Never raises: on error it only disables itself.
     """
     global _STOP_KB_COUNT
     try:
@@ -349,21 +353,25 @@ def trace_kstep_bookkeeping(runner: Any, valid_sampled_token_ids: Any, logits: A
 
 
 def neutralize_kstep_min_tokens(logitsprocs: Any) -> None:
-    """K 步下让 vLLM 层的 ``min_tokens`` 不再 censoring 停止信号。
+    """Stop vLLM's ``min_tokens`` layer from censoring the stop signal.
 
-    yaml 的 ``min_tokens: 50`` 在 K 步下是通过 **把 stop token（id 1）的 logit
-    置成 -inf** 实现的（``MinTokensLogitsProcessor``）。它自己的解除条件是
-    ``len(output_token_ids) >= min_tokens``，而这个长度归 vLLM 的 spec 记账管；
-    只要那个计数没有推进到位，请求唯一的停止信号就被永久 mask，
-    ``finished_reason`` 只能是 ``length``（910C 现场：stage1 全 length、0 stop）。
+    The yaml ``min_tokens: 50`` is enforced by ``MinTokensLogitsProcessor``
+    writing -inf into the stop-token logits. It unmasks once
+    ``len(output_token_ids) >= min_tokens``, a counter owned by vLLM's spec
+    bookkeeping; while that counter lags, the request's only stop signal stays
+    masked and ``finished_reason`` can only be ``length`` (observed on stage 1:
+    all length, zero stop).
 
-    真正的"最小帧数"保护不在这里：``talker_codec_sample.greedy_codec_sample``
-    用 ``state.step < min_tokens`` 把 codec EOS 本身压成 -inf，用的是模型自己
-    的帧计数，与 vLLM 的 token 记账无关。所以这一层是重复的、且在 K 步下会
-    把停止信号一起吃掉 —— 清空它的名单，把最小长度交还给模型内的那道保护。
+    The real minimum-length guard lives elsewhere:
+    ``talker_codec_sample.greedy_codec_sample`` masks the codec EOS itself via
+    ``state.step < min_tokens``, using the model's own frame counter. This vLLM
+    layer is therefore redundant and, under multi-frame decode, also swallows
+    the stop signal -- clear its list and leave the minimum to the model-side
+    guard.
 
-    ``min_toks`` 每个 step 都会被 ``update_state`` 重新登记，所以本函数必须
-    每步调用（调用点在 runner 的采样前）。永不抛异常。
+    ``min_toks`` is re-registered by ``update_state`` every step, so this must
+    be called every step (the caller places it right before sampling). Never
+    raises.
     """
     try:
         for proc in getattr(logitsprocs, "non_argmax_invariant", None) or []:
@@ -605,10 +613,10 @@ def begin_narrow_step(
     from vllm.config import CUDAGraphMode
     from vllm.forward_context import BatchDescriptor
 
-    # 迁移注记（2026-09-21）：narrow replay 所需的 KV 几何由第 6 项
-    # （platforms/npu/attention/fixed_kv_decode）提供，本分支未迁第 6 项。
-    # 这里容错导入：模块缺席时按本函数既有承诺 decline，调用方回落 wide replay
-    # （见 docstring），K 步解码与停止链不受影响。
+    # The KV geometry required by narrow replay lives in
+    # platforms/npu/attention/fixed_kv_decode, which may be absent. Import
+    # defensively: when missing, decline as documented and let the caller fall
+    # back to wide replay; multi-frame decode and the stop chain are unaffected.
     try:
         from vllm_omni.platforms.npu.attention import fixed_kv_decode
     except Exception:

@@ -34,14 +34,15 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 logger = init_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# K 步记账 trace（默认关）
+# Multi-frame bookkeeping trace (off by default).
 #
 #   VLLM_OMNI_MINICPMO_KSTEP_ACCOUNT_TRACE=1
 #
-# 回答的问题：模型已经在发 row_stop，为什么请求不停？记每一步每个请求"被接受的
-# token 值"——若它恒为 0（continue），说明 stop 行没有变成请求 token 表里的 1，
-# check_stop(stop_token_ids=[1]) 永远不会触发，请求就会一路走到 max_model_len。
-# 契约：诊断永不抛异常。
+# Question it answers: the model already emits stop rows, so why does the
+# request not finish? It logs each request's accepted token values per step --
+# if they stay 0 (continue), the stop row never became a 1 in the request's
+# token table and check_stop(stop_token_ids=[1]) never fires, so the request
+# runs to max_model_len. Diagnostics never raise.
 # ---------------------------------------------------------------------------
 _KSTEP_ACCOUNT_TRACE_ENV = "VLLM_OMNI_MINICPMO_KSTEP_ACCOUNT_TRACE"
 _KSTEP_ACCOUNT_TRACE: dict = {"lines": 0, "reqs": {}, "off": False}

@@ -20,17 +20,9 @@ connectors:
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
       codec_chunk_frames: 25
-      # 第 13 项（2026-09-20 实测采纳）：首块缝 25 帧 —— 首个 payload 用更小的窗口，
-      # 让音频首包更早出来。实测（r17 对照 r16）：c1 -7.4%、c4 +2.8%、c8 +13.3%
-      # （相对 r14 基线仍 -3.8%）；WER 干净态复测 1.2179% = 基线，零质量代价。
-      #
-      # !! 生效条件 / 迁移依赖：本项仅在 initial < codec_chunk_frames 时生效。
-      # 迁移来源分支 rtf-validated-optimizations 的稳态块长是 75，故那里的 25 生效；
-      # 而 main 此处的稳态块长是 25，25 >= 25 会按 _initial_chunk_frames 的回落规则
-      # **视为关闭**（等价于不加这一行，不会出错）。若要让本项在 main 上真正生效，
-      # 需先把基座 codec_chunk_frames 调到 >25（例如 75）—— 那是基座配置差异，
-      # 不在本项迁移范围内，需单独决策。不要把这里调成 <25：历史上 12 帧会引入
-      # 中缝、WER 翻倍（kstep_910b_validation_and_self_review.md §11.1）。
+      # Smaller first payload so the first audio packet is emitted earlier.
+      # Takes effect only when initial < codec_chunk_frames; values far below
+      # the steady-state chunk length add a seam between chunks and hurt WER.
       initial_codec_chunk_frames: 25
       codec_left_context_frames: 3
       # HiFT capture buckets are derived from codec_chunk_frames and
@@ -48,23 +40,10 @@ stages:
     # Leave headroom on the shared GPU for Talker KV + concurrent Code2Wav.
     gpu_memory_utilization: 0.55
     enforce_eager: false
-    # 第 2 项（图模式 + 前缀缓存 + stage2 去 eager）—— "前缀缓存"部分。
-    # 顶层 enable_prefix_caching 保持 false（双工安全），这里给 stage0 单独打开，
-    # 让 stage0 的重复前缀得以复用。
-    # 该项另两部分 main 上已有，无需迁移：图模式（enable_hift_graph /
-    # enable_cfm_graph）、stage2 去 eager（code2wav_enable_npu_graph）。
-    # 收益（旧代码实测口径，仅方向参考）：-22.0% / -3.9% / +1.1%（三档）。
+    # Stage-level prefix caching override; the top level stays false for duplex safety.
+    # Stage-0 n-gram speculative decoding is intentionally not enabled here: vLLM
+    # rejects prefix caching together with speculative decoding.
     enable_prefix_caching: true
-    # 第 3 项（stage0 ngram 投机，k=14）：N-gram speculative decoding。
-    # async_scheduling 必须保持 false —— vLLM 的 VllmConfig 校验拒绝
-    # "async_scheduling + ngram proposer" 这个组合。
-    # 收益（旧代码实测口径，仅方向参考）：RTF -11.8% / -3.7% / -5.9%（三档）、TTFT -69%。
-    async_scheduling: false
-    speculative_config:
-      method: ngram
-      num_speculative_tokens: 14
-      prompt_lookup_min: 1
-      prompt_lookup_max: 1
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
     devices: "0"
@@ -154,9 +133,8 @@ platforms:
         compilation_config:
           cudagraph_mode: PIECEWISE
       - stage_id: 1
-        # 第 9 项（2026-09-20 实测采纳）：stage1 并发上限 4→8。
-        # npu 覆盖块原先只写了 stage0 / stage2，stage1 沿用基座的 4，这一格是漏配。
-        # 收益：r16 对照 r14 基线 c8 −15.1%、c4 −3.5%、c1 −1.1%。
+        # Stage-1 concurrency cap raised from 4 to 8. The NPU override block
+        # only covered stages 0 and 2, so stage 1 kept the base value of 4.
         max_num_seqs: 8
         max_num_batched_tokens: 8192
         compilation_config:
@@ -166,9 +144,9 @@ platforms:
         # estimator kernels through the NPU platform patch.
         additional_config:
           code2wav_enable_npu_graph: true
-          # 第 10 项（2026-09-20 实测采纳）：NPU 图池 32→64。32 个形状不够时会触顶，
-          # 之后的形状永久退化为 eager。收益（r34 对照 r22）：c4 -17.0% / c8 -23.5% / c1 +5.8%。
-          # 注：该项以第 11 项（CFM mel 分桶，bucket_frames=16）为前置稳定性支撑
-          # （把捕获形状数从 64 压到 19，池扩容才可持续）；main 上已有
-          # cfm_graph_bucket_frames: 16，故第 11 项无需迁移。
+          # NPU graph pool raised from 32 to 64. Once the 32 captured shapes are
+          # exhausted, later shapes permanently degrade to eager. The CFM mel
+          # bucketing already present in main (cfm_graph_bucket_frames: 16) keeps
+          # the captured shape count at 19, which is what makes a pool this size
+          # sustainable.
           code2wav_max_npu_graphs: 64

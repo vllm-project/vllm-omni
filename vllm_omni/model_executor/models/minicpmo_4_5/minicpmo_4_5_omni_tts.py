@@ -343,19 +343,21 @@ def resolve_codec_sampling_params(
 
 
 # ---------------------------------------------------------------------------
-# K 步逐帧诊断（默认关，与 talker_multiframe 的逐步计时互补）
+# Per-frame trace for the multi-frame loop (off by default; complements the
+# per-step timers in talker_multiframe).
 #
-#   VLLM_OMNI_MINICPMO_KSTEP_FRAME_TRACE=1   打开
-#   最多打 _KSTEP_FRAME_TRACE_FRAMES 帧，然后静默
+#   VLLM_OMNI_MINICPMO_KSTEP_FRAME_TRACE=1  enable
+#   prints at most _KSTEP_FRAME_TRACE_FRAMES frames, then goes quiet
 #
-# 回答逐步计时回答不了的那个问题：K 循环里**模型自己的采样器**有没有走到 EOS，
-# 以及每一帧实际吃进去的 code 是不是上一帧的采样值（契约不变式 I1）。
-# 契约：诊断永不许反杀引擎 —— 任何异常只把本诊断永久关掉并记一条 warning。
+# Answers what the per-step timers cannot: whether the model's own sampler
+# reaches EOS inside the K loop, and whether each frame is fed the previous
+# frame's sampled code (frame-order invariant). Diagnostics never take the
+# engine down: on any error they disable themselves and log one warning.
 # ---------------------------------------------------------------------------
 _KSTEP_FRAME_TRACE_ENV = "VLLM_OMNI_MINICPMO_KSTEP_FRAME_TRACE"
-_KSTEP_FRAME_TRACE_LINES = 128   # 打点行数上限
-_KSTEP_FRAME_TRACE_HEAD = 16     # 头 N 帧逐帧（用于校验帧序不变式 I1）
-_KSTEP_FRAME_TRACE_STRIDE = 16   # 之后每 N 帧一条（覆盖到约第 1800 帧，够看 EOS）
+_KSTEP_FRAME_TRACE_LINES = 128   # max printed lines
+_KSTEP_FRAME_TRACE_HEAD = 16     # first N frames printed one by one (frame-order check)
+_KSTEP_FRAME_TRACE_STRIDE = 16   # then one line every N frames (covers ~1800 frames)
 _KSTEP_FRAME_TRACE: dict[str, Any] = {"reqs": {}, "lines": 0, "off": False}
 
 
@@ -399,7 +401,7 @@ def _trace_kstep_frame(model: Any, **fields: Any) -> None:
             device_states.get(fields.get("request_id")) if isinstance(device_states, dict) else None
         )
         device_step = int(device_state.step.reshape(-1)[0].item()) if device_state is not None else -1
-        state["lines"] += 1  # 只防刷屏，窗口按请求单独计数
+        state["lines"] += 1  # cap printed lines only; per-request windows count separately
         logger.info(
             "[kstep-frame] frame=%d req=%s step=%s->%s device_step=%s in_code=%s row=%s "
             "sampled=%s is_eos=%s limit=%s finished=%s ctx=%s min=%s max=%s",
@@ -1150,16 +1152,18 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             else:
                 codes = codes.to(device=hidden.device, dtype=torch.long).reshape(-1)
             step = _codec_int_param(state, "step", 0)
-            # 迁移注记（2026-09-21，待设备复测后决定是否接线）：main 侧的 turn-end
-            # 语义要求 turn-end 排空块在每个 25 帧 cadence 边界后的 5 步内屏蔽 codec
-            # EOS（见本文件 _turn_end_boundary_eos_masked 与 state["turn_end_drain"]，
-            # MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS 为 4 个 chunk，故窗口落在
-            # step 25-29 / 50-54 / 75-79 / 100-103）。第 8 项把 EOS 屏蔽移进了采样核
-            # （talker_codec_sample.prepare_codec_logits / greedy_codec_sample），其判据
-            # 是 state.step < min_tokens，而 min_tokens 是每请求缓存的张量
-            # （_request_codec_device_inputs），此处无法逐帧表达该周期窗口 —— 因此本项
-            # 迁移后该窗口屏蔽未接线，只影响双工 turn-end（离线/TTS 路径不受影响）。
-            # 本文件保留了 main 的常量、budget 与 turn_end_drain 状态标志。
+            # Note: main's turn-end semantics require masking codec EOS within 5
+            # steps after each 25-frame cadence boundary (see
+            # _turn_end_boundary_eos_masked and state["turn_end_drain"];
+            # MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS is 4 chunks, so the window
+            # lands on steps 25-29 / 50-54 / 75-79 / 100-103). The EOS masking
+            # moved into the sampling core (talker_codec_sample.
+            # prepare_codec_logits / greedy_codec_sample), whose criterion is
+            # state.step < min_tokens with min_tokens a per-request cached
+            # tensor, so that periodic window cannot be expressed per frame here
+            # and is left unwired. It only affects duplex turn-end; the
+            # offline/TTS path is unaffected. The constants, budget and
+            # turn_end_drain flag from main are kept in this file.
             min_tokens = _codec_int_param(state, "min_tokens", self._codec_min_tokens)
             max_tokens = _codec_int_param(state, "max_tokens", self._codec_max_tokens)
             if self._codec_temperature == 0.0:

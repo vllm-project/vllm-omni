@@ -281,9 +281,10 @@ class MiniCPMO45Code2Wav(nn.Module):
             raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be >= 0")
         if self._initial_batch_size and self._initial_batch_size < self._min_batch_size:
             raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be 0 or >= code2wav_min_batch_size")
-        # 第 49 项（2026-09-20 实测采纳，env 门控默认关）：强制 stage2 每个解码批
-        # 只有 1 行，使 CFM 确定性地走 even 路径（批内等长 → 图回放），绕开
-        # mixed-length 批的 ragged eager 链。数值路径零改动（even 是原有代码路径）。
+        # Force stage 2 to decode a single row per batch so CFM deterministically
+        # takes the even path (equal-length rows -> graph replay) instead of the
+        # ragged eager chain for mixed-length batches. Numerics are unchanged
+        # (even is an existing code path).
         self._single_row_batch = os.environ.get("VLLM_OMNI_C2W_SINGLE_ROW", "") == "1"
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
         self._prompt_wav_override = extra.get("prompt_wav")
@@ -671,8 +672,9 @@ class MiniCPMO45Code2Wav(nn.Module):
     ) -> Iterable[list[_WorkItem]]:
         for bucket in buckets:
             if self._single_row_batch:
-                # 第 49 项：每批 1 行 → 每次 CFM 调用都落在 even 路径上
-                # （批内等长 → 图回放）。刻意绕过下面的波次切分与 min-batch 门。
+                # One row per batch -> every CFM call lands on the even path
+                # (equal-length rows -> graph replay), intentionally bypassing
+                # the wave split and min-batch gate below.
                 for item in bucket:
                     yield [item]
                 continue
