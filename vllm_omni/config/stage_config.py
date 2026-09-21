@@ -785,6 +785,40 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
 # model-side gate accepts.
 _MINICPMO_TALKER_FRAMES_MAX = 16
 
+# Frames the deploy layer declared for stage 1's Talker multi-frame decode,
+# recorded when a deploy config is parsed. NPU workers inherit the value across
+# the fork, so a reader that runs before the engine hands the runner its
+# vllm_config -- the warmup guard is one -- sees the same decision.
+_resolved_talker_frames: int = 1
+
+
+def talker_frames_per_step() -> int:
+    """Codec frames one stage-1 step produces, per the last deploy config parsed.
+
+    1 means the deploy layer did not ask for the multi-frame loop.
+    """
+    return _resolved_talker_frames
+
+
+def _record_talker_frames(stages: list[StageDeployConfig]) -> None:
+    """Remember stage 1's declared frame count for out-of-band readers.
+
+    Stage 1 carries the multi-frame decode as an n-gram speculative_config
+    whose ``num_speculative_tokens`` is K - 1, so the deploy YAML is the only
+    place the decision is written down.
+    """
+    global _resolved_talker_frames
+    for stage in stages:
+        if stage.stage_id != 1:
+            continue
+        spec = (stage.engine_extras or {}).get("speculative_config") or {}
+        frames = 1
+        if isinstance(spec, dict) and spec.get("method") == "ngram":
+            num_spec = spec.get("num_speculative_tokens", 0) or 0
+            if num_spec > 0:
+                frames = min(int(num_spec) + 1, _MINICPMO_TALKER_FRAMES_MAX)
+        _resolved_talker_frames = frames
+
 
 def load_deploy_config(path: str | Path) -> DeployConfig:
     """Load a deploy YAML (with optional base_config inheritance)."""
@@ -796,6 +830,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         )
 
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
+    _record_talker_frames(stages)
 
     model_runner = raw_dict.get("model_runner", "v1")
     if model_runner not in ("v1", "v2"):
