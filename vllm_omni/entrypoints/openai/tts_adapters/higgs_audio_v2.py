@@ -13,6 +13,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     ARTTSAdapter,
     PreparedRequest,
     apply_max_new_tokens,
+    conditioning_cache_salt,
     resolve_stage_model_path,
 )
 
@@ -55,7 +56,7 @@ class HiggsAudioV2Adapter(ARTTSAdapter):
             prompt_token_ids = input_ids_to_python_list(inputs)
             return tokens_input(prompt_token_ids=prompt_token_ids)
 
-        wav_list, sr, _ = await self._resolve_ref_audio(request.ref_audio)
+        wav_list, sr, cache_key = await self._resolve_ref_audio(request.ref_audio)
         wav = np.asarray(wav_list, dtype=np.float32)
         out = await asyncio.to_thread(
             build_voice_clone_prompt,
@@ -75,7 +76,9 @@ class HiggsAudioV2Adapter(ARTTSAdapter):
         prompt["additional_information"] = {
             "audio_input_ids": out["audio_input_ids"],
             "audio_input_ids_mask": out["audio_input_ids_mask"],
+            "ref_audio_cache_key": cache_key,
         }
+        prompt["cache_salt"] = conditioning_cache_salt(request, prompt["additional_information"])
         return prompt
 
     async def _resolve_higgs_audio_v2_processor(self):
