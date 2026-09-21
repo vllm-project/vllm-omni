@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Gradio demo for VoxCPM2 TTS with gapless streaming audio playback.
 
 Uses a custom AudioWorklet-based player for gap-free streaming
@@ -273,7 +276,10 @@ def _encode_audio(audio_data: tuple) -> str:
         audio_np = np.clip(audio_np, -1.0, 1.0)
         audio_np = (audio_np * 32767).astype(np.int16)
     elif audio_np.dtype != np.int16:
-        audio_np = audio_np.astype(np.int16)
+        # gr.Audio(type="numpy") hands back samples at the source bit depth, so a 24/32-bit
+        # upload arrives at full int32 scale; a bare astype() would wrap it modulo 2**16.
+        shift = 8 * audio_np.dtype.itemsize - 16
+        audio_np = (audio_np >> shift).astype(np.int16) if shift > 0 else audio_np.astype(np.int16) << -shift
     buf = io.BytesIO()
     sf.write(buf, audio_np, sr, format="WAV")
     return f"data:audio/wav;base64,{base64.b64encode(buf.getvalue()).decode()}"

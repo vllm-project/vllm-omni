@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Gradio demo for AURA Omni online serving."""
 
 from __future__ import annotations
@@ -68,8 +68,14 @@ def _audio_to_data_url(audio_file: Any | None) -> str | None:
             audio_np = np.asarray(audio_np)
             if audio_np.ndim > 1:
                 audio_np = audio_np[:, 0]
-            if audio_np.dtype != np.int16:
+            if audio_np.dtype.kind == "f":
                 audio_np = np.clip(audio_np.astype(np.float32), -1.0, 1.0)
+            elif audio_np.dtype != np.int16:
+                # gr.Audio(type="numpy") hands back samples at the source bit depth, so a 24/32-bit
+                # upload arrives at full int32 scale; clipping it to [-1, 1] would flatten it to a
+                # 3-level square wave.
+                shift = 8 * audio_np.dtype.itemsize - 16
+                audio_np = (audio_np >> shift).astype(np.int16) if shift > 0 else audio_np.astype(np.int16) << -shift
             buf = io.BytesIO()
             sf.write(buf, audio_np, int(sample_rate), format="WAV")
             return f"data:audio/wav;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"

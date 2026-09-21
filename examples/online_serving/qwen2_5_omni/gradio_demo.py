@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import argparse
 import base64
 import io
@@ -128,7 +131,10 @@ def audio_to_base64_data_url(audio_data: tuple[np.ndarray, int]) -> str:
             audio_np = np.clip(audio_np, -1.0, 1.0)
             audio_np = (audio_np * 32767).astype(np.int16)
         else:
-            audio_np = audio_np.astype(np.int16)
+            # gr.Audio(type="numpy") hands back samples at the source bit depth, so a 24/32-bit
+            # upload arrives at full int32 scale; a bare astype() would wrap it modulo 2**16.
+            shift = 8 * audio_np.dtype.itemsize - 16
+            audio_np = (audio_np >> shift).astype(np.int16) if shift > 0 else audio_np.astype(np.int16) << -shift
 
     # Write to WAV bytes
     buffered = io.BytesIO()

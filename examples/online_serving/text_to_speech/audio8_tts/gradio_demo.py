@@ -37,7 +37,10 @@ def encode_audio_to_base64(audio_data: tuple) -> str:
         if audio_np.dtype in (np.float32, np.float64):
             audio_np = (np.clip(audio_np, -1.0, 1.0) * 32767).astype(np.int16)
         else:
-            audio_np = audio_np.astype(np.int16)
+            # gr.Audio(type="numpy") hands back samples at the source bit depth, so a 24/32-bit
+            # upload arrives at full int32 scale; a bare astype() would wrap it modulo 2**16.
+            shift = 8 * audio_np.dtype.itemsize - 16
+            audio_np = (audio_np >> shift).astype(np.int16) if shift > 0 else audio_np.astype(np.int16) << -shift
     buf = io.BytesIO()
     sf.write(buf, audio_np, sample_rate, format="WAV")
     return f"data:audio/wav;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
