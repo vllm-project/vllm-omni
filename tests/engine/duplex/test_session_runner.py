@@ -162,7 +162,7 @@ class Harness:
 
     def deliver(
         self,
-        output: object,
+        output: SimpleNamespace,
         *,
         stage_id: int = 1,
         segment_finished: bool = False,
@@ -182,7 +182,7 @@ class Harness:
         )
         return self.runner.on_stage_output(stage_id, output, metrics, request_id=output.request_id, context=context)
 
-    async def deliver_and_settle(self, output: object, **kwargs: Any) -> list[DuplexEvent]:
+    async def deliver_and_settle(self, output: SimpleNamespace, **kwargs: Any) -> list[DuplexEvent]:
         self.deliver(output, **kwargs)
         return await self.settle()
 
@@ -1033,7 +1033,7 @@ async def test_conversation_items_can_be_injected_and_deleted() -> None:
         await close_harness(h)
 
 
-def _stage_metrics_of(event: object) -> dict[str, dict[str, object]]:
+def _stage_metrics_of(event: DuplexEvent) -> dict[str, dict[str, object]]:
     """Per-stage engine metrics as the client reads them off one wire event."""
     payload = event.to_realtime()
     metadata = payload.get("metadata")
@@ -1191,5 +1191,53 @@ async def test_server_vad_speech_stopped_still_commits_a_turn_mode_session() -> 
         assert "input_audio_buffer.speech_stopped" in types(events)
         assert "input_audio_buffer.committed" in types(events)
         assert len(_final_submissions(h)) == 1, "the detector's stop commits the turn and starts the response"
+    finally:
+        await close_harness(h)
+
+
+# --------------------------------------------------------------------------- #
+# Per-response request timing                                                 #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_response_request_metrics_are_measured_from_the_model_turn_request_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-response TTFT/TTFP start when the runner submits the native request, not at response.created.
+
+    The client library and the Omni-DuplexEval benchmark prefer these
+    server-side numbers to their own receive clock, so the response announces
+    them on ``response.created`` and every delta repeats them.
+    """
+    from vllm_omni.engine.duplex.session import model_channel as model_channel_module
+
+    now = {"monotonic": 10.0}
+    monkeypatch.setattr(model_channel_module, "time", SimpleNamespace(monotonic=lambda: now["monotonic"]))
+    h = await open_harness()
+    try:
+        await h.run(append_audio())  # the Stage0 request starts executing at t=10.0
+        request_id = h.stage0_request_id()
+        now["monotonic"] = 10.25
+        events = await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hi"))
+        expected = {
+            "source": "server_monotonic_request_start",
+            "measurement_origin": {
+                "ttft": "native model-turn request execution start to first non-empty text output",
+                "ttfp": "native model-turn request execution start to first audio output",
+            },
+            "ttft_ms": pytest.approx(250.0),
+            "ttfp_ms": pytest.approx(250.0),
+        }
+        created = find(events, "response.created").to_realtime()
+        assert created["response"]["metadata"]["duplex_event"]["response_request_metrics"] == expected
+        delta = find(events, "response.output_audio.delta").to_realtime()
+        assert delta["metadata"]["vllm_omni"]["response_request_metrics"] == expected
+
+        # The first outputs fix the numbers; later units of the same response repeat them.
+        now["monotonic"] = 10.9
+        events = await h.deliver_and_settle(tts_output(request_id, samples=48000, text="hi there"))
+        delta = find(events, "response.output_audio.delta").to_realtime()
+        assert delta["metadata"]["vllm_omni"]["response_request_metrics"] == expected
     finally:
         await close_harness(h)

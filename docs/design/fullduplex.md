@@ -179,7 +179,6 @@ vllm_omni/
 │   │   ├── realtime_input.py        RealtimeEnvelope (query rules, first message), parse_resume_request
 │   │   ├── session_attachment.py    DuplexSessionAttachmentRegistry (resume tokens, replay journal)
 │   │   ├── audio_encoding.py        encode_audio, injected into DuplexOmniEngine for the plugin's data plane
-│   │   ├── chat_completions.py      DuplexChatCompletionsAdapter (/v1/chat/completions on a session per request)
 │   │   └── websocket.py             websocket send/close/receive helpers
 │   └── openai/api_server.py         builds DuplexOmni for duplex models; session-backed app state
 ├── protocol/                        SHARED WIRE CODEC (no engine / no model / no transport)
@@ -430,7 +429,6 @@ follow-up PRs port them (RFC vllm-omni#7181, PR 2/3).
   `tests/entrypoints/openai/test_duplex_session_attachment.py`,
   `tests/entrypoints/openai_api/test_duplex_api_server.py` (the duplex
   server: pipeline probe, app state, routes, warmup gate),
-  `tests/entrypoints/duplex/test_chat_completions_adapter.py`,
   `tests/clients/**`, `tests/engine/test_duplex_import_boundary.py`,
   `tests/model_executor/models/minicpmo_4_5/duplex/**`,
   `tests/worker/test_native_duplex_hooks.py`.

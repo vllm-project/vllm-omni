@@ -165,6 +165,9 @@ class ModelChannel:
         # Anchor the submission time before the RPC; the acceptance callback
         # commits timing state only if the append actually submitted.
         submit_time = time.monotonic()
+        # Per-response TTFT/TTFP start here: the model-turn request begins
+        # executing before the client ever sees response.created.
+        session.mark_model_turn_request_started(helpers.append_fence(session, payload).turn_id, submit_time)
         try:
             result = await self._append_via_data_plane(
                 payload,
@@ -776,7 +779,16 @@ class ModelChannel:
         if response_id is None:
             response_id = session.begin_response(turn_id=model_turn_id)
             response_created = True
-            self._out.emit(self.response_created_payload(response_id, epoch=session.epoch))
+        response_request_metrics = session.mark_response_first_outputs(
+            observed_at_s=time.monotonic(),
+            has_text=has_text,
+            has_audio=has_audio,
+        )
+        if response_created:
+            created_payload = self.response_created_payload(response_id, epoch=session.epoch)
+            if response_request_metrics:
+                created_payload["response_request_metrics"] = dict(response_request_metrics)
+            self._out.emit(created_payload)
         stage_metrics = model_result.get("stage_metrics")
         response_stage_metrics = session.accumulate_response_stage_metrics(
             stage_metrics if isinstance(stage_metrics, Mapping) else None
@@ -791,7 +803,12 @@ class ModelChannel:
                 "end_of_turn": end_of_turn,
                 "model_speak": True,
             }
-            self._attach_runtime_metadata(speak_payload, model_result, stage_metrics=response_stage_metrics)
+            self._attach_runtime_metadata(
+                speak_payload,
+                model_result,
+                stage_metrics=response_stage_metrics,
+                response_request_metrics=response_request_metrics,
+            )
             self._out.emit(speak_payload)
         previous_sent_ms = session.playback.sent_ms
         text_chars_before_append = len("".join(session.assistant_text_buffer))
@@ -854,7 +871,12 @@ class ModelChannel:
         sample_rate_hz = model_result.get("sample_rate_hz") or model_result.get("audio_sample_rate_hz")
         if isinstance(sample_rate_hz, int | float) and int(sample_rate_hz) > 0:
             payload["sample_rate_hz"] = int(sample_rate_hz)
-        self._attach_runtime_metadata(payload, model_result, stage_metrics=response_stage_metrics)
+        self._attach_runtime_metadata(
+            payload,
+            model_result,
+            stage_metrics=response_stage_metrics,
+            response_request_metrics=response_request_metrics,
+        )
         self._out.emit(payload)
         if (
             not end_of_turn
@@ -950,6 +972,7 @@ class ModelChannel:
         model_result: dict[str, object],
         *,
         stage_metrics: Mapping[str, object] | None = None,
+        response_request_metrics: Mapping[str, object] | None = None,
     ) -> None:
         metadata: dict[str, object] = {}
         runtime_impl = model_result.get("runtime_impl")
@@ -972,6 +995,8 @@ class ModelChannel:
                 for stage_id, values in effective_stage_metrics.items()
                 if isinstance(values, Mapping)
             }
+        if response_request_metrics:
+            metadata["response_request_metrics"] = dict(response_request_metrics)
         if metadata:
             payload["vllm_omni"] = metadata
 

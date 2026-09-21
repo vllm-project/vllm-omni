@@ -9,6 +9,7 @@ import asyncio
 import base64
 import json
 from pathlib import Path
+from typing import TypedDict
 
 import pytest
 import websockets
@@ -50,6 +51,13 @@ def _assert_request_metrics(metrics: object, *, expected_count: int) -> None:
         assert isinstance(request["response_id"], str)
         assert request["ttft_ms"] is not None and request["ttft_ms"] >= 0
         assert request["ttfp_ms"] >= 0
+        # TTFT/TTFP are anchored on the server's model-turn request start,
+        # which the engine announces on response.created and every delta;
+        # the client only falls back to its own receive clock without it.
+        assert request["source"] == "server_request_start_and_client_receive", request
+        origin = request["measurement_origin"]
+        assert origin["ttft"].startswith("native model-turn request execution start"), origin
+        assert origin["ttfp"].startswith("native model-turn request execution start"), origin
         assert request["rtf"] is not None and request["rtf"] >= 0
         assert request["audio_generation_ms"] >= 0
         assert request["audio_duration_ms"] > 0
@@ -174,6 +182,13 @@ async def _run_text_only_response_create(
         return await asyncio.wait_for(receive_outcome(), timeout=timeout_s)
 
 
+class _SeededTurnResult(TypedDict):
+    audio_bytes: int
+    transcript: str
+    output_text: str
+    event_types: list[str]
+
+
 async def _run_seeded_text_to_audio(
     *,
     url: str,
@@ -183,7 +198,7 @@ async def _run_seeded_text_to_audio(
     modalities: tuple[str, ...] = ("audio", "text"),
     silence_seconds: float = 12.0,
     timeout_s: float = 180.0,
-) -> dict[str, object]:
+) -> _SeededTurnResult:
     """Speak a seeded text: the duplex route's text-to-speech shape.
 
     A model-native session takes its text once, in the session context

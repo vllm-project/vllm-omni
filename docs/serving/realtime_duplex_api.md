@@ -482,11 +482,11 @@ Semantic divergences hidden behind shared names:
   the Tier 3 surface on top of the same Tier 1 events, so both kinds of
   client can share one deployment and one event log.
 
-### Turn-based Chat audio metadata
+### Chat audio metadata
 
-For turn-based models served through Chat fallback, non-empty audio choices
-produced by the Omni Chat audio encoder include `audio_metadata`, in both
-streaming and complete Chat responses. Text-only choices do not require it.
+On `/v1/chat/completions`, non-empty audio choices produced by the Omni Chat
+audio encoder include `audio_metadata`, in both streaming and complete Chat
+responses. Text-only choices do not require it.
 
 | Field | Meaning |
 | --- | --- |
@@ -501,17 +501,10 @@ The encoder uses a model-reported sample rate when available; Qwen3-Omni
 currently omits it and uses the existing 24 kHz default. This metadata does
 not independently determine a model's sample rate.
 
-Chat fallback requests the session's output format explicitly. Its internal
-`response.output_audio.delta` carries `format`, `sample_rate_hz`, `channels`,
-and `audio_duration_ms`. The Realtime endpoint exposes output `format` and
-`sample_rate_hz` on `response.audio.delta`, with duration in
-`metadata.audio_duration_ms`; it does not currently forward `channels`.
-The duration is cumulative for the response:
-integer frames are summed before converting to milliseconds and rounding down.
-Non-empty audio without valid metadata, or a sample-rate change within one
-response, fails that fallback response with `response_error`.
-
-In this Chat fallback path, `response.done.response.metadata.playback` reports:
+On the duplex route the audio delta itself carries the output `format` and
+`sample_rate_hz`, with the response's cumulative duration in
+`metadata.audio_duration_ms`; `channels` is not forwarded.
+`response.done.response.metadata.playback` reports:
 
 - `generated_ms`: cumulative source-waveform duration.
 - `sent_ms`: cumulative audio accepted into the server output path, including
@@ -520,10 +513,10 @@ In this Chat fallback path, `response.done.response.metadata.playback` reports:
 - `played_ms`: cumulative playback reported by the client.
 - `committed_ms`: playback position used for history reconciliation.
 
-The native model path still records audio before sending; it does not yet
-share Chat fallback's output-acceptance timing. Only client playback reports
-establish what was played. The existing duration-proportional text truncation
-remains an approximation, not word-level audio alignment.
+The engine records audio as sent when it emits the delta, before the socket
+delivers it; only client playback reports establish what was played. The
+existing duration-proportional text truncation remains an approximation, not
+word-level audio alignment.
 
 ### Event catalogue
 

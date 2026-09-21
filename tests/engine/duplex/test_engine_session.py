@@ -688,3 +688,78 @@ def test_minicpmo_native_capabilities_do_not_overclaim_single_session_deployment
 
     assert caps["supports_multi_session"] is False
     assert caps["supports_multi_session_same_replica"] is False
+
+
+# ---- per-response request timing (server-side TTFT / TTFP) ----
+
+
+def test_response_timing_binds_latest_request_start_for_model_turn():
+    session = _session(config=DuplexSessionConfig(model="test-model", extra_body={"auto_response": True}))
+    session.mark_model_turn_request_started(0, 10.0)
+    session.mark_model_turn_request_started(0, 11.0)
+    session.begin_response(turn_id=0)
+
+    first = session.mark_response_first_outputs(observed_at_s=11.2, has_text=True, has_audio=False)
+    assert first["ttft_ms"] == pytest.approx(200.0)
+    assert "ttfp_ms" not in first
+    assert first["source"] == "server_monotonic_request_start"
+    assert set(first["measurement_origin"]) == {"ttft", "ttfp"}
+
+    # Once bound, the active response keeps its anchor; a later start for the
+    # same turn does not move it.
+    session.mark_model_turn_request_started(0, 12.0)
+    second = session.mark_response_first_outputs(observed_at_s=12.3, has_text=False, has_audio=True)
+    assert second["ttfp_ms"] == pytest.approx(1300.0)
+    assert second["ttft_ms"] == pytest.approx(200.0)
+
+
+def test_response_timing_is_empty_without_a_request_start_and_is_scoped_to_one_response():
+    session = _session()
+    session.begin_response(turn_id=0)
+    assert session.mark_response_first_outputs(observed_at_s=1.0, has_text=True, has_audio=True) == {}
+
+    # A start recorded while its response is already active binds to it.
+    session.mark_model_turn_request_started(0, 2.0)
+    metrics = session.mark_response_first_outputs(observed_at_s=2.5, has_text=True, has_audio=False)
+    assert metrics["ttft_ms"] == pytest.approx(500.0)
+    session.end_response()
+
+    # The next response measures from its own turn's start; a completed turn's
+    # start is dropped rather than inherited.
+    session.mark_model_turn_request_started(0, 3.0)
+    session.mark_model_turn_request_started(1, 4.0)
+    session.complete_model_turn(0)
+    session.begin_response(turn_id=1)
+    metrics = session.mark_response_first_outputs(observed_at_s=4.25, has_text=True, has_audio=True)
+    assert metrics["ttft_ms"] == pytest.approx(250.0)
+    assert metrics["ttfp_ms"] == pytest.approx(250.0)
+    session.end_response()
+
+    # A barge-in aborts the pending starts along with the work they belong to.
+    session.mark_model_turn_request_started(2, 5.0)
+    session.barge_in()
+    session.begin_response(turn_id=2)
+    assert session.mark_response_first_outputs(observed_at_s=5.5, has_text=True, has_audio=True) == {}
+
+
+def test_response_tpot_fallback_ignores_single_token_segment():
+    session = _session(config=DuplexSessionConfig(model="test-model", extra_body={"auto_response": True}))
+    session.begin_response(turn_id=0)
+
+    first_metrics = session.accumulate_response_stage_metrics({"0": {"num_tokens_out": 1, "vllm_tpot_ms": 900.0}})
+    assert "vllm_tpot_ms" not in first_metrics["0"]
+
+    second_metrics = session.accumulate_response_stage_metrics({"0": {"num_tokens_out": 2, "vllm_tpot_ms": 15.0}})
+    assert second_metrics["0"]["num_tokens_out"] == 3
+    assert second_metrics["0"]["vllm_tpot_ms"] == 15.0
+
+
+def test_response_tpot_keeps_token_weighted_value_when_itls_exist():
+    session = _session(config=DuplexSessionConfig(model="test-model", extra_body={"auto_response": True}))
+    session.begin_response(turn_id=0)
+    metrics = session.accumulate_response_stage_metrics(
+        {"0": {"num_tokens_out": 4, "vllm_tpot_ms": 10.0, "vllm_itls_ms": [30.0]}}
+    )
+    assert metrics["0"]["vllm_itls_ms"] == [30.0]
+    assert metrics["0"]["vllm_itl_ms"] == 30.0
+    assert metrics["0"]["vllm_tpot_ms"] == 10.0
