@@ -59,7 +59,11 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
 )
 from vllm_omni.worker.output.payload_build import build_omni_mm_payload
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
-from vllm_omni.worker.sampling_utils import clamp_prompt_ids_to_penalty_padding, sanitize_min_tokens_stop_ids
+from vllm_omni.worker.sampling_utils import (
+    call_model_sampler,
+    clamp_prompt_ids_to_penalty_padding,
+    sanitize_min_tokens_stop_ids,
+)
 from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
 
 logger = init_logger(__name__)
@@ -1315,7 +1319,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     )
                 prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(sampling_metadata)
                 self._apply_duplex_sampling(logits, prepared_sampling_metadata)
-                sampler_output = model_sample(logits, prepared_sampling_metadata)
+                sampler_output = call_model_sampler(
+                    self.model,
+                    model_sample,
+                    logits,
+                    prepared_sampling_metadata,
+                    input_batch=self.input_batch,
+                    requests=getattr(self, "requests", None),
+                )
                 if sampler_output is not None:
                     return sampler_output
                 # Contract: None => fall back to the default sampler (see

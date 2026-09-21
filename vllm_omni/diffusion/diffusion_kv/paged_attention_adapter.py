@@ -765,6 +765,19 @@ class DiffusionPagedAttentionAdapter:
                 slot_mappings=slot_mappings,
                 causal=(row_segments[0].mode == "causal"),
             )
+            # FA2's ``num_splits=0`` auto policy selects SplitKV for these
+            # already-small piecewise calls. Reuse vLLM's supported metadata
+            # control to select the single-pass kernel and avoid its extra
+            # partial-output/reduction work. Leave newer native backends and
+            # metadata without this control untouched.
+            for layer_name, native_metadata in segment_metadata.items():
+                layer = self.layers.get(layer_name)
+                if (
+                    layer is not None
+                    and getattr(layer.impl, "vllm_flash_attn_version", None) == 2
+                    and hasattr(native_metadata, "max_num_splits")
+                ):
+                    native_metadata.max_num_splits = 1
             # FA3's full-CUDA-graph metadata builder reuses one persistent
             # scheduler buffer across builds. Piecewise attention prepares all
             # segments before executing any of them, so each segment needs its
@@ -908,9 +921,17 @@ class DiffusionPagedAttentionAdapter:
                 raise KeyError(
                     f"No piecewise native attention metadata was built for diffusion layer {layer_name!r}"
                 ) from exc
+        # Identical rows are sliced and packed once per segment by the
+        # homogeneous piecewise runner.  Keeping the projection view here
+        # avoids first copying the complete Q tensor only to copy each segment
+        # again immediately afterwards.  Other native paths still require one
+        # packed query buffer.
+        query_input = query_flat
+        if piecewise_plan is None or piecewise_plan.homogeneous_batch_shape is None:
+            query_input = query_flat.contiguous()
         return DiffusionPagedAttentionContext(
             layer=layer,
-            query=query_flat.contiguous(),
+            query=query_input,
             key_write=key_flat,
             value_write=value_flat,
             slot_mapping=slot_mapping,

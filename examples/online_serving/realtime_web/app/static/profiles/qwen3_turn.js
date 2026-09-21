@@ -3,6 +3,7 @@
   const profiles = root.OmniRealtimeProfiles;
   profiles['qwen3-turn'] = (config) => {
     const vad = config.adapter === 'vad';
+    let interruptOnSpeech = vad;
     let imageSeq = 0;
     let imageItems = [];
     // The engine refuses a ninth image (or 4 MiB of them) for the whole
@@ -31,6 +32,7 @@
       },
       initialMessages(config, instructions) {
         imageItems = [];
+        interruptOnSpeech = vad;
         if (!vad) return [
           { type: 'session.update', model: config.model },
           { type: 'input_audio_buffer.commit', final: false },
@@ -70,6 +72,20 @@
       ack: (responseId, playedMs) => vad ? { type: 'playback.ack', response_id: responseId,
         item_id: `item_${responseId}`, played_ms: playedMs, committed_ms: playedMs } : null,
       mapEvent(event) {
+        if (event.type === 'session.created' || event.type === 'session.updated') {
+          const input = event.session?.audio?.input;
+          const turnDetection = input && 'turn_detection' in input
+            ? input.turn_detection : event.session?.turn_detection;
+          if (turnDetection !== undefined) {
+            interruptOnSpeech = vad && turnDetection?.type === 'server_vad'
+              && turnDetection.interrupt_response !== false;
+          }
+        }
+        // Generation can finish long before the speaker drains its queue. In
+        // that case the server has no active response left to cancel for us.
+        if (interruptOnSpeech && event.type === 'input_audio_buffer.speech_started') {
+          return { kind: 'interrupt' };
+        }
         if (event.type === 'playback.acknowledged') return { kind: 'ack', committedMs: (event.event || event).committed_ms || 0 };
         if (event.type === 'response.output_text.delta' || event.type === 'transcription.delta') {
           // On the shipped STT route transcription.* is model-generated text,
@@ -81,7 +97,7 @@
         }
         if (vad && (event.type === 'output_audio_buffer.cleared' ||
             (event.type === 'response.done' && event.response?.status === 'cancelled'))) {
-          return { kind: 'interrupt' };
+          return { kind: 'interrupt', responseId: event.response_id || event.response?.id || null };
         }
         if (event.type === 'input_audio_buffer.committed') return { kind: 'begin' };
         if (event.type === 'input_audio_buffer.cleared') return { kind: 'backpressure', message: 'Input cleared. Model is answering; please wait.' };

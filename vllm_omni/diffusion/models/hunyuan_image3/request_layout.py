@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -375,27 +375,57 @@ def build_hunyuan_diffusion_kv_requests(
     real_pos = tokenizer_output.real_pos
     assert prefix_positions is not None and real_pos is not None
 
+    def boundary_rows(field_name: str) -> list[int | None]:
+        positions = getattr(tokenizer_output, field_name)
+        if positions is None:
+            return [None] * cfg_factor
+        if not isinstance(positions, list) or not positions:
+            raise ValueError(f"Hunyuan {field_name} must be a non-empty boundary list")
+        # Batched tokenizer output contains a separate boundary for each CFG
+        # row. Never broadcast a conditional boundary into a negative row.
+        if cfg_factor == 1 and len(positions) == 1 and (positions[0] is None or type(positions[0]) is int):
+            return positions
+        if len(positions) == cfg_factor and all(
+            isinstance(row, list) and len(row) == 1 and (row[0] is None or type(row[0]) is int) for row in positions
+        ):
+            return [row[0] for row in positions]
+        raise ValueError(f"Hunyuan {field_name} must contain one boundary per CFG row")
+
+    think_boundaries = boundary_rows("think_recaption_end_pos")
+    uncond_boundaries = boundary_rows("uncond_cfg_start_pos")
+
     target_len = hunyuan_num_image_tokens(prepared_layout.generated_image_info)
-    requests: list[DiffusionKVRequest] = []
-    for sequence_id, (prefix_row, valid_row) in enumerate(zip(prefix_positions, real_pos, strict=True)):
-        prefix_len = int(prefix_row[-1].item())
-        seq_len = int(valid_row[-1].item())
-        requests.append(
-            DiffusionKVRequest(
-                f"{request.request_id}/diffusion-kv/{sequence_id}",
-                sequence_id=sequence_id,
-                # The generated-image timestep position terminates the reusable
-                # prompt/reference-image prefix for this execution row.
-                prefix_len=prefix_len,
-                target_len=target_len,
-                seq_len=seq_len,
-                # Prompt and reference-image tokens are already embedded in this
-                # row's primary self-attention sequence. Hunyuan therefore has no
-                # independently projected cross/joint-attention KV context.
-                kv_contexts=(),
-            )
+    reusable_lens = [0] * cfg_factor
+    if think_boundaries[0] is not None:
+        reusable_lens[0] = think_boundaries[0] or 0
+    if any(boundary is not None for boundary in uncond_boundaries):
+        for sequence_id in range(1, cfg_factor):
+            reusable_lens[sequence_id] = min(reusable_lens[0], uncond_boundaries[sequence_id] or 0)
+    return tuple(
+        DiffusionKVRequest(
+            f"{request.request_id}/diffusion-kv/{sequence_id}",
+            sequence_id=sequence_id,
+            # The generated-image timestep position terminates the reusable
+            # prompt/reference-image prefix for this execution row.
+            prefix_len=int(prefix_row[-1].item()),
+            target_len=target_len,
+            seq_len=int(valid_row[-1].item()),
+            # Native AR -> DiT transfer needs token IDs to describe the
+            # transferred prefix.  Local paged prefix caching does not: its
+            # identity is attached later by ``prepare_hunyuan_prefix_cache``.
+            # Keep this conversion out of the disabled/local-only path.
+            prompt_token_ids=(
+                tokenizer_output.tokens[sequence_id, : reusable_lens[sequence_id]].tolist()
+                if request.kv_transfer_params is not None
+                else None
+            ),
+            # Prompt and reference-image tokens are already embedded in this
+            # row's primary self-attention sequence. Hunyuan therefore has no
+            # independently projected cross/joint-attention KV context.
+            kv_contexts=(),
         )
-    return tuple(requests)
+        for sequence_id, (prefix_row, valid_row) in enumerate(zip(prefix_positions, real_pos))
+    )
 
 
 def prepare_hunyuan_prefix_cache(request: OmniDiffusionRequest) -> None:
@@ -494,3 +524,14 @@ def get_hunyuan_prepared_layout(source: Any) -> HunyuanPreparedLayout | None:
             f"HunyuanImage3 expected prepared_layout to be HunyuanPreparedLayout, got {type(prepared_layout).__name__}"
         )
     return prepared_layout
+
+
+def native_kv_covers_cond_images(output: TokenizerEncodeOutput, computed_tokens: tuple[int, ...]) -> bool:
+    """Skip image encoding only when every CFG row already contains its image KV."""
+    image_slices = output.joint_image_slices
+    if not image_slices or len(image_slices) != len(computed_tokens):
+        return False
+    return all(
+        slices and all(image_slice.stop <= computed for image_slice in slices)
+        for slices, computed in zip(image_slices, computed_tokens, strict=True)
+    )

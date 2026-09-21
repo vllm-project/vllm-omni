@@ -190,7 +190,7 @@ def test_legacy_default_stage_build_accepts_engine_adapter_metadata(monkeypatch)
     )[0]
     assert "api_key" not in stage_dict["engine_args"]
     stage_cfg = create_config(stage_dict)
-    metadata = SimpleNamespace(stage_id=0, cfg_kv_collect_func=None)
+    metadata = SimpleNamespace(stage_id=0, cfg_kv_collect_func=None, default_sampling_params=None)
     monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 1)
 
     config = stage_init_utils.build_diffusion_config("unused", stage_cfg, metadata)

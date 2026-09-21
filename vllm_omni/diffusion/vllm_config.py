@@ -151,6 +151,9 @@ class _DiffusionVllmModelConfig:
     def get_head_size(self) -> int:
         return self._require_attention_geometry()[2]
 
+    def get_total_num_kv_heads(self) -> int:
+        return self.hf_text_config.num_key_value_heads
+
     @property
     def is_diffusion(self) -> bool:
         # This config is also installed as the current VllmConfig for the

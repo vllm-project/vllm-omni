@@ -1189,6 +1189,8 @@ def _project_omni_stage_engine_args(
     engine_args["async_chunk"] = connector_config.async_chunk
     if connector_config.omni_kv_config is not None:
         engine_args["omni_kv_config"] = copy.deepcopy(connector_config.omni_kv_config)
+    if connector_config.kv_transfer_config is not None:
+        engine_args["kv_transfer_config"] = copy.deepcopy(connector_config.kv_transfer_config)
 
     if is_diffusion:
         engine_args["parallel_config"] = _project_omni_config_fields(
@@ -1979,6 +1981,11 @@ def build_diffusion_config(
         include_engine_adapter_metadata=True,
     )
     od_config = OmniDiffusionConfig(**{name: value for name, value in diffusion_kwargs.items() if value is not None})
+
+    for dimension in ("height", "width"):
+        value = getattr(metadata.default_sampling_params, dimension, None)
+        if isinstance(value, int) and value > 0:
+            od_config.additional_config.setdefault(f"diffusion_kv_profile_{dimension}", value)
 
     num_devices_per_stage = od_config.parallel_config.world_size
     device_control_env = current_omni_platform.device_control_env_var

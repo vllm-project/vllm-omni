@@ -47,7 +47,7 @@ stages:
         fps: 1
         num_frames: 128
     limit_mm_per_prompt:
-      # Daily-Omni MiniCPM pack: up to 64 interleaved image/audio pairs (1fps).
+      # Daily-Omni: up to 64 interleaved image/audio pairs (1fps).
       image: 64
       audio: 64
       video: 1

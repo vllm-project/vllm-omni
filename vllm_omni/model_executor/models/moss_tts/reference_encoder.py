@@ -18,7 +18,7 @@ arriving via different locators shares one entry), single-flight (concurrent
 requests for one uncached clip join a single encode), and micro-batched
 encoding (cold encodes arriving close together share one processor forward).
 
-Kept import-light (only ``asyncio`` / ``hashlib`` / ``torch`` plus the logger)
+Kept import-light (``asyncio`` / ``hashlib`` / ``numpy`` / ``torch`` plus the logger)
 so importing it from the API-server process does not pull the talker/codec.
 """
 
@@ -29,7 +29,9 @@ import hashlib
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+import numpy as np
 import torch
+from numpy.typing import NDArray
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -41,14 +43,16 @@ _REF_ENCODE_MAX_BATCH = 8
 
 _INT32_MAX = 2**31
 
+_Waveform = NDArray[np.float32] | list[float]
+
 
 def _sha1(s: str) -> str:
     return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
 
 
-def _prep_wav_sync(wav_list: list, sr: int, sr_target: int) -> torch.Tensor:
+def _prep_wav_sync(waveform: _Waveform, sr: int, sr_target: int) -> torch.Tensor:
     """Tensor-ise + resample one clip to ``sr_target`` (the blocking prep)."""
-    wav = torch.tensor(wav_list, dtype=torch.float32)
+    wav = torch.tensor(waveform, dtype=torch.float32)
     if wav.dim() == 1:
         wav = wav.unsqueeze(0)
     if sr != sr_target:
@@ -101,12 +105,12 @@ class _RefEncodeBatcher:
 
     def __init__(
         self,
-        encode_batch_fn: Callable[[list[tuple[list, int]]], list],
+        encode_batch_fn: Callable[[list[tuple[_Waveform, int]]], list],
         *,
         window_ms: float,
         max_batch: int,
     ):
-        # encode_batch_fn: sync, takes [(wav_list, sr), ...], returns a list of
+        # encode_batch_fn: sync, takes [(waveform, sr), ...], returns a list of
         # (codes_tensor | Exception) aligned to the input order.
         self._encode_batch_fn = encode_batch_fn
         self._window_s = max(0.0, float(window_ms) / 1000.0)
@@ -120,18 +124,23 @@ class _RefEncodeBatcher:
         if self._drainer is None or self._drainer.done():
             self._drainer = asyncio.create_task(self._drain_loop())
 
-    async def submit(self, wav_list: list, sr: int) -> torch.Tensor:
+    async def submit(self, waveform: _Waveform, sr: int) -> torch.Tensor:
         self._ensure_started()
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._queue.put_nowait((wav_list, sr, fut))  # type: ignore[union-attr]
+        self._queue.put_nowait((waveform, sr, fut))  # type: ignore[union-attr]
         return await fut
 
     async def _drain_loop(self) -> None:
         assert self._queue is not None
         while True:
             first = await self._queue.get()
-            jobs = await self._coalesce(first)
-            await self._run_batch(jobs)
+            jobs = None
+            try:
+                jobs = await self._coalesce(first)
+                await self._run_batch(jobs)
+            finally:
+                # Do not retain the completed batch while waiting for new work.
+                del first, jobs
 
     async def _coalesce(self, first: tuple) -> list[tuple]:
         """Group ``first`` with jobs arriving within the batch window."""
@@ -155,8 +164,8 @@ class _RefEncodeBatcher:
                     break
         return jobs
 
-    async def _run_batch(self, jobs: list[tuple[list, int, asyncio.Future]]) -> None:
-        payload = [(wav_list, sr) for wav_list, sr, _ in jobs]
+    async def _run_batch(self, jobs: list[tuple[_Waveform, int, asyncio.Future]]) -> None:
+        payload = [(waveform, sr) for waveform, sr, _ in jobs]
         futs = [fut for _, _, fut in jobs]
         try:
             results = await asyncio.to_thread(self._encode_batch_fn, payload)
@@ -215,14 +224,14 @@ class MossReferenceEncoder:
         self,
         ref_str: str,
         *,
-        resolve_ref_audio: Callable[[str], Awaitable[tuple[list, int, str]]],
+        resolve_ref_audio: Callable[[str], Awaitable[tuple[_Waveform, int, str]]],
         get_artifact_key: Callable[[str], str | None],
         voice_name: str | None = None,
         voice_created_at: int = 0,
     ) -> tuple[torch.Tensor, str | None]:
         """Encode one reference clip into MOSS RVQ codes, reusing the cache.
 
-        ``resolve_ref_audio`` maps ``ref_str`` to ``(wav_list, sr, cache_key)``
+        ``resolve_ref_audio`` maps ``ref_str`` to ``(waveform, sr, cache_key)``
         where *cache_key* is the content-aware resolve key (it folds mtime/size
         for local files). ``get_artifact_key`` maps that resolve key to the
         waveform-content artifact key, or ``None`` when unknown.
@@ -291,13 +300,13 @@ class MossReferenceEncoder:
     async def _resolve_and_encode(
         self,
         ref_str: str,
-        resolve_ref_audio: Callable[[str], Awaitable[tuple[list, int, str]]],
+        resolve_ref_audio: Callable[[str], Awaitable[tuple[_Waveform, int, str]]],
         get_artifact_key: Callable[[str], str | None],
         voice_name: str | None,
         created_at: int,
     ) -> tuple[torch.Tensor, str]:
         """Flight body: resolve → re-check cache by content hash → batch-encode."""
-        wav_list, sr, resolve_key = await resolve_ref_audio(ref_str)
+        waveform, sr, resolve_key = await resolve_ref_audio(ref_str)
 
         # The content hash is available now that the clip is resolved; this also
         # catches the case where another flight populated the cache in between.
@@ -312,7 +321,7 @@ class MossReferenceEncoder:
         if cached is not None:
             return cached["codes"], resolve_key
 
-        codes = await self._batcher.submit(wav_list, sr)
+        codes = await self._batcher.submit(waveform, sr)
         compact = _to_compact_codes(codes)
         self._speaker_cache.put(key, {"codes": compact})
         logger.debug(
@@ -323,15 +332,15 @@ class MossReferenceEncoder:
         )
         return compact, resolve_key
 
-    def _encode_batch_sync(self, payload: list[tuple[list, int]]) -> list:
+    def _encode_batch_sync(self, payload: list[tuple[_Waveform, int]]) -> list:
         """Worker-thread body: prep each clip, then one batched forward."""
         n = len(payload)
         results: list = [None] * n
         prepared: list[torch.Tensor] = []
         prepared_idx: list[int] = []
-        for i, (wav_list, sr) in enumerate(payload):
+        for i, (waveform, sr) in enumerate(payload):
             try:
-                prepared.append(_prep_wav_sync(wav_list, sr, self._sr_target))
+                prepared.append(_prep_wav_sync(waveform, sr, self._sr_target))
                 prepared_idx.append(i)
             except Exception as exc:  # noqa: BLE001 — isolate this clip's failure
                 results[i] = exc
@@ -416,7 +425,7 @@ async def encode_request_references(
     ref_audio: str,
     ref_audio_2: str | None = None,
     *,
-    resolve_ref_audio: Callable[[str], Awaitable[tuple[list, int, str]]],
+    resolve_ref_audio: Callable[[str], Awaitable[tuple[_Waveform, int, str]]],
     get_artifact_key: Callable[[str], str | None],
     voice_name: str | None = None,
     voice_created_at: int = 0,

@@ -53,7 +53,9 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         return self.ctx.server._speaker_cache
 
     async def _resolve_ref_audio(self, ref_audio: str):
-        return await self.ctx.server._resolve_ref_audio(ref_audio)
+        if self._moss_variant is None:  # Nano sends lists through engine IPC.
+            return await self.ctx.server._resolve_ref_audio(ref_audio)
+        return await self.ctx.server._resolve_ref_audio_array(ref_audio)
 
     def _voice_created_at(self, voice: str) -> int:
         return self.ctx.server._voice_created_at(voice)

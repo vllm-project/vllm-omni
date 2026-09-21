@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -64,7 +64,7 @@ class StepScheduler(BaseScheduler):
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids
-        if not scheduled_request_ids:
+        if not scheduled_request_ids and not sched_output.finished_req_ids:
             return set()
 
         terminal_statuses: dict[str, DiffusionRequestStatus] = {}

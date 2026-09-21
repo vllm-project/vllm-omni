@@ -10,6 +10,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from vllm_omni.core.sched.utils import free_kv_blocks_in_physical_order
 from vllm_omni.diffusion.diffusion_kv.metadata import (
     DiffusionKVMetadata,
     DiffusionKVSequenceMetadata,
@@ -291,7 +292,7 @@ class DiffusionKVCacheManager:
         requests = self._requests.pop(public_request_id, ())
         self._metadata.pop(public_request_id, None)
         for request in reversed(requests):
-            self.native_manager.free(request)
+            free_kv_blocks_in_physical_order(self.native_manager, request)
             request.num_computed_tokens = 0
             request.shared_prefix_boundary = 0
             self._internal_request_ids.discard(request.request_id)
@@ -302,6 +303,6 @@ class DiffusionKVCacheManager:
 
     def _rollback(self, requests: Sequence[DiffusionKVRequest]) -> None:
         for request in reversed(requests):
-            self.native_manager.free(request)
+            free_kv_blocks_in_physical_order(self.native_manager, request)
             request.num_computed_tokens = 0
             request.shared_prefix_boundary = 0
