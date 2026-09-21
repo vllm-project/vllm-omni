@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -30,7 +30,8 @@ def build_text_to_image_prompt(
     deriving the AR image grid from ``height`` / ``width``.
 
     Model-specific sampling knobs (``text_guidance_scale``, ``cfg_range``,
-    ``num_inference_steps``) flow separately via ``extra_body`` -> ``extra_args``.
+    ``cfg_execution_mode``, ``num_inference_steps``) flow separately via
+    ``extra_body`` -> ``extra_args``.
     The structural token ids are included in ``additional_information`` so the
     AR sampler can apply the same constraints for both Preview and Dev.
 
@@ -67,9 +68,10 @@ MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS = frozenset(
     {
         "text_guidance_scale",
         "cfg_range",
-        # MammothModa2's DiT stage consumes inputs via the kwargs interface rather
-        # than OmniDiffusionRequest, so the standard --num-inference-steps flag does
-        # not reach it; it is routed through extra_body like the CFG knobs.
+        # Preview-only opt-in batching of the two CFG branches on one device.
+        "cfg_execution_mode",
+        # Compatibility alias for the standard --num-inference-steps request
+        # field; non-null values here take precedence (see _parse_request).
         "num_inference_steps",
     }
 )
@@ -97,5 +99,5 @@ def build_x_to_text_prompt(
     )
 
 
-MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS = frozenset()
+MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS: frozenset[str] = frozenset()
 MAMMOTHMODA2_PREVIEW_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES = True

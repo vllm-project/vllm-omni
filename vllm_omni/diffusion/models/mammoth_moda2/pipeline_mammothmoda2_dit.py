@@ -67,6 +67,38 @@ def _root_weight_source(
     )
 
 
+def _pack_cfg_conditions(
+    positive_embeds: torch.Tensor,
+    positive_mask: torch.Tensor,
+    negative_embeds: torch.Tensor,
+    negative_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Right-pad complete conditions, with positive then negative batch rows.
+
+    Preview's positive condition already includes the refined AR image tokens.
+    The transformer and RoPE use each row's effective length; valid tokens must
+    form a contiguous prefix. Do not insert padding between text and image tokens.
+    """
+    for embeds, mask in ((positive_embeds, positive_mask), (negative_embeds, negative_mask)):
+        if embeds.ndim != 3 or embeds.shape[0] != 1:
+            raise ValueError("Packed CFG requires single-request conditions of shape [1, T, H]")
+        if mask.shape != embeds.shape[:2] or mask.dtype != torch.bool:
+            raise ValueError("Packed CFG requires boolean attention masks of shape [1, T]")
+        if torch.any(mask[:, 1:] & ~mask[:, :-1]):
+            raise ValueError("Packed CFG requires attention masks with a contiguous valid prefix")
+    if positive_embeds.shape[-1] != negative_embeds.shape[-1]:
+        raise ValueError("Packed CFG condition hidden dimensions must match")
+
+    max_length = max(positive_embeds.shape[1], negative_embeds.shape[1])
+    packed_embeds = positive_embeds.new_zeros((2, max_length, positive_embeds.shape[-1]))
+    packed_mask = positive_mask.new_zeros((2, max_length))
+    for row, (embeds, mask) in enumerate(((positive_embeds, positive_mask), (negative_embeds, negative_mask))):
+        length = embeds.shape[1]
+        packed_embeds[row, :length] = embeds[0]
+        packed_mask[row, :length] = mask[0]
+    return packed_embeds, packed_mask
+
+
 @dataclass(frozen=True)
 class _MammothRequest:
     request_id: str
@@ -77,6 +109,7 @@ class _MammothRequest:
     width: int
     text_guidance_scale: float
     cfg_range: tuple[float, float]
+    cfg_execution_mode: str
     num_inference_steps: int
     seed: int | None
     generator: torch.Generator | list[torch.Generator] | None
@@ -272,6 +305,44 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         if not 0 <= cfg_start <= cfg_end <= 1:
             raise ValueError(f"cfg_range must satisfy 0 <= start <= end <= 1 for request {request_id}")
 
+        cfg_execution_mode = extra_args.get("cfg_execution_mode", "sequential")
+        if cfg_execution_mode not in ("sequential", "packed"):
+            raise ValueError(f"cfg_execution_mode must be 'sequential' or 'packed' for request {request_id}")
+        if cfg_execution_mode == "packed":
+            model_type = getattr(self.config.llm_config, "model_type", "")
+            nested_embedder = getattr(self.gen_transformer.time_caption_embed, "image_embedder", None)
+            if model_type != "mammothmoda2_qwen2_5_vl" or nested_embedder is not None:
+                raise NotImplementedError(
+                    f"Packed CFG currently supports MammothModa2-Preview only, for request {request_id}; "
+                    "use cfg_execution_mode='sequential' for Dev or a nested image embedder"
+                )
+            if not self.od_config.enforce_eager:
+                raise NotImplementedError(
+                    f"Packed CFG is only qualified under eager execution, for request {request_id}; "
+                    "set enforce_eager=True or use cfg_execution_mode='sequential' with torch.compile"
+                )
+            if self.od_config.cache_backend != "none" or self.od_config.cache_strategy != "none":
+                raise NotImplementedError(
+                    f"Packed CFG is only qualified with diffusion caching disabled, for request {request_id}; "
+                    "set cache_backend='none' or use cfg_execution_mode='sequential'"
+                )
+            parallel_config = self.od_config.parallel_config
+            if any(
+                getattr(parallel_config, attr, 1) not in (None, 1)
+                for attr in (
+                    "pipeline_parallel_size",
+                    "tensor_parallel_size",
+                    "sequence_parallel_size",
+                    "ulysses_degree",
+                    "ring_degree",
+                    "allgather_degree",
+                )
+            ):
+                raise NotImplementedError(
+                    f"Packed CFG is only qualified for single-device execution, for request {request_id}; "
+                    "use cfg_execution_mode='sequential' under parallelism"
+                )
+
         generator = sampling.generator
         if isinstance(generator, list) and len(generator) != 1:
             raise ValueError(
@@ -287,6 +358,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             width=width,
             text_guidance_scale=text_guidance_scale,
             cfg_range=(cfg_start, cfg_end),
+            cfg_execution_mode=cfg_execution_mode,
             num_inference_steps=num_inference_steps,
             seed=sampling.seed,
             generator=generator,
@@ -432,30 +504,60 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
 
         # Run diffusion loop (CFG supported when text_guidance_scale > 1.0)
         total_steps = max(1, len(scheduler.timesteps))
+        packed_prompt_embeds = None
+        packed_prompt_attention_mask = None
+        if (
+            request.cfg_execution_mode == "packed"
+            and negative_prompt_embeds is not None
+            and any(
+                request.cfg_range[0] <= i / total_steps <= request.cfg_range[1] for i in range(len(scheduler.timesteps))
+            )
+        ):
+            # Conditions do not change between steps. Pack after the full positive
+            # condition has been built so image tokens stay in its valid prefix.
+            packed_prompt_embeds, packed_prompt_attention_mask = _pack_cfg_conditions(
+                prompt_embeds,
+                prompt_attention_mask,
+                negative_prompt_embeds,
+                negative_prompt_attention_mask,
+            )
         for i, t in enumerate(scheduler.timesteps):
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
-            model_pred = self.gen_transformer(
-                hidden_states=latents,
-                timestep=timestep,
-                text_hidden_states=prompt_embeds,
-                text_attention_mask=prompt_attention_mask,
-                ref_image_hidden_states=None,
-                ar_image_hidden_states=ar_image_embeds,
-                ar_image_attention_mask=ar_image_attention_mask,
-                freqs_cis=self.gen_freqs_cis,
-            )
             guidance_scale = (
                 request.text_guidance_scale if request.cfg_range[0] <= i / total_steps <= request.cfg_range[1] else 1.0
             )
-            if guidance_scale > 1.0 and negative_prompt_embeds is not None:
-                model_pred_uncond = self.gen_transformer(
-                    hidden_states=latents,
-                    timestep=timestep,
-                    text_hidden_states=negative_prompt_embeds,
-                    text_attention_mask=negative_prompt_attention_mask,
+            cfg_active = guidance_scale > 1.0 and negative_prompt_embeds is not None
+            if cfg_active and request.cfg_execution_mode == "packed":
+                packed_pred = self.gen_transformer(
+                    hidden_states=torch.cat([latents, latents], dim=0),
+                    timestep=torch.cat([timestep, timestep], dim=0),
+                    text_hidden_states=packed_prompt_embeds,
+                    text_attention_mask=packed_prompt_attention_mask,
                     ref_image_hidden_states=None,
                     freqs_cis=self.gen_freqs_cis,
                 )
+                model_pred, model_pred_uncond = packed_pred.chunk(2, dim=0)
+            else:
+                model_pred = self.gen_transformer(
+                    hidden_states=latents,
+                    timestep=timestep,
+                    text_hidden_states=prompt_embeds,
+                    text_attention_mask=prompt_attention_mask,
+                    ref_image_hidden_states=None,
+                    ar_image_hidden_states=ar_image_embeds,
+                    ar_image_attention_mask=ar_image_attention_mask,
+                    freqs_cis=self.gen_freqs_cis,
+                )
+                if cfg_active:
+                    model_pred_uncond = self.gen_transformer(
+                        hidden_states=latents,
+                        timestep=timestep,
+                        text_hidden_states=negative_prompt_embeds,
+                        text_attention_mask=negative_prompt_attention_mask,
+                        ref_image_hidden_states=None,
+                        freqs_cis=self.gen_freqs_cis,
+                    )
+            if cfg_active:
                 model_pred = model_pred_uncond + guidance_scale * (model_pred - model_pred_uncond)
             latents = scheduler.step(model_pred, t, latents, return_dict=False)[0]
             latents = latents.to(dtype=prompt_embeds.dtype)
