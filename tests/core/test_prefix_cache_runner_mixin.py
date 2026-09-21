@@ -218,6 +218,20 @@ def test_abort_prepared_layout_releases_manager_state(monkeypatch):
     assert r._prefix_cache_write_layout is None
 
 
+def test_prepared_step_guard_aborts_post_forward_failure():
+    r = _Runner()
+    stub = _CacheStub()
+    r.omni_prefix_cache = stub
+    r._prefix_cache_write_layout = PrefixCacheWriteLayout((), 0)
+
+    with pytest.raises(RuntimeError, match="post-forward failure"):
+        with r._prefix_cache_prepared_step_guard():
+            raise RuntimeError("post-forward failure")
+
+    assert stub.abort_calls == 1
+    assert r._prefix_cache_write_layout is None
+
+
 def test_save_failure_aborts_prepared_manager_state(monkeypatch):
     _patch_pp(monkeypatch, is_last=True)
     r = _Runner()

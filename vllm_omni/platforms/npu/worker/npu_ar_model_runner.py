@@ -671,45 +671,46 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             self._prefix_cache_abort_prepared_step()
             raise
         with record_function_or_nullcontext("post process"):
-            #  -------------------------------------- Omni-new -------------------------------------------------
-            # [Omni] Map pending ropes metadata to req_ids.
-            flush_pending_metadata = getattr(self.model, "flush_pending_metadata", None)
-            if callable(flush_pending_metadata):
-                flush_pending_metadata(req_ids[:num_reqs])
+            with self._prefix_cache_prepared_step_guard():
+                #  -------------------------------------- Omni-new -------------------------------------------------
+                # [Omni] Map pending ropes metadata to req_ids.
+                flush_pending_metadata = getattr(self.model, "flush_pending_metadata", None)
+                if callable(flush_pending_metadata):
+                    flush_pending_metadata(req_ids[:num_reqs])
 
-            # [Omni] Hand the model the batch's req_ids in logits order, for
-            # models that gate logits per request. Mirrors gpu_ar_model_runner.
-            # Only valid without spec decode: there logits_indices carries several
-            # rows per request, so row i no longer corresponds to req_ids[i].
-            if spec_decode_metadata is None:
-                set_batch_req_ids = getattr(self.model, "set_batch_req_ids", None)
-                if callable(set_batch_req_ids):
-                    set_batch_req_ids(req_ids[:num_reqs])
+                # [Omni] Hand the model the batch's req_ids in logits order, for
+                # models that gate logits per request. Mirrors gpu_ar_model_runner.
+                # Only valid without spec decode: there logits_indices carries several
+                # rows per request, so row i no longer corresponds to req_ids[i].
+                if spec_decode_metadata is None:
+                    set_batch_req_ids = getattr(self.model, "set_batch_req_ids", None)
+                    if callable(set_batch_req_ids):
+                        set_batch_req_ids(req_ids[:num_reqs])
 
-            hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
+                hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
 
-            if multimodal_outputs is not None:
-                keys_or_type = (
-                    list(multimodal_outputs.keys())
-                    if isinstance(multimodal_outputs, Mapping)
-                    else type(multimodal_outputs)
+                if multimodal_outputs is not None:
+                    keys_or_type = (
+                        list(multimodal_outputs.keys())
+                        if isinstance(multimodal_outputs, Mapping)
+                        else type(multimodal_outputs)
+                    )
+                    logger.debug(f"[AR] execute_model: multimodal_outputs keys = {keys_or_type}")
+                else:
+                    logger.debug("[AR] execute_model: multimodal_outputs is None")
+                #  -------------------------------------- Omni-new -------------------------------------------------
+                aux_hidden_states = None
+                if self.use_aux_hidden_state_outputs:
+                    hidden_states, aux_hidden_states = hidden_states
+
+                #  -------------------------------------- Omni-new -------------------------------------------------
+                prefix_cache_step_id = self._prefix_cache_save_step(
+                    hidden_states,
+                    multimodal_outputs,
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    num_tokens_padded=num_tokens_padded,
                 )
-                logger.debug(f"[AR] execute_model: multimodal_outputs keys = {keys_or_type}")
-            else:
-                logger.debug("[AR] execute_model: multimodal_outputs is None")
-            #  -------------------------------------- Omni-new -------------------------------------------------
-            aux_hidden_states = None
-            if self.use_aux_hidden_state_outputs:
-                hidden_states, aux_hidden_states = hidden_states
-
-            #  -------------------------------------- Omni-new -------------------------------------------------
-            prefix_cache_step_id = self._prefix_cache_save_step(
-                hidden_states,
-                multimodal_outputs,
-                num_tokens_unpadded=num_tokens_unpadded,
-                num_tokens_padded=num_tokens_padded,
-            )
-            #  -------------------------------------- Omni-new -------------------------------------------------
+                #  -------------------------------------- Omni-new -------------------------------------------------
 
             if not self.broadcast_pp_output:
                 # Common case.

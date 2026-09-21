@@ -1175,29 +1175,30 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 self._set_runner_assisted_full_attention_metadata_context(enabled=False)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
-            if self.use_aux_hidden_state_outputs:
-                # True when EAGLE 3 is used.
-                hidden_states, aux_hidden_states = model_output
-            else:
-                # Common case.
-                hidden_states = model_output
-                aux_hidden_states = None
+            with self._prefix_cache_prepared_step_guard():
+                if self.use_aux_hidden_state_outputs:
+                    # True when EAGLE 3 is used.
+                    hidden_states, aux_hidden_states = model_output
+                else:
+                    # Common case.
+                    hidden_states = model_output
+                    aux_hidden_states = None
 
-            # A pooling stage skips mm extraction + the omni prefix cache (both assume an AR
-            # [n_tok, hidden] output) and exits through the shared _pool() branch below.
-            if self.is_pooling_model:
-                multimodal_outputs = None
-            else:
-                hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
-            hidden_states_cpu = None
-            # Prefix-cache write: freeze + submit; policy gating (full
-            # hidden, skip/deferred keys) happens inside the manager.
-            prefix_cache_step_id = self._prefix_cache_save_step(
-                hidden_states,
-                multimodal_outputs,
-                num_tokens_unpadded=num_tokens_unpadded,
-                num_tokens_padded=num_tokens_padded,
-            )
+                # A pooling stage skips mm extraction + the omni prefix cache (both assume an AR
+                # [n_tok, hidden] output) and exits through the shared _pool() branch below.
+                if self.is_pooling_model:
+                    multimodal_outputs = None
+                else:
+                    hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
+                hidden_states_cpu = None
+                # Prefix-cache write: freeze + submit; policy gating (full
+                # hidden, skip/deferred keys) happens inside the manager.
+                prefix_cache_step_id = self._prefix_cache_save_step(
+                    hidden_states,
+                    multimodal_outputs,
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    num_tokens_padded=num_tokens_padded,
+                )
             if (
                 prefix_cache_step_id is not None
                 and not self._model_needs_full_prefix_hidden_states()
