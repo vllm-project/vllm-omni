@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Characterization tests for ``vllm_omni.worker.base.OmniGPUWorkerBase``.
 
 Pins the CURRENT behaviour of ``determine_available_memory`` (device-level

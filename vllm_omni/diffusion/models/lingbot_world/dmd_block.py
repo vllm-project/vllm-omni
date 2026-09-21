@@ -22,6 +22,7 @@ from diffusers.utils.torch_utils import randn_tensor
 
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.models.lingbot_world.transformer import (
+    CameraModulationCache,
     LingBotAttentionCache,
     LingBotTransformerCache,
 )
@@ -109,11 +110,16 @@ class LingBotDMDBlockRunner:
         start_frame: int,
         timestep_value: float,
         step_index: int,
+        camera_cache: CameraModulationCache | None = None,
     ) -> torch.Tensor:
         """Predict flow for one denoise step.
 
         A probe never writes KV: only the clean x0 of a finished block may
         enter the cache, which is ``commit_block_kv``'s job.
+
+        ``camera_cache`` is the block's camera-modulation cache when the caller
+        holds it across separate calls (the stepwise path); ``generate_block``
+        opens the window itself instead.
         """
         if not self.enforce_eager:
             torch.compiler.cudagraph_mark_step_begin()
@@ -130,6 +136,7 @@ class LingBotDMDBlockRunner:
             cache=self._block_cache(condition=condition, cache=cache, ar=ar, commit_current=False),
             start_frame=start_frame,
             update_cache=False,
+            camera_modulation_cache=camera_cache,
         )
         if flow_prediction.shape != current_latents.shape:
             raise RuntimeError(
@@ -172,11 +179,13 @@ class LingBotDMDBlockRunner:
         cache: LingBotTransformerCache | None,
         ar: ARBlockContext | None,
         start_frame: int,
+        camera_cache: CameraModulationCache | None = None,
     ) -> None:
         """Write the finished block's clean x0 into KV and commit its pages.
 
         The fifth transformer call of a block, deliberately not a denoise step:
-        on the stepwise path it belongs to ``post_decode()``.
+        on the stepwise path it belongs to ``post_decode()``. ``camera_cache``
+        is as in ``probe_step``.
         """
         # Commit K/V only for the final clean block, never for noisy probes.
         cache_input = torch.cat((latents.to(dtype=condition.dtype), condition), dim=1)
@@ -190,6 +199,7 @@ class LingBotDMDBlockRunner:
             cache=self._block_cache(condition=condition, cache=cache, ar=ar, commit_current=True),
             start_frame=start_frame,
             update_cache=True,
+            camera_modulation_cache=camera_cache,
         )
         if ar is not None:
             ar.state.commit_paged_context(ar.branch)
@@ -210,6 +220,10 @@ class LingBotDMDBlockRunner:
         """Request mode: all probes of one block, then its commit."""
         block_shape = (1, self.transformer.config.out_channels, *condition.shape[2:5])
         current_latents = randn_tensor(block_shape, generator=generator, device=self.device, dtype=torch.float32)
+        # Every forward below -- each probe and the commit -- reads the same camera trajectory, so the camera
+        # injector is built once per block: one cache for the whole loop, exactly as the stepwise path holds
+        # one per block across its separate calls.
+        camera_cache = CameraModulationCache()
         for step_index, (timestep_value, sigma) in enumerate(schedule):
             flow_prediction = self.probe_step(
                 current_latents=current_latents,
@@ -221,6 +235,7 @@ class LingBotDMDBlockRunner:
                 start_frame=start_frame,
                 timestep_value=timestep_value,
                 step_index=step_index,
+                camera_cache=camera_cache,
             )
             next_sigma = schedule[step_index + 1][1] if step_index + 1 < len(schedule) else None
             current_latents = self.apply_transition(
@@ -235,5 +250,6 @@ class LingBotDMDBlockRunner:
             cache=cache,
             ar=ar,
             start_frame=start_frame,
+            camera_cache=camera_cache,
         )
         return current_latents

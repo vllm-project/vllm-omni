@@ -10,7 +10,6 @@ from vllm_omni.diffusion.layers.indexed_modulation import (
     _MAX_1D_GRID_SIZE,
     _iter_row_chunks,
     _launch_row_chunks,
-    _use_hopper_bf16_affine_semantics,
     indexed_gate,
     indexed_gate_rms_norm_scale_shift,
     indexed_scale_shift_,
@@ -194,52 +193,28 @@ def test_fused_modulation_preserves_bf16_residual_boundary() -> None:
 
 
 @pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.skipif(
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 9,
-    reason="SM90-specific precision path",
-)
+@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
-def test_hopper_fused_modulation_matches_pytorch_reference() -> None:
-    torch.manual_seed(42)
-    rows, hidden_size, conditions = 128, 3072, 4
-    residual = torch.randn(rows, hidden_size, device="cuda", dtype=torch.bfloat16)
-    gate = torch.randn(conditions, hidden_size, device="cuda", dtype=torch.bfloat16)
-    branch = torch.randn(rows, hidden_size, device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
-    shift = torch.randn(conditions, hidden_size, device="cuda", dtype=torch.bfloat16)
-    scale = torch.randn(conditions, hidden_size, device="cuda", dtype=torch.bfloat16)
-    indices = torch.arange(rows, device="cuda") % conditions
+@pytest.mark.parametrize("fused_gate", [False, True])
+def test_fused_modulation_keeps_fp32_affine_intermediates(fused_gate: bool) -> None:
+    device = current_omni_platform.get_torch_device()
+    rows, hidden_size = 2, 5376
+    x = torch.ones(rows, hidden_size, device=device, dtype=torch.bfloat16)
+    weight = torch.full((hidden_size,), 1.125, device=device, dtype=x.dtype)
+    shift = torch.zeros(1, hidden_size, device=device, dtype=x.dtype)
+    scale = torch.full_like(shift, 0.09375)
+    indices = torch.zeros(rows, device=device, dtype=torch.int64)
     eps = 1e-6
+    if fused_gate:
+        residual, actual = indexed_gate_rms_norm_scale_shift(
+            x, torch.zeros_like(shift), x, weight, shift, scale, indices, eps
+        )
+        assert torch.equal(residual, x)
+    else:
+        actual = rms_norm_indexed_scale_shift(x, weight, shift, scale, indices, eps)
 
-    reference_residual = (residual + gate.index_select(0, indices) * branch).to(torch.bfloat16)
-    normalized = reference_residual.float()
-    variance = normalized.pow(2).mean(-1, keepdim=True)
-    normalized = (weight.float() * (normalized * torch.rsqrt(variance + eps))).to(torch.bfloat16)
-    reference_modulated = (normalized * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)).to(
-        torch.bfloat16
-    )
-
-    actual_residual, actual_modulated = indexed_gate_rms_norm_scale_shift(
-        residual,
-        gate,
-        branch,
-        weight,
-        shift,
-        scale,
-        indices,
-        eps,
-    )
-
-    torch.testing.assert_close(actual_residual, reference_residual, atol=5e-2, rtol=5e-2)
-    torch.testing.assert_close(actual_modulated, reference_modulated, atol=5e-2, rtol=5e-2)
-
-
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_hopper_precision_dispatch_is_architecture_scoped(monkeypatch) -> None:
-    tensor = torch.empty(0, device="cuda")
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (9, 0))
-    assert _use_hopper_bf16_affine_semantics(tensor)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (10, 3))
-    assert not _use_hopper_bf16_affine_semantics(tensor)
+    # Without the RMS epsilon, 1.125 * 1.09375 = 1.23046875 is exactly
+    # halfway between two BF16 values. FP32 normalization keeps the epsilon
+    # and rounds down to 1.2265625. Premature BF16 rounding drops the epsilon
+    # and instead rounds the tie up to 1.234375, changing every output row.
+    assert torch.equal(actual, torch.full_like(x, 1.2265625))
