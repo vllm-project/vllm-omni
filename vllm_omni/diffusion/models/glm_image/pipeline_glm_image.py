@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 GlmImagePipeline implementation for vLLM-Omni.
 
@@ -193,6 +193,16 @@ def retrieve_timesteps(
                 f" timestep or sigma schedules. Please check whether you are using the correct scheduler."
             )
         scheduler.set_timesteps(timesteps=timesteps, sigmas=sigmas, device=device, **kwargs)
+        # GLM-Image conditions the DiT on the *unshifted* timesteps while integrating
+        # with the resolution-shifted sigmas: the model internalized the `mu` shift, so
+        # telling it the shifted timestep (929 instead of 800, ...) makes it over-predict
+        # the velocity, and over 50 steps the latents drift far out of distribution -- the
+        # image comes out magenta and grainy. `FlowMatchEulerDiscreteScheduler.set_timesteps`
+        # silently overwrites the timesteps we pass with `sigmas * num_train_timesteps`
+        # (unlike `FlowMatchLCMScheduler`, which keeps provided timesteps), so restore them
+        # here. `scheduler.step()` looks the step index up by matching against
+        # `scheduler.timesteps`, so it keeps using the shifted sigmas for the Euler update.
+        scheduler.timesteps = torch.as_tensor(timesteps, dtype=torch.float32, device=scheduler.timesteps.device)
         timesteps = scheduler.timesteps
         num_inference_steps = len(timesteps)
     elif timesteps is not None:

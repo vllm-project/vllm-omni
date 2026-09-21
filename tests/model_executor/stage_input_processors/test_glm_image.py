@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for GLM-Image stage input processor."""
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.stage_input_processors.glm_image import (
     _first_source_image,
     _has_source_image,
@@ -14,6 +16,7 @@ from vllm_omni.model_executor.stage_input_processors.glm_image import (
     _upsample_token_ids,
     ar2diffusion,
     compute_max_tokens,
+    prepare_ar_prompt,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -383,3 +386,98 @@ class TestAr2Diffusion:
         assert result["prompt"] == "first"
         assert result["height"] == 1024
         assert result["width"] == 1024
+
+
+# =============================================================================
+# Tests for prepare_ar_prompt (stage-0 prompt transform)
+# =============================================================================
+
+
+class TestPrepareArPrompt:
+    """The stage-0 transform that lets an offline raw prompt reach the AR processor.
+
+    ``OmniRenderer`` only routes a prompt through ``GlmImageMultiModalProcessor``
+    when it carries ``mm_processor_kwargs``; the serving layer always attaches
+    those, a raw ``Omni.generate("...")`` prompt does not.
+    """
+
+    def test_raw_string_gains_target_size(self):
+        transformed = prepare_ar_prompt("a red apple on a white table", [])
+        assert transformed["prompt"] == "a red apple on a white table"
+        assert transformed["mm_processor_kwargs"] == {"target_h": 1024, "target_w": 1024}
+
+    def test_size_comes_from_the_diffusion_stage_params(self):
+        """The scaffold must match the image the caller asked for, not the default."""
+        params = [SimpleNamespace(), OmniDiffusionSamplingParams(height=768, width=512)]
+        kwargs = prepare_ar_prompt("x", params)["mm_processor_kwargs"]
+        assert (kwargs["target_h"], kwargs["target_w"]) == (768, 512)
+
+    def test_serving_layer_kwargs_are_not_overridden(self):
+        """An explicit size from the OpenAI layer outranks the sampling params."""
+        prompt = {"prompt": "x", "mm_processor_kwargs": {"target_h": 512, "target_w": 512}}
+        params = [None, OmniDiffusionSamplingParams(height=1024, width=1024)]
+        assert prepare_ar_prompt(prompt, params)["mm_processor_kwargs"] == {"target_h": 512, "target_w": 512}
+
+    def test_caller_prompt_is_not_mutated(self):
+        prompt = {"prompt": "x"}
+        prepare_ar_prompt(prompt, [None, OmniDiffusionSamplingParams(height=768, width=768)])
+        assert prompt == {"prompt": "x"}
+
+    def test_prompt_embeds_passed_through_untouched(self):
+        prompt = {"prompt_embeds": "embeds"}
+        assert prepare_ar_prompt(prompt, []) is prompt
+
+    def test_non_mapping_prompt_passed_through_untouched(self):
+        prompt = ["a", "b"]
+        assert prepare_ar_prompt(prompt, []) is prompt
+
+    @pytest.mark.parametrize(
+        "size",
+        [
+            {"height": 768},
+            {"width": 768},
+            {"height": 768, "width": 512},
+            {"height": 1024, "width": 1024},
+            {},
+        ],
+    )
+    def test_agrees_with_ar2diffusion_on_partial_sizes(self, size):
+        """The two sites must resolve the same size, per dimension.
+
+        ``prepare_ar_prompt`` decides the layout the AR stage generates and
+        ``ar2diffusion`` parses that layout back out. A disagreement slices the
+        prior tokens at the wrong offsets and silently conditions the DiT on a
+        wrong-layout prior -- the length check downstream still passes, so there is
+        no error and no log anomaly. Sampling params carrying only one of
+        height/width used to diverge here.
+        """
+        params = OmniDiffusionSamplingParams(**size)
+        stamped = prepare_ar_prompt("x", [None, params])["mm_processor_kwargs"]
+
+        # Deliberately generous token stream so the layout check passes for every size.
+        token_ids = list(range(8192))
+        result = ar2diffusion([_source_output(token_ids)], prompt="x", sampling_params=params)
+
+        assert (stamped["target_h"], stamped["target_w"]) == (result["height"], result["width"])
+
+    def test_string_prompt_text_reaches_the_diffusion_stage(self):
+        """``req_state.prompt`` is the untransformed prompt, so a raw string arrives
+        here as a ``str``. Dropping it costs the quoted substrings that GLM-Image
+        renders as glyphs.
+        """
+        token_ids = list(range(256)) + list(range(1024)) + [16385]
+        result = ar2diffusion(
+            [_source_output(token_ids)],
+            prompt='a poster that says "OPEN"',
+            sampling_params=OmniDiffusionSamplingParams(height=1024, width=1024),
+        )
+        assert result["prompt"] == 'a poster that says "OPEN"'
+
+    def test_sampling_params_parameter_name_is_load_bearing(self):
+        """The orchestrator discovers this parameter by name via ``inspect.signature``.
+
+        Renaming or dropping it silently disables the offline size fallback with no
+        other test failure, and the resulting failure mode is a wrong-layout prior
+        rather than an exception.
+        """
+        assert "sampling_params" in inspect.signature(ar2diffusion).parameters

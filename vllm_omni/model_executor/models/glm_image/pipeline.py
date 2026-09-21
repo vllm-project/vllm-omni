@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """GLM-Image pipeline topologies (frozen).
 Two-stage (default):
   Stage 0: AR — multimodal understanding + token_ids generation
@@ -31,6 +31,10 @@ GLM_IMAGE_PIPELINE = PipelineConfig(
             engine_output_type="token_ids",
             model_subdir="vision_language_encoder",
             tokenizer_subdir="processor",
+            # Attaches target_h/target_w so the AR stage's multimodal processor
+            # runs (it owns the grid scaffold) even for prompts that did not come
+            # from the OpenAI serving layer.
+            prompt_transform_func="vllm_omni.model_executor.stage_input_processors.glm_image.prepare_ar_prompt",
         ),
         StagePipelineConfig(
             stage_id=1,

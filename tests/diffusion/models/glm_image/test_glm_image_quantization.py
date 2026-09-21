@@ -6,7 +6,9 @@ These tests verify that the GLM-Image DiT transformer correctly accepts and uses
 quantization configs for W4A16/AutoRound quantization support.
 """
 
+import importlib
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -438,6 +440,32 @@ class TestGlmImagePipelineConfig:
         assert stage_0.model_stage == "ar"
         assert stage_0.execution_type.value == "llm_ar"
         assert stage_0.owns_tokenizer is True
+
+    def test_stage_0_registers_prompt_transform(self):
+        """Verify stage 0 wires up the prompt transform that the AR stage depends on.
+
+        Without it, a prompt that did not come from the OpenAI serving layer carries no
+        ``mm_processor_kwargs``, so ``OmniRenderer`` skips
+        ``GlmImageMultiModalProcessor`` and the AR stage never emits its grid scaffold --
+        offline ``Omni.generate("...")`` then returns a flat red image.
+        """
+        stage_0 = GLM_IMAGE_PIPELINE.stages[0]
+        assert stage_0.prompt_transform_func == (
+            "vllm_omni.model_executor.stage_input_processors.glm_image.prepare_ar_prompt"
+        )
+
+        # The hook is resolved by dotted path at stage-init time, so a rename that leaves
+        # the string behind would only fail at runtime. Resolve it here instead.
+        module_path, _, attr = stage_0.prompt_transform_func.rpartition(".")
+        transform = getattr(importlib.import_module(module_path), attr)
+        assert callable(transform)
+
+        # Exercise it the way stage init does: a raw string plus the per-stage sampling
+        # params list, whose last entry is the diffusion stage's.
+        params = [SimpleNamespace(), SimpleNamespace(height=768, width=512)]
+        transformed = transform("a red apple on a white table", params)
+        assert transformed["prompt"] == "a red apple on a white table"
+        assert transformed["mm_processor_kwargs"] == {"target_h": 768, "target_w": 512}
 
     def test_stage_1_is_diffusion(self):
         """Verify stage 1 is the DiT diffusion stage."""

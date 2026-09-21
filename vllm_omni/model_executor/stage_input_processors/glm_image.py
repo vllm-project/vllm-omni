@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage input processor for GLM-Image: AR → Diffusion transition."""
 
 import math
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
@@ -14,6 +14,103 @@ from vllm.logger import init_logger
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 logger = init_logger(__name__)
+
+_DEFAULT_TARGET_SIZE = 1024
+
+
+def _coerce_dim(v: Any, default: int) -> int:
+    try:
+        iv = int(v)
+        return iv if iv > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _sampling_params_target_size(sampling_params: Any) -> tuple[int | None, int | None]:
+    """Read the diffusion target size off a diffusion sampling params object."""
+    if sampling_params is None:
+        return None, None
+    if isinstance(sampling_params, Mapping):
+        return sampling_params.get("height"), sampling_params.get("width")
+    return getattr(sampling_params, "height", None), getattr(sampling_params, "width", None)
+
+
+def _diffusion_sampling_params(sampling_params_list: Sequence[Any]) -> Any:
+    """Pick the diffusion stage's params out of a per-stage sampling params list.
+
+    GLM-Image is AR → diffusion, so this is the last entry; the AR stage's text
+    ``SamplingParams`` exposes no height/width and is skipped.
+    """
+    for params in reversed(list(sampling_params_list or ())):
+        sp_h, sp_w = _sampling_params_target_size(params)
+        if sp_h is not None or sp_w is not None:
+            return params
+    return None
+
+
+def _resolve_target_size(
+    mm_processor_kwargs: Any, prompt_fields: Mapping[str, Any], sampling_params: Any
+) -> tuple[int, int]:
+    """Resolve the AR scaffold's target size, highest-precedence source first.
+
+    ``mm_processor_kwargs`` (set by the serving layer) wins, then top-level
+    ``height``/``width`` on the prompt for backward compatibility, then the
+    diffusion stage's own sampling params, then :data:`_DEFAULT_TARGET_SIZE`.
+
+    Both :func:`prepare_ar_prompt` and :func:`ar2diffusion` resolve the size
+    through here, and each dimension resolves independently. They must agree
+    exactly: the former decides the layout the AR stage generates and the latter
+    parses that layout back out, and a disagreement slices the prior tokens at the
+    wrong offsets without raising.
+    """
+    sp_h, sp_w = _sampling_params_target_size(sampling_params)
+    mm = mm_processor_kwargs if isinstance(mm_processor_kwargs, Mapping) else {}
+    height = _coerce_dim(
+        mm.get("target_h"), _coerce_dim(prompt_fields.get("height"), _coerce_dim(sp_h, _DEFAULT_TARGET_SIZE))
+    )
+    width = _coerce_dim(
+        mm.get("target_w"), _coerce_dim(prompt_fields.get("width"), _coerce_dim(sp_w, _DEFAULT_TARGET_SIZE))
+    )
+    return height, width
+
+
+def prepare_ar_prompt(prompt: Any, sampling_params_list: Sequence[Any]) -> Any:
+    """Give the stage-0 prompt the target size its multimodal processor needs.
+
+    GLM-Image's AR stage only emits prior tokens when ``GlmImageMultiModalProcessor``
+    runs: that processor appends the ``<sop>H W<eop><sop>h w<eop><bos>`` grid
+    scaffold and builds the M-RoPE generation grids. ``OmniRenderer`` routes a
+    prompt through it only when the prompt carries ``mm_processor_kwargs``, which
+    the OpenAI serving layer always attaches but a raw prompt does not — so
+    ``Omni.generate("a red apple on a white table")`` used to reach the AR stage
+    as plain text, decode until it hit ``max_tokens`` instead of stopping at EOS,
+    and leave the diffusion stage conditioned on garbage prior tokens.
+
+    The target size comes from the diffusion stage's sampling params so the
+    scaffold matches the image the caller actually asked for.
+    """
+    if isinstance(prompt, str):
+        transformed: dict[str, Any] = {"prompt": prompt}
+    elif isinstance(prompt, Mapping):
+        # Covers TextPrompt and TokensPrompt alike -- both are TypedDicts. Stamping a
+        # token prompt is harmless: the processor guards the scaffold append with a
+        # suffix check, so a caller that built its own scaffold keeps it.
+        transformed = dict(prompt)
+    else:
+        # Anything else (e.g. a list of prompts) is not ours to rewrite.
+        return prompt
+
+    if "prompt_embeds" in transformed:
+        return prompt
+
+    mm_processor_kwargs = dict(transformed.get("mm_processor_kwargs") or {})
+    height, width = _resolve_target_size(
+        mm_processor_kwargs, transformed, _diffusion_sampling_params(sampling_params_list)
+    )
+    mm_processor_kwargs["target_h"] = height
+    mm_processor_kwargs["target_w"] = width
+    transformed["mm_processor_kwargs"] = mm_processor_kwargs
+    return transformed
 
 
 def _has_source_image(mm_data: Any) -> bool:
@@ -217,6 +314,7 @@ def ar2diffusion(
     prompt: OmniTokensPrompt | TextPrompt | list | None = None,
     requires_multimodal_data: bool = False,
     streaming_context: Any | None = None,
+    sampling_params: Any | None = None,
 ) -> dict[str, Any] | None:
     """Process AR stage outputs to create Diffusion stage inputs.
 
@@ -244,6 +342,10 @@ def ar2diffusion(
 
     if isinstance(original_prompt, dict):
         pass
+    elif isinstance(original_prompt, str):
+        # A raw offline string prompt: keep the text, or the diffusion stage loses the
+        # quoted substrings it renders as glyphs (see GlmImagePipeline.get_glyph_texts).
+        original_prompt = {"prompt": original_prompt}
     elif hasattr(original_prompt, "_asdict"):
         original_prompt = original_prompt._asdict()
     elif hasattr(original_prompt, "__dict__"):
@@ -253,23 +355,11 @@ def ar2diffusion(
 
     mm_processor_kwargs = original_prompt.get("mm_processor_kwargs")
 
-    def _coerce_dim(v: Any, default: int) -> int:
-        try:
-            iv = int(v)
-            return iv if iv > 0 else default
-        except (TypeError, ValueError):
-            return default
-
-    # Prefer GLM-Image target size from mm_processor_kwargs (set by serving layer),
-    # then fall back to top-level fields for backward compatibility.
-    height = _coerce_dim(
-        mm_processor_kwargs.get("target_h") if isinstance(mm_processor_kwargs, dict) else None,
-        _coerce_dim(original_prompt.get("height"), 1024),
-    )
-    width = _coerce_dim(
-        mm_processor_kwargs.get("target_w") if isinstance(mm_processor_kwargs, dict) else None,
-        _coerce_dim(original_prompt.get("width"), 1024),
-    )
+    # `req_state.prompt` is the *untransformed* prompt, so an offline request carries
+    # neither mm_processor_kwargs nor top-level height/width and this stage's own
+    # sampling params are what identify the size. Resolution has to match
+    # prepare_ar_prompt exactly; both go through _resolve_target_size.
+    height, width = _resolve_target_size(mm_processor_kwargs, original_prompt, sampling_params)
     text_prompt = original_prompt.get("prompt", "")
 
     # Detect i2i mode.
