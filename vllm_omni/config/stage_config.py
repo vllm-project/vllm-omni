@@ -786,9 +786,11 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
 _MINICPMO_TALKER_FRAMES_MAX = 16
 
 # Frames the deploy layer declared for stage 1's Talker multi-frame decode,
-# recorded when a deploy config is parsed. NPU workers inherit the value across
-# the fork, so a reader that runs before the engine hands the runner its
-# vllm_config -- the warmup guard is one -- sees the same decision.
+# recorded when a deploy config is parsed. A reader in the same process that
+# runs before the engine hands the runner its vllm_config -- the warmup guard
+# is one -- sees the same decision here. Stage workers are spawned, so they do
+# NOT inherit it: the guard on that side decides without asking, see
+# ascend_warmup_patch._skipped_names.
 _resolved_talker_frames: int = 1
 
 
