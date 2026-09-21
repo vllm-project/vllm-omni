@@ -9,6 +9,12 @@ the owner document for `vllm_omni/engine/duplex/**`,
 `vllm_omni/entrypoints/duplex_omni.py`, `vllm_omni/entrypoints/duplex/**`,
 `vllm_omni/clients/**` and the per-model `duplex/` packages.
 
+`vllm_omni/protocol/realtime/**` (the OpenAI Realtime API) and
+`vllm_omni/protocol/duplex/**` (vLLM-Omni's extension of it) are the shared
+wire codec duplex is built on. Duplex is its first consumer but not its owner: the codec
+is deliberately runtime-agnostic so a second Realtime surface can reuse it
+(RFC #6592 P0a).
+
 The public wire contract lives in
 [`docs/serving/realtime_duplex_api.md`](../serving/realtime_duplex_api.md);
 this page describes how it is produced.
@@ -124,6 +130,40 @@ plugin and the session runtime config to `DuplexOrchestrator` directly.
    attachment/resume/replay bookkeeping; it holds no session state.
 6. **No `typing.Protocol`** in the duplex surfaces: the plugin, data plane,
    session state, PCM buffer, stage port and client transport seams are ABCs.
+7. **The wire codec is not duplex, and a wire type is not a mailbox message.**
+   The event and command *vocabulary* plus its wire rendering, the audio format
+   negotiation, the conversation-item rules and the error envelope are model-
+   and runtime-agnostic, and split along the three tiers
+   [`docs/serving/realtime_duplex_api.md`](../serving/realtime_duplex_api.md)
+   already defines: **Tier 1** (identical to OpenAI) is
+   `vllm_omni/protocol/realtime/**`; **Tier 2** (OpenAI names carrying our
+   extensions) and **Tier 3** (ours alone) are `vllm_omni/protocol/duplex/**`.
+   A Tier 2 class *subclasses* its Tier 1 twin and declares only what it adds,
+   so the OpenAI surface stays honestly pure --- `session.created` without
+   `resume_token`, `input_audio_buffer.append` without `video_frames`. Our
+   error **codes** are Tier 3 (`protocol/duplex/errors.py`); only the envelope
+   shape and OpenAI's three `error.type` classes are Tier 1.
+   What stays engine-side is everything that is *internal representation*
+   rather than contract: `DuplexCommand.payload()` renders the session runner's
+   mailbox dictionary, whose channel genuinely differs from the client event
+   (`session.update` and the three `conversation.item.*` commands all travel on
+   `turn.signal`); `engine/duplex/realtime_commands.py` decides which command a
+   decoded event becomes; `engine/duplex/realtime_events.py` holds the
+   session's projection state. The codec may not import the engine, the
+   entrypoints, `model_executor` or the clients
+   (`tests/protocol/realtime/test_protocol_import_boundary.py`), and there is
+   exactly one implementation of each codec behaviour
+   (`tests/protocol/realtime/test_realtime_codec_single_source.py`).
+   The dependency chain is `protocol/realtime` <- `protocol/duplex` <- engine /
+   entrypoints / clients, and a duplex consumer uses **only** the middle link:
+   `protocol/duplex/**` re-exports the Tier 1 names it does not extend, so a
+   helper that later needs a duplex-specific version (`convert_input_audio_with_rate`
+   resamples to MiniCPM-o's 16 kHz rather than the client's rate) is overridden
+   in one file instead of at every call site
+   (`tests/protocol/duplex/test_duplex_protocol_facade.py`).
+   `DuplexEvent` is therefore a plain alias of `RealtimeEvent` --- an event has
+   no engine-internal half --- while `DuplexCommand` is a real class, because a
+   command does.
 
 ## Package layout
 
@@ -142,6 +182,31 @@ vllm_omni/
 │   │   ├── chat_completions.py      DuplexChatCompletionsAdapter (/v1/chat/completions on a session per request)
 │   │   └── websocket.py             websocket send/close/receive helpers
 │   └── openai/api_server.py         builds DuplexOmni for duplex models; session-backed app state
+├── protocol/                        SHARED WIRE CODEC (no engine / no model / no transport)
+│   ├── realtime/                    the OpenAI Realtime API itself
+│   │   ├── events.py                RealtimeEvent + OpenAI's 30 server events (22 ship as Tier 1;
+│   │   │                            8 have a Tier 2 twin in protocol/duplex)
+│   │   ├── commands.py              RealtimeCommand + OpenAI's 10 client commands (8 Tier 1,
+│   │   │                            2 with a Tier 2 twin) --- wire_type + fields, no payload()
+│   │   ├── formats.py               audio format spellings, what is supported, per-session validation
+│   │   ├── session.py               session-object readers; RealtimeInputDefaults (append defaults)
+│   │   ├── items.py                 conversation item shape, truncation, transcripts, camera frames
+│   │   ├── audio_input.py           decode_audio_append -> RealtimeAudioAppend; client speech hints
+│   │   ├── audio.py                 PCM / G.711 / WAV decode, resample, re-encode
+│   │   ├── errors.py                RealtimeProtocolError (the envelope's exception type)
+│   │   └── capabilities.py          RealtimeProtocolCapabilities: what one consumer can serve
+│   └── duplex/                      Tier 2 + Tier 3, and the one door a duplex consumer uses
+│       ├── __init__.py              re-exports the Tier 1 helper functions (audio, formats,
+│       │                            items, session, capabilities) so the engine never
+│       │                            imports protocol/realtime directly
+│       ├── events.py                the whole 42-event vocabulary: 22 Tier-1 re-exports,
+│       │                            8 Tier-2 subclasses (session.created + resume_token, ...),
+│       │                            12 Tier-3 events (listen/speak, playback, resume, ...);
+│       │                            DuplexEvent = RealtimeEvent
+│       ├── commands.py              the whole 17-command vocabulary: 8 Tier-1 re-exports,
+│       │                            2 Tier-2 subclasses (append + hints, commit + final),
+│       │                            7 Tier-3 commands (barge_in, playback.ack, ...)
+│       └── errors.py                our error-code vocabulary (Tier 3) + RealtimeProtocolError
 ├── engine/
 │   ├── omni_engine_base.py          OmniEngineBase (stage processes, orchestrator thread, queues, RPC)
 │   ├── async_omni_engine.py         AsyncOmniEngine (turn-based request building)
@@ -149,16 +214,20 @@ vllm_omni/
 │   ├── orchestrator.py              OrchestratorBase + Orchestrator
 │   ├── duplex_orchestrator.py       DuplexOrchestrator (+ DuplexOrchestratorRequestState; implements DuplexStagePort)
 │   └── duplex/
-│       ├── commands.py              DuplexCommand dataclasses, command_from_realtime
-│       ├── realtime_commands.py     Realtime client event -> DuplexCommand translation
-│       ├── events.py                DuplexEvent dataclasses (+ to_realtime), REALTIME_ERROR_TYPES_BY_CODE
+│       ├── commands.py              mailbox half: DuplexCommand.payload() + the mailbox `type`,
+│       │                            paired with each protocol command; command_from_realtime
+│       ├── realtime_commands.py     duplex binding of the codec: decoded event -> DuplexCommand,
+│       │                            DUPLEX_REALTIME_CAPABILITIES, duplex_response_format
+│       ├── events.py                re-export shim (DuplexEvent = RealtimeEvent) + the runner's
+│       │                            epoch-filter sets DOMAIN_TERMINAL_EVENTS / MODEL_OUTPUT_EVENTS
 │       ├── realtime_events.py       RealtimeProjectionState: internal event -> typed events
 │       ├── messages.py              queue envelopes (Open/Close/Resume/Touch/Command/Result/Event), DuplexSessionError
 │       ├── config.py                DuplexSessionConfig, DuplexCapabilities, ResponseCreateOptions
 │       ├── contracts.py             DuplexFence (session_id, epoch, turn_id), stage request records, DuplexStagePort
 │       ├── plugin.py                DuplexModelPlugin, DuplexModelSessionState, DuplexDataPlane, PcmAppendBuffer ABCs
 │       ├── turn_detection.py        server-side VAD turn detector used by the session
-│       ├── audio.py / vad.py / intermediate.py
+│       ├── audio.py                 compatibility re-export, via protocol/duplex
+│       ├── vad.py / intermediate.py
 │       └── session/                 one engine-resident session and everything that runs it
 │           ├── engine_session.py    DuplexEngineSession: ledgers, lease, fence, stage resources, append sequencing
 │           ├── runner.py            DuplexSessionRunner (per-session mailbox on the orchestrator loop)

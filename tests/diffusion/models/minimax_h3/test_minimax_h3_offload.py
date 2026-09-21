@@ -86,6 +86,7 @@ def test_decode_releases_only_audio_before_return(monkeypatch):
         audio_vae=Mock(decode_latent=Mock(return_value=audio)),
         _component_on_device=lambda component: nullcontext(),
         _offload_model_cpu_stage_output=Mock(side_effect=lambda value: value),
+        _release_stage_cache=Mock(),
     )
     monkeypatch.setattr(
         module.current_omni_platform,
@@ -152,6 +153,7 @@ def test_forward_releases_video_after_quantization_and_before_next_seed(monkeypa
         diffuse=diffuse,
         decode=decode,
         _offload_model_cpu_stage_output=_recording_release(events, releases),
+        _release_stage_cache=lambda: None,
     )
     request = SimpleNamespace(prompts=["a prompt"], sampling_params=SimpleNamespace())
 
@@ -201,6 +203,7 @@ def test_forward_drops_the_decoded_video_before_the_next_seed_diffuses(monkeypat
         diffuse=diffuse,
         decode=decode,
         _offload_model_cpu_stage_output=lambda value: value.clone(),
+        _release_stage_cache=lambda: None,
     )
     request = SimpleNamespace(prompts=["a prompt"], sampling_params=SimpleNamespace())
 
@@ -231,6 +234,7 @@ def test_post_decode_releases_video_after_quantization(monkeypatch):
         _unpack_denoised_rows=lambda *args, **kwargs: (torch.zeros(1), torch.zeros(1)),
         decode=decode,
         _offload_model_cpu_stage_output=_recording_release(events, releases),
+        _release_stage_cache=lambda: None,
     )
     state = SimpleNamespace(
         latents=torch.zeros(1),
@@ -529,7 +533,7 @@ def test_h3_model_cpu_offload_shares_embedded_and_standalone_audio_scope(monkeyp
     torch.nn.Module.__init__(pipeline)
     pipeline.audio_vae = Mock()
     pipeline._model_cpu_offload_modules = [pipeline.audio_vae]
-    events = []
+    events: list[tuple] = []
 
     @contextmanager
     def record_component(value):

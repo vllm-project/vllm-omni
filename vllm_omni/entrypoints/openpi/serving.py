@@ -194,6 +194,9 @@ class ServingRealtimeRobotOpenPI:
         # (e.g. a policy deploy yaml's ``extra_args``) and layer the OpenPI
         # protocol fields on top.
         seed = obs.pop("seed", None)
+        # Nested so engine knobs cannot collide with robot-defined obs keys.
+        sampling = obs.get("sampling_params") or {}
+        robot_obs = {key: value for key, value in obs.items() if key != "sampling_params"}
         sampling_params = OmniDiffusionSamplingParams()
         for default_params in get_default_sampling_params_list(self.engine_client):
             if isinstance(default_params, OmniDiffusionSamplingParams):
@@ -205,15 +208,16 @@ class ServingRealtimeRobotOpenPI:
             {
                 "reset": reset,
                 "session_id": session_id,
-                "robot_obs": obs,
+                "robot_obs": robot_obs,
             }
         )
 
         prompt = obs.get("prompt", "")
-        sampling_params = OmniDiffusionSamplingParams(
-            seed=int(seed) if seed is not None else None,
-            extra_args=extra_args,
-        )
+        if seed is not None:
+            sampling_params.seed = int(seed)
+        if "num_inference_steps" in sampling:
+            sampling_params.num_inference_steps = sampling["num_inference_steps"]
+        sampling_params.extra_args = extra_args
         return OmniDiffusionRequest(
             prompt=prompt,
             sampling_params=sampling_params,

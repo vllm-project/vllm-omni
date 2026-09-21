@@ -151,10 +151,10 @@ class SupportsInteractionApply(Protocol):
     """Optional protocol for pipelines with unified mid-generation, chunk-boundary hooks."""
 
     def peek_chunk_media(self, state: StepRequestState) -> ChunkMediaSpec:
-        """Return the media timeline represented by the upcoming/current chunk.
+        """Return the media timeline and latent frame count for the upcoming/current chunk.
 
         Useful when interaction handler needs interpolation/integration on a frame-by-frame basis,
-        or for backpressure/pacing.
+        and/or for backpressure/pacing.
         """
         ...
 

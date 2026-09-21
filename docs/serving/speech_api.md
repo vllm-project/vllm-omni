@@ -521,6 +521,15 @@ are cached in-process with a shared LRU so repeated requests with the same
 all TTS model types; deleting a voice invalidates every model-type slot at
 once.
 
+Decoded reference waveforms use a separate LRU cache of owned, contiguous
+float32 arrays at the source sampling rate. Its byte budget counts numeric
+buffers (four bytes per mono sample), excluding cache metadata. Numeric storage
+avoids retaining a Python float object for every sample during garbage
+collection. MOSS reference encoding consumes these arrays directly; other
+list-based interfaces, including MOSS Nano, receive temporary lists that are
+not retained in the resolve cache. The MOSS reference encoder also releases
+completed batch inputs before waiting for more work.
+
 ### Precomputed Custom Voices
 
 Qwen3-TTS Base and VoxCPM2 can load offline-precomputed voices at startup.
