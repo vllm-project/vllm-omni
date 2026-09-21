@@ -34,6 +34,7 @@ from vllm_omni.clients.duplex import (
     ReconnectPolicy,
     SessionConfig,
     SessionResumed,
+    SessionUpdated,
     build_realtime_url,
     chunk_period_ms,
     duplex_unit_boundary_ms,
@@ -824,7 +825,8 @@ async def test_inline_input_defaults_change_only_after_session_updated(accepted,
             else {"type": "error", "error": {"code": "invalid_session_update", "message": "rejected"}}
         )
         handle.feed(event)
-        await client.wait_for("session.updated" if accepted else "error", timeout_s=2.0)
+        received = await client.wait_for("session.updated" if accepted else "error", timeout_s=2.0)
+        assert isinstance(received, SessionUpdated if accepted else ErrorEvent)
 
         pcm = struct.pack("<f", 0.05) * 16
         await client.send({"type": "input_audio_buffer.append", "audio": _b64(pcm)})
