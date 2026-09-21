@@ -19,6 +19,9 @@ stages:
       action_dim: 64
       num_embodiment_domains: 32
       default_fps: 15.0
+      # Experimental: batch frame-causal clean K/V refreshes. Keep framewise
+      # until checkpoint-level quality and performance have been validated.
+      clean_commit_mode: framewise  # framewise | batched
       ar_diffusion_kv_config:
         gpu_memory_fraction: 0.35
         warmup_cudagraph: false

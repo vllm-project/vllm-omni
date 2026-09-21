@@ -189,10 +189,14 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     _SESSION_CAPACITY = 1
     _ar_diffusion_kv_state = None
     _bound_session_id: str | None = None
+    clean_commit_mode: str = "framewise"
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__(od_config=od_config, prefix=prefix)
         self.manifest = Cosmos3NanoSimBimanualManifest.from_od_config(od_config)
+        self.clean_commit_mode = deploy_option(od_config, "clean_commit_mode", "framewise")
+        if self.clean_commit_mode not in {"framewise", "batched"}:
+            raise ValueError("clean_commit_mode must be 'framewise' or 'batched'")
         self.resolution_policy = _resolution_policy(od_config, self.manifest)
         self.manifest.require_exported_artifact()
         if not isinstance(self.transformer, Cosmos3NanoSimBimanualTransformer):
@@ -647,6 +651,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         condition_vision: bool,
         null_action_frame_indexes: tuple[int, ...],
         commit_current: bool,
+        frame_causal: bool = False,
     ) -> Cosmos3NanoSimBimanualTransformerOutput:
         paged_state = self._ar_diffusion_kv_state
         tokens_per_frame = geometry.tokens_per_frame(self.manifest.conditioning_tokens_per_frame)
@@ -658,7 +663,8 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 self._MAIN_BRANCH,
                 seq_len=seq_len,
                 commit_current=commit_current,
-                extra_visible_tokens=seq_len,
+                extra_visible_tokens=tokens_per_frame if frame_causal else seq_len,
+                frame_causal=frame_causal,
             )
         else:
             dense_history = state.dense_kv_by_branch.get(self._MAIN_BRANCH)
@@ -677,11 +683,23 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             dense_history=dense_history,
             condition_vision=condition_vision,
             null_action_frame_indexes=null_action_frame_indexes,
+            frame_causal=frame_causal,
         )
         if paged_state is not None:
             paged_state.commit_paged_context(self._MAIN_BRANCH)
         elif commit_current:
-            self._append_dense_kv(state, output.current_kv, geometry)
+            if frame_causal:
+                for start in range(0, seq_len, tokens_per_frame):
+                    self._append_dense_kv(
+                        state,
+                        [
+                            (k[:, start : start + tokens_per_frame], v[:, start : start + tokens_per_frame])
+                            for k, v in output.current_kv
+                        ],
+                        geometry,
+                    )
+            else:
+                self._append_dense_kv(state, output.current_kv, geometry)
         return output
 
     # -- Action and latent preparation ------------------------------------
@@ -863,6 +881,42 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 condition_vision=True,
                 null_action_frame_indexes=(0,) if null_action else (),
                 commit_current=True,
+            )
+        finally:
+            self._reset_mixed_precision()
+
+    def _commit_clean_chunk(
+        self,
+        state: Cosmos3NanoSimBimanualSessionState,
+        latent: torch.Tensor,
+        *,
+        geometry: Cosmos3NanoSimBimanualGeometry,
+        frame_start: int,
+        text_kv: list[tuple[torch.Tensor, torch.Tensor]],
+        real_text_kv_len: int,
+        fps: float,
+        action: torch.Tensor,
+        domain_ids: torch.Tensor,
+        null_action_frame_indexes: tuple[int, ...],
+    ) -> None:
+        """Refresh a clean prefix in one frame-causal transformer forward."""
+        try:
+            self._set_mixed_precision_step(self._distilled_num_steps - 1, self._distilled_num_steps)
+            self._transformer_forward(
+                state,
+                latent.to(self.dtype),
+                torch.zeros(1, device=self.device, dtype=torch.float32),
+                geometry=geometry,
+                text_kv=text_kv,
+                real_text_kv_len=real_text_kv_len,
+                frame_start=frame_start,
+                fps=fps,
+                action_latents=action,
+                action_domain_ids=domain_ids,
+                condition_vision=True,
+                null_action_frame_indexes=null_action_frame_indexes,
+                commit_current=True,
+                frame_causal=True,
             )
         finally:
             self._reset_mixed_precision()
@@ -1317,26 +1371,46 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 "clean_cache_commit_s",
                 enabled=measure_tick_latency,
             ):
-                for local_idx, frame_idx in iter_clean_commit_frames(
-                    chunk_start,
-                    chunk_end,
-                    target_frame=target_frame,
-                    terminal_request=terminal_request,
-                ):
-                    action_start = local_idx * action_count
-                    action_frame = action_chunk[:, action_start : action_start + action_count]
-                    self._commit_clean_frame(
+                commit_frames = list(
+                    iter_clean_commit_frames(
+                        chunk_start,
+                        chunk_end,
+                        target_frame=target_frame,
+                        terminal_request=terminal_request,
+                    )
+                )
+                if getattr(self, "clean_commit_mode", "framewise") == "batched" and commit_frames:
+                    # The helper returns a contiguous prefix, excluding only
+                    # the global terminal frame when no continuation is needed.
+                    count = len(commit_frames)
+                    self._commit_clean_chunk(
                         state,
-                        clean_chunk[:, :, local_idx : local_idx + 1],
+                        clean_chunk[:, :, :count],
                         geometry=geometry,
-                        frame_idx=frame_idx,
+                        frame_start=chunk_start,
                         text_kv=text_kv,
                         real_text_kv_len=real_text_kv_len,
                         fps=fps,
-                        action=action_frame,
+                        action=action_chunk[:, : count * action_count],
                         domain_ids=domain_ids,
-                        null_action=local_idx in null_action_indexes,
+                        null_action_frame_indexes=tuple(i for i in null_action_indexes if i < count),
                     )
+                else:
+                    for local_idx, frame_idx in commit_frames:
+                        action_start = local_idx * action_count
+                        action_frame = action_chunk[:, action_start : action_start + action_count]
+                        self._commit_clean_frame(
+                            state,
+                            clean_chunk[:, :, local_idx : local_idx + 1],
+                            geometry=geometry,
+                            frame_idx=frame_idx,
+                            text_kv=text_kv,
+                            real_text_kv_len=real_text_kv_len,
+                            fps=fps,
+                            action=action_frame,
+                            domain_ids=domain_ids,
+                            null_action=local_idx in null_action_indexes,
+                        )
             state.append_chunk(clean_chunk, frame_start=chunk_start, retain_latent=not tick and not stream_video)
             retain_output(clean_chunk)
             del clean_chunk

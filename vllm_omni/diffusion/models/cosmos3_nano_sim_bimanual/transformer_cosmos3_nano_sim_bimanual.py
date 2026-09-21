@@ -57,6 +57,7 @@ class Cosmos3NanoSimBimanualJointAttention(Cosmos3CrossAttention):
         tokens_per_frame: int,
         action_tokens_per_frame: int,
         null_action_frame_indexes: tuple[int, ...] = (),
+        clean_history_window: tuple[int, int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if hidden_states.shape[0] != 1:
             raise ValueError(
@@ -101,7 +102,31 @@ class Cosmos3NanoSimBimanualJointAttention(Cosmos3CrossAttention):
                 text_k[0, :real_text_kv_len],
                 text_v[0, :real_text_kv_len],
                 self.head_dim**-0.5,
+                framewise_attention=clean_history_window is not None,
             ).unsqueeze(0)
+        elif clean_history_window is not None:
+            # Dense oracle for batched clean refresh. Projections and MLPs
+            # remain batched, while each attention sees its sequential prefix.
+            sink_frames, window_frames = clean_history_window
+            sink_tokens = sink_frames * tokens_per_frame
+            tail_tokens = window_frames * tokens_per_frame
+            history_k, history_v = dense_history if dense_history is not None else (k[:, :0], v[:, :0])
+            outputs = []
+            for frame in range(num_frames):
+                start, end = frame * tokens_per_frame, (frame + 1) * tokens_per_frame
+                key = torch.cat([history_k, k[:, :start]], dim=1)
+                value = torch.cat([history_v, v[:, :start]], dim=1)
+                if key.shape[1] > sink_tokens + tail_tokens:
+                    key = torch.cat([key[:, :sink_tokens], key[:, -tail_tokens:]], dim=1)
+                    value = torch.cat([value[:, :sink_tokens], value[:, -tail_tokens:]], dim=1)
+                outputs.append(
+                    self.attn(
+                        q[:, start:end],
+                        torch.cat([text_k[:, :real_text_kv_len], key, k[:, start:end]], dim=1),
+                        torch.cat([text_v[:, :real_text_kv_len], value, v[:, start:end]], dim=1),
+                    )
+                )
+            output = torch.cat(outputs, dim=1)
         else:
             key_parts = [text_k[:, :real_text_kv_len]]
             value_parts = [text_v[:, :real_text_kv_len]]
@@ -288,22 +313,33 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
         real_text_kv_len: int,
         fps: float,
         null_action_frame_indexes: tuple[int, ...],
+        frame_causal: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         absolute_null_frames = tuple(frame_start + frame for frame in null_action_frame_indexes)
+        # Sequential clean commits treat each frame as its own AR unit. In
+        # particular every null action is colocated with its vision frame;
+        # the ordinary multi-frame denoise packer only colocates the first.
+        spans = [(frame_start + i, 1) for i in range(num_frames)] if frame_causal else [(frame_start, num_frames)]
         position_ids = (
-            build_interleaved_mrope_position_ids(
-                frame_start=frame_start,
-                num_frames=num_frames,
-                grid_h=grid_h,
-                grid_w=grid_w,
-                text_temporal_offset=real_text_kv_len,
-                temporal_modality_margin=self.temporal_modality_margin,
-                fps=fps,
-                base_fps=self.base_fps,
-                temporal_compression_factor=self.temporal_compression_factor,
-                enable_fps_modulation=self.enable_fps_modulation,
-                action_tokens_per_frame=self.manifest.action_tokens_per_frame,
-                null_action_frames=absolute_null_frames,
+            torch.cat(
+                [
+                    build_interleaved_mrope_position_ids(
+                        frame_start=start,
+                        num_frames=count,
+                        grid_h=grid_h,
+                        grid_w=grid_w,
+                        text_temporal_offset=real_text_kv_len,
+                        temporal_modality_margin=self.temporal_modality_margin,
+                        fps=fps,
+                        base_fps=self.base_fps,
+                        temporal_compression_factor=self.temporal_compression_factor,
+                        enable_fps_modulation=self.enable_fps_modulation,
+                        action_tokens_per_frame=self.manifest.action_tokens_per_frame,
+                        null_action_frames=absolute_null_frames,
+                    )
+                    for start, count in spans
+                ],
+                dim=1,
             )
             .unsqueeze(1)
             .to(hidden.device)
@@ -327,12 +363,15 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
         dense_history: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         condition_vision: bool = False,
         null_action_frame_indexes: tuple[int, ...] = (),
+        frame_causal: bool = False,
     ) -> Cosmos3NanoSimBimanualTransformerOutput:
         """Denoise or clean-commit one current chunk.
 
-        ``paged_kv`` is non-committing during denoise and committing only for a
-        one-frame clean refresh. Dense history is the permanent numerical oracle.
+        ``paged_kv`` is non-committing during denoise. Clean refreshes commit
+        one frame or a frame-causal batch. Dense history is the numerical oracle.
         """
+        if frame_causal and not condition_vision:
+            raise ValueError("Frame-causal batching is only supported for clean conditioning forwards")
         if hidden_states.ndim != 5 or hidden_states.shape[0] != 1:
             raise ValueError(
                 f"Cosmos3-Nano-Sim-Bimanual hidden_states must have shape [1,C,T,H,W], got {tuple(hidden_states.shape)}"
@@ -406,6 +445,7 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
             real_text_kv_len=real_text_kv_len,
             fps=fps,
             null_action_frame_indexes=null_action_frame_indexes,
+            frame_causal=frame_causal,
         )
 
         if paged_kv is not None:
@@ -443,6 +483,9 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
                     tokens_per_frame=actual_tokens_per_frame,
                     action_tokens_per_frame=action_count,
                     null_action_frame_indexes=null_action_frame_indexes,
+                    clean_history_window=(self.manifest.sink_frames, self.manifest.window_frames)
+                    if frame_causal
+                    else None,
                 )
                 hidden, current_k, current_v = layer_output
                 if collect_current_kv:
