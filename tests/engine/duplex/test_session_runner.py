@@ -509,6 +509,64 @@ async def test_clear_input_drops_buffered_audio() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["decode", "vad"])
+@pytest.mark.parametrize("fails", [False, True])
+async def test_audio_admission_is_held_until_preprocessing_finishes(monkeypatch, phase, fails) -> None:
+    h = await open_harness(
+        auto_response=False,
+        runtime_config=DuplexSessionRuntimeConfig(max_pending_input_bytes_per_session=64_000),
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+    owner = h.runner if phase == "decode" else h.runner.control
+    method = "offload" if phase == "decode" else "run_turn_detection"
+    original = getattr(owner, method)
+    on_command = h.runner._on_command
+
+    async def track_command(command):
+        try:
+            await on_command(command)
+        finally:
+            finished.set()
+
+    async def blocked(*args, **kwargs):
+        started.set()
+        await release.wait()
+        if fails:
+            raise ValueError("preprocessing failed")
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, method, blocked)
+    monkeypatch.setattr(h.runner, "_on_command", track_command)
+    try:
+        h.submit(append_audio(samples=8000))
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        assert h.session.pending_input_bytes == 32_000
+        h.submit(append_audio(samples=10_000, event_id="over-limit"))
+        events = await h.settle()
+        assert any(
+            event.type == "error" and event.code == "input_backpressure" and event.related_event_id == "over-limit"
+            for event in events
+        )
+
+        release.set()
+        await asyncio.wait_for(finished.wait(), timeout=2.0)
+        events = await h.settle()
+        assert h.session.pending_input_bytes == (0 if fails else 32_000)
+        assert h.session._input.queued_input_bytes == 0
+        if fails:
+            assert any(event.type == "error" and "preprocessing failed" in event.message for event in events)
+        else:
+            assert h.runner.model_state.audio_buffer.pending_byte_count == 32_000
+        await h.run(commands.ClearInput())
+        assert h.session.pending_input_bytes == 0
+    finally:
+        release.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("committed", [False, True])
 async def test_clear_input_preserves_queued_append_byte_reservations(monkeypatch, committed) -> None:
     h = await open_harness(

@@ -24,6 +24,7 @@ import asyncio
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypeVar
 
@@ -514,10 +515,11 @@ class DuplexSessionRunner:
         session = self.session
         projector = self._require_projector()
         if isinstance(command, AppendAudio):
-            # The manager reserved the wire size at admission; the handler
-            # re-reserves the decoded size around its PCM reservation.
-            session.release_input_bytes(len(command.audio), queued=True)
-            await self._on_append_audio(command.payload())
+            # Keep admission charged across decoding/VAD. Release once, at the
+            # PCM handoff or on an earlier return, error or cancellation.
+            with ExitStack() as reservation:
+                reservation.callback(session.release_input_bytes, len(command.audio), queued=True)
+                await self._on_append_audio(command.payload(), release_queued_input=reservation.close)
         elif isinstance(command, AppendText):
             session.mark_user_input_activity()
             self._emit_error(
@@ -756,7 +758,13 @@ class DuplexSessionRunner:
         self.tasks.active_response_task = None
         return True
 
-    async def _on_append_audio(self, event: dict[str, object]) -> None:
+    async def _on_append_audio(
+        self,
+        event: dict[str, object],
+        *,
+        release_queued_input: Callable[[], None] | None = None,
+    ) -> None:
+        """Prepare audio, then replace its admission charge with a PCM reservation."""
         session = self.session
         model_state = self.model_state
         session.mark_user_input_activity()
@@ -883,6 +891,9 @@ class DuplexSessionRunner:
             self.session, event, payload
         )
         raw_audio_bytes = helpers.audio_payload_size_bytes(payload)
+        # No await between releasing admission bytes and reserving PCM bytes.
+        if release_queued_input is not None:
+            release_queued_input()
         try:
             if not session.reserve_input_bytes(
                 raw_audio_bytes,

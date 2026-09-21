@@ -259,10 +259,9 @@ class DuplexSessionManager:
 
         Backpressure contract shared with the runner: a ``Commit`` that passes
         admission holds one pending-turn reservation and an ``AppendAudio``
-        holds its wire-size byte reservation until the runner dequeues the
-        command (the runner then re-reserves the decoded size around its PCM
-        reservation), so the mailbox never holds more bytes than the session
-        limit even while the worker is busy.
+        holds its admitted byte reservation through decoding and VAD. The
+        runner then replaces it with the decoded PCM reservation without an
+        intervening await, keeping pending audio charged while it is busy.
         """
         runner = self.runners.get(message.session_id)
         command = message.command
