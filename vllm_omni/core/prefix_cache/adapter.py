@@ -31,6 +31,7 @@ class PrefixCacheRequestEvent:
     hit_end: int = 0
     block_ids: tuple[tuple[int, ...], ...] = ()
     scheduled_tokens: int = 0
+    num_output_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +79,10 @@ class PrefixCacheSchedulerAdapter:
 
     @staticmethod
     def _blocks(data: Any) -> tuple[tuple[int, ...], ...]:
-        blocks = getattr(data, "block_ids", None)
+        return PrefixCacheSchedulerAdapter._blocks_value(getattr(data, "block_ids", None))
+
+    @staticmethod
+    def _blocks_value(blocks: Any) -> tuple[tuple[int, ...], ...]:
         if blocks is None:
             return ()
         if blocks and isinstance(blocks[0], int):
@@ -91,10 +95,31 @@ class PrefixCacheSchedulerAdapter:
         resumed = set(getattr(cached, "resumed_req_ids", ()) or ()) if cached is not None else set()
         aborted = set(getattr(scheduler_output, "aborted_req_ids", ()) or ())
         scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
+        terminal_ids = {
+            str(req_id)
+            for req_id in (set(getattr(scheduler_output, "finished_req_ids", ()) or ()) | aborted)
+        }
+
+        cached_by_id: dict[str, tuple[int, Any, int]] = {}
+        if cached is not None:
+            req_ids = tuple(getattr(cached, "req_ids", ()) or ())
+            computed = tuple(getattr(cached, "num_computed_tokens", ()) or ())
+            new_blocks = tuple(getattr(cached, "new_block_ids", ()) or ())
+            output_tokens = tuple(getattr(cached, "num_output_tokens", ()) or ())
+            for index, req_id in enumerate(req_ids):
+                cached_by_id[str(req_id)] = (
+                    int(computed[index]) if index < len(computed) else 0,
+                    new_blocks[index] if index < len(new_blocks) else None,
+                    int(output_tokens[index]) if index < len(output_tokens) else 0,
+                )
 
         for data in getattr(scheduler_output, "scheduled_new_reqs", ()) or ():
             req_id = self._req_id(data)
-            kind = PrefixCacheEventKind.EXTENDED if req_id in self._observed_req_ids else PrefixCacheEventKind.STARTED
+            kind = (
+                PrefixCacheEventKind.STARTED
+                if req_id in terminal_ids or req_id not in self._observed_req_ids
+                else PrefixCacheEventKind.EXTENDED
+            )
             self._observed_req_ids.add(req_id)
             computed = int(getattr(data, "num_computed_tokens", 0) or 0)
             blocks = self._blocks(data)
@@ -112,11 +137,15 @@ class PrefixCacheSchedulerAdapter:
         for req_id in resumed:
             req_id = str(req_id)
             self._observed_req_ids.add(req_id)
+            hit_end, block_ids, num_output_tokens = cached_by_id.get(req_id, (0, None, 0))
             events.append(
                 PrefixCacheRequestEvent(
                     req_id,
                     PrefixCacheEventKind.RESUMED,
+                    hit_end=hit_end,
+                    block_ids=self._blocks_value(block_ids),
                     scheduled_tokens=int(scheduled_tokens.get(req_id, 0)),
+                    num_output_tokens=num_output_tokens,
                 )
             )
 
