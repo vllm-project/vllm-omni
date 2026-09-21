@@ -32,10 +32,6 @@ from vllm_omni.diffusion.models.lingbot_world.camera import (
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.experimental.ar_diffusion.capability import supports_chunk_step_grouping
-from vllm_omni.experimental.ar_diffusion.tick_protocol import (
-    ARDiffusionControlInput,
-    ARDiffusionTickRequest,
-)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -625,75 +621,6 @@ def test_preprocess_materializes_external_inputs_before_worker_execution(tmp_pat
     assert sampling.extra_args["action_path"] == "forward"
     assert sampling.extra_args["_lingbot_camera_trajectory"] is trajectory
     assert len(load_calls) == 1
-
-
-def test_preprocess_materializes_camera_from_typed_tick_without_action_path() -> None:
-    module = _load_pipeline_module()
-    poses = torch.eye(4).repeat(9, 1, 1)
-    intrinsics = torch.tensor([[100.0, 100.0, 8.0, 8.0]]).repeat(9, 1)
-    tick = ARDiffusionTickRequest(
-        session_id="world-1",
-        request_id="tick-request-0",
-        chunk_index=0,
-        controls=(
-            ARDiffusionControlInput(
-                track="camera",
-                schema="lingbot.camera_trajectory.v1",
-                data={
-                    "poses": poses.tolist(),
-                    "intrinsics": intrinsics.tolist(),
-                },
-            ),
-        ),
-    )
-    sampling = _SamplingParams(include_action=False)
-    sampling.extra_args.update(tick.to_extra_args())
-    request = SimpleNamespace(
-        request_id="tick-request-0",
-        prompt=_prompt(),
-        sampling_params=sampling,
-    )
-
-    result = module.get_lingbot_world_pre_process_func(_od_config())(request)
-
-    trajectory = result.sampling_params.extra_args["_lingbot_camera_trajectory"]
-    torch.testing.assert_close(trajectory.poses, poses)
-    torch.testing.assert_close(trajectory.intrinsics, intrinsics)
-
-
-def test_preprocess_materializes_chunk_sized_actions_from_typed_tick() -> None:
-    module = _load_pipeline_module()
-    tick = ARDiffusionTickRequest(
-        session_id="world-actions",
-        request_id="tick-request-0",
-        chunk_index=0,
-        controls=(
-            ARDiffusionControlInput(
-                track="camera",
-                schema="lingbot.camera_actions.v1",
-                data={
-                    "mode": "frames",
-                    "frames": [["w"], ["w", "j"], []],
-                },
-            ),
-        ),
-    )
-    sampling = _SamplingParams(include_action=False)
-    sampling.extra_args.update(tick.to_extra_args())
-    request = SimpleNamespace(
-        request_id="tick-request-0",
-        prompt=_prompt(),
-        sampling_params=sampling,
-    )
-
-    result = module.get_lingbot_world_pre_process_func(_od_config())(request)
-
-    assert result.sampling_params.extra_args["_lingbot_camera_trajectory"] is None
-    assert result.sampling_params.extra_args["_lingbot_camera_actions"] == (
-        ("w",),
-        ("w", "j"),
-        (),
-    )
 
 
 def _request(*, sampling=None, prompt=None, num_reqs: int = 1):
@@ -1608,152 +1535,6 @@ def test_multi_chunk_generation_uses_one_request_local_cache_and_decodes_accumul
     assert cache_ref() is None
 
 
-def _tick_extra_args(*, chunk_index: int, prompt: str = "move through the room", session_id: str = "world-1"):
-    return ARDiffusionTickRequest(
-        session_id=session_id,
-        request_id="legacy-lingbot-request",
-        chunk_index=chunk_index,
-        applied_event_ids=(chunk_index,),
-        prompt=prompt,
-        controls=(
-            ARDiffusionControlInput(
-                track="camera",
-                schema="lingbot.camera_trajectory.v1",
-                data={"poses": [], "intrinsics": []},
-            ),
-        ),
-    ).to_extra_args()
-
-
-def test_realtime_rejects_pixel_output_before_condition_encoding() -> None:
-    pipeline = _pipeline(_load_pipeline_module())
-    pipeline._ar_diffusion_kv_state = object()
-    sampling = _SamplingParams(output_type="np", extra_args=_tick_extra_args(chunk_index=0))
-    with pytest.raises(ValueError, match="require output_type='latent'"):
-        pipeline(_request(sampling=sampling))
-    assert pipeline._ar_sessions == {}
-    assert pipeline.vae.encoder.inputs == []
-
-
-def test_typed_ticks_generate_one_global_block_and_return_standard_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module = _load_pipeline_module()
-    pipeline = _pipeline(module)
-    pipeline._ar_height = 16
-    pipeline._ar_width = 16
-    pipeline._ar_diffusion_kv_state = object()
-    cross_calls = []
-    generated = []
-
-    def ar_text_caches(prompt_embeds, *, invalidate):
-        del prompt_embeds
-        cross_calls.append(invalidate)
-        return [SimpleNamespace()]
-
-    def generate_block(**kwargs):
-        block = torch.randn(
-            (1, 16, 3, 2, 2),
-            generator=kwargs["generator"],
-        )
-        generated.append(
-            {
-                "start_frame": kwargs["start_frame"],
-                "condition": kwargs["condition"].clone(),
-                "block": block.clone(),
-            }
-        )
-        return block
-
-    monkeypatch.setattr(pipeline, "_ar_text_caches", ar_text_caches)
-    monkeypatch.setattr(pipeline, "_generate_block", generate_block)
-
-    first_sampling = _SamplingParams(extra_args=_tick_extra_args(chunk_index=0))
-    first = pipeline(_request(sampling=first_sampling))
-    switched_prompt = _prompt()
-    switched_prompt["prompt"] = "enter the snowy valley"
-    second_sampling = _SamplingParams(
-        extra_args=_tick_extra_args(
-            chunk_index=1,
-            prompt=switched_prompt["prompt"],
-        )
-    )
-    second = pipeline(_request(sampling=second_sampling, prompt=switched_prompt))
-
-    assert generated[0]["start_frame"] == 0
-    assert generated[1]["start_frame"] == 3
-    assert torch.count_nonzero(generated[0]["condition"]) > 0
-    torch.testing.assert_close(
-        generated[1]["condition"][:, :4],
-        torch.zeros_like(generated[1]["condition"][:, :4]),
-    )
-    assert torch.count_nonzero(generated[1]["condition"][:, 4:]) > 0
-    assert cross_calls == [False, True]
-    assert first.output["payload"]["latents"].shape == (1, 16, 3, 2, 2)
-    assert second.output["metadata"]["ar_diffusion"] == {
-        "session_id": "world-1",
-        "request_id": "legacy-lingbot-request",
-        "chunk_index": 1,
-        "applied_event_ids": [1],
-    }
-    assert pipeline._ar_sessions["world-1"].next_chunk_index == 2
-    assert pipeline._ar_sessions["world-1"].camera_tail is not None
-    assert pipeline._ar_sessions["world-1"].camera_tail.poses.shape == (1, 4, 4)
-    expected_generator = torch.Generator(device="cpu").manual_seed(17)
-    expected_first = torch.randn((1, 16, 3, 2, 2), generator=expected_generator)
-    expected_second = torch.randn((1, 16, 3, 2, 2), generator=expected_generator)
-    torch.testing.assert_close(generated[0]["block"], expected_first)
-    torch.testing.assert_close(generated[1]["block"], expected_second)
-
-
-def test_typed_action_ticks_integrate_camera_across_chunks(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module = _load_pipeline_module()
-    pipeline = _pipeline(module)
-    pipeline._ar_height = 16
-    pipeline._ar_width = 16
-    pipeline._ar_diffusion_kv_state = object()
-    monkeypatch.setattr(
-        pipeline,
-        "_ar_text_caches",
-        lambda *args, **kwargs: [SimpleNamespace()],
-    )
-    monkeypatch.setattr(
-        pipeline,
-        "_generate_block",
-        lambda **kwargs: torch.zeros_like(kwargs["condition"][:, :16]),
-    )
-
-    def action_sampling(chunk_index: int, frames: list[list[str]]) -> _SamplingParams:
-        tick = ARDiffusionTickRequest(
-            session_id="world-actions",
-            request_id="legacy-lingbot-request",
-            chunk_index=chunk_index,
-            controls=(
-                ARDiffusionControlInput(
-                    track="camera",
-                    schema="lingbot.camera_actions.v1",
-                    data={"mode": "frames", "frames": frames},
-                ),
-            ),
-        )
-        sampling = _SamplingParams(extra_args=tick.to_extra_args())
-        sampling.extra_args["_lingbot_camera_trajectory"] = None
-        sampling.extra_args["_lingbot_camera_actions"] = tuple(tuple(frame) for frame in frames)
-        return sampling
-
-    pipeline(_request(sampling=action_sampling(0, [["w"], ["w"], ["w"]])))
-    first_tail = pipeline._ar_sessions["world-actions"].camera_tail.poses.clone()
-    pipeline(_request(sampling=action_sampling(1, [["d"], ["d"], ["d"]])))
-    state = pipeline._ar_sessions["world-actions"]
-
-    assert state.next_chunk_index == 2
-    assert state.camera_tail is not None
-    torch.testing.assert_close(state.camera_tail.poses[0, 2, 3], first_tail[0, 2, 3])
-    assert state.camera_tail.poses[0, 0, 3] > first_tail[0, 0, 3]
-
-
 def test_first_typed_yaw_action_uses_pre_action_identity_anchor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1818,78 +1599,6 @@ def test_first_typed_yaw_action_uses_pre_action_identity_anchor(
     torch.testing.assert_close(tail.poses, action_trajectory.poses[-1:])
 
 
-def test_typed_tick_rejects_non_contiguous_chunk_index(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module = _load_pipeline_module()
-    pipeline = _pipeline(module)
-    pipeline._ar_height = 16
-    pipeline._ar_width = 16
-    pipeline._ar_diffusion_kv_state = object()
-    monkeypatch.setattr(
-        pipeline,
-        "_ar_text_caches",
-        lambda *args, **kwargs: [SimpleNamespace()],
-    )
-
-    sampling = _SamplingParams(extra_args=_tick_extra_args(chunk_index=2))
-    with pytest.raises(ValueError, match="must be contiguous"):
-        pipeline(_request(sampling=sampling))
-
-
-def test_typed_ticks_keep_bounded_encoder_state_beyond_ten_chunks(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module = _load_pipeline_module()
-    pipeline = _pipeline(module)
-    pipeline._ar_height = 16
-    pipeline._ar_width = 16
-    pipeline._ar_diffusion_kv_state = object()
-    generated = []
-    monkeypatch.setattr(
-        pipeline,
-        "_ar_text_caches",
-        lambda *args, **kwargs: [SimpleNamespace()],
-    )
-
-    def generate_block(**kwargs):
-        generated.append(
-            {
-                "condition": kwargs["condition"].clone(),
-                "start_frame": kwargs["start_frame"],
-            }
-        )
-        return torch.zeros_like(kwargs["condition"][:, :16])
-
-    monkeypatch.setattr(pipeline, "_generate_block", generate_block)
-
-    for chunk_index in range(11):
-        sampling = _SamplingParams(
-            extra_args=_tick_extra_args(chunk_index=chunk_index),
-        )
-        pipeline(_request(sampling=sampling))
-
-    assert pipeline.vae.encode_inputs == []
-    # The stub encoder's history settles after its second block; the nine
-    # blocks after that reuse the settled condition without an encode.
-    assert [video.shape[2] for video in pipeline.vae.encoder.inputs] == [1] + [4] * 5
-    assert all(torch.count_nonzero(video) == 0 for video in pipeline.vae.encoder.inputs[1:])
-    assert pipeline._ar_sessions["world-1"].condition_fixed_point is not None
-    encoder_cache = pipeline._ar_sessions["world-1"].encoder_cache
-    assert sum(t.numel() * t.element_size() for t in encoder_cache) == pipeline._condition_encoder_cache_bytes()
-    assert pipeline.vae._enc_feat_map == ["module-owned"]
-    assert pipeline.vae._enc_conv_idx == [71]
-    assert pipeline._ar_sessions["world-1"].next_chunk_index == 11
-    assert [item["start_frame"] for item in generated] == list(range(0, 33, 3))
-    assert torch.count_nonzero(generated[0]["condition"][:, :4]) > 0
-    torch.testing.assert_close(
-        generated[1]["condition"][:, :4],
-        torch.zeros_like(generated[1]["condition"][:, :4]),
-    )
-    for item in generated[2:]:
-        torch.testing.assert_close(item["condition"], generated[1]["condition"])
-
-
 def _tiny_condition_pipeline(monkeypatch: pytest.MonkeyPatch):
     from diffusers import AutoencoderKLWan
 
@@ -1910,10 +1619,8 @@ def _tiny_condition_pipeline(monkeypatch: pytest.MonkeyPatch):
     return pipeline
 
 
-@pytest.mark.parametrize("mode", ["realtime", "stepwise"])
 def test_condition_continues_real_causal_vae_beyond_initial_horizon(
     monkeypatch: pytest.MonkeyPatch,
-    mode: str,
 ) -> None:
     pipeline = _tiny_condition_pipeline(monkeypatch)
     blocks = 12
@@ -1928,31 +1635,16 @@ def test_condition_continues_real_causal_vae_beyond_initial_horizon(
         torch.testing.assert_close(condition, expected[:, :, index * 3 : (index + 1) * 3], rtol=1e-6, atol=1e-6)
         seen.append(condition.clone())
 
-    if mode == "realtime":
-        pipeline._ar_diffusion_kv_state = object()
-
-        def generate_block(**kwargs):
+    def probe_step(**kwargs):
+        if kwargs["step_index"] == 0:
             check(kwargs["condition"])
-            return torch.zeros_like(kwargs["condition"][:, :16])
+        return torch.ones_like(kwargs["current_latents"])
 
-        monkeypatch.setattr(pipeline, "_generate_block", generate_block)
-        session_id = "world-1"
-        outputs = (
-            pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=index))))
-            for index in range(blocks)
-        )
-    else:
-
-        def probe_step(**kwargs):
-            if kwargs["step_index"] == 0:
-                check(kwargs["condition"])
-            return torch.ones_like(kwargs["current_latents"])
-
-        monkeypatch.setattr(pipeline._dmd_blocks, "probe_step", probe_step)
-        monkeypatch.setattr(pipeline._dmd_blocks, "commit_block_kv", lambda **kwargs: None)
-        state = _stepwise_state(num_frames=(blocks * 3 - 1) * 4 + 1)
-        session_id = state.request_id
-        outputs = _stepwise_chunks(pipeline, state, _FakeARState(session_id))
+    monkeypatch.setattr(pipeline._dmd_blocks, "probe_step", probe_step)
+    monkeypatch.setattr(pipeline._dmd_blocks, "commit_block_kv", lambda **kwargs: None)
+    state = _stepwise_state(num_frames=(blocks * 3 - 1) * 4 + 1)
+    session_id = state.request_id
+    outputs = _stepwise_chunks(pipeline, state, _FakeARState(session_id))
 
     cache_sizes = []
     for _ in outputs:
@@ -1970,6 +1662,18 @@ def test_condition_continues_real_causal_vae_beyond_initial_horizon(
     assert pipeline._ar_sessions == {}
 
 
+def _stepwise_encoder_probe(pipeline, monkeypatch: pytest.MonkeyPatch, on_condition):
+    """Route the stepwise DiT through ``on_condition`` so a test can watch each block's condition."""
+
+    def probe_step(**kwargs):
+        if kwargs["step_index"] == 0:
+            on_condition(kwargs["condition"], kwargs["start_frame"])
+        return torch.ones_like(kwargs["current_latents"])
+
+    monkeypatch.setattr(pipeline._dmd_blocks, "probe_step", probe_step)
+    monkeypatch.setattr(pipeline._dmd_blocks, "commit_block_kv", lambda **kwargs: None)
+
+
 def test_condition_encoder_stops_at_its_fixed_point_and_restarts_with_the_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1979,9 +1683,9 @@ def test_condition_encoder_stops_at_its_fixed_point_and_restarts_with_the_sessio
     stored condition is only allowed to be a speedup, never a change.
     """
     pipeline = _tiny_condition_pipeline(monkeypatch)
-    pipeline._ar_diffusion_kv_state = object()
     blocks = 12
-    inputs = pipeline._parse_request(_request(sampling=_SamplingParams(num_frames=(blocks * 3 - 1) * 4 + 1)))
+    num_frames = (blocks * 3 - 1) * 4 + 1
+    inputs = pipeline._parse_request(_request(sampling=_SamplingParams(num_frames=num_frames)))
     with torch.inference_mode():
         expected = pipeline._prepare_condition(inputs, dtype=torch.float32)
     encoder_calls = []
@@ -1993,27 +1697,25 @@ def test_condition_encoder_stops_at_its_fixed_point_and_restarts_with_the_sessio
 
     seen: list[torch.Tensor] = []
 
-    def generate_block(**kwargs):
+    def on_condition(condition, start_frame):
         index = len(seen) % blocks
-        torch.testing.assert_close(
-            kwargs["condition"], expected[:, :, index * 3 : (index + 1) * 3], rtol=1e-6, atol=1e-6
-        )
-        seen.append(kwargs["condition"])
-        return torch.zeros_like(kwargs["condition"][:, :16])
+        assert start_frame == index * 3
+        torch.testing.assert_close(condition, expected[:, :, index * 3 : (index + 1) * 3], rtol=1e-6, atol=1e-6)
+        seen.append(condition)
 
     monkeypatch.setattr(pipeline.vae.encoder, "forward", encoder)
-    monkeypatch.setattr(pipeline, "_generate_block", generate_block)
+    _stepwise_encoder_probe(pipeline, monkeypatch, on_condition)
 
-    def tick(index):
-        pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=index))))
-
+    state = _stepwise_state(num_frames=num_frames)
+    session_id = state.request_id
     settled_at = None
-    for index in range(blocks):
-        tick(index)
-        state = pipeline._ar_sessions["world-1"]
-        if settled_at is None and state.condition_fixed_point is not None:
-            settled_at = index
-        assert state.pending_encoder_cache is None and state.encoder_cache is not None
+    # Each yield lands after block ``index`` is committed and block ``index + 1`` is prepared, so a fixed point
+    # first seen at ``index`` was stored while preparing ``index + 1``: that block still encoded, later ones do not.
+    for index, _ in enumerate(_stepwise_chunks(pipeline, state, _FakeARState(session_id))):
+        session = pipeline._ar_sessions[session_id]
+        if settled_at is None and session.condition_fixed_point is not None:
+            settled_at = index + 1
+        assert session.encoder_cache is not None
     assert settled_at is not None and 0 < settled_at < blocks - 1, settled_at
     # Three encoder passes per encoded block, none once the fixed point is stored.
     assert encoder_calls == [index for index in range(settled_at + 1) for _ in range(3)]
@@ -2021,36 +1723,41 @@ def test_condition_encoder_stops_at_its_fixed_point_and_restarts_with_the_sessio
     assert all(seen[settled_at] is not later for later in seen[settled_at + 1 :])
 
     # A session restarted from chunk 0 encodes again from the source image.
-    pipeline.reset_ar_diffusion_session("world-1")
-    tick(0)
-    state = pipeline._ar_sessions["world-1"]
-    assert state.condition_fixed_point is None
-    assert encoder_calls[-3:] == [blocks] * 3
+    pipeline.reset_ar_diffusion_session(session_id)
+    state = _stepwise_state(num_frames=num_frames)
+    next(_stepwise_chunks(pipeline, state, _FakeARState(session_id)))
+    session = pipeline._ar_sessions[session_id]
+    assert session.condition_fixed_point is None
+    # Blocks 0 and 1 of the restarted session are encoded from the source image again.
+    assert encoder_calls[-6:] == [blocks] * 3 + [blocks + 1] * 3
 
 
 def test_condition_encoder_fixed_point_is_released_with_the_session(monkeypatch: pytest.MonkeyPatch) -> None:
     pipeline = _tiny_condition_pipeline(monkeypatch)
-    pipeline._ar_diffusion_kv_state = object()
-    monkeypatch.setattr(pipeline, "_generate_block", lambda **kwargs: torch.zeros_like(kwargs["condition"][:, :16]))
-    for index in range(8):
-        pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=index))))
-    state = pipeline._ar_sessions["world-1"]
-    assert state.condition_fixed_point is not None
-    pipeline.close_ar_diffusion_session("world-1")
-    assert state.condition_fixed_point is None and state.encoder_cache is None
+    _stepwise_encoder_probe(pipeline, monkeypatch, lambda condition, start_frame: None)
+    state = _stepwise_state(num_frames=(12 * 3 - 1) * 4 + 1)
+    chunks = _stepwise_chunks(pipeline, state, _FakeARState(state.request_id))
+    for _ in range(8):
+        next(chunks)
+    session = pipeline._ar_sessions[state.request_id]
+    assert session.condition_fixed_point is not None
+    pipeline.close_ar_diffusion_session(state.request_id)
+    assert session.condition_fixed_point is None and session.encoder_cache is None
 
 
 def test_condition_encoder_interleaving_retry_and_reset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two stepwise sessions interleave; a failed chunk leaves its session's committed history untouched."""
     pipeline = _tiny_condition_pipeline(monkeypatch)
-    pipeline._ar_diffusion_kv_state = object()
-    prompts = {
-        "a": _prompt(images=Image.new("RGB", (16, 16), (255, 0, 0))),
-        "b": _prompt(images=Image.new("RGB", (16, 16), (0, 255, 0))),
+    images = {
+        "a": Image.new("RGB", (16, 16), (255, 0, 0)),
+        "b": Image.new("RGB", (16, 16), (0, 255, 0)),
     }
     expected = {}
     with torch.inference_mode():
-        for name, prompt in prompts.items():
-            inputs = pipeline._parse_request(_request(prompt=prompt, sampling=_SamplingParams(num_frames=45)))
+        for name, image in images.items():
+            inputs = pipeline._parse_request(
+                _request(prompt=_prompt(images=image), sampling=_SamplingParams(num_frames=45))
+            )
             expected[name] = pipeline._prepare_condition(inputs, dtype=torch.float32)
     assert not torch.equal(expected["a"], expected["b"])
     active = None
@@ -2063,44 +1770,65 @@ def test_condition_encoder_interleaving_retry_and_reset(monkeypatch: pytest.Monk
             raise RuntimeError("injected encoder failure")
         return output
 
-    def generate_block(**kwargs):
-        index = kwargs["start_frame"]
-        torch.testing.assert_close(kwargs["condition"], expected[active][:, :, index : index + 3], rtol=1e-6, atol=1e-6)
+    def on_condition(condition, start_frame):
+        torch.testing.assert_close(
+            condition, expected[active][:, :, start_frame : start_frame + 3], rtol=1e-6, atol=1e-6
+        )
         if failure == "dit":
             raise RuntimeError("injected DiT failure")
-        return torch.zeros_like(kwargs["condition"][:, :16])
 
     monkeypatch.setattr(pipeline.vae.encoder, "forward", encoder)
-    monkeypatch.setattr(pipeline, "_generate_block", generate_block)
+    _stepwise_encoder_probe(pipeline, monkeypatch, on_condition)
 
-    def run(name, index):
+    ar_states = {name: _FakeARState(name) for name in images}
+    states: dict[str, StepRequestState] = {}
+
+    def open_session(name):
+        state = _stepwise_state(request_id=name, num_frames=45)
+        state.prompt = _prompt(images=images[name])
+        states[name] = state
+        with pipeline.bind_ar_diffusion_state(name, ar_states[name]):
+            pipeline.prepare_encode(state)
+
+    def run(name):
+        """Prepare and denoise the session's next chunk the way the scheduler does."""
         nonlocal active
         active = name
-        sampling = _SamplingParams(extra_args=_tick_extra_args(chunk_index=index, session_id=name))
-        return pipeline(_request(prompt=prompts[name], sampling=sampling))
+        state = states[name]
+        with pipeline.bind_ar_diffusion_state(name, ar_states[name]):
+            pipeline.prepare_next_chunk(state)
+            while not state.chunk_denoise_completed:
+                noise = pipeline.denoise_step(None, states=[state])
+                pipeline.step_scheduler(state, noise)
+            return pipeline.post_decode(state)
 
-    run("a", 0)
+    open_session("a")
+    open_session("b")
+    run("a")
     for index, kind in [(1, "encoder"), (2, "dit")]:
-        state = pipeline._ar_sessions["a"]
-        committed = state.encoder_cache
+        session = pipeline._ar_sessions["a"]
+        committed = session.encoder_cache
         saved = [t.clone() if t is not None else None for t in committed]
         failure = kind
         with pytest.raises(RuntimeError, match="injected"):
-            run("a", index)
-        assert state.next_chunk_index == index and state.encoder_cache is committed
-        assert state.pending_encoder_cache is None
+            run("a")
+        assert session.next_chunk_index == index and session.encoder_cache is committed
         for before, after in zip(saved, committed, strict=True):
             if before is not None:
                 torch.testing.assert_close(before, after, rtol=0, atol=0)
         failure = None
-        run("b", index - 1)
-        run("a", index)
+        # The failed chunk is retried from its committed history after the other session advances.
+        states["a"].chunk_index = index
+        session.pending_encoder_cache = None
+        run("b")
+        run("a")
 
     old_a = pipeline._ar_sessions["a"]
     pipeline.reset_ar_diffusion_session("a")
     assert old_a.encoder_cache is None and old_a.pending_encoder_cache is None
     assert "a" not in pipeline._ar_sessions and "b" in pipeline._ar_sessions
-    run("a", 0)
+    open_session("a")
+    run("a")
     old_b = pipeline._ar_sessions["b"]
     pipeline.close_ar_diffusion_session("b")
     assert old_b.encoder_cache is None and old_b.pending_encoder_cache is None
@@ -2127,19 +1855,14 @@ def test_stepwise_failed_chunk_releases_pending_encoder_on_close(monkeypatch: py
     assert state.request_id not in pipeline._ar_sessions
 
 
-@pytest.mark.parametrize("mode", ["realtime", "stepwise"])
-def test_stateful_condition_rejects_tiled_encoder(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+def test_stateful_condition_rejects_tiled_encoder(monkeypatch: pytest.MonkeyPatch) -> None:
     pipeline = _pipeline(_load_pipeline_module())
     _enable_vae_tiling(pipeline, tile_sample_min=8)
     with pytest.raises(ValueError, match="does not support tiled VAE encoding"):
-        if mode == "realtime":
-            pipeline._ar_diffusion_kv_state = object()
-            pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=0))))
-        else:
-            state = _stepwise_state()
-            with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
-                pipeline.prepare_encode(state)
-                pipeline.prepare_next_chunk(state)
+        state = _stepwise_state()
+        with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
+            pipeline.prepare_encode(state)
+            pipeline.prepare_next_chunk(state)
     assert pipeline.vae.encoder.inputs == []
     assert all(s.encoder_cache is None and s.pending_encoder_cache is None for s in pipeline._ar_sessions.values())
 
@@ -2230,9 +1953,6 @@ class _FakeARState:
     def commit_paged_context(self, branch):
         self.commits.append(branch)
 
-    def clear_cross_attention(self):
-        return None
-
     def is_cross_attention_populated(self, branch, name):
         del branch, name
         return True
@@ -2257,7 +1977,6 @@ def _stepwise_state(
     num_chunks = ((num_frames - 1) // 4 + 1) // 3
     sampling = _SamplingParams(num_frames=num_frames, seed=seed)
     sampling.extra_args["_lingbot_camera_trajectory"] = None
-    sampling.extra_args["_lingbot_camera_actions"] = None
     sampling.extra_args["_lingbot_camera_action_script"] = (
         script if script is not None else _empty_action_script(num_chunks)
     )
@@ -2358,28 +2077,19 @@ def test_preprocess_materializes_camera_action_script_without_action_path() -> N
     result = module.get_lingbot_world_pre_process_func(_od_config())(request)
 
     assert result.sampling_params.extra_args["_lingbot_camera_trajectory"] is None
-    assert result.sampling_params.extra_args["_lingbot_camera_actions"] is None
     assert result.sampling_params.extra_args["_lingbot_camera_action_script"] == (
         (("w",), ("w",), ("w",)),
         (("a",), (), ()),
     )
 
 
-@pytest.mark.parametrize(
-    "extra_args",
-    [
-        pytest.param({}, id="request_mode"),
-        pytest.param(_tick_extra_args(chunk_index=0), id="tick_mode"),
-    ],
-)
-def test_forward_rejects_a_stepwise_camera_action_script(extra_args) -> None:
+def test_forward_rejects_a_stepwise_camera_action_script() -> None:
     """A script only steers step execution, so request mode must not drop it silently."""
     module = _load_pipeline_module()
     pipeline = _pipeline(module)
     sampling = _SamplingParams(
         include_action=False,
         extra_args={
-            **extra_args,
             "_lingbot_camera_trajectory": None,
             "_lingbot_camera_action_script": _empty_action_script(1),
         },
@@ -2415,66 +2125,8 @@ def test_stepwise_progress_metadata_and_commit_trace() -> None:
             "session_id": "req-1",
             "request_id": "req-1",
             "chunk_index": chunk_index,
-            "applied_event_ids": [],
         }
         assert output.output["payload"]["latents"].shape == (1, 16, 3, 2, 2)
-
-
-@pytest.mark.parametrize("num_chunks", [2, 12])
-def test_stepwise_matches_tick_transformer_trace_and_latents(num_chunks) -> None:
-    module = _load_pipeline_module()
-    transformer = _RecordingTransformer()
-    pipeline = _pipeline(module, transformer=transformer)
-    pipeline._ar_height = 16
-    pipeline._ar_width = 16
-    script = ((("w",), ("w",), ("w",)), (("d",), ("d",), ("d",))) * (num_chunks // 2)
-    fake = _FakeARState("world-1")
-
-    with pipeline.bind_ar_diffusion_state("world-1", fake):
-        tick_latents = []
-        for chunk_index, frames in enumerate(script):
-            tick = ARDiffusionTickRequest(
-                session_id="world-1",
-                request_id="legacy-lingbot-request",
-                chunk_index=chunk_index,
-                controls=(
-                    ARDiffusionControlInput(
-                        track="camera",
-                        schema="lingbot.camera_actions.v1",
-                        data={"mode": "frames", "frames": [list(frame) for frame in frames]},
-                    ),
-                ),
-            )
-            sampling = _SamplingParams(extra_args=tick.to_extra_args(), seed=17)
-            sampling.extra_args["_lingbot_camera_trajectory"] = None
-            sampling.extra_args["_lingbot_camera_actions"] = frames
-            result = pipeline(_request(sampling=sampling))
-            tick_latents.append(result.output["payload"]["latents"].clone())
-    tick_calls = list(transformer.calls)
-    transformer.calls.clear()
-    pipeline.close_ar_diffusion_session("world-1")
-
-    stepwise_state = _stepwise_state(request_id="req-1", num_frames=12 * num_chunks - 3, script=script, seed=17)
-    stepwise_fake = _FakeARState(stepwise_state.request_id)
-    with pipeline.bind_ar_diffusion_state(stepwise_state.request_id, stepwise_fake):
-        stepwise_outputs = _run_stepwise(pipeline, stepwise_state)
-
-    assert [call["update_cache"] for call in transformer.calls] == [call["update_cache"] for call in tick_calls]
-    assert [call["start_frame"] for call in transformer.calls] == [call["start_frame"] for call in tick_calls]
-    for tick_latent, output in zip(tick_latents, stepwise_outputs, strict=True):
-        torch.testing.assert_close(output.output["payload"]["latents"], tick_latent)
-    for step_call, tick_call in zip(transformer.calls, tick_calls, strict=True):
-        torch.testing.assert_close(step_call["hidden_states"], tick_call["hidden_states"])
-        torch.testing.assert_close(step_call["camera_hidden_states"], tick_call["camera_hidden_states"])
-    assert stepwise_state.extra["condition"].shape[2] == 3
-    assert pipeline.vae.encode_inputs == []
-    # The stub encoder's history settles after its second block, so both
-    # modes encode two blocks and reuse the settled condition after that.
-    encoded_blocks = min(num_chunks, 2)
-    assert [video.shape[2] for video in pipeline.vae.encoder.inputs] == ([1] + [4] * (encoded_blocks * 3 - 1)) * 2
-    assert stepwise_fake.commits == ["main"] * num_chunks
-    assert len(stepwise_outputs) == num_chunks and stepwise_outputs[-1].finished
-    assert pipeline.vae.decode_inputs == []
 
 
 def test_stepwise_trajectory_camera_matches_request_mode_under_non_uniform_speed(monkeypatch) -> None:
@@ -2975,45 +2627,6 @@ def test_the_prompt_encode_cache_is_bounded() -> None:
     pipeline.encode_prompt("prompt 0", max_sequence_length=512, dtype=torch.float32)
     pipeline.encode_prompt(f"prompt {size}", max_sequence_length=512, dtype=torch.float32)
     assert encoded == [f"prompt {index}" for index in range(size + 1)] + ["prompt 0"]
-
-
-def test_realtime_ticks_reuse_the_encode_and_still_invalidate_on_a_prompt_change(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module = _load_pipeline_module()
-    pipeline = _pipeline(module)
-    pipeline._ar_height = 16
-    pipeline._ar_width = 16
-    pipeline._ar_diffusion_kv_state = object()
-    encoded = _counting_text_encoder(pipeline)
-    invalidations: list[bool] = []
-
-    def ar_text_caches(prompt_embeds, *, invalidate):
-        del prompt_embeds
-        invalidations.append(invalidate)
-        return [SimpleNamespace()]
-
-    monkeypatch.setattr(pipeline, "_ar_text_caches", ar_text_caches)
-    monkeypatch.setattr(
-        pipeline,
-        "_generate_block",
-        lambda **kwargs: torch.randn((1, 16, 3, 2, 2), generator=kwargs["generator"]),
-    )
-
-    for chunk_index in range(3):
-        pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=chunk_index))))
-    switched = _prompt()
-    switched["prompt"] = "enter the snowy valley"
-    pipeline(
-        _request(
-            sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=3, prompt=switched["prompt"])),
-            prompt=switched,
-        )
-    )
-
-    assert encoded == ["move through the room", "enter the snowy valley"]
-    # A new prompt must still drop the cross-attention K/V built from the old one.
-    assert invalidations == [False, False, False, True]
 
 
 def test_stepwise_requests_with_the_same_prompt_share_one_encode() -> None:

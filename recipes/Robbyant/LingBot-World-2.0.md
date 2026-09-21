@@ -1,13 +1,13 @@
 # LingBot-World 2.0
 
-> Offline and experimental realtime interactive world generation
+> Offline and streaming interactive world generation
 
 ## Summary
 
 - Vendor: Robbyant
 - Model: `robbyant/lingbot-world-v2-14b-causal-fast-diffusers`
 - Task: image-conditioned interactive world generation
-- Modes: offline trajectory replay, stepwise one-request streaming, and in-process realtime AR-Diffusion ticks (deprecated)
+- Modes: offline trajectory replay and stepwise one-request streaming
 - Hardware validated: NVIDIA H200 and B200
 - Maintainer: Community
 
@@ -16,7 +16,7 @@ non-commercial use. The vLLM-Omni integration code remains Apache-2.0.
 
 ## Which path to use
 
-There are three ways to drive this model, each documented in its own section
+There are two ways to drive this model, each documented in its own section
 below.
 
 - **Realtime stepwise** — see [Streaming video serving](#streaming-video-serving).
@@ -24,9 +24,6 @@ below.
   rollout, one video chunk per AR block. Mid-session camera control uses
   structural SE3 `session.interaction` payloads; optional
   `camera_action_script` remains for request-scoped WASD scripts.
-- **Realtime tick** *(deprecated)* — see
-  [Realtime in-process generation](#realtime-in-process-generation-deprecated).
-  Older one-block-per-`generate()` control plane with JSONL WASD frames; will be removed in the future.
 - **Offline** — see [Offline generation](#offline-generation). Replays a fixed
   pose/intrinsics trajectory in one request and writes an MP4. Use it when the
   camera path is known up front and streaming is not needed.
@@ -53,42 +50,6 @@ source frames, at least as many as requested and at most 4096. The runtime
 consumes only the prefix needed by the request. Longer rollouts also require
 sufficient device memory.
 
-## Realtime in-process generation (deprecated)
-
-Prefer [Streaming video serving](#streaming-video-serving) for mid-session
-camera control. This tick example still works and emits no runtime warning;
-removal is tracked as B4 of the LingBot World 2.0 roadmap
-([#6672](https://github.com/vllm-project/vllm-omni/issues/6672)).
-
-The realtime example keeps AR-Diffusion KV and model-owned state across
-requests. Each JSONL line describes the prompt and/or three latent-frame camera
-actions applied at the next chunk boundary:
-
-```json
-{"event_id":1,"prompt":"A road through a forest","frames":[["j"],[],[]]}
-{"event_id":2,"frames":[["w"],["w"],["w"]]}
-{"event_id":3,"prompt":"The road enters a snowy valley","frames":[[],[],[]]}
-```
-
-Run:
-
-```bash
-python examples/offline_inference/diffusion/lingbot_world_v2_realtime.py \
-  --image /path/to/first_frame.png \
-  --events /path/to/events.jsonl \
-  --output-dir /tmp/lingbot-realtime \
-  --gpu-memory-fraction 0.6
-```
-
-The example writes one latent tensor and one metadata JSON file per chunk. It
-exercises the same `ARDiffusionSessionManager -> ARDiffusionOmniTickConsumer
--> AsyncOmni -> ARDiffusionEngine` path used by a future HTTP or WebSocket
-transport.
-
-Realtime serving now goes through the generic `WS /v1/realtime/video`
-transport, which exposes no LingBot-specific event fields; the tick loop above
-stays available only for the older control plane.
-
 ## Streaming video serving
 
 The stepwise path keeps AR-Diffusion paged KV but issues **one** request for
@@ -109,8 +70,8 @@ vllm serve robbyant/lingbot-world-v2-14b-causal-fast-diffusers \
 ```
 
 `--deploy-config` is required: the `lingbot_world` pipeline deliberately
-registers no default deploy config, so offline replay and the tick example
-keep their request-mode topology when no deploy config is given, and the
+registers no default deploy config, so offline replay keeps its request-mode
+topology when no deploy config is given, and the
 stepwise serving topology is only ever an explicit choice.
 
 Clients then use the generic WebSocket protocol documented in
@@ -175,23 +136,11 @@ in the deploy config, because the AR cache geometry is fixed at load time.
 Blocks are decoded independently, so seams between chunks are possible; a
 session-owned streaming decoder is tracked separately.
 
-The deprecated tick example remains available for the older
-one-block-per-`generate()` control plane.
+## Chunk identity
 
-## Realtime identity and controls
-
-- `session_id` identifies the persistent world and its worker-owned state.
-- `event_id` identifies a prompt/control update and remains monotonic across reset.
-- `chunk_index` is contiguous from zero and restarts from zero after reset.
-- `request_id` correlates one chunk snapshot with its output metadata.
-- AsyncOmni uses a separate UUID-suffixed internal engine routing ID.
-
-The generic runtime transports controls as opaque snapshots. LingBot's adapter
-accepts:
-
-- `lingbot.camera_actions.v1` for per-latent-frame key states such as `w`, `a`,
-  `s`, `d`, `i`, `j`, `k`, and `l`;
-- `lingbot.camera_trajectory.v1` for explicit pose/intrinsics trajectories.
+Every streamed chunk carries `metadata["ar_diffusion"]` with `session_id`,
+`request_id`, and `chunk_index`. The request is the session, so the two ids
+are equal and `chunk_index` is contiguous from zero for the whole rollout.
 
 ## Validation
 
@@ -199,12 +148,11 @@ Real-checkpoint validation uses 480x832 output, four DMD steps, and seed 42.
 The exercised matrix includes:
 
 - TP=1 and TP=2 execution;
-- two interleaved resident sessions;
-- action input and prompt switching;
+- camera action scripts;
 - seven contiguous chunks crossing the sink plus recent rolling window;
 - direct versus paged replay;
 - CUDA Graph execution;
-- reset, close, failure cleanup, and exact metadata matching; and
+- abort cleanup and exact chunk metadata matching; and
 - nine-frame VAE decode.
 
 Official `generate.py` accuracy and performance numbers, together with
@@ -214,18 +162,16 @@ tested commit.
 ## Current limitations
 
 - Only the 14B causal-fast checkpoint is supported.
-- The tick control plane is internal; the public transport is the stepwise
-  `WS /v1/realtime/video` path with structural SE3 mid-session camera
-  interaction (WASD remains a client-side or `camera_action_script` convenience).
+- The public transport is the stepwise `WS /v1/realtime/video` path with structural SE3 mid-session camera interaction.
 - Stepwise serving requires an explicit
   `--deploy-config vllm_omni/deploy/lingbot_world_v2_stepwise.yaml`; there is
   no default deploy config for this model.
 - AR-Diffusion stages currently require one replica because session-affine
   routing across replicas is not implemented.
-- Tick mode generates one AR block per request. Stepwise mode generates many
-  AR blocks in one request. `max_num_seqs` must be one in both cases.
-- Stateful streaming VAE decode is not implemented; the realtime example emits
-  latent chunks.
+- Stepwise mode generates many AR blocks in one request; `max_num_seqs` must
+  be one.
+- Stateful streaming VAE decode is not implemented; blocks are decoded
+  independently.
 - SP/USP, pipeline/CFG parallelism, HSDP, VAE parallelism, quantization,
   Cache-DiT, TeaCache, causal-pretrain, and the 1.3B checkpoint are not claimed.
 - No AMD GPU, Ascend NPU, or Intel GPU support is claimed.
@@ -238,4 +184,4 @@ tested commit.
 - Streaming serving client: [`examples/online_serving/streaming_video_generation/`](../../examples/online_serving/streaming_video_generation/README.md)
 - Streaming serving end-to-end test: [`tests/e2e/online_serving/test_lingbot_world_v2_stepwise.py`](../../tests/e2e/online_serving/test_lingbot_world_v2_stepwise.py)
 - Stepwise latent-level end-to-end test: [`tests/e2e/offline_inference/test_lingbot_world_v2_stepwise.py`](../../tests/e2e/offline_inference/test_lingbot_world_v2_stepwise.py)
-- Realtime design: [`docs/design/feature/realtime_ar_diffusion.md`](../../docs/design/feature/realtime_ar_diffusion.md)
+- AR-Diffusion pipeline contract: [`docs/design/ar_diffusion_pipeline_capability.md`](../../docs/design/ar_diffusion_pipeline_capability.md)

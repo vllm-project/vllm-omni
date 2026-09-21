@@ -4,7 +4,7 @@
 
 One ``AsyncOmni.generate()`` must stream one latent chunk per AR block while
 keeping a single request identity, which is what separates this path from the
-tick control plane exercised by ``test_lingbot_world_v2.py``.
+request-mode replay exercised by ``test_lingbot_world_v2.py``.
 """
 
 from __future__ import annotations
@@ -136,7 +136,6 @@ def test_lingbot_world_v2_stepwise_streams_one_chunk_per_block() -> None:
         # and chunk indices must be contiguous from zero.
         assert metadata["chunk_index"] == chunk_index
         assert metadata["session_id"] == metadata["request_id"]
-        assert metadata["applied_event_ids"] == []
         assert finished is (chunk_index == _NUM_CHUNKS - 1)
 
     # The engine suffixes the caller's id to keep it unique; what this path

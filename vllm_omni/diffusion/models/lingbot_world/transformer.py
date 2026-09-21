@@ -367,7 +367,7 @@ class LingBotSelfAttention(nn.Module):
             )
             if query.is_cuda and query.shape[0] == 1:
                 # Use the same block-table FlashAttention entry point as the
-                # realtime path so direct replay is a numerical oracle for
+                # stepwise path so direct replay is a numerical oracle for
                 # paged execution, rather than a comparison between two
                 # different attention kernels.
                 block_size = key.shape[1]

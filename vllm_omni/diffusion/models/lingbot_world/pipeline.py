@@ -34,16 +34,12 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery, SupportsStepExecution
 from vllm_omni.diffusion.models.lingbot_world.actions import (
-    LINGBOT_CAMERA_ACTION_SCHEMA,
-    LINGBOT_CAMERA_TRAJECTORY_SCHEMA,
     LINGBOT_CONTROLLER_TRANSLATION_UNIT,
     LingBotCameraActionFrames,
     LingBotCameraActionScript,
-    as_camera_action_frames,
     as_camera_action_script,
     camera_trajectory_from_absolute_pose,
     integrate_lingbot_camera_actions,
-    parse_lingbot_camera_action_frames,
     parse_lingbot_camera_action_script,
 )
 from vllm_omni.diffusion.models.lingbot_world.camera import (
@@ -68,6 +64,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPi
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.experimental.ar_diffusion.capability import (
+    ARDiffusionChunkMetadata,
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
@@ -75,10 +72,6 @@ from vllm_omni.experimental.ar_diffusion.capability import (
 from vllm_omni.experimental.ar_diffusion.streaming_decode import (
     StreamingDecodeState,
     WanStreamingDecoder,
-)
-from vllm_omni.experimental.ar_diffusion.tick_protocol import (
-    ARDiffusionChunkMetadata,
-    ARDiffusionTickRequest,
 )
 
 logger = init_logger(__name__)
@@ -112,7 +105,6 @@ _MAX_SEQUENCE_LENGTH = 512
 _PROMPT_EMBEDS_CACHE_SIZE = 4
 _ACTION_ROOT_ENV = "VLLM_OMNI_LINGBOT_ACTION_ROOT"
 _PREPROCESSED_CAMERA_KEY = "_lingbot_camera_trajectory"
-_PREPROCESSED_CAMERA_ACTIONS_KEY = "_lingbot_camera_actions"
 _PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY = "_lingbot_camera_action_script"
 _SOURCE_IMAGE_ERROR = (
     "Unable to load multi_modal_data.image; expected a decodable image within 4096 * 4096 source pixels."
@@ -123,25 +115,24 @@ _SOURCE_IMAGE_ERROR = (
 class _LingBotRequestInputs:
     """Validated model-specific request boundary.
 
-    Pre-processing materializes exactly one of the three camera fields, chosen
-    from the shape of the incoming control. They are not alternative spellings
-    of one input: ``camera_action_script`` is a *container* whose element is a
-    ``camera_actions``, and the two are live at once during step execution.
+    Pre-processing materializes at most one of ``camera_trajectory`` and
+    ``camera_action_script``, chosen from the shape of the incoming control.
+    They are not alternative spellings of one input: ``camera_action_script``
+    is a *container* whose element is a ``camera_actions``, and the two are
+    live at once during step execution.
 
     - ``camera_trajectory`` is explicit per-frame poses and intrinsics. Offline
-      replay loads it from ``extra_args["action_path"]``; the tick entry point
-      receives the same content as a ``lingbot.camera_trajectory.v1`` control.
-      Integrating WASD actions also produces one, written back onto this field.
+      replay loads it from ``extra_args["action_path"]``. Integrating WASD
+      actions also produces one, written back onto this field.
     - ``camera_actions`` is WASD key state for *one* three-latent-frame block:
-      the unit every path reduces to before the camera is embedded. The tick
-      entry point fills it directly, because one of its requests is one block;
-      step execution derives it per block by slicing ``camera_action_script``.
+      the unit the camera is embedded in. Pre-processing never fills it; step
+      execution derives it per block by slicing ``camera_action_script``.
       ``_prepare_camera`` also reads it as the signal that the trajectory it
       was handed is already latent-aligned.
     - ``camera_action_script`` holds one such action list *per generated chunk*
       for the whole rollout, which only step execution needs, because only it
-      runs every block inside a single ``generate()``. The tick entry point has
-      no use for it and ``forward()`` rejects a request that carries it.
+      runs every block inside a single ``generate()``. ``forward()`` rejects a
+      request that carries it.
     """
 
     prompt: str
@@ -167,22 +158,11 @@ class _LingBotARSessionState:
     """Model-owned state; attention tensors remain runner-owned."""
 
     next_chunk_index: int = 0
-    # The umT5 embedding itself is reused by ``encode_prompt``'s own cache.
-    # ``text_cache_key`` does the same job for the runner-owned cross-attention
-    # K/V built from that embedding: it holds the (prompt, max_sequence_length,
-    # dtype) the K/V was built from and is only published after a successful
-    # build; ``text_cache_dirty`` is raised for the duration of a build, so a
-    # build that fails forces the next tick to invalidate whatever its prompt is.
-    text_cache_key: tuple[str, int, str] | None = None
-    text_cache_dirty: bool = False
-    generator_state: torch.Tensor | None = None
     encoder_cache: list[torch.Tensor | None] | None = None
     pending_encoder_cache: list[torch.Tensor | None] | None = None
     # The condition the encoder settles on once its history has stopped
     # changing; see ``_next_condition_chunk``.
     condition_fixed_point: torch.Tensor | None = None
-    camera_tail: CameraTrajectory | None = None
-    camera_pitch: float = 0.0
 
 
 def _positive_finite_flow_shift(value: Any) -> float:
@@ -411,52 +391,7 @@ def get_lingbot_world_pre_process_func(
         extra_args = getattr(request.sampling_params, "extra_args", None) or {}
         if not isinstance(extra_args, dict):
             raise ValueError("sampling_params.extra_args must be a mapping.")
-        tick = ARDiffusionTickRequest.from_extra_args(extra_args)
-        if tick is not None:
-            camera_controls = [control for control in tick.controls if control.track == "camera"]
-            if len(camera_controls) != 1:
-                raise ValueError("LingBot realtime ticks require exactly one camera control.")
-            camera_control = camera_controls[0]
-            if camera_control.schema == LINGBOT_CAMERA_TRAJECTORY_SCHEMA:
-                camera_data = camera_control.data
-                try:
-                    poses = torch.as_tensor(camera_data["poses"], dtype=torch.float32)
-                    intrinsics = torch.as_tensor(
-                        camera_data["intrinsics"],
-                        dtype=torch.float32,
-                    )
-                except (KeyError, TypeError, ValueError):
-                    raise ValueError(
-                        "lingbot.camera_trajectory.v1 requires numeric poses and intrinsics fields."
-                    ) from None
-                if poses.ndim != 3 or poses.shape[1:] != (4, 4):
-                    raise ValueError("camera control poses must have shape [frames, 4, 4].")
-                if intrinsics.ndim != 2 or intrinsics.shape[1:] != (4,):
-                    raise ValueError("camera control intrinsics must have shape [frames, 4].")
-                if poses.shape[0] != intrinsics.shape[0] or poses.shape[0] == 0:
-                    raise ValueError(
-                        "camera control poses and intrinsics must contain the same positive number of frames."
-                    )
-                if not torch.isfinite(poses).all() or not torch.isfinite(intrinsics).all():
-                    raise ValueError("camera control values must all be finite.")
-                trajectory = CameraTrajectory(
-                    poses=poses,
-                    intrinsics=intrinsics,
-                )
-                camera_actions = None
-            elif camera_control.schema == LINGBOT_CAMERA_ACTION_SCHEMA:
-                trajectory = None
-                camera_actions = parse_lingbot_camera_action_frames(
-                    camera_control.data,
-                    expected_frames=3,
-                )
-            else:
-                raise ValueError(
-                    "LingBot realtime camera controls require schema "
-                    "'lingbot.camera_trajectory.v1' or 'lingbot.camera_actions.v1'."
-                )
-            camera_action_script = None
-        elif extra_args.get("camera_action_script") is not None:
+        if extra_args.get("camera_action_script") is not None:
             if extra_args.get("action_path"):
                 raise ValueError("camera_action_script cannot be combined with action_path.")
             camera_action_script = parse_lingbot_camera_action_script(
@@ -464,7 +399,6 @@ def get_lingbot_world_pre_process_func(
                 frames_per_chunk=3,
             )
             trajectory = None
-            camera_actions = None
         else:
             action_path = extra_args.get("action_path")
             if action_path is None or action_path == "":
@@ -473,7 +407,6 @@ def get_lingbot_world_pre_process_func(
                 # interaction (idle hold until the first camera event).
                 if getattr(od_config, "step_execution", False) or getattr(od_config, "streaming_output", False):
                     trajectory = None
-                    camera_actions = None
                     camera_action_script = None
                 else:
                     raise ValueError("action_path is required in sampling_params.extra_args.action_path.")
@@ -495,7 +428,6 @@ def get_lingbot_world_pre_process_func(
                     raise ValueError(
                         "Unable to load camera trajectory from action_path; expected poses.npy and intrinsics.npy."
                     ) from None
-                camera_actions = None
                 camera_action_script = None
 
         updated_prompt = dict(prompt)
@@ -506,7 +438,6 @@ def get_lingbot_world_pre_process_func(
         request.sampling_params.extra_args = {
             **extra_args,
             _PREPROCESSED_CAMERA_KEY: trajectory,
-            _PREPROCESSED_CAMERA_ACTIONS_KEY: camera_actions,
             _PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY: camera_action_script,
         }
         return request
@@ -696,7 +627,7 @@ class LingBotWorldCausalDMDPipeline(
         )
 
     def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
-        """Describe the fixed worker-local cache geometry for realtime ticks."""
+        """Describe the fixed worker-local cache geometry for step execution."""
         patch_frames, patch_height, patch_width = self.transformer.config.patch_size
         if patch_frames != 1:
             raise ValueError("LingBot AR-Diffusion requires temporal patch size 1.")
@@ -879,21 +810,16 @@ class LingBotWorldCausalDMDPipeline(
         if not isinstance(extra_args, dict):
             raise ValueError("sampling_params.extra_args must be a mapping.")
         camera_trajectory = extra_args.get(_PREPROCESSED_CAMERA_KEY)
-        camera_actions = extra_args.get(_PREPROCESSED_CAMERA_ACTIONS_KEY)
         camera_action_script = extra_args.get(_PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY)
         if camera_trajectory is not None and not isinstance(camera_trajectory, CameraTrajectory):
             raise ValueError("LingBot camera trajectory must be materialized by the pre-process function.")
-        if camera_actions is not None:
-            camera_actions = as_camera_action_frames(camera_actions)
         if camera_action_script is not None:
             camera_action_script = as_camera_action_script(camera_action_script)
-        camera_sources = (
-            int(camera_trajectory is not None) + int(camera_actions is not None) + int(camera_action_script is not None)
-        )
+        camera_sources = int(camera_trajectory is not None) + int(camera_action_script is not None)
         if camera_sources > 1:
             raise ValueError("LingBot pre-processing must materialize at most one camera input.")
         # Zero camera sources are allowed for stepwise camera-interaction sessions;
-        # request-mode ``forward`` still requires an explicit trajectory or actions.
+        # request-mode ``forward`` still requires an explicit trajectory.
 
         request_flow_shift = (
             extra_args["flow_shift"] if "flow_shift" in extra_args else getattr(self.scheduler.config, "shift", 5.0)
@@ -988,7 +914,7 @@ class LingBotWorldCausalDMDPipeline(
             prompt=prompt.strip(),
             image=image,
             camera_trajectory=camera_trajectory,
-            camera_actions=camera_actions,
+            camera_actions=None,
             camera_action_script=camera_action_script,
             height=height,
             width=width,
@@ -1277,17 +1203,10 @@ class LingBotWorldCausalDMDPipeline(
         )
         return _fold_camera_embedding(camera_embedding), tail
 
-    def _ar_text_caches(
-        self,
-        prompt_embeds: torch.Tensor,
-        *,
-        invalidate: bool,
-    ) -> list[LingBotAttentionCache]:
+    def _ar_text_caches(self, prompt_embeds: torch.Tensor) -> list[LingBotAttentionCache]:
         state = self._ar_diffusion_kv_state
         if state is None:
             raise RuntimeError("LingBot AR text cache requested without a bound state.")
-        if invalidate:
-            state.clear_cross_attention()
         if not state.is_cross_attention_populated(
             self._AR_BRANCH,
             self._AR_TEXT_CACHE,
@@ -1341,14 +1260,8 @@ class LingBotWorldCausalDMDPipeline(
             self._dmd_block_runner = runner
         return runner
 
-    def _ar_block_context(
-        self,
-        cross_attention: list[LingBotAttentionCache] | None,
-    ) -> ARBlockContext | None:
-        """Wrap the bound session for the block runner; ``None`` keeps
-        request-local KV."""
-        if cross_attention is None:
-            return None
+    def _ar_block_context(self, cross_attention: list[LingBotAttentionCache]) -> ARBlockContext:
+        """Wrap the bound session for the block runner."""
         state = self._ar_diffusion_kv_state
         if state is None:
             raise RuntimeError("LingBot AR cache requested without a bound state.")
@@ -1360,52 +1273,25 @@ class LingBotWorldCausalDMDPipeline(
         condition: torch.Tensor,
         camera: torch.Tensor,
         prompt_embeds: torch.Tensor,
-        cache: LingBotTransformerCache | None,
-        ar_cross_attention: list[LingBotAttentionCache] | None,
+        cache: LingBotTransformerCache,
         start_frame: int,
         schedule: tuple[tuple[float, float], ...],
         generator: torch.Generator,
         progress_bar: TqdmProgressBar[Any],
     ) -> torch.Tensor:
+        """Generate one block against request-local KV; step execution uses
+        the bound AR session through :meth:`_ar_block_context` instead."""
         return self._dmd_blocks.generate_block(
             condition=condition,
             camera=camera,
             prompt_embeds=prompt_embeds,
             cache=cache,
-            ar=self._ar_block_context(ar_cross_attention),
+            ar=None,
             start_frame=start_frame,
             schedule=schedule,
             generator=generator,
             progress_bar=progress_bar,
         )
-
-    def _session_text_caches(
-        self,
-        prompt_embeds: torch.Tensor,
-        *,
-        prompt: str,
-        max_sequence_length: int,
-        session_state: _LingBotARSessionState,
-    ) -> list[LingBotAttentionCache]:
-        """Runner-owned cross-attention K/V for this tick, rebuilt when its inputs change.
-
-        The K/V is keyed by everything that defines the prompt embedding
-        (text, sequence length, dtype). The first build of a session needs no
-        invalidation (the runner state is empty); a key change does. The dirty
-        flag is raised for the duration of the build and cleared only after
-        ``_ar_text_caches`` returns, so a build that fails after invalidating
-        or partially writing the caches makes the next tick, whatever its
-        prompt, invalidate again instead of consuming partial K/V.
-        """
-        text_key = (prompt, int(max_sequence_length), str(prompt_embeds.dtype))
-        previous = session_state.text_cache_key
-        invalidate = session_state.text_cache_dirty or (previous is not None and previous != text_key)
-        session_state.text_cache_dirty = True
-        session_state.text_cache_key = None
-        caches = self._ar_text_caches(prompt_embeds, invalidate=invalidate)
-        session_state.text_cache_key = text_key
-        session_state.text_cache_dirty = False
-        return caches
 
     def encode_prompt(
         self,
@@ -1419,7 +1305,7 @@ class LingBotWorldCausalDMDPipeline(
         The encode depends only on the whitespace-normalised text, the sequence
         length and the dtype -- the tokenizer and text encoder are fixed once
         loaded -- so those three are the key. That covers every caller the same
-        way: a realtime tick repeats its session's prompt on every block, a
+        way: a streaming session can repeat its prompt across requests, a
         stepwise request encodes once per request, and a server tends to open
         many sessions with the same scene prompt.
 
@@ -1460,89 +1346,27 @@ class LingBotWorldCausalDMDPipeline(
             # steering the camera.
             raise ValueError(
                 "camera_action_script is read only by LingBot step execution; "
-                "request mode takes one three-frame camera_actions control per "
-                "block, or a camera_trajectory for the request."
+                "request mode takes a camera_trajectory for the request."
             )
-        if inputs.camera_trajectory is None and inputs.camera_actions is None:
+        if inputs.camera_trajectory is None:
+            raise ValueError("LingBot request mode requires camera_trajectory; omit it only for stepwise sessions.")
+        if self._ar_diffusion_kv_state is not None:
             raise ValueError(
-                "LingBot request mode requires camera_trajectory or camera_actions; "
-                "omit them only for stepwise camera-interaction sessions."
+                "LingBot request mode does not run under ARDiffusionEngine session "
+                "binding; enable step execution for AR-Diffusion serving."
             )
-        tick = ARDiffusionTickRequest.from_extra_args(req.sampling_params.extra_args)
-        if tick is not None and self._ar_diffusion_kv_state is None:
-            raise RuntimeError("LingBot typed ticks require ARDiffusionEngine session binding.")
-        if tick is None and self._ar_diffusion_kv_state is not None:
-            raise ValueError("LingBot ARDiffusionEngine requests must carry ar_diffusion_tick.")
-        if tick is not None and inputs.output_type != "latent":
-            raise ValueError(
-                "LingBot realtime ticks currently require output_type='latent'; "
-                "stateful streaming VAE decode is a separate integration step."
-            )
-        session_state: _LingBotARSessionState | None = None
-        if tick is not None:
-            if tick.prompt is not None and " ".join(tick.prompt.split()) != " ".join(inputs.prompt.split()):
-                raise ValueError("ar_diffusion_tick.prompt must match the standard request prompt.")
-            block_frames = int(self.transformer.config.num_frames_per_block)
-            if inputs.num_latent_frames != block_frames:
-                raise ValueError("A LingBot AR-Diffusion request must generate exactly one three-latent-frame block.")
-            if (inputs.height, inputs.width) != (
-                self._ar_height,
-                self._ar_width,
-            ):
-                raise ValueError(
-                    "LingBot AR-Diffusion request resolution must match the "
-                    "fixed cache geometry "
-                    f"{self._ar_height}x{self._ar_width}."
-                )
-            session_state = self._ar_sessions.setdefault(
-                tick.session_id,
-                _LingBotARSessionState(),
-            )
-            if tick.chunk_index != session_state.next_chunk_index:
-                raise ValueError(
-                    "LingBot chunk_index must be contiguous within a session: "
-                    f"expected {session_state.next_chunk_index}, got "
-                    f"{tick.chunk_index}."
-                )
         schedule = _build_shifted_flow_schedule(
             flow_shift=inputs.flow_shift,
         )
         dtype = self.transformer.dtype
         # Phase 1: turn all three user inputs into DiT-ready conditions.
-        # ``encode_prompt`` reuses an already-encoded prompt itself; the
-        # runner-owned cross-attention K/V is keyed the same way in
-        # ``_session_text_caches`` below.
         prompt_embeds = self.encode_prompt(
             inputs.prompt,
             max_sequence_length=inputs.max_sequence_length,
             dtype=dtype,
         )
-        if tick is None:
-            condition = self._prepare_condition(inputs, dtype=dtype)
-        else:
-            assert session_state is not None
-            condition, pending_encoder_cache = self._next_condition_chunk(
-                inputs,
-                start_frame=tick.chunk_index * block_frames,
-                session_state=session_state,
-                dtype=dtype,
-            )
-        camera_pitch: float | None = None
-        if inputs.camera_actions is not None:
-            assert session_state is not None
-            action_trajectory, camera_pitch = integrate_lingbot_camera_actions(
-                inputs.camera_actions,
-                width=inputs.width,
-                height=inputs.height,
-                initial_pose=(session_state.camera_tail.poses[-1] if session_state.camera_tail is not None else None),
-                initial_pitch=session_state.camera_pitch,
-            )
-            inputs = replace(inputs, camera_trajectory=action_trajectory)
-        camera, camera_tail = self._prepare_camera(
-            inputs,
-            dtype=dtype,
-            previous=session_state.camera_tail if session_state is not None else None,
-        )
+        condition = self._prepare_condition(inputs, dtype=dtype)
+        camera, _ = self._prepare_camera(inputs, dtype=dtype)
         if camera.shape[2:] != condition.shape[2:]:
             raise RuntimeError(
                 "folded camera and image condition must share latent frame/height/width geometry; "
@@ -1550,48 +1374,28 @@ class LingBotWorldCausalDMDPipeline(
             )
 
         block_frames = int(self.transformer.config.num_frames_per_block)
-        cache: LingBotTransformerCache | None = None
-        ar_cross_attention: list[LingBotAttentionCache] | None = None
-        if tick is None:
-            # Direct/offline oracle keeps request-local contiguous K/V.
-            cache = self.transformer.allocate_cache(
-                batch_size=1,
-                latent_height=condition.shape[-2],
-                latent_width=condition.shape[-1],
-                device=self.device,
-                dtype=dtype,
-            )
-        else:
-            assert session_state is not None
-            if session_state.generator_state is not None:
-                inputs.generator.set_state(session_state.generator_state)
-            ar_cross_attention = self._session_text_caches(
-                prompt_embeds,
-                prompt=inputs.prompt,
-                max_sequence_length=inputs.max_sequence_length,
-                session_state=session_state,
-            )
+        # Direct/offline oracle keeps request-local contiguous K/V.
+        cache: LingBotTransformerCache | None = self.transformer.allocate_cache(
+            batch_size=1,
+            latent_height=condition.shape[-2],
+            latent_width=condition.shape[-1],
+            device=self.device,
+            dtype=dtype,
+        )
         generated_blocks: list[torch.Tensor] = []
         total_steps = (inputs.num_latent_frames // block_frames) * len(LINGBOT_DMD_TIMESTEPS)
-        first_start_frame = tick.chunk_index * block_frames if tick is not None else 0
         with self.progress_bar(total=total_steps) as progress_bar:
             # Phase 3: generate left-to-right in latent-frame blocks. The
             # monotonically increasing ``start_frame`` is also the temporal
             # position and cache offset used by the Transformer.
-            for local_start_frame in range(
-                0,
-                inputs.num_latent_frames,
-                block_frames,
-            ):
-                start_frame = first_start_frame + local_start_frame
-                stop_frame = local_start_frame + block_frames
+            for start_frame in range(0, inputs.num_latent_frames, block_frames):
+                stop_frame = start_frame + block_frames
                 generated_blocks.append(
                     self._generate_block(
-                        condition=condition[:, :, local_start_frame:stop_frame],
-                        camera=camera[:, :, local_start_frame:stop_frame],
+                        condition=condition[:, :, start_frame:stop_frame],
+                        camera=camera[:, :, start_frame:stop_frame],
                         prompt_embeds=prompt_embeds,
                         cache=cache,
-                        ar_cross_attention=ar_cross_attention,
                         start_frame=start_frame,
                         schedule=schedule,
                         generator=inputs.generator,
@@ -1603,23 +1407,10 @@ class LingBotWorldCausalDMDPipeline(
         # all latent blocks have been generated. Release it before VAE decode
         # so the two large allocations do not overlap.
         cache = None
-        if tick is not None:
-            assert session_state is not None
-            session_state.generator_state = inputs.generator.get_state()
-            session_state.encoder_cache = pending_encoder_cache
-            session_state.camera_tail = camera_tail
-            if camera_pitch is not None:
-                session_state.camera_pitch = camera_pitch
-            session_state.next_chunk_index += 1
 
         # Phase 4: either expose model-space latents or invert the checkpoint's
         # latent normalization and decode to pixel-space video.
-        if tick is not None:
-            output = {
-                "payload": {"latents": generated_latents},
-                "metadata": {"ar_diffusion": ARDiffusionChunkMetadata.from_tick(tick).to_dict()},
-            }
-        elif inputs.output_type == "latent":
+        if inputs.output_type == "latent":
             output = generated_latents
         else:
             latent_mean, latent_std = self._vae_latent_stats(generated_latents)
@@ -1775,8 +1566,6 @@ class LingBotWorldCausalDMDPipeline(
             ]
         )
         inputs = self._parse_request(req)
-        if ARDiffusionTickRequest.from_extra_args(state.sampling.extra_args) is not None:
-            raise ValueError("LingBot step execution does not accept AR-Diffusion ticks.")
         if (inputs.height, inputs.width) != (self._ar_height, self._ar_width):
             raise ValueError(
                 "LingBot AR-Diffusion request resolution must match the "
@@ -1832,7 +1621,7 @@ class LingBotWorldCausalDMDPipeline(
             "camera_trajectory_cache": camera_trajectory_cache,
             "camera_embedding_cache": camera_embedding_cache,
         }
-        self._ar_text_caches(prompt_embeds, invalidate=False)
+        self._ar_text_caches(prompt_embeds)
         self._ar_sessions[state.request_id] = _LingBotARSessionState()
         return state
 
@@ -1950,10 +1739,7 @@ class LingBotWorldCausalDMDPipeline(
         extra["camera_cache"] = CameraModulationCache()
         extra["camera_tail"] = camera_tail
         extra["start_frame"] = start_frame
-        extra["ar_cross_attention"] = self._ar_text_caches(
-            cast(torch.Tensor, state.prompt_embeds),
-            invalidate=False,
-        )
+        extra["ar_cross_attention"] = self._ar_text_caches(cast(torch.Tensor, state.prompt_embeds))
         state.latents = randn_tensor(
             (
                 1,
@@ -2067,7 +1853,6 @@ class LingBotWorldCausalDMDPipeline(
                     session_id=state.request_id,
                     request_id=state.request_id,
                     chunk_index=completed_chunk_index,
-                    applied_event_ids=(),
                 ).to_dict()
             },
         }
