@@ -170,7 +170,10 @@ class _ModelEngineOverrides(TypedDict, total=False):
     limit_mm_per_prompt: dict[str, Any]
     interleave_mm_strings: bool
     media_io_kwargs: dict[str, Any]
+    final_output: bool
     active_stream_window: int
+    use_v2_model_runner: bool
+    supports_native_mrv2_data_plane: bool
     enable_sleep_mode: bool
     subtalker_sampling_params: dict[str, Any]
     silence_ban_frames: int
@@ -271,6 +274,7 @@ class _ParallelEngineOverrides(_ParallelConfigEngineOverrides, total=False):
 
 class _ConnectorEngineOverrides(TypedDict, total=False):
     omni_kv_config: dict[str, Any]
+    kv_transfer_config: KVTransferConfig | dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -332,6 +336,8 @@ def _first_defined(*values: Any) -> Any:
 
 def _validate_async_chunk_support(pipeline: PipelineConfig, deploy: DeployConfig) -> None:
     has_inter_stage_edges = any(stage.input_sources for stage in pipeline.stages)
+    if deploy.async_chunk and any(stage.engine_extras.get("kv_transfer_config") for stage in deploy.stages):
+        raise ValueError("Native AR-to-DiT KV transfer requires async_chunk=False.")
     if (
         deploy.async_chunk
         and has_inter_stage_edges
@@ -490,9 +496,12 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     # MiniCPM interleaved AV packing and media decode knobs (Daily-Omni).
     interleave_mm_strings: bool | None = None
     media_io_kwargs: dict[str, Any] | None = None
+    final_output: bool = False
     active_stream_window: int = Field(default=0, ge=0)
     session_mode: str = "turn"
     duplex_max_sessions: int = Field(default=1, ge=1)
+    use_v2_model_runner: bool = False
+    supports_native_mrv2_data_plane: bool = False
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
@@ -605,6 +614,7 @@ class OmniStageConnectorConfig:
 
     async_chunk: bool = False
     omni_kv_config: dict[str, Any] | None = None
+    kv_transfer_config: KVTransferConfig | None = None
     stage_connector: dict[str, Any] = field(
         default_factory=lambda: {
             "name": "SharedMemoryConnector",
@@ -1386,7 +1396,7 @@ def normalize_and_validate_diffusion_engine_ingress_kwargs(
         | orchestrator_field_names()
         # Coordination fields also live on the typed orchestrator config, not
         # all of them are present on the CLI-only OrchestratorArgs dataclass.
-        | frozenset(config_field.name for config_field in fields(VllmOmniOrchestratorConfig))
+        | frozenset(config_field.name for config_field in fields(cast(Any, VllmOmniOrchestratorConfig)))
     )
     allowed_fields = stage_consumed_fields | externally_consumed_fields
     validate_omni_diffusion_kwargs(normalized, allowed_fields, stage_id=stage_id)
@@ -1961,8 +1971,14 @@ def _build_model_config(
         kwargs["dtype"] = _copy_value(deploy.dtype)
     if "active_stream_window" not in kwargs:
         kwargs["active_stream_window"] = _copy_value(deploy.active_stream_window)
+    kwargs["final_output"] = topology.final_output
     if "custom_voice_dir" not in kwargs and deploy.custom_voice_dir is not None:
         kwargs["custom_voice_dir"] = _copy_value(deploy.custom_voice_dir)
+    kwargs.setdefault("use_v2_model_runner", deploy.model_runner == "v2")
+    kwargs.setdefault(
+        "supports_native_mrv2_data_plane",
+        topology.supports_native_mrv2_data_plane,
+    )
     if "has_sampling_extra_args" not in kwargs:
         kwargs["has_sampling_extra_args"] = bool((default_sampling_params or {}).get("extra_args"))
     if "model_subdir" not in kwargs and topology.model_subdir is not None:
@@ -2078,6 +2094,7 @@ def _build_connector_config(
     return cast(Any, OmniStageConnectorConfig)(
         async_chunk=resolve_stage_async_chunk(deploy, stage_deploy),
         omni_kv_config=_copy_value(engine.get("omni_kv_config")),
+        kv_transfer_config=_copy_value(engine.get("kv_transfer_config")),
         output_connectors=_copy_value(output_connectors) if output_connectors else None,
         input_connectors=_copy_value(input_connectors) if input_connectors else None,
     )

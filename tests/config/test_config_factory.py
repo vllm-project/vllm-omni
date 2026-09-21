@@ -1429,6 +1429,9 @@ stages:
         assert deploy.async_chunk is True
         assert deploy.connectors is not None
         assert deploy.platforms is not None
+        connector = deploy.connectors["connector_of_shared_memory"]
+        assert "async_chunk_batch_min_size" not in connector["extra"]
+        assert "async_chunk_batch_max_wait_ms" not in connector["extra"]
 
     @pytest.mark.parametrize(
         ("hf_config", "model"),
@@ -2703,6 +2706,56 @@ class TestPlatformOverrides:
         deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
 
         assert deploy.stages[0].engine_extras["block_size"] == 128
+
+    @pytest.mark.parametrize("platform", ["cuda", "npu"])
+    def test_recommended_native_runner_platform_defaults(self, platform):
+        filename, pipeline_key = "qwen3_tts_mrv2.yaml", "qwen3_tts"
+        deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
+        deploy = _apply_platform_overrides(deploy, platform=platform)
+        expect_v2 = platform == "cuda"
+        assert deploy.model_runner == ("v2" if expect_v2 else "v1")
+
+        # The selection must reach the live worker-dispatch consumer, not just
+        # the transport-level DeployConfig field.
+        pipeline = resolve_pipeline_config(pipeline_key)
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [expect_v2] * len(stages)
+
+        if expect_v2 and pipeline.stages and deploy.async_chunk:
+            # v2 only engages the native plane on stages declaring support.
+            assert all(ps.supports_native_mrv2_data_plane for ps in pipeline.stages)
+
+    @pytest.mark.parametrize("runner,native", [("v1", False), ("v2", False), ("v2", True)])
+    def test_mrv2_undeclared_transport_warns(self, monkeypatch, runner, native):
+        from unittest.mock import Mock
+
+        warning = Mock()
+        monkeypatch.setattr("vllm_omni.config.stage_config.logger.warning", warning)
+        pipeline = PipelineConfig(
+            model_type="custom_pipeline",
+            stages=[
+                StagePipelineConfig(
+                    stage_id=0, model_stage="custom_ar", final_output=True, supports_native_mrv2_data_plane=native
+                )
+            ],
+        )
+        merge_pipeline_deploy(pipeline, DeployConfig(model_runner=runner))
+        assert warning.call_count == int(runner == "v2" and not native)
+        if warning.called:
+            assert "legacy transport path" in warning.call_args.args[0]
+
+    def test_runner_selection_rejects_engine_extras_override(self):
+        pipeline = PipelineConfig(
+            model_type="runner_selection_reserved",
+            stages=SINGLE_STAGE_PIPE_CFG,
+        )
+        for reserved in ("use_v2_model_runner", "supports_native_mrv2_data_plane"):
+            deploy = DeployConfig(
+                model_runner="v2",
+                stages=[StageDeployConfig(stage_id=0, engine_extras={reserved: False})],
+            )
+            with pytest.raises(ValueError, match=f"{reserved!r} must not be set"):
+                merge_pipeline_deploy(pipeline, deploy)
 
     def test_npu_overrides(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))

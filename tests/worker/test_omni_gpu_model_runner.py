@@ -770,8 +770,10 @@ def test_accumulate_full_payload_output_keeps_all_zero_qwen3_omni_prefill_placeh
 def test_full_payload_output_accumulation_hook_matrix():
     assert _make_full_payload_accumulation_runner(model_stage="thinker")._should_accumulate_full_payload_output()
     assert _make_full_payload_accumulation_runner(model_stage="talker")._should_accumulate_full_payload_output()
-    assert not _make_full_payload_accumulation_runner(
-        model_stage="code2wav", final_output=True
+    # A stage may publish a user-visible output and still feed another stage
+    # (Qwen3-Omni thinker publishes text while sending audio state to talker).
+    assert _make_full_payload_accumulation_runner(
+        model_stage="thinker", final_output=True
     )._should_accumulate_full_payload_output()
     assert not _make_full_payload_accumulation_runner(
         model_stage="token2audio",

@@ -179,6 +179,7 @@ def test_encoder_preparation_routes_edit_sources_without_qwen_inputs(
     pipeline.device = torch.device("cpu")
     pipeline.default_video_shift = 12.0
     pipeline.default_audio_shift = 3.0
+    pipeline.od_config = SimpleNamespace(step_execution=False)
     pipeline._fasth3 = None
     pipeline._active_turbo_spec = lambda _sampling: None
     pipeline._has_active_native_lora = lambda _sampling: False

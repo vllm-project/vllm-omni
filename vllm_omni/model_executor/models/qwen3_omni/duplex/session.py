@@ -17,8 +17,9 @@ class QwenDuplexSessionState(DuplexModelSessionState):
     """Mutable model-owned state of one Qwen duplex session (owned by the session runner)."""
 
     audio_buffer: QwenPcmBuffer = field(default_factory=QwenPcmBuffer)
-    # Keep content objects alongside payloads so identity survives history copies.
-    audio_history: list[tuple[object, dict]] = field(default_factory=list)
+    # Each payload can combine several audio commits from one pending turn.
+    # Keep their content objects so associations survive shallow history copies.
+    audio_history: list[tuple[tuple[object, ...], dict]] = field(default_factory=list)
     input_since_commit: bool = False
     speech_since_commit: bool = False
     context_locked: bool = False
