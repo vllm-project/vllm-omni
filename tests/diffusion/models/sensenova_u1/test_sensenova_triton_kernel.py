@@ -18,7 +18,10 @@ import torch
 pytestmark = [
     pytest.mark.core_model,
     pytest.mark.cuda,
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.version.hip is not None,
+        reason="CUDA required; the fused kernel has no ROCm path",
+    ),
 ]
 
 SEED = 42
@@ -270,5 +273,5 @@ def test_fused_qk_norm_rope_batched(seq_len: int, rope_batch: int, dtype: torch.
     ref_q, ref_k = reference_kernel(*data.args())
     out_q, out_k = triton_qk_norm_rope(*data.args(), EPS)
 
-    torch.testing.assert_close(out_q, ref_q, atol=atol, rtol=rtol)
-    torch.testing.assert_close(out_k, ref_k, atol=atol, rtol=rtol)
+    assert_close_with_error_stats(out_q, ref_q, name="query", atol=atol, rtol=rtol)
+    assert_close_with_error_stats(out_k, ref_k, name="key", atol=atol, rtol=rtol)
