@@ -46,8 +46,11 @@ stages:
     gpu_memory_utilization: 0.40
     enforce_eager: false
     # Stage-level prefix caching override; the top level stays false for duplex safety.
-    # Stage-0 n-gram speculative decoding is intentionally not enabled here: vLLM
-    # rejects prefix caching together with speculative decoding.
+    # Stage-0 n-gram speculative decoding is intentionally not enabled here: the
+    # omni prefix cache refuses the pair (stage_prefix_cache_config ->
+    # check_prefix_cache_token_accounting raises OmniPrefixCacheUnmatchError as soon
+    # as a stage has enable_prefix_caching and a speculative_config; vLLM itself
+    # allows the combination).
     enable_prefix_caching: true
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
