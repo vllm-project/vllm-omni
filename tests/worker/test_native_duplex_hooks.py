@@ -2639,7 +2639,7 @@ _REQUIRED_DUPLEX_CALLS = {
     "_sample": "_apply_duplex_sampling",
 }
 
-_MODEL_SAMPLER_CALL = "model_sample"
+_MODEL_SAMPLER_CALL = "call_model_sampler"
 
 
 def _repo_root():

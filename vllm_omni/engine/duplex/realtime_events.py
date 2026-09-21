@@ -946,6 +946,16 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         if not isinstance(response_id, str) or not response_id:
             return events
         if response_is_done(state, response_id):
+            # Generation may finish long before the client drains its audio.
+            # A later barge-in still needs to stop that queued playback, but
+            # must not produce a second response.done for the completed turn.
+            playback = event.get("playback")
+            if (
+                not events
+                and isinstance(playback, Mapping)
+                and _int_or(playback.get("sent_ms")) > _int_or(playback.get("committed_ms"))
+            ):
+                events.append(OutputAudioCleared(response_id=response_id))
             return events
         committed_ms = event.get("committed_ms")
         if isinstance(committed_ms, int | float):
@@ -1320,7 +1330,11 @@ def resolve_cancel_response(state: RealtimeProjectionState, command: CancelRespo
 def resolve_clear_output_audio(state: RealtimeProjectionState, command: ClearOutputAudio) -> ResolvedControl:
     payload: dict[str, object] = {"type": "output_audio_buffer.clear", "reason": "output_audio_buffer.clear"}
     response_id = command.response_id or state.active_response_id or state.last_response_id
-    if response_is_done(state, response_id):
+    # A completed response can still own queued playback. Clear the latest
+    # response in the engine, while keeping late clears away from newer turns.
+    if response_is_done(state, response_id) and (
+        state.active_response_id is not None or response_id != state.last_response_id
+    ):
         return ResolvedControl(payloads=[], events=[OutputAudioCleared(response_id=_str_or_none(response_id))])
     if isinstance(response_id, str) and response_id:
         payload["response_id"] = response_id
@@ -1362,7 +1376,6 @@ def resolve_truncate_item(state: RealtimeProjectionState, command: TruncateItem)
             payloads=[], events=[error_event("bad_event", truncate_error, event_id=command.event_id)]
         )
     state.item_truncation_cursors[command.item_id] = (command.content_index, command.audio_end_ms)
-    truncate_realtime_item_content(item, content_index=command.content_index, audio_end_ms=command.audio_end_ms)
     ack_payload: dict[str, object] = {
         "type": "playback.ack",
         "item_id": command.item_id,

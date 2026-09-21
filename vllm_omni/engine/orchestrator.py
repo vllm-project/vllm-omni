@@ -38,6 +38,7 @@ from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
@@ -191,6 +192,8 @@ class OrchestratorRequestState:
     final_stage_id: int = -1
     final_output_stage_ids: set[int] = field(default_factory=set)
     finished_final_output_stage_ids: set[int] = field(default_factory=set)
+    finished_stage_ids: set[int] = field(default_factory=set)
+    pending_final_output: OutputMessage | None = None
 
     # Wall-clock timestamp when the client-facing engine request was accepted.
     request_timestamp: float = 0.0
@@ -211,6 +214,7 @@ class OrchestratorRequestState:
     session_owned: bool = False
     running_counter_registered: bool = False
     request_artifact_dirs: set[str] = field(default_factory=set)
+    native_kv_transfer_id: str | None = None
 
 
 @dataclass
@@ -761,20 +765,21 @@ class OrchestratorBase:
                     float(kv_wait_s),
                 )
             req_state = self.request_states.get(getattr(eco, "request_id", None))
-            if req_state is None or not req_state.streaming.enabled:
+            if req_state is None:
                 continue
-            segment_finished = bool(getattr(eco, "is_segment_finished", False))
-            raw_mm = self._completion_multimodal_output(eco, None)
-            req_state.streaming.segments[stage_id] = StreamingSegmentState(
-                finished=segment_finished,
-                token_ids=(self._coerce_int_list(getattr(eco, "new_token_ids", None)) if segment_finished else []),
-                output_metadata=(dict(raw_mm) if segment_finished and isinstance(raw_mm, dict) else {}),
-            )
-            req_state.streaming.new_prompt_len_snapshot = getattr(
-                eco,
-                "new_prompt_len_snapshot",
-                None,
-            )
+            if req_state.streaming.enabled:
+                segment_finished = bool(getattr(eco, "is_segment_finished", False))
+                raw_mm = self._completion_multimodal_output(eco, None)
+                req_state.streaming.segments[stage_id] = StreamingSegmentState(
+                    finished=segment_finished,
+                    token_ids=(self._coerce_int_list(getattr(eco, "new_token_ids", None)) if segment_finished else []),
+                    output_metadata=(dict(raw_mm) if segment_finished and isinstance(raw_mm, dict) else {}),
+                )
+                req_state.streaming.new_prompt_len_snapshot = getattr(
+                    eco,
+                    "new_prompt_len_snapshot",
+                    None,
+                )
             if await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state):
                 raw_terminal_request_ids.add(req_state.request_id)
             await self._report_duplex_session_request_error(stage_id, replica_id, eco, req_state)
@@ -785,6 +790,11 @@ class OrchestratorBase:
             iteration_stats=iteration_stats,
         )
         if self._stat_logger is not None and (raw_outputs.scheduler_stats is not None or iteration_stats is not None):
+            key = (stage_id, replica_id)
+            if key not in self._stage_replica_to_engine_idx:
+                engine_idx = len(self._stage_replica_to_engine_idx)
+                self._stat_logger.register_replica(engine_idx, str(stage_id), str(replica_id))
+                self._stage_replica_to_engine_idx[key] = engine_idx
             self._stat_logger.record(
                 raw_outputs.scheduler_stats,
                 iteration_stats,
@@ -1358,6 +1368,16 @@ class OrchestratorBase:
         try:
             await dispatch()
             return True
+        except NativeKVHandoffError as e:
+            await self._fail_request_client_error(
+                req_id,
+                stage_id,
+                str(e),
+                status_code=HTTPStatus.BAD_GATEWAY.value,
+                error_type="NativeKVHandoffError",
+                release_owners=True,
+            )
+            return False
         except StageUnavailableError as e:
             # No specific replica to evict: the stage already has no live
             # replica or the chosen slot was evicted. Fail just this request.
@@ -1489,18 +1509,19 @@ class OrchestratorBase:
         ``is_segment_finished=False``, but vLLM's output processor may remove the
         request state before that EngineCoreOutput is processed.
 
-        Only update ``finished_final_output_stage_ids`` here. Request cleanup stays
-        in ``_route_output`` so downstream async-chunk stages can still deliver
-        outputs after stage-0 session end.
+        Record raw stage completion here. Client completion is
+        resolved after this raw batch passes through the output processor, so a
+        real processed output wins over the swallowed-terminal fallback.
         """
         if getattr(eco, "finish_reason", None) is None:
             return False
         if getattr(eco, "is_segment_finished", False):
             return False
 
+        req_state.finished_stage_ids.add(stage_id)
         final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
         if stage_id not in final_output_stage_ids:
-            return False
+            return True
         req_state.finished_final_output_stage_ids.add(stage_id)
         return True
 
@@ -1553,16 +1574,23 @@ class OrchestratorBase:
         replica_id: int,
         request_ids: set[str],
     ) -> None:
-        """Finish streaming requests whose raw terminal had no processed output."""
+        """Finish requests whose raw terminal had no processed output."""
         pool = self.stage_pools[stage_id]
-        if not pool.final_output:
-            return
-
         for request_id in request_ids:
             req_state = self.request_states.get(request_id)
             if req_state is None or req_state.session_owned:
                 continue
-
+            pending = req_state.pending_final_output
+            if pending is not None:
+                if set(req_state.stage_submit_ts).issubset(req_state.finished_stage_ids):
+                    req_state.pending_final_output = None
+                    await self.output_async_queue.put(pending)
+                    await self._cleanup_request_ids([request_id, *self._cfg_tracker.cleanup_parent(request_id)])
+                # A real terminal output is pending; do not replace it with
+                # the swallowed-output fallback before upstream completion.
+                continue
+            if not pool.final_output:
+                continue
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
             if not final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids):
                 continue
@@ -1636,27 +1664,41 @@ class OrchestratorBase:
             await self._cleanup_request_ids([req_id])
             return
 
+        if finished and not segment_finished:
+            req_state.finished_stage_ids.add(stage_id)
+
         request_finished = False
         if finished and self.stage_pools[stage_id].final_output and not segment_finished:
             req_state.finished_final_output_stage_ids.add(stage_id)
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
             request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
         if req_state.session_owned:
-            # Session-owned outputs are delivered to their session through
-            # ``_intercept_stage_output`` below, never to a request queue.
+            # Session-owned outputs are delivered through the session interceptor.
             pass
         elif self.stage_pools[stage_id].final_output:
-            await self.output_async_queue.put(
-                OutputMessage(
-                    request_id=req_id,
-                    stage_id=stage_id,
-                    replica_id=replica_id,
-                    engine_outputs=output,
-                    metrics=stage_metrics,
-                    finished=request_finished,
-                    stage_submit_ts=submit_ts,
-                )
+            message = OutputMessage(
+                request_id=req_id,
+                stage_id=stage_id,
+                replica_id=replica_id,
+                engine_outputs=output,
+                metrics=stage_metrics,
+                finished=request_finished,
+                stage_submit_ts=submit_ts,
             )
+            if (
+                request_finished
+                and self.async_chunk
+                and not req_state.streaming.enabled
+                and not set(req_state.stage_submit_ts).issubset(req_state.finished_stage_ids)
+            ):
+                # Direct chunk delivery can finish the decoder before the
+                # upstream engine's terminal output/metrics reaches this loop.
+                # Keep request state until those messages are routed, otherwise
+                # the frontend publishes incomplete usage and loses stop reasons.
+                req_state.pending_final_output = message
+                request_finished = False
+            else:
+                await self.output_async_queue.put(message)
         elif stage_metrics is not None:
             await self.output_async_queue.put(
                 StageMetricsMessage(
@@ -1723,6 +1765,12 @@ class OrchestratorBase:
                         is_streaming_session=True,
                         is_final_update=True,
                     )
+
+        pending = req_state.pending_final_output
+        if pending is not None and set(req_state.stage_submit_ts).issubset(req_state.finished_stage_ids):
+            req_state.pending_final_output = None
+            await self.output_async_queue.put(pending)
+            request_finished = True
 
         if request_finished and not req_state.session_owned:
             await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
@@ -2188,12 +2236,13 @@ class OrchestratorBase:
                     req_id,
                     req_state,
                     diffusion_prompt,
-                    submit_kwargs={
-                        "kv_sender_info": self._build_kv_sender_info(
-                            list(getattr(next_client, "engine_input_source", None) or [src_stage_id]),
-                            request_id=req_id,
-                        )
-                    },
+                    submit_kwargs=self._diffusion_submit_kwargs(
+                        req_id,
+                        src_stage_id,
+                        next_client,
+                        req_state,
+                        output,
+                    ),
                     params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
                 )
             self._on_stage_submitted(
@@ -2447,12 +2496,12 @@ class OrchestratorBase:
             _t_submit_start = _time.perf_counter()
 
             if next_pool.stage_type == "diffusion":
-                submit_kwargs = {
-                    "kv_sender_info": self._build_kv_sender_info(
-                        list(getattr(next_pool.stage_client, "engine_input_source", None) or [next_stage_id - 1]),
-                        request_id=request_id,
-                    )
-                }
+                submit_kwargs = self._diffusion_submit_kwargs(
+                    request_id,
+                    next_stage_id - 1,
+                    next_pool.stage_client,
+                    req_state,
+                )
                 submitted = await self._dispatch_or_fail_request(
                     lambda: next_pool.submit_initial(
                         request_id,
@@ -2465,8 +2514,6 @@ class OrchestratorBase:
                     operation="async-chunk prewarm",
                 )
             else:
-                import copy
-
                 from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
 
                 try:
@@ -2489,7 +2536,9 @@ class OrchestratorBase:
 
                 original_prompt = req_state.prompt
                 if isinstance(original_prompt, dict):
-                    base_input = copy.deepcopy(original_prompt)
+                    from vllm_omni.engine.request_snapshot import copy_request_snapshot
+
+                    base_input = copy_request_snapshot(original_prompt)
                 else:
                     base_input = {}
 
@@ -2548,6 +2597,67 @@ class OrchestratorBase:
             )
 
         return True
+
+    def _maybe_attach_native_kv_transfer_params(
+        self,
+        req_state: OrchestratorRequestState,
+        prompt: Any,
+    ) -> None:
+        source_stage_id = 0
+        if source_stage_id + 1 > req_state.final_stage_id:
+            return
+        config = getattr(self.stage_pools[source_stage_id].stage_vllm_config, "kv_transfer_config", None)
+        if getattr(config, "kv_role", None) != "kv_producer":
+            return
+        if self.stage_pools[source_stage_id + 1].stage_type != "diffusion":
+            return
+
+        from vllm_omni.diffusion.diffusion_kv.kv_connector import build_source_kv_transfer_params, mint_transfer_id
+
+        transfer_id = mint_transfer_id(req_state.request_id)
+        req_state.native_kv_transfer_id = transfer_id
+        params = build_source_kv_transfer_params(
+            transfer_id=transfer_id,
+            remote_engine_id=None,
+            remote_bootstrap_addr=None,
+        )
+        for sampling in (req_state.sampling_params_list[source_stage_id], prompt.sampling_params):
+            sampling.extra_args = {**(sampling.extra_args or {}), "kv_transfer_params": params}
+
+    def _diffusion_submit_kwargs(
+        self,
+        request_id: str,
+        source_stage_id: int,
+        next_client: Any,
+        req_state: OrchestratorRequestState,
+        output: Any = None,
+    ) -> dict[str, Any]:
+        source_stage_ids = list(getattr(next_client, "engine_input_source", None) or [source_stage_id])
+        if req_state.native_kv_transfer_id is None:
+            return {"kv_sender_info": self._build_kv_sender_info(source_stage_ids, request_id=request_id)}
+        if output is None:
+            raise NativeKVHandoffError("Native KV handoff requires one completed AR source")
+        from vllm_omni.diffusion.diffusion_kv.kv_connector import (
+            bootstrap_addr_from_kv_transfer_config,
+            build_target_kv_transfer_params,
+        )
+
+        source = self.stage_pools[source_stage_id].get_bound_client(request_id)
+        config = getattr(getattr(source, "vllm_config", None), "kv_transfer_config", None)
+        if source is None or config is None:
+            raise NativeKVHandoffError(
+                f"Native KV handoff for {request_id}: bound AR replica or its KV configuration is unavailable"
+            )
+        params = getattr(output, "kv_transfer_params", None)
+        if not params or "num_transfer_tokens" not in params:
+            raise NativeKVHandoffError("AR source completed without native KV transfer metadata")
+        return {
+            "kv_transfer_params": build_target_kv_transfer_params(
+                source_params=params,
+                remote_engine_id=config.engine_id,
+                remote_bootstrap_addr=bootstrap_addr_from_kv_transfer_config(config),
+            )
+        }
 
     def _build_kv_sender_info(
         self,
@@ -2672,6 +2782,7 @@ class Orchestrator(OrchestratorBase):
             request_artifact_dirs=set(msg.request_artifact_dirs or ()),
         )
         self.request_states[request_id] = req_state
+        self._maybe_attach_native_kv_transfer_params(req_state, prompt)
         self._register_running_request(req_state)
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
         req_state.stage_submit_ts[stage_id] = _time.time()

@@ -213,16 +213,27 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         # The history accessor copies message dicts but preserves content identity.
         # Keep payloads privately, never put PCM into public conversation events.
         has_audio = bool(payload.get("audio"))
-        last_content = history[-1].get("content") if history else None
-        current_is_in_history = (
-            has_audio
-            and isinstance(last_content, list)
-            and any(part.get("type") == "audio_url" for part in last_content)
-        )
+        # A committed audio item need not be last: camera/text items can arrive
+        # before response.create. Search only the unanswered user turn so a new
+        # payload can never overwrite an earlier, already answered utterance.
+        current_contents = []
+        if has_audio:
+            for message in reversed(history):
+                if message.get("role") != "user":
+                    break
+                content = message.get("content")
+                if isinstance(content, list) and any(part.get("type") == "audio_url" for part in content):
+                    current_contents.append(content)
+        current_is_in_history = bool(current_contents)
         if current_is_in_history:
-            content = history[-1].get("content")
-            state.audio_history = [(key, value) for key, value in state.audio_history if key is not content]
-            state.audio_history.append((content, payload))
+            # The runner concatenates multiple commits made before a response.
+            # Associate that single payload with all of its source audio items.
+            state.audio_history = [
+                (keys, value)
+                for keys, value in state.audio_history
+                if not any(key is content for key in keys for content in current_contents)
+            ]
+            state.audio_history.append((tuple(current_contents), payload))
         # Reserve one of the four audio slots for the actual submitted input,
         # including when deferred input has no trailing user history entry.
         history_limit = 4 if current_is_in_history or not has_audio else 3
@@ -230,32 +241,74 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         while len(retained) > 1 and sum(len(value.get("audio", "")) for _, value in retained) > 8 * 1024 * 1024:
             retained.pop(0)
         state.audio_history = retained
+        # Match the official demo's unit of history: consecutive user items
+        # followed by their assistant reply(s). Prune whole turns, before
+        # formatting, so a camera item cannot rescue an orphaned answer.
+        turns = []
+        for index, message in enumerate(history):
+            role = message.get("role")
+            if not turns or role == "system" or (role == "user" and turns[-1][1][-1].get("role") != "user"):
+                turns.append((index, []))
+            turns[-1][1].append(message)
+
         messages = []
-
-        def has_image(message):
-            content = message.get("content")
-            return isinstance(content, list) and any(p.get("type") == "image_url" for p in content)
-
-        selected = [m for m in history[:-16] if has_image(m)] + history[-16:]
-        for message in selected:
-            content = message.get("content")
-            audio = next((value for key, value in retained if key is content), None)
-            if audio is not None:
-                messages.append({"role": "user", "audio_payload": audio})
-            elif isinstance(content, list) and any(part.get("type") == "image_url" for part in content):
-                messages.append(message)
-            elif isinstance(content, str) and content:
-                messages.append(message)
-            elif message.get("role") == "user":
-                # Do not keep an assistant answer after dropping its user audio.
-                messages = [m for m in messages if has_image(m)]
-        while messages and messages[0].get("role") == "assistant":
-            messages.pop(0)
+        for index, turn in turns:
+            # Keep the existing recent-message window, rounded outwards to a
+            # complete turn. Never retain an answer whose input was cut off.
+            if index + len(turn) <= len(history) - 16:
+                continue
+            if turn[0].get("role") == "assistant":
+                continue
+            resolved = []
+            included_audio = set()
+            for message in turn:
+                content = message.get("content")
+                if message.get("role") == "user" and isinstance(content, list):
+                    if any(part.get("type") == "audio_url" for part in content):
+                        audio = next((value for keys, value in retained if any(key is content for key in keys)), None)
+                        if audio is None:
+                            break
+                        if id(audio) not in included_audio:
+                            resolved.append({"role": "user", "audio_payload": audio})
+                            included_audio.add(id(audio))
+                        # Preserve text/images in mixed source items as well.
+                        other_parts = [part for part in content if part.get("type") != "audio_url"]
+                        if other_parts:
+                            resolved.append({"role": "user", "content": other_parts})
+                        continue
+                resolved.append(message)
+            else:
+                messages.extend(resolved)
         if has_audio and not current_is_in_history:
             # History is context, not a replacement for the current request.
             # Re-encoding only history here makes Qwen answer an old question.
             messages.append({"role": "user", "audio_payload": payload})
         return {**config, "qwen_messages": messages}
+
+    @staticmethod
+    def format_history(messages):
+        """Merge user items as Qwen's official web_demo.format_history does.
+
+        This is a model-input view, not a mutation of addressable session items.
+        Empty assistant messages remain boundaries for interrupted/unheard turns.
+        """
+        formatted = []
+        pending = []
+        for message in messages:
+            if message.get("role") == "user":
+                content = message.get("content")
+                pending.extend([{"type": "text", "text": content}] if isinstance(content, str) else content or [])
+                continue
+            if pending:
+                formatted.append({"role": "user", "content": pending})
+                pending = []
+            formatted.append(message)
+        if pending:
+            # The official demo puts media before the final turn's instruction.
+            media = [part for part in pending if part.get("type") != "text"]
+            text = [part for part in pending if part.get("type") == "text"]
+            formatted.append({"role": "user", "content": media + text})
+        return formatted
 
     @staticmethod
     def _trim_prompt_images(messages, images):
@@ -323,7 +376,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             raise DuplexRuntimeConfigError("Qwen generation requires committed audio or conversation history")
         audios = []
         images = []
-        for index, message in enumerate(history):
+        for message in history:
             if "audio_payload" not in message:
                 content = message.get("content")
                 if isinstance(content, list):
@@ -343,10 +396,11 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 continue
             content, audio = self._audio_content(message["audio_payload"])
             audios.append((audio, 16000))
-            if runtime_config.get("initial_user_text") and index == len(history) - 1:
-                content.append({"type": "text", "text": runtime_config["initial_user_text"]})
             messages.append({"role": "user", "content": content})
+        if payload.get("audio") and runtime_config.get("initial_user_text"):
+            messages.append({"role": "user", "content": runtime_config["initial_user_text"]})
         messages, images = self._trim_prompt_images(messages, images)
+        messages = self.format_history(messages)
         prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         mm = {"audio": audios} if audios else {}
         if images:

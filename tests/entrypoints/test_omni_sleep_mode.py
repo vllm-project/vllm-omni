@@ -18,6 +18,7 @@ import torch
 from vllm import SamplingParams
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -98,16 +99,6 @@ MODEL = "ByteDance-Seed/BAGEL-7B-MoT"
 MODEL_DIFF = "riverclouds/qwen_image_random"
 
 
-def get_dynamic_devices(stage_idx: int, num_stages: int, tp_size: int) -> str:
-    total_gpus = torch.accelerator.device_count()
-    gpus_per_stage = tp_size
-    start_idx = stage_idx * gpus_per_stage
-    if start_idx + gpus_per_stage > total_gpus:
-        start_idx = start_idx % total_gpus
-    device_ids = [str(start_idx + i) for i in range(gpus_per_stage)]
-    return ",".join(device_ids)
-
-
 async def _ensure_awake(engine: AsyncOmni, stage_ids: list[int]) -> None:
     """Best-effort full wake + resume so the next shared-engine test starts active."""
     try:
@@ -120,33 +111,28 @@ async def _ensure_awake(engine: AsyncOmni, stage_ids: list[int]) -> None:
         logger.warning("ensure_resume failed (stage_ids=%s): %s", stage_ids, e)
 
 
-def _build_llm_stages() -> tuple[list[dict], list[dict]]:
-    common_args = {
-        "worker_type": "ar",
-        "enable_sleep_mode": True,
-        "dtype": "bfloat16",
-        "trust_remote_code": True,
-        "max_model_len": 2048,
-        "max_num_batched_tokens": 8192,
-        "enforce_eager": True,
-    }
-    stages = [
-        {
-            "stage_id": 0,
-            "stage_type": "llm",
-            "runtime": {"process": True, "devices": "0", "max_batch_size": 1},
-            "engine_args": {**common_args, "model_stage": "thinker", "gpu_memory_utilization": 0.1},
+def _sleep_deploy_config(*, diffusion_only: bool = False, tp_size: int = 1) -> str:
+    """Use registered BAGEL topology and override only deployment settings."""
+    filename = "bagel_single_stage.yaml" if diffusion_only else "bagel.yaml"
+    stage_ids = (0,) if diffusion_only else (0, 1)
+    return modify_stage_config(
+        get_deploy_config_path(filename),
+        updates={
+            "stages": {
+                stage_id: {
+                    "devices": ",".join(str(stage_id * tp_size + rank) for rank in range(tp_size)),
+                    "tensor_parallel_size": tp_size,
+                    "enable_sleep_mode": True,
+                    "enforce_eager": True,
+                    "dtype": "bfloat16",
+                    # Stages use disjoint GPUs. On an 80 GiB H100, 40% cannot
+                    # fit TP=1 Thinker weights, activation peaks and KV cache.
+                    "gpu_memory_utilization": 0.8 if not diffusion_only and stage_id == 0 else 0.4,
+                }
+                for stage_id in stage_ids
+            }
         },
-        {
-            "stage_id": 1,
-            "stage_type": "llm",
-            "engine_input_source": [0],
-            "runtime": {"process": True, "devices": "1", "max_batch_size": 1, "connector_type": "queue"},
-            "engine_args": {**common_args, "model_stage": "talker", "gpu_memory_utilization": 0.1},
-        },
-    ]
-    connectors = [{"src_stage_id": 0, "dst_stage_id": 1, "connector_type": "queue"}]
-    return stages, connectors
+    )
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -163,11 +149,10 @@ def _module_device_cleanup():
 
 @pytest_asyncio.fixture(scope="class", loop_scope="class")
 async def llm_engine():
-    """Shared 2-stage BAGEL LLM engine for sleep/wake protocol tests."""
+    """Shared BAGEL Thinker + DiT engine for LLM sleep/wake protocol tests."""
     if current_omni_platform.is_rocm():
         clean_device_envs()
-    stages, connectors = _build_llm_stages()
-    engine = AsyncOmni(model=MODEL, stages=stages, connectors=connectors, init_timeout=600, enable_sleep_mode=True)
+    engine = AsyncOmni(model=MODEL, deploy_config=_sleep_deploy_config(), init_timeout=600, enable_sleep_mode=True)
     yield engine
     engine.shutdown()
     await asyncio.sleep(1.5)
@@ -178,27 +163,12 @@ async def diffusion_engine():
     """Shared BAGEL diffusion TP=2 engine for sleep/wake + generate checks."""
     if current_omni_platform.is_rocm():
         clean_device_envs()
-    stages = [
-        {
-            "stage_id": 0,
-            "stage_type": "diffusion",
-            "runtime": {"process": True, "devices": "0,1", "max_batch_size": 1},
-            "engine_args": {
-                "model_stage": "base",
-                "gpu_memory_utilization": 0.1,
-                "model_class_name": "BagelPipeline",
-                "enable_sleep_mode": True,
-                "enforce_eager": True,
-                "max_num_batched_tokens": 8192,
-                "parallel_config": {
-                    "tensor_parallel_size": 2,
-                },
-            },
-            "final_output": True,
-            "final_output_type": "image",
-        }
-    ]
-    engine = AsyncOmni(model=MODEL, stages=stages, init_timeout=600, enable_sleep_mode=True)
+    engine = AsyncOmni(
+        model=MODEL,
+        deploy_config=_sleep_deploy_config(diffusion_only=True, tp_size=2),
+        init_timeout=600,
+        enable_sleep_mode=True,
+    )
     yield engine
     engine.shutdown()
     await asyncio.sleep(1.5)
@@ -208,7 +178,7 @@ class TestOmniLlmSleepMode:
     """LLM sleep/wake protocol tests sharing one class-scoped engine."""
 
     @pytest.mark.asyncio(loop_scope="class")
-    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
     async def test_llm_sleep_ack(self, llm_engine: AsyncOmni):
         """LLM Thinker (GPU0) Signal and Physical Recycling Audit"""
         device_id = 0
@@ -333,11 +303,10 @@ class TestOmniDiffusionSleepMode:
             # --- integrity: baseline generate at original resolution/steps ---
             prompt = "A huge swimming pool, with many people swimming."
             sp = OmniDiffusionSamplingParams(num_inference_steps=4, height=512, width=512, seed=42)
-            llm_sp = SamplingParams()
 
             logger.info("Running Baseline Generation...")
             base_output = None
-            async for output in diffusion_engine.generate(prompt, request_id="base", sampling_params_list=[llm_sp, sp]):
+            async for output in diffusion_engine.generate(prompt, request_id="base", sampling_params=sp):
                 base_output = output
             assert base_output is not None and len(base_output.images) > 0
             logger.info("Baseline Generation successful.")
@@ -384,7 +353,7 @@ class TestOmniDiffusionSleepMode:
             # --- integrity + lifecycle: post-wake generate ---
             logger.info("Running Post-Wakeup Generation...")
             post_output = None
-            async for output in diffusion_engine.generate(prompt, request_id="post", sampling_params_list=[llm_sp, sp]):
+            async for output in diffusion_engine.generate(prompt, request_id="post", sampling_params=sp):
                 post_output = output
             assert post_output is not None
             assert len(base_output.images) == len(post_output.images)
@@ -458,41 +427,22 @@ class TestOmniCoordinatedSleepMode:
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.asyncio
 async def test_multistage_llm_diffusion_sleep_wake(tp_size: int):
-    """Explicit 2-stage (llm + diffusion) + connectors; sleep/wake both stages."""
+    """Registered BAGEL Thinker + DiT topology; sleep/wake both stages."""
     if current_omni_platform.is_rocm():
         clean_device_envs()
     num_gpus = torch.accelerator.device_count()
     if num_gpus < tp_size * 2:
         pytest.skip("Not enough GPUs")
 
-    stages = []
-    for i in range(2):
-        devs = get_dynamic_devices(i, 2, tp_size)
-        stages.append(
-            {
-                "stage_id": i,
-                "stage_type": "llm" if i == 0 else "diffusion",
-                "runtime": {"process": True, "devices": devs},
-                "engine_args": {
-                    "model": MODEL,
-                    "model_stage": "thinker" if i == 0 else "base",
-                    "tensor_parallel_size": tp_size,
-                    "gpu_memory_utilization": 0.4,
-                    "dtype": "bfloat16",
-                    "enable_sleep_mode": True,
-                    "trust_remote_code": True,
-                },
-            }
-        )
-
-    connectors = [{"src_stage_id": 0, "dst_stage_id": 1, "connector_type": "queue"}]
-
     engine = AsyncOmni(
-        model=MODEL, stages=stages, connectors=connectors, enable_sleep_mode=True, stage_init_timeout=1200
+        model=MODEL,
+        deploy_config=_sleep_deploy_config(tp_size=tp_size),
+        enable_sleep_mode=True,
+        stage_init_timeout=1200,
     )
     try:
         sp = OmniDiffusionSamplingParams(num_inference_steps=2)
-        async for _ in engine.generate("warmup", sampling_params_list=[SamplingParams(), sp]):
+        async for _ in engine.generate("warmup", sampling_params_list=[engine.default_sampling_params_list[0], sp]):
             pass
 
         acks = await engine.sleep(stage_ids=[0, 1], level=1)
@@ -500,7 +450,7 @@ async def test_multistage_llm_diffusion_sleep_wake(tp_size: int):
 
         await engine.wake_up(stage_ids=[0, 1])
         await engine.resume_generation(stage_ids=[0, 1])
-        async for _ in engine.generate("verify", sampling_params_list=[SamplingParams(), sp]):
+        async for _ in engine.generate("verify", sampling_params_list=[engine.default_sampling_params_list[0], sp]):
             pass
     finally:
         engine.shutdown()

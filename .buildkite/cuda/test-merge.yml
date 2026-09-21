@@ -163,6 +163,16 @@ steps:
             "
         mirror_hardwares: h100_1
 
+      - label: "Diffusion · LingBot-Video Test"
+        source_file_dependencies: diffusion_lingbot_function
+        commands:
+          - |
+            timeout 40m bash -c "
+              export VLLM_IMAGE_FETCH_TIMEOUT=60
+              pytest -s -v tests/e2e/online_serving/test_lingbot_video.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
+            "
+        mirror_hardwares: h100_1
+
       - label: "Diffusion · MiniMax-H3 L3 DLO DP2 and FastH3"
         source_file_dependencies: diffusion_minimax_h3_function
         # Keep four server lifecycles in one Buildkite job, but never in one

@@ -1393,7 +1393,7 @@ class TestConnectRemoteEngineCoresCoordinator:
             yield mocker.Mock()
 
         mocker.patch("vllm_omni.engine.stage_engine_startup.zmq_socket_ctx", return_value=fake_socket_ctx())
-        mock_wait = mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup")
+        mock_wait = mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup", autospec=True)
         with connect_remote_engine_cores(
             vllm_config=vllm_config,
             omni_master_server=omni_master_server,
@@ -1428,7 +1428,7 @@ class TestConnectRemoteEngineCoresCoordinator:
             yield mocker.Mock()
 
         mocker.patch("vllm_omni.engine.stage_engine_startup.zmq_socket_ctx", return_value=fake_socket_ctx())
-        mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup")
+        mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup", autospec=True)
         with connect_remote_engine_cores(
             vllm_config=vllm_config,
             omni_master_server=omni_master_server,
@@ -1454,7 +1454,7 @@ class TestConnectRemoteEngineCoresCoordinator:
             yield mocker.Mock()
 
         mocker.patch("vllm_omni.engine.stage_engine_startup.zmq_socket_ctx", return_value=fake_socket_ctx())
-        mock_wait = mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup")
+        mock_wait = mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup", autospec=True)
 
         with connect_remote_diffusion_proc(
             omni_master_server=omni_master_server,
@@ -1466,7 +1466,8 @@ class TestConnectRemoteEngineCoresCoordinator:
         omni_master_server.get_zmq_addresses.assert_called_once_with(7, replica_id=2)
         omni_master_server.get_allocation.assert_called_once_with(7, replica_id=2)
         mock_wait.assert_called_once()
-        _, core_engines, parallel_config, *_ = mock_wait.call_args.args
+        _, core_engines, parallel_config, _, _, launch = mock_wait.call_args.args
+        assert launch.addresses is omni_master_server.get_zmq_addresses.return_value
         assert core_engines[0].local is False
         assert parallel_config.data_parallel_size_local == 0
 
@@ -1507,7 +1508,7 @@ class TestLaunchOmniCoreEngines:
             "vllm_omni.engine.stage_engine_startup.CoreEngineProcManager",
             return_value=local_engine_manager,
         )
-        mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup")
+        mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup", autospec=True)
         with _launch_omni_core_engines(
             vllm_config=vllm_config,
             executor_class=mocker.Mock(),
@@ -1584,7 +1585,7 @@ class TestLaunchOmniCoreEngines:
             "vllm_omni.engine.stage_engine_startup.CoreEngineProcManager",
             return_value=mocker.Mock(),
         )
-        mock_wait = mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup")
+        mock_wait = mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup", autospec=True)
         with _launch_omni_core_engines(
             vllm_config=vllm_config,
             executor_class=mocker.Mock(),

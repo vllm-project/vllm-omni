@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for Wan2.2 quant_config propagation through transformer creation.
 
 Tests cover:
@@ -196,7 +196,7 @@ class TestPatchWanRmsNorm:
     """Test that patch_wan_rms_norm doesn't raise on concurrent module registration."""
 
     def test_patches_modules_with_wan_rms_norm(self):
-        from vllm_omni.diffusion.layers.norm import RMSNormVAE
+        from vllm_omni.diffusion.models.wan2_2.norm import RMSNormVAE
         from vllm_omni.diffusion.models.wan2_2.patch_diffusers import patch_wan_rms_norm
 
         # Create a fake module that has WanRMS_norm

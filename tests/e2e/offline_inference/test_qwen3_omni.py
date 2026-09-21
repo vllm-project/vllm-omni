@@ -112,16 +112,18 @@ def test_structured_multistage_config_reaches_runtime(omni_runner, offline_clien
     assert code2wav_vllm.scheduler_config.async_scheduling is False
 
     # Sampling defaults are consumed from StageClient metadata, rather than
-    # from either the resolver output or VllmConfig.
+    # from either the resolver output or VllmConfig. These literals mirror
+    # vllm_omni/deploy/qwen3_omni_moe.yaml exactly.
     expected_sampling = (
         {"temperature": 0.0, "max_tokens": 2048},
         {"temperature": 0.9, "top_k": 50, "max_tokens": 4096, "repetition_penalty": 1.05},
         {
             "temperature": 0.0,
             "top_p": 1.0,
-            # SamplingParams normalizes the disabled greedy-sampling sentinel
-            # from the deploy YAML (top_k=-1) to its runtime value (top_k=0).
-            "top_k": 0,
+            # Deploy YAML literal. The resolver check below compares it verbatim;
+            # the runtime check normalizes it through SamplingParams, which turns
+            # the greedy-sampling sentinel -1 into 0.
+            "top_k": -1,
             "max_tokens": 65536,
             "repetition_penalty": 1.1,
         },

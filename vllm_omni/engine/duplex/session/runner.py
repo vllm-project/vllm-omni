@@ -1313,7 +1313,7 @@ class DuplexSessionRunner:
                 {
                     "type": "audio.cancelled",
                     "session_id": session.session_id,
-                    "response_id": session.active_response_id,
+                    "response_id": event.get("response_id") or session.active_response_id,
                     "reason": cancel_reason,
                     "cancelled_epoch": session.epoch,
                     "epoch": session.epoch,
