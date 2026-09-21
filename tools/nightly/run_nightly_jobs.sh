@@ -44,7 +44,7 @@
 #                   whose filename contains the substring (benchmark runner chosen by JSON family).
 #
 #   stability (when included in TEST_TYPE):
-#     From repo root: pytest -s -v --run-level full_model --run-slow -m "<mark>" tests/dfx/stability/scripts/...
+#     From repo root: pytest -s -v --run-level full_model -m "<mark>" tests/dfx/stability/scripts/...
 #     -m comes from --pytest-mark / PYTEST_MARK when set (e.g. H800 or A3).
 #     Otherwise -m defaults to H800. PYTEST_MARK is rejected unless stability is enabled.
 #     model_type: omni → qwen3_omni + minicpmo_4_5; tts → qwen3_tts;
@@ -852,7 +852,7 @@ def run_stability_mode(jobs_dir: Path, model_types: list[str]) -> int:
             print(f"# skip (missing file): {rel_path}", file=sys.stderr)
             continue
         pytest_line = (
-            f"pytest -s -v --run-level full_model --run-slow "
+            f"pytest -s -v --run-level full_model "
             f"-m {_shell_quote_pytest_mark(marker_expr)} "
             f"{shlex.quote(rel_posix)}"
         )
