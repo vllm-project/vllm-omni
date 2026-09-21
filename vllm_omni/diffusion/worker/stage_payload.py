@@ -29,6 +29,19 @@ class DiffusionStagePayloadMixin(OmniConnectorModelRunnerMixin):
     _STAGE_PAYLOAD_HANDLE_KEY = "_stage_payload_transfer"
 
     def _stage_payload_broadcast_groups(self) -> tuple[Any, ...]:
+        from vllm_omni.diffusion.distributed.parallel_state import get_fs_group, get_hsdp_replicate_group
+
+        hsdp_groups = []
+        for get_group in (get_fs_group, get_hsdp_replicate_group):
+            try:
+                group = get_group()
+            except AssertionError:
+                continue
+            if group is not None and getattr(group, "world_size", 1) > 1:
+                hsdp_groups.append(group)
+        if hsdp_groups:
+            return tuple(hsdp_groups)
+
         groups = list(super()._stage_payload_broadcast_groups())
         try:
             from vllm_omni.diffusion.distributed.parallel_state import get_sp_group

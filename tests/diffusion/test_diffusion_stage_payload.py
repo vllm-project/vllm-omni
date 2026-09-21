@@ -95,6 +95,91 @@ def _conditioning():
     return {"text_encoder_output": {"hidden_states": torch.zeros(4, 8), "token_tags": torch.zeros(4)}}
 
 
+@pytest.mark.parametrize("shard_size,replicate_size", [(4, 1), (1, 4), (2, 2)])
+def test_standalone_hsdp_elects_one_payload_consumer(monkeypatch, shard_size, replicate_size):
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    leaders = []
+    for rank in range(shard_size * replicate_size):
+        shard_group = SimpleNamespace(world_size=shard_size, rank_in_group=rank % shard_size)
+        replicate_group = SimpleNamespace(world_size=replicate_size, rank_in_group=rank // shard_size)
+        monkeypatch.setattr(parallel_state, "get_fs_group", lambda: shard_group)
+        monkeypatch.setattr(parallel_state, "get_hsdp_replicate_group", lambda: replicate_group)
+        monkeypatch.setattr(parallel_state, "get_sp_group", lambda: None)
+        runner = _make_runner(_FakeConnector())
+        monkeypatch.setattr(runner, "_get_local_tp_group", lambda: None)
+        if runner.is_data_transfer_rank():
+            leaders.append(rank)
+
+    assert leaders == [0]
+
+
+@pytest.mark.parametrize("shard_size,replicate_size", [(4, 1), (1, 4), (2, 2)])
+@pytest.mark.parametrize("delivered", [True, False])
+def test_standalone_hsdp_payload_fanout(monkeypatch, shard_size, replicate_size, delivered):
+    from uuid import uuid4
+
+    from vllm_omni.diffusion.distributed import parallel_state
+    from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
+
+    packets = {}
+
+    class MeshGroup:
+        def __init__(self, dimension, peer_rank, rank, size):
+            self.key = (dimension, peer_rank)
+            self.rank_in_group = rank
+            self.world_size = size
+
+        def broadcast_object(self, value, src=0):
+            if self.rank_in_group == src:
+                packets[self.key, "delivered"] = value
+            return packets[self.key, "delivered"]
+
+        def broadcast_tensor_dict(self, value, src=0):
+            if self.rank_in_group == src:
+                packets[self.key, "payload"] = value
+            return packets[self.key, "payload"]
+
+    connector = SharedMemoryConnector({})
+    request_id = f"hsdp-{uuid4().hex}"
+    key = f"{request_id}_0_0"
+    expected = torch.arange(8).reshape(2, 4)
+    calls = []
+    original_get = connector.get_with_deadline
+
+    def tracked_get(*args, **kwargs):
+        calls.append(rank)
+        return original_get(*args, **kwargs)
+
+    monkeypatch.setattr(connector, "get_with_deadline", tracked_get)
+    monkeypatch.setattr(parallel_state, "get_sp_group", lambda: None)
+    try:
+        if delivered:
+            assert connector.put("0", "1", key, {"encoder_output": expected})[0]
+        for rank in range(shard_size * replicate_size):
+            shard_rank = rank % shard_size
+            replicate_rank = rank // shard_size
+            shard_group = MeshGroup("shard", replicate_rank, shard_rank, shard_size)
+            replicate_group = MeshGroup("replicate", shard_rank, replicate_rank, replicate_size)
+            monkeypatch.setattr(parallel_state, "get_fs_group", lambda: shard_group)
+            monkeypatch.setattr(parallel_state, "get_hsdp_replicate_group", lambda: replicate_group)
+            runner = _make_runner(connector, payload_keys=("encoder_output",))
+            monkeypatch.setattr(runner, "_get_local_tp_group", lambda: None)
+            request = _make_request({"prompt": "test"}, request_id=request_id)
+            if delivered:
+                runner._maybe_recv_stage_payload(request)
+                torch.testing.assert_close(request.prompt["additional_information"]["encoder_output"], expected)
+            else:
+                with pytest.raises(RuntimeError, match="Stage payload unavailable"):
+                    runner._maybe_recv_stage_payload(request)
+        assert set(calls) == {0}
+        if delivered:
+            assert calls == [0]
+            assert connector.get("0", "1", key) is None
+    finally:
+        connector.close()
+
+
 def test_key_convention_fetch_merges_into_additional_information():
     connector = _FakeConnector(_conditioning())
     runner = _make_runner(connector)

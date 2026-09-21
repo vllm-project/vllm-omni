@@ -16,7 +16,7 @@ flowchart TB
     Consumer --> Adapter
     Adapter --> Runtime[Shared OmniConnector runtime]
     Runtime --> Descriptor[Request key and endpoint resolution]
-    Runtime --> Fanout[Ordered TP then SP fanout]
+    Runtime --> Fanout[TP then SP or HSDP shard then replicate fanout]
     Runtime --> Manager[OmniKVTransferManager owns lazy connector]
     Manager --> SHM[SharedMemoryConnector]
     Manager --> NIXL[NixlConnector]
@@ -100,12 +100,14 @@ unchanged.
 
 The deadline covers retry sleeps, metadata socket waits, and NIXL completion
 polling. It is **not a hard real-time bound** on Python execution, allocation,
-serialization, individual native driver calls, device copies, or TP/SP
+serialization, individual native driver calls, device copies, or payload-group
 collectives. A stuck native call cannot safely be preempted with a Python
 future timeout. The implementation does not start a detached READ and discard
 its ownership when the model-thread budget expires.
 
 ## Successful Transfer
+
+The synchronous diffusion producer uses an explicit handle:
 
 ```mermaid
 sequenceDiagram
@@ -127,12 +129,50 @@ sequenceDiagram
     R->>R: Merge and validate required keys
 ```
 
-Exactly one rank, the leader in every participating group, accesses the
-connector. The shared broadcaster traverses TP and then SP groups in the same
-order on every rank. In a TP-by-SP grid, TP first populates the source SP row;
-SP then propagates each TP column. Followers do not initialize or query a
-connector. Absence is broadcast too, so peers do not wait for tensor broadcasts
-that the leader will never issue.
+MiniMax-H3 instead uses the AR encoder's asynchronous sender. It does not
+forward the diffusion producer's explicit handle:
+
+```mermaid
+sequenceDiagram
+    participant A as AR encoder leader
+    participant S as Background sender
+    participant B as Connector
+    participant O as Orchestrator
+    participant C as Diffusion consumer leader
+    participant R as Consumer peer ranks
+    A->>S: Queue encoder conditioning for conventional key
+    A->>O: Output without inline conditioning
+    O->>C: Request identity and request-scoped sender endpoint
+    par Asynchronous publication
+        S->>B: put(conventional key, conditioning), with retries
+    and Bounded receive
+        C->>B: get_with_deadline(conventional key, endpoint)
+        B-->>C: Payload or absence
+    end
+    C->>B: abandon_get(key)
+    C->>R: Delivery status, then tensors if present
+    C->>C: Merge and validate encoder_output
+    R->>R: Merge and validate encoder_output
+```
+
+Within a TP-by-SP payload grid, exactly one rank, the leader in both groups,
+accesses the connector. The shared broadcaster traverses TP and then SP in
+the same order on every rank: TP first populates the source SP row, then SP
+propagates each TP column.
+
+When initialized HSDP groups span the stage, the adapter instead uses the
+HSDP shard and replicate dimensions. The shard broadcast populates the first
+replica row; the replicate broadcast propagates every shard position to the
+other rows. Both dimensions participate in leader election. This includes
+standalone HSDP, whose TP/SP groups are singletons, as well as pure sharding
+and pure replication. The two HSDP dimensions replace, rather than overlap,
+the TP/SP fanout.
+
+The single-consumer guarantee is scoped to these configured payload groups;
+it is not a global election across arbitrary independent DP/CFG/PP groups or
+stage replicas. Followers do not initialize or query a connector. Absence is
+broadcast too, so peers do not wait for tensor broadcasts that the leader will
+never issue.
 
 Pipelines must gather sharded producer outputs before publication. Selecting
 payload keys does not gather tensor shards automatically.
@@ -150,12 +190,19 @@ Dummy request IDs (`dummy_req_id` and its slash-prefixed variants) bypass both
 directions. A pure warmup batch does not lazily initialize the connector,
 publish buffers, wait for remote data, or enter payload fanout.
 
-If `put()` fails, the producer keeps its inline fields. If a receive fails,
-inline continuation is valid only when **all required keys have non-`None`
-values**. Missing required values raise an explicit stage-payload error on
-each rank after fanout. In particular, a successful H3 producer removes its
-large inline encoder output: loss of that remote payload is an error, not a
-claim that the original prompt is equivalent conditioning. With no declared
+For the synchronous diffusion producer, failed `put()` calls preserve inline
+fields; only successful publications replace those fields with a handle.
+This guarantee does not apply to H3's AR encoder asynchronous sender. That
+path omits inline conditioning before the background `put()` completes;
+exhausting its send retries does not restore conditioning to the forwarded
+output. It uses the conventional key and request-scoped sender endpoint,
+not the diffusion producer's handle-based handoff.
+
+If a receive fails, inline continuation is valid only when **all required
+keys have non-`None` values**. Missing required values raise an explicit
+stage-payload error on each rank after fanout. H3 with omitted inline
+conditioning therefore fails explicitly if remote publication or delivery
+fails; the original prompt is not equivalent conditioning. With no declared
 input keys, an explicit handle's `payload_keys` defines the required set.
 
 ## NIXL Ownership and Recovery
@@ -175,8 +222,11 @@ stateDiagram-v2
     Deferred --> Released: terminal state and completion ACK
 ```
 
-Claims are scoped by payload generation and UUID. A transient metadata miss
-reuses the same UUID. At the end of the synchronous retry loop, `abandon_get()`
+Claims are scoped by payload generation and UUID. Query timeouts or lost
+metadata replies retain the cached UUID for retries, since the producer may
+already have granted ownership. An explicit `META_NOT_FOUND` reply clears
+the cached claim; a subsequent query can use a new UUID. At the end of the
+synchronous retry loop, `abandon_get()`
 moves unresolved queries to background recovery. Recovery asks for the same
 claim, obtains the generation, and acknowledges it **without submitting a
 READ**. A lost completion reply is retried against that exact generation,
@@ -217,7 +267,7 @@ Repeated manager close is safe, including for an unused manager.
 
 | Test module | Main invariants |
 | --- | --- |
-| `tests/diffusion/test_diffusion_stage_payload.py` | Warmup bypass, strict missing-payload errors, valid inline fallback, source-stage endpoints, TP/SP fanout, handle publication. |
+| `tests/diffusion/test_diffusion_stage_payload.py` | Warmup bypass, strict missing-payload errors, valid inline fallback, source-stage endpoints, TP/SP fanout, standalone HSDP election and SHM fanout, handle publication. |
 | `tests/diffusion/test_diffusion_model_runner.py` | New-request receive and final-only stepwise publication with cached external identity. |
 | `tests/distributed/omni_connectors/test_nixl_connector.py` | Lost replies, same-claim recovery, deadlines, generation isolation, active DMA retention, deferred close and ACKs. |
 | `tests/distributed/omni_connectors/test_shm_connector.py` | Key and metadata reads, lock contention, expired deadline, cleanup. |
