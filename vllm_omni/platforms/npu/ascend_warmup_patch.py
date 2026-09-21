@@ -83,18 +83,24 @@ def _probe_soc_name() -> str:
 
 
 def _kstep_armed() -> bool:
-    """Whether the Talker K-step is explicitly armed (frames > 1).
+    """Whether this worker runs the Talker multi-frame decode.
 
-    Single source of truth is the same env the deploy config reads; a loader
-    that cannot import it is treated as "not armed" so the baseline never
-    changes by accident.
+    Read off the engine's speculative_config, which the deploy YAML's stage-1
+    block provides; an unreadable config counts as not armed so the baseline
+    warmup never changes by accident.
     """
     try:
-        from vllm_omni.config.stage_config import talker_frames_per_step
+        from vllm.config import get_current_vllm_config_or_none
 
-        return talker_frames_per_step() > 1
+        cfg = get_current_vllm_config_or_none()
     except Exception:
         return False
+    spec = getattr(cfg, "speculative_config", None) if cfg is not None else None
+    if spec is None:
+        return False
+    method = getattr(spec, "method", None)
+    num_spec = getattr(spec, "num_speculative_tokens", 0) or 0
+    return method == "ngram" and num_spec > 0
 
 
 def _skipped_names() -> set[str]:

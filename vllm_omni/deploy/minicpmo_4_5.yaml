@@ -81,6 +81,19 @@ stages:
     # Talker context is 4096 (tts_config.max_position_embeddings).
     max_model_len: 4096
     devices: "0"
+    # Multi-frame decode: the Talker produces 8 codec frames per scheduler step.
+    # vLLM learns that each request advances 8 tokens through this
+    # speculative_config (the n-gram proposer is never consulted -- the runner
+    # supplies constant continue drafts), and async scheduling is rejected next
+    # to an n-gram proposer. stop_token_ids above must stay the two-wide
+    # continue/stop id the head emits in this mode. Remove the block (or set it
+    # to null) to fall back to one frame per step.
+    speculative_config:
+      method: ngram
+      num_speculative_tokens: 7
+      prompt_lookup_min: 1
+      prompt_lookup_max: 1
+    async_scheduling: false
     output_connectors:
       to_stage_2: connector_of_shared_memory
     # Talker is a single-vocab codec LM. These knobs go to vLLM's Sampler

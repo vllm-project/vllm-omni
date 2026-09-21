@@ -406,18 +406,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if stop_after_transfer and req_id in self.requests_needing_kv_transfer:
             self.pending_stop_after_extraction.add(req_id)
 
-    # Env var shared with stage_config._apply_minicpmo_talker_multiframe_default;
-    # keep the name in sync there.
-    _TALKER_FRAMES_ENV = "VLLM_OMNI_MINICPMO_TALKER_FRAMES"
-
     def _talker_kstep_armed(self) -> bool:
-        """True when this scheduler drives the Talker K-frame decode.
+        """True when this scheduler drives the Talker multi-frame decode.
 
-        Mirrors `_apply_minicpmo_talker_multiframe_default`: the Talker stage
-        gets an injected n-gram config with exactly frames-1 draft tokens.
-        Matching that fingerprint keeps both sides reading the same env var.
-        The text stage's explicit n-gram config (15 draft tokens by default)
-        does not match, so this stays a no-op there.
+        Both conditions come off the engine config: the stage must be the
+        Talker (``model_config.model_stage == "tts"``) and it must carry the
+        injected n-gram config whose ``num_speculative_tokens`` is exactly
+        ``K - 1``. The same stage-1 config feeds the model-side gate, so the
+        scheduler and the runner cannot disagree about K.
         """
         cache = getattr(self, "_omni_talker_kstep_cache", None)
         if cache is None:
@@ -425,23 +421,20 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # attribute and SchedulerConfig has no num_speculative_tokens
             # either, so the canonical engine-side source is vllm_config.
             # Reading anything else silently yields 0 drafts and this whole
-            # guard never arms -- exactly the bug that survived the 11:47
-            # crash fix.
+            # guard never arms.
+            vllm_cfg = getattr(self, "vllm_config", None)
             spec = getattr(self, "speculative_config", None)
             if spec is None:
-                vllm_cfg = getattr(self, "vllm_config", None)
                 spec = getattr(vllm_cfg, "speculative_config", None) if vllm_cfg is not None else None
-            num_spec = 0
-            is_ngram = True
-            if spec is not None:
+            if isinstance(spec, dict):
+                num_spec = spec.get("num_speculative_tokens", 0) or 0
+                is_ngram = spec.get("method", "ngram") == "ngram"
+            else:
                 num_spec = getattr(spec, "num_speculative_tokens", 0) or 0
                 is_ngram = getattr(spec, "method", "ngram") == "ngram"
-            try:
-                frames = int(os.environ.get(self._TALKER_FRAMES_ENV, "8") or 8)
-            except ValueError:
-                frames = 8
-            armed = is_ngram and frames > 1 and num_spec == frames - 1
-            cache = self._omni_talker_kstep_cache = armed
+            model_cfg = getattr(vllm_cfg, "model_config", None)
+            is_talker = getattr(model_cfg, "model_stage", None) == "tts"
+            cache = self._omni_talker_kstep_cache = is_talker and is_ngram and num_spec > 0
         return cache
 
     def _log_kstep_guard_view(self, verdict: str, widths: set[int], states: list, dropped: int = 0) -> None:

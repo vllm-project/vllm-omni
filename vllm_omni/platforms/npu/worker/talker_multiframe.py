@@ -12,8 +12,8 @@ step could just as well carry K frames. This module runs them.
 
 ## How a frame advances without the host
 
-The step is scheduled with K query positions per request (see
-``_apply_minicpmo_talker_multiframe_default``). vLLM prepares all K of them --
+The step is scheduled with K query positions per request (stage 1's
+``speculative_config`` in the deploy YAML). vLLM prepares all K of them --
 positions, KV slots, block table, sequence lengths -- and the captured graph is
 a K-token uniform decode. What vLLM cannot do is fill in the *inputs*: frame
 k+1's embedding is the codec token sampled at frame k, so the K positions are
@@ -49,7 +49,7 @@ D2H carries them out at the end of the step.
   drops (``_codec_scalars``). So the audio is expected to be bit-identical, not
   merely close -- which is a far stronger check than the CER gate.
 
-Off with ``VLLM_OMNI_MINICPMO_TALKER_FRAMES=1``.
+Off when stage 1's deploy config carries no speculative_config.
 """
 
 from __future__ import annotations

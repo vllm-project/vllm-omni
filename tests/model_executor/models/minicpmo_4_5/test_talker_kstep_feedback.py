@@ -28,7 +28,6 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-_TALKER_FRAMES_ENV = "VLLM_OMNI_MINICPMO_TALKER_FRAMES"
 _NUM_AUDIO_TOKENS = 6562
 _EOS_ID = _NUM_AUDIO_TOKENS - 1
 
@@ -128,12 +127,17 @@ def test_decode_preprocess_embeds_state_last_code():
     assert out["codes"]["audio"].reshape(-1).tolist() == [42]
 
 
-def _make_scheduler(*, num_spec: int, waiting=(), running=()):
+def _make_scheduler(*, num_spec: int, waiting=(), running=(), stage: str = "tts"):
     from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched._omni_talker_kstep_cache = None
-    sched.speculative_config = SimpleNamespace(method="ngram", num_speculative_tokens=num_spec)
+    # The armed check reads the stage and the n-gram fingerprint off the engine
+    # config; the real Scheduler exposes neither as a plain attribute.
+    sched.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(model_stage=stage),
+        speculative_config=SimpleNamespace(method="ngram", num_speculative_tokens=num_spec),
+    )
     # vLLM's Scheduler stores the count here (vllm_config.num_speculative_tokens);
     # the guard predicts row widths from it.
     sched.num_spec_tokens = num_spec
@@ -154,8 +158,7 @@ def _req(*, computed: int, prompt: int, spec: list[int], total: int | None = Non
     )
 
 
-def test_guard_drops_drafts_when_waiting_request_pending(monkeypatch):
-    monkeypatch.setenv(_TALKER_FRAMES_ENV, "8")
+def test_guard_drops_drafts_when_waiting_request_pending():
     decode_req = _req(computed=100, prompt=100, spec=[0] * 7)
     sched = _make_scheduler(num_spec=7, waiting=[object()], running=[decode_req])
 
@@ -163,8 +166,7 @@ def test_guard_drops_drafts_when_waiting_request_pending(monkeypatch):
     assert decode_req.spec_token_ids == []
 
 
-def test_guard_keeps_drafts_when_no_prefill_pending(monkeypatch):
-    monkeypatch.setenv(_TALKER_FRAMES_ENV, "8")
+def test_guard_keeps_drafts_when_no_prefill_pending():
     decode_req = _req(computed=100, prompt=100, spec=[0] * 7, total=101)
     sched = _make_scheduler(num_spec=7, waiting=[], running=[decode_req])
 
@@ -172,8 +174,7 @@ def test_guard_keeps_drafts_when_no_prefill_pending(monkeypatch):
     assert decode_req.spec_token_ids == [0] * 7
 
 
-def test_guard_drops_drafts_when_chunked_prefill_in_flight(monkeypatch):
-    monkeypatch.setenv(_TALKER_FRAMES_ENV, "8")
+def test_guard_drops_drafts_when_chunked_prefill_in_flight():
     decoding_req = _req(computed=100, prompt=100, spec=[0] * 7, total=101)
     chunking_req = _req(computed=50, prompt=100, spec=[])
     sched = _make_scheduler(num_spec=7, waiting=[], running=[decoding_req, chunking_req])
@@ -182,35 +183,35 @@ def test_guard_drops_drafts_when_chunked_prefill_in_flight(monkeypatch):
     assert decoding_req.spec_token_ids == []
 
 
-def test_guard_noop_for_text_stage_spec_config(monkeypatch):
-    monkeypatch.setenv(_TALKER_FRAMES_ENV, "8")
+def test_guard_noop_for_text_stage_spec_config():
+    # The text stage may carry its own n-gram config; only the Talker stage runs
+    # the multi-frame loop, so the guard must stay a no-op there.
     text_req = _req(computed=100, prompt=100, spec=[0] * 15)
-    sched = _make_scheduler(num_spec=15, waiting=[object()], running=[text_req])
+    sched = _make_scheduler(num_spec=15, stage="llm", waiting=[object()], running=[text_req])
 
     sched._drop_talker_drafts_if_prefill_pending()
     assert text_req.spec_token_ids == [0] * 15
 
 
-def test_guard_arms_from_vllm_config_and_drops_drafts_for_a_running_chunk(monkeypatch):
+def test_guard_arms_from_vllm_config_and_drops_drafts_for_a_running_chunk():
     # Real vLLM Scheduler instances expose no .speculative_config attribute
     # (and SchedulerConfig has no num_speculative_tokens), so the armed check
     # must read vllm_config.speculative_config -- otherwise the whole guard
-    # silently stays off while the engine-side loop is armed (the 11:47 and
-    # 12:04 crashes on 910B).
+    # silently stays off while the engine-side loop is armed.
     #
-    # 2026-09-18 12:39 crash: spans=[(0,7),(7,15)] -- a request carrying a
-    # 7-token streaming chunk shares the step with a steady-state decode that
-    # vLLM pads to 1+7 rows. Both spec_token_ids lists look innocent ([] and
-    # 7 placeholders), so the guard must predict row widths from
-    # num_tokens - num_computed_tokens instead.
+    # Steady-state decode sharing a step with a 7-token streaming chunk: both
+    # spec_token_ids lists look innocent ([] and 7 placeholders), so the guard
+    # must predict row widths from num_tokens - num_computed_tokens instead.
     from types import SimpleNamespace
 
     from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 
-    monkeypatch.setenv(_TALKER_FRAMES_ENV, "8")
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched._omni_talker_kstep_cache = None
-    sched.vllm_config = SimpleNamespace(speculative_config=SimpleNamespace(method="ngram", num_speculative_tokens=7))
+    sched.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(model_stage="tts"),
+        speculative_config=SimpleNamespace(method="ngram", num_speculative_tokens=7),
+    )
     assert sched._talker_kstep_armed() is True
     sched.num_spec_tokens = 7
     sched.max_model_len = 40960
@@ -225,11 +226,10 @@ def test_guard_arms_from_vllm_config_and_drops_drafts_for_a_running_chunk(monkey
     assert chunk.spec_token_ids == []
 
 
-def test_guard_keeps_drafts_when_all_decodes_share_the_padded_width(monkeypatch):
+def test_guard_keeps_drafts_when_all_decodes_share_the_padded_width():
     # A first-step decode (no placeholders yet) and a steady-state decode both
     # schedule 1 token this step, so vLLM gives both the same 1+num_spec row
     # width: spans stay uniform and nothing may drop.
-    monkeypatch.setenv(_TALKER_FRAMES_ENV, "8")
     steady = _req(computed=100, prompt=100, spec=[0] * 7, total=101)
     first_step = _req(computed=100, prompt=100, spec=[], total=101)
     sched = _make_scheduler(num_spec=7, waiting=[], running=[steady, first_step])
@@ -239,30 +239,22 @@ def test_guard_keeps_drafts_when_all_decodes_share_the_padded_width(monkeypatch)
     assert first_step.spec_token_ids == []
 
 
-def test_talker_stop_token_ids_follow_the_arming_decision(monkeypatch):
+def test_talker_stop_token_ids_match_the_multi_frame_head():
     """Stage 1's stop id must be one the head that actually runs can emit.
 
-    2026-09-18 root cause: the pipeline constraint pinned ``stop_token_ids`` to
-    the codec EOS (6561) unconditionally. With the K-frame loop armed the
-    vLLM-level head is the two-wide continue/stop row, so the only sampleable
-    ids are 0/1, `check_stop` never matched, and every K-step request ran to
-    ``max_tokens`` (142s per request on 910B, model finished at frame ~116).
+    The pipeline constraint used to pin ``stop_token_ids`` to the codec EOS
+    (6561) unconditionally. With the multi-frame loop on, the vLLM-level head
+    is the two-wide continue/stop row, so the only sampleable ids are 0/1,
+    `check_stop` never matched, and every request ran to ``max_tokens`` (142s
+    per request, model finished at frame ~116). The pipeline default therefore
+    follows the multi-frame head; a deployment that turns the loop off
+    overrides stage 1's stop token per stage.
     """
     from vllm_omni.model_executor.models.minicpmo_4_5 import pipeline as mcp_pipeline
     from vllm_omni.platforms.npu.worker import talker_multiframe
 
-    monkeypatch.setenv(_TALKER_FRAMES_ENV, "8")
     assert mcp_pipeline._talker_stop_token_ids() == [talker_multiframe.STOP_TOKEN_ID]
     assert talker_multiframe.STOP_TOKEN_ID == 1
-
-    monkeypatch.setenv(_TALKER_FRAMES_ENV, "1")
-    assert mcp_pipeline._talker_stop_token_ids() == [6561]
-
-    # No explicit frame count on a 910B box: the loop stays off, so the real
-    # codec head runs and its EOS is the stop.
-    monkeypatch.delenv(_TALKER_FRAMES_ENV, raising=False)
-    monkeypatch.setenv("SOC_VERSION", "ascend910b1")
-    assert mcp_pipeline._talker_stop_token_ids() == [6561]
 
 
 def test_multiframe_gate_matrix():

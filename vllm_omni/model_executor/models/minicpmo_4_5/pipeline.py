@@ -28,25 +28,20 @@ def _talker_stop_token_ids() -> list[int]:
 
     Two shapes exist for the Talker's vLLM-level head:
 
-    * K-frame loop off -- ``compute_logits`` is the real 6562-wide codec head,
-      so the sampled id *is* a codec id and the codec EOS (6561) is the stop;
-    * K-frame loop on -- ``compute_logits`` collapses to the two-wide
+    * multi-frame decode on -- ``compute_logits`` collapses to the two-wide
       continue/stop row, so the only sampleable ids are 0 and 1 and the codec
       EOS can never appear at this level (the model samples codec ids inside
       the loop and forwards them to stage 2 itself).
 
-    Pinning this to [6561] regardless is what made every K-step request run to
-    ``max_tokens``: the model did emit the stop marker, ``check_stop`` compared
-    it against 6561, and the request kept its slot until the context ran out.
-
-    Asked per construction so both this file and the deploy loader read the
-    same predicate; the env the answer depends on is set before any of this is
-    imported.
+    Pinning this to [6561] regardless is what made every multi-frame request run
+    to ``max_tokens``: the model did emit the stop marker, ``check_stop``
+    compared it against 6561, and the request kept its slot until the context
+    ran out. A deployment that turns multi-frame decode off overrides this per
+    stage with the codec EOS.
     """
-    from vllm_omni.config.stage_config import talker_multiframe_armed
     from vllm_omni.platforms.npu.worker.talker_multiframe import STOP_TOKEN_ID
 
-    return [STOP_TOKEN_ID] if talker_multiframe_armed() else [_CODEC_EOS_TOKEN_ID]
+    return [STOP_TOKEN_ID]
 
 
 MINICPMO_4_5_PIPELINE = PipelineConfig(

@@ -503,18 +503,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._tts_config = None
             self._codec_eos_id = 0
 
-        # K-step activation (910C/A3 target).
-        # K is the frame count per Talker decode step: a value >= 2 engages the
-        # multi-frame loop -- the scheduler hands each request K query positions
-        # through the vLLM V1 speculative path (constant `continue` drafts),
-        # talker_multiframe.run() replays the decode graph K times, and this
-        # model samples one codec frame per replay in-model (the vLLM-level head
-        # degenerates to a one-hot stop/continue row so the rejection sampler
-        # verifies without touching the codec stream).
-        # SoC guard: the spec-driven verify trips rejection_random_sample_kernel
-        # past the vector-core limit on the 910B family, so the gate refuses to
-        # arm there instead of leaving a crash switch behind an env var.
-        self._k_step_frames = self._parse_k_step_frames()
+        # Multi-frame decode: K codec frames per Talker decode step. A value
+        # >= 2 engages the loop -- the scheduler hands each request K query
+        # positions through the vLLM V1 speculative path (constant `continue`
+        # drafts), talker_multiframe.run() replays the decode graph K times,
+        # and this model samples one codec frame per replay in-model (the
+        # vLLM-level head degenerates to a one-hot stop/continue row so the
+        # rejection sampler verifies without touching the codec stream). K is
+        # read back from the injected stage-1 speculative_config.
+        self._k_step_frames = self._parse_k_step_frames(vllm_config)
         self.supports_multi_frame_decode = self._k_step_frames > 0
         # Per-request device RNG streams for in-model codec sampling (the
         # multi-frame loop cannot run the vLLM host sampler per frame).
@@ -558,80 +555,38 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             return ""
 
     @classmethod
-    def _soc_allows_k_step(cls) -> bool:
-        """Ask the very question the deploy-config gate asked, and no other.
-
-        910B family: rejection_random_sample_kernel hits a vector-core limit
-        once the verifier runs K tokens per request, which crashed six bring-up
-        attempts before this gate existed. 910C / A3 is the activation target.
-
-        This must delegate rather than re-probe. The config layer answers the
-        same question while building the deploy config (it decides whether to
-        inject the stage-1 speculative_config), and it can only see the launch
-        environment -- it deliberately never touches the device. A second,
-        device-probing answer here could differ from that one, and a mismatch
-        is not benign: if the loop arms while the scheduler has no
-        speculative_config it silently never engages, and if the scheduler
-        reserves K positions while the loop refuses them the stage deadlocks
-        with no request making progress. One source of truth, one answer.
-        """
-        from vllm_omni.config.stage_config import (
-            _MINICPMO_TALKER_FRAMES_ENV,
-            _npu_soc_allows_talker_multiframe,
-        )
-
-        if os.environ.get(_MINICPMO_TALKER_FRAMES_ENV, "").strip():
-            # An explicit frame count is an operator decision; the deploy-config
-            # gate arms on it too, so the two stay in agreement.
-            logger.info(
-                "[minicpmo] %s set explicitly; skipping the SoC check",
-                _MINICPMO_TALKER_FRAMES_ENV,
-            )
-            return True
-        return _npu_soc_allows_talker_multiframe()
-
-    @classmethod
-    def _parse_k_step_frames(cls) -> int:
+    def _parse_k_step_frames(cls, vllm_config: Any = None) -> int:
         """K codec frames per Talker step, or 0 when the loop must not engage.
 
-        The count comes from ``config.stage_config.talker_frames_per_step`` --
-        the very function the deploy-config loader uses to size the injected
-        speculative_config -- so the runner and the scheduler cannot disagree
-        about K. An explicit ``VLLM_OMNI_MINICPMO_TALKER_FRAMES`` (or the older
-        ``OMNI_K_STEP``) skips the SoC gate, exactly as the loader does for the
-        same input; that keeps the two sides aligned even when an operator
-        forces the loop on by hand.
+        Read back from the engine-side speculative_config that stage_config.py
+        injects for stage 1 (method ``ngram`` with ``num_speculative_tokens ==
+        K - 1``). Deriving K from the engine config rather than from a separate
+        channel is what keeps the runner and the scheduler from disagreeing: a
+        mismatch either arms the loop with no drafts to consume, or leaves it
+        off while the scheduler reserves K positions per request.
         """
-        from vllm_omni.config.stage_config import (
-            _MINICPMO_FRAMES_OFF,
-            _MINICPMO_TALKER_FRAMES_ENV,
-            talker_frames_per_step,
-        )
+        from vllm_omni.config.stage_config import _MINICPMO_TALKER_FRAMES_MAX
 
-        raw = os.environ.get("OMNI_K_STEP", "").strip().lower()
-        explicit = os.environ.get(_MINICPMO_TALKER_FRAMES_ENV, "").strip().lower()
-        if raw not in ("", "0", "off", "false", "no"):
-            try:
-                frames = int(raw)
-            except ValueError:
-                raise ValueError(f"OMNI_K_STEP must be an integer frame count (>=2), got {raw!r}") from None
-            explicit = "forced"
+        model_cfg = getattr(vllm_config, "model_config", None)
+        if getattr(model_cfg, "model_stage", None) != "tts":
+            return 0
+        spec = getattr(vllm_config, "speculative_config", None)
+        if isinstance(spec, dict):
+            method = spec.get("method")
+            num_spec = spec.get("num_speculative_tokens", 0) or 0
         else:
-            frames = talker_frames_per_step()
+            method = getattr(spec, "method", None)
+            num_spec = getattr(spec, "num_speculative_tokens", 0) or 0
+        if method != "ngram":
+            return 0
+        frames = int(num_spec) + 1
         if frames < 2:
             # K=1 degenerates to the ordinary one-frame path; treat it as off
             # so the flag never silently half-arms the pipeline.
             return 0
-        if frames > 16:
-            raise ValueError(f"K-step frame count is capped at 16, got {frames}")
-        forced = explicit not in ("",) + _MINICPMO_FRAMES_OFF
-        if not forced and not cls._soc_allows_k_step():
-            logger.warning(
-                "[minicpmo] K-step decode left off: the SoC either cannot verify "
-                "spec-width rows (910B family limit) or was not identified.",
-            )
-            return 0
-        logger.info("[minicpmo] Talker K-step decode armed: %d codec frames per step", frames)
+        if frames > _MINICPMO_TALKER_FRAMES_MAX:
+            raise ValueError(f"K-step frame count is capped at {_MINICPMO_TALKER_FRAMES_MAX}, got {frames}")
+        logger.info("[minicpmo] Talker multi-frame decode armed: %d codec frames per step", frames)
         return frames
 
     def _init_native_talker(self, prefix: str) -> None:
