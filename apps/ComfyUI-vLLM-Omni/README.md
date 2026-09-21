@@ -134,11 +134,13 @@ You can configure per-stage sampling parameters for multi-stage models.
 </p>
 
 > [!TIP]
-> Connect a **frame** image for first-frame / image-to-video (e.g., Wan I2V, MiniMax-H3 FL2VA).
+> Connect **frame** for backward-compatible first-frame / image-to-video behavior. For MiniMax-H3 FL2VA,
+> connect **first_frame**, **last_frame**, or both to condition the start frame, end frame, or both.
 >
 > For reference-conditioned generation (MiniMax-H3 Ref2VA), connect a **Video References** node instead.
 >
-> Do not use `frame` and `references` together. Task routing is automatic from which inputs you connect.
+> Do not combine `frame` with `first_frame` or `last_frame`, and do not combine any frame input with
+> `references`. Task routing is automatic from which inputs you connect.
 
 For MiniMax-H3 Ref2VA, **Video References** accepts up to 9 images (`image_1`–`image_9`),
 3 videos (`video_1`–`video_3`), and 3 audio clips (`audio_1`–`audio_3`), with at most
