@@ -367,7 +367,8 @@ def test_step_execution_matches_request_mode_with_latent_edits():
     torch.testing.assert_close(state.extra[mod._STEP_AUDIO_ROWS], reference_audio)
 
 
-def test_batched_step_execution_matches_independent_requests():
+@pytest.mark.parametrize("lock_audio", [False, True])
+def test_batched_step_execution_matches_independent_requests(lock_audio):
     """Two co-batched requests must land where they would have landed alone."""
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
     from vllm_omni.diffusion.models.minimax_h3.latent_mask import MiniMaxH3LatentEdit
@@ -402,7 +403,10 @@ def test_batched_step_execution_matches_independent_requests():
             audio_mask,
         )
         state.extra[mod._STEP_VIDEO_EDIT] = video_edit
-        state.extra[mod._STEP_AUDIO_EDIT] = audio_edit
+        if lock_audio and index == 0:
+            branch.locked_audio_rows = audio_rows.clone()
+        else:
+            state.extra[mod._STEP_AUDIO_EDIT] = audio_edit
         return state
 
     alone: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -735,3 +739,33 @@ def test_broadcast_rank0_exception_propagates_to_non_zero_ranks(monkeypatch):
     assert rank2_info.value.status_code == 422
     assert rank2_info.value.error_type == "UnprocessableEntityError"
     assert "invalid reference-video file" in str(rank2_info.value)
+
+
+def test_locked_driving_audio_is_clean_and_unchanged_during_denoising():
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
+
+    branch, video, audio = _make_branch(text_len=3, latent_t=2, latent_h=2, latent_w=2, audio_t=3, seed=7)
+    branch.locked_audio_rows = audio.clone()
+    seen = []
+
+    def model(**kwargs):
+        positions = kwargs["audio_pos_info"]["position_ids"]
+        times = kwargs["unique_timesteps"][kwargs["inverse_indices"]]
+        torch.testing.assert_close(times[positions], torch.ones_like(times[positions]))
+        torch.testing.assert_close(kwargs["audio_x"][0, positions], audio)
+        seen.append(True)
+        return torch.ones_like(video), torch.ones_like(audio)
+
+    result_video, result_audio = minimax_h3_denoise_loop(
+        model=model,
+        positive=branch,
+        initial_video_rows=video,
+        initial_audio_rows=audio,
+        keyframe_cond_rows=None,
+        sigmas_video=[1.0, 0.5, 0.0],
+        sigmas_audio=[1.0, 0.25, 0.0],
+        device=torch.device("cpu"),
+    )
+    assert len(seen) == 2
+    torch.testing.assert_close(result_audio, audio)
+    assert not torch.equal(result_video, video)

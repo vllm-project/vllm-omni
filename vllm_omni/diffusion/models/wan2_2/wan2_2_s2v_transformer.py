@@ -32,7 +32,8 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
-from vllm_omni.diffusion.layers.rope import RotaryEmbeddingS2VGrid, RotaryEmbeddingWanS2V, WanS2VRotaryPosEmbed
+from vllm_omni.diffusion.layers.rope import RotaryEmbeddingS2VGrid
+from vllm_omni.diffusion.models.wan2_2.rope import RotaryEmbeddingWanS2V, WanS2VRotaryPosEmbed
 from vllm_omni.platforms import current_omni_platform
 
 from .wan2_2_transformer import DistributedRMSNorm, WanFeedForward

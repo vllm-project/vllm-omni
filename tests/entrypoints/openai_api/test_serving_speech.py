@@ -1592,7 +1592,8 @@ class TestTTSMethods:
 
         assert first[1] == 24000
         assert second[1] == 24000
-        assert first[0] is second[0]
+        assert first[0] == second[0]
+        assert first[0] is not second[0]
         assert first[0][0] == pytest.approx(float(wav[0]), abs=1e-4)
         cache_key = first[2]
         assert speech_server._get_resolved_ref_audio_artifact_key(
@@ -5430,7 +5431,7 @@ class TestTTSAsyncOffloading:
         ref_audio = "data:audio/wav;base64,same"
         qwen3_tts_server._put_resolved_ref_audio(
             hashlib.sha1(ref_audio.encode("utf-8")).hexdigest(),
-            wav_list,
+            np.asarray(wav_list, dtype=np.float32),
             24000,
             artifact_key,
         )
@@ -5466,9 +5467,9 @@ class TestTTSAsyncOffloading:
         qwen3_tts_server._ref_audio_resolve_cache_max_entries = 1
         qwen3_tts_server._ref_audio_resolve_cache_max_bytes = 1_000_000
 
-        qwen3_tts_server._put_resolved_ref_audio("ref-a", [0.0] * 8, 24000, "artifact-a")
+        qwen3_tts_server._put_resolved_ref_audio("ref-a", np.zeros(8, dtype=np.float32), 24000, "artifact-a")
         qwen3_tts_server._ref_audio_model_artifact_ready.add(("artifact-a", False))
-        qwen3_tts_server._put_resolved_ref_audio("ref-b", [0.0] * 8, 24000, "artifact-b")
+        qwen3_tts_server._put_resolved_ref_audio("ref-b", np.zeros(8, dtype=np.float32), 24000, "artifact-b")
 
         assert ("artifact-a", False) not in qwen3_tts_server._ref_audio_model_artifact_ready
         assert "artifact-b" in {entry[3] for entry in qwen3_tts_server._ref_audio_resolve_cache.values()}
@@ -5715,7 +5716,7 @@ class TestTTSAsyncOffloading:
     def test_qwen3_xvector_ready_artifact_does_not_enable_icl_artifact_only(self, qwen3_tts_server):
         # An x-vector-only artifact (speaker embedding, no ref_code) must not enable
         # the artifact-only path for a later ICL request with the same ref_audio (#5049).
-        qwen3_tts_server._put_resolved_ref_audio("ref-a", [0.0] * 8, 24000, "artifact-a")
+        qwen3_tts_server._put_resolved_ref_audio("ref-a", np.zeros(8, dtype=np.float32), 24000, "artifact-a")
         qwen3_tts_server._track_ref_audio_artifact_warmup("req-xvec", "artifact-a", x_vector_only=True)
         qwen3_tts_server._mark_ref_audio_artifact_ready_for_request("req-xvec")
 
@@ -5723,7 +5724,7 @@ class TestTTSAsyncOffloading:
         assert qwen3_tts_server._adapter._qwen3_tts_can_use_ref_audio_artifact_only(icl_params, "artifact-a") is False
 
     def test_qwen3_xvector_ready_artifact_still_reusable_by_xvector_request(self, qwen3_tts_server):
-        qwen3_tts_server._put_resolved_ref_audio("ref-a", [0.0] * 8, 24000, "artifact-a")
+        qwen3_tts_server._put_resolved_ref_audio("ref-a", np.zeros(8, dtype=np.float32), 24000, "artifact-a")
         qwen3_tts_server._track_ref_audio_artifact_warmup("req-xvec", "artifact-a", x_vector_only=True)
         qwen3_tts_server._mark_ref_audio_artifact_ready_for_request("req-xvec")
 
@@ -5731,7 +5732,7 @@ class TestTTSAsyncOffloading:
         assert qwen3_tts_server._adapter._qwen3_tts_can_use_ref_audio_artifact_only(xvec_params, "artifact-a") is True
 
     def test_qwen3_icl_ready_artifact_enables_icl_artifact_only(self, qwen3_tts_server):
-        qwen3_tts_server._put_resolved_ref_audio("ref-a", [0.0] * 8, 24000, "artifact-a")
+        qwen3_tts_server._put_resolved_ref_audio("ref-a", np.zeros(8, dtype=np.float32), 24000, "artifact-a")
         qwen3_tts_server._track_ref_audio_artifact_warmup("req-icl", "artifact-a", x_vector_only=False)
         qwen3_tts_server._mark_ref_audio_artifact_ready_for_request("req-icl")
 

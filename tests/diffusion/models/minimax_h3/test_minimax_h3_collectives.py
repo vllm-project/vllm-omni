@@ -15,6 +15,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 def _collective_worker(rank, rendezvous, backend):
+    from vllm_omni.diffusion.models.minimax_h3 import distributed_errors
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
     from vllm_omni.errors import OmniClientError
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -29,7 +30,12 @@ def _collective_worker(rank, rendezvous, backend):
         backend, init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=45)
     )
     try:
-        module._dit_rank_world = lambda: (dist.group.WORLD, rank, 2)
+        # The cross-rank helpers live in ``distributed_errors`` and resolve
+        # ``_dit_rank_world`` from that module's globals; the pipeline holds a
+        # re-exported reference, so both bindings have to be replaced.
+        rank_world = lambda: (dist.group.WORLD, rank, 2)  # noqa: E731
+        distributed_errors._dit_rank_world = rank_world
+        module._dit_rank_world = rank_world
 
         class VisualCodec:
             fail = False
@@ -87,7 +93,8 @@ def _collective_worker(rank, rendezvous, backend):
         sampling = OmniDiffusionSamplingParams(
             height=32, width=32, num_frames=96, extra_args={"task": "t2va", "aspect_ratio": "1:1"}
         )
-        text_conditioning = model._prepare_local_conditioning({"prompt": "test"}, sampling)
+        text_conditioning, window_text = model._prepare_local_conditioning({"prompt": "test"}, sampling)
+        assert window_text is None
         torch.testing.assert_close(text_conditioning.hidden_states, torch.full_like(text_conditioning.hidden_states, 2))
         assert text_conditioning.visual_condition is None
 
