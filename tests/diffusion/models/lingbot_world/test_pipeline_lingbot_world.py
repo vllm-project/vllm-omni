@@ -1358,10 +1358,34 @@ def test_first_frame_condition_and_camera_fold_match_transformer_contract() -> N
     assert expected_camera.shape == (1, 384, 3, 2, 2)
 
 
-def test_fixed_dmd_transition_and_cache_commit_trace() -> None:
+@pytest.mark.parametrize("value", ["true", "false", 1, 0, None])
+def test_reuse_last_step_kv_rejects_non_boolean_config(value: object) -> None:
+    config = _od_config()
+    config.model_config["lingbot_reuse_last_step_kv"] = value
+    with pytest.raises(ValueError, match="lingbot_reuse_last_step_kv must be a bool"):
+        _pipeline(_load_pipeline_module(), od_config=config)
+
+
+def test_reuse_last_step_kv_is_fixed_per_instance(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_LINGBOT_REUSE_LAST_STEP_KV", "1")
+    module = _load_pipeline_module()
+    config = _od_config()
+    config.model_config["lingbot_reuse_last_step_kv"] = True
+    reuse = _pipeline(module, od_config=config)
+    default = _pipeline(module)
+    config.model_config["lingbot_reuse_last_step_kv"] = False
+    assert reuse._dmd_blocks.reuse_last_step_kv is True
+    assert default._dmd_blocks.reuse_last_step_kv is False
+    assert reuse._dmd_blocks is reuse._dmd_blocks
+
+
+@pytest.mark.parametrize("reuse_last_step_kv", [False, True])
+def test_fixed_dmd_transition_and_cache_commit_trace(reuse_last_step_kv: bool) -> None:
     module = _load_pipeline_module()
     transformer = _RecordingTransformer()
-    pipeline = _pipeline(module, transformer=transformer)
+    config = _od_config()
+    config.model_config["lingbot_reuse_last_step_kv"] = reuse_last_step_kv
+    pipeline = _pipeline(module, transformer=transformer, od_config=config)
 
     result = pipeline(_request())
 
@@ -1383,14 +1407,18 @@ def test_fixed_dmd_transition_and_cache_commit_trace() -> None:
             current = x0
     torch.testing.assert_close(result.output, current)
 
+    expected_timesteps = [timestep for timestep, _ in warped_schedule]
+    if not reuse_last_step_kv:
+        expected_timesteps.append(0.0)
     torch.testing.assert_close(
-        torch.cat([call["timestep"] for call in transformer.calls]),
-        torch.tensor([*(timestep for timestep, _ in warped_schedule), 0.0]),
+        torch.cat([call["timestep"] for call in transformer.calls]), torch.tensor(expected_timesteps)
     )
-    assert [call["update_cache"] for call in transformer.calls] == [False, False, False, False, True]
-    assert [call["start_frame"] for call in transformer.calls] == [0, 0, 0, 0, 0]
+    commit_flags = [False] * (len(expected_timesteps) - 1) + [True]
+    assert [call["update_cache"] for call in transformer.calls] == commit_flags
+    assert [call["start_frame"] for call in transformer.calls] == [0] * len(expected_timesteps)
     assert len({call["cache_id"] for call in transformer.calls}) == 1
-    torch.testing.assert_close(transformer.calls[-1]["hidden_states"][:, :16], result.output)
+    committed_latent = result.output + warped_schedule[-1][1] if reuse_last_step_kv else result.output
+    torch.testing.assert_close(transformer.calls[-1]["hidden_states"][:, :16], committed_latent)
 
 
 @pytest.mark.parametrize(
@@ -2389,10 +2417,13 @@ def test_forward_rejects_a_stepwise_camera_action_script(extra_args) -> None:
         pipeline(_request(sampling=sampling))
 
 
-def test_stepwise_progress_metadata_and_commit_trace() -> None:
+@pytest.mark.parametrize("reuse_last_step_kv", [False, True])
+def test_stepwise_progress_metadata_and_commit_trace(reuse_last_step_kv: bool) -> None:
     module = _load_pipeline_module()
     transformer = _RecordingTransformer()
-    pipeline = _pipeline(module, transformer=transformer)
+    config = _od_config()
+    config.model_config["lingbot_reuse_last_step_kv"] = reuse_last_step_kv
+    pipeline = _pipeline(module, transformer=transformer, od_config=config)
     pipeline._ar_height = 16
     pipeline._ar_width = 16
     state = _stepwise_state(num_frames=21)
@@ -2406,8 +2437,9 @@ def test_stepwise_progress_metadata_and_commit_trace() -> None:
     assert [output.chunk_index for output in outputs] == [0, 1]
     assert all(output.total_chunks == 2 for output in outputs)
     assert outputs[-1].finished is True
-    assert [call["update_cache"] for call in transformer.calls] == [False, False, False, False, True] * 2
-    assert [call["start_frame"] for call in transformer.calls] == [0] * 5 + [3] * 5
+    calls_per_chunk = 4 if reuse_last_step_kv else 5
+    assert [call["update_cache"] for call in transformer.calls] == ([False] * (calls_per_chunk - 1) + [True]) * 2
+    assert [call["start_frame"] for call in transformer.calls] == [0] * calls_per_chunk + [3] * calls_per_chunk
     assert fake.commits == ["main", "main"]
     for chunk_index, output in enumerate(outputs):
         metadata = output.output["metadata"]["ar_diffusion"]

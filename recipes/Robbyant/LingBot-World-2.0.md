@@ -53,6 +53,26 @@ source frames, at least as many as requested and at most 4096. The runtime
 consumes only the prefix needed by the request. Longer rollouts also require
 sufficient device memory.
 
+## Experimental KV writeback reuse
+
+To reuse KV from the final denoising step instead of running the additional
+clean-latent writeback, pass this option in the `model_config` supplied to
+`Omni` or `AsyncOmni`:
+
+```python
+model_config = {"lingbot_reuse_last_step_kv": True}
+```
+
+The default is `False`. The value must be a boolean, not a string or integer.
+It is validated and fixed when the pipeline instance is constructed; changing
+it requires a new instance. It is not a per-request `extra_args` option.
+The previous `VLLM_OMNI_LINGBOT_REUSE_LAST_STEP_KV` environment variable is no
+longer read.
+
+This experimental mode stores the final noisy probe's KV rather than clean
+`x0` KV, so generated outputs can differ. The four denoising steps, chunk
+boundaries, and paged-context finalization remain the same.
+
 ## Realtime in-process generation (deprecated)
 
 Prefer [Streaming video serving](#streaming-video-serving) for mid-session

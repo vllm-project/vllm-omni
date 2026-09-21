@@ -581,6 +581,11 @@ class LingBotWorldCausalDMDPipeline(
         del prefix
         _validate_parallel_config(od_config)
         self.od_config = od_config
+        model_config = getattr(od_config, "model_config", None) or {}
+        reuse_last_step_kv = model_config.get("lingbot_reuse_last_step_kv", False)
+        if not isinstance(reuse_last_step_kv, bool):
+            raise ValueError("model_config.lingbot_reuse_last_step_kv must be a bool.")
+        self._reuse_last_step_kv = reuse_last_step_kv
         self.device = get_local_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model = od_config.model
@@ -666,7 +671,6 @@ class LingBotWorldCausalDMDPipeline(
 
         self.vae_scale_factor_temporal = int(getattr(self.vae.config, "scale_factor_temporal", 4))
         self.vae_scale_factor_spatial = int(getattr(self.vae.config, "scale_factor_spatial", 8))
-        model_config = getattr(od_config, "model_config", None) or {}
         self._ar_height = int(model_config.get("ar_diffusion_height", 480))
         self._ar_width = int(model_config.get("ar_diffusion_width", 832))
         self._ar_diffusion_kv_state: ARDiffusionKVState | None = None
@@ -1337,6 +1341,7 @@ class LingBotWorldCausalDMDPipeline(
                 self.transformer,
                 device=self.device,
                 enforce_eager=bool(self.od_config.enforce_eager),
+                reuse_last_step_kv=self._reuse_last_step_kv,
             )
             self._dmd_block_runner = runner
         return runner
