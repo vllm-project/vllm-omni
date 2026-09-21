@@ -27,6 +27,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     resolve_adapter,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.audio8_tts import Audio8TTSAdapter
+from vllm_omni.entrypoints.openai.tts_adapters.base import conditioning_cache_salt
 from vllm_omni.model_executor.models.audio8_tts.pipeline import AUDIO8_TTS_PIPELINE
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -115,3 +116,6 @@ def test_build_accepts_ref_audio_resolver_cache_key(monkeypatch):
     prepared = asyncio.run(adapter.build(request, [], has_inline_ref_audio=True))
 
     assert prepared.prompt["ref_audio_data"] == ([0.0, 0.1], 44_100)
+    assert prepared.tts_params == {"ref_audio_cache_key": "cache-key"}
+    assert prepared.prompt["cache_salt"] == conditioning_cache_salt(request, prepared.tts_params)
+    assert prepared.prompt["cache_salt"] != conditioning_cache_salt(request, {})
