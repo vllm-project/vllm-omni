@@ -15,7 +15,7 @@ import os
 
 import pytest
 
-from tests.helpers.mark import hardware_marks
+from tests.helpers.mark import hardware_marks, hardware_test
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -42,6 +42,7 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
 def test_cfg_off(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
     request_config = {

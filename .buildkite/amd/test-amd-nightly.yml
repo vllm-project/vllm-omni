@@ -64,3 +64,34 @@ steps:
         commands:
           - export VLLM_ROCM_USE_AITER=1
           - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py::test_text_to_text_audio_001 -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
+
+  - group: ":full_moon: LingBot-Video MI300 Nightly"
+    steps:
+      - label: "LingBot-Video Dense CFG-off Smoke"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 90
+        artifact_paths:
+          - artifacts/rocm-lingbot-nightly/**/*
+        commands:
+          - export LINGBOT_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-lingbot-nightly"
+          - mkdir -p "$$LINGBOT_ARTIFACT_DIR"
+          - rocm-smi 2>&1 | tee "$$LINGBOT_ARTIFACT_DIR/rocm-smi.txt"
+          - >-
+            pytest --collect-only -q
+            tests/e2e/online_serving/test_lingbot_video_expansion.py::test_cfg_off
+            -m "full_model and diffusion and rocm and MI325 and cards_1"
+            --run-level "full_model"
+          - >-
+            pytest -s -v -ra
+            tests/e2e/online_serving/test_lingbot_video_expansion.py::test_cfg_off
+            -m "full_model and diffusion and rocm and MI325 and cards_1"
+            --run-level "full_model"
+            --durations=0
+            --junitxml="$$LINGBOT_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$LINGBOT_ARTIFACT_DIR/pytest.log"
+          - >-
+            tail -n 100 "$$LINGBOT_ARTIFACT_DIR/pytest.log" >
+            "$$LINGBOT_ARTIFACT_DIR/pytest-summary.txt"
