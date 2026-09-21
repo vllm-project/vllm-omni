@@ -125,6 +125,10 @@ platforms:
         compilation_config:
           cudagraph_mode: PIECEWISE
       - stage_id: 1
+        # 第 9 项（2026-09-20 实测采纳）：stage1 并发上限 4→8。
+        # npu 覆盖块原先只写了 stage0 / stage2，stage1 沿用基座的 4，这一格是漏配。
+        # 收益：r16 对照 r14 基线 c8 −15.1%、c4 −3.5%、c1 −1.1%。
+        max_num_seqs: 8
         max_num_batched_tokens: 8192
         compilation_config:
           cudagraph_mode: PIECEWISE
