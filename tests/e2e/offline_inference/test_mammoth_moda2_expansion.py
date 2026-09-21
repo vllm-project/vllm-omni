@@ -27,9 +27,9 @@ import torch
 from PIL import Image
 from vllm.sampling_params import SamplingParams
 
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniRunner
-from tests.helpers.stage_config import get_deploy_config_path
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.transformers_utils.repo_utils import hf_api
@@ -45,8 +45,27 @@ _AR_PATCH_SIZE = 16
 
 MODEL_PATH = "bytedance-research/MammothModa2-Preview"
 T2I_DEPLOY_CONFIG = get_deploy_config_path("mammoth_moda2.yaml")
+CFG_PARALLEL_DEPLOY_CONFIG = modify_stage_config(
+    T2I_DEPLOY_CONFIG,
+    updates={"stages": {1: {"devices": "0,1"}}},
+)
 
-_OMNI_RUNNER_PARAM = (MODEL_PATH, T2I_DEPLOY_CONFIG)
+_OMNI_RUNNER_PARAMS = [
+    pytest.param(
+        (MODEL_PATH, T2I_DEPLOY_CONFIG, {"cfg_parallel_size": 1}),
+        marks=hardware_marks(res={"cuda": "H100"}, num_cards=1),
+        id="cfg1",
+    ),
+    pytest.param(
+        (
+            MODEL_PATH,
+            CFG_PARALLEL_DEPLOY_CONFIG,
+            {"cfg_parallel_size": 2},
+        ),
+        marks=hardware_marks(res={"cuda": "H100"}, num_cards=2),
+        id="cfg2",
+    ),
+]
 
 # Optional golden pixel reference file. Set UPDATE_GOLDEN=1 to regenerate.
 _GOLDEN_T2I_PATH = Path(__file__).parent / "fixtures" / "mammoth_moda2_t2i_golden.json"
@@ -129,8 +148,7 @@ def test_diffusion_output_exposes_images_at_top_level():
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True)
-@hardware_test(res={"cuda": "H100"})
+@pytest.mark.parametrize("omni_runner", _OMNI_RUNNER_PARAMS, indirect=True)
 def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
     """
     End-to-end text-to-image generation with MammothModa2 (AR -> DiT).
@@ -164,9 +182,12 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
         height=height,
         width=width,
         seed=42,
-        guidance_scale=1.0,
+        guidance_scale=9.0,
         num_inference_steps=2,
-        extra_args={"cfg_range": [0.0, 1.0]},
+        extra_args={
+            "text_guidance_scale": 9.0,
+            "cfg_range": [0.0, 1.0],
+        },
     )
 
     outputs = list(

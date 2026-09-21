@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 from diffusers.image_processor import VaeImageProcessor
@@ -16,6 +16,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
@@ -82,7 +83,7 @@ class _MammothRequest:
     generator: torch.Generator | list[torch.Generator] | None
 
 
-class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
+class MammothModa2DiTPipeline(nn.Module, CFGParallelMixin, SupportsComponentDiscovery):
     """
     MammothModa2 DiT + VAE generation stage (non-autoregressive).
 
@@ -110,6 +111,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         super().__init__()
         del prefix
         self.od_config = od_config
+        self.parallel_config = od_config.parallel_config
         self.device = get_local_device()
         self.config = _build_mammoth_config(od_config)
         self.weights_sources = [_root_weight_source(od_config)]
@@ -189,7 +191,8 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         prompt = req.prompts[0]
         prompt = prompt if isinstance(prompt, dict) else {}
         info = prompt.get("additional_information")
-        if req.is_dummy_run():
+        is_dummy_run = req.is_dummy_run()
+        if is_dummy_run:
             full_hidden_states = torch.zeros((2, self._llm_hidden_size), dtype=torch.float32, device="cpu")
             full_token_ids = [0, int(self.config.llm_config.gen_vocab_start_index)]
             answer_start_index = 1
@@ -234,7 +237,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
 
         request_info = info if isinstance(info, dict) else {}
         extra_args = sampling.extra_args or {}
-        guidance = extra_args.get("text_guidance_scale")
+        guidance = 1.0 if is_dummy_run else extra_args.get("text_guidance_scale")
         if guidance is None:
             guidance = sampling.guidance_scale if sampling.guidance_scale_provided else None
         if guidance is None:
@@ -332,6 +335,10 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         text_cond = full_hidden_states[text_mask].contiguous()
         image_cond = full_hidden_states[image_mask].contiguous()
         return text_cond, image_cond
+
+    def predict_noise(self, **kwargs: Any) -> torch.Tensor:
+        """Run one MammothModa2 CFG branch."""
+        return self.gen_transformer(**kwargs)
 
     @torch.inference_mode()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
@@ -434,29 +441,37 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         total_steps = max(1, len(scheduler.timesteps))
         for i, t in enumerate(scheduler.timesteps):
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
-            model_pred = self.gen_transformer(
-                hidden_states=latents,
-                timestep=timestep,
-                text_hidden_states=prompt_embeds,
-                text_attention_mask=prompt_attention_mask,
-                ref_image_hidden_states=None,
-                ar_image_hidden_states=ar_image_embeds,
-                ar_image_attention_mask=ar_image_attention_mask,
-                freqs_cis=self.gen_freqs_cis,
-            )
+            positive_kwargs = {
+                "hidden_states": latents,
+                "timestep": timestep,
+                "text_hidden_states": prompt_embeds,
+                "text_attention_mask": prompt_attention_mask,
+                "ref_image_hidden_states": None,
+                "ar_image_hidden_states": ar_image_embeds,
+                "ar_image_attention_mask": ar_image_attention_mask,
+                "freqs_cis": self.gen_freqs_cis,
+            }
             guidance_scale = (
                 request.text_guidance_scale if request.cfg_range[0] <= i / total_steps <= request.cfg_range[1] else 1.0
             )
-            if guidance_scale > 1.0 and negative_prompt_embeds is not None:
-                model_pred_uncond = self.gen_transformer(
-                    hidden_states=latents,
-                    timestep=timestep,
-                    text_hidden_states=negative_prompt_embeds,
-                    text_attention_mask=negative_prompt_attention_mask,
-                    ref_image_hidden_states=None,
-                    freqs_cis=self.gen_freqs_cis,
-                )
-                model_pred = model_pred_uncond + guidance_scale * (model_pred - model_pred_uncond)
+            do_true_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
+            negative_kwargs = None
+            if do_true_cfg:
+                negative_kwargs = {
+                    "hidden_states": latents,
+                    "timestep": timestep,
+                    "text_hidden_states": negative_prompt_embeds,
+                    "text_attention_mask": negative_prompt_attention_mask,
+                    "ref_image_hidden_states": None,
+                    "freqs_cis": self.gen_freqs_cis,
+                }
+            model_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=do_true_cfg,
+                true_cfg_scale=guidance_scale,
+                positive_kwargs=positive_kwargs,
+                negative_kwargs=negative_kwargs,
+                cfg_normalize=False,
+            )
             latents = scheduler.step(model_pred, t, latents, return_dict=False)[0]
             latents = latents.to(dtype=prompt_embeds.dtype)
 
