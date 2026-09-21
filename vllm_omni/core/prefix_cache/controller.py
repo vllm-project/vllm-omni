@@ -53,9 +53,10 @@ class StagingBufferHolder(NamedTuple):
     Not a buffer state — concurrent owners share the same slot:
     - for_step: claimed at save, released when materialize/discard consumes the ctx
     - for_task: bound before WriteTask submit, released when that task completes
+    - for_read: held until a producer-bound read finishes or is cancelled
     """
 
-    kind: Literal["step", "task"]
+    kind: Literal["step", "task", "read"]
     owner_id: int
 
     @classmethod
@@ -65,6 +66,10 @@ class StagingBufferHolder(NamedTuple):
     @classmethod
     def for_task(cls, tid: int) -> StagingBufferHolder:
         return cls("task", tid)
+
+    @classmethod
+    def for_read(cls, read_id: int) -> StagingBufferHolder:
+        return cls("read", read_id)
 
 
 @dataclass
@@ -392,9 +397,9 @@ class StagingBufferPool:
     skips a per-task device→host. Slots recycle; this is not the CPU block pool.
 
     A slot stays busy while anyone still holds it: the step (until
-    materialize/discard) and each immediate write that views the page
-    (until its pool write). Prefix hits do not hold a slot —
-    they wait for the pool write and read the durable pool.
+    materialize/discard), each immediate write that views the page (until
+    its pool write), and any read plan bound to that producer (until fetch
+    completion or cancellation). Committed reads use the durable pool.
 
     Saves with only leftover mm still claim a slot (empty views) so
     every step id shares this bound. A full pool waits; timeout then errors.
@@ -436,6 +441,26 @@ class StagingBufferPool:
     def bind(self, slot: int, holder: StagingBufferHolder) -> None:
         with self._slot_free_condition:
             self._busy[slot].add(holder)
+
+    def bind_if_held(
+        self,
+        slot: int,
+        required: StagingBufferHolder,
+        holder: StagingBufferHolder,
+    ) -> bool:
+        """Bind ``holder`` only while ``required`` still owns the page.
+
+        A read plan uses this to atomically acquire a lease on an immediate
+        producer's staging page.  If the task holder has already left, its
+        pool write is complete and the planner snapshots the durable row
+        instead.  Checking and binding under the same condition lock closes
+        the page-reuse window between those two cases.
+        """
+        with self._slot_free_condition:
+            if required not in self._busy[slot]:
+                return False
+            self._busy[slot].add(holder)
+            return True
 
     def release(self, slot: int, holder: StagingBufferHolder) -> None:
         with self._slot_free_condition:
@@ -561,6 +586,16 @@ class OmniPrefixCacheController:
 
     def staging_bind(self, slot: int, holder: StagingBufferHolder) -> None:
         self._staging_pool.bind(slot, holder)
+
+    def staging_bind_read(self, task: WriteTask, holder: StagingBufferHolder) -> bool:
+        """Lease an immediate task's staging page if it is still task-owned."""
+        if task.staging_slot is None:
+            return False
+        return self._staging_pool.bind_if_held(
+            task.staging_slot,
+            StagingBufferHolder.for_task(task.tid),
+            holder,
+        )
 
     def staging_release(self, slot: int, holder: StagingBufferHolder) -> None:
         self._staging_pool.release(slot, holder)
