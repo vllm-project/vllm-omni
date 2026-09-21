@@ -94,6 +94,7 @@ class InputBufferState:
     commit_seq: int = 0
     overlap_speech_ms: int = 0
     reserved_input_bytes: int = 0
+    queued_input_bytes: int = 0
     pending_turns: int = 0
 
 
@@ -607,23 +608,31 @@ class DuplexEngineSession:
 
     @property
     def pending_input_bytes(self) -> int:
-        return self._input.reserved_input_bytes
+        return self._input.reserved_input_bytes + self._input.queued_input_bytes
 
     @property
     def pending_input_turns(self) -> int:
         return self._input.pending_turns
 
-    def reserve_input_bytes(self, size: int, *, limit: int) -> bool:
+    def reserve_input_bytes(self, size: int, *, limit: int, queued: bool = False) -> bool:
         size = max(0, int(size))
-        if self._input.reserved_input_bytes + size > int(limit):
+        if self.pending_input_bytes + size > int(limit):
             return False
-        self._input.reserved_input_bytes += size
+        if queued:
+            self._input.queued_input_bytes += size
+        else:
+            self._input.reserved_input_bytes += size
         return True
 
-    def release_input_bytes(self, size: int) -> None:
-        self._input.reserved_input_bytes = max(0, self._input.reserved_input_bytes - max(0, int(size)))
+    def release_input_bytes(self, size: int, *, queued: bool = False) -> None:
+        size = max(0, int(size))
+        if queued:
+            self._input.queued_input_bytes = max(0, self._input.queued_input_bytes - size)
+        else:
+            self._input.reserved_input_bytes = max(0, self._input.reserved_input_bytes - size)
 
-    def release_all_input_bytes(self) -> None:
+    def release_buffered_input_bytes(self) -> None:
+        # Buffered audio can be discarded without releasing later mailbox appends.
         self._input.reserved_input_bytes = 0
 
     def reserve_pending_turn(self, *, limit: int) -> bool:
@@ -639,9 +648,9 @@ class DuplexEngineSession:
         self.turn_state = DuplexTurnState.USER_SPEAKING
 
     def cancel_pending_input(self) -> dict[str, int]:
-        """Drop every pending reservation; the PCM buffer itself is model state cleared by the runner."""
+        """Drop processed input reservations, not appends still queued in the mailbox."""
         cancelled = {"text_chunks": 0, "audio_chunks": 0}
-        self._input.reserved_input_bytes = 0
+        self.release_buffered_input_bytes()
         self._input.pending_turns = 0
         self.turn_state = DuplexTurnState.IDLE
         return cancelled
@@ -1355,6 +1364,8 @@ class DuplexEngineSession:
 
     def close(self) -> None:
         self.state = DuplexSessionState.CLOSED
+        self.release_buffered_input_bytes()
+        self._input.queued_input_bytes = 0
         self.turn_state = DuplexTurnState.IDLE
         self._response.active_response_turn_id = None
         self._response.active_response_input_commit_seq = None
