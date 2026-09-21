@@ -191,27 +191,16 @@ def test_bagel_lora_scale_and_deactivation(omni_runner: OmniRunner, tmp_path) ->
 # ---------------------------------------------------------------------------
 
 
-def _clean_device_envs() -> None:
-    for key in (
-        "CUDA_VISIBLE_DEVICES",
-        "HIP_VISIBLE_DEVICES",
-        "ZE_AFFINITY_MASK",
-        "ONEAPI_DEVICE_SELECTOR",
-        "ASCEND_RT_VISIBLE_DEVICES",
-    ):
-        os.environ.pop(key, None)
-
-
 def _get_device_global_memory_used_gib(device_id: int) -> float:
-    """GPU-wide memory in use (GiB), includes all processes (driver view)."""
-    try:
-        with current_omni_platform.device(device_id):
-            current_omni_platform.synchronize()
-            free_b, total_b = current_omni_platform.get_device_memory()
-        return (total_b - free_b) / 1024**3
-    except Exception as e:
-        logger.warning("get_device_global_memory_used_gib(%s): %s", device_id, e)
-        return 0.0
+    """GPU-wide memory in use (GiB), including all processes (driver view).
+
+    Fail closed: a swallowed query that returned 0.0 used to inflate
+    ``drop_gib`` and false-pass VRAM assertions.
+    """
+    with current_omni_platform.device(device_id):
+        current_omni_platform.synchronize()
+        free_b, total_b = current_omni_platform.get_device_memory()
+    return (total_b - free_b) / 1024**3
 
 
 def _get_ack_info(ack, key, default=None):
@@ -236,8 +225,6 @@ async def _ensure_awake(engine: AsyncOmni, stage_ids: list[int]) -> None:
 @pytest_asyncio.fixture(scope="class", loop_scope="class")
 async def bagel_diffusion_engine():
     """Shared BAGEL BagelPipeline TP=2 engine for sleep/wake + generate."""
-    if current_omni_platform.is_rocm():
-        _clean_device_envs()
     stages = [
         {
             "stage_id": 0,
@@ -394,9 +381,6 @@ class TestBagelCoordinatedSleepMode:
     @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
     async def test_coordinated_cross_device(self):
         """Heterogeneous coordinated cleanup (talker + diffusion on GPU 1)."""
-        if current_omni_platform.is_rocm():
-            _clean_device_envs()
-
         llm_stages, llm_connectors = _build_bagel_llm_stages()
         llm_engine = AsyncOmni(
             model=MODEL, stages=llm_stages, connectors=llm_connectors, init_timeout=600, enable_sleep_mode=True

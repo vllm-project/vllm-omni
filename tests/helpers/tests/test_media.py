@@ -387,3 +387,9 @@ def test_cleanup_whisper_allowance_maps_logical_gpu(monkeypatch):
     monkeypatch.setattr(media, "whisper_resident_device_index", lambda: 1)
     monkeypatch.setattr(clean, "get_physical_device_indices", lambda devices: [7] if devices == [1] else [])
     assert clean._whisper_vram_allowance() == (2.5, 7)
+
+
+def test_whisper_table_has_no_eleven_gib_unknown_default():
+    """Unknown sizes must not default to 11 GiB (that hid engine leaks on the Whisper GPU)."""
+    assert not hasattr(media, "_WHISPER_VRAM_GIB_DEFAULT")
+    assert media._WHISPER_VRAM_GIB.get("not-a-whisper-size", 0.0) == 0.0

@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 
 import pytest
 import pytest_asyncio
@@ -55,30 +54,6 @@ AR_STAGE_CONFIG = modify_stage_config(
 )
 
 
-def clean_device_envs():
-    """Clear device-visibility env vars so tests see all available devices."""
-    for key in (
-        "CUDA_VISIBLE_DEVICES",
-        "HIP_VISIBLE_DEVICES",
-        "ZE_AFFINITY_MASK",
-        "ONEAPI_DEVICE_SELECTOR",
-        "ASCEND_RT_VISIBLE_DEVICES",
-    ):
-        os.environ.pop(key, None)
-
-
-def get_device_global_memory_used_gib(device_id: int) -> float:
-    """GPU-wide memory in use (GiB), includes all processes (driver view)."""
-    try:
-        with current_omni_platform.device(device_id):
-            current_omni_platform.synchronize()
-            free_b, total_b = current_omni_platform.get_device_memory()
-        return (total_b - free_b) / 1024**3
-    except Exception as e:
-        logger.warning("get_device_global_memory_used_gib(%s): %s", device_id, e)
-        return 0.0
-
-
 def get_ack_info(ack, key, default=None):
     if hasattr(ack, key):
         return getattr(ack, key)
@@ -96,6 +71,25 @@ async def _ensure_awake(engine: AsyncOmni, stage_ids: list[int] | None = None) -
         await engine.resume_generation(stage_ids=stage_ids)
     except Exception as e:
         logger.warning("ensure_resume failed (stage_ids=%s): %s", stage_ids, e)
+
+
+async def _tiny_dit_multistage_generate(engine: AsyncOmni, prompt: str, request_id: str):
+    """2-step tiny-DiT generate through the joint AR + DiT pipeline.
+
+    Restores the old H100 ``test_multistage_llm_diffusion_sleep_wake`` contract
+    (generate before and after ``sleep(stage_ids=[0, 1])``) without BAGEL.
+    AR is capped so this stays a sleep/wake orchestration check, not a 7B
+    completion.
+    """
+    params_list = [
+        SamplingParams(max_tokens=4),
+        OmniDiffusionSamplingParams(num_inference_steps=2, height=256, width=256),
+    ]
+    output = None
+    async for item in engine.generate(prompt, request_id=request_id, sampling_params_list=params_list):
+        output = item
+    assert output is not None, f"generate({request_id!r}) produced no output"
+    return output
 
 
 async def _shutdown_engine_and_clear_gpu(engine: AsyncOmni) -> None:
@@ -139,8 +133,6 @@ def _module_device_cleanup():
 @pytest_asyncio.fixture(scope="class", loop_scope="class")
 async def diffusion_engine():
     """Shared tiny diffusion engine on L4."""
-    if current_omni_platform.is_rocm():
-        clean_device_envs()
     engine = AsyncOmni(
         model=MODEL_DIFF,
         enable_sleep_mode=True,
@@ -197,8 +189,6 @@ class TestOmniDiffusionSleepMode:
 @pytest_asyncio.fixture(scope="class", loop_scope="class")
 async def ar_engine():
     """Shared thinker-only AR engine for #4473 protocol checks on L4."""
-    if current_omni_platform.is_rocm():
-        clean_device_envs()
     engine = AsyncOmni(
         model=MODEL_AR,
         deploy_config=AR_STAGE_CONFIG,
@@ -217,26 +207,25 @@ class TestOmniArSleepMode:
     @pytest.mark.asyncio(loop_scope="class")
     @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     async def test_llm_sleep_ack(self, ar_engine: AsyncOmni):
-        device_id = 0
+        """AR sleep reports EngineCore SUCCESS; generate works after a full wake.
+
+        ``AsyncOmni.sleep()`` synthesizes OmniACK with ``freed_bytes=0`` (no
+        worker handshake), so VRAM / ``freed_bytes`` is not a real contract.
+        """
         try:
-            used_before = get_device_global_memory_used_gib(device_id)
             acks = await ar_engine.sleep(stage_ids=[0], level=1)
-            await asyncio.sleep(1.5)
-            used_after = get_device_global_memory_used_gib(device_id)
-            drop_gib = used_before - used_after
+            assert acks
             assert all(get_ack_info(ack, "status") == "SUCCESS" for ack in acks)
-            freed_gib = sum(get_ack_info(ack, "freed_bytes", 0) for ack in acks) / 1024**3
-            logger.info(
-                "AR: ACK freed=%.2f GiB, global drop=%.2f GiB (before=%.2f, after=%.2f)",
-                freed_gib,
-                drop_gib,
-                used_before,
-                used_after,
-            )
-            assert freed_gib > 1.0 or drop_gib > 0.5, (
-                "Expected ACK freed_bytes or global VRAM drop after sleep. "
-                f"ACK={freed_gib:.2f} GiB, global_drop={drop_gib:.2f} GiB"
-            )
+            for ack in acks:
+                meta = get_ack_info(ack, "metadata") or {}
+                assert meta.get("path") == "engine_core", f"expected EngineCore ACK, got metadata={meta}"
+
+            await ar_engine.wake_up(stage_ids=[0])
+            await ar_engine.resume_generation(stage_ids=[0])
+            output = None
+            async for item in ar_engine.generate("test", sampling_params=SamplingParams(max_tokens=4)):
+                output = item
+            assert output is not None, "generate after full wake produced no output"
         finally:
             await _ensure_awake(ar_engine, [0])
 
@@ -282,17 +271,12 @@ class TestOmniArSleepMode:
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.asyncio
 async def test_multistage_ar_diffusion_sleep_wake():
-    """Orchestration: joint sleep/wake/resume on thinker-only AR + tiny DiT.
+    """Orchestration: generate → joint sleep/wake/resume → generate.
 
-    Covers ``sleep(stage_ids=[0, 1])`` then a 2-step tiny-DiT generate after
-    resume. BAGEL BagelPipeline TP=2 stays in expansion (diffusion-only); the
-    skipped dual-engine suite does not cover this path.
+    Covers the old H100 path that ``TestBagelCoordinatedSleepMode`` (still
+    skipped) and BAGEL TP=2 expansion (diffusion-only) do not: a 2-step
+    tiny-DiT generate after ``sleep(stage_ids=[0, 1])`` + ``resume_generation``.
     """
-    if current_omni_platform.is_rocm():
-        clean_device_envs()
-    if current_omni_platform.get_device_count() < 2:
-        pytest.skip("Need 2 GPUs for light multistage sleep/wake")
-
     stages = [
         {
             "stage_id": 0,
@@ -335,19 +319,15 @@ async def test_multistage_ar_diffusion_sleep_wake():
         stage_init_timeout=1200,
     )
     try:
+        await _tiny_dit_multistage_generate(engine, "warmup", "warmup")
+
         acks = await engine.sleep(stage_ids=[0, 1], level=1)
         assert len(acks) == 2
         assert all(get_ack_info(ack, "status") == "SUCCESS" for ack in acks)
 
         await engine.wake_up(stage_ids=[0, 1])
         await engine.resume_generation(stage_ids=[0, 1])
-        sp = OmniDiffusionSamplingParams(num_inference_steps=2, height=256, width=256)
-        post_output = None
-        async for output in engine.generate(
-            "verify",
-            sampling_params_list=[SamplingParams(), sp],
-        ):
-            post_output = output
+        post_output = await _tiny_dit_multistage_generate(engine, "verify", "verify")
         assert post_output is not None
         logger.info("Light multistage joint sleep/wake/resume generate OK")
     finally:
