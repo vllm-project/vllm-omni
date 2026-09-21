@@ -121,7 +121,7 @@ class PrefixCacheSchedulerAdapter:
             )
 
         finished = set(getattr(scheduler_output, "finished_req_ids", ()) or ())
-        for req_id in sorted(finished):
+        for req_id in sorted(finished | aborted):
             req_id = str(req_id)
             kind = PrefixCacheEventKind.ABORTED if req_id in aborted else PrefixCacheEventKind.FINISHED
             events.append(PrefixCacheRequestEvent(req_id, kind))

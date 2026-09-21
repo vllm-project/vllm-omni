@@ -57,7 +57,7 @@ from collections.abc import Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn
+from typing import Any, NamedTuple, NoReturn
 
 import torch
 
