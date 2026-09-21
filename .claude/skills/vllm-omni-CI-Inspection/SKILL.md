@@ -822,16 +822,25 @@ ci env
 
 OOM / TypeError / Timeout are **symptoms**—put them in the First Error summary column, not Diagnosis category.
 
-### Summary Output Format (Feishu)
+### Summary Output & Alert Forwarding
 
-**Do not use markdown tables** for alert-group messages. Feishu splits long messages into multiple bubbles; table headers and rows land in separate bubbles and become unreadable.
+The summary table is the **single source of truth**: it is produced once, already filtered, and used for both the triage session output and the alert-group forwarding. There is no separate "full vs filtered" copy.
 
-**Use one record per line**, fields separated by `|`, each line self-contained:
+**Filtering applied at summary-table generation time** (before any output):
+
+| CI type | 🔴 PR-introduced rows | Effect |
+|---------|----------------------|--------|
+| READY CI / NPU READY CI | **Excluded** from the summary table | PR-author fixes; silent on these |
+| MERGE CI | **Kept** — MERGE CI forwards everything | Merged-to-main problems must all be tracked |
+
+If filtering removes every row (all failures were PR-introduced), **send nothing** to the alert group (stay silent).
+
+**Format — do not use markdown tables.** Feishu splits long messages into multiple bubbles; table headers and rows land in separate bubbles and become unreadable. Use one record per line, fields separated by `|`, each line self-contained:
 
 ```
 📋 CI Triage Summary
 
-Build#11824 | https://buildkite.com/... | Simple · Diffusion Test | test_xxx | 🔴 Product code defect | 🔴 PR-introduced | AssertionError: ... | Hypothesis 1 | [File issue](https://github.com/vllm-project/vllm-omni/issues/new?template=400-bug-report.yml&labels=bug,ci-failure,high%20priority&title=...&current-environment=...&code-version=...&bug-description=...)
+Build#11824 | https://buildkite.com/... | Simple · Diffusion Test | test_xxx | 🔴 Product code defect | 🟡 Pre-existing | AssertionError: ... | Hypothesis 1 | [File issue](https://github.com/vllm-project/vllm-omni/issues/new?template=400-bug-report.yml&labels=bug,ci-failure,high%20priority&title=...&current-environment=...&code-version=...&bug-description=...)
 Build#11825 | https://buildkite.com/... | Engine Test | test_yyy | 🟢 Infrastructure | 🔵 Infra/env | OOM killed | Hypothesis 2 | [File issue](https://github.com/vllm-project/vllm-omni/issues/new?template=400-bug-report.yml&labels=bug,ci-failure,high%20priority&title=...&current-environment=...&code-version=...&bug-description=...)
 ```
 
@@ -852,32 +861,34 @@ Build#11825 | https://buildkite.com/... | Engine Test | test_yyy | 🟢 Infrastr
 8. Top hypothesis (one sentence)
 9. File issue (clickable link or `N/A`)
 
+**Alert-group forwarding** — forward the (already-filtered) summary table + per-job details directly:
+
+```bash
+cc-connect send -s "feishu:oc_929f070b14744291bef4150c0d62deb0:ou_b5fe2c5e00ae0619cf6ae7e0c21321e1" --stdin <<EOF
+<filtered summary table and per-job analysis>
+EOF
+```
+
+No second filtering pass at forward time — filtering already happened when the summary table was built. If the filtered table is empty, send nothing.
+
 ### CSV Persistence
 
-Append each scheduled run to CSV:
+Append each scheduled run to CSV. The CSV directory resolves in priority order:
 
-- **READY CI**: `/home/zmj/ci_triage_data/ready_ci.csv`
-- **NPU READY CI**: `/home/zmj/ci_triage_data/ready_npu_ci.csv`
-- **MERGE CI**: `/home/zmj/ci_triage_data/merge_ci.csv`
+1. `CI_TRIAGE_DATA_DIR` environment variable (if set)
+2. Default: `<current working directory>/ci_triage_data/` (created if missing; cron runs unattended, so fall back to this default without prompting)
+
+File name by CI type:
+
+- **READY CI**: `ready_ci.csv`
+- **NPU READY CI**: `ready_npu_ci.csv`
+- **MERGE CI**: `merge_ci.csv`
 
 CSV columns: `time_window,failed_build,build_url,failed_job,failed_test,diagnosis,attribution,first_error_summary,hypothesis`
 
 - Create file with header if missing; append rows only (no duplicate headers)
 - Time window format: `YYYYMMDD_HHMM-HHMM`, e.g. `20260707_1800-0900`
-
-### Alert Group Forwarding
-
-After analysis, forward summary + per-job details to the alert group:
-
-```bash
-cc-connect send -s "feishu:oc_929f070b14744291bef4150c0d62deb0:ou_b5fe2c5e00ae0619cf6ae7e0c21321e1" --stdin <<EOF
-<summary and per-job analysis>
-EOF
-```
-
-**Filtering**:
-- **READY CI**: exclude 🔴 PR-introduced rows from the **alert-group** copy (summary and per-job). Full report in the triage session stays unfiltered. If nothing remains after filtering, **send nothing** to the alert group (stay silent)
-- **MERGE CI**: forward all rows including 🔴 PR-introduced. If no failed builds, send nothing
+- CSV records **all** analyzed failures (pre-filter, unfiltered), since the CSV is the audit trail — only the summary table and alert forwarding apply the PR-introduced filter
 
 ### Root-Cause Evidence Validation
 

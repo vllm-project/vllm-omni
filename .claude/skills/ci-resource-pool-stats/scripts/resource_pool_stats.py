@@ -69,7 +69,7 @@ except ImportError:
 
 BUILDKITE_API_BASE = "https://api.buildkite.com/v2"
 ORG_SLUG = "vllm"
-DEFAULT_PIPELINES = ["vllm-omni", "vllm-omni-npu-ci"]
+DEFAULT_PIPELINES = ["vllm-omni", "vllm-omni-npu-ci", "vllm-omni-amd-ci"]
 
 # ── Static YAML source (used by Per-Pool Detail section) ────────────────
 #
@@ -94,6 +94,11 @@ PIPELINE_YAML_MAP: dict[str, list[tuple[str, str]]] = {
     "vllm-omni-npu-ci": [
         ("ready", ".buildkite/npu/test-npu-ready.yml"),
         ("nightly", ".buildkite/npu/test-npu-nightly.yml"),
+    ],
+    "vllm-omni-amd-ci": [
+        ("ready", ".buildkite/amd/test-amd-ready.yml"),
+        ("merge", ".buildkite/amd/test-amd-merge.yml"),
+        ("nightly", ".buildkite/amd/test-amd-nightly.yml"),
     ],
 }
 
@@ -725,6 +730,11 @@ table.pool-stats tr.summary-row td.pool-name {
   color: var(--dashboard-text);
   border-color: color-mix(in srgb, #1f9d63 25%, transparent);
 }
+.latest-total-chip--mi300 {
+  background: color-mix(in srgb, #8b5cf6 10%, var(--dashboard-panel-bg));
+  color: var(--dashboard-text);
+  border-color: color-mix(in srgb, #8b5cf6 25%, transparent);
+}
 .latest-total-chip strong {
   font-weight: 800;
   color: var(--dashboard-text);
@@ -1209,6 +1219,16 @@ def _extract_queue_for_step(
         if q:
             return q, "", "agents.queue"
 
+    # AMD pipeline steps carry an ``agent_pool`` field (e.g. ``mi300_2``)
+    # that the Jinja template ``test-template-amd-omni.j2`` expands into
+    # ``agents.queue: amd_<agent_pool>``.  We don't run that template here, so
+    # recover both the queue and a usable preset name directly.  The trailing
+    # digit of ``agent_pool`` is the accelerator count.
+    ap = step.get("agent_pool")
+    if isinstance(ap, str) and ap.strip():
+        pool = ap.strip()
+        return f"amd_{pool}", pool, "agent_pool"
+
     mh = step.get("mirror_hardwares")
     if isinstance(mh, str):
         preset = mirror_registry.get(mh)
@@ -1220,9 +1240,10 @@ def _extract_queue_for_step(
         # mirror_hardwares present but unresolvable — skip the step
         return None
     if isinstance(mh, list):
-        # AMD-style list (e.g. ``[amdproduction]``); the queue is derived
-        # from ``agent_pool`` via a Jinja template we don't have here.
-        # Skip rather than guess.
+        # AMD ``mirror_hardwares: [amdproduction]`` is a Jinja inclusion filter,
+        # not a preset.  AMD steps that reached here without an ``agent_pool``
+        # have no resolvable queue locally — skip rather than guess.  (Steps
+        # with ``agent_pool`` are caught by the branch above.)
         return None
     return None
 
@@ -1251,6 +1272,136 @@ def _walk_steps_for_queues(
         nested = step.get("steps")
         if isinstance(nested, list):
             out.extend(_walk_steps_for_queues(nested, mirror_registry))
+    return out
+
+
+# ── Preset recovery from raw YAML (mirrors upload_pipeline.py logic) ────
+#
+# ``upload_pipeline.py --all`` expands ``mirror_hardwares`` (explicit preset
+# or inferred from pytest ``-m`` SKU + ``cards_n`` markers) into
+# ``agents.queue`` and *deletes* the ``mirror_hardwares`` field.  So the
+# rendered YAML we walk for queues has no preset name left, and every H100
+# step collapses into a single ``mithril-h100-pool`` row with
+# ``gpus_per_unit=0`` — losing the h100_1..h100_4 / l4_1 / l4_4 machine
+# granularity the Per-Pool Detail panel is meant to show.
+#
+# Fix: walk the *raw* (pre-render) YAML and recover each leaf step's preset
+# name by reusing the uploader's own pure functions.  The preset is then
+# paired with the rendered YAML's queue by step ``label`` (which is stable
+# across render — it's the Buildkite job name).  This reproduces exactly
+# what the uploader computed without parsing its stderr log (which is only
+# emitted for inferred presets, not explicit ones).
+
+_UPLOAD_PIPELINE_MOD = None  # cached module handle
+
+
+def _import_upload_pipeline(repo_path: Path):
+    """Import the vllm-omni ``upload_pipeline`` module and cache it.
+
+    Returns the module object, or ``None`` on any failure (missing file,
+    import error in its ``skip_ci`` / pytest-mark dependencies).  Callers
+    fall back to the empty-preset path so the report never hard-aborts.
+    """
+    global _UPLOAD_PIPELINE_MOD
+    if _UPLOAD_PIPELINE_MOD is not None:
+        return _UPLOAD_PIPELINE_MOD
+    scripts_dir = repo_path / ".buildkite" / "common" / "scripts"
+    if not (scripts_dir / "upload_pipeline.py").is_file():
+        return None
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    try:
+        import upload_pipeline  # noqa: PLC0415
+        _UPLOAD_PIPELINE_MOD = upload_pipeline
+        return upload_pipeline
+    except Exception as e:  # broad: skip_ci / mark deps may be unavailable
+        print(
+            f"upload_pipeline import failed; preset recovery disabled: "
+            f"{type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _resolve_preset_for_raw_step(step: dict, uploader) -> str:
+    """Recover the ``mirror_hardwares`` preset name for a *raw* (pre-render)
+    leaf step by replaying ``upload_pipeline.py``'s own resolution logic.
+
+    Returns the preset string (e.g. ``h100_2`` / ``l4_4`` / ``a3_npu_4``),
+    or ``""`` when the step has no preset (CPU job, skipped, or a step that
+    sets ``agents`` directly).  Mirrors ``_expand_mirror_hardwares`` but only
+    returns the name instead of the expanded agents block.
+
+    Two branches, exactly as the uploader does:
+
+      1. **Explicit** — ``mirror_hardwares: <preset>`` present →
+         ``_resolve_mirror_hardware_name`` returns it verbatim (honouring
+         the ``MIRROR_HW`` selector, which is unset here).
+      2. **Inferred** — no ``mirror_hardwares`` and no inline
+         ``agents``/``plugins``/``image`` → parse pytest ``-m`` SKU +
+         ``cards_n`` marks and compose ``{chip}_{n}`` via
+         ``_compose_mirror_hardware_name``.  No SKU/cards ⇒ CPU step ⇒ ``""``.
+    """
+    if uploader is None:
+        return ""
+    step_label = step.get("group") or step.get("label") or "<step>"
+    has_pool = (
+        step.get("agents") is not None
+        or step.get("plugins") is not None
+        or step.get("image") is not None
+    )
+    # AMD pipeline steps carry ``agent_pool`` (e.g. ``mi300_2``) and a list-style
+    # ``mirror_hardwares: [amdproduction]`` that is a Jinja inclusion filter, not
+    # a ci_mirror_hardwares.yml preset.  upload_pipeline.py can't resolve it
+    # (would raise ValueError), so recover the preset directly from agent_pool.
+    ap = step.get("agent_pool")
+    if isinstance(ap, str) and ap.strip():
+        return ap.strip()
+    if "mirror_hardwares" in step:
+        if has_pool:
+            # Uploader rejects mirror_hardwares + agents together; this step
+            # is unchanged by the uploader, so it has no preset to recover.
+            return ""
+        name = uploader._resolve_mirror_hardware_name(
+            step.get("mirror_hardwares"), step_label=step_label
+        )
+        return name or ""
+    if has_pool:
+        return ""
+    chips, cards = uploader._parse_pytest_marks(step)
+    if not chips and cards is None:
+        return ""
+    preset = uploader._compose_mirror_hardware_name(
+        chips, cards, step_label=step_label
+    )
+    return preset or ""
+
+
+def _walk_raw_steps_for_presets(
+    steps: list,
+    uploader,
+) -> dict[str, str]:
+    """Walk a *raw* steps list and return a ``{label: preset}`` map.
+
+    Only leaf steps with a non-empty ``label`` are recorded — ``label`` is
+    the join key against the rendered-YAML queue walk.  Nested ``group``
+    blocks are recursed into.  When a label appears more than once (rare:
+    duplicate labels across groups), the last non-empty preset wins.
+    """
+    out: dict[str, str] = {}
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        label = (step.get("label") or "").strip()
+        # Only leaf steps carry a resolvable preset; groups have no
+        # ``mirror_hardwares`` / pytest marks of their own.
+        if label and not isinstance(step.get("steps"), list):
+            preset = _resolve_preset_for_raw_step(step, uploader)
+            if preset:
+                out[label] = preset
+        nested = step.get("steps")
+        if isinstance(nested, list):
+            out.update(_walk_raw_steps_for_presets(nested, uploader))
     return out
 
 
@@ -1463,7 +1614,7 @@ def extract_queue_from_job(job: dict) -> str:
 
 _NVIDIA_GPU_RE = re.compile(r"^nvidia\.com/gpu[=\-](\d+)$")
 _NPU_RE = re.compile(r"^npu[=\-]?(\d+)$")
-_PRESET_ACCEL_RE = re.compile(r"^(?:h100|l4|a2b3_npu|a3_npu)_(\d+)$")
+_PRESET_ACCEL_RE = re.compile(r"^(?:h100|l4|a2b3_npu|a3_npu|310p_npu|a5_npu|mi\d+)_(\d+)$")
 
 
 def _parse_accel_count_from_rc(rc: str | None) -> int:
@@ -1541,6 +1692,17 @@ def _accel_count_for_job(
     if n is not None:
         return n
 
+    # 5. AMD-style queue name (``amd_mi300_N``) carries the accelerator
+    # count in its suffix — the Jinja template derives it from
+    # ``agent_pool[-1:]``.  AMD jobs have no resource_class, so this is the
+    # authoritative path for them.  Read the queue from agent_query_rules.
+    rules = job.get("agent_query_rules") or []
+    for rule in rules:
+        rq = rule if isinstance(rule, str) else (rule.get("query") or "")
+        m = re.match(r"^queue=amd_mi\d+_(\d+)$", (rq or "").strip())
+        if m:
+            return int(m.group(1))
+
     return 1
 
 
@@ -1553,9 +1715,28 @@ def _infer_preset_for_job(queue: str, accel_count: int) -> str:
     We reconstruct the preset name from the queue + count combo so the
     per-preset Device-hours panel still has labels to group by.
 
-    Returns the raw queue name when no preset inference applies.
+    Returns the raw queue name when no preset inference applies — in
+    particular when ``accel_count`` is 0 (we could not recover a card count
+    from the job's resource_class or the YAML label→accel lookup).  In that
+    case synthesizing ``h100_0`` / ``310p_npu_0`` would invent a preset that
+    does not exist in ci_mirror_hardwares.yml, so we fall back to the queue
+    name and let the job aggregate under its pool.
     """
-    # l4_N → gpu_N_queue
+    # AMD queues encode the full preset name: ``amd_mi300_2`` → ``mi300_2``.
+    # This is a direct match (not synthesised from accel_count) so it runs
+    # before the ``accel_count <= 0`` guard.
+    m = re.match(r"^amd_(mi\d+)_(\d+)$", queue)
+    if m:
+        return f"{m.group(1)}_{m.group(2)}"
+    if accel_count <= 0:
+        return queue
+    # l4_N presets (l4_1, l4_2, l4_3, l4_4) all map to the ``l4-k8s`` queue
+    # in ci_mirror_hardwares.yml (the queue name carries no card count), so
+    # we synthesize the preset from the accelerator count recovered via
+    # the YAML label→accel lookup.  The legacy ``gpu_N_queue`` shape is
+    # kept for older queue conventions.
+    if queue == "l4-k8s":
+        return f"l4_{accel_count}"
     m = re.match(r"^gpu_(\d+)_queue$", queue)
     if m:
         return f"l4_{accel_count}"
@@ -1565,6 +1746,10 @@ def _infer_preset_for_job(queue: str, accel_count: int) -> str:
         return f"a2b3_npu_{accel_count}"
     if queue == "ascend-a3":
         return f"a3_npu_{accel_count}"
+    if queue == "ascend-310p":
+        return f"310p_npu_{accel_count}"
+    if queue == "ascend-a5":
+        return f"a5_npu_{accel_count}"
     return queue
 
 
@@ -1709,10 +1894,12 @@ class StaticPoolEntry:
 # via the ``_is_a2_preset`` / ``_is_a3_preset`` filters below.
 _H100_PRESET_RE = re.compile(r"^h100_\d+$")
 _L4_PRESET_RE = re.compile(r"^l4_\d+$")
-_NPU_PRESET_RE = re.compile(r"^(?:a2b3|a3)_npu_\d+$")
+_NPU_PRESET_RE = re.compile(r"^(?:a2b3|a3|310p|a5)_npu_\d+$")
+_AMD_PRESET_RE = re.compile(r"^mi\d+_(\d+)$")
 _GPU_QUEUE_RE = re.compile(r"^gpu_(\d+)_queue$")
-_PRESET_COUNT_RE = re.compile(r"^(?:h100|l4|a2b3_npu|a3_npu)_(\d+)$")
-_ASCEND_QUEUE = ("ascend-a2b3", "ascend-a3")
+_PRESET_COUNT_RE = re.compile(r"^(?:h100|l4|a2b3_npu|a3_npu|310p_npu|a5_npu|mi\d+)_(\d+)$")
+_ASCEND_QUEUE = ("ascend-a2b3", "ascend-a3", "ascend-310p", "ascend-a5")
+_AMD_QUEUE_PREFIX = "amd_mi"
 
 
 def _is_npu_preset(preset: str, queue: str) -> bool:
@@ -1749,6 +1936,16 @@ def _is_a3_preset(preset: str, queue: str) -> bool:
     return queue.startswith("ascend-a3")
 
 
+def _is_mi300_preset(preset: str, queue: str) -> bool:
+    """MI300 covers any ``mi<N>_<n>`` agent_pool preset (e.g. ``mi300_2``)
+    and any direct ``amd_mi*`` queue reference.  AMD steps set
+    ``agent_pool`` instead of a ``ci_mirror_hardwares.yml`` preset, so we
+    match the agent_pool-derived names here."""
+    if preset and _AMD_PRESET_RE.match(preset):
+        return True
+    return queue.startswith(_AMD_QUEUE_PREFIX)
+
+
 def _is_gpu_preset(preset: str, queue: str) -> bool:
     """True for any GPU-based preset/queue (H100 or L4)."""
     if _is_npu_preset(preset, queue):
@@ -1775,6 +1972,9 @@ _PIPELINE_TOTAL_CHIPS: dict[str, list[tuple[str, Callable]]] = {
     "vllm-omni-npu-ci": [
         ("A2", _is_a2_preset),
         ("A3", _is_a3_preset),
+    ],
+    "vllm-omni-amd-ci": [
+        ("MI300", _is_mi300_preset),
     ],
 }
 
@@ -1928,14 +2128,17 @@ def compute_static_pool_data(
         _, head_sha = git_pull_local_repo(repo_path)
 
     mirror_registry = _load_mirror_hardwares_registry(repo_path)
+    # Import the uploader once so we can recover preset names from the raw
+    # YAML (the rendered YAML has ``mirror_hardwares`` stripped).  Best-effort;
+    # when unavailable, preset stays empty and behaviour degrades to the
+    # queue-keyed view (same as before this fix).
+    uploader = _import_upload_pipeline(repo_path)
 
     out: dict[str, StaticPipelineData] = {}
     for pipeline_slug in pipeline_slugs:
         yaml_files = PIPELINE_YAML_MAP.get(pipeline_slug)
         if not yaml_files:
-            # No static definition for this pipeline — skip silently.  AMD
-            # uses an AMD-specific template; Intel has its own pipeline
-            # file.  We only handle vllm-omni and vllm-omni-npu-ci.
+            # No static definition for this pipeline — skip silently.
             continue
         data = StaticPipelineData(
             pipeline=pipeline_slug,
@@ -1971,30 +2174,60 @@ def compute_static_pool_data(
             if not isinstance(steps, list):
                 continue
 
+            # Recover the preset name per leaf step from the *raw* YAML.
+            # ``upload_pipeline.py`` strips ``mirror_hardwares`` after
+            # expansion, so the rendered YAML we just walked for queues has
+            # no preset left — every H100 step would collapse into one
+            # ``mithril-h100-pool`` row with ``gpus_per_unit=0``.  Replaying
+            # the uploader's resolution against the raw YAML gives us the
+            # preset (explicit or inferred from pytest ``-m``) keyed by the
+            # step ``label``, which is stable across render.
+            label_to_preset: dict[str, str] = {}
+            if uploader is not None:
+                try:
+                    raw_doc = yaml.safe_load(raw_text)
+                    if isinstance(raw_doc, dict):
+                        raw_steps = raw_doc.get("steps") or []
+                        if isinstance(raw_steps, list):
+                            label_to_preset = _walk_raw_steps_for_presets(
+                                raw_steps, uploader
+                            )
+                except (yaml.YAMLError, OSError) as e:
+                    print(
+                        f"failed to parse raw {path} for preset recovery: {e}",
+                        file=sys.stderr,
+                    )
+
             file_basename = Path(rel_path).name
             data.files.append(file_basename)
             cat_buckets: dict[str, int] = {}
             label_to_accel_cat = data.label_to_accel.setdefault(category, {})
             for queue, mh, _src, label in _walk_steps_for_queues(steps, mirror_registry):
+                # Override the (empty) rendered-YAML preset with the preset
+                # recovered from the raw YAML, paired by step label.  Falls
+                # back to the queue-derived value when no preset maps.
+                preset = mh
+                if not preset and label and label in label_to_preset:
+                    preset = label_to_preset[label]
                 # Bucket by preset when available, else by queue.  This is
                 # what lets mithril-h100-pool split into h100_1..h100_4
                 # instead of aggregating as a single row.
-                key = _display_key_for(mh, queue)
+                key = _display_key_for(preset, queue)
                 cat_buckets[key] = cat_buckets.get(key, 0) + 1
                 pe = data.pools.get(key)
                 if pe is None:
                     pe = StaticPoolEntry(
                         pipeline=pipeline_slug,
                         queue=queue,
-                        preset_name=mh,
-                        gpus_per_unit=_gpus_for_unit(mh, queue),
+                        preset_name=preset,
+                        gpus_per_unit=_gpus_for_unit(preset, queue),
                     )
                     data.pools[key] = pe
                 pe.total_steps += 1
                 pe.categories[category] = pe.categories.get(category, 0) + 1
                 pe.files[file_basename] = pe.files.get(file_basename, 0) + 1
-                if mh:
-                    pe.mirror_hardwares[mh] = pe.mirror_hardwares.get(mh, 0) + 1
+                if preset:
+                    pe.mirror_hardwares[preset] = pe.mirror_hardwares.get(preset, 0) + 1
                 # Reverse lookup: Buildkite job name == step label, so we
                 # record each leaf step's accelerator count by label here.
                 # Mirrors the precedence _accel_count_for_job uses, but
@@ -2002,7 +2235,7 @@ def compute_static_pool_data(
                 # Skip entries without a label — these can't be matched
                 # to Buildkite jobs anyway.
                 if label and label not in label_to_accel_cat:
-                    accel = _gpus_for_unit(mh, queue)
+                    accel = _gpus_for_unit(preset, queue)
                     label_to_accel_cat[label] = accel
             data.categories[category] = cat_buckets
 
@@ -2145,7 +2378,7 @@ def _compute_summary_cards(all_pools: dict[str, dict[str, PoolStats]]) -> list[d
     total_pools = 0
     all_waits: list[float] = []
     total_occ = 0.0
-    device_hours_by_chip: dict[str, float] = {"h100": 0.0, "l4": 0.0, "npu": 0.0, "cpu": 0.0}
+    device_hours_by_chip: dict[str, float] = {"h100": 0.0, "l4": 0.0, "npu": 0.0, "amd": 0.0, "cpu": 0.0}
 
     for pipeline_slug, pools in all_pools.items():
         total_pools += len(pools)
@@ -2164,7 +2397,7 @@ def _compute_summary_cards(all_pools: dict[str, dict[str, PoolStats]]) -> list[d
     # hides the CPU segment entirely when no CPU jobs ran.
     breakdown = " · ".join(
         f"{chip} {device_hours_by_chip[chip]:.1f}h"
-        for chip in ("h100", "l4", "npu", "cpu")
+        for chip in ("h100", "l4", "npu", "amd", "cpu")
         if device_hours_by_chip[chip] > 0
     )
 
@@ -2220,12 +2453,16 @@ def _chip_family_for_pool(pool_name: str) -> str:
     """
     if pool_name.startswith("cpu_"):
         return "cpu"
+    if pool_name == "amd-cpu":
+        return "cpu"
     if pool_name == "mithril-h100-pool":
         return "h100"
     if pool_name.startswith("gpu_") and pool_name.endswith("_queue"):
         return "l4"
     if pool_name.startswith("ascend-"):
         return "npu"
+    if pool_name.startswith("amd_mi"):
+        return "amd"
     return "h100"
 
 
@@ -2265,10 +2502,17 @@ def _aggregate_device_hours_by_preset(
                 # dedicated CPU sub-table.  ``_infer_preset_for_job``
                 # returns the raw queue name for these, which is the
                 # signal we use here.
-                if jr.pool_name.startswith("cpu_") or preset == jr.pool_name and preset.startswith("cpu_"):
+                if (
+                    jr.pool_name.startswith("cpu_")
+                    or jr.pool_name == "amd-cpu"
+                    or (preset == jr.pool_name and preset.startswith("cpu_"))
+                    or (preset == jr.pool_name and preset == "amd-cpu")
+                ):
                     device_type = "cpu"
-                elif preset.startswith(("a2b3_npu", "a3_npu")):
+                elif preset.startswith(("a2b3_npu", "a3_npu", "310p_npu", "a5_npu")):
                     device_type = "npu"
+                elif _AMD_PRESET_RE.match(preset):
+                    device_type = "amd"
                 else:
                     device_type = "gpu"
                 b = buckets.setdefault(
@@ -2950,9 +3194,11 @@ def _render_device_hours_by_preset(
     # cards column there is intentionally just the job count.
     gpu_rows = [r for r in rows if r["device_type"] == "gpu"]
     npu_rows = [r for r in rows if r["device_type"] == "npu"]
+    amd_rows = [r for r in rows if r["device_type"] == "amd"]
     cpu_rows = [r for r in rows if r["device_type"] == "cpu"]
     gpu_total = sum(r["hours"] for r in gpu_rows)
     npu_total = sum(r["hours"] for r in npu_rows)
+    amd_total = sum(r["hours"] for r in amd_rows)
     cpu_total = sum(r["hours"] for r in cpu_rows)
 
     def _render_subtable(
@@ -3029,9 +3275,10 @@ def _render_device_hours_by_preset(
 
     gpu_section = _render_subtable("GPU", gpu_rows, gpu_total, "GPU")
     npu_section = _render_subtable("NPU", npu_rows, npu_total, "NPU")
+    amd_section = _render_subtable("AMD (MI300)", amd_rows, amd_total, "AMD")
     cpu_section = _render_subtable("CPU", cpu_rows, cpu_total, "CPU", cards_label="Instances")
 
-    return gpu_section + "\n" + npu_section + "\n" + cpu_section
+    return gpu_section + "\n" + npu_section + "\n" + amd_section + "\n" + cpu_section
 
 
 # CI category display labels and ordering (for the grouped view's chip list).

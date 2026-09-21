@@ -280,3 +280,28 @@ def perf_row_matches_local_test(row: dict, local_keys: frozenset[str]) -> bool:
             if cand == key or key in cand or cand in key:
                 return True
     return False
+
+
+def row_source_file_matches_local(row: dict, local_keys: frozenset[str]) -> bool:
+    """Authoritative local-provenance check via the record's ``source_file``.
+
+    ``perf_row_matches_local_test`` keys off ``test_name``/``config_key``, which
+    share a model slug across hardware variants — so a Buildkite H100 record
+    (``test_name=minicpmo_4_5``) substring-matches a local L20X record
+    (``minicpmo_4_5_omniinteract_l20x_...``) and gets misclassified as Local.
+
+    The ``source_file`` field (the original perf JSON filename written into
+    ``*_history.json`` by ``generate_charts.py``) is unique per run and is the
+    authoritative provenance marker: it derives the same timestamp-stripped key
+    as the local perf JSON on disk for genuinely local rows, and a different
+    key for Buildkite CI rows. Use it when present so the two never collide.
+    """
+    if not local_keys:
+        return False
+    source_file = str(row.get("source_file") or "").strip()
+    if not source_file:
+        return False
+    key = normalize_test_key(test_key_from_perf_filename(source_file))
+    if not key:
+        return False
+    return key in {normalize_test_key(k) for k in local_keys if k}

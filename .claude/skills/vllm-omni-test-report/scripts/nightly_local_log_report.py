@@ -45,6 +45,7 @@ from local_perf_results import (  # noqa: E402
     local_perf_result_files,
     perf_row_matches_local_test,
     resolve_local_perf_result_dir,
+    row_source_file_matches_local,
 )
 from nightly_job_log_discovery import discover_job_logs, read_combined_job_logs  # noqa: E402
 from nightly_job_pytest_table import (  # noqa: E402
@@ -4296,8 +4297,19 @@ def _filter_perf_summary_for_local(
         out["local_perf_scope"] = scope
         return out
 
+    def _is_local_row(row: dict[str, Any]) -> bool:
+        # Authoritative: a genuine local run's ``source_file`` is an actual
+        # local perf JSON filename (timestamp-stripped key matches a local key).
+        # Only fall back to the looser test_name/config_key match when the row
+        # lacks ``source_file`` (e.g. older history.json without provenance),
+        # so a Buildkite record that merely shares the model slug is never
+        # misclassified as Local (see L20X-vs-H100 overlap regression).
+        if row.get("source_file"):
+            return row_source_file_matches_local(row, local_keys)
+        return perf_row_matches_local_test(row, local_keys)
+
     filtered = [
-        row for row in summary.get("rows", []) if isinstance(row, dict) and perf_row_matches_local_test(row, local_keys)
+        row for row in summary.get("rows", []) if isinstance(row, dict) and _is_local_row(row)
     ]
     stats = {"pass": 0, "normal": 0, "fail": 0, "n/a": 0}
     for row in filtered:
@@ -4335,6 +4347,23 @@ def _recompute_perf_summary_stats(rows: list[dict[str, Any]]) -> dict[str, int]:
     return stats
 
 
+def _is_genuinely_local_row(row: dict[str, Any], local_keys: frozenset[str]) -> bool:
+    """Whether a history.json perf row is a genuine local run.
+
+    Uses the record's ``source_file`` (the original perf JSON filename, written
+    by ``generate_charts.py``) as the authoritative provenance marker: its
+    timestamp-stripped key matches a local perf JSON key for real local runs and
+    differs for Buildkite CI runs. Falls back to the looser
+    :func:`perf_row_matches_local_test` only when ``source_file`` is absent
+    (older history.json without provenance). This prevents a Buildkite H100
+    record whose ``test_name=minicpmo_4_5`` is a substring of a local
+    ``minicpmo_4_5_omniinteract_l20x`` key from being treated as local.
+    """
+    if row.get("source_file"):
+        return row_source_file_matches_local(row, local_keys)
+    return perf_row_matches_local_test(row, local_keys)
+
+
 def _filter_perf_summary_exclude_local_overlap(
     summary: dict[str, Any],
     *,
@@ -4351,7 +4380,14 @@ def _filter_perf_summary_exclude_local_overlap(
         return summary
 
     original_rows = [row for row in summary.get("rows", []) if isinstance(row, dict)]
-    filtered = [row for row in original_rows if not perf_row_matches_local_test(row, local_keys)]
+    # Drop a Buildkite row only when it is genuinely a local run — i.e. its
+    # ``source_file`` is an actual local perf JSON. The looser
+    # ``perf_row_matches_local_test`` substring match (off ``test_name``) would
+    # also evict Buildkite H100 rows that merely share the model slug with a
+    # local L20X run, making the H100 row vanish from the Buildkite section AND
+    # reappear mislabeled as Local. Guarding eviction on ``source_file`` keeps
+    # such Buildkite-only rows in the Buildkite section where they belong.
+    filtered = [row for row in original_rows if not _is_genuinely_local_row(row, local_keys)]
 
     out = dict(summary)
     out["rows"] = filtered

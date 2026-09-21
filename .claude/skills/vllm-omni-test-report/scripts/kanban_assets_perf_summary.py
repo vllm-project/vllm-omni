@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,25 @@ LOWER_BETTER_HINTS = (
 HIGHER_BETTER_HINTS = ("throughput", "qps", "tps")
 NORMAL_DEGRADATION_THRESHOLD_PCT = 6.0
 
+# A test whose freshest record is older than this (relative to the freshest
+# record across all history files) is treated as stale: its last run likely
+# stopped, so its final regression status would otherwise be frozen in the
+# "All major regressions" table forever. 14 days sits in the gap between the
+# active tests (<= 7d) and the stopped ones (>= 25d); see STALE perf record
+# distribution. Overridable via env STALE_PERF_DAYS for tuning. Set to 0 or a
+# negative value to disable staleness filtering entirely (surface every test).
+def _resolve_stale_perf_days() -> int:
+    raw = os.environ.get("STALE_PERF_DAYS", "").strip()
+    if not raw:
+        return 14
+    try:
+        return int(raw)
+    except ValueError:
+        return 14
+
+
+STALE_PERF_DAYS = _resolve_stale_perf_days()
+
 
 def _empty_perf_status_counts() -> dict[str, int]:
     return {"pass": 0, "normal": 0, "fail": 0, "n/a": 0}
@@ -58,6 +78,7 @@ class PerfRow:
     config_key: str
     config_view: str
     test_name: str
+    source_file: str
     metric: str
     latest: float
     baseline: float
@@ -254,6 +275,52 @@ def _pick_latest_records_per_test(records: list[dict[str, Any]]) -> list[dict[st
     return out
 
 
+def _filter_stale_records(
+    records: list[dict[str, Any]],
+    *,
+    reference_day: str,
+    max_age_days: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Drop records whose date is older than ``reference_day - max_age_days``.
+
+    A test whose freshest record is too old has effectively stopped running;
+    keeping it surfaces its last (possibly failing) comparison as a live
+    regression in "All major regressions" indefinitely. Filtering at the
+    record level (before ``_build_perf_rows``) keeps both the Buildkite and
+    Local perf sections consistent and lets the skipped-count surface in the
+    rendered report.
+
+    Returns ``(kept_records, stale_test_keys)`` where each stale key is
+    ``"{model_id}|{test_name}|{date}"`` for the warning.
+    """
+    if not reference_day or max_age_days <= 0:
+        return records, []
+    try:
+        ref_dt = datetime.strptime(reference_day, "%Y-%m-%d")
+    except ValueError:
+        return records, []
+    cutoff = ref_dt - timedelta(days=max_age_days)
+    kept: list[dict[str, Any]] = []
+    stale: list[str] = []
+    for rec in records:
+        day = _date_key(rec)
+        if not day:
+            kept.append(rec)
+            continue
+        try:
+            rec_dt = datetime.strptime(day, "%Y-%m-%d")
+        except ValueError:
+            kept.append(rec)
+            continue
+        if rec_dt < cutoff:
+            stale.append(
+                f"{rec.get('model_id') or rec.get('title')}|{rec.get('test_name')}|{day}"
+            )
+            continue
+        kept.append(rec)
+    return kept, stale
+
+
 def _history_summary(metas: list[dict[str, Any]], used_group_payloads: bool) -> dict[str, Any]:
     generated = sorted({str(m.get("generated_at") or "") for m in metas if m.get("generated_at")})
     files = [str(m.get("file") or "") for m in metas if m.get("file")]
@@ -420,6 +487,7 @@ def _build_perf_rows(records: list[dict[str, Any]]) -> tuple[list[PerfRow], int]
         model = str(model_id or title)
         config_key = str(rec.get("config_key") or rec.get("source_file") or "")
         test_name = str(rec.get("test_name") or "")
+        source_file = str(rec.get("source_file") or "")
         m_type = _model_type(model, test_name)
         cfg_view = _config_view(rec, m_type)
         date_value = str(rec.get("date") or "")
@@ -447,6 +515,7 @@ def _build_perf_rows(records: list[dict[str, Any]]) -> tuple[list[PerfRow], int]
                     config_key=config_key,
                     config_view=cfg_view,
                     test_name=test_name,
+                    source_file=source_file,
                     metric=metric,
                     latest=latest,
                     baseline=baseline,
@@ -642,6 +711,18 @@ def build_assets_perf_summary(
             "source": src_meta.__dict__,
             "latest_day_per_file": file_latest_days,
         }
+    # Drop records whose freshest run is older than STALE_PERF_DAYS relative to
+    # the freshest record across all history files. A test that has stopped
+    # running otherwise keeps its last regression status frozen in the "All
+    # major regressions" table forever (e.g. challenge tests last run 8-26).
+    stale_cutoff = absolute_latest_day or ""
+    stale_skipped: list[str] = []
+    if day_records and stale_cutoff:
+        day_records, stale_skipped = _filter_stale_records(
+            day_records,
+            reference_day=stale_cutoff,
+            max_age_days=STALE_PERF_DAYS,
+        )
     rows, skipped_unidentified = _build_perf_rows(day_records)
     if skipped_unidentified:
         warnings.append(
@@ -649,6 +730,15 @@ def build_assets_perf_summary(
             f"`model_id` and `title` (would have surfaced as a bogus 'unknown' "
             f"model group). Re-run `sync_buildkite_raw_model_results.py` + "
             f"`generate_charts.py` to refresh `docs/assets/charts/*_history.json`."
+        )
+    if stale_skipped:
+        warnings.append(
+            f"Skipped {len(stale_skipped)} stale perf record(s) whose latest run "
+            f"is older than {STALE_PERF_DAYS} day(s) before the freshest record "
+            f"({stale_cutoff}); re-run the corresponding tests or raise "
+            f"STALE_PERF_DAYS (env) to surface them again. Affected: "
+            + ", ".join(sorted(set(stale_skipped))[:20])
+            + (" ..." if len(set(stale_skipped)) > 20 else "")
         )
     # Keep only models that have baseline-backed rows.
     rows = [row for row in rows if row.baseline is not None]
@@ -671,6 +761,7 @@ def build_assets_perf_summary(
                 "config_key": r.config_key,
                 "config_view": r.config_view,
                 "test_name": r.test_name,
+                "source_file": r.source_file,
                 "metric": r.metric,
                 "latest": r.latest,
                 "baseline": r.baseline,
