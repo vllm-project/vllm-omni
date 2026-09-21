@@ -306,7 +306,7 @@ class RealtimeEventCollector:
         measurement_origin: dict[str, str] | None = None,
     ) -> dict[str, object]:
         """Summarize engine token metrics and client-observed audio cadence."""
-        stage0_metrics: dict[str, object] | None = None
+        stage_snapshots: dict[str, dict[str, object]] = {}
         response_created_at_s: float | None = None
         first_text_received_at_s: float | None = None
         audio_received_at_s: list[float] = []
@@ -332,10 +332,12 @@ class RealtimeEventCollector:
             ):
                 first_text_received_at_s = received_at_s
 
-            stage_metrics = _event_stage_metrics(event)
-            stage0 = stage_metrics.get("0") if isinstance(stage_metrics, dict) else None
-            if isinstance(stage0, dict):
-                stage0_metrics = stage0
+            event_stage_metrics = _event_stage_metrics(event)
+            if isinstance(event_stage_metrics, dict):
+                # Stage snapshots are cumulative.
+                for stage_id, snapshot in event_stage_metrics.items():
+                    if isinstance(snapshot, dict):
+                        stage_snapshots[str(stage_id)] = dict(snapshot)
 
             if event.get("type") != "response.output_audio.delta" or (
                 response_id is not None and event_response_id != response_id
@@ -351,6 +353,10 @@ class RealtimeEventCollector:
                 cumulative_audio_ms.append(max(0.0, float(duration_ms)))
 
         result: dict[str, object] = {}
+        if stage_snapshots:
+            result["stage_metrics"] = stage_snapshots
+
+        stage0_metrics = stage_snapshots.get("0")
         if stage0_metrics is not None:
             raw_itls = stage0_metrics.get("vllm_itls_ms")
             itls = (

@@ -13,7 +13,10 @@ import argparse
 import asyncio
 import concurrent.futures
 import json
+import sys
 from pathlib import Path
+
+from vllm.benchmarks.serve import TaskType
 
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import DEFAULT_DATASET, DuplexSample, load_samples
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import evaluate_sample, summarize_scores
@@ -24,7 +27,11 @@ from vllm_omni.benchmarks.duplex_session_metrics import (
     merge_duplex_metrics_report,
     read_duplex_metrics_report,
 )
+from vllm_omni.benchmarks.metrics.metrics import build_stage_metrics_from_snapshots, print_stage_metrics
 from vllm_omni.entrypoints.cli.benchmark.base import OmniBenchmarkSubcommandBase
+
+_STAGE_PERCENTILE_METRICS = ["ttft", "tpot", "itl", "audio_ttfp", "audio_duration"]
+_STAGE_PERCENTILES = [99.0]
 
 
 def _common(parser: argparse.ArgumentParser) -> None:
@@ -70,6 +77,11 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     generate.add_argument("--clock", choices=("media",), default="media")
     generate.add_argument("--concurrency", type=int, default=1)
     generate.add_argument("--overwrite", action="store_true")
+    generate.add_argument(
+        "--print-stage",
+        action="store_true",
+        help="Print aggregated per-stage metrics from samples generated in this run.",
+    )
     evaluate = actions.add_parser("evaluate")
     _common(evaluate)
     evaluate.add_argument("--response-root", required=True)
@@ -142,11 +154,38 @@ def run(args: argparse.Namespace) -> int:
                         pace=args.pace,
                         clock=args.clock,
                         overwrite=args.overwrite,
+                        collect_stage_metrics=args.print_stage,
                     )
 
             return list(await asyncio.gather(*(generate_one(sample) for sample in samples)))
 
-        _write_duplex_metrics(args.response_root, asyncio.run(generate()))
+        results = asyncio.run(generate())
+        _write_duplex_metrics(args.response_root, results)
+        if args.print_stage:
+            skipped = sum(not result.generated for result in results)
+            if skipped:
+                print(
+                    f"Stage metrics are unavailable for {skipped} skipped sample(s); "
+                    "use --overwrite to regenerate them.",
+                    file=sys.stderr,
+                )
+            snapshots = [
+                stage_metrics
+                for result in results
+                if result.generated
+                for metric in result.request_metrics
+                if isinstance((stage_metrics := metric.get("stage_metrics")), dict)
+            ]
+            stages = build_stage_metrics_from_snapshots(snapshots)
+            if not stages and any(result.generated for result in results):
+                print("No stage metrics were returned for samples generated in this run.", file=sys.stderr)
+            for stage in stages:
+                print_stage_metrics(
+                    TaskType.GENERATION,
+                    _STAGE_PERCENTILE_METRICS,
+                    _STAGE_PERCENTILES,
+                    stage,
+                )
         return 0
 
     if args.eval_workers < 1:
