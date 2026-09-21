@@ -1,0 +1,25 @@
+# SenseNova-Vision-7B-MoT single-stage deploy: the diffusion stage owns the
+# LLM, VAE, ViT, and tokenizer, so no Thinker-to-DiT KV transfer is required.
+#
+# Select via:
+#   vllm serve <SenseNova-Vision checkpoint> --omni \
+#       --deploy-config vllm_omni/deploy/sensenova_vision_single_stage.yaml
+
+pipeline: sensenova_vision_single_stage
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    # Explicit because SenseNova checkpoints do not reliably advertise a
+    # diffusion pipeline class in config.json.
+    model_class_name: SenseNovaVisionPipeline
+    max_num_batched_tokens: 32768
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.90
+    enforce_eager: true
+    enable_prefix_caching: false
+    enable_chunked_prefill: true
+    trust_remote_code: true
+    devices: "0"
+    default_sampling_params:
+      seed: 52
