@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from collections.abc import Iterable
+from contextlib import nullcontext
+
 import torch
 import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -10,6 +13,9 @@ from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange
 from torch import nn
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
@@ -67,6 +73,22 @@ class LuminaFeedForward(nn.Module):
             inner_dim = int(ffn_dim_multiplier * inner_dim)
         inner_dim = multiple_of * ((inner_dim + multiple_of - 1) // multiple_of)
 
+        self.dim = dim
+        self.inner_dim = inner_dim
+        self.padded_dim = inner_dim
+        tp_size = get_tensor_model_parallel_world_size()
+        self.linear_1: nn.Module
+        self.linear_2: nn.Module
+        self.linear_3: nn.Module
+
+        if tp_size > 1:
+            padded_dim = ((inner_dim + tp_size - 1) // tp_size) * tp_size
+            self.padded_dim = padded_dim
+            self.linear_1 = ColumnParallelLinear(dim, padded_dim, bias=False, gather_output=False, return_bias=False)
+            self.linear_3 = ColumnParallelLinear(dim, padded_dim, bias=False, gather_output=False, return_bias=False)
+            self.linear_2 = RowParallelLinear(padded_dim, dim, bias=False, input_is_parallel=True, return_bias=False)
+            return
+
         self.linear_1 = nn.Linear(
             dim,
             inner_dim,
@@ -82,6 +104,26 @@ class LuminaFeedForward(nn.Module):
             inner_dim,
             bias=False,
         )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Pad the FFN intermediate dimension before native TP weight loading."""
+        params = dict(self.named_parameters())
+        loaded = set()
+        for name, weight in weights:
+            param = params[name]
+            is_down = name == "linear_2.weight"
+            full_shape = (self.dim, self.inner_dim) if is_down else (self.inner_dim, self.dim)
+            if tuple(weight.shape) != full_shape:
+                raise ValueError(f"Expected full projection shape {full_shape}, got {tuple(weight.shape)}")
+            # Gate/up pad output rows; down pads the matching input columns.
+            # For TP7, the checkpoint's 10240 intermediate features become 10241.
+            padding = self.padded_dim - self.inner_dim
+            if padding:
+                weight = F.pad(weight, (0, padding) if is_down else (0, 0, 0, padding))
+            loader = getattr(param, "weight_loader", default_weight_loader)
+            loader(param, weight)
+            loaded.add(name)
+        return loaded
 
     def swiglu(self, x, y):
         return F.silu(x.float(), inplace=False).to(x.dtype) * y
@@ -285,9 +327,15 @@ class AttnProcessor:
     ) -> torch.Tensor:
         batch_size, sequence_length, _ = hidden_states.shape
 
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(encoder_hidden_states)
-        value = attn.to_v(encoder_hidden_states)
+        if getattr(attn, "qkv_proj", None) is not None:
+            qkv = attn.qkv_proj(hidden_states)
+            q_size = attn.qkv_proj.num_heads * attn.qkv_proj.head_size
+            kv_size = attn.qkv_proj.num_kv_heads * attn.qkv_proj.head_size
+            query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        else:
+            query = attn.to_q(hidden_states)
+            key = attn.to_k(encoder_hidden_states)
+            value = attn.to_v(encoder_hidden_states)
 
         head_dim = query.shape[-1] // attn.heads
         kv_heads = key.shape[-1] // head_dim
@@ -350,24 +398,56 @@ class TransformerBlock(nn.Module):
     ) -> None:
         """Initialize the transformer block."""
         super().__init__()
+        if num_attention_heads <= 0 or dim % num_attention_heads:
+            raise ValueError("Hidden size must be divisible by positive Q heads")
         self.head_dim = dim // num_attention_heads
+        self.num_attention_heads = num_attention_heads
+        self.num_kv_heads = num_kv_heads
         self.modulation = modulation
+        tp_size = get_tensor_model_parallel_world_size()
+        local_q, local_kv = num_attention_heads, num_kv_heads
+        if tp_size > 1:
+            if num_kv_heads <= 0 or num_attention_heads % num_kv_heads:
+                raise ValueError("Positive Q heads must be divisible by positive KV heads")
+            local_kv = (num_kv_heads + tp_size - 1) // tp_size
+            local_q = local_kv * (num_attention_heads // num_kv_heads)
 
         processor = AttnProcessor()
 
         # Initialize attention layer
-        self.attn = Attention(
-            query_dim=dim,
-            cross_attention_dim=None,
-            dim_head=dim // num_attention_heads,
-            qk_norm=None,
-            heads=num_attention_heads,
-            kv_heads=num_kv_heads,
-            eps=1e-5,
-            bias=False,
-            out_bias=False,
-            processor=processor,
-        )
+        # Diffusers builds dense projections internally. On TP ranks construct
+        # those placeholders on meta, then allocate only local projection shards.
+        with torch.device("meta") if tp_size > 1 else nullcontext():
+            self.attn = Attention(
+                query_dim=dim,
+                cross_attention_dim=None,
+                dim_head=dim // num_attention_heads,
+                qk_norm=None,
+                heads=num_attention_heads,
+                kv_heads=num_kv_heads,
+                eps=1e-5,
+                bias=False,
+                out_bias=False,
+                processor=processor,
+            )
+        if tp_size > 1:
+            padded_q_heads = local_q * tp_size
+            padded_kv_heads = local_kv * tp_size
+            self.attn.qkv_proj = QKVParallelLinear(
+                hidden_size=dim,
+                head_size=self.head_dim,
+                total_num_heads=padded_q_heads,
+                total_num_kv_heads=padded_kv_heads,
+                bias=False,
+                return_bias=False,
+            )
+            self.attn.to_q = None
+            self.attn.to_k = None
+            self.attn.to_v = None
+            self.attn.to_out[0] = RowParallelLinear(
+                padded_q_heads * self.head_dim, dim, bias=False, input_is_parallel=True, return_bias=False
+            )
+            self.attn.heads = local_q
         # 显式使用 transformers 的 Qwen2RMSNorm，避免依赖 diffusers 内部创建的 `RMSNorm` 再做递归替换。
         self.attn.norm_q = Qwen2RMSNorm(self.head_dim, eps=1e-5)
         self.attn.norm_k = Qwen2RMSNorm(self.head_dim, eps=1e-5)
@@ -376,17 +456,20 @@ class TransformerBlock(nn.Module):
         # there. It owns no parameters, so checkpoint keys are unchanged. The
         # diffusers Attention above is kept for its projections and QK norms.
         self.attn.omni_attn = OmniAttention(
-            num_heads=num_attention_heads,
+            num_heads=local_q,
             head_size=self.head_dim,
             causal=False,
             softmax_scale=self.attn.scale,
-            num_kv_heads=num_kv_heads,
+            num_kv_heads=local_kv,
             allow_fp32_fallback=True,
         )
 
         # Initialize feed-forward network
         self.feed_forward = LuminaFeedForward(
-            dim=dim, inner_dim=4 * dim, multiple_of=multiple_of, ffn_dim_multiplier=ffn_dim_multiplier
+            dim=dim,
+            inner_dim=4 * dim,
+            multiple_of=multiple_of,
+            ffn_dim_multiplier=ffn_dim_multiplier,
         )
 
         # Initialize normalization layers
@@ -398,6 +481,49 @@ class TransformerBlock(nn.Module):
         self.ffn_norm1 = Qwen2RMSNorm(dim, eps=norm_eps)
         self.norm2 = Qwen2RMSNorm(dim, eps=norm_eps)
         self.ffn_norm2 = Qwen2RMSNorm(dim, eps=norm_eps)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load original separate Q/K/V checkpoint keys into the fused TP layer."""
+        params = dict(self.named_parameters())
+        loaded = set()
+        qkv_shards = {
+            "attn.to_q.weight": "q",
+            "attn.to_k.weight": "k",
+            "attn.to_v.weight": "v",
+        }
+        for name, weight in weights:
+            if name.startswith("feed_forward."):
+                ffn_name = name.removeprefix("feed_forward.")
+                ffn_loaded = self.feed_forward.load_weights([(ffn_name, weight)])
+                loaded.update(f"feed_forward.{param_name}" for param_name in ffn_loaded)
+            elif "attn.qkv_proj.weight" in params and name in qkv_shards:
+                shard_id = qkv_shards[name]
+                qkv_proj = self.attn.qkv_proj
+                heads = self.num_attention_heads if shard_id == "q" else self.num_kv_heads
+                padded_heads = qkv_proj.total_num_heads if shard_id == "q" else qkv_proj.total_num_kv_heads
+                full_shape = (heads * self.head_dim, qkv_proj.hidden_size)
+                if tuple(weight.shape) != full_shape:
+                    raise ValueError(f"Expected full projection shape {full_shape}, got {tuple(weight.shape)}")
+                # TP2/4/8: pad 7 KV heads to 8 and 21 Q heads to 24 with zeros.
+                # TP7 already divides the original heads, so no head padding is needed.
+                weight = F.pad(weight, (0, 0, 0, (padded_heads - heads) * self.head_dim))
+                param = params["attn.qkv_proj.weight"]
+                param.weight_loader(param, weight, shard_id)
+                loaded.add("attn.qkv_proj.weight")
+            else:
+                param = params[name]
+                if name == "attn.to_out.0.weight" and "attn.qkv_proj.weight" in params:
+                    qkv_proj = self.attn.qkv_proj
+                    full_shape = (qkv_proj.hidden_size, self.num_attention_heads * self.head_dim)
+                    if tuple(weight.shape) != full_shape:
+                        raise ValueError(f"Expected full projection shape {full_shape}, got {tuple(weight.shape)}")
+                    # Dummy Q heads need matching zero columns in the output projection.
+                    padding = (qkv_proj.total_num_heads - self.num_attention_heads) * self.head_dim
+                    weight = F.pad(weight, (0, padding))
+                loader = getattr(param, "weight_loader", default_weight_loader)
+                loader(param, weight)
+                loaded.add(name)
+        return loaded
 
     def forward(
         self,

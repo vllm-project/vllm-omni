@@ -113,6 +113,19 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         self.device = get_local_device()
         self.config = _build_mammoth_config(od_config)
         self.weights_sources = [_root_weight_source(od_config)]
+        parallel = od_config.parallel_config
+        # remove the following check when support DiT TP with PP/SP/CFG > 1
+        if parallel.tensor_parallel_size > 1:
+            if (
+                parallel.pipeline_parallel_size != 1
+                or parallel.sequence_parallel_size != 1
+                or parallel.cfg_parallel_size != 1
+            ):
+                raise ValueError("MammothModa2 DiT TP requires PP=SP=CFG parallel size 1")
+            if od_config.quantization_config is not None:
+                raise ValueError("MammothModa2 DiT TP does not yet support quantized projections")
+            if not od_config.enforce_eager:
+                raise ValueError("MammothModa2 DiT TP currently requires enforce_eager=True")
 
         # --- Build DiT / VAE modules (names must match checkpoint keys) ---
         if self.config.gen_vae_config is None or self.config.gen_dit_config is None:
