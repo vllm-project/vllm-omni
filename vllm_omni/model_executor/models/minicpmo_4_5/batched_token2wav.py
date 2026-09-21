@@ -309,7 +309,11 @@ class BatchedToken2Wav(nn.Module):
                 logger.info("HiFT CUDA Graph captured successfully")
         self._cfm_graph_wrapper: CFMGraphWrapper | None = None
         cfm_graph_cfg = dict(cfm_graph_config or {})
-        if bool(cfm_graph_cfg.get("enabled", False)):
+        # Graph capture can be provided by the platform instead of the CUDA
+        # wrapper above (on NPU it is the platform graph runner), so keep the
+        # request flag separate: bucketing and padding key off this.
+        self._cfm_graph_enabled = bool(cfm_graph_cfg.get("enabled", False))
+        if self._cfm_graph_enabled:
             flow_parameter = next(self.flow.parameters(), None)
             if flow_parameter is not None and flow_parameter.device.type == "cuda":
                 estimator = self.flow.decoder.estimator
@@ -327,7 +331,9 @@ class BatchedToken2Wav(nn.Module):
         # chunk up to a multiple of this many frames so the graph cache key
         # space stays small (0 disables bucketing, e.g. when graphs are off).
         self._cfm_graph_bucket_frames = (
-            int(cfm_graph_cfg.get("bucket_frames", 0)) if self._cfm_graph_wrapper is not None else 0
+            int(cfm_graph_cfg.get("bucket_frames", 0))
+            if (self._cfm_graph_wrapper is not None or self._cfm_graph_enabled)
+            else 0
         )
         if self._cfm_graph_bucket_frames > 1:
             logger.info(
@@ -668,10 +674,14 @@ class BatchedToken2Wav(nn.Module):
             bucket_frames=self._cfm_graph_bucket_frames,
             disabled=(
                 valid_lengths is not None
-                or self._cfm_graph_wrapper is None
-                # `_disable` keeps the wrapper object alive, so check the flag
-                # too: padding under a disabled wrapper is pure overhead.
-                or not self._cfm_graph_wrapper.enabled
+                # Padding only pays off while replay is active. On CUDA that is
+                # the wrapper (`_disable` keeps the object alive, so check its
+                # flag); on NPU there is no wrapper and the platform runner is
+                # keyed by `_cfm_graph_enabled`.
+                or not (
+                    (self._cfm_graph_wrapper is not None and self._cfm_graph_wrapper.enabled)
+                    or (self._cfm_graph_wrapper is None and self._cfm_graph_enabled)
+                )
             ),
         )
         if pad_frames:

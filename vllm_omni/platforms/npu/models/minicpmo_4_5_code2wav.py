@@ -75,6 +75,7 @@ def _graphable_estimator_step(
     cond,
     cnn_cache,
     att_cache,
+    attn_mask=None,
     valid_frames=None,
 ):
     """Run the CFM estimator body after host-backed timestep embedding."""
@@ -91,7 +92,7 @@ def _graphable_estimator_step(
     result = estimator.blocks_forward_chunk(
         estimator_input,
         time_embedding,
-        None,
+        attn_mask,
         old_cnn,
         old_att,
         cnn_out,
@@ -121,7 +122,9 @@ def _patched_estimator_step(
         graph_runner is None
         or self._trt_stepper is not None
         or self._cfm_graph_wrapper is not None
-        or attn_mask is not None
+        # The ragged (per-request length) path stays eager, but the padding
+        # mask produced by bucketing has a shape fixed by the bucket, so it
+        # replays as a graph input like any other tensor.
         or valid_lengths is not None
     ):
         return _original_estimator_step(
@@ -149,12 +152,25 @@ def _patched_estimator_step(
     # The upstream embedder creates a frequency tensor on the host. Keep it
     # outside capture while retaining the tensor-only estimator body in graph.
     time_embedding = estimator.t_embedder(time).unsqueeze(1)
+    # A bucketing mask travels as a graph input: the capture key only covers
+    # shapes, so replaying an existing graph must copy the current mask in.
+    # Like `valid_frames`, it is forwarded only when present, so graphable
+    # bodies written before this feature keep working with the old signature.
+    has_mask = attn_mask is not None
+    mask_inputs = (attn_mask,) if has_mask else ()
+
+    def _step_kwargs(rest):
+        kwargs = dict(graphable_kwargs)
+        if has_mask:
+            kwargs["attn_mask"] = rest[0]
+        return kwargs
+
     if cnn_cache is None:
         return graph_runner.run(
             "cfm_estimator",
-            (x, mu, time_embedding, speakers, cond),
-            (False,),
-            lambda step_x, step_mu, step_time, step_speakers, step_cond: _graphable_estimator_step(
+            (x, mu, time_embedding, speakers, cond, *mask_inputs),
+            ((False, has_mask) if has_mask else (False,)),
+            lambda step_x, step_mu, step_time, step_speakers, step_cond, *rest: _graphable_estimator_step(
                 self,
                 estimator,
                 x=step_x,
@@ -164,15 +180,15 @@ def _patched_estimator_step(
                 cond=step_cond,
                 cnn_cache=None,
                 att_cache=None,
-                **graphable_kwargs,
+                **_step_kwargs(rest),
             ),
         )
 
     return graph_runner.run(
         "cfm_estimator",
-        (x, mu, time_embedding, speakers, cond, cnn_cache, att_cache),
-        (True,),
-        lambda step_x, step_mu, step_time, step_speakers, step_cond, step_cnn, step_att: _graphable_estimator_step(
+        (x, mu, time_embedding, speakers, cond, cnn_cache, att_cache, *mask_inputs),
+        ((True, has_mask) if has_mask else (True,)),
+        lambda step_x, step_mu, step_time, step_speakers, step_cond, step_cnn, step_att, *rest: _graphable_estimator_step(
             self,
             estimator,
             x=step_x,
@@ -182,7 +198,7 @@ def _patched_estimator_step(
             cond=step_cond,
             cnn_cache=step_cnn,
             att_cache=step_att,
-            **graphable_kwargs,
+            **_step_kwargs(rest),
         ),
     )
 
