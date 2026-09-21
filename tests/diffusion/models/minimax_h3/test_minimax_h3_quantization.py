@@ -42,7 +42,7 @@ class _FakeAttention(nn.Module):
         super().__init__()
 
 
-def _small_od_config():
+def _small_od_config(*, class_name=None):
     arch = {
         "num_layers": 1,
         "token_refiner_num_layers": 1,
@@ -61,6 +61,8 @@ def _small_od_config():
         "final_adaln_out_features": 2 * 8,
         "rope_inv_freq_len": 2,
     }
+    if class_name is not None:
+        arch["_class_name"] = class_name
     return SimpleNamespace(
         tf_model_config=arch,
         parallel_config=SimpleNamespace(ulysses_degree=1),
@@ -135,6 +137,24 @@ def test_fp8_scope_and_prefix_propagation(monkeypatch):
         )
         for prefix in ignored_layers
     )
+
+
+def test_explicit_native_weight_format_overrides_diffusers_class_name(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
+
+    monkeypatch.setattr(h3, "ColumnParallelLinear", _FakeLinear)
+    monkeypatch.setattr(h3, "MergedColumnParallelLinear", _FakeLinear)
+    monkeypatch.setattr(h3, "QKVParallelLinear", _FakeLinear)
+    monkeypatch.setattr(h3, "RowParallelLinear", _FakeLinear)
+    monkeypatch.setattr(h3, "Attention", _FakeAttention)
+    monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
+
+    model = h3.MiniMaxH3DiTModel(
+        _small_od_config(class_name="MiniMaxH3Transformer3DModel"),
+        diffusers_weights=False,
+    )
+
+    assert model._diffusers_weights is False
 
 
 class _WeightTarget(nn.Module):

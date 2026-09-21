@@ -68,12 +68,12 @@ class BaseExtractorTest(ABC):
         pass
 
     @abstractmethod
-    def get_module(self):
+    def get_module(self, module, /):
         """Return model module instance."""
         pass
 
     @abstractmethod
-    def get_sample_inputs(self):
+    def get_sample_inputs(self, sample_inputs, /):
         """Return sample inputs for model."""
         pass
 
@@ -740,10 +740,10 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
         monkeypatch,
     ):
         """Strict SP must not mix local TeaCache state with gathered block rows."""
-        from vllm_omni.diffusion.attention.ops import minimax_h3_modulation
         from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
         from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
         from vllm_omni.diffusion.distributed import parallel_state
+        from vllm_omni.diffusion.layers import indexed_modulation
 
         seq_len = sample_inputs["x"].shape[1]
         local_len = seq_len // 2
@@ -847,13 +847,13 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
         )
         monkeypatch.setattr(parallel_state, "get_sp_group", lambda: sp_group)
 
-        original_indexed_scale_shift = minimax_h3_modulation.indexed_scale_shift_
+        original_indexed_scale_shift = indexed_modulation.indexed_scale_shift_
 
         def capture_indexed_scale_shift(hidden, shift, scale, indices):
             captured_modulation_indices.append(indices.clone())
             return original_indexed_scale_shift(hidden, shift, scale, indices)
 
-        monkeypatch.setattr(minimax_h3_modulation, "indexed_scale_shift_", capture_indexed_scale_shift)
+        monkeypatch.setattr(indexed_modulation, "indexed_scale_shift_", capture_indexed_scale_shift)
 
         local_img_pos = torch.tensor([0, 1])
         local_audio_pos = torch.tensor([2, 3])

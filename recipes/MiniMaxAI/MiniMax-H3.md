@@ -23,6 +23,12 @@ One vLLM-Omni diffusion stage can load both DiTs while instantiating the
 tokenizer, processor, Qwen3-VL text encoder, video VAE, and audio VAE only
 once. Requests select the DiT with `extra_params.task`.
 
+This single-stage recipe uses the default `model_loaded.text_encoder: true` and
+`model_loaded.vae_encoder: true`. Precomputed text conditioning can replace the
+local Qwen call. Setting `model_loaded.text_encoder: false` while leaving
+`model_loaded.vae_encoder: true` requires precomputed text conditioning;
+reference media is still encoded locally.
+
 The generated MP4 contains H.264 video and synchronized stereo audio.
 
 ## Prerequisites
@@ -35,7 +41,7 @@ hf auth login
 export MODEL=MiniMaxAI/MiniMax-H3
 ```
 
-The vLLM-Omni pipeline downloads `FL2VA/**`, `Ref2VA/model_index.json`, and
+By default, the pipeline downloads `FL2VA/**`, `Ref2VA/model_index.json`, and
 `Ref2VA/transformer/**`. It does not download or load the diffusers-format
 `transformer`, `transformer_ref`, or `vae` weights at the repository root, nor
 duplicate Ref2VA copies of shared components.
@@ -972,7 +978,7 @@ or a person detector merely because `control_type=pose` was selected.
 | FL2VA | first image, last image, or ordered first+last images | at most 2 images; `frame_indices` is `[0]`, `[-1]`, or `[0,-1]` |
 | Ref2VA | image-only, image+image, image+video, video+audio, and mixed image/video/audio | images ≤9, videos ≤3, audios ≤3, total references ≤12; audio requires a visual reference |
 
-The H3 output contract is 4–15 seconds at 24 FPS, stereo 32 kHz audio, and a
+The default H3 output contract is 4–15 seconds at 24 FPS, stereo 32 kHz audio, and a
 32-pixel canvas multiple. T2VA requires one named output ratio from `21:9`,
 `16:9`, `4:3`, `1:1`, `3:4`, or `9:16`. FL2VA always follows the first input
 image's ratio and ignores a generic `aspect_ratio` override. Ref2VA defaults to
@@ -982,6 +988,152 @@ default. `short_edge` controls the 768-pixel canvas and must be `768`.
 `seed + output_index`. The asynchronous endpoint returns all
 outputs; the synchronous raw-MP4 endpoint returns the first output when more
 than one is requested.
+
+## Long video and driving audio
+
+Set `extra_params.long_video=true` to opt into durations above 15 seconds.
+Ref2VA long-video requests now default to latent continuation with global
+temporal RoPE positions (A+B), described below. Set `long_video_mode=full`
+explicitly to sample the entire target latent at once for comparison. Both modes
+retain the native `17n+5` video-frame grid, `5n+2` video-latent grid, and 40 Hz
+audio latents. A request for 75 seconds becomes 1,807 frames (75.292 seconds at
+24 FPS). In full mode, attention cost and activation memory grow with the full
+sequence length. Reference-video and reference-audio limits remain unchanged.
+Other task types retain full-mode behavior. Requests are limited to 30 seconds
+in full mode and 300 seconds in continuation mode; without `long_video=true`,
+the limit remains 15 seconds. The limits cover duration aliases and explicit
+`num_frames`, and externally encoded requests are checked again before diffusion.
+Native frame-grid alignment can round the output slightly above the requested
+limit. These are request sanity bounds, not a guarantee that a given resolution
+fits GPU memory. Full mode still allocates the whole sequence, and continuation
+retains cumulative latents and reference inputs.
+
+Use `audio_mode=lock_source` with one `audio_reference` to drive generation
+with a soundtrack, rather than treating it as a short reference. The encoder
+places that waveform in the target audio latent, crops or zero-pads its two
+channels independently to the output duration, and keeps those rows clean
+(timestep 1) throughout sampling. This mode does not insert an `<Audio 1>`
+reference tag. It supports request and step execution; the default `native`
+mode continues generating audio normally. Returned audio is the audio VAE's
+reconstruction, not a byte-for-byte copy of the input recording.
+
+Against a Ref2VA server, using the same asset-server setup as above:
+
+```bash
+curl --fail-with-body -sS -X POST "${API_URL}" \
+  -F 'prompt=<prompt.txt' \
+  -F 'width=960' -F 'height=544' -F 'fps=24' \
+  -F 'num_inference_steps=50' -F 'flow_shift=12' -F 'seed=19960422' \
+  -F 'extra_params={"task":"ref2va","duration":75,"long_video":true,"audio_mode":"lock_source","audio_flow_shift":3,"preencode_mp4":true,"preencode_batch_frames":17}' \
+  -F "input_reference=@${REF_IMAGE};type=image/png" \
+  -F "audio_reference={\"audio_url\":\"${AUDIO_URL}\"}" \
+  -o long-video.mp4
+```
+
+`preencode_mp4` decodes and muxes temporal chunks on the worker, avoiding a
+full decoded long video in the API process. It does not reduce the denoiser's
+sequence length. For Turbo adapters, use the matching adapter's step count
+and flow shift from the Turbo table below.
+
+The [RunningHub workflow](https://www.runninghub.cn/post/2100530217365364737/)
+uses T8's `MiniMaxH3AudioConditioningT8`, a full-length latent, and
+`MiniMaxH3DualClockSamplerT8`; its `remix_source` strength is zero, equivalent
+to source locking. This differs from rolling-overlap continuation nodes.
+See [T8 conditioning](https://github.com/T8mars/comfyui-minimax-h3-audio-T8)
+and [ComfyUI H3 masking](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/ldm/minimax/model.py).
+The workflow's custom Dasiwa weights, Sol attention, and T8-specific LoRA are
+not supplied by this feature.
+
+### Latent-tail continuation with global temporal positions (A+B)
+
+`long_video=true` selects this mode by default for Ref2VA. It can also be selected
+explicitly with `long_video_mode=continuation`. This experimental mode supports
+Ref2VA request execution with uncached denoising (`quality=lossless`); step
+execution is rejected. Use `long_video_mode=full` explicitly for whole-target
+sampling, including requests up to 30 seconds that require step execution.
+Continuation currently rejects latent-mask editing (`video_noise_mask` or
+`audio_noise_mask` with retained source regions). Full mode supports editing;
+`audio_mode=lock_source` cannot be combined with audio latent-mask editing.
+
+```json
+{
+  "task": "ref2va",
+  "duration": 75,
+  "long_video": true,
+  "long_video_mode": "continuation",
+  "continuation_window_frames": 277,
+  "continuation_overlap_frames": 22,
+  "audio_mode": "lock_source",
+  "audio_flow_shift": 3,
+  "preencode_mp4": true,
+  "preencode_batch_frames": 17
+}
+```
+
+These defaults sample seven windows for a 1,807-frame output. Each continuation
+uses the preceding AV latent tail as fixed condition rows at the new target's
+time origin, samples a fresh unmasked target, discards its hidden overlap, and
+appends only the new suffix. The reference image and full prompt remain present
+in every window. Both window and overlap use the `17n+5` frame grid; the window
+must be 107..345 frames and larger than the overlap. A final window may be shorter.
+Audio boundaries are rounded on the cumulative 24 FPS / 40 Hz timeline to avoid
+drift; a locked driving track is sliced separately for each stereo channel.
+
+Before RoPE evaluation, every window adds `start_frame * 40 / 24` to the temporal
+position IDs of its target audio/video, reference audio/video, and latent-tail
+guides. The start includes the overlap (not just the newly appended frames).
+Text, static image references, spatial coordinates, and padding remain unchanged.
+Offsets retain fractional precision independently of rounded audio slice indices.
+For the default windows starting at frames 0, 255, 510, the added positions are
+0, 425, 850. This follows the media-only global-offset convention in
+[LongMedia temporal positioning](https://github.com/vizart-vj/ComfyUI-MiniMax-H3-LongMedia/blob/main/temporal_positioning.py).
+The shifted layout is constructed once per window and then used by all denoising
+steps and sequence-parallel ranks; no RoPE-frequency scaling is applied.
+
+For a narrative with different scenes, pass `continuation_prompts` as a JSON
+list containing exactly one non-empty prompt string per planned window (seven
+strings for the default 75-second request). These prompts are independently
+encoded with the same reference assets and selected in window order. Shot times
+inside each prompt describe that local window, including its hidden overlap.
+This option requires a local text encoder; external-encoder stage execution is
+not supported. Media positions use one shared origin after the longest encoded
+text prefix, so different prompt lengths do not shift the global AV clock.
+Without this list, the request's single prompt is reused as before.
+
+The cumulative latent is decoded once after all windows. Denoising memory is
+bounded by the window, while cumulative latent storage still grows with duration.
+This follows the [ComfyUI latent-tail continuation algorithm](https://github.com/ttulttul/ComfyUI-Minimax-H3-Continuation).
+Global positions can still exceed the model's trained temporal range. This
+mode does not guarantee seamless cuts or adherence to absolute shot timestamps in
+a repeated prompt. For comparison, keep the model, seed, prompt, source media,
+steps, shifts, and output size fixed, changing only `long_video_mode`.
+
+For a reproducible approximately 20-second comparison, use a request-mode
+Ref2VA server with caching disabled and the same `prompt.txt` and `REF_IMAGE`
+for both requests. Use a single prompt without `continuation_prompts` so that
+both modes receive identical text. The commands below generate native audio:
+
+```bash
+for mode in full continuation; do
+  curl --fail-with-body -sS --max-time 14400 "${API_URL}" \
+    -F 'prompt=<prompt.txt' \
+    -F "input_reference=@${REF_IMAGE};type=image/png" \
+    -F 'width=960' -F 'height=544' -F 'fps=24' \
+    -F 'num_inference_steps=50' -F 'flow_shift=12' -F 'seed=19960422' \
+    -F 'quality=lossless' \
+    -F "extra_params={\"task\":\"ref2va\",\"duration\":20,\"long_video\":true,\"long_video_mode\":\"${mode}\",\"audio_flow_shift\":3,\"preencode_mp4\":true}" \
+    -o "h3-20s-${mode}.mp4" || break
+done
+```
+
+Both outputs should contain 481 frames (20.042 seconds at 24 FPS).
+Continuation uses windows `[0,277)` and `[255,481)`; inspect frames 276/277
+(about 11.54 seconds) for visual and audio discontinuities. Compare the complete
+clips for motion, identity, prompt adherence, and sound, not just frame similarity:
+the trajectories differ by design. Report the tested commit, checkpoint, hardware,
+settings, and both videos with any comparison; the command alone is not quality
+evidence. A matching seed does not imply matching noise over differently sized
+full and windowed latents.
 
 ## Request-scoped quality
 
@@ -1253,6 +1405,68 @@ generations move the end-to-end figure toward the denoising one. Fusing the
 adapter does not measurably change startup: weight loading took 77.3 s with it
 against 85.8 s without.
 
+### FastH3 8-Step V2 full checkpoint
+
+[FastH3 8-Step V2](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2)
+ships a full Diffusers-format transformer, including learned VSA compression
+gates. Serve the Hugging Face model ID or a downloaded snapshot directly:
+
+```bash
+export FASTH3_V2_MODEL=FastVideo/FastVideo-FastH3-8-Step-V2
+```
+
+Use a Hugging Face account with access to the release, and pin `--revision`
+when reproducing a result. The existing component loader reads its safetensors
+shards; the H3 weight loader maps names and loads Q/K/V and MLP projections into
+native parameters in memory. No conversion command or second transformer
+checkpoint is needed.
+
+The transformer and text components come from the V2 release. To retain Omni's
+native tiled and parallel VAE execution, the loader fetches only the video/audio
+VAEs from the `MiniMaxAI/MiniMax-H3` revision pinned in V2's `provenance.json`.
+Those components use the normal Hugging Face cache. No separate base-model
+argument or full base-transformer download is required. Download time is a
+preparation cost, separate from warmup and request latency.
+
+Install the optional `fastvideo-kernel` build required by the
+`FASTVIDEO_VSA` backend, including its H3 block-map entry point. A four-GPU
+configuration is:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve "${FASTH3_V2_MODEL}" --omni \
+  --host 127.0.0.1 --port 8095 --trust-remote-code --task-type fl2va \
+  --served-model-name FastH3-V2 \
+  --num-gpus 4 --usp 4 --ring 1 \
+  --vae-patch-parallel-size 4 --vae-parallel-mode tile --vae-use-tiling \
+  --diffusion-attention-backend FASTVIDEO_VSA
+
+curl --fail-with-body -sS http://127.0.0.1:8095/v1/videos/sync \
+  -F 'model=FastH3-V2' \
+  -F 'prompt=A red fox runs through fresh snow at dawn, with fast pawsteps, winter wind and distant birds.' \
+  -F 'width=1344' -F 'height=768' -F 'aspect_ratio=16:9' -F 'fps=24' \
+  -F 'num_inference_steps=8' -F 'guidance_scale=1' -F 'flow_shift=10' \
+  -F 'seed=1101' \
+  -F 'extra_params={"task":"t2va","duration":4.4,"audio_flow_shift":3.0}' \
+  -o fasth3_v2.mp4
+```
+
+V2 pins video/audio shifts **10/3**, guidance **1**, and the unshifted ladder
+`[0.999, 0.874, 0.749, 0.624, 0.5, 0.375, 0.25, 0.125, 0.0]`.
+Use **`num_inference_steps=8`** in Omni: these nine nodes bound eight model
+evaluations. FastVideo's `--steps 9` counts nodes instead. The existing H3 ODE
+update is reused without stochastic re-noising.
+
+The trained attention policy is **80% sparsity with 64-token video tiles**.
+Omni derives the number of selected video tiles from each request's geometry;
+do not supply a fixed `--fastvideo-vsa-topk`. Text/condition/audio prefix keys
+remain available to every query, and prefix queries remain dense. Missing VSA
+geometry or a failed H3 kernel raises an error instead of serving the student
+with dense attention.
+
+This release supports T2VA only, with local or pure Ulysses attention. Additional
+LoRA adapters, Ref2VA and FL2VA conditioning are unsupported. The legacy
+four-step adapter keeps its original sampling and fixed-top-k behavior.
+
 ## Key parameters
 
 | Parameter | Recommended value | Notes |
@@ -1383,11 +1597,9 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
   mode does not support `cache_backend`.
 - The first regional-compile request is a warmup and should not be included in
   steady-state performance measurements.
-- The serving path accepts fewer references than the model supports. H3 documents up
-  to 9 images, 3 video clips, and 3 audio clips (12 files) per Omni Reference
-  request; the current vLLM-Omni path takes exactly one image plus one audio
-  reference, or one or more videos with no separate `audio_reference` (it uses the
-  source soundtracks).
+- Ref2VA accepts up to 9 images, 3 video clips, and 3 audio clips, with at most
+  12 references in total. At least one image or video is required; audio-only
+  requests are rejected.
 - The 768 px short-edge mode is available for T2VA and FL2VA; 1344x768 is the
   documented 16:9 request shape.
 - `--cfg-parallel-size > 1` is rejected by design (CFG-distilled, no negative branch).
@@ -1400,9 +1612,6 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
   in host memory on every rank during startup before retaining only each rank's
   shard. Size startup host memory for that transient peak.
 - TeaCache and Cache-DiT cannot be enabled on the same server.
-- Image+audio Ref2VA accepts exactly one image and one audio reference.
-- Video Ref2VA accepts one or more video files, but not an additional standalone
-  audio reference.
 - Pure Ulysses still replicates the full DiT on every rank, so smaller-memory GPUs
   cannot use `--usp N --tp 1` as a resident capacity path. Use DiT tensor parallelism
   or model-level CPU offload; text-encoder TP alone is not sufficient.

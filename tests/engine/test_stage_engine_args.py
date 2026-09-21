@@ -29,6 +29,7 @@ from vllm_omni.config.omni_config import (
     OmniStageSchedulerConfig,
     VllmOmniARStageConfig,
     VllmOmniConfig,
+    extract_diffusion_stage_config_kwargs,
 )
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
 from vllm_omni.config.stage_config import (
@@ -95,6 +96,7 @@ _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
         "num_weight_load_threads",
         "omni_kv_config",
         "parallel_config",
+        "pooling_output_decoder",
         "silence_ban_frames",
         "subtalker_sampling_params",
         "task_type",
@@ -366,6 +368,21 @@ def test_typed_llm_projection_does_not_emit_inherited_upstream_defaults():
     assert inherited_defaults.isdisjoint(engine_args)
 
 
+def test_typed_llm_projection_omits_diffusion_only_and_process_only_defaults():
+    stage_config = VllmOmniARStageConfig(
+        stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="test"),
+    )
+
+    engine_args = stage_init_utils._project_omni_stage_engine_args(stage_config)
+
+    assert {
+        "enable_multithread_weight_load",
+        "num_weight_load_threads",
+        "disable_autocast",
+        "log_level",
+    }.isdisjoint(engine_args)
+
+
 def test_mammoth_fp8_kv_deploy_projects_only_ar_stage(monkeypatch):
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda _engine_args: None)
 
@@ -551,7 +568,9 @@ def test_engine_args_consume_stage_diffusion_attention_shorthand(tmp_path):
         assert engine_args.get("diffusion_attention_backend") is None
         assert isinstance(engine_args["diffusion_attention_config"], AttentionConfig)
         assert engine_args["diffusion_attention_config"].default.backend == "TORCH_SDPA"
-        od_config = OmniDiffusionConfig.from_kwargs(**engine_args)
+        od_config = OmniDiffusionConfig.from_kwargs(
+            **extract_diffusion_stage_config_kwargs(engine_args, stage_id=2, include_engine_adapter_metadata=True)
+        )
         assert od_config.diffusion_attention_config.default.backend == "TORCH_SDPA"
 
 
@@ -584,7 +603,9 @@ def test_engine_args_apply_cli_attention_shorthand_over_yaml_config(tmp_path, ya
         attention_config = engine_args["diffusion_attention_config"]
         assert attention_config.default.backend == "TORCH_SDPA"
         assert attention_config.per_role["cross"].backend == "SAGE_ATTN"
-        od_config = OmniDiffusionConfig.from_kwargs(**engine_args)
+        od_config = OmniDiffusionConfig.from_kwargs(
+            **extract_diffusion_stage_config_kwargs(engine_args, stage_id=2, include_engine_adapter_metadata=True)
+        )
         assert od_config.diffusion_attention_config.default.backend == "TORCH_SDPA"
 
 

@@ -81,6 +81,7 @@ class ARDiffusionKVCacheSpec:
     sink_frames: int = 0
     reset_at_boundary: bool = False
     cross_attention: tuple[ARDiffusionCrossAttentionKVSpec, ...] = ()
+    # Initial vLLM storage horizon; extended to fit an in-flight span.
     max_model_len: int = 1 << 20
     max_scratch_tokens_per_branch: int = 0
     model_owned_state_bytes_per_session: int = 0

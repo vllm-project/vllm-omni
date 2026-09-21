@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Sampling-state guards shared by the GPU and NPU AR model runners."""
+"""Sampling helpers shared by the GPU and NPU AR model runners."""
+
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
@@ -8,7 +10,46 @@ from vllm.v1.sample.logits_processor import LogitsProcessors, MinTokensLogitsPro
 
 logger = init_logger(__name__)
 
-__all__ = ["clamp_prompt_ids_to_penalty_padding", "sanitize_min_tokens_stop_ids"]
+__all__ = [
+    "build_model_sampler_extra_args",
+    "call_model_sampler",
+    "clamp_prompt_ids_to_penalty_padding",
+    "sanitize_min_tokens_stop_ids",
+]
+
+
+def build_model_sampler_extra_args(input_batch: Any, requests: Any) -> list[dict | None]:
+    """Return per-request ``SamplingParams.extra_args`` in batch-row order."""
+    request_states = requests or {}
+    per_req_extra_args: list[dict | None] = []
+    for req_id in getattr(input_batch, "req_ids", []):
+        state = request_states.get(req_id)
+        params = getattr(state, "sampling_params", None)
+        per_req_extra_args.append(getattr(params, "extra_args", None))
+    return per_req_extra_args
+
+
+def call_model_sampler(
+    model: Any,
+    model_sample: Any,
+    logits: torch.Tensor,
+    sampling_metadata: Any,
+    *,
+    input_batch: Any,
+    requests: Any,
+) -> Any:
+    """Call an opted-in model sampler with per-request extra arguments.
+
+    The opt-in keeps the existing two-argument sampler contract unchanged for
+    every other model while allowing custom samplers to make row-local choices.
+    """
+    if not getattr(model, "model_sampler_wants_extra_args", False):
+        return model_sample(logits, sampling_metadata)
+    return model_sample(
+        logits,
+        sampling_metadata,
+        per_req_extra_args=build_model_sampler_extra_args(input_batch, requests),
+    )
 
 
 def clamp_prompt_ids_to_penalty_padding(prompt_token_ids: torch.Tensor, logits_vocab: int) -> torch.Tensor:

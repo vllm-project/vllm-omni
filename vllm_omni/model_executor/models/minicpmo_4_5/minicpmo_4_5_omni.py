@@ -157,15 +157,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         del sampling_metadata
         self._minicpmo45_active_duplex_rows = [row.row_idx for row in rows]
         self._minicpmo45_duplex_row_sessions = {
-            row.row_idx: (row.session_id, row.incarnation) for row in rows if row.session_id is not None
+            row.row_idx: row.session_id for row in rows if row.session_id is not None
         }
         request_sessions = getattr(self, "_minicpmo45_duplex_request_sessions", None)
         if not isinstance(request_sessions, dict):
             request_sessions = {}
             self._minicpmo45_duplex_request_sessions = request_sessions
-        request_sessions.update(
-            {row.request_id: (row.session_id, row.incarnation) for row in rows if row.session_id is not None}
-        )
+        request_sessions.update({row.request_id: row.session_id for row in rows if row.session_id is not None})
         self._minicpmo45_duplex_row_payloads = {row.row_idx: row.payload for row in rows if row.payload is not None}
         self._minicpmo45_duplex_row_max_tokens = {
             row.row_idx: row.max_tokens for row in rows if row.max_tokens is not None
@@ -199,7 +197,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             force_listen = payload.get("force_listen") is True
             is_speech = payload.get("is_speech")
             segment_key = (row.request_id, row.seq if row.seq is not None else -1)
-            session_key = (row.session_id, row.incarnation) if row.session_id is not None else None
+            session_key = row.session_id
             if turn_eos_id >= 0 and session_key is not None:
                 state = helper_sessions.get(session_key) if isinstance(helper_sessions, dict) else None
                 pending_speech_context = (
@@ -326,16 +324,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         helper = self._duplex_data_plane_helper()
         session_id = str(duplex.get("session_id") or "")
-        try:
-            incarnation = int(duplex.get("incarnation", 0))
-        except (TypeError, ValueError):
-            incarnation = 0
         payload = duplex.get("payload")
         if not session_id or not isinstance(payload, dict):
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
             return input_ids, embeds, {"duplex": {"prefill_success": False, "reason": "bad_duplex_payload"}}
 
-        session_key = (session_id, incarnation)
+        session_key = session_id
         state = helper.sessions.get(session_key)
         if state is None:
             from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (

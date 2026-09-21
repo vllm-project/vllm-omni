@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -607,6 +607,13 @@ def test_control_rows_and_padded_sequence_survive_denoise_preparation():
         control_rows=control_rows,
         control_context_scale=0.75,
         pad_seq_len=192,
+        locked_audio_rows=None,
+        video_edit_clean_rows=None,
+        video_edit_mask_rows=None,
+        video_edit_restore_mask_rows=None,
+        audio_edit_clean_rows=None,
+        audio_edit_mask_rows=None,
+        audio_edit_restore_mask_rows=None,
     )
     inputs = pipeline._build_denoise_inputs(**pipeline._denoise_kwargs(context))
     branch = inputs["branch"]
@@ -615,3 +622,81 @@ def test_control_rows_and_padded_sequence_survive_denoise_preparation():
     assert branch.static_kwargs["control_rows"] is control_rows
     assert branch.static_kwargs["control_context_scale"] == 0.75
     assert inputs["video_rows"].shape == (12, 96)
+
+
+def test_control_rejects_external_vae_encoder_before_weight_loading(control_startup):
+    pipeline_module, config = control_startup
+    config.model_loaded["vae_encoder"] = False
+    config.model_loaded["text_encoder"] = False
+    with patch.object(pipeline_module, "_resolve_minimax_h3_model_root") as resolve_root:
+        with pytest.raises(ValueError, match="local VAE encoding"):
+            pipeline_module.MiniMaxH3Pipeline(od_config=config)
+        resolve_root.assert_not_called()
+
+
+def test_encoder_conditioning_keeps_control_separate_from_latent_edit(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
+
+    pipeline = object.__new__(pipeline_module.MiniMaxH3Pipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.od_config = SimpleNamespace(
+        controlnet_model_path="/control.safetensors",
+        step_execution=False,
+    )
+    pipeline.load_vae_encoder = True
+    pipeline.video_vae = nn.Module()
+    pipeline.video_vae.encoder_component = nn.Identity()
+    pipeline.video_vae.encode_control_latents = lambda pixels: pixels
+    pipeline._component_on_device = lambda component: nullcontext()
+    pipeline._release_stage_cache = lambda: None
+    pipeline._resolve_task = lambda *args, **kwargs: "t2va"
+    pipeline._active_turbo_spec = lambda sampling: None
+    pipeline._has_active_native_lora = lambda sampling: False
+    pipeline._fasth3_checkpoint = None
+    pipeline._fasth3 = None
+    pipeline._resolve_sigma_positions = lambda task, sampling: (None, 2)
+    pipeline._quality_policy = SimpleNamespace(resolve=lambda **kwargs: SimpleNamespace(cache_dit=None))
+    pipeline._cache_dit_runtime = SimpleNamespace(prepare=lambda cache: None)
+    pipeline.default_video_shift = 12.0
+    pipeline.default_audio_shift = 3.0
+
+    num_frames = 5
+    planner = pipeline_module.MINIMAX_H3_SHAPE_PLANNER
+    conditioning = SimpleNamespace(
+        task="t2va",
+        height=32,
+        width=32,
+        num_frames=num_frames,
+        latent_t=planner.video_latent_t(num_frames),
+        audio_t=planner.audio_latent_t(num_frames / pipeline_module.MINIMAX_H3_FPS),
+        hidden_states=torch.ones(3, 4),
+        token_tags=torch.ones(3, dtype=torch.long),
+        visual_condition=None,
+        visual_condition_shapes=(),
+        audio_condition=None,
+        audio_condition_lengths=(),
+        ref_blocks=(),
+        keyframe_frame_indices=(),
+        video_edit_clean_rows=None,
+        video_edit_mask=None,
+        audio_edit_clean_rows=None,
+        audio_edit_mask=None,
+    )
+    sampling = SimpleNamespace(
+        extra_args={"canny": {"control_path": "control.mkv", "control_context_scale": 0.5}},
+        quality="lossless",
+        seed=7,
+        num_outputs_per_prompt=1,
+    )
+    pixels = torch.ones(1, 3, num_frames, 32, 32)
+    rows = torch.ones(planner.video_latent_t(num_frames) * 4, 196)
+    monkeypatch.setattr(pipeline_module, "load_control_pixels", lambda *args, **kwargs: pixels)
+    monkeypatch.setattr(pipeline_module, "build_control_rows", lambda *args, **kwargs: rows)
+
+    context = pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling)
+
+    assert context["control_rows"] is rows
+    assert context["control_context_scale"] == 0.5
+    assert context["video_edit_clean_rows"] is None
+    assert context["audio_edit_clean_rows"] is None

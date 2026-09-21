@@ -10,6 +10,9 @@ from .utils.api_client import VLLMOmniClient
 from .utils.logger import get_logger
 from .utils.models import lookup_model_spec
 from .utils.types import (
+    MAX_REFERENCE_AUDIOS,
+    MAX_REFERENCE_IMAGES,
+    MAX_REFERENCE_VIDEOS,
     AudioFormat,
     AutoregressionSamplingParams,
     DiffusionSamplingParams,
@@ -200,6 +203,8 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
             },
             "optional": {
                 "frame": ("IMAGE",),
+                "first_frame": ("IMAGE",),
+                "last_frame": ("IMAGE",),
                 "references": ("VIDEO_REFERENCES",),
                 "sampling_params": ("SAMPLING_PARAMS",),
                 "lora": ("REMOTE_LORA",),
@@ -213,12 +218,30 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
     FUNCTION = "generate"
 
     @classmethod
-    def VALIDATE_INPUTS(cls, url, model, frame=None, references=None, **_kwargs) -> str | Literal[True]:
+    def VALIDATE_INPUTS(
+        cls,
+        url,
+        model,
+        frame=None,
+        first_frame=None,
+        last_frame=None,
+        references=None,
+        fast_h3=None,
+        **_kwargs,
+    ) -> str | Literal[True]:
         base = super().VALIDATE_INPUTS(url, model)
         if base is not True:
             return base
         if frame is not None and references is not None:
             return "Provide only one of frame or references, not both."
+        if frame is not None and (first_frame is not None or last_frame is not None):
+            return "Provide either frame or first_frame/last_frame, not both."
+        if references is not None and (first_frame is not None or last_frame is not None):
+            return "Provide either first_frame/last_frame or references, not both."
+        if fast_h3 is not None and any(value is not None for value in (frame, first_frame, last_frame, references)):
+            return (
+                "FastH3 Preview supports T2VA only; disconnect frame, first_frame, last_frame, and references inputs."
+            )
         return True
 
     async def generate(
@@ -232,6 +255,8 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         duration: float,
         negative_prompt: str | None = None,
         frame: torch.Tensor | None = None,
+        first_frame: torch.Tensor | None = None,
+        last_frame: torch.Tensor | None = None,
         references: dict | None = None,
         sampling_params: dict | list[dict] | None = None,
         model_params: dict | None = None,
@@ -249,8 +274,11 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         spec_model = model
 
         if fast_h3 is not None:
-            if frame is not None or references is not None:
-                raise ValueError("FastH3 Preview supports T2VA only; disconnect frame and references inputs.")
+            if any(value is not None for value in (frame, first_frame, last_frame, references)):
+                raise ValueError(
+                    "FastH3 Preview supports T2VA only; disconnect frame, first_frame, "
+                    "last_frame, and references inputs."
+                )
             if lora is not None:
                 raise ValueError(
                     "FastH3 is already fused into the selected server; disconnect the request-level LoRA input."
@@ -311,6 +339,8 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
             spec_model=spec_model,
             prompt=prompt,
             frame=frame,  # frame present => fl2va / Wan I2V
+            first_frame=first_frame,
+            last_frame=last_frame,
             references=references,
             width=width,
             height=height,
@@ -496,6 +526,66 @@ class VLLMOmniTTS(_VLLMOmniGenerateBase):
             response_format=response_format,
             speed=speed,
             **combined_params,
+        )
+        return (audio,)
+
+
+class VLLMOmniGenerateMusic(_VLLMOmniGenerateBase):
+    """Generate a song from lyrics and a musical description with MiniMax Music 3."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url": ("STRING", {"default": "http://localhost:8000/v1"}),
+                "model": ("STRING", {"default": "MiniMaxAI/MiniMax-Music3"}),
+                "instructions": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "display_name": "caption",
+                        "tooltip": "Music caption: describe genre, instruments, tempo and mood.",
+                    },
+                ),
+                "lyrics": ("STRING", {"multiline": True}),
+                "max_duration_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 300.0,
+                        "min": 1,
+                        "max": 360,
+                        "step": 0.01,
+                        "tooltip": "Upper limit; rounded down to whole 25 Hz audio frames. May end earlier.",
+                    },
+                ),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 2**53 - 1, "control_after_generate": True}),
+                "response_format": (["wav", "mp3", "flac", "opus"],),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "generate"
+
+    async def generate(
+        self,
+        url: str,
+        model: str,
+        lyrics: str,
+        instructions: str,
+        response_format: AudioFormat,
+        max_duration_seconds: float,
+        seed: int = 0,
+    ) -> tuple[AudioInput]:
+        audio = await VLLMOmniClient(url.rstrip("/")).generate_speech(
+            model=model,
+            input=lyrics,
+            instructions=instructions,
+            voice="default",
+            speed=1.0,
+            response_format=response_format,
+            max_new_tokens=int(max_duration_seconds * 25),
+            seed=seed,
         )
         return (audio,)
 
@@ -918,6 +1008,10 @@ class VLLMOmniVideoReferences:
                 "audio_2": ("AUDIO",),
                 "video_1": ("VIDEO",),
                 "video_2": ("VIDEO",),
+                # Append ports to preserve connections in saved workflows.
+                **{f"image_{i}": ("IMAGE",) for i in range(3, MAX_REFERENCE_IMAGES + 1)},
+                **{f"audio_{i}": ("AUDIO",) for i in range(3, MAX_REFERENCE_AUDIOS + 1)},
+                **{f"video_{i}": ("VIDEO",) for i in range(3, MAX_REFERENCE_VIDEOS + 1)},
             },
         }
 
@@ -934,21 +1028,26 @@ class VLLMOmniVideoReferences:
         audio_2: AudioInput | None = None,
         video_1: VideoInput | None = None,
         video_2: VideoInput | None = None,
+        image_3: torch.Tensor | None = None,
+        image_4: torch.Tensor | None = None,
+        image_5: torch.Tensor | None = None,
+        image_6: torch.Tensor | None = None,
+        image_7: torch.Tensor | None = None,
+        image_8: torch.Tensor | None = None,
+        image_9: torch.Tensor | None = None,
+        audio_3: AudioInput | None = None,
+        video_3: VideoInput | None = None,
         **kwargs,
     ):
         if kwargs:
             logger.info("Uncaught kwargs: %s", kwargs)
         refs = VideoReferences()
-        if image_1 is not None:
-            refs["image_1"] = image_1
-        if image_2 is not None:
-            refs["image_2"] = image_2
-        if audio_1 is not None:
-            refs["audio_1"] = audio_1
-        if audio_2 is not None:
-            refs["audio_2"] = audio_2
-        if video_1 is not None:
-            refs["video_1"] = video_1
-        if video_2 is not None:
-            refs["video_2"] = video_2
+        for kind, values in (
+            ("image", (image_1, image_2, image_3, image_4, image_5, image_6, image_7, image_8, image_9)),
+            ("video", (video_1, video_2, video_3)),
+            ("audio", (audio_1, audio_2, audio_3)),
+        ):
+            for index, value in enumerate(values, start=1):
+                if value is not None:
+                    refs[f"{kind}_{index}"] = value
         return (refs,)

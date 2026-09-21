@@ -55,10 +55,12 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.serving_video import (
+    LatentEditInput,
     OmniOpenAIServingVideo,
     ReferenceAudio,
     ReferenceImage,
     ReferenceVideo,
+    _stage_diffusion_model_class_name,
 )
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE
@@ -94,6 +96,9 @@ CONTROL_REFERENCE_IMAGE_SUFFIXES = frozenset({".bmp", ".gif", ".jpg", ".jpeg", "
 CONTROL_REFERENCE_VIDEO_SUFFIXES = frozenset({".mkv", ".mov", ".mp4", ".webm"})
 CONTROL_REFERENCE_MAX_BYTES = 512 * 1024 * 1024
 
+LATENT_EDIT_SOURCE_MAX_BYTES = 512 * 1024 * 1024
+LATENT_EDIT_MASK_FILE_MAX_BYTES = 8 * 1024 * 1024
+
 VIDEO_SYNC_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", 600.0))
 
 
@@ -127,6 +132,79 @@ def _parse_form_json(value: str | None, expected_type: type | None = None) -> An
     return parsed
 
 
+def _parse_latent_edit_mask_json(
+    value: str,
+    *,
+    field_name: str,
+) -> Any:
+    """Decode one request mask; Stage 0 owns its semantic validation."""
+    try:
+        parsed = _parse_form_json(value)
+        # Bound container nesting at the parsing boundary without duplicating
+        # Stage 0's numeric, range, or shape validation.
+        pending = [(parsed, 0)]
+        while pending:
+            item, depth = pending.pop()
+            if not isinstance(item, (list, dict)):
+                continue
+            if depth >= 64:
+                raise ValueError("JSON nesting exceeds 64 levels")
+            children = item.values() if isinstance(item, dict) else item
+            pending.extend((child, depth + 1) for child in children)
+        return parsed
+    except (RecursionError, ValueError) as exc:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"{field_name} contains invalid JSON or is nested too deeply.",
+        ) from exc
+
+
+async def _read_latent_edit_mask_json(
+    value: UploadFile | None,
+    *,
+    field_name: str,
+) -> Any | None:
+    """Read a mask from a bounded UTF-8 JSON file part."""
+    if value is None:
+        return None
+
+    try:
+        declared_size = value.size
+        if isinstance(declared_size, Integral) and int(declared_size) > LATENT_EDIT_MASK_FILE_MAX_BYTES:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"{field_name} JSON exceeds the {LATENT_EDIT_MASK_FILE_MAX_BYTES // (1024 * 1024)} MiB limit.",
+            )
+
+        payload = await value.read(LATENT_EDIT_MASK_FILE_MAX_BYTES + 1)
+        if len(payload) > LATENT_EDIT_MASK_FILE_MAX_BYTES:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"{field_name} JSON exceeds the {LATENT_EDIT_MASK_FILE_MAX_BYTES // (1024 * 1024)} MiB limit.",
+            )
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"{field_name} JSON file must be UTF-8 encoded.",
+            ) from exc
+        if not text:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"{field_name} JSON file must not be empty.",
+            )
+        parsed = _parse_latent_edit_mask_json(text, field_name=field_name)
+        if parsed is None:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"{field_name} JSON file must contain a mask value.",
+            )
+        return parsed
+    finally:
+        await value.close()
+
+
 def _config_get(config: Any, key: str, default: Any = None) -> Any:
     if isinstance(config, dict):
         return config.get(key, default)
@@ -136,10 +214,6 @@ def _config_get(config: Any, key: str, default: Any = None) -> Any:
         except Exception:
             pass
     return getattr(config, key, default)
-
-
-def _stage_engine_args(stage_cfg: Any) -> Any:
-    return _config_get(stage_cfg, "engine_args", {}) or {}
 
 
 def _diffusion_model_classes(stage_configs: list[Any] | None) -> list[type]:
@@ -152,7 +226,7 @@ def _diffusion_model_classes(stage_configs: list[Any] | None) -> list[type]:
     for stage_cfg in stage_configs:
         if get_stage_type(stage_cfg) != "diffusion":
             continue
-        model_class_name = _config_get(_stage_engine_args(stage_cfg), "model_class_name")
+        model_class_name = _stage_diffusion_model_class_name(stage_cfg)
         if not model_class_name:
             continue
         model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
@@ -283,6 +357,7 @@ def _cleanup_video_references(
     reference_video: ReferenceVideo | None,
     reference_audio: ReferenceAudio | None,
     control_path: str | list[str] | None = None,
+    latent_edit_input: LatentEditInput | None = None,
 ) -> None:
     if reference_video is not None:
         for path in reference_video.cleanup_paths:
@@ -296,6 +371,10 @@ def _cleanup_video_references(
     for path in _reference_list(control_path):
         if os.path.exists(path):
             os.unlink(path)
+    if latent_edit_input is not None:
+        for path in latent_edit_input.cleanup_paths:
+            if os.path.exists(path):
+                os.unlink(path)
 
 
 def _unpack_video_generation_result(
@@ -326,16 +405,20 @@ async def _run_video_generation_job(
     reference_audio: ReferenceAudio | None = None,
     control_path: str | list[str] | None = None,
     app_state: Any | None = None,
+    latent_edit_input: LatentEditInput | None = None,
 ) -> None:
     job = await VIDEO_STORE.get(video_id)
     if job is None:
         logger.warning("Video job %s missing before generation task started; skipping", video_id)
-        _cleanup_video_references(reference_video, reference_audio, control_path)
+        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
         return
 
-    await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
     started_at = time.perf_counter()
     try:
+
+        async def _mark_started() -> None:
+            await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
+
         video_bytes, stage_durations, peak_memory_mb, action, video_metadata = _unpack_video_generation_result(
             await handler.generate_video_bytes(
                 request,
@@ -343,6 +426,8 @@ async def _run_video_generation_job(
                 reference_image=reference_image,
                 reference_video=reference_video,
                 reference_audio=reference_audio,
+                on_started=_mark_started,
+                latent_edit_input=latent_edit_input,
             )
         )
 
@@ -402,7 +487,7 @@ async def _run_video_generation_job(
         await VIDEO_STORE.pop(video_id)
         raise
     finally:
-        _cleanup_video_references(reference_video, reference_audio, control_path)
+        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
 
 
 async def _persist_uploaded_video_references(uploads: list[UploadFile]) -> list[str]:
@@ -425,25 +510,15 @@ async def _persist_uploaded_video_references(uploads: list[UploadFile]) -> list[
     return paths
 
 
-async def _persist_uploaded_control_reference(
+async def _persist_uploaded_reference(
     upload: UploadFile,
     *,
-    max_bytes: int = CONTROL_REFERENCE_MAX_BYTES,
-    field_name: str = "control_reference",
+    field_name: str,
+    suffix: str,
+    max_bytes: int,
 ) -> str:
-    """Stream one model control upload to request-scoped local storage."""
-    kind = _uploaded_media_kind(upload)
-    suffix = Path(upload.filename or "").suffix.lower()
-    supported_suffixes = CONTROL_REFERENCE_IMAGE_SUFFIXES | CONTROL_REFERENCE_VIDEO_SUFFIXES
-    if kind == "audio" or (suffix and suffix not in supported_suffixes):
-        raise HTTPException(
-            status_code=HTTPStatus.BAD_REQUEST.value,
-            detail=f"{field_name} must be an image or video file.",
-        )
-    if not suffix:
-        suffix = ".png" if kind == "image" else ".mp4"
-
-    declared_size = getattr(upload, "size", None)
+    """Stream one bounded upload to request-scoped local storage."""
+    declared_size = upload.size
     if isinstance(declared_size, Integral) and int(declared_size) > max_bytes:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
@@ -476,6 +551,89 @@ async def _persist_uploaded_control_reference(
                 os.unlink(path)
 
 
+async def _persist_uploaded_control_reference(
+    upload: UploadFile,
+    *,
+    max_bytes: int = CONTROL_REFERENCE_MAX_BYTES,
+    field_name: str = "control_reference",
+) -> str:
+    """Stream one model control upload to request-scoped local storage."""
+    kind = _uploaded_media_kind(upload)
+    suffix = Path(upload.filename or "").suffix.lower()
+    supported_suffixes = CONTROL_REFERENCE_IMAGE_SUFFIXES | CONTROL_REFERENCE_VIDEO_SUFFIXES
+    if kind == "audio" or (suffix and suffix not in supported_suffixes):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"{field_name} must be an image or video file.",
+        )
+    if not suffix:
+        suffix = ".png" if kind == "image" else ".mp4"
+    return await _persist_uploaded_reference(
+        upload,
+        field_name=field_name,
+        suffix=suffix,
+        max_bytes=max_bytes,
+    )
+
+
+async def _persist_latent_edit_source(
+    upload: UploadFile,
+    *,
+    field_name: Literal["source_video", "source_audio"],
+    max_bytes: int = LATENT_EDIT_SOURCE_MAX_BYTES,
+) -> str:
+    """Stream one latent-edit source upload to request-scoped storage."""
+    suffix = Path(upload.filename or "").suffix.lower()
+    if field_name == "source_video":
+        allowed_suffixes = MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES
+        expected = "an MP4 or MOV file"
+    else:
+        allowed_suffixes = MINIMAX_H3_REFERENCE_AUDIO_SUFFIXES
+        expected = "a WAV or MP3 file"
+    if suffix not in allowed_suffixes:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"{field_name} must be {expected}.",
+        )
+
+    return await _persist_uploaded_reference(
+        upload,
+        field_name=field_name,
+        suffix=suffix,
+        max_bytes=max_bytes,
+    )
+
+
+def _validate_latent_edit_inputs(
+    handler: OmniOpenAIServingVideo,
+    *,
+    source_video: UploadFile | None,
+    source_audio: UploadFile | None,
+    video_noise_mask: Any | None,
+    audio_noise_mask: Any | None,
+) -> bool:
+    """Validate cross-field latent-edit requirements before persisting files."""
+    has_any_input = any(value is not None for value in (source_video, source_audio, video_noise_mask, audio_noise_mask))
+    if not has_any_input:
+        return False
+    if not handler.supports_latent_mask_editing:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="Latent-mask editing is not supported by this model.",
+        )
+    if video_noise_mask is None and audio_noise_mask is None:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="Latent-mask editing requires at least one of video_noise_mask or audio_noise_mask.",
+        )
+    if source_audio is not None and audio_noise_mask is None:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="source_audio requires an audio_noise_mask upload.",
+        )
+    return True
+
+
 def _validate_control_upload(
     handler: OmniOpenAIServingVideo,
     request: VideoGenerationRequest,
@@ -497,7 +655,7 @@ def _validate_control_upload(
         )
 
     normalized_type = control_type.strip().lower()
-    supported_types = frozenset(getattr(handler, "supported_control_upload_types", ()))
+    supported_types = handler.supported_control_upload_types
     if normalized_type not in supported_types:
         supported = ", ".join(sorted(supported_types)) or "none"
         raise HTTPException(
@@ -561,7 +719,10 @@ def _validate_h3_control_uploads(
     if selected == "inpaint" and mask_reference is None:
         reject("control_type=inpaint requires mask_reference.")
     if has_references:
-        reject("MiniMax H3 control cannot be combined with input/image/video/audio references or keyframes.")
+        reject(
+            "MiniMax H3 control cannot be combined with input/image/video/audio references, "
+            "keyframes, or latent-mask editing."
+        )
     config = extras.get(selected, {})
     if not isinstance(config, Mapping):
         reject(f"extra_params.{selected} must be an object.")
@@ -796,6 +957,10 @@ async def _parse_video_form(
     lora: str | None = Form(default=None),
     extra_params: str | None = Form(default=None),
     return_stage_metrics: bool | None = Form(default=None),
+    source_video: UploadFile | None = File(default=None),
+    source_audio: UploadFile | None = File(default=None),
+    video_noise_mask: UploadFile | None = File(default=None),
+    audio_noise_mask: UploadFile | None = File(default=None),
 ) -> tuple[
     VideoGenerationRequest,
     "OmniOpenAIServingVideo",
@@ -804,6 +969,7 @@ async def _parse_video_form(
     ReferenceVideo | None,
     ReferenceAudio | None,
     str | list[str] | None,
+    LatentEditInput | None,
 ]:
     """FastAPI dependency that parses video form data, validates inputs,
     resolves the handler, and decodes any reference image.
@@ -815,6 +981,14 @@ async def _parse_video_form(
     parsed_image_reference = _parse_form_json(image_reference)
     parsed_video_reference = _parse_form_json(video_reference)
     parsed_audio_reference = _parse_form_json(audio_reference)
+    parsed_video_noise_mask = await _read_latent_edit_mask_json(
+        video_noise_mask,
+        field_name="video_noise_mask",
+    )
+    parsed_audio_noise_mask = await _read_latent_edit_mask_json(
+        audio_noise_mask,
+        field_name="audio_noise_mask",
+    )
 
     if input_references and any(
         item is not None for item in (parsed_image_reference, parsed_video_reference, input_reference)
@@ -899,6 +1073,14 @@ async def _parse_video_form(
             detail=f"Video generation setup failed: {str(e)}",
         )
 
+    has_latent_edit = _validate_latent_edit_inputs(
+        handler,
+        source_video=source_video,
+        source_audio=source_audio,
+        video_noise_mask=parsed_video_noise_mask,
+        audio_noise_mask=parsed_audio_noise_mask,
+    )
+
     h3_control = bool(getattr(handler, "is_minimax_h3", False))
     if h3_control:
         normalized_control_type = _validate_h3_control_uploads(
@@ -917,7 +1099,8 @@ async def _parse_video_form(
                     parsed_video_reference,
                     parsed_audio_reference,
                 )
-            ),
+            )
+            or has_latent_edit,
         )
     else:
         if source_reference is not None or mask_reference is not None:
@@ -929,7 +1112,7 @@ async def _parse_video_form(
         # until reference parsing succeeds, preserving failure cleanup.
         _attach_control_upload(request, normalized_control_type)
 
-    supports_mixed_reference_inputs = bool(getattr(handler, "supports_mixed_reference_inputs", False))
+    supports_mixed_reference_inputs = handler.supports_mixed_reference_inputs
     if input_reference is not None:
         input_reference_bytes = await _read_upload_limited(
             input_reference,
@@ -1081,6 +1264,38 @@ async def _parse_video_form(
             raise
     control_path = control_paths or None
 
+    latent_edit_input: LatentEditInput | None = None
+    if has_latent_edit:
+        source_paths: list[str] = []
+        try:
+            source_video_path = None
+            source_audio_path = None
+            if source_video is not None:
+                source_video_path = await _persist_latent_edit_source(
+                    source_video,
+                    field_name="source_video",
+                )
+                source_paths.append(source_video_path)
+            if source_audio is not None:
+                source_audio_path = await _persist_latent_edit_source(
+                    source_audio,
+                    field_name="source_audio",
+                )
+                source_paths.append(source_audio_path)
+            latent_edit_input = LatentEditInput(
+                source_video=source_video_path,
+                source_audio=source_audio_path,
+                video_noise_mask=parsed_video_noise_mask,
+                audio_noise_mask=parsed_audio_noise_mask,
+                cleanup_paths=tuple(source_paths),
+            )
+        except (asyncio.CancelledError, Exception):
+            for path in source_paths:
+                with suppress(OSError):
+                    os.unlink(path)
+            _cleanup_video_references(reference_video, reference_audio, control_path)
+            raise
+
     return (
         request,
         handler,
@@ -1089,4 +1304,5 @@ async def _parse_video_form(
         reference_video,
         reference_audio,
         control_path,
+        latent_edit_input,
     )

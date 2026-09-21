@@ -171,10 +171,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         # such as the vLLM-text perf benchmark.
         #
         # Default to the thinker: it is the text-generation stage, which is what
-        # a non-staged run of this model is asking for. Same shape as
-        # dynin_omni ("token2text") and glm_tts ("glm_tts"). An explicitly wrong
-        # value still reaches the ValueError below rather than being silently
-        # accepted.
+        # a non-staged run of this model is asking for. Same shape as glm_tts
+        # ("glm_tts"). An explicitly wrong value still reaches the ValueError
+        # below rather than being silently accepted.
         self.model_stage = getattr(vllm_config.model_config, "model_stage", None) or "thinker"
         # Staged startup always injects model_stage; its absence means a plain
         # vLLM run with no talker stage downstream, so no one consumes captured
