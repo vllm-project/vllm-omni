@@ -7,7 +7,7 @@ from __future__ import annotations
 import importlib
 import inspect
 from collections import deque
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.distributed.parallel_state import get_tp_group
@@ -29,21 +29,23 @@ if TYPE_CHECKING:
 class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     """Own payload caching, full/chunk transport, and connector I/O."""
 
+    _full_payload_replace_keys_cached: frozenset[str]
+
     # ------------------------------------------------------------------ #
     #  Local payload cache (RFC §2.4 – Model Runner ownership)
     # ------------------------------------------------------------------ #
 
     def put_local_stage_payload(self, req_id: str, payload: OmniPayload) -> None:
         """Store a full stage payload in the local cache."""
-        self._local_stage_payload_cache[req_id] = payload
+        self._local_stage_payload_cache[req_id] = cast(dict[str, Any], payload)
 
     def get_local_stage_payload(self, req_id: str) -> OmniPayload | None:
         """Read a stage payload without removing it."""
-        return self._local_stage_payload_cache.get(req_id)
+        return cast(OmniPayload | None, self._local_stage_payload_cache.get(req_id))
 
     def pop_local_stage_payload(self, req_id: str) -> OmniPayload | None:
         """Remove and return a stage payload (consume after use)."""
-        return self._local_stage_payload_cache.pop(req_id, None)
+        return cast(OmniPayload | None, self._local_stage_payload_cache.pop(req_id, None))
 
     def put_local_request_metadata(self, req_id: str, metadata: dict[str, Any]) -> None:
         """Store lightweight scheduling metadata for a request."""
@@ -58,7 +60,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def _extract_scheduling_metadata(cls, payload: OmniPayload) -> dict[str, Any]:
+    def _extract_scheduling_metadata(cls, payload: dict[str, Any] | OmniPayload) -> dict[str, Any]:
         """Extract only the fields the scheduler needs from a full payload."""
         extracted: dict[str, Any] = {}
         meta = payload.get("meta") if isinstance(payload, dict) else None
@@ -66,11 +68,13 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
         if "next_stage_prompt_len" in meta:
             extracted["next_stage_prompt_len"] = meta["next_stage_prompt_len"]
-        elif "next_stage_prompt_len" in payload:
-            logger.warning_once(
-                "legacy flat 'next_stage_prompt_len' key in payload; expected 'meta.next_stage_prompt_len'"
-            )
-            extracted["next_stage_prompt_len"] = payload["next_stage_prompt_len"]
+        else:
+            legacy_prompt_len = cast(dict[str, Any], payload).get("next_stage_prompt_len")
+            if legacy_prompt_len is not None:
+                logger.warning_once(
+                    "legacy flat 'next_stage_prompt_len' key in payload; expected 'meta.next_stage_prompt_len'"
+                )
+                extracted["next_stage_prompt_len"] = legacy_prompt_len
 
         audio_codes = cls._payload_audio_codes(payload)
         if audio_codes is not None:
@@ -129,7 +133,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         return None
 
     @classmethod
-    def _payload_is_consumable(cls, payload: OmniPayload | None) -> bool:
+    def _payload_is_consumable(cls, payload: dict[str, Any] | OmniPayload | None) -> bool:
         """Return True when an async payload can drive a real forward step.
 
         Metadata-only wake-ups should not transition WAITING_FOR_CHUNK requests
@@ -502,8 +506,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             # Skip the per-step accumulator+build that would otherwise be
             # silently discarded.  Defends against a terminal stage whose
             # custom_process_input_func has a *_full_payload derivative in
-            # the same module (e.g. dynin stage 2 token2image_to_token2audio
-            # in pipelines that don't configure any connector at all).
+            # the same module, even in pipelines that don't configure any
+            # connector at all.
             #
             # Known limitation: a *terminal-consumer* stage that has a
             # connector configured for receiving upstream input is NOT
@@ -556,7 +560,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 output[k] = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
         return output, request
 
-    def _resolve_full_payload_replace_keys(self) -> frozenset:
+    def _resolve_full_payload_replace_keys(self) -> frozenset[str]:
         """Per-model REPLACE-key set for the full-payload accumulator.
 
         Looked up from the stage-input-processor module that ships the model's sync builder
@@ -584,7 +588,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             import sys as _sys
 
             mod = _sys.modules.get(module_name) or importlib.import_module(module_name)
-            keys = getattr(mod, "_FULL_PAYLOAD_REPLACE_KEYS", frozenset())
+            keys: Any = getattr(mod, "_FULL_PAYLOAD_REPLACE_KEYS", frozenset())
         except ImportError:
             logger.debug(
                 "Could not import stage input processor module %s while resolving "
@@ -748,7 +752,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     code_len = len(audio_codes)
                 else:
                     code_len = None
-                meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+                raw_meta = payload.get("meta")
+                meta = raw_meta if isinstance(raw_meta, dict) else {}
                 logger.debug(
                     "[Stage-%s] send_full_payload_outputs: req=%s payload_keys=%s code_len=%s left_context_size=%s",
                     self._stage_id,
@@ -863,6 +868,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         if not self.is_data_transfer_rank():
             return True
         raw_req_id = getattr(request, "request_id", None) or getattr(request, "req_id", None)
+        if not isinstance(raw_req_id, str):
+            logger.warning("[Stage-%s] send_chunk: missing request_id", self._stage_id)
+            return False
         request_id = self._resolve_external_req_id(request, raw_req_id)
         # Cache the internal→external mapping so that finish sentinels can
         # resolve the external ID even after the request is freed.
@@ -988,6 +996,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         """Re-enqueue a failed send task or drop it after max retries."""
         retry_count = task.get("_retry_count", 0) + 1
         req_id = task.get("request_id")
+        if not isinstance(req_id, str):
+            logger.error(
+                "[Stage-%s] Failed send task is missing request_id; dropping it",
+                getattr(self, "_stage_id", "?"),
+            )
+            return
         if retry_count <= self._MAX_SEND_RETRIES:
             task["_retry_count"] = retry_count
             logger.warning(
@@ -1268,7 +1282,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         if not success:
             return False
 
-        self._decrement_pending_save_count(request_id)
+        if isinstance(request_id, str):
+            self._decrement_pending_save_count(request_id)
         return True
 
     def _decrement_pending_save_count(self, request_id: str) -> None:
@@ -1299,7 +1314,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         """Accumulate chunk payloads (concat tensors, extend lists)."""
         if req_id not in self._send_side_request_payload:
             self._send_side_request_payload[req_id] = dict(payload_data)
-            return dict(self._send_side_request_payload[req_id])
+            return cast(OmniPayload, dict(self._send_side_request_payload[req_id]))
 
         origin = self._send_side_request_payload[req_id]
         merged = dict(origin)
@@ -1338,4 +1353,4 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     merged[key] = value
 
         self._send_side_request_payload[req_id] = merged
-        return dict(merged)
+        return cast(OmniPayload, dict(merged))
