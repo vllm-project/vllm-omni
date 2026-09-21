@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-
 """Translation boundary between vLLM runner state and the omni prefix cache.
 
 The adapter is the only prefix-cache component that interprets scheduler
@@ -10,10 +7,9 @@ to retain or inspect upstream scheduler state.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Mapping
 
 
 class PrefixCacheEventKind(str, Enum):
@@ -35,7 +31,6 @@ class PrefixCacheRequestEvent:
     hit_end: int = 0
     block_ids: tuple[tuple[int, ...], ...] = ()
     scheduled_tokens: int = 0
-    num_output_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,21 +47,21 @@ class PrefixCacheWrite:
     req_id: str
     row_start: int
     row_end: int
+    slots: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class PrefixCacheWriteLayout:
     writes: tuple[PrefixCacheWrite, ...]
     total_rows: int
-    slots_cpu: Any = None
 
 
 class PrefixCacheSchedulerAdapter:
     """Translate scheduler output and post-update batch state.
 
-    ``aborted_req_ids`` is deliberately optional: current vLLM/Omni scheduler
-    outputs do not carry an explicit abort side channel yet. Finished IDs are
-    never guessed to be aborted.
+    ``aborted_req_ids`` is deliberately optional: current main does not carry
+    an explicit abort side channel, and finished IDs must never be guessed to
+    be aborted.
     """
 
     def __init__(self) -> None:
@@ -83,10 +78,7 @@ class PrefixCacheSchedulerAdapter:
 
     @staticmethod
     def _blocks(data: Any) -> tuple[tuple[int, ...], ...]:
-        return PrefixCacheSchedulerAdapter._blocks_value(getattr(data, "block_ids", None))
-
-    @staticmethod
-    def _blocks_value(blocks: Any) -> tuple[tuple[int, ...], ...]:
+        blocks = getattr(data, "block_ids", None)
         if blocks is None:
             return ()
         if blocks and isinstance(blocks[0], int):
@@ -99,45 +91,19 @@ class PrefixCacheSchedulerAdapter:
         resumed = set(getattr(cached, "resumed_req_ids", ()) or ()) if cached is not None else set()
         aborted = set(getattr(scheduler_output, "aborted_req_ids", ()) or ())
         scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
-        terminal_ids = {
-            str(req_id) for req_id in (set(getattr(scheduler_output, "finished_req_ids", ()) or ()) | aborted)
-        }
-
-        cached_by_id: dict[str, tuple[int, Any, int]] = {}
-        if cached is not None:
-            req_ids = tuple(getattr(cached, "req_ids", ()) or ())
-            computed = tuple(getattr(cached, "num_computed_tokens", ()) or ())
-            new_blocks = tuple(getattr(cached, "new_block_ids", ()) or ())
-            output_tokens = tuple(getattr(cached, "num_output_tokens", ()) or ())
-            for index, req_id in enumerate(req_ids):
-                cached_by_id[str(req_id)] = (
-                    int(computed[index]) if index < len(computed) else 0,
-                    new_blocks[index] if index < len(new_blocks) else None,
-                    int(output_tokens[index]) if index < len(output_tokens) else 0,
-                )
-
-        # Clear terminal observations before classifying new requests. A
-        # request ID may be reused in the same scheduler step.
-        finished = set(getattr(scheduler_output, "finished_req_ids", ()) or ())
-        for req_id in sorted(finished | aborted):
-            self._observed_req_ids.discard(str(req_id))
 
         for data in getattr(scheduler_output, "scheduled_new_reqs", ()) or ():
             req_id = self._req_id(data)
-            kind: PrefixCacheEventKind = (
-                PrefixCacheEventKind.STARTED
-                if req_id in terminal_ids or req_id not in self._observed_req_ids
-                else PrefixCacheEventKind.EXTENDED
-            )
+            kind = PrefixCacheEventKind.EXTENDED if req_id in self._observed_req_ids else PrefixCacheEventKind.STARTED
             self._observed_req_ids.add(req_id)
-            computed_tokens = int(getattr(data, "num_computed_tokens", 0) or 0)
+            computed = int(getattr(data, "num_computed_tokens", 0) or 0)
             blocks = self._blocks(data)
             events.append(
                 PrefixCacheRequestEvent(
                     req_id,
                     kind,
                     0,
-                    computed_tokens,
+                    computed,
                     blocks,
                     int(scheduled_tokens.get(req_id, 0)),
                 )
@@ -146,22 +112,20 @@ class PrefixCacheSchedulerAdapter:
         for req_id in resumed:
             req_id = str(req_id)
             self._observed_req_ids.add(req_id)
-            hit_end, resumed_blocks, num_output_tokens = cached_by_id.get(req_id, (0, None, 0))
             events.append(
                 PrefixCacheRequestEvent(
                     req_id,
                     PrefixCacheEventKind.RESUMED,
-                    hit_end=hit_end,
-                    block_ids=self._blocks_value(resumed_blocks),
                     scheduled_tokens=int(scheduled_tokens.get(req_id, 0)),
-                    num_output_tokens=num_output_tokens,
                 )
             )
 
-        for req_id in sorted(finished | aborted):
+        finished = set(getattr(scheduler_output, "finished_req_ids", ()) or ())
+        for req_id in sorted(finished):
             req_id = str(req_id)
             kind = PrefixCacheEventKind.ABORTED if req_id in aborted else PrefixCacheEventKind.FINISHED
             events.append(PrefixCacheRequestEvent(req_id, kind))
+            self._observed_req_ids.discard(req_id)
         return tuple(events)
 
     def translate_step(self, scheduler_output: Any) -> PrefixCacheStep:
@@ -193,7 +157,8 @@ class PrefixCacheSchedulerAdapter:
                     req_id,
                     start,
                     end,
+                    tuple(int(x) for x in slots[cursor : cursor + count].tolist()),
                 )
             )
             cursor += count
-        return PrefixCacheWriteLayout(tuple(writes), cursor, slots)
+        return PrefixCacheWriteLayout(tuple(writes), cursor)

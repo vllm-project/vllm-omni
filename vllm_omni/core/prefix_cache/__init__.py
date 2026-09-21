@@ -46,6 +46,14 @@ from vllm_omni.core.prefix_cache.interface import (
     WriteSchedule,
 )
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
+from vllm_omni.core.prefix_cache.adapter import (
+    PrefixCacheEventKind,
+    PrefixCacheRequestEvent,
+    PrefixCacheSchedulerAdapter,
+    PrefixCacheStep,
+    PrefixCacheWrite,
+    PrefixCacheWriteLayout,
+)
 
 __all__ = [
     "HIDDEN_KEY",

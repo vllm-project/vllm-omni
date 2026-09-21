@@ -29,6 +29,7 @@ import torch
 from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
 from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

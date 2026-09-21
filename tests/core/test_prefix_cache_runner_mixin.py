@@ -30,8 +30,8 @@ except ModuleNotFoundError:
     sys.modules["vllm"] = _vllm
     sys.modules["vllm.logger"] = _vllm_logger
 
-from vllm_omni.core.prefix_cache.adapter import PrefixCacheStep, PrefixCacheWriteLayout
 from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig, StageCacheOutputs
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheWriteLayout
 from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -165,7 +165,7 @@ def test_save_step_gates_and_passthrough(monkeypatch):
         build_write_layout=lambda view, *, num_scheduled_tokens: PrefixCacheWriteLayout((), 0)
     )
     r._prefix_cache_group_view = SimpleNamespace()
-    r._prefix_cache_step = PrefixCacheStep((), ())
+    r._prefix_cache_num_scheduled_tokens = {}
     r.is_pooling_model = True
     assert save() is None  # pooling stage never writes
     r.is_pooling_model = False

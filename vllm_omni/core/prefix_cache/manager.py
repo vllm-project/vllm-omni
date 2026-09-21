@@ -57,7 +57,7 @@ from collections.abc import Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Any, NamedTuple, NoReturn
+from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn
 
 import torch
 
@@ -539,8 +539,10 @@ class OmniPrefixCacheManager:
                 num_computed = int(event.hit_end)
                 if num_computed > 0:
                     # block_ids is per-kv-group; group 0 only.
-                    block_groups = event.block_ids
-                    if not block_groups or not block_groups[0]:
+                    blocks = event.block_ids
+                    if blocks is not None and len(blocks) > 0 and not isinstance(blocks[0], int):
+                        blocks = blocks[0]
+                    if not blocks:
                         # Fail at the cause: a hit we cannot snapshot now would
                         # crash at materialize time with less context (materialize is
                         # forbidden from reading the live batch).
@@ -552,7 +554,7 @@ class OmniPrefixCacheManager:
                         raise OmniPrefixCacheUnmatchError(
                             f"prefix hit not block aligned (req={req_id}, hit_upto={num_computed}, block_size={bs})"
                         )
-                    hit_blocks = list(block_groups[0][: num_computed // bs])
+                    hit_blocks = list(blocks[: num_computed // bs])
                     self._hit_spans[req_id] = (num_computed, hit_blocks)
 
             # 4. Gather those spans on the prefetch thread; overlaps this forward.
@@ -606,7 +608,7 @@ class OmniPrefixCacheManager:
         num_sched = {write.req_id: write.row_end - write.row_start for write in write_layout.writes}
         query_start = {write.req_id: write.row_start for write in write_layout.writes}
 
-        slots_cpu: torch.Tensor | None = write_layout.slots_cpu
+        slots_cpu: torch.Tensor | None = None
         mm_outputs = mm_outputs or {}
         freeze_event = None
 
@@ -614,8 +616,10 @@ class OmniPrefixCacheManager:
         if num_tokens_unpadded > 0:
             # Derive the slot mapping on CPU: reading the device one back
             # would need a stream sync that waits on the whole forward.
-            if slots_cpu is None:
-                raise ValueError("write_layout is missing its CPU slot snapshot")
+            slots_cpu = torch.tensor(
+                [slot for write in write_layout.writes for slot in write.slots],
+                dtype=torch.long,
+            )
             if int(slots_cpu.numel()) != num_tokens_unpadded:
                 # Fail at the cause: skipping the save would leave rows absent
                 # behind hashes vLLM already published — a delayed crash at
