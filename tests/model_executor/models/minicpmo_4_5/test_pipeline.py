@@ -170,7 +170,9 @@ class TestDeployTopology:
         assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(expected_processor)
         assert "hf_overrides" not in stages[1].yaml_engine_args
         if filename == "minicpmo_4_5.yaml":
-            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [4, 4, 4]
+            # Stage-1 caps out at 8 so concurrent Talker decodes are not
+            # serialized behind the base value of 4.
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [4, 8, 4]
             memory_utilizations = [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages]
             assert memory_utilizations == [
                 0.55,
@@ -210,9 +212,12 @@ class TestDeployTopology:
         assert stages[0].yaml_engine_args["compilation_config"]["cudagraph_mode"] == "PIECEWISE"
         assert stages[1].yaml_engine_args["compilation_config"]["cudagraph_mode"] == "PIECEWISE"
         assert stages[2].yaml_engine_args["enforce_eager"] is True
+        # Only the single-card deploy raises the Code2Wav graph pool; the
+        # multi-card variants keep the base value.
+        expected_graph_pool = 64 if filename == "minicpmo_4_5.yaml" else 32
         assert stages[2].yaml_engine_args["additional_config"] == {
             "code2wav_enable_npu_graph": True,
-            "code2wav_max_npu_graphs": 32,
+            "code2wav_max_npu_graphs": expected_graph_pool,
         }
 
     def test_pipeline_exposes_full_and_async_payload_hooks(self) -> None:
