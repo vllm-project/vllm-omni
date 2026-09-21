@@ -1517,13 +1517,6 @@ def extract_cosmos3_context(
     def postprocess(hidden: torch.Tensor) -> Any:
         return module._gen_postprocess(hidden, prep)
 
-    if control_latents is None:
-        controls: list[torch.Tensor] = []
-    elif isinstance(control_latents, torch.Tensor):
-        controls = [control_latents]
-    else:
-        controls = list(control_latents)
-
     return CacheContext(
         # SeaCache uses the separate inputs in extra_states for its decision.
         modulated_input=prep.hidden_gen,
@@ -1533,7 +1526,10 @@ def extract_cosmos3_context(
         run_transformer_blocks=run_transformer_blocks,
         postprocess=postprocess,
         extra_states={
-            "sea_cache_latents": [*controls, hidden_states],
+            # Controls are fully conditioned, separate vision items. They still
+            # enter _gen_preprocess above, but not the SEA change indicator.
+            # The target stays whole, including any clean I2V/V2V prefix frames.
+            "sea_cache_latents": [hidden_states],
             "sea_cache_noisy_frame_mask": noisy_frame_mask,
         },
     )
