@@ -60,6 +60,10 @@ from vllm_omni.config.stage_config import (
     validate_stage_async_chunk_edges,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.quantization.factory import (
+    build_quantization_config,
+    get_stage_quantization_config,
+)
 
 logger = init_logger(__name__)
 
@@ -374,13 +378,11 @@ def _stage_cli_overrides(
             name: _copy_value(value) for name, value in cli_overrides.items() if stage_override_pattern.match(name)
         }
         global_inputs = {name: _copy_value(value) for name, value in cli_overrides.items() if name not in stage_scoped}
-        cli_overrides = {
-            **normalize_and_validate_diffusion_engine_ingress_kwargs(
-                global_inputs,
-                stage_id=stage_id,
-            ),
-            **stage_scoped,
-        }
+        normalized_globals = normalize_and_validate_diffusion_engine_ingress_kwargs(
+            global_inputs,
+            stage_id=stage_id,
+        )
+        cli_overrides = {**normalized_globals, **stage_scoped}
     runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
     global_stage_fields = _global_stage_cli_fields()
     owned_fields = None if execution_type is None else _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
@@ -888,7 +890,7 @@ class _DiffusionConfigProjection:
     kv_transfer_config: KVTransferConfig | None = None
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
-    quantization_config: _QuantizationConfigType = None
+    quantization_config: QuantizationConfig | None = None
     # Internal provenance, retained across config projection and worker transport.
     quantization_config_is_auto_detected: bool = False
     extras: dict[str, Any] = field(default_factory=dict)
@@ -902,19 +904,18 @@ class _DiffusionConfigProjection:
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> _DiffusionConfigProjection:
-        from vllm_omni.diffusion.data import (
-            normalize_omni_diffusion_kwargs,
-            validate_omni_diffusion_kwargs,
-        )
+        from vllm_omni.diffusion.data import normalize_omni_kwargs, validate_omni_diffusion_kwargs
         from vllm_omni.diffusion.offloader.config import parse_diffusion_offload_config
 
-        valid_fields = frozenset(f.name for f in fields(cast(Any, cls)))
-        normalized = normalize_omni_diffusion_kwargs(kwargs)
-        validate_omni_diffusion_kwargs(normalized, valid_fields)
+        normalized = normalize_omni_kwargs(kwargs, is_diffusion=True)
         # Validate before stage construction while retaining the raw mapping
         # needed by dataclass/config serialization across process boundaries.
+        # Reject unknown fields before dropping None values, so a stray key still
+        # surfaces when its value is None instead of being silently discarded.
+        valid_fields = {config_field.name for config_field in fields(cls)}
+        validate_omni_diffusion_kwargs(normalized, valid_fields)
         parse_diffusion_offload_config(normalized.get("diffusion_offload_config"))
-        return cls(**{name: value for name, value in normalized.items() if value is not None})
+        return cls(**{name: value for name, value in normalized.items() if name in valid_fields and value is not None})
 
     def __post_init__(self) -> None:
         # Keep diffusion imports lazy so importing vllm_omni.config does not
@@ -930,7 +931,6 @@ class _DiffusionConfigProjection:
             validate_host_weight_runtime_options,
         )
         from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
-        from vllm_omni.quantization import build_quant_config
 
         if self.tf_model_config is None:
             self.tf_model_config = TransformerConfig()
@@ -973,19 +973,7 @@ class _DiffusionConfigProjection:
         elif not isinstance(self.video_output_transport, VideoOutputTransportConfig):
             raise TypeError("video_output_transport must be a VideoOutputTransportConfig or mapping")
 
-        self._propagate_quantization_from_tf_config(self.tf_model_config)
-        if self.quantization_config is not None:
-            if isinstance(self.quantization_config, QuantizationConfig):
-                pass
-            elif isinstance(self.quantization_config, str):
-                self.quantization_config = build_quant_config(self.quantization_config)
-            elif isinstance(self.quantization_config, Mapping):
-                self.quantization_config = dict(self.quantization_config)
-            else:
-                raise TypeError(
-                    "quantization_config must be str, dict, QuantizationConfig, or None, "
-                    f"got {type(self.quantization_config)!r}"
-                )
+        self.quantization_config = build_quantization_config(self.quantization_config)
 
         if self.diffusion_attention_config is None or isinstance(
             self.diffusion_attention_config,
@@ -1028,51 +1016,6 @@ class _DiffusionConfigProjection:
                 "diffusers_load_kwargs and diffusers_call_kwargs are only "
                 "valid together with diffusion_load_format=diffusers"
             )
-
-    def _propagate_quantization_from_tf_config(self, tf_config: Any) -> None:
-        quant_config = getattr(tf_config, "quant_config", None)
-        if quant_config is None:
-            return
-        quant_method = getattr(tf_config, "quant_method", None)
-        is_checkpoint_fp8 = bool(getattr(quant_config, "is_checkpoint_fp8_serialized", False))
-        is_checkpoint_nvfp4 = bool(getattr(quant_config, "is_checkpoint_nvfp4_serialized", False))
-        should_use_checkpoint_config = (
-            self.quantization_config is None
-            or (is_checkpoint_fp8 and self._is_generic_fp8_quant_config(self.quantization_config))
-            or (is_checkpoint_nvfp4 and self._is_generic_nvfp4_quant_config(self.quantization_config))
-        )
-        if should_use_checkpoint_config:
-            if self.quantization_config is None:
-                self.quantization_config_is_auto_detected = True
-            self.quantization_config = quant_config
-            if quant_method is not None:
-                self.additional_config.setdefault("auto_detected_quant_method", quant_method)
-
-    @staticmethod
-    def _is_generic_fp8_quant_config(quant_config: object) -> bool:
-        if isinstance(quant_config, str):
-            return quant_config.lower() == "fp8"
-        if isinstance(quant_config, Mapping):
-            method = quant_config.get("method", quant_config.get("quant_method"))
-            return isinstance(method, str) and method.lower() == "fp8"
-        if hasattr(quant_config, "get_name"):
-            return quant_config.get_name() == "fp8"
-        return False
-
-    @staticmethod
-    def _is_generic_nvfp4_quant_config(quant_config: object) -> bool:
-        if isinstance(quant_config, str):
-            return quant_config.lower() in {"fp4", "nvfp4", "modelopt_fp4"}
-        if isinstance(quant_config, Mapping):
-            method = quant_config.get("method", quant_config.get("quant_method"))
-            return isinstance(method, str) and method.lower() in {"fp4", "nvfp4", "modelopt_fp4"}
-        if hasattr(quant_config, "get_name"):
-            return quant_config.get_name() == "modelopt_fp4"
-        return False
-
-    def set_tf_model_config(self, tf_config: Any) -> None:
-        self.tf_model_config = tf_config
-        self._propagate_quantization_from_tf_config(tf_config)
 
     def enrich_config(self) -> None:
         from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -1361,10 +1304,10 @@ def normalize_and_validate_diffusion_engine_ingress_kwargs(
     *,
     stage_id: int | str,
 ) -> dict[str, Any]:
-    """Normalize and validate raw diffusion input without inserting defaults."""
+    """Normalize and validate raw diffusion input into a CLI override payload."""
     from vllm_omni.diffusion.data import (
         OmniDiffusionConfig,
-        normalize_omni_diffusion_kwargs,
+        normalize_omni_kwargs,
         validate_omni_diffusion_kwargs,
     )
     from vllm_omni.engine.arg_utils import orchestrator_field_names
@@ -1375,7 +1318,7 @@ def normalize_and_validate_diffusion_engine_ingress_kwargs(
         for name in _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS | {"quantization"}
         if name in mixed_kwargs
     }
-    normalized = normalize_omni_diffusion_kwargs(mixed_kwargs, apply_defaults=False)
+    normalized = normalize_omni_kwargs(mixed_kwargs, is_diffusion=True)
     if engine_owned.get("quantization") is not None and normalized.get("quantization_config") is not None:
         raise ValueError("Diffusion config fields 'quantization' and 'quantization_config' cannot both be provided.")
     normalized.update(engine_owned)
@@ -1412,7 +1355,7 @@ def extract_diffusion_stage_config_kwargs(
     """Take the diffusion-owned payload from resolved mixed stage arguments."""
     from vllm_omni.diffusion.data import (
         OmniDiffusionConfig,
-        normalize_omni_diffusion_kwargs,
+        normalize_omni_kwargs,
         validate_omni_diffusion_kwargs,
     )
 
@@ -1438,7 +1381,7 @@ def extract_diffusion_stage_config_kwargs(
     # the compatibility adapter without treating it as a deprecated alias.
     mixed_kwargs = {name: _copy_value(value) for name, value in kwargs.items()}
     engine_quantization = mixed_kwargs.pop("quantization", None)
-    normalized = normalize_omni_diffusion_kwargs(mixed_kwargs)
+    normalized = normalize_omni_kwargs(mixed_kwargs, is_diffusion=True)
     if engine_quantization is not None:
         if normalized.get("quantization_config") is not None:
             raise ValueError(
@@ -1636,7 +1579,7 @@ class BaseVllmOmniStageConfig:
     parallel_config: OmniStageParallelConfig = field(default_factory=OmniStageParallelConfig)
     compilation_config: VllmCompilationConfig | None = None
     profiler_config: VllmProfilerConfig | None = None
-    quantization_config: _QuantizationConfigType = None
+    quantization_config: QuantizationConfig | None = None
 
     @property
     def stage_id(self) -> int:
@@ -1755,9 +1698,9 @@ def _build_common_stage_config_kwargs(
     parallel_config_cls: type[OmniStageParallelConfig] = OmniStageParallelConfig,
     *,
     model: str | None,
+    quantization_config: QuantizationConfig | None,
 ) -> tuple[dict[str, Any], str | None, str | None]:
     input_proc, next_stage_proc = _select_processor_funcs(topology, resolve_stage_async_chunk(deploy, stage_deploy))
-    quantization_config = _build_quantization_config(deploy, engine.quantization)
     parallel_config = _build_parallel_config(deploy, engine.parallel, parallel_config_cls)
 
     return (
@@ -1798,7 +1741,7 @@ def _build_common_stage_config_kwargs(
             "parallel_config": parallel_config,
             "compilation_config": _copy_value(engine.compilation_config),
             "profiler_config": _copy_value(engine.profiler_config),
-            "quantization_config": _copy_value(quantization_config),
+            "quantization_config": quantization_config,
         },
         input_proc,
         next_stage_proc,
@@ -1823,6 +1766,7 @@ def _build_ar_stage_config(
     engine: _StageEngineValues,
     *,
     model: str | None,
+    quantization_config: QuantizationConfig | None,
 ) -> VllmOmniARStageConfig:
     common_kwargs, input_proc, next_stage_proc = _build_common_stage_config_kwargs(
         pipeline,
@@ -1831,6 +1775,7 @@ def _build_ar_stage_config(
         stage_deploy,
         engine,
         model=model,
+        quantization_config=quantization_config,
     )
     return cast(
         VllmOmniARStageConfig,
@@ -1850,6 +1795,7 @@ def _build_generation_stage_config(
     engine: _StageEngineValues,
     *,
     model: str | None,
+    quantization_config: QuantizationConfig | None,
 ) -> VllmOmniGenerationStageConfig:
     common_kwargs, input_proc, next_stage_proc = _build_common_stage_config_kwargs(
         pipeline,
@@ -1858,6 +1804,7 @@ def _build_generation_stage_config(
         stage_deploy,
         engine,
         model=model,
+        quantization_config=quantization_config,
     )
     return cast(
         VllmOmniGenerationStageConfig,
@@ -1877,6 +1824,7 @@ def _build_diffusion_stage_config(
     engine: _StageEngineValues,
     *,
     model: str | None,
+    quantization_config: QuantizationConfig | None,
 ) -> VllmOmniDiffusionStageConfig:
     common_kwargs, input_proc, next_stage_proc = _build_common_stage_config_kwargs(
         pipeline,
@@ -1886,6 +1834,7 @@ def _build_diffusion_stage_config(
         engine,
         OmniStageDiffusionParallelConfig,
         model=model,
+        quantization_config=quantization_config,
     )
     common_kwargs["diffusion_config"] = _build_diffusion_config_projection(
         pipeline,
@@ -1912,6 +1861,33 @@ _STAGE_CONFIG_BUILDERS = {
 }
 
 
+def _build_stage_quantization_config(
+    deploy: DeployConfig,
+    topology: StagePipelineConfig,
+    engine: _StageEngineValues,
+    model: str | None,
+) -> QuantizationConfig | None:
+    """Get the quantization config for a single stage."""
+    quantization = _first_defined(
+        engine.quantization.get("quantization_config"),
+        engine.quantization.get("quantization"),
+        deploy.quantization,
+    )
+    trust_remote_code = _first_defined(
+        engine.model.get("trust_remote_code"),
+        deploy.trust_remote_code,
+        False,
+    )
+    return get_stage_quantization_config(
+        model,
+        quantization,
+        revision=engine.model.get("revision"),
+        stage_type=_resolve_execution_mode(topology.execution_type)[0].value,
+        trust_remote_code=trust_remote_code,
+        hf_config_name=topology.hf_config_name,
+    )
+
+
 def _build_stage_config(
     pipeline: PipelineConfig,
     deploy: DeployConfig,
@@ -1921,6 +1897,7 @@ def _build_stage_config(
     *,
     model: str | None,
 ) -> StageConfigType:
+    quantization_config = _build_stage_quantization_config(deploy, topology, engine, model)
     try:
         builder = _STAGE_CONFIG_BUILDERS[topology.execution_type]
     except KeyError as exc:
@@ -1934,18 +1911,8 @@ def _build_stage_config(
             stage_deploy,
             engine,
             model=model,
+            quantization_config=quantization_config,
         ),
-    )
-
-
-def _build_quantization_config(
-    deploy: DeployConfig,
-    engine: _QuantizationEngineOverrides,
-) -> _QuantizationConfigType:
-    return _first_defined(
-        engine.get("quantization_config"),
-        engine.get("quantization"),
-        deploy.quantization,
     )
 
 
@@ -2154,7 +2121,7 @@ def _build_diffusion_config_projection(
     engine: _DiffusionEngineOverrides,
     *,
     model: str | None,
-    quantization_config: _QuantizationConfigType,
+    quantization_config: QuantizationConfig | None,
 ) -> _DiffusionConfigProjection:
     diffusion_kwargs = engine.to_kwargs()
     diffusion_kwargs["stage_id"] = topology.stage_id
@@ -2174,7 +2141,7 @@ def _build_diffusion_config_projection(
     if "model" not in diffusion_kwargs and model is not None:
         diffusion_kwargs["model"] = model
     if quantization_config is not None:
-        diffusion_kwargs["quantization_config"] = _copy_value(quantization_config)
+        diffusion_kwargs["quantization_config"] = quantization_config
 
     return _DiffusionConfigProjection.from_kwargs(**{k: v for k, v in diffusion_kwargs.items() if v is not None})
 

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 from pytest_mock import MockerFixture
+from vllm.model_executor.layers.quantization.inc import INCConfig
 
 import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 as wan22_module
 import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_vace as wan22_vace_module
@@ -24,6 +25,7 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_vace import (
     create_vace_transformer_from_config,
 )
+from vllm_omni.quantization.factory import build_quantization_config
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -240,9 +242,7 @@ class TestI2VTransformer2QuantConfig:
     """Test the transformer_2 quant_config build logic from pipeline_wan2_2_i2v."""
 
     def test_transformer_2_quant_config_built_from_dict(self):
-        """When transformer_2 config has quantization_config dict, build_quant_config is called."""
-        from vllm_omni.quantization.factory import build_quant_config
-
+        """When transformer_2 config has quantization_config dict, build_quantization_config is called."""
         t2_config = {
             "patch_size": [1, 2, 2],
             "num_layers": 2,
@@ -256,15 +256,8 @@ class TestI2VTransformer2QuantConfig:
         }
 
         # Replicate the logic from pipeline_wan2_2_i2v.py
-        t2_quant = t2_config.get("quantization_config")
-        if isinstance(t2_quant, dict) and "quant_method" in t2_quant:
-            method = t2_quant["quant_method"]
-            kwargs = {k: v for k, v in t2_quant.items() if k != "quant_method"}
-            t2_quant = build_quant_config(method, **kwargs)
-        else:
-            t2_quant = None
-
-        from vllm.model_executor.layers.quantization.inc import INCConfig
+        t2_disk_qc = t2_config.get("quantization_config", {})
+        t2_quant = build_quantization_config(t2_disk_qc.get("quant_method"), t2_disk_qc)
 
         assert isinstance(t2_quant, INCConfig)
         assert t2_quant.weight_bits == 4

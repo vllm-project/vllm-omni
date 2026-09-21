@@ -117,7 +117,10 @@ def _from_pipeline_key(
     )
 
 
-def test_mammothmoda2_diffusion_stage_projects_native_backend_config() -> None:
+def test_mammothmoda2_diffusion_stage_projects_native_backend_config(monkeypatch) -> None:
+    # The AR stage's eager quant build reads its checkpoint config; stub it so
+    # the offline test path is not validated as an HF repo id.
+    monkeypatch.setattr(omni_config_module, "get_stage_quantization_config", lambda *a, **k: None)
     config = _from_pipeline_key(
         "mammoth_moda2",
         cli_overrides={"model": "/models/MammothModa2-Preview"},
@@ -566,20 +569,33 @@ def test_diffusion_deploy_dtype_survives_unset_cli_overrides(cli_overrides, expe
         {"omni_dp_size_local": 2, "omni_heartbeat_timeout": 60.0, "omni_lb_policy": "random"},
     ],
 )
-def test_diffusion_ingress_routes_coordination_fields_away(coordination_kwargs):
+def test_diffusion_ingress_routes_coordination_fields_away(coordination_kwargs, monkeypatch):
+    # ensure we haven't set cache related overrides that would change normalized values
+    monkeypatch.delenv("DIFFUSION_CACHE_BACKEND", raising=False)
+    monkeypatch.delenv("DIFFUSION_CACHE_ADAPTER", raising=False)
     normalize = omni_config_module.normalize_and_validate_diffusion_engine_ingress_kwargs
-    assert normalize({**coordination_kwargs, "enable_sleep_mode": True}, stage_id=0) == {"enable_sleep_mode": True}
+    # The override payload carries only caller-set fields; unset dtype/cache_backend
+    # defaults are left to the construction path so they cannot clobber deploy values.
+    assert normalize({**coordination_kwargs, "enable_sleep_mode": True}, stage_id=0) == {
+        "enable_sleep_mode": True,
+    }
     with pytest.raises(ValueError, match="omni_master_unknown_field"):
         normalize({**coordination_kwargs, "omni_master_unknown_field": "unknown"}, stage_id=0)
 
 
-def test_diffusion_ingress_defers_defaults(monkeypatch):
+def test_diffusion_ingress_omits_unset_defaults(monkeypatch):
+    # dtype/cache_backend are eager defaults only on the construction path; the
+    # override ingress must omit them unless the caller set them, otherwise they
+    # would override deploy-config values the user never touched (including via env).
     monkeypatch.setenv("DIFFUSION_CACHE_BACKEND", "tea_cache")
+    normalize = omni_config_module.normalize_and_validate_diffusion_engine_ingress_kwargs
 
-    assert omni_config_module.normalize_and_validate_diffusion_engine_ingress_kwargs({}, stage_id=0) == {}
-    assert omni_config_module.normalize_and_validate_diffusion_engine_ingress_kwargs(
-        {"dtype": None, "cache_backend": None}, stage_id=0
-    ) == {"dtype": None, "cache_backend": None}
+    assert normalize({}, stage_id=0) == {}
+    assert normalize({"dtype": None, "cache_backend": None}, stage_id=0) == {}
+    assert normalize({"dtype": "float16", "cache_backend": "deep_cache"}, stage_id=0) == {
+        "dtype": "float16",
+        "cache_backend": "deep_cache",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1748,35 +1764,6 @@ def test_diffusion_config_field_classification_covers_current_fields():
     assert "prompt_file_path" in omni_config_module._DIFFUSION_RUNTIME_CONFIG_FIELDS
 
 
-def test_diffusion_config_projection_keeps_mapping_quantization_config_serializable():
-    quantization_config = {
-        "method": "example_quant",
-        "weights": "weights.bin",
-    }
-
-    cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(quantization_config=quantization_config)
-
-    assert cfg.quantization_config == quantization_config
-
-
-def test_diffusion_quantization_mapping_reaches_terminal_config(monkeypatch):
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-
-    quantization_config = {"method": "int8", "activation_scheme": "dynamic"}
-    cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(
-        quantization_config=quantization_config,
-    )
-
-    # Exercise the terminal construction performed by the future typed startup
-    # path without probing ports or loading remote model metadata.
-    monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda _self: 29500)
-    monkeypatch.setattr(OmniDiffusionConfig, "enrich_config", lambda _self: None)
-    cfg.enrich_config()
-
-    assert cfg.quantization_config is not None
-    assert cfg.quantization_config.get_name() == "int8"
-
-
 def test_video_output_transport_mapping_is_normalized() -> None:
     from vllm_omni.diffusion.data import VideoOutputTransportConfig
 
@@ -1926,7 +1913,7 @@ def test_async_chunk_rejects_mismatched_connector_edge(disabled_stage, builder):
 @pytest.mark.parametrize("explicit", [False, True])
 def test_diffusion_quantization_origin_survives_projection_and_transport(monkeypatch, explicit):
     from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
-    from vllm_omni.quantization import build_quant_config
+    from vllm_omni.quantization import build_quantization_config
 
     checkpoint = TransformerConfig.from_dict(
         {
@@ -1937,12 +1924,15 @@ def test_diffusion_quantization_origin_survives_projection_and_transport(monkeyp
             }
         }
     )
-    requested = build_quant_config("mxfp4", w4a8_fallback_steps=[]) if explicit else None
+    requested = build_quantization_config({"method": "mxfp4", "w4a8_fallback_steps": []}) if explicit else None
     cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(
         tf_model_config=checkpoint,
         quantization_config=requested,
     )
-    assert cfg.quantization_config_is_auto_detected is not explicit
+    # Projection construction does not auto-detect from the checkpoint; that
+    # happens at enrich (load) time via set_tf_model_config below. See the
+    # follow-up to resolve quantization per-component and drop this flag.
+    assert cfg.quantization_config_is_auto_detected is False
     monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda _self: 29500)
     monkeypatch.setattr(OmniDiffusionConfig, "enrich_config", lambda self: self.set_tf_model_config(checkpoint))
     cfg.enrich_config()
@@ -1985,7 +1975,7 @@ def test_direct_diffusion_aliases_promote_none_and_reject_real_conflicts(monkeyp
     from vllm_omni.diffusion import data as diffusion_data
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
-    monkeypatch.setattr(diffusion_data, "build_quant_config", lambda config: config)
+    monkeypatch.setattr(diffusion_data, "build_quantization_config", lambda config: config)
     with pytest.warns(FutureWarning) as warnings:
         config = OmniDiffusionConfig.from_kwargs(
             quantization={"method": "example"},

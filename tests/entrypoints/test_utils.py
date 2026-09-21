@@ -380,6 +380,7 @@ class TestResolveOmniConfig:
             "vllm_omni.config.config_factory.StageConfigFactory.get_pipeline_config",
             return_value=QWEN3_OMNI_PIPELINE,
         )
+        mocker.patch("vllm_omni.quantization.factory.read_checkpoint_quantization_config", return_value=None)
 
         resolved = resolve_omni_config(
             "dummy-model",

@@ -264,7 +264,6 @@ def test_build_vllm_config_proceeds_on_consistent_layout(mocker: MockerFixture) 
         side_effect=capture_create_engine_config,
     )
     mocker.patch.object(stage_init_utils.Executor, "get_class", return_value=sentinel_executor)
-    mocker.patch.object(stage_init_utils.OmniINCConfig, "maybe_upgrade", side_effect=lambda quant: quant)
 
     vllm_config, executor_class = build_vllm_config(
         stage,

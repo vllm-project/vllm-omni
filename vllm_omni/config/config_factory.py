@@ -15,7 +15,6 @@ from transformers import PretrainedConfig
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
-from vllm.transformers_utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.omni_config import (
@@ -40,6 +39,7 @@ from vllm_omni.config.stage_config import (
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.io_support import get_diffusion_output_type
 from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
+from vllm_omni.utils.model_source import materialize_object_storage_configs
 
 logger = init_logger(__name__)
 
@@ -61,28 +61,6 @@ class _LegacyConfigResolution:
     stage_configs: list[StageConfig]
     pipeline_config: PipelineConfig
     omni_lb_policy: str | None
-
-
-@functools.cache
-def _materialize_object_storage_configs(model: str) -> str:
-    """Materialize an object-storage model URI's config files locally.
-
-    vLLM's Run:AI streamer keeps ``s3://``/``gs://``/``az://`` URIs opaque until
-    each stage builds its ``ModelConfig``; parent-process resolution (HF config
-    lookup, pipeline/pipeline-key matching) would instead hand the URI to
-    ``huggingface_hub`` helpers, which reject it with ``HFValidationError``.
-    Pull the lightweight files once into vLLM's deterministic
-    ``model_streamer/<hash>`` directory so config reads work here, and so the
-    stage processes' own pull lands in that same directory.
-
-    Returns the input unchanged for non object-storage paths.
-    """
-    if not is_runai_obj_uri(model):
-        return model
-    object_storage_model = ObjectStorageModel(url=model)
-    object_storage_model.pull_files(model, allow_pattern=["*.model", "*.py", "*.json"])
-    logger.info("Materialized object-storage configs for %s at %s", model, object_storage_model.dir)
-    return object_storage_model.dir
 
 
 def _name_match_candidate(model: str) -> str:
@@ -161,19 +139,29 @@ class StageConfigFactory:
 
     @classmethod
     @functools.cache
-    def get_hf_config(cls, model: str, trust_remote_code: bool) -> PretrainedConfig | None:
+    def get_hf_config(
+        cls,
+        model: str,
+        trust_remote_code: bool,
+        revision: str | None,
+    ) -> PretrainedConfig | None:
         """Fetch the HF config (if it exists) from the model directory.
 
         Args:
             model: Model name or path.
             trust_remote_code: Whether to trust remote code for HF config loading.
+            revision: Model revision to load.
 
         Returns:
             the model's config or None.
         """
         hf_config = None
         try:
-            return get_config(_materialize_object_storage_configs(model), trust_remote_code=trust_remote_code)
+            return get_config(
+                materialize_object_storage_configs(model),
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+            )
         except Exception as e:
             logger.debug(f"`get_config` failed with exception {e}; inferred HF config is None")
         return hf_config
@@ -215,11 +203,12 @@ class StageConfigFactory:
         hf_config = cls.get_hf_config(
             model=model,
             trust_remote_code=trust_remote_code,
+            revision=None,
         )
         if hf_config is not None:
             return hf_config.model_type
 
-        config_source = _materialize_object_storage_configs(model)
+        config_source = materialize_object_storage_configs(model)
 
         # Fallback: read config.json directly for custom model types that
         # are not registered with transformers (e.g. qwen3_tts).
@@ -290,7 +279,7 @@ class StageConfigFactory:
     ) -> PipelineConfig | None:
         """Resolve the PipelineConfig for a model path/name."""
         model_type = cls.try_infer_model_type(model=model, trust_remote_code=trust_remote_code)
-        hf_config = cls.get_hf_config(model=model, trust_remote_code=trust_remote_code)
+        hf_config = cls.get_hf_config(model=model, trust_remote_code=trust_remote_code, revision=None)
 
         # Resolve the deploy config & check if the user set the pipeline;
         # If the pipeline is explicitly set, it takes highest priority

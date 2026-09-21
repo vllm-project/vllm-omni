@@ -9,6 +9,7 @@ from collections.abc import Mapping
 
 import pytest
 import torch
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.omni_config import extract_diffusion_stage_config_kwargs
@@ -43,6 +44,34 @@ def _roundtrip_diffusion_config(**kwargs) -> OmniDiffusionConfig:
     engine_args = dict(stages[0]["engine_args"])
     diffusion_kwargs = extract_diffusion_stage_config_kwargs(engine_args, stage_id=0)
     return OmniDiffusionConfig(**{name: value for name, value in diffusion_kwargs.items() if value is not None})
+
+
+class TestQuantizationConfigPropagation:
+    def test_init_resolves_mapping_without_mutating_input(self):
+        spec = {"method": "fp8", "activation_scheme": "static"}
+        expected = dict(spec)
+
+        config = OmniDiffusionConfig(model=None, quantization_config=spec)
+
+        assert isinstance(config.quantization_config, Fp8Config)
+        assert config.quantization_config.activation_scheme == "static"
+        assert spec == expected
+
+    def test_init_accepts_built_quantization_config(self):
+        config = OmniDiffusionConfig(model=None, quantization_config=Fp8Config())
+
+        assert isinstance(config.quantization_config, Fp8Config)
+        assert config.quantization_config.get_name() == "fp8"
+
+    def test_init_resolves_string_quantization_config(self):
+        config = OmniDiffusionConfig(model=None, quantization_config="fp8")
+
+        assert isinstance(config.quantization_config, Fp8Config)
+
+    @pytest.mark.parametrize("value", [1, [], object()])
+    def test_init_rejects_invalid_quantization_type(self, value):
+        with pytest.raises(TypeError, match="quantization must be a string, mapping, QuantizationConfig, or None"):
+            OmniDiffusionConfig(model=None, quantization_config=value)
 
 
 class TestParallelConfigPropagation:

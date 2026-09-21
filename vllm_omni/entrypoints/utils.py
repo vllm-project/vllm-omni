@@ -8,10 +8,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from typing import Any, get_args, get_origin
 
+from omegaconf import DictConfig, OmegaConf
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.config.config_factory import with_trust_remote_code_override
+from vllm_omni.diffusion.data import normalize_omni_kwargs, parse_attention_config
 from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.inputs.data import OmniSamplingParams
 
@@ -144,6 +146,65 @@ def prepare_stage_config_inputs(
         stage_overrides=stage_overrides,
         strategy_config_path=strategy_config_path,
     )
+
+
+# Kwargs for diffusion to directly copy over into the engine args;
+# Note that this excludes kwargs that have any kind of builder utils,
+# e.g., for attention.
+_DIFFUSION_KWARG_NAMES = [
+    "lora_path",
+    "lora_backend",
+    "additional_config",
+    "diffusion_kv_cache_dtype",
+    "diffusion_kv_cache_skip_steps",
+    "diffusion_kv_cache_skip_layers",
+    "enable_diffusion_pipeline_profiler",
+    "enable_ar_profiler",
+]
+
+
+def _apply_stage_engine_arg_overrides(
+    stage_config: DictConfig,
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply diffusion-specific CLI kwargs to a stage's engine_args (set-if-absent).
+
+    NOTE: quantization / quantization config are handled separately, and this code
+    is being actively refactored. We build the quantization configs as early as possible,
+    since we already have the HF config from resolving the PipelineConfig, and just pass the
+    quant config per type to the engine args.
+    """
+    is_diffusion = stage_config.stage_type == "diffusion"
+
+    if is_diffusion:
+        if stage_config.engine_args is None:
+            stage_config.engine_args = OmegaConf.create({})
+
+        diff_attn_config = getattr(stage_config.engine_args, "diffusion_attention_config", None)
+        diff_attn_backend = getattr(stage_config.engine_args, "diffusion_attention_backend", None)
+        has_stage_attention = diff_attn_config is not None or diff_attn_backend is not None
+        if not has_stage_attention:
+            stage_config.engine_args.diffusion_attention_config = parse_attention_config(
+                kwargs.get("diffusion_attention_config"),
+                attention_backend=kwargs.get("diffusion_attention_backend"),
+                fastvideo_vsa_topk=kwargs.get("fastvideo_vsa_topk"),
+            )
+
+        for name in _DIFFUSION_KWARG_NAMES:
+            val = kwargs.get(name)
+            if val is not None and getattr(stage_config.engine_args, name, None) is None:
+                stage_config.engine_args[name] = val
+
+        # TODO (Alex) deprecate static_lora_scale alias
+        lora_scale = kwargs.get("lora_scale")
+        if lora_scale is None:
+            lora_scale = kwargs.get("static_lora_scale")
+        if lora_scale is not None and getattr(stage_config.engine_args, "lora_scale", None) is None:
+            stage_config.engine_args.lora_scale = lora_scale
+
+    # Normalize the STAGE's own engine args (quantization -> quantization_config) and convert to dict.
+    engine_args = _to_dict(stage_config.engine_args) if stage_config.engine_args is not None else {}
+    return normalize_omni_kwargs(engine_args, is_diffusion=is_diffusion)
 
 
 def get_final_stage_id_for_e2e(

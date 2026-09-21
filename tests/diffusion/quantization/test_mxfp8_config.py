@@ -7,7 +7,7 @@ Coverage:
 - get_quant_method dispatch (mocked platform)
 - MXFPLinearMethodBase.apply() reshape skeleton (CPU)
 - Weight / scale shape-transform arithmetic from process_weights_after_loading (CPU)
-- build_quant_config integration
+- build_quantization_config integration
 - MXFP8_QUANT_CONFIG structure as the auto-detection contract
 - Offload-after-quant capability of the shared online-method mixin (CPU)
 """
@@ -19,7 +19,9 @@ from torch.nn import Module
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
 from vllm_omni.platforms import current_omni_platform
-from vllm_omni.quantization import build_quant_config
+from vllm_omni.quantization import SUPPORTED_QUANTIZATION_METHODS, build_quantization_config
+from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config, MXFPLinearMethodBase
+from vllm_omni.quantization.tools.merge_mxfp8_checkpoint import MXFP8_QUANT_CONFIG
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -32,82 +34,63 @@ npu_available = pytest.mark.skipif(not current_omni_platform.is_npu(), reason="N
 
 
 def test_mxfp8_config_get_name():
-    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
-
     assert DiffusionMXFP8Config.get_name() == "mxfp8"
 
 
 def test_mxfp8_config_from_config_defaults():
-    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
-
     cfg = DiffusionMXFP8Config.from_config({})
     assert cfg.is_checkpoint_mxfp8_serialized is False
     assert cfg.ignored_layers == []
 
 
 def test_mxfp8_config_from_config_serialized():
-    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
-
     cfg = DiffusionMXFP8Config.from_config({"is_checkpoint_mxfp8_serialized": True})
     assert cfg.is_checkpoint_mxfp8_serialized is True
 
 
 def test_mxfp8_config_from_config_ignored_layers():
-    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
-
     cfg = DiffusionMXFP8Config.from_config({"ignored_layers": ["proj_out"]})
     assert cfg.ignored_layers == ["proj_out"]
 
 
 def test_mxfp8_config_from_config_modules_to_not_convert_fallback():
     """modules_to_not_convert must be accepted as an alias for ignored_layers."""
-    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
-
     cfg = DiffusionMXFP8Config.from_config({"modules_to_not_convert": ["proj_out"]})
     assert cfg.ignored_layers == ["proj_out"]
 
 
 # ---------------------------------------------------------------------------
-# build_quant_config integration
+# build_quantization_config integration
 # ---------------------------------------------------------------------------
 
 
 def test_build_quant_config_mxfp8_string():
-    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
-
-    cfg = build_quant_config("mxfp8")
+    cfg = build_quantization_config("mxfp8")
     assert isinstance(cfg, DiffusionMXFP8Config)
     assert cfg.get_name() == "mxfp8"
     assert cfg.is_checkpoint_mxfp8_serialized is False
 
 
 def test_build_quant_config_mxfp8_dict():
-    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
-
-    cfg = build_quant_config({"method": "mxfp8", "is_checkpoint_mxfp8_serialized": True})
+    cfg = build_quantization_config({"method": "mxfp8", "is_checkpoint_mxfp8_serialized": True})
     assert isinstance(cfg, DiffusionMXFP8Config)
     assert cfg.is_checkpoint_mxfp8_serialized is True
 
 
 def test_build_quant_config_mxfp8_config_json_format():
     """Verify that the exact quantization_config injected by merge_mxfp8_checkpoint.py
-    is accepted by build_quant_config and selects the offline (serialized) path.
+    is accepted by build_quantization_config and selects the offline (serialized) path.
 
     This is the critical auto-detection contract: TransformerConfig.from_dict()
     reads quant_method + is_checkpoint_mxfp8_serialized to pick NPUMxfp8LinearMethod.
     """
-    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
-    from vllm_omni.quantization.tools.merge_mxfp8_checkpoint import MXFP8_QUANT_CONFIG
-
-    cfg = build_quant_config(MXFP8_QUANT_CONFIG)
+    cfg = build_quantization_config(MXFP8_QUANT_CONFIG)
     assert isinstance(cfg, DiffusionMXFP8Config)
     assert cfg.is_checkpoint_mxfp8_serialized is True
 
 
 def test_mxfp8_quant_config_structure():
     """MXFP8_QUANT_CONFIG must contain exactly the keys that auto-detection reads."""
-    from vllm_omni.quantization.tools.merge_mxfp8_checkpoint import MXFP8_QUANT_CONFIG
-
     assert MXFP8_QUANT_CONFIG.get("quant_method") == "mxfp8"
     assert MXFP8_QUANT_CONFIG.get("is_checkpoint_mxfp8_serialized") is True
 
@@ -120,8 +103,6 @@ def test_mxfp8_quant_config_structure():
 @pytest.mark.skipif(not current_omni_platform.is_npu(), reason="Native MXFP8 offline only supported on NPU")
 def test_get_quant_method_offline_npu(mocker: MockerFixture):
     """Offline (serialized) path must return NPUMxfp8LinearMethod on NPU."""
-    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
-
     config = DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=True)
     layer = mocker.Mock(spec=LinearBase)
 
@@ -132,8 +113,6 @@ def test_get_quant_method_offline_npu(mocker: MockerFixture):
 @pytest.mark.skipif(not current_omni_platform.is_xpu(), reason="XPU platform not available")
 def test_get_quant_method_offline_xpu_raises(mocker: MockerFixture):
     """XPU offline mode must raise NotImplementedError (use AutoRound MXFP8 instead)."""
-    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
-
     config = DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=True)
     layer = mocker.Mock(spec=LinearBase)
 
@@ -146,8 +125,6 @@ def test_get_quant_method_offline_xpu_raises(mocker: MockerFixture):
 )
 def test_get_quant_method_online(mocker: MockerFixture):
     """Online (BF16 checkpoint) path must return platform-specific method on current platform."""
-    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
-
     # Mock the vLLM online method to avoid config dependency for XPU
     if current_omni_platform.is_xpu():
         mock_inner = mocker.Mock()
@@ -169,8 +146,6 @@ def test_get_quant_method_online(mocker: MockerFixture):
 
 def test_get_quant_method_unsupported_platform_raises(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     """Unsupported platform (CUDA, ROCm) must raise NotImplementedError."""
-    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
-
     config = DiffusionMXFP8Config()
     layer = mocker.Mock(spec=LinearBase)
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
@@ -183,8 +158,6 @@ def test_get_quant_method_unsupported_platform_raises(mocker: MockerFixture, mon
 
 def test_get_quant_method_ignored_layer(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     """A prefix in ignored_layers must bypass quantization → UnquantizedLinearMethod."""
-    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
-
     config = DiffusionMXFP8Config(ignored_layers=["proj_out"])
     layer = mocker.Mock(spec=LinearBase)
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
@@ -197,8 +170,6 @@ def test_get_quant_method_ignored_layer(mocker: MockerFixture, monkeypatch: pyte
 
 def test_get_quant_method_non_linear_returns_none(monkeypatch: pytest.MonkeyPatch):
     """Non-LinearBase layers (norms, embeddings) must get None → no quantization."""
-    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
-
     config = DiffusionMXFP8Config()
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
 
@@ -213,8 +184,6 @@ def test_get_quant_method_non_linear_returns_none(monkeypatch: pytest.MonkeyPatc
 
 def test_apply_reshape_skeleton():
     """apply() must flatten batch dims → _apply_inner → restore original leading dims."""
-    from vllm_omni.quantization.mxfp8_config import MXFPLinearMethodBase
-
     OUT_FEATURES = 4
 
     class _StubMethod(MXFPLinearMethodBase):
@@ -244,8 +213,6 @@ def test_apply_reshape_skeleton():
 
 def test_apply_reshape_with_bias():
     """apply() must pass bias through to _apply_inner unchanged."""
-    from vllm_omni.quantization.mxfp8_config import MXFPLinearMethodBase
-
     received_bias = []
 
     class _StubMethod(MXFPLinearMethodBase):
@@ -334,8 +301,6 @@ def test_num_groups_formula():
 
 
 def test_supported_methods_include_mxfp8():
-    from vllm_omni.quantization import SUPPORTED_QUANTIZATION_METHODS
-
     assert "mxfp8" in SUPPORTED_QUANTIZATION_METHODS
 
 

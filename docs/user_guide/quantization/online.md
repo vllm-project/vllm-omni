@@ -77,9 +77,9 @@ vllm serve <your-model> --omni --quantization mxfp4_dualscale
 Per-component routing:
 
 ```python
-from vllm_omni.quantization import build_quant_config
+from vllm_omni.quantization import build_quantization_config
 
-config = build_quant_config({
+config = build_quantization_config({
     "transformer": {"method": "fp8"},
     "vae": None,
 })
