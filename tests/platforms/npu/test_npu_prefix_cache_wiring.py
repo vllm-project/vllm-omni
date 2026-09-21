@@ -28,6 +28,7 @@ import torch
 
 from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -119,8 +120,16 @@ def _run_step(mgr, view, req_id, blocks, start_pos, sched, *, hit=0, finished=()
         finished_req_ids=set(finished),
         num_scheduled_tokens={req_id: sched},
     )
-    mgr.new_step_starts(sched_out)
-    return mgr.save_outputs(hidden, {}, num_tokens_unpadded=sched, num_tokens_padded=sched)
+    adapter = PrefixCacheSchedulerAdapter()
+    mgr.new_step_starts(adapter.translate_scheduler_output(sched_out))
+    layout = adapter.build_write_layout(view, num_scheduled_tokens=sched_out.num_scheduled_tokens)
+    return mgr.save_outputs(
+        hidden,
+        {},
+        num_tokens_unpadded=sched,
+        num_tokens_padded=sched,
+        write_layout=layout,
+    )
 
 
 def _expected_rows(slots: torch.Tensor) -> torch.Tensor:
@@ -134,7 +143,7 @@ def _make_npu_mode_manager(monkeypatch) -> tuple[OmniPrefixCacheManager, _FakeVi
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     view = _FakeView()
     config = PrefixCacheConfig(num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE)
-    return OmniPrefixCacheManager(config, view), view
+    return OmniPrefixCacheManager(config), view
 
 
 def test_npu_mode_auto_selects_eager_and_roundtrips(monkeypatch):
