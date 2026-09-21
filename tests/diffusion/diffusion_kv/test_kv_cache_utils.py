@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Native multimodal block hashing and diffusion-specific identity helpers."""
 
@@ -243,6 +243,26 @@ def test_engine_gates_hook_loading_and_admission(monkeypatch, mode, enabled, exp
         assert row.mm_features == []
         load_hook.assert_not_called()
         hook.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "model_class_name,load_format",
+    [(None, "default"), ("UnregisteredPipeline", "default"), ("HunyuanImage3ForCausalMM", "diffusers")],
+)
+def test_engine_rejects_enabled_prefix_caching_without_hook(monkeypatch, model_class_name, load_format):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda _self: 29500)
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig.from_kwargs(
+        model_class_name=model_class_name,
+        diffusion_load_format=load_format,
+        diffusion_kv_mode="paged_scheduler",
+        diffusion_kv_max_rows_per_request=2,
+        enable_prefix_caching=True,
+    )
+    with pytest.raises(ValueError, match="requires a registered prefix-cache hook"):
+        engine._init_process_hooks(engine.od_config)
 
 
 def test_engine_rejects_out_of_profile_request_before_hashing():

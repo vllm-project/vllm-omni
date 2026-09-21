@@ -188,6 +188,39 @@ def test_slice_cached_prefix_inputs_keeps_full_kv_axis() -> None:
     assert sliced_seq_len == 4
 
 
+@pytest.mark.parametrize("local_prefix_hit", [True, False])
+def test_ar_reuse_does_not_consume_local_prefix_hits(local_prefix_hit):
+    from vllm_omni.diffusion.forward_context import set_forward_context
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+        HunyuanImage3Text2ImagePipeline,
+    )
+
+    pipe = object.__new__(HunyuanImage3Text2ImagePipeline)
+    input_ids = torch.arange(12).reshape(1, 12)
+    cond_image = torch.ones(1, 1)
+    kwargs = dict(
+        query_lens=[12],
+        attention_mask=torch.ones(1, 1, 12, 12),
+        position_ids=input_ids.clone(),
+        image_mask=torch.zeros_like(input_ids, dtype=torch.bool),
+        gen_timestep_scatter_index=torch.tensor([[8]]),
+        cond_vae_images=cond_image,
+    )
+    runtime = SimpleNamespace(metadata=SimpleNamespace(prefill_rows=[SimpleNamespace(kv_start_pos=4)]))
+    with set_forward_context(paged_kv_runtime=runtime, paged_kv_cached_prefix_len=4 if local_prefix_hit else 0):
+        output, ar_reuse_len = pipe._maybe_handle_ar_kv_reuse(input_ids, kwargs, 1, False, None, torch.device("cpu"))
+    if local_prefix_hit:
+        assert ar_reuse_len == 0
+        assert output is input_ids
+        assert kwargs["query_lens"] == [12]
+        assert kwargs["cond_vae_images"] is cond_image
+    else:
+        assert ar_reuse_len == 4
+        torch.testing.assert_close(output, input_ids[:, 4:])
+        assert kwargs["query_lens"] == [8]
+        assert "cond_vae_images" not in kwargs
+
+
 def test_hunyuan_step_group_key_ignores_step_index_for_later_steps():
     pipeline = _pipeline()
     states = [_state("req-0", 1), _state("req-1", 3)]
@@ -457,7 +490,7 @@ def test_denoise_step_uses_input_batch_group_order_and_splits_back(monkeypatch):
             }
         ]
 
-    captured = {}
+    captured: dict[str, object] = {}
 
     def fake_restore_prompt_kv_cache(states_arg, row_state_indexes, row_branches):
         del states_arg
@@ -484,7 +517,9 @@ def test_denoise_step_uses_input_batch_group_order_and_splits_back(monkeypatch):
     assert captured["row_state_indexes"] == [0, 1, 0, 1]
     assert captured["row_branches"] == [0, 0, 1, 1]
     assert captured["input_ids"] is None
+    assert isinstance(captured["images"], torch.Tensor)
     assert tuple(captured["images"].shape) == (4, 1)
+    assert isinstance(captured["timestep"], torch.Tensor)
     assert captured["timestep"].tolist() == [0.5, 0.0, 0.5, 0.0]
     assert captured["merged_attention_mask_shape"] == (4, 1, 2, 6)
     assert captured["merged_full_attn_spans"] == [[(4, 6)], [(4, 6)], [(4, 6)], [(4, 6)]]

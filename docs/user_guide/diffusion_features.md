@@ -43,8 +43,9 @@ cache, TeaCache and Cache-DiT.
 | Model / combination | Scope |
 |---------------------|-------|
 | HunyuanImage3 standalone DiT | Stable text/reference-image prefix reuse; dynamic image tokens are excluded |
-| TP4 + EP, SP1, CFGP1 | Prefix-hit accuracy test topology; CFG guidance does not require CFG parallelism |
-| SP>1, CFGP>1, other TP sizes | Prefix-hit E2E accuracy not yet validated |
+| TP4/SP1 + EP, CFGP1 | Validated reference-image prefix hits |
+| TP2/SP2 (Ulysses) + EP, CFGP1 | Validated reference-image prefix hits; CFG guidance does not require CFG parallelism |
+| Other SP/TP combinations, CFGP>1 | Prefix-hit E2E accuracy not yet validated |
 | AR-imported KV / cross-stage missing-page transfer | Not covered by local prefix caching |
 | TeaCache / Cache-DiT, offload, quantization | Not validated with prefix hits |
 | Step execution | Not supported with HunyuanImage3 paged KV; use request-level execution |

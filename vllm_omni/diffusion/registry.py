@@ -818,7 +818,7 @@ def get_diffusion_pre_process_func(od_config: OmniDiffusionConfig):
 
 def get_diffusion_prefix_cache_func(od_config: OmniDiffusionConfig):
     """Load optional model preparation for native multimodal KV identities."""
-    if uses_diffusers_adapter(od_config):
+    if uses_diffusers_adapter(od_config) or od_config.model_class_name is None:
         return None
     func_name = _DIFFUSION_PREFIX_CACHE_FUNCS.get(od_config.model_class_name)
     return None if func_name is None else _load_process_func(od_config, func_name)

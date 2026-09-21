@@ -191,11 +191,12 @@ plus model/layout and LoRA context. The same image with different prompts can
 reuse the common leading blocks; it does not imply that every image span or CFG
 branch is interchangeable. Disabling prefix caching skips cache-identity hashing;
 `dense_legacy` remains the default. Enabling prefix caching with a mode other than
-`paged_scheduler` raises a configuration error; switch modes or disable caching.
+`paged_scheduler`, without a registered model hook, or together with native
+`kv_transfer_config` raises a configuration error.
 
 The current scope is local DiT reuse, not AR-imported KV or missing-page-only
-cross-stage transfer. Prefix-hit accuracy has been exercised with TP4, SP1 and
-CFGP1; SP>1 and other combinations still require validation. See the
+cross-stage transfer. Prefix-hit accuracy has been exercised with TP4/SP1 and
+TP2/SP2 (Ulysses), both with EP and CFGP1. Other combinations still require validation. See the
 [diffusion compatibility notes](../../user_guide/diffusion_features.md#diffusion-kv-prefix-caching).
 
 #### Shared-reference benchmark

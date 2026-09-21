@@ -76,7 +76,9 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
     get_paged_kv_computed_tokens,
+    is_forward_context_available,
     paged_kv_prefill,
     set_forward_context_denoise_step_idx,
 )
@@ -1093,7 +1095,6 @@ class ImageKVCacheManager(nn.Module):
         shard_image_size: int | None,
         full_attn_spans: list[list[tuple[int, int]]],
         uncond_cfg_prefill: bool,
-        cached_prefix_len: int,
     ) -> torch.Tensor:
         """Run Hunyuan attention against Worker-managed Scheduler pages.
 
@@ -1108,13 +1109,10 @@ class ImageKVCacheManager(nn.Module):
             raise ValueError("Hunyuan Scheduler-paged KV requires matching query and sequence lengths")
         if len(full_attn_spans) != len(query_lens):
             raise ValueError("Hunyuan Scheduler-paged KV requires one full-attention span row per sequence")
-        if cached_prefix_len < 0:
-            raise ValueError(f"cached_prefix_len must be non-negative, got {cached_prefix_len}")
 
         self.clear_legacy_prompt_kv_cache()
         bs = len(query_lens)
         q_len = query_lens[0]
-        seq_len = seq_lens[0]
         assert query.shape[0] == bs * q_len, f"{query.shape[0]} != {bs * q_len}"
 
         head_num_per_rank = query.shape[1]
@@ -1132,14 +1130,7 @@ class ImageKVCacheManager(nn.Module):
         elif self.sp_size > 1 and first_step:
             if shard_image_size is None or shard_image_size <= 0:
                 raise ValueError("Hunyuan paged Ulysses requires a positive local image shard size")
-            logical_prompt_len = seq_len - shard_image_size
             joint_query_len = query.shape[1] - shard_image_size
-            if logical_prompt_len != cached_prefix_len + joint_query_len:
-                raise ValueError(
-                    "Hunyuan paged Ulysses prompt layout mismatch: "
-                    f"logical_prompt={logical_prompt_len}, cached_prefix={cached_prefix_len}, "
-                    f"query_prompt={joint_query_len}"
-                )
             joint_text_query = query[:, :joint_query_len]
             joint_text_key = key[:, :joint_query_len]
             joint_text_value = value[:, :joint_query_len]
@@ -1278,7 +1269,6 @@ class ImageKVCacheManager(nn.Module):
                 shard_image_size=kwargs.get("shard_image_size") if self.sp_size > 1 else None,
                 full_attn_spans=full_attn_spans,
                 uncond_cfg_prefill=kwargs.get("uncond_cfg_prefill", False),
-                cached_prefix_len=int(kwargs.get("paged_kv_cached_prefix_len", 0)),
             )
         if attention_mask is None:
             raise ValueError("Hunyuan dense attention requires an attention mask")
@@ -2604,7 +2594,6 @@ class HunyuanImage3Model(nn.Module):
                 shard_image_size=shard_image_size,
                 shard_padding_size=shard_padding_size,
                 uncond_cfg_prefill=uncond_cfg_prefill,
-                paged_kv_cached_prefix_len=paged_kv_cached_prefix_len,
                 full_attn_spans=full_attn_spans,
             )
 
@@ -3039,6 +3028,10 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         cfg_rank,
         device,
     ):
+        if is_forward_context_available() and get_forward_context().paged_kv_cached_prefix_len:
+            # Local hits are sliced after conditional-image embeddings are
+            # prepared in forward_call; the AR path must not truncate them.
+            return input_ids, 0
         ar_kv_data = model_kwargs.pop("ar_kv_data", None)
         computed_tokens = get_paged_kv_computed_tokens()
         if computed_tokens and computed_tokens[0] > 0:

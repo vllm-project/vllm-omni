@@ -13,7 +13,7 @@ from __future__ import annotations
 import copy
 import gc
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Any, cast
 
@@ -97,9 +97,10 @@ def _dit_any_rank_failed(local_failed: bool) -> bool:
     if not torch.distributed.is_initialized():
         return local_failed
     try:
-        from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
+        from vllm_omni.diffusion.distributed import parallel_state
 
-        group = get_dit_group()
+        get_dit_group = getattr(parallel_state, "get_dit_group", None)
+        group = get_dit_group() if get_dit_group is not None else None
     except (AssertionError, ImportError):
         group = None
     if group is None:
@@ -486,6 +487,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput):
         from vllm_omni.diffusion.diffusion_kv.kv_connector import wait_for_kv_load
 
+        assert self.od_config.kv_transfer_config is not None
         timeout = self.od_config.kv_transfer_config.kv_connector_extra_config.get("transfer_timeout", 60.0)
         return wait_for_kv_load(self._kv_connector, scheduler_output, timeout)
 
@@ -500,7 +502,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     ) -> int:
         return self.diffusion_kv_backend.get_diffusion_kv_row(request_id, sequence_id, context_id)
 
-    def remove_diffusion_kv_requests(self, request_ids: list[str | tuple[str, int]]) -> int:
+    def remove_diffusion_kv_requests(self, request_ids: Sequence[str | tuple[str, int]]) -> int:
         return self.diffusion_kv_backend.remove_diffusion_kv_requests(request_ids)
 
     def refresh_diffusion_kv_block_table_layout(self) -> None:
@@ -533,23 +535,18 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         f"request={request_metadata.request_id!r}, sequence={sequence.sequence_id}, "
                         f"active={active_seq_len}, allocated={sequence.seq_len}"
                     )
+                # Imported AR KV and local hits have separate owners.
+                kv_start_pos = (
+                    sequence.num_computed_tokens
+                    if getattr(self.od_config, "kv_transfer_config", None) is not None
+                    else sequence.cached_prefix_len
+                )
                 prefill_rows.append(
                     DiffusionPagedAttentionRow(
                         request_id=request_metadata.request_id,
                         sequence_id=sequence.sequence_id,
-                        # Local prefix hits and imported AR KV use different
-                        # boundaries. The connector owns num_computed_tokens;
-                        # native prefix caching owns cached_prefix_len.
-                        kv_start_pos=(
-                            sequence.num_computed_tokens
-                            if getattr(self.od_config, "kv_transfer_config", None) is not None
-                            else sequence.cached_prefix_len
-                        ),
-                        query_len=sequence.seq_len - (
-                            sequence.num_computed_tokens
-                            if getattr(self.od_config, "kv_transfer_config", None) is not None
-                            else sequence.cached_prefix_len
-                        ),
+                        kv_start_pos=kv_start_pos,
+                        query_len=sequence.seq_len - kv_start_pos,
                         seq_len=sequence.seq_len,
                     )
                 )
@@ -802,20 +799,23 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         "Diffusion KV metadata count must match the request batch: "
                         f"metadata={len(diffusion_kv_metadata)}, requests={len(reqs)}"
                     )
-                if getattr(self.od_config, "kv_transfer_config", None) is not None:
+                native_kv_transfer = getattr(self.od_config, "kv_transfer_config", None) is not None
+                if native_kv_transfer:
                     for req, metadata in zip(reqs, diffusion_kv_metadata, strict=True):
                         # This field is consumed by Hunyuan only for native
                         # AR->DiT transfer. Local prefix hits must still run
                         # their VAE/ViT conditioning path.
                         req.kv_computed_tokens = tuple(seq.num_computed_tokens for seq in metadata.sequences)
                 paged_metadata = self._build_paged_attention_metadata(diffusion_kv_metadata)
-                cached_prefix_lens = {row.kv_start_pos for row in paged_metadata.prefill_rows}
-                if len(cached_prefix_lens) != 1:
-                    raise ValueError(
-                        "One paged request-level forward requires a uniform cached prefix boundary; "
-                        f"got {sorted(cached_prefix_lens)}"
-                    )
-                paged_kv_cached_prefix_len = next(iter(cached_prefix_lens))
+                paged_kv_cached_prefix_len = 0
+                if not native_kv_transfer:
+                    cached_prefix_lens = {row.kv_start_pos for row in paged_metadata.prefill_rows}
+                    if len(cached_prefix_lens) != 1:
+                        raise ValueError(
+                            "One paged request-level forward requires a uniform cached prefix boundary; "
+                            f"got {sorted(cached_prefix_lens)}"
+                        )
+                    paged_kv_cached_prefix_len = next(iter(cached_prefix_lens))
                 paged_kv_runtime, paged_kv_context = self.diffusion_kv_backend.activate_paged_attention_metadata(
                     paged_metadata
                 )

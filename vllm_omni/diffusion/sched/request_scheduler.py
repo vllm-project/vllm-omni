@@ -17,7 +17,7 @@ from vllm_omni.diffusion.sched.interface import (
 )
 
 if TYPE_CHECKING:
-    from vllm_omni.diffusion.worker.utils import RunnerOutput
+    from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 # LoRA identity is derived from `sampling.lora_request`, not a same-named field
 # on sampling params, so it must be resolved separately from the bulk lookup.
@@ -111,7 +111,7 @@ class RequestScheduler(BaseScheduler):
     def _build_sampling_params_key(self, request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
         return build_request_batch_sampling_params_key(request)
 
-    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
+    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: BaseRunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids
         if not scheduled_request_ids and not sched_output.finished_req_ids:
             return set()

@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -154,6 +154,7 @@ class DiffusionKVModelRunnerBackend:
 
         if attention_geometry is not None:
             num_heads, num_kv_heads, head_size = attention_geometry
+            assert callable(set_attention_geometry)
             try:
                 set_attention_geometry(
                     num_heads=num_heads,
@@ -603,7 +604,7 @@ class DiffusionKVModelRunnerBackend:
                     )
         raise RuntimeError(f"Diffusion KV request state is missing logical length for {identity!r}")
 
-    def remove_diffusion_kv_requests(self, request_ids: list[str | tuple[str, int]]) -> int:
+    def remove_diffusion_kv_requests(self, request_ids: Sequence[str | tuple[str, int]]) -> int:
         """Retire Worker rows without logically freeing Scheduler-owned blocks."""
         if (
             not is_scheduler_paged_kv_mode(

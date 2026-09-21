@@ -99,7 +99,7 @@ class _FakeTokenizerWrapper:
         )
         sections = []
         for _ in range(rows):
-            row_sections = []
+            row_sections: list[dict[str, object]] = []
             if has_cond_image:
                 row_sections.append(
                     {
@@ -732,7 +732,9 @@ def test_prepared_model_inputs_match_local_tokenization(
         reused = pipeline.prepare_model_inputs(
             # The image span is [5, 10); native KV must cover its end, not
             # merely reach the first image token.
-            **common_kwargs, prepared_layout=prepared_layout, kv_computed_tokens=(10,) * len(prefix_lens)
+            **common_kwargs,
+            prepared_layout=prepared_layout,
+            kv_computed_tokens=(10,) * len(prefix_lens),
         )
         assert reused["cond_vae_images"] is None and reused["cond_vit_images"] is None
         partial = pipeline.prepare_model_inputs(

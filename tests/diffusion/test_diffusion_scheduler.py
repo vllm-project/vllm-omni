@@ -157,6 +157,7 @@ def _make_aborted_request_output(req_id: str) -> RunnerOutput:
         result=DiffusionOutput(output=None, aborted=True),
     )
 
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scheduler_cls", [RequestScheduler, StepScheduler])
 @pytest.mark.parametrize("failure", ["timeout", "registration"])
@@ -188,7 +189,7 @@ async def test_single_native_kv_failure_reaches_output_stream(mocker, scheduler_
     engine.abort_queue = queue.Queue()
     engine._cv = threading.Condition()
     engine.main_loop = asyncio.get_running_loop()
-    stream = asyncio.Queue()
+    stream: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
     engine._out_streams = {"failed": stream}
     engine.executor = mocker.Mock()
     engine.executor.prepare_kv_for_forward.return_value = KVConnectorOutput()
@@ -659,6 +660,35 @@ class TestRequestScheduler:
             self.scheduler.update_from_output(next_wave, _make_request_output("second"))
         assert not self.scheduler.has_requests()
         assert pool.get_num_free_blocks() == empty_free_blocks
+
+    def test_deferred_allocation_is_not_registered_for_transfer(self, mocker) -> None:
+        _initialize_paged_scheduler(self.scheduler, max_num_seqs=2)
+        manager = self.scheduler._diffusion_kv_manager
+        connector = mocker.Mock()
+        connector.get_num_new_matched_tokens.return_value = (4, True)
+        self.scheduler._kv_connector = connector
+        # Model a compatibility decision that needs the completed lookup.
+        can_schedule = self.scheduler._can_schedule_waiting
+        mocker.patch.object(
+            self.scheduler,
+            "_can_schedule_waiting",
+            side_effect=lambda state: can_schedule(state)
+            and not (state.request_id == "deferred" and manager.has_request("deferred")),
+        )
+        for request_id in ("admitted", "deferred"):
+            request = _make_request(request_id)
+            _attach_diffusion_kv(request)
+            request.diffusion_kv_requests[0].prompt_token_ids = [1, 2, 3, 4]
+            request.kv_transfer_params = {"num_transfer_tokens": 4}
+            self.scheduler.add_request(request)
+
+        assert _new_ids(self.scheduler.schedule()) == ["admitted"]
+        assert connector.update_state_after_alloc.call_count == 1
+        assert not manager.has_request("deferred")
+        assert "deferred" not in self.scheduler._kv_request_generations
+        assert "deferred" not in self.scheduler._kv_loading_request_ids
+        assert "deferred/diffusion-kv/0" not in self.scheduler._kv_transfer_request_ids
+        assert self.scheduler.get_request_state("deferred").status is DiffusionRequestStatus.WAITING
 
     def test_diffusion_kv_deferred_request_can_be_cancelled(self) -> None:
         _initialize_paged_scheduler(self.scheduler, max_num_seqs=2, enable_prefix_caching=True)

@@ -113,7 +113,7 @@ class _FakeLayer:
         self.head_size_v = 4
         self.spec = _FakeSpec(non_causal=non_causal)
         self.updates: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-        self.calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, object]] = []
+        self.calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, _FakeNativeMetadata]] = []
         self.native_events: list[str] = []
         self.layer_name = "layer-0"
         self.kv_cache = object()
@@ -122,6 +122,8 @@ class _FakeLayer:
 
 
 class _FakeNativeImpl:
+    vllm_flash_attn_version: int
+
     def __init__(self, layer: _FakeLayer) -> None:
         self.layer = layer
 
@@ -143,7 +145,7 @@ class _FakeNativeImpl:
         key: torch.Tensor,
         value: torch.Tensor,
         _kv_cache,
-        metadata: object,
+        metadata: _FakeNativeMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
         self.layer.native_events.append("forward")
@@ -1267,10 +1269,15 @@ def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads
     monkeypatch.setattr("vllm.config.get_current_vllm_config", lambda: config)
     monkeypatch.setattr(selector, "_cached_get_attn_backend", select_backend)
     monkeypatch.setattr(adapter_module, "set_current_vllm_config", lambda _config: nullcontext())
+
+    def specialize_backend(backend, *, ulysses_degree):
+        specialized_backends.append((backend, ulysses_degree))
+        return backend
+
     monkeypatch.setattr(
         adapter_module.current_omni_platform,
         "get_diffusion_paged_kv_attn_backend",
-        lambda backend, *, ulysses_degree: specialized_backends.append((backend, ulysses_degree)) or backend,
+        specialize_backend,
     )
     layer = SimpleNamespace(num_heads=8, softmax_scale=0.125)
     spec = FullAttentionSpec(
@@ -1453,7 +1460,12 @@ def test_omni_attention_keeps_dense_kernel_without_active_adapter() -> None:
     layer._no_parallel_strategy = object()
     layer._get_active_parallel_strategy = lambda: Strategy()
     layer._with_kv_cache_dtype = lambda metadata: metadata
-    layer._run_local_attention = lambda query, _key, _value, _metadata: events.append("dense") or query
+
+    def run_local_attention(query, _key, _value, _metadata):
+        events.append("dense")
+        return query
+
+    layer._run_local_attention = run_local_attention
     qkv = torch.zeros(1, 2, 2, 4)
 
     assert not layer.is_paged_kv_active()

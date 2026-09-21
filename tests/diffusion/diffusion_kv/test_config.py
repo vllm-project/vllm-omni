@@ -44,6 +44,26 @@ def test_prefix_caching_accepts_paged_scheduler(config_cls) -> None:
     assert config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
 
 
+@pytest.mark.parametrize("enable_prefix_caching", [False, True])
+def test_native_kv_transfer_requires_prefix_caching_disabled(enable_prefix_caching) -> None:
+    kwargs = dict(
+        diffusion_kv_mode="paged_scheduler",
+        diffusion_kv_max_rows_per_request=2,
+        enable_prefix_caching=enable_prefix_caching,
+        kv_transfer_config={
+            "kv_connector": "MooncakeConnector",
+            "kv_role": "kv_consumer",
+            "engine_id": "test-diffusion",
+        },
+    )
+    if enable_prefix_caching:
+        with pytest.raises(ValueError, match="disable enable_prefix_caching for AR KV import"):
+            OmniDiffusionConfig.from_kwargs(**kwargs)
+    else:
+        config = OmniDiffusionConfig.from_kwargs(**kwargs)
+        assert config.kv_transfer_config.kv_role == "kv_consumer"
+
+
 @pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
 @pytest.mark.parametrize("mode", ["dense_legacy", "paged_scheduler"])
 def test_disabled_prefix_caching_accepts_both_modes(config_cls, mode) -> None:

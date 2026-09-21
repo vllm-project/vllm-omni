@@ -131,7 +131,7 @@ __all__ = [
 
 
 def _func_accepts_parameter(func: object | None, parameter_name: str) -> bool:
-    if func is None:
+    if not callable(func):
         return False
     parameters = inspect.signature(func).parameters
     return parameter_name in parameters or any(
@@ -301,6 +301,12 @@ class DiffusionEngine:
         self.post_process_func = get_diffusion_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
         self.prefix_cache_func = get_diffusion_prefix_cache_func(od_config) if self._prefix_cache_enabled() else None
+        if self._prefix_cache_enabled() and self.prefix_cache_func is None:
+            raise ValueError(
+                "enable_prefix_caching=True requires a registered prefix-cache hook for "
+                f"{od_config.model_class_name!r}; "
+                "disable enable_prefix_caching or use a supported native pipeline such as HunyuanImage3ForCausalMM"
+            )
         # Cache whether the model-specific postprocess accepts request-level
         # sampling params so step() can support both legacy and extended hooks.
         self._post_process_accepts_sampling_params = _func_accepts_parameter(self.post_process_func, "sampling_params")
@@ -583,6 +589,7 @@ class DiffusionEngine:
         )
 
     def _busy_loop(self):
+        assert self.stop_event is not None
         while not self.stop_event.is_set():
             self._process_aborts_queue()
             self._process_rpc_queue()
@@ -684,6 +691,7 @@ class DiffusionEngine:
 
         Caller must hold ``self._cv``.
         """
+        assert self.stop_event is not None
         start = time.monotonic()
         decision = self.scheduler.get_admission_wait_decision(
             now=start,
@@ -1133,7 +1141,7 @@ class DiffusionEngine:
                 # sync func should receive one result
                 if (
                     sched_output.scheduled_request_ids
-                    and not isinstance(runner_output, RunnerOutput)
+                    and isinstance(runner_output, BatchRunnerOutput)
                     and len(runner_output) != 1
                 ):
                     raise ValueError("Sync func should receive one result at one time")

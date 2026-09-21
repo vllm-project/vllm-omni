@@ -843,7 +843,7 @@ class OmniDiffusionConfig:
     parallel_config: DiffusionParallelConfig = field(default_factory=DiffusionParallelConfig)
 
     # Cache backend configuration (NEW)
-    cache_backend: str = "none"  # "tea_cache", "deep_cache", etc.
+    cache_backend: str | None = "none"  # "tea_cache", "deep_cache", etc.
     cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
     video_output_transport: VideoOutputTransportConfig = field(default_factory=VideoOutputTransportConfig)
     enable_cache_dit_summary: bool = False
@@ -1235,6 +1235,11 @@ class OmniDiffusionConfig:
             if self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
                 raise ValueError("native kv_transfer_config requires diffusion_kv_mode='paged_scheduler'")
             self.kv_transfer_config = parse_kv_transfer_config(self.kv_transfer_config)
+            if self.enable_prefix_caching and self.kv_transfer_config is not None:
+                raise ValueError(
+                    "Diffusion prefix caching cannot be combined with native kv_transfer_config; "
+                    "disable enable_prefix_caching for AR KV import or remove kv_transfer_config for local DiT reuse"
+                )
             if self.enable_sleep_mode:
                 raise ValueError("Native KV transfer does not support sleep mode: registered pages must remain mapped")
 

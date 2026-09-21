@@ -35,7 +35,7 @@ from vllm_omni.diffusion.sched.interface import (
     StepBatchSamplingParamsKey,
     _AdmissionWaitDecision,
 )
-from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 logger = init_logger(__name__)
 
@@ -210,6 +210,11 @@ class BaseScheduler(ABC):
                         continue
                     if allocation is None:
                         break
+                    # Check the lookup result before registering destination
+                    # pages with the connector: deferred pages can be freed.
+                    if not self._can_schedule_waiting(state):
+                        self._diffusion_kv_manager.free_request(request_id)
+                        break
                     diffusion_kv_metadata = allocation
                     self._kv_request_generations[request_id] = allocation.allocation_generation
                     if self._kv_connector is not None:
@@ -232,13 +237,6 @@ class BaseScheduler(ABC):
                             self._kv_loading_request_ids.add(request_id)
                         for sequence, request in zip(allocation.sequences, state.diffusion_kv_requests, strict=True):
                             sequence.num_computed_tokens = request.num_computed_tokens
-
-                # Prefix compatibility is known only after the native lookup.
-                # Defer a different boundary without publishing uncomputed KV.
-                if not self._can_schedule_waiting(state):
-                    if not already_reserved:
-                        self._diffusion_kv_manager.free_request(request_id)
-                    break
 
             self._waiting.popleft()
             was_new_request = state.status == DiffusionRequestStatus.WAITING
@@ -299,7 +297,7 @@ class BaseScheduler(ABC):
         return scheduler_output
 
     @abstractmethod
-    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
+    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: BaseRunnerOutput) -> set[str]:
         pass
 
     def has_requests(self) -> bool:

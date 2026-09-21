@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from concurrent.futures import Future
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -12,7 +13,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import KVConnectorOutput
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.sched.interface import CachedRequestData
 
 if TYPE_CHECKING:
@@ -132,6 +133,10 @@ class DiffusionExecutor(ABC):
         """
         return None
 
+    def wait_output_ready(self, async_output_id: str) -> Future[DiffusionOutput]:
+        """Resolve deferred output; only asynchronous executors implement this."""
+        raise NotImplementedError(f"{type(self).__name__} does not support asynchronous output")
+
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         """Collect rank-local native specs after every Worker loads its model."""
 
@@ -178,7 +183,7 @@ class DiffusionExecutor(ABC):
 
     def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput) -> KVConnectorOutput | None:
         if scheduler_output.kv_connector_metadata is None:
-            return
+            return None
         transfer_output = replace(
             scheduler_output,
             scheduled_new_reqs=[],
