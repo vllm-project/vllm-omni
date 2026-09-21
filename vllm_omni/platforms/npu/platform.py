@@ -54,6 +54,46 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     _omni_enum = OmniPlatformEnum.NPU
     dist_backend: str = "hccl"
 
+    @classmethod
+    def get_attn_backend_cls(cls, selected_backend, attn_selector_config, num_heads: int | None = None):
+        """Route short-context decoders onto the fixed-KV decode backend.
+
+        Under FULL_DECODE_ONLY the captured decode step has to re-issue attention on
+        every layer on every step, because the op takes the KV length as a host
+        argument that grows each step. On the small Talker decoder that rebind is
+        ~38% of its busy time. Scoped by ``max_model_len`` (Talker 4096 engages,
+        Thinker 32768 does not). ``VLLM_OMNI_FIXED_KV_DECODE=0`` restores stock.
+
+        The one-query capture this backend exists for is what makes the 910B
+        family work at all: the stock builder faults its vector core on
+        spec-width rows, so without this route there the K-step cannot capture.
+        """
+        resolved = super().get_attn_backend_cls(selected_backend, attn_selector_config, num_heads)
+        if resolved != "vllm_ascend.attention.attention_v1.AscendAttentionBackend":
+            return resolved
+        from vllm.config import get_current_vllm_config
+
+        from vllm_omni.platforms.npu.attention import fixed_kv_decode
+
+        if not fixed_kv_decode.is_enabled():
+            return resolved
+        vllm_config = get_current_vllm_config()
+        max_model_len = getattr(getattr(vllm_config, "model_config", None), "max_model_len", None)
+        block_size = getattr(getattr(vllm_config, "cache_config", None), "block_size", None)
+        capacity = (
+            fixed_kv_decode.capacity_for(max_model_len, block_size)
+            if max_model_len and block_size
+            else None
+        )
+        fixed_kv_decode.install_into_ascend_aclgraph()
+        logger.info(
+            "[minicpmo] fixed-KV decode attention on (max_model_len=%s, kv_capacity=%s); "
+            "set VLLM_OMNI_FIXED_KV_DECODE=0 to disable",
+            max_model_len,
+            capacity,
+        )
+        return "vllm_omni.platforms.npu.attention.fixed_kv_backend.OmniFixedKVAttentionBackend"
+
     # conv2d convolution operator in the code2wav module of Qwen3-TTS not being able to run on Aclnn
     def __init__(self) -> None:
         from vllm_ascend.utils import adapt_patch
