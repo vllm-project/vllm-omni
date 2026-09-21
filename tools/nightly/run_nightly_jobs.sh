@@ -47,7 +47,10 @@
 #     From repo root: pytest -s -v --run-level full_model -m "<mark>" tests/dfx/stability/scripts/...
 #     -m comes from --pytest-mark / PYTEST_MARK when set (e.g. H800 or A3).
 #     Otherwise -m defaults to H800. PYTEST_MARK is rejected unless stability is enabled.
-#     model_type: omni → qwen3_omni; tts → qwen3_tts; diffusion → qwen_image + wan22 + hunyuan_image; all → all five
+#     model_type: omni → qwen3_omni + minicpmo_4_5; tts → qwen3_tts;
+#                 diffusion → qwen_image + wan22 + hunyuan_image + minimax_h3 + hunyuanvideo15; all → all eight
+#     stability_minimax_h3: download FastH3 LoRA only when VLLM_TEST_MINIMAX_H3_FASTH3_LORA is unset,
+#     then export before pytest (collection skipif needs the path).
 #     LABEL_SUBSTR: if set, script path / job key / filename must contain it
 #
 # Requirements: bash, python3, PyYAML (pip install pyyaml)
@@ -596,11 +599,14 @@ def _write_job_timeouts_manifest(jobs_dir: Path, job_timeouts: dict[str, int]) -
 
 # Fixed stability scripts (when stability is selected); MODEL_TYPES narrows which run.
 STABILITY_CASES: list[tuple[str, str, tuple[str, ...]]] = [
-    ("stability_qwen3_omni", "tests/dfx/stability/scripts/test_stability_qwen3_omni.py", ("omni",)),
-    ("stability_qwen3_tts", "tests/dfx/stability/scripts/test_stability_qwen3_tts.py", ("tts",)),
-    ("stability_qwen_image", "tests/dfx/stability/scripts/test_stability_qwen_image.py", ("diffusion",)),
-    ("stability_wan22", "tests/dfx/stability/scripts/test_stability_wan22.py", ("diffusion",)),
-    ("stability_hunyuan_image", "tests/dfx/stability/scripts/test_stability_hunyuan_image.py", ("diffusion",)),
+    ("stability_qwen3_omni", "tests/dfx/stability/scripts/run_stability_qwen3_omni.py", ("omni",)),
+    ("stability_qwen3_tts", "tests/dfx/stability/scripts/run_stability_qwen3_tts.py", ("tts",)),
+    ("stability_minicpmo_4_5", "tests/dfx/stability/scripts/run_stability_minicpmo_4_5.py", ("omni",)),
+    ("stability_qwen_image", "tests/dfx/stability/scripts/run_stability_qwen_image.py", ("diffusion",)),
+    ("stability_wan22", "tests/dfx/stability/scripts/run_stability_wan22.py", ("diffusion",)),
+    ("stability_hunyuan_image", "tests/dfx/stability/scripts/run_stability_hunyuan_image.py", ("diffusion",)),
+    ("stability_minimax_h3", "tests/dfx/stability/scripts/run_stability_minimax_h3.py", ("diffusion",)),
+    ("stability_hunyuanvideo15", "tests/dfx/stability/scripts/run_stability_hunyuanvideo15.py", ("diffusion",)),
 ]
 
 
@@ -611,6 +617,25 @@ def _stability_model_matches(model_types: list[str], families: tuple[str, ...]) 
 
 
 STABILITY_DEFAULT_PYTEST_MARK = "H800"
+
+# Extra shell lines before pytest. MiniMax-H3 FastH3 skipif reads
+# VLLM_TEST_MINIMAX_H3_FASTH3_LORA at collection; merge CI downloads the same way.
+_FASTH3_LORA_DOWNLOAD = (
+    'VLLM_TEST_MINIMAX_H3_FASTH3_LORA="$(python3 -c '
+    "'from huggingface_hub import hf_hub_download; "
+    "print(hf_hub_download(repo_id=\"FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA\", "
+    "filename=\"dense-datafree/adapter_model.safetensors\"))')\""
+)
+STABILITY_JOB_PRELUDE: dict[str, list[str]] = {
+    "stability_minimax_h3": [
+        "if [ -f vllm_omni/diffusion/models/minimax_h3/fasth3.py ]; then",
+        '  if [ -z "${VLLM_TEST_MINIMAX_H3_FASTH3_LORA:-}" ]; then',
+        f"    {_FASTH3_LORA_DOWNLOAD}",
+        "  fi",
+        "  export VLLM_TEST_MINIMAX_H3_FASTH3_LORA",
+        "fi",
+    ],
+}
 
 
 def _shell_quote_pytest_mark(marker_expr: str) -> str:
@@ -850,6 +875,7 @@ def run_stability_mode(jobs_dir: Path, model_types: list[str]) -> int:
             + (" (--pytest-mark)" if mark_from_cli else f" (default {STABILITY_DEFAULT_PYTEST_MARK})"),
             "set -euo pipefail",
             f'cd "{REPO_ROOT}"',
+            *STABILITY_JOB_PRELUDE.get(key, []),
             pytest_line,
         ]
         _write_job_script(key, script_lines, jobs_dir)

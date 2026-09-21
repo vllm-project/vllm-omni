@@ -3,7 +3,7 @@
 
 import json
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
 from typing import Any, TypeVar
@@ -2837,41 +2837,63 @@ def test_dit_encoder_selection_keeps_vae_resident():
     component.offload_to_cpu.assert_not_called()
 
 
-def test_keyframe_encode_pins_and_restores_cudnn_settings():
+@pytest.mark.parametrize(
+    ("capability", "allow_tf32"),
+    [((8, 6), True), ((9, 0), False), ((10, 0), True), ((10, 3), True), (None, True)],
+)
+@pytest.mark.parametrize("initial_tf32", [False, True])
+@pytest.mark.parametrize("fail_encode", [False, True])
+def test_keyframe_encode_pins_and_restores_cudnn_settings(
+    monkeypatch, capability, allow_tf32, initial_tf32, fail_encode
+):
+    from vllm.platforms.interface import DeviceCapability
+
     from vllm_omni.diffusion.models.minimax_h3.vae import (
         _minimax_h3_keyframe_encode_context,
     )
+    from vllm_omni.platforms import current_omni_platform
+
+    def get_capability(device_id):
+        assert device_id == 1
+        return DeviceCapability(*capability) if capability is not None else None
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(current_omni_platform, "get_device_capability", get_capability)
 
     cudnn = torch.backends.cudnn
-    original = (
-        cudnn.enabled,
-        cudnn.benchmark,
-        cudnn.deterministic,
-        cudnn.allow_tf32,
-    )
-    try:
-        cudnn.enabled = False
-        cudnn.benchmark = True
-        cudnn.deterministic = False
-        cudnn.allow_tf32 = False
-
-        with _minimax_h3_keyframe_encode_context(torch.device("cuda")):
+    with cudnn.flags(enabled=False, benchmark=True, deterministic=False, allow_tf32=initial_tf32):
+        error_context = pytest.raises(RuntimeError, match="encode failed") if fail_encode else nullcontext()
+        with error_context, _minimax_h3_keyframe_encode_context(torch.device("cuda:1")):
             assert cudnn.enabled
             assert not cudnn.benchmark
             assert cudnn.deterministic
-            assert cudnn.allow_tf32
+            assert cudnn.allow_tf32 is allow_tf32
+            if fail_encode:
+                raise RuntimeError("encode failed")
 
         assert not cudnn.enabled
         assert cudnn.benchmark
         assert not cudnn.deterministic
-        assert not cudnn.allow_tf32
-    finally:
-        (
-            cudnn.enabled,
-            cudnn.benchmark,
-            cudnn.deterministic,
-            cudnn.allow_tf32,
-        ) = original
+        assert cudnn.allow_tf32 is initial_tf32
+
+
+def test_keyframe_encode_cpu_keeps_cudnn_settings(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.vae import (
+        _minimax_h3_keyframe_encode_context,
+    )
+    from vllm_omni.platforms import current_omni_platform
+
+    def unexpected_capability_query(device_id):
+        pytest.fail("CPU keyframe encode must not query CUDA capability")
+
+    monkeypatch.setattr(current_omni_platform, "get_device_capability", unexpected_capability_query)
+    cudnn = torch.backends.cudnn
+    with cudnn.flags(enabled=False, benchmark=True, deterministic=False, allow_tf32=False):
+        with _minimax_h3_keyframe_encode_context(torch.device("cpu")):
+            assert not cudnn.enabled
+            assert cudnn.benchmark
+            assert not cudnn.deterministic
+            assert not cudnn.allow_tf32
 
 
 @pytest.mark.parametrize("fail_encode", [False, True])

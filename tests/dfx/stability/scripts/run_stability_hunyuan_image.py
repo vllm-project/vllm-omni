@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Hunyuan-Image stability: OmniServer (diffusion) + ``diffusion_benchmark_serving.py``.
 
@@ -34,8 +37,7 @@ server_to_benchmark_mapping = create_test_parameter_mapping(BENCHMARK_CONFIGS) i
 benchmark_indices = create_benchmark_indices(BENCHMARK_CONFIGS, server_to_benchmark_mapping)
 
 
-@pytest.mark.slow
-@pytest.mark.diffusion
+# Pytest marks (hardware, local_model, slow, diffusion) come from test_hunyuan_image.json.
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @pytest.mark.parametrize("stability_benchmark_params", benchmark_indices, indirect=True)
 def test_stability_hunyuan_image(omni_server, stability_benchmark_params):
