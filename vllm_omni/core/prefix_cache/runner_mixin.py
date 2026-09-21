@@ -16,7 +16,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter, PrefixCacheStep
+from vllm_omni.core.prefix_cache.adapter import (
+    PrefixCacheSchedulerAdapter,
+    PrefixCacheStep,
+    PrefixCacheWriteLayout,
+)
 from vllm_omni.core.prefix_cache.group_view import get_prefix_cache_group_view
 from vllm_omni.core.prefix_cache.interface import (
     ModelCachePolicy,
@@ -59,6 +63,7 @@ class PrefixCacheRunnerMixin:
     _prefix_cache_adapter: PrefixCacheSchedulerAdapter | None = None
     _prefix_cache_group_view: Any = None
     _prefix_cache_step: PrefixCacheStep | None = None
+    _prefix_cache_write_layout: PrefixCacheWriteLayout | None = None
 
     def _snapshot_prefix_cache_model_policy(self, model) -> None:
         """Freeze the model's cache policy at load_model."""
@@ -139,17 +144,48 @@ class PrefixCacheRunnerMixin:
             raise RuntimeError("prefix-cache adapter was not initialized")
         if self._prefix_cache_step is None:
             raise RuntimeError("prefix-cache step snapshot was not initialized")
+        layout = self._prefix_cache_write_layout
+        self._prefix_cache_write_layout = None
+        if layout is None:
+            # Compatibility fallback for callers that have not split layout
+            # preparation from output saving yet.
+            layout = self._prefix_cache_adapter.build_write_layout(
+                self._prefix_cache_group_view,
+                num_scheduled_tokens=dict(self._prefix_cache_step.scheduled_tokens),
+            )
+        try:
+            return self.omni_prefix_cache.save_outputs(
+                hidden_states,
+                flatten_payload(multimodal_outputs) if multimodal_outputs else {},
+                num_tokens_unpadded=num_tokens_unpadded,
+                num_tokens_padded=num_tokens_padded,
+                write_layout=layout,
+            )
+        except BaseException:
+            self.omni_prefix_cache.abort_prepared_step()
+            raise
+
+    def _prefix_cache_prepare_write_layout(self) -> None:
+        """Build post-order slots and start disjoint hit reads pre-forward."""
+        from vllm.distributed.parallel_state import get_pp_group
+
+        if self.is_pooling_model or self.omni_prefix_cache is None or not get_pp_group().is_last_rank:
+            return
+        if self._prefix_cache_adapter is None or self._prefix_cache_group_view is None:
+            raise RuntimeError("prefix-cache adapter was not initialized")
+        if self._prefix_cache_step is None:
+            raise RuntimeError("prefix-cache step snapshot was not initialized")
         layout = self._prefix_cache_adapter.build_write_layout(
             self._prefix_cache_group_view,
             num_scheduled_tokens=dict(self._prefix_cache_step.scheduled_tokens),
         )
-        return self.omni_prefix_cache.save_outputs(
-            hidden_states,
-            flatten_payload(multimodal_outputs) if multimodal_outputs else {},
-            num_tokens_unpadded=num_tokens_unpadded,
-            num_tokens_padded=num_tokens_padded,
-            write_layout=layout,
-        )
+        self.omni_prefix_cache.prepare_read_plans(layout)
+        self._prefix_cache_write_layout = layout
+
+    def _prefix_cache_abort_prepared_step(self) -> None:
+        if self.omni_prefix_cache is not None and self._prefix_cache_write_layout is not None:
+            self.omni_prefix_cache.abort_prepared_step()
+        self._prefix_cache_write_layout = None
 
     def _prefix_cache_materialize(
         self, step_id: int | None, req_ids: list[str]

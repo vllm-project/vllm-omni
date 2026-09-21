@@ -1123,6 +1123,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        self._prefix_cache_prepare_write_layout()
         try:
             with (
                 nullcontext(),
@@ -1166,6 +1167,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     set_batch_req_ids = getattr(self.model, "set_batch_req_ids", None)
                     if callable(set_batch_req_ids):
                         set_batch_req_ids(req_ids[:num_reqs])
+        except BaseException:
+            self._prefix_cache_abort_prepared_step()
+            raise
         finally:
             if runner_assisted_context_enabled:
                 self._set_runner_assisted_full_attention_metadata_context(enabled=False)

@@ -36,8 +36,8 @@ except ModuleNotFoundError:
     sys.modules["vllm"] = _vllm
     sys.modules["vllm.logger"] = _vllm_logger
 
-from vllm_omni.core.prefix_cache.controller import StagingBufferHolder
 from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
+from vllm_omni.core.prefix_cache.controller import StagingBufferHolder
 from vllm_omni.core.prefix_cache.group_view import (
     FullAttentionGroupView,
     check_prefix_cache_kv_groups,
@@ -54,6 +54,7 @@ from vllm_omni.core.prefix_cache.interface import (
 from vllm_omni.core.prefix_cache.manager import (
     OmniPrefixCacheManager,
     _is_step_token_tensor,
+    _Presence,
     _snapshot_leftover_mm_cpu,
 )
 
@@ -110,10 +111,16 @@ class FakeSchedOut:
         self.num_scheduled_tokens = dict(num_scheduled or {})
 
 
-def make_manager(view=None, policy=None, **cfg_kwargs) -> tuple[OmniPrefixCacheManager, FakeView]:
+def make_manager(
+    view=None,
+    policy=None,
+    *,
+    controller_eager: bool = True,
+    **cfg_kwargs,
+) -> tuple[OmniPrefixCacheManager, FakeView]:
     view = view or FakeView()
     config = PrefixCacheConfig(num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE, **cfg_kwargs)
-    mgr = OmniPrefixCacheManager(config, eager=True)
+    mgr = OmniPrefixCacheManager(config, eager=controller_eager)
     if policy is not None:
         mgr.register_policy(policy)
     return mgr, view
@@ -127,6 +134,7 @@ def run_step(
     finished=(),
     mm=None,
     num_tokens_padded=None,
+    hidden_values: dict[str, float] | None = None,
 ) -> int:
     """One step: reqs = req_id -> (blocks, sched_start_pos, sched_tokens)."""
     view.order = list(reqs.keys())
@@ -140,7 +148,10 @@ def run_step(
         num_sched[req_id] = sched
         slots = view.slots_for(req_id, start_pos, start_pos + sched)
         slot_parts.append(slots)
-        hidden_parts.append(slots.to(DTYPE).unsqueeze(1).expand(sched, HIDDEN).clone())
+        if hidden_values is not None and req_id in hidden_values:
+            hidden_parts.append(torch.full((sched, HIDDEN), hidden_values[req_id], dtype=DTYPE))
+        else:
+            hidden_parts.append(slots.to(DTYPE).unsqueeze(1).expand(sched, HIDDEN).clone())
         hit = (new_hits or {}).get(req_id, 0)
         new_reqs.append(FakeNewReq(req_id, num_computed_tokens=hit, block_ids=[list(blocks)]))
     view.step_slot_mapping = torch.cat(slot_parts)
@@ -152,6 +163,7 @@ def run_step(
     events = adapter.translate_scheduler_output(sched_out)
     layout = adapter.build_write_layout(view, num_scheduled_tokens=num_sched)
     mgr.new_step_starts(events)
+    mgr.prepare_read_plans(layout)
     n = int(view.step_slot_mapping.numel())
     padded = n if num_tokens_padded is None else int(num_tokens_padded)
     return mgr.save_outputs(hidden, mm or {}, num_tokens_unpadded=n, num_tokens_padded=padded, write_layout=layout)
@@ -347,6 +359,24 @@ def test_absent_hit_fails_fast():
         mgr.materialize(sid, ["c"])
     if d2h is not None:
         assert not mgr._controller._staging_pool._busy[d2h.staging_slot]
+
+
+def test_unreadable_plan_cannot_rebind_after_slot_reuse():
+    mgr, view = make_manager()
+    victim = run_step(
+        mgr,
+        view,
+        {"victim": ([5, 6, 7], 8, 4)},
+        new_hits={"victim": 8},
+        hidden_values={"victim": 9.0},
+    )
+    plan = mgr._step_ctxs[victim].hit_plans["victim"][HIDDEN_KEY]
+    assert plan.error == "8 slots have unknown presence"
+
+    writer = run_step(mgr, view, {"writer": ([5, 6], 0, 8)}, hidden_values={"writer": 7.0})
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="unknown presence"):
+        mgr.materialize(victim, ["victim"])
+    mgr.discard_step(writer)
 
 
 def test_hit_not_block_aligned_fails_at_register():
@@ -781,7 +811,7 @@ def test_join_next_step_previous_save():
     mgr.materialize(s1, ["a"])
     s2 = run_step(mgr, view, {"a": ([0], 2, 1)})
     assert mgr._controller.get_task(task_id) is None
-    assert int(mgr._slot_status.state[HIDDEN_KEY][view.slots_for("a", 0, 2)].min()) == 2
+    assert int(mgr._slot_status.state[HIDDEN_KEY][view.slots_for("a", 0, 2)].min()) == _Presence.PRESENT
     mgr.materialize(s2, ["a"])
 
 
@@ -809,6 +839,24 @@ def test_tenant_succession_mm_key():
     rows = mgr.materialize(s3, ["c"]).mm_outputs["k"]["c"]
     assert torch.equal(rows[:4], torch.full((4, 2), 2.0))
     assert torch.equal(rows[4:], torch.full((2, 2), 3.0))
+
+
+def test_replaced_owner_completion_cannot_publish_present():
+    mgr, _ = make_manager()
+    slots = torch.tensor([0, 1], dtype=torch.long)
+    table = mgr._slot_status
+    table.map_slots(slots, 101, [HIDDEN_KEY])
+    old_versions = table.get_slot_status(HIDDEN_KEY).slot_version[slots].clone()
+    table.map_slots(slots, 202, [HIDDEN_KEY])
+    current = table.get_slot_status(HIDDEN_KEY)
+    assert torch.all(current.slot_version[slots] > old_versions)
+
+    table.commit([101])
+    assert torch.all(current.presence[slots] == _Presence.PENDING)
+    assert torch.all(current.producers[slots] == 202)
+    table.commit([202])
+    assert torch.all(current.presence[slots] == _Presence.PRESENT)
+    assert torch.all(current.producers[slots] == 0)
 
 
 def test_scatter_rows_coalesces_per_key_last_chunk_wins_and_skips_reassigned():
@@ -1363,6 +1411,41 @@ def test_hit_prefetch_prebuilds_merged_buffer():
     assert torch.equal(merged[8:], expected_rows(view.slots_for("b", 8, 12)))
 
 
+def test_disjoint_committed_hit_prefetch_starts_before_save(monkeypatch):
+    mgr, view = make_manager()
+    seed = run_step(mgr, view, {"old": ([0, 1], 0, 8)}, hidden_values={"old": 1.0})
+    mgr.materialize(seed, ["old"])
+
+    view.order = ["hit"]
+    view.req_blocks["hit"] = [0, 1, 2]
+    view.computed["hit"] = 8
+    sched = FakeSchedOut(
+        new_reqs=[FakeNewReq("hit", num_computed_tokens=8, block_ids=[[0, 1, 2]])],
+        finished=["old"],
+        num_scheduled={"hit": 1},
+    )
+    adapter = mgr._test_adapter
+    step = adapter.translate_step(sched)
+    mgr.new_step_starts(step)
+    layout = adapter.build_write_layout(view, num_scheduled_tokens={"hit": 1})
+    started = threading.Event()
+    real_prefetch = mgr._prefetch_hit
+
+    def observe(plan, n_new):
+        started.set()
+        return real_prefetch(plan, n_new)
+
+    monkeypatch.setattr(mgr, "_prefetch_hit", observe)
+    mgr.prepare_read_plans(layout)
+    assert started.wait(2.0)
+    mgr._hit_prefetch["hit"][HIDDEN_KEY].result(timeout=2.0)
+
+    hidden = torch.full((1, HIDDEN), 9.0)
+    sid = mgr.save_outputs(hidden, {}, num_tokens_unpadded=1, num_tokens_padded=1, write_layout=layout)
+    out = mgr.materialize(sid, ["hit"])
+    assert torch.equal(out.hidden_states["hit"][:8], torch.full((8, HIDDEN), 1.0))
+
+
 def test_same_step_hit_prefetch_starts_at_save(caplog):
     """b hits blocks a computes in the same step: nothing to plan at
     new_step_starts (rows ABSENT), planned at publish once a's write is
@@ -1377,6 +1460,347 @@ def test_same_step_hit_prefetch_starts_at_save(caplog):
     assert torch.equal(fut.result()[:8], expected_rows(view.slots_for("b", 0, 8)))
     outs = mgr.materialize(sid, ["a", "b"])
     assert torch.equal(outs.hidden_states["b"][:8], expected_rows(view.slots_for("b", 0, 8)))
+
+
+def test_same_step_producer_wins_over_different_committed_residency():
+    """The current step's writer, not an older value in the same slots, is
+    the source selected for another request's hit."""
+    mgr, view = make_manager()
+    old = run_step(mgr, view, {"old": ([0], 0, 4)}, hidden_values={"old": 1.0})
+    mgr.materialize(old, ["old"])
+
+    # `writer` reuses block 0 with observably different contents while `hit`
+    # consumes that block in the same step. Planning before writer
+    # registration would incorrectly preserve the 1.0 residency.
+    sid = run_step(
+        mgr,
+        view,
+        {"writer": ([0], 0, 4), "hit": ([0, 2], 4, 2)},
+        new_hits={"hit": 4},
+        finished=["old"],
+        hidden_values={"writer": 7.0, "hit": 9.0},
+    )
+    out = mgr.materialize(sid, ["writer", "hit"])
+    assert torch.equal(out.hidden_states["hit"][:4], torch.full((4, HIDDEN), 7.0))
+    assert torch.equal(out.hidden_states["hit"][4:], torch.full((2, HIDDEN), 9.0))
+
+
+def test_pool_snapshot_excludes_pending_producer_rows(monkeypatch):
+    mgr, view = make_manager()
+    seed = run_step(mgr, view, {"old": ([0, 1], 0, 8)}, hidden_values={"old": 1.0})
+    mgr.materialize(seed, ["old"])
+    requested = []
+    real_rows = mgr._pool.rows
+
+    def rows(key, slots):
+        requested.extend(int(slot) for slot in slots.tolist())
+        return real_rows(key, slots)
+
+    monkeypatch.setattr(mgr._pool, "rows", rows)
+    sid = run_step(
+        mgr,
+        view,
+        {"writer": ([0], 0, 4), "hit": ([0, 1, 2], 8, 1)},
+        new_hits={"hit": 8},
+        finished=["old"],
+        hidden_values={"writer": 7.0, "hit": 9.0},
+    )
+    assert requested == list(range(BLOCK_SIZE, 2 * BLOCK_SIZE))
+    out = mgr.materialize(sid, ["writer", "hit"])
+    assert torch.equal(out.hidden_states["hit"][:4], torch.full((4, HIDDEN), 7.0))
+    assert torch.equal(out.hidden_states["hit"][4:8], torch.full((4, HIDDEN), 1.0))
+
+
+def test_read_plan_pool_snapshot_follows_failed_immediate_lease(monkeypatch):
+    """If the producer commits while the planner tries to lease its page,
+    the fallback snapshot must observe the just-committed value."""
+    mgr, view = make_manager()
+    old = run_step(mgr, view, {"old": ([0], 0, 4)}, hidden_values={"old": 1.0})
+    mgr.materialize(old, ["old"])
+
+    _hold_writes(mgr)
+    sid = run_step(mgr, view, {"new": ([0], 0, 4)}, finished=["old"], hidden_values={"new": 7.0})
+    task = mgr._controller.get_task(next(iter(mgr._request_tasks.tasks["new"])))
+    assert task is not None
+    real_bind = mgr._controller.staging_bind_read
+
+    def commit_before_bind(candidate, holder):
+        assert candidate is task
+        mgr._controller._scatter(task)
+        return real_bind(candidate, holder)
+
+    monkeypatch.setattr(mgr._controller, "staging_bind_read", commit_before_bind)
+    slots = view.slots_for("new", 0, 4)
+    with mgr._state_lock:
+        plan = mgr._read_plan(slots, HIDDEN_KEY, "new")
+    assert not plan.leases
+    assert torch.equal(mgr._execute_read_plan(plan), torch.full((4, HIDDEN), 7.0))
+    mgr.discard_step(sid)
+
+
+def test_read_plan_does_not_treat_failed_producer_as_committed(monkeypatch):
+    mgr, view = make_manager()
+    seed = run_step(mgr, view, {"old": ([0], 0, 4)}, hidden_values={"old": 1.0})
+    mgr.materialize(seed, ["old"])
+    _hold_writes(mgr)
+    sid = run_step(mgr, view, {"new": ([0], 0, 4)}, finished=["old"], hidden_values={"new": 7.0})
+    task = mgr._controller.get_task(next(iter(mgr._request_tasks.tasks["new"])))
+    assert task is not None
+
+    def fail_before_bind(candidate, holder):
+        assert candidate is task
+        mgr._controller._fail_task(task.tid)
+        return False
+
+    monkeypatch.setattr(mgr._controller, "staging_bind_read", fail_before_bind)
+    with mgr._state_lock:
+        plan = mgr._read_plan(view.slots_for("new", 0, 4), HIDDEN_KEY, "new")
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="failed before read binding"):
+        mgr._execute_read_plan(plan)
+    assert all(holder.kind != "read" for busy in mgr._controller._staging_pool._busy for holder in busy)
+    mgr.discard_step(sid)
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="write failed"):
+        mgr.new_step_starts(())
+    mgr.shutdown()
+
+
+def test_failed_save_cleans_same_step_read_plans(monkeypatch):
+    mgr, view = make_manager()
+    seed = run_step(mgr, view, {"old": ([0], 0, 4)}, hidden_values={"old": 1.0})
+    mgr.materialize(seed, ["old"])
+
+    def fail_dispatch(task):
+        raise RuntimeError("injected dispatch failure")
+
+    monkeypatch.setattr(mgr._controller, "_run_eager", fail_dispatch)
+    with pytest.raises(RuntimeError, match="injected dispatch failure"):
+        run_step(
+            mgr,
+            view,
+            {"writer": ([0], 0, 4), "hit": ([0, 2], 4, 1)},
+            new_hits={"hit": 4},
+            finished=["old"],
+            hidden_values={"writer": 7.0, "hit": 9.0},
+        )
+    assert not mgr._step_ctxs
+    deadline = time.monotonic() + 2.0
+    while any(holder.kind == "read" for busy in mgr._controller._staging_pool._busy for holder in busy):
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    assert all(holder.kind != "read" for busy in mgr._controller._staging_pool._busy for holder in busy)
+    mgr.shutdown()
+
+
+@pytest.mark.parametrize("consume", ["discard", "subset"])
+def test_unconsumed_output_does_not_release_running_prefetch_lease(monkeypatch, consume):
+    """Discard/subset materialize cannot recycle staging during prefetch."""
+    mgr, view = make_manager()
+    old = run_step(mgr, view, {"old": ([0], 0, 4)}, hidden_values={"old": 1.0})
+    mgr.materialize(old, ["old"])
+    _hold_writes(mgr)
+
+    entered = threading.Event()
+    resume = threading.Event()
+    real_execute = mgr._execute_read_plan
+
+    def blocked_execute(plan):
+        entered.set()
+        assert resume.wait(2.0)
+        return real_execute(plan)
+
+    monkeypatch.setattr(mgr, "_execute_read_plan", blocked_execute)
+    sid = run_step(
+        mgr,
+        view,
+        {"writer": ([0], 0, 4), "hit": ([0, 2], 4, 1)},
+        new_hits={"hit": 4},
+        finished=["old"],
+        hidden_values={"writer": 7.0, "hit": 9.0},
+    )
+    ctx = mgr._step_ctxs[sid]
+    future = ctx.hit_prefetch["hit"][HIDDEN_KEY]
+    plan = ctx.hit_plans["hit"][HIDDEN_KEY]
+    assert entered.wait(2.0) and plan.leases
+
+    if consume == "discard":
+        mgr.discard_step(sid)
+    else:
+        out = mgr.materialize(sid, ["writer"])
+        assert torch.equal(out.hidden_states["writer"], torch.full((4, HIDDEN), 7.0))
+    for slot, holder in plan.leases:
+        assert holder in mgr._controller._staging_pool._busy[slot]
+
+    producer = next(task for task, _ in plan.producers)
+    mgr._controller._scatter(producer)
+    resume.set()
+    future.result(timeout=2.0)
+    for slot, holder in plan.leases:
+        assert holder not in mgr._controller._staging_pool._busy[slot]
+    for task in list(mgr._controller._tasks.values()):
+        if not task.done.is_set():
+            mgr._controller._scatter(task)
+    mgr.shutdown()
+
+
+@pytest.mark.parametrize("cleanup", ["discard", "shutdown"])
+def test_cancelled_prefetch_releases_read_lease(cleanup):
+    mgr, view = make_manager()
+    old = run_step(mgr, view, {"old": ([0], 0, 4)}, hidden_values={"old": 1.0})
+    mgr.materialize(old, ["old"])
+    _hold_writes(mgr)
+
+    release_worker = threading.Event()
+    blocker = mgr._prefetch_pool.submit(release_worker.wait)
+    sid = run_step(
+        mgr,
+        view,
+        {"writer": ([0], 0, 4), "hit": ([0, 2], 4, 1)},
+        new_hits={"hit": 4},
+        finished=["old"],
+        hidden_values={"writer": 7.0, "hit": 9.0},
+    )
+    ctx = mgr._step_ctxs[sid]
+    future = ctx.hit_prefetch["hit"][HIDDEN_KEY]
+    plan = ctx.hit_plans["hit"][HIDDEN_KEY]
+    assert plan.leases and not future.running()
+
+    if cleanup == "discard":
+        mgr.discard_step(sid)
+        assert future.cancelled()
+        for slot, holder in plan.leases:
+            assert holder not in mgr._controller._staging_pool._busy[slot]
+        release_worker.set()
+        blocker.result(timeout=2.0)
+        for task in list(mgr._controller._tasks.values()):
+            if not task.done.is_set():
+                mgr._controller._scatter(task)
+        mgr.shutdown()
+    else:
+        for task in list(mgr._controller._tasks.values()):
+            if not task.done.is_set():
+                mgr._controller._scatter(task)
+        stopped = threading.Event()
+
+        def stop():
+            mgr.shutdown()
+            stopped.set()
+
+        thread = threading.Thread(target=stop, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 2.0
+        while not future.cancelled() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert future.cancelled()
+        for slot, holder in plan.leases:
+            assert holder not in mgr._controller._staging_pool._busy[slot]
+        release_worker.set()
+        thread.join(timeout=2.0)
+        assert stopped.is_set()
+
+
+def test_read_plan_prefetch_toggle_has_identical_sparse_results():
+    """Prefetch is only an early execution of the same producer-bound plan."""
+    policy = ModelCachePolicy(needs_full_hidden_states=True, deferred_keys=frozenset({"sparse"}))
+    results = []
+    for enabled in (False, True):
+        mgr, view = make_manager(policy=policy)
+        mgr._prefetch_reads = enabled
+        first = run_step(mgr, view, {"a": ([1], 0, 4)}, mm={"sparse": torch.ones(4, 2)})
+        mgr.materialize(first, ["a"])
+        seed = run_step(mgr, view, {"seed": ([0], 0, 4)})
+        mgr.materialize(seed, ["seed"])
+        second = run_step(
+            mgr,
+            view,
+            {"b": ([0, 2], 4, 2)},
+            new_hits={"b": 4},
+            finished=["seed"],
+            mm={"sparse": torch.full((2, 2), 9.0)},
+        )
+        out = mgr.materialize(second, ["b"])
+        # The sparse key has no producer for the hit block: it is explicit
+        # absence, not the old tenant's row in the CPU mirror.
+        results.append(out.mm_outputs["sparse"]["b"][:4].clone())
+        mgr.shutdown()
+    assert torch.equal(results[0], results[1])
+    assert torch.equal(results[0], torch.zeros(4, 2))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="real async controller requires a CUDA stream")
+def test_eager_and_async_controller_have_identical_read_plans():
+    def execute(async_controller: bool):
+        mgr, view = make_manager(controller_eager=not async_controller)
+
+        first = run_step(mgr, view, {"old": ([0], 0, 4)}, hidden_values={"old": 1.0})
+        mgr.materialize(first, ["old"])
+        second = run_step(
+            mgr,
+            view,
+            {"writer": ([0], 0, 4), "hit": ([0, 2], 4, 2)},
+            new_hits={"hit": 4},
+            finished=["old"],
+            hidden_values={"writer": 7.0, "hit": 9.0},
+        )
+        out = mgr.materialize(second, ["writer", "hit"])
+        for tids in list(mgr._request_tasks.tasks.values()):
+            mgr._controller.join(list(tids))
+        with mgr._state_lock:
+            mgr._commit_drained_writes()
+        status = mgr._slot_status.get_slot_status(HIDDEN_KEY)
+        slots = torch.arange(0, 3 * BLOCK_SIZE)
+        snapshot = (
+            out.hidden_states["writer"].clone(),
+            out.hidden_states["hit"].clone(),
+            status.presence[slots].clone(),
+            status.slot_version[slots].clone(),
+        )
+        mgr.shutdown()
+        return snapshot
+
+    eager = execute(False)
+    asynchronous = execute(True)
+    for eager_value, async_value in zip(eager, asynchronous):
+        assert torch.equal(eager_value, async_value)
+
+
+def test_unknown_presence_is_not_explicit_sparse_absence():
+    policy = ModelCachePolicy(needs_full_hidden_states=True, deferred_keys=frozenset({"sparse"}))
+    mgr, view = make_manager(policy=policy)
+    first = run_step(mgr, view, {"a": ([0], 0, 4)}, mm={"sparse": torch.ones(4, 2)})
+    mgr.materialize(first, ["a"])
+
+    unknown_slots = torch.arange(BLOCK_SIZE, 2 * BLOCK_SIZE)
+    status = mgr._slot_status.get_slot_status("sparse")
+    assert torch.all(status.presence[unknown_slots] == _Presence.UNKNOWN)
+    unknown = run_step(
+        mgr,
+        view,
+        {"b": ([1, 2], 4, 1)},
+        new_hits={"b": 4},
+        finished=["a"],
+        mm={"sparse": torch.full((1, 2), 9.0)},
+    )
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="unknown presence"):
+        mgr.materialize(unknown, ["b"])
+
+    # A real write omitting the already-known sparse key explicitly marks its
+    # slots absent; that state is readable as the sparse zero value.
+    absent = run_step(mgr, view, {"c": ([1], 0, 4)})
+    mgr.materialize(absent, ["c"])
+    assert torch.all(status.presence[unknown_slots] == _Presence.ABSENT)
+
+
+def test_read_plan_binds_committed_rows_before_slot_reuse():
+    """A delayed plan returns its captured producer, never a newer tenant."""
+    mgr, view = make_manager()
+    first = run_step(mgr, view, {"a": ([0], 0, 4)})
+    mgr.materialize(first, ["a"])
+    slots = view.slots_for("a", 0, 4)
+    with mgr._state_lock:
+        plan = mgr._read_plan(slots, HIDDEN_KEY, "a")
+    second = run_step(mgr, view, {"b": ([0], 0, 4)}, finished=["a"])
+    mgr.materialize(second, ["b"])
+    assert torch.equal(mgr._execute_read_plan(plan), expected_rows(slots))
 
 
 def test_delayed_read_of_reassigned_hit_raises():
