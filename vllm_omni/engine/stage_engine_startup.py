@@ -1607,7 +1607,10 @@ def launch_diffusion_stage_replica(
         return client, StageReplicaResources()
 
     from vllm_omni.diffusion import stage_diffusion_proc
-    from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
+    from vllm_omni.diffusion.stage_diffusion_client import (
+        StageDiffusionClient,
+        diffusion_model_config_snapshot,
+    )
 
     od_config = build_diffusion_config(model, stage_config, metadata)
     parallel_config = getattr(od_config, "parallel_config", None)
@@ -1660,6 +1663,7 @@ def launch_diffusion_stage_replica(
             request_address=proc_manager.addresses.inputs[0],
             response_address=proc_manager.addresses.outputs[0],
             proc_manager=proc_manager,
+            model_config=diffusion_model_config_snapshot(getattr(od_config, "model_config", None)),
         )
         return client, StageReplicaResources(
             manager=proc_manager,

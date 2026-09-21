@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for MultiprocDiffusionExecutor async result pump and wait_output_ready."""
 
 import concurrent.futures
+import copy
 import queue
 import threading
 import time
@@ -12,6 +13,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from vllm_omni.diffusion.data import AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
+from vllm_omni.errors import OmniClientError, client_error_metadata
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -212,6 +214,122 @@ class TestResultPumpDispatch:
         result = fut.result(timeout=1.0)
         assert result.kind == AsyncOutputKind.COMPUTE_DONE
 
+    @pytest.mark.parametrize("client_error", [True, False])
+    @pytest.mark.parametrize("collect_rank_status", [True, False])
+    def test_worker_rpc_error_round_trip(self, mocker, client_error, collect_rank_status):
+        from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
+
+        executor = _make_executor()
+        future = concurrent.futures.Future()
+        executor._rpc_futures["1"] = future
+        message = "guide[0] interval is outside the target; OmniClientError is not a type tag"
+        original = (
+            OmniClientError(message, error_type="GuideValidationError") if client_error else RuntimeError(message)
+        )
+        proc = object.__new__(WorkerProc)
+        proc.gpu_id = 0
+        proc.od_config = SimpleNamespace(step_execution=False)
+        proc.worker = SimpleNamespace(execute_method=MagicMock(side_effect=original))
+        proc.result_mq = MagicMock()
+        proc._result_mq_lock = threading.Lock()
+        proc._running = True
+        proc.recv_message = MagicMock(
+            side_effect=[
+                {
+                    "type": "rpc",
+                    "method": "execute_model",
+                    "rpc_id": "1",
+                    "output_rank": 0,
+                    "exec_all_ranks": True,
+                    "collect_rank_status": collect_rank_status,
+                },
+                {"type": "shutdown"},
+            ]
+        )
+        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker._cleanup_after_execution_error")
+        mocker.patch.object(proc, "_gather_rpc_rank_statuses", side_effect=lambda status: [status])
+        proc._worker_busy_loop()
+
+        proc.result_mq.enqueue.assert_called_once()
+        # Real transport serialization is covered in test_diffusion_ipc.py.
+        wire_message = copy.deepcopy(proc.result_mq.enqueue.call_args.args[0])
+        _feed_one_msg_to_pump(executor, wire_message)
+        with pytest.raises(OmniClientError if client_error else RuntimeError) as caught:
+            future.result(timeout=1)
+        output = DiffusionOutput.from_exception(caught.value)
+        assert message in output.error
+        assert output.error_status_code == (400 if client_error else None)
+        assert output.error_type == ("GuideValidationError" if client_error else None)
+        assert client_error_metadata(caught.value) == (output.error_status_code, output.error_type)
+        assert (output.error_status_code or 500) == (400 if client_error else 500)
+
+    @pytest.mark.parametrize("unknown_peer_error", [True, False])
+    def test_async_rejection_waits_for_all_rank_terminal_statuses(self, mocker, unknown_peer_error):
+        from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
+
+        executor = _make_executor()
+        entered = threading.Event()
+        release = threading.Event()
+        barrier = threading.Barrier(2)
+        statuses = [None, None]
+        workers = []
+        messages = []
+        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker._cleanup_after_execution_error")
+
+        def execute(rank):
+            if rank == 1:
+                entered.set()
+                assert release.wait(5)
+                if unknown_peer_error:
+                    raise RuntimeError("unknown failure on rank 1")
+            raise OmniClientError(f"invalid guide on rank {rank}")
+
+        def gather(rank, status):
+            statuses[rank] = status
+            barrier.wait(timeout=5)
+            return statuses
+
+        def enqueue(message):
+            messages.append(copy.deepcopy(message))
+            _feed_one_msg_to_pump(executor, messages[-1])
+
+        def broadcast(request):
+            assert request["collect_rank_status"] is True
+            for rank in range(2):
+                proc = object.__new__(WorkerProc)
+                proc.gpu_id = rank
+                proc.result_mq = SimpleNamespace(enqueue=enqueue)
+                proc._result_mq_lock = threading.Lock()
+                proc.worker = SimpleNamespace(execute_method=lambda *args, r=rank, **kwargs: execute(r))
+                proc._gather_rpc_rank_statuses = lambda status, r=rank: gather(r, status)
+                proc._running = True
+                proc.recv_message = MagicMock(side_effect=[request, {"type": "shutdown"}])
+                thread = threading.Thread(target=proc._worker_busy_loop)
+                workers.append(thread)
+                thread.start()
+
+        executor._broadcast_mq.enqueue = broadcast
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            result = pool.submit(
+                executor.collective_rpc, "execute_model", timeout=5, unique_reply_rank=0, exec_all_ranks=True
+            )
+            try:
+                assert entered.wait(2)
+                assert not result.done()
+                assert messages == []
+            finally:
+                release.set()
+            with pytest.raises(RuntimeError if unknown_peer_error else OmniClientError) as caught:
+                result.result(timeout=5)
+            output = DiffusionOutput.from_exception(caught.value)
+            assert output.error_status_code == (None if unknown_peer_error else 400)
+            assert ("unknown failure on rank 1" if unknown_peer_error else "invalid guide on rank 1") in output.error
+        for worker in workers:
+            worker.join(timeout=2)
+            assert not worker.is_alive()
+        assert len(messages) == 1
+        assert executor._rpc_futures == {}
+
     def test_output_ready_routes_to_output_future(self):
         executor = _make_executor()
         async_output_id = "abc123"
@@ -365,6 +483,34 @@ class TestBatchSplitDelivery:
         # No stale batch-level state left behind.
         assert executor._batch_split_map == {}
         assert executor._completed_outputs == {}
+
+    @pytest.mark.parametrize("deliver_early", [True, False])
+    @pytest.mark.parametrize("client_error", [True, False])
+    def test_error_metadata_survives_batch_split(self, deliver_early, client_error):
+        executor = _make_executor()
+        executor.od_config.parallel_config.data_parallel_size = 1
+        message = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id="batch-error",
+            error="invalid guide interval" if client_error else "packing failed",
+            error_status_code=400 if client_error else None,
+            error_type="GuideValidationError" if client_error else None,
+        )
+
+        def collective_rpc(*args, **kwargs):
+            if deliver_early:
+                _feed_one_msg_to_pump(executor, message)
+            return AsyncDiffusionOutput(kind=AsyncOutputKind.COMPUTE_DONE, async_output_id="batch-error")
+
+        executor.collective_rpc = collective_rpc
+        executor.execute_batch(_make_scheduler_output(["A", "B"]))
+        if not deliver_early:
+            _feed_one_msg_to_pump(executor, message)
+        for request_id in ["A", "B"]:
+            output = executor.wait_output_ready(f"batch-error/{request_id}").result(timeout=1)
+            assert output.error == message.error
+            assert output.error_status_code == message.error_status_code
+            assert output.error_type == message.error_type
 
     def test_engine_waiter_before_output_is_resolved(self):
         """Consumers already blocked in wait_output_ready must be woken."""

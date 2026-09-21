@@ -546,6 +546,56 @@ def test_get_diffusion_od_config_falls_back_to_inner_engine():
     assert omni.get_diffusion_od_config() is diffusion_od_config
 
 
+def test_out_of_process_diffusion_client_exposes_model_config_to_the_api_process():
+    """Out-of-process stages keep ``od_config`` in the worker.
+
+    Without the ``diffusion_model_config`` snapshot, the head process falls
+    back to a view with no ``model_config``, and every server-owned policy
+    block (timeline-guide admission limits in particular) silently reverts to
+    its default in split deployments.
+    """
+    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+    from vllm_omni.model_executor.models.minimax_h3.timeline_guides import TimelineGuideLimits
+
+    model_config = {"minimax_h3_timeline_guides": {"max_entries": 2, "max_outstanding_requests": 1}}
+    engine = object.__new__(AsyncOmniEngine)
+    engine.model = "MiniMaxAI/MiniMax-H3"
+    engine._diffusion_od_config_view = None
+    # The out-of-process client deliberately exposes no ``od_config``.
+    engine.stage_clients = [
+        SimpleNamespace(stage_type="llm"),
+        SimpleNamespace(stage_type="diffusion", diffusion_model_config=model_config),
+    ]
+    omni = object.__new__(AsyncOmni)
+    omni.engine = engine
+
+    view = omni.get_diffusion_od_config()
+
+    assert getattr(view, "od_config", None) is None
+    limits = TimelineGuideLimits.from_config(view.model_config)
+    assert limits.max_entries == 2
+    assert limits.max_outstanding_requests == 1
+
+
+def test_diffusion_model_config_is_resolved_after_late_stage_attachment():
+    """Headless replicas can attach their diffusion client after the first call."""
+    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+
+    engine = object.__new__(AsyncOmniEngine)
+    engine.model = "MiniMaxAI/MiniMax-H3"
+    engine._diffusion_od_config_view = None
+    engine.stage_clients = []
+
+    assert engine.get_diffusion_od_config().model_config == {}
+
+    engine.stage_clients = [
+        SimpleNamespace(
+            stage_type="diffusion", diffusion_model_config={"minimax_h3_timeline_guides": {"max_entries": 3}}
+        )
+    ]
+    assert engine.get_diffusion_od_config().model_config == {"minimax_h3_timeline_guides": {"max_entries": 3}}
+
+
 @pytest.mark.asyncio
 async def test_async_omni_yields_only_final_stage_outputs(monkeypatch: pytest.MonkeyPatch):
     engine = FakeAsyncOmniEngine(

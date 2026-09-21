@@ -27,6 +27,7 @@ def minimax_h3_imgvid_cond_noise_aug_rows(
     imgvid_cond_num_frames: int,
     seed: int,
     noise_aug: float,
+    guided: bool = False,
 ) -> torch.Tensor:
     """Apply the imgvid-condition RF noise recipe to packed clean rows.
 
@@ -35,6 +36,15 @@ def minimax_h3_imgvid_cond_noise_aug_rows(
     created for every condition. Under the dependent-noise policy, each draw
     uses the target temporal length plus the template's imgvid-condition frame
     count, then slices the prefix matching the current condition.
+
+    ``guided`` selects the packed-row recipe used by the multi-frame reference
+    workflow, and is an internal per-request selection made by the pipeline, not
+    a request-visible option. Each condition then draws noise directly in its own
+    packed ``[rows, 96]`` shape, so the noise of an existing condition does not
+    depend on the target length or on how many other conditions the request
+    carries. Adding a guide therefore leaves the earlier conditions bit-identical.
+    The mix uses Python float scalars, matching the reference implementation's
+    ``aug * r + (1 - aug) * noise`` evaluation order.
     """
 
     noise_aug = float(noise_aug)
@@ -83,11 +93,23 @@ def minimax_h3_imgvid_cond_noise_aug_rows(
     row_offset = 0
     timestep = torch.tensor(noise_aug, dtype=torch.float32, device="cpu")
     for latent_t, latent_h, latent_w in parsed_shapes:
+        generator = torch.Generator(device="cpu").manual_seed(int(seed))
+        if guided:
+            row_count = latent_t * (latent_h // 2) * (latent_w // 2)
+            clean_part = clean_rows[row_offset : row_offset + row_count]
+            noise_rows = torch.randn(
+                clean_part.shape,
+                generator=generator,
+                dtype=torch.float32,
+                device="cpu",
+            )
+            out.append(noise_aug * clean_part + (1.0 - noise_aug) * noise_rows)
+            row_offset += row_count
+            continue
         # Official Ref2VA allows a reference video to be longer than the
         # generated clip.  The old implementation sized the draw only from
         # the target clip and consequently rejected valid long references.
         full_t = max(target_latent_t + imgvid_cond_num_frames, latent_t)
-        generator = torch.Generator(device="cpu").manual_seed(int(seed))
         noise = torch.randn(
             1,
             24,
@@ -112,6 +134,7 @@ def minimax_h3_audio_cond_noise_aug_rows(
     condition_audio_t: Sequence[int],
     seed: int,
     noise_aug: float,
+    guided: bool = False,
 ) -> torch.Tensor:
     """Apply the audio-condition RF noise recipe to packed clean rows.
 
@@ -123,7 +146,10 @@ def minimax_h3_audio_cond_noise_aug_rows(
     numerically different for ordered multi-reference requests.
 
     The mix is intentionally evaluated on CPU in fp32 before the packed rows
-    are transferred to the DiT device.
+    are transferred to the DiT device. The per-condition draw already uses each
+    condition's own packed row shape, so ``guided`` only switches the mix to the
+    reference implementation's Python float scalar arithmetic; with the default
+    ``noise_aug`` of 1.0 the clean rows are returned unchanged either way.
     """
 
     noise_aug = float(noise_aug)
@@ -157,7 +183,10 @@ def minimax_h3_audio_cond_noise_aug_rows(
             dtype=torch.float32,
             device="cpu",
         )
-        out.append(timestep * clean_part + (1.0 - timestep) * noise)
+        if guided:
+            out.append(noise_aug * clean_part + (1.0 - noise_aug) * noise)
+        else:
+            out.append(timestep * clean_part + (1.0 - timestep) * noise)
         row_offset += row_count
     return torch.cat(out, dim=0).to(device=clean_rows.device, dtype=torch.float32).contiguous()
 

@@ -68,6 +68,8 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |
 | `input_reference` | file | null | Uploaded reference image or video for image-to-video/video-to-video requests |
+| `timeline_guides` | string | null | H3-only ordered JSON manifest of pixel-frame guide placements; see [H3 Timeline Guides](#h3-timeline-guides) |
+| `guide_files` | repeated file | null | Separate uploads addressed by zero-based `upload_index` in `timeline_guides` |
 | `control_reference` | file | null | Optional uploaded image/video control, up to 512 MiB, for models that declare control-upload support |
 | `control_type` | string | null | Model control name associated with `control_reference`; currently Cosmos3 supports `edge`, `blur`, `depth`, `seg`, and `wsm` |
 | `image_reference` | string | null | JSON-encoded reference image payload; do not combine with `input_reference` or `video_reference` |
@@ -122,6 +124,8 @@ request for execution.
 task. Cancellation cleanup is also bounded and best-effort: it confirms
 the abort was queued, and the current request batch may still drain.
 The job is then re-read so a completed save is not orphaned.
+Guided requests are the exception; see
+[Cancellation and Cleanup](#cancellation-and-cleanup).
 
 ### Synchronous Response
 
@@ -278,6 +282,152 @@ curl -s http://localhost:8091/v1/videos \
   -F "guidance_scale=4.5" \
   -F "fps=16"
 ```
+
+### H3 Timeline Guides
+
+For implementation boundaries, packing invariants, and request ownership, see
+the [H3 timeline guide implementation](../design/feature/minimax_h3_timeline_guides.md).
+
+MiniMax H3 accepts ordered image, clip, audio-only, and visual-plus-audio guides
+on both video endpoints. Guided HTTP requests require Python 3.11 or newer for
+reliable cancellation-state tracking; older runtimes reject them before admission.
+No-guide requests retain their existing runtime behavior.
+These are timeline conditions, not ordinary references:
+they never enter Qwen reference presentation or change `<Picture N>` labels.
+Use base H3 weights, dense attention, and cache-free execution. Send
+`quality=lossless`; `quality=high` enables Cache-DiT and is rejected with guides,
+even when caching was disabled at startup. Active/fused LoRA (including Turbo),
+FastH3, few-step distilled schedules, sparse attention, and cache acceleration are not
+supported for guided requests. No-guide requests retain their existing behavior.
+
+```bash
+curl --fail-with-body http://localhost:8091/v1/videos/sync \
+  -F 'prompt=A bird flies across the lake and lands beside the reeds.' \
+  -F 'width=1344' -F 'height=768' -F 'num_frames=124' -F 'fps=24' \
+  -F 'num_inference_steps=50' -F 'seed=1101' -F 'quality=lossless' \
+  -F 'extra_params={"task":"t2va","aspect_ratio":"16:9","audio_flow_shift":3.0}' \
+  -F 'timeline_guides=[{"frame_index":36,"image":{"upload_index":0}},{"frame_index":-22,"video":{"upload_index":1},"audio":{"upload_index":2}}]' \
+  -F 'guide_files=@middle.png;type=image/png' \
+  -F 'guide_files=@tail.mp4;type=video/mp4' \
+  -F 'guide_files=@tail.flac;type=audio/flac' \
+  -o guided.mp4
+```
+
+Use `/v1/videos` instead to create a job, then poll and download normally.
+`tail.mp4` in this example must normalize to no more than 22 frames. For an
+audio-only guide, use a manifest such as
+`[{"frame_index":0,"audio":{"upload_index":0}}]` and upload only its audio file.
+Guide audio supports WAV, MP3, and FLAC, including clips shorter than two seconds.
+A guide video's soundtrack is **not** extracted automatically: upload explicit
+audio when it should condition the output.
+
+Manifest indices must be JSON integers, not booleans, floats, or strings. Each
+entry requires `frame_index` and at least one of `image`, `video`, or `audio`;
+`image` and `video` cannot coexist in one entry. Source objects contain only
+`upload_index`. Unknown fields, missing/out-of-range indices, unreferenced
+uploads, and mismatched media are rejected. Reusing an upload is allowed;
+each occurrence is conditioned in insertion order, including overlaps and
+nonchronological entries. Empty or omitted guides with no files use the legacy
+path. Do not put the manifest in `extra_params`, send server paths or URLs as
+guides, or supply the reserved `_minimax_h3_timeline_guides` field yourself.
+
+#### Placement and Normalization
+
+- H3 outputs 24 FPS. Let `N` be the actual output frame count after upward
+  alignment to `17k+5`; negative index `i` resolves to `N+i`.
+- Starts are exact pixel-frame indices, not rounded to VAE latent boundaries.
+- A source with 1-4 visual frames becomes its first frame. Otherwise it becomes
+  `G=5+17*floor((M-5)/17)` frames. Empty visuals are rejected.
+- Clips are decoded using elapsed timestamps at 24 FPS before normalization.
+  The normalized clip must satisfy `0 <= start` and `start+G <= N`; it is not
+  trimmed again to fit. For a 22-frame clip, `-22` fits at the end but `-1` does not.
+- Guide visuals are center-cropped to the output canvas. Ordinary FL2VA
+  first/last images retain their existing stretching behavior.
+- Explicit audio starts at the same frame and may outlast the visual guide.
+  After encoding, each channel is cropped to at most
+  `floor(round(N*40/24)-(5/3)*start)` latent positions. Audio-only guides use a
+  one-frame start check and must leave at least one audio latent position.
+- Guides condition generation; pixel-identical or sample-identical reconstruction
+  is not promised.
+
+Ordinary inputs still determine routing: text plus guides uses `t2va`/FL2VA
+weights, first/last inputs use `fl2va`, and ordinary visual references use
+`ref2va`. Guides coexist with `input_references` and typed ordinary references.
+A `t2va` request still needs an explicit ratio in the multipart `aspect_ratio`
+field or `extra_params.aspect_ratio`, even when `width` and `height` are supplied.
+H3's existing 4-15 second output-duration
+restriction remains in force; short guide inputs do not permit shorter outputs.
+A Ref2VA-only server still requires an ordinary visual reference; guides are
+not implicitly converted into references. Existing step-mode, fanout, batching,
+and offload restrictions continue to apply.
+
+#### Admission Limits
+
+The server owns the `od_config.model_config["minimax_h3_timeline_guides"]`
+configuration block, configurable through the existing deploy YAML/stage
+overrides. Requests cannot override it. Every value must be finite and positive.
+
+For example, merge this block into the H3 diffusion stage of a deploy YAML
+(not the text-encoder stage):
+
+```yaml
+model_config:
+  minimax_h3_timeline_guides:
+    max_entries: 4
+    max_outstanding_requests: 2
+```
+
+| Configuration key | Default |
+| --- | ---: |
+| `max_entries` / `max_unique_files` | 8 / 16 |
+| `max_image_bytes` | 31,457,280 (30 MiB) |
+| `max_video_bytes` | 52,428,800 (50 MiB) |
+| `max_audio_bytes` | 15,728,640 (15 MiB) |
+| `max_total_upload_bytes` | 134,217,728 (128 MiB) |
+| `max_guide_rows` / `max_packed_rows` | 65,536 / 262,144 |
+| `max_source_pixels` | 16,777,216 |
+| `max_decoded_visual_pixels` | 268,435,456 |
+| `max_decoded_audio_samples` | 8,388,608 stereo scalar samples at 32 kHz |
+| `subprocess_timeout_seconds` | 60 per probe/decode operation |
+| `max_outstanding_requests` | 4 per handler, including abandoned running work |
+
+Reused files count once for upload bytes, but every occurrence counts toward
+decode and conditioning work. Visual work counts source/canvas pixel-frames,
+including frames discarded during normalization. For clips, work is
+`max(source_frames, resampled_24_fps_frames) * max(source_pixels, canvas_pixels)`;
+high-FPS source frames count even when resampling discards them. Packed rows include text,
+ordinary references, first/last anchors, guides, targets, and padding. Oversized
+sources must be trimmed or resized by the client. These are admission-policy
+defaults, **not measured safe GPU capacity**. Multipart parsing may spool data
+before admission; configure reverse-proxy ingress limits separately.
+
+#### Cancellation and Cleanup
+
+For guided requests, a sync timeout, client cancellation, or job DELETE abandons
+the response but does **not** interrupt already-submitted generation. GPU work
+may continue. The server retains all file-backed inputs, including ordinary
+references, and the outstanding-job reservation until the inner task completes
+safely, then discards the result and removes temporary files. Unsubmitted work
+can be cleaned up immediately. DELETE cannot be undone by a late completion or
+output-store write. Guided DELETE deliberately skips the bounded engine abort and
+frontend task cancellation used for no-guide jobs: an abort acknowledgment does
+not establish that a worker stopped reading the file-backed guide inputs.
+Graceful shutdown drains submitted guided work before engine
+teardown; this can take as long as generation. No immediate GPU abort or
+cross-host file transfer is provided. No-guide cancellation is unchanged.
+Guided jobs report `queued` until the engine reports inference start, matching
+no-guide jobs.
+
+If an engine failure or unexpected inner-task cancellation prevents confirmation
+that workers finished reading, cleanup is deliberately conservative: inputs and
+admission slots remain retained, including after the graceful drain. The current
+engine's shutdown return is not a worker-termination acknowledgment. Such abnormal
+retention has no automatic reclamation; operators must independently confirm
+reader termination before removing retained files or restarting admission.
+
+Schema/association errors are rejected before queueing where possible.
+Output-dependent validation failures use normal synchronous client errors or
+structured asynchronous failed-job errors.
 
 ### Synchronous Generation
 

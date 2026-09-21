@@ -15,6 +15,11 @@ class DiffusionModelMetadata:
     # ``control_type`` by the video API.  A pipeline that opts in receives the
     # persisted upload through ``extra_args[control_type]["control_path"]``.
     supported_control_upload_types: tuple[str, ...] = ()
+    # Ordered timeline guides are exposed as the ``timeline_guides`` manifest
+    # plus ``guide_files`` uploads by the video API.  A pipeline that opts in
+    # receives trusted local descriptors through the reserved sampling-extras
+    # key and must own its own guide admission limits.
+    supports_timeline_guides: bool = False
     attention_mask_free: bool = False
     final_output_type: str | None = None
     # Whether ``/v1/videos`` accepts source media plus per-token video/audio
@@ -56,6 +61,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=9,
         supports_mixed_reference_inputs=True,
+        supports_timeline_guides=True,
         supports_latent_mask_editing=True,
         final_output_type="video",
         # H3 represents alignment padding as a second packed sequence.  The
@@ -71,6 +77,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=9,
         supports_mixed_reference_inputs=True,
+        supports_timeline_guides=True,
         supports_latent_mask_editing=True,
         final_output_type="video",
         attention_mask_free=True,

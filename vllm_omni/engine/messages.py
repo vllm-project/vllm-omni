@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from typing import Literal
@@ -86,6 +89,7 @@ class ErrorMessage(EngineQueueMessage, kw_only=True):
     status_code: int | None = None
     error_type: str | None = None
     fatal: bool = False
+    worker_finished: bool = False
     request_id: str | None = None
     stage_id: int | None = None
     event_id: str | None = None  # for interactions on diffusion generation requests

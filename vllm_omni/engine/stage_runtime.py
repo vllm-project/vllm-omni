@@ -96,6 +96,29 @@ class StageRemoteFactoryContext:
     executor_class: type | None = None
 
 
+def _stage_cfg_diffusion_model_config(stage_cfg: Any) -> Any:
+    """Read the server-owned ``model_config`` policy block off a stage config.
+
+    Remote diffusion replicas never build an ``OmniDiffusionConfig`` in the
+    head process, so the block has to come straight from the stage config that
+    launched them. Structured stages carry it on ``diffusion_config``; legacy
+    mapping stages still carry it under ``engine_args``.
+    """
+
+    def _get(container: Any, key: str) -> Any:
+        if container is None:
+            return None
+        if isinstance(container, Mapping):
+            return container.get(key)
+        return getattr(container, key, None)
+
+    for owner in ("diffusion_config", "engine_args"):
+        model_config = _get(_get(stage_cfg, owner), "model_config")
+        if model_config:
+            return model_config
+    return None
+
+
 class OmniClientConfig(TypedDict, total=False):
     """Per-frontend transport/configuration passed across process boundaries."""
 
@@ -1551,7 +1574,10 @@ class DistStageRuntime(StageRuntime):
         metadata.replica_id = replica_id
 
         if ctx.stage_type == "diffusion":
-            from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
+            from vllm_omni.diffusion.stage_diffusion_client import (
+                StageDiffusionClient,
+                diffusion_model_config_snapshot,
+            )
 
             resources = None
             try:
@@ -1581,6 +1607,7 @@ class DistStageRuntime(StageRuntime):
                 metadata,
                 request_address=resources.addresses.inputs[0],
                 response_address=resources.addresses.outputs[0],
+                model_config=diffusion_model_config_snapshot(_stage_cfg_diffusion_model_config(ctx.stage_cfg)),
             )
             logger.info(
                 "[DistStageRuntime] Remote diffusion replica attached stage=%d replica=%d",

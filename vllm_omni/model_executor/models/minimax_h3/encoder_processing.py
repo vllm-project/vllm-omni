@@ -24,11 +24,9 @@ from vllm_omni.model_executor.models.minimax_h3.conditioning import (
 )
 from vllm_omni.model_executor.models.minimax_h3.long_video import max_output_seconds, resolve_long_video_mode
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
-    MINIMAX_H3_OUTPUT_SHORT_EDGE,
     load_minimax_h3_images,
-    resolve_minimax_h3_aspect_ratio,
-    resolve_minimax_h3_output_canvas,
     resolve_minimax_h3_reference_image_shape,
+    resolve_minimax_h3_target_canvas,
 )
 from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
@@ -41,6 +39,7 @@ from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     validate_reference_audio_files,
     validate_reference_audio_waveforms,
 )
+from vllm_omni.model_executor.models.minimax_h3.timeline_guides import GUIDES_EXTRA_KEY
 
 MINIMAX_H3_FPS = 24
 MINIMAX_H3_MIN_OUTPUT_SECONDS = 4.0
@@ -182,26 +181,15 @@ def resolve_minimax_h3_shape(
         raise OmniClientError(f"MiniMax H3 output duration must be {duration_range}, got {requested_frames / fps:.3f}")
     num_frames = minimax_h3_align_frame_count(requested_frames)
 
-    height = getattr(sampling, "height", None)
-    width = getattr(sampling, "width", None)
-    aspect_ratio = resolve_minimax_h3_aspect_ratio(
+    # One shared canvas resolver; the split-stage Qwen preparation calls the
+    # same function so reference/target shapes cannot drift between stages.
+    height, width = resolve_minimax_h3_target_canvas(
         task,
-        target.get("aspect_ratio", extra.get("aspect_ratio")),
-        image,
+        height=getattr(sampling, "height", None),
+        width=getattr(sampling, "width", None),
+        extra_args=extra,
+        image=image,
     )
-    raw_short_edge = target.get("short_edge", extra.get("short_edge", MINIMAX_H3_OUTPUT_SHORT_EDGE))
-    if isinstance(raw_short_edge, bool) or not isinstance(raw_short_edge, (int, np.integer)):
-        raise OmniClientError(
-            f"MiniMax H3 target.short_edge must be {MINIMAX_H3_OUTPUT_SHORT_EDGE}, got {raw_short_edge!r}"
-        )
-    if height is None or width is None:
-        height, width = resolve_minimax_h3_output_canvas(aspect_ratio, int(raw_short_edge))
-    height = int(height) // 32 * 32
-    width = int(width) // 32 * 32
-    if min(height, width) <= 0:
-        raise OmniClientError(f"invalid MiniMax H3 canvas {width}x{height}")
-    if width > 4 * height or height > 4 * width:
-        raise OmniClientError("MiniMax H3 canvas aspect ratio must be in [1:4, 4:1]")
     return (
         height,
         width,
@@ -234,13 +222,19 @@ def _prepare_encoder_images(
     *,
     height: int,
     width: int,
+    guided: bool = False,
 ) -> list[Any]:
     if not images:
         return []
     if task == "ref2va":
+        # Guided Ref2VA scales ordinary reference images down to the target
+        # pixel area instead of the 2048-short-edge reference canvas, matching
+        # the native multi-frame reference workflow. The Qwen presentation and
+        # the VAE reference both read this one selection.
+        target = (width, height) if guided else None
         return [
             image.resize(
-                resolve_minimax_h3_reference_image_shape(image),
+                resolve_minimax_h3_reference_image_shape(image, target=target),
                 Image.Resampling.LANCZOS,
             )
             for image in images
@@ -502,6 +496,7 @@ def prepare_encoder_inputs(
         raw_images,
         height=height,
         width=width,
+        guided=extra_args.get(GUIDES_EXTRA_KEY, []) != [],
     )
     keyframe_indices = _resolve_fl2va_keyframe_indices(extra_args, len(images)) if task == "fl2va" else []
     video_timestamps: list[list[float]] = []

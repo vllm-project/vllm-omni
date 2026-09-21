@@ -1253,6 +1253,9 @@ class TestSingleStageReplicaInitialization:
             request_address="tcp://127.0.0.1:26002",
             response_address="tcp://127.0.0.1:26003",
             proc_manager=mocker.ANY,
+            # Sanitized ``model_config`` snapshot so the API process can read
+            # server-owned policy blocks from an out-of-process stage.
+            model_config={},
         )
         assert mock_from_addresses.call_args.kwargs["proc_manager"].proc is proc
 

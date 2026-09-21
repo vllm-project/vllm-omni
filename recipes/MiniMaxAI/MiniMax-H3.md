@@ -1,7 +1,7 @@
 # MiniMax H3
 
 > Joint video and audio generation with text, first/last keyframes, and
-> mixed image/video/audio references
+> mixed image/video/audio references, and ordered timeline guides
 
 ## Summary
 
@@ -816,6 +816,494 @@ video in `extra_params.start_time_seconds`.
 Reference images accept JPG/JPEG, PNG, WEBP, HEIC, or HEIF up to 30 MiB. Standalone
 audio references accept WAV or MP3 up to 15 MiB, with 2–15 seconds per file and
 at most 15 seconds combined.
+
+## Timeline guides (GUIDE-01)
+
+The [implementation document](../../docs/design/feature/minimax_h3_timeline_guides.md)
+describes the data flow, packed layout, VAE contracts, admission budgets, RPC
+error provenance, and cancellation/storage ownership in detail.
+
+Both `/v1/videos` and `/v1/videos/sync` accept ordered timeline conditions through
+top-level multipart `timeline_guides` JSON and repeated `guide_files` uploads.
+The manifest addresses that separate upload list, not `input_references`.
+Images, clips, audio-only guides, and explicit visual-plus-audio guides are
+supported. Guided HTTP serving requires Python 3.11+ for cancellation-state
+tracking and rejects older runtimes before reserving capacity. This requirement
+does not change no-guide behavior. The feature adds no ComfyUI nodes, workflow
+JSON, masks, editing, ControlNet, remote guide URLs, or public server-path input.
+
+Start a **base H3** service using a dense attention backend appropriate for your
+hardware. Retain a supported offload path if needed; do not activate LoRA/Turbo,
+FastH3, few-step distilled schedules, sparse attention, or cache acceleration. Use
+`quality=lossless` for every guided request. `quality=high` is incompatible
+because it activates Cache-DiT even without startup caching. Existing no-guide
+optimization support is unchanged.
+
+### Middle image and tail clip
+
+For the initial smoke use 1344x768, 124 frames, 24 FPS, and the base schedule:
+
+```bash
+curl --fail-with-body -X POST "${API_URL}" \
+  -F 'prompt=A white bird flies over the lake, then lands in the reeds.' \
+  -F 'width=1344' -F 'height=768' -F 'num_frames=124' -F 'fps=24' \
+  -F 'num_inference_steps=50' -F 'flow_shift=12' \
+  -F 'seed=1101' -F 'quality=lossless' \
+  -F 'extra_params={"task":"t2va","aspect_ratio":"16:9","audio_flow_shift":3.0}' \
+  -F 'timeline_guides=[{"frame_index":36,"image":{"upload_index":0}},{"frame_index":-22,"video":{"upload_index":1}}]' \
+  -F 'guide_files=@middle.png;type=image/png' \
+  -F 'guide_files=@tail_22_frames.mp4;type=video/mp4' \
+  -o guide_smoke.mp4
+```
+
+Guide-only text uses the FL2VA partition's `t2va` route. To test the last image,
+use a single image entry at `frame_index=-1`. To combine ordinary references
+with guides, add `input_reference`/`input_references` (or typed reference fields)
+and select `task=ref2va` on a combined or Ref2VA service. First/last ordinary
+images still use `task=fl2va` and `frame_indices`. Guides do not alter Qwen's
+`<Picture N>` labels. A Ref2VA-only service requires an ordinary visual reference
+even when guides are present.
+
+### Audio-only and AV guides
+
+```bash
+curl --fail-with-body -X POST "${API_URL}" \
+  -F 'prompt=Rain falls gently over the lake with a distant roll of thunder.' \
+  -F 'width=1344' -F 'height=768' -F 'num_frames=124' -F 'fps=24' \
+  -F 'num_inference_steps=50' -F 'seed=1101' -F 'quality=lossless' \
+  -F 'extra_params={"task":"t2va","aspect_ratio":"16:9","audio_flow_shift":3.0}' \
+  -F 'timeline_guides=[{"frame_index":0,"audio":{"upload_index":0}}]' \
+  -F 'guide_files=@rain.flac;type=audio/flac' \
+  -o guide_audio.mp4
+```
+
+To make an AV guide, use one entry such as
+`{"frame_index":36,"video":{"upload_index":0},"audio":{"upload_index":1}}`
+with separate video and audio uploads. Video soundtracks are not extracted
+automatically. WAV, MP3, and FLAC guide audio can be shorter than the ordinary
+Ref2VA two-second minimum, but cannot be empty. Mono audio is converted to stereo.
+Audio may extend past its visual guide; after VAE encoding, it is cropped on
+each channel's time axis to the remaining target audio positions.
+
+### Semantics and resource policy
+
+Output frame counts align upward to `17k+5`. Negative indices resolve against
+that actual count. Guide starts retain exact pixel-frame placement, including
+fractional latent-time coordinates. Decode video at 24 FPS by elapsed timestamp,
+then use only the first frame for sources of 1-4 frames, or
+`5+17*floor((M-5)/17)` frames for longer sources. A normalized guide must fit in
+full: a 22-frame clip fits at `-22`, not `-1`. Guide visuals are center-cropped;
+legacy FL2VA first/last resizing is unchanged. Explicit audio is cropped to
+`floor(round(N*40/24)-(5/3)*start)` latent positions per channel. Audio-only
+placements require a valid frame and at least one remaining audio latent position.
+Repeated, overlapping, and nonchronological entries retain insertion order;
+guides do not promise pixel/sample-identical reconstruction.
+
+The shared server configuration lives under
+`od_config.model_config["minimax_h3_timeline_guides"]`, never request extras.
+Defaults are 8 entries, 16 unique files, 30/50/15 MiB per image/video/audio,
+128 MiB aggregate uploads, 65,536 guide rows, 262,144 total packed rows,
+16,777,216 pixels per source frame, 268,435,456 aggregate decoded visual
+pixel-frames, 8,388,608 stereo scalar audio samples at 32 kHz, 60 seconds per
+probe/decode operation, and 4 outstanding guided requests per handler.
+Reused uploads count once for bytes and once per occurrence for decode and
+conditioning. Total rows include text, references, legacy anchors, targets,
+guides, and padding. Values must be finite and positive. These are policy
+defaults, not validated GPU-capacity guarantees; measure four-image and 22-frame
+clip cases on your deployment before increasing them. Offline execution shares
+model/decode limits but has no HTTP job reservation. See the
+[Videos API guide](../../docs/serving/videos_api.md#h3-timeline-guides) for exact
+configuration keys, schema validation, and ingress-limit caveats.
+
+Guided timeout, disconnect cancellation, or DELETE abandons the response but
+does not abort submitted GPU work. All file-backed inputs, including ordinary
+references, and the outstanding reservation remain owned until generation
+finishes safely; abandoned output is discarded. Graceful shutdown waits for
+submitted guided work. This can continue consuming GPU resources after the
+client stops waiting. Unsubmitted files can be removed immediately; no-guide
+lifecycle and existing request/step execution restrictions are unchanged.
+An engine failure or unexpected inner-task cancellation with unconfirmed worker
+completion instead retains inputs and admission slots conservatively. There is
+no automatic reclamation for that abnormal path: engine shutdown can defer
+worker teardown, so operator cleanup requires independent confirmation that all
+readers have terminated.
+
+### HTTP smoke
+
+The guide manifest addresses uploaded files by zero-based `upload_index`.
+Repeated `guide_files` parts preserve guide order; no workflow JSON is required.
+Remove the `timeline_guides` and `guide_files` parts for the same-seed no-guide
+comparison.
+
+```bash
+curl --fail-with-body --silent --show-error --max-time 1800 \
+  http://127.0.0.1:8079/v1/videos/sync \
+  -F 'prompt=A white bird flies over the lake, then lands in the reeds.' \
+  -F 'width=1344' -F 'height=768' -F 'num_frames=124' -F 'fps=24' \
+  -F 'num_inference_steps=50' -F 'seed=1101' -F 'quality=lossless' \
+  -F 'extra_params={"task":"t2va","aspect_ratio":"16:9"}' \
+  -F 'timeline_guides=[{"frame_index":36,"image":{"upload_index":0}},{"frame_index":0,"audio":{"upload_index":1}},{"frame_index":-22,"video":{"upload_index":2},"audio":{"upload_index":3}}]' \
+  -F 'guide_files=@middle.png;type=image/png' \
+  -F 'guide_files=@rain.wav;type=audio/wav' \
+  -F 'guide_files=@tail_22_frames.mp4;type=video/mp4' \
+  -F 'guide_files=@tail.flac;type=audio/flac' \
+  --output guide_smoke.mp4
+```
+
+Select server-side parallelism/offload for available hardware; do not launch
+this on occupied GPUs. Ready-to-run scripts are in
+`examples/online_serving/minimax_h3/`.
+
+### Validation checklist
+
+The commands above are reproducible smoke recipes, not claims that guide quality
+or capacity has been validated on the hardware listed elsewhere in this recipe.
+Validate middle/last images, a 22-frame tail clip, audio-only, AV, Ref2VA plus
+multiple guides, and same-seed no-guide T2VA/FL2VA/Ref2VA regressions. Exercise
+both endpoints and raw/preencoded MP4 outputs. Record checkpoint/input hashes,
+request parameters, actual schedule, code revision, hardware, memory, and output
+artifacts. Inspect anchor neighborhoods and synchronized audio content, not
+just container metadata:
+
+```bash
+ffprobe -v error -count_frames -show_entries stream=codec_type,codec_name,width,height,avg_frame_rate,nb_read_frames,sample_rate,channels,duration -of json guide_smoke.mp4
+ffmpeg -v error -i guide_smoke.mp4 -f null -
+```
+
+### Implementation validation record (2026-09-14)
+
+The GUIDE-01 checkout was based on
+`f3ea77099e44381fce4e61995f32e66a731be6f8`; implementation changes were uncommitted.
+The following preflight commands were run:
+
+```bash
+nvidia-smi --query-gpu=index,name,memory.total,memory.used,utilization.gpu --format=csv
+free -h
+command -v ffmpeg ffprobe
+python -c "import vllm; print(vllm.__version__); from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline"
+```
+
+Preflight found four idle NVIDIA H20 GPUs (97,871 MiB each) and about 2.1 TiB
+available host RAM. `/path/to/MiniMax-H3/FL2VA/model_index.json` was readable;
+checkpoint shards were not loaded or hashed. The environment's vLLM 0.28.0
+could not import this checkout because `vllm.v1.kv_cache_interface` lacks
+`compute_layout_strides`. API test collection also failed because
+`vllm.entrypoints.generate.base.protocol` is absent. Neither `ffmpeg` nor
+`ffprobe` was on the session PATH. CPU decoder tests can use the bundled
+imageio ffmpeg executable, but this does not establish a working production
+probe/decode installation.
+
+Consequently no guide inference server was started, no real-model guide MP4
+was generated, and the model-quality/capacity matrix above remains **blocked,
+not passed**. Existing MP4s in the workspace are not GUIDE-01 validation artifacts.
+Use a matching vLLM runtime and install both media tools before running the
+matrix. Isolated CPU/synthetic checks are not real-model evidence.
+
+The planned regression commands, run from the repository root, are:
+
+```bash
+python -m pytest -q tests/diffusion/models/minimax_h3/test_minimax_h3_timeline_guides.py tests/diffusion/models/minimax_h3/test_minimax_h3_contract.py tests/diffusion/models/minimax_h3/test_minimax_h3_packing.py tests/diffusion/models/minimax_h3/test_minimax_h3_step_execution.py tests/model_executor/stage_input_processors/test_minimax_h3.py
+python -m pytest -q tests/entrypoints/openai_api/test_video_server.py tests/entrypoints/openai_api/test_video_api_utils.py
+```
+
+Test counts below that mention an "offline CLI suite" refer to a local
+`Omni`-API driver script and its 24-test suite that were exercised during
+validation but are not part of this PR.
+
+The default Python and the project environment did not contain pytest. The
+commands were retried with the project environment's Python; collection
+then hit the dependency errors above. The offline CLI suite passed 24 tests.
+The packing suite
+passed 41 tests using real tensors while bypassing the H3 package's eager
+pipeline import, not by replacing packing computation.
+At 1344x768, 124 output frames, and 256 text rows, four image guides used
+4,032 guide rows / 42,048 total padded rows; a 22-frame tail guide used
+7,056 / 45,056. These synthetic admission checks fit the default row limits
+but do not measure safe GPU capacity.
+The standalone `test_minimax_h3_timeline_guides.py` suite passed 217 tests and
+skipped one ffprobe-dependent test. This includes real ffmpeg WAV/MP3/FLAC
+decoding, tiny audio-budget checks, 600-FPS source-work accounting, visible-pixel
+codec-padding boundaries, and MP3 duration-padding regressions, not VAE/model inference:
+
+```bash
+python -m pytest -q tests/diffusion/models/minimax_h3/test_minimax_h3_timeline_guides.py
+python -c "import sys, types, pytest; p='vllm_omni.diffusion.models.minimax_h3'; m=types.ModuleType(p); m.__path__=['vllm_omni/diffusion/models/minimax_h3']; sys.modules[p]=m; raise SystemExit(pytest.main(['-q','tests/diffusion/models/minimax_h3/test_minimax_h3_packing.py']))"
+```
+
+An additional guarded run passed **341 tests** across H3 contract, step,
+stage-adapter, packing, offload, and parallel suites. These tests use CPU
+tensors and mocked model components, including simulated two-rank post-encode
+failures. They do not prove recovery from process loss or hangs inside native
+collectives.
+
+```bash
+python -m pytest -q --tb=short tests/diffusion/models/minimax_h3/test_minimax_h3_contract.py tests/diffusion/models/minimax_h3/test_minimax_h3_step_execution.py tests/model_executor/stage_input_processors/test_minimax_h3.py tests/diffusion/models/minimax_h3/test_minimax_h3_packing.py tests/diffusion/models/minimax_h3/test_minimax_h3_offload.py tests/diffusion/models/minimax_h3/test_minimax_h3_parallel.py
+```
+
+The isolated lifetime harness passed **45 tests**, exercising actual serving
+method/job-wrapper bodies with dependency doubles and real threaded-storage
+cancellation. It is not FastAPI end-to-end coverage. Both-endpoint multipart
+tests were added to `test_video_server.py`, but remain blocked by normal API
+import collection. Python runtime-gate tests simulate version checks under
+Python 3.13 rather than executing a Python 3.10 interpreter. The existing
+orchestrator error-handling suite passed another **30 tests**. Terminal-worker
+provenance is preserved through error transport; an abort acknowledgment alone
+never authorizes cleanup.
+
+```bash
+python -m pytest -q tests/entrypoints/openai_api/test_video_guided_lifetime.py
+python -m pytest -q tests/engine/test_orchestrator_error_handling.py --tb=short
+```
+
+The final combined guarded run passed **657 tests**, with **1 skip** and 14
+PyTorch deprecation warnings. Ruff passed for all changed Python files, and
+`git diff --check` passed. This combined run has the same isolation and
+real-model limitations described above:
+
+```bash
+env PYTHONPATH=. python -m pytest -q --tb=short tests/diffusion/models/minimax_h3/test_minimax_h3_timeline_guides.py tests/diffusion/models/minimax_h3/test_minimax_h3_contract.py tests/diffusion/models/minimax_h3/test_minimax_h3_step_execution.py tests/model_executor/stage_input_processors/test_minimax_h3.py tests/diffusion/models/minimax_h3/test_minimax_h3_packing.py tests/diffusion/models/minimax_h3/test_minimax_h3_offload.py tests/diffusion/models/minimax_h3/test_minimax_h3_parallel.py tests/entrypoints/openai_api/test_video_guided_lifetime.py tests/engine/test_orchestrator_error_handling.py
+```
+
+### Installed-media follow-up (2026-09-14)
+
+After ffmpeg and ffprobe were installed in `$CONDA_PREFIX/bin`,
+both tools reported version **8.1.2**. This supersedes the missing-media-tools
+blocker in the earlier record, but not the vLLM runtime blocker. This conda
+ffmpeg build disables GPL codecs and has `libopenh264`, not `libx264`; the test
+fixture now selects an available software H.264 encoder without changing the
+production decoder or replacing the installed tools.
+
+The standalone timeline suite passed **229 tests with no skips**. Six audio
+cases use actual ffprobe plus ffmpeg for mono/stereo WAV, MP3, and FLAC, including
+exact PCM budgets despite MP3 duration padding. Six video cases use the complete
+probe/decode path for 12/30/60/600 FPS, a 130x130 visible-pixel boundary, and a
+22-frame tail clip. The combined guarded suite passed **669 tests with no skips**
+and 14 PyTorch deprecation warnings. Model components in that combined suite
+remain isolated/mocked as explained above; media probe/decode is real.
+
+```bash
+env PATH=$CONDA_PREFIX/bin:$PATH PYTHONPATH=. python -m pytest -q tests/diffusion/models/minimax_h3/test_minimax_h3_timeline_guides.py --tb=short
+env PATH=$CONDA_PREFIX/bin:$PATH python -m pytest -q --tb=short --basetemp=<artifact-dir> tests/diffusion/models/minimax_h3/test_minimax_h3_timeline_guides.py tests/diffusion/models/minimax_h3/test_minimax_h3_contract.py tests/diffusion/models/minimax_h3/test_minimax_h3_step_execution.py tests/model_executor/stage_input_processors/test_minimax_h3.py tests/diffusion/models/minimax_h3/test_minimax_h3_packing.py tests/diffusion/models/minimax_h3/test_minimax_h3_offload.py tests/diffusion/models/minimax_h3/test_minimax_h3_parallel.py tests/entrypoints/openai_api/test_video_guided_lifetime.py tests/engine/test_orchestrator_error_handling.py
+```
+
+Fixtures remain under `<artifact-dir>/`. The actual
+offline invocation used `test_real_video_probe_and_deco5/guide.mp4`, whose
+ffprobe result was H.264, 32x16, 24 FPS, 22 frames, and 0.916667 seconds. Its
+SHA256 is `c4bb855d0010b1316598b9abd51d6e7fab6a035ca6f13515c0e606c4ecdbacda`.
+This is synthetic **input** media, not a generated model-quality artifact.
+
+With four H20 GPUs confirmed idle, this real invocation was attempted without
+the guarded test harness. It used a local offline driver script built on the
+`Omni` API that is not part of this PR; the equivalent supported path is the
+HTTP smoke above:
+
+```bash
+env PATH=$CONDA_PREFIX/bin:$PATH CUDA_VISIBLE_DEVICES=0,1,2,3 python examples/offline_inference/minimax_h3/end2end.py --model /path/to/MiniMax-H3/FL2VA --task t2va --width 1344 --height 768 --num-frames 124 --fps 24 --steps 50 --seed 1101 --quality lossless --cache-backend none --diffusion-attention-backend FLASH_ATTN --usp 4 --enforce-eager --init-timeout 60 --guide -22 video=<artifact-dir>/test_real_video_probe_and_deco5/guide.mp4 --prompts "A quiet cinematic landscape with a bird flying over a lake." --output <artifact-dir>/model-output
+```
+
+Guide parsing and request configuration succeeded. Diffusion-stage initialization
+failed importing `compute_layout_strides` from installed vLLM 0.28.0, before
+model generation. No model output was produced. The two required API suites
+still fail collection because `vllm.entrypoints.generate.base.protocol` is
+missing. Full model and HTTP validation therefore remain **blocked**, pending
+a vLLM runtime matching this checkout; installing media tools alone does not
+resolve these separate API incompatibilities.
+
+### vLLM 0.29 real-model follow-up (2026-09-14)
+
+Upgrading the environment to **vLLM 0.29.0** resolved both import blockers above.
+The H3/adapter/offload/packing/lifetime regression group passed **669 tests**
+without the paged-KV import guard; the complete video-server/API-utils suites
+passed **279 tests**. Test dependencies still came from the isolated pytest
+directories, not from replacements for vLLM modules. The editable vLLM-Omni
+package reports `0.28.1.dev87+gf080f41e0` and emits a version-mismatch warning;
+that warning was not suppressed. HEAD remained
+`f3ea77099e44381fce4e61995f32e66a731be6f8` plus uncommitted GUIDE-01 changes.
+
+Real execution found and fixed a video-guide integration error: CPU decoding
+returns PIL frames, whereas the native H3 VAE expects a contiguous uint8 NumPy
+array shaped `[T,H,W,3]`. The pipeline now stacks frames at that boundary.
+Contract tests assert the actual dtype, shape, channel and frame order instead
+of accepting a PIL list through a mock.
+
+The environment's PyTorch `2.13.0.dev20260831+cu130` was built against cuDNN 9.20,
+but the inherited `/usr/local/cuda/lib64` search path loaded cuDNN 9.15. Only the
+validation processes' library search order was adjusted; global configuration
+and installed packages were not changed. A real CUDA convolution passed with:
+
+```bash
+env LD_LIBRARY_PATH=$CONDA_PREFIX/lib/python3.13/site-packages/nvidia/cudnn/lib:$LD_LIBRARY_PATH python -c "import torch; print('cuDNN',torch.backends.cudnn.version()); x=torch.zeros((1,4,16,16),device='cuda'); y=torch.nn.Conv2d(4,4,3).cuda()(x); torch.cuda.synchronize(); print('CUDA convolution OK',tuple(y.shape))"
+```
+
+#### Actual requests and artifacts
+
+Four idle H20 GPUs were used with base FL2VA weights, BF16, dense `FLASH_ATTN`,
+SP=4, text-encoder TP=4, VAE patch parallelism=4, native tile mode, and eager
+execution. No LoRA, cache, quantization, or distilled schedule was enabled.
+Every successful request used 1344x768, 124 output frames, 24 FPS,
+`num_inference_steps=50`, `quality=lossless`, and seed 1101. The checkpoint's
+video/audio shift scales were **12/3**. The actual schedule is 50 float32
+positions from 1 to 0, shifted by `s*t/(1+(s-1)*t)`, hence **49 denoising
+intervals**, as shown in the runtime progress log.
+
+Artifact directory: `<artifact-dir>/vllm029-tail/`.
+
+| Artifact | Real execution |
+| --- | --- |
+| `minimax_h3_t2va_0.mp4` | Offline 22-frame clip at `-22`; 433.052 s generation latency |
+| `http-sync-av.mp4` | `/v1/videos/sync`, image plus explicit FLAC at frame 36; HTTP 200, 726.628 s wall time including queueing behind the async request |
+| `http-async-audio-preencoded.mp4` | `/v1/videos`, audio-only FLAC at frame 0, `preencode_mp4=true`; completed and content download returned 200; 399.022 s, reported peak memory 66,174 MiB |
+| `http-sync-baseline.mp4` | Same prompt/seed/schedule/offload as the synchronous AV request, no guides; HTTP 200, 323.576 s |
+| `comparison.png` | Image-guide and tail-clip neighborhoods beside the no-guide control |
+| `analysis.json` | Frame, audio-sample, spectral, and pixel-error measurements |
+
+The offline run used full residency, logging 80.5177 GiB model allocation per
+rank and recoverable allocator OOM/retry warnings during output decode. It
+eventually succeeded; this is **not** evidence of comfortable resident-memory
+headroom. HTTP runs used the existing model-level CPU-offload path instead.
+
+All four MP4s passed full `ffmpeg -v error -i ... -f null -` decoding and contain
+H.264 **1344x768 / 124 frames / 24 FPS**, plus AAC **32 kHz stereo**. Video
+duration is **5.166667 s**; audio duration is **5.175 s**, matching 207 audio
+latent positions at 40 Hz. Decoded AAC includes padding: 165,888 samples per
+channel versus 165,600 samples represented by the audio track duration.
+
+The image-guide pixel MAE at frame 36 was **4.65/255**, compared with **62.80/255**
+for the same-seed no-guide control; adjacent frames 35/37 were about 5.03.
+For the 22-frame tail, mean error to the normalized source clip was
+**2.02/255**, compared with **85.68/255** for the control. The offline clip and
+HTTP control differ in offload profile, so that comparison is not a strict
+bitwise-equivalence experiment. The explicit 440 Hz audio guide dominated its
+intended windows: **99.85%** of spectral power in 430-450 Hz at 1.5-2.5 s for
+the synchronous AV output, and **99.83%** at 0-1 s for audio-only output. The
+same-prompt AV control had only **0.0092%** in that band. These observations
+validate timeline conditioning, not a general quality or exact reconstruction
+guarantee.
+
+#### Reproduction commands
+
+Successful offline invocation, using the same local `Omni`-API driver script
+that is not shipped with this PR:
+
+```bash
+env PATH=$CONDA_PREFIX/bin:$PATH LD_LIBRARY_PATH=$CONDA_PREFIX/lib/python3.13/site-packages/nvidia/cudnn/lib:$LD_LIBRARY_PATH CUDA_VISIBLE_DEVICES=0,1,2,3 python examples/offline_inference/minimax_h3/end2end.py --model /path/to/MiniMax-H3/FL2VA --task t2va --width 1344 --height 768 --num-frames 124 --fps 24 --steps 50 --seed 1101 --quality lossless --cache-backend none --diffusion-attention-backend FLASH_ATTN --usp 4 --text-encoder-tp-size 4 --vae-patch-parallel-size 4 --vae-use-tiling --enforce-eager --init-timeout 600 --guide -22 video=<artifact-dir>/test_real_video_probe_and_deco5/guide.mp4 --prompts "A quiet cinematic landscape with a bird flying over a lake." --output <artifact-dir>/vllm029-tail
+```
+
+The HTTP server was bound only to localhost. `--noproxy 127.0.0.1` is necessary
+in this environment because inherited proxy settings otherwise route local
+requests through an external proxy:
+
+```bash
+env PATH=$CONDA_PREFIX/bin:$PATH LD_LIBRARY_PATH=$CONDA_PREFIX/lib/python3.13/site-packages/nvidia/cudnn/lib:$LD_LIBRARY_PATH CUDA_VISIBLE_DEVICES=0,1,2,3 VLLM_WORKER_MULTIPROC_METHOD=spawn VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800 vllm serve /path/to/MiniMax-H3/FL2VA --omni --host 127.0.0.1 --port 8079 --trust-remote-code --num-gpus 4 --usp 4 --ring 1 --text-encoder-tp-size 4 --vae-patch-parallel-size 4 --vae-parallel-mode tile --vae-use-tiling --enable-cpu-offload --enforce-eager --cache-backend none --diffusion-attention-backend FLASH_ATTN --stage-init-timeout 600
+```
+
+The image guide was extracted from frame 36 of the offline output. Audio was a
+one-second, 440 Hz stereo FLAC, intentionally below Ref2VA's ordinary two-second
+audio minimum:
+
+```bash
+ffmpeg -v error -i <artifact-dir>/vllm029-tail/minimax_h3_t2va_0.mp4 -vf 'select=eq(n\,36)' -frames:v 1 <artifact-dir>/vllm029-tail/middle.png
+ffmpeg -v error -f lavfi -i sine=frequency=440:sample_rate=32000:duration=1 -ac 2 <artifact-dir>/vllm029-tail/tone.flac
+curl --noproxy 127.0.0.1 --fail-with-body --silent --show-error http://127.0.0.1:8079/v1/videos -F 'prompt=A quiet cinematic landscape with a soft electronic tone.' -F 'width=1344' -F 'height=768' -F 'num_frames=124' -F 'fps=24' -F 'num_inference_steps=50' -F 'seed=1101' -F 'quality=lossless' -F 'extra_params={"task":"t2va","aspect_ratio":"16:9","preencode_mp4":true}' -F 'timeline_guides=[{"frame_index":0,"audio":{"upload_index":0}}]' -F 'guide_files=@<artifact-dir>/vllm029-tail/tone.flac;type=audio/flac'
+curl --noproxy 127.0.0.1 --fail-with-body --silent --show-error --max-time 1800 http://127.0.0.1:8079/v1/videos/sync -F 'prompt=A quiet cinematic landscape with a bird flying over a lake.' -F 'width=1344' -F 'height=768' -F 'num_frames=124' -F 'fps=24' -F 'num_inference_steps=50' -F 'seed=1101' -F 'quality=lossless' -F 'extra_params={"task":"t2va","aspect_ratio":"16:9"}' -F 'timeline_guides=[{"frame_index":36,"image":{"upload_index":0},"audio":{"upload_index":1}}]' -F 'guide_files=@<artifact-dir>/vllm029-tail/middle.png;type=image/png' -F 'guide_files=@<artifact-dir>/vllm029-tail/tone.flac;type=audio/flac' --output <artifact-dir>/vllm029-tail/http-sync-av.mp4
+curl --noproxy 127.0.0.1 --fail-with-body --silent --show-error --max-time 1800 http://127.0.0.1:8079/v1/videos/sync -F 'prompt=A quiet cinematic landscape with a bird flying over a lake.' -F 'width=1344' -F 'height=768' -F 'num_frames=124' -F 'fps=24' -F 'num_inference_steps=50' -F 'seed=1101' -F 'quality=lossless' -F 'extra_params={"task":"t2va","aspect_ratio":"16:9"}' --output <artifact-dir>/vllm029-tail/http-sync-baseline.mp4
+```
+
+Successful async job ID was `video_gen_89c8301e853640c7b46244c629cc6b83`; its
+metadata and `/content` were fetched normally. Analyze the retained artifacts
+with `env PATH=$CONDA_PREFIX/bin:$PATH PYTHONPATH=. python -m pytest -q <artifact-dir>/`.
+Existing H3 requirements still apply: `t2va` needs explicit `aspect_ratio` even
+with dimensions, and outputs must be 4-15 seconds. Initial requests omitting
+the ratio or asking for 22 output frames were rejected; 22-frame **guide input**
+is supported, not 22-frame output.
+
+#### Live error propagation and recovery
+
+The live run exposed a second integration bug: multi-process RPC converted
+typed client rejections into generic errors, losing HTTP status and terminal
+worker provenance. Worker/executor transport now carries shared client-error
+metadata, collects all-rank terminal statuses, and drains DP replies before
+surfacing a rejection. Unknown or mixed fatal errors remain unknown/500.
+Guided shape-planner validation failures are also classified as client errors,
+without changing the existing no-guide exception behavior.
+
+After restarting with the fixes, **six consecutive invalid guided sync requests
+returned 400**, exceeding the default four-request capacity without exhausting
+it. An async invalid placement then reached a structured failed-job **400**;
+DELETE removed that failed job, subsequent GET returned 404, and no new guide
+uploads remained on disk. This exercises actual four-GPU worker rejection and
+cleanup, not a fake engine or an abort acknowledgment. The earlier three
+conservatively retained upload copies were removed only after the original
+server and worker PIDs had exited, with their timestamps and SHA256 values
+matched to this run's inputs.
+
+The request/error records are in `http-error-propagation.json`. Verify the
+error-propagation behavior by replaying the same invalid request sequence
+and checking that each returns HTTP 400 before the valid recovery request.
+
+A valid image guide at `frame_index=-1` then returned **HTTP 200** in 90.613 s,
+producing `http-recovery-last-image-3sigma.mp4`. It contains the expected 124
+frames and stereo audio and passed full decoding. This final request uses only
+**3 sigma positions / 2 denoising intervals** to check post-error recovery and
+the updated RPC success path; it is **not** another 50-step quality result:
+
+```bash
+curl --noproxy 127.0.0.1 --fail-with-body --silent --show-error --max-time 300 http://127.0.0.1:8079/v1/videos/sync -F 'prompt=A quiet cinematic landscape with a bird flying over a lake.' -F 'width=1344' -F 'height=768' -F 'num_frames=124' -F 'fps=24' -F 'num_inference_steps=3' -F 'seed=1101' -F 'quality=lossless' -F 'extra_params={"task":"t2va","aspect_ratio":"16:9"}' -F 'timeline_guides=[{"frame_index":-1,"image":{"upload_index":0}}]' -F 'guide_files=@<artifact-dir>/vllm029-tail/middle.png;type=image/png' --output <artifact-dir>/vllm029-tail/http-recovery-last-image-3sigma.mp4
+```
+
+The final unguarded combined regression run passed **1,151 tests**, with 25
+version/deprecation warnings and no skips. It includes the worker/IPC error
+transport tests. Ruff and `git diff --check` passed. The validation service was
+stopped; all four GPUs subsequently reported zero allocated memory, and no
+`vllm_omni_guide_*` upload files remained.
+
+```bash
+env PATH=$CONDA_PREFIX/bin:$PATH \
+  LD_LIBRARY_PATH=$CONDA_PREFIX/lib/python3.13/site-packages/nvidia/cudnn/lib:$LD_LIBRARY_PATH \
+  python -m pytest -q --tb=short \
+  tests/diffusion/models/minimax_h3/test_minimax_h3_timeline_guides.py \
+  tests/diffusion/models/minimax_h3/test_minimax_h3_contract.py \
+  tests/diffusion/models/minimax_h3/test_minimax_h3_packing.py \
+  tests/diffusion/models/minimax_h3/test_minimax_h3_step_execution.py \
+  tests/model_executor/stage_input_processors/test_minimax_h3.py \
+  tests/diffusion/models/minimax_h3/test_minimax_h3_offload.py \
+  tests/diffusion/models/minimax_h3/test_minimax_h3_parallel.py \
+  tests/entrypoints/openai_api/test_video_guided_lifetime.py \
+  tests/engine/test_orchestrator_error_handling.py \
+  tests/entrypoints/openai_api/test_video_server.py \
+  tests/entrypoints/openai_api/test_video_api_utils.py \
+  tests/diffusion/test_diffusion_ipc.py \
+  tests/diffusion/test_multiproc_engine_concurrency.py \
+  tests/diffusion/test_result_pump.py \
+  tests/diffusion/test_async_output_worker.py \
+  tests/diffusion/test_ipc_async.py \
+  tests/diffusion/test_diffusion_engine_rpc_routing.py \
+  tests/diffusion/test_async_output_timeout.py
+```
+
+#### Hashes and remaining coverage
+
+The complete 29-file safetensors weight-manifest digest is
+`eaa4e21da58011ba15dec883ff7fcc71772108657c541f523760c61f7518306e`, computed
+from the model directory using
+`sha256sum transformer/*.safetensors text_encoder/*.safetensors video_vae/source/model.safetensors audio_vae/model.safetensors | sha256sum`.
+
+| File | SHA256 |
+| --- | --- |
+| `middle.png` | `13bbcf7f52fd1a110e49a171872bc419e1a21b1123c8ac53afae3fbc063dd57a` |
+| `tone.flac` | `19bd64f7ee4f2673a41a8e39f4d9a8120a609af4749aeaa82a1960dd885f7160` |
+| `minimax_h3_t2va_0.mp4` | `654f9912d449f2f2cdc9bd8bc276431e76b1459b94d8b91e93c739a85ad08a79` |
+| `http-sync-av.mp4` | `d3d8529468f7aa6fe1a02d9f5a22159610776a4cdf518f10ab95146e67b10e10` |
+| `http-async-audio-preencoded.mp4` | `9a8913b253dae8bdb0edf1e93f54006562c636238b5d292e51d5e2c335c6693f` |
+| `http-sync-baseline.mp4` | `af5f5c17ba1cbb6d053a5865770d0a5e936a02f7de2b16bf78c1bae103ceabb2` |
+| `http-recovery-last-image-3sigma.mp4` | `84a3741b28c4605eacf22228040f1ccad11ff87ba6767d70df4502e8c0bb46bb` |
+
+This is real request-mode evidence for clip guides, image+audio guides,
+audio-only guides, raw/preencoded output, model-level offload, and no-guide
+T2VA. It does **not** complete the entire planned real-model matrix: Ref2VA,
+legacy first/last plus guides, real heterogeneous/fanout/step execution,
+disaggregated serving, and live timeout/DELETE races remain separate acceptance
+work. Their automated tests are not substitutes for those real-model runs.
 
 ## Official input matrix and limits
 

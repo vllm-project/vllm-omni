@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from vllm import TokensPrompt
@@ -118,6 +118,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
+        on_engine_admitted: Callable[[], None] | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -141,6 +142,11 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 Must have the same length as the number of stages.
                 If *None*, uses default sampling params for each stage.
             output_modalities: Optional list of output modalities.
+            on_engine_admitted: Optional callback invoked exactly once, right
+                after EngineCore has accepted the request. Callers use it to
+                distinguish "the generate coroutine was entered" from "the
+                request was actually submitted". It must not raise or block;
+                it may only record local state.
 
         Yields:
             OmniRequestOutput objects as they are produced by each stage.
@@ -276,6 +282,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
                 )
+            if on_engine_admitted is not None:
+                on_engine_admitted()
             submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
             req_start_ts[request_id] = submit_ts

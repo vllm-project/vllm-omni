@@ -10,10 +10,12 @@ interface the Orchestrator expects from a stage client.
 from __future__ import annotations
 
 import asyncio
+import copy
 import multiprocessing.connection
 import time
 import uuid
 import weakref
+from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
 from threading import Thread
 from typing import TYPE_CHECKING, Any
@@ -44,6 +46,42 @@ logger = init_logger(__name__)
 _MISSING_RPC_RESULT = object()
 
 
+def diffusion_model_config_snapshot(model_config: Any) -> dict[str, Any]:
+    """Return a plain, detached ``dict`` view of a diffusion ``model_config``.
+
+    The head process needs a few server-owned policy blocks (for example the
+    timeline-guide admission limits) even when the diffusion stage runs
+    out-of-process and the real ``OmniDiffusionConfig`` only exists in the
+    worker. The snapshot is deliberately a plain ``dict``: consumers such as
+    ``TimelineGuideLimits.from_config`` require a real ``Mapping`` and reject
+    unknown keys, so no OmegaConf node may leak through here.
+    """
+    if model_config is None:
+        return {}
+
+    try:
+        from omegaconf import DictConfig, OmegaConf
+    except ImportError:  # pragma: no cover - omegaconf is a hard dependency
+        DictConfig = ()  # type: ignore[assignment]
+        OmegaConf = None  # type: ignore[assignment]
+    else:
+        if isinstance(model_config, DictConfig):
+            model_config = OmegaConf.to_container(model_config, resolve=True)
+
+    if not isinstance(model_config, Mapping):
+        logger.warning(
+            "[StageDiffusionClient] ignoring non-mapping diffusion model_config of type %s",
+            type(model_config).__name__,
+        )
+        return {}
+
+    try:
+        return copy.deepcopy(dict(model_config))
+    except Exception:  # pragma: no cover - defensive: exotic unpicklable values
+        logger.warning("[StageDiffusionClient] diffusion model_config is not copyable; using a shallow snapshot")
+        return dict(model_config)
+
+
 def create_diffusion_client(
     model: str,
     od_config: OmniDiffusionConfig,
@@ -66,6 +104,7 @@ def create_diffusion_client(
         request_address=proc_manager.addresses.inputs[0],
         response_address=proc_manager.addresses.outputs[0],
         proc_manager=proc_manager,
+        model_config=diffusion_model_config_snapshot(getattr(od_config, "model_config", None)),
     )
 
 
@@ -89,12 +128,14 @@ class StageDiffusionClient(StageClientBase):
         response_address: str,
         *,
         proc_manager: StageDiffusionProcManager | None = None,
+        model_config: dict[str, Any] | None = None,
     ) -> None:
         self._initialize_client(
             metadata,
             request_address,
             response_address,
             proc_manager=proc_manager,
+            model_config=model_config,
         )
 
     @classmethod
@@ -105,6 +146,7 @@ class StageDiffusionClient(StageClientBase):
         response_address: str,
         *,
         proc_manager: StageDiffusionProcManager | None = None,
+        model_config: dict[str, Any] | None = None,
     ) -> StageDiffusionClient:
         """Create a client for an already-running diffusion subprocess."""
         return cls(
@@ -112,6 +154,7 @@ class StageDiffusionClient(StageClientBase):
             request_address,
             response_address,
             proc_manager=proc_manager,
+            model_config=model_config,
         )
 
     def _initialize_client(
@@ -121,9 +164,16 @@ class StageDiffusionClient(StageClientBase):
         response_address: str,
         *,
         proc_manager: StageDiffusionProcManager | None = None,
+        model_config: dict[str, Any] | None = None,
     ) -> None:
         self._set_stage_metadata(metadata)
         self._proc_manager = proc_manager
+        # Deliberately not named ``od_config``: this is only a sanitized
+        # ``model_config`` snapshot, and ``AsyncOmni.get_diffusion_od_config()``
+        # returns the first client-level ``od_config`` it finds, so a partial
+        # object here would regress consumers reading ``model``, ``revision``
+        # or ``supports_multimodal_inputs``.
+        self.diffusion_model_config: dict[str, Any] = model_config or {}
         self._connect_transport(request_address, response_address)
 
         self._output_queue: asyncio.Queue[OmniRequestOutput] = asyncio.Queue()

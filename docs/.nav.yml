@@ -141,6 +141,7 @@ nav:
           - Yuanrong Store Connector: design/feature/omni_connectors/yuanrong_connector.md
           - Yuanrong Transfer Engine Connector: design/feature/omni_connectors/yuanrong_transfer_engine_connector.md
       - Quantization: design/feature/quantization.md
+      - MiniMax H3 Timeline Guides: design/feature/minimax_h3_timeline_guides.md
       - Diffusion Acceleration:
         - Parallelism:
           - CFG-Parallel: design/feature/cfg_parallel.md

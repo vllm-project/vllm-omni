@@ -1036,6 +1036,7 @@ class OmniDiffusionConfig:
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
     supports_mixed_reference_inputs: bool = False
+    supports_timeline_guides: bool = False
 
     log_level: str = "info"
 
@@ -1464,6 +1465,7 @@ class OmniDiffusionConfig:
         self.supports_multimodal_inputs = metadata.supports_multimodal_inputs
         self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
         self.supports_mixed_reference_inputs = metadata.supports_mixed_reference_inputs
+        self.supports_timeline_guides = metadata.supports_timeline_guides
 
     @staticmethod
     def _looks_like_lance_subfolder(model: str | None) -> bool:
@@ -1832,6 +1834,8 @@ class AsyncDiffusionOutput:
     result: Any | None = None
     output: DiffusionOutput | None = None
     error: str | None = None
+    error_status_code: int | None = None
+    error_type: str | None = None
 
 
 class DiffusionRequestAbortedError(RuntimeError):

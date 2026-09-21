@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from vllm_omni.data_entry_keys import unflatten_payload
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MINIMAX_H3_CONDITION_LABELS_KEY,
@@ -17,6 +18,7 @@ from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MiniMaxH3EncoderConditioning,
 )
 from vllm_omni.model_executor.models.minimax_h3.encoder_processing import prepare_encoder_inputs
+from vllm_omni.model_executor.models.minimax_h3.timeline_guides import GUIDES_EXTRA_KEY
 
 
 def _diffusion_sampling_params(sampling_params_list: Sequence[Any]) -> Any:
@@ -37,6 +39,18 @@ def prepare_encoder_prompt(
     prompt: Any,
     sampling_params_list: Sequence[Any],
 ) -> Any:
+    # Reject request-visible incompatibilities before split-stage Qwen work.
+    # Startup cache, fused adapters and resolved attention roles are checked by
+    # the diffusion pipeline, which owns those model instances/configurations.
+    for sampling in sampling_params_list:
+        if not isinstance(sampling, OmniDiffusionSamplingParams) or not (sampling.extra_args or {}).get(
+            GUIDES_EXTRA_KEY
+        ):
+            continue
+        if sampling.quality == "high":
+            raise OmniClientError("MiniMax H3 timeline guides require cache-free execution; use quality=lossless")
+        if sampling.lora_request is not None and float(sampling.lora_scale) != 0.0:
+            raise OmniClientError("MiniMax H3 timeline guides do not support active LoRA/Turbo adapters")
     prepared = prepare_encoder_inputs(prompt, _diffusion_sampling_params(sampling_params_list))
     if isinstance(prompt, str):
         prompt = {"prompt": prompt}

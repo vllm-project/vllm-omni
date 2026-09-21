@@ -83,6 +83,7 @@ from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
+from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniInteractionPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
@@ -1136,6 +1137,9 @@ class WorkerProc:
         if isinstance(output, OmniACK):
             self._enqueue_result(output)
             return
+        if rpc_id is not None and isinstance(output, dict) and output.get("type") == DIFFUSION_RPC_RESULT_ENVELOPE:
+            self._enqueue_result(AsyncDiffusionOutput(kind=AsyncOutputKind.RPC_RESULT, rpc_id=rpc_id, result=output))
+            return
 
         # Async path: enqueue compute_done immediately, bg thread does D2H+SHM.
         if not self.od_config.step_execution and isinstance(output, (DiffusionOutput, BatchRunnerOutput)):
@@ -1340,11 +1344,14 @@ class WorkerProc:
             result = self.worker.execute_method(method, *args, **kwargs)
         except Exception as e:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
+            status_code, error_type = client_error_metadata(e)
             status.update(
                 {
                     "ok": False,
                     "error": str(e),
                     "error_type": type(e).__name__,
+                    "error_status_code": status_code,
+                    "client_error_type": error_type,
                     "traceback": traceback.format_exc(),
                 }
             )
@@ -1358,6 +1365,12 @@ class WorkerProc:
         if collect_rank_status:
             rank_statuses = self._gather_rpc_rank_statuses(status)
             if should_reply:
+                # Async execution keeps the compute/output split on success,
+                # but reports rejection only after every rank has terminated.
+                if rpc_request.get("rpc_id") is not None and all(s["ok"] for s in rank_statuses):
+                    return result, True
+                if rpc_request.get("rpc_id") is not None:
+                    result = None
                 return (
                     {
                         "type": DIFFUSION_RPC_RESULT_ENVELOPE,
@@ -1427,6 +1440,7 @@ class WorkerProc:
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     error = str(e)
+                    status_code, error_type = client_error_metadata(e)
                     _cleanup_after_execution_error(e)
                     # Apply the same reply gate as the success path so
                     # non-output ranks don't enqueue stale error replies
@@ -1435,7 +1449,7 @@ class WorkerProc:
                     exec_all_ranks = msg.get("exec_all_ranks", False)
                     wave_id = msg.get("wave_id")
                     if self.result_mq is not None:
-                        if rpc_id is not None:
+                        if rpc_id is not None and (output_rank is None or output_rank == self.gpu_id):
                             # Async RPC: must complete the executor's pending
                             # future so collective_rpc() doesn't hang.
                             self._enqueue_result(
@@ -1443,6 +1457,8 @@ class WorkerProc:
                                     kind=AsyncOutputKind.RPC_RESULT,
                                     rpc_id=rpc_id,
                                     error=error,
+                                    error_status_code=status_code,
+                                    error_type=error_type,
                                 )
                             )
                         elif output_rank is None and exec_all_ranks:
@@ -1470,11 +1486,26 @@ class WorkerProc:
                                 except Exception:
                                     dp_rank = self.gpu_id
                                 self._return_result(
-                                    {"status": "error", "error": error, "dp_rank": dp_rank, "wave_id": wave_id}
+                                    {
+                                        "status": "error",
+                                        "error": error,
+                                        "error_status_code": status_code,
+                                        "error_type": error_type,
+                                        "dp_rank": dp_rank,
+                                        "wave_id": wave_id,
+                                    }
                                 )
                         elif output_rank is None or output_rank == self.gpu_id:
                             # Normal RPC: only the expected rank replies
-                            self._return_result({"status": "error", "error": error, "wave_id": wave_id})
+                            self._return_result(
+                                {
+                                    "status": "error",
+                                    "error": error,
+                                    "error_status_code": status_code,
+                                    "error_type": error_type,
+                                    "wave_id": wave_id,
+                                }
+                            )
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)

@@ -34,6 +34,12 @@ from vllm_omni.diffusion.offloader.config import (
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
 from vllm_omni.diffusion.worker import WorkerProc
+from vllm_omni.errors import (
+    client_error_from_metadata,
+    client_error_metadata,
+    is_client_error_status,
+    raise_client_error_or,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
@@ -262,9 +268,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     @staticmethod
     def _raise_for_rpc_error_dict(response: Any) -> None:
         if isinstance(response, dict) and response.get("status") == "error":
-            raise RuntimeError(
+            raise_client_error_or(
                 f"Worker failed with error '{response.get('error')}', "
-                "please check the stack trace above for the root cause"
+                "please check the stack trace above for the root cause",
+                status_code=response.get("error_status_code"),
+                error_type=response.get("error_type"),
+                fallback=RuntimeError,
             )
 
     @staticmethod
@@ -279,15 +288,32 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 f"rank {status.get('rank')}: {status.get('error_type') or 'Error'}: {status.get('error')}"
                 for status in failed
             )
+            method = response.get("method", "<unknown>")
             tracebacks = "\n\n".join(
                 f"rank {status.get('rank')} traceback:\n{status['traceback']}"
                 for status in failed
                 if status.get("traceback")
             )
             if tracebacks:
-                details = f"{details}\n\n{tracebacks}"
-            method = response.get("method", "<unknown>")
-            raise RuntimeError(f"RPC '{method}' failed on worker rank(s): {details}")
+                # Tracebacks are operator diagnostics, not client output:
+                # ``api_server`` echoes ``str(exc)`` for 4xx *and* 5xx, so any
+                # traceback appended to the message would leak worker file
+                # paths and source lines to the HTTP client.
+                logger.error(
+                    "RPC '%s' failed on worker rank(s) %s: %s\n\n%s",
+                    method,
+                    [status.get("rank") for status in failed],
+                    details,
+                    tracebacks,
+                )
+            # An unknown failure on any rank must not become a safe 4xx.
+            client_failure = all(is_client_error_status(status.get("error_status_code")) for status in failed)
+            raise_client_error_or(
+                f"RPC '{method}' failed on worker rank(s): {details}",
+                status_code=failed[0].get("error_status_code") if client_failure else None,
+                error_type=failed[0].get("client_error_type") if client_failure else None,
+                fallback=RuntimeError,
+            )
 
         result = response.get("result")
         if isinstance(result, bool):
@@ -592,7 +618,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                             request_id=new_req.request_id,
                             step_index=None,
                             finished=True,
-                            result=DiffusionOutput(error=str(exc)),
+                            result=DiffusionOutput.from_exception(exc),
                         )
                     )
             return BatchRunnerOutput.from_list(runner_outputs)
@@ -643,7 +669,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         request_id=new_req.request_id,
                         step_index=None,
                         finished=True,
-                        result=DiffusionOutput(error=str(exc)),
+                        result=DiffusionOutput.from_exception(exc),
                     )
                 )
 
@@ -711,10 +737,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 try:
                     batch_output = early.result()
                     error = None
+                    status_code, error_type = None, None
                 except Exception as exc:
                     batch_output = None
                     error = str(exc)
-                self._deliver_batch_split(per_req_map, batch_output, error)
+                    status_code, error_type = client_error_metadata(exc)
+                self._deliver_batch_split(per_req_map, batch_output, error, status_code, error_type)
             return BatchRunnerOutput.from_list(runner_outputs)
         if not isinstance(result, BatchRunnerOutput):
             raise RuntimeError(f"Unexpected response type for execute_batch: {type(result)!r}")
@@ -778,6 +806,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         ):
             rpc_id = self._next_rpc_id()
             rpc_request["rpc_id"] = rpc_id
+            # A typed rejection is terminal only once all executing ranks have
+            # replied to the status gather, not when the first error arrives.
+            rpc_request["collect_rank_status"] = execute_all_ranks
             fut: concurrent.futures.Future = concurrent.futures.Future()
             with self._futures_lock:
                 self._rpc_futures[rpc_id] = fut
@@ -831,7 +862,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         )
                     result_mqs = [all_result_mqs[rank] for rank in primary_ranks]
                 tagged: list[tuple[int, Any]] = []
-                collected_errors: list[str] = []
+                collected_errors: list[Exception] = []
                 for result_mq in result_mqs:
                     response = self._dequeue_one_with_failure_polling(deadline, method, result_mq)
                     response = self._validate_wave_id(response, wave_id, deadline, method, result_mq)
@@ -839,16 +870,22 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         unpack_diffusion_output_shm(response)
                     except Exception as e:
                         logger.warning("SHM unpack failed (data may already be inline): %s", e)
-                    if isinstance(response, dict) and response.get("status") == "error":
-                        collected_errors.append(str(response.get("error", "unknown")))
-                    else:
+                    try:
                         response = MultiprocDiffusionExecutor._handle_rpc_response(response)
+                    except Exception as exc:
+                        collected_errors.append(exc)
+                    else:
                         if isinstance(response, dict) and "dp_rank" in response:
                             tagged.append((response["dp_rank"], response["output"]))
                         else:
                             tagged.append((len(tagged), response))
                 if collected_errors:
-                    raise RuntimeError(f"Worker error: {collected_errors[0]}")
+                    # Drain every terminal reply before surfacing a request
+                    # error; prefer unknown failures over client rejections.
+                    raise next(
+                        (exc for exc in collected_errors if not is_client_error_status(client_error_metadata(exc)[0])),
+                        collected_errors[0],
+                    )
                 tagged.sort(key=lambda x: x[0])
                 responses = [r for _, r in tagged]
             else:
@@ -926,8 +963,17 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 with self._futures_lock:
                     fut = self._rpc_futures.pop(msg.rpc_id, None) if msg.rpc_id else None
                 if fut is not None and not fut.done():
-                    if msg.error:
-                        try_set_exception(fut, RuntimeError(msg.error))
+                    try:
+                        if msg.error:
+                            raise_client_error_or(
+                                msg.error,
+                                status_code=msg.error_status_code,
+                                error_type=msg.error_type,
+                                fallback=RuntimeError,
+                            )
+                        self._handle_rpc_response(msg.result)
+                    except Exception as exc:
+                        try_set_exception(fut, exc)
                     else:
                         try_set_result(fut, msg)
             elif msg.kind == AsyncOutputKind.OUTPUT_READY:
@@ -940,13 +986,19 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         unpack_diffusion_output_shm(msg.output)
                     except Exception:
                         logger.exception("SHM unpack failed for batch %s", batch_id)
-                    self._deliver_batch_split(per_req_map, msg.output, msg.error)
+                    self._deliver_batch_split(per_req_map, msg.output, msg.error, msg.error_status_code, msg.error_type)
                 else:
                     # Single-request result: unpack SHM first, then resolve or cache atomically.
                     output_result: DiffusionOutput | None = None
                     exc: Exception | None = None
                     if msg.error:
-                        exc = RuntimeError(msg.error)
+                        exc = (
+                            client_error_from_metadata(
+                                msg.error, status_code=msg.error_status_code, error_type=msg.error_type
+                            )
+                            if is_client_error_status(msg.error_status_code)
+                            else RuntimeError(msg.error)
+                        )
                     else:
                         try:
                             unpack_diffusion_output_shm(msg.output)
@@ -976,6 +1028,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         per_req_map: dict[str, str],
         batch_output: Any,
         error: str | None = None,
+        error_status_code: int | None = None,
+        error_type: str | None = None,
     ) -> None:
         """Resolve per-request futures from one batch-level output."""
         for per_req_id, req_id in per_req_map.items():
@@ -984,7 +1038,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             if req_output is not None and req_output.result is not None:
                 per_req_result = req_output.result
             elif error:
-                per_req_result = DiffusionOutput(error=error)
+                per_req_result = DiffusionOutput(
+                    error=error, error_status_code=error_status_code, error_type=error_type
+                )
             else:
                 per_req_result = DiffusionOutput(error="No output result for batch request")
             with self._futures_lock:

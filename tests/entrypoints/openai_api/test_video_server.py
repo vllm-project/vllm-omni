@@ -9,12 +9,14 @@ import base64
 import io
 import json
 import os
+import sys
 import threading
 import time
 from concurrent.futures import CancelledError as FutureCancelledError
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import av
 import httpx
@@ -40,15 +42,35 @@ from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, R
 from vllm_omni.entrypoints.openai.storage import LocalStorageManager
 from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
 from vllm_omni.entrypoints.openai.video.generation import helpers as video_generation_helpers
+from vllm_omni.entrypoints.openai.video.generation.guided_lifetime import GUIDED_JOBS
 from vllm_omni.entrypoints.openai.video.generation.helpers import (
     MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES,
     _read_upload_limited,
     _reference_video_decode_spec,
 )
-from vllm_omni.errors import GuardrailViolationError
+from vllm_omni.errors import GuardrailViolationError, OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+_requires_guided_runtime = pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="Guided ownership requires Python 3.11+"
+)
+
+
+def _delete_request_stub(handler=None):
+    """Minimal ``Request`` stand-in for direct ``delete_video`` calls.
+
+    ``delete_video`` resolves the video handler from ``app.state`` to issue the
+    bounded engine abort. Guided jobs return before that lookup, so the stub only
+    needs to expose the attribute chain.
+    """
+    if handler is None:
+        handler = SimpleNamespace(abort_request=_noop_abort_request)
+    return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(openai_serving_video=handler)))
+
+
+async def _noop_abort_request(request_id):
+    del request_id
 
 
 class MockVideoResult:
@@ -92,9 +114,13 @@ class FakeAsyncOmni:
     def get_diffusion_od_config(self):
         return SimpleNamespace(model_class_name=self.model_class_name)
 
-    async def generate(self, prompt, request_id, sampling_params_list):
+    async def generate(self, prompt, request_id, sampling_params_list, **kwargs):
         self.captured_prompt = prompt
         self.captured_sampling_params_list = sampling_params_list
+        # ``_run_generation`` passes ``on_engine_admitted`` for guided requests.
+        on_engine_admitted = kwargs.get("on_engine_admitted")
+        if on_engine_admitted is not None:
+            on_engine_admitted()
         for control_type in ("edge", "blur", "depth", "seg", "wsm"):
             control_params = sampling_params_list[0].extra_args.get(control_type)
             if isinstance(control_params, dict) and isinstance(control_params.get("control_path"), str):
@@ -352,8 +378,8 @@ class AbortTrackingOmni(FakeAsyncOmni):
         self.aborted: list[str] = []
         self.entered = threading.Event()
 
-    async def generate(self, prompt, request_id, sampling_params_list):
-        del prompt, request_id, sampling_params_list
+    async def generate(self, prompt, request_id, sampling_params_list, **kwargs):
+        del prompt, request_id, sampling_params_list, kwargs
         self.entered.set()
         yield MockVideoResult(
             [],
@@ -389,7 +415,9 @@ def isolated_video_backends(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch):
+@pytest.mark.parametrize("cancel_drain", [False, True])
+@pytest.mark.parametrize("serve_failure", [None, RuntimeError, asyncio.CancelledError])
+async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch, cancel_drain, serve_failure):
     events: list[str] = []
     serve_started = asyncio.Event()
     http_shutdown = asyncio.Event()
@@ -421,6 +449,9 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
             await http_shutdown.wait()
             events.append("http_shutdown")
 
+        if serve_failure is not None:
+            await wait_for_shutdown()
+            raise serve_failure()
         return asyncio.create_task(wait_for_shutdown())
 
     async def fake_storage_start():
@@ -431,7 +462,18 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
         return None
 
     async def fake_init_app_state(engine_client, state, args):
-        del engine_client, state, args
+        del engine_client, args
+
+        class FakeVideo:
+            async def drain_guided_requests(self):
+                events.append("video_drain")
+                if cancel_drain:
+                    raise asyncio.CancelledError
+
+            def shutdown(self):
+                events.append("video_shutdown")
+
+        state.openai_serving_video = FakeVideo()
         events.append("init_app_state")
 
     monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
@@ -467,10 +509,16 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
     assert not engine_context_exited.is_set()
 
     http_shutdown.set()
-    await asyncio.wait_for(worker_task, timeout=2)
+    expected_error = asyncio.CancelledError if cancel_drain else serve_failure
+    if expected_error is not None:
+        with pytest.raises(expected_error):
+            await asyncio.wait_for(worker_task, timeout=2)
+    else:
+        await asyncio.wait_for(worker_task, timeout=2)
 
     assert sock.closed
-    assert events.index("http_shutdown") < events.index("engine_exit")
+    assert events.index("http_shutdown") < events.index("video_drain")
+    assert events.index("video_drain") < events.index("video_shutdown") < events.index("engine_exit")
 
 
 @pytest.fixture
@@ -491,6 +539,1035 @@ def _make_test_image_bytes(size=(64, 64)) -> bytes:
     buf = io.BytesIO()
     image.save(buf, format="PNG")
     return buf.getvalue()
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize(
+    "guide",
+    [
+        {"frame_index": True, "image": {"upload_index": 0}},
+        {"frame_index": "0", "image": {"upload_index": 0}},
+        {"frame_index": 0.0, "image": {"upload_index": 0}},
+        {"frame_index": 0, "image": {"upload_index": False}},
+        {"frame_index": 0, "image": {"upload_index": "0"}},
+        {"frame_index": 0, "image": {"upload_index": -1}},
+        {"frame_index": 0, "image": {"upload_index": 1}},
+        {"frame_index": 0, "image": {"path": "/etc/passwd"}},
+        {"frame_index": 0, "image": "/etc/passwd"},
+        {"frame_index": 0, "image": {"upload_index": 0}, "unknown": 1},
+        {"frame_index": 0, "image": {"upload_index": 0, "path": "/etc/passwd"}},
+        {"frame_index": 0},
+        {"frame_index": 0, "image": {"upload_index": 0}, "video": {"upload_index": 0}},
+    ],
+)
+def test_timeline_guide_manifest_rejections(test_client, endpoint, guide):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    response = test_client.post(
+        endpoint,
+        data={"prompt": "test", "timeline_guides": json.dumps([guide])},
+        files={"guide_files": ("guide.png", _make_test_image_bytes(), "image/png")},
+    )
+    assert response.status_code == 400
+    assert not handler.guided_requests.bundles
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize(
+    "manifest,files",
+    [
+        ([], [("image.png", b"image", "image/png")]),
+        ([{"frame_index": 0, "image": {"upload_index": 0}}], []),
+        ([{"frame_index": 0, "audio": {"upload_index": 0}}], [("guide.png", b"image", "image/png")]),
+        ([{"frame_index": 0, "image": {"upload_index": 0}}], [("guide.png", b"image", "audio/wav")]),
+        ([{"frame_index": 0, "audio": {"upload_index": 0}}], [("guide.ogg", b"audio", "audio/ogg")]),
+        ([{"frame_index": 0, "image": {"upload_index": 0}}], [("guide.png", b"", "image/png")]),
+    ],
+)
+@_requires_guided_runtime
+def test_timeline_guide_binding_rejections(test_client, endpoint, manifest, files):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    response = test_client.post(
+        endpoint,
+        data={"prompt": "test", "timeline_guides": json.dumps(manifest)},
+        files=[("guide_files", item) for item in files],
+    )
+    assert response.status_code == 400
+    assert not handler.guided_requests.bundles
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize("key", ["_minimax_h3_timeline_guides", "timeline_guides", "guide_files"])
+def test_timeline_guide_extra_injection_rejected(test_client, endpoint, key):
+    response = test_client.post(endpoint, data={"prompt": "test", "extra_params": json.dumps({key: "/etc/passwd"})})
+    assert response.status_code == 400
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize("kinds", [("video",), ("audio",), ("video", "audio")])
+@_requires_guided_runtime
+def test_timeline_guide_clip_flac_and_av_transport(test_client, mocker, monkeypatch, endpoint, kinds):
+    handler = test_client.app.state.openai_serving_video
+    engine = handler._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    # Opaque sentinel bytes exercise transport/binding only, not codec or model decode.
+    uploads = {
+        "video": ("guide.mp4", b"transport-only-video", "video/mp4"),
+        "audio": ("guide.flac", b"fLaC-transport-only-audio", "audio/flac"),
+    }
+    manifest = [{"frame_index": 36, **{kind: {"upload_index": index} for index, kind in enumerate(kinds)}}]
+    paths = []
+    captured = {}
+
+    async def generate(prompt, request_id, sampling_params_list, on_engine_admitted=None):
+        descriptors = sampling_params_list[0].extra_args["_minimax_h3_timeline_guides"]
+        assert len(descriptors) == 1
+        assert descriptors[0]["frame_index"] == 36
+        assert set(descriptors[0]) == {"frame_index", *kinds}
+        for kind in kinds:
+            path = Path(descriptors[0][kind])
+            paths.append(path)
+            captured[kind] = path.read_bytes()
+            assert path.suffix == Path(uploads[kind][0]).suffix
+        assert not prompt.get("multi_modal_data")
+        on_engine_admitted()
+        yield MockVideoResult([object()])
+
+    monkeypatch.setattr(engine, "generate", generate)
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"video")
+    response = test_client.post(
+        endpoint,
+        data={"prompt": "test", "timeline_guides": json.dumps(manifest)},
+        files=[("guide_files", uploads[kind]) for kind in kinds],
+    )
+    assert response.status_code == 200
+    if endpoint == "/v1/videos":
+        _wait_for_status(test_client, response.json()["id"], "completed")
+    else:
+        assert response.content == b"video"
+    assert captured == {kind: uploads[kind][1] for kind in kinds}
+    assert len(set(paths)) == len(kinds)
+    assert not any(path.exists() for path in paths)
+    assert not handler.guided_requests.bundles
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+def test_timeline_guides_reject_unsupported_model_before_persistence(test_client, mocker, endpoint):
+    handler = test_client.app.state.openai_serving_video
+    assert handler._engine_client.model_class_name == "WanPipeline"
+    persist = mocker.patch.object(video_generation_helpers, "_persist_guide_uploads")
+    generate = mocker.patch.object(handler, "generate_video_bytes")
+    response = test_client.post(
+        endpoint,
+        data={"prompt": "test", "timeline_guides": '[{"frame_index": 0, "audio": {"upload_index": 0}}]'},
+        files={"guide_files": ("guide.flac", b"fLaC-transport-only-audio", "audio/flac")},
+    )
+    assert response.status_code == 400
+    assert "does not support timeline guides" in response.json()["detail"]
+    persist.assert_not_called()
+    generate.assert_not_called()
+    assert not handler.guided_requests.bundles
+
+
+@pytest.mark.parametrize(
+    "model_class_name,supported",
+    [
+        ("MiniMaxH3Pipeline", True),
+        # The modular alias shares the guide contract and must not be rejected
+        # by a hardcoded pipeline name.
+        ("MiniMaxH3ModularPipeline", True),
+        ("WanPipeline", False),
+        ("Cosmos3OmniDiffusersPipeline", False),
+        (None, False),
+    ],
+)
+def test_timeline_guide_capability_follows_model_metadata(test_client, model_class_name, supported):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = model_class_name
+
+    assert handler.supports_timeline_guides is supported
+    if supported:
+        assert handler.timeline_guide_limits().max_entries == 8
+    else:
+        with pytest.raises(HTTPException) as excinfo:
+            handler.timeline_guide_limits()
+        assert excinfo.value.status_code == 400
+
+
+def test_timeline_guide_capability_uses_stage_config_metadata(test_client):
+    """Split-stage deployments name the pipeline in a stage config only."""
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = None
+    handler._stage_configs = [
+        SimpleNamespace(engine_args={"model_class_name": "MiniMaxH3TextEncoder"}),
+        SimpleNamespace(engine_args={"model_class_name": "MiniMaxH3ModularPipeline"}),
+    ]
+
+    assert handler.supports_timeline_guides
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize("with_guides", [False, True])
+def test_python310_rejects_guides_but_preserves_legacy_requests(test_client, mocker, endpoint, with_guides):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    mocker.patch("vllm_omni.entrypoints.openai.video.generation.guided_lifetime.version_info", (3, 10, 14))
+    persist = mocker.patch.object(video_generation_helpers, "_persist_guide_uploads")
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"video")
+    manifest = [{"frame_index": 0, "image": {"upload_index": 0}}] if with_guides else []
+    response = test_client.post(
+        endpoint,
+        data={"prompt": "test", "timeline_guides": json.dumps(manifest)},
+        files=[("guide_files", ("guide.png", _make_test_image_bytes(), "image/png"))] if with_guides else [],
+    )
+    if with_guides:
+        assert response.status_code == 503
+        assert "Python 3.11" in response.json()["detail"]
+        assert "omit timeline_guides" in response.json()["detail"]
+    else:
+        assert response.status_code == 200
+        if endpoint == "/v1/videos":
+            _wait_for_status(test_client, response.json()["id"], "completed")
+    persist.assert_not_called()
+    assert not handler.guided_requests.bundles
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@_requires_guided_runtime
+def test_timeline_guide_reuse_order_and_trusted_extras(test_client, mocker, endpoint):
+    handler = test_client.app.state.openai_serving_video
+    engine = handler._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"video")
+    manifest = [{"frame_index": index, "image": {"upload_index": 0}} for index in (36, -1, 0)]
+    response = test_client.post(
+        endpoint,
+        data={"prompt": "test", "timeline_guides": json.dumps(manifest)},
+        files={"guide_files": ("../../guide.png", _make_test_image_bytes(), "image/png")},
+    )
+    assert response.status_code == 200
+    if endpoint == "/v1/videos":
+        _wait_for_status(test_client, response.json()["id"], "completed")
+    descriptors = engine.captured_sampling_params_list[0].extra_args["_minimax_h3_timeline_guides"]
+    assert [item["frame_index"] for item in descriptors] == [36, -1, 0]
+    paths = {item["image"] for item in descriptors}
+    assert len(paths) == 1
+    assert not any(Path(path).exists() for path in paths)
+    assert "image" not in engine.captured_prompt.get("multi_modal_data", {})
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@_requires_guided_runtime
+def test_terminal_guide_validation_errors_do_not_exhaust_capacity(test_client, monkeypatch, endpoint):
+    handler = test_client.app.state.openai_serving_video
+    engine = handler._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    paths = []
+
+    async def generate(prompt, request_id, sampling_params_list, on_engine_admitted=None):
+        guide = sampling_params_list[0].extra_args["_minimax_h3_timeline_guides"][0]
+        assert guide["frame_index"] == 100000
+        paths.append(Path(guide["image"]))
+        assert paths[-1].exists()
+        on_engine_admitted()
+        error = OmniClientError("timeline guide frame_index 100000 is outside the output")
+        error.worker_finished = True  # Simulate an origin-qualified terminal worker rejection.
+        raise error
+        yield  # Make the engine double an async iterator; serving methods remain real.
+
+    monkeypatch.setattr(engine, "generate", generate)
+    for _ in range(6):  # Exceeds the default four outstanding guided requests.
+        response = test_client.post(
+            endpoint,
+            data={"prompt": "test", "timeline_guides": '[{"frame_index": 100000, "image": {"upload_index": 0}}]'},
+            files={"guide_files": ("guide.png", _make_test_image_bytes(), "image/png")},
+        )
+        if endpoint == "/v1/videos":
+            assert response.status_code == 200
+            failed = _wait_for_status(test_client, response.json()["id"], "failed")
+            assert failed["error"]["code"] == 400
+        else:
+            assert response.status_code == 400
+            assert "100000" in response.json()["detail"]
+        _wait_until(lambda: not handler.guided_requests.bundles)
+        assert not any(path.exists() for path in paths)
+    assert len(paths) == 6
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@_requires_guided_runtime
+def test_pre_dispatch_generate_failures_do_not_exhaust_capacity(test_client, monkeypatch, endpoint):
+    """Failures before EngineCore accepts must release uploads and capacity.
+
+    ``AsyncOmni.generate()`` rejects an asleep engine, a diffusion list prompt
+    and bad sampling params after the generator is entered but before
+    ``add_request_async``. Nothing is queued in any worker then, so retaining
+    the uploads would leak the files *and* an admission slot on every attempt.
+    """
+    handler = test_client.app.state.openai_serving_video
+    engine = handler._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    paths = []
+
+    async def generate(prompt, request_id, sampling_params_list, on_engine_admitted=None):
+        guide = sampling_params_list[0].extra_args["_minimax_h3_timeline_guides"][0]
+        paths.append(Path(guide["image"]))
+        assert paths[-1].exists()
+        # Never acknowledge admission: this models the pre-submission rejects.
+        raise RuntimeError("Generation rejected: Engine is partially or fully asleep.")
+        yield  # Make the engine double an async iterator; serving methods remain real.
+
+    monkeypatch.setattr(engine, "generate", generate)
+    for _ in range(6):  # Exceeds the default four outstanding guided requests.
+        response = test_client.post(
+            endpoint,
+            data={"prompt": "test", "timeline_guides": '[{"frame_index": 0, "image": {"upload_index": 0}}]'},
+            files={"guide_files": ("guide.png", _make_test_image_bytes(), "image/png")},
+        )
+        if endpoint == "/v1/videos":
+            assert response.status_code == 200
+            failed = _wait_for_status(test_client, response.json()["id"], "failed")
+            assert failed["error"]["code"] == 500
+        else:
+            assert response.status_code == 500
+        _wait_until(lambda: not handler.guided_requests.bundles)
+        assert not any(path.exists() for path in paths)
+    assert len(paths) == 6
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize("limit", ["max_image_bytes", "max_total_upload_bytes", "max_source_pixels"])
+@_requires_guided_runtime
+def test_timeline_guide_upload_budgets(test_client, monkeypatch, endpoint, limit):
+    handler = test_client.app.state.openai_serving_video
+    monkeypatch.setattr(
+        handler._engine_client,
+        "get_diffusion_od_config",
+        lambda: SimpleNamespace(
+            model_class_name="MiniMaxH3Pipeline",
+            model_config={"minimax_h3_timeline_guides": {limit: 1}},
+        ),
+    )
+    response = test_client.post(
+        endpoint,
+        data={
+            "prompt": "test",
+            "timeline_guides": '[{"frame_index": 0, "image": {"upload_index": 0}}]',
+        },
+        files={"guide_files": ("guide.png", _make_test_image_bytes(), "image/png")},
+    )
+    assert response.status_code == 400
+    assert not handler.guided_requests.bundles
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["timeout", "cancel", "delete", "error"])
+@_requires_guided_runtime
+async def test_guided_request_keeps_all_inputs_until_completion(monkeypatch, isolated_video_backends, operation):
+    store, _, storage = isolated_video_backends
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    app = FastAPI()
+    app.include_router(router)
+    app.state.openai_serving_video = handler
+    # Async video jobs live in process-local state, so the routes require a
+    # declared single-API-worker topology.
+    app.state.api_server_count = 1
+    entered, finish = asyncio.Event(), asyncio.Event()
+    paths = set()
+
+    async def generate(request, reference_id, **kwargs):
+        paths.update(request._guide_bundle.paths)
+        assert kwargs["reference_video"] is not None
+        assert kwargs["reference_audio"] is not None
+        entered.set()
+        await finish.wait()
+        assert len(paths) == 3 and all(Path(path).exists() for path in paths)
+        if operation == "error":
+            raise HTTPException(400, "invalid guide placement")
+        return b"video", {}, 0.0, None
+
+    monkeypatch.setattr(handler, "generate_video_bytes", generate)
+    monkeypatch.setattr(api_server, "VIDEO_SYNC_TIMEOUT_S", 0.05)
+    endpoint = "/v1/videos" if operation in ("delete", "error") else "/v1/videos/sync"
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        outer = asyncio.create_task(
+            client.post(
+                endpoint,
+                data={
+                    "prompt": "test",
+                    "timeline_guides": '[{"frame_index": 0, "image": {"upload_index": 0}}]',
+                },
+                files=[
+                    ("guide_files", ("guide.png", _make_test_image_bytes(), "image/png")),
+                    ("input_references", ("reference.mp4", b"reference-video", "video/mp4")),
+                    ("input_references", ("reference.wav", b"reference-audio", "audio/wav")),
+                ],
+            )
+        )
+        await asyncio.wait_for(entered.wait(), 2)
+        bundle = next(iter(handler.guided_requests.bundles))
+        if operation == "timeout":
+            assert (await outer).status_code == 504
+        elif operation == "cancel":
+            outer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await outer
+        else:
+            response = await outer
+            job_id = response.json()["id"]
+            if operation == "delete":
+                assert (await client.delete(f"/v1/videos/{job_id}")).status_code == 200
+                assert await store.get(job_id) is None
+        assert not bundle.task.done()
+        assert all(Path(path).exists() for path in paths)
+        finish.set()
+        await bundle.task
+        await asyncio.sleep(0)
+        assert not handler.guided_requests.bundles
+        assert not any(Path(path).exists() for path in paths)
+        if operation == "delete":
+            assert await store.get(job_id) is None
+            assert not storage.exists(job_id)
+        if operation == "error":
+            job = await store.get(job_id)
+            assert job.status == VideoGenerationStatus.FAILED
+            assert job.error.code == 400
+    handler.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@_requires_guided_runtime
+async def test_guided_request_owns_latent_edit_sources(monkeypatch, isolated_video_backends, endpoint):
+    """Timeline guides and latent-mask edits must compose under one lifetime.
+
+    Latent-edit sources are request inputs like guide and reference uploads, so
+    a guided request must keep them readable until the bundle completes rather
+    than unlinking them when the HTTP handler returns.
+    """
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    app = FastAPI()
+    app.include_router(router)
+    app.state.openai_serving_video = handler
+    app.state.api_server_count = 1
+    entered, finish = asyncio.Event(), asyncio.Event()
+    owned_paths: set[str] = set()
+    source_paths: list[str] = []
+    masks: list[list] = []
+
+    async def generate(request, reference_id, **kwargs):
+        latent_edit_input = kwargs["latent_edit_input"]
+        owned_paths.update(request._guide_bundle.paths)
+        source_paths.extend([latent_edit_input.source_video, latent_edit_input.source_audio])
+        masks.extend([latent_edit_input.video_noise_mask, latent_edit_input.audio_noise_mask])
+        entered.set()
+        await finish.wait()
+        # The bundle still owns every input while the engine may read it.
+        assert all(Path(path).exists() for path in source_paths)
+        return b"video", {}, 0.0, None
+
+    monkeypatch.setattr(handler, "generate_video_bytes", generate)
+    monkeypatch.setattr(api_server, "VIDEO_SYNC_TIMEOUT_S", 0.05)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        outer = asyncio.create_task(
+            client.post(
+                endpoint,
+                data={
+                    "prompt": "edit the guided timeline",
+                    "timeline_guides": '[{"frame_index": 0, "image": {"upload_index": 0}}]',
+                },
+                files=[
+                    ("guide_files", ("guide.png", _make_test_image_bytes(), "image/png")),
+                    ("source_video", ("source.mp4", b"source-video", "video/mp4")),
+                    ("source_audio", ("source.mp3", b"source-audio", "audio/mpeg")),
+                    ("video_noise_mask", _mask_file([[[0.0, 1.0], [0.5, 1.0]]])),
+                    ("audio_noise_mask", _mask_file([0.0, 0.25, 1.0])),
+                ],
+            )
+        )
+        await asyncio.wait_for(entered.wait(), 2)
+        bundle = next(iter(handler.guided_requests.bundles))
+        if endpoint.endswith("/sync"):
+            assert (await outer).status_code == 504
+        else:
+            assert (await outer).status_code == 200
+        assert masks == [[[[0.0, 1.0], [0.5, 1.0]]], [0.0, 0.25, 1.0]]
+        # Guide upload plus both latent-edit sources are bundle-owned.
+        assert set(source_paths) <= owned_paths and len(owned_paths) == 3
+        assert all(Path(path).exists() for path in owned_paths)
+        finish.set()
+        await bundle.task
+        await asyncio.sleep(0)
+        assert not handler.guided_requests.bundles
+        assert not any(Path(path).exists() for path in owned_paths)
+    handler.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_save", [False, True])
+@pytest.mark.parametrize("cancel_delete", [False, True])
+@pytest.mark.parametrize("save_fails", [False, True])
+@_requires_guided_runtime
+async def test_guided_delete_during_storage_save(
+    monkeypatch,
+    isolated_video_backends,
+    cancel_save,
+    cancel_delete,
+    save_fails,
+):
+    from vllm_omni.entrypoints.openai.video.generation.guided_lifetime import GuidedRequestLifetime
+
+    store, _, storage = isolated_video_backends
+    owner = GuidedRequestLifetime()
+    bundle = owner.reserve(4)
+    request = VideoGenerationRequest(prompt="test")
+    request._guide_bundle = bundle
+    job = VideoResponse(id="guided-save-race", model="test", prompt="test")
+    await store.upsert(job.id, job)
+    bundle.job_id = job.id
+    GUIDED_JOBS[job.id] = bundle
+    saving, finish_save = asyncio.Event(), asyncio.Event()
+    original_save = storage.save
+
+    async def save(*args):
+        saving.set()
+        await finish_save.wait()
+        if save_fails:
+            raise OSError("storage failure")
+        return await original_save(*args)
+
+    async def generate(*args, **kwargs):
+        return b"video", {}, 0.0, None
+
+    monkeypatch.setattr(storage, "save", save)
+    task = bundle.submit(
+        video_generation_helpers._run_video_generation_job(
+            SimpleNamespace(generate_video_bytes=generate),
+            request,
+            job.id,
+        )
+    )
+    await asyncio.wait_for(saving.wait(), 2)
+    if cancel_save:
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+    deleting = asyncio.create_task(api_server.delete_video(job.id, _delete_request_stub()))
+    await asyncio.sleep(0)
+    assert bundle.abandoned
+    if cancel_delete:
+        deleting.cancel()
+        await asyncio.sleep(0)
+        assert not deleting.done()
+    finish_save.set()
+    await asyncio.gather(task, deleting)
+    assert await store.get(job.id) is None
+    assert not storage.exists(job.id)
+    if cancel_save:
+        assert bundle in owner.bundles
+        bundle.close()  # Fake generation is known to be quiescent.
+    assert not owner.bundles
+
+
+@pytest.mark.asyncio
+@_requires_guided_runtime
+async def test_cancelled_guided_delete_behind_threaded_save_removes_job_and_artifact(
+    tmp_path,
+    monkeypatch,
+    isolated_video_backends,
+):
+    from vllm_omni.entrypoints.openai.video.generation.guided_lifetime import GuidedRequestLifetime
+
+    store, _, storage = isolated_video_backends
+    owner = GuidedRequestLifetime()
+    bundle = owner.reserve(1)
+    guide = tmp_path / "guide"
+    guide.write_bytes(b"input")
+    bundle.paths.add(str(guide))
+    job = VideoResponse(id="cancelled-delete-threaded-save", model="test", prompt="test")
+    await store.upsert(job.id, job)
+    bundle.job_id = job.id
+    GUIDED_JOBS[job.id] = bundle
+    request = VideoGenerationRequest(prompt="test")
+    request._guide_bundle = bundle
+    saving, delete_waiting = asyncio.Event(), asyncio.Event()
+    release_write, write_finished = threading.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    original_save = storage._save_sync
+    original_delete = api_server._delete_guided_video
+
+    def save(*args):
+        loop.call_soon_threadsafe(saving.set)
+        assert release_write.wait(5)
+        assert guide.exists()
+        saved = original_save(*args)
+        write_finished.set()
+        return saved
+
+    async def remove(video_id, owner_bundle):
+        delete_waiting.set()
+        await original_delete(video_id, owner_bundle)
+
+    async def generate(*args, on_started=None, **kwargs):
+        # Guided jobs stay QUEUED until the engine reports inference start.
+        await on_started()
+        return b"video", {}, 0.0, None
+
+    monkeypatch.setattr(storage, "_save_sync", save)
+    monkeypatch.setattr(api_server, "_delete_guided_video", remove)
+    task = bundle.submit(
+        video_generation_helpers._run_video_generation_job(
+            SimpleNamespace(generate_video_bytes=generate),
+            request,
+            job.id,
+        )
+    )
+    deleting = None
+    try:
+        await asyncio.wait_for(saving.wait(), 2)
+        deleting = asyncio.create_task(api_server.delete_video(job.id, _delete_request_stub()))
+        await asyncio.wait_for(delete_waiting.wait(), 2)
+        assert bundle.lock.locked()
+        assert (await store.get(job.id)).status == VideoGenerationStatus.IN_PROGRESS
+        deleting.cancel()
+        assert task.cancelling() == 0
+        release_write.set()
+        response = await deleting
+        assert response.deleted
+        await task
+        assert write_finished.is_set()
+        assert await store.get(job.id) is None
+        assert not storage.exists(job.id)
+        assert not guide.exists() and not owner.bundles
+    finally:
+        release_write.set()
+        await asyncio.gather(task, *([] if deleting is None else [deleting]), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@_requires_guided_runtime
+async def test_guided_cancel_during_metadata_update_discards_saved_output(monkeypatch, isolated_video_backends):
+    from vllm_omni.entrypoints.openai.video.generation.guided_lifetime import GuidedRequestLifetime
+
+    store, _, storage = isolated_video_backends
+    owner = GuidedRequestLifetime()
+    bundle = owner.reserve(1)
+    job = VideoResponse(id="guided-metadata-cancel", model="test", prompt="test")
+    await store.upsert(job.id, job)
+    bundle.job_id = job.id
+    GUIDED_JOBS[job.id] = bundle
+    request = VideoGenerationRequest(prompt="test")
+    request._guide_bundle = bundle
+    updating = asyncio.Event()
+    original_update = store.update_fields
+
+    async def update(key, fields):
+        if fields.get("status") == VideoGenerationStatus.COMPLETED:
+            updating.set()
+            await asyncio.Future()
+        return await original_update(key, fields)
+
+    async def generate(*args, **kwargs):
+        return b"video", {}, 0.0, None
+
+    monkeypatch.setattr(store, "update_fields", update)
+    task = bundle.submit(
+        video_generation_helpers._run_video_generation_job(
+            SimpleNamespace(generate_video_bytes=generate),
+            request,
+            job.id,
+        )
+    )
+    await asyncio.wait_for(updating.wait(), 2)
+    assert storage.exists(job.id)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert bundle.abandoned
+    assert await store.get(job.id) is None
+    assert not storage.exists(job.id)
+    assert bundle in owner.bundles
+    bundle.close()  # The fake engine has no external readers.
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@_requires_guided_runtime
+def test_guided_capacity_reserved_before_persisting_any_inputs(test_client, mocker, endpoint):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    reservations = [handler.guided_requests.reserve(4) for _ in range(4)]
+    persist = mocker.patch.object(video_generation_helpers, "_persist_guide_uploads")
+    refs = mocker.patch.object(video_generation_helpers, "_persist_uploaded_media_references")
+    try:
+        response = test_client.post(
+            endpoint,
+            data={
+                "prompt": "test",
+                "timeline_guides": '[{"frame_index": 0, "image": {"upload_index": 0}}]',
+            },
+            files=[
+                ("guide_files", ("guide.png", _make_test_image_bytes(), "image/png")),
+                ("input_references", ("reference.mp4", b"reference", "video/mp4")),
+            ],
+        )
+        assert response.status_code == 503
+        persist.assert_not_called()
+        refs.assert_not_called()
+    finally:
+        for bundle in reservations:
+            bundle.close()
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@_requires_guided_runtime
+def test_guided_partial_upload_failure_releases_files(test_client, monkeypatch, endpoint):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    original = video_generation_helpers.tempfile.mkstemp
+    paths = []
+
+    def record(*args, **kwargs):
+        fd, path = original(*args, **kwargs)
+        paths.append(path)
+        return fd, path
+
+    monkeypatch.setattr(video_generation_helpers.tempfile, "mkstemp", record)
+    manifest = [{"frame_index": 0, "image": {"upload_index": index}} for index in range(2)]
+    response = test_client.post(
+        endpoint,
+        data={"prompt": "test", "timeline_guides": json.dumps(manifest)},
+        files=[
+            ("guide_files", ("first.png", _make_test_image_bytes(), "image/png")),
+            ("guide_files", ("second.png", b"broken", "image/png")),
+        ],
+    )
+    assert response.status_code == 400
+    assert not handler.guided_requests.bundles
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@_requires_guided_runtime
+def test_out_of_process_diffusion_stage_limits_reach_the_http_boundary(test_client, monkeypatch, endpoint):
+    """Split deployments must not silently fall back to default guide limits.
+
+    An out-of-process diffusion stage keeps its ``OmniDiffusionConfig`` in the
+    worker, so the API process only sees the sanitized ``model_config``
+    snapshot the stage client carries. This exercises the real resolution
+    chain: stage client -> ``AsyncOmniEngine`` view -> ``AsyncOmni`` ->
+    ``timeline_guide_limits()``.
+    """
+    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.data.resolve_model_class_name",
+        lambda model: "MiniMaxH3Pipeline",
+    )
+    handler = test_client.app.state.openai_serving_video
+    inner = object.__new__(AsyncOmniEngine)
+    inner.model = "MiniMaxAI/MiniMax-H3"
+    inner._diffusion_od_config_view = None
+    inner.stage_clients = [
+        SimpleNamespace(
+            stage_type="diffusion",
+            diffusion_model_config={"minimax_h3_timeline_guides": {"max_entries": 1, "max_outstanding_requests": 1}},
+        )
+    ]
+    omni = object.__new__(AsyncOmni)
+    omni.engine = inner
+    monkeypatch.setattr(handler._engine_client, "get_diffusion_od_config", omni.get_diffusion_od_config)
+
+    limits = handler.timeline_guide_limits()
+    assert limits.max_entries == 1
+    assert limits.max_outstanding_requests == 1
+
+    generate = Mock(side_effect=AssertionError("over-limit guided request must never reach the engine"))
+    monkeypatch.setattr(handler._engine_client, "generate", generate)
+    response = test_client.post(
+        endpoint,
+        data={
+            "prompt": "test",
+            "timeline_guides": (
+                '[{"frame_index": 0, "image": {"upload_index": 0}}, {"frame_index": 24, "image": {"upload_index": 1}}]'
+            ),
+        },
+        files=[
+            ("guide_files", ("first.png", _make_test_image_bytes(), "image/png")),
+            ("guide_files", ("second.png", _make_test_image_bytes(), "image/png")),
+        ],
+    )
+    assert response.status_code == 400
+    generate.assert_not_called()
+    # Rejected before any bundle reserved a slot, so no upload was persisted.
+    assert not handler.guided_requests.bundles
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+def test_empty_timeline_guides_leave_legacy_model_unchanged(test_client, mocker, endpoint):
+    handler = test_client.app.state.openai_serving_video
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"video")
+    response = test_client.post(endpoint, data={"prompt": "test", "timeline_guides": "[]"})
+    assert response.status_code == 200
+    if endpoint == "/v1/videos":
+        _wait_for_status(test_client, response.json()["id"], "completed")
+    assert not handler.guided_requests.bundles
+    assert "_minimax_h3_timeline_guides" not in handler._engine_client.captured_sampling_params_list[0].extra_args
+
+
+@pytest.mark.asyncio
+@_requires_guided_runtime
+async def test_guided_delete_before_generation_starts(tmp_path, isolated_video_backends):
+    from vllm_omni.entrypoints.openai.video.generation.guided_lifetime import GuidedRequestLifetime
+
+    store, _, storage = isolated_video_backends
+    owner = GuidedRequestLifetime()
+    bundle = owner.reserve(1)
+    path = tmp_path / "queued-guide"
+    path.write_bytes(b"guide")
+    bundle.paths.add(str(path))
+    job = VideoResponse(id="guided-queued", model="test", prompt="test")
+    await store.upsert(job.id, job)
+    bundle.job_id = job.id
+    GUIDED_JOBS[job.id] = bundle
+    request = VideoGenerationRequest(prompt="test")
+    request._guide_bundle = bundle
+
+    async def generate(*args, **kwargs):
+        pytest.fail("Deleted queued generation must not be submitted to the engine")
+
+    task = bundle.submit(
+        video_generation_helpers._run_video_generation_job(
+            SimpleNamespace(generate_video_bytes=generate),
+            request,
+            job.id,
+        )
+    )
+    response = await api_server.delete_video(job.id, _delete_request_stub())
+    await task
+    assert response.deleted
+    assert await store.get(job.id) is None
+    assert not storage.exists(job.id)
+    assert not path.exists()
+    assert not owner.bundles
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "engine_error", "partial_then_error", "empty"])
+@_requires_guided_runtime
+async def test_guided_engine_boundary_requires_normal_output_completion(tmp_path, monkeypatch, outcome):
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test")
+    bundle = handler.guided_requests.reserve(1)
+    path = tmp_path / "guide"
+    path.write_bytes(b"input")
+    bundle.paths.add(str(path))
+
+    async def generate(**kwargs):
+        # A submitted request is the only thing that makes ``engine_started``
+        # true; production sets it from this callback, never on entry.
+        kwargs["on_engine_admitted"]()
+        if outcome == "engine_error":
+            raise RuntimeError("engine transport failed")
+        if outcome != "empty":
+            yield MockVideoResult([object()])
+        if outcome == "partial_then_error":
+            raise RuntimeError("engine failed after yielding partial output")
+
+    monkeypatch.setattr(engine, "generate", generate)
+    task = bundle.submit(
+        handler._run_generation(
+            {"prompt": "test"},
+            OmniDiffusionSamplingParams(),
+            "guided-boundary",
+            guide_bundle=bundle,
+        )
+    )
+    await asyncio.gather(task, return_exceptions=True)
+    assert bundle.engine_started
+    assert bundle.engine_completed is (outcome in {"success", "empty"})
+    await handler.drain_guided_requests()
+    if outcome in {"success", "empty"}:
+        assert not path.exists() and not handler.guided_requests.bundles
+    else:
+        assert path.exists() and bundle in handler.guided_requests.bundles
+        bundle.close()  # This test independently knows that its engine double has no readers.
+    handler.shutdown()
+
+
+@pytest.mark.asyncio
+@_requires_guided_runtime
+async def test_guided_generation_reports_started_and_engine_boundaries(tmp_path, monkeypatch):
+    """Guided requests keep both lifecycle signals: admission and inference start.
+
+    ``on_engine_admitted`` guards input ownership while ``on_started`` drives the
+    QUEUED -> IN_PROGRESS transition. The started sentinel must not be mistaken
+    for a generation result.
+    """
+    from vllm_omni.diffusion.data import DIFFUSION_REQUEST_LIFECYCLE_KEY, DIFFUSION_REQUEST_STARTED
+
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test")
+    bundle = handler.guided_requests.reserve(1)
+    path = tmp_path / "guide"
+    path.write_bytes(b"input")
+    bundle.paths.add(str(path))
+    final = MockVideoResult([object()])
+    lifecycle_enabled = []
+
+    async def generate(**kwargs):
+        kwargs["on_engine_admitted"]()
+        lifecycle_enabled.append(kwargs["sampling_params_list"][0].emit_request_lifecycle)
+        yield MockVideoResult([], custom_output={DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED})
+        yield final
+
+    started = []
+
+    async def on_started() -> None:
+        started.append(bundle.engine_started)
+
+    monkeypatch.setattr(engine, "generate", generate)
+    result = await bundle.submit(
+        handler._run_generation(
+            {"prompt": "test"},
+            OmniDiffusionSamplingParams(),
+            "guided-started",
+            on_started=on_started,
+            guide_bundle=bundle,
+        )
+    )
+    assert result is final
+    assert lifecycle_enabled == [True]
+    assert started == [True]
+    assert bundle.engine_started and bundle.engine_completed
+    await handler.drain_guided_requests()
+    assert not path.exists() and not handler.guided_requests.bundles
+    handler.shutdown()
+
+
+@pytest.mark.asyncio
+@_requires_guided_runtime
+async def test_guided_job_stays_queued_until_engine_reports_start(isolated_video_backends):
+    """A guided async job must not report IN_PROGRESS before inference starts."""
+    from vllm_omni.entrypoints.openai.video.generation.guided_lifetime import GuidedRequestLifetime
+
+    store, _, _storage = isolated_video_backends
+    owner = GuidedRequestLifetime()
+    bundle = owner.reserve(1)
+    job = VideoResponse(id="guided-queued-until-start", model="test", prompt="test")
+    await store.upsert(job.id, job)
+    bundle.job_id = job.id
+    GUIDED_JOBS[job.id] = bundle
+    request = VideoGenerationRequest(prompt="test")
+    request._guide_bundle = bundle
+    inferring = asyncio.Event()
+    release = asyncio.Event()
+
+    async def generate(*args, on_started=None, **kwargs):
+        assert (await store.get(job.id)).status == VideoGenerationStatus.QUEUED
+        await on_started()
+        inferring.set()
+        await release.wait()
+        return b"video", {}, 0.0, None
+
+    task = bundle.submit(
+        video_generation_helpers._run_video_generation_job(
+            SimpleNamespace(generate_video_bytes=generate),
+            request,
+            job.id,
+        )
+    )
+    await asyncio.wait_for(inferring.wait(), 2)
+    assert (await store.get(job.id)).status == VideoGenerationStatus.IN_PROGRESS
+    release.set()
+    await task
+    assert (await store.get(job.id)).status == VideoGenerationStatus.COMPLETED
+    assert not owner.bundles
+
+
+@pytest.mark.asyncio
+@_requires_guided_runtime
+async def test_guided_started_notification_after_delete_keeps_job_removed(tmp_path, isolated_video_backends):
+    """DELETE pops the store entry; a later start notification must not revive it."""
+    from vllm_omni.entrypoints.openai.video.generation.guided_lifetime import GuidedRequestLifetime
+
+    store, _, _storage = isolated_video_backends
+    owner = GuidedRequestLifetime()
+    bundle = owner.reserve(1)
+    path = tmp_path / "guide"
+    path.write_bytes(b"input")
+    bundle.paths.add(str(path))
+    job = VideoResponse(id="guided-start-after-delete", model="test", prompt="test")
+    await store.upsert(job.id, job)
+    bundle.job_id = job.id
+    GUIDED_JOBS[job.id] = bundle
+    request = VideoGenerationRequest(prompt="test")
+    request._guide_bundle = bundle
+    entered = asyncio.Event()
+    deleted = asyncio.Event()
+
+    async def generate(*args, on_started=None, **kwargs):
+        entered.set()
+        await deleted.wait()
+        await on_started()
+        return b"video", {}, 0.0, None
+
+    task = bundle.submit(
+        video_generation_helpers._run_video_generation_job(
+            SimpleNamespace(generate_video_bytes=generate),
+            request,
+            job.id,
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 2)
+    assert (await api_server.delete_video(job.id, _delete_request_stub())).deleted
+    deleted.set()
+    await task
+    assert await store.get(job.id) is None
+    assert not path.exists() and not owner.bundles
+
+
+@pytest.mark.asyncio
+@_requires_guided_runtime
+async def test_guided_failure_before_engine_admission_releases_inputs(tmp_path, monkeypatch):
+    """A failure before EngineCore accepts must release uploads and capacity.
+
+    ``generate()`` can reject a request after the coroutine is entered but
+    before ``add_request_async`` (asleep engine, diffusion list-prompt
+    rejection, sampling resolution). Nothing is queued in the worker then, so
+    retaining the uploads would leak both the files and an admission slot.
+    """
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test")
+    bundle = handler.guided_requests.reserve(1)
+    path = tmp_path / "guide"
+    path.write_bytes(b"input")
+    bundle.paths.add(str(path))
+
+    async def generate(**kwargs):
+        raise RuntimeError("Generation rejected: Engine is partially or fully asleep.")
+        yield  # Make the double an async iterator without ever admitting.
+
+    monkeypatch.setattr(engine, "generate", generate)
+    task = bundle.submit(
+        handler._run_generation(
+            {"prompt": "test"},
+            OmniDiffusionSamplingParams(),
+            "guided-pre-dispatch",
+            guide_bundle=bundle,
+        )
+    )
+    await asyncio.gather(task, return_exceptions=True)
+    assert not bundle.engine_started
+    assert not bundle.engine_completed
+    assert bundle.closed
+    assert not path.exists()
+    assert not handler.guided_requests.bundles
+    handler.shutdown()
 
 
 def _make_test_image_data_url(size=(64, 64)) -> str:
@@ -612,7 +1689,7 @@ def test_async_video_generation_with_audio_bypasses_base64(test_client, mocker: 
 
     engine = test_client.app.state.openai_serving_video._engine_client
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, **kwargs):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
         yield MockVideoResult([object()], audios=[object()], sample_rate=48000)
@@ -1586,7 +2663,7 @@ def test_model_reported_fps_wins_when_request_fps_omitted(test_client, mocker: M
 
     engine = test_client.app.state.openai_serving_video._engine_client
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, **kwargs):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
         result = MockVideoResult([object()])
@@ -1781,7 +2858,7 @@ def test_worker_fps_multiplier_is_applied_to_async_encoding(test_client, mocker:
     fps_values = []
     engine = test_client.app.state.openai_serving_video._engine_client
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, **kwargs):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
         import numpy as np
@@ -1838,7 +2915,7 @@ def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFi
         ),
     )
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, **kwargs):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
         import numpy as np
@@ -1865,7 +2942,7 @@ def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFi
 def test_video_job_persists_profiler_metadata(test_client, mocker: MockerFixture):
     engine = test_client.app.state.openai_serving_video._engine_client
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, **kwargs):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
         yield MockVideoResult(
@@ -1897,7 +2974,7 @@ def test_video_generation_response_exposes_action_payload(mocker: MockerFixture)
         model_name="Cosmos3-8B-UVA",
     )
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, **kwargs):
         del prompt, request_id, sampling_params_list
         import numpy as np
 
@@ -1943,7 +3020,7 @@ def test_video_generation_response_exposes_action_payload(mocker: MockerFixture)
 def test_video_job_persists_action_metadata(test_client, mocker: MockerFixture):
     engine = test_client.app.state.openai_serving_video._engine_client
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, **kwargs):
         import numpy as np
 
         engine.captured_prompt = prompt
@@ -2821,7 +3898,7 @@ def test_sync_t2v_returns_video_bytes(test_client, mocker: MockerFixture):
 def test_sync_t2v_returns_profiler_headers(test_client, mocker: MockerFixture):
     engine = test_client.app.state.openai_serving_video._engine_client
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, **kwargs):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
         yield MockVideoResult(
@@ -3254,7 +4331,7 @@ def test_worker_fps_multiplier_is_applied_to_sync_encoding(test_client, mocker: 
     engine = test_client.app.state.openai_serving_video._engine_client
     fps_values = []
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, **kwargs):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
         yield MockVideoResult(

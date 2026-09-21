@@ -79,6 +79,17 @@ transport is outside this configuration.
 The `/v1/videos` request schema and `extra_params.task` values (`t2va`,
 `fl2va`, and `ref2va`) are unchanged from the single-stage recipe.
 
+The base deployment also accepts the [GUIDE-01 multipart timeline guide
+fields](MiniMax-H3.md#timeline-guides-guide-01). Guide descriptors travel with
+diffusion sampling extras to stage 1; they do not become stage 0 Qwen references
+or change picture labels. Uploaded files must remain accessible to the diffusion
+worker in this deployment; no cross-host guide-file transfer is provided.
+Configure `model_config.minimax_h3_timeline_guides` on the diffusion stage using
+the existing deployment overrides. Use dense attention and `quality=lossless`;
+guides cannot be combined with the Turbo deployment below. Guided cancellation
+retains inputs and permits GPU work to finish before cleanup, as in the
+single-stage service.
+
 ## Turbo LoRA
 
 The deploy config below carries the four-step 768p contract -- five sigma
