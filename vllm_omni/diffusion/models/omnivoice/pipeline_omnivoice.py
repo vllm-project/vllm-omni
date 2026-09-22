@@ -43,6 +43,7 @@ from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.errors import OmniClientError
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.omnivoice.duration import RuleDurationEstimator
 from vllm_omni.model_executor.models.omnivoice.omnivoice_decoder import OmniVoiceDecoder
 from vllm_omni.model_executor.models.omnivoice.omnivoice_generator import (
@@ -248,6 +249,8 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
     OmniVoiceDecoder (HiggsAudioV2 RVQ + DAC) into a single forward() call.
     """
 
+    audio_sample_rate = 24000
+
     support_audio_output: ClassVar[bool] = True
     supports_request_batch: ClassVar[bool] = True
     supports_step_execution: ClassVar[bool] = True
@@ -448,7 +451,7 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
     def _prepare_request_input(
         self,
         prompt: Any,
-        extra: dict[str, Any],
+        sampling_params: OmniDiffusionSamplingParams,
     ) -> _PreparedOmniVoiceRequest | DiffusionOutput:
         """Build one request's conditional/unconditional model inputs."""
         ref_audio = None
@@ -456,7 +459,8 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         lang = "None"
         instruct = "None"
         voice_name = None
-        seed = extra.get("seed", None)
+        extra = sampling_params.extra_args or {}
+        seed = sampling_params.seed
         try:
             chunk_duration = _parse_chunking_seconds(
                 "audio_chunk_duration",
@@ -709,8 +713,7 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
 
     def prepare_encode(self, state: StepRequestState) -> StepRequestState:
         prompt = state.prompt if state.prompt else ""
-        extra = state.sampling.extra_args or {}
-        prepared = self._prepare_request_input(prompt, extra)
+        prepared = self._prepare_request_input(prompt, state.sampling)
         if isinstance(prepared, DiffusionOutput):
             raise OmniClientError(prepared.error or "OmniVoice request preparation failed")
 
@@ -950,7 +953,8 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         prepared_indices: list[int] = []
         generators: list[torch.Generator] = []
         for i, request in enumerate(req.requests):
-            prepared = self._prepare_request_input(request.prompt or "", request.sampling_params.extra_args or {})
+            prompt = request.prompt if request.prompt else ""
+            prepared = self._prepare_request_input(prompt, request.sampling_params)
             if isinstance(prepared, DiffusionOutput):
                 outputs[i] = prepared
                 continue
