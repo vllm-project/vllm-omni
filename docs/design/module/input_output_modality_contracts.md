@@ -87,7 +87,7 @@ interpretation, connector transport mechanics, scheduling policy, or semantic
 error classification. The `ErrorMessage` schema belongs here; the meaning and
 public rendering of its error fields belong to `error_contracts.md`.
 
-## Full-payload scheduling metadata
+## Runner scheduling metadata
 
 `SchedulingMetadataUpdate`, carried by
 `OmniConnectorOutput.request_metadata`, is the internal typed contract from a
@@ -98,11 +98,14 @@ local cache.
 | --- | --- |
 | `prompt_token_ids` | Replace the prompt token IDs and reset prompt-computation state. |
 | `resize_prompt_to` | Resize a prompt that has not started decoding and reset prompt-computation state. |
+| `input_terminal` | Mark terminal input for the coordinator to consume when the request is scheduled. |
 
 A runner-side `SchedulingMetadataAdapter` owns model-specific lookup and
-normalization and produces this update. This contract applies only to the
-runner-owned, non-async full-payload receive path. Async-chunk request updates
-remain owned by `OmniChunkTransferAdapter`.
+normalization and produces the prompt updates; runner transport adds the
+terminal-input signal. Configured adapters apply to non-async full-payload
+receive. Native MRV2 async receive uses the built-in adapter and the same
+typed updates; other async-chunk paths remain owned by
+`OmniChunkTransferAdapter`.
 
 ## Candidate invariants
 

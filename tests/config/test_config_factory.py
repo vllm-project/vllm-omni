@@ -2034,6 +2034,7 @@ stages:
                         stage_id=0,
                         model_stage="consumer",
                         scheduling_metadata_adapter=adapter_path,
+                        final_output=True,
                     ),
                 ),
             ),
@@ -2051,6 +2052,7 @@ stages:
                     stage_id=0,
                     model_stage="consumer",
                     scheduling_metadata_adapter=adapter_path,
+                    final_output=True,
                 ),
             ),
         )
@@ -2073,6 +2075,7 @@ stages:
                         stage_id=1,
                         model_stage="talker",
                         scheduling_metadata_adapter="pipeline.TalkerAdapter",
+                        final_output=True,
                     ),
                 ),
             ),
@@ -3427,6 +3430,7 @@ class TestCLIOverrideFlow:
                         model_stage="consumer",
                         requires_full_payload_input=True,
                         scheduling_metadata_adapter="pipeline.Adapter",
+                        final_output=True,
                     ),
                 ),
             ),
@@ -3443,7 +3447,14 @@ class TestCLIOverrideFlow:
         assert stage.runtime_overrides["requires_full_payload_input"] is False
         assert stage.runtime_overrides["scheduling_metadata_adapter"] == "cli.Adapter"
 
-        final_config = stage.to_omegaconf()
+        with patch("vllm_omni.config.stage_config.logger.warning") as warning:
+            final_config = stage.to_omegaconf()
+
+        assert warning.call_count == 2
+        assert {call.args[1:] for call in warning.call_args_list} == {
+            (0, "requires_full_payload_input"),
+            (0, "scheduling_metadata_adapter"),
+        }
         assert final_config.engine_args.requires_full_payload_input is True
         assert final_config.engine_args.scheduling_metadata_adapter == "pipeline.Adapter"
 
