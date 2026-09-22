@@ -311,6 +311,7 @@ def test_ffmpeg_mux_kills_process_that_survives_stdin_eof(monkeypatch) -> None:
         def wait(self, timeout: float | None = None) -> int:
             if self.killed:
                 return -9
+            assert timeout is not None
             raise subprocess.TimeoutExpired("ffmpeg", timeout)
 
         def terminate(self) -> None:

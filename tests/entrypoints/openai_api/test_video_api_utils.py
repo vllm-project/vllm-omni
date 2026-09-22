@@ -45,11 +45,13 @@ class _ChunkedStream(httpx.AsyncByteStream):
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
-def test_encode_video_bytes_selects_portable_ffmpeg_default() -> None:
+@pytest.mark.parametrize("enable_borrowed_frames", [False, True])
+def test_encode_video_bytes_selects_portable_ffmpeg_default(enable_borrowed_frames) -> None:
     encoded = video_api_utils._encode_video_bytes(
         np.zeros((2, 16, 16, 3), dtype=np.uint8),
         fps=12,
         backend="ffmpeg",
+        enable_borrowed_frames=enable_borrowed_frames,
         video_codec_options={"preset": "ultrafast", "threads": "1"},
     )
 

@@ -643,19 +643,20 @@ def mux_video_audio_ffmpeg_bytes(
             process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
         except FileNotFoundError as exc:
             raise RuntimeError("ffmpeg executable was not found on PATH.") from exc
-        assert process.stdin is not None
+        stdin = process.stdin
+        assert stdin is not None
         stderr_chunks: list[bytes] = []
 
         def write_frames() -> None:
             try:
                 for frame in video_frames:
-                    process.stdin.write(np.ascontiguousarray(frame).tobytes())
+                    stdin.write(np.ascontiguousarray(frame).tobytes())
             except OSError:
                 pass
             finally:
-                if not process.stdin.closed:
+                if not stdin.closed:
                     try:
-                        process.stdin.close()
+                        stdin.close()
                     except OSError:
                         pass
 

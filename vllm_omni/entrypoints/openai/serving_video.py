@@ -600,6 +600,12 @@ class OmniOpenAIServingVideo:
                     status_code=HTTPStatus.BAD_REQUEST.value,
                     detail="extra_params must be a JSON object/dict.",
                 )
+            video_encoder_backend = request.extra_params.get("video_encoder_backend", "pyav")
+            if video_encoder_backend not in ("pyav", "ffmpeg"):
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail=f"Unsupported video encoder backend: {video_encoder_backend}",
+                )
             if (
                 request.extra_params.get("preencode_mp4")
                 and request.extra_params.get("video_encoder_backend") == "ffmpeg"
