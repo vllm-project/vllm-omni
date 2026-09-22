@@ -181,53 +181,78 @@ async def _tiny_dit_multistage_generate(engine: AsyncOmni, prompt: str, request_
     return output
 
 
-def _reap_leftover_engine_children() -> None:
-    """Kill leftover AsyncOmni workers still parented by this pytest process."""
+_ENGINE_CHILD_MARKERS = (
+    "stagediffusionproc",
+    "enginecore",
+    "diffusionworker",
+    "vllm::worker",
+    "vllm-omni:",
+)
+
+
+def _is_engine_worker_proc(proc) -> bool:
+    blob = " ".join([proc.name(), *proc.cmdline()]).lower()
+    return any(marker in blob for marker in _ENGINE_CHILD_MARKERS)
+
+
+def _snapshot_engine_child_pids() -> list[int]:
+    """PIDs of engine workers under this pytest process (before shutdown).
+
+    ``DiffusionWorker`` is started ``daemon=True``. After StagePool joins
+    ``StageDiffusionProc``, that worker is reparented to PID 1 and a later
+    ``children(recursive=True)`` scan misses it while it still holds VRAM.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return []
+    try:
+        children = psutil.Process().children(recursive=True)
+    except psutil.Error:
+        return []
+    pids: list[int] = []
+    for proc in children:
+        try:
+            if _is_engine_worker_proc(proc):
+                pids.append(proc.pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return pids
+
+
+def _reap_engine_pids(pids: list[int]) -> None:
+    """SIGKILL snapshot PIDs even if they were reparented after shutdown."""
     try:
         import psutil
     except ImportError:
         return
 
-    keywords = ("stagediffusionproc", "enginecore", "vllm::worker", "vllm-omni::")
-    try:
-        children = psutil.Process().children(recursive=True)
-    except psutil.Error:
-        return
-
-    matched = []
-    for proc in children:
+    procs = []
+    for pid in pids:
         try:
-            blob = " ".join([proc.name(), *proc.cmdline()]).lower()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            procs.append(psutil.Process(pid))
+        except psutil.NoSuchProcess:
             continue
-        if any(keyword in blob for keyword in keywords):
-            matched.append(proc)
-    if not matched:
+    print(f"[sleep_mode] engine worker snapshot pids={pids} still_alive={[p.pid for p in procs]}")
+    if not procs:
         return
-
-    logger.info("Reaping leftover engine pids: %s", [proc.pid for proc in matched])
-    for proc in matched:
-        try:
-            proc.terminate()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-    _, still_alive = psutil.wait_procs(matched, timeout=5)
-    for proc in still_alive:
+    # shutdown() already tried a graceful exit. SIGTERM + 5s here just
+    # delays SIGKILL on CUDA workers that ignore it.
+    for proc in procs:
         try:
             proc.kill()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
-    if still_alive:
-        psutil.wait_procs(still_alive, timeout=3)
+    psutil.wait_procs(procs, timeout=3)
 
 
 async def _shutdown_engine_and_clear_gpu(engine: AsyncOmni) -> None:
     """Shut down the engine, reap leftover workers, then run shared cleanup."""
     from tests.helpers.clean import cleanup_test_environment
 
+    leftover_pids = _snapshot_engine_child_pids()
     engine.shutdown()
-    _reap_leftover_engine_children()
-    await asyncio.sleep(1.5)
+    _reap_engine_pids(leftover_pids)
     cleanup_test_environment()
 
 
@@ -238,8 +263,8 @@ def _module_device_cleanup():
     print("\n=== PRE-MODULE DEVICE CLEANUP (sleep_mode) ===")
     cleanup_test_environment()
     yield
-    print("\n=== POST-MODULE DEVICE CLEANUP (sleep_mode) ===")
-    cleanup_test_environment()
+    # Fixture / test teardown already ran cleanup_test_environment(); a second
+    # POST wait just repeats the same 5%×60s on leftover worker VRAM.
 
 
 # ---------------------------------------------------------------------------
@@ -287,13 +312,17 @@ class TestOmniDiffusionSleepMode:
         try:
             acks = await diffusion_engine.sleep(level=1)
             assert acks is not None
+            assert all(get_ack_info(ack, "status") == "SUCCESS" for ack in acks)
             await diffusion_engine.wake_up()
             await diffusion_engine.resume_generation()
-            async for _ in diffusion_engine.generate(
+            output = None
+            async for item in diffusion_engine.generate(
                 "test",
                 sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, height=256, width=256),
             ):
-                pass
+                output = item
+            assert output is not None, "generate after sleep/wake produced no output"
+            assert output.images and output.images[0] is not None, "generate after sleep/wake produced no image"
         finally:
             await _ensure_awake(diffusion_engine)
 
@@ -409,8 +438,7 @@ async def test_multistage_ar_diffusion_sleep_wake():
 
         await engine.wake_up(stage_ids=[0, 1])
         await engine.resume_generation(stage_ids=[0, 1])
-        post_output = await _tiny_dit_multistage_generate(engine, "verify", "verify")
-        assert post_output is not None
+        await _tiny_dit_multistage_generate(engine, "verify", "verify")
         logger.info("Light multistage joint sleep/wake/resume generate OK")
     finally:
         await _shutdown_engine_and_clear_gpu(engine)

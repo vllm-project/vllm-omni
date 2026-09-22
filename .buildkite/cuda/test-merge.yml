@@ -60,11 +60,7 @@ steps:
     depends_on: upload-merge-pipeline
     steps:
       - label: "Entrypoint Test with H100"
-        # TEMPORARY 60 -> 90: engine startup/sleep-wake is ~13-15 min slower per
-        # run on the vLLM 0.26 image (model loading ~2x, init ~2x; see builds
-        # 2915 vs 2916), which pushed this suite past 60 min. Revert once the
-        # 0.26 startup regression is understood and fixed.
-        timeout_in_minutes: 90
+        timeout_in_minutes: 60
         commands:
           # Turn-based server VAD over /v1/realtime is deferred to RFC #7181 PR 5
           # (see the P0 thread on #7413); the test stays in the tree and runs again there.
