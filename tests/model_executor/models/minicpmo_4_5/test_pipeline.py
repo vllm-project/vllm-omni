@@ -110,14 +110,14 @@ class TestPipelineTopology:
         assert talker.engine_output_type == "latent"
         # scope KV cache / mrope sizing to talker sub-config
         assert talker.hf_config_name == "tts_config"
-        # The multi-frame head collapses the vLLM-level head to the two-wide
-        # continue/stop row, whose only stop id is 1. It is an NPU-worker
-        # feature (that is where the continue drafts are injected), so on any
-        # other platform stage 1 keeps its full codec head and the codec EOS.
-        expected_stop = [1] if (current_omni_platform.device_name or "").lower() == "npu" else [_CODEC_EOS_TOKEN_ID]
+        # The pipeline default is the codec EOS of the one-frame head. The
+        # deploy config that arms the multi-frame row (stage 1's
+        # speculative_config, under platforms.npu) adds that row's stop marker
+        # (1) through its default_sampling_params; see
+        # test_minicpmo_talker_multi_frame_is_npu_scoped for the merged list.
         assert talker.sampling_constraints == {
             "detokenize": False,
-            "stop_token_ids": expected_stop,
+            "stop_token_ids": [_CODEC_EOS_TOKEN_ID],
         }
         assert talker.custom_process_next_stage_input_func == (
             "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_full_payload"

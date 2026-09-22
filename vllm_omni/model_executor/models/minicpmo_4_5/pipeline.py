@@ -22,24 +22,20 @@ _CODEC_EOS_TOKEN_ID = 6561  # tts_config.num_audio_tokens - 1
 
 
 def _talker_stop_token_ids() -> list[int]:
-    """Stage 1's default stop id, derived from the head this platform runs.
+    """Stage 1's default stop id: the codec EOS of the one-frame head.
 
-    On NPU, stage 1's ``speculative_config`` collapses the vLLM-level head to
-    the two-wide continue/stop row: only 0/1 are sampleable, so the codec EOS
-    can never appear. Everywhere else that block stays out of the config (it is
-    confined to ``platforms.npu``), the head is the full codec vocabulary, and
-    the codec EOS is the only valid stop.
+    The deploy config that arms the multi-frame decode (stage 1's
+    ``speculative_config``, under ``platforms.npu``) collapses the vLLM-level
+    head to the two-wide continue/stop row, where the codec EOS can never
+    appear; that same config adds the stop marker (1) through its
+    ``default_sampling_params``, and ``merge_sampling_constraints`` unions both
+    lists. The marker therefore travels with the block that needs it, and this
+    default covers every deployment without one.
+
+    A deployment that keeps the marker here instead ends every one-frame
+    request on the first ordinary codec id 1.
     """
-    from vllm_omni.platforms import current_omni_platform
-
-    # The deploy config confines stage 1's speculative_config to platforms.npu,
-    # so a non-NPU stage 1 keeps the full codec head.
-    if (current_omni_platform.device_name or "").lower() != "npu":
-        return [_CODEC_EOS_TOKEN_ID]
-
-    from vllm_omni.platforms.npu.worker.talker_multiframe import STOP_TOKEN_ID
-
-    return [STOP_TOKEN_ID]
+    return [_CODEC_EOS_TOKEN_ID]
 
 
 MINICPMO_4_5_PIPELINE = PipelineConfig(

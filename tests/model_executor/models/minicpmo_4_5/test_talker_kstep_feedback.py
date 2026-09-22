@@ -251,16 +251,13 @@ def test_talker_stop_token_ids_match_the_multi_frame_head():
     NPU worker, and the codec EOS on every platform without that worker.
     """
     from vllm_omni.model_executor.models.minicpmo_4_5 import pipeline as mcp_pipeline
-    from vllm_omni.platforms import current_omni_platform
     from vllm_omni.platforms.npu.worker import talker_multiframe
 
     assert talker_multiframe.STOP_TOKEN_ID == 1
-    if (current_omni_platform.device_name or "").lower() == "npu":
-        assert mcp_pipeline._talker_stop_token_ids() == [talker_multiframe.STOP_TOKEN_ID]
-    else:
-        # No NPU worker means no constant-draft injection, so the K-frame loop
-        # is off and the two-wide continue/stop row never runs.
-        assert mcp_pipeline._talker_stop_token_ids() == [mcp_pipeline._CODEC_EOS_TOKEN_ID]
+    # The pipeline default cannot depend on the platform: the block that
+    # collapses the head is a deploy-config decision, so the marker is added
+    # there (test_minicpmo_talker_multi_frame_is_npu_scoped pins the merge).
+    assert mcp_pipeline._talker_stop_token_ids() == [mcp_pipeline._CODEC_EOS_TOKEN_ID]
 
 
 def test_multiframe_gate_matrix():

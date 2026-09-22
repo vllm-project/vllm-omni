@@ -1384,12 +1384,15 @@ class TestDeployConfigLoading:
             platform=platform,
         )
         # Check the deploy-side stop id before the merge: afterwards it is
-        # unioned with the pipeline's platform-aware constraint.
+        # unioned with the pipeline's codec-EOS default.
         deploy_stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
         stages = merge_pipeline_deploy(resolve_pipeline_config("minicpmo_4_5"), deploy)
 
         if platform == "npu":
             assert deploy_stage1.default_sampling_params["stop_token_ids"] == [1]
+            # The armed head ends on 1; the union keeps the codec EOS inert
+            # (the collapsed head cannot sample it).
+            assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1, 6561]
             assert stages[0].yaml_engine_args["enable_prefix_caching"] is True
             assert stages[1].yaml_engine_args["speculative_config"] == {
                 "method": "ngram",
@@ -1401,6 +1404,10 @@ class TestDeployConfigLoading:
             assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [8, 8, 8]
         else:
             assert "stop_token_ids" not in (deploy_stage1.default_sampling_params or {})
+            # Without the block the head is the full codec vocabulary, so the
+            # codec EOS is the only stop id -- the marker would end a request
+            # on an ordinary codec id.
+            assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [6561]
             # Either absent (falls back to the top-level false) or explicitly
             # false; the regression this guards against is true.
             assert stages[0].yaml_engine_args.get("enable_prefix_caching") is not True
