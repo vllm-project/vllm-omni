@@ -9,22 +9,23 @@ audio streaming, client-driven VAD, and tool calling
 
 The endpoint is currently only supported for Qwen3-Omni. To start:
 
-```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
-```
-
-Run the provided client with a mono, 16-bit PCM, 16 kHz WAV file:
+Start vLLM-Omni with port `8000` bound to an address reachable from Docker:
 
 ```bash
-python examples/online_serving/qwen3_omni/openai_realtime_client.py \
-  --url ws://localhost:8091/v1/realtime \
-  --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
-  --input-wav input_16k_mono.wav \
-  --output-wav response.wav \
-  --output-text response.txt
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 --host 0.0.0.0
 ```
 
-The client dependency is `websockets`.
+Then start the docker compose:
+
+```bash
+cd examples/online_serving/qwen3_omni/fullduplex-livekit-frontend
+VLLM_OMNI_HOST=$VLLM_OMNI_HOST docker compose up --build
+```
+
+Where `VLLM_OMNI_HOST` is a network address. If vLLM-Omni is running on localhost, use
+`host.docker.internal`
+
+Open [http://localhost:3000](http://localhost:3000) and begin chatting.
 
 ## Protocol
 
@@ -63,8 +64,6 @@ the default `/v1/realtime` handler in all supported models.
 - Read `sample_rate_hz` from each audio event instead of assuming an output
   rate. Qwen3-Omni output is typically 24 kHz.
 - Concatenate audio deltas in receive order to construct the output waveform.
-- Set `input_audio_buffer.commit.final` to `true` after the last input chunk so
-  the server can terminate the streaming request.
 
 ## Availability and Limitations
 
@@ -72,7 +71,7 @@ The path is registered on the unified API server, but it is usable only when
 the loaded pipeline implements realtime audio input and produces compatible
 audio output. Unsupported deployments return an `error` event. The endpoint
 does not provide duplex session resume, playback acknowledgement, overlap
-policy, or barge-in controls internally. Those must be driven by the user
+policy, or barge-in controls internally. Those must be driven by the client application
 via the relevant WS events (e.g. `response.cancel`, `conversation.item.truncate`)
 
 See the [Qwen3-Omni online serving example](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/qwen3_omni)
