@@ -35,8 +35,6 @@ is constructed, because the constructor can run before the device is set --
 and a probe that failed there would silently strip a warmup the baseline
 relies on. A probe that still cannot name the SoC skips the faulting warmup: a
 missing warmup costs latency, a faulting one costs the whole run.
-``VLLM_OMNI_NPU_SKIP_WARMUPS`` overrides the set (comma separated substrings
-of the warmup names, or "none" to restore stock behaviour).
 
 ``rejection_sampler_triton_warmup`` is in the default skip set for the same
 reason: its dummy (batch, spec_len, vocab) sweep faults the 910_93 vector
@@ -48,7 +46,6 @@ Talker's K-step sample() and its SoC guards fall back to torch argmax.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from typing import Any
 
@@ -57,7 +54,6 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _PATCHED = False
-_ENV = "VLLM_OMNI_NPU_SKIP_WARMUPS"
 # Substrings matched against the warmup function names in kernel_warmup.py.
 _DEFAULT_SKIP = ("penalties", "rejection_sampler")
 _WARMUP_NAMES = (
@@ -107,11 +103,6 @@ def _kstep_armed() -> bool:
 
 
 def _skipped_names() -> set[str]:
-    raw = os.environ.get(_ENV, "").strip().lower()
-    if raw:
-        if raw in ("none", "off", "0", "false", "no"):
-            return set()
-        return {part.strip() for part in raw.split(",") if part.strip()}
     soc = _probe_soc_name()
     if soc.startswith("Ascend910B"):
         # This warmup faults the vector core (acl 507035) on this family, and the
@@ -176,7 +167,6 @@ def apply_ascend_warmup_patch() -> None:
     if guarded:
         logger.info(
             "[npu] ascend Triton warmups guarded (%s); the skip set is resolved "
-            "per call, so the SoC probe sees a live device. Override with %s.",
+            "per call, so the SoC probe sees a live device.",
             ", ".join(guarded),
-            _ENV,
         )

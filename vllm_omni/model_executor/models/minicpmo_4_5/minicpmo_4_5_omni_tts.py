@@ -12,14 +12,8 @@ Pipeline:
   5. Next decode embeds that id with emb_code and emits it to Code2Wav
 """
 
-import os
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
-
-try:
-    import torch_npu  # noqa: F401  (NPU platform guarantee)
-except Exception:  # pragma: no cover
-    torch_npu = None
 from typing import Any
 
 import torch
@@ -194,112 +188,6 @@ def _apply_batched_repetition_penalty(
         penalized[start:end] = torch.where(chunk_logits < 0, chunk_logits * alpha, chunk_logits / alpha)
 
     return penalized
-
-
-def _apply_top_k_top_p(
-    logits: torch.Tensor,
-    *,
-    top_k: int | None,
-    top_p: float | None,
-    min_tokens_to_keep: int = 3,
-    inplace: bool = False,
-) -> torch.Tensor:
-    """Reference warper: same candidate floors as the upstream warpers."""
-    filtered = logits if inplace else logits.clone()
-    vocab_size = filtered.shape[-1]
-    if top_p is not None and 0.0 < top_p < 1.0:
-        sorted_logits, sorted_indices = torch.sort(filtered, descending=False, dim=-1)
-        cumulative_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
-        remove = cumulative_probs <= (1.0 - float(top_p))
-        remove[..., -min_tokens_to_keep:] = False
-        remove = remove.scatter(-1, sorted_indices, remove)
-        filtered.masked_fill_(remove, float("-inf"))
-    if top_k is not None and top_k > 0:
-        keep = min(vocab_size, max(int(top_k), min_tokens_to_keep))
-        threshold = torch.topk(filtered, keep, dim=-1).values[..., -1, None]
-        filtered.masked_fill_(filtered < threshold, float("-inf"))
-    return filtered
-
-
-_NPU_TOPK_CACHE: dict = {}
-_NPU_TOP_K_TOP_P = os.environ.get("MINICPMO_TTS_NPU_TOPK_TOPP", "1") != "0"
-# npu_top_k_top_p wins on launches at small batch but loses to the two-op
-# torch path at large batch (128/8 A/B: 1.391 gated-off vs on).
-_NPU_TOPK_MAX_BATCH = int(os.environ.get("MINICPMO_TTS_NPU_TOPK_TOPP_MAX_BATCH", "64"))
-
-
-def _npu_top_k_top_p_warp(logits, *, top_k, top_p):
-    """Fused top-k/top-p floor via torch_npu.npu_top_k_top_p.
-
-    Kernel semantics: keep top-k by value, then keep the top-p probability
-    mass over the retained set. Falls back to the exact PyTorch warper when
-    the kernel is unavailable or fails.
-    """
-    if top_k is None or top_p is None or not 0.0 < top_p < 1.0:
-        return logits
-    npu = getattr(torch_npu, "npu_top_k_top_p", None)
-    if npu is None:
-        return logits
-    key = (str(logits.device), str(logits.dtype), float(top_p), int(top_k))
-    cached = _NPU_TOPK_CACHE.get(key)
-    if cached is None:
-        dev = torch.full((1,), float(top_p), device=logits.device, dtype=logits.dtype)
-        dk = torch.full((1,), int(top_k), device=logits.device, dtype=torch.int32)
-        _NPU_TOPK_CACHE[key] = (dev, dk)
-    else:
-        dev, dk = cached
-    try:
-        return npu(
-            logits,
-            dev.expand(logits.shape[0]).contiguous(),
-            dk.expand(logits.shape[0]).contiguous(),
-        )
-    except Exception:
-        return _apply_top_k_top_p(logits, top_k=top_k, top_p=top_p, min_tokens_to_keep=3, inplace=True)
-
-
-def _maybe_prewarp_top_k_top_p(logits, sampling_metadata):
-    """Pre-apply the fused floor and neutralize the sampler's own warpers.
-
-    Only engages when every row shares one (top_k, top_p) at temperature 1.0,
-    where the floor on raw logits is exactly the floor the sampler would
-    compute itself (top-k is rank based, so temperature invariance holds and
-    top-p mass matches at T=1). Any structural surprise returns None and the
-    native sampler path runs untouched.
-    """
-    if not _NPU_TOP_K_TOP_P:
-        return None
-    if not isinstance(logits, torch.Tensor) or logits.ndim != 2 or logits.shape[0] == 0:
-        return None
-    if logits.shape[0] > _NPU_TOPK_MAX_BATCH:
-        return None
-    if getattr(torch_npu, "npu_top_k_top_p", None) is None:
-        return None
-    try:
-        params = getattr(sampling_metadata, "sampling_params", None)
-        if not isinstance(params, (list, tuple)) or len(params) != logits.shape[0]:
-            return None
-        top_k = top_p = None
-        for sp in params:
-            k = getattr(sp, "top_k", None)
-            pp = getattr(sp, "top_p", None)
-            t = getattr(sp, "temperature", None)
-            if t is None or float(t) != 1.0:
-                return None
-            if k is None or int(k) <= 0:
-                return None
-            if pp is None or not 0.0 < float(pp) < 1.0:
-                return None
-            if top_k is None:
-                top_k, top_p = int(k), float(pp)
-            elif int(k) != top_k or float(pp) != top_p:
-                return None
-        logits = _npu_top_k_top_p_warp(logits, top_k=top_k, top_p=top_p)
-        new_params = [replace(sp, top_p=1.0, top_k=-1) for sp in params]
-        sampling_metadata = replace(sampling_metadata, sampling_params=list(new_params))
-        return logits, sampling_metadata
-    except Exception:
-        return None
 
 
 def resolve_codec_sampling_params(
@@ -1656,9 +1544,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 prompt_token_ids=blank_scheduler_prompt_for_penalties(prompt_ids, logits.shape[-1]),
             )
         logits, sampling_metadata = self._apply_codec_repetition_penalty(logits, sampling_metadata)
-        prewarped = _maybe_prewarp_top_k_top_p(logits, sampling_metadata)
-        if prewarped is not None:
-            logits, sampling_metadata = prewarped
         force_eos = self._pending_force_eos_rows
         self._pending_force_eos_rows = None
         output = Sampler()(logits, sampling_metadata)
