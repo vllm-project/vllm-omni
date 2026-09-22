@@ -340,8 +340,6 @@ def resolve_codec_sampling_params(
     return resolved
 
 
-
-
 def _codec_int_param(state: Any, key: str, fallback: int) -> int:
     """Read an integer codec knob from a request state, None meaning unset.
 
@@ -1065,7 +1063,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     # stub this method with the sampled tensor itself.
                     sampled = stochastic_result.reshape(()).to(torch.long)
             sampled_id = int(sampled.item())
-            prev_code = state.get("last_code") if isinstance(state, Mapping) else None
             is_eos = sampled_id == self._codec_eos_id
             state["step"] = _codec_int_param(state, "step", 0) + 1
             reached_limit = int(state["step"]) >= _codec_int_param(state, "max_tokens", self._codec_max_tokens)

@@ -34,7 +34,6 @@ from __future__ import annotations
 import torch
 import torch_npu
 from vllm.logger import init_logger
-
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import (
     SWA_INT_MAX,
@@ -106,9 +105,7 @@ class OmniFixedKVMetadataBuilder(AscendAttentionMetadataBuilder):
         if self._omni_buckets and attn_metadata.fixed_kv_decode_step:
             seq_lens_list = attn_metadata.seq_lens_list or [1]
             max_seq_len = getattr(common, "max_seq_len", None) or max(seq_lens_list)
-            fixed_kv_decode.set_runtime_bucket(
-                fixed_kv_decode.select_bucket(int(max_seq_len), self._omni_buckets)
-            )
+            fixed_kv_decode.set_runtime_bucket(fixed_kv_decode.select_bucket(int(max_seq_len), self._omni_buckets))
         else:
             fixed_kv_decode.set_runtime_bucket(None)
             # A single fresh prefill inside a captured bucket replays a graph
@@ -161,9 +158,7 @@ class OmniFixedKVAttentionBackendImpl(AscendAttentionBackendImpl):
         # +2 matches the query_start_loc buffer, which carries the FIA padding
         # request on a full batch.
         self._omni_max_rows = int(self.vllm_config.scheduler_config.max_num_seqs) + 2
-        self._omni_buckets = fixed_kv_decode.buckets_for(
-            self._omni_capacity, self.vllm_config.cache_config.block_size
-        )
+        self._omni_buckets = fixed_kv_decode.buckets_for(self._omni_capacity, self.vllm_config.cache_config.block_size)
         # A step that schedules several tokens per sequence (the Talker's
         # multi-frame decode declares them through a speculative_config) is
         # still a uniform decode, and the fixed-capacity mask covers it as
@@ -324,9 +319,7 @@ class OmniFixedKVAttentionBackendImpl(AscendAttentionBackendImpl):
         # The bias is per step, not per layer, and only the FIA path reads it,
         # so it is recorded by the first layer that actually wants it.
         if not attn_metadata.fixed_kv_pse_recorded:
-            fixed_kv_decode.emit_mask_refresh(
-                pse, seq_lens_device, self.num_heads, capacity, q_len
-            )
+            fixed_kv_decode.emit_mask_refresh(pse, seq_lens_device, self.num_heads, capacity, q_len)
             attn_metadata.fixed_kv_pse_recorded = True
 
         softmax_lse = fixed_kv_decode.keep_alive(

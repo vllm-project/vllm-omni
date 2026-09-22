@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
@@ -368,7 +367,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             is_talker = getattr(model_cfg, "model_stage", None) == "tts"
             cache = self._omni_talker_kstep_cache = is_talker and is_ngram and num_spec > 0
         return cache
-
 
     def _drop_talker_drafts_if_prefill_pending(self) -> None:
         """Keep the Talker's K-frame decode out of steps with uneven spans.

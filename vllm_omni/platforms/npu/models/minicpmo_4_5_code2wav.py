@@ -164,6 +164,7 @@ def _patched_estimator_step(
         if has_mask:
             kwargs["attn_mask"] = rest[0]
         return kwargs
+
     if cnn_cache is None:
         return graph_runner.run(
             "cfm_estimator",
@@ -187,7 +188,14 @@ def _patched_estimator_step(
         "cfm_estimator",
         (x, mu, time_embedding, speakers, cond, cnn_cache, att_cache, *mask_inputs),
         ((True, has_mask) if has_mask else (True,)),
-        lambda step_x, step_mu, step_time, step_speakers, step_cond, step_cnn, step_att, *rest: _graphable_estimator_step(
+        lambda step_x,
+        step_mu,
+        step_time,
+        step_speakers,
+        step_cond,
+        step_cnn,
+        step_att,
+        *rest: _graphable_estimator_step(
             self,
             estimator,
             x=step_x,

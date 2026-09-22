@@ -179,9 +179,7 @@ def install_into_ascend_aclgraph() -> None:
 
     wrapper_cls.__call__ = _call
     wrapper_cls._omni_fixed_kv_call = True
-    logger.info(
-        "[minicpmo] fixed-KV: ACLGraphWrapper keyed per KV capacity, pre-replay barrier dropped"
-    )
+    logger.info("[minicpmo] fixed-KV: ACLGraphWrapper keyed per KV capacity, pre-replay barrier dropped")
 
 
 def _is_fixed_graph_here(capacity: int) -> bool:
@@ -205,6 +203,7 @@ def install_into_ascend_backend() -> None:
     if not is_enabled():
         return
     from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+
     from vllm_omni.platforms.npu.attention.fixed_kv_backend import (
         OmniFixedKVAttentionBackendImpl,
         OmniFixedKVMetadataBuilder,
@@ -382,9 +381,7 @@ def emit_mask_refresh(
     """
     ar = _get_arange(num_heads, capacity, pse.device, q_len)
     neg, zero = _get_scalars(pse.dtype, pse.device)
-    lens = (
-        (seq_lens_device - (q_len - 1)).clamp(min=_MIN_SEQ_LEN).to(torch.int32).view(-1, 1, 1, 1)
-    )
+    lens = (seq_lens_device - (q_len - 1)).clamp(min=_MIN_SEQ_LEN).to(torch.int32).view(-1, 1, 1, 1)
     torch.where(ar >= lens, neg, zero, out=pse)
 
 

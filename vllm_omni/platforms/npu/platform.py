@@ -78,11 +78,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         vllm_config = get_current_vllm_config()
         max_model_len = getattr(getattr(vllm_config, "model_config", None), "max_model_len", None)
         block_size = getattr(getattr(vllm_config, "cache_config", None), "block_size", None)
-        capacity = (
-            fixed_kv_decode.capacity_for(max_model_len, block_size)
-            if max_model_len and block_size
-            else None
-        )
+        capacity = fixed_kv_decode.capacity_for(max_model_len, block_size) if max_model_len and block_size else None
         fixed_kv_decode.install_into_ascend_aclgraph()
         logger.info(
             "[minicpmo] fixed-KV decode attention on (max_model_len=%s, kv_capacity=%s); "

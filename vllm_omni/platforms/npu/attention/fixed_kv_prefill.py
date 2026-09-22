@@ -39,7 +39,8 @@ Off with ``VLLM_OMNI_FIXED_KV_PREFILL=0``.
 from __future__ import annotations
 
 import os
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
@@ -57,6 +58,7 @@ BUCKETS: tuple[int, ...] = TALKER_BUCKETS
 def configure(buckets: tuple[int, ...]) -> None:
     global BUCKETS
     BUCKETS = tuple(sorted(buckets))
+
 
 _LOGGED_REPLAY = False
 
@@ -223,5 +225,3 @@ def replay(attn_metadata: Any) -> torch.Tensor | None:
         _LOGGED_REPLAY = True
         logger.info("[minicpmo] prefill replays its own captured %d-token graph", bucket)
     return hidden_out
-
-
