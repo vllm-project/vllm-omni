@@ -806,30 +806,12 @@ _TRANSCRIBER_CALL_LOCK = threading.Lock()
 # Guards the _TRANSCRIBER pointer itself.
 _TRANSCRIBER_LOCK = threading.Lock()
 _TRANSCRIBER: concurrent.futures.ProcessPoolExecutor | None = None
-# Parent-side record of sizes this worker has successfully loaded, plus the
-# device the child reported. Sizes recorded before a result would credit VRAM
-# while the model might still be on CPU. Reserved GiB is the child's allocator
-# reading (not nvidia-smi PID memory, which is N/A on some CI drivers).
-_TRANSCRIBER_MODEL_SIZES: set[str] = set()
+# Parent-side record of the device the child reported and its allocator
+# reserved GiB. Credit only after a GPU result (not while the model might
+# still be on CPU). Reserved is the child's caching-allocator reading, not
+# nvidia-smi PID memory (N/A on some CI drivers) and not a size table.
 _TRANSCRIBER_DEVICE: str | None = None
 _TRANSCRIBER_RESERVED_GIB: float = 0.0
-
-# Empirical GPU footprint for ``whisper.load_model`` (weights + CUDA context),
-# not host checkpoint size. large-v3 measured ~10.8 GiB on H100/H800.
-# Unknown sizes contribute 0: a 11 GiB default would hide engine leaks on the
-# same GPU when subtracted from device-wide used memory.
-_WHISPER_VRAM_GIB = {
-    "tiny": 1.0,
-    "base": 1.5,
-    "small": 2.5,
-    "medium": 5.5,
-    "large": 11.0,
-    "large-v1": 11.0,
-    "large-v2": 11.0,
-    "large-v3": 11.0,
-    "large-v3-turbo": 4.0,
-    "turbo": 4.0,
-}
 
 
 def _accelerator_index_from_device(device: str | None) -> int | None:
@@ -858,25 +840,18 @@ def whisper_resident_device_index() -> int | None:
 def whisper_resident_vram_gib() -> float:
     """VRAM (GiB) held by the living Whisper worker, or 0 if none / CPU.
 
-    Prefers the child's caching-allocator reading. The known-size table is only
-    an upper bound (and a fallback when the child could not measure). Unknown
-    sizes add 0, never 11 GiB. This is not a substitute for engine PID reap or
-    a raised 5% wait threshold (RFC #6851).
+    Only the child's caching-allocator reading. Unmeasured or CPU → 0 (fail
+    closed: do not invent a size-table credit). This is not a substitute for
+    engine PID reap or a raised 5% wait threshold (RFC #6851).
     """
     with _TRANSCRIBER_LOCK:
         if _TRANSCRIBER is None:
             return 0.0
         device = _TRANSCRIBER_DEVICE
-        sizes = frozenset(_TRANSCRIBER_MODEL_SIZES)
         measured = _TRANSCRIBER_RESERVED_GIB
     if _accelerator_index_from_device(device) is None:
         return 0.0
-    table = sum(_WHISPER_VRAM_GIB.get(size, 0.0) for size in sizes)
-    if measured > 0.0 and table > 0.0:
-        return min(measured, table)
-    if measured > 0.0:
-        return measured
-    return table
+    return measured if measured > 0.0 else 0.0
 
 
 def _get_transcriber() -> concurrent.futures.ProcessPoolExecutor:
@@ -899,7 +874,6 @@ def _discard_transcriber(executor: concurrent.futures.ProcessPoolExecutor) -> No
         if _TRANSCRIBER is not executor:
             return
         _TRANSCRIBER = None
-        _TRANSCRIBER_MODEL_SIZES.clear()
         _TRANSCRIBER_DEVICE = None
         _TRANSCRIBER_RESERVED_GIB = 0.0
     # Joining the worker can block; do it outside the lock.
@@ -921,7 +895,6 @@ def release_audio_transcriber() -> None:
     with _TRANSCRIBER_CALL_LOCK:
         with _TRANSCRIBER_LOCK:
             executor, _TRANSCRIBER = _TRANSCRIBER, None
-            _TRANSCRIBER_MODEL_SIZES.clear()
             _TRANSCRIBER_DEVICE = None
             _TRANSCRIBER_RESERVED_GIB = 0.0
         if executor is not None:
@@ -963,7 +936,6 @@ def convert_audio_file_to_text(output_path: str, model_size: str = "small", lang
                     executor.submit(_whisper_transcribe_in_current_process, output_path, model_size, language).result()
                 )
                 with _TRANSCRIBER_LOCK:
-                    _TRANSCRIBER_MODEL_SIZES.add(model_size)
                     _TRANSCRIBER_DEVICE = device
                     if _accelerator_index_from_device(device) is None:
                         _TRANSCRIBER_RESERVED_GIB = 0.0

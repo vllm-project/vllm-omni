@@ -350,10 +350,9 @@ def _get_device_global_memory_used_gib(device_id: int) -> float:
     return (total_b - free_b) / 1024**3
 
 
-@pytest_asyncio.fixture(scope="class", loop_scope="class")
-async def bagel_diffusion_engine():
-    """Shared BAGEL BagelPipeline TP=2 engine for sleep/wake + generate."""
-    stages = [
+def _bagel_diffusion_stages() -> list[dict]:
+    """TP=2 BagelPipeline topology shared by the live fixture and the skipped coordinated case."""
+    return [
         {
             "stage_id": 0,
             "stage_type": "diffusion",
@@ -371,7 +370,12 @@ async def bagel_diffusion_engine():
             "final_output_type": "image",
         }
     ]
-    engine = AsyncOmni(model=MODEL_BAGEL, stages=stages, init_timeout=600, enable_sleep_mode=True)
+
+
+@pytest_asyncio.fixture(scope="class", loop_scope="class")
+async def bagel_diffusion_engine():
+    """Shared BAGEL BagelPipeline TP=2 engine for sleep/wake + generate."""
+    engine = AsyncOmni(model=MODEL_BAGEL, stages=_bagel_diffusion_stages(), init_timeout=600, enable_sleep_mode=True)
     yield engine
     engine.shutdown()
     await asyncio.sleep(1.5)
@@ -507,26 +511,8 @@ class TestBagelCoordinatedSleepMode:
         llm_engine = AsyncOmni(
             model=MODEL_BAGEL, stages=llm_stages, connectors=llm_connectors, init_timeout=600, enable_sleep_mode=True
         )
-        diffusion_stages = [
-            {
-                "stage_id": 0,
-                "stage_type": "diffusion",
-                "runtime": {"process": True, "devices": "0,1", "max_batch_size": 1},
-                "engine_args": {
-                    "model_stage": "base",
-                    "gpu_memory_utilization": 0.1,
-                    "model_class_name": "BagelPipeline",
-                    "enable_sleep_mode": True,
-                    "enforce_eager": True,
-                    "max_num_batched_tokens": 8192,
-                    "parallel_config": {"tensor_parallel_size": 2},
-                },
-                "final_output": True,
-                "final_output_type": "image",
-            }
-        ]
         diffusion_engine = AsyncOmni(
-            model=MODEL_BAGEL, stages=diffusion_stages, init_timeout=600, enable_sleep_mode=True
+            model=MODEL_BAGEL, stages=_bagel_diffusion_stages(), init_timeout=600, enable_sleep_mode=True
         )
         device_id = 1
         try:

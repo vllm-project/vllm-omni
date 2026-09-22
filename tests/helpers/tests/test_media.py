@@ -311,7 +311,7 @@ def test_whisper_resident_vram_is_zero_until_a_gpu_result(monkeypatch):
 def test_whisper_resident_vram_tracks_gpu_device_after_success(monkeypatch):
     _patch_executors(
         monkeypatch,
-        outcomes_per_executor=([("London", "cuda:1"), ("Paris", "cuda:1")],),
+        outcomes_per_executor=([("London", "cuda:1", 2.5), ("Paris", "cuda:1", 9.6)],),
     )
     media.convert_audio_file_to_text("/tmp/a.wav", "small")
     assert media.whisper_resident_device_index() == 1
@@ -319,30 +319,31 @@ def test_whisper_resident_vram_tracks_gpu_device_after_success(monkeypatch):
 
     media.convert_audio_file_to_text("/tmp/b.wav", "large-v3")
     assert media.whisper_resident_device_index() == 1
-    assert media.whisper_resident_vram_gib() == pytest.approx(13.5)
+    assert media.whisper_resident_vram_gib() == pytest.approx(9.6)
 
     media.release_audio_transcriber()
     assert media.whisper_resident_vram_gib() == 0.0
     assert media.whisper_resident_device_index() is None
 
 
-def test_whisper_unknown_size_does_not_credit_eleven_gib(monkeypatch):
+def test_whisper_unmeasured_gpu_result_credits_zero(monkeypatch):
+    """A GPU device without a reserved reading must not invent a size-table credit."""
     _patch_executors(monkeypatch, outcomes_per_executor=([("London", "cuda:0")],))
     media.convert_audio_file_to_text("/tmp/a.wav", "not-a-whisper-size")
     assert media.whisper_resident_device_index() == 0
     assert media.whisper_resident_vram_gib() == 0.0
 
 
-def test_whisper_resident_vram_caps_table_by_child_reserved(monkeypatch):
+def test_whisper_resident_vram_uses_child_reserved(monkeypatch):
     _patch_executors(monkeypatch, outcomes_per_executor=([("London", "cuda:0", 1.0)],))
     media.convert_audio_file_to_text("/tmp/a.wav", "small")
     assert media.whisper_resident_vram_gib() == pytest.approx(1.0)
 
 
-def test_whisper_resident_vram_caps_reserved_by_known_table(monkeypatch):
+def test_whisper_resident_vram_does_not_cap_measured_reserved(monkeypatch):
     _patch_executors(monkeypatch, outcomes_per_executor=([("London", "cuda:0", 20.0)],))
     media.convert_audio_file_to_text("/tmp/a.wav", "small")
-    assert media.whisper_resident_vram_gib() == pytest.approx(2.5)
+    assert media.whisper_resident_vram_gib() == pytest.approx(20.0)
 
 
 def test_whisper_unknown_size_uses_measured_reserved(monkeypatch):
@@ -389,7 +390,6 @@ def test_cleanup_whisper_allowance_maps_logical_gpu(monkeypatch):
     assert clean._whisper_vram_allowance() == (2.5, 7)
 
 
-def test_whisper_table_has_no_eleven_gib_unknown_default():
-    """Unknown sizes must not default to 11 GiB (that hid engine leaks on the Whisper GPU)."""
+def test_whisper_has_no_size_table():
+    assert not hasattr(media, "_WHISPER_VRAM_GIB")
     assert not hasattr(media, "_WHISPER_VRAM_GIB_DEFAULT")
-    assert media._WHISPER_VRAM_GIB.get("not-a-whisper-size", 0.0) == 0.0
