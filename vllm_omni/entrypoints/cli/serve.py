@@ -606,6 +606,16 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--diffusion-compile-mode",
+            choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+            default=None,
+            help=(
+                "torch.compile mode for diffusion stages. Applies to the generic model runner and to "
+                "pipelines that implement their own setup_compile(). 'default' (the default) avoids the "
+                "CUDA graph static-address constraints that 'reduce-overhead' introduces."
+            ),
+        )
+        omni_config_group.add_argument(
             "--fa-deterministic",
             dest="fa_deterministic",
             action="store_true",

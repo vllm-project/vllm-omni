@@ -595,16 +595,23 @@ class TestDiffusionCompileConfig:
 
         assert config.diffusion_compile_granularity == "regional"
         assert config.diffusion_compile_dynamic is True
+        assert config.diffusion_compile_mode == "default"
 
     def test_from_kwargs_preserves_compile_controls(self) -> None:
         config = OmniDiffusionConfig.from_kwargs(
             model="test",
             diffusion_compile_granularity="full",
             diffusion_compile_dynamic=False,
+            diffusion_compile_mode="reduce-overhead",
         )
 
         assert config.diffusion_compile_granularity == "full"
         assert config.diffusion_compile_dynamic is False
+        assert config.diffusion_compile_mode == "reduce-overhead"
+
+    def test_config_rejects_invalid_compile_mode(self) -> None:
+        with pytest.raises(ValueError, match="diffusion_compile_mode"):
+            OmniDiffusionConfig(model="test", diffusion_compile_mode="turbo")
 
     def test_config_rejects_invalid_compile_granularity(self) -> None:
         with pytest.raises(ValueError, match="diffusion_compile_granularity"):
