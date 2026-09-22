@@ -936,15 +936,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # _turn_end_boundary_eos_masked and state["turn_end_drain"];
             # MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS is 4 chunks, so the window
             # lands on steps 25-29 / 50-54 / 75-79 / 100-103). The EOS masking
-            # moved into the sampling core (talker_codec_sample.
-            # prepare_codec_logits / greedy_codec_sample), whose criterion is
-            # state.step < min_tokens with min_tokens a per-request cached
-            # tensor, so that periodic window cannot be expressed per frame here
-            # and is left unwired. It only affects duplex turn-end; the
-            # offline/TTS path is unaffected. The constants, budget and
-            # turn_end_drain flag from main are kept in this file.
+            # lives in the sampling core (talker_codec_sample.
+            # prepare_codec_logits / greedy_codec_sample), so the periodic
+            # window rides along as the eos_window_masked flag below -- the same
+            # criterion the single-frame path's mask_eos_rows applies.
             min_tokens = _codec_int_param(state, "min_tokens", self._codec_min_tokens)
             max_tokens = _codec_int_param(state, "max_tokens", self._codec_max_tokens)
+            eos_window_masked = bool(state.get("turn_end_drain")) and _turn_end_boundary_eos_masked(step)
             if self._codec_temperature == 0.0:
                 sampled = self._sample_audio_code_greedy(
                     hidden[end - 1 : end],
@@ -953,9 +951,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     step,
                     min_tokens,
                     max_tokens,
+                    eos_window_masked,
                 )
             else:
-                stochastic_result = self._sample_audio_code(hidden[end - 1 : end], codes, request_id, step)
+                stochastic_result = self._sample_audio_code(
+                    hidden[end - 1 : end], codes, request_id, step, eos_window_masked
+                )
                 if isinstance(stochastic_result, TalkerCodecSampleResult):
                     sampled = stochastic_result.sampled_token.reshape(()).to(torch.long)
                 else:
@@ -1088,6 +1089,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         history: torch.Tensor,
         request_id: str,
         step: int,
+        eos_window_masked: bool = False,
     ) -> TalkerCodecSampleResult:
         device_states = getattr(self, "_request_codec_device_states", None)
         if device_states is None:
@@ -1138,6 +1140,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             top_k=self._codec_top_k,
             top_p=self._codec_top_p,
             min_tokens_to_keep=3,
+            eos_window_masked=eos_window_masked,
         )
         probabilities = torch.softmax(logits, dim=-1)
         sampled = torch.multinomial(
@@ -1161,6 +1164,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         step: int,
         min_tokens: int,
         max_tokens: int,
+        eos_window_masked: bool = False,
     ) -> torch.Tensor:
         """Run the greedy codec boundary while keeping sampler state on device.
 
@@ -1205,6 +1209,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             penalty_tensor,
             top_k=self._codec_top_k,
             eos_token_id=self._codec_eos_id,
+            eos_window_masked=eos_window_masked,
         )
         device_states[request_id] = result.state
         # The kernel ABI is int32, while the existing connector/audio-code
