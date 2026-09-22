@@ -97,6 +97,7 @@ def pipeline_methods() -> type:
         "_resolve_action_layout",
         "_actions_for_frames",
         "_build_output",
+        "_commit_clean_chunk",
     }
     selected = [node for node in pipeline.body if isinstance(node, ast.FunctionDef) and node.name in methods]
     body.append(ast.ClassDef(name="Pipeline", bases=[], keywords=[], decorator_list=[], body=selected))
@@ -212,6 +213,45 @@ def test_latent_output_keeps_existing_path() -> None:
     assert output.shape == (1, 3, 16, 2, 2) and state.latents
     pipe._decode_live_latents.assert_not_called()
     pipe._decode_latents.assert_not_called()
+
+
+@pytest.mark.parametrize("frames", [5, 17, 21, 61])
+@pytest.mark.parametrize("prefix", [True, False])
+def test_batched_clean_commit_preserves_terminal_frame_and_action_slices(frames, prefix):
+    pipe, state = fake_pipeline(prefix=prefix)
+    pipe.clean_commit_mode = "batched"
+    pipe._set_mixed_precision_step = Mock()
+    pipe._reset_mixed_precision = Mock()
+    pipe.forward(request(frames))
+    committed = [call.kwargs["frame_idx"] for call in pipe._commit_clean_frame.call_args_list]
+    for call in pipe._transformer_forward.call_args_list:
+        if not call.kwargs.get("frame_causal"):
+            continue
+        count = call.args[1].shape[2]
+        start = call.kwargs["frame_start"]
+        committed.extend(range(start, start + count))
+        assert call.kwargs["condition_vision"] and call.kwargs["commit_current"]
+        assert call.kwargs["action_latents"].shape[1] == count * pipe.manifest.action_tokens_per_frame
+        assert call.kwargs["null_action_frame_indexes"] == tuple(range(count))
+    assert committed == list(range(state.next_frame_idx - 1))
+    assert pipe._set_mixed_precision_step.call_count == pipe._reset_mixed_precision.call_count
+
+
+def test_batched_clean_commit_resets_precision_on_failure():
+    pipe, _ = fake_pipeline()
+    pipe.clean_commit_mode = "batched"
+    pipe._set_mixed_precision_step = Mock()
+    pipe._reset_mixed_precision = Mock()
+
+    def forward(_state, latent, *_args, **kwargs):
+        if kwargs.get("frame_causal"):
+            raise RuntimeError("clean refresh failed")
+        return SimpleNamespace(video=latent)
+
+    pipe._transformer_forward.side_effect = forward
+    with pytest.raises(RuntimeError, match="clean refresh failed"):
+        pipe.forward(request(17))
+    pipe._reset_mixed_precision.assert_called_once()
 
 
 def test_full_video_keeps_guardrail_output_route() -> None:
