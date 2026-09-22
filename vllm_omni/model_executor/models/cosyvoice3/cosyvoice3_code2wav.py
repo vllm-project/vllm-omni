@@ -206,8 +206,14 @@ class CosyVoice3Code2Wav(nn.Module):
         token_lens: torch.Tensor | None = None,
         prompt_token_lens: torch.Tensor | None = None,
         prompt_feat_lens: torch.Tensor | None = None,
+        noise_offset_tokens: int | torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Generate mel features via the upstream flow-model inference path."""
+        """Generate mel features via the upstream flow-model inference path.
+
+        ``noise_offset_tokens`` is the absolute emitted-token index of the
+        first token in ``token`` (per row when batched); the flow turns it into
+        a mel offset so its fixed initial noise lines up with the stream.
+        """
         flow_weight = next(self.flow_model.parameters())
         device = flow_weight.device
         dtype = flow_weight.dtype
@@ -244,6 +250,7 @@ class CosyVoice3Code2Wav(nn.Module):
             streaming=streaming,
             finalize=finalize,
             n_timesteps=n_timesteps,
+            noise_offset=self._noise_offset_mel(noise_offset_tokens),
         )
 
         trim_mel = max(0, int(token_offset_tokens)) * int(self.token_mel_ratio)
@@ -332,6 +339,35 @@ class CosyVoice3Code2Wav(nn.Module):
         }
         return emitted_speech.reshape(emitted_speech.shape[0], 1, -1), new_state
 
+    def _noise_offset_mel(self, noise_offset_tokens: int | torch.Tensor | None):
+        if noise_offset_tokens is None:
+            return None
+        ratio = int(self.token_mel_ratio)
+        if isinstance(noise_offset_tokens, torch.Tensor):
+            return noise_offset_tokens.to(torch.long).clamp(min=0) * ratio
+        return max(0, int(noise_offset_tokens)) * ratio
+
+    def _stream_noise_offset(self, cache_state: dict | None, token_offset_tokens: int) -> int:
+        """Absolute index of the first resent token: emitted so far minus the left context."""
+        emitted = 0 if not cache_state else int(cache_state.get("flow_emitted_tokens", 0))
+        return max(0, emitted - max(0, int(token_offset_tokens)))
+
+    def _advance_stream_noise_offset(
+        self,
+        new_state: dict | None,
+        cache_state: dict | None,
+        token_len: int,
+        token_offset_tokens: int,
+        finalize: bool,
+    ) -> dict | None:
+        """Record how many tokens the stream has emitted after this chunk."""
+        if new_state is None:
+            return None
+        emitted = 0 if not cache_state else int(cache_state.get("flow_emitted_tokens", 0))
+        valid = int(token_len) - (0 if finalize else int(self.flow_model.pre_lookahead_len))
+        new_state["flow_emitted_tokens"] = emitted + max(0, valid - max(0, int(token_offset_tokens)))
+        return new_state
+
     @torch.inference_mode()
     def forward_streaming_batch(
         self,
@@ -413,6 +449,13 @@ class CosyVoice3Code2Wav(nn.Module):
             prompt_token_lens = torch.full((len(group),), prompt_tokens.shape[1], dtype=torch.int32)
             prompt_feat_lens = torch.full((len(group),), prompt_feats.shape[1], dtype=torch.int32)
             finalize = bool(group[0][1].get("finalize", False))
+            noise_offsets = torch.tensor(
+                [
+                    self._stream_noise_offset(item.get("cache_state"), int(item.get("token_offset_tokens", 0)))
+                    for _, item in group
+                ],
+                dtype=torch.long,
+            )
 
             with cosyvoice3_batch_flow_profile(f"cosyvoice3_flow_batch_b{len(group)}_t{tokens.shape[1]}"):
                 feat = self._forward_mel(
@@ -422,11 +465,15 @@ class CosyVoice3Code2Wav(nn.Module):
                     embedding=embeddings,
                     n_timesteps=n_timesteps,
                     token_offset_tokens=0,
-                    streaming=True,
+                    # Upstream's last streaming chunk runs the flow with its
+                    # default ``stream=False``: full bidirectional attention
+                    # over the (windowed) history, which keeps the tail intact.
+                    streaming=not finalize,
                     finalize=finalize,
                     token_lens=token_lens,
                     prompt_token_lens=prompt_token_lens,
                     prompt_feat_lens=prompt_feat_lens,
+                    noise_offset_tokens=noise_offsets,
                 )
 
             for row, (index, item) in enumerate(group):
@@ -438,11 +485,19 @@ class CosyVoice3Code2Wav(nn.Module):
                 row_feat = feat[row : row + 1, :, :valid_mel]
                 if trim_mel > 0:
                     row_feat = row_feat[:, :, trim_mel:]
-                results[index] = self._stream_hift_from_feat(
+                speech, new_state = self._stream_hift_from_feat(
                     row_feat,
                     cache_state=item.get("cache_state"),
                     finalize=finalize,
                 )
+                new_state = self._advance_stream_noise_offset(
+                    new_state,
+                    item.get("cache_state"),
+                    int(token_lens[row].item()),
+                    int(item.get("token_offset_tokens", 0)),
+                    finalize,
+                )
+                results[index] = (speech, new_state)
 
         assert all(result is not None for result in results), "every streaming item must produce exactly one result"
         return cast(list[tuple[torch.Tensor, dict[str, torch.Tensor] | None]], results)
@@ -475,10 +530,18 @@ class CosyVoice3Code2Wav(nn.Module):
             embedding=embedding,
             n_timesteps=n_timesteps,
             token_offset_tokens=token_offset_tokens,
-            streaming=True,
+            # Upstream's last streaming chunk runs the flow with its default
+            # ``stream=False``: full bidirectional attention over the
+            # (windowed) history, which keeps the tail intact.
+            streaming=not finalize,
             finalize=finalize,
+            noise_offset_tokens=self._stream_noise_offset(cache_state, token_offset_tokens),
         )
-        return self._stream_hift_from_feat(feat, cache_state=cache_state, finalize=finalize)
+        speech, new_state = self._stream_hift_from_feat(feat, cache_state=cache_state, finalize=finalize)
+        new_state = self._advance_stream_noise_offset(
+            new_state, cache_state, int(token.shape[1]), token_offset_tokens, finalize
+        )
+        return speech, new_state
 
     @torch.inference_mode()
     def forward(

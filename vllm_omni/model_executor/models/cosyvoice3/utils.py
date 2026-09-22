@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import logging
 from functools import cache, lru_cache
 
 import numpy as np
@@ -10,8 +9,6 @@ import torchaudio
 import torchaudio.compliance.kaldi as kaldi
 
 from vllm_omni.utils.audio import mel_filter_bank
-
-logger = logging.getLogger(__name__)
 
 
 def dynamic_range_compression_torch(x, c=1, clip_val=1e-5):
@@ -273,3 +270,105 @@ def make_pad_mask(lengths: torch.Tensor, max_len: int = 0) -> torch.Tensor:
     seq_length_expand = lengths.unsqueeze(-1)
     mask = seq_range_expand >= seq_length_expand
     return mask
+
+
+def subsequent_chunk_mask(
+    size: int,
+    chunk_size: int,
+    num_left_chunks: int = -1,
+    device: torch.device = torch.device("cpu"),
+) -> torch.Tensor:
+    """Create chunk-wise causal mask ``(size, size)`` for streaming DiT/encoder.
+
+    ``True`` means the query position may attend to that key position.
+
+    Example (size=4, chunk_size=2)::
+
+        [[1, 1, 0, 0],
+         [1, 1, 0, 0],
+         [1, 1, 1, 1],
+         [1, 1, 1, 1]]
+    """
+    del num_left_chunks  # CosyVoice ONNX-friendly impl does not use left-chunk limit.
+    pos_idx = torch.arange(size, device=device)
+    block_value = (torch.div(pos_idx, chunk_size, rounding_mode="trunc") + 1) * chunk_size
+    return pos_idx.unsqueeze(0) < block_value.unsqueeze(1)
+
+
+def add_optional_chunk_mask(
+    xs: torch.Tensor,
+    masks: torch.Tensor,
+    use_dynamic_chunk: bool,
+    use_dynamic_left_chunk: bool,
+    decoding_chunk_size: int,
+    static_chunk_size: int,
+    num_decoding_left_chunks: int,
+    enable_full_context: bool = True,
+) -> torch.Tensor:
+    """Apply optional chunk / pad mask for CosyVoice DiT attention.
+
+    Inference path used by CosyVoice3 DiT:
+
+    - ``streaming=True`` → ``static_chunk_size > 0`` chunk mask
+    - ``streaming=False`` → ``static_chunk_size=0`` → pad mask only
+    """
+    del use_dynamic_left_chunk  # unused on CosyVoice3 DiT inference path
+    if use_dynamic_chunk:
+        max_len = xs.size(1)
+        if decoding_chunk_size < 0:
+            chunk_size = max_len
+            num_left_chunks = -1
+        elif decoding_chunk_size > 0:
+            chunk_size = decoding_chunk_size
+            num_left_chunks = num_decoding_left_chunks
+        else:
+            chunk_size = torch.randint(1, max_len, (1,)).item()
+            num_left_chunks = -1
+            if chunk_size > max_len // 2 and enable_full_context:
+                chunk_size = max_len
+            else:
+                chunk_size = chunk_size % 25 + 1
+        chunk_masks = subsequent_chunk_mask(xs.size(1), chunk_size, num_left_chunks, xs.device)
+        chunk_masks = chunk_masks.unsqueeze(0)
+        chunk_masks = masks & chunk_masks
+    elif static_chunk_size > 0:
+        chunk_masks = subsequent_chunk_mask(xs.size(1), static_chunk_size, num_decoding_left_chunks, xs.device)
+        chunk_masks = chunk_masks.unsqueeze(0)
+        chunk_masks = masks & chunk_masks
+    else:
+        chunk_masks = masks
+    assert chunk_masks.dtype == torch.bool
+    # ``any`` rather than ``sum``: summing a bool tensor first copies it to
+    # int64, eight bytes per element of a batch-by-frames-squared map.
+    empty_rows = ~chunk_masks.any(dim=-1, keepdim=True)
+    chunk_masks = torch.where(empty_rows, torch.ones_like(chunk_masks), chunk_masks)
+    return chunk_masks
+
+
+def build_dit_attention_mask(pad_mask: torch.Tensor, *, streaming: bool, static_chunk_size: int) -> torch.Tensor:
+    """The DiT's full query-key attention mask, ``(B, 1, T, T)`` bool.
+
+    Upstream CosyVoice3 (``cosyvoice/flow/DiT/dit.py``) builds this inside the
+    DiT from the ``streaming`` flag: chunk-causal blocks of ``static_chunk_size``
+    mel frames (a frame attends to everything up to the end of its own block,
+    all earlier blocks, and nothing after) when streaming, the padding mask
+    alone otherwise. It is factored out so the TensorRT estimator, whose
+    attention is frozen at export time, can receive the same mask as an
+    engine input.
+
+    ``pad_mask`` is ``(B, 1, T)`` or ``(B, T)``; ``True`` marks a valid frame.
+    """
+    if pad_mask.dim() == 2:
+        pad_mask = pad_mask.unsqueeze(1)
+    if pad_mask.dim() != 3:
+        raise ValueError(f"pad_mask must be (B, 1, T) or (B, T), got {tuple(pad_mask.shape)}")
+    masks = pad_mask.bool()
+    size = int(masks.shape[-1])
+    if streaming and static_chunk_size > 0:
+        chunk = subsequent_chunk_mask(size, int(static_chunk_size), -1, masks.device).unsqueeze(0)
+        full = masks & chunk
+    else:
+        full = masks.expand(masks.shape[0], size, size)
+    empty_rows = ~full.any(dim=-1, keepdim=True)
+    full = torch.where(empty_rows, torch.ones_like(full), full)
+    return full.unsqueeze(1)

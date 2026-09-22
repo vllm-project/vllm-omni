@@ -13,16 +13,25 @@
 #     dynamic conv shapes).
 #
 # Streaming continuity is GPU-class sensitive — TUNE PER GPU.
-#   The defaults below (max_num_seqs: 8, codec_chunk_frames: 15) are tuned for
+#   The defaults below (max_num_seqs: 8, codec_chunk_frames: 25) are tuned for
 #   H100, where streaming continuity at concurrency 4 stays ~100%. They push
 #   more audio per scheduler step through the SharedMemoryConnector than a
 #   slower GPU can keep up with: on H20-3e the same config regressed continuity
 #   to ~78% at c=4 (vs ~86% with smaller batch/chunk), because code2wav can't
 #   produce mel chunks fast enough to feed the streaming output → buffer
 #   underruns → audible gaps.
-#   On a slower GPU class, lower max_num_seqs (e.g. 4) and/or codec_chunk_frames
-#   first. Raising connector_get_sleep_s also relaxes the consumer's polling
-#   cadence, but trades against TTFP — keep it as a last resort.
+#   On a slower GPU class, lower max_num_seqs (e.g. 4) first. Raising
+#   connector_get_sleep_s also relaxes the consumer's polling cadence, but
+#   trades against TTFP — keep it as a last resort.
+#
+# Chunk sizes are multiples of 25 tokens on purpose. The flow's streaming
+#   attention is chunk-causal in 50-mel-frame (25-token) blocks, exactly as
+#   upstream CosyVoice3 runs it (its token_hop_len "must match training
+#   static_chunk_size"); with the prompt padded up to a hop multiple every hop
+#   boundary is a block boundary, so the frames a chunk re-computes match the
+#   ones already played. A hop of 15 would cut blocks in half and put an
+#   audible seam at every boundary. The price is TTFA: the first chunk waits
+#   for 25 + 3 tokens instead of 15 + 3, about 0.4 s of audio at 25 Hz.
 pipeline: cosyvoice3
 async_chunk: true
 connectors:
@@ -33,7 +42,7 @@ connectors:
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
-      codec_chunk_frames: 15
+      codec_chunk_frames: 25
       codec_left_context_frames: 25
       codec_vocab_size: 6561
 
