@@ -343,6 +343,10 @@ class BaseScheduler(ABC):
     def num_running_requests(self) -> int:
         return len(self._running)
 
+    def pending_finished_request_ids(self) -> set[str]:
+        """Finished requests whose state the engine has not consumed yet."""
+        return {request_id for request_id in self._finished_req_ids if request_id in self._request_states}
+
     def get_admission_wait_decision(
         self,
         *,

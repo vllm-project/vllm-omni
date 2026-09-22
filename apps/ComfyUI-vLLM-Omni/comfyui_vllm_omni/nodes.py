@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import math
 from typing import Literal
 
 import torch
 from comfy_api.input import AudioInput, VideoInput
 
 from .utils.api_client import VLLMOmniClient
+from .utils.latent_mask import _align_frame_count, _video_latent_t
 from .utils.logger import get_logger
 from .utils.models import lookup_model_spec
 from .utils.types import (
@@ -17,6 +19,7 @@ from .utils.types import (
     AutoregressionSamplingParams,
     DiffusionSamplingParams,
     FastH3Deployment,
+    LatentMaskEditing,
     MiniMaxH3ModelSpecificParams,
     QwenTTSModelSpecificParams,
     VideoReferences,
@@ -210,6 +213,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
                 "lora": ("REMOTE_LORA",),
                 "model_params": ("VIDEO_PARAMS",),
                 "fast_h3": ("FASTH3_DEPLOYMENT",),
+                "latent_edit": ("LATENT_MASK_EDITING",),
             },
         }
 
@@ -262,6 +266,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         model_params: dict | None = None,
         lora: dict | None = None,
         fast_h3: dict | None = None,
+        latent_edit: dict | None = None,
         **kwargs,
     ):
         if kwargs:
@@ -350,6 +355,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
             sampling_params=sampling_params,
             lora=lora,
             model_params=model_params,
+            latent_edit=latent_edit,
         )
         return (output,)
 
@@ -1051,3 +1057,89 @@ class VLLMOmniVideoReferences:
                 if value is not None:
                     refs[f"{kind}_{index}"] = value
         return (refs,)
+
+
+class VLLMOmniLatentMaskEditing:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {},
+            "optional": {
+                "source_video": ("VIDEO",),
+                "source_audio": ("AUDIO",),
+                "video_mask": ("MASK",),
+                "audio_mask": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 1.0, "step": 0.01}),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT_MASK_EDITING",)
+    RETURN_NAMES = ("latent_edit",)
+    FUNCTION = "get_latent_edit"
+    CATEGORY = "vLLM-Omni"
+
+    def get_latent_edit(
+        self,
+        source_video: VideoInput | None = None,
+        source_audio: AudioInput | None = None,
+        video_mask: torch.Tensor | None = None,
+        audio_mask: float = -1.0,
+        **kwargs,
+    ):
+        if kwargs:
+            logger.info("Uncaught kwargs: %s", kwargs)
+        edit = LatentMaskEditing()
+        if source_video is not None:
+            edit["source_video"] = source_video
+        if source_audio is not None:
+            edit["source_audio"] = source_audio
+        if video_mask is not None:
+            edit["video_mask"] = video_mask
+        if audio_mask >= 0.0:
+            edit["audio_mask"] = audio_mask
+        return (edit,)
+
+
+class VLLMOmniMiniMaxH3TemporalMask:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "source_fps": ("FLOAT", {"default": 24.0, "min": 0.01}),
+                "duration": ("FLOAT", {"default": 5.0, "min": 0.01, "max": 15.0}),
+                "mode": (["continuation", "extension"],),
+                "preserve_fraction": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0}),
+            }
+        }
+
+    RETURN_TYPES = ("MASK", "FLOAT", "IMAGE", "MASK")
+    RETURN_NAMES = ("mask", "preview_fps", "preview_images", "preview_mask")
+    FUNCTION = "build"
+    CATEGORY = "vLLM-Omni"
+
+    def build(self, images, source_fps, duration, mode, preserve_fraction=0.5):
+        if images.shape[0] <= 0 or not math.isfinite(source_fps) or source_fps <= 0:
+            raise ValueError("Source must contain frames and have a positive finite FPS.")
+        if not math.isfinite(duration) or duration <= 0 or not 0 <= preserve_fraction <= 1:
+            raise ValueError("Invalid duration or preserve_fraction.")
+        frames = _align_frame_count(max(1, round(duration * 24)))
+        source_seconds = images.shape[0] / source_fps
+        if mode == "extension":
+            if frames / 24 <= source_seconds:
+                raise ValueError("Extension output must be longer than the source; increase duration.")
+            boundary = source_seconds
+        elif mode == "continuation":
+            boundary = min(source_seconds, frames / 24) * preserve_fraction
+        else:
+            raise ValueError(f"Unknown temporal mask mode: {mode}")
+        available = min(frames, math.floor(boundary * 24 + 1e-8))
+        prefix = 0 if available < 5 else 5 + 17 * ((available - 5) // 17)
+        preserved = _video_latent_t(prefix) if prefix else 0
+        total = _video_latent_t(frames)
+        mask = torch.ones(total, 1, 1)
+        mask[:preserved] = 0
+        indices = torch.arange(frames, device=images.device)
+        source_indices = (indices * (source_fps / 24)).floor().long().clamp(max=images.shape[0] - 1)
+        preview_images = images.index_select(0, source_indices)
+        preview_mask = mask.index_select(0, torch.arange(frames) * total // frames)
+        return mask, 24.0, preview_images, preview_mask

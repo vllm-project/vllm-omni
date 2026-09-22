@@ -134,6 +134,8 @@ def _install_vllm_stubs() -> None:
             **kwargs,
         ) -> None:
             super().__init__()
+            self.quant_config = kwargs.pop("quant_config", None)
+            self.prefix = kwargs.pop("prefix", "")
             del kwargs
             self.return_bias = return_bias
             self.weight = nn.Parameter(torch.empty(output_size, input_size))
@@ -164,6 +166,8 @@ def _install_vllm_stubs() -> None:
             **kwargs,
         ) -> None:
             super().__init__()
+            self.quant_config = kwargs.pop("quant_config", None)
+            self.prefix = kwargs.pop("prefix", "")
             del kwargs
             self.num_heads = total_num_heads
             self.num_kv_heads = total_num_kv_heads or total_num_heads

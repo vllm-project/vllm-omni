@@ -8,6 +8,7 @@ import struct
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -1345,6 +1346,16 @@ class OmniKVTransferManager:
         except Exception:
             logger.exception("KV load failed for %s; falling back to sync receive", request_id)
             return None, 0
+
+    def wait_prefetch(self, timeout: float | None = None) -> bool:
+        """Block until no background prefetch is running; payloads stay consumable.
+
+        Returns False if a prefetch is still in flight when ``timeout`` expires.
+        """
+        futures = list(self._prefetch_futures.values())
+        if not futures:
+            return True
+        return not wait_futures(futures, timeout=timeout).not_done
 
     def _discard_future(self, request_id: str) -> None:
         """Cancel an unstarted prefetch or attach a callback to drop a running one."""

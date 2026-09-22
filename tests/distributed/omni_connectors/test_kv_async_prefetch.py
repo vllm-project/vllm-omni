@@ -5,6 +5,7 @@ mock connector, dedup, per-call sender_info isolation, role classification, and
 miss/abort paths.  GPU H2D and D2D paths need CUDA (integration tests).
 """
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -373,3 +374,41 @@ def test_consume_then_apply_attaches_payload():
     receiver._record_stream_for_prefetched(data)
     receiver.apply_kv_cache_to_request(req, data)
     assert req.past_key_values is not None
+
+
+# --------------------------------------------------------------------------- #
+#  wait_prefetch: the pause barrier's view of outstanding background loads
+# --------------------------------------------------------------------------- #
+
+
+def test_wait_prefetch_is_true_when_nothing_outstanding():
+    _, receiver, _ = _make_sender_receiver()
+    assert receiver.wait_prefetch(timeout=0.01) is True
+
+
+def test_wait_prefetch_is_true_when_prefetch_disabled():
+    _, receiver, _ = _make_sender_receiver(async_prefetch=False)
+    assert receiver.wait_prefetch(timeout=0.01) is True
+
+
+def test_wait_prefetch_reports_a_running_prefetch_and_keeps_its_payload():
+    sender, receiver, connector = _make_sender_receiver()
+    _seed_payload(sender, "rid-w")
+    gate = threading.Event()
+    real_get = connector.get
+
+    def slow_get(*args, **kwargs):
+        gate.wait(timeout=5.0)
+        return real_get(*args, **kwargs)
+
+    connector.get = slow_get
+    receiver.start_prefetch({"request_id": "rid-w", "kv_sender_info": _SENDER_INFO})
+    try:
+        assert receiver.wait_prefetch(timeout=0.05) is False
+        gate.set()
+        assert receiver.wait_prefetch(timeout=5.0) is True
+        data, _ = receiver.consume_prefetched_kv(_req("rid-w"))
+        assert data is not None
+    finally:
+        gate.set()
+        receiver.shutdown_prefetch()

@@ -26,6 +26,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
+from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import install_wan_spatial_shard_decode
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.modality_handlers.camera import CameraSession
@@ -91,6 +92,10 @@ logger = init_logger(__name__)
 # scaling, and at 832x480 in bf16 this yields the 1801 MiB the decoder was
 # measured to hold.
 _STREAMING_DECODE_BYTES_PER_PIXEL_FP32 = 37832 * 1024 / (64 * 64)
+
+# The frame dimension the decoder is sharded along when the pipeline runs on
+# more than one Ulysses rank; see ``_install_sharded_vae_decode``.
+_VAE_SHARD_SPLIT_DIM = "width"
 
 if TYPE_CHECKING:
     from tqdm.std import tqdm as TqdmProgressBar
@@ -236,8 +241,6 @@ def _validate_scheduler_config(config: dict[str, Any]) -> None:
 
 
 def _validate_parallel_config(od_config: OmniDiffusionConfig) -> None:
-    if getattr(od_config, "quantization_config", None) is not None:
-        raise NotImplementedError("LingBot World v1 does not support quantization.")
     parallel_config = getattr(od_config, "parallel_config", None)
     if parallel_config is None:
         return
@@ -580,7 +583,13 @@ class LingBotWorldCausalDMDPipeline(
         super().__init__()
         del prefix
         _validate_parallel_config(od_config)
+        parallel_config = getattr(od_config, "parallel_config", None)
         self.od_config = od_config
+        model_config = getattr(od_config, "model_config", None) or {}
+        reuse_last_step_kv = model_config.get("lingbot_reuse_last_step_kv", False)
+        if not isinstance(reuse_last_step_kv, bool):
+            raise ValueError("model_config.lingbot_reuse_last_step_kv must be a bool.")
+        self._reuse_last_step_kv = reuse_last_step_kv
         self.device = get_local_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model = od_config.model
@@ -666,7 +675,6 @@ class LingBotWorldCausalDMDPipeline(
 
         self.vae_scale_factor_temporal = int(getattr(self.vae.config, "scale_factor_temporal", 4))
         self.vae_scale_factor_spatial = int(getattr(self.vae.config, "scale_factor_spatial", 8))
-        model_config = getattr(od_config, "model_config", None) or {}
         self._ar_height = int(model_config.get("ar_diffusion_height", 480))
         self._ar_width = int(model_config.get("ar_diffusion_width", 832))
         self._ar_diffusion_kv_state: ARDiffusionKVState | None = None
@@ -679,6 +687,14 @@ class LingBotWorldCausalDMDPipeline(
         self._streaming_decode_states: dict[str, StreamingDecodeState] = {}
         self._cached_streaming_decoder: WanStreamingDecoder | None = None
         self._streaming_decode_unsupported = False
+        self._vae_shard_split_dim: str | None = None
+        self._vae_shard_world_size = 1
+        vae_sharding = model_config.get("lingbot_vae_spatial_sharding", True)
+        if not isinstance(vae_sharding, bool):
+            raise ValueError("lingbot_vae_spatial_sharding must be a boolean.")
+        sequence_parallel_size = int(getattr(parallel_config, "sequence_parallel_size", 1) or 1)
+        if sequence_parallel_size > 1 and vae_sharding:
+            self._install_sharded_vae_decode(sequence_parallel_size)
         self.setup_diffusion_pipeline_profiler(
             profiler_targets=[
                 "vae.encode",
@@ -799,9 +815,24 @@ class LingBotWorldCausalDMDPipeline(
         decoder = self._streaming_decoder()
         if decoder is None:
             return 0
+        height, width = self._ar_height, self._ar_width
+        if self._vae_shard_split_dim is not None:
+            # The decoder pads the latent extent to a multiple of the group
+            # size before splitting. Account for that padding on every rank,
+            # including ranks whose final pixels are trimmed after gathering.
+            scale = self.vae_scale_factor_spatial
+            extent = width if self._vae_shard_split_dim == "width" else height
+            latent_extent = (extent + scale - 1) // scale
+            local_extent = (latent_extent + self._vae_shard_world_size - 1) // self._vae_shard_world_size
+            if self._vae_shard_split_dim == "width":
+                width = local_extent * scale
+            else:
+                height = local_extent * scale
+            # Temporal caches retain local inputs, before spatial halo exchange.
+            # Halo receive buffers belong to the decoder, not to each session.
         return decoder.declared_state_bytes(
-            height=self._ar_height,
-            width=self._ar_width,
+            height=height,
+            width=width,
             dtype=self.vae.dtype,
         )
 
@@ -1337,6 +1368,7 @@ class LingBotWorldCausalDMDPipeline(
                 self.transformer,
                 device=self.device,
                 enforce_eager=bool(self.od_config.enforce_eager),
+                reuse_last_step_kv=self._reuse_last_step_kv,
             )
             self._dmd_block_runner = runner
         return runner
@@ -1653,6 +1685,51 @@ class LingBotWorldCausalDMDPipeline(
         tile_latent_min_height = int(getattr(self.vae, "tile_sample_min_height", None) or 0) // compression
         tile_latent_min_width = int(getattr(self.vae, "tile_sample_min_width", None) or 0) // compression
         return bool(latents.shape[-2] > tile_latent_min_height or latents.shape[-1] > tile_latent_min_width)
+
+    def _vae_shard_group(self) -> tuple[Any, int]:
+        """The Ulysses ranks the decoder is sharded across, and how many there are."""
+        from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+
+        group = get_sp_group().device_group
+        return group, torch.distributed.get_world_size(group=group)
+
+    def _install_sharded_vae_decode(self, sequence_parallel_size: int) -> None:
+        """Shard the Wan decoder across the Ulysses ranks along the width.
+
+        The DiT runs on ``sequence_parallel_size`` ranks, and the decode of
+        one AR block used to run on every one of them in full: each rank
+        decoded the whole frame so that its own ``post_decode`` could carry
+        on. Splitting the frame across those same ranks with halo exchange at
+        the convolution borders makes each decode a quarter of the work at
+        four ranks; every rank still ends the block with the assembled frame
+        because the gather is an all-gather, so nothing downstream changes.
+        The streaming decoder is unaffected: ``feat_cache``, ``feat_idx`` and
+        ``first_chunk`` pass straight through to the patched decoder, and the
+        per-session temporal cache shrinks by the same factor.
+
+        This is the default for multi-rank deployments; setting
+        ``model_config.lingbot_vae_spatial_sharding=False`` keeps full-frame
+        decode on each rank without changing DiT parallelism.
+        ``vae_patch_parallel_size`` stays rejected because it would make the
+        registry set up the tiled distributed executor and force
+        tiling on a decoder that is already sharded. Width rather than height
+        because at 480x832 it is the longer side, so each rank keeps a
+        208-pixel shard against the same halo, and it is the split this was
+        measured on: 269.9 -> 98.7 ms per block on 4xH200. Numerically it is
+        not bit-exact against a single-rank decode: the halo-exchanged
+        convolutions accumulate in a different order at the shard borders
+        (max abs diff 0.0195 on [-1, 1] at 480x832).
+        """
+        group, world_size = self._vae_shard_group()
+        if world_size != sequence_parallel_size:
+            raise RuntimeError(
+                f"LingBot World sequence_parallel_size={sequence_parallel_size} but the Ulysses group has "
+                f"{world_size} ranks."
+            )
+        install_wan_spatial_shard_decode(self.vae, group, split_dim=_VAE_SHARD_SPLIT_DIM, dst=None)
+        self._vae_shard_split_dim = _VAE_SHARD_SPLIT_DIM
+        self._vae_shard_world_size = world_size
+        logger.info("LingBot World VAE decode sharded along %s across %d ranks.", _VAE_SHARD_SPLIT_DIM, world_size)
 
     def _streaming_decoder(self) -> WanStreamingDecoder | None:
         """The session-owned streaming decoder, or ``None`` on a VAE that cannot stream.
