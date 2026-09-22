@@ -59,8 +59,9 @@ def merge_conditioning(caches: list[dict], counts: list[int], image_tokens: int)
     """Pad each CFG prefix independently, preserving each image's 3-D positions.
 
     Dense storage is [sum(counts), Hkv, max_prefix, D]. Padding is masked out
-    before softmax; the following image tokens remain bidirectional. No AR
-    context or scheduler row is consumed here.
+    by a 2-D boolean key mask that compatible native backends can unpad into a
+    varlen attention call; the following image tokens remain bidirectional. No
+    AR context or scheduler row is consumed here.
     """
     merged = {}
     for branch in ("cond", "uncond", "img_cond"):
@@ -84,10 +85,10 @@ def merge_conditioning(caches: list[dict], counts: list[int], image_tokens: int)
             kv.update(keys, values, layer_idx)
         mask = None
         if len(set(lengths)) > 1:
-            mask = keys.new_zeros(total, 1, 1, max_len + image_tokens)
+            mask = torch.ones(total, max_len + image_tokens, dtype=torch.bool, device=keys.device)
             start = 0
             for count, length in zip(counts, lengths, strict=True):
-                mask[start : start + count, :, :, length:max_len] = float("-inf")
+                mask[start : start + count, length:max_len] = False
                 start += count
         merged[branch] = kv
         merged[f"mask_{branch}"] = {"full_attention": mask}

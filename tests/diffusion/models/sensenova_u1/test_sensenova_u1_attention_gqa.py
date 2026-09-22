@@ -15,6 +15,7 @@ import torch
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend, FlashAttentionImpl
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.models.sensenova_u1.sensenova_u1_transformer import (
     SenseNovaU1Attention,
@@ -44,7 +45,15 @@ class _Router:
         self.native = _Recorder()
         self.fallback = _Recorder()
         self.sdpa_fallback = type("Fallback", (), {"forward": self.fallback})()
-        self.attn_backend = type("Backend", (), {"supports_piecewise_spans": True})()
+        self.attn_backend = type(
+            "Backend",
+            (),
+            {
+                "supports_piecewise_spans": True,
+                "supports_attention_mask": classmethod(lambda cls, attention_spec=None: True),
+            },
+        )()
+        self.attn_spec = None
 
     @property
     def calls(self):
@@ -61,6 +70,7 @@ class _AttnHost:
     _align_mask_dtype = staticmethod(SenseNovaU1Attention._align_mask_dtype)
     _plain_causal_spans = staticmethod(SenseNovaU1Attention._plain_causal_spans)
     _attn_metadata = SenseNovaU1Attention._attn_metadata
+    _native_padding_mask_supported = SenseNovaU1Attention._native_padding_mask_supported
     _run_attn = SenseNovaU1Attention._run_attn
     _run_attn_bshd = SenseNovaU1Attention._run_attn_bshd
 
@@ -112,6 +122,68 @@ def test_mixed_block_causal_mask_keeps_sdpa_fallback():
     assert metadata is not None
     assert metadata.attn_mask is mixed
     assert metadata.full_attn_spans is None
+
+
+def test_bool_key_padding_mask_uses_native_backend():
+    host = _AttnHost()
+    q = torch.randn(2, 3, N_HEADS, HEAD_DIM)
+    k = torch.randn(2, 7, N_KV_HEADS, HEAD_DIM)
+    mask = torch.tensor(
+        [
+            [True, True, False, False, True, True, True],
+            [True, True, True, True, True, True, True],
+        ]
+    )
+    host._run_attn_bshd(q, k, k.clone(), mask)
+    assert len(host.attn.native.calls) == 1
+    assert not host.attn.fallback.calls
+    metadata = host.attn.native.calls[-1][2]
+    assert metadata is not None
+    assert metadata.attn_mask is mask
+
+
+def test_bool_key_padding_mask_reaches_flash_varlen(monkeypatch):
+    from vllm_omni.diffusion.attention.backends.utils import fa
+
+    calls = []
+
+    def fake_varlen(q, k, v, **kwargs):
+        calls.append((q.shape, k.shape, kwargs))
+        return torch.zeros_like(q)
+
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen)
+
+    host = _AttnHost()
+    impl = FlashAttentionImpl(
+        num_heads=N_HEADS,
+        head_size=HEAD_DIM,
+        softmax_scale=HEAD_DIM**-0.5,
+        num_kv_heads=N_KV_HEADS,
+    )
+    host.attn.native = impl.forward_cuda
+    host.attn.attn_backend = FlashAttentionBackend
+
+    q = torch.randn(2, 3, N_HEADS, HEAD_DIM)
+    k = torch.randn(2, 7, N_KV_HEADS, HEAD_DIM)
+    mask = torch.tensor(
+        [
+            [True, True, False, False, True, True, True],
+            [True, True, True, True, True, True, True],
+        ]
+    )
+    output = host._run_attn_bshd(q, k, k.clone(), mask)
+
+    assert output.shape == q.shape
+    assert not host.attn.fallback.calls
+    assert len(calls) == 1
+    q_shape, k_shape, kwargs = calls[0]
+    assert q_shape == (6, N_HEADS, HEAD_DIM)
+    assert k_shape == (12, N_KV_HEADS, HEAD_DIM)
+    assert kwargs["cu_seqlens_q"].tolist() == [0, 3, 6]
+    assert kwargs["cu_seqlens_k"].tolist() == [0, 5, 12]
+    assert kwargs["max_seqlen_q"] == 3
+    assert kwargs["max_seqlen_k"] == 7
 
 
 def test_compressed_kv_computes_what_expansion_computed():

@@ -60,13 +60,16 @@ def test_padded_attention_matches_independent_requests(lengths, branches):
     for branch in branches:
         mask = merged[f"mask_{branch}"]["full_attention"]
         assert (mask is None) == (lengths[0] == lengths[1])
+        if mask is not None:
+            assert mask.dtype == torch.bool
+            assert mask.shape == (4, max(lengths) + 3)
         for layer_idx in range(2):
             layer = merged[branch].layers[layer_idx]
             actual = F.scaled_dot_product_attention(
                 query,
                 torch.cat([layer.keys, image_k], dim=2),
                 torch.cat([layer.values, image_v], dim=2),
-                attn_mask=mask,
+                attn_mask=None if mask is None else mask[:, None, None, :],
             )
             expected = []
             for i, prefix in enumerate(prefixes):

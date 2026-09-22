@@ -379,6 +379,26 @@ class SenseNovaU1Attention(nn.Module):
             return AttentionMetadata(full_attn_spans=spans)
         return AttentionMetadata(attn_mask=attention_mask)
 
+    def _native_padding_mask_supported(
+        self,
+        attention_mask: torch.Tensor | None,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> bool:
+        """Whether the selected backend can consume a key-padding mask.
+
+        A 2-D boolean mask is the shared backend contract for varlen padding.
+        Keep arbitrary additive and structural masks on SenseNova's explicit
+        SDPA fallback; they cannot be reduced to independent ragged rows.
+        """
+        return bool(
+            attention_mask is not None
+            and attention_mask.dtype == torch.bool
+            and attention_mask.ndim == 2
+            and attention_mask.shape == (query.shape[0], key.shape[1])
+            and self.attn.attn_backend.supports_attention_mask(getattr(self.attn, "attn_spec", None))
+        )
+
     def _run_attn(
         self,
         query_bhsd: torch.Tensor,
@@ -392,7 +412,11 @@ class SenseNovaU1Attention(nn.Module):
         v = value_bhsd.transpose(1, 2).contiguous()
         attention_mask = self._align_mask_dtype(attention_mask, q)
         attn_metadata = self._attn_metadata(attention_mask, q, k)
-        if attn_metadata is not None and attn_metadata.attn_mask is not None:
+        if (
+            attn_metadata is not None
+            and attn_metadata.attn_mask is not None
+            and not self._native_padding_mask_supported(attn_metadata.attn_mask, q, k)
+        ):
             return self.attn.sdpa_fallback.forward(q, k, v, attn_metadata)
         return self.attn(q, k, v, attn_metadata)
 
@@ -406,7 +430,11 @@ class SenseNovaU1Attention(nn.Module):
         """Run unified attention with [B, S, H, D] inputs. Returns [B, S, H, D]."""
         attention_mask = self._align_mask_dtype(attention_mask, query_bshd)
         attn_metadata = self._attn_metadata(attention_mask, query_bshd, key_bshd)
-        if attn_metadata is not None and attn_metadata.attn_mask is not None:
+        if (
+            attn_metadata is not None
+            and attn_metadata.attn_mask is not None
+            and not self._native_padding_mask_supported(attn_metadata.attn_mask, query_bshd, key_bshd)
+        ):
             return self.attn.sdpa_fallback.forward(query_bshd, key_bshd, value_bshd, attn_metadata)
         return self.attn(query_bshd, key_bshd, value_bshd, attn_metadata)
 
