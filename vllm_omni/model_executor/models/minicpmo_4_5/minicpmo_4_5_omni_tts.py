@@ -745,6 +745,20 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 request_states = {}
                 self._request_audio_states = request_states
             request_states[request_id] = state
+            if native_duplex:
+                # A new duplex condition starts a fresh codec segment: drop the
+                # sampler's device-side caches for this request so the next
+                # decode rebuilds them from this condition's state (step, EOS
+                # floor, limits) instead of resuming the previous segment's.
+                # The repetition-penalty window is carried through the state
+                # and ``codes`` above, so only the counters and the cached
+                # input tensors reset.
+                codec_states = getattr(self, "_request_codec_device_states", None)
+                if isinstance(codec_states, dict):
+                    codec_states.pop(request_id, None)
+                codec_inputs = getattr(self, "_request_codec_device_inputs", None)
+                if isinstance(codec_inputs, dict):
+                    codec_inputs.pop(request_id, None)
             empty_codes = torch.empty(0, dtype=torch.long, device=embeds.device)
             return (
                 input_ids,
