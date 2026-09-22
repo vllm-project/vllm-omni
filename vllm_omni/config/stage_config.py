@@ -779,6 +779,11 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
     return merged
 
 
+# Same TND ceiling as stage 0: at most 16 query positions per sequence.
+# Consumed by minicpmo_4_5_omni_tts._parse_k_step_frames as the hard cap on
+# the K-step frame count accepted from the deploy YAML.
+_MINICPMO_TALKER_FRAMES_MAX = 16
+
 # Stage 1's multi-frame decode is configured through its ``speculative_config``
 # in the deploy YAML. The parse records whether it is armed here, because the
 # reader (``ascend_warmup_patch._kstep_armed``) can run in a spawned stage

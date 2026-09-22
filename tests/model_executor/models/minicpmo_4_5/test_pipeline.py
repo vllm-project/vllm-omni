@@ -29,7 +29,11 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import (
+    _CODEC_EOS_TOKEN_ID,
+)
 from vllm_omni.model_executor.models.registry import _OMNI_MODELS
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -106,12 +110,14 @@ class TestPipelineTopology:
         assert talker.engine_output_type == "latent"
         # scope KV cache / mrope sizing to talker sub-config
         assert talker.hf_config_name == "tts_config"
+        # The multi-frame head collapses the vLLM-level head to the two-wide
+        # continue/stop row, whose only stop id is 1. It is an NPU-worker
+        # feature (that is where the continue drafts are injected), so on any
+        # other platform stage 1 keeps its full codec head and the codec EOS.
+        expected_stop = [1] if (current_omni_platform.device_name or "").lower() == "npu" else [_CODEC_EOS_TOKEN_ID]
         assert talker.sampling_constraints == {
             "detokenize": False,
-            # The multi-frame head: stage 1's deploy config carries the
-            # speculative_config that collapses the vLLM-level head to the
-            # two-wide continue/stop row, whose only stop id is 1.
-            "stop_token_ids": [1],
+            "stop_token_ids": expected_stop,
         }
         assert talker.custom_process_next_stage_input_func == (
             "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_full_payload"
@@ -177,9 +183,10 @@ class TestDeployTopology:
         assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(expected_processor)
         assert "hf_overrides" not in stages[1].yaml_engine_args
         if filename == "minicpmo_4_5.yaml":
-            # All three stages cap out at 8 so the top tier is not gated by a
-            # single stage.
-            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [8, 8, 8]
+            # The NPU overlay caps all three stages at 8 so the top tier is not
+            # gated by a single stage; every other platform keeps the base 4.
+            expected_seqs = 8 if (current_omni_platform.device_name or "").lower() == "npu" else 4
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [expected_seqs] * 3
             memory_utilizations = [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages]
             assert memory_utilizations == [
                 0.55,
