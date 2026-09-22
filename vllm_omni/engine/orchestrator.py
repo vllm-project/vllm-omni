@@ -59,7 +59,11 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
-from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
+from vllm_omni.errors import (
+    DEFAULT_CLIENT_ERROR_TYPE,
+    MULTIMODAL_CACHE_MISS_ERROR_TYPE,
+    OmniClientError,
+)
 from vllm_omni.metrics import definitions as metric_defs
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
@@ -639,8 +643,16 @@ class OrchestratorBase:
         if not request_ids:
             return []
         abort_outputs: list[OutputMessage] = []
+        first_error: Exception | None = None
         for pool in self.stage_pools:
-            stage_outputs = await pool.abort_requests(request_ids) or []
+            try:
+                stage_outputs = await pool.abort_requests(request_ids) or []
+            except Exception as exc:
+                # Keep this pool's bindings so a later cleanup can retry it,
+                # but do not strand requests in the remaining healthy pools.
+                if first_error is None:
+                    first_error = exc
+                continue
             if bool(getattr(pool, "final_output", False)) and getattr(pool, "stage_type", None) != "diffusion":
                 final_output_type = getattr(pool.stage_client, "final_output_type", None) or "text"
                 for orch_req_id, request_output in stage_outputs:
@@ -670,6 +682,8 @@ class OrchestratorBase:
                         )
                     )
             pool.release_bindings(request_ids)
+        if first_error is not None:
+            raise first_error
         last_index_by_req: dict[str, int] = {}
         for index, output_msg in enumerate(abort_outputs):
             last_index_by_req[output_msg.request_id] = index
@@ -773,6 +787,7 @@ class OrchestratorBase:
         """
         pool = self.stage_pools[stage_id]
         await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
+        mm_cache_misses: dict[str, list[str]] = {}
         for eco in raw_outputs.outputs:
             # Emit kv_wait_s before _handle_kv_ready_raw_outputs'
             # async_chunk early-return so it lands in all modes.
@@ -786,6 +801,17 @@ class OrchestratorBase:
                     kv_params.get("connector_type") or "unknown",
                     float(kv_wait_s),
                 )
+            raw_mm_cache_misses = getattr(eco, "mm_cache_miss_hashes", None)
+            if raw_mm_cache_misses:
+                request_id = str(eco.request_id)
+                output_processor = pool.output_processor
+                processor_states = getattr(output_processor, "request_states", None)
+                if processor_states is not None:
+                    processor_state = processor_states.get(request_id)
+                    request_id = str(getattr(processor_state, "external_req_id", None) or request_id)
+                hashes = mm_cache_misses.setdefault(request_id, [])
+                hashes.extend(mm_hash for mm_hash in map(str, raw_mm_cache_misses) if mm_hash not in hashes)
+                continue
             req_state = self.request_states.get(getattr(eco, "request_id", None))
             if req_state is None:
                 continue
@@ -811,6 +837,11 @@ class OrchestratorBase:
             raw_outputs,
             iteration_stats=iteration_stats,
         )
+        processed = await self._handle_multimodal_cache_misses(
+            stage_id,
+            mm_cache_misses,
+            processed,
+        )
         if self._stat_logger is not None and (raw_outputs.scheduler_stats is not None or iteration_stats is not None):
             key = (stage_id, replica_id)
             if key not in self._stage_replica_to_engine_idx:
@@ -832,6 +863,81 @@ class OrchestratorBase:
                 stage_id,
                 replica_id,
                 int(_sched_stats.num_waiting_reqs),
+            )
+        return processed
+
+    async def _handle_multimodal_cache_misses(
+        self,
+        stage_id: int,
+        misses_by_request: dict[str, list[str]],
+        processed: list[Any],
+    ) -> list[Any]:
+        """Fail requests whose frontend multimodal cache drifted.
+
+        vLLM reports the exact stale hashes on EngineCoreOutput and expects
+        the frontend to invalidate them before the client retries. Do not
+        route the empty terminal output produced for that failed attempt as
+        a successful response.
+        """
+        if not misses_by_request:
+            return processed
+
+        stage_input_processor = self._stage_input_processors.get(stage_id)
+        stage_renderer = getattr(stage_input_processor, "renderer", None)
+        stage_cache = getattr(stage_renderer, "mm_processor_cache", None)
+        if stage_cache is not None:
+            for hashes in misses_by_request.values():
+                for mm_hash in hashes:
+                    stage_cache.invalidate(mm_hash)
+
+        misses_by_parent: dict[str, list[str]] = {}
+        failed_request_ids = set(misses_by_request)
+        for request_id, hashes in misses_by_request.items():
+            parent_id = self._cfg_tracker.get_parent_id(request_id) or request_id
+            parent_hashes = misses_by_parent.setdefault(parent_id, [])
+            parent_hashes.extend(mm_hash for mm_hash in hashes if mm_hash not in parent_hashes)
+            failed_request_ids.add(parent_id)
+            failed_request_ids.update(self._cfg_tracker.get_companion_request_ids(parent_id).values())
+
+        processed = [output for output in processed if output.request_id not in failed_request_ids]
+        for parent_id, hashes in misses_by_parent.items():
+            companion_ids_by_role = dict(self._cfg_tracker.get_companion_request_ids(parent_id))
+            cleanup_ids = [parent_id, *companion_ids_by_role.values()]
+            try:
+                await self._cleanup_request_ids(
+                    cleanup_ids,
+                    abort=True,
+                    release_owners=True,
+                )
+            except Exception:
+                # The miss belongs to this request; a failure while aborting a
+                # different stage must not be attributed to the replica that
+                # reported it or suppress the retry notification. Restore CFG
+                # ownership so the frontend's parent-only exception cleanup
+                # can retry companions retained by a failed pool.
+                if companion_ids_by_role:
+                    self._cfg_tracker.register_parent(parent_id)
+                    for role, companion_id in companion_ids_by_role.items():
+                        self._cfg_tracker.register_companion(parent_id, role, companion_id)
+                logger.exception(
+                    "[Orchestrator] Failed to abort every stage after multimodal cache miss for req=%s",
+                    parent_id,
+                )
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    request_id=parent_id,
+                    stage_id=stage_id,
+                    error="Multimodal processor cache state drifted; retry the request.",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                    error_type=MULTIMODAL_CACHE_MISS_ERROR_TYPE,
+                    mm_cache_miss_hashes=hashes,
+                )
+            )
+            logger.warning(
+                "[Orchestrator] Multimodal processor cache miss for req=%s at stage-%s (%d hash(es))",
+                parent_id,
+                stage_id,
+                len(hashes),
             )
         return processed
 

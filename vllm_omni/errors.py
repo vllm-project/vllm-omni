@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Request-scoped client error types shared across vLLM-Omni entrypoints."""
 
@@ -10,6 +10,7 @@ from http import HTTPStatus
 from typing import NoReturn
 
 DEFAULT_CLIENT_ERROR_TYPE = "BadRequestError"
+MULTIMODAL_CACHE_MISS_ERROR_TYPE = "MultiModalCacheMissError"
 
 
 class OmniClientError(ValueError):
@@ -35,6 +36,18 @@ class OmniClientError(ValueError):
 
 class GuardrailViolationError(OmniClientError):
     """Raised when a model guardrail rejects request content."""
+
+
+class MultiModalCacheMissError(RuntimeError):
+    """Retryable P0/P1 multimodal processor-cache drift."""
+
+    status_code = HTTPStatus.SERVICE_UNAVAILABLE.value
+    error_type = MULTIMODAL_CACHE_MISS_ERROR_TYPE
+
+    def __init__(self, message: str, mm_hashes: list[str]) -> None:
+        super().__init__(message)
+        self.message = message
+        self.mm_hashes = list(mm_hashes)
 
 
 def client_error_metadata(exc: BaseException) -> tuple[int | None, str | None]:

@@ -230,6 +230,7 @@ class FakeCollectiveRpcStageClient(FakeStageClient):
 class FakeOutputProcessor:
     def __init__(self, *, request_outputs: list[object] | None = None) -> None:
         self.request_outputs = list(request_outputs or [])
+        self.request_states: dict[str, object] = {}
         self.add_request_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         self.abort_calls: list[list[str]] = []
 
@@ -1998,6 +1999,153 @@ async def test_abort_retry_does_not_repeat_successful_stage_abort():
     assert first.physical_abort_calls == 1
     assert second.physical_abort_calls == 2
     assert second.bound == set()
+
+
+@pytest.mark.asyncio
+async def test_multimodal_cache_miss_is_request_error_not_empty_success(orchestrator_factory) -> None:
+    request_id = "mm-cache-miss"
+    internal_request_id = "engine-internal-mm-cache-miss"
+    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+
+    class _TerminalStateRemovingOutputProcessor(RecordingOutputProcessor):
+        def process_outputs(self, *args, **kwargs):
+            result = super().process_outputs(*args, **kwargs)
+            self.request_states.pop(internal_request_id, None)
+            return result
+
+    processor = _TerminalStateRemovingOutputProcessor(
+        request_outputs=[
+            _build_request_output(
+                request_id,
+                token_ids=[],
+                text="",
+                finish_reason="error",
+            )
+        ]
+    )
+    processor.request_states[internal_request_id] = SimpleNamespace(external_req_id=request_id)
+    orchestrator_fixture = orchestrator_factory([stage0], output_processors=[processor])
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id=request_id,
+            prompt=FakePromptRequest(request_id=request_id, prompt_token_ids=[1, 2]),
+            original_prompt={"prompt": "image question"},
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+        )
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+
+        stage0.push_engine_core_outputs(
+            EngineCoreOutputs(
+                outputs=[
+                    EngineCoreOutput(
+                        request_id=internal_request_id,
+                        new_token_ids=[],
+                        finish_reason=FinishReason.ERROR,
+                        mm_cache_miss_hashes=["hash-a"],
+                    )
+                ],
+                timestamp=1.0,
+                finished_requests={internal_request_id},
+            )
+        )
+
+        deadline = time.monotonic() + 2.0
+        message = None
+        while message is None:
+            if time.monotonic() >= deadline:
+                raise AssertionError("Timed out waiting for multimodal cache miss error")
+            try:
+                message = orchestrator_fixture.output_sync_q.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.01)
+
+        assert isinstance(message, ErrorMessage)
+        assert message.request_id == request_id
+        assert message.stage_id == 0
+        assert message.mm_cache_miss_hashes == ["hash-a"]
+        assert orchestrator_fixture.output_sync_q.empty()
+        await _wait_for(lambda: request_id not in orchestrator_fixture.orchestrator.request_states)
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_multimodal_cache_miss_preserves_cfg_cleanup_after_failed_abort() -> None:
+    class _Pool:
+        final_output = False
+        stage_type = "llm"
+
+        def __init__(self, *, fail_once: bool = False) -> None:
+            self.bound = {"request-a", "request-a-cfg"}
+            self.fail_once = fail_once
+            self.physical_abort_calls = 0
+
+        async def abort_requests(self, request_ids: list[str]):
+            active = self.bound.intersection(request_ids)
+            if not active:
+                return []
+            self.physical_abort_calls += 1
+            if self.fail_once:
+                self.fail_once = False
+                raise RuntimeError("stage abort failed")
+            return []
+
+        def release_bindings(self, request_ids: list[str]) -> None:
+            self.bound.difference_update(request_ids)
+
+    class _Cache:
+        def __init__(self) -> None:
+            self.invalidated: list[str] = []
+
+        def invalidate(self, mm_hash: str) -> None:
+            self.invalidated.append(mm_hash)
+
+    cache = _Cache()
+    output_queue: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=output_queue,
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[],
+    )
+    first = _Pool()
+    failing = _Pool(fail_once=True)
+    later = _Pool()
+    orchestrator.stage_pools = [first, failing, later]
+    orchestrator.request_states["request-a"] = OrchestratorRequestState(request_id="request-a")
+    orchestrator.request_states["request-a-cfg"] = OrchestratorRequestState(request_id="request-a-cfg")
+    orchestrator._cfg_tracker.register_companion("request-a", "negative", "request-a-cfg")
+    orchestrator._stage_input_processors[1] = SimpleNamespace(renderer=SimpleNamespace(mm_processor_cache=cache))
+    processed = await orchestrator._handle_multimodal_cache_misses(
+        1,
+        {"request-a-cfg": ["hash-a"]},
+        [],
+    )
+
+    assert processed == []
+    assert cache.invalidated == ["hash-a"]
+    message = output_queue.get_nowait()
+    assert isinstance(message, ErrorMessage)
+    assert message.request_id == "request-a"
+    assert message.stage_id == 1
+    assert [first.physical_abort_calls, failing.physical_abort_calls, later.physical_abort_calls] == [1, 1, 1]
+    assert first.bound == set()
+    assert failing.bound == {"request-a", "request-a-cfg"}
+    assert later.bound == set()
+    assert "request-a" in orchestrator.request_states
+    assert "request-a-cfg" in orchestrator.request_states
+    assert orchestrator._cfg_tracker.get_companion_request_ids("request-a") == {"negative": "request-a-cfg"}
+
+    # The frontend's exception cleanup can still retry the failed pool.
+    await orchestrator._cleanup_request_ids(["request-a"], abort=True, release_owners=True)
+    assert [first.physical_abort_calls, failing.physical_abort_calls, later.physical_abort_calls] == [1, 2, 1]
+    assert failing.bound == set()
+    assert later.bound == set()
+    assert "request-a" not in orchestrator.request_states
+    assert "request-a-cfg" not in orchestrator.request_states
 
 
 @pytest.mark.asyncio

@@ -79,6 +79,49 @@ def get_async_omni_instance(fake_add_request=_noop, fake_abort_request=_noop) ->
 
 
 @pytest.mark.cpu
+@pytest.mark.asyncio
+async def test_multimodal_cache_miss_invalidates_frontend_cache(mocker) -> None:
+    from vllm_omni.engine.messages import ErrorMessage
+    from vllm_omni.entrypoints.client_request_state import ClientRequestState
+    from vllm_omni.errors import MultiModalCacheMissError
+
+    request_id = "mm-cache-miss"
+    cache = mocker.Mock()
+    omni = object.__new__(AsyncOmni)
+    omni.input_processor = mocker.Mock(
+        renderer=mocker.Mock(mm_processor_cache=cache),
+    )
+    state = ClientRequestState(request_id=request_id)
+    omni.request_states = {request_id: state}
+    await state.queue.put(
+        ErrorMessage(
+            request_id=request_id,
+            stage_id=0,
+            error="Multimodal processor cache state drifted; retry the request.",
+            status_code=503,
+            error_type="MultiModalCacheMissError",
+            mm_cache_miss_hashes=["hash-a", "hash-b"],
+        )
+    )
+
+    results = omni._process_orchestrator_results(
+        request_id,
+        mocker.Mock(),
+        0,
+        {},
+        0.0,
+    )
+    with pytest.raises(MultiModalCacheMissError) as exc_info:
+        await anext(results)
+
+    assert exc_info.value.mm_hashes == ["hash-a", "hash-b"]
+    assert cache.invalidate.call_args_list == [
+        mocker.call("hash-a"),
+        mocker.call("hash-b"),
+    ]
+
+
+@pytest.mark.cpu
 def test_generate_submits_randomized_id_to_engine():
     """Ensure the engine receives a UUID-suffixed ID, not the raw request ID"""
 

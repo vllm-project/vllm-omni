@@ -29,7 +29,7 @@ from vllm_omni.engine.omni_engine_base import OmniEngineBase
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_stage_id_for_e2e
-from vllm_omni.errors import raise_client_error_or
+from vllm_omni.errors import MultiModalCacheMissError, raise_client_error_or
 from vllm_omni.metrics.modality import OmniModalityMetrics, observe_modality_at_finalize
 from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
 from vllm_omni.metrics.stats import OrchestratorAggregator
@@ -544,6 +544,16 @@ class OmniBase(PDDisaggregationMixin):
 
     def _raise_nonfatal_error_message(self, msg: ErrorMessage) -> None:
         """Raise the exception for a non-fatal, request-scoped error message."""
+        if msg.mm_cache_miss_hashes:
+            input_processor = getattr(self, "input_processor", None)
+            if input_processor is None:
+                input_processor = getattr(self.engine, "input_processor", None)
+            renderer = getattr(input_processor, "renderer", None)
+            mm_processor_cache = getattr(renderer, "mm_processor_cache", None)
+            if mm_processor_cache is not None:
+                for mm_hash in msg.mm_cache_miss_hashes:
+                    mm_processor_cache.invalidate(mm_hash)
+            raise MultiModalCacheMissError(msg.error, msg.mm_cache_miss_hashes)
         raise_client_error_or(
             msg.error,
             status_code=msg.status_code,

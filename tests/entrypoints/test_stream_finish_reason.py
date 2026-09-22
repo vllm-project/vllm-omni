@@ -84,6 +84,76 @@ def _make_audio_omni_output(
 
 
 # ---------------------------------------------------------------------------
+# Tests: streaming errors
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_multimodal_cache_miss_stream_uses_retryable_error_type(mocker):
+    from vllm_omni.errors import MultiModalCacheMissError
+
+    serving_chat = build_serving_chat()
+    request = make_request(modalities=["text"])
+
+    async def result_generator():
+        if False:
+            yield
+        raise MultiModalCacheMissError("multimodal cache drift", ["hash-a"])
+
+    raw_lines = await collect_stream(
+        serving_chat.chat_completion_stream_generator(
+            request=request,
+            result_generator=result_generator(),
+            request_id="test-req",
+            model_name="test-model",
+            conversation=[],
+            tokenizer=mocker.MagicMock(),
+            request_metadata=mocker.MagicMock(),
+        )
+    )
+
+    chunks = parse_sse_chunks(raw_lines)
+    assert chunks == [
+        {
+            "error": {
+                "message": "multimodal cache drift",
+                "type": "MultiModalCacheMissError",
+                "param": None,
+                "code": 503,
+            }
+        }
+    ]
+    assert raw_lines[-1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_multimodal_cache_miss_nonstream_uses_retryable_error_type(mocker):
+    from vllm_omni.errors import MultiModalCacheMissError
+
+    serving_chat = build_serving_chat()
+    request = make_request(modalities=["text"])
+
+    async def result_generator():
+        if False:
+            yield
+        raise MultiModalCacheMissError("multimodal cache drift", ["hash-a"])
+
+    response = await serving_chat.chat_completion_full_generator(
+        request=request,
+        result_generator=result_generator(),
+        request_id="test-req",
+        model_name="test-model",
+        conversation=[],
+        tokenizer=mocker.MagicMock(),
+        request_metadata=mocker.MagicMock(),
+    )
+
+    assert response.error.message == "multimodal cache drift"
+    assert response.error.type == "MultiModalCacheMissError"
+    assert response.error.code == 503
+
+
+# ---------------------------------------------------------------------------
 # Tests: finish_reason correctness
 # ---------------------------------------------------------------------------
 

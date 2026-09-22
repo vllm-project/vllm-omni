@@ -380,6 +380,117 @@ def create_sse_chunk(data_dict):
     return f"data: {json.dumps(data_dict)}\n\n".encode()
 
 
+@pytest.mark.asyncio
+async def test_chat_omni_retries_typed_multimodal_cache_miss(mocker: MockerFixture):
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=2,
+        output_len=4,
+    )
+    cache_miss = MockResponse(
+        200,
+        [
+            create_sse_chunk(
+                {
+                    "error": {
+                        "message": "multimodal cache drift",
+                        "type": "MultiModalCacheMissError",
+                        "code": 503,
+                    }
+                }
+            ),
+            b"data: [DONE]\n\n",
+        ],
+    )
+    success = MockResponse(
+        200,
+        [
+            create_sse_chunk(
+                {
+                    "choices": [{"delta": {"content": "A"}}],
+                    "modality": "text",
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+                }
+            ),
+            b"data: [DONE]\n\n",
+        ],
+    )
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(side_effect=[cache_miss, success])
+    mocker.patch("vllm_omni.benchmarks.patch.patch.asyncio.sleep", new=mocker.AsyncMock())
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert mock_session.post.call_count == 2
+    assert output.success is True
+    assert output.generated_text == "A"
+
+
+@pytest.mark.asyncio
+async def test_chat_omni_stops_after_multimodal_cache_miss_retry_limit(mocker: MockerFixture):
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=2,
+        output_len=4,
+    )
+
+    def cache_miss_response():
+        return MockResponse(
+            200,
+            [
+                create_sse_chunk(
+                    {
+                        "error": {
+                            "message": "multimodal cache drift",
+                            "type": "MultiModalCacheMissError",
+                            "code": 503,
+                        }
+                    }
+                )
+            ],
+        )
+
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(side_effect=[cache_miss_response() for _ in range(4)])
+    mocker.patch("vllm_omni.benchmarks.patch.patch.asyncio.sleep", new=mocker.AsyncMock())
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert mock_session.post.call_count == 4
+    assert output.success is False
+    assert output.error == "multimodal cache drift"
+
+
+@pytest.mark.asyncio
+async def test_chat_omni_does_not_retry_untyped_stream_error(mocker: MockerFixture):
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=2,
+        output_len=4,
+    )
+    response = MockResponse(
+        200,
+        [create_sse_chunk({"error": {"message": "bad request", "type": "BadRequestError", "code": 400}})],
+    )
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=response)
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert mock_session.post.call_count == 1
+    assert output.success is False
+    assert output.error == "bad request"
+
+
 def test_chat_text_timing_metrics_request_stage_metrics():
     args = Namespace(
         backend="openai-chat-omni",

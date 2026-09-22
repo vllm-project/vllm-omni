@@ -9,6 +9,7 @@ import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timedelta, timezone
+from http import HTTPStatus
 from io import BytesIO
 from typing import Any, Final, cast
 
@@ -147,7 +148,7 @@ from vllm_omni.entrypoints.openai.utils import (
     resolve_diffusion_od_config,
     validate_requested_speaker,
 )
-from vllm_omni.errors import OmniClientError
+from vllm_omni.errors import MultiModalCacheMissError, OmniClientError
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.output_metadata import DiffusionMetadataMapping, DiffusionMetadataValue
@@ -2380,6 +2381,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         delta=False,
                     )
 
+        except MultiModalCacheMissError as e:
+            logger.warning(
+                "Retryable multimodal cache miss during streaming for request %s",
+                request_id,
+            )
+            data = self.create_streaming_error_response(
+                str(e),
+                err_type=e.error_type,
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            yield f"data: {data}\n\n"
         except EngineDeadError as e:
             logger.error(
                 "EngineDeadError during streaming for request %s: %s",
@@ -2423,6 +2435,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 final_outputs.append(res)
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
+        except MultiModalCacheMissError as e:
+            return self.create_error_response(
+                str(e),
+                err_type=e.error_type,
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
         except ValueError as e:
             return self.create_error_response(e)
 
