@@ -7,10 +7,8 @@
 ``SymInt[]``, so its tiling is baked into the captured task. The KV length grows
 by one every step, so vllm-ascend re-issues the op for every layer on every step
 (``update_full_graph_params`` -> ``graph_task_update_begin``/``_end``). On the
-20-layer, 768-hidden MiniCPM-o Talker that rebind *is* the step: py-spy puts 26%
-of the stage-1 main-thread wall -- ~38% of its busy time -- inside it, and
-removing it measured RTF 0.1896 -> 0.1599 on A3.
-See ``server-env/design/R1_UNDER_FULL_DECODE_20260827.md``.
+20-layer, 768-hidden MiniCPM-o Talker that rebind *is* the step: it dominates
+the stage-1 main-thread wall, which is what this module removes.
 
 The mechanism lives in :mod:`fixed_kv_decode`; this module is only the seam. It
 is a subclass rather than a patch because every place vllm-ascend needs to be
@@ -24,9 +22,9 @@ told about it is a factory vLLM-Omni already controls:
     ACLGraphWrapper.__call__ key + replay barrier           -> wrapped by
                                                                :func:`fixed_kv_decode.install_into_ascend_aclgraph`
 
-That matters: the ranked evaluation installs only this tree and leaves
-vllm-ascend as the image ships it, so anything that has to be applied *to*
-vllm-ascend cannot reach a scored run.
+That matters: vllm-ascend is used exactly as the image ships it, so anything
+that would have to be applied *to* vllm-ascend is out of reach and a factory
+seam has to be used instead.
 """
 
 from __future__ import annotations
@@ -191,8 +189,8 @@ class OmniFixedKVAttentionBackendImpl(AscendAttentionBackendImpl):
         num_tokens,
         vllm_config,
         speculative_config=None,
-        # T2/910B compat: num_dcp_pcp_tokens was dropped from the upstream
-        # signature (vllm-ascend removed PCP from MRV1, see #12592).
+        # The vllm-ascend build this targets dropped ``num_dcp_pcp_tokens`` from
+        # the upstream signature (PCP removed from MRV1, see #12592).
         draft_attn_metadatas=None,
     ):
         """Skip the per-step rebind for a step that captured no updatable tasks."""
@@ -359,8 +357,9 @@ class OmniFixedKVAttentionBackendImpl(AscendAttentionBackendImpl):
         the runtime replays the recorded tasks and never re-enters here. The
         call mirrors the eager ``PrefillNoCache`` branch exactly -- causal FIA
         against the singleton mask, KV length = query length, no block table --
-        with the workspace and the softmax LSE held outside the graph pool so
-        the capture strands nothing (the fixed-KV workspace-leak lesson).
+        with the workspace and the softmax LSE held outside the graph pool, so
+        the capture strands nothing (an allocation made while capturing comes out
+        of the graph's private pool).
         """
         bucket = int(attn_metadata.fixed_kv_prefill_bucket)
         fia_kwargs = dict(

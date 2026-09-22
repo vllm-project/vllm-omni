@@ -649,7 +649,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
     # and the stage-1 engine dies with empty audio.
     @property
     def supports_multi_frame_decode(self) -> bool:
-        # Present on both stage kinds; only the Talker (tts) path uses it.
+        # "This wrapper implements the multi-frame path", not "the loop is
+        # running": the Talker (tts) stage has it, the Thinker does not. Whether
+        # a step actually runs it is decided per deployment by stage 1's
+        # speculative_config (the runner checks its num_spec_tokens for that).
         return self.model_stage == "tts"
 
     def take_batch_stop_logits(self):

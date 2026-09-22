@@ -61,10 +61,10 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         Under FULL_DECODE_ONLY the captured decode step has to re-issue attention on
         every layer on every step, because the op takes the KV length as a host
         argument that grows each step. On the small Talker decoder that rebind is
-        ~38% of its busy time. Scoped by ``max_model_len`` (Talker 4096 engages,
-        Thinker 32768 does not). ``VLLM_OMNI_FIXED_KV_DECODE=0`` restores stock.
-        The 910B family also needs it to capture at all: the stock builder
-        faults there on spec-width rows.
+        most of its busy time. Scoped by ``max_model_len`` (Talker 4096 engages,
+        a 32768-token Thinker does not). ``VLLM_OMNI_FIXED_KV_DECODE=0`` restores
+        stock. The 910B family also needs it to capture at all: with the K-step
+        armed the stock capture path faults there (acl 507035).
         """
         resolved = super().get_attn_backend_cls(selected_backend, attn_selector_config, num_heads)
         if resolved != "vllm_ascend.attention.attention_v1.AscendAttentionBackend":
@@ -80,12 +80,20 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         block_size = getattr(getattr(vllm_config, "cache_config", None), "block_size", None)
         capacity = fixed_kv_decode.capacity_for(max_model_len, block_size) if max_model_len and block_size else None
         fixed_kv_decode.install_into_ascend_aclgraph()
-        logger.info(
-            "[minicpmo] fixed-KV decode attention on (max_model_len=%s, kv_capacity=%s); "
-            "set VLLM_OMNI_FIXED_KV_DECODE=0 to disable",
-            max_model_len,
-            capacity,
-        )
+        if capacity:
+            logger.info(
+                "[minicpmo] fixed-KV decode attention on (max_model_len=%s, kv_capacity=%s); "
+                "set VLLM_OMNI_FIXED_KV_DECODE=0 to disable",
+                max_model_len,
+                capacity,
+            )
+        else:
+            # The backend class is still returned; it declines for this
+            # max_model_len, so no bucket is captured and nothing engages.
+            logger.info(
+                "[minicpmo] fixed-KV decode attention not engaged (max_model_len=%s is above the context ceiling)",
+                max_model_len,
+            )
         return "vllm_omni.platforms.npu.attention.fixed_kv_backend.OmniFixedKVAttentionBackend"
 
     # conv2d convolution operator in the code2wav module of Qwen3-TTS not being able to run on Aclnn

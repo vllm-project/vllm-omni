@@ -1063,12 +1063,21 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 self.input_batch.sampling_metadata.logitsprocs,
                 logits.shape[-1],
             )
-            if getattr(self.model, "supports_multi_frame_decode", False):
-                # K-step only: this layer censors the stop token itself, and its
-                # release condition is a spec-decoding bookkeeping counter we do
-                # not control -- a request whose count never advances can never
-                # stop. The model already masks the codec EOS by its own frame
-                # count (talker_codec_sample), so clear this list every step.
+            # K-step only, and both halves matter: the model class has to
+            # implement the multi-frame path (``supports_multi_frame_decode``)
+            # *and* this deployment has to arm it -- stage 1's speculative_config
+            # is what sets ``num_spec_tokens``. With the loop off, vLLM's
+            # min_tokens layer behaves as it does on any other stage and must
+            # keep working, so it is only cleared when both hold.
+            #
+            # Why clear it at all: this layer censors the stop token itself, and
+            # its release condition is a spec-decoding bookkeeping counter we do
+            # not control -- a request whose count never advances can never
+            # stop. The model already masks the codec EOS by its own frame count
+            # (talker_codec_sample), so the vLLM-level layer is redundant here.
+            if getattr(self.model, "supports_multi_frame_decode", False) and int(
+                getattr(self, "num_spec_tokens", 0) or 0
+            ) > 0:
                 from vllm_omni.platforms.npu.worker import talker_multiframe
 
                 talker_multiframe.neutralize_kstep_min_tokens(

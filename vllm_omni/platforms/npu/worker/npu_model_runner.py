@@ -482,12 +482,12 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         run_model = partial(self.model, **model_inputs)
 
         # K-step (Talker multi-frame decode). A decode step that schedules K
-        # positions per request belongs to ``talker_multiframe``: it replays the
-        # captured decode graph K times -- refreshing the graph's parameters
-        # before every replay, which is what keeps positions and embeddings in
-        # step with the frame being produced -- and samples one codec frame per
-        # replay. Everything else (prefill, a mixed step, another stage) falls
-        # through to the ordinary single-forward path below.
+        # positions per request belongs to ``talker_multiframe``: it replays a
+        # captured decode graph once per frame and samples one codec frame per
+        # replay. The one-query path writes each frame's embedding straight into
+        # the buffer the graph reads; the wide path refreshes the per-frame
+        # inputs instead. Everything else (prefill, a mixed step, another stage)
+        # falls through to the ordinary single-forward path below.
         from vllm_omni.platforms.npu.worker import talker_multiframe
 
         frames = talker_multiframe.applies(self.model, model_kwargs_extra)
@@ -526,20 +526,18 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                 )
             finally:
                 talker_multiframe.end_narrow_step(forward_context, narrow)
-            # Restore the vocab gate the ed8c7db8 refactor dropped along with
-            # the _model_forward override it lived in. The Talker's vLLM-level
-            # head is the two-wide continue/stop row, but input_batch reports
-            # vocab_size=0, and the rejection sampler's parse_output then masks
-            # every accepted token as out-of-vocab: the request comes back with
-            # nothing, the scheduler never rolls back the K tokens it advanced,
-            # and the next steps schedule a negative count -- the engine hangs
-            # right after the first 'engaged' step. Single-frame steps never
-            # took the branch that reads vocab_size; only the K-step does.
-            # The gate needs one thing from this call: that this really is a
-            # multi-frame decode step. The width it writes is the two-wide stop
-            # row, never the hidden width this tensor happens to carry. Hand it
-            # the stop rows when they are at hand so the intent is visible, and
-            # keep the hidden states only as the "this is a K-step" signal.
+            # The vocab gate the multi-frame path needs, applied here because
+            # this is the wrapper the K-step runs through. The Talker's
+            # vLLM-level head is the two-wide continue/stop row, but input_batch
+            # reports vocab_size=0, and the rejection sampler's parse_output
+            # then masks every accepted token as out-of-vocab: the request comes
+            # back with nothing, the scheduler never rolls back the K tokens it
+            # advanced, and the next steps schedule a negative count -- the
+            # engine hangs right after the first 'engaged' step. Single-frame
+            # steps never took the branch that reads vocab_size; only the K-step
+            # does. The gate takes only "not None" from this argument: the width
+            # it writes is the two-wide stop row, never the width of whatever
+            # tensor it is handed.
             stop_rows = getattr(self.model, "_batch_stop_logits", None)
             talker_multiframe.ensure_stop_token_vocab(
                 self,

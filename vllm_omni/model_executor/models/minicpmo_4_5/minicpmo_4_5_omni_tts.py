@@ -64,7 +64,6 @@ _CODEC_TOP_P = 0.85
 _CODEC_REPETITION_PENALTY = 1.05
 _CODEC_MIN_TOKENS = 50
 _CODEC_MAX_TOKENS = 2048
-_FAST_CODEC_PENALTY = os.getenv("MINICPMO_FAST_CODEC_PENALTY", "1") == "1"
 # YAML key -> (tts_config attribute, hardcoded fallback, type)
 _CODEC_SAMPLING_SOURCES: tuple[tuple[str, str, Any, Any], ...] = (
     ("seed", "seed", _CODEC_SEED, int),
@@ -309,15 +308,14 @@ def resolve_codec_sampling_params(
 ) -> dict[str, Any]:
     """Resolve Talker codec knobs: deploy YAML, then checkpoint, then defaults.
 
-    The deploy YAML that starts a ranked run comes from the organizer's
-    baseline branch and carries no ``codec_sampling_params`` block, so
-    requiring one there is a startup failure rather than a configuration
-    error: the Talker stage would not come up at all under the official
-    launch. Falling back to the checkpoint's ``tts_config`` is what the
-    upstream Talker does, and it is what makes this tree drop into the
-    official deploy config unchanged.
+    A deploy YAML is not required to carry a ``codec_sampling_params`` block --
+    the stock MiniCPM-o configs do not -- so requiring one would turn a
+    missing block into a startup failure: the Talker stage would not come up
+    at all. Falling back to the checkpoint's ``tts_config`` is what the
+    upstream Talker does, and it is what lets an existing deploy config work
+    unchanged.
 
-    A YAML block still wins key by key, so our own configs keep overriding.
+    A YAML block still wins key by key, so a deployment can override any knob.
     """
     provided = yaml_params if isinstance(yaml_params, Mapping) else {}
     resolved: dict[str, Any] = {}

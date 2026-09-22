@@ -1,16 +1,15 @@
 """Captured graphs for the Talker's prefill, bucketed by token count.
 
 One Talker prefill forward is ~18.4 ms of host dispatch wrapped around 1-3 ms
-of device work (`DEVICE_BOUND_FRAME_20260830.md` §4a': three back-to-back
-forwards never accumulate more than 0.07 ms of drain), and the ranked case
-runs 1.26 of them per request -- ~23 ms, all but a couple of milliseconds of it
-removable. The decode side of this problem was solved by `fixed_kv_decode`;
-this module is the same idea for the prefill shape.
+of device work (three back-to-back forwards never accumulate more than 0.07 ms
+of drain), and a request pays roughly one of them -- all but a couple of
+milliseconds of it removable. The decode side of this problem was solved by
+`fixed_kv_decode`; this module is the same idea for the prefill shape.
 
 ## Why a padded prefill replays exactly
 
-The ranked Talker prefill is a single fresh request of 9-25 tokens (measured
-distribution; `{16, 32}` covers it). A graph captured at bucket ``B`` with
+The Talker prefill this targets is a single fresh request of 9-25 tokens, so
+`{16, 32}` covers it. A graph captured at bucket ``B`` with
 ``actual_seq_lengths = [B]`` replays a real ``n <= B`` prefill bit-exactly for
 the rows that matter:
 
@@ -33,12 +32,10 @@ The eligibility gate is deliberately narrow -- one request, ``PrefillNoCache``,
 offset 0, ``n`` inside a captured bucket -- and everything else takes today's
 eager path unchanged.
 
-Off with ``VLLM_OMNI_FIXED_KV_PREFILL=0``.
 """
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from typing import Any
 
@@ -47,11 +44,9 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-_ENV = "VLLM_OMNI_FIXED_KV_PREFILL"
-# Per-stage: the Talker's prefill is 9-25 tokens, stage 0's ranked prefill is
-# 144-160. The capture routine picks one set per process by model traits.
+# The Talker's prefill is 9-25 tokens; a stage that prefills longer selects its
+# own set through ``configure``.
 TALKER_BUCKETS: tuple[int, ...] = (16, 32)
-STAGE0_BUCKETS: tuple[int, ...] = (160, 192)
 BUCKETS: tuple[int, ...] = TALKER_BUCKETS
 
 
@@ -61,10 +56,6 @@ def configure(buckets: tuple[int, ...]) -> None:
 
 
 _LOGGED_REPLAY = False
-
-
-def is_enabled() -> bool:
-    return os.getenv(_ENV, "1") == "1"
 
 
 class _State:
@@ -87,8 +78,8 @@ def prewarm(device: torch.device) -> None:
     """Allocate every runtime buffer before any capture can start.
 
     An allocation made while a graph is capturing comes out of that graph's
-    private pool and is stranded there (the fixed-KV workspace leak), so the
-    slot buffers and aranges exist before `capture` runs.
+    private pool and is stranded there, so the slot buffers and aranges exist
+    before any capture runs.
     """
     for bucket in BUCKETS:
         if bucket not in _state.slot_buffers:
@@ -124,8 +115,8 @@ def store_graph(bucket: int, graph: Any, hidden_out: torch.Tensor) -> None:
     step graph owns its own -- deliberately NOT entries in the ACL graph
     wrapper. A wrapper-FULL prefill replay poisons the request that follows
     it: every codec-step replay afterwards blocks the host for the queued
-    backbone work (+9 ms per decode step, the bisect4/fixtest arms), and
-    neither the capture order nor the pre-replay barrier explains it. The
+    backbone work, and neither the capture order nor the pre-replay barrier
+    explains it. The
     codec graph itself proves raw replays coexist cleanly with everything,
     so the prefill graphs live the same way.
     """
@@ -182,9 +173,9 @@ def maybe_mark_step(attn_metadata: Any, prefill_state: Any, block_size_hint: int
         # Slots are contiguous only within a block, and a request's block
         # table covers ceil(n / block_size) blocks -- a bucket that needs one
         # more block than the prompt does would write into somebody else's.
-        # (The first stage-0 round hit exactly this: a 148-token prompt spans
-        # two blocks, and a slot0+arange fill pushed rows past 127 into the
-        # physical block after block 0 -- runaway text, 7/32 finished.)
+        # (A prompt that spans two blocks hits exactly this: a slot0+arange fill
+        # pushes rows past the first block's 127 slots into the physical block
+        # after it -- runaway text instead of a captured prefill.)
         return
     block_table = getattr(attn_metadata, "block_tables", None)
     if bucket <= block_size:

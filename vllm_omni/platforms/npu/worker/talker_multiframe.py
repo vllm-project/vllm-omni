@@ -1,10 +1,10 @@
 """Several codec frames inside one stage-1 ``execute_model``.
 
-Measured on A3 / 910C (``server-env/design/RTF_CEILING_20260828.md``): one
-MiniCPM-o Talker decode step is ~2.9 ms of vLLM host work wrapped around a
-0.83 ms device forward, for a 190M-parameter model that emits exactly one codec
-frame. Over ~118 frames per request that host work is ~340 ms of the ~540 ms
-that follows TTFT -- by a wide margin the largest single term left in the score.
+One MiniCPM-o Talker decode step is almost all vLLM host work wrapped around a
+small device forward: a 190M-parameter model that emits exactly one codec
+frame, but pays scheduler, metadata, sampling and IPC costs per step. Over the
+~118 frames of a typical request that host work is the largest single term
+after TTFT.
 
 None of it is per *frame*. The scheduler step, input preparation, attention
 metadata, sampling, output assembly and engine-core IPC are per *step*, and a
@@ -27,9 +27,8 @@ their KV is stale too -- but the attention bias is causal, so row k never reads
 them, and the next replay overwrites them with the real thing. After the K'th
 replay every row and every KV entry is what a K-step decode would have written.
 
-A replay of the 20-layer forward is 0.83 ms of device and 8 us of host
-(``server-env/tools/dispatch_cost.py``), so K replays cost what K frames cost
-and the ~2.9 ms is paid once. At K=4 that is a cadence of ~1.9 ms against ~4.0.
+A replay of the 20-layer forward is 0.83 ms of device and microseconds of host,
+so K replays cost what K frames cost and the per-step host work is paid once.
 
 Nothing in the loop touches the host: the embedding lookup, the codec sample
 (the captured codec-sampling step), the stop row and the emitted delta are all device
@@ -326,7 +325,7 @@ def begin_narrow_step(
         fixed_kv_decode = None
 
     if fixed_kv_decode is None:
-        return _decline("fixed-KV decode (item 6) is not present in this tree")
+        return _decline("the fixed-KV decode backend is not present in this build")
     if not narrow_replay_enabled(runner) or inputs_embeds is None or positions is None:
         return None
     rows = len(spans)
@@ -617,17 +616,14 @@ def ensure_stop_token_vocab(runner: Any, logits: Any) -> None:
     head is the two-wide continue/stop row `compute_logits` builds, so two is
     what every `vocab_size` reader has to see.
 
-    The caller used to hand over `text_hidden_states`, so this landed on the
-    hidden width (768). That passes the `parse_output` filter by accident (0
-    and 1 are both below 768) and breaks the one reader that repays checking:
-    `InputBatch.add_request` stores `top_k = vocab_size` as its "no top-k"
-    sentinel, which only holds for 0 and 2. At 768 `top_k_reqs` stops being
-    empty, `sampling_metadata.top_k` stops being None, and the Ascend
-    `enable_reduce_sample` branch starts treating a two-column distribution as
-    a 768-way one. The stop row then does not survive into the request's token
-    list, so the request runs to `max_tokens` instead of stopping on EOS -- and
-    the frame stream that keeps arriving after the codec sequence ended is what
-    eventually hands the scheduler a step it cannot merge.
+    The width has to be the row the model emits, not the width of whatever
+    tensor the caller happens to be holding: `InputBatch.add_request` stores
+    `top_k = vocab_size` as its "no top-k" sentinel, which only holds for 0 and
+    2. A hidden width (768) instead passes the `parse_output` filter by accident
+    but leaves `top_k_reqs` non-empty, and the Ascend `enable_reduce_sample`
+    branch then treats the two-column distribution as a 768-way one -- the stop
+    row does not survive into the request's token list and the request runs to
+    `max_tokens`.
     """
     if logits is None or not getattr(runner.model, "supports_multi_frame_decode", False):
         return

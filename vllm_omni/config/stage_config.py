@@ -779,16 +779,11 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
     return merged
 
 
-# Same TND ceiling as stage 0: at most 16 query positions per sequence. The
-# Talker's multi-frame decode is configured through stage 1's
-# speculative_config in the deploy YAML; this only bounds the frame count the
-# model-side gate accepts.
-_MINICPMO_TALKER_FRAMES_MAX = 16
-
-# Stage 1's declared frame count, recorded when a deploy config is parsed.
-# Same-process readers that run before the engine hands the runner its
-# vllm_config see it here; spawned stage workers do not, see
-# ascend_warmup_patch._skipped_names.
+# Stage 1's multi-frame decode is configured through its ``speculative_config``
+# in the deploy YAML. The parse records whether it is armed here, because the
+# reader (``ascend_warmup_patch._kstep_armed``) can run in a spawned stage
+# worker that has no vllm_config to read it from. It only answers "armed or
+# not" -- 1 means not armed.
 _resolved_talker_frames: int = 1
 
 
@@ -808,7 +803,7 @@ def _record_talker_frames(stages: list[StageDeployConfig]) -> None:
         if isinstance(spec, dict) and spec.get("method") == "ngram":
             num_spec = spec.get("num_speculative_tokens", 0) or 0
             if num_spec > 0:
-                frames = min(int(num_spec) + 1, _MINICPMO_TALKER_FRAMES_MAX)
+                frames = int(num_spec) + 1
         _resolved_talker_frames = frames
 
 

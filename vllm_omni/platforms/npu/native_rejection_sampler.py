@@ -5,23 +5,23 @@
 
 vllm-ascend module-patches vllm's ``rejection_sample`` (and its two helpers)
 onto Triton kernels (``vllm_ascend/patch/worker/patch_rejection_sampler.py``).
-On the 910_93 vector core those kernels fault: the 02:38 run pinned acl
-507035 on their warmup, which is why ``rejection_sampler`` sits in the
-warmup skip set. The skip moves the fault to the first request -- every
-verify then JIT-compiles the kernel family on the fly, and both stages
-stall there: stage 0 verifies the n-gram drafts of every decode step, and
-stage 1 verifies the always-``continue`` drafts behind the K-step
-block-table growth.
+On the 910_93 vector core those kernels fault (acl 507035) during their
+warmup, which is why ``rejection_sampler`` sits in the warmup skip set. The
+skip only moves the fault to the first request -- every verify then
+JIT-compiles the kernel family on the fly, and both stages stall there:
+stage 0 verifies the n-gram drafts of every decode step, and stage 1
+verifies the always-``continue`` drafts behind the K-step block-table
+growth.
 
 The torch-native implementation the patch replaces is pure tensor ops and
 exact for both callers, so this module reloads vllm's own sampler source
 into a fresh module object and re-points the three names at the pre-patch
 functions. Scoped to the same SoC that skips the warmup; the 910B baseline
 keeps the Triton kernels it has been measured with -- except when the Talker
-K-step is explicitly armed there. That is the one path whose spec width the
-910B kernels cannot take (aivec 507035 on every one of the 8 combos tried),
-so the restore on a 910B is tied to exactly that arming, never to the SoC
-alone: the stock baseline (no arming env) keeps its sampler byte-for-byte.
+multi-frame decode is armed there (stage 1's ``speculative_config``). That is
+the one path whose spec width the 910B kernels cannot take, so the restore on
+a 910B is tied to that arming, never to the SoC alone: a 910B deployment
+without the Talker ``speculative_config`` keeps its sampler byte-for-byte.
 """
 
 import importlib.util

@@ -16,13 +16,10 @@
 #
 """Fixed-capacity decode attention: full-graph replay without per-step rebinding.
 
-Vendored from vllm-ascend (Apache-2.0) so that vLLM-Omni can deliver it. The
-ranked evaluation installs only this tree -- ``pip install -e .`` over our
-source into the official image -- and leaves vllm-ascend exactly as the image
-ships it, so a patch to vllm-ascend cannot reach a scored run. Everything this
-module needs from vllm-ascend is reachable through factories vLLM-Omni already
-overrides, so the rest of the change lives in ``fixed_kv_backend.py`` and in
-``NPUOmniPlatform``.
+Vendored from vllm-ascend (Apache-2.0) so that vLLM-Omni can deliver it
+without patching vllm-ascend: everything this module needs from vllm-ascend is
+reachable through factories vLLM-Omni already overrides, so the rest of the
+change lives in ``fixed_kv_backend.py`` and in ``NPUOmniPlatform``.
 
 ``FULL_DECODE_ONLY`` captures a whole decode step, but
 ``npu_fused_infer_attention_score`` takes ``actual_seq_lengths_kv`` as a host
@@ -130,23 +127,22 @@ def install_into_ascend_aclgraph() -> None:
       baked into the captured tasks, so one batch size holds one graph *per
       bucket*. Without that, the second capture pass finds the first bucket's
       entry, replays it instead of capturing, and hangs on the device
-      synchronize that closes the pass -- round ``20260827T170843Z``, exactly.
+      synchronize that closes the pass.
     * It synchronizes the stream before every FULL replay, to order
       ``update_attn_params`` against the previous one. This path issues no
       updates, so the barrier is pure cost. ``enable_enpu`` gates that one line
-      and nothing else in ``__call__`` (stock ``8092d3f6`` line 264), which is
-      what lets us borrow it instead of copying ~140 lines.
+      and nothing else in the stock ``__call__``, which is what lets us borrow it
+      instead of copying the whole wrapper.
 
     This wraps ``__call__`` rather than subclassing ``ACLGraphWrapper``, for the
     same reason :func:`install_into_ascend_backend` patches the backend class:
     ``current_platform`` is vllm-ascend's ``NPUPlatform``, so
     ``NPUOmniPlatform.get_graph_wrapper_cls`` is never consulted.
 
-    It deliberately does **not** touch ``vllm_ascend.attention.fixed_kv_decode``.
-    That module, and the ``graph_key()`` call site in the stock wrapper, exist
-    only where our own ``vllm-ascend-fixed-kv-decode.patch`` has been applied --
-    on the A3 box, not in the ranked image. Reaching for it made this look
-    delivered while it was still leaning on the patch it exists to replace.
+    It deliberately does **not** touch ``vllm_ascend.attention.fixed_kv_decode``:
+    that module only exists in vllm-ascend builds carrying the out-of-tree
+    fixed-KV patch, and leaning on it would leave this change dependent on the
+    patch it exists to replace.
     """
     from vllm_ascend.compilation import acl_graph
 
@@ -196,9 +192,9 @@ def install_into_ascend_backend() -> None:
     """Put the omni impl/builder on the class vLLM's selector actually uses.
 
     ``current_platform.get_attn_backend_cls`` is vllm-ascend's ``NPUPlatform``,
-    not ``NPUOmniPlatform``. Round ``20260827T175303Z`` captured extra buckets
-    then ran the stock builder, so runtime looked up ``(batch, None)``. Patch
-    the stock backend class in this process instead.
+    not ``NPUOmniPlatform``. Without this the extra buckets are captured but the
+    stock builder still runs for them, so runtime looks up ``(batch, None)``.
+    Patch the stock backend class in this process instead.
     """
     if not is_enabled():
         return
@@ -237,13 +233,11 @@ def buckets_for(capacity: int, block_size: int) -> tuple[int, ...]:
     """
     if not capacity:
         return ()
-    # The default has to be a code default, not an environment one: a ranked run
-    # sets no environment variables. Attention reads the declared capacity every
-    # step, so a bucket that just covers the sequence is worth having -- the
-    # Talker's is ~135 (a ~15-token condition plus ~118 codec frames), and 512
-    # against 4096 alone measured RTF 0.1592 vs 0.1721 on A3, -7.5%. The full
-    # capacity is always kept as the top bucket, so a longer sequence still has
-    # a graph to land on.
+    # The default has to be a code default, not an environment one: attention
+    # reads the declared capacity every step, so a bucket that just covers the
+    # sequence is worth having -- the Talker's is ~135 (a ~15-token condition
+    # plus ~118 codec frames). The full capacity is always kept as the top
+    # bucket, so a longer sequence still has a graph to land on.
     raw = os.getenv(_BUCKETS_ENV, _DEFAULT_BUCKETS)
     candidates = set()
     for part in raw.split(","):
@@ -290,7 +284,11 @@ def current_capacity() -> int | None:
 
 
 def graph_key() -> int | None:
-    """Extra ACL graph dispatch key, so one batch size can hold several buckets."""
+    """Extra ACL graph dispatch key, so one batch size can hold several buckets.
+
+    Read by vllm-ascend's ``ACLGraphWrapper`` in builds that carry the fixed-KV
+    hook; nothing in this package calls it directly.
+    """
     return current_capacity() if is_enabled() else None
 
 
