@@ -1,16 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Entrypoint sleep-mode coverage on small models.
+"""Entrypoint sleep-mode coverage on small models plus H100 BAGEL.
 
 Layering (tiny DiT before 7B on the same L4 so residual thinker weights cannot
 OOM the diffusion suite):
 1. Diffusion sleep/wake/generate — ``riverclouds/qwen_image_random`` on L4
 2. AR protocol (#4473) — ``Qwen/Qwen2.5-Omni-7B`` thinker-only on L4
 3. Light multistage orchestration — thinker-only AR + tiny DiT on L4×2
-
-BAGEL BagelPipeline TP=2 / coordinated dual-engine stay in
-``tests/e2e/offline_inference/test_bagel_expansion.py``.
+4. BAGEL BagelPipeline TP=2 / coordinated dual-engine — H100, ``full_model``
 """
 
 from __future__ import annotations
@@ -33,6 +31,7 @@ logger = logging.getLogger("OmniTest")
 
 MODEL_DIFF = "riverclouds/qwen_image_random"
 MODEL_AR = "Qwen/Qwen2.5-Omni-7B"
+MODEL_BAGEL = "ByteDance-Seed/BAGEL-7B-MoT"
 # Sleep/wake on 24 GiB L4 needs CPU-offload headroom. The thinker-only CI overlay
 # is the abort-test profile (util 0.90 / max_model_len 16384); 16.78 GiB weights
 # already left 0 KV at util 0.85. Match the L4×2 fixture below.
@@ -273,9 +272,9 @@ class TestOmniArSleepMode:
 async def test_multistage_ar_diffusion_sleep_wake():
     """Orchestration: generate → joint sleep/wake/resume → generate.
 
-    Covers the old H100 path that ``TestBagelCoordinatedSleepMode`` (still
-    skipped) and BAGEL TP=2 expansion (diffusion-only) do not: a 2-step
-    tiny-DiT generate after ``sleep(stage_ids=[0, 1])`` + ``resume_generation``.
+    Covers the L4 path that ``TestBagelCoordinatedSleepMode`` (still skipped)
+    and BAGEL TP=2 (diffusion-only, ``full_model``) do not: a 2-step tiny-DiT
+    generate after ``sleep(stage_ids=[0, 1])`` + ``resume_generation``.
     """
     stages = [
         {
@@ -332,3 +331,218 @@ async def test_multistage_ar_diffusion_sleep_wake():
         logger.info("Light multistage joint sleep/wake/resume generate OK")
     finally:
         await _shutdown_engine_and_clear_gpu(engine)
+
+
+# ---------------------------------------------------------------------------
+# 4) BAGEL — H100 ``full_model`` (nightly Entrypoints Test)
+# ---------------------------------------------------------------------------
+
+
+def _get_device_global_memory_used_gib(device_id: int) -> float:
+    """GPU-wide memory in use (GiB), including all processes (driver view).
+
+    Fail closed: a swallowed query that returned 0.0 used to inflate
+    ``drop_gib`` and false-pass VRAM assertions.
+    """
+    with current_omni_platform.device(device_id):
+        current_omni_platform.synchronize()
+        free_b, total_b = current_omni_platform.get_device_memory()
+    return (total_b - free_b) / 1024**3
+
+
+@pytest_asyncio.fixture(scope="class", loop_scope="class")
+async def bagel_diffusion_engine():
+    """Shared BAGEL BagelPipeline TP=2 engine for sleep/wake + generate."""
+    stages = [
+        {
+            "stage_id": 0,
+            "stage_type": "diffusion",
+            "runtime": {"process": True, "devices": "0,1", "max_batch_size": 1},
+            "engine_args": {
+                "model_stage": "base",
+                "gpu_memory_utilization": 0.1,
+                "model_class_name": "BagelPipeline",
+                "enable_sleep_mode": True,
+                "enforce_eager": True,
+                "max_num_batched_tokens": 8192,
+                "parallel_config": {"tensor_parallel_size": 2},
+            },
+            "final_output": True,
+            "final_output_type": "image",
+        }
+    ]
+    engine = AsyncOmni(model=MODEL_BAGEL, stages=stages, init_timeout=600, enable_sleep_mode=True)
+    yield engine
+    engine.shutdown()
+    await asyncio.sleep(1.5)
+
+
+@pytest.mark.full_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+class TestBagelDiffusionSleepMode:
+    """BAGEL diffusion sleep/wake on a class-scoped TP=2 BagelPipeline."""
+
+    @pytest.mark.asyncio(loop_scope="class")
+    async def test_diffusion_sleep_handshake(self, bagel_diffusion_engine: AsyncOmni):
+        try:
+            acks = await bagel_diffusion_engine.sleep(stage_ids=[0], level=1)
+            assert len(acks) >= 1
+            assert all(get_ack_info(ack, "status") == "SUCCESS" for ack in acks)
+            await bagel_diffusion_engine.wake_up(stage_ids=[0])
+        finally:
+            await _ensure_awake(bagel_diffusion_engine, [0])
+
+    @pytest.mark.asyncio(loop_scope="class")
+    async def test_cross_device_cleanup(self, bagel_diffusion_engine: AsyncOmni):
+        try:
+            used_before = _get_device_global_memory_used_gib(0) + _get_device_global_memory_used_gib(1)
+            acks = await bagel_diffusion_engine.sleep(stage_ids=[0], level=1)
+            await asyncio.sleep(1.5)
+            used_after = _get_device_global_memory_used_gib(0) + _get_device_global_memory_used_gib(1)
+            drop_gib = used_before - used_after
+            freed_gb = sum(get_ack_info(ack, "freed_bytes", 0) for ack in acks) / 1024**3
+            assert freed_gb > 14.0 or drop_gib > 8.0, f"ACK={freed_gb:.2f} GiB, global_drop={drop_gib:.2f} GiB"
+        finally:
+            await _ensure_awake(bagel_diffusion_engine, [0])
+
+    @pytest.mark.asyncio(loop_scope="class")
+    async def test_diffusion_sleep_wake_generate(self, bagel_diffusion_engine: AsyncOmni):
+        import gc
+
+        device_id = 1
+        try:
+            prompt = "A huge swimming pool, with many people swimming."
+            sp = OmniDiffusionSamplingParams(num_inference_steps=4, height=512, width=512, seed=42)
+            llm_sp = SamplingParams()
+
+            base_output = None
+            async for output in bagel_diffusion_engine.generate(
+                prompt, request_id="base", sampling_params_list=[llm_sp, sp]
+            ):
+                base_output = output
+            assert base_output is not None and len(base_output.images) > 0
+
+            current_omni_platform.empty_cache()
+            vram_initial = _get_device_global_memory_used_gib(device_id)
+
+            acks = await bagel_diffusion_engine.sleep(stage_ids=[0], level=1)
+            statuses = [get_ack_info(ack, "status") for ack in acks]
+            assert all(s == "SUCCESS" for s in statuses), f"Sleep failed. Statuses: {statuses}"
+
+            reported_freed_gib = sum(get_ack_info(ack, "freed_bytes", 0) for ack in acks) / 1024**3
+            await asyncio.sleep(2)
+            current_omni_platform.empty_cache()
+            vram_sleeping = _get_device_global_memory_used_gib(device_id)
+            assert reported_freed_gib > 14.0 or vram_sleeping < 5.0, (
+                f"Reported: {reported_freed_gib:.2f}G, Measured: {vram_sleeping:.2f}G"
+            )
+
+            await bagel_diffusion_engine.wake_up(stage_ids=[0])
+            await bagel_diffusion_engine.resume_generation(stage_ids=[0])
+            await asyncio.sleep(2.0)
+            gc.collect()
+            current_omni_platform.empty_cache()
+            vram_restored = _get_device_global_memory_used_gib(device_id)
+            assert abs(vram_restored - vram_initial) < 3.0, "VRAM failed to restore to initial levels"
+
+            post_output = None
+            async for output in bagel_diffusion_engine.generate(
+                prompt, request_id="post", sampling_params_list=[llm_sp, sp]
+            ):
+                post_output = output
+            assert post_output is not None
+            assert len(base_output.images) == len(post_output.images)
+            assert post_output.images[0] is not None
+        finally:
+            await _ensure_awake(bagel_diffusion_engine, [0])
+
+
+def _build_bagel_llm_stages() -> tuple[list[dict], list[dict]]:
+    common_args = {
+        "worker_type": "ar",
+        "enable_sleep_mode": True,
+        "dtype": "bfloat16",
+        "trust_remote_code": True,
+        "max_model_len": 2048,
+        "max_num_batched_tokens": 8192,
+        "enforce_eager": True,
+    }
+    stages = [
+        {
+            "stage_id": 0,
+            "stage_type": "llm",
+            "runtime": {"process": True, "devices": "0", "max_batch_size": 1},
+            "engine_args": {**common_args, "model_stage": "thinker", "gpu_memory_utilization": 0.1},
+        },
+        {
+            "stage_id": 1,
+            "stage_type": "llm",
+            "engine_input_source": [0],
+            "runtime": {"process": True, "devices": "1", "max_batch_size": 1, "connector_type": "queue"},
+            "engine_args": {**common_args, "model_stage": "talker", "gpu_memory_utilization": 0.1},
+        },
+    ]
+    connectors = [{"src_stage_id": 0, "dst_stage_id": 1, "connector_type": "queue"}]
+    return stages, connectors
+
+
+@pytest.mark.full_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+class TestBagelCoordinatedSleepMode:
+    """Dual-engine coordination (kept skipped; do not delete)."""
+
+    @pytest.mark.skip(
+        reason=(
+            "Flaky/CI: dual AsyncOmni can fail with "
+            "RuntimeError: Orchestrator init failed, StageDiffusionProc died during handshake. "
+            "Re-enable when stable (no OOM on coordinated talker+diffusion)."
+        )
+    )
+    @pytest.mark.asyncio(loop_scope="class")
+    async def test_coordinated_cross_device(self):
+        """Heterogeneous coordinated cleanup (talker + diffusion on GPU 1)."""
+        llm_stages, llm_connectors = _build_bagel_llm_stages()
+        llm_engine = AsyncOmni(
+            model=MODEL_BAGEL, stages=llm_stages, connectors=llm_connectors, init_timeout=600, enable_sleep_mode=True
+        )
+        diffusion_stages = [
+            {
+                "stage_id": 0,
+                "stage_type": "diffusion",
+                "runtime": {"process": True, "devices": "0,1", "max_batch_size": 1},
+                "engine_args": {
+                    "model_stage": "base",
+                    "gpu_memory_utilization": 0.1,
+                    "model_class_name": "BagelPipeline",
+                    "enable_sleep_mode": True,
+                    "enforce_eager": True,
+                    "max_num_batched_tokens": 8192,
+                    "parallel_config": {"tensor_parallel_size": 2},
+                },
+                "final_output": True,
+                "final_output_type": "image",
+            }
+        ]
+        diffusion_engine = AsyncOmni(
+            model=MODEL_BAGEL, stages=diffusion_stages, init_timeout=600, enable_sleep_mode=True
+        )
+        device_id = 1
+        try:
+            await llm_engine.wake_up(stage_ids=[1])
+            await diffusion_engine.wake_up(stage_ids=[0])
+            current_omni_platform.empty_cache()
+            await asyncio.sleep(2)
+            initial_vram = _get_device_global_memory_used_gib(device_id)
+
+            await llm_engine.sleep(stage_ids=[1], level=2)
+            await asyncio.sleep(1.0)
+            await diffusion_engine.sleep(stage_ids=[0], level=2)
+            await asyncio.sleep(3.0)
+            current_omni_platform.empty_cache()
+            final_vram = _get_device_global_memory_used_gib(device_id)
+            assert initial_vram - final_vram > 15.0 or final_vram < 8.0
+        finally:
+            llm_engine.shutdown()
+            diffusion_engine.shutdown()

@@ -537,7 +537,10 @@ class TestQwen3OmniRealtimeWebSocket:
 
 # These regressions use the engine-owned Qwen duplex plugin. The older class
 # above intentionally exercises the separate turn/STT deployment.
-_DUPLEX_REPEATS = int(os.environ.get("VLLM_OMNI_TEST_QWEN_DUPLEX_REPEATS", "20"))
+# ``advanced_model`` (merge) uses 5 interruptions; ``full_model`` (nightly)
+# keeps the 20-repeat race hunt. Marks select the case, not ``--run-level``.
+_DUPLEX_REPEATS_ADVANCED = 5
+_DUPLEX_REPEATS_FULL = 20
 _DUPLEX_LONG_INSTRUCTIONS = "Answer the user's question in English using at least eight complete sentences."
 _DUPLEX_SHORT_INSTRUCTIONS = "Answer the user's question in one short English sentence."
 
@@ -906,15 +909,12 @@ async def _run_duplex_history_pruning(runtime, log_path: Path) -> None:
         _duplex_assert_completed_audio(events, response_id)
 
 
-@pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 class TestQwen3OmniDuplexPlayback:
-    @pytest.mark.parametrize("generation_finished", [False, True], ids=["generating", "queued-playback"])
-    @pytest.mark.parametrize("repetition", range(_DUPLEX_REPEATS))
-    def test_speech_interrupts_playback(
+    def _run_speech_interrupts_playback(
         self, qwen_duplex_server, tmp_path: Path, generation_finished: bool, repetition: int
-    ):
+    ) -> None:
         """Reuse one live deployment; every repetition opens an independent call."""
         asyncio.run(
             _run_duplex_playback_interruption(
@@ -922,5 +922,22 @@ class TestQwen3OmniDuplexPlayback:
             )
         )
 
+    @pytest.mark.advanced_model
+    @pytest.mark.parametrize("generation_finished", [False, True], ids=["generating", "queued-playback"])
+    @pytest.mark.parametrize("repetition", range(_DUPLEX_REPEATS_ADVANCED))
+    def test_speech_interrupts_playback(
+        self, qwen_duplex_server, tmp_path: Path, generation_finished: bool, repetition: int
+    ):
+        self._run_speech_interrupts_playback(qwen_duplex_server, tmp_path, generation_finished, repetition)
+
+    @pytest.mark.full_model
+    @pytest.mark.parametrize("generation_finished", [False, True], ids=["generating", "queued-playback"])
+    @pytest.mark.parametrize("repetition", range(_DUPLEX_REPEATS_FULL))
+    def test_speech_interrupts_playback_full(
+        self, qwen_duplex_server, tmp_path: Path, generation_finished: bool, repetition: int
+    ):
+        self._run_speech_interrupts_playback(qwen_duplex_server, tmp_path, generation_finished, repetition)
+
+    @pytest.mark.advanced_model
     def test_mixed_image_audio_history_pruning(self, qwen_duplex_server, tmp_path: Path):
         asyncio.run(_run_duplex_history_pruning(qwen_duplex_server, tmp_path / "events.json"))
