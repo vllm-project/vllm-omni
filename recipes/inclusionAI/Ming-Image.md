@@ -27,7 +27,8 @@ For Design-Layer, the first returned image is the reconstructed composite and th
 - Python: 3.10+
 - CUDA: 13.0
 - vLLM version: 0.29.0
-- vLLM-Omni version or commit: 2ab5d1701
+- vLLM-Omni version or commit: 59db6a428
+- 2x H100 80GB (1xH100 to be validated)
 
 ### Commands
 
@@ -46,7 +47,7 @@ Note that a prompt refiner is expected to describe the prompts with details; we 
 curl -s http://127.0.0.1:8091/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "/path/to/inclusionAI/Ming-Image-0.1-Design",
+    "model": "inclusionAI/Ming-Image-0.1-Design",
     "messages": [{"role": "user", "content": "A clean editorial botanical poster"}],
     "modalities": ["image"],
     "extra_body": {
@@ -55,7 +56,7 @@ curl -s http://127.0.0.1:8091/v1/chat/completions \
     }
   }' \
   | jq -r '.choices[0].message.content[0].image_url.url | split(",")[1]' \
-  | base64 -d > ming_design.png
+  | base64 -d > ming_design_smoke.png
 ```
 
 ## Image editing
