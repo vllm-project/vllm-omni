@@ -19,8 +19,13 @@ logger = init_logger(__name__)
 class SchedulingMetadataAdapter(Protocol):
     """Translate runner payloads into generic scheduler-visible effects.
 
-    The current production consumer is the runner-owned full-payload receive
-    path. Async-chunk scheduling remains owned by OmniChunkTransferAdapter.
+    Configured adapters apply to runner-owned full-payload receive. Native
+    MRV2 async receive uses the built-in adapter; other async-chunk paths
+    remain owned by OmniChunkTransferAdapter.
+
+    Treat payload and all nested values, including tensors, as read-only.
+    They may share storage with the runner's cached payload. Extraction must
+    not modify them, including when it raises, so failed receives can be retried.
     """
 
     def extract(
