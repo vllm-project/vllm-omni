@@ -247,6 +247,16 @@ def cleanup_test_environment(*, shutdown_ray: bool = False) -> None:
         ray.shutdown()
 
     print("Pre-test device status:")
+    gc.collect()
+    if not current_omni_platform.is_cpu():
+        current_omni_platform.empty_cache()
+        try:
+            import torch
+
+            torch._C._host_emptyCache()
+        except AttributeError:
+            logger.warning("torch._C._host_emptyCache() only available in Pytorch >=2.5")
+
     num_devices = current_omni_platform.device_count()
     if num_devices > 0:
         try:
@@ -257,16 +267,6 @@ def cleanup_test_environment(*, shutdown_ray: bool = False) -> None:
             )
         except Exception as e:
             print(f"Device cleanup note: {e}")
-
-    gc.collect()
-    if not current_omni_platform.is_cpu():
-        current_omni_platform.empty_cache()
-        try:
-            import torch
-
-            torch._C._host_emptyCache()
-        except AttributeError:
-            logger.warning("torch._C._host_emptyCache() only available in Pytorch >=2.5")
 
     if current_omni_platform.is_available():
         print("Post-test device status:")

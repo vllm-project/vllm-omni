@@ -181,26 +181,54 @@ async def _tiny_dit_multistage_generate(engine: AsyncOmni, prompt: str, request_
     return output
 
 
-async def _shutdown_engine_and_clear_gpu(engine: AsyncOmni) -> None:
-    """Drop the engine, then wait until this L4 is free for the next class.
+def _reap_leftover_engine_children() -> None:
+    """Kill leftover AsyncOmni workers still parented by this pytest process."""
+    try:
+        import psutil
+    except ImportError:
+        return
 
-    ``shutdown()`` + a short sleep is not enough: residual thinker weights can
-    still occupy the device when the next class loads tiny DiT or another 7B.
-    """
-    from tests.helpers.clean import cleanup_test_environment, wait_for_gpu_memory_to_clear
+    keywords = ("stagediffusionproc", "enginecore", "vllm::worker", "vllm-omni::")
+    try:
+        children = psutil.Process().children(recursive=True)
+    except psutil.Error:
+        return
+
+    matched = []
+    for proc in children:
+        try:
+            blob = " ".join([proc.name(), *proc.cmdline()]).lower()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        if any(keyword in blob for keyword in keywords):
+            matched.append(proc)
+    if not matched:
+        return
+
+    logger.info("Reaping leftover engine pids: %s", [proc.pid for proc in matched])
+    for proc in matched:
+        try:
+            proc.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    _, still_alive = psutil.wait_procs(matched, timeout=5)
+    for proc in still_alive:
+        try:
+            proc.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    if still_alive:
+        psutil.wait_procs(still_alive, timeout=3)
+
+
+async def _shutdown_engine_and_clear_gpu(engine: AsyncOmni) -> None:
+    """Shut down the engine, reap leftover workers, then run shared cleanup."""
+    from tests.helpers.clean import cleanup_test_environment
 
     engine.shutdown()
+    _reap_leftover_engine_children()
     await asyncio.sleep(1.5)
     cleanup_test_environment()
-    n = current_omni_platform.device_count()
-    if n <= 0:
-        return
-    # Fail closed. Module autouse cleanup only logs a note on timeout.
-    wait_for_gpu_memory_to_clear(
-        devices=list(range(n)),
-        threshold_ratio=0.15,
-        timeout_s=120,
-    )
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -438,8 +466,7 @@ async def bagel_diffusion_engine():
         enable_sleep_mode=True,
     )
     yield engine
-    engine.shutdown()
-    await asyncio.sleep(1.5)
+    await _shutdown_engine_and_clear_gpu(engine)
 
 
 @pytest.mark.full_model
@@ -589,5 +616,5 @@ class TestBagelCoordinatedSleepMode:
             final_vram = _get_device_global_memory_used_gib(device_id)
             assert initial_vram - final_vram > 15.0 or final_vram < 8.0
         finally:
-            llm_engine.shutdown()
-            diffusion_engine.shutdown()
+            await _shutdown_engine_and_clear_gpu(llm_engine)
+            await _shutdown_engine_and_clear_gpu(diffusion_engine)
