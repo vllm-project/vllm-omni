@@ -32,13 +32,15 @@ For Design-Layer, the first returned image is the reconstructed composite and th
 ### Commands
 
 ```bash
-MODEL=/path/to/inclusionAI/Ming-Image-0.1-Design
+MODEL=inclusionAI/Ming-Image-0.1-Design
 vllm serve "$MODEL" --omni --deploy-config vllm_omni/deploy/ming_image.yaml --port 8091
 ```
 
-For layer decomposition, set `MODEL` to `/path/to/inclusionAI/Ming-Image-0.1-Design-Layer`.
+For layer decomposition, set `MODEL` to `inclusionAI/Ming-Image-0.1-Design-Layer`.
 
 ## Text-to-image
+
+Note that a prompt refiner is expected to describe the prompts with details; we will refine the example inputs soon.
 
 ```bash
 curl -s http://127.0.0.1:8091/v1/chat/completions \
@@ -61,42 +63,61 @@ curl -s http://127.0.0.1:8091/v1/chat/completions \
 Pass one input image and an editing instruction:
 
 ```bash
-IMAGE_B64=$(base64 -w0 input.png)
-curl -s http://127.0.0.1:8091/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d "$(jq -n --arg image "$IMAGE_B64" '{
-    model: "/path/to/inclusionAI/Ming-Image-0.1-Design",
+MODEL=inclusionAI/Ming-Image-0.1-Design
+INPUT_IMAGE=/path/to/input.png
+
+jq -n \
+  --arg model "$MODEL" \
+  --rawfile image <(base64 -w0 "$INPUT_IMAGE") \
+  '{
+    model: $model,
     messages: [{role: "user", content: [
       {type: "image_url", image_url: {url: ("data:image/png;base64," + $image)}},
-      {type: "text", text: "Replace the background with a quiet blue studio"}
+      {type: "text", text: "Change the background to blue"}
     ]}],
     modalities: ["image"],
-    extra_body: {height: 1024, width: 1024, seed: 42}
-  }')" \
+    extra_body: {
+      height: 1024, width: 1024,
+      steps: 12, cfg: 1.0, seed: 42
+    }
+  }' |
+curl -sS http://127.0.0.1:8091/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  --data-binary @- \
   | jq -r '.choices[0].message.content[0].image_url.url | split(",")[1]' \
   | base64 -d > ming_edit.png
 ```
 
 ## Layer decomposition
 
-Use the Design-Layer checkpoint and set `num_layers`. Four requested layers
-produce five RGBA outputs: one reconstructed composite followed by four layers.
+Use the Design-Layer checkpoint and set `INPUT_IMAGE` to a local flattened design image.
+Note that the prompt should better depict each layer to be decomposed, we will refine the example inputs soon.
 
 ```bash
-IMAGE_B64=$(base64 -w0 input.png)
-curl -s http://127.0.0.1:8091/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d "$(jq -n --arg image "$IMAGE_B64" '{
-    model: "/path/to/inclusionAI/Ming-Image-0.1-Design-Layer",
+MODEL=inclusionAI/Ming-Image-0.1-Design-Layer
+INPUT_IMAGE=/path/to/input.png
+PROMPT="Decompose this design into editable visual layers"
+
+jq -n \
+  --arg model "$MODEL" \
+  --rawfile image <(base64 -w0 "$INPUT_IMAGE") \
+  --arg prompt "$PROMPT" \
+  '{
+    model: $model,
     messages: [{role: "user", content: [
       {type: "image_url", image_url: {url: ("data:image/png;base64," + $image)}},
-      {type: "text", text: "Decompose this design into editable visual layers"}
+      {type: "text", text: $prompt}
     ]}],
     modalities: ["image"],
     extra_body: {
-      num_layers: 4, height: 1024, width: 1024, seed: 42
+      num_layers: 6,
+      height: 1024, width: 1024,
+      steps: 12, cfg: 2.0, seed: 42
     }
-  }')" > response.json
+  }' |
+curl -sS http://127.0.0.1:8091/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  --data-binary @- > response.json
 
 jq -r '.choices[0].message.content[].image_url.url | split(",")[1]' response.json |
   nl -v 0 |
