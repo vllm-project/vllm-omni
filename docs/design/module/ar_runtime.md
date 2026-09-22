@@ -43,8 +43,9 @@ only the typed update and readiness signal; it does not inspect payload fields.
 The receive flow is
 `process_pending_full_payload_inputs()` -> `register_chunk_recv()` ->
 `recv_full_payload_inputs()` -> `SchedulingMetadataAdapter.extract()` ->
-`OmniConnectorOutput` -> `update_request_metadata()`. With `async_chunk`
-enabled, this coordinator is not created and `OmniChunkTransferAdapter` retains
+`OmniConnectorOutput` -> `update_request_metadata()`. Native MRV2 async
+receive also uses this coordinator and typed updates, with the built-in
+metadata adapter. Other async-chunk paths retain `OmniChunkTransferAdapter`
 ownership of chunk transfer and request updates.
 
 ## Candidate invariants
