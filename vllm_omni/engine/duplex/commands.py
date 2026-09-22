@@ -1,41 +1,62 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Typed commands accepted by a duplex session.
+"""The command vocabulary one duplex session accepts, plus its mailbox rendering.
 
 ``DuplexSessionHandle.submit()`` takes one of these; the websocket handler and
-``InlineDuplexClient`` build them with :func:`command_from_realtime` from the
-OpenAI Realtime client event vocabulary. Every command can also render the
-session-internal mailbox payload (``payload()``), which is the dictionary
-vocabulary the session runner bodies were written against.
+``InlineDuplexClient`` build them with :func:`command_from_realtime`.
+
+The *wire* half of each command --- which client event it decodes from and what
+fields survive decoding --- now lives in ``vllm_omni.protocol.duplex.commands``,
+which carries the whole vocabulary: the eight Tier 1 classes re-exported from
+``vllm_omni.protocol.realtime.commands``, the two Tier 2 ones and the seven
+Tier 3 ones. The engine imports that module and never the Tier 1 one directly,
+so a command that later grows a duplex extension changes one file
+(RFC #6592 P0a).
+
+The *engine* half stays here, because it is not wire contract at all:
+``payload()`` renders the session-internal mailbox dictionary the runner bodies
+were written against, and its ``type`` is the mailbox channel rather than the
+client event. Those two genuinely differ --- ``session.update`` and
+``conversation.item.create`` / ``.delete`` / ``.truncate`` all travel on the
+``turn.signal`` channel --- which is why the halves are separated instead of
+the classes being relocated wholesale.
 """
 
 from __future__ import annotations
 
 import base64
 from collections.abc import Mapping
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, ClassVar
 
+from vllm_omni.protocol.duplex import RealtimeProtocolError
+from vllm_omni.protocol.duplex import commands as _duplex_wire
+from vllm_omni.protocol.duplex.commands import RealtimeCommand
+
 if TYPE_CHECKING:
-    from vllm_omni.engine.duplex.realtime_commands import RealtimeInputDefaults
+    from vllm_omni.protocol.duplex import RealtimeInputDefaults
 
 
-class DuplexCommandError(ValueError):
-    """A client payload could not be turned into a command."""
+class DuplexCommandError(RealtimeProtocolError):
+    """A client payload could not be turned into a duplex command.
 
-    def __init__(self, message: str, *, code: str = "bad_event", event_id: str | None = None) -> None:
-        super().__init__(message)
-        self.code = code
-        self.event_id = event_id
+    The duplex name for a Realtime protocol error: same ``code`` /
+    ``event_id`` contract, so the error envelope is rendered identically
+    whichever consumer raised it.
+    """
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class DuplexCommand:
+class DuplexCommand(RealtimeCommand):
+    """A Realtime command as the duplex engine handles it.
+
+    Adds the mailbox channel (``type``) and its rendering on top of the wire
+    command; every concrete class below pairs this with its protocol twin.
+    """
+
     #: Mailbox event type this command renders to (see ``payload()``).
     type: ClassVar[str] = ""
-    #: Client correlation id (OpenAI ``event_id``), echoed on error events.
-    event_id: str | None = None
 
     def payload(self) -> dict[str, object]:
         """Render the session-internal mailbox dictionary."""
@@ -56,19 +77,25 @@ class DuplexCommand:
         return data
 
 
+# ---- GA commands ----
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
-class AppendAudio(DuplexCommand):
+class UpdateSession(DuplexCommand, _duplex_wire.UpdateSession):
+    type: ClassVar[str] = "turn.signal"
+
+    def payload(self) -> dict[str, object]:
+        data = DuplexCommand.payload(self)
+        data["event"] = "session.update"
+        data["payload"] = dict(data.pop("patch", {}) or {})
+        return data
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AppendAudio(DuplexCommand, _duplex_wire.AppendAudio):
     type: ClassVar[str] = "input_audio_buffer.append"
-    #: Raw audio bytes in ``format`` at ``sample_rate_hz`` (base64 only on the wire).
-    audio: bytes
-    format: str = "pcm16"
-    sample_rate_hz: int | None = None
-    is_speech: bool | None = None
-    video_frames: tuple[str, ...] = ()
-    duration_ms: int | None = None
-    audio_end_ms: int | None = None
-    #: Model-neutral hints carried through from the wire (rms, vad, transcript hints ...).
-    hints: Mapping[str, object] = field(default_factory=dict)
+    #: Empty ``audio`` with ``video_frames`` is legal when capabilities allow video without audio.
+    audio: bytes = b""
 
     def payload(self) -> dict[str, object]:
         data = DuplexCommand.payload(self)
@@ -83,28 +110,18 @@ class AppendAudio(DuplexCommand):
             merged: dict[str, object] = dict(hints)
             merged.update(data)
             data = merged
-        data["audio"] = base64.b64encode(self.audio).decode("ascii")
+        if self.audio:
+            data["audio"] = base64.b64encode(self.audio).decode("ascii")
+        else:
+            data.pop("audio", None)
         if not data.get("video_frames"):
             data.pop("video_frames", None)
         return data
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class AppendText(DuplexCommand):
-    type: ClassVar[str] = "input.text.append"
-    text: str
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class Commit(DuplexCommand):
+class Commit(DuplexCommand, _duplex_wire.Commit):
     type: ClassVar[str] = "input_audio_buffer.commit"
-    final: bool = True
-    #: ``None`` means "no explicit request": the runner decides on commit (auto-response
-    #: sessions answer on their own); ``True`` / ``False`` force it.
-    create_response: bool | None = None
-    is_speech: bool | None = None
-    #: Realtime conversation item created for this commit (wire correlation only).
-    realtime_item_id: str | None = None
 
     def payload(self) -> dict[str, object]:
         data = DuplexCommand.payload(self)
@@ -114,10 +131,18 @@ class Commit(DuplexCommand):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class CreateResponse(DuplexCommand):
+class ClearInput(DuplexCommand, _duplex_wire.ClearInput):
+    type: ClassVar[str] = "input_audio_buffer.clear"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ClearOutputAudio(DuplexCommand, _duplex_wire.ClearOutputAudio):
+    type: ClassVar[str] = "output_audio_buffer.clear"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CreateResponse(DuplexCommand, _duplex_wire.CreateResponse):
     type: ClassVar[str] = "response.create"
-    #: Raw Realtime ``response`` object (instructions, voice, modalities, ...).
-    options: Mapping[str, object] = field(default_factory=dict)
 
     def payload(self) -> dict[str, object]:
         data = DuplexCommand.payload(self)
@@ -128,84 +153,13 @@ class CreateResponse(DuplexCommand):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class ClearInput(DuplexCommand):
-    type: ClassVar[str] = "input_audio_buffer.clear"
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class CancelInput(DuplexCommand):
-    type: ClassVar[str] = "input.cancel"
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class CancelResponse(DuplexCommand):
+class CancelResponse(DuplexCommand, _duplex_wire.CancelResponse):
     type: ClassVar[str] = "response.cancel"
-    response_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class BargeIn(DuplexCommand):
-    type: ClassVar[str] = "barge_in"
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class ClearOutputAudio(DuplexCommand):
-    type: ClassVar[str] = "output_audio_buffer.clear"
-    #: Explicit response to clear; ``None`` targets the active/last response.
-    response_id: str | None = None
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class SignalTurn(DuplexCommand):
-    """Generic ``turn.signal`` (local turn transitions such as ``user_started``)."""
-
+class CreateItem(DuplexCommand, _duplex_wire.CreateItem):
     type: ClassVar[str] = "turn.signal"
-    event: str
-    signal_payload: Mapping[str, object] = field(default_factory=dict)
-
-    def payload(self) -> dict[str, object]:
-        data = DuplexCommand.payload(self)
-        signal_payload = data.pop("signal_payload", None)
-        if isinstance(signal_payload, Mapping) and signal_payload:
-            data["payload"] = dict(signal_payload)
-        return data
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class UpdateSession(DuplexCommand):
-    """``session.update``: a Realtime ``session`` object patch."""
-
-    type: ClassVar[str] = "turn.signal"
-    patch: Mapping[str, object] = field(default_factory=dict)
-
-    def payload(self) -> dict[str, object]:
-        data = DuplexCommand.payload(self)
-        data["event"] = "session.update"
-        data["payload"] = dict(data.pop("patch", {}) or {})
-        return data
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class AckPlayback(DuplexCommand):
-    type: ClassVar[str] = "playback.ack"
-    played_ms: int
-    committed_ms: int | None = None
-    response_id: str | None = None
-    item_id: str | None = None
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class Heartbeat(DuplexCommand):
-    type: ClassVar[str] = "session.heartbeat"
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class CreateItem(DuplexCommand):
-    """``conversation.item.create`` (history injection or function-call output)."""
-
-    type: ClassVar[str] = "turn.signal"
-    item: Mapping[str, object]
-    previous_item_id: str | None = None
 
     def payload(self) -> dict[str, object]:
         data = DuplexCommand.payload(self)
@@ -219,9 +173,8 @@ class CreateItem(DuplexCommand):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class DeleteItem(DuplexCommand):
+class DeleteItem(DuplexCommand, _duplex_wire.DeleteItem):
     type: ClassVar[str] = "turn.signal"
-    item_id: str
 
     def payload(self) -> dict[str, object]:
         data = DuplexCommand.payload(self)
@@ -231,11 +184,8 @@ class DeleteItem(DuplexCommand):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class TruncateItem(DuplexCommand):
+class TruncateItem(DuplexCommand, _duplex_wire.TruncateItem):
     type: ClassVar[str] = "turn.signal"
-    item_id: str
-    audio_end_ms: int
-    content_index: int = 0
 
     def payload(self) -> dict[str, object]:
         data = DuplexCommand.payload(self)
@@ -248,15 +198,51 @@ class TruncateItem(DuplexCommand):
         return data
 
 
+# ---- duplex extension commands ----
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
-class CloseSession(DuplexCommand):
-    """Graceful close requested through the command stream (``session.close``)."""
+class AppendText(DuplexCommand, _duplex_wire.AppendText):
+    type: ClassVar[str] = "input.text.append"
 
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CancelInput(DuplexCommand, _duplex_wire.CancelInput):
+    type: ClassVar[str] = "input.cancel"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class BargeIn(DuplexCommand, _duplex_wire.BargeIn):
+    type: ClassVar[str] = "barge_in"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SignalTurn(DuplexCommand, _duplex_wire.SignalTurn):
+    type: ClassVar[str] = "turn.signal"
+
+    def payload(self) -> dict[str, object]:
+        data = DuplexCommand.payload(self)
+        signal_payload = data.pop("signal_payload", None)
+        if isinstance(signal_payload, Mapping) and signal_payload:
+            data["payload"] = dict(signal_payload)
+        return data
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AckPlayback(DuplexCommand, _duplex_wire.AckPlayback):
+    type: ClassVar[str] = "playback.ack"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Heartbeat(DuplexCommand, _duplex_wire.Heartbeat):
+    type: ClassVar[str] = "session.heartbeat"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CloseSession(DuplexCommand, _duplex_wire.CloseSession):
     type: ClassVar[str] = "session.close"
-    reason: str = "client_close"
 
 
-#: Realtime client event types that map onto commands (wire vocabulary).
 REALTIME_COMMAND_TYPES: frozenset[str] = frozenset(
     {
         "input_audio_buffer.append",
@@ -300,7 +286,6 @@ def command_from_realtime(
 
 
 __all__ = [
-    "REALTIME_COMMAND_TYPES",
     "AckPlayback",
     "AppendAudio",
     "AppendText",
@@ -317,6 +302,8 @@ __all__ = [
     "DuplexCommand",
     "DuplexCommandError",
     "Heartbeat",
+    "REALTIME_COMMAND_TYPES",
+    "RealtimeCommand",
     "SignalTurn",
     "TruncateItem",
     "UpdateSession",

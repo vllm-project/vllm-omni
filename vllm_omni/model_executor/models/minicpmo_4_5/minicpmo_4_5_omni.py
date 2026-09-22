@@ -371,8 +371,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             seq=seq,
             is_speech=bool(payload.get("is_speech", False)),
             final=bool(duplex.get("final")),
+            stage0_window=(duplex.get("stage0_window") if isinstance(duplex.get("stage0_window"), dict) else None),
         )
         update_result = dict(result)
+        if result.get("stage0_window_replaced") is True:
+            window = duplex.get("stage0_window", {})
+            logger.info(
+                "MiniCPM-o Stage-0 window replaced: mode=%s drop_units=%s tokens=%s seq=%s",
+                window.get("mode"),
+                window.get("drop_units"),
+                result.get("num_input_tokens"),
+                seq,
+            )
         update_result.pop("inputs_embeds", None)
         if result.get("success") is not True:
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)

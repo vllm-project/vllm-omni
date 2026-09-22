@@ -428,11 +428,17 @@ class SileroStreamingVAD:
 
             if self._speech_active:
                 contained_speech = True
+                if probability >= self.config.threshold:
+                    # Confirmed speech cancels a pending endpoint. Otherwise a
+                    # brief pause can age through resumed speech and split the
+                    # utterance at the next low-probability frame.
+                    self._silence_samples = 0
+                    continue
                 below_negative_threshold = probability < negative_threshold
                 if not below_negative_threshold and self._silence_samples == 0:
                     continue
-                # A silence candidate is running: louder frames keep its clock
-                # moving but cannot themselves close the turn.
+                # Scores inside the hysteresis band keep the pending timer,
+                # but cannot themselves close the turn.
                 self._silence_samples += self._WINDOW_SAMPLES
                 if not below_negative_threshold or self._silence_samples < min_silence_samples:
                     continue

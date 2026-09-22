@@ -3,7 +3,7 @@
 
 import json
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
 from typing import Any, TypeVar
@@ -282,15 +282,44 @@ def test_encoder_task_validation_and_transformer_routing():
     assert pipeline._resolve_task(None, {"image": object()}) == "fl2va"
     assert pipeline._resolve_task(None, {"audio": object()}) == "ref2va"
     assert pipeline._resolve_task(None, {"video": object()}) == "ref2va"
+    assert pipeline._resolve_task(None, {"audio": object()}, audio_mode="lock_source") == "t2va"
+    assert (
+        pipeline._resolve_task(
+            None,
+            {"image": object(), "audio": object()},
+            audio_mode="lock_source",
+        )
+        == "fl2va"
+    )
+    assert (
+        pipeline._resolve_task(
+            None,
+            {"video": object(), "audio": object()},
+            audio_mode="lock_source",
+        )
+        == "ref2va"
+    )
     fl2v_spec = _turbo_spec("minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors")
     ref2v_spec = _turbo_spec("minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors")
     assert pipeline._resolve_task("fl2va", {"image": object()}, turbo_spec=fl2v_spec) == "fl2va"
     with pytest.raises(OmniClientError, match="serves"):
         pipeline._resolve_task("ref2va", {}, turbo_spec=fl2v_spec)
     assert pipeline._resolve_task("ref2va", {"image": object()}, turbo_spec=ref2v_spec) == "ref2va"
+    pipeline.partition = "fl2va"
+    pipeline.supported_tasks = frozenset({"t2va", "fl2va"})
+    assert pipeline._resolve_task(None, {"audio": object()}, audio_mode="lock_source") == "t2va"
+    assert (
+        pipeline._resolve_task(
+            None,
+            {"image": object(), "audio": object()},
+            audio_mode="lock_source",
+        )
+        == "fl2va"
+    )
     pipeline.partition = "ref2va"
     pipeline.supported_tasks = frozenset({"ref2va"})
     assert pipeline._resolve_task("ref2va") == "ref2va"
+    assert pipeline._resolve_task(None, {"audio": object()}, audio_mode="lock_source") == "ref2va"
 
     pipeline.partition = "combined"
     pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
@@ -423,6 +452,7 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
     assert pipeline.partition == expected_partition
     assert pipeline.supported_tasks == expected_tasks
     assert len(created["dit"]) == expected_dits
+    assert all(kwargs["diffusers_weights"] is False for _, kwargs in created["dit"])
     component_path = tmp_path / component_partition
     assert created["video_vae"] == [str(component_path / "video_vae")]
     assert created["audio_vae"] == [str(component_path / "audio_vae")]
@@ -1041,6 +1071,56 @@ def test_packed_attention_rejects_backends_without_multi_doc_capability(backend_
         )
 
 
+def test_rainfusion_packed_padding_stays_mask_free_on_unaligned_lengths():
+    """Regression for the #5543 follow-up crash fixed in #7235.
+
+    MiniMax-H3 pads every packed request to a multiple of 64 rows, so any
+    non-64-aligned length reaches this path with used < packed_total. Before
+    RAINFUSION_ATTN advertised supports_prefix_kv_slicing, the model built a
+    padding mask here that _assert_metadata_compatible then rejected at the
+    first sparse layer. This drives the real backend class (not a fake flag)
+    through the packed path; both the sparse dispatch and the dense fallback
+    share this metadata construction and neither ever reads attn_mask.
+    """
+    from vllm_omni.diffusion.attention.backends.rainfusion_attn import (
+        RainFusionAttentionBackend,
+    )
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3Attention,
+    )
+
+    class FakeAttention(torch.nn.Module):
+        attn_backend = RainFusionAttentionBackend
+
+        def __init__(self):
+            super().__init__()
+            self.metadata = None
+
+        def forward(self, query, key, value, metadata):
+            self.metadata = metadata
+            return query
+
+    attention = object.__new__(MiniMaxH3Attention)
+    torch.nn.Module.__init__(attention)
+    attention.attention = FakeAttention()
+    q = torch.randn(8, 2, 4)
+
+    attention._run_packed_attention(
+        q,
+        q,
+        q,
+        # One request: 5 valid rows padded to the 8-row alignment boundary.
+        cu_seqlens=torch.tensor([0, 5, 8], dtype=torch.int32),
+        max_seqlen=5,
+        packed_total=8,
+    )
+
+    metadata = attention.attention.metadata
+    assert metadata is not None
+    assert metadata.attn_mask is None
+    assert metadata.extra["valid_kv_length"] == 5
+
+
 def test_reference_image_resize_contract():
     from PIL import Image
 
@@ -1099,6 +1179,7 @@ def test_minimax_h3_advertises_the_official_ref2va_image_limit():
     from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
     assert get_diffusion_model_metadata("MiniMaxH3Pipeline").max_multimodal_image_inputs == 9
+    assert get_diffusion_model_metadata("MiniMaxH3Pipeline").supports_latent_mask_editing
 
 
 def test_text_attention_routes_local_gqa_heads_through_sdpa_helper(monkeypatch):
@@ -2756,41 +2837,63 @@ def test_dit_encoder_selection_keeps_vae_resident():
     component.offload_to_cpu.assert_not_called()
 
 
-def test_keyframe_encode_pins_and_restores_cudnn_settings():
+@pytest.mark.parametrize(
+    ("capability", "allow_tf32"),
+    [((8, 6), True), ((9, 0), False), ((10, 0), True), ((10, 3), True), (None, True)],
+)
+@pytest.mark.parametrize("initial_tf32", [False, True])
+@pytest.mark.parametrize("fail_encode", [False, True])
+def test_keyframe_encode_pins_and_restores_cudnn_settings(
+    monkeypatch, capability, allow_tf32, initial_tf32, fail_encode
+):
+    from vllm.platforms.interface import DeviceCapability
+
     from vllm_omni.diffusion.models.minimax_h3.vae import (
         _minimax_h3_keyframe_encode_context,
     )
+    from vllm_omni.platforms import current_omni_platform
+
+    def get_capability(device_id):
+        assert device_id == 1
+        return DeviceCapability(*capability) if capability is not None else None
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(current_omni_platform, "get_device_capability", get_capability)
 
     cudnn = torch.backends.cudnn
-    original = (
-        cudnn.enabled,
-        cudnn.benchmark,
-        cudnn.deterministic,
-        cudnn.allow_tf32,
-    )
-    try:
-        cudnn.enabled = False
-        cudnn.benchmark = True
-        cudnn.deterministic = False
-        cudnn.allow_tf32 = False
-
-        with _minimax_h3_keyframe_encode_context(torch.device("cuda")):
+    with cudnn.flags(enabled=False, benchmark=True, deterministic=False, allow_tf32=initial_tf32):
+        error_context = pytest.raises(RuntimeError, match="encode failed") if fail_encode else nullcontext()
+        with error_context, _minimax_h3_keyframe_encode_context(torch.device("cuda:1")):
             assert cudnn.enabled
             assert not cudnn.benchmark
             assert cudnn.deterministic
-            assert cudnn.allow_tf32
+            assert cudnn.allow_tf32 is allow_tf32
+            if fail_encode:
+                raise RuntimeError("encode failed")
 
         assert not cudnn.enabled
         assert cudnn.benchmark
         assert not cudnn.deterministic
-        assert not cudnn.allow_tf32
-    finally:
-        (
-            cudnn.enabled,
-            cudnn.benchmark,
-            cudnn.deterministic,
-            cudnn.allow_tf32,
-        ) = original
+        assert cudnn.allow_tf32 is initial_tf32
+
+
+def test_keyframe_encode_cpu_keeps_cudnn_settings(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.vae import (
+        _minimax_h3_keyframe_encode_context,
+    )
+    from vllm_omni.platforms import current_omni_platform
+
+    def unexpected_capability_query(device_id):
+        pytest.fail("CPU keyframe encode must not query CUDA capability")
+
+    monkeypatch.setattr(current_omni_platform, "get_device_capability", unexpected_capability_query)
+    cudnn = torch.backends.cudnn
+    with cudnn.flags(enabled=False, benchmark=True, deterministic=False, allow_tf32=False):
+        with _minimax_h3_keyframe_encode_context(torch.device("cpu")):
+            assert not cudnn.enabled
+            assert cudnn.benchmark
+            assert not cudnn.deterministic
+            assert not cudnn.allow_tf32
 
 
 @pytest.mark.parametrize("fail_encode", [False, True])
@@ -2851,15 +2954,17 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
 
     class FakeEncoder:
-        instances = []
+        instances: list["FakeEncoder"] = []
 
         def __init__(self, **kwargs):
             self.pushes = []
             self.kwargs = kwargs
             self.__class__.instances.append(self)
 
-        def push(self, frames):
+        def push(self, frames, *, on_consumed=None):
             self.pushes.append(np.array(frames, copy=True))
+            if on_consumed is not None:
+                on_consumed()
 
         def finish(self):
             return b"mp4"
@@ -2872,6 +2977,8 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
             return torch.zeros(1, 1, 2)
 
     class FakeVideoVAE:
+        chunk_value_range = (0.0, 1.0)
+
         def decode_with_chunks(self, latent, *, on_chunk):
             for value in (0.0, 0.25, 0.5):
                 on_chunk(torch.full((1, 3, 3, 2, 2), value))
@@ -2883,7 +2990,7 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
     pipeline.device = torch.device("cpu")
     monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_uses_manual_component_offload", lambda self, component: False)
     monkeypatch.setattr(
-        "vllm_omni.diffusion.utils.media_utils.ChunkedMP4Encoder",
+        "vllm_omni.diffusion.utils.chunked_video.ChunkedMP4Encoder",
         FakeEncoder,
     )
 
@@ -2903,19 +3010,90 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
     assert encoder.pushes[1].shape == (3, 2, 2, 3)
 
 
+def _peer_rank_preencode_pipeline(monkeypatch):
+    """An H3 pipeline whose video VAE is a distributed rank that owns no output.
+
+    Every rank of the VAE group must call ``decode_with_chunks`` to keep the
+    temporal collectives in lockstep, but only the owner receives chunks, so a
+    peer's callback is never invoked.
+    """
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+
+    class FakeAudioVAE:
+        def decode_latent(self, latent):
+            return torch.zeros(1, 1, 2)
+
+    class PeerRankVideoVAE:
+        chunk_value_range = (0.0, 1.0)
+
+        def decode_with_chunks(self, latent, *, on_chunk):
+            del latent, on_chunk
+
+    pipeline = object.__new__(mod.MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.audio_vae = FakeAudioVAE()
+    pipeline.video_vae = PeerRankVideoVAE()
+    pipeline.device = torch.device("cpu")
+    pipeline.od_config = SimpleNamespace()
+    monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_uses_manual_component_offload", lambda self, component: False)
+    return pipeline
+
+
+def test_peer_vae_rank_returns_no_preencoded_output_instead_of_failing(monkeypatch):
+    """A rank that owns no output must not turn its silence into a request error."""
+    pipeline = _peer_rank_preencode_pipeline(monkeypatch)
+
+    output = pipeline.decode_to_mp4(torch.zeros(1), torch.zeros(1), height=2, width=2)
+
+    assert output == b""
+
+
+def test_peer_vae_rank_post_decode_reaches_post_processing(monkeypatch):
+    """The real H3 post_decode chain, not just the shared consumer, tolerates a peer rank."""
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.worker.utils import StepRequestState
+
+    pipeline = _peer_rank_preencode_pipeline(monkeypatch)
+    monkeypatch.setattr(pipeline, "_unpack_denoised_rows", lambda *args, **kwargs: (torch.zeros(1), torch.zeros(1)))
+    state = StepRequestState(
+        request_id="peer-rank",
+        sampling=SimpleNamespace(num_outputs_per_prompt=1),
+        prompt="a prompt",
+    )
+    state.latents = torch.zeros(1)
+    state.extra[mod._STEP_BRANCH] = object()
+    state.extra[mod._STEP_AUDIO_ROWS] = torch.zeros(1)
+    state.extra[mod._STEP_SHAPE] = {
+        "latent_t": 1,
+        "latent_h": 1,
+        "latent_w": 1,
+        "audio_t": 1,
+        "height": 2,
+        "width": 2,
+        "preencode_mp4": True,
+    }
+
+    output = pipeline.post_decode(state)
+
+    assert output.output == (b"", None)
+    assert mod._minimax_h3_post_process(output.output)["video"] == [b""]
+
+
 def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatch):
     """A client's encoder options must survive the worker-side pre-encode path."""
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
 
     class FakeEncoder:
-        instances = []
+        instances: list["FakeEncoder"] = []
 
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             self.__class__.instances.append(self)
 
-        def push(self, frames):
+        def push(self, frames, *, on_consumed=None):
             del frames
+            if on_consumed is not None:
+                on_consumed()
 
         def finish(self):
             return b"mp4"
@@ -2928,6 +3106,8 @@ def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatc
             return torch.zeros(1, 1, 2)
 
     class FakeVideoVAE:
+        chunk_value_range = (0.0, 1.0)
+
         def decode_with_chunks(self, latent, *, on_chunk):
             on_chunk(torch.zeros(1, 3, 1, 2, 2))
 
@@ -2937,7 +3117,7 @@ def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatc
     pipeline.video_vae = FakeVideoVAE()
     pipeline.device = torch.device("cpu")
     monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_uses_manual_component_offload", lambda self, component: False)
-    monkeypatch.setattr("vllm_omni.diffusion.utils.media_utils.ChunkedMP4Encoder", FakeEncoder)
+    monkeypatch.setattr("vllm_omni.diffusion.utils.chunked_video.ChunkedMP4Encoder", FakeEncoder)
 
     pipeline.decode_to_mp4(
         torch.zeros(1),
@@ -3010,3 +3190,19 @@ def test_video_codec_options_are_normalized_for_the_encoder():
     assert normalize_video_codec_options(None) is None
     with pytest.raises(ValueError, match="video_codec_options"):
         normalize_video_codec_options("preset=ultrafast")
+
+
+@pytest.mark.parametrize("duration", [60, 75])
+def test_long_video_shape_requires_explicit_opt_in(duration):
+    from vllm_omni.errors import OmniClientError
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.model_executor.models.minimax_h3.encoder_processing import resolve_minimax_h3_shape
+
+    sampling = OmniDiffusionSamplingParams(width=960, height=544, fps=24, extra_args={"duration": duration})
+    with pytest.raises(OmniClientError, match="15"):
+        resolve_minimax_h3_shape("ref2va", sampling, None)
+    sampling.extra_args["long_video"] = True
+    _, _, frames, video_t, audio_t = resolve_minimax_h3_shape("ref2va", sampling, None)
+    assert frames >= duration * 24 and frames % 17 == 5
+    assert video_t == (frames - 5) // 17 * 5 + 2
+    assert audio_t == round(frames / 24 * 40)

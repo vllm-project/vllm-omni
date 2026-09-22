@@ -45,7 +45,10 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.data_plane import (
     MiniCPMO45DataPlaneContext,
     MiniCPMO45DataPlaneSession,
 )
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
+    MiniCPMO45DuplexPolicy,
+    MiniCPMO45DuplexWindowConfig,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.session import (
     MiniCPMO45ServingSessionState,
 )
@@ -63,6 +66,15 @@ _DUPLEX_VISION_TOKENS_PER_FRAME = 66
 # Official stacked pair uses max_slice_nums=[2, 1]: the current frame is HD
 # sliced (1 source + 2 patches on 960x540) and the composite is not.
 _DUPLEX_HD_SLICES_PER_BASE_FRAME = 3
+# How many blocks that slicing costs depends on the frame, and at
+# ``max_slice_nums=2`` the processor's grid search has only two outcomes.
+# ``MiniCPMVImageProcessor.get_sliced_grid`` takes
+# ``multiple = min(ceil(w * h / scale_resolution**2), max_slice_nums)`` and
+# returns no grid at all for ``multiple <= 1``; at 2 the only candidate split
+# is 2, so a frame is either unsliced or a 2-cell grid. One normalization tile
+# is therefore the whole decision -- but ``scale_resolution`` is the
+# checkpoint's, not a constant, so it is read from the model rather than
+# assumed.
 
 PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
     {
@@ -70,11 +82,17 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
         "duplex_stage_max_tokens",
         "duplex_stage0_max_tokens",
         "duplex_scheduler_token_id",
+        "duplex_vision_tile_pixels",
         "duplex_first_append_context_tokens",
         "ref_audio_data",
         "ref_audio_format",
         "ref_audio_sample_rate_hz",
         "initial_user_text",
+        "duplex_window_config",
+        "duplex_window_prefix_tokens",
+        "duplex_window_suffix_token_ids",
+        "duplex_window_previous_marker_token_ids",
+        "duplex_window_special_token_ids",
     }
 )
 
@@ -86,29 +104,68 @@ class MiniCPMO45ClientRuntimeConfigError(DuplexRuntimeConfigError):
 # ---- engine policy helpers: scheduler token budget ----
 
 
-def _duplex_frame_count(payload: object) -> int:
+def _duplex_frames(payload: object) -> list[str]:
     if not isinstance(payload, dict):
-        return 0
+        return []
     frames = payload.get("video_frames")
     if not isinstance(frames, list):
-        return 0
-    return sum(1 for frame in frames if isinstance(frame, str) and frame)
+        return []
+    return [frame for frame in frames if isinstance(frame, str) and frame]
 
 
-def _duplex_vision_tokens(payload: object) -> int:
+def _duplex_base_frame_blocks(frame: str, tile_pixels: int | None) -> int:
+    """Blocks the HD-sliced frame of a stacked pair costs, read from the frame.
+
+    Wire format is the one Stage0 decodes: bare base64 JPEG/PNG, and only the
+    header is parsed -- the pixels are the worker's job.
+
+    Every uncertainty resolves to the sliced count, because the two directions
+    are not symmetric. Over-reserving wastes scheduler slots. Under-reserving
+    hands the worker fewer prompt slots than it has embeddings, and
+    ``MiniCPMO45OmniModel`` then drops the tail of the unit with a warning
+    rather than failing, which is silent audio loss.
+    """
+    if tile_pixels is None:
+        return _DUPLEX_HD_SLICES_PER_BASE_FRAME
+
+    from io import BytesIO
+
+    from PIL import Image
+
+    try:
+        raw = b64decode(frame, validate=True)
+        with Image.open(BytesIO(raw)) as image:
+            width, height = image.size
+    except (BinasciiError, ValueError, OSError, Image.DecompressionBombError):
+        return _DUPLEX_HD_SLICES_PER_BASE_FRAME
+    if width * height <= tile_pixels:
+        return 1
+    return _DUPLEX_HD_SLICES_PER_BASE_FRAME
+
+
+def _duplex_vision_tile_pixels(runtime_config: object) -> int | None:
+    """Area of the tile this model normalizes a frame to, or ``None`` if unknown."""
+    if not isinstance(runtime_config, dict):
+        return None
+    value = runtime_config.get("duplex_vision_tile_pixels")
+    return value if isinstance(value, int) and value > 0 else None
+
+
+def _duplex_vision_tokens(payload: object, *, tile_pixels: int | None = None) -> int:
     """Scheduler slots for this append's camera track.
 
     Audio is never stacked: a unit still carries one second of soundtrack.
     ``stack_frames`` only adds a second *image*. Official HD on that pair is
-    ``[2, 1]``, so the base frame reserves three 66-token blocks and every
-    extra frame reserves one.
+    ``[2, 1]``, so only the first frame is sliced and every other frame
+    reserves one 66-token block.
     """
-    count = _duplex_frame_count(payload)
-    if count <= 0:
+    frames = _duplex_frames(payload)
+    if not frames:
         return 0
-    if count >= 2:
-        return (_DUPLEX_HD_SLICES_PER_BASE_FRAME + (count - 1)) * _DUPLEX_VISION_TOKENS_PER_FRAME
-    return count * _DUPLEX_VISION_TOKENS_PER_FRAME
+    if len(frames) == 1:
+        return _DUPLEX_VISION_TOKENS_PER_FRAME
+    blocks = _duplex_base_frame_blocks(frames[0], tile_pixels) + (len(frames) - 1)
+    return blocks * _DUPLEX_VISION_TOKENS_PER_FRAME
 
 
 def _duplex_pcm_sample_count(payload: object) -> int | None:
@@ -136,8 +193,8 @@ def duplex_first_append_unit_count(payload: object) -> int | None:
     return max(1, sample_count // _DUPLEX_CHUNK_SAMPLES - 1)
 
 
-def duplex_scheduler_token_budget(payload: object, *, default: int = 64) -> int:
-    vision_tokens = _duplex_vision_tokens(payload)
+def duplex_scheduler_token_budget(payload: object, *, default: int = 64, tile_pixels: int | None = None) -> int:
+    vision_tokens = _duplex_vision_tokens(payload, tile_pixels=tile_pixels)
     sample_count = _duplex_pcm_sample_count(payload)
     if sample_count is None:
         return max(1, int(default)) + vision_tokens
@@ -185,17 +242,19 @@ def build_duplex_data_plane_prompt(
     payload: object,
     final: bool,
 ) -> dict[str, object]:
-    token_budget = duplex_scheduler_token_budget(payload)
+    tile_pixels = _duplex_vision_tile_pixels(runtime_config)
+    token_budget = duplex_scheduler_token_budget(payload, tile_pixels=tile_pixels)
     if seq <= 1:
         context_reserve = duplex_first_append_context_reserve(runtime_config)
         token_budget += context_reserve
         first_units = duplex_first_append_unit_count(payload)
         if first_units is not None:
-            token_budget = context_reserve + first_units * 12 - 1 + _duplex_vision_tokens(payload)
+            vision_tokens = _duplex_vision_tokens(payload, tile_pixels=tile_pixels)
+            token_budget = context_reserve + first_units * 12 - 1 + vision_tokens
     if seq > 1 and duplex_payload_is_exact_chunks(payload):
         token_budget += 1
-    if final and duplex_payload_is_exact_chunks(payload):
-        token_budget += 12
+        # Serving already pads the final residual audio. Stage0 does not
+        # append another silent unit, so final must not reserve extra slots.
     extra_body = session_config.get("extra_body")
     raw_token_id = runtime_config.get("duplex_scheduler_token_id")
     try:
@@ -464,6 +523,38 @@ def _apply_first_append_context_tokens(
         return
     ref_tokens = MiniCPMO45DuplexPolicy.audio_token_count(ref_sample_count or 0)
     runtime_config["duplex_first_append_context_tokens"] = len(prefix_ids) + ref_tokens + len(suffix_ids)
+    runtime_config["duplex_window_prefix_tokens"] = len(prefix_ids) + ref_tokens
+    runtime_config["duplex_window_suffix_token_ids"] = [int(token_id) for token_id in suffix_ids]
+    marker_ids = tokenizer.encode("\n\nprevious: ", add_special_tokens=False)
+    runtime_config["duplex_window_previous_marker_token_ids"] = [int(token_id) for token_id in marker_ids]
+    runtime_config["duplex_window_special_token_ids"] = sorted(
+        MiniCPMO45DuplexPolicy.native_special_token_ids(
+            MiniCPMO45DuplexPolicy.token_ids_from_tokenizer(tokenizer),
+            tokenizer_special_ids=list(getattr(tokenizer, "all_special_ids", ()) or ()),
+        )
+    )
+
+
+def _model_vision_tile_pixels(model_config: ModelConfig | None) -> int | None:
+    """Area of one normalization tile, from the checkpoint that will do the slicing.
+
+    ``MiniCPMVImageProcessor`` is built with ``scale_resolution=config.image_size``
+    and Stage0 loads the checkpoint's own processor, so this is per-checkpoint
+    configuration. ``None`` when it cannot be read, which keeps the reservation
+    at the sliced count.
+    """
+    hf_config = getattr(model_config, "hf_config", None)
+    if hf_config is None:
+        return None
+    slice_config = getattr(hf_config, "slice_config", None)
+    side = getattr(slice_config, "scale_resolution", None)
+    if not isinstance(side, int):
+        side = slice_config.get("scale_resolution") if isinstance(slice_config, dict) else None
+    if not isinstance(side, int):
+        side = getattr(hf_config, "image_size", None)
+    if not isinstance(side, int) or side <= 0:
+        return None
+    return side * side
 
 
 def _apply_default_scheduler_policy(
@@ -471,6 +562,7 @@ def _apply_default_scheduler_policy(
     *,
     config: DuplexSessionConfig,
     tokenizer: PreTrainedTokenizerBase | None,
+    model_config: ModelConfig | None = None,
 ) -> None:
     stage0_max_tokens = config.max_tokens if isinstance(config.max_tokens, int) and config.max_tokens > 0 else 20
     runtime_config["duplex_stage_max_tokens"] = {"0": stage0_max_tokens, "1": 8192}
@@ -491,6 +583,9 @@ def _apply_default_scheduler_policy(
     scheduler_token_id = _scheduler_token_id(tokenizer)
     if scheduler_token_id is not None:
         runtime_config["duplex_scheduler_token_id"] = scheduler_token_id
+    tile_pixels = _model_vision_tile_pixels(model_config)
+    if tile_pixels is not None:
+        runtime_config["duplex_vision_tile_pixels"] = tile_pixels
 
 
 class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
@@ -645,6 +740,8 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
                 code="unsupported_ref_audio_path",
             )
         runtime_config: dict[str, object] = {"instructions": config.instructions}
+        window_config = self._pop_window_config(extra_body) or MiniCPMO45DuplexWindowConfig()
+        runtime_config["duplex_window_config"] = window_config.as_dict()
         # ``duplex_initial_user_text`` is the older extra_body spelling and
         # still works; the session field is the framework-level one.
         initial_user_text = extra_body.pop("duplex_initial_user_text", None)
@@ -653,7 +750,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         if isinstance(initial_user_text, str) and initial_user_text:
             runtime_config["initial_user_text"] = initial_user_text
         tokenizer = await self._tokenizer_for(model_config)
-        _apply_default_scheduler_policy(runtime_config, config=config, tokenizer=tokenizer)
+        _apply_default_scheduler_policy(runtime_config, config=config, tokenizer=tokenizer, model_config=model_config)
 
         ref_audio = config.ref_audio
         extra_ref_audio = extra_body.get("ref_audio")
@@ -711,6 +808,17 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         current: Mapping[str, object],
     ) -> dict[str, object]:
         runtime_config = deepcopy(dict(current))
+        extra_body = dict(config.extra_body)
+        requested_window = self._pop_window_config(extra_body)
+        if requested_window is not None:
+            reject_changed_runtime_value(
+                requested_window.as_dict(),
+                runtime_config.get("duplex_window_config"),
+                message="sliding-window configuration cannot be changed after the session is created",
+                code="sliding_window_update_unsupported",
+                error_cls=MiniCPMO45ClientRuntimeConfigError,
+            )
+        config.extra_body = extra_body
         reject_changed_runtime_value(
             config.instructions,
             runtime_config.get("instructions"),
@@ -734,6 +842,23 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         stage_sampling["0"] = stage0
         runtime_config["duplex_stage_sampling_params"] = stage_sampling
         return runtime_config
+
+    @staticmethod
+    def _pop_window_config(extra_body: dict[str, object]) -> MiniCPMO45DuplexWindowConfig | None:
+        names = (
+            "sliding_window_mode",
+            "basic_window_high_tokens",
+            "basic_window_low_tokens",
+            "context_previous_max_tokens",
+            "context_max_units",
+        )
+        provided = {name: extra_body.pop(name) for name in names if name in extra_body}
+        if not provided:
+            return None
+        try:
+            return MiniCPMO45DuplexWindowConfig.from_mapping(provided)
+        except ValueError as exc:
+            raise MiniCPMO45ClientRuntimeConfigError(str(exc), code="invalid_sliding_window_config") from exc
 
     def data_plane_context(
         self,

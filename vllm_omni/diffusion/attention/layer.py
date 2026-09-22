@@ -321,7 +321,7 @@ class Attention(nn.Module):
             dtype = None
         parallel_config = getattr(config, "parallel_config", None)
         ring_degree = getattr(parallel_config, "ring_degree", 1)
-        if dtype:
+        if dtype and dtype != "float":
             if ring_degree > 1:
                 raise ValueError(
                     "KV quantization is not compatible with ring attention "
@@ -338,13 +338,15 @@ class Attention(nn.Module):
         self._kv_cache_dtype = dtype
         self._kv_cache_skip_steps = getattr(config, "diffusion_kv_cache_skip_step_indices", None)
         self._kv_cache_skip_layers = getattr(config, "diffusion_kv_cache_skip_layer_indices", None)
+        if self._kv_cache_skip_layers and self.layer_idx is None and not self._disable_kv_quant:
+            raise ValueError("Attention quantization skip_layers requires a parseable transformer block index.")
 
     def _should_apply_kv_cache_quant(self) -> bool:
         skip_steps = self._kv_cache_skip_steps
         skip_layers = self._kv_cache_skip_layers
         if skip_steps is not None:
             step_idx = get_forward_context().denoise_step_idx if is_forward_context_available() else None
-            if step_idx is not None and step_idx in skip_steps:
+            if skip_steps and (step_idx is None or step_idx in skip_steps):
                 return False
         if skip_layers is not None:
             if self.layer_idx is not None and self.layer_idx in skip_layers:
@@ -352,18 +354,21 @@ class Attention(nn.Module):
         return True
 
     def _with_kv_cache_dtype(self, attn_metadata: AttentionMetadata | None) -> AttentionMetadata | None:
-        kv_cache_dtype = self._kv_cache_dtype
-        if kv_cache_dtype is None or self._disable_kv_quant or not self._should_apply_kv_cache_quant():
-            if attn_metadata is None or "kv_cache_dtype" not in attn_metadata.extra:
-                return attn_metadata
-            extra = dict(attn_metadata.extra)
-            extra.pop("kv_cache_dtype", None)
-            return replace(attn_metadata, extra=extra)
-
+        disabled = self._disable_kv_quant or not self._should_apply_kv_cache_quant()
+        dtype = self._kv_cache_dtype
+        if dtype in (None, "float"):
+            dtype = None
+        elif disabled:
+            dtype = "float"
+        if dtype is None and (attn_metadata is None or "kv_cache_dtype" not in attn_metadata.extra):
+            return attn_metadata
+        extra = dict(attn_metadata.extra) if attn_metadata is not None else {}
+        # Recompute per forward so shared metadata cannot retain another step's policy.
+        extra.pop("kv_cache_dtype", None)
+        if dtype is not None:
+            extra["kv_cache_dtype"] = dtype
         if attn_metadata is None:
-            return AttentionMetadata(extra={"kv_cache_dtype": kv_cache_dtype})
-        extra = dict(attn_metadata.extra)
-        extra["kv_cache_dtype"] = kv_cache_dtype
+            return AttentionMetadata(extra=extra) if extra else None
         return replace(attn_metadata, extra=extra)
 
     def forward(

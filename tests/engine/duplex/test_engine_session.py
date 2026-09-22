@@ -21,6 +21,7 @@ from vllm_omni.engine.duplex.config import (
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.events import TurnEvent
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
+from vllm_omni.engine.duplex.session.playback_ledger import apply_playback_ack
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.capabilities import (
     minicpmo45_native_capabilities,
 )
@@ -241,6 +242,96 @@ def test_history_commit_with_ack_only_policy_defers_unacknowledged_text():
     assert f"item_{response_id}" in session.pending_history_item_ids
 
 
+def test_history_commit_with_ack_only_policy_keeps_only_acknowledged_prefix():
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    session.begin_response()
+    session.append_assistant_text("hello world")
+    session.mark_audio_sent(duration_ms=1_000, text_chars=6)
+    session.mark_audio_sent(duration_ms=2_000, text_chars=11)
+    session.acknowledge_playback(played_ms=1_000, committed_ms=1_000)
+
+    committed = session.end_response(commit_text=True)
+
+    assert committed == {"role": "assistant", "content": "hello"}
+
+
+@pytest.mark.parametrize("audio_complete", [False, True])
+def test_unaligned_response_keeps_empty_turn_before_later_user_input(audio_complete):
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    first = session.commit_audio_input(transcript="recite a poem")
+    response_id = session.begin_response()
+    session.reserve_history_item(f"item_{response_id}")
+    session.append_assistant_text("An answer the user has only partly heard")
+    session.mark_audio_sent(
+        duration_ms=10_000,
+        text_requires_complete_audio=True,
+        audio_complete=audio_complete,
+    )
+
+    assert session.end_response(commit_text=True) is None
+    session.barge_in()
+    session.clear_playback_cursor()
+    second = session.commit_audio_input(transcript="stop")
+    empty_answer = {"role": "assistant", "content": ""}
+    assert session.history == (first.message, empty_answer, second.message)
+
+    ack = apply_playback_ack(session, {"response_id": response_id, "played_ms": 6_981})
+    assert ack[0].to_realtime()["event"]["history_committed"] is False
+    assert session.history == (first.message, empty_answer, second.message)
+
+    if audio_complete:
+        ack = apply_playback_ack(session, {"response_id": response_id, "played_ms": 10_000})
+        assert ack[0].to_realtime()["event"]["history_committed"] is True
+        assert session.history == (
+            first.message,
+            {"role": "assistant", "content": "An answer the user has only partly heard"},
+            second.message,
+        )
+
+
+@pytest.mark.parametrize(("reserve_slot", "assistant_text"), [(True, ""), (False, "unplayed answer")])
+def test_unaligned_response_only_materializes_an_existing_answer_slot(reserve_slot, assistant_text):
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    first = session.commit_audio_input(transcript="first input")
+    response_id = session.begin_response()
+    if reserve_slot:
+        session.reserve_history_item(f"item_{response_id}")
+    session.append_assistant_text(assistant_text)
+    session.mark_audio_sent(duration_ms=10_000, text_requires_complete_audio=True, audio_complete=True)
+
+    assert session.end_response(commit_text=reserve_slot) is None
+    assert session.history == (first.message,)
+
+
+@pytest.mark.parametrize("operation", ["delete", "truncate"])
+def test_removing_one_empty_assistant_preserves_the_other_turn_boundary(operation):
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    user_inputs = []
+    response_ids = []
+    for transcript in ("first input", "second input"):
+        user_inputs.append(session.commit_audio_input(transcript=transcript).message)
+        response_id = session.begin_response()
+        response_ids.append(response_id)
+        session.reserve_history_item(f"item_{response_id}")
+        session.append_assistant_text("unplayed answer")
+        session.mark_audio_sent(duration_ms=10_000, text_requires_complete_audio=True, audio_complete=True)
+        session.end_response(commit_text=True)
+
+    item_id = f"item_{response_ids[1]}"
+    if operation == "delete":
+        assert session.delete_history_item(item_id) is True
+    else:
+        # A full ACK releases the pending snapshot. Truncation then edits the
+        # stored message into another empty dict before removing that item.
+        ack = apply_playback_ack(session, {"response_id": response_ids[1], "played_ms": 10_000})
+        assert ack[0].to_realtime()["event"]["history_committed"] is True
+        assert session.truncate_history_item(item_id, audio_end_ms=0, hard=True) is True
+    assert session.history == (user_inputs[0], {"role": "assistant", "content": ""}, user_inputs[1])
+    ack = apply_playback_ack(session, {"response_id": response_ids[1], "played_ms": 10_000})
+    assert ack[0].to_realtime()["error"]["code"] == "playback_item_not_found"
+    assert session.history == (user_inputs[0], {"role": "assistant", "content": ""}, user_inputs[1])
+
+
 def test_truncate_history_item_uses_response_alignment_marks():
     session = _session()
     response_id = session.begin_response()
@@ -389,6 +480,36 @@ def test_cancel_fence_releases_stage_requests_and_advances_identity():
         session.cancel_fence(next_fence, DuplexFence("sid-cancel", epoch=1, turn_id=1))
     with pytest.raises(DuplexFenceMismatchError):
         session.cancel_fence(DuplexFence("sid-other", epoch=1, turn_id=0), DuplexFence("sid-cancel", epoch=2))
+
+
+def test_request_resource_keys_are_stage_id_and_request_id():
+    session = _session("sid-keys")
+    session.bind_stage_request(0, "req-a", fence=session.fence)
+    session.bind_stage_request(1, "req-b", fence=session.fence)
+    session.bind_stage_request(2, "req-tts", fence=session.fence)
+    stale_keys = list(session.request_resources.keys())
+    stale_ids = list(dict.fromkeys(rid for _, rid in stale_keys))
+    assert stale_ids == ["req-a", "req-b", "req-tts"]
+    for sid, rid in stale_keys:
+        if sid < 2:
+            session.request_resources.pop((sid, rid), None)
+    assert session.resource_request_ids() == ["req-tts"]
+    with pytest.raises(TypeError, match="unhashable"):
+        dict.fromkeys(rid for _, rid in session.request_resources.items())
+
+
+def test_release_resources_for_request_ids_keeps_other_ids_on_the_same_fence():
+    session = _session("sid-drain-release")
+    fence = session.fence
+    session.bind_stage_request(2, "drain", fence=fence)
+    session.bind_stage_request(3, "drain", fence=fence)
+    session.bind_stage_request(0, "live", fence=fence)
+
+    released = session.release_resources_for_request_ids(["drain"])
+
+    assert released == ["drain"]
+    assert session.resource_request_ids() == ["live"]
+    assert session.release_resources_for_request_ids([]) == []
 
 
 # ---- public view ----
@@ -567,10 +688,10 @@ def test_overlap_policy_defaults_and_invalid_values_to_listen_only():
     assert DuplexSessionConfig.from_event({"session": {"overlap_policy": "bogus"}}).overlap_policy == "listen_only"
 
 
-def test_capabilities_as_dict_reports_model_native_duplex_constants():
+def test_capabilities_as_dict_reports_declared_implementation():
     caps = DuplexCapabilities().as_dict()
 
-    assert caps["implementation_level"] == "model_native_duplex"
+    assert caps["implementation_level"] == "turn_based_duplex"
     assert caps["input_modes"] == ["append_audio_chunk"]
     assert caps["supports_kv_lease"] is False
     assert caps["supports_core_kv_lease"] is False
@@ -610,3 +731,65 @@ def test_minicpmo_native_capabilities_do_not_overclaim_single_session_deployment
 
     assert caps["supports_multi_session"] is False
     assert caps["supports_multi_session_same_replica"] is False
+
+
+def test_draining_response_stays_ack_admissible_after_next_begin_response() -> None:
+    from vllm_omni.engine.duplex.events import ErrorEvent
+    from vllm_omni.engine.duplex.session.playback_ledger import apply_playback_ack
+
+    session = _session()
+    first = session.begin_response(turn_id=1)
+    session.append_assistant_text("hello")
+    session.mark_audio_sent(400, text_chars=5)
+    session.snapshot_active_response_for_drain()
+    second = session.begin_response(turn_id=2)
+    assert second != first
+    assert session.playback.sent_ms == 0
+    events = apply_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": first,
+            "item_id": f"item_{first}",
+            "played_ms": 100,
+            "committed_ms": 100,
+        },
+    )
+    assert not any(isinstance(event, ErrorEvent) and event.code == "playback_item_not_found" for event in events)
+    session.mark_audio_sent(900, text_chars=5, response_id=first)
+    assert session.playback_for_response(first).sent_ms == 900
+    assert session.playback.sent_ms == 0
+
+
+def test_finished_drain_keeps_sent_audio_ackable() -> None:
+    from vllm_omni.engine.duplex.events import ErrorEvent
+    from vllm_omni.engine.duplex.session.playback_ledger import apply_playback_ack
+
+    session = _session()
+    first = session.begin_response(turn_id=1)
+    session.append_assistant_text("hello")
+    session.mark_audio_sent(400, text_chars=5)
+    session.snapshot_active_response_for_drain()
+    second = session.begin_response(turn_id=2)
+    session.release_finished_drain_response(first)
+    assert first in session._conversation.assistant_response_snapshots
+    assert f"item_{first}" in session._conversation.history_item_placeholders
+    events = apply_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": first,
+            "item_id": f"item_{first}",
+            "played_ms": 400,
+            "committed_ms": 400,
+        },
+    )
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert session.active_response_id == second
+
+    silent = session.begin_response(turn_id=3)
+    session.snapshot_active_response_for_drain()
+    session.begin_response(turn_id=4)
+    session.release_finished_drain_response(silent)
+    assert silent not in session._conversation.assistant_response_snapshots
+    assert f"item_{silent}" not in session._conversation.history_item_placeholders

@@ -176,10 +176,11 @@ def test_worker_honors_explicit_kv_memory_budget(monkeypatch) -> None:
     profile_request = object()
 
     assert worker.determine_available_kv_memory(profile_request) == [4096]
-    worker.model_runner.profile_run.assert_called_once_with(profile_request)
+    worker.model_runner.profile_run.assert_not_called()
 
 
 def test_worker_treats_zero_kv_memory_budget_as_profiled_auto_sizing(monkeypatch) -> None:
+    monkeypatch.setattr(diffusion_worker_module, "current_omni_platform", SimpleNamespace(empty_cache=Mock()))
     worker = object.__new__(DiffusionWorker)
     worker.rank = 0
     worker.init_snapshot = SimpleNamespace(free_memory=900)
@@ -209,6 +210,7 @@ def test_worker_treats_zero_kv_memory_budget_as_profiled_auto_sizing(monkeypatch
 
 @pytest.mark.parametrize("non_kv_cache_memory", [750, 800])
 def test_worker_rejects_non_positive_profiled_kv_memory(monkeypatch, non_kv_cache_memory: int) -> None:
+    monkeypatch.setattr(diffusion_worker_module, "current_omni_platform", SimpleNamespace(empty_cache=Mock()))
     worker = object.__new__(DiffusionWorker)
     worker.rank = 0
     worker.init_snapshot = SimpleNamespace(free_memory=900)
@@ -245,6 +247,7 @@ def test_worker_rejects_non_positive_profiled_kv_memory(monkeypatch, non_kv_cach
 
 
 def test_worker_profiles_activation_headroom_instead_of_current_residency(monkeypatch) -> None:
+    monkeypatch.setattr(diffusion_worker_module, "current_omni_platform", SimpleNamespace(empty_cache=Mock()))
     worker = object.__new__(DiffusionWorker)
     worker.rank = 0
     worker.init_snapshot = SimpleNamespace(free_memory=1200)
@@ -310,3 +313,31 @@ def test_rank_probe_gathers_local_failure_before_raising(monkeypatch) -> None:
         )
 
     assert gathered == [(False, "ValueError: local failure")]
+
+
+def test_hunyuan_native_layer_identity_matches_ar_spec(monkeypatch):
+    import vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer as hy3
+
+    monkeypatch.setattr(hy3, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(hy3, "get_sequence_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(hy3, "get_allgather_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(hy3, "get_sequence_parallel_rank", lambda: 0)
+    monkeypatch.setattr(hy3, "QKVParallelLinear", lambda **_: nn.Identity())
+    monkeypatch.setattr(hy3, "RowParallelLinear", lambda **_: nn.Identity())
+    monkeypatch.setattr(hy3, "get_rope", lambda **_: nn.Identity())
+
+    # Only backend construction is fake; execute both HY3 constructors and the
+    # real runner spec-discovery path, including the actual Attention prefix.
+    def attention(**kwargs):
+        return _attention(enabled=kwargs.get("paged_kv_cache_role") is not None, prefix=kwargs["prefix"])
+
+    monkeypatch.setattr(hy3, "Attention", attention)
+    model = hy3.HunYuanAttention(
+        config=SimpleNamespace(num_key_value_heads=2, attention_head_dim=8),
+        hidden_size=16,
+        num_heads=2,
+        num_kv_heads=2,
+        prefix="layers.3.self_attn",
+    )
+    runner = _runner(model.image_attn.attn)
+    assert set(runner.get_kv_cache_spec()) == {"model.layers.3.self_attn.attn"}

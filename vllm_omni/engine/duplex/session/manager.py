@@ -286,8 +286,18 @@ class DuplexSessionManager:
             )
             return
         if isinstance(command, AppendAudio):
+            has_audio = bool(command.audio)
+            has_video = bool(command.video_frames)
+            modality_error = session.capabilities.validate_append_modalities(has_audio=has_audio, has_video=has_video)
+            if modality_error is not None:
+                self.emit(
+                    session,
+                    self._error_event("invalid_input_modality", modality_error, command=command),
+                )
+                return
             limit = int(self.runtime_config.max_pending_input_bytes_per_session)
-            if not session.reserve_input_bytes(len(command.audio), limit=limit):
+            pending_bytes = len(command.audio) + sum(len(frame) for frame in command.video_frames)
+            if not session.reserve_input_bytes(pending_bytes, limit=limit):
                 self.emit(
                     session,
                     self._error_event(
@@ -408,8 +418,11 @@ class DuplexSessionManager:
         return configured
 
     @staticmethod
-    def stage_request_id(fence: DuplexFence, *, stage_id: int) -> str:
-        return duplex_resource_request_id(fence, f"stage{stage_id}")
+    def stage_request_id(fence: DuplexFence, *, stage_id: int, resumable: bool = True) -> str:
+        role = f"stage{stage_id}"
+        if not resumable:
+            role += f"-turn{fence.turn_id}"
+        return duplex_resource_request_id(fence, role)
 
     def ensure_stage_request(
         self,
@@ -422,7 +435,8 @@ class DuplexSessionManager:
         if stage_id >= self.stage_port.stage_count:
             return None
         effective_fence = fence or session.fence
-        request_id = self.stage_request_id(effective_fence, stage_id=stage_id)
+        resumable = session.capabilities.supports_core_resumable_request
+        request_id = self.stage_request_id(effective_fence, stage_id=stage_id, resumable=resumable)
         session.reserve_stage_request(stage_id, request_id, fence=effective_fence)
         context = DuplexStageRequestContext(
             request_id=request_id,
@@ -685,7 +699,9 @@ class DuplexSessionManager:
         while not shutdown_event.is_set():
             try:
                 await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
-            except TimeoutError:
+            # The timeout is this loop's tick. asyncio.TimeoutError is not the builtin
+            # TimeoutError before Python 3.11, so catch both or the tick escapes the loop.
+            except (TimeoutError, asyncio.TimeoutError):
                 try:
                     await self.reap_expired()
                 except Exception:

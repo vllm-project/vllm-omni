@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import struct
 import wave
 from collections.abc import Callable
 from typing import Any
@@ -33,6 +34,7 @@ from vllm_omni.clients.duplex import (
     ReconnectPolicy,
     SessionConfig,
     SessionResumed,
+    SessionUpdated,
     build_realtime_url,
     chunk_period_ms,
     duplex_unit_boundary_ms,
@@ -795,6 +797,52 @@ async def test_inline_client_submits_typed_commands_in_order():
         assert commit.final is True and commit.create_response is True
         assert cancel.response_id == "resp-1"
         assert ack.played_ms == 120 and ack.response_id == "resp-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [True, False])
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"input_audio_format": "pcm_f32le", "sample_rate_hz": 24_000},
+        {"audio": {"input": {"format": "pcm_f32le", "sample_rate_hz": 24_000}}},
+    ],
+)
+async def test_inline_input_defaults_change_only_after_session_updated(accepted, patch):
+    client, omni = make_inline_client()
+    patch = {**patch, "overlap_silence_rms": 0.1}
+    async with client:
+        handle = omni.handles[0]
+        previous_session = dict(client.session_info)
+        await client.send({"type": "session.update", "session": patch})
+        # Sending a patch is not an acknowledgement of its acceptance.
+        assert client.session_info == previous_session
+        assert client._input_defaults().input_sample_rate_hz == 16_000
+        updated_session = {**previous_session, **patch}
+        event: dict[str, object] = (
+            {"type": "session.updated", "session": updated_session}
+            if accepted
+            else {"type": "error", "error": {"code": "invalid_session_update", "message": "rejected"}}
+        )
+        handle.feed(event)
+        received = await client.wait_for("session.updated" if accepted else "error", timeout_s=2.0)
+        assert isinstance(received, SessionUpdated if accepted else ErrorEvent)
+
+        pcm = struct.pack("<f", 0.05) * 16
+        await client.send({"type": "input_audio_buffer.append", "audio": _b64(pcm)})
+        command = handle.commands[-1]
+        assert isinstance(command, duplex_commands.AppendAudio)
+        assert command.format == "pcm_f32le"
+        if accepted:
+            assert client.session_info == updated_session
+            assert command.audio == pcm
+            assert command.sample_rate_hz == 24_000
+            assert command.is_speech is False
+        else:
+            assert client.session_info == previous_session
+            assert len(command.audio) == 2 * len(pcm)  # Still decoded as pcm16.
+            assert command.sample_rate_hz == 16_000
+            assert command.is_speech is True
 
 
 @pytest.mark.asyncio

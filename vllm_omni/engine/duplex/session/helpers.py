@@ -13,6 +13,7 @@ Functions, not a component, because there is nothing here to own.
 
 from __future__ import annotations
 
+import asyncio
 import binascii
 from typing import TYPE_CHECKING
 
@@ -21,6 +22,7 @@ import pybase64 as base64
 from vllm_omni.engine.duplex.config import DuplexPlaybackCommitPolicy
 from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_request_id
 from vllm_omni.engine.duplex.events import ErrorEvent, OverlapDecision, error_event
+from vllm_omni.engine.duplex.plugin import payload_turn_id
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -29,13 +31,46 @@ if TYPE_CHECKING:
     from vllm_omni.engine.duplex.session.engine_session import DuplexCommittedInput, DuplexEngineSession
 
 
+def task_is_cancelling(task: asyncio.Task[object] | None) -> bool:
+    """True when *task* has a pending cancellation (Python 3.11+ ``Task.cancelling``)."""
+    if task is None:
+        return False
+    cancelling = getattr(task, "cancelling", None)
+    return bool(cancelling()) if callable(cancelling) else False
+
+
 # --------------------------------------------------------------------------- #
 # Questions about the session                                                 #
 # --------------------------------------------------------------------------- #
 
 
+def append_fence(session: DuplexEngineSession, payload: object, *, epoch: int | None = None) -> DuplexFence:
+    """The fence one append is submitted under.
+
+    A model without a resumable core request gets one stage request per turn,
+    so the turn this resolves to is part of the request id. The runner names
+    that id when it queues the append and the model channel names it again
+    when it submits, and the two must not disagree --- otherwise the session
+    binds a request id it never submitted.
+    """
+    turn_id = payload_turn_id(payload)
+    if turn_id is None:
+        turn_id = session.active_response_turn_id
+    if turn_id is None:
+        turn_id = session.turn_id
+    return DuplexFence(
+        session.session_id,
+        epoch=session.epoch if epoch is None else epoch,
+        turn_id=turn_id,
+    )
+
+
 def stage0_request_id(session: DuplexEngineSession, epoch: int) -> str:
-    return duplex_resource_request_id(DuplexFence(session.session_id, epoch=epoch), "stage0")
+    """Stable ``stage0`` or ephemeral ``stage0-turn{T}`` request id for Stage0."""
+    fence = DuplexFence(session.session_id, epoch=epoch, turn_id=session.turn_id)
+    if session.capabilities.supports_core_resumable_request:
+        return duplex_resource_request_id(fence, "stage0")
+    return duplex_resource_request_id(fence, f"stage0-turn{fence.turn_id}")
 
 
 def response_in_progress(session: DuplexEngineSession, tasks: DuplexSessionTasks) -> bool:
@@ -52,6 +87,24 @@ def response_in_progress(session: DuplexEngineSession, tasks: DuplexSessionTasks
     if active_task is not None and not active_task.done():
         return True
     return tasks.has_response_bound_append_tasks()
+
+
+def next_commit_allowed(
+    session: DuplexEngineSession,
+    tasks: DuplexSessionTasks,
+    *,
+    concurrent_turn_requests_released: bool,
+) -> bool:
+    """Whether a new commit may flush/submit now.
+
+    Idle sessions always allow it. When ``supports_concurrent_turn_requests`` is on and
+    the plugin has released the commit gate, a commit is allowed even though
+    prior assistant TTS/playback still counts as ``response_in_progress``.
+    Barge-in remains the abort path; this gate does not cancel anything.
+    """
+    if not response_in_progress(session, tasks):
+        return True
+    return session.capabilities.supports_concurrent_turn_requests and concurrent_turn_requests_released
 
 
 def assistant_playback_active(session: DuplexEngineSession) -> bool:

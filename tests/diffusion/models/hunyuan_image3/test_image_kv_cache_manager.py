@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 from contextlib import ExitStack, contextmanager
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -141,6 +142,104 @@ def test_cache_manager_registers_attention_without_adding_dense_state() -> None:
     assert isinstance(mgr, nn.Module)
     assert dict(mgr.named_modules())["attn"] is mgr.attn
     assert mgr.state_dict() == {}
+
+
+def test_cache_manager_initializes_with_quantization_skip_layers(monkeypatch):
+    import vllm_omni.diffusion.attention.layer as layer
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import ImageKVCacheManager
+
+    config = SimpleNamespace(
+        diffusion_attention_config=None,
+        parallel_config=SimpleNamespace(ring_degree=1),
+        diffusion_kv_cache_dtype="auto",
+        diffusion_kv_cache_skip_layer_indices={3},
+    )
+    monkeypatch.setattr(layer, "get_attn_backend_for_role", lambda **_: (layer.SDPABackend, None))
+    monkeypatch.setattr(layer, "build_parallel_attention_strategy", lambda **_: object())
+    with patched_mgr_env(), set_current_diffusion_config(config):
+        # Keep the real Attention constructor and its skip-layer validation.
+        with patch(f"{_TRANSFORMER_MODULE}.Attention", layer.Attention):
+            mgr = ImageKVCacheManager(
+                num_heads=NUM_HEADS,
+                num_kv_heads=NUM_KV_HEADS,
+                head_dim=HEAD_DIM,
+                scaling=SCALING,
+                prefix="model.layers.3.self_attn",
+            )
+    assert mgr.attn.layer_idx == 3
+    assert not mgr.attn._should_apply_kv_cache_quant()
+
+
+@pytest.mark.parametrize("first_step", [True, False])
+def test_native_connector_keeps_imported_prefix_in_paged_attention(first_step) -> None:
+    from vllm_omni.diffusion.forward_context import override_paged_kv_adapter, set_forward_context
+
+    mgr = _make_cache_mgr()
+    mgr.attn.paged_kv_active = True
+    query_len, prefix_len = IMAGE_TOKEN_LEN, 19
+    key, value = _make_known_kv(2 * query_len)
+    spans = [[(prefix_len, prefix_len + query_len)]] * 2
+    with (
+        set_forward_context(),
+        override_paged_kv_adapter(object()),
+        patch.object(mgr, "_forward_dense_legacy", side_effect=AssertionError("dense KV path")),
+        patch(f"{_TRANSFORMER_MODULE}.repeat_kv", side_effect=AssertionError("KV head expansion")),
+        patch(f"{_TRANSFORMER_MODULE}.get_paged_kv_computed_tokens", return_value=(prefix_len, prefix_len)),
+    ):
+        _call_mgr(
+            mgr,
+            2,
+            query_len,
+            prefix_len + query_len,
+            key,
+            value,
+            first_step=first_step,
+            full_attn_spans=spans,
+        )
+    assert len(mgr.attn.paged_calls) == 1
+    assert mgr.attn.paged_calls[0][1].shape == (2, query_len, NUM_KV_HEADS, HEAD_DIM)
+    assert mgr.attn.paged_metadata[0].attn_mask is None
+    assert mgr.attn.paged_metadata[0].full_attn_spans == spans
+    assert mgr.image_kv_cache_map is None
+    assert not hasattr(mgr, "_materialize_paged_prefix")
+
+
+def test_legacy_tensor_prefix_still_uses_dense_cache_and_reuse() -> None:
+    mgr = _make_cache_mgr()
+    prefix_len, prompt_len = 3, 2
+    imported = _make_known_kv(prefix_len, base=10.0)
+    mgr._injected_ar_kv = [imported]
+    first_len = prompt_len + IMAGE_TOKEN_LEN
+    key, value = _make_known_kv(first_len, base=20.0)
+    with (
+        patch.object(mgr, "_forward_paged", side_effect=AssertionError("legacy entered paged path")),
+    ):
+        _call_mgr(
+            mgr,
+            1,
+            first_len,
+            prefix_len + first_len,
+            key,
+            value,
+            first_step=True,
+            gen_timestep_scatter_index=_gen_timestep_index(1, prompt_len),
+        )
+        assert mgr.image_kv_cache_map is not None
+        assert mgr.image_kv_cache_map[0].shape[1] == prefix_len + prompt_len
+        next_key, next_value = _make_known_kv(IMAGE_TOKEN_LEN, base=30.0)
+        _call_mgr(
+            mgr,
+            1,
+            IMAGE_TOKEN_LEN,
+            prefix_len + first_len,
+            next_key,
+            next_value,
+            position_ids=torch.arange(prefix_len + prompt_len, prefix_len + first_len).unsqueeze(0),
+        )
+    assert len(mgr.attn.calls) == 2
+    assert not mgr.attn.paged_calls
+    assert mgr.attn.calls[-1][1].shape == (1, prefix_len + first_len, NUM_HEADS, HEAD_DIM)
 
 
 def test_scheduler_paged_kv_runs_piecewise_for_first_and_later_steps() -> None:

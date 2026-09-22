@@ -38,6 +38,8 @@ from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
+SERVER_STARTUP_TIMEOUT_S = 1200
+
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
 PromptVideoInput = list[Any] | Any | None
@@ -246,9 +248,10 @@ class OmniServer:
             cwd=_omni_subprocess_cwd(),
         )
 
-        max_wait = 1200
-        start_time = time.time()
-        while time.time() - start_time < max_wait:
+        max_wait = SERVER_STARTUP_TIMEOUT_S
+        # System clock corrections must not shorten or extend startup waits.
+        start_time = time.monotonic()
+        while time.monotonic() - start_time < max_wait:
             ret = self.proc.poll()
             if ret is not None:
                 raise RuntimeError(f"Server processes exited with code {ret} before becoming ready.")
@@ -550,9 +553,10 @@ class OmniServerStageCli(OmniServer):
             for replica_id in range(self.stage_replica_counts.get(stage_id, 1)):
                 self._launch_stage(stage_id, headless=True, replica_id=replica_id)
 
-        max_wait = 1200
-        start_time = time.time()
-        while time.time() - start_time < max_wait:
+        max_wait = SERVER_STARTUP_TIMEOUT_S
+        # System clock corrections must not shorten or extend startup waits.
+        start_time = time.monotonic()
+        while time.monotonic() - start_time < max_wait:
             self._ensure_stage_processes_alive()
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(1)
@@ -1166,6 +1170,7 @@ def pi0_openpi_run_policy_session(
     prompt: str = PI0_OPENPI_DEFAULT_PROMPT,
     session_id: str | None = None,
     num_steps: int = 2,
+    num_inference_steps: int | None = None,
 ) -> dict[str, Any]:
     """Connect, read handshake metadata, send ``num_steps`` observations."""
     import uuid
@@ -1184,6 +1189,8 @@ def pi0_openpi_run_policy_session(
         actions = []
         for _ in range(num_steps):
             payload = pi0_make_dummy_obs(prompt=prompt, session_id=session_id)
+            if num_inference_steps is not None:
+                payload["sampling_params"] = {"num_inference_steps": num_inference_steps}
             payload["endpoint"] = "infer"
             conn.send(packer.pack(payload))
             actions.append(_pi0_decode_action_response(conn.recv()))

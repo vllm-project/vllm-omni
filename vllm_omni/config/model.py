@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from dataclasses import MISSING, field
 from typing import Any
 
@@ -124,6 +127,8 @@ class OmniModelConfig(ModelConfig):
     async_chunk: bool = False
     session_mode: str = "turn"
     retains_state_across_chunks: bool = False
+    use_v2_model_runner: bool = False
+    supports_native_mrv2_data_plane: bool = False
     # Stage-1 active stream slots; 0 keeps legacy chunk-level round-robin.
     active_stream_window: int = 0
     duplex_max_sessions: int = 1
@@ -134,6 +139,7 @@ class OmniModelConfig(ModelConfig):
     # Optional dotted path of a per-stage pooling-output decoder applied
     # worker-side before IPC. Read by the AR scheduler.
     pooling_output_decoder: str | None = None
+    final_output: bool = False
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
     stage_connector_config: dict[str, Any] = field(

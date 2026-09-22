@@ -12,6 +12,8 @@ and applies the session-owned policy.
 
 from __future__ import annotations
 
+import asyncio
+import threading
 import time as _time
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
@@ -20,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import init_logger
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
     DuplexOutputContext,
@@ -77,6 +80,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
+        self._prompt_processing_lock = threading.Lock()
         self.plugin = plugin
         self.duplex_session_config = duplex_session_config
         self.session_manager = DuplexSessionManager(
@@ -150,13 +154,28 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             # Session gone: nothing may forward or reach a client.
             return True
         segment = req_state.streaming.segment(stage_id)
+        finished = bool(getattr(output, "finished", False)) or (req_state.streaming.enabled and segment.finished)
+        transcript = self.plugin.user_transcript(
+            stage_id=stage_id,
+            output=output,
+            prompt=getattr(req_state, "prompt", None),
+            finished=finished,
+        )
+        if isinstance(transcript, str) and transcript:
+            payload: dict[str, object] = {"type": "input.transcribed", "transcript": transcript}
+            prompt = getattr(req_state, "prompt", None)
+            info = prompt.get("additional_information") if isinstance(prompt, dict) else None
+            item_id = info.get("realtime_item_id") if isinstance(info, dict) else None
+            if isinstance(item_id, str) and item_id:
+                payload["realtime_item_id"] = item_id
+            runner.emit(payload)
         context = DuplexOutputContext(
             identity=DuplexRequestIdentity(
                 session_id=req_state.session_id,
                 fence=req_state.stage_fences.get(stage_id, req_state.fence),
             ),
             final_stage_id=req_state.final_stage_id,
-            segment_finished=req_state.streaming.enabled and segment.finished,
+            segment_finished=finished,
             segment_token_ids=tuple(segment.token_ids),
             segment_output_metadata=segment.output_metadata,
         )
@@ -177,13 +196,18 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
     ) -> bool:
         if not req_state.session_owned:
             return False
+        # Resumable resident Stage0: stage failure closes the session.
+        # Ephemeral turn-commit: free this turn's stages without tearing down WS.
+        close_session = self.plugin.capabilities(
+            max_sessions=self.duplex_session_config.max_sessions
+        ).supports_core_resumable_request
         runner = self.session_manager.runner_for_request_id(req_id)
         if runner is not None:
-            runner.on_stage_failure(next_stage_id, exc)
+            runner.on_stage_failure(next_stage_id, exc, request_id=req_id)
         await self._cleanup_request_ids(
             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
             abort=True,
-            release_owners=True,
+            release_owners=close_session,
         )
         return True
 
@@ -244,6 +268,19 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             defaults.append(client.default_sampling_params)
         return tuple(defaults)
 
+    def _stage_receives_async_chunks(self, stage_id: int) -> bool:
+        """Whether a stage's connector supplies its runtime inputs.
+
+        Stages with a custom orchestrator input processor must be fed via
+        process_engine_inputs, not zero-prewarm + connector chunks. Codec edges
+        without a custom processor still use async chunk transport.
+        """
+        pool = self.stage_pools[stage_id]
+        client = getattr(pool, "stage_client", None)
+        if client is not None and getattr(client, "custom_process_input_func", None) is not None:
+            return False
+        return super()._stage_receives_async_chunks(stage_id)
+
     @staticmethod
     def _sync_bridge_state(
         request_state: OrchestratorRequestState,
@@ -288,7 +325,6 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 fence=context.fence,
                 config_generation=context.config_generation,
             )
-            request_state.streaming.enabled = True
             self.request_states[context.request_id] = request_state
         elif isinstance(request_state, DuplexOrchestratorRequestState):
             if request_state.config_generation != context.config_generation:
@@ -301,21 +337,58 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         self._sync_bridge_state(request_state, context)
         self.session_manager.register_request(context.request_id, context.session_id)
 
+    def _upgrade_processed_stage_request(self, request, raw_prompt):
+        request = super()._upgrade_processed_stage_request(request, raw_prompt)
+        if not self.plugin.capabilities(
+            max_sessions=self.duplex_session_config.max_sessions
+        ).supports_core_resumable_request and not isinstance(request, OmniEngineCoreRequest):
+            request = OmniEngineCoreRequest.from_request(request)
+        return request
+
+    def _process_turn_prompt(self, *args, **kwargs):
+        # Input processors own mutable caches. Hold a thread lock even if the
+        # awaiting session is cancelled while its preprocessing is still running.
+        with self._prompt_processing_lock:
+            return self._build_next_stage_request(*args, **kwargs)
+
     async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
         context = submission.context
         request_state = self.request_states.get(context.request_id)
         if not isinstance(request_state, DuplexOrchestratorRequestState):
             raise RuntimeError(f"duplex request was not preregistered: {context.request_id}")
-        request = build_engine_core_request_from_tokens(
-            request_id=context.request_id,
-            prompt=dict(submission.prompt),
-            params=context.stage_sampling_params,
-            model_config=self.stage_pools[context.stage_id].stage_vllm_config.model_config,
-            resumable=True,
-        )
+        request_state.streaming.enabled = submission.resumable
+        # Keep raw Stage0 prompt (additional_information / multi_modal_data) for
+        # stage input processors via process_engine_inputs.
+        request_state.prompt = dict(submission.prompt)
+        if submission.resumable:
+            request = build_engine_core_request_from_tokens(
+                request_id=context.request_id,
+                prompt=dict(submission.prompt),
+                params=context.stage_sampling_params,
+                model_config=self.stage_pools[context.stage_id].stage_vllm_config.model_config,
+                resumable=True,
+            )
+        else:
+            # Use the ordinary multimodal input processor for turn-model plugins.
+            # Its CPU preprocessing runs off the session/orchestrator event loop.
+            request = await asyncio.to_thread(
+                self._process_turn_prompt,
+                context.request_id,
+                context.stage_id,
+                dict(submission.prompt),
+                context.stage_sampling_params,
+                resumable=False,
+            )
+            if self.request_states.get(context.request_id) is not request_state:
+                raise RuntimeError("duplex request cancelled during input preprocessing")
         request.external_req_id = request.request_id
+        mm_features = getattr(request, "mm_features", None)
+        if mm_features is not None:
+            request_state.mm_features = mm_features
         pool = self.stage_pools[context.stage_id]
         if submission.already_submitted:
+            if not submission.resumable:
+                raise RuntimeError(f"ephemeral duplex request cannot submit_update: {context.request_id}")
             replica_id = await pool.submit_update(context.request_id, request_state, request)
         else:
             replica_id = await pool.submit_initial(context.request_id, request_state, request, prompt_text=None)
@@ -340,6 +413,48 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             stage_id=context.stage_id,
             replica_id=replica_id,
         )
+
+    async def _route_output(
+        self,
+        stage_id: int,
+        replica_id: int,
+        output: Any,
+        req_state: OrchestratorRequestState,
+        stage_metrics: Any,
+    ) -> None:
+        plan = self.plugin.plan_partial_stage_output(self, stage_id, replica_id, output, req_state)
+        if plan is not None:
+            # A text-bearing final is not itself the end sentinel. Submit the
+            # sentence resumable first; the follow-up, if any, closes the stream.
+            await self._forward_to_next_stage(
+                req_state.request_id,
+                stage_id,
+                plan.output,
+                req_state,
+                src_replica_id=replica_id,
+                is_streaming_session=True,
+                is_final_update=plan.is_final_update and not plan.queue_close_after,
+            )
+            followup = self.plugin.partial_stage_followup(plan, req_state)
+            if followup is not None:
+                await self._forward_to_next_stage(
+                    req_state.request_id,
+                    stage_id,
+                    followup.output,
+                    req_state,
+                    src_replica_id=replica_id,
+                    is_streaming_session=True,
+                    is_final_update=followup.is_final_update,
+                )
+            # Sentence TTS already handed this Stage1 result to Talker. The
+            # legacy path below would run aura2tts on the original full text
+            # again when the next stage is not connector-fed (AURA Talker is
+            # a sender: Stage1→2 is orchestrator-fed).
+            req_state.skip_legacy_stage_forward = True
+        try:
+            await super()._route_output(stage_id, replica_id, output, req_state, stage_metrics)
+        finally:
+            req_state.skip_legacy_stage_forward = False
 
     async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None:
         await self._cleanup_request_ids(request_ids, abort=abort)

@@ -30,6 +30,7 @@ primary_code_paths:
   - vllm_omni/entrypoints/utils.py
   - vllm_omni/entrypoints/duplex/**
   - vllm_omni/clients/**
+  - vllm_omni/protocol/**
 primary_path_exceptions:
   - path: vllm_omni/entrypoints/openai/errors.py
     owner: error_contracts.md
@@ -53,6 +54,7 @@ depends_on:
   - error_contracts.md
   - engine_orchestration.md
 validation_paths:
+  - tests/protocol/**
   - tests/entrypoints/test_omni_entrypoints.py
   - tests/entrypoints/test_async_omni.py
   - tests/entrypoints/test_async_omni_pause_sleep_routing.py
@@ -106,6 +108,31 @@ placement, payload implementation, or semantic error classification.
 `entrypoints/openai/errors.py` is an explicit primary-path exception owned by
 `error_contracts.md`.
 
+It also owns `vllm_omni/protocol/**`, the shared wire codec promoted by RFC
+[#6592](https://github.com/vllm-project/vllm-omni/issues/6592) P0a. It follows the three tiers
+`docs/serving/realtime_duplex_api.md` already defines. `protocol/realtime/**`
+is Tier 1, identical to OpenAI: 30 server events, 10 client commands, their
+typed fields and pure wire rendering, audio-format negotiation,
+conversation-item rules and the error-envelope shape. `protocol/duplex/**` is
+Tier 2 (OpenAI names carrying vLLM-Omni extensions, each a subclass of its
+Tier 1 twin declaring only what it adds) and Tier 3 (ours alone, including our
+error-code vocabulary), kept separate so a GA-only consumer is not handed a
+vocabulary its clients never send. That package sits
+outside `entrypoints/` on purpose --- the engine depends on it, so it belongs
+to neither layer --- but deciding what a Realtime client may put on the wire is
+this document's subject, and the same reasoning already places
+`vllm_omni/errors.py`, `inputs/` and `outputs/` under contract documents rather
+than under a consumer.
+
+It is deliberately **not** owned by `../fullduplex.md`, even though duplex is
+the codec's only consumer today. RFC #6592 asks for a named owner precisely so
+a second Realtime consumer does not need duplex review to change the codec
+(#6592 open question 8). Ownership here is review scope, not a dependency: the
+codec may not import the engine, the entrypoints or the model code, which
+`tests/protocol/realtime/test_protocol_import_boundary.py` enforces. When a
+second consumer lands (#6592 P0b) the package is expected to graduate to its
+own module document with owners drawn from both consumers.
+
 ## Candidate invariants
 
 These identifiers are proposals while the document is `draft`.
@@ -114,6 +141,22 @@ These identifiers are proposals while the document is `draft`.
 
 **Rule:** Entrypoints MUST NOT implement cross-stage routing or stage lifecycle
 policy.
+
+### ENTRY-INV-002: The shared Realtime codec does not depend on its consumers
+
+**Rule:** `vllm_omni/protocol/**` MUST NOT import `vllm_omni.engine`,
+`vllm_omni.entrypoints`, `vllm_omni.model_executor`, `vllm_omni.worker` or
+`vllm_omni.clients`; `protocol/duplex/**` MAY depend on `protocol/realtime/**`
+but never the reverse, and a Tier 1 class MUST NOT carry a vLLM-Omni extension
+field; and each protocol/codec behavior MUST have exactly one
+implementation that every consumer uses. A wire type MUST NOT carry a
+consumer's internal representation: the duplex mailbox rendering
+(`DuplexCommand.payload()`, whose channel differs from the client event for
+`session.update` and the `conversation.item.*` commands) stays engine-side.
+A duplex consumer (`engine/duplex/**`, `entrypoints/duplex/**`, the duplex
+clients) MUST import `vllm_omni.protocol.duplex` and MUST NOT import
+`vllm_omni.protocol.realtime` directly, so the tier boundary has exactly one
+extension point.
 
 ### ENTRY-INV-100: Public requests are normalized once
 
