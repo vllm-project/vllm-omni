@@ -117,6 +117,7 @@ def test_explicit_sender_port_is_not_derived(name):
 
 @pytest.mark.parametrize("need_recv_cache", [False, True])
 @pytest.mark.parametrize("update_before_init", [False, True])
+@pytest.mark.usefixtures("reliable_claim_queries")
 def test_manager_receiver_does_not_bind_shared_producer_port(producer, need_recv_cache, update_before_init):
     """Payload-only and KV receivers must dial, not bind, the incoming edge."""
     from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
@@ -165,6 +166,7 @@ def test_manager_receiver_does_not_bind_shared_producer_port(producer, need_recv
 
 
 @pytest.mark.parametrize("need_recv_cache", [False, True])
+@pytest.mark.usefixtures("reliable_claim_queries")
 def test_manager_receiver_preserves_explicit_standalone_sender(producer, need_recv_cache):
     from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
         OmniKVCacheConfig,
@@ -477,7 +479,7 @@ def consumer(nixl_connector_cls):
 
 
 @pytest.fixture
-def reliable_claim_queries(producer, consumer, monkeypatch):
+def reliable_claim_queries(producer, nixl_connector_cls, monkeypatch):
     """Ownership probes need exact claims, not claims retained after lost replies.
 
     Exercise the real resolver, wire encoding and producer handler synchronously;
@@ -487,13 +489,13 @@ def reliable_claim_queries(producer, consumer, monkeypatch):
 
     from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import _GET_META_MSG, _META_NOT_FOUND
 
-    def query(key, host, port, *, generation=None):
+    def query(self, key, host, port, *, generation=None):
         assert (host, port) == (producer.host, producer._zmq_port)
         request = {"key": key, "generation": generation, "claim_id": uuid.uuid4().hex}
         reply = producer._handle_handshake_message(_GET_META_MSG + msgspec.msgpack.encode(request))
         return None if reply == _META_NOT_FOUND else msgspec.msgpack.decode(reply)
 
-    monkeypatch.setattr(consumer, "_query_metadata_at", query)
+    monkeypatch.setattr(nixl_connector_cls, "_query_metadata_at", query)
 
 
 def test_put_publishes_its_handshake_endpoint(producer):
