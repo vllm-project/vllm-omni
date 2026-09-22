@@ -797,13 +797,30 @@ def talker_frames_per_step() -> int:
     return _resolved_talker_frames
 
 
-def _record_talker_frames(stages: list[StageDeployConfig]) -> None:
-    """Record stage 1's frame count (its n-gram ``num_speculative_tokens`` is K - 1)."""
+def _record_talker_frames(
+    stages: list[StageDeployConfig],
+    platforms: dict[str, Any] | None = None,
+) -> None:
+    """Record stage 1's frame count (its n-gram ``num_speculative_tokens`` is K - 1).
+
+    The K block sits under ``platforms.npu`` -- the loop is NPU-only -- so the
+    NPU overlay is merged here. This runs at load time, before the per-platform
+    merge, and its reader (``ascend_warmup_patch._kstep_armed``) runs in a
+    spawned stage worker that may have no vllm_config to read it from.
+    """
     global _resolved_talker_frames
+    npu_overlay: dict[int, dict[str, Any]] = {}
+    for stage_override in ((platforms or {}).get("npu") or {}).get("stages") or []:
+        if isinstance(stage_override, dict) and "stage_id" in stage_override:
+            npu_overlay[stage_override["stage_id"]] = stage_override
     for stage in stages:
         if stage.stage_id != 1:
             continue
-        spec = (stage.engine_extras or {}).get("speculative_config") or {}
+        spec = (stage.engine_extras or {}).get("speculative_config")
+        if spec is None:
+            # Platform overrides follow _extract_platform_overrides: every key
+            # but stage_id/devices/env is an engine or stage override.
+            spec = (npu_overlay.get(1) or {}).get("speculative_config")
         frames = 1
         if isinstance(spec, dict) and spec.get("method") == "ngram":
             num_spec = spec.get("num_speculative_tokens", 0) or 0
@@ -822,7 +839,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         )
 
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
-    _record_talker_frames(stages)
+    _record_talker_frames(stages, raw_dict.get("platforms"))
 
     model_runner = raw_dict.get("model_runner", "v1")
     if model_runner not in ("v1", "v2"):
