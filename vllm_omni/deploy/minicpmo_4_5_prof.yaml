@@ -149,8 +149,9 @@ platforms:
         kv_cache_memory_bytes: 6442450944
         compilation_config:
           # A full decode-step graph keeps in-graph sampling and multi-frame
-          # expansion; PIECEWISE silently drops both. Measured on 910B3:
-          # -32.6% RTF versus PIECEWISE.
+          # expansion: with PIECEWISE the K-step replay trips vLLM's capture-time
+          # guard (CUDA graph capturing detected at an inappropriate time) and
+          # stage 1 dies.
           cudagraph_mode: FULL_DECODE_ONLY
       - stage_id: 1
         # Concurrency cap raised from 4 to 8; the override block only covered
