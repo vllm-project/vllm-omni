@@ -14,6 +14,11 @@ __author__ = """vLLM-Omni Team"""
 __email__ = "vllm-omni@vllm.ai"
 __version__ = "0.0.1"
 
+from .comfyui_vllm_omni.node_lingbot import (
+    VLLMOmniLingBotOfflineJSON,
+    VLLMOmniLingBotRealtimeJSON,
+    VLLMOmniLingBotWorld,
+)
 from .comfyui_vllm_omni.nodes import (
     VLLMOmniARSampling,
     VLLMOmniDiffusionSampling,
@@ -37,6 +42,9 @@ from .comfyui_vllm_omni.nodes import (
 # A dictionary that contains all nodes you want to export with their names
 NODE_CLASS_MAPPINGS = {
     "VLLMOmniMiniMaxH3TemporalMask": VLLMOmniMiniMaxH3TemporalMask,
+    "VLLMOmniLingBotWorld": VLLMOmniLingBotWorld,
+    "VLLMOmniLingBotRealtimeJSON": VLLMOmniLingBotRealtimeJSON,
+    "VLLMOmniLingBotOfflineJSON": VLLMOmniLingBotOfflineJSON,
     # === Generation ===
     "VLLMOmniGenerateImage": VLLMOmniGenerateImage,
     "VLLMOmniGenerateVideo": VLLMOmniGenerateVideo,
@@ -60,6 +68,9 @@ NODE_CLASS_MAPPINGS = {
 # A dictionary that contains the friendly/humanly readable titles for the nodes
 NODE_DISPLAY_NAME_MAPPINGS = {
     "VLLMOmniMiniMaxH3TemporalMask": "MiniMax-H3 Temporal Mask",
+    "VLLMOmniLingBotWorld": "LingBot World (Realtime)",
+    "VLLMOmniLingBotRealtimeJSON": "LingBot World (Realtime JSON)",
+    "VLLMOmniLingBotOfflineJSON": "LingBot World (Offline JSON)",
     # === Generation ===
     "VLLMOmniGenerateImage": "Generate Image",
     "VLLMOmniGenerateVideo": "Generate Video",
