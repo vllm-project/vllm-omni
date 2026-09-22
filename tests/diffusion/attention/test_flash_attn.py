@@ -11,6 +11,7 @@ This script tests two main scenarios:
 
 import sys
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -54,6 +55,81 @@ def test_versioned_flash_attention_selection_rejects_invalid_or_unavailable_vers
         fa._choose_vllm_flash_attn_version(9, "5", frozenset((2, 3, 4)))
     with pytest.raises(RuntimeError, match="FlashAttention 4 is unavailable"):
         fa._choose_vllm_flash_attn_version(9, "4", frozenset((2, 3)))
+
+
+def test_vllm_dense_adapter_builds_varlen_metadata_and_restores_lse(monkeypatch):
+    batch_size, seqlen_q, seqlen_k, num_heads, head_dim = 2, 3, 5, 4, 8
+    query = torch.randn(batch_size, seqlen_q, num_heads, head_dim)
+    key = torch.randn(batch_size, seqlen_k, num_heads, head_dim)
+    value = torch.randn_like(key)
+    packed_out = torch.randn(batch_size * seqlen_q, num_heads, head_dim)
+    packed_lse = torch.arange(num_heads * batch_size * seqlen_q).reshape(num_heads, -1)
+    captured: dict[str, Any] = {}
+
+    def fake_varlen(q, k, v, **kwargs):
+        captured.update(q=q, k=k, v=v, **kwargs)
+        return packed_out, packed_lse
+
+    monkeypatch.setattr(fa, "vllm_flash_attn_varlen_with_lse", fake_varlen)
+
+    out, lse = fa.vllm_flash_attn_dense_with_lse(query, key, value, causal=True, softmax_scale=0.25)
+
+    assert out.shape == query.shape
+    assert torch.equal(out.flatten(0, 1), packed_out)
+    assert lse.shape == (batch_size, num_heads, seqlen_q)
+    assert torch.equal(lse, packed_lse.unflatten(1, (batch_size, seqlen_q)).permute(1, 0, 2))
+    assert captured["q"].shape == (batch_size * seqlen_q, num_heads, head_dim)
+    assert captured["k"].shape == (batch_size * seqlen_k, num_heads, head_dim)
+    assert captured["v"].shape == (batch_size * seqlen_k, num_heads, head_dim)
+    assert torch.equal(captured["cu_seqlens_q"], torch.tensor([0, 3, 6], dtype=torch.int32))
+    assert torch.equal(captured["cu_seqlens_k"], torch.tensor([0, 5, 10], dtype=torch.int32))
+    assert captured["max_seqlen_q"] == seqlen_q
+    assert captured["max_seqlen_k"] == seqlen_k
+    assert captured["causal"] is True
+    assert captured["softmax_scale"] == 0.25
+
+
+@hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="vLLM FlashAttention requires CUDA")
+def test_vllm_dense_adapter_cuda_matches_sdpa_and_lse():
+    """Exercise the real versioned vLLM dispatcher and its LSE contract."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    batch_size, seqlen_q, seqlen_k, num_heads, head_dim = 2, 17, 23, 4, 64
+    softmax_scale = head_dim**-0.5
+
+    torch.manual_seed(19)
+    query = torch.randn(batch_size, seqlen_q, num_heads, head_dim, device=device, dtype=dtype)
+    key = torch.randn(batch_size, seqlen_k, num_heads, head_dim, device=device, dtype=dtype)
+    value = torch.randn_like(key)
+
+    capability = torch.cuda.get_device_capability(device)
+    expected_version = 3 if capability[0] == 9 else 2
+    assert capability[0] in (8, 9), f"test expects an Ampere/Ada or Hopper GPU, got SM{capability[0]}{capability[1]}"
+    assert fa.resolve_vllm_flash_attn_version() == expected_version
+
+    output, lse = fa.vllm_flash_attn_dense_with_lse(
+        query,
+        key,
+        value,
+        softmax_scale=softmax_scale,
+        causal=False,
+    )
+
+    query_bhsd = query.transpose(1, 2)
+    key_bhsd = key.transpose(1, 2)
+    value_bhsd = value.transpose(1, 2)
+    output_ref = torch.nn.functional.scaled_dot_product_attention(
+        query_bhsd,
+        key_bhsd,
+        value_bhsd,
+        scale=softmax_scale,
+    ).transpose(1, 2)
+    logits = torch.matmul(query_bhsd.float(), key_bhsd.float().transpose(-2, -1)) * softmax_scale
+    lse_ref = torch.logsumexp(logits, dim=-1)
+
+    torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
 
 def create_attention_mask(batch_size: int, seq_len: int, valid_len: int, device: torch.device) -> torch.Tensor:
