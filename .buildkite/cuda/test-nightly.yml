@@ -146,8 +146,7 @@ steps:
         # collects full_model (20 interruptions + BAGEL sleep).
         timeout_in_minutes: 180
         commands:
-          - pytest -s -v tests/entrypoints/ -m "full_model and cuda and H100" --run-level "full_model"
-        mirror_hardwares: h100_2
+          - pytest -s -v tests/entrypoints/ -m "full_model and cuda and H100 and cards_2" --run-level "full_model"
 
   - group: ":card_index_dividers: TTS Model Test"
     key: nightly-tts-test-group

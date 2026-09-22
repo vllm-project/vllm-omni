@@ -51,6 +51,96 @@ AR_STAGE_CONFIG = modify_stage_config(
         }
     },
 )
+_MULTISTAGE_SLEEP_PIPELINE = "qwen2_5_omni_thinker_tiny_dit"
+
+
+def _tiny_dit_multistage_deploy_config() -> str:
+    """Thinker-only AR + tiny DiT deploy for joint sleep/wake.
+
+    ``AsyncOmni(stages=...)`` is ignored by ``resolve_omni_config``: a
+    ``model=Qwen2.5-Omni-7B`` call otherwise loads the native 3-stage
+    thinker/talker/code2wav pipeline (``Expected 3 sampling params, got 2``).
+    """
+    import atexit
+    import os
+    import tempfile
+    from pathlib import Path
+
+    import yaml
+
+    from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, register_pipeline
+    from vllm_omni.config.stage_config import PipelineConfig, StageExecutionType, StagePipelineConfig
+
+    if _MULTISTAGE_SLEEP_PIPELINE not in OMNI_PIPELINES:
+        register_pipeline(
+            PipelineConfig(
+                model_type=_MULTISTAGE_SLEEP_PIPELINE,
+                hf_architectures=(),
+                stages=(
+                    StagePipelineConfig(
+                        stage_id=0,
+                        model_stage="thinker",
+                        execution_type=StageExecutionType.LLM_AR,
+                        input_sources=(),
+                        owns_tokenizer=True,
+                        requires_multimodal_data=True,
+                        hf_config_name="thinker_config",
+                        model_arch="Qwen2_5OmniForConditionalGeneration",
+                        engine_output_type="latent",
+                        sampling_constraints={"detokenize": True},
+                    ),
+                    StagePipelineConfig(
+                        stage_id=1,
+                        model_stage="dit",
+                        execution_type=StageExecutionType.DIFFUSION,
+                        input_sources=(0,),
+                        final_output=True,
+                        final_output_type="image",
+                    ),
+                ),
+            )
+        )
+
+    config = {
+        "pipeline": _MULTISTAGE_SLEEP_PIPELINE,
+        "async_chunk": False,
+        "dtype": "bfloat16",
+        "trust_remote_code": True,
+        "enable_prefix_caching": False,
+        "connectors": {
+            "shared_memory_connector": {"name": "SharedMemoryConnector"},
+        },
+        "stages": [
+            {
+                "stage_id": 0,
+                "devices": "0",
+                "enable_sleep_mode": True,
+                "gpu_memory_utilization": _AR_SLEEP_GPU_MEMORY_UTILIZATION,
+                "enforce_eager": True,
+                "max_model_len": _AR_SLEEP_MAX_MODEL_LEN,
+                "max_num_batched_tokens": _AR_SLEEP_MAX_NUM_BATCHED_TOKENS,
+                "skip_mm_profiling": True,
+                "mm_processor_cache_gb": 0,
+                "max_num_seqs": 1,
+            },
+            {
+                "stage_id": 1,
+                "devices": "1",
+                "model": MODEL_DIFF,
+                "enable_sleep_mode": True,
+                "gpu_memory_utilization": 0.4,
+                "enforce_eager": True,
+                "tensor_parallel_size": 1,
+                "max_num_seqs": 1,
+                "input_connectors": {"from_stage_0": "shared_memory_connector"},
+            },
+        ],
+    }
+    fd, path = tempfile.mkstemp(prefix="sleep_thinker_tiny_dit_", suffix=".yaml")
+    atexit.register(Path(path).unlink, missing_ok=True)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        yaml.safe_dump(config, f, sort_keys=False)
+    return path
 
 
 def get_ack_info(ack, key, default=None):
@@ -276,44 +366,9 @@ async def test_multistage_ar_diffusion_sleep_wake():
     and BAGEL TP=2 (diffusion-only, ``full_model``) do not: a 2-step tiny-DiT
     generate after ``sleep(stage_ids=[0, 1])`` + ``resume_generation``.
     """
-    stages = [
-        {
-            "stage_id": 0,
-            "stage_type": "llm",
-            "runtime": {"process": True, "devices": "0", "max_batch_size": 1},
-            "engine_args": {
-                "model": MODEL_AR,
-                "model_stage": "thinker",
-                "gpu_memory_utilization": _AR_SLEEP_GPU_MEMORY_UTILIZATION,
-                "dtype": "bfloat16",
-                "enable_sleep_mode": True,
-                "trust_remote_code": True,
-                "enforce_eager": True,
-                "max_model_len": _AR_SLEEP_MAX_MODEL_LEN,
-                "max_num_batched_tokens": _AR_SLEEP_MAX_NUM_BATCHED_TOKENS,
-            },
-        },
-        {
-            "stage_id": 1,
-            "stage_type": "diffusion",
-            "runtime": {"process": True, "devices": "1", "max_batch_size": 1},
-            "engine_args": {
-                "model": MODEL_DIFF,
-                "gpu_memory_utilization": 0.4,
-                "dtype": "bfloat16",
-                "enable_sleep_mode": True,
-                "enforce_eager": True,
-                "tensor_parallel_size": 1,
-            },
-            "final_output": True,
-            "final_output_type": "image",
-        },
-    ]
-    connectors = [{"src_stage_id": 0, "dst_stage_id": 1, "connector_type": "queue"}]
     engine = AsyncOmni(
         model=MODEL_AR,
-        stages=stages,
-        connectors=connectors,
+        deploy_config=_tiny_dit_multistage_deploy_config(),
         enable_sleep_mode=True,
         stage_init_timeout=1200,
     )
