@@ -936,17 +936,28 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         The native temporal encoder returns the same moments as VideoX-Fun's
         VAE._encode: per-clip spatial tiling, final-frame padding, token_drop.
         Its first 24 channels are the diagonal Gaussian mean.
+        Match VideoX-Fun control/inpaint encoding: normalize on-device in FP32,
+        then encode under FP16 autocast rather than the keyframe sampling path.
         """
         parameter = next(self.parameters())
         pixels = pixels.to(device=parameter.device, dtype=torch.float32)
         mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
         std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
-        with current_omni_platform.create_autocast_context(
-            device_type=parameter.device.type,
-            dtype=torch.float16,
-            enabled=parameter.device.type != "cpu",
-        ):
-            moments = self.model.encode_temporal((pixels - mean) / std)
+        previous_parallel = self.model.parallel_tiling
+        if int(getattr(self, "parallel_size", 1)) <= 1:
+            self.model.parallel_tiling = False
+        try:
+            with (
+                self._encoder_tiling_context(int(pixels.shape[-2]), int(pixels.shape[-1])),
+                current_omni_platform.create_autocast_context(
+                    device_type=parameter.device.type,
+                    dtype=torch.float16,
+                    enabled=parameter.device.type != "cpu",
+                ),
+            ):
+                moments = self.model.encode_temporal((pixels - mean) / std)
+        finally:
+            self.model.parallel_tiling = previous_parallel
         channels = int(self.config_dict["latent_channels"])
         if moments.shape[1] != 2 * channels:
             raise ValueError("H3 control encoder must return mean and log-variance channels")

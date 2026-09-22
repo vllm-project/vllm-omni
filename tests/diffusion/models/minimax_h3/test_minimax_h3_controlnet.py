@@ -407,6 +407,7 @@ def test_vae_control_uses_normalized_posterior_mode():
             super().__init__()
             self.anchor = nn.Parameter(torch.zeros(1))
             self.input = None
+            self.parallel_tiling = False
 
         def encode_temporal(self, pixels):
             self.input = pixels
