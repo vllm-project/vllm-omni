@@ -15,7 +15,7 @@ nav:
         - Image Edit: serving/image_edit_api.md
         - Videos: serving/videos_api.md
       - Streaming and Realtime:
-        - Full Duplex OpenAI: serving/realtime_duplex_openai_api.md
+        - Full Duplex OpenAI: serving/realtime_openai_duplex_api.md
         - Full Duplex: serving/full_duplex_api.md
         - Realtime Duplex Reference: serving/realtime_duplex_api.md
         - Streaming Video Input: serving/video_stream_api.md
