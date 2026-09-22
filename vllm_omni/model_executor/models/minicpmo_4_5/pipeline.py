@@ -22,33 +22,18 @@ _CODEC_EOS_TOKEN_ID = 6561  # tts_config.num_audio_tokens - 1
 
 
 def _talker_stop_token_ids() -> list[int]:
-    """Stage 1's default stop id: the one the multi-frame head can emit.
+    """Stage 1's default stop id, derived from the head this platform runs.
 
-    Stage 1's deploy config carries the ``speculative_config`` that arms the
-    multi-frame decode, and ``compute_logits`` then collapses the Talker's
-    vLLM-level head to the two-wide continue/stop row. The only sampleable ids
-    are therefore 0 and 1, and the codec EOS can never appear at this level (the
-    model samples codec ids inside the loop and forwards them to stage 2
-    itself).
-
-    Pinning this to the codec EOS regardless is what made every multi-frame
-    request run to ``max_tokens``: the model did emit the stop marker,
-    ``check_stop`` compared it against 6561, and the request kept its slot until
-    the context ran out. A deployment that drops the ``speculative_config`` from
-    stage 1 falls back to one frame per step, where the head is the full codec
-    vocabulary again and the codec EOS is the stop id; it overrides this per
-    stage through the usual ``stop_token_ids`` sampling parameter.
+    On NPU, stage 1's ``speculative_config`` collapses the vLLM-level head to
+    the two-wide continue/stop row: only 0/1 are sampleable, so the codec EOS
+    can never appear. Everywhere else that block stays out of the config (it is
+    confined to ``platforms.npu``), the head is the full codec vocabulary, and
+    the codec EOS is the only valid stop.
     """
     from vllm_omni.platforms import current_omni_platform
 
-    # ``speculative_config`` only means "constant continue drafts" next to the
-    # NPU worker that intercepts the step
-    # (``vllm_omni.platforms.npu.worker.talker_multiframe``); on every other
-    # platform the same block hands the Talker to vLLM's real n-gram proposer and
-    # rejection sampler, which asserts on the codec ids. The block is therefore
-    # confined to ``platforms.npu`` in the deploy config, and the stop id follows:
-    # NPU keeps the two-wide continue/stop row, everyone else keeps the full codec
-    # head and stops on the codec EOS.
+    # The deploy config confines stage 1's speculative_config to platforms.npu,
+    # so a non-NPU stage 1 keeps the full codec head.
     if (current_omni_platform.device_name or "").lower() != "npu":
         return [_CODEC_EOS_TOKEN_ID]
 
