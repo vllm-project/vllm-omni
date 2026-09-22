@@ -84,6 +84,7 @@ class SamplingKind(str, Enum):
     MUSIC_NONE = "music_none"
     VIDEO_NONE = "video_none"
     VIDEO_DIFFUSION_SINGLE = "video_diffusion_single"
+    VIDEO_FL2VA = "video_fl2va"
     VIDEO_FASTH3 = "video_fasth3"
     VIDEO_REF2VA_IMAGE_AUDIO = "video_ref2va_image_audio"
     VIDEO_REF2VA_MULTI_VIDEO = "video_ref2va_multi_video"
@@ -150,7 +151,7 @@ AR_LIST_SAMPLING_PARAMS = [
 
 VIDEO_MODEL_PARAMS = WanModelSpecificParams({"guidance_scale_2": 5.0, "boundary_ratio": 0.98, "flow_shift": 12.0})
 
-# Matches MiniMax-H3 recipe Ref2VA defaults (task is auto-routed by the client).
+# Matches MiniMax-H3 recipe defaults (task is auto-routed by the client).
 H3_MODEL_PARAMS = MiniMaxH3ModelSpecificParams(
     {
         "type": "minimax_h3",
@@ -417,6 +418,34 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
                 LORA_PARAMS,
             )
             _assert_model_param_values(received_sampling_params_list[0], VIDEO_MODEL_PARAMS)
+        elif sampling_case.kind is SamplingKind.VIDEO_FL2VA:
+            assert len(received_sampling_params_list) == 1
+            assert isinstance(prompt, dict)
+            multi_modal_data = prompt.get("multi_modal_data")
+            assert isinstance(multi_modal_data, dict)
+            input_images = multi_modal_data.get("image")
+
+            if isinstance(input_images, list):
+                assert len(input_images) == 2
+                assert input_images[0].getpixel((0, 0)) == (0, 0, 0)
+                assert input_images[1].getpixel((0, 0)) == (255, 255, 255)
+                expected_frame_indices = [0, -1]
+            else:
+                assert isinstance(input_images, Image.Image)
+                pixel = input_images.getpixel((0, 0))
+                assert pixel in {(0, 0, 0), (255, 255, 255)}
+                is_first_frame = pixel == (0, 0, 0)
+                expected_frame_indices = [0] if is_first_frame else [-1]
+
+            _assert_model_param_values(
+                received_sampling_params_list[0],
+                {
+                    "flow_shift": 12.0,
+                    "task": "fl2va",
+                    "audio_flow_shift": 3.0,
+                    "frame_indices": expected_frame_indices,
+                },
+            )
         elif sampling_case.kind is SamplingKind.VIDEO_FASTH3:
             assert len(received_sampling_params_list) == 1
             received = received_sampling_params_list[0]
@@ -935,6 +964,164 @@ async def test_video_generation_node(api_server: str, model: str, image_input: b
     assert isinstance(result, tuple)
     assert len(result) == 1
     assert isinstance(result[0], VideoInput)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "server_case",
+    [
+        pytest.param(
+            ServerCase(
+                served_model="MiniMaxAI/MiniMax-H3",
+                stage_list=["diffusion"],
+                stage_configs=[H3_STAGE_CONFIG],
+                outputs=[_build_diffusion_video_output()],
+            ),
+            id="minimax-h3",
+        ),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "sampling_case",
+    [pytest.param(SamplingCase(kind=SamplingKind.VIDEO_FL2VA, sampling_params=None), id="fl2va")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "frame_selection",
+    [
+        pytest.param("first", id="first-frame"),
+        pytest.param("last", id="last-frame"),
+        pytest.param("both", id="first-and-last-frame"),
+    ],
+)
+async def test_video_generation_node_minimax_h3_fl2va(
+    api_server: str,
+    sampling_case: SamplingCase,
+    frame_selection: str,
+):
+    node = VLLMOmniGenerateVideo()
+    first_frame = torch.zeros((1, VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=torch.float32)
+    last_frame = torch.ones((1, VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=torch.float32)
+    frame_inputs = {
+        "first": {"first_frame": first_frame},
+        "last": {"last_frame": last_frame},
+        "both": {"first_frame": first_frame, "last_frame": last_frame},
+    }[frame_selection]
+
+    result = await node.generate(
+        url=api_server,
+        model="MiniMaxAI/MiniMax-H3",
+        prompt="A cinematic transition between the supplied keyframes.",
+        negative_prompt="",
+        width=VIDEO_WIDTH,
+        height=VIDEO_HEIGHT,
+        fps=VIDEO_FPS,
+        duration=VIDEO_DURATION,
+        model_params=H3_MODEL_PARAMS,
+        **frame_inputs,
+    )
+
+    assert isinstance(result, tuple)
+    assert len(result) == 1
+    assert isinstance(result[0], VideoInput)
+
+
+def test_video_generation_node_exposes_explicit_keyframe_inputs():
+    node_inputs = VLLMOmniGenerateVideo.INPUT_TYPES()
+    optional_inputs = node_inputs["optional"]
+
+    assert optional_inputs["first_frame"] == ("IMAGE",)
+    assert optional_inputs["last_frame"] == ("IMAGE",)
+    assert node_inputs["required"]["duration"][0] == "FLOAT"
+    assert "num_frames" not in node_inputs["required"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"frame": object(), "first_frame": object()}, "frame or first_frame/last_frame"),
+        ({"frame": object(), "last_frame": object()}, "frame or first_frame/last_frame"),
+        ({"last_frame": object(), "references": {}}, "first_frame/last_frame or references"),
+    ],
+)
+async def test_video_generation_node_rejects_conflicting_frame_inputs(kwargs: dict, message: str):
+    node = VLLMOmniGenerateVideo()
+    validation_result = node.VALIDATE_INPUTS(
+        url="http://localhost:8000/v1",
+        model="MiniMaxAI/MiniMax-H3",
+        **kwargs,
+    )
+
+    assert isinstance(validation_result, str)
+    assert message in validation_result
+
+    with pytest.raises(ValueError, match=message):
+        await node.generate(
+            url="http://localhost:8000/v1",
+            model="MiniMaxAI/MiniMax-H3",
+            prompt="test",
+            width=VIDEO_WIDTH,
+            height=VIDEO_HEIGHT,
+            fps=VIDEO_FPS,
+            duration=VIDEO_DURATION,
+            **kwargs,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("keyframe_name", ["first_frame", "last_frame"])
+async def test_video_generation_node_rejects_keyframes_with_fast_h3(keyframe_name: str):
+    node = VLLMOmniGenerateVideo()
+    fast_h3 = {"url": "http://localhost:8000/v1", "model": "MiniMaxAI/MiniMax-H3"}
+    keyframe = {keyframe_name: object()}
+
+    validation_result = node.VALIDATE_INPUTS(
+        url="http://ignored.invalid/v1",
+        model="ignored-model",
+        fast_h3=fast_h3,
+        **keyframe,
+    )
+
+    assert isinstance(validation_result, str)
+    assert "FastH3 Preview supports T2VA only" in validation_result
+
+    with pytest.raises(ValueError, match="FastH3 Preview supports T2VA only"):
+        await node.generate(
+            url="http://ignored.invalid/v1",
+            model="ignored-model",
+            prompt="test",
+            width=VIDEO_WIDTH,
+            height=VIDEO_HEIGHT,
+            fps=VIDEO_FPS,
+            duration=VIDEO_DURATION,
+            fast_h3=fast_h3,
+            **keyframe,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "keyframes",
+    [
+        {"first_frame": object()},
+        {"last_frame": object()},
+        {"first_frame": object(), "last_frame": object()},
+    ],
+)
+async def test_video_generation_node_rejects_h3_keyframes_for_other_models(keyframes: dict):
+    with pytest.raises(ValueError, match="supported only for MiniMax-H3; use frame"):
+        await VLLMOmniGenerateVideo().generate(
+            url="http://localhost:8000/v1",
+            model="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+            prompt="test",
+            width=VIDEO_WIDTH,
+            height=VIDEO_HEIGHT,
+            fps=VIDEO_FPS,
+            duration=VIDEO_DURATION,
+            **keyframes,
+        )
 
 
 @pytest.mark.asyncio

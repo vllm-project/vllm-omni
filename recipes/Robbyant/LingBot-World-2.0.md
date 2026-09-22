@@ -53,6 +53,26 @@ source frames, at least as many as requested and at most 4096. The runtime
 consumes only the prefix needed by the request. Longer rollouts also require
 sufficient device memory.
 
+## Experimental KV writeback reuse
+
+To reuse KV from the final denoising step instead of running the additional
+clean-latent writeback, pass this option in the `model_config` supplied to
+`Omni` or `AsyncOmni`:
+
+```python
+model_config = {"lingbot_reuse_last_step_kv": True}
+```
+
+The default is `False`. The value must be a boolean, not a string or integer.
+It is validated and fixed when the pipeline instance is constructed; changing
+it requires a new instance. It is not a per-request `extra_args` option.
+The previous `VLLM_OMNI_LINGBOT_REUSE_LAST_STEP_KV` environment variable is no
+longer read.
+
+This experimental mode stores the final noisy probe's KV rather than clean
+`x0` KV, so generated outputs can differ. The four denoising steps, chunk
+boundaries, and paged-context finalization remain the same.
+
 ## Realtime in-process generation (deprecated)
 
 Prefer [Streaming video serving](#streaming-video-serving) for mid-session
@@ -193,6 +213,47 @@ accepts:
   `s`, `d`, `i`, `j`, `k`, and `l`;
 - `lingbot.camera_trajectory.v1` for explicit pose/intrinsics trajectories.
 
+## Online FP8 linear layers (experimental)
+
+Pass `quantization_config={"method": "fp8"}` to the existing `AsyncOmni`
+construction to use vLLM's online FP8 linear implementation. On the tested
+Hopper-class GPU this dispatches to CUTLASS FP8 GEMM with online per-tensor
+activation scaling; no LingBot-specific quantization kernel is introduced.
+
+Only the transformer's existing vLLM parallel linear layers are eligible:
+self-attention, cross-attention, FFN, camera injectors, and C2WS projections.
+The ordinary PyTorch linear layers (including the output head and
+time/text embeddings), normalization, convolutions, VAE, text encoder, and
+AR KV cache are not converted to FP8 by this option.
+
+Quality-sensitive projections can remain BF16 through fully qualified
+`ignored_layers` names. For example, the following configuration tests
+retaining the camera/C2WS path in BF16:
+
+```python
+quantization_config = {
+    "method": "fp8",
+    "ignored_layers": [
+        f"transformer.blocks.{i}.cam_injector_layer{j}"
+        for i in range(40)
+        for j in (1, 2)
+    ]
+    + [
+        "transformer.c2ws_hidden_states_layer1",
+        "transformer.c2ws_hidden_states_layer2",
+    ],
+}
+```
+
+Use `transformer.blocks.<i>.self_attn.qkv` to exclude the fused Q/K/V
+projection as a unit. The example exclusion list is an ablation, not a
+universal quality guarantee or a default. Validate the intended scene, seed,
+camera trajectory, and session length against BF16 before selecting a policy.
+An FP8 kernel speedup alone is not an end-to-end performance claim.
+The long-session E8 quality gate in
+[#7074](https://github.com/vllm-project/vllm-omni/issues/7074) remains required
+for Tier-2 acceptance.
+
 ## Validation
 
 Real-checkpoint validation uses 480x832 output, four DMD steps, and seed 42.
@@ -226,7 +287,7 @@ tested commit.
   AR blocks in one request. `max_num_seqs` must be one in both cases.
 - Stateful streaming VAE decode is not implemented; the realtime example emits
   latent chunks.
-- SP/USP, pipeline/CFG parallelism, HSDP, VAE parallelism, quantization,
+- SP/USP, pipeline/CFG parallelism, HSDP, VAE parallelism, quantization methods other than online FP8,
   Cache-DiT, TeaCache, causal-pretrain, and the 1.3B checkpoint are not claimed.
 - No AMD GPU, Ascend NPU, or Intel GPU support is claimed.
 

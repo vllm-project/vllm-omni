@@ -1,0 +1,8 @@
+# Experimental B4 profile. Early first audio can require startup buffering.
+# MPS is a separate operator setting and is not enabled by this file.
+base_config: qwen3_tts_high_concurrency_mrv2.yaml
+connectors:
+  connector_of_shared_memory:
+    extra:
+      decode_batch_max_size: 4
+      decode_cudagraph_batch_sizes: [1, 2, 3, 4]

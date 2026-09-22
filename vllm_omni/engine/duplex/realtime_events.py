@@ -895,6 +895,33 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
                 state, event, response_id, status=status, status_details=status_details
             ),
         ]
+    if event_type == "input.transcribed":
+        transcript = event.get("transcript")
+        if not isinstance(transcript, str) or not transcript.strip():
+            return []
+        transcript = transcript.strip()
+        raw_item_id = event.get("realtime_item_id")
+        item_id = raw_item_id if isinstance(raw_item_id, str) and raw_item_id else f"item_{uuid4().hex}"
+        committed_item = state.conversation_items.get(item_id)
+        if isinstance(committed_item, dict):
+            content = committed_item.get("content")
+            if not isinstance(content, list):
+                content = []
+                committed_item["content"] = content
+            updated = False
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "input_audio":
+                    part["transcript"] = transcript
+                    updated = True
+                    break
+            if not updated:
+                content.append({"type": "input_audio", "transcript": transcript})
+        return [
+            InputTranscriptionCompleted(
+                item_id=item_id,
+                transcript=transcript,
+            )
+        ]
     if event_type == "input.committed":
         event_item_id = event.get("realtime_item_id")
         item_id = (
@@ -1168,6 +1195,7 @@ def note_input_append(
     payload: dict[str, object],
     *,
     vad_result: TurnDetectionResult | None = None,
+    allows_video_without_audio: bool = False,
 ) -> list[DuplexEvent]:
     """Update the input-buffer projection for one appended chunk; returns typed events.
 
@@ -1180,9 +1208,18 @@ def note_input_append(
     audio = payload.get("audio")
     looks_like_speech = bool(vad_result.is_speech) if vad_result is not None else payload.get("is_speech") is not False
     has_audio = isinstance(audio, str) and bool(audio)
-    state.input_audio_buffer_has_audio = state.input_audio_buffer_has_audio or (looks_like_speech and has_audio)
+    video_frames = payload.get("video_frames")
+    has_video = isinstance(video_frames, list) and any(isinstance(frame, str) and frame for frame in video_frames)
+    # Vision-carrying silent appends are real turn content only when the model
+    # allows video without required audio. Without this gate, turn-mode
+    # camera sessions would treat silent+frames as buffer content and open a response.
+    state.input_audio_buffer_has_audio = (
+        state.input_audio_buffer_has_audio
+        or (looks_like_speech and has_audio)
+        or (has_video and allows_video_without_audio)
+    )
     state.input_audio_buffer_had_non_speech = state.input_audio_buffer_had_non_speech or (
-        not looks_like_speech and has_audio
+        not looks_like_speech and has_audio and not (has_video and allows_video_without_audio)
     )
     events: list[DuplexEvent] = []
     stop_ms: object = payload.get("audio_end_ms", payload.get("audio_ms", 0))

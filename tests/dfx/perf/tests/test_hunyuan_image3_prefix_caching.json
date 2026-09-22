@@ -3,7 +3,6 @@
     "test_name": "test_hunyuan_image3_prefix_dense",
     "mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 4}}, "diffusion", "local_model"],
     "description": "Repeated two-image IT2I request on a single DiT stage: dense baseline (TP4, CFGP1)",
-    "benchmark_runner": "vllm-bench",
     "server_params": {
       "model": "tencent/HunyuanImage-3.0-Instruct",
       "serve_args": {
@@ -47,7 +46,6 @@
     "test_name": "test_hunyuan_image3_prefix_paged_no_cache",
     "mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 4}}, "diffusion", "local_model"],
     "description": "Repeated two-image IT2I request on a single DiT stage: paged without prefix caching (TP4, CFGP1)",
-    "benchmark_runner": "vllm-bench",
     "server_params": {
       "model": "tencent/HunyuanImage-3.0-Instruct",
       "serve_args": {
@@ -91,7 +89,6 @@
     "test_name": "test_hunyuan_image3_prefix_paged_prefix",
     "mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 4}}, "diffusion", "local_model"],
     "description": "Repeated two-image IT2I request on a single DiT stage: paged with full prefix reuse (TP4, CFGP1)",
-    "benchmark_runner": "vllm-bench",
     "server_params": {
       "model": "tencent/HunyuanImage-3.0-Instruct",
       "serve_args": {

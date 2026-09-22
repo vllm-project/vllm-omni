@@ -2305,3 +2305,19 @@ class TestStepScheduler:
 
         with pytest.raises(ValueError):
             self.scheduler.add_request(request)
+
+
+class TestPendingFinishedRequestIds:
+    def test_reports_finished_ids_that_still_hold_state_without_clearing_them(self):
+        sched = RequestScheduler()
+        sched.initialize(SimpleNamespace(max_num_seqs=1, request_batch_max_wait_ms=0.0))
+        sched.add_request(_make_request("a"))
+        sched.add_request(_make_request("b"))
+
+        sched.finish_requests("a", DiffusionRequestStatus.FINISHED_ABORTED)
+        assert sched.pending_finished_request_ids() == {"a"}
+
+        sched.pop_request_state("a")
+        assert sched.pending_finished_request_ids() == set()
+        # The next wave still ships the id to the worker for its own cleanup.
+        assert sched.schedule().finished_req_ids == {"a"}

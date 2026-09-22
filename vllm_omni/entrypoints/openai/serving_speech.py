@@ -110,8 +110,8 @@ _REF_AUDIO_MIN_DURATION = 1.0  # seconds
 _REF_AUDIO_MAX_DURATION = 30.0  # seconds
 _REF_AUDIO_METADATA_FETCH_ATTEMPTS = 3
 _REMOTE_REF_AUDIO_SCHEMES = frozenset({"http", "https", "data"})
-_REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES = 256
-_REF_AUDIO_RESOLVE_CACHE_MAX_BYTES = 256 * 1024 * 1024
+_REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES = 1024
+_REF_AUDIO_RESOLVE_CACHE_MAX_BYTES = 512 * 1024 * 1024
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _DEFAULT_VOICE_NAME = "default"
 
@@ -246,6 +246,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except ValueError:
             logger.warning("Invalid SPEAKER_MAX_UPLOADED=%r; using default 1000", _raw_cap)
             self._max_uploaded_speakers = 1000
+        _policy = os.environ.get("VLLM_OMNI_SPEAKER_REGISTRATION_POLICY", "overwrite").lower()
+        if _policy not in ("overwrite", "immutable"):
+            raise ValueError(
+                f"Invalid VLLM_OMNI_SPEAKER_REGISTRATION_POLICY={_policy!r}; expected 'overwrite' or 'immutable'."
+            )
+        self._registration_policy = _policy
         self.uploaded_speakers: dict[str, dict[str, Any]] = {}
         self._ref_audio_data_url_cache: dict[str, str] = {}
         self._ref_audio_resolve_cache: OrderedDict[str, tuple[np.ndarray, int, int, str]] = OrderedDict()
@@ -410,6 +416,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         adapter = self._adapter
         if adapter is not None:
             adapter.load_capabilities()
+            self._drop_shadowing_uploads()
         available_speakers = self._get_available_speakers()
         logger.info("Loaded %d supported speakers: %s", len(available_speakers), sorted(available_speakers))
 
@@ -448,6 +455,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             ctx = SpeechServingContext(server=self, engine_client=self.engine_client)
             self._adapter = adapter_cls(ctx)
             self._adapter.load_capabilities()
+            self._drop_shadowing_uploads()
         return self._adapter
 
     def _uses_native_speed_control(self) -> bool:
@@ -803,6 +811,39 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 f"the cap via SPEAKER_MAX_UPLOADED."
             )
 
+    def _drop_shadowing_uploads(self) -> None:
+        """Uploads are restored from disk before the adapter exists, so a name
+        registered under a built-in speaker before the collision guard would
+        keep shadowing it across restarts. Drop such entries from the registry;
+        the file stays on disk for the operator to remove."""
+        caps = self._adapter.capabilities if self._adapter is not None else None
+        if caps is None:
+            return
+        for voice_name_lower in list(self.uploaded_speakers):
+            if voice_name_lower in caps.supported_speakers or voice_name_lower in caps.precomputed_speakers:
+                info = self.uploaded_speakers.pop(voice_name_lower)
+                logger.warning(
+                    "Uploaded voice %r shadows a built-in speaker and is ignored; remove %s to clear this warning.",
+                    voice_name_lower,
+                    info.get("file_path"),
+                )
+
+    def _check_registration_allowed(self, voice_name_lower: str, name: str) -> None:
+        """Reject names that would shadow a built-in voice or, under the
+        immutable policy, silently overwrite an existing upload."""
+        caps = self._adapter.capabilities if self._adapter is not None else None
+        if caps is not None and (
+            voice_name_lower in caps.supported_speakers or voice_name_lower in caps.precomputed_speakers
+        ):
+            raise ValueError(
+                f"Voice name '{name}' is reserved by a built-in speaker of this model; choose a different name."
+            )
+        if self._registration_policy == "immutable" and voice_name_lower in self.uploaded_speakers:
+            raise ValueError(
+                f"Voice '{name}' already exists and VLLM_OMNI_SPEAKER_REGISTRATION_POLICY is 'immutable'; "
+                f"delete it first via DELETE /v1/audio/voices/{name}."
+            )
+
     def _evict_existing_upload(self, voice_name_lower: str, name: str) -> None:
         """Drop an existing upload with this name so the caller can re-register it."""
         if voice_name_lower not in self.uploaded_speakers:
@@ -885,6 +926,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         async with self._upload_lock:
             voice_name_lower = name.lower()
+            self._check_registration_allowed(voice_name_lower, name)
             self._evict_existing_upload(voice_name_lower, name)
             self._check_upload_cap()
 
@@ -1005,6 +1047,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         async with self._upload_lock:
             voice_name_lower = name.lower()
+            self._check_registration_allowed(voice_name_lower, name)
             self._evict_existing_upload(voice_name_lower, name)
             self._check_upload_cap()
 
@@ -1359,10 +1402,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._ref_audio_resolve_cache.move_to_end(cache_key)
         return cached[3]
 
-    def _put_resolved_ref_audio(self, cache_key: str, waveform: np.ndarray, sr: int, artifact_key: str) -> None:
+    def _put_resolved_ref_audio(
+        self, cache_key: str, waveform: np.ndarray | list[float], sr: int, artifact_key: str
+    ) -> None:
         if self._ref_audio_resolve_cache_max_entries <= 0 or self._ref_audio_resolve_cache_max_bytes <= 0:
             return
-        size = waveform.nbytes
+        # Keep the finalized ndarray's ownership and identity for the array
+        # resolver. Legacy list callers are materialized into a compact array;
+        # their Python list remains independent from cached storage.
+        waveform = np.asarray(waveform, dtype=np.float32)
+        if not waveform.flags.c_contiguous:
+            waveform = np.ascontiguousarray(waveform)
+        size = int(waveform.nbytes)
         if size > self._ref_audio_resolve_cache_max_bytes:
             return
         previous = self._ref_audio_resolve_cache.pop(cache_key, None)
