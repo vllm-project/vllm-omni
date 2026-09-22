@@ -103,7 +103,9 @@ class OmniStaticShapeMetadataBuilder(AscendAttentionMetadataBuilder):
         if self._omni_buckets and attn_metadata.static_shape_decode_step:
             seq_lens_list = attn_metadata.seq_lens_list or [1]
             max_seq_len = getattr(common, "max_seq_len", None) or max(seq_lens_list)
-            static_shape_decode.set_runtime_bucket(static_shape_decode.select_bucket(int(max_seq_len), self._omni_buckets))
+            static_shape_decode.set_runtime_bucket(
+                static_shape_decode.select_bucket(int(max_seq_len), self._omni_buckets)
+            )
         else:
             static_shape_decode.set_runtime_bucket(None)
             # A single fresh prefill inside a captured bucket replays a graph
@@ -156,7 +158,9 @@ class OmniStaticShapeAttentionBackendImpl(AscendAttentionBackendImpl):
         # +2 matches the query_start_loc buffer, which carries the FIA padding
         # request on a full batch.
         self._omni_max_rows = int(self.vllm_config.scheduler_config.max_num_seqs) + 2
-        self._omni_buckets = static_shape_decode.buckets_for(self._omni_capacity, self.vllm_config.cache_config.block_size)
+        self._omni_buckets = static_shape_decode.buckets_for(
+            self._omni_capacity, self.vllm_config.cache_config.block_size
+        )
         # A step that schedules several tokens per sequence (the Talker's
         # multi-frame decode declares them through a speculative_config) is
         # still a uniform decode, and the fixed-capacity mask covers it as
