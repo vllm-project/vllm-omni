@@ -193,6 +193,9 @@ branch is interchangeable. Disabling prefix caching skips cache-identity hashing
 `dense_legacy` remains the default. Enabling prefix caching with a mode other than
 `paged_scheduler`, without a registered model hook, or together with native
 `kv_transfer_config` raises a configuration error.
+Combining it with `enable_sleep_mode: true` is also rejected: sleep discards KV
+pages without invalidating the Scheduler's prefix-cache index. Disable either
+prefix caching or sleep mode.
 
 The current scope is local DiT reuse, not AR-imported KV or missing-page-only
 cross-stage transfer. Prefix-hit accuracy has been exercised with TP4/SP1 and

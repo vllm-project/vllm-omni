@@ -44,6 +44,30 @@ def test_prefix_caching_accepts_paged_scheduler(config_cls) -> None:
     assert config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
 
 
+@pytest.mark.parametrize("build_config", [OmniDiffusionConfig, OmniDiffusionConfig.from_kwargs])
+def test_prefix_caching_rejects_sleep_mode(build_config) -> None:
+    with pytest.raises(ValueError, match="disable enable_prefix_caching or enable_sleep_mode"):
+        build_config(
+            diffusion_kv_mode="paged_scheduler",
+            diffusion_kv_max_rows_per_request=2,
+            enable_prefix_caching=True,
+            enable_sleep_mode=True,
+        )
+
+
+@pytest.mark.parametrize("mode", ["dense_legacy", "paged_scheduler"])
+def test_sleep_mode_accepts_disabled_prefix_caching(mode) -> None:
+    config = OmniDiffusionConfig.from_kwargs(
+        diffusion_kv_mode=mode,
+        diffusion_kv_max_rows_per_request=2,
+        enable_prefix_caching=False,
+        enable_sleep_mode=True,
+    )
+
+    assert config.enable_sleep_mode is True
+    assert config.enable_prefix_caching is False
+
+
 @pytest.mark.parametrize("enable_prefix_caching", [False, True])
 def test_native_kv_transfer_requires_prefix_caching_disabled(enable_prefix_caching) -> None:
     kwargs = dict(

@@ -1192,6 +1192,12 @@ class OmniDiffusionConfig:
                 "enable_prefix_caching=True requires diffusion_kv_mode='paged_scheduler'; "
                 "set diffusion_kv_mode='paged_scheduler' or disable enable_prefix_caching"
             )
+        if self.enable_prefix_caching and self.enable_sleep_mode:
+            raise ValueError(
+                "Diffusion prefix caching cannot be combined with sleep mode: "
+                "sleep discards KV pages without invalidating cached prefixes; "
+                "disable enable_prefix_caching or enable_sleep_mode"
+            )
         if self.diffusion_kv_max_rows_per_request is not None and (
             type(self.diffusion_kv_max_rows_per_request) is not int or self.diffusion_kv_max_rows_per_request <= 0
         ):
