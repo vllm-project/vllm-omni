@@ -12,10 +12,13 @@ This module tests the WorkerWrapperBase implementation:
 - Dynamic worker class extension
 """
 
+import gc
+import weakref
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import torch
 from pytest_mock import MockerFixture
 
 from vllm_omni.diffusion.worker.diffusion_worker import (
@@ -250,6 +253,61 @@ class TestWorkerWrapperBaseDelegation:
         assert events == ["offload", "kv", "distributed"]
         kv_manager.close.assert_called_once_with()
         destroy.assert_called_once_with()
+
+    @pytest.mark.parametrize("cleanup_fails", [False, True])
+    def test_worker_shutdown_releases_model_references(self, mocker: MockerFixture, cleanup_fails):
+        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env")
+        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.shutdown_kv_connector")
+        offload_backend = mocker.Mock()
+        if cleanup_fails:
+            offload_backend.disable.side_effect = RuntimeError("offload cleanup failed")
+        worker = DiffusionWorker.__new__(DiffusionWorker)
+        weights = torch.ones(1)
+        weights_ref = weakref.ref(weights)
+        pipeline = SimpleNamespace(weights=weights)
+        worker.model_runner = SimpleNamespace(
+            pipeline=pipeline, offload_backend=offload_backend, kv_transfer_manager=None
+        )
+        worker.lora_manager = SimpleNamespace(pipeline=pipeline)
+        worker._sleep_saved_buffers = {"buffer": weights}
+        del weights, pipeline
+
+        if cleanup_fails:
+            with pytest.raises(RuntimeError, match="offload cleanup failed"):
+                worker.shutdown()
+        else:
+            worker.shutdown()
+        gc.collect()
+
+        assert worker.model_runner is None
+        assert worker.lora_manager is None
+        assert worker._sleep_saved_buffers == {}
+        assert weights_ref() is None
+
+    @pytest.mark.parametrize("owns_pool", [False, True])
+    @pytest.mark.parametrize("cleanup_fails", [False, True])
+    def test_worker_shutdown_releases_only_owned_sleep_pool(self, mocker: MockerFixture, owns_pool, cleanup_fails):
+        destroy = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env")
+        shutdown_connector = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.shutdown_kv_connector")
+        allocator_class = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker._get_cumem_allocator_class")
+        release = allocator_class.return_value.get_instance.return_value.release_pools
+        if cleanup_fails:
+            release.side_effect = RuntimeError("pool release failed")
+        worker = DiffusionWorker.__new__(DiffusionWorker)
+        worker.model_runner = None
+        worker._owns_sleep_pool = owns_pool
+
+        if owns_pool and cleanup_fails:
+            with pytest.raises(RuntimeError, match="pool release failed"):
+                worker.shutdown()
+        else:
+            worker.shutdown()
+
+        assert release.call_count == int(owns_pool)
+        shutdown_connector.assert_called_once_with()
+        destroy.assert_called_once_with()
+        if not cleanup_fails:
+            assert not worker._owns_sleep_pool
 
 
 # -------------------------------------------------------------------------
@@ -509,6 +567,26 @@ class TestCustomPipelineWorkerExtension:
         )
         # Verify re_init_pipeline was called with custom_pipeline_args
         mock_worker_instance.re_init_pipeline.assert_called_once_with(custom_args)
+
+    @pytest.mark.parametrize("cleanup_fails", [False, True])
+    def test_custom_pipeline_initialization_failure_cleans_worker(
+        self, mocker: MockerFixture, mock_od_config, cleanup_fails
+    ):
+        worker = mocker.Mock()
+        worker.re_init_pipeline.side_effect = RuntimeError("custom pipeline load failed")
+        if cleanup_fails:
+            worker.shutdown.side_effect = RuntimeError("cleanup failed")
+        worker_class = mocker.Mock(return_value=worker)
+        mocker.patch.object(WorkerWrapperBase, "_prepare_worker_class", return_value=worker_class)
+
+        with pytest.raises(RuntimeError, match="custom pipeline load failed"):
+            WorkerWrapperBase(
+                gpu_id=0,
+                od_config=mock_od_config,
+                custom_pipeline_args={"pipeline_class": "unused"},
+            )
+
+        worker.shutdown.assert_called_once_with()
 
     def test_custom_pipeline_with_explicit_extension(self, mocker: MockerFixture, mock_od_config):
         """Test that explicit worker_extension_cls is preserved when custom_pipeline_args is provided."""

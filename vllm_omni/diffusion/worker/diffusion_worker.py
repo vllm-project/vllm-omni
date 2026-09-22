@@ -256,6 +256,7 @@ class DiffusionWorker:
         self.init_snapshot: MemorySnapshot | None = None
         self.requested_memory: int | None = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
+        self._owns_sleep_pool = False
         self.lora_manager: DiffusionLoRAManager | None = None
         # Worker-side cache of (lora_request, lora_scale) per scheduled
         # request id. Used by step mode to recover LoRA identity for cached
@@ -1002,6 +1003,7 @@ class DiffusionWorker:
             allocator = CuMemAllocator.get_instance()
             if tag == "weights":
                 assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
+                self._owns_sleep_pool = True
             logger.info(f"[Worker {self.rank}] Activating Diffusion CuMem pool for tag: {tag}")
             return allocator.use_memory_pool(tag=tag)
         return nullcontext()
@@ -1021,17 +1023,26 @@ class DiffusionWorker:
                     if mgr is not None:
                         mgr.close()
         finally:
+            self.model_runner = None
+            self.lora_manager = None
+            self._sleep_saved_buffers = {}
             try:
-                shutdown_kv_connector()
+                if getattr(self, "_owns_sleep_pool", False):
+                    gc.collect()
+                    _get_cumem_allocator_class().get_instance().release_pools()
+                    self._owns_sleep_pool = False
             finally:
                 try:
-                    a2a_permute = sys.modules.get("vllm_omni.diffusion.distributed.a2a_permute")
-                    if a2a_permute is not None:
-                        a2a_permute.clear_a2a_permute_workspaces()
-                except Exception:
-                    logger.exception("Failed to release fused Ulysses symmetric-memory workspaces")
+                    shutdown_kv_connector()
                 finally:
-                    destroy_distributed_env()
+                    try:
+                        a2a_permute = sys.modules.get("vllm_omni.diffusion.distributed.a2a_permute")
+                        if a2a_permute is not None:
+                            a2a_permute.clear_a2a_permute_workspaces()
+                    except Exception:
+                        logger.exception("Failed to release fused Ulysses symmetric-memory workspaces")
+                    finally:
+                        destroy_distributed_env()
 
 
 class CustomPipelineWorkerExtension:
@@ -1636,7 +1647,14 @@ class WorkerWrapperBase:
 
         # Re-initialize pipeline with custom pipeline if provided
         if self.uses_custom_pipeline:
-            self.worker.re_init_pipeline(self.custom_pipeline_args)
+            try:
+                self.worker.re_init_pipeline(self.custom_pipeline_args)
+            except Exception:
+                try:
+                    self.worker.shutdown()
+                except Exception:
+                    logger.exception("Failed to clean up worker after custom pipeline initialization failure")
+                raise
 
     def _prepare_worker_class(self) -> type:
         """
