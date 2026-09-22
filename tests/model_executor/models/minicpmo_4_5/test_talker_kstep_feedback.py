@@ -49,6 +49,7 @@ def _make_talker(*, k_step_frames: int, scripted_samples: list[int]):
     model._num_audio_tokens = _NUM_AUDIO_TOKENS
     model._codec_eos_id = _EOS_ID
     model._request_audio_states = {}
+    model._request_codec_history = {}
     emb = nn.Embedding(_NUM_AUDIO_TOKENS, 4)
     with torch.no_grad():
         emb.weight.zero_()
@@ -94,6 +95,10 @@ def test_kstep_frame_sample_is_recorded_for_next_frame():
     assert state["last_code"] == 43
     assert state["finished"] is True
     assert out2.multimodal_outputs["codes"]["audio"][0].numel() == 0
+    # Only confirmed frames are recorded: the terminating frame carries no
+    # codec id for the next step to embed, so streaming prompt recompute must
+    # not see it in the history either.
+    assert model._request_codec_history["r1"] == [42, 43]
 
 
 def test_legacy_single_frame_path_does_not_touch_last_code():
