@@ -33,6 +33,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
 
 if TYPE_CHECKING:
@@ -611,7 +612,7 @@ class QwenImage21TransformerBlock(nn.Module):
         prefix_kv_cache_dtype: str | None = None,
     ):
         super().__init__()
-        self.img_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.img_norm1 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
         self.attn = QwenImage21Attention(
             dim=dim,
             heads=num_attention_heads,
@@ -621,7 +622,7 @@ class QwenImage21TransformerBlock(nn.Module):
             prefix=f"{prefix}.attn",
             prefix_kv_cache_dtype=prefix_kv_cache_dtype,
         )
-        self.img_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.img_norm2 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
         self.img_mlp = QwenImage21SwiGLUFeedForward(
             hidden_size=dim,
             mlp_hidden_size=dim * mlp_ratio,
@@ -631,14 +632,13 @@ class QwenImage21TransformerBlock(nn.Module):
 
     def _modulate(
         self,
-        hidden_states: torch.Tensor,
         mod_params: torch.Tensor,
         target_token_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         scale, gate = mod_params.chunk(2, dim=-1)
         scale = _select_modulation_rows(scale, target_token_mask)
         gate = _select_modulation_rows(gate, target_token_mask)
-        return hidden_states * (1 + scale), gate
+        return scale, gate
 
     def forward(
         self,
@@ -655,7 +655,8 @@ class QwenImage21TransformerBlock(nn.Module):
     ) -> torch.Tensor:
         mod1, mod2 = modulation.chunk(2, dim=-1)
 
-        img_modulated, img_gate1 = self._modulate(self.img_norm1(hidden_states), mod1, target_token_mask)
+        scale1, img_gate1 = self._modulate(mod1, target_token_mask)
+        img_modulated = self.img_norm1(hidden_states, scale1, torch.zeros_like(scale1))
         attn_output = self.attn(
             img_modulated,
             freqs,
@@ -668,7 +669,8 @@ class QwenImage21TransformerBlock(nn.Module):
         )
         hidden_states = hidden_states + img_gate1.tanh() * attn_output
 
-        img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), mod2, target_token_mask)
+        scale2, img_gate2 = self._modulate(mod2, target_token_mask)
+        img_modulated2 = self.img_norm2(hidden_states, scale2, torch.zeros_like(scale2))
         hidden_states = hidden_states + img_gate2.tanh() * self.img_mlp(img_modulated2)
 
         if hidden_states.dtype == torch.float16:
