@@ -57,7 +57,7 @@ def _make_talker(*, k_step_frames: int, scripted_samples: list[int]):
     model.emb_code = nn.ModuleList([emb])
     queue = iter(scripted_samples)
 
-    def _greedy(_hidden, _codes, _request_id, _step, _min_tokens, _max_tokens):
+    def _greedy(_hidden, _codes, _request_id, _step, _min_tokens, _max_tokens, _eos_window_masked=False):
         return torch.tensor(next(queue), dtype=torch.long)
 
     model._sample_audio_code_greedy = _greedy

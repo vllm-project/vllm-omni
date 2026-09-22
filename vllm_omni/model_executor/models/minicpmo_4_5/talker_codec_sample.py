@@ -65,8 +65,14 @@ def prepare_codec_logits(
     top_k: int,
     top_p: float,
     min_tokens_to_keep: int = MIN_TOKENS_TO_KEEP,
+    eos_window_masked: bool = False,
 ) -> torch.Tensor:
-    """Prepare and filter logits without changing native NPU RNG semantics."""
+    """Prepare and filter logits without changing native NPU RNG semantics.
+
+    ``eos_window_masked`` masks the codec EOS for this frame regardless of the
+    step counter -- the duplex turn-end drain window (a few frames after each
+    cadence boundary), which the ``step < min_tokens`` criterion cannot express.
+    """
     logits = raw_logits.float() / temperature.reshape(1, 1)
     positions = torch.arange(HISTORY_WINDOW, dtype=torch.int32, device=raw_logits.device).reshape(1, -1)
     valid = positions < state.history_len.reshape(1, 1)
@@ -76,11 +82,14 @@ def prepare_codec_logits(
     alpha = torch.pow(repetition_penalty.reshape(1, 1), counts)
     logits = torch.where(logits < 0, logits * alpha, logits / alpha)
     eos = logits[..., eos_token_id : eos_token_id + 1]
-    eos = torch.where(
-        (state.step < min_tokens).reshape(1, 1),
-        torch.full_like(eos, float("-inf")),
-        eos,
-    )
+    if eos_window_masked:
+        eos = torch.full_like(eos, float("-inf"))
+    else:
+        eos = torch.where(
+            (state.step < min_tokens).reshape(1, 1),
+            torch.full_like(eos, float("-inf")),
+            eos,
+        )
     logits = torch.cat([logits[..., :eos_token_id], eos, logits[..., eos_token_id + 1 :]], dim=-1)
     if 0.0 < float(top_p) < 1.0:
         sorted_logits, sorted_indices = torch.sort(logits, descending=False, dim=-1)
@@ -142,8 +151,13 @@ def greedy_codec_sample(
     *,
     top_k: int,
     eos_token_id: int,
+    eos_window_masked: bool = False,
 ) -> TalkerCodecSampleResult:
-    """Greedy codec sample in graph-capturable tensor ops."""
+    """Greedy codec sample in graph-capturable tensor ops.
+
+    ``eos_window_masked`` masks the codec EOS for this frame regardless of the
+    step counter -- see prepare_codec_logits.
+    """
     positions = torch.arange(HISTORY_WINDOW, dtype=torch.int32, device=raw_logits.device).reshape(1, -1)
     valid = positions < state.history_len.reshape(1, 1)
     safe_tokens = torch.where(valid, state.history, torch.zeros_like(state.history)).to(torch.long)
@@ -153,11 +167,14 @@ def greedy_codec_sample(
     penalized = torch.where(raw_logits < 0, raw_logits * alpha, raw_logits / alpha)
 
     eos = penalized[..., eos_token_id : eos_token_id + 1]
-    eos = torch.where(
-        (state.step < min_tokens).reshape(1, 1),
-        torch.full_like(eos, float("-inf")),
-        eos,
-    )
+    if eos_window_masked:
+        eos = torch.full_like(eos, float("-inf"))
+    else:
+        eos = torch.where(
+            (state.step < min_tokens).reshape(1, 1),
+            torch.full_like(eos, float("-inf")),
+            eos,
+        )
     penalized = torch.cat([penalized[..., :eos_token_id], eos, penalized[..., eos_token_id + 1 :]], dim=-1)
     if top_k > 0:
         keep = min(VOCAB_SIZE, max(int(top_k), MIN_TOKENS_TO_KEEP))
