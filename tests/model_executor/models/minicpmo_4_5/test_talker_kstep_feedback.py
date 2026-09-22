@@ -247,14 +247,21 @@ def test_talker_stop_token_ids_match_the_multi_frame_head():
     is the two-wide continue/stop row, so the only sampleable ids are 0/1,
     `check_stop` never matched, and every request ran to ``max_tokens`` (142s
     per request, model finished at frame ~116). The pipeline default therefore
-    follows the multi-frame head; a deployment that turns the loop off
-    overrides stage 1's stop token per stage.
+    follows the head that runs: the multi-frame row next to the NPU worker,
+    which is the only place that injects the continue drafts, and the codec EOS
+    everywhere else.
     """
     from vllm_omni.model_executor.models.minicpmo_4_5 import pipeline as mcp_pipeline
+    from vllm_omni.platforms import current_omni_platform
     from vllm_omni.platforms.npu.worker import talker_multiframe
 
-    assert mcp_pipeline._talker_stop_token_ids() == [talker_multiframe.STOP_TOKEN_ID]
     assert talker_multiframe.STOP_TOKEN_ID == 1
+    if (current_omni_platform.device_name or "").lower() == "npu":
+        assert mcp_pipeline._talker_stop_token_ids() == [talker_multiframe.STOP_TOKEN_ID]
+    else:
+        # No NPU worker means no constant-draft injection, so the K-frame loop
+        # is off and the two-wide continue/stop row never runs.
+        assert mcp_pipeline._talker_stop_token_ids() == [mcp_pipeline._CODEC_EOS_TOKEN_ID]
 
 
 def test_multiframe_gate_matrix():

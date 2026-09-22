@@ -18,6 +18,7 @@ from vllm_omni.config.stage_config import (
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni"
 MINICPMO45_REFERENCE_AUDIO_KEY = "_minicpmo45_reference_audio"
+_CODEC_EOS_TOKEN_ID = 6561  # tts_config.num_audio_tokens - 1
 
 
 def _talker_stop_token_ids() -> list[int]:
@@ -38,6 +39,19 @@ def _talker_stop_token_ids() -> list[int]:
     vocabulary again and the codec EOS is the stop id; it overrides this per
     stage through the usual ``stop_token_ids`` sampling parameter.
     """
+    from vllm_omni.platforms import current_omni_platform
+
+    # ``speculative_config`` only means "constant continue drafts" next to the
+    # NPU worker that intercepts the step
+    # (``vllm_omni.platforms.npu.worker.talker_multiframe``); on every other
+    # platform the same block hands the Talker to vLLM's real n-gram proposer and
+    # rejection sampler, which asserts on the codec ids. The block is therefore
+    # confined to ``platforms.npu`` in the deploy config, and the stop id follows:
+    # NPU keeps the two-wide continue/stop row, everyone else keeps the full codec
+    # head and stops on the codec EOS.
+    if (current_omni_platform.device_name or "").lower() != "npu":
+        return [_CODEC_EOS_TOKEN_ID]
+
     from vllm_omni.platforms.npu.worker.talker_multiframe import STOP_TOKEN_ID
 
     return [STOP_TOKEN_ID]
