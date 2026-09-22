@@ -100,7 +100,7 @@ duration and decoded-memory limits remain enforced by upstream media helpers,
 and recognized-format corruption errors propagate. Tests in
 `tests/inputs/test_audio_decode.py` cover these compatibility boundaries.
 
-## Full-payload scheduling metadata
+## Runner scheduling metadata
 
 `SchedulingMetadataUpdate`, carried by
 `OmniConnectorOutput.request_metadata`, is the internal typed contract from a
@@ -111,11 +111,14 @@ local cache.
 | --- | --- |
 | `prompt_token_ids` | Replace the prompt token IDs and reset prompt-computation state. |
 | `resize_prompt_to` | Resize a prompt that has not started decoding and reset prompt-computation state. |
+| `input_terminal` | Mark terminal input for the coordinator to consume when the request is scheduled. |
 
 A runner-side `SchedulingMetadataAdapter` owns model-specific lookup and
-normalization and produces this update. This contract applies only to the
-runner-owned, non-async full-payload receive path. Async-chunk request updates
-remain owned by `OmniChunkTransferAdapter`.
+normalization and produces the prompt updates; runner transport adds the
+terminal-input signal. Configured adapters apply to non-async full-payload
+receive. Native MRV2 async receive uses the built-in adapter and the same
+typed updates; other async-chunk paths remain owned by
+`OmniChunkTransferAdapter`.
 
 ## Candidate invariants
 
