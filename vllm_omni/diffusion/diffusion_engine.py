@@ -228,9 +228,10 @@ class DiffusionEngine:
     #: remains a pure explicit user override (never mutated by engines).
     default_diffusion_model_runner_cls: str | None = None
 
-    # Class-level default so tests using object.__new__ (without __init__)
-    # don't hit AttributeError when _busy_loop accesses self.dp_concurrent.
+    # Class-level defaults so tests using object.__new__ (without __init__)
+    # don't hit AttributeError when _busy_loop accesses them.
     dp_concurrent: bool = False
+    _scheduling_paused: bool = False
 
     def __init__(
         self,
@@ -387,6 +388,8 @@ class DiffusionEngine:
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
+        # pause_scheduler(mode="keep"): no new batch is scheduled while set.
+        self._scheduling_paused = False
         # Copied onto the existing output metrics payload so queue monitoring
         # reuses the normal diffusion result path without additional IPC.
         self._scheduler_num_waiting_reqs = 0
@@ -584,10 +587,16 @@ class DiffusionEngine:
         while not self.stop_event.is_set():
             self._process_aborts_queue()
             self._process_rpc_queue()
+            if self._scheduling_paused:
+                # No wave runs while paused, so requests finished by an abort
+                # would otherwise wait for the resume to surface.
+                with self._cv:
+                    pending_finished = self.scheduler.pending_finished_request_ids()
+                self._emit_finished_outputs(pending_finished, None)
 
             with self._cv:
                 while (
-                    not self.scheduler.has_requests()
+                    (self._scheduling_paused or not self.scheduler.has_requests())
                     and self._rpc_queue.empty()
                     and self.abort_queue.empty()
                     and not self.stop_event.is_set()
@@ -597,11 +606,14 @@ class DiffusionEngine:
                 if self.stop_event.is_set():
                     break
 
-                if not self.scheduler.has_requests():
+                if self._scheduling_paused or not self.scheduler.has_requests():
                     # Only RPC / abort work pending; loop back to drain it.
                     continue
 
                 self._wait_for_admission_if_needed_locked()
+                if self._scheduling_paused:
+                    # The gate closed while the batching wait released the lock.
+                    continue
 
                 try:
                     sched_output = self.scheduler.schedule()
@@ -693,7 +705,7 @@ class DiffusionEngine:
         last_waiting = -1
         stable_since = start
 
-        while not self.stop_event.is_set():
+        while not self.stop_event.is_set() and not self._scheduling_paused:
             waiting = self.scheduler.num_waiting_requests()
             now = time.monotonic()
 
@@ -733,19 +745,34 @@ class DiffusionEngine:
             except queue.Empty:
                 return
 
-            fut = task.future
-            if fut.cancelled() or fut.done():
-                continue
+            self._run_rpc_task(task)
 
-            remaining: float | None = None
-            if task.deadline is not None:
-                remaining = task.deadline - time.monotonic()
-                if remaining <= 0:
-                    if not fut.done():
-                        fut.set_exception(TimeoutError(f"RPC call to {task.method} timed out before execution."))
-                    continue
+            if task.method == "pause_scheduler":
+                # A dequeued pause ends this drain whatever became of it, so
+                # the batch that just ran is delivered before anything the
+                # caller queued behind the pause. The rest of the queue is
+                # picked up on the next pass of the busy loop.
+                return
 
-            try:
+    def _run_rpc_task(self, task: _RpcTask) -> None:
+        fut = task.future
+        if fut.cancelled() or fut.done():
+            return
+
+        remaining: float | None = None
+        if task.deadline is not None:
+            remaining = task.deadline - time.monotonic()
+            if remaining <= 0:
+                if not fut.done():
+                    fut.set_exception(TimeoutError(f"RPC call to {task.method} timed out before execution."))
+                return
+
+        try:
+            if task.method == "pause_scheduler":
+                result = self._run_pause_barrier(remaining)
+            elif task.method == "resume_scheduler":
+                result = self._open_scheduling_gate()
+            else:
                 result = self.executor.collective_rpc(
                     method=task.method,
                     timeout=remaining,
@@ -753,16 +780,16 @@ class DiffusionEngine:
                     kwargs=task.kwargs,
                     unique_reply_rank=task.unique_reply_rank,
                 )
-            except BaseException as exc:  # noqa: BLE001 - propagate to caller
-                # The future may have been cancelled (e.g. by a sync timeout
-                # or asyncio cancellation) while the executor call was
-                # running. Setting state on a cancelled/done future raises
-                # InvalidStateError, which would kill the busy loop.
-                if not fut.done():
-                    fut.set_exception(exc)
-            else:
-                if not fut.done():
-                    fut.set_result(result)
+        except BaseException as exc:  # noqa: BLE001 - propagate to caller
+            # The future may have been cancelled (e.g. by a sync timeout
+            # or asyncio cancellation) while the executor call was
+            # running. Setting state on a cancelled/done future raises
+            # InvalidStateError, which would kill the busy loop.
+            if not fut.done():
+                fut.set_exception(exc)
+        else:
+            if not fut.done():
+                fut.set_result(result)
 
     def _fail_pending_rpcs(self, exc: BaseException) -> None:
         while True:
@@ -772,6 +799,30 @@ class DiffusionEngine:
                 return
             if not task.future.done():
                 task.future.set_exception(exc)
+
+    def _check_pause_request(self, kwargs: dict | None) -> None:
+        mode = (kwargs or {}).get("mode")
+        if mode != "keep":
+            raise ValueError(f"DiffusionEngine pause supports mode='keep' only, got {mode!r}.")
+        if self.execution_mode != DiffusionExecutionMode.REQUEST_BATCH:
+            raise NotImplementedError("DiffusionEngine pause supports request-level execution only.")
+
+    def _run_pause_barrier(self, timeout: float | None) -> None:
+        """Return once every worker has finished the device work of the batch that ran."""
+        self.executor.collective_rpc("synchronize_device", timeout=timeout, kwargs={"timeout": timeout})
+
+    def _open_scheduling_gate(self) -> None:
+        with self._cv:
+            self._scheduling_paused = False
+            self._cv.notify_all()
+
+    def _run_engine_control(self, method: str, timeout: float | None, kwargs: dict | None) -> None:
+        """Bootstrap-path dispatch for engine-local control methods."""
+        if method == "pause_scheduler":
+            self._check_pause_request(kwargs)
+            self._scheduling_paused = True
+            return self._run_pause_barrier(timeout)
+        return self._open_scheduling_gate()
 
     def _remove_diffusion_kv_requests(self, request_ids: Iterable[str]) -> None:
         """Clear terminal Worker rows while Scheduler owns the allocations."""
@@ -1309,6 +1360,9 @@ class DiffusionEngine:
             unique_reply_rank=unique_reply_rank,
         )
         with self._cv:
+            if method == "pause_scheduler":
+                self._check_pause_request(kwargs)
+                self._scheduling_paused = True
             self._rpc_queue.put(task)
             self._cv.notify_all()
         return task
@@ -1351,6 +1405,8 @@ class DiffusionEngine:
                 # between the outer check and acquiring the lock, in which
                 # case we should use the queued path for proper ordering.
                 if not self._loop_started:
+                    if method in ("pause_scheduler", "resume_scheduler"):
+                        return self._run_engine_control(method, timeout, kwargs)
                     return self.executor.collective_rpc(
                         method=method,
                         timeout=timeout,

@@ -1,4 +1,6 @@
-# Opt-in CUDA Model Runner V2 profile. The base profile retains V1.
+# Explicit CUDA Model Runner V2 profile. `qwen3_tts.yaml` now selects V2 by
+# default (experimental); this file is kept for scripts that name the MRV2
+# profile explicitly and for the platform fallbacks below.
 base_config: qwen3_tts.yaml
 model_runner: v2
 

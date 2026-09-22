@@ -149,7 +149,8 @@ class OmniServeCommand(CLISubcommand):
             args.model_config = model_config
             explicit_keys = getattr(args, "explicit_keys", None)
             if explicit_keys is not None:
-                args.explicit_keys = explicit_keys | {"model_config"}
+                # --no-guardrails is a CLI-only alias, not a diffusion engine arg.
+                args.explicit_keys = (explicit_keys - {"no_guardrails"}) | {"model_config"}
 
         if args.headless:
             run_headless(args)

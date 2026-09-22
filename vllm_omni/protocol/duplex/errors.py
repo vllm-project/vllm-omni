@@ -65,6 +65,7 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "ref_audio_update_unsupported": "invalid_request_error",
     "native_text_append_unsupported": "invalid_request_error",
     "invalid_video_frames": "invalid_request_error",
+    "invalid_input_modality": "invalid_request_error",
     "invalid_function_call_output": "invalid_request_error",
     "server_vad_unavailable": "server_error",
 }

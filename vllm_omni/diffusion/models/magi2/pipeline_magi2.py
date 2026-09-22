@@ -225,7 +225,7 @@ def _resolve_checkpoint_root(model: str, revision: str | None) -> str:
                 "MAGI-2 expects a local checkpoint directory or the official "
                 f"model ID {MAGI2_MODEL_ID!r}; got {model!r}."
             )
-        from vllm.transformers_utils.repo_utils import hf_api
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
         pinned_revision = revision or MAGI2_MODEL_REVISION
         logger.warning(
