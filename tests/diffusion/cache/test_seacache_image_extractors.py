@@ -178,7 +178,7 @@ def test_modulated_indicator_matches_native_attention_and_preserves_full_executi
 def _apply_image_hook(module, adapter, metadata, threshold=1e6):
     return apply_sea_cache_hook(
         module,
-        SeaCacheConfig(threshold=threshold),
+        SeaCacheConfig(threshold=threshold, power_exp=2.0, max_consecutive_cached=0),
         current_step_callback=lambda: metadata.step,
         current_sigma_callback=lambda: metadata.sigma,
         num_inference_steps_callback=lambda: metadata.num_steps,

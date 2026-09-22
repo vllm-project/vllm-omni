@@ -172,10 +172,10 @@ def test_config_validation() -> None:
         SeaCacheConfig(max_consecutive_cached=-1)
 
 
-def test_sea_filter_matches_reference_equation() -> None:
+@pytest.mark.parametrize("power_exp", [2.0, 3.0])
+def test_sea_filter_matches_reference_equation(power_exp: float) -> None:
     hidden = torch.randn(3, 4, 5, 2, dtype=torch.float32)
     sigma = 0.4
-    power_exp = 3.0
 
     spectrum = torch.fft.fftn(hidden, dim=(0, 1, 2))
     gain = None
@@ -225,24 +225,25 @@ def test_indicator_distance_and_linear_extrapolation() -> None:
     )
 
 
-def test_hook_skips_middle_steps_and_forces_endpoints() -> None:
+@pytest.mark.parametrize("cap, full_count, skip_count, history", [(2, 3, 3, [3, 5]), (0, 2, 4, [0, 5])])
+def test_hook_skips_middle_steps_and_forces_endpoints(cap, full_count, skip_count, history) -> None:
     transformer = TinyCosmos3Transformer()
-    metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=4)
+    metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=6)
     hook = _apply_test_hook(
         transformer,
         metadata,
-        SeaCacheConfig(threshold=100.0, max_consecutive_cached=2),
+        SeaCacheConfig(threshold=100.0, max_consecutive_cached=cap),
     )
     hook.refresh(transformer)
 
-    for step, timestep in enumerate((1000, 750, 500, 250)):
+    for step, timestep in enumerate((1000, 850, 700, 550, 400, 250)):
         metadata.step = step
         metadata.sigma = timestep / 1000
         _run_step(transformer, timestep, 1.0 - step * 0.01, hook=hook)
 
-    assert hook.full_count == 2
-    assert hook.skip_count == 2
-    assert [step for step, _ in hook.state_manager._states["cond"].history] == [0, 3]
+    assert hook.full_count == full_count
+    assert hook.skip_count == skip_count
+    assert [step for step, _ in hook.state_manager._states["cond"].history] == history
 
 
 def test_parameter_sharded_hook_skips_when_all_shard_ranks_agree(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -589,6 +590,7 @@ def test_backend_selector_and_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
     backend.enable(pipeline)
     hook = pipeline.transformer._hook_registry.get_hook(SeaCacheRootHook._HOOK_NAME)
     assert isinstance(hook, SeaCacheRootHook)
+    assert (hook.config.power_exp, hook.config.max_consecutive_cached) == (3.0, 2)
     assert callable(getattr(pipeline, "_cache_context_factory", None))
     for name in ("_seacache_skip", "_seacache_record", "_seacache_residual", "_seacache_last_residual"):
         assert not hasattr(pipeline.transformer, name)
@@ -631,5 +633,5 @@ def test_shared_config_defaults() -> None:
     config = DiffusionCacheConfig()
     assert config.sea_threshold == 0.25
     assert config.sea_residual_order == 1
-    assert config.sea_max_consecutive_cached == 2
-    assert config.sea_power_exp == 3.0
+    assert config.sea_max_consecutive_cached is None
+    assert config.sea_power_exp is None

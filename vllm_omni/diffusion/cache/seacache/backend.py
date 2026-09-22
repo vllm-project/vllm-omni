@@ -37,11 +37,19 @@ def _enable_seacache(
     if transformer is None:
         raise ValueError("SeaCache requires a pipeline with a transformer")
 
+    image_pipeline = type(pipeline).__name__ in _IMAGE_EXTRACTORS
+    max_consecutive_cached = config.sea_max_consecutive_cached
+    power_exp = config.sea_power_exp
+    if max_consecutive_cached is None:
+        max_consecutive_cached = 0 if image_pipeline else 2
+    if power_exp is None:
+        power_exp = 2.0 if image_pipeline else 3.0
+
     sea_config = SeaCacheConfig(
         threshold=config.sea_threshold,
         residual_order=config.sea_residual_order,
-        max_consecutive_cached=config.sea_max_consecutive_cached,
-        power_exp=config.sea_power_exp,
+        max_consecutive_cached=max_consecutive_cached,
+        power_exp=power_exp,
     )
     hook = apply_sea_cache_hook(
         transformer,

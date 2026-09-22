@@ -30,8 +30,24 @@ def test_image_pipeline_routing_and_zero_threshold(pipeline_name, extractor_name
     install = mocker.patch.object(backend_module, "apply_sea_cache_hook")
     get_cache_backend("sea_cache", {"sea_threshold": 0}).enable(pipeline)
 
-    assert install.call_args.args[1].threshold == 0
+    config = install.call_args.args[1]
+    assert (config.threshold, config.power_exp, config.max_consecutive_cached) == (0, 2.0, 0)
     assert install.call_args.kwargs["extractor_fn"] is getattr(backend_module, extractor_name)
+
+
+@pytest.mark.parametrize(("power_exp", "max_cached"), [(None, None), (4.0, None), (None, 1), (None, 0)])
+def test_model_defaults_and_overrides_do_not_mutate_shared_config(power_exp, max_cached, mocker):
+    config = DiffusionCacheConfig(sea_power_exp=power_exp, sea_max_consecutive_cached=max_cached)
+    backend = SeaCacheBackend(config)
+    install = mocker.patch.object(backend_module, "apply_sea_cache_hook")
+    for pipeline_name, default_power, default_cap in [("Flux2Pipeline", 2.0, 0), ("Cosmos3OmniPipeline", 3.0, 2)]:
+        pipeline = type(pipeline_name, (), {})()
+        pipeline.transformer = torch.nn.Identity()
+        backend.enable(pipeline)
+        effective = install.call_args.args[1]
+        assert effective.power_exp == (default_power if power_exp is None else power_exp)
+        assert effective.max_consecutive_cached == (default_cap if max_cached is None else max_cached)
+        assert (config.sea_power_exp, config.sea_max_consecutive_cached) == (power_exp, max_cached)
 
 
 def test_unqualified_image_variant_is_rejected():

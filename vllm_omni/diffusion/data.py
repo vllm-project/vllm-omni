@@ -565,8 +565,10 @@ class DiffusionCacheConfig:
     # SeaCache parameters [sea_cache only]
     sea_threshold: float = 0.25
     sea_residual_order: int = 1
-    sea_max_consecutive_cached: int = 2
-    sea_power_exp: float = 3.0
+    # None selects image defaults (limit 0 / power 2) or video defaults (2 / 3).
+    # A zero limit allows unlimited consecutive cached steps.
+    sea_max_consecutive_cached: int | None = None
+    sea_power_exp: float | None = None
 
     # MagCache parameters [mag_cache only]
     # Default: 0.24 threshold for accumulated magnitude error
