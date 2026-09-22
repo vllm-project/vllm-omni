@@ -43,8 +43,6 @@ degenerates to a fixed capacity, which is only sensible for short contexts.
 
 Env switches:
   ``VLLM_OMNI_FIXED_KV_DECODE``           0 to disable (default 1)
-  ``VLLM_OMNI_FIXED_KV_DECODE_MAX_LEN``   only engage at or below this
-                                            ``max_model_len`` (default 8192)
   ``VLLM_OMNI_FIXED_KV_DECODE_BUCKETS``   comma-separated candidate capacities,
                                             e.g. "1024,4096"; default "512". Each
                                             model keeps the candidates below its own
@@ -91,12 +89,19 @@ _capture_bucket: int | None = None
 _runtime_bucket: int | None = None
 
 
+_ENV = "VLLM_OMNI_FIXED_KV_DECODE"
 _BUCKETS_ENV = "VLLM_OMNI_FIXED_KV_DECODE_BUCKETS"
 _DEFAULT_BUCKETS = "512"
 
+# Only a small decoder has fixed-capacity graphs worth capturing; a long-context
+# stage (a 32768-token Thinker) keeps the stock path. The ceiling is a property of
+# the shapes that get captured, not a per-deployment preference, so it is a code
+# constant: the stage's own ``max_model_len`` is what selects the outcome.
+_MAX_CONTEXT = 8192
+
 
 def is_enabled() -> bool:
-    return os.getenv("VLLM_OMNI_FIXED_KV_DECODE", "1") == "1"
+    return os.getenv(_ENV, "1") == "1"
 
 
 class _CapacityEntries(dict):
@@ -218,8 +223,7 @@ def capacity_for(max_model_len: int, block_size: int) -> int:
     """Full KV capacity this decoder would run at, or 0 when it should not engage."""
     if not is_enabled():
         return 0
-    limit = int(os.getenv("VLLM_OMNI_FIXED_KV_DECODE_MAX_LEN", "8192"))
-    if max_model_len > limit:
+    if max_model_len > _MAX_CONTEXT:
         return 0
     # Round to the block table, not to max_model_len: the op indexes whole blocks.
     return -(-int(max_model_len) // int(block_size)) * int(block_size)
