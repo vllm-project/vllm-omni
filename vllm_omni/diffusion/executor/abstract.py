@@ -182,7 +182,31 @@ class DiffusionExecutor(ABC):
         )
 
     def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput) -> KVConnectorOutput | None:
-        if scheduler_output.kv_connector_metadata is None:
+        if scheduler_output.kv_prefetch_connector_metadata is not None:
+            current = replace(
+                scheduler_output,
+                kv_transfer_request_ids=scheduler_output.kv_transfer_request_ids
+                - scheduler_output.kv_prefetch_request_ids,
+                kv_prefetch_connector_metadata=None,
+                kv_prefetch_request_ids=set(),
+            )
+            # First complete the current request on every rank. Only then
+            # submit B, preventing Mooncake from coalescing its bytes with A.
+            self.prepare_kv_for_forward(current)
+            return self.prepare_kv_for_forward(
+                replace(
+                    current,
+                    kv_connector_metadata=scheduler_output.kv_prefetch_connector_metadata,
+                    kv_transfer_request_ids=scheduler_output.kv_prefetch_request_ids,
+                    kv_required_request_ids=set(),
+                    kv_finished_request_ids=set(),
+                )
+            )
+        if (
+            scheduler_output.kv_connector_metadata is None
+            and not scheduler_output.kv_required_request_ids
+            and not scheduler_output.kv_poll_only
+        ):
             return None
         transfer_output = replace(
             scheduler_output,
@@ -199,6 +223,14 @@ class DiffusionExecutor(ABC):
         if len(outputs) != self.od_config.num_gpus or any(output.invalid_block_ids for output in outputs):
             # Missing ranks / invalid pages cannot establish safe ownership.
             raise RuntimeError("Diffusion KV receive failed on one or more ranks")
+        if scheduler_output.kv_required_request_ids is not None:
+            # Prefetch workers retain completion events until retirement.
+            # Their cumulative snapshots can be intersected directly.
+            finished = set.intersection(*(set(output.finished_recving or ()) for output in outputs))
+            if not scheduler_output.kv_required_request_ids.issubset(finished):
+                raise RuntimeError("Required diffusion KV receive did not complete on every rank")
+            outputs[0].finished_recving = finished
+            return outputs[0]
         completed = getattr(self, "_kv_receive_completed_ranks", {})
         for rank, output in enumerate(outputs):
             for request_id in output.finished_recving or ():

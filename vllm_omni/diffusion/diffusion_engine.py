@@ -393,6 +393,7 @@ class DiffusionEngine:
         self._cv = threading.Condition(self._rpc_lock)
         self._out_streams: dict[str, asyncio.Queue[DiffusionOutput]] = {}
         self._closed = False
+        self._shutting_down = False
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
@@ -644,6 +645,7 @@ class DiffusionEngine:
                     if sched_output.scheduled_request_ids
                     else BatchRunnerOutput.from_list([])
                 )
+                self._poll_native_kv()
                 worker_execution_completed = True
             except Exception as exc:
                 if self._closed:
@@ -855,7 +857,12 @@ class DiffusionEngine:
                 raise
 
     def _prepare_kv_for_forward(self, sched_output: DiffusionSchedulerOutput) -> None:
-        if getattr(sched_output, "kv_connector_metadata", None) is None:
+        if (
+            getattr(sched_output, "kv_connector_metadata", None) is None
+            and getattr(sched_output, "kv_prefetch_connector_metadata", None) is None
+            and not getattr(sched_output, "kv_required_request_ids", None)
+            and not getattr(sched_output, "kv_poll_only", False)
+        ):
             return
         try:
             output = self.executor.prepare_kv_for_forward(sched_output)
@@ -863,7 +870,10 @@ class DiffusionEngine:
             self.scheduler.update_kv_connector_output(output)
             if not self.abort_queue.empty():
                 self._process_aborts_queue()
-            incomplete = sched_output.kv_transfer_request_ids - (output.finished_recving or set())
+            required_ids = sched_output.kv_required_request_ids
+            if required_ids is None:
+                required_ids = sched_output.kv_transfer_request_ids
+            incomplete = required_ids - (output.finished_recving or set())
             sched_output.finished_req_ids.update(self.scheduler.fail_incomplete_kv_loads(incomplete))
             # Timed-out/cancelled requests must never reach model execution.
             terminal = {
@@ -889,26 +899,37 @@ class DiffusionEngine:
             self._fail_engine(exc)
             raise
 
-    def _fail_engine(self, exc: Exception) -> None:
-        if getattr(self, "_shutdown_complete", False):
+    def _poll_native_kv(self, *, drain_request_ids: list[str] | None = None) -> None:
+        poll = getattr(self.scheduler, "native_kv_poll_output", None)
+        if poll is None:
             return
-        logger.error("Diffusion engine failed; stopping workers before releasing KV pages", exc_info=exc)
+        output = poll(drain_request_ids=drain_request_ids)
+        if output is not None:
+            self._prepare_kv_for_forward(output)
+
+    def _fail_engine(self, exc: Exception) -> None:
         with self._cv:
+            if getattr(self, "_shutdown_complete", False) or getattr(self, "_shutting_down", False):
+                return
+            # Mark shutdown before invoking any component callbacks.  A
+            # failing shutdown can re-enter this method from another error
+            # path, and repeating executor.shutdown() is unsafe.
+            self._shutting_down = True
             self._closed = True
             if self.stop_event is not None:
                 self.stop_event.set()
             streams = list(self._out_streams.values())
             self._cv.notify_all()
+
+        logger.error("Diffusion engine failed; stopping workers before releasing KV pages", exc_info=exc)
         for stream in streams:
             self._put_queue_output(stream, DiffusionOutput.from_exception(exc))
         self._fail_pending_rpcs(exc)
-        try:
-            self.executor.shutdown()
-        finally:
-            try:
-                self.scheduler.close()
-            finally:
-                self._shutdown_complete = True
+        # If Worker shutdown fails, retain the Scheduler reservations. A
+        # remote producer may still be writing into those allocations.
+        self.executor.shutdown()
+        self.scheduler.close()
+        self._shutdown_complete = True
 
     def _emit_finished_outputs(
         self,
@@ -1172,6 +1193,7 @@ class DiffusionEngine:
                         if sched_output.scheduled_request_ids
                         else BatchRunnerOutput.from_list([])
                     )
+                    self._poll_native_kv()
                 except EngineDeadError:
                     raise
                 except Exception as exc:
@@ -1317,7 +1339,8 @@ class DiffusionEngine:
             width=profile_width,
             guidance_scale=5.0,
             num_image_inputs=get_dummy_run_num_image_inputs(model_class_name),
-            # Mandatory memory profiling is independent of optional warmup.
+            # Hunyuan skips generic warmup, but paged KV still needs its
+            # prepared image request to measure the startup memory envelope.
             num_frames=1,
         )
         if request is None:
@@ -1521,8 +1544,15 @@ class DiffusionEngine:
         else:
             self._loop_started = False
 
-        self.scheduler.close()
-        self.executor.shutdown()
+        if getattr(self.scheduler, "_native_prefetch_enabled", False):
+            # No new schedules after the busy loop exits. Finish outstanding
+            # writes before shutting down consumers and releasing reservations.
+            self._poll_native_kv(drain_request_ids=list(self.scheduler._kv_loading_request_ids))
+            self.executor.shutdown()
+            self.scheduler.close()
+        else:
+            self.scheduler.close()
+            self.executor.shutdown()
         self._shutdown_complete = True
 
     def abort(self, request_id: str | Iterable[str]) -> None:
@@ -1557,6 +1587,8 @@ class DiffusionEngine:
     def _abort_requests(self, request_ids: str | Iterable[str]) -> None:
         request_ids = [request_ids] if isinstance(request_ids, str) else list(request_ids)
         request_ids = list(dict.fromkeys(request_ids))
+
+        self._poll_native_kv(drain_request_ids=request_ids)
 
         for request_id in request_ids:
             if self.scheduler.get_request_state(request_id) is not None:

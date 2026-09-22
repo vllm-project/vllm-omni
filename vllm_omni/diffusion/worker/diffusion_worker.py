@@ -801,6 +801,9 @@ class DiffusionWorker:
         Args:
             level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
         """
+        progress = getattr(getattr(self, "model_runner", None), "_kv_receive_progress", None)
+        if progress is not None and progress.submitted:
+            raise RuntimeError("Cannot sleep with live native KV prefetch reservations; finish requests first")
         # The config validator rejects sleep for the native paged path. Keep
         # this worker-side guard precise as well: test doubles and legacy
         # configs may expose arbitrary attributes through Mock/getattr.
