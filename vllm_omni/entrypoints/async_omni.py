@@ -95,6 +95,10 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # sleep uses _paused as a temporary admission gate and clears it
         # on wake so sleep → wake → generate keeps working.
         self._hold_admission_until_resume: bool = False
+        # Stages whose scheduler pause_generation closed (AR in any mode,
+        # diffusion with mode="keep"); admission stays closed until
+        # resume_generation has reopened all of them.
+        self._paused_stage_ids: set[int] = set()
         self._sleeping_tags: set[str] = set()
         self._stage_sleeping_tags: dict[int, set[str]] = {}
         self._level2_sleeping: bool = False
@@ -115,6 +119,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
+        session_id: str | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
@@ -124,6 +129,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         Coordinates multi-stage pipeline execution. Processes the prompt
         through all stages in the pipeline and yields outputs as they become
         available.
+
+        ``session_id`` is accepted for EngineClient protocol compatibility
+        and is not duplex-session plumbing.
 
         **Diffusion batching:**
         Diffusion stages accept only a single prompt per request.  Passing a
@@ -182,7 +190,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
             # Reject diffusion list-prompt early with a clear API error.
             if isinstance(prompt, list) and any(
-                getattr(client, "stage_type", "") == "diffusion" for client in getattr(self.engine, "stage_clients", [])
+                stage_config.stage_type == "diffusion" for stage_config in self.engine.stage_configs
             ):
                 raise ValueError(
                     "Diffusion stages accept only a single prompt per request. "
@@ -542,10 +550,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> list[Any]:
-        """Call an AR EngineCore helper via collective_rpc (orchestrator loop).
+        """Call an engine control helper via collective_rpc (orchestrator loop).
 
         StagePool resolves ``{method}_async`` on the AR client when present
-        (vLLM AsyncMPClient convention). Raises if any replica reports failure.
+        (vLLM AsyncMPClient convention); diffusion stages answer the same
+        method names inside DiffusionEngine. Raises if any replica reports
+        failure.
         """
         results = await self.collective_rpc(
             method=method,
@@ -620,7 +630,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
     def _split_stage_ids_by_type(self, stage_ids: list[int] | None = None) -> tuple[list[int], list[int]]:
         """Split stage ids into AR/LLM (EngineCore) vs diffusion (worker RPC)."""
-        n_stages = len(self.engine.stage_clients)
+        n_stages = len(self.engine.stage_configs)
         if stage_ids is None:
             stage_ids = list(range(n_stages))
         else:
@@ -634,8 +644,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         ar_stage_ids: list[int] = []
         diffusion_stage_ids: list[int] = []
         for sid in stage_ids:
-            client = self.engine.stage_clients[sid]
-            if getattr(client, "stage_type", "llm") == "diffusion":
+            stage_config = self.engine.stage_configs[sid]
+            if stage_config.stage_type == "diffusion":
                 diffusion_stage_ids.append(sid)
             else:
                 ar_stage_ids.append(sid)
@@ -695,8 +705,13 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         1. Stop frontend admission (``_paused``).
         2. For AR/LLM stages, call EngineCore.pause_scheduler via the
            Orchestrator loop (abort/wait/keep + optional cache clear).
-        3. Diffusion stages have no EngineCore scheduler — only frontend
-           admission is paused for them.
+        3. For diffusion stages, ``mode="keep"`` pauses the DiffusionEngine
+           scheduler and returns once the batch that was running has finished
+           on every worker; that batch is delivered before any control RPC
+           issued after this call runs, so the documented pause -> sleep order
+           is safe. Queued requests stay queued until
+           :meth:`resume_generation`. Other modes pause frontend admission
+           only.
 
         Note: ``sleep()`` already pauses the AR scheduler internally (same as
         vLLM EngineCore.sleep). Call this API when you need pause *without*
@@ -711,7 +726,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             self._paused = True
             self._hold_admission_until_resume = True
 
-        ar_stage_ids, _diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+        if mode != "keep":
+            diffusion_stage_ids = []
+        # Recorded before the RPCs so a failed or cancelled pause can still
+        # be undone with an explicit resume_generation.
+        self._paused_stage_ids.update(ar_stage_ids, diffusion_stage_ids)
         if ar_stage_ids:
             logger.info(
                 "[%s] Pausing AR stage(s) %s via EngineCore.pause_scheduler(mode=%s)",
@@ -726,6 +746,17 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 stage_ids=ar_stage_ids,
                 kwargs={"mode": mode, "clear_cache": clear_cache},
             )
+        if diffusion_stage_ids:
+            logger.info(
+                "[%s] Pausing diffusion stage(s) %s via DiffusionEngine pause_scheduler(mode=keep)",
+                self._name,
+                diffusion_stage_ids,
+            )
+            await self._engine_core_rpc(
+                "pause_scheduler",
+                stage_ids=diffusion_stage_ids,
+                kwargs={"mode": "keep"},
+            )
 
         # Frontend / sender-side cache clear (P0). EngineCore.pause_scheduler
         # already clears AR-side caches when clear_cache=True.
@@ -739,10 +770,26 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
     async def resume_generation(self, stage_ids: list[int] | None = None) -> None:
         """Resume generation after :meth:`pause_generation`."""
-        ar_stage_ids, _diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
         if ar_stage_ids:
             logger.info("[%s] Resuming AR stage(s) %s via EngineCore", self._name, ar_stage_ids)
             await self._engine_core_rpc("resume_scheduler", stage_ids=ar_stage_ids)
+            self._paused_stage_ids.difference_update(ar_stage_ids)
+        diffusion_stage_ids = [sid for sid in diffusion_stage_ids if sid in self._paused_stage_ids]
+        if diffusion_stage_ids:
+            logger.info("[%s] Resuming diffusion stage(s) %s via DiffusionEngine", self._name, diffusion_stage_ids)
+            await self._engine_core_rpc("resume_scheduler", stage_ids=diffusion_stage_ids)
+            self._paused_stage_ids.difference_update(diffusion_stage_ids)
+
+        if self._paused_stage_ids:
+            # Reopening admission now would let new requests queue on a stage
+            # whose scheduler is still closed.
+            logger.info(
+                "[%s] Admission stays paused: stage(s) %s are still paused",
+                self._name,
+                sorted(self._paused_stage_ids),
+            )
+            return
 
         async with self._pause_cond:
             self._paused = False
@@ -816,8 +863,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         AR/LLM stages use EngineCore.sleep (pause scheduler, wait idle, then
         offload/discard memory) — matching vLLM AsyncLLM.sleep.
 
-        Diffusion stages keep the existing worker-level handle_sleep_task RPC
-        because StageDiffusionProc does not expose EngineCore.pause_scheduler.
+        Diffusion stages keep the worker-level handle_sleep_task RPC, which
+        does not stop the DiffusionEngine scheduler; quiesce a busy diffusion
+        stage first with ``pause_generation(mode="keep")`` (or abort it).
 
         Frontend admission is blocked at the start of this call (``_paused``)
         so pipelined :meth:`generate` cannot race into stages while sleep is

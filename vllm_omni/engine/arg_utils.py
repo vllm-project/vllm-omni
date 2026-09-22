@@ -190,6 +190,7 @@ class OmniEngineArgs(EngineArgs):
     model_stage: str = "thinker"
     model_arch: str | None = None
     engine_output_type: str | None = None
+    final_output: bool = False
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
     requires_full_payload_input: bool = False
@@ -199,6 +200,8 @@ class OmniEngineArgs(EngineArgs):
     async_chunk: bool = False
     session_mode: str = "turn"
     retains_state_across_chunks: bool = False
+    use_v2_model_runner: bool = False
+    supports_native_mrv2_data_plane: bool = False
     # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
     # Must be declared here so engine_args dict propagation does not silently
     # drop the value when constructing OmniEngineArgs from kwargs.
@@ -220,6 +223,12 @@ class OmniEngineArgs(EngineArgs):
     # Diffusion request-mode batch admission (forwarded to OmniDiffusionConfig).
     request_batch_max_wait_ms: float = 0.0
     fa_deterministic: bool = False
+    # Tensor-parallel degree for the diffusion text encoder (forwarded to
+    # DiffusionParallelConfig via the generic diffusion fallback). Declared
+    # here so ``from_cli_args`` field filtering keeps ``--text-encoder-tp-size``
+    # for library callers (#7564); registered pipelines may consume it through
+    # their own stage_cli_aliases or deploy YAML.
+    text_encoder_tp_size: int | None = None
 
     @classmethod
     def _add_omni_specific_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -423,6 +432,8 @@ class OmniEngineArgs(EngineArgs):
             async_chunk=self.async_chunk,
             session_mode=self.session_mode,
             retains_state_across_chunks=self.retains_state_across_chunks,
+            use_v2_model_runner=self.use_v2_model_runner,
+            supports_native_mrv2_data_plane=self.supports_native_mrv2_data_plane,
             active_stream_window=self.active_stream_window,
             duplex_max_sessions=self.duplex_max_sessions,
             model_stage=self.model_stage,
@@ -430,6 +441,7 @@ class OmniEngineArgs(EngineArgs):
             worker_type=self.worker_type,
             pooling_output_decoder=self.pooling_output_decoder,
             engine_output_type=self.engine_output_type,
+            final_output=self.final_output,
             hf_config_name=self.hf_config_name,
             custom_process_next_stage_input_func=self.custom_process_next_stage_input_func,
             requires_full_payload_input=self.requires_full_payload_input,
@@ -575,6 +587,7 @@ class OrchestratorArgs:
     step_execution: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    vae_fast_path: str = "lossless"
     enable_multithread_weight_load: bool = True
     enable_broadcast_weight_load: bool = False
     num_weight_load_threads: int = 4

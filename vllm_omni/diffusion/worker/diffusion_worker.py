@@ -186,11 +186,16 @@ def _setup_diffusion_worker_proc_title_and_log_prefix(
 def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[None]:
     import vllm.model_executor.layers.quantization.modelopt as vllm_modelopt
 
-    linear_method_cls = getattr(quant_config, "LinearMethodCls", None)
-    if linear_method_cls in {
-        vllm_modelopt.ModelOptFp8LinearMethod,
-        vllm_modelopt.ModelOptFp8PcPtLinearMethod,
-    }:
+    # vLLM #49381 replaced the per-format ModelOpt linear methods with the
+    # generic ``ModelOptLinearMethod`` and removed the ``LinearMethodCls``
+    # attributes this used to match on. The same two formats are identified by
+    # the ModelOpt quant-algo string carried on the config
+    # (``ModelOptQuantConfigBase.quant_method``): "FP8" used to select
+    # ``ModelOptFp8LinearMethod`` and "FP8_PER_CHANNEL_PER_TOKEN" used to select
+    # ``ModelOptFp8PcPtLinearMethod``. "FP8_PB_WO" / "NVFP4" / "W4A16_NVFP4"
+    # were never matched here and still are not.
+    quant_algo = getattr(quant_config, "quant_method", None)
+    if quant_algo in ("FP8", "FP8_PER_CHANNEL_PER_TOKEN"):
         from vllm.platforms import current_platform
 
         if current_platform.is_cuda() and current_platform.has_device_capability(89):
@@ -801,6 +806,9 @@ class DiffusionWorker:
         Args:
             level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
         """
+        progress = getattr(getattr(self, "model_runner", None), "_kv_receive_progress", None)
+        if progress is not None and progress.submitted:
+            raise RuntimeError("Cannot sleep with live native KV prefetch reservations; finish requests first")
         # The config validator rejects sleep for the native paged path. Keep
         # this worker-side guard precise as well: test doubles and legacy
         # configs may expose arbitrary attributes through Mock/getattr.
@@ -876,6 +884,19 @@ class DiffusionWorker:
             logger.info(f"[Worker {self.rank}] Buffers restored from CPU.")
         logger.info(f"[Worker {self.rank}] Wake-up complete.")
         return True
+
+    def synchronize_device(self, timeout: float | None = None) -> None:
+        """Wait until this rank has no device work left.
+
+        A KV prefetch still receiving on its background thread has queued no
+        device work yet, so it is joined first. ``timeout`` bounds that join
+        (and the multi-process worker's output drain before this call); the
+        device wait itself is unbounded.
+        """
+        manager = getattr(self.model_runner, "kv_transfer_manager", None)
+        if manager is not None and not manager.wait_prefetch(timeout=timeout):
+            raise TimeoutError("Diffusion KV prefetch did not finish before pause")
+        current_omni_platform.synchronize()
 
     def handle_sleep_task(self, task: OmniSleepTask | dict) -> OmniACK | None:
         from vllm_omni.platforms import current_omni_platform
@@ -1214,11 +1235,13 @@ class WorkerProc:
                     self._async_output_pending = max(0, self._async_output_pending - 1)
                     self._async_output_done.notify_all()
 
-    def drain_async_outputs(self, timeout: float = _ASYNC_OUTPUT_DRAIN_TIMEOUT_S) -> bool:
+    def drain_async_outputs(self, timeout: float | None = None) -> bool:
         """Block until background D2H/SHM packing has no work left.
 
         Returns False if outputs are still in flight when ``timeout`` expires.
         """
+        if timeout is None:
+            timeout = _ASYNC_OUTPUT_DRAIN_TIMEOUT_S
         with self._async_output_done:
             if self._async_output_pending == 0:
                 return True
@@ -1334,6 +1357,8 @@ class WorkerProc:
         }
 
         try:
+            if method == "synchronize_device" and not self.drain_async_outputs(timeout=kwargs.get("timeout")):
+                raise TimeoutError("Diffusion async outputs did not drain before pause")
             if method in _MEMORY_RELEASING_METHODS:
                 self.drain_async_outputs()
             # Use execute_method from WorkerWrapperBase for consistent method resolution

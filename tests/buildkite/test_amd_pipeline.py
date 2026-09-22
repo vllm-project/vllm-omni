@@ -67,11 +67,31 @@ def test_ready_diffusion_cpu_suite_is_sharded() -> None:
     assert "--shard-id=$$BUILDKITE_PARALLEL_JOB" in pytest_command
 
 
-def test_cosyvoice_gpu_abort_gets_one_fresh_job_retry() -> None:
-    step = _find_step("CosyVoice3-TTS E2E Test", AMD_READY_PIPELINE)
+def test_cosyvoice_ready_smoke_uses_sdpa() -> None:
+    step = _find_step("CosyVoice3-TTS E2E Smoke (SDPA)", AMD_READY_PIPELINE)
 
+    assert step["grade"] == "Blocking"
     assert step["retry"] == {"automatic": [{"exit_status": 134, "limit": 1}]}
+    assert "export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA" in step["commands"]
 
+    pytest_command = next(command for command in step["commands"] if "pytest" in command)
+    assert "tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py::test_voice_clone_zh_002" in pytest_command
+
+
+def test_cosyvoice_full_default_backend_suite_runs_nightly() -> None:
+    step = _find_step("CosyVoice3-TTS E2E Test", AMD_NIGHTLY_PIPELINE)
+
+    assert step["grade"] == "NonBlocking"
+    assert step["timeout_in_minutes"] == 90
+    assert step["retry"] == {"automatic": [{"exit_status": 134, "limit": 1}]}
+    assert all("DIFFUSION_ATTENTION_BACKEND" not in command for command in step["commands"])
+
+    pytest_command = next(command for command in step["commands"] if "pytest" in command)
+    assert "tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py" in pytest_command
+    assert "::" not in pytest_command
+
+
+def test_amd_template_preserves_step_retry_policy() -> None:
     template = AMD_TEMPLATE.read_text(encoding="utf-8")
     # Both grouped and top-level AMD steps must preserve an explicit retry
     # policy when the source suite is rendered into the uploaded pipeline.

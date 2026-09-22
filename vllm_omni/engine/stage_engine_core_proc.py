@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Stage Core Process for vLLM-Omni V1 architecture.
 
@@ -27,6 +30,7 @@ from vllm.v1.engine.utils import (
     EngineZmqAddresses,
     SignalCallback,
 )
+from vllm.v1.executor.uniproc_executor import UniProcExecutor
 
 from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -75,6 +79,24 @@ def _signal_exit_code(signum: int) -> int:
     return _SIGNAL_EXIT_BASE + signum
 
 
+def _bind_native_data_plane_ready_sink(model_executor: Any, scheduler: Any) -> bool:
+    """Bind the TP1 in-process runner control plane directly to its scheduler."""
+    if not isinstance(model_executor, UniProcExecutor):
+        return False
+    parallel_config = model_executor.vllm_config.parallel_config
+    if parallel_config.tensor_parallel_size != 1 or parallel_config.pipeline_parallel_size != 1:
+        return False
+    driver_worker = getattr(model_executor, "driver_worker", None)
+    worker = getattr(driver_worker, "worker", None)
+    model_runner = getattr(worker, "model_runner", None)
+    data_plane = getattr(model_runner, "_omni_data_plane", None)
+    sink = getattr(scheduler, "enqueue_omni_connector_output", None)
+    if data_plane is None or not callable(sink):
+        return False
+    data_plane.set_omni_connector_output_sink(sink)
+    return True
+
+
 class StageEngineCoreProc(EngineCoreProc):
     """Stage-specific engine core process for vLLM-Omni.
 
@@ -83,12 +105,17 @@ class StageEngineCoreProc(EngineCoreProc):
     ``EngineCoreProc.run_engine_core()``.
     """
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        if _bind_native_data_plane_ready_sink(self.model_executor, self.scheduler):
+            logger.info("Bound native MRv2 connector readiness directly to the scheduler inbox.")
+
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""
         scheduler_request, current_wave = super().preprocess_add_request(request)
         scheduler_request.additional_information = request.additional_information
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
-        scheduler_request.payload_sender_info = request.payload_sender_info
+        scheduler_request.payload_sender_info = getattr(request, "payload_sender_info", None)
         return scheduler_request, current_wave
 
     @staticmethod

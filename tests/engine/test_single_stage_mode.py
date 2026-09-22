@@ -17,7 +17,12 @@ from vllm.v1.engine.utils import EngineZmqAddresses
 
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.omni_config import VllmOmniARStageConfig, VllmOmniDiffusionStageConfig
-from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, StageExecutionType, StagePipelineConfig
+from vllm_omni.config.stage_config import (
+    DuplexSessionRuntimeConfig,
+    PipelineConfig,
+    StageExecutionType,
+    StagePipelineConfig,
+)
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
 from vllm_omni.engine.stage_engine_startup import (
@@ -393,6 +398,7 @@ class TestSingleStageModeDetection:
         stage_cfgs: list[Any] | None = None,
         resolved_config_path: str = "/fake/path",
         patch_deploy_config: bool = True,
+        resolved_pipeline: PipelineConfig | None = None,
         **kwargs: Any,
     ) -> AsyncOmniEngine:
         mock_stage_configs = stage_cfgs or [_make_stage_cfg(0)]
@@ -407,10 +413,19 @@ class TestSingleStageModeDetection:
                 "vllm_omni.engine.omni_engine_base.load_deploy_config",
                 return_value=SimpleNamespace(duplex_session=DuplexSessionRuntimeConfig()),
             )
+
+        def resolve_stage_configs(engine, *args, **kwargs):
+            if resolved_pipeline is not None:
+                engine._config_resolution = SimpleNamespace(
+                    pipeline_config=resolved_pipeline, config_path=resolved_config_path
+                )
+            return resolved_config_path, mock_stage_configs
+
         mocker.patch.object(
             AsyncOmniEngine,
             "_resolve_stage_configs",
-            return_value=(resolved_config_path, mock_stage_configs),
+            autospec=True,
+            side_effect=resolve_stage_configs,
         )
         mocker.patch.object(AsyncOmniEngine, "_bootstrap_orchestrator")
         mock_thread_cls = mocker.patch("threading.Thread")
@@ -434,6 +449,19 @@ class TestSingleStageModeDetection:
             omni_master_port=20000,
         )
         assert engine.single_stage_mode is True
+
+    @pytest.mark.parametrize("model_type, expected", [("qwen3_tts", True), ("qwen3_omni_moe", False)])
+    def test_event_driven_default_uses_resolved_pipeline(self, mocker, model_type, expected):
+        pipeline = PipelineConfig(
+            model_type=model_type,
+            stages=(StagePipelineConfig(stage_id=0, model_stage="a", final_output=True),),
+        )
+        engine = self._make_engine_no_thread(mocker, resolved_pipeline=pipeline)
+
+        StageConfigFactory.get_pipeline_config.assert_called_once_with(
+            model="fake-model", trust_remote_code=False, deploy_config_path=None
+        )
+        assert engine._event_driven_orch_default is expected
 
     def test_stage_id_kwarg_promotes_to_single_stage_mode(self, mocker: MockerFixture):
         engine = self._make_engine_no_thread(
@@ -1393,7 +1421,7 @@ class TestConnectRemoteEngineCoresCoordinator:
             yield mocker.Mock()
 
         mocker.patch("vllm_omni.engine.stage_engine_startup.zmq_socket_ctx", return_value=fake_socket_ctx())
-        mock_wait = mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup")
+        mock_wait = mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup", autospec=True)
         with connect_remote_engine_cores(
             vllm_config=vllm_config,
             omni_master_server=omni_master_server,
@@ -1428,7 +1456,7 @@ class TestConnectRemoteEngineCoresCoordinator:
             yield mocker.Mock()
 
         mocker.patch("vllm_omni.engine.stage_engine_startup.zmq_socket_ctx", return_value=fake_socket_ctx())
-        mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup")
+        mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup", autospec=True)
         with connect_remote_engine_cores(
             vllm_config=vllm_config,
             omni_master_server=omni_master_server,
@@ -1454,7 +1482,7 @@ class TestConnectRemoteEngineCoresCoordinator:
             yield mocker.Mock()
 
         mocker.patch("vllm_omni.engine.stage_engine_startup.zmq_socket_ctx", return_value=fake_socket_ctx())
-        mock_wait = mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup")
+        mock_wait = mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup", autospec=True)
 
         with connect_remote_diffusion_proc(
             omni_master_server=omni_master_server,
@@ -1466,7 +1494,8 @@ class TestConnectRemoteEngineCoresCoordinator:
         omni_master_server.get_zmq_addresses.assert_called_once_with(7, replica_id=2)
         omni_master_server.get_allocation.assert_called_once_with(7, replica_id=2)
         mock_wait.assert_called_once()
-        _, core_engines, parallel_config, *_ = mock_wait.call_args.args
+        _, core_engines, parallel_config, _, _, launch = mock_wait.call_args.args
+        assert launch.addresses is omni_master_server.get_zmq_addresses.return_value
         assert core_engines[0].local is False
         assert parallel_config.data_parallel_size_local == 0
 
@@ -1507,7 +1536,7 @@ class TestLaunchOmniCoreEngines:
             "vllm_omni.engine.stage_engine_startup.CoreEngineProcManager",
             return_value=local_engine_manager,
         )
-        mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup")
+        mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup", autospec=True)
         with _launch_omni_core_engines(
             vllm_config=vllm_config,
             executor_class=mocker.Mock(),
@@ -1584,7 +1613,7 @@ class TestLaunchOmniCoreEngines:
             "vllm_omni.engine.stage_engine_startup.CoreEngineProcManager",
             return_value=mocker.Mock(),
         )
-        mock_wait = mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup")
+        mock_wait = mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup", autospec=True)
         with _launch_omni_core_engines(
             vllm_config=vllm_config,
             executor_class=mocker.Mock(),

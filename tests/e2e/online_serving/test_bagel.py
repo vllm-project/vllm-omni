@@ -25,9 +25,11 @@ import os
 from io import BytesIO
 
 import pytest
+from PIL import Image
 from vllm.assets.image import ImageAsset
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
@@ -120,3 +122,55 @@ def test_bagel_img2img_online(omni_server, online_client) -> None:
     }
 
     online_client.send_diffusion_request(request_config)
+
+
+EDIT_SOURCE_SIZE = (1280, 720)
+EDIT_REQUESTED_SIZE = "1024x1024"
+
+
+def _edit_source_jpeg() -> tuple[str, bytes, str]:
+    synthetic = generate_synthetic_image(*EDIT_SOURCE_SIZE, seed=7287)
+    return ("source.jpg", base64.b64decode(synthetic["base64"]), "image/jpeg")
+
+
+def _build_edit_request(size: str) -> dict:
+    return {
+        "files": [("image", _edit_source_jpeg())],
+        "data": {
+            "prompt": IMG2IMG_PROMPT,
+            "size": size,
+            "num_inference_steps": 2,
+            "seed": 42,
+            "response_format": "b64_json",
+        },
+    }
+
+
+@pytest.mark.slow
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "H100"})
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_bagel_image_edit_honors_explicit_size_two_stage(omni_server, online_client) -> None:
+    """An explicit ``size`` wins over the AR stage's source-derived KV image shape (#7283)."""
+    (response,) = online_client.send_images_edits_http_request(_build_edit_request(EDIT_REQUESTED_SIZE))
+
+    payload = response.json_body
+    assert isinstance(payload, dict)
+    assert payload["size"] == EDIT_REQUESTED_SIZE
+    image = Image.open(BytesIO(base64.b64decode(payload["data"][0]["b64_json"])))
+    assert image.size == (1024, 1024)
+
+
+@pytest.mark.slow
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "H100"})
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_bagel_image_edit_floors_unaligned_size_two_stage(omni_server, online_client) -> None:
+    """A side that is not a multiple of the latent stride is floored to one (1000x700 -> 992x688)."""
+    (response,) = online_client.send_images_edits_http_request(_build_edit_request("1000x700"))
+
+    payload = response.json_body
+    assert isinstance(payload, dict)
+    assert payload["size"] == "992x688"
+    image = Image.open(BytesIO(base64.b64decode(payload["data"][0]["b64_json"])))
+    assert image.size == (992, 688)

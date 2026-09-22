@@ -34,9 +34,13 @@ from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
+from transformers import AutoModel, Qwen3VLConfig, Qwen3VLForConditionalGeneration, Qwen3VLModel, Qwen3VLProcessor
+from vllm.config.quantization import QuantizationConfigArgs
 from vllm.logger import init_logger
-from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -54,6 +58,7 @@ from vllm_omni.diffusion.models.boogu_image.scheduling_flow_match_euler_discrete
 )
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.models.utils import create_transformers_model_with_vllm_linears
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
@@ -243,6 +248,7 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         self.od_config = od_config
         self._raise_unsupported_features()
         transformer_quant_config = resolve_component_quant_config(od_config.quantization_config, "transformer")
+        mllm_quant_config = resolve_component_quant_config(od_config.quantization_config, "mllm")
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -273,22 +279,7 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
             local_files_only=local_files_only,
             revision=od_config.revision,
         )
-
-        mllm = from_pretrained_with_prefetch(
-            Qwen3VLForConditionalGeneration.from_pretrained,
-            model,
-            subfolder="mllm",
-            prefetch_list=boogu_subfolders,
-            local_files_only=local_files_only,
-            torch_dtype=od_config.dtype,
-            revision=od_config.revision,
-        )
-        # Upstream reuses the full VLM as an optional instruction rewriter and
-        # encodes with its inner model (no ``lm_head``); the rewriter is not
-        # ported, so keep only the inner ``Qwen3VLModel`` as the encoder.
-        if hasattr(mllm, "lm_head"):
-            mllm = mllm.model
-        self.mllm = mllm.to(self._execution_device)
+        self.mllm = self._load_mllm(model, local_files_only, mllm_quant_config, boogu_subfolders)
 
         self.processor = Qwen3VLProcessor.from_pretrained(
             model,
@@ -323,6 +314,68 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         self.SYSTEM_PROMPT_4_TI2I = SYSTEM_PROMPT_4_TI2I_UNIFIED
         self.SYSTEM_PROMPT_4_I2I = SYSTEM_PROMPT_4_TI2I_UNIFIED
 
+    def _load_mllm(
+        self,
+        model_path: str,
+        local_files_only: bool,
+        quant_config: QuantizationConfig | None,
+        prefetch_list: list[str],
+    ) -> Qwen3VLModel:
+        """Load MLLM through HF, or prepare it for deferred online FP8 loading."""
+        config = None
+        if quant_config is not None:
+            if not isinstance(quant_config, Fp8Config):
+                raise ValueError(
+                    "Boogu MLLM only supports FP8 quantization. Set mllm to null to disable online quantization."
+                )
+            config = Qwen3VLConfig.from_pretrained(
+                model_path, subfolder="mllm", local_files_only=local_files_only, revision=self.od_config.revision
+            )
+
+        # With no MLLM quantization override, or with checkpoint quantization
+        # metadata, preserve HF model initialization and weight loading.
+        if config is None or getattr(config, "quantization_config", None):
+            mllm = from_pretrained_with_prefetch(
+                Qwen3VLForConditionalGeneration.from_pretrained,
+                model_path,
+                subfolder="mllm",
+                prefetch_list=prefetch_list,
+                local_files_only=local_files_only,
+                torch_dtype=self.od_config.dtype,
+                revision=self.od_config.revision,
+            )
+            # Upstream reuses the full VLM as an optional instruction rewriter and
+            # encodes with its inner model (no ``lm_head``); the rewriter is not
+            # ported, so keep only the inner ``Qwen3VLModel`` as the encoder.
+            if hasattr(mllm, "lm_head"):
+                mllm = mllm.model
+            return mllm.to(self._execution_device)
+
+        online_quant_config = OnlineQuantizationConfig(
+            QuantizationConfigArgs(linear="fp8_per_block", ignore=quant_config.ignored_layers)
+        )
+
+        mllm = create_transformers_model_with_vllm_linears(
+            AutoModel,
+            config,
+            online_quant_config,
+            dtype=self.od_config.dtype,
+            device=self._execution_device,
+            prefix="mllm",
+            skip_modules=("mllm.visual",),
+        )
+
+        self.weights_sources.append(
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=model_path,
+                subfolder="mllm",
+                revision=self.od_config.revision,
+                prefix="mllm.",
+            )
+        )
+
+        return mllm.requires_grad_(False).eval()
+
     def _raise_unsupported_features(self) -> None:
         """Reject execution modes that do not have Boogu-specific support."""
         parallel_config = self.od_config.parallel_config
@@ -339,7 +392,8 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        mapper = WeightsMapper(orig_to_new_prefix={"mllm.lm_head.": None, "mllm.model.": "mllm."})
+        return loader.load_weights(weights, mapper=mapper)
 
     # ------------------------------------------------------------------
     # Prompt encoding (upstream ``encode_instruction``, t2i path)
