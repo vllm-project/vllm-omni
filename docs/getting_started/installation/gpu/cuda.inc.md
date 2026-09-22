@@ -57,6 +57,12 @@ cd vllm-omni
 uv pip install -e .
 ```
 
+To use the optional forward-only FlashAttention 3 package on Ampere, Ada, or Hopper, install it separately:
+
+```bash
+uv pip install -e '.[fa3]'
+```
+
 To run Gradio demos, install with optional extras:
 ```bash
 uv pip install -e '.[demo]'
@@ -126,6 +132,15 @@ docker run --runtime nvidia --gpus 2 \
 
 ```bash
 DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.cuda -t vllm-omni-cuda .
+```
+
+The CUDA Dockerfile installs the `fa3` extra by default. To build without it, set `INSTALL_FA3_FWD=0`:
+
+```bash
+DOCKER_BUILDKIT=1 docker build \
+  -f docker/Dockerfile.cuda \
+  --build-arg INSTALL_FA3_FWD=0 \
+  -t vllm-omni-cuda .
 ```
 
 If you want to specify the base vLLM version:

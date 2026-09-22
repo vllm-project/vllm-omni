@@ -2,6 +2,7 @@ ARG BASE_IMAGE=vllm/vllm-openai:v0.29.0
 FROM ${BASE_IMAGE}
 
 ARG COMMON_WORKDIR=/app
+ARG INSTALL_FA3_FWD=1
 
 WORKDIR ${COMMON_WORKDIR}
 
@@ -15,7 +16,12 @@ RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
 
 # Step 2: Copy vllm-omni code and install
 COPY . ${COMMON_WORKDIR}/vllm-omni
-RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."
+RUN cd ${COMMON_WORKDIR}/vllm-omni && \
+    if [ "${INSTALL_FA3_FWD}" = "1" ]; then \
+        uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir ".[fa3]"; \
+    else \
+        uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."; \
+    fi
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
