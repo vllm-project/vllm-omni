@@ -405,32 +405,38 @@ def _get_device_global_memory_used_gib(device_id: int) -> float:
     return (total_b - free_b) / 1024**3
 
 
-def _bagel_diffusion_stages() -> list[dict]:
-    """TP=2 BagelPipeline topology shared by the live fixture and the skipped coordinated case."""
-    return [
-        {
-            "stage_id": 0,
-            "stage_type": "diffusion",
-            "runtime": {"process": True, "devices": "0,1", "max_batch_size": 1},
-            "engine_args": {
-                "model_stage": "base",
-                "gpu_memory_utilization": 0.1,
-                "model_class_name": "BagelPipeline",
-                "enable_sleep_mode": True,
-                "enforce_eager": True,
-                "max_num_batched_tokens": 8192,
-                "parallel_config": {"tensor_parallel_size": 2},
-            },
-            "final_output": True,
-            "final_output_type": "image",
-        }
-    ]
+def _bagel_diffusion_deploy_config() -> str:
+    """Official single-stage BAGEL DiT, TP=2 on cards 0,1.
+
+    ``AsyncOmni(stages=...)`` is ignored and leaked as an unknown diffusion
+    field (``Unknown diffusion config field(s) for stage 1: 'stages'``).
+    """
+    return modify_stage_config(
+        get_deploy_config_path("bagel_single_stage.yaml"),
+        updates={
+            "stages": {
+                0: {
+                    "devices": "0,1",
+                    "tensor_parallel_size": 2,
+                    "enable_sleep_mode": True,
+                    "enforce_eager": True,
+                    "dtype": "bfloat16",
+                    "gpu_memory_utilization": 0.4,
+                }
+            }
+        },
+    )
 
 
 @pytest_asyncio.fixture(scope="class", loop_scope="class")
 async def bagel_diffusion_engine():
-    """Shared BAGEL BagelPipeline TP=2 engine for sleep/wake + generate."""
-    engine = AsyncOmni(model=MODEL_BAGEL, stages=_bagel_diffusion_stages(), init_timeout=600, enable_sleep_mode=True)
+    """Shared BAGEL single-stage DiT TP=2 engine for sleep/wake + generate."""
+    engine = AsyncOmni(
+        model=MODEL_BAGEL,
+        deploy_config=_bagel_diffusion_deploy_config(),
+        init_timeout=600,
+        enable_sleep_mode=True,
+    )
     yield engine
     engine.shutdown()
     await asyncio.sleep(1.5)
@@ -473,12 +479,9 @@ class TestBagelDiffusionSleepMode:
         try:
             prompt = "A huge swimming pool, with many people swimming."
             sp = OmniDiffusionSamplingParams(num_inference_steps=4, height=512, width=512, seed=42)
-            llm_sp = SamplingParams()
 
             base_output = None
-            async for output in bagel_diffusion_engine.generate(
-                prompt, request_id="base", sampling_params_list=[llm_sp, sp]
-            ):
+            async for output in bagel_diffusion_engine.generate(prompt, request_id="base", sampling_params=sp):
                 base_output = output
             assert base_output is not None and len(base_output.images) > 0
 
@@ -506,9 +509,7 @@ class TestBagelDiffusionSleepMode:
             assert abs(vram_restored - vram_initial) < 3.0, "VRAM failed to restore to initial levels"
 
             post_output = None
-            async for output in bagel_diffusion_engine.generate(
-                prompt, request_id="post", sampling_params_list=[llm_sp, sp]
-            ):
+            async for output in bagel_diffusion_engine.generate(prompt, request_id="post", sampling_params=sp):
                 post_output = output
             assert post_output is not None
             assert len(base_output.images) == len(post_output.images)
@@ -567,7 +568,10 @@ class TestBagelCoordinatedSleepMode:
             model=MODEL_BAGEL, stages=llm_stages, connectors=llm_connectors, init_timeout=600, enable_sleep_mode=True
         )
         diffusion_engine = AsyncOmni(
-            model=MODEL_BAGEL, stages=_bagel_diffusion_stages(), init_timeout=600, enable_sleep_mode=True
+            model=MODEL_BAGEL,
+            deploy_config=_bagel_diffusion_deploy_config(),
+            init_timeout=600,
+            enable_sleep_mode=True,
         )
         device_id = 1
         try:
