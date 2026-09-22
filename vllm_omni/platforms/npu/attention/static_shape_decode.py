@@ -41,17 +41,11 @@ per batch size, one per candidate capacity, and each step replays the smallest
 bucket that covers it. With one bucket equal to the model's whole block table this
 degenerates to a fixed capacity, which is only sensible for short contexts.
 
-Env switches:
-  ``VLLM_OMNI_FIXED_KV_DECODE``           0 to disable (default 1)
-  ``VLLM_OMNI_FIXED_KV_DECODE_BUCKETS``   comma-separated candidate capacities,
-                                            e.g. "1024,4096"; default "512". Each
-                                            model keeps the candidates below its own
-                                            block-table capacity and always adds that
-                                            capacity as the top bucket. Empty means a
-                                            single bucket: the full capacity.
+There is no switch: the numbers below are the measured-stable ones, and the only
+thing that decides whether a stage engages is its own ``max_model_len`` (see
+:func:`capacity_for`), so a long-context stage keeps the stock path untouched.
 """
 
-import os
 from contextlib import contextmanager
 
 import torch
@@ -89,19 +83,18 @@ _capture_bucket: int | None = None
 _runtime_bucket: int | None = None
 
 
-_ENV = "VLLM_OMNI_FIXED_KV_DECODE"
-_BUCKETS_ENV = "VLLM_OMNI_FIXED_KV_DECODE_BUCKETS"
-_DEFAULT_BUCKETS = "512"
+# Candidate capacities to capture graphs for, smallest first. A bucket that just
+# covers the sequence is worth having: attention reads the declared capacity every
+# step, and the Talker's sequence is ~135 (a ~15-token condition plus ~118 codec
+# frames) against a 4096-token table. The model's own capacity is always added as
+# the top bucket, so a longer sequence still has a graph to land on.
+_CANDIDATE_BUCKETS = "512"
 
 # Only a small decoder has fixed-capacity graphs worth capturing; a long-context
 # stage (a 32768-token Thinker) keeps the stock path. The ceiling is a property of
 # the shapes that get captured, not a per-deployment preference, so it is a code
 # constant: the stage's own ``max_model_len`` is what selects the outcome.
 _MAX_CONTEXT = 8192
-
-
-def is_enabled() -> bool:
-    return os.getenv(_ENV, "1") == "1"
 
 
 class _CapacityEntries(dict):
@@ -201,8 +194,6 @@ def install_into_ascend_backend() -> None:
     stock builder still runs for them, so runtime looks up ``(batch, None)``.
     Patch the stock backend class in this process instead.
     """
-    if not is_enabled():
-        return
     from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
 
     from vllm_omni.platforms.npu.attention.static_shape_backend import (
@@ -221,8 +212,6 @@ def install_into_ascend_backend() -> None:
 
 def capacity_for(max_model_len: int, block_size: int) -> int:
     """Full KV capacity this decoder would run at, or 0 when it should not engage."""
-    if not is_enabled():
-        return 0
     if max_model_len > _MAX_CONTEXT:
         return 0
     # Round to the block table, not to max_model_len: the op indexes whole blocks.
@@ -237,12 +226,7 @@ def buckets_for(capacity: int, block_size: int) -> tuple[int, ...]:
     """
     if not capacity:
         return ()
-    # The default has to be a code default, not an environment one: attention
-    # reads the declared capacity every step, so a bucket that just covers the
-    # sequence is worth having -- the Talker's is ~135 (a ~15-token condition
-    # plus ~118 codec frames). The full capacity is always kept as the top
-    # bucket, so a longer sequence still has a graph to land on.
-    raw = os.getenv(_BUCKETS_ENV, _DEFAULT_BUCKETS)
+    raw = _CANDIDATE_BUCKETS
     candidates = set()
     for part in raw.split(","):
         part = part.strip()
@@ -293,7 +277,7 @@ def graph_key() -> int | None:
     Read by vllm-ascend's ``ACLGraphWrapper`` in builds that carry the static-shape
     hook; nothing in this package calls it directly.
     """
-    return current_capacity() if is_enabled() else None
+    return current_capacity()
 
 
 def get_pse_buffer(

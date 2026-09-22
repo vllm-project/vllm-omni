@@ -62,9 +62,10 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         every layer on every step, because the op takes the KV length as a host
         argument that grows each step. On the small Talker decoder that rebind is
         most of its busy time. Scoped by ``max_model_len`` (Talker 4096 engages,
-        a 32768-token Thinker does not). ``VLLM_OMNI_FIXED_KV_DECODE=0`` restores
-        stock. The 910B family also needs it to capture at all: with the K-step
-        armed the stock capture path faults there (acl 507035).
+        a 32768-token Thinker does not), which is the only thing that decides: the
+        backend declines above the ceiling, so nothing else changes. The 910B
+        family also needs it to capture at all: with the K-step armed the stock
+        capture path faults there (acl 507035).
         """
         resolved = super().get_attn_backend_cls(selected_backend, attn_selector_config, num_heads)
         if resolved != "vllm_ascend.attention.attention_v1.AscendAttentionBackend":
@@ -73,8 +74,6 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
         from vllm_omni.platforms.npu.attention import static_shape_decode
 
-        if not static_shape_decode.is_enabled():
-            return resolved
         vllm_config = get_current_vllm_config()
         max_model_len = getattr(getattr(vllm_config, "model_config", None), "max_model_len", None)
         block_size = getattr(getattr(vllm_config, "cache_config", None), "block_size", None)
@@ -82,8 +81,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         static_shape_decode.install_into_ascend_aclgraph()
         if capacity:
             logger.info(
-                "[minicpmo] static-shape decode attention on (max_model_len=%s, kv_capacity=%s); "
-                "set VLLM_OMNI_FIXED_KV_DECODE=0 to disable",
+                "[minicpmo] static-shape decode attention on (max_model_len=%s, kv_capacity=%s)",
                 max_model_len,
                 capacity,
             )
