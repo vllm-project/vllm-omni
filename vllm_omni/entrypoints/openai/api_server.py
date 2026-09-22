@@ -2103,6 +2103,8 @@ async def generate_images(
                 extra_body["system_prompt"] = request.system_prompt
             if request.return_stage_metrics is not None:
                 extra_body["return_stage_metrics"] = request.return_stage_metrics
+            if request.layers is not None:
+                extra_body["layers"] = request.layers
 
             generation_result = await chat_handler.generate_diffusion_images(
                 prompt=request.prompt,
