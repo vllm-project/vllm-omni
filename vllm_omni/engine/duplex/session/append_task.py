@@ -158,10 +158,15 @@ class AppendAttempt:
                 self.ctx.run.runtime_closed = True
                 return False
             if not emitted_response and session.epoch == self.epoch:
-                # Only if the session still points at this append's request:
-                # ``clear_request`` compares before it clears, and the id
-                # carries a turn suffix when the core request is not resumable.
-                session.clear_request(self.request_id)
+                # Resident Stage0 (``…r.stage0``): clear the listen-only bind.
+                # Ephemeral ``…r.stage{N}-turn{T}`` must stay bound after a
+                # listen-only append (``clear_request`` compares before clear).
+                if session.capabilities.supports_core_resumable_request:
+                    session.clear_request(self.request_id)
+                else:
+                    active = session.active_request_id
+                    if isinstance(active, str) and active.endswith(".r.stage0"):
+                        session.clear_request(active)
                 if self.final:
                     self.out.emit_events([session.signal_turn(DuplexTurnEventType.USER_STARTED.value)])
             return append_ok

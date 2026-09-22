@@ -71,6 +71,18 @@ main { width: min(1040px, calc(100% - 40px)); margin: 28px auto 48px; }
 }
 
 .call-actions { display: flex; gap: 8px; }
+/* AURA only: class is added solely by the aura-ptt profile. */
+.call-bar:has(.camera-preview-large) .call-actions { grid-column: 1 / -1; }
+.call-actions:has(.camera-preview-large) { flex-wrap: wrap; align-items: center; }
+.call-actions:has(.camera-preview-large) .camera-preview-large {
+  order: -1;
+  flex: 0 0 100%;
+  width: 100% !important;
+  height: auto !important;
+  max-height: 480px;
+  aspect-ratio: 4 / 3;
+}
+.call-actions:has(.camera-preview-large) button { flex: 0 0 auto; }
 button { border-radius: 5px; border: 1px solid transparent; cursor: pointer; }
 button:disabled { opacity: .46; cursor: default; }
 .primary { padding: 10px 15px; color: #ffffff; background: #16834b; font-weight: 700; }

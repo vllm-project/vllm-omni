@@ -216,3 +216,20 @@ def test_fused_qk_norm_rope_min_tokens_resolution(monkeypatch):
         monkeypatch.setenv(env, bad)
         with pytest.raises(ValueError, match=env):
             fused_qk_norm_rope_min_tokens(2048)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAS_TRITON, reason="CUDA and Triton required")
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_fused_qk_norm_rope_large_storage_offsets(interleaved):
+    """Only three tokens, but the last row lies beyond signed 32-bit indexing."""
+    from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
+
+    # 4 GiB of backing storage; initialize only the three small visible rows.
+    q = torch.empty_strided((3, 1, 128), (2**30, 128, 1), device="cuda", dtype=torch.bfloat16)
+    q.fill_(1)
+    weight = torch.ones(128, device="cuda", dtype=torch.bfloat16)
+    table = torch.zeros(3, 96, device="cuda", dtype=torch.bfloat16)
+    table[:, :48] = 1
+    actual = fused_qk_norm_rope(q, q, weight, weight, table, _EPS, interleaved=interleaved)
+    for value in actual:
+        torch.testing.assert_close(value, torch.ones_like(value))

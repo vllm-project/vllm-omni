@@ -127,7 +127,8 @@ if HAS_TRITON:
         eps: tl.constexpr,
         heads_per_program: tl.constexpr,
     ):
-        token = tl.program_id(0)
+        # 长视频的 Q/K view 可跨越 fused QKV storage 中超过 2**31 个元素。
+        token = tl.program_id(0).to(tl.int64)
         head_group = tl.program_id(1)
         heads = head_group * heads_per_program + tl.arange(0, heads_per_program)
         dims = tl.arange(0, head_dim)
@@ -219,7 +220,8 @@ if HAS_TRITON:
         (partial rotary or lane padding) the output is the normalized value
         unchanged.
         """
-        token = tl.program_id(0)
+        # 长视频的 Q/K view 可跨越 fused QKV storage 中超过 2**31 个元素。
+        token = tl.program_id(0).to(tl.int64)
         head_group = tl.program_id(1)
         dims = tl.arange(0, padded_dim)
         dim_mask = dims < head_dim
