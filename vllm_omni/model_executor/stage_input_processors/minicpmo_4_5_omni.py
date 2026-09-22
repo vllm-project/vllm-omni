@@ -865,8 +865,25 @@ def llm2tts(
                     special_token_ids.get("chunk_eos_token_id"),
                     special_token_ids.get("chunk_tts_eos_token_id"),
                 }
-            tts_token_ids_slice = torch.tensor(full_token_ids[tts_bos_idx:end_idx], dtype=torch.long)
-            tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
+            if is_native_duplex_handoff:
+                # Earlier unforwarded decisions may already be folded into
+                # the rebuilt prompt while still appearing in this delta.
+                # Align the explicit tts_bos path by the segment's end, just
+                # like the native speak/text paths below, rather than adding
+                # those decisions to the prompt a second time.
+                out_start = tts_bos_idx - prompt_token_ids_len
+                out_end = tts_eos_idx - prompt_token_ids_len if tts_eos_idx is not None else len(llm_output_ids)
+                hidden_base = int(thinker_hidden_states.shape[0]) - len(llm_output_ids)
+                if hidden_base >= 0 and out_end > out_start:
+                    tts_token_ids_slice = torch.tensor(llm_output_ids[out_start:out_end], dtype=torch.long)
+                    tts_hidden_slice = (
+                        thinker_hidden_states[hidden_base + out_start : hidden_base + out_end]
+                        .to(torch.float32)
+                        .contiguous()
+                    )
+            else:
+                tts_token_ids_slice = torch.tensor(full_token_ids[tts_bos_idx:end_idx], dtype=torch.long)
+                tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
         elif is_native_duplex_handoff:
             # Official MiniCPM-o duplex does not prefill an assistant
             # <|tts_bos|> boundary before generation. A segment delta can

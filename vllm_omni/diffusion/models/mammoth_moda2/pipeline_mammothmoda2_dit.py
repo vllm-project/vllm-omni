@@ -15,7 +15,12 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.cache.cachedit import (
+    CacheDiTBackend,
+    CacheDiTRequestSpec,
+    RequestScopedCacheDiTRuntime,
+)
+from vllm_omni.diffusion.data import DiffusionCacheConfig, DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
@@ -27,6 +32,9 @@ from .rope_real import RotaryPosEmbedReal
 from .schedulers import FlowMatchEulerDiscreteScheduler
 
 logger = init_logger(__name__)
+
+# Identifies the pipeline-owned Cache-DiT installation across requests.
+_MAMMOTHMODA2_CACHE_DIT_KEY = "mammothmoda2:cache_dit"
 
 
 def _first_request_value(value: object) -> object:
@@ -168,6 +176,54 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         )
 
         self._llm_hidden_size = llm_hidden_size
+
+        # Cache-DiT lifecycle: the diffusion runner enables the configured
+        # backend (``cache_backend`` on the deploy YAML stage entry) at startup
+        # and transfers ownership here via the request-scoped protocol;
+        # forward() then reconciles per-request state (step count, CFG parity).
+        # The runner also emits the cache summary when
+        # ``enable_cache_dit_summary`` is set.
+        self._cache_dit_runtime = RequestScopedCacheDiTRuntime(self)
+        self._cache_dit_config: DiffusionCacheConfig | None = None
+        if str(getattr(od_config, "cache_backend", "") or "").lower() == "cache_dit":
+            cache_config = od_config.cache_config
+            self._cache_dit_config = (
+                cache_config
+                if isinstance(cache_config, DiffusionCacheConfig)
+                else DiffusionCacheConfig.from_dict(cache_config or {})
+            )
+
+    def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
+        """Adopt a runner-installed Cache-DiT backend (request-scoped protocol)."""
+
+        self._cache_dit_runtime.adopt(backend, installation_key=_MAMMOTHMODA2_CACHE_DIT_KEY)
+
+    def is_cache_dit_enabled(self) -> bool:
+        """Return the request-scoped Cache-DiT installation state."""
+
+        return self._cache_dit_runtime.is_enabled
+
+    def _prepare_cache_dit_for_request(self, *, num_inference_steps: int, cfg_active: bool) -> None:
+        """Reconcile Cache-DiT hooks with this request before the denoise loop.
+
+        cache-dit's separate-CFG accounting assumes exactly two transformer
+        forwards per denoise step (conditional then unconditional), so CFG
+        requests refresh the context (per-request step counts vary) while
+        no-CFG requests run with hooks disabled: their single forward per
+        step cannot be represented by the parity accounting.
+        """
+        if self._cache_dit_config is None:
+            return
+        if not cfg_active:
+            self._cache_dit_runtime.prepare(None)
+            return
+        self._cache_dit_runtime.prepare(
+            CacheDiTRequestSpec(
+                installation_key=_MAMMOTHMODA2_CACHE_DIT_KEY,
+                cache_config=self._cache_dit_config,
+                num_inference_steps=num_inference_steps,
+            )
+        )
 
     def _reinit_caption_embedder(self, in_features: int) -> None:
         # Align with upstream Mammothmoda2Model's `reinit_caption_embedder`:
@@ -432,6 +488,18 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
 
         # Run diffusion loop (CFG supported when text_guidance_scale > 1.0)
         total_steps = max(1, len(scheduler.timesteps))
+        self._prepare_cache_dit_for_request(
+            num_inference_steps=total_steps,
+            cfg_active=request.text_guidance_scale > 1.0,
+        )
+        # cache-dit distinguishes the conditional vs unconditional passes
+        # purely by transformer-forward parity, so when it is active the
+        # uncond pass must run on every step. Outside cfg_range CFG is
+        # neutralized via scale=1.0 (uncond + 1.0 * (cond - uncond) == cond),
+        # matching the skip optimization's cond-only update.
+        requires_paired_cfg = self._cache_dit_runtime.is_enabled and getattr(
+            self, "_cache_dit_requires_paired_cfg", False
+        )
         for i, t in enumerate(scheduler.timesteps):
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
             model_pred = self.gen_transformer(
@@ -447,7 +515,10 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             guidance_scale = (
                 request.text_guidance_scale if request.cfg_range[0] <= i / total_steps <= request.cfg_range[1] else 1.0
             )
-            if guidance_scale > 1.0 and negative_prompt_embeds is not None:
+            run_uncond = guidance_scale > 1.0 and negative_prompt_embeds is not None
+            if requires_paired_cfg and negative_prompt_embeds is not None:
+                run_uncond = True
+            if run_uncond:
                 model_pred_uncond = self.gen_transformer(
                     hidden_states=latents,
                     timestep=timestep,

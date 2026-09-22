@@ -51,6 +51,7 @@ from vllm_omni.engine.duplex.plugin import (
     PcmAppendReservation,
 )
 from vllm_omni.engine.duplex.session import manager as session_manager_module
+from vllm_omni.engine.duplex.session.context import DuplexSessionTasks
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
@@ -1612,3 +1613,34 @@ async def test_reaper_loop_survives_one_cleanup_failure(first_cleanup_delay: flo
     finally:
         shutdown.set()
         await asyncio.wait_for(task, timeout=5.0)
+
+
+# --------------------------------------------------------------------------- #
+# Cancellation waits                                                          #
+# --------------------------------------------------------------------------- #
+
+
+async def test_cancel_append_tasks_absorbs_a_task_that_outlives_the_wait() -> None:
+    """The wait after cancelling is allowed to time out; that is not an error.
+
+    On Python 3.10 the timeout arrives as ``asyncio.TimeoutError``, which is a
+    different class from the builtin ``TimeoutError`` until 3.11.
+    """
+
+    async def outlives_the_first_cancel() -> bool:
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            await asyncio.sleep(1)
+            raise
+        return True
+
+    tasks = DuplexSessionTasks()
+    task = asyncio.create_task(outlives_the_first_cancel())
+    await asyncio.sleep(0)
+    tasks.track_append_task(task, epoch=0, final=False, response_bound=False)
+    tasks.append_tail = task
+
+    assert await tasks.cancel_append_tasks(timeout_s=0.05) is True
+    assert tasks.append_tail is None
+    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5.0)

@@ -772,6 +772,41 @@ async def test_cancel_response_aborts_the_stage_request_and_reports_playback() -
 
 
 @pytest.mark.asyncio
+async def test_cancel_response_absorbs_a_response_task_that_outlives_the_wait() -> None:
+    """The 0.25 s wait after cancelling the response task may time out.
+
+    On Python 3.10 that timeout is ``asyncio.TimeoutError``, not the builtin
+    ``TimeoutError``, and it must not stop the cancel from completing.
+    """
+
+    async def outlives_the_first_cancel() -> None:
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            await asyncio.sleep(1)
+            raise
+
+    h = await open_harness()
+    task = asyncio.create_task(outlives_the_first_cancel())
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
+        h.runner.tasks.active_response_task = task
+
+        events = await h.run(commands.CancelResponse())
+        # The runner is still inside that wait when the mailbox goes quiet.
+        events += await h.settle(idle_s=0.6, timeout_s=5.0)
+        assert find(events, "response.done").status == "cancelled"
+        assert "error" not in types(events)
+        assert h.session.epoch == 1
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_listen_decision_is_consumed_and_never_forwarded_to_tts() -> None:
     h = await open_harness()
     try:

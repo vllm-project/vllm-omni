@@ -155,13 +155,13 @@ class AsyncOmniBase(OmniBase):
 
     def _get_comprehension_stage_index(self) -> int | None:
         fallback_idx: int | None = None
-        for idx, stage_client in enumerate(self.engine.stage_clients):
+        for idx, stage_config in enumerate(self.engine.stage_configs):
             stage_vllm_config = self.engine.stage_vllm_configs[idx]
             if stage_vllm_config is None:
                 continue
             if fallback_idx is None:
                 fallback_idx = idx
-            if stage_client.is_comprehension:
+            if stage_config.is_comprehension:
                 return idx
         return fallback_idx
 
@@ -186,12 +186,10 @@ class AsyncOmniBase(OmniBase):
 
     def get_diffusion_od_config(self) -> Any | None:
         """Return the diffusion-stage config when the pipeline has one."""
-        saw_diffusion_stage = False
+        saw_diffusion_stage = any(stage_config.stage_type == "diffusion" for stage_config in self.engine.stage_configs)
         for stage_client in self.engine.stage_clients:
             if getattr(stage_client, "stage_type", None) != "diffusion":
                 continue
-
-            saw_diffusion_stage = True
 
             od_config = getattr(stage_client, "od_config", None)
             if od_config is not None:

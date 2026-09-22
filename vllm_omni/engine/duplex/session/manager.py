@@ -699,7 +699,9 @@ class DuplexSessionManager:
         while not shutdown_event.is_set():
             try:
                 await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
-            except TimeoutError:
+            # The timeout is this loop's tick. asyncio.TimeoutError is not the builtin
+            # TimeoutError before Python 3.11, so catch both or the tick escapes the loop.
+            except (TimeoutError, asyncio.TimeoutError):
                 try:
                     await self.reap_expired()
                 except Exception:
