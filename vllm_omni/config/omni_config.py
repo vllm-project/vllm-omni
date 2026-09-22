@@ -266,6 +266,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     hsdp_shard_size: int
     hsdp_replicate_size: int
     enable_expert_parallel: bool
+    enable_pipefusion: bool
 
 
 class _ParallelEngineOverrides(_ParallelConfigEngineOverrides, total=False):
@@ -723,6 +724,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     mask_sp_padding: bool = False
     hsdp_shard_size: int = -1
     hsdp_replicate_size: int = Field(default=1, ge=1)
+    enable_pipefusion: bool = False
 
     def __post_init__(self) -> None:
         self.data_parallel_index = self.data_parallel_rank
@@ -738,6 +740,8 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
                 "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "
                 f"but got {self.vae_parallel_mode!r}."
             )
+        if self.enable_pipefusion and self.pipeline_parallel_size <= 1:
+            raise ValueError(f"PipeFusion requires pipeline_parallel_size > 1, but got {self.pipeline_parallel_size}")
 
         other_parallel_world_size = (
             self.pipeline_parallel_size

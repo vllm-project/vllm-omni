@@ -445,6 +445,7 @@ class StageDeployConfig:
     use_hsdp: bool | None = None
     hsdp_shard_size: int | None = None
     hsdp_replicate_size: int | None = None
+    enable_pipefusion: bool | None = None
 
     # Diffusion model loading and adapter construction.
     model_class_name: str | None = None
