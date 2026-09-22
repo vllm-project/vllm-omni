@@ -22,7 +22,9 @@ stages:
       seed: 42
 
   - stage_id: 1
-    enforce_eager: true
+    enforce_eager: false
+    diffusion_compile_granularity: regional
+    diffusion_compile_dynamic: false
     tensor_parallel_size: 1
     devices: "1"
     max_num_seqs: 1

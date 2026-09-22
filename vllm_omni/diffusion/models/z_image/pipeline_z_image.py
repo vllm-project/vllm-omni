@@ -657,6 +657,8 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
                 latent_model_input = latent_model_input.unsqueeze(2)
             latent_model_input_list = list(latent_model_input.unbind(dim=0))
 
+            if not self.od_config.enforce_eager:
+                torch.compiler.cudagraph_mark_step_begin()
             model_out_list = self.transformer(
                 latent_model_input_list,
                 timestep_model_input,

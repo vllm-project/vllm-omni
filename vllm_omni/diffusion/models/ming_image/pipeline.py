@@ -16,6 +16,7 @@ from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from PIL import Image
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import (
     DistributedAutoencoderKLQwenImage,
@@ -177,6 +178,24 @@ class MingImageDiffusionPipeline(ZImagePipeline):
         )
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler
+        )
+
+    def setup_compile(self) -> None:
+        # Keep request preparation, scheduling, and VAE work eager,
+        # while captures the fixed-shape block regions for replay.
+        if self.od_config.diffusion_compile_granularity != "regional":
+            logger.warning(
+                "Ming-Image CUDA Graph uses regional DiT compilation; diffusion_compile_granularity=%r is ignored.",
+                self.od_config.diffusion_compile_granularity,
+            )
+        if self.od_config.diffusion_compile_dynamic:
+            logger.warning("Ming-Image CUDA Graph requires static shapes; diffusion_compile_dynamic=True is ignored.")
+
+        self.transformer = regionally_compile(
+            self.transformer,
+            mode="reduce-overhead",
+            fullgraph=True,
+            dynamic=False,
         )
 
     def encode_prompt(self, *args, **kwargs):

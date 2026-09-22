@@ -84,6 +84,7 @@ def test_variant_config_rejects_mixed_semantics():
         _validate_variant_config(
             {"_class_name": "MingImageDiffusionPipeline"},
             SimpleNamespace(
+                _class_name="DiffusionTransformer",
                 alignment_padding_mode="learned",
                 multi_frame_output=False,
             ),
@@ -170,6 +171,34 @@ def test_two_stage_topology_and_request_metadata():
     for class_name in MING_IMAGE_PIPELINE.diffusers_class_aliases + (MING_IMAGE_PIPELINE.diffusers_class_name,):
         assert "num_layers" in get_extra_body_params(class_name)
         assert should_init_extra_args_for_non_diffusion_stages(class_name)
+
+
+def test_stage1_compile_uses_static_regional_cuda_graph(monkeypatch):
+    pipeline = MingImageDiffusionPipeline.__new__(MingImageDiffusionPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = SimpleNamespace(
+        diffusion_compile_granularity="regional",
+        diffusion_compile_dynamic=False,
+    )
+    pipeline.transformer = torch.nn.Identity()
+    captured = {}
+
+    def _regionally_compile(model, **kwargs):
+        captured.update(kwargs)
+        return model
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.ming_image.pipeline.regionally_compile",
+        _regionally_compile,
+    )
+
+    pipeline.setup_compile()
+
+    assert captured == {
+        "mode": "reduce-overhead",
+        "fullgraph": True,
+        "dynamic": False,
+    }
 
 
 def test_checkpoint_resolver_accepts_root_or_mllm_subfolder(tmp_path):
