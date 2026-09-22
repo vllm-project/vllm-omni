@@ -64,3 +64,25 @@ steps:
         commands:
           - export VLLM_ROCM_USE_AITER=1
           - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py::test_text_to_text_audio_001 -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
+
+  - group: ":full_moon: HunyuanImage3 MI300 Nightly"
+    steps:
+      - label: "HunyuanImage3 Offline Pixel Accuracy"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        env:
+          HUNYUAN_IMAGE3_MODEL: "tencent/HunyuanImage-3.0-Instruct"
+          HUNYUAN_IMAGE3_DEVICES: "0,1,2,3"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-hunyuanimage3/**/*
+        commands:
+          - pytest --collect-only -q tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py::test_hunyuan_image3_pixel_accuracy_offline -m "full_model and rocm and MI325 and cards_4" --run-level full_model
+          - pytest -s -v tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py::test_hunyuan_image3_pixel_accuracy_offline -m "full_model and rocm and MI325 and cards_4" --run-level full_model
+          - |
+            artifact_dir="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-hunyuanimage3"
+            mkdir -p "$$artifact_dir"
+            cp -v tests/e2e/accuracy/artifacts/HunyuanImage-3_0-Instruct/*.png "$$artifact_dir/"
