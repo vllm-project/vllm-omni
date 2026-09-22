@@ -1376,18 +1376,15 @@ class TestDeployConfigLoading:
         ``get_token_bin_counts_and_mask``).
 
         Stage 0's prefix caching is NPU-scoped for the same reason: a CUDA
-        stage-0 prefix hit rewrites the prefill bookkeeping, so the Thinker
-        hands an empty tts handoff and the Talker indexes past the codec vocab
-        (ValueError in ``minicpmo_4_5_omni_tts.preprocess`` plus a
-        device-side assert out of ``indexSelectSmallIndex``).
+        stage-0 prefix hit hands the Thinker an empty tts handoff, and the
+        Talker then indexes past the codec vocab.
         """
         deploy = _apply_platform_overrides(
             load_deploy_config(Path(get_deploy_config_path("minicpmo_4_5.yaml"))),
             platform=platform,
         )
-        # Assert the deploy-side stop id before the merge: afterwards it is
-        # unioned with the pipeline's own platform-aware constraint, so an
-        # exact-list check here would depend on the host running the suite.
+        # Check the deploy-side stop id before the merge: afterwards it is
+        # unioned with the pipeline's platform-aware constraint.
         deploy_stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
         stages = merge_pipeline_deploy(resolve_pipeline_config("minicpmo_4_5"), deploy)
 

@@ -242,14 +242,8 @@ def test_guard_keeps_drafts_when_all_decodes_share_the_padded_width():
 def test_talker_stop_token_ids_match_the_multi_frame_head():
     """Stage 1's stop id must be one the head that actually runs can emit.
 
-    The pipeline constraint used to pin ``stop_token_ids`` to the codec EOS
-    (6561) unconditionally. With the multi-frame loop on, the vLLM-level head
-    is the two-wide continue/stop row, so the only sampleable ids are 0/1,
-    `check_stop` never matched, and every request ran to ``max_tokens`` (142s
-    per request, model finished at frame ~116). The pipeline default therefore
-    follows the head that runs: the multi-frame row next to the NPU worker,
-    which is the only place that injects the continue drafts, and the codec EOS
-    everywhere else.
+    The default follows the head: the two-wide continue/stop row next to the
+    NPU worker, and the codec EOS on every platform without that worker.
     """
     from vllm_omni.model_executor.models.minicpmo_4_5 import pipeline as mcp_pipeline
     from vllm_omni.platforms import current_omni_platform
