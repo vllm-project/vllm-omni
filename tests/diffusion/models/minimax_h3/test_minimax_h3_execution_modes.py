@@ -108,7 +108,8 @@ def test_prepare_encode_uses_the_same_mode_and_conditioning(pipeline, task, load
 
     request = _request(task)
     if not load_text_encoder:
-        conditioning = pipeline._prepare_local_conditioning(request.prompts[0], request.sampling_params)
+        conditioning, window_text = pipeline._prepare_local_conditioning(request.prompts[0], request.sampling_params)
+        assert window_text is None
         request.prompts[0] = {"additional_information": {"encoder_output": conditioning.to_omni_payload()}}
         pipeline.encode_prompt.reset_mock()
         pipeline.video_vae.encode_image.reset_mock()

@@ -466,6 +466,12 @@ def _source_output(payload) -> SimpleNamespace:
     )
 
 
+def _assert_same_tensor_view(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, check_stride=True)
+    assert actual.data_ptr() == expected.data_ptr()
+    assert actual.untyped_storage().data_ptr() == expected.untyped_storage().data_ptr()
+
+
 def _full_encoder_output() -> dict:
     return MiniMaxH3EncoderConditioning(
         hidden_states=torch.randn(4, 5120, dtype=torch.bfloat16),
@@ -524,8 +530,8 @@ def test_encoder_handoff_preserves_all_components(representation, with_media, vi
     # different dtype by the adapter. Empty FP32 optional slots remain on wire.
     assert output["hidden_states"]["output"] is payload["hidden_states"]["output"]
     if with_media:
-        assert output["embed"]["embedding"] is payload["embed"]["embedding"]
-        assert output["embed"]["speech_feat"] is payload["embed"]["speech_feat"]
+        for key in ("embedding", "speech_feat"):
+            _assert_same_tensor_view(output["embed"][key], payload["embed"][key])
     else:
         for tensor in output["embed"].values():
             assert tensor.shape == (0,)
@@ -641,8 +647,8 @@ def test_encoder_handoff_cleans_media_without_mutating_prompt_or_stripping_outpu
     assert info["meta"] == {"private": 42}
     assert set(info["hidden_states"]) == {"output"}
     assert info["hidden_states"]["output"] is retained_hidden
-    assert info["encoder_output"]["embed"]["embedding"] is incoming["embed"]["embedding"]
-    assert info["encoder_output"]["embed"]["speech_feat"] is incoming["embed"]["speech_feat"]
+    for key in ("embedding", "speech_feat"):
+        _assert_same_tensor_view(info["encoder_output"]["embed"][key], incoming["embed"][key])
     if not inline:
         assert info["encoder_output"] is incoming
     assert prompt["multi_modal_data"] is not None
