@@ -548,7 +548,6 @@ class OmniStagePoolingConfig:
     default_pooling_params: PoolingParams | None = None
 
 
-
 @_enforce_keyword_only_init
 @config(kw_only=True)
 class OmniStageLoadConfig(_TrackExplicitConfigFields, VllmLoadConfig):

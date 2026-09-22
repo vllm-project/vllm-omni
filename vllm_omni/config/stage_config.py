@@ -1259,19 +1259,23 @@ class StageConfig:
         # rationale as the platform-overlay deep-merge. Legacy atomic mappings
         # are handled explicitly below.
         for key, value in runtime_overrides.items():
-            if (
-                value is not None
-                and key not in _RUNTIME_ONLY_OVERRIDE_FIELDS
-                and key not in _TOPOLOGY_OWNED_ENGINE_FIELDS
-            ):
-                existing = engine_args.get(key)
-                # ``omni_kv_config`` is an atomic legacy override: callers use
-                # a partial mapping to replace the topology-provided transfer
-                # role, rather than to add fields to it.
-                if key != "omni_kv_config" and isinstance(existing, dict) and isinstance(value, dict):
-                    engine_args[key] = _get_recursively_merged_dict(existing, value)
-                else:
-                    engine_args[key] = value
+            if value is None or key in _RUNTIME_ONLY_OVERRIDE_FIELDS:
+                continue
+            if key in _TOPOLOGY_OWNED_ENGINE_FIELDS:
+                logger.warning(
+                    "Stage %s: ignoring runtime override for topology-owned field '%s'; keeping the pipeline value.",
+                    self.stage_id,
+                    key,
+                )
+                continue
+            existing = engine_args.get(key)
+            # ``omni_kv_config`` is an atomic legacy override: callers use
+            # a partial mapping to replace the topology-provided transfer
+            # role, rather than to add fields to it.
+            if key != "omni_kv_config" and isinstance(existing, dict) and isinstance(value, dict):
+                engine_args[key] = _get_recursively_merged_dict(existing, value)
+            else:
+                engine_args[key] = value
 
         # Terminal-stage ownership comes from topology, not engine overrides.
         engine_args["final_output"] = self.final_output

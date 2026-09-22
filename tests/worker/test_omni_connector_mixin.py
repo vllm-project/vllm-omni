@@ -996,7 +996,7 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
 
         self.assertEqual(results, {"r1": payload})
         self.assertEqual(host.get_local_stage_payload("r1"), payload)
-        self.assertIsNone(host.get_local_request_metadata("r1"))
+        self.assertEqual(host.get_local_request_metadata("r1"), SchedulingMetadataUpdate(input_terminal=True))
         self.assertEqual(host._stage_recv_req_ids, {"r1"})
         self.assertNotIn("r1", host._pending_load_reqs)
         self.assertEqual(tp_group.broadcast_inputs, [None])
@@ -1136,6 +1136,7 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
 
     def test_poll_single_request_accepts_tensor_audio_codes(self):
         host = self._make_host(rank=0)
+        host._scheduling_metadata_adapter = MagicMock()
         audio_codes = torch.tensor([[10, 11, 12]], dtype=torch.long)
         payload = {
             "codes": {"audio": audio_codes},
@@ -1153,6 +1154,28 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
         self.assertTrue(torch.equal(cached_payload["codes"]["audio"], audio_codes))
         self.assertIn("r1", host._finished_load_reqs)
         self.assertIn("r1", host._async_chunk_updated_req_ids)
+        self.assertEqual(
+            host.get_omni_connector_output().request_metadata,
+            {"r1": SchedulingMetadataUpdate(prompt_token_ids=(10, 11, 12))},
+        )
+        host._scheduling_metadata_adapter.extract.assert_not_called()
+        host.shutdown_omni_connectors()
+
+    def test_finish_only_chunk_publishes_terminal_metadata_to_sink(self):
+        host = self._make_host(rank=0)
+        host._omni_connector.get.return_value = ({"meta": {"finished": torch.tensor(True)}}, 1)
+        sink = MagicMock()
+        host.set_omni_connector_output_sink(sink)
+
+        with patch.object(host, "_get_local_tp_group", return_value=None):
+            self.assertTrue(host._poll_single_request("r1"))
+
+        sink.assert_called_once()
+        output = sink.call_args.args[0]
+        self.assertEqual(output.chunk_ready_req_ids, {"r1"})
+        self.assertEqual(output.chunk_finished_req_ids, {"r1"})
+        self.assertEqual(output.request_metadata, {"r1": SchedulingMetadataUpdate(input_terminal=True)})
+        self.assertEqual(host.get_omni_connector_output().request_metadata, {})
         host.shutdown_omni_connectors()
 
     def test_tp_follower_skips_connector_poll_for_async_chunk(self):
@@ -1352,7 +1375,7 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         self.assertTrue(host._payload_is_consumable(payload))
         host.shutdown_omni_connectors()
 
-    def test_ar_metadata_only_followup_chunk_does_not_publish_scheduler_metadata(self):
+    def test_ar_metadata_only_followup_chunk_uses_builtin_adapter(self):
         host = MixinHost()
         host.init_omni_connectors(
             model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
@@ -1388,7 +1411,7 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         host._poll_single_request("r1")
         output2 = host.get_omni_connector_output()
         self.assertEqual(output2.chunk_ready_req_ids, set())
-        self.assertEqual(output2.request_metadata, {})
+        self.assertEqual(output2.request_metadata, {"r1": SchedulingMetadataUpdate(resize_prompt_to=7)})
         host._scheduling_metadata_adapter.extract.assert_not_called()
 
         host.shutdown_omni_connectors()

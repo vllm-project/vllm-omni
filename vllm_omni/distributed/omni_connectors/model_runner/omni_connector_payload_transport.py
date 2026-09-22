@@ -8,6 +8,7 @@ import importlib
 import inspect
 from collections import deque
 from collections.abc import Callable
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -20,6 +21,7 @@ from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime i
     should_accumulate_full_payload_output,
 )
 from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
+from vllm_omni.worker.scheduling_metadata_adapter import DefaultSchedulingMetadataAdapter
 
 if TYPE_CHECKING:
     from vllm_omni.distributed.omni_connectors.connectors.base import (
@@ -52,13 +54,20 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         """Retrieve the pending scheduler-visible update for a request."""
         return self._local_request_metadata.get(req_id)
 
-    def _extract_scheduling_metadata_update(self, payload: OmniPayload) -> SchedulingMetadataUpdate | None:
-        update = self._scheduling_metadata_adapter.extract(payload, model_mode=self._model_mode)
+    def _extract_scheduling_metadata_update(
+        self, payload: dict[str, Any] | OmniPayload
+    ) -> SchedulingMetadataUpdate | None:
+        # Native async receive keeps the built-in interpretation. Configured
+        # adapters remain scoped to the full-payload receive transaction.
+        adapter = DefaultSchedulingMetadataAdapter() if self._async_chunk else self._scheduling_metadata_adapter
+        update = adapter.extract(cast(OmniPayload, payload), model_mode=self._model_mode)
         if update is not None and not isinstance(update, SchedulingMetadataUpdate):
             raise TypeError(
                 "scheduling_metadata_adapter.extract must return None or "
                 f"SchedulingMetadataUpdate, got {type(update).__name__}"
             )
+        if self._payload_finished(payload):
+            update = replace(update or SchedulingMetadataUpdate(), input_terminal=True)
         return update
 
     # ------------------------------------------------------------------ #
@@ -1064,10 +1073,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 else:
                     self._local_stage_payload_cache[req_id] = payload_data
                 self._async_chunk_updated_req_ids.add(req_id)
-                # Runner-owned async receive is not wired into the current
-                # scheduler. Add typed metadata extraction only when async
-                # registration, consumption, and failure propagation migrate
-                # together from OmniChunkTransferAdapter.
+                update = self._extract_scheduling_metadata_update(self._local_stage_payload_cache[req_id])
+                if update is not None:
+                    self._local_request_metadata[req_id] = update
                 # A finish-only sentinel still needs one terminal wake-up so
                 # the downstream stage can sync the merged local payload and
                 # flush/finish even when the last recv carries no new

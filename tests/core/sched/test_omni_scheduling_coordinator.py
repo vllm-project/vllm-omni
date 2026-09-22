@@ -125,6 +125,18 @@ def test_chunk_registration_ready_and_terminal_lifecycle():
     req.status = RequestStatus.WAITING_FOR_CHUNK
     coord.process_pending_chunks(waiting, [], set(), {"internal"})
     assert "internal" in coord.finished_requests
+    coord.update_request_metadata(
+        {"internal": req},
+        {"internal": SchedulingMetadataUpdate(input_terminal=True)},
+    )
+    unscheduled = SimpleNamespace(num_scheduled_tokens={})
+    assert coord.get_scheduled_input_terminal_req_ids(unscheduled) == set()
+    coord.postprocess_scheduler_output(SimpleNamespace(scheduled_new_reqs=[], scheduled_cached_reqs=None))
+    assert coord.input_terminal_req_ids == {"internal"}
+    scheduled = SimpleNamespace(num_scheduled_tokens={"internal": 1}, scheduled_new_reqs=[], scheduled_cached_reqs=None)
+    assert coord.get_scheduled_input_terminal_req_ids(scheduled) == {"internal"}
+    coord.postprocess_scheduler_output(scheduled)
+    assert coord.input_terminal_req_ids == set()
 
 
 def test_chunk_waiting_removes_request_from_running_list():
