@@ -4,7 +4,7 @@ One Talker prefill forward is ~18.4 ms of host dispatch wrapped around 1-3 ms
 of device work (three back-to-back forwards never accumulate more than 0.07 ms
 of drain), and a request pays roughly one of them -- all but a couple of
 milliseconds of it removable. The decode side of this problem was solved by
-`fixed_kv_decode`; this module is the same idea for the prefill shape.
+`static_shape_decode`; this module is the same idea for the prefill shape.
 
 ## Why a padded prefill replays exactly
 
@@ -140,7 +140,7 @@ def maybe_mark_step(attn_metadata: Any, prefill_state: Any, block_size_hint: int
     """Builder hook: route an eligible prefill step onto its captured graph.
 
     Cheap, and refuses everything unusual: called once per step from
-    ``OmniFixedKVMetadataBuilder.build``. When it marks the step, it also
+    ``OmniStaticShapeMetadataBuilder.build``. When it marks the step, it also
     fills the persistent slot buffer -- real slots for the real rows, the
     request's own next slots for the padding, one device add with no sync.
     """
@@ -190,7 +190,7 @@ def maybe_mark_step(attn_metadata: Any, prefill_state: Any, block_size_hint: int
         arange = _state.aranges[bucket]
         blocks = block_table[0].index_select(0, (arange // block_size).to(torch.int64))
         torch.add(arange % block_size, blocks * block_size, out=_state.slot_buffers[bucket])
-    attn_metadata.fixed_kv_prefill_bucket = bucket
+    attn_metadata.static_shape_prefill_bucket = bucket
 
 
 def replay(attn_metadata: Any) -> torch.Tensor | None:
@@ -203,7 +203,7 @@ def replay(attn_metadata: Any) -> torch.Tensor | None:
     """
     if isinstance(attn_metadata, dict):
         attn_metadata = next(iter(attn_metadata.values()), None)
-    bucket = getattr(attn_metadata, "fixed_kv_prefill_bucket", None)
+    bucket = getattr(attn_metadata, "static_shape_prefill_bucket", None)
     if bucket is None:
         return None
     entry = _state.graphs.get(bucket)

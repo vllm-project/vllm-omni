@@ -56,7 +56,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, attn_selector_config, num_heads: int | None = None):
-        """Route short-context decoders onto the fixed-KV decode backend.
+        """Route short-context decoders onto the static-shape decode backend.
 
         Under FULL_DECODE_ONLY the captured decode step has to re-issue attention on
         every layer on every step, because the op takes the KV length as a host
@@ -71,18 +71,18 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
             return resolved
         from vllm.config import get_current_vllm_config
 
-        from vllm_omni.platforms.npu.attention import fixed_kv_decode
+        from vllm_omni.platforms.npu.attention import static_shape_decode
 
-        if not fixed_kv_decode.is_enabled():
+        if not static_shape_decode.is_enabled():
             return resolved
         vllm_config = get_current_vllm_config()
         max_model_len = getattr(getattr(vllm_config, "model_config", None), "max_model_len", None)
         block_size = getattr(getattr(vllm_config, "cache_config", None), "block_size", None)
-        capacity = fixed_kv_decode.capacity_for(max_model_len, block_size) if max_model_len and block_size else None
-        fixed_kv_decode.install_into_ascend_aclgraph()
+        capacity = static_shape_decode.capacity_for(max_model_len, block_size) if max_model_len and block_size else None
+        static_shape_decode.install_into_ascend_aclgraph()
         if capacity:
             logger.info(
-                "[minicpmo] fixed-KV decode attention on (max_model_len=%s, kv_capacity=%s); "
+                "[minicpmo] static-shape decode attention on (max_model_len=%s, kv_capacity=%s); "
                 "set VLLM_OMNI_FIXED_KV_DECODE=0 to disable",
                 max_model_len,
                 capacity,
@@ -91,10 +91,10 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
             # The backend class is still returned; it declines for this
             # max_model_len, so no bucket is captured and nothing engages.
             logger.info(
-                "[minicpmo] fixed-KV decode attention not engaged (max_model_len=%s is above the context ceiling)",
+                "[minicpmo] static-shape decode attention not engaged (max_model_len=%s is above the context ceiling)",
                 max_model_len,
             )
-        return "vllm_omni.platforms.npu.attention.fixed_kv_backend.OmniFixedKVAttentionBackend"
+        return "vllm_omni.platforms.npu.attention.static_shape_backend.OmniStaticShapeAttentionBackend"
 
     # conv2d convolution operator in the code2wav module of Qwen3-TTS not being able to run on Aclnn
     def __init__(self) -> None:

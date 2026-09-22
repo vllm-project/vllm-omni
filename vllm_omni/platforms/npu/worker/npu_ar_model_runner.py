@@ -116,16 +116,16 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     """Autoregressive NPU model runner that returns hidden states per request."""
 
     # vllm-ascend's ascend-graph wrapper reads this flag from the runner, but
-    # the vllm-ascend build this image ships never sets it -- the fixed-KV
+    # the vllm-ascend build this image ships never sets it -- the static-shape
     # capture path would raise AttributeError without a default here.
     enable_hamming_sparse: bool = False
 
     def __init__(self, *args, **kwargs):
-        from vllm_omni.platforms.npu.attention import fixed_kv_decode
+        from vllm_omni.platforms.npu.attention import static_shape_decode
 
         # Before parent init: vLLM's selector uses current_platform
         # (vllm-ascend), not NPUOmniPlatform.get_attn_backend_cls.
-        fixed_kv_decode.install_into_ascend_backend()
+        static_shape_decode.install_into_ascend_backend()
         super().__init__(*args, **kwargs)
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         # each model stage has their own hidden size
@@ -180,7 +180,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             return super()._check_and_update_cudagraph_mode(*args, **kwargs)
 
     def _capture_cudagraphs(self, *args, **kwargs):
-        """Capture fixed-KV decode graphs per KV capacity bucket.
+        """Capture static-shape decode graphs per KV capacity bucket.
 
         Each bucket needs its own pass: the default path leaves the capacity unset
         and would file the graphs under a key decode never looks up. Signature is
@@ -188,15 +188,15 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         extra ``profiler`` argument that this override must not swallow."""
         from vllm.config import CUDAGraphMode
 
-        from vllm_omni.platforms.npu.attention import fixed_kv_decode
+        from vllm_omni.platforms.npu.attention import static_shape_decode
 
         runtime_mode = kwargs.get("cudagraph_runtime_mode")
         if runtime_mode is None and len(args) >= 2:
             runtime_mode = args[1]
         buckets: tuple[int, ...] = ()
         if runtime_mode == CUDAGraphMode.FULL:
-            buckets = fixed_kv_decode.buckets_for(
-                fixed_kv_decode.capacity_for(
+            buckets = static_shape_decode.buckets_for(
+                static_shape_decode.capacity_for(
                     self.vllm_config.model_config.max_model_len,
                     self.vllm_config.cache_config.block_size,
                 ),
@@ -206,8 +206,8 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             return super()._capture_cudagraphs(*args, **kwargs)
         with self._narrow_decode_query_len():
             for capacity in sorted(buckets, reverse=True):
-                logger.info("[minicpmo] capturing fixed-KV decode graphs at kv_capacity=%d", capacity)
-                with fixed_kv_decode.capturing_bucket(capacity):
+                logger.info("[minicpmo] capturing static-shape decode graphs at kv_capacity=%d", capacity)
+                with static_shape_decode.capturing_bucket(capacity):
                     super()._capture_cudagraphs(*args, **kwargs)
 
     def propose_draft_token_ids(self, valid_sampled_token_ids, *args, **kwargs):

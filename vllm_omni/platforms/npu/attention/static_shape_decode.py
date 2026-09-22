@@ -14,12 +14,12 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-"""Fixed-capacity decode attention: full-graph replay without per-step rebinding.
+"""Static-shape decode attention: full-graph replay without per-step rebinding.
 
 Vendored from vllm-ascend (Apache-2.0) so that vLLM-Omni can deliver it
 without patching vllm-ascend: everything this module needs from vllm-ascend is
 reachable through factories vLLM-Omni already overrides, so the rest of the
-change lives in ``fixed_kv_backend.py`` and in ``NPUOmniPlatform``.
+change lives in ``static_shape_backend.py`` and in ``NPUOmniPlatform``.
 
 ``FULL_DECODE_ONLY`` captures a whole decode step, but
 ``npu_fused_infer_attention_score`` takes ``actual_seq_lengths_kv`` as a host
@@ -105,7 +105,7 @@ def is_enabled() -> bool:
 
 
 class _CapacityEntries(dict):
-    """The wrapper's entries dict, plus one dict per fixed-KV capacity.
+    """The wrapper's entries dict, plus one dict per static-shape capacity.
 
     Sleep mode's ``reset_all_graph_params`` clears whatever dict is installed on
     the wrapper, so the per-capacity dicts hang off it rather than off the
@@ -126,7 +126,7 @@ class _CapacityEntries(dict):
 def install_into_ascend_aclgraph() -> None:
     """Give the image's ACLGraphWrapper a per-capacity key and drop a dead barrier.
 
-    Two things the stock wrapper does that are wrong for fixed-KV decode:
+    Two things the stock wrapper does that are wrong for static-shape decode:
 
     * It keys captured graphs on ``batch_descriptor`` alone. The KV capacity is
       baked into the captured tasks, so one batch size holds one graph *per
@@ -146,13 +146,13 @@ def install_into_ascend_aclgraph() -> None:
 
     It deliberately does **not** touch ``vllm_ascend.attention.fixed_kv_decode``:
     that module only exists in vllm-ascend builds carrying the out-of-tree
-    fixed-KV patch, and leaning on it would leave this change dependent on the
+    static-shape patch, and leaning on it would leave this change dependent on the
     patch it exists to replace.
     """
     from vllm_ascend.compilation import acl_graph
 
     wrapper_cls = acl_graph.ACLGraphWrapper
-    if getattr(wrapper_cls, "_omni_fixed_kv_call", False):
+    if getattr(wrapper_cls, "_omni_static_shape_call", False):
         return
     original_call = wrapper_cls.__call__
 
@@ -170,7 +170,7 @@ def install_into_ascend_aclgraph() -> None:
         # Only once the capture has recorded this (size, capacity) is there a
         # fixed graph to replay with nothing to order against; during the
         # capture itself the barrier still has to stand.
-        if not saved_enpu and _is_fixed_graph_here(capacity):
+        if not saved_enpu and _is_static_shape_graph_here(capacity):
             self.enable_enpu = True
         try:
             return original_call(self, *args, **kwargs)
@@ -179,12 +179,12 @@ def install_into_ascend_aclgraph() -> None:
             self.enable_enpu = saved_enpu
 
     wrapper_cls.__call__ = _call
-    wrapper_cls._omni_fixed_kv_call = True
-    logger.info("[minicpmo] fixed-KV: ACLGraphWrapper keyed per KV capacity, pre-replay barrier dropped")
+    wrapper_cls._omni_static_shape_call = True
+    logger.info("[minicpmo] static-shape: ACLGraphWrapper keyed per KV capacity, pre-replay barrier dropped")
 
 
-def _is_fixed_graph_here(capacity: int) -> bool:
-    """``is_fixed_graph`` for the batch size the forward context is about to run."""
+def _is_static_shape_graph_here(capacity: int) -> bool:
+    """``is_static_shape_graph`` for the batch size the forward context is about to run."""
     from vllm.forward_context import get_forward_context
 
     descriptor = getattr(get_forward_context(), "batch_descriptor", None)
@@ -205,18 +205,18 @@ def install_into_ascend_backend() -> None:
         return
     from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
 
-    from vllm_omni.platforms.npu.attention.fixed_kv_backend import (
-        OmniFixedKVAttentionBackendImpl,
-        OmniFixedKVMetadataBuilder,
+    from vllm_omni.platforms.npu.attention.static_shape_backend import (
+        OmniStaticShapeAttentionBackendImpl,
+        OmniStaticShapeMetadataBuilder,
     )
 
-    if getattr(AscendAttentionBackend, "_omni_fixed_kv_installed", False):
+    if getattr(AscendAttentionBackend, "_omni_static_shape_installed", False):
         return
-    AscendAttentionBackend.get_impl_cls = staticmethod(lambda: OmniFixedKVAttentionBackendImpl)
-    AscendAttentionBackend.get_builder_cls = staticmethod(lambda: OmniFixedKVMetadataBuilder)
-    AscendAttentionBackend._omni_fixed_kv_installed = True
+    AscendAttentionBackend.get_impl_cls = staticmethod(lambda: OmniStaticShapeAttentionBackendImpl)
+    AscendAttentionBackend.get_builder_cls = staticmethod(lambda: OmniStaticShapeMetadataBuilder)
+    AscendAttentionBackend._omni_static_shape_installed = True
     install_into_ascend_aclgraph()
-    logger.info("[minicpmo] installed omni fixed-KV impl/builder onto AscendAttentionBackend")
+    logger.info("[minicpmo] installed omni static-shape impl/builder onto AscendAttentionBackend")
 
 
 def capacity_for(max_model_len: int, block_size: int) -> int:
@@ -290,7 +290,7 @@ def current_capacity() -> int | None:
 def graph_key() -> int | None:
     """Extra ACL graph dispatch key, so one batch size can hold several buckets.
 
-    Read by vllm-ascend's ``ACLGraphWrapper`` in builds that carry the fixed-KV
+    Read by vllm-ascend's ``ACLGraphWrapper`` in builds that carry the static-shape
     hook; nothing in this package calls it directly.
     """
     return current_capacity() if is_enabled() else None
@@ -449,7 +449,7 @@ def captured_seq_lens(num_tokens: int) -> torch.Tensor | None:
     return None if captured is None else captured[0]
 
 
-def is_fixed_graph(num_tokens: int) -> bool:
+def is_static_shape_graph(num_tokens: int) -> bool:
     capacity = current_capacity()
     return capacity is not None and (num_tokens, capacity) in _captured_inputs
 

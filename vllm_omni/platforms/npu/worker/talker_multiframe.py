@@ -316,22 +316,22 @@ def begin_narrow_step(
     from vllm.forward_context import BatchDescriptor
 
     # The KV geometry required by narrow replay lives in
-    # platforms/npu/attention/fixed_kv_decode, which may be absent. Import
+    # platforms/npu/attention/static_shape_decode, which may be absent. Import
     # defensively: when missing, decline as documented and let the caller fall
     # back to wide replay; multi-frame decode and the stop chain are unaffected.
     try:
-        from vllm_omni.platforms.npu.attention import fixed_kv_decode
+        from vllm_omni.platforms.npu.attention import static_shape_decode
     except Exception:
-        fixed_kv_decode = None
+        static_shape_decode = None
 
-    if fixed_kv_decode is None:
-        return _decline("the fixed-KV decode backend is not present in this build")
+    if static_shape_decode is None:
+        return _decline("the static-shape decode backend is not present in this build")
     if not narrow_replay_enabled(runner) or inputs_embeds is None or positions is None:
         return None
     rows = len(spans)
     if rows <= 0:
         return None
-    seq_lens = fixed_kv_decode.captured_seq_lens(rows)
+    seq_lens = static_shape_decode.captured_seq_lens(rows)
     if seq_lens is None:
         return _decline(f"no one-query graph captured for {rows} rows")
     metadata = getattr(forward_context, "attn_metadata", None)
@@ -339,7 +339,7 @@ def begin_narrow_step(
         metadata = next(iter(metadata.values()), None)
     step_slot_mapping = getattr(metadata, "slot_mapping", None)
     live_seq_lens = getattr(metadata, "seq_lens_device", None)
-    graph_slot_mapping = fixed_kv_decode.captured_slot_mapping(rows)
+    graph_slot_mapping = static_shape_decode.captured_slot_mapping(rows)
     if step_slot_mapping is None or live_seq_lens is None or graph_slot_mapping is None:
         return _decline("this step's attention metadata carries no slot mapping")
     if step_slot_mapping.shape[0] < rows * frames:
@@ -431,7 +431,7 @@ def run(
 
     ``after_forward`` is the runner's post-forward graph bookkeeping. It is
     called after every replay because that is where it sits in the single-frame
-    path; under fixed-KV decode it is two pointer comparisons, and the frames of
+    path; under static-shape decode it is two pointer comparisons, and the frames of
     one step share their sequence lengths so there is nothing for it to rebind.
     """
     global _LOGGED_ENGAGE
