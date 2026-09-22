@@ -206,7 +206,7 @@ class FlashInferAttentionImpl(AttentionImpl):
     ) -> tuple[torch.Tensor, float]:
         if torch.finfo(to_dtype).bits == 8:
             scale_tensor = tensor.abs().amax().float().clamp_min(1e-6) / torch.finfo(to_dtype).max
-            tensor = (tensor * torch.reciprocal(scale_tensor).to(tensor.dtype)).to(to_dtype)
+            tensor = (tensor.float() * torch.reciprocal(scale_tensor)).to(to_dtype)
             return tensor, FlashInferAttentionImpl._extract_scalar(scale_tensor)
         return tensor.to(to_dtype), 1.0
 
