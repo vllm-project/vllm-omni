@@ -357,9 +357,6 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         if not isinstance(request_state, DuplexOrchestratorRequestState):
             raise RuntimeError(f"duplex request was not preregistered: {context.request_id}")
         request_state.streaming.enabled = submission.resumable
-        # Keep raw Stage0 prompt (additional_information / multi_modal_data) for
-        # stage input processors via process_engine_inputs.
-        request_state.prompt = dict(submission.prompt)
         if submission.resumable:
             request = build_engine_core_request_from_tokens(
                 request_id=context.request_id,
@@ -369,6 +366,11 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 resumable=True,
             )
         else:
+            # Keep raw Stage0 prompt (additional_information / multi_modal_data) for
+            # stage input processors via process_engine_inputs. Resumable requests
+            # leave it unset: their prompt is one append with Stage0's duplex
+            # buffer, which the async-chunk prewarm would copy downstream.
+            request_state.prompt = dict(submission.prompt)
             # Use the ordinary multimodal input processor for turn-model plugins.
             # Its CPU preprocessing runs off the session/orchestrator event loop.
             request = await asyncio.to_thread(
