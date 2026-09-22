@@ -171,17 +171,6 @@ model-native lane the audio is already streaming into the model before the
 commit, so the model may start answering — or emit a listen decision —
 without any commit at all.
 
-### Buffered OpenAI Realtime execution
-
-When `/v1/realtime` is served by the buffered OpenAI Realtime connection (for
-example, the Qwen3-Omni path), `response.create` starts one generation from a
-snapshot of the conversation and the audio committed before that request.
-Audio appended while that generation is running is retained for the next
-response; it is not injected into the already-running model request. This is
-different from the model-native lane described above, where the model itself
-consumes the live audio stream and can decide to speak or keep listening while
-it is generating.
-
 ### Consume responses
 
 `responses()` demultiplexes the event stream into one `ResponseHandle` per
