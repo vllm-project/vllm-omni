@@ -33,9 +33,12 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
-from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
+from vllm_omni.core.prefix_cache import stage_prefix_cache_config
+from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
+from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
+from vllm_omni.model_executor.models.model_local_kv import collect_model_local_kv_specs
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -77,7 +80,7 @@ def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dic
     return {key: value for key, value in kwargs.items() if key in accepted}
 
 
-class OmniGPUModelRunner(GPUModelRunner):
+class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
     intermediate_tensors: IntermediateTensors | None
 
     def __init__(self, *args, **kwargs):
@@ -85,11 +88,16 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.model_intermediate_buffer: dict[str, dict[str, Any]] = {}
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
-        # The Omni tensor prefix cache will be allocated
-        # when we initialize the metadata builders if enabled
+        # Omni prefix cache (hidden / per-token mm tensors reused on prefix
+        # hits). Built once, on the first real step after load_model: the
+        # config is staged at kv-cache init and cleared after construction.
         self.omni_prefix_cache = None
+        self._omni_prefix_cache_cfg = None
         self._sampled_token_ids_cpu_override = None
         self._omni_query_start_loc_model_kwarg = False
+        # Output-payload constant snapshotted once in load_model; the cache
+        # policy counterpart lives on PrefixCacheRunnerMixin.
+        self._pooler_payload_include_hidden_flag = True
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         override_fn = self._sampled_token_ids_cpu_override
@@ -170,15 +178,20 @@ class OmniGPUModelRunner(GPUModelRunner):
                                 device=sm.device,
                             )
 
-        # Initialize the wrapper for both multimodal output tensors
-        # and for hidden states to be passed between stages
-        if self.cache_config.enable_prefix_caching:
-            self.omni_prefix_cache = OmniTensorPrefixCache(
-                num_blocks=kv_cache_config.num_blocks,
-                block_size=self.cache_config.block_size,
-                hidden_size=self.model_config.get_hidden_size(),
-                hs_dtype=self.dtype,
-            )
+        # Stage the config; the manager is built on the first step once
+        # input_batch exists. The gate (pooling stage, kv_consumer, hybrid
+        # kv groups) is shared with the NPU runner.
+        cfg = stage_prefix_cache_config(
+            kv_cache_config=kv_cache_config,
+            cache_config=self.cache_config,
+            kv_transfer_config=getattr(self.vllm_config, "kv_transfer_config", None),
+            scheduler_config=self.scheduler_config,
+            model_config=self.model_config,
+            is_pooling_model=self.is_pooling_model,
+            speculative_config=self.speculative_config,
+        )
+        if cfg is not None:
+            self._omni_prefix_cache_cfg = cfg
 
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
@@ -190,10 +203,58 @@ class OmniGPUModelRunner(GPUModelRunner):
             if callable(candidate):
                 override_fn = candidate
         self._sampled_token_ids_cpu_override = override_fn
+        self._snapshot_prefix_cache_model_policy(model)
+        self._pooler_payload_include_hidden_flag = bool(getattr(model, "omni_pooler_payload_include_hidden", True))
         self._omni_query_start_loc_model_kwarg = bool(getattr(model, "supports_omni_query_start_loc", False))
         self._maybe_enable_output_token_ids_for_model_sampler()
         self._init_talker_mtp()
         self._prewarm_attention_capture_workspaces()
+        self._report_model_local_kv()
+
+    def _report_model_local_kv(self) -> None:
+        """Log attention KV this model holds outside the paged manager.
+
+        Reporting only. Two of these caches are captured into CUDA graphs
+        during ``load_model``, so NVML already charges them to the process
+        before ``determine_available_memory()`` samples it; subtracting the
+        declared total from the KV budget would double-count them. What is not
+        charged is the per-request half, which appears after profiling and
+        scales with ``max_num_seqs``.
+
+        Wrapped whole: a memory report has no business breaking model load,
+        and this runs on platforms these declarations have never been
+        exercised on.
+        """
+        try:
+            self._log_model_local_kv()
+        except Exception:
+            logger.warning("Model-local KV reporting failed; continuing", exc_info=True)
+
+    def _log_model_local_kv(self) -> None:
+        specs = collect_model_local_kv_specs(getattr(self, "model", None))
+        if not specs:
+            return
+        max_num_seqs = max(1, int(self.scheduler_config.max_num_seqs))
+        total = sum(spec.peak_bytes(max_num_seqs) for _, spec in specs)
+        logger.info(
+            "Model-local KV (outside the paged manager): %.2f MiB across %d declaration(s) at max_num_seqs=%d",
+            total / (1 << 20),
+            len(specs),
+            max_num_seqs,
+        )
+        for path, spec in specs:
+            logger.info(
+                "  %s.%s: %.2f MiB (%d rows from %s x %.2f MiB/row, scope=%s, %d positions from %s)",
+                path or type(self.model).__name__,
+                spec.name,
+                spec.peak_bytes(max_num_seqs) / (1 << 20),
+                spec.row_count(max_num_seqs),
+                spec.rows.value if spec.rows.value != "fixed" else f"fixed({spec.rows_fixed}; {spec.rows_reason})",
+                spec.bytes_per_row / (1 << 20),
+                spec.scope.value,
+                spec.physical_capacity_positions,
+                spec.capacity_source,
+            )
 
     def _maybe_enable_output_token_ids_for_model_sampler(self) -> None:
         if getattr(self.model, "logitsprocs_need_output_token_ids", False):
@@ -467,10 +528,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
-        # Used for prefix cache
-        if self.omni_prefix_cache is not None:
-            self.omni_prefix_cache.reset_prefix_cached_new_req_ids()
-
         # Remove finished requests from the cached states.
         # cleanup_finished_request lives on OmniConnectorModelRunnerMixin and
         # is only safe to call once init_omni_connectors() has finished
@@ -487,8 +544,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.requests.pop(req_id, None)
             self.model_intermediate_buffer.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
-            if self.omni_prefix_cache is not None:
-                self.omni_prefix_cache.discard_deferred_mm_outputs(req_id)
             if hasattr(self, "_downstream_payload_cache"):
                 self._downstream_payload_cache.pop(req_id, None)
             if hasattr(self, "_talker_mtp_generators"):
@@ -551,13 +606,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 req_state = self._update_streaming_request(req_id, new_req_data)
                 reqs_to_add.append(req_state)
                 continue
-
-            # Since this is the first time the request has been scheduled,
-            # num_computed_tokens > 0 means that we have a hit in prefix
-            # caching; mark it so that we can manage the hidden states
-            # later on as needed.
-            if self.omni_prefix_cache is not None and new_req_data.num_computed_tokens > 0:
-                self.omni_prefix_cache.add_prefix_cached_new_req_id(req_id)
 
             sampling_params = new_req_data.sampling_params
             pooling_params = new_req_data.pooling_params
@@ -642,7 +690,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self._init_mrope_positions(req_state)
 
             # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
-            if self.uses_xdrope_dim > 0:
+            if getattr(self, "uses_xdrope_dim", 0) > 0:
                 self._init_xdrope_positions(req_state)
 
             reqs_to_add.append(self.requests[req_id])
@@ -845,8 +893,8 @@ class OmniGPUModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def extract_multimodal_outputs(
-        self, hidden_states: torch.Tensor | list[torch.Tensor] | OmniOutput
-    ) -> tuple[Any, Any]:
+        self, hidden_states: torch.Tensor | list[torch.Tensor] | OmniOutput | IntermediateTensors
+    ) -> tuple[torch.Tensor | IntermediateTensors, OmniPayload | None]:
         if (
             hasattr(self.model, "have_multimodal_outputs")
             and self.model.have_multimodal_outputs
@@ -855,7 +903,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             text_hidden_states = hidden_states.text_hidden_states
             multimodal_outputs = hidden_states.multimodal_outputs
 
-        elif isinstance(hidden_states, torch.Tensor):
+        elif isinstance(hidden_states, (torch.Tensor, IntermediateTensors)):
             text_hidden_states = hidden_states
             multimodal_outputs = {}
         elif isinstance(hidden_states, list) or isinstance(hidden_states, tuple):
@@ -1116,7 +1164,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
             if self.uses_mrope:
                 positions = self.mrope_positions.gpu[:, :num_tokens_padded]
-            elif self.uses_xdrope_dim > 0:
+            elif getattr(self, "uses_xdrope_dim", 0) > 0:
                 positions = self.xdrope_positions.gpu[:, :num_tokens_padded]
             else:
                 positions = self.positions[:num_tokens_padded]
@@ -1178,6 +1226,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             else:
                 hidden_states = outputs
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
+            if isinstance(hidden_states, IntermediateTensors):
+                # Profiling/graph capture needs a tensor to select dummy sampler rows.
+                hidden_states = hidden_states["hidden_states"]
             if self.speculative_config and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
@@ -1650,7 +1701,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         if self.uses_mrope:
             positions = self.mrope_positions.gpu[:, :num_input_tokens]
-        elif self.uses_xdrope_dim > 0:
+        elif getattr(self, "uses_xdrope_dim", 0) > 0:
             positions = self.xdrope_positions.gpu[:, :num_input_tokens]
         else:
             positions = self.positions[:num_input_tokens]
@@ -1991,10 +2042,20 @@ class OmniGPUModelRunner(GPUModelRunner):
                     if req_state is not None:
                         existing = self.model_intermediate_buffer.setdefault(req_id, {})
                         existing.setdefault(out_key[0], {})[out_key[1]] = row
+                        validity_key = getattr(self.model, "talker_mtp_validity_key", None)
+                        if validity_key is not None:
+                            existing.setdefault(validity_key[0], {})[validity_key[1]] = torch.ones(
+                                (), dtype=torch.bool, device=code_predictor_codes.device
+                            )
                         req_state.additional_information_cpu = existing
             else:
                 for idx, req_id in enumerate(decode_req_ids):
                     update_dict = {out_key[0]: {out_key[1]: code_predictor_codes[idx : idx + 1]}}
+                    validity_key = getattr(self.model, "talker_mtp_validity_key", None)
+                    if validity_key is not None:
+                        update_dict.setdefault(validity_key[0], {})[validity_key[1]] = torch.ones(
+                            (), dtype=torch.bool, device=code_predictor_codes.device
+                        )
                     self._update_intermediate_buffer(req_id, update_dict)
 
     def _model_forward(
@@ -2025,7 +2086,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             **model_kwargs,
             **model_kwargs_extra,
         )
-        if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
+        if not isinstance(model_output, (OmniOutput, IntermediateTensors)) and hasattr(self.model, "make_omni_output"):
             model_output = self.model.make_omni_output(model_output, **model_kwargs, **model_kwargs_extra)
         # Cache model output so later sample_tokens can consume multimodal results.
         self._omni_last_model_output = model_output

@@ -19,6 +19,19 @@ from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
+_NATIVE_SINGLE_FILE_MODELS = {
+    "AnimaPipeline": ("AnimaModularPipeline",),
+}
+
+
+def resolve_native_single_file(model_class_name: str | None) -> str | None:
+    """Return the canonical native pipeline for a single-file model class."""
+    for canonical, aliases in _NATIVE_SINGLE_FILE_MODELS.items():
+        if model_class_name == canonical or model_class_name in aliases:
+            return canonical
+    return None
+
+
 _DIFFUSION_MODELS = {
     # arch:(mod_folder, mod_relname, cls_name)
     "QwenImagePipeline": (
@@ -55,6 +68,11 @@ _DIFFUSION_MODELS = {
         "ovis_image",
         "pipeline_ovis_image",
         "OvisImagePipeline",
+    ),
+    "MammothModa2DiTPipeline": (
+        "mammoth_moda2",
+        "pipeline_mammothmoda2_dit",
+        "MammothModa2DiTPipeline",
     ),
     "WanPipeline": (
         "wan2_2",
@@ -115,6 +133,11 @@ _DIFFUSION_MODELS = {
         "minimax_h3",
         "pipeline_minimax_h3",
         "MiniMaxH3Pipeline",
+    ),
+    "AuKPipeline": (
+        "auk",
+        "pipeline_auk",
+        "AuKPipeline",
     ),
     "StableAudioPipeline": (
         "stable_audio",
@@ -200,6 +223,11 @@ _DIFFUSION_MODELS = {
         "pi0",
         "pipeline_pi0",
         "Pi0Pipeline",
+    ),
+    "Pi05Pipeline": (
+        "pi05",
+        "pipeline_pi05",
+        "Pi05Pipeline",
     ),
     "LongCatImageEditPipeline": (
         "longcat_image",
@@ -346,6 +374,11 @@ _DIFFUSION_MODELS = {
         "pipeline_dreamzero",
         "DreamZeroPipeline",
     ),
+    "AnimaPipeline": (
+        "anima",
+        "pipeline_anima",
+        "AnimaPipeline",
+    ),
     "StableDiffusionXLPipeline": (
         "sdxl",
         "pipeline_sdxl",
@@ -372,11 +405,13 @@ DiffusionModelRegistry = _ModelRegistry(
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
+    "AnimaPipeline",
     # π0 is a flow-matching VLA with a self-contained sample_actions loop and no
     # DiT-style ``.transformer`` block list, so cache_dit / tea_cache cannot apply
     # to it; list it here so a stray cache_backend override disables gracefully
     # instead of erroring.
     "Pi0Pipeline",
+    "Pi05Pipeline",
     "LingBotWorldCausalDMDPipeline",
 }
 
@@ -548,11 +583,13 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     # `post_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
     "QwenImagePipeline": "get_qwen_image_post_process_func",
+    "AnimaPipeline": "get_anima_post_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_post_process_func",
     "GlmImagePipeline": "get_glm_image_post_process_func",
     "ZImagePipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
+    "MammothModa2DiTPipeline": "get_mammoth_moda2_post_process_func",
     "BooguImagePipeline": "get_boogu_image_post_process_func",
     "BooguImageTurboPipeline": "get_boogu_image_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",
@@ -567,6 +604,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
     "MiniMaxH3Pipeline": "get_minimax_h3_post_process_func",
     "MiniMaxH3ModularPipeline": "get_minimax_h3_post_process_func",
+    "AuKPipeline": "get_auk_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
@@ -580,6 +618,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "MingImagePipeline": "get_ming_image_post_process_func",
     "InternVLAA1Pipeline": "get_internvla_a1_post_process_func",
     "Pi0Pipeline": "get_pi0_post_process_func",
+    "Pi05Pipeline": "get_pi05_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
     "FluxKontextPipeline": "get_flux_kontext_post_process_func",

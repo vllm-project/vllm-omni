@@ -1,6 +1,7 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates.
 # Copyright (c) 2024 The Qwen Team and The HuggingFace Inc. team.
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # This file has been modified by ByteDance Ltd. and/or its affiliates.
 #
@@ -48,10 +49,10 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_sp_group,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
-from vllm_omni.diffusion.layers.mot.mot_layernorm import MoTRMSNorm
-from vllm_omni.diffusion.layers.mot.mot_qkv_parallel_linear import MoTQKVParallelLinear
-from vllm_omni.diffusion.layers.mot.mot_row_parallel_linear import MoTRowParallelLinear
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.models.bagel.mot.mot_layernorm import MoTRMSNorm
+from vllm_omni.diffusion.models.bagel.mot.mot_qkv_parallel_linear import MoTQKVParallelLinear
+from vllm_omni.diffusion.models.bagel.mot.mot_row_parallel_linear import MoTRowParallelLinear
 from vllm_omni.diffusion.utils.kv_utils import left_pad_stack
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 

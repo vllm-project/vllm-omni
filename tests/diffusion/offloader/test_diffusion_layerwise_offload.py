@@ -12,7 +12,7 @@ import pytest
 import torch
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks
 from tests.helpers.monitor import DeviceMemoryMonitor
 from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -34,8 +34,14 @@ IMAGE_VIDEO_MODELS: dict[str, dict[str, int | None]] = {
 MODELS: dict[str, dict[str, int | None]] = {**AUDIO_MODEL, **IMAGE_VIDEO_MODELS}
 
 MODEL_MARKS = {
-    "riverclouds/qwen_image_random": pytest.mark.core_model,
-    "stabilityai/stable-audio-open-1.0": pytest.mark.full_model,
+    "riverclouds/qwen_image_random": [
+        pytest.mark.core_model,
+        *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}),
+    ],
+    "stabilityai/stable-audio-open-1.0": [
+        pytest.mark.full_model,
+        *hardware_marks(res={"cuda": ["L4", "B200"], "rocm": "MI325"}),
+    ],
 }
 
 AUDIO_MODEL_PARAMS: dict[str, dict[str, Any]] = {
@@ -309,7 +315,6 @@ def test_stable_audio_requires_both_outputs(audio_no_offload, audio_offload, mes
 
 
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 @pytest.mark.parametrize(
     "model_name",
     [pytest.param(name, marks=MODEL_MARKS[name]) for name in MODELS],

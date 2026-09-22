@@ -1,0 +1,60 @@
+# Benchmark deploy config: LingBot-World 2.0 on four GPUs, Ulysses SP-4, compiled.
+#
+# This is the realtime topology. Two things differ from the single-GPU config,
+# and both matter to the number the benchmark reports:
+#
+#   parallel_config   Pure Ulysses sequence parallelism over four ranks. The
+#                     pipeline validates this: LingBot requires
+#                     sequence_parallel_size == ulysses_degree, ring_degree and
+#                     allgather_degree of 1, ulysses_mode "strict", and
+#                     ulysses_a2a_permute disabled. Pipeline, CFG, and VAE
+#                     parallel sizes above 1 are rejected. This config uses
+#                     TP=1; the validator does not reject larger TP sizes.
+#   enforce_eager     false puts LingBotDMDBlockRunner on the compiled path
+#                     (regional torch.compile with cudagraph step marking). The
+#                     first rollout therefore pays compile and capture cost --
+#                     use --warmup-sessions 1 before measured repetitions.
+#                     Chunk warmup only excludes the attention-window ramp.
+#
+# Serve it under a GPU reservation, since it needs four cards:
+#
+#   gpu run --gpus 4 -- vllm serve robbyant/lingbot-world-v2-14b-causal-fast-diffusers \
+#     --omni --deploy-config benchmarks/lingbot_world/configs/usp4_compiled.yaml \
+#     --port 8000
+#
+# `devices` is the rank->card mapping inside the reservation, so it stays
+# "0,1,2,3" no matter which physical cards CUDA_VISIBLE_DEVICES selected.
+
+pipeline: lingbot_world
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3"
+    max_num_seqs: 1
+    enforce_eager: false
+    model_class_name: LingBotWorldCausalDMDPipeline
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    step_execution: true
+    streaming_output: true
+    parallel_config:
+      tensor_parallel_size: 1
+      sequence_parallel_size: 4
+      ulysses_degree: 4
+      ring_degree: 1
+    default_sampling_params:
+      num_inference_steps: 4
+      output_type: pil
+      extra_args:
+        flow_shift: 5.0
+    model_config:
+      ar_diffusion_height: 480
+      ar_diffusion_width: 832
+      ar_diffusion_kv_config:
+        # Each rank holds its own shard of the paged KV cache, so the per-card
+        # fraction can stay at the single-GPU value; lower it if the four-rank
+        # start OOMs on smaller cards.
+        gpu_memory_fraction: 0.6
+        warmup_cudagraph: true

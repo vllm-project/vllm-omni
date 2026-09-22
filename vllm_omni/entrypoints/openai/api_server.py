@@ -6,6 +6,7 @@ This module owns app construction, server startup, app-state initialization,
 and route bodies that have not yet moved to endpoint-owned modules."""
 
 import asyncio
+import copy
 import dataclasses
 import json
 import multiprocessing
@@ -14,13 +15,17 @@ import os
 
 # Image generation API imports
 import random
+import signal
+import socket
 import time
 from argparse import Namespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from http import HTTPStatus
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
+import uvloop
 import vllm.envs as envs
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -80,16 +85,23 @@ from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils import random_uuid
-from vllm.utils.system_utils import decorate_logs
+from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.config.endpoint_policy import (
     shutdown_unsupported_routes,
 )
-from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.entrypoints.duplex.capability import should_enable_duplex_endpoint
+from vllm_omni.engine.stage_init_utils import set_death_signal
+from vllm_omni.engine.stage_runtime import OmniClientConfig
+from vllm_omni.entrypoints.async_omni import ABORT_TIMEOUT_S, AsyncOmni
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
-from vllm_omni.entrypoints.duplex.warmup import _warmup_duplex_realtime
+from vllm_omni.entrypoints.duplex.warmup import (
+    DUPLEX_WARMUP_CLIENT_WAIT_S,
+    _warmup_duplex_realtime,
+    lookup_duplex_plugin,
+    startup_warmup_kind,
+)
+from vllm_omni.entrypoints.duplex_omni import DuplexOmni
 from vllm_omni.entrypoints.openai import app_state as openai_app_state
 from vllm_omni.entrypoints.openai.app_state import (
     ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL,
@@ -121,6 +133,7 @@ from vllm_omni.entrypoints.openai.images.helpers import (
     _check_max_generated_image_size,
     _choose_output_format,
     _extract_images_from_result,
+    _generated_size_str,
     _get_max_edit_input_images,
     _load_input_images,
     _update_if_not_none,
@@ -138,6 +151,10 @@ from vllm_omni.entrypoints.openai.protocol.images import (
     ImageGenerationResponse,
     ResponseFormat,
 )
+from vllm_omni.entrypoints.openai.protocol.rollout import (
+    CreateSessionRequest,
+    RolloutStepRequest,
+)
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoDeleteResponse,
     VideoGenerationRequest,
@@ -146,11 +163,18 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
+from vllm_omni.entrypoints.openai.rollout_session import (
+    RolloutSessionCapacityError,
+    RolloutSessionClosedError,
+    RolloutSessionNotFoundError,
+)
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import (
+    LatentEditInput,
     OmniOpenAIServingVideo,
     ReferenceAudio,
     ReferenceImage,
@@ -191,6 +215,8 @@ from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingName
 logger = init_logger(__name__)
 router = APIRouter()
 
+VIDEO_ABORT_TIMEOUT_S = ABORT_TIMEOUT_S
+
 profiler_router = APIRouter()
 
 
@@ -219,8 +245,55 @@ async def omni_run_server(args, **uvicorn_kwargs) -> None:
     await omni_run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
 
 
-async def omni_run_server_worker(listen_address, sock, args, client_config=None, **uvicorn_kwargs) -> None:
+def run_omni_api_server_worker_proc(
+    listen_address: str,
+    sock: socket.socket,
+    args: TrackingNamespace,
+    client_config: dict[str, Any] | None = None,
+    **uvicorn_kwargs: object,
+) -> None:
+    """Entrypoint used by vLLM's API server process manager."""
+    set_death_signal(signal.SIGTERM)
+    manager_config = client_config or {}
+    client_index = int(manager_config.get("client_index", 0))
+    all_client_configs = getattr(args, "_omni_stage_client_configs", None)
+    if not all_client_configs or not 0 <= client_index < len(all_client_configs):
+        raise RuntimeError(f"Missing Omni stage client configuration for API server {client_index}")
+
+    omni_client_config: OmniClientConfig = copy.deepcopy(all_client_configs[client_index])
+    omni_client_config["client_count"] = int(manager_config.get("client_count", 1))
+    omni_client_config["client_index"] = client_index
+
+    stage_addresses = omni_client_config["stage_addresses"]
+    first_stage_id = min(stage_addresses)
+    first_replica_id = min(stage_addresses[first_stage_id])
+    first_addresses = stage_addresses[first_stage_id][first_replica_id]
+    for key in ("input_address", "output_address", "actual_address_pipe", "tensor_queue"):
+        if key in manager_config:
+            first_addresses[key] = manager_config[key]
+
+    set_process_title("APIServer", str(client_index))
+    decorate_logs("APIServer", skip_if_decorated=True)
+    uvloop.run(
+        omni_run_server_worker(
+            listen_address,
+            sock,
+            args,
+            client_config=omni_client_config,
+            **uvicorn_kwargs,
+        )
+    )
+
+
+async def omni_run_server_worker(
+    listen_address: str,
+    sock: socket.socket,
+    args: TrackingNamespace,
+    client_config: OmniClientConfig | None = None,
+    **uvicorn_kwargs: object,
+) -> None:
     """Run a single API server worker."""
+    api_server_count = _resolve_api_server_count(args, client_config)
 
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
         ToolParserManager.import_tool_parser(args.tool_parser_plugin)
@@ -260,6 +333,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
 
         # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
         app = build_openai_app(args, supported_tasks)
+        app.state.api_server_count = api_server_count
 
         # OMNI: Remove upstream routes that we override with omni-specific handlers
         remove_route_from_app(app, "/v1/chat/completions", {"POST"})
@@ -335,18 +409,22 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                 if scope["type"] == "http":
                     scope.setdefault("state", {})
                     scope["state"]["request_timestamp"] = time.time()
+
                 await self._inner(scope, receive, send)
 
-        # Startup duplex warmup (duplex_session.warmup_frames in the deploy
-        # yaml): real /v1/realtime connections wait on this event so the
-        # first client never pays cold-start costs.
+        # Startup duplex warmup: real /v1/realtime connections wait on this
+        # event. Video-required models (AURA) do this by default — one short
+        # audio chunk plus one frame — even when warmup_frames is 0. That is
+        # not another call to the empty 0.01 s JIT-kernel registry.
         duplex_warmup_frames = 0
+        warmup_kind = None
         if getattr(app.state, "openai_serving_duplex", None) is not None:
             duplex_cfg = getattr(engine_client, "duplex_session_config", None)
             duplex_warmup_frames = int(getattr(duplex_cfg, "warmup_frames", 0) or 0)
-        app.state.duplex_warmup_done = asyncio.Event() if duplex_warmup_frames > 0 else None
+            warmup_kind = startup_warmup_kind(lookup_duplex_plugin(engine_client), duplex_warmup_frames)
+        app.state.duplex_warmup_done = asyncio.Event() if warmup_kind is not None else None
         warmup_task: asyncio.Task | None = None
-        if duplex_warmup_frames > 0:
+        if warmup_kind is not None:
             # Scheduled before serve_http (which may not return until
             # shutdown); the coroutine retries its self-connect until the
             # server socket is accepting.
@@ -393,7 +471,7 @@ async def build_async_omni(
     args: TrackingNamespace,
     *,
     disable_frontend_multiprocessing: bool | None = None,
-    client_config: dict[str, Any] | None = None,
+    client_config: OmniClientConfig | None = None,
 ) -> AsyncIterator[EngineClient]:
     """Build an AsyncOmni instance from command-line arguments.
 
@@ -424,8 +502,41 @@ async def build_async_omni(
     async with build_async_omni_from_stage_config(
         args,
         disable_frontend_multiprocessing=disable_frontend_multiprocessing,
+        client_config=client_config,
     ) as async_omni:
         yield async_omni
+
+
+def _should_serve_duplex(model: str, kwargs: dict[str, Any]) -> bool:
+    """Select the serving engine without changing the model's duplex capability."""
+    from vllm_omni.config.config_factory import StageConfigFactory
+    from vllm_omni.config.stage_config import _DEPLOY_DIR, resolve_deploy_yaml
+
+    pipeline_config = StageConfigFactory.get_pipeline_config(
+        model=model,
+        trust_remote_code=bool(kwargs.get("trust_remote_code")),
+        deploy_config_path=kwargs.get("deploy_config"),
+    )
+    if pipeline_config is None or not getattr(pipeline_config, "duplex_plugin", None):
+        return False
+
+    deploy_path = kwargs.get("deploy_config")
+    if deploy_path is None:
+        if pipeline_config.default_deploy_config_name is None:
+            raise ValueError("A duplex-capable model requires a deploy config with session_mode: turn or duplex")
+        deploy_path = _DEPLOY_DIR / pipeline_config.default_deploy_config_name
+    else:
+        deploy_path = Path(deploy_path)
+        if not deploy_path.exists() and deploy_path.parent == Path("."):
+            deploy_path = _DEPLOY_DIR / deploy_path
+
+    # Resolve base_config too, so the API and stage workers use the same mode.
+    session_mode = resolve_deploy_yaml(deploy_path).get(
+        "session_mode", getattr(pipeline_config, "default_session_mode", None)
+    )
+    if session_mode not in ("turn", "duplex"):
+        raise ValueError("A duplex-capable model requires session_mode: turn or duplex in its deploy config")
+    return session_mode == "duplex"
 
 
 @asynccontextmanager
@@ -433,6 +544,7 @@ async def build_async_omni_from_stage_config(
     args: TrackingNamespace,
     *,
     disable_frontend_multiprocessing: bool = False,
+    client_config: OmniClientConfig | None = None,
 ) -> AsyncIterator[EngineClient]:
     """Create AsyncOmni from stage configuration.
 
@@ -485,9 +597,16 @@ async def build_async_omni_from_stage_config(
 
     try:
         kwargs = args.get_explicit_kwargs_dict()
+        # This controls only the API-process WebSocket and is not an AsyncOmni option.
+        kwargs.pop("robot_openpi_idle_timeout", None)
         model = kwargs.pop("model", None) or args.model
         kwargs.setdefault("log_stats", not args.disable_log_stats)
-        async_omni = AsyncOmni(model=model, **kwargs)
+        if client_config is not None:
+            kwargs["client_config"] = client_config
+        if _should_serve_duplex(model, kwargs):
+            async_omni = DuplexOmni(model=model, **kwargs)
+        else:
+            async_omni = AsyncOmni(model=model, **kwargs)
 
         # # Don't keep the dummy data in memory
         # await async_llm.reset_mm_cache()
@@ -496,6 +615,134 @@ async def build_async_omni_from_stage_config(
     finally:
         if async_omni:
             async_omni.shutdown()
+
+
+async def _init_duplex_app_state(
+    engine_client: DuplexOmni,
+    state: State,
+    args: Namespace,
+    base_model_paths: list[BaseModelPath],
+    vllm_config: Any,
+    request_logger: RequestLogger | None,
+) -> None:
+    """Minimal app state for a duplex server: only the surfaces a duplex session backs."""
+    state.vllm_config = vllm_config
+    state.diffusion_engine = None
+    state.openai_serving_models = OpenAIServingModels(
+        engine_client=engine_client,  # type: ignore[arg-type]
+        base_model_paths=base_model_paths,
+        lora_modules=None,
+    )
+    state.serving_tokenization = None
+    state.serving_tokens = None
+    # Replaced by the chat init below when the model serves chat.
+    state.online_renderer = None
+    for attribute in (
+        "openai_serving_chat_batch",
+        "openai_serving_completion",
+        "openai_serving_responses",
+        "openai_serving_embedding",
+        "openai_serving_pooling",
+        "openai_serving_classification",
+        "openai_serving_scores",
+        "openai_serving_transcription",
+        "openai_serving_translation",
+        "openai_serving_speech",
+        "openai_serving_audio_generate",
+        "openai_serving_video",
+        "openai_streaming_speech",
+        "openai_streaming_video",
+        "openai_streaming_video_output",
+        "openai_serving_realtime",
+        "openai_serving_realtime_robot",
+        "anthropic_serving_messages",
+    ):
+        setattr(state, attribute, None)
+    state.openai_serving_duplex = OmniDuplexSessionHandler(duplex_omni=engine_client)
+    # One engine, both surfaces. ``DuplexOmni`` extends ``AsyncOmni``, so the
+    # ordinary chat service runs on it unchanged: a chat request is a turn-based
+    # request on the same pipeline, not a session, and costs no admission slot.
+    state.openai_serving_chat = await _init_duplex_chat(engine_client, state, args, request_logger)
+    state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
+    state.server_load_metrics = 0
+    if state.openai_serving_chat is not None:
+        logger.info(
+            "Duplex mode: serving %s over /v1/realtime?duplex=1 and /v1/chat/completions",
+            engine_client.model,
+        )
+    else:
+        logger.info(
+            "Duplex mode: serving %s over /v1/realtime?duplex=1 only "
+            "(/v1/chat/completions unavailable: the model does not declare supports_chat_completions)",
+            engine_client.model,
+        )
+
+
+async def _init_duplex_chat(
+    engine_client: DuplexOmni,
+    state: State,
+    args: Namespace,
+    request_logger: RequestLogger | None,
+) -> OmniOpenAIServingChat | None:
+    """The ordinary chat service, on a duplex engine, when the model allows it.
+
+    Gated on ``DuplexCapabilities.supports_chat_completions`` so the decision
+    stays the model's: a duplex model that should not answer chat requests says
+    so in its plugin, and the route reports "not available" rather than
+    answering badly. ``endpoint_restrictions`` remains the per-deployment
+    opt-out on top of this.
+    """
+    if not engine_client.duplex_capabilities.supports_chat_completions:
+        return None
+    supported_tasks: set[str] = {"generate"}
+    if hasattr(engine_client, "get_supported_tasks"):
+        supported_tasks = set(await engine_client.get_supported_tasks())
+    if "generate" not in supported_tasks:
+        return None
+
+    resolved_chat_template = load_chat_template(args.chat_template)
+    if resolved_chat_template is None:
+        try:
+            tokenizer = await engine_client.get_tokenizer()
+        except Exception as exc:
+            logger.debug("Could not inspect tokenizer chat_template before duplex chat init: %s", exc)
+            tokenizer = None
+        if tokenizer is None or getattr(tokenizer, "chat_template", None) is None:
+            resolved_chat_template = _load_model_chat_template_json(args.model)
+
+    state.online_renderer = OnlineRenderer(
+        model_config=engine_client.model_config,
+        renderer=engine_client.renderer,
+        request_logger=request_logger,
+        chat_template=resolved_chat_template,
+        chat_template_content_format=args.chat_template_content_format,
+        trust_request_chat_template=args.trust_request_chat_template,
+        enable_auto_tools=args.enable_auto_tool_choice,
+        exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
+        tool_parser=args.tool_call_parser,
+        reasoning_parser=args.structured_outputs_config.reasoning_parser,
+        default_chat_template_kwargs=args.default_chat_template_kwargs,
+    )
+    return OmniOpenAIServingChat(
+        engine_client=engine_client,
+        models=state.openai_serving_models,
+        response_role=args.response_role,
+        online_renderer=state.online_renderer,
+        request_logger=request_logger,
+        chat_template=resolved_chat_template,
+        chat_template_content_format=args.chat_template_content_format,
+        default_chat_template_kwargs=args.default_chat_template_kwargs,
+        trust_request_chat_template=args.trust_request_chat_template,
+        return_tokens_as_token_ids=args.return_tokens_as_token_ids,
+        enable_auto_tools=args.enable_auto_tool_choice,
+        exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
+        tool_parser=args.tool_call_parser,
+        reasoning_parser=args.structured_outputs_config.reasoning_parser,
+        enable_prompt_tokens_details=args.enable_prompt_tokens_details,
+        enable_force_include_usage=args.enable_force_include_usage,
+        enable_log_outputs=args.enable_log_outputs,
+        enable_log_deltas=args.enable_log_deltas,
+    )
 
 
 async def omni_init_app_state(
@@ -547,6 +794,11 @@ async def omni_init_app_state(
     # For omni models
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
     model_name = served_model_names[0] if served_model_names else args.model
+
+    # Initialize the API surface for the selected engine, not just the model.
+    if isinstance(engine_client, DuplexOmni):
+        await _init_duplex_app_state(engine_client, state, args, base_model_paths, vllm_config, request_logger)
+        return
 
     # Pure Diffusion mode: use simplified initialization logic
     if is_pure_diffusion:
@@ -602,6 +854,10 @@ async def omni_init_app_state(
             engine_client=engine_client,
             model_name=model_name,
         )
+        if state.openai_serving_realtime_robot is not None:
+            state.rl_rollout_serving = ServingRLRollout(state.openai_serving_realtime_robot)
+        else:
+            state.rl_rollout_serving = None
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
@@ -924,17 +1180,6 @@ async def omni_init_app_state(
         else None
     )
     state.openai_serving_duplex = None
-    if state.openai_serving_chat is not None and should_enable_duplex_endpoint(
-        state.stage_configs,
-        config_path=getattr(engine_client, "config_path", None) or getattr(args, "deploy_config", None),
-    ):
-        state.openai_serving_duplex = OmniDuplexSessionHandler(
-            chat_service=state.openai_serving_chat,
-            served_model_name=model_name,
-            log_stats=state.log_stats,
-            duplex_session_config=getattr(engine_client, "duplex_session_config", None),
-            serving_runtime_adapter_path=getattr(engine_client, "duplex_serving_adapter_path", None),
-        )
     state.openai_serving_realtime = OpenAIServingRealtime(
         engine_client=engine_client,
         models=state.openai_serving_models,
@@ -947,6 +1192,7 @@ async def omni_init_app_state(
         stage_configs=state.stage_configs,
     )
     state.openai_serving_realtime_robot = None
+    state.rl_rollout_serving = None
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
@@ -1225,7 +1471,6 @@ async def list_voices(raw_request: Request):
     handler = Omnispeech(raw_request)
     if handler is None:
         return _create_speech_error_json_response(
-            raw_request,
             "The model does not support Speech API",
             err_type="NotFoundError",
             status_code=HTTPStatus.NOT_FOUND,
@@ -1253,6 +1498,42 @@ async def list_voices(raw_request: Request):
             uploaded_speakers.append(voice_entry)
 
     return JSONResponse(content={"voices": speakers, "uploaded_voices": uploaded_speakers})
+
+
+def _resolve_api_server_count(args: Namespace, client_config: OmniClientConfig | None) -> int:
+    """Resolve frontend topology once, from the launcher's client configuration."""
+    requested = getattr(args, "api_server_count", None)
+    actual = 1 if client_config is None else client_config.get("client_count")
+    if type(actual) is not int or actual < 1:
+        raise ValueError("API client configuration requires a positive integer client_count")
+    if requested is not None and (type(requested) is not int or requested < 1 or requested != actual):
+        raise ValueError("API server count does not match the frontend launch configuration")
+    return actual
+
+
+def _reject_process_local_state_with_multiple_api_workers(raw_request: Request, operation: str) -> None:
+    """Reject access to frontend state that is not shared across API workers."""
+    api_server_count = getattr(raw_request.app.state, "api_server_count", None)
+    if type(api_server_count) is not int or api_server_count < 1:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            detail="API worker topology is not initialized.",
+        )
+    if api_server_count > 1:
+        raise HTTPException(
+            status_code=HTTPStatus.CONFLICT.value,
+            detail=(
+                f"{operation} is not supported with --api-server-count > 1 because "
+                "the operation uses process-local frontend state"
+            ),
+        )
+
+
+async def _require_single_api_video_store(raw_request: Request) -> None:
+    # VIDEO_STORE and VIDEO_TASKS are process-local, including reads and
+    # cancellation. Keep this independent of the temporary diffusion launch
+    # restriction: enabling multi-API diffusion alone cannot make jobs shared.
+    _reject_process_local_state_with_multiple_api_workers(raw_request, "Asynchronous video jobs")
 
 
 @router.post(
@@ -1300,10 +1581,10 @@ async def upload_voice(
     Returns:
         JSON response with voice information
     """
+    _reject_process_local_state_with_multiple_api_workers(raw_request, "Runtime voice upload")
     handler = Omnispeech(raw_request)
     if handler is None:
         return _create_speech_error_json_response(
-            raw_request,
             "The model does not support Speech API",
             err_type="NotFoundError",
             status_code=HTTPStatus.NOT_FOUND,
@@ -1311,9 +1592,7 @@ async def upload_voice(
 
     try:
         if speaker_embedding is not None and audio_sample is not None:
-            return _create_speech_error_json_response(
-                raw_request, "'audio_sample' and 'speaker_embedding' are mutually exclusive"
-            )
+            return _create_speech_error_json_response("'audio_sample' and 'speaker_embedding' are mutually exclusive")
         if speaker_embedding is not None:
             result = await handler.upload_voice_embedding(speaker_embedding, consent, name)
         elif audio_sample is not None:
@@ -1325,18 +1604,15 @@ async def upload_voice(
                 speaker_description=speaker_description,
             )
         else:
-            return _create_speech_error_json_response(
-                raw_request, "Either 'audio_sample' or 'speaker_embedding' must be provided"
-            )
+            return _create_speech_error_json_response("Either 'audio_sample' or 'speaker_embedding' must be provided")
 
         return JSONResponse(content={"success": True, "voice": result})
 
     except ValueError as e:
-        return _create_speech_error_json_response(raw_request, str(e))
+        return _create_speech_error_json_response(str(e))
     except Exception as e:
         logger.exception(f"Failed to upload voice: {e}")
         return _create_speech_error_json_response(
-            raw_request,
             f"Failed to upload voice: {str(e)}",
             err_type="InternalServerError",
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -1365,10 +1641,10 @@ async def delete_voice(name: str, raw_request: Request):
     Returns:
         JSON response indicating success or failure
     """
+    _reject_process_local_state_with_multiple_api_workers(raw_request, "Runtime voice deletion")
     handler = Omnispeech(raw_request)
     if handler is None:
         return _create_speech_error_json_response(
-            raw_request,
             "The model does not support Speech API",
             err_type="NotFoundError",
             status_code=HTTPStatus.NOT_FOUND,
@@ -1379,7 +1655,6 @@ async def delete_voice(name: str, raw_request: Request):
         success = await handler.delete_voice(name)
         if not success:
             return _create_speech_error_json_response(
-                raw_request,
                 f"Voice '{name}' not found",
                 err_type="NotFoundError",
                 status_code=HTTPStatus.NOT_FOUND,
@@ -1388,11 +1663,10 @@ async def delete_voice(name: str, raw_request: Request):
         return JSONResponse(content={"success": True, "message": f"Voice '{name}' deleted successfully"})
 
     except ValueError as e:
-        return _create_speech_error_json_response(raw_request, str(e))
+        return _create_speech_error_json_response(str(e))
     except Exception as e:
         logger.exception(f"Failed to delete voice '{name}': {e}")
         return _create_speech_error_json_response(
-            raw_request,
             f"Failed to delete voice: {str(e)}",
             err_type="InternalServerError",
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -1458,21 +1732,22 @@ async def streaming_video_output(websocket: WebSocket):
 @router.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket):
     """WebSocket endpoint for OpenAI-style realtime interactions."""
-    # Hold real clients until the startup duplex warmup finishes (the warmup
-    # connection marks itself with vllm_omni_warmup=1 and passes through).
-    warmup_done = getattr(websocket.app.state, "duplex_warmup_done", None)
-    if warmup_done is not None and not warmup_done.is_set() and websocket.query_params.get("vllm_omni_warmup") != "1":
-        try:
-            await asyncio.wait_for(warmup_done.wait(), timeout=120)
-        except (TimeoutError, asyncio.TimeoutError):
-            logger.warning("Duplex warmup still running after 120 s; admitting the client anyway.")
     duplex_handler = getattr(websocket.app.state, "openai_serving_duplex", None)
     duplex_query = websocket.query_params.get("duplex")
     use_duplex_realtime = duplex_handler is not None and (
         duplex_query is None or (isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"})
     )
     if use_duplex_realtime and duplex_handler is not None:
+        if await _reject_multi_api_duplex(websocket):
+            return
+        await _wait_for_duplex_warmup(websocket)
         await duplex_handler.handle_realtime_session(websocket)
+        return
+
+    if isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"}:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "code": "unsupported", "error": "VAD realtime is not enabled"})
+        await websocket.close(code=1008)
         return
 
     serving = getattr(websocket.app.state, "openai_serving_realtime", None)
@@ -1485,6 +1760,37 @@ async def realtime_websocket(websocket: WebSocket):
     await connection.handle_connection()
 
 
+async def _wait_for_duplex_warmup(websocket: WebSocket) -> None:
+    """Hold real clients until the startup duplex warmup finishes.
+
+    The warmup connection marks itself with ``vllm_omni_warmup=1`` and passes through.
+    """
+    warmup_done = getattr(websocket.app.state, "duplex_warmup_done", None)
+    if warmup_done is not None and not warmup_done.is_set() and websocket.query_params.get("vllm_omni_warmup") != "1":
+        try:
+            await asyncio.wait_for(warmup_done.wait(), timeout=DUPLEX_WARMUP_CLIENT_WAIT_S)
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.warning(
+                "Duplex warmup still running after %d s; admitting the client anyway.",
+                DUPLEX_WARMUP_CLIENT_WAIT_S,
+            )
+
+
+@router.websocket("/v1/duplex")
+async def duplex_websocket(websocket: WebSocket):
+    """Alias of ``/v1/realtime?duplex=1``: the same Realtime duplex session protocol."""
+    if await _reject_multi_api_duplex(websocket):
+        return
+    await _wait_for_duplex_warmup(websocket)
+    handler = getattr(websocket.app.state, "openai_serving_duplex", None)
+    if handler is None:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "error": "Duplex API is not available", "code": "unsupported"})
+        await websocket.close()
+        return
+    await handler.handle_realtime_session(websocket)
+
+
 @router.websocket("/v1/realtime/robot/openpi")
 async def realtime_robot_openpi(websocket: WebSocket):
     """WebSocket endpoint for robot policy inference via OpenPI messages."""
@@ -1494,24 +1800,115 @@ async def realtime_robot_openpi(websocket: WebSocket):
 
     serving = getattr(websocket.app.state, "openai_serving_realtime_robot", None)
     if serving is None:
+        logger.warning(
+            "Rejecting robot OpenPI WebSocket: policy serving is disabled. "
+            "The diffusion stage must provide model_config.policy_server_config."
+        )
         await websocket.accept()
-        await websocket.send_json({"type": "error", "error": "Robot policy not available", "code": "unsupported"})
+        await websocket.send_json(
+            {
+                "type": "error",
+                "error": "Robot policy not available",
+                "code": "unsupported",
+            }
+        )
         await websocket.close()
         return
-    connection = RobotRealtimeConnection(websocket, serving)
+    state_args = getattr(websocket.app.state, "args", None)
+    configured_timeout = getattr(state_args, "robot_openpi_idle_timeout", 30.0)
+    idle_timeout = None if configured_timeout == 0 else configured_timeout
+    connection = RobotRealtimeConnection(websocket, serving, idle_timeout=idle_timeout)
     await connection.handle_connection()
 
 
-@router.websocket("/v1/duplex")
-async def duplex_websocket(websocket: WebSocket):
-    """WebSocket endpoint for vLLM-Omni duplex session control."""
-    handler = getattr(websocket.app.state, "openai_serving_duplex", None)
-    if handler is None:
-        await websocket.accept()
-        await websocket.send_json({"type": "error", "error": "Duplex API is not available", "code": "unsupported"})
-        await websocket.close()
-        return
-    await handler.handle_session(websocket)
+async def _reject_multi_api_duplex(websocket: WebSocket) -> bool:
+    # Session credentials and replay state are local to each frontend; a shared
+    # listening socket cannot route reconnects back to the session owner.
+    count = getattr(websocket.app.state, "api_server_count", None)
+    if count is None or (type(count) is int and count == 1):
+        return False
+    await websocket.accept()
+    await websocket.send_json(
+        {
+            "type": "error",
+            "error": "Duplex sessions require a single API worker with initialized topology.",
+            "code": "multi_api_duplex_unsupported",
+        }
+    )
+    await websocket.close(code=1008)
+    return True
+
+
+# RL Rollout serving (RFC #3747, P0)
+
+
+def _rl_rollout_serving(request: Request) -> ServingRLRollout:
+    serving = getattr(request.app.state, "rl_rollout_serving", None)
+    if serving is None:
+        raise HTTPException(status_code=501, detail="RL rollout serving not available for this model.")
+    return serving
+
+
+@router.post("/v1/realtime/sessions")
+async def create_rollout_session(body: CreateSessionRequest, request: Request):
+    serving = _rl_rollout_serving(request)
+    try:
+        return (await serving.create_session(body)).model_dump()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RolloutSessionCapacityError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.post("/v1/realtime/sessions/{session_id}/step")
+async def rollout_step(session_id: str, body: RolloutStepRequest, request: Request):
+    serving = _rl_rollout_serving(request)
+    response = await serving.step(session_id, body)
+    if response.error is not None:
+        status_code = None
+        if response.error.code == "session_not_found":
+            status_code = 404
+        elif response.error.code == "session_closed":
+            status_code = 410
+        elif response.error.code in {"invalid_request", "step_already_committed", "step_out_of_order"}:
+            status_code = 400
+        if status_code is not None:
+            return JSONResponse(content=response.model_dump(), status_code=status_code)
+    return response.model_dump()
+
+
+@router.post("/v1/realtime/sessions/{session_id}/reset")
+async def reset_rollout_session(session_id: str, request: Request):
+    serving = _rl_rollout_serving(request)
+    try:
+        return (await serving.reset_session(session_id)).model_dump()
+    except RolloutSessionNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Session {session_id!r} not found.")
+    except RolloutSessionClosedError:
+        raise HTTPException(status_code=410, detail=f"Session {session_id!r} is closed.")
+
+
+@router.post("/v1/realtime/sessions/{session_id}/close")
+async def close_rollout_session(session_id: str, request: Request):
+    serving = _rl_rollout_serving(request)
+    try:
+        await serving.close_session(session_id)
+        return {"session_id": session_id, "closed": True}
+    except RolloutSessionNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Session {session_id!r} not found.")
+    except RolloutSessionClosedError:
+        return {"session_id": session_id, "closed": True}
+
+
+@router.get("/v1/realtime/sessions/{session_id}/status")
+async def rollout_session_status(session_id: str, request: Request):
+    serving = _rl_rollout_serving(request)
+    try:
+        return (await serving.get_status(session_id)).model_dump()
+    except RolloutSessionNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Session {session_id!r} not found.")
+    except RolloutSessionClosedError:
+        raise HTTPException(status_code=410, detail=f"Session {session_id!r} is closed.")
 
 
 # Health and Model endpoints for diffusion mode
@@ -1590,7 +1987,9 @@ def _build_image_generation_response(
     output_format = _choose_output_format(request.output_format or "png", None)
     image_data = [
         ImageData(
-            b64_json=encode_image_base64_with_compression(image, format=output_format),
+            b64_json=encode_image_base64_with_compression(
+                image, format=output_format, output_compression=request.output_compression
+            ),
             revised_prompt=None,
         )
         for image in images
@@ -1605,8 +2004,9 @@ def _build_image_generation_response(
             peak_memory_mb=peak_memory_mb,
         ),
     }
-    if request.size is not None:
-        response_kwargs["size"] = request.size
+    size = _generated_size_str(images, request.size)
+    if size is not None:
+        response_kwargs["size"] = size
     response = ImageGenerationResponse(**response_kwargs)
     if request.response_format == ResponseFormat.FILE:
         return response.stream_response()
@@ -1654,6 +2054,8 @@ async def generate_images(
         )
 
     try:
+        width: int | None = None
+        height: int | None = None
         # Unify request construction for any multi-stage pipeline to avoid
         # divergence between /v1/images and /v1/chat/completions.
         if len(stage_configs) > 1:
@@ -1671,7 +2073,6 @@ async def generate_images(
                 "num_outputs_per_prompt": request.n,
             }
             if request.size is not None:
-                parse_size(request.size)
                 width, height = parse_size(request.size)
                 app_state_args = getattr(raw_request.app.state, "args", None)
                 _check_max_generated_image_size(app_state_args, width, height)
@@ -1725,7 +2126,7 @@ async def generate_images(
             )
 
         # Build params - pass through user values directly
-        prompt: OmniTextPrompt = {"prompt": request.prompt, "modalities": ["image"]}
+        prompt = OmniTextPrompt(prompt=request.prompt, modalities=["image"])
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
         gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
@@ -1741,12 +2142,11 @@ async def generate_images(
         if extra_args:
             gen_params.extra_args = extra_args
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
-        lora_request, lora_scale = _parse_lora_request(request.lora)
+        lora_request, lora_scale = _parse_lora_request(request.lora) if request.lora is not None else (None, None)
         _update_if_not_none(gen_params, "lora_request", lora_request)
         _update_if_not_none(gen_params, "lora_scale", lora_scale)
 
         # Parse and add size if provided
-        width, height = None, None
         if request.size:
             width, height = parse_size(request.size)
             size_str = f"{width}x{height}"
@@ -1912,9 +2312,9 @@ async def edit_images(
     try:
         # 2. Build prompt & images params
         cot_output = None
-        prompt: OmniTextPrompt = {"prompt": prompt, "modalities": ["image"]}
+        omni_prompt = OmniTextPrompt(prompt=prompt, modalities=["image"])
         if negative_prompt is not None:
-            prompt["negative_prompt"] = negative_prompt
+            omni_prompt["negative_prompt"] = negative_prompt
         input_images_list = []
         images = image or image_array
         urls = url or url_array
@@ -1945,17 +2345,17 @@ async def edit_images(
         # Hunyuan-aware behavior. RGBA/P uploads otherwise diverge from offline.
         normalize_edit_images_rgb = bot_task is not None or sys_type is not None
         pil_images = await _load_input_images(input_images_list, normalize_rgb=normalize_edit_images_rgb)
-        prompt["multi_modal_data"] = {}
-        prompt["multi_modal_data"]["image"] = pil_images
+        omni_prompt["multi_modal_data"] = {}
+        omni_prompt["multi_modal_data"]["image"] = pil_images
 
         if mask_image is not None:
             # Mask role is different (alpha channel matters); never normalize.
             loaded = await _load_input_images([mask_image], normalize_rgb=False)
-            prompt["multi_modal_data"]["mask_image"] = loaded[0]
+            omni_prompt["multi_modal_data"]["mask_image"] = loaded[0]
 
         if reference_image is not None:
             loaded = await _load_input_images([reference_image], normalize_rgb=normalize_edit_images_rgb)
-            prompt["multi_modal_data"]["reference_image"] = loaded[0]
+            omni_prompt["multi_modal_data"]["reference_image"] = loaded[0]
 
         # 3 Build sample params
         gen_params = OmniDiffusionSamplingParams()
@@ -2021,16 +2421,18 @@ async def edit_images(
         # Keep AR stage target grid in sync with requested output size.
         # GLM-Image consumes target_h/target_w via mm_processor_kwargs.
         if width is not None and height is not None:
-            prompt["mm_processor_kwargs"] = {
+            omni_prompt["mm_processor_kwargs"] = {
                 "target_h": height,
                 "target_w": width,
             }
             # Backward-compatible fallback for processors reading top-level fields.
-            prompt["height"] = height
-            prompt["width"] = width
+            omni_prompt["height"] = height
+            omni_prompt["width"] = width
 
         _update_if_not_none(gen_params, "width", width)
         _update_if_not_none(gen_params, "height", height)
+        gen_params.width_not_provided = size_was_auto
+        gen_params.height_not_provided = size_was_auto
 
         # 3.4 Add optional parameters ONLY if provided
         _update_if_not_none(gen_params, "num_inference_steps", num_inference_steps)
@@ -2125,7 +2527,7 @@ async def edit_images(
             if return_stage_metrics is not None:
                 extra_body["return_stage_metrics"] = return_stage_metrics
 
-            prompt_text = prompt.get("prompt", "")
+            prompt_text = omni_prompt.get("prompt", "")
             generation_result = await chat_handler.generate_diffusion_images(
                 prompt=prompt_text,
                 extra_body=extra_body,
@@ -2156,7 +2558,7 @@ async def edit_images(
                 engine_client=engine_client,
                 gen_params=gen_params,
                 stage_configs=stage_configs,
-                prompt=prompt,
+                prompt=omni_prompt,
                 request_id=request_id,
             )
             images = _extract_images_from_result(result)
@@ -2164,6 +2566,8 @@ async def edit_images(
             peak_memory_mb = getattr(result, "peak_memory_mb", None)
             response_metrics = getattr(result, "metrics", None) if return_stage_metrics else None
 
+        if images is None:
+            images = []
         logger.debug(f"Successfully generated {len(images)} image(s)")
 
         # Encode images to base64
@@ -2181,7 +2585,7 @@ async def edit_images(
             created=int(time.time()),
             data=image_data,
             output_format=output_format,
-            size=size_str,
+            size=_generated_size_str(images, size_str),
             cot_output=cot_output,
             metrics=_build_image_response_metrics(
                 response_metrics=response_metrics,
@@ -2207,6 +2611,7 @@ async def edit_images(
 
 @router.post(
     "/v1/videos",
+    dependencies=[Depends(_require_single_api_video_store)],
     responses={
         HTTPStatus.OK.value: {"model": VideoResponse},
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
@@ -2224,6 +2629,7 @@ async def create_video(
         ReferenceVideo | None,
         ReferenceAudio | None,
         str | None,
+        LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> VideoResponse:
     """Create an asynchronous video generation job.
@@ -2239,6 +2645,7 @@ async def create_video(
         reference_video,
         reference_audio,
         control_path,
+        latent_edit_input,
     ) = ctx
     ref = video_response_from_request(effective_model_name, request)
     await VIDEO_STORE.upsert(ref.id, ref)
@@ -2252,6 +2659,7 @@ async def create_video(
             reference_audio,
             control_path,
             app_state=raw_request.app.state,
+            latent_edit_input=latent_edit_input,
         )
     )
     await VIDEO_TASKS.upsert(ref.id, task)
@@ -2277,6 +2685,7 @@ async def create_video_sync(
         ReferenceVideo | None,
         ReferenceAudio | None,
         str | None,
+        LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> Response:
     """Synchronous video generation endpoint.
@@ -2296,6 +2705,7 @@ async def create_video_sync(
         reference_video,
         reference_audio,
         control_path,
+        latent_edit_input,
     ) = ctx
     request_id = f"video_sync-{random_uuid()}"
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
@@ -2309,6 +2719,7 @@ async def create_video_sync(
                     reference_image=reference_image,
                     reference_video=reference_video,
                     reference_audio=reference_audio,
+                    latent_edit_input=latent_edit_input,
                 ),
                 timeout=VIDEO_SYNC_TIMEOUT_S,
             ),
@@ -2332,7 +2743,7 @@ async def create_video_sync(
             detail=f"Video generation failed: {str(exc)}",
         ) from exc
     finally:
-        _cleanup_video_references(reference_video, reference_audio, control_path)
+        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
     inference_time_s = time.perf_counter() - started_at
 
     return Response(
@@ -2348,7 +2759,7 @@ async def create_video_sync(
     )
 
 
-@router.get("/v1/videos", response_model=VideoListResponse)
+@router.get("/v1/videos", response_model=VideoListResponse, dependencies=[Depends(_require_single_api_video_store)])
 async def list_videos(
     after: str | None = None,
     limit: int | None = Query(None, ge=0, le=100),
@@ -2385,7 +2796,7 @@ async def list_videos(
     return VideoListResponse(data=jobs, has_more=has_more, first_id=first_id, last_id=last_id)
 
 
-@router.get("/v1/videos/{video_id}", response_model=None)
+@router.get("/v1/videos/{video_id}", response_model=None, dependencies=[Depends(_require_single_api_video_store)])
 async def retrieve_video(video_id: str) -> VideoResponse | JSONResponse:
     """Retrieve metadata for a previously created video job.
 
@@ -2413,12 +2824,12 @@ async def retrieve_video(video_id: str) -> VideoResponse | JSONResponse:
     return job
 
 
-@router.delete("/v1/videos/{video_id}")
-async def delete_video(video_id: str) -> VideoDeleteResponse:
+@router.delete("/v1/videos/{video_id}", dependencies=[Depends(_require_single_api_video_store)])
+async def delete_video(video_id: str, raw_request: Request) -> VideoDeleteResponse:
     """Delete a stored video job and any generated output.
 
-    If the job is still queued or running, this endpoint first attempts to
-    cancel the in-flight generation task before removing the stored metadata.
+    In-flight jobs get a bounded engine abort, then frontend cancel. The job
+    is re-read afterwards so a completed save is not orphaned.
 
     Args:
         video_id: Identifier of the video job to delete.
@@ -2435,19 +2846,37 @@ async def delete_video(video_id: str) -> VideoDeleteResponse:
         raise HTTPException(status_code=404, detail="Video not found")
 
     if job.status in (VideoGenerationStatus.QUEUED, VideoGenerationStatus.IN_PROGRESS):
+        handler = raw_request.app.state.openai_serving_video
+        try:
+            await asyncio.wait_for(handler.abort_request(video_id), timeout=VIDEO_ABORT_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Timed out aborting video request %s after %.1fs; "
+                "engine abort is best-effort until the current batch drains",
+                video_id,
+                VIDEO_ABORT_TIMEOUT_S,
+            )
+        except Exception:
+            logger.exception("Failed to abort in-flight video request %s", video_id)
         task = await VIDEO_TASKS.get(video_id)
         if task is not None:
             task.cancel()
             try:
-                await asyncio.wait_for(task, timeout=2.0)
+                # Cancel cleanup may spend a full abort budget; +2s covers scheduling slack.
+                await asyncio.wait_for(task, timeout=VIDEO_ABORT_TIMEOUT_S + 2.0)
             except asyncio.TimeoutError:
                 raise HTTPException(status_code=409, detail="Cancellation in progress. Please try again later.")
             except asyncio.CancelledError:
                 pass
 
+        job = await VIDEO_STORE.get(video_id)
+        if job is None:
+            return VideoDeleteResponse(id=video_id, deleted=True)
+        if job.status in (VideoGenerationStatus.QUEUED, VideoGenerationStatus.IN_PROGRESS):
             await VIDEO_STORE.pop(video_id)
             return VideoDeleteResponse(id=job.id, deleted=True)
-    elif job.status is VideoGenerationStatus.FAILED:
+
+    if job.status is VideoGenerationStatus.FAILED:
         if job.file_name is not None:
             try:
                 await STORAGE_MANAGER.delete(video_id)
@@ -2465,7 +2894,7 @@ async def delete_video(video_id: str) -> VideoDeleteResponse:
     return VideoDeleteResponse(id=job.id, deleted=True)
 
 
-@router.get("/v1/videos/{video_id}/content")
+@router.get("/v1/videos/{video_id}/content", dependencies=[Depends(_require_single_api_video_store)])
 async def download_video(video_id: str) -> Response:
     """Download the generated file for a completed video job.
 
@@ -2558,6 +2987,7 @@ async def stop_profile(raw_request: Request, request: ProfileRequest | None = No
 
 @router.post("/v1/omni/sleep")
 async def omni_sleep(request: OmniSleepRequest, raw_request: Request):
+    _reject_process_local_state_with_multiple_api_workers(raw_request, "Sleep")
     engine_client = raw_request.app.state.engine_client
     sleeping_set = raw_request.app.state.sleeping_stages
     if not hasattr(engine_client, "sleep"):
@@ -2565,11 +2995,15 @@ async def omni_sleep(request: OmniSleepRequest, raw_request: Request):
     acks = await engine_client.sleep(stage_ids=request.stage_ids, level=request.level)
     for sid in request.stage_ids:
         sleeping_set.add(sid)
-    return {"status": "SUCCESS", "acks": [dataclasses.asdict(a) if dataclasses.is_dataclass(a) else a for a in acks]}
+    return {
+        "status": "SUCCESS",
+        "acks": [dataclasses.asdict(a) if dataclasses.is_dataclass(a) and not isinstance(a, type) else a for a in acks],
+    }
 
 
 @router.post("/v1/omni/wakeup")
 async def omni_wakeup(request: OmniWakeupRequest, raw_request: Request):
+    _reject_process_local_state_with_multiple_api_workers(raw_request, "Wakeup")
     engine_client = raw_request.app.state.engine_client
     sleeping_set = raw_request.app.state.sleeping_stages
     if not any(sid in sleeping_set for sid in request.stage_ids):
@@ -2580,7 +3014,10 @@ async def omni_wakeup(request: OmniWakeupRequest, raw_request: Request):
     for sid in request.stage_ids:
         if sid in sleeping_set:
             sleeping_set.remove(sid)
-    return {"status": "SUCCESS", "acks": [dataclasses.asdict(a) if dataclasses.is_dataclass(a) else a for a in acks]}
+    return {
+        "status": "SUCCESS",
+        "acks": [dataclasses.asdict(a) if dataclasses.is_dataclass(a) and not isinstance(a, type) else a for a in acks],
+    }
 
 
 if __name__ == "__main__":

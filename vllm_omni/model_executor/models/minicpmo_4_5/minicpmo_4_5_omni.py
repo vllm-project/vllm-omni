@@ -157,15 +157,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         del sampling_metadata
         self._minicpmo45_active_duplex_rows = [row.row_idx for row in rows]
         self._minicpmo45_duplex_row_sessions = {
-            row.row_idx: (row.session_id, row.incarnation) for row in rows if row.session_id is not None
+            row.row_idx: row.session_id for row in rows if row.session_id is not None
         }
         request_sessions = getattr(self, "_minicpmo45_duplex_request_sessions", None)
         if not isinstance(request_sessions, dict):
             request_sessions = {}
             self._minicpmo45_duplex_request_sessions = request_sessions
-        request_sessions.update(
-            {row.request_id: (row.session_id, row.incarnation) for row in rows if row.session_id is not None}
-        )
+        request_sessions.update({row.request_id: row.session_id for row in rows if row.session_id is not None})
         self._minicpmo45_duplex_row_payloads = {row.row_idx: row.payload for row in rows if row.payload is not None}
         self._minicpmo45_duplex_row_max_tokens = {
             row.row_idx: row.max_tokens for row in rows if row.max_tokens is not None
@@ -199,7 +197,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             force_listen = payload.get("force_listen") is True
             is_speech = payload.get("is_speech")
             segment_key = (row.request_id, row.seq if row.seq is not None else -1)
-            session_key = (row.session_id, row.incarnation) if row.session_id is not None else None
+            session_key = row.session_id
             if turn_eos_id >= 0 and session_key is not None:
                 state = helper_sessions.get(session_key) if isinstance(helper_sessions, dict) else None
                 pending_speech_context = (
@@ -326,16 +324,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         helper = self._duplex_data_plane_helper()
         session_id = str(duplex.get("session_id") or "")
-        try:
-            incarnation = int(duplex.get("incarnation", 0))
-        except (TypeError, ValueError):
-            incarnation = 0
         payload = duplex.get("payload")
         if not session_id or not isinstance(payload, dict):
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
             return input_ids, embeds, {"duplex": {"prefill_success": False, "reason": "bad_duplex_payload"}}
 
-        session_key = (session_id, incarnation)
+        session_key = session_id
         state = helper.sessions.get(session_key)
         if state is None:
             from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
@@ -377,8 +371,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             seq=seq,
             is_speech=bool(payload.get("is_speech", False)),
             final=bool(duplex.get("final")),
+            stage0_window=(duplex.get("stage0_window") if isinstance(duplex.get("stage0_window"), dict) else None),
         )
         update_result = dict(result)
+        if result.get("stage0_window_replaced") is True:
+            window = duplex.get("stage0_window", {})
+            logger.info(
+                "MiniCPM-o Stage-0 window replaced: mode=%s drop_units=%s tokens=%s seq=%s",
+                window.get("mode"),
+                window.get("drop_units"),
+                result.get("num_input_tokens"),
+                seq,
+            )
         update_result.pop("inputs_embeds", None)
         if result.get("success") is not True:
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
@@ -547,13 +551,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             )
 
             if isinstance(thinker_output, tuple):
-                embeds, text_hidden_states = thinker_output
+                _, text_hidden_states = thinker_output
             else:
                 text_hidden_states = thinker_output
 
             # Prepare hidden states for downstream stages
-            # Ensure correct shape: (batch_size, seq_len, hidden_dim)
-            if added_batch_dim:
+            # Ensure correct shape: (seq_len, hidden_dim)
+            if text_hidden_states.ndim == 3 and text_hidden_states.shape[0] == 1:
                 text_hidden_states = text_hidden_states.squeeze(0)
 
             # Return hidden states with latent in multimodal_outputs for stage_input_processors

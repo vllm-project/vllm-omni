@@ -135,6 +135,7 @@ class MockResponse:
 async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch):
     class FakeRealtimeClient:
         last_instance = None
+        instances: list = []
 
         def __init__(self, url):
             assert url == "ws://localhost:8000/v1/realtime?duplex=1"
@@ -143,6 +144,9 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
             self.sent = []
             self.response_count = 0
             self.ack_count = 0
+            self.silence_seconds = []
+            self.closed = 0
+            type(self).instances.append(self)
             type(self).last_instance = self
 
         async def __aenter__(self):
@@ -155,10 +159,22 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
             assert model == "openbmb/MiniCPM-o-4_5"
             self.configure_kwargs = kwargs
 
+        async def stream_silence(self, *, seconds, chunk_ms=200, until=None):
+            # A model-native session speaks off its seeded context once audio
+            # units arrive; the silence itself carries no content. The probe
+            # stops the silence as soon as the turn settles.
+            self.silence_seconds.append(seconds)
+            self._emit_response()
+            assert until is not None and until()
+            return 1.0
+
         async def send(self, event):
             self.sent.append(event)
             if event["type"] != "response.create":
                 return
+            self._emit_response()
+
+        def _emit_response(self):
             self.response_count += 1
             response_id = f"resp-{self.response_count}"
             now = time.monotonic()
@@ -168,7 +184,7 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
             )
             self.events.add(
                 {
-                    "type": "response.audio_transcript.delta",
+                    "type": "response.output_audio_transcript.delta",
                     "response_id": response_id,
                     "delta": f"turn {self.response_count}",
                 },
@@ -176,7 +192,7 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
             )
             self.events.add(
                 {
-                    "type": "response.audio.delta",
+                    "type": "response.output_audio.delta",
                     "response_id": response_id,
                     "delta": base64.b64encode(b"\x00\x00" * 2400).decode(),
                     "sample_rate_hz": 24_000,
@@ -210,7 +226,7 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
             self.ack_count += 1
 
         async def close_session(self, **_kwargs):
-            return None
+            self.closed += 1
 
     monkeypatch.setattr(
         "vllm_omni.benchmarks.patch.patch._RealtimeTTSProbe",
@@ -239,30 +255,27 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
         session=None,
     )
 
-    client = FakeRealtimeClient.last_instance
-    assert client.configure_kwargs["native_duplex"] is False
-    assert client.configure_kwargs["extra_body"] == {
-        "ref_audio": "data:audio/wav;base64,AAAA",
-        "return_stage_metrics": True,
-    }
-    assert client.sent == [
-        event
-        for index in range(4)
-        for event in (
-            {
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": f"text {index}"}],
-                },
-            },
-            {"type": "response.create"},
-        )
-    ]
-    assert client.ack_count == 4
+    # One session per utterance: a model-native duplex session takes its text
+    # once, in the session context, so it cannot be re-seeded for a second one.
+    sessions = FakeRealtimeClient.instances
+    assert len(sessions) == 4
+    for index, client in enumerate(sessions):
+        assert "native_duplex" not in client.configure_kwargs
+        assert client.configure_kwargs["extra_body"] == {
+            "ref_audio": "data:audio/wav;base64,AAAA",
+            "return_stage_metrics": True,
+            "duplex_initial_user_text": f"text {index}",
+            "force_listen_count": 0,
+        }
+        # The target text rides the session context, never a conversation item:
+        # a text-only response.create is rejected by a model-native session.
+        assert client.sent == []
+        assert client.silence_seconds and all(seconds > 0 for seconds in client.silence_seconds)
+        assert client.ack_count == 1
+        assert client.closed == 1
+
     assert output.success is True
-    assert output.generated_text == "turn 1 turn 2 turn 3 turn 4"
+    assert output.generated_text == "turn 1 turn 1 turn 1 turn 1"
     assert output.audio_duration == pytest.approx(0.4)
     assert output.ttft > 0
     assert output.audio_ttfp > output.ttft
@@ -281,26 +294,32 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
             "session_id": session_id,
             "request_index": index,
             "utterance_id": f"utt-{index}",
-            "response_id": f"resp-{index + 1}",
+            # Response ids are per session, and each utterance now gets its own.
+            "response_id": "resp-1",
             "source": "client_monotonic_receive",
             "measurement_origin": {
-                "ttft": "conversation.item.create client send to first non-empty text delta",
-                "ttfp": "conversation.item.create client send to first audio packet",
+                "ttft": "first silence append client send to first non-empty text delta",
+                "ttfp": "first silence append client send to first audio packet",
                 "rtf": "request-start-to-last-audio receive time divided by emitted audio duration",
+                "tpot": "Stage-0 engine mean time per output token",
             },
             "ttft_ms": pytest.approx(20.0, abs=2.0),
+            "tpot_ms": 10.0,
             "ttfp_ms": pytest.approx(30.0, abs=2.0),
             "rtf": pytest.approx(0.3, abs=0.03),
             "audio_generation_ms": pytest.approx(30.0, abs=2.0),
             "audio_duration_ms": 100.0,
         }
-    assert output.duplex_session_metrics == {
-        "session_id": session_id,
-        "audio_turn_count": 4,
-        "mean_ttft_ms": pytest.approx(20.0, abs=2.0),
-        "mean_ttfp_ms": pytest.approx(30.0, abs=2.0),
-        "mean_rtf": pytest.approx(0.3, abs=0.03),
-    }
+    session = output.duplex_session_metrics
+    assert session["session_id"] == session_id
+    assert session["audio_turn_count"] == 4
+    assert session["ttft_ms"]["count"] == 4
+    assert session["ttft_ms"]["mean"] == pytest.approx(20.0, abs=2.0)
+    assert session["tpot_ms"] == {"count": 4, "mean": 10.0, "p50": 10.0, "p99": 10.0}
+    assert session["ttfp_ms"]["count"] == 4
+    assert session["ttfp_ms"]["mean"] == pytest.approx(30.0, abs=2.0)
+    assert session["rtf"]["count"] == 4
+    assert session["rtf"]["mean"] == pytest.approx(0.3, abs=0.03)
 
 
 def test_stage0_token_timings_use_weighted_tpot_when_itls_are_incomplete():

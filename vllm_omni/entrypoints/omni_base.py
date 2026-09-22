@@ -18,13 +18,14 @@ from vllm.transformers_utils.repo_utils import file_or_path_exists
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
-from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.config.stage_config import merge_sampling_constraints
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
     ErrorMessage,
     OutputMessage,
     StageMetricsMessage,
 )
+from vllm_omni.engine.omni_engine_base import OmniEngineBase
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_stage_id_for_e2e
@@ -65,7 +66,7 @@ class OmniEngineDeadError(EngineDeadError):
         self.error_stage_id = error_stage_id
 
 
-def _weak_shutdown_engine(engine: AsyncOmniEngine) -> None:
+def _weak_shutdown_engine(engine: OmniEngineBase) -> None:
     """Best-effort engine cleanup for GC finalization."""
     try:
         engine.shutdown()
@@ -205,13 +206,13 @@ class OmniBase(PDDisaggregationMixin):
         self.tts_batch_max_items: int = kwargs.pop("tts_batch_max_items", 32)
 
         logger.info("[%s] Initializing with model %s", self.__class__.__name__, model)
-        # Construct transfer_metrics first so we can hand it to AsyncOmniEngine
+        # Construct transfer_metrics first so we can hand it to the engine
         # (which forwards it to the Orchestrator background thread for
-        # TX-side emit; see Orchestrator._forward_to_next_stage).
+        # TX-side emit; see OrchestratorBase._forward_to_next_stage).
         self.transfer_metrics = OmniTransferMetrics(model_name=model, log_stats=log_stats)
         self.prom_metrics = OmniPrometheusMetrics(model_name=model, log_stats=log_stats)
         st = time.time()
-        self.engine = AsyncOmniEngine(
+        self.engine = self._create_engine(
             model=model,
             init_timeout=init_timeout,
             stage_init_timeout=stage_init_timeout,
@@ -223,15 +224,14 @@ class OmniBase(PDDisaggregationMixin):
         self._shutdown_called = False
         self._weak_finalizer = weakref.finalize(self, _weak_shutdown_engine, self.engine)
         et = time.time()
-        logger.info("[%s] AsyncOmniEngine initialized in %.2f seconds", self.__class__.__name__, et - st)
-        # Authoritative: ``AsyncOmniEngine`` resolves (pipeline + deploy YAML +
+        logger.info("[%s] %s initialized in %.2f seconds", self.__class__.__name__, type(self.engine).__name__, et - st)
+        # Authoritative: the engine resolves (pipeline + deploy YAML +
         # CLI overrides) through ``StageConfigFactory`` and stores the final
         # value on ``engine.async_chunk``; mirror it here so ``--no-async-chunk``
         # (explicit ``False``) is not fallen-back-through by ``or``.
         self.async_chunk = bool(getattr(self.engine, "async_chunk", False))
 
         self.request_states: dict[str, ClientRequestState] = {}
-        self._consumed_metric_messages: dict[str, set[int]] = {}
         self.mod_metrics = OmniModalityMetrics(model_name=model, log_stats=log_stats)
 
         self.default_sampling_params_list = self.engine.default_sampling_params_list
@@ -252,6 +252,10 @@ class OmniBase(PDDisaggregationMixin):
 
         # PD disaggregation state (detects if a prefill/decode stage pair is configured)
         self._init_pd_state()
+
+    def _create_engine(self, **engine_kwargs: Any) -> OmniEngineBase:
+        """Construct this entrypoint's engine (``AsyncOmniEngine`` for turn-based use)."""
+        raise NotImplementedError
 
     @property
     def num_stages(self) -> int:
@@ -297,13 +301,6 @@ class OmniBase(PDDisaggregationMixin):
     def _stage_has_no_live_replica(self, pool: StagePool) -> bool:
         """True when a non-empty stage pool has lost all of its replicas."""
         return len(pool.clients) > 0 and self._live_replica_count(pool) == 0
-
-    def _consumed_metric_message_ids(self, request_id: str) -> set[int]:
-        consumed_by_request = getattr(self, "_consumed_metric_messages", None)
-        if consumed_by_request is None:
-            consumed_by_request = {}
-            self._consumed_metric_messages = consumed_by_request
-        return consumed_by_request.setdefault(request_id, set())
 
     @property
     def is_running(self) -> bool:
@@ -380,12 +377,12 @@ class OmniBase(PDDisaggregationMixin):
 
     @staticmethod
     def _apply_sampling_constraints(params: Any, constraints: Mapping[str, Any]) -> Any:
-        """Rebuild params with pipeline-required settings without mutating caller input."""
+        """Apply pipeline requirements, merging required stops with caller stops."""
         if not constraints:
             return params
         if isinstance(params, Mapping):
-            return {**params, **constraints}
-        if is_dataclass(params):
+            values = dict(params)
+        elif is_dataclass(params):
             values = {field.name: getattr(params, field.name) for field in fields(params) if field.init}
         elif struct_fields := getattr(params, "__struct_fields__", None):
             values = {
@@ -395,7 +392,11 @@ class OmniBase(PDDisaggregationMixin):
             }
         else:
             raise TypeError(f"Expected a mapping, dataclass, or msgspec struct, got {type(params).__name__}")
-        return type(params)(**{**values, **constraints})
+
+        resolved = merge_sampling_constraints(values, constraints)
+        if isinstance(params, Mapping):
+            return resolved
+        return type(params)(**resolved)
 
     def _record_request_failure_once(self, request_id: str, reason: str) -> None:
         req_state = self.request_states.get(request_id)
@@ -449,9 +450,6 @@ class OmniBase(PDDisaggregationMixin):
             )
         finally:
             self.request_states.pop(request_id, None)
-            consumed_by_request = getattr(self, "_consumed_metric_messages", None)
-            if consumed_by_request is not None:
-                consumed_by_request.pop(request_id, None)
             # Republish gauges so any stale value left by the per-stage
             # publish in _process_single_result (which runs while the request
             # is still in self.request_states) is corrected after the pop.
@@ -532,7 +530,7 @@ class OmniBase(PDDisaggregationMixin):
             stage_meta = self.engine.get_stage_metadata(stage_id)
             output_type = getattr(msg.engine_outputs, "final_output_type", stage_meta.final_output_type)
             msg_id = id(msg)
-            consumed = self._consumed_metric_message_ids(req_id)
+            consumed = req_state.consumed_metric_message_ids
             if msg_id not in consumed:
                 req_state.metrics.on_stage_metrics(stage_id, req_id, msg.metrics, output_type)
                 submit_ts = msg.stage_submit_ts
@@ -642,8 +640,9 @@ class OmniBase(PDDisaggregationMixin):
         output_type = getattr(engine_outputs, "final_output_type", stage_meta.final_output_type)
         if finished and _m is not None:
             msg_id = id(result)
-            consumed = self._consumed_metric_message_ids(req_id)
-            if msg_id not in consumed:
+            req_state = self.request_states.get(req_id)
+            consumed = req_state.consumed_metric_message_ids if req_state is not None else None
+            if consumed is not None and msg_id not in consumed:
                 metrics.accumulate_diffusion_metrics(stage_meta.stage_type, req_id, engine_outputs)
                 metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
                 consumed.add(msg_id)

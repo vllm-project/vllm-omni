@@ -1,5 +1,5 @@
 ARG VLLM_ASCEND_IMAGE=quay.io/atlas-ci/vllm-ascend
-ARG VLLM_ASCEND_VERSION=v0.28.0
+ARG VLLM_ASCEND_VERSION=v0.29.0
 ARG VLLM_ASCEND_DEVICE_SUFFIX=
 FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_VERSION}${VLLM_ASCEND_DEVICE_SUFFIX}
 
@@ -44,6 +44,7 @@ RUN python3 -m pip install -U pip && \
       "onnx>=1.16.0" \
       "librosa>=0.10.0" \
       "datasets>=3.0.0" \
+      "torchmetrics==1.9.0" \
       --index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
       --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
       --default-timeout=60

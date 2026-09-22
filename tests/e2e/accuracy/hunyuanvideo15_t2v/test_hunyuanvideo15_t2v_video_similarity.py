@@ -144,7 +144,7 @@ def _generate_online_video(*, omni_server, online_client, timeout_seconds: int) 
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 def test_hunyuanvideo15_t2v_diffusers_offline_generates_video() -> None:
     if not torch.cuda.is_available():
         pytest.skip("HunyuanVideo-1.5 T2V offline accuracy test requires CUDA.")
@@ -160,7 +160,7 @@ def test_hunyuanvideo15_t2v_diffusers_offline_generates_video() -> None:
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_CASES, indirect=True)
 def test_hunyuanvideo15_t2v_online_serving_generates_video(
     omni_server,
@@ -182,7 +182,7 @@ def test_hunyuanvideo15_t2v_online_serving_generates_video(
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 def test_hunyuanvideo15_t2v_serving_matches_offline_video_similarity() -> None:
     if not torch.cuda.is_available():
         pytest.skip("HunyuanVideo-1.5 T2V video similarity test requires CUDA.")

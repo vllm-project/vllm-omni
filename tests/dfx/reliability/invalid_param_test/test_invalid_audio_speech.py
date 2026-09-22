@@ -157,14 +157,8 @@ def test_speech_missing_required_fields(omni_server: OmniServer, online_client: 
                 "ref_audio": None,
                 "ref_text": None,
             },
-            # NOTE: This is delegating down the TTS adapter, so the message is both specific
-            # to the Qwen3TTS adapter and dependent on whether or not the model has any speakers
-            # (as opposed to having valida speakers, but getting an invalid speaker). it would
-            # be more ideal to validate that this is landing on `.validate()` on the adapter
-            # and ensuring that the returned message matches what we would get from calling the
-            # adapter validate directly.
-            ("no speakers configured",),
-            id="customvoice_invalid_voice",
+            ("Base checkpoint does not support task_type='CustomVoice'",),
+            id="base_checkpoint_customvoice_task_mismatch",
         ),
         pytest.param(
             {"task_type": "InvalidEnum"}, ("task_type", "literal_error", "CustomVoice"), id="task_type_invalid"

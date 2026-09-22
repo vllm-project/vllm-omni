@@ -23,7 +23,6 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "FishSpeechFastARConfig": "vllm_omni.transformers_utils.configs.fish_speech",
     "GLMTTSConfig": "vllm_omni.transformers_utils.configs.glm_tts",
     "VoxCPM2Config": "vllm_omni.transformers_utils.configs.voxcpm2",
-    "DotsTTSConfig": "vllm_omni.transformers_utils.configs.dots_tts",
     "VoxtralTTSConfig": "vllm_omni.transformers_utils.configs.voxtral_tts",
     "CosyVoice3Config": "vllm_omni.transformers_utils.configs.cosyvoice3",
     "MiniMaxMusic3Config": "vllm_omni.transformers_utils.configs.minimax_music3",
@@ -34,11 +33,13 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "MingFlashOmniConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "Qwen3VLMoeVisionConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "WhisperEncoderConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
+    "AuKConfig": "vllm_omni.transformers_utils.configs.auk",
     "SenseNovaU1Config": "vllm_omni.transformers_utils.configs.sensenova_u1",
 }
 
 __all__ = [
     "Audio8TTSConfig",
+    "AuKConfig",
     "Audio8TTSFastARConfig",
     "Audio8TTSSlowARConfig",
     "HiggsAudioV3Config",
@@ -51,7 +52,6 @@ __all__ = [
     "FishSpeechFastARConfig",
     "GLMTTSConfig",
     "VoxCPM2Config",
-    "DotsTTSConfig",
     "VoxtralTTSConfig",
     "CosyVoice3Config",
     "MiniMaxMusic3Config",
@@ -82,8 +82,8 @@ def __dir__():
 # Eagerly import all config modules so their AutoConfig.register() side-effects
 # run as soon as `vllm_omni.transformers_utils.configs` is imported.
 from vllm_omni.transformers_utils.configs import audio8_tts as _audio8_tts  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import auk as _auk  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import cosyvoice3 as _cosyvoice3  # noqa: F401, E402
-from vllm_omni.transformers_utils.configs import dots_tts as _dots_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import glm_tts as _glm_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import higgs_audio_v3 as _higgs_audio_v3  # noqa: F401, E402

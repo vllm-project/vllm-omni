@@ -13,12 +13,14 @@ Bootstrap mode (``bootstrap-upload-steps.yml``):
 Test pipeline mode (e.g. test-merge.yml, test-nightly.yml, test-weekly.yml):
   - Drop steps whose ``source_file_dependencies`` do not match changed files
     (string/list keys from ci_source_file_dependencies.yml, or inline path
-    prefixes). Filtering applies on **PR label** uploads only; ``main`` + env
-    schedule (NIGHTLY/WEEKLY/merge push) keeps every job and still strips the field.
-    If no job-key prefix matches, a change to the pipeline YAML being uploaded
-    or to a path under the ``source_filter_fallback`` registry key keeps every
-    job so command, env, and hardware edits can be validated before merge.
-    When any job-key prefix already matches, normal filtering wins.
+    prefixes). Filtering applies on **PR label** uploads and on post-merge
+    ``main`` L3 uploads. Scheduled ``main`` uploads that pass ``--all``
+    (NIGHTLY/WEEKLY) or ``--e2e`` keep every selected job and still strip
+    the field. If no job-key prefix matches, a change to the pipeline YAML
+    being uploaded or to a path under the ``source_filter_fallback`` registry
+    key keeps every job so command, env, and hardware edits can be validated
+    before merge. When any job-key prefix already matches, normal filtering
+    wins.
   - Expand uploader-only ``mirror_hardwares`` into ``agents`` (+ optional ``image``
     for NPU) + ``plugins`` (see ci_mirror_hardwares.yml).
   - Omit ``mirror_hardwares`` to compose ``{chip}_{n}`` from pytest ``-m`` SKU
@@ -780,16 +782,13 @@ def _changed_files_for_source_filter(
 ) -> list[str] | None:
     """Return the diff to filter against, or None to keep every step.
 
-    ``source_file_dependencies`` is label-only: scheduled ``main`` uploads
-    (NIGHTLY/WEEKLY/post-merge) run the full pipeline. ``--all`` / ``--e2e``
-    also disable filtering. Pipeline YAML / ``source_filter_fallback`` matches
-    are applied later in ``_render_test_pipeline`` only when no job-key prefix
-    already matched.
+    ``--all`` / ``--e2e`` disable filtering (scheduled NIGHTLY/WEEKLY full
+    uploads and weekly E2E sweeps). Post-merge ``main`` L3 and PR-label
+    uploads filter against the commit/PR diff. Pipeline YAML /
+    ``source_filter_fallback`` matches are applied later in
+    ``_render_test_pipeline`` only when no job-key prefix already matched.
     """
     if force_all or e2e_only:
-        return None
-    if os.environ.get("BUILDKITE_BRANCH", "") == "main":
-        _log("main branch: keep all jobs (source_file_dependencies is label-only)")
         return None
     return ctx.changed_files
 
