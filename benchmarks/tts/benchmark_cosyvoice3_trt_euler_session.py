@@ -27,7 +27,8 @@ def make_case(length):
     mask = torch.ones((1, 1, length), device="cuda")
     spks = 0.1 * torch.randn((1, 80), device="cuda", generator=gen)
     cond = 0.1 * torch.randn((1, 80, length), device="cuda", generator=gen)
-    t_span = torch.linspace(0, 1, 11, device="cuda")
+    t_span = torch.linspace(0, 1, 11, device=mu.device, dtype=mu.dtype)
+    t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
     return x, t_span, mu, mask, spks, cond
 
 
@@ -100,6 +101,7 @@ def bootstrap_median_ci(values, samples=5000, seed=12345):
     ]
 
 
+@torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("onnx")
@@ -175,6 +177,8 @@ def main():
         "io_dtype": str(wrapper.io_dtype),
         "length": args.length,
         "steps": 10,
+        "inference_mode": torch.is_inference_mode_enabled(),
+        "t_scheduler": cfm.t_scheduler,
         "repeats": args.repeats,
         "baseline_host_ms": summary(baseline_host),
         "optimized_host_ms": summary(optimized_host),
