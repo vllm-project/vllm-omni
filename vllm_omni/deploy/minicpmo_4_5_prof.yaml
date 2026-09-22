@@ -45,13 +45,18 @@ stages:
     # replicas below; the NPU block caps stage 0/1 KV explicitly.
     gpu_memory_utilization: 0.40
     enforce_eager: false
-    # Stage-level prefix caching override; the top level stays false for duplex safety.
-    # Stage-0 n-gram speculative decoding is intentionally not enabled here: the
+    # Stage-level prefix caching is NPU-only (see platforms.npu below);
+    # the top level stays false for duplex safety. Observed with this flag
+    # in the platform-shared block on CUDA: the first duplex case dies with
+    # an empty tts handoff (token_ids/hidden_states=None -> ValueError in
+    # minicpmo_4_5_omni_tts.preprocess) alongside a device-side assert out
+    # of indexSelectSmallIndex; the stage-1 replica is killed and every later
+    # case fails with "stage 1 has no live replica". Stage-0 n-gram
+    # speculative decoding stays off too: the
     # omni prefix cache refuses the pair (stage_prefix_cache_config ->
-    # check_prefix_cache_token_accounting raises OmniPrefixCacheUnmatchError as soon
-    # as a stage has enable_prefix_caching and a speculative_config; vLLM itself
-    # allows the combination).
-    enable_prefix_caching: true
+    # check_prefix_cache_token_accounting raises OmniPrefixCacheUnmatchError
+    # as soon as a stage has enable_prefix_caching and a speculative_config;
+    # vLLM itself allows the combination).
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
     devices: "0"
@@ -88,19 +93,6 @@ stages:
     # Talker context is 4096 (tts_config.max_position_embeddings).
     max_model_len: 4096
     devices: "0"
-    # Multi-frame decode: the Talker produces 8 codec frames per scheduler step.
-    # vLLM learns that each request advances 8 tokens through this
-    # speculative_config (the n-gram proposer is never consulted -- the runner
-    # supplies constant continue drafts), and async scheduling is rejected next
-    # to an n-gram proposer. stop_token_ids above must stay the two-wide
-    # continue/stop id the head emits in this mode. Remove the block (or set it
-    # to null) to fall back to one frame per step.
-    speculative_config:
-      method: ngram
-      num_speculative_tokens: 7
-      prompt_lookup_min: 1
-      prompt_lookup_max: 1
-    async_scheduling: false
     output_connectors:
       to_stage_2: connector_of_shared_memory
     # Talker is a single-vocab codec LM. These knobs go to vLLM's Sampler
@@ -116,8 +108,6 @@ stages:
       top_k: 25
       repetition_penalty: 1.05
       min_tokens: 50
-      # The Talker's stop head emits this id to finish a request.
-      stop_token_ids: [1]
       max_tokens: 4096
       seed: 42
       detokenize: false
@@ -159,6 +149,10 @@ platforms:
         # not gated by a single stage.
         max_num_seqs: 8
         max_num_batched_tokens: 8192
+        # Stage-0 prefix caching was moved here from the platform-shared
+        # block: keep the PR's NPU behaviour unchanged while CUDA falls back
+        # to the top-level false (duplex safety, see the base stage comment).
+        enable_prefix_caching: true
         # Explicit KV cap: the auto-computed value does not leave room for the
         # two stage-2 replicas on this card.
         kv_cache_memory_bytes: 6442450944
@@ -172,6 +166,30 @@ platforms:
         # stages 0 and 2, so stage 1 kept the base value of 4.
         max_num_seqs: 8
         max_num_batched_tokens: 8192
+        # Multi-frame decode: the Talker produces 8 codec frames per scheduler
+        # step. vLLM learns that each request advances 8 tokens through this
+        # speculative_config; the n-gram proposer itself is never consulted
+        # because the NPU worker replays the decode graph with constant continue
+        # drafts, and async scheduling is rejected next to an n-gram proposer.
+        # stop_token_ids must stay the two-wide continue/stop id the head emits
+        # in this mode. Remove the block (or set it to null) to fall back to one
+        # frame per step.
+        #
+        # NPU-only on purpose: only
+        # vllm_omni.platforms.npu.worker.talker_multiframe intercepts the step
+        # and injects those drafts. Left in the base stage, the same block hands
+        # stage 1 to vLLM's real n-gram proposer and rejection sampler on CUDA,
+        # which asserts on the Talker's codec ids (device-side assert out of
+        # get_token_bin_counts_and_mask).
+        speculative_config:
+          method: ngram
+          num_speculative_tokens: 7
+          prompt_lookup_min: 1
+          prompt_lookup_max: 1
+        async_scheduling: false
+        default_sampling_params:
+          # The Talker's stop head emits this id to finish a request.
+          stop_token_ids: [1]
         # Explicit KV cap: the auto-computed value does not leave room for the
         # two stage-2 replicas on this card.
         kv_cache_memory_bytes: 2684354560
