@@ -9,7 +9,6 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
 )
 
 _MLLM_REQUIRED_PATTERNS = [
-    "model_index.json",
     "mllm/**",
     "mlp/**",
 ]

@@ -49,16 +49,10 @@ _VENDOR_TRANSFORMER_CLASS = "DiffusionTransformer"
 
 
 def _validate_variant_config(
-    model_index: dict[str, Any],
+    model_index: dict[str, Any] | None,
     transformer_config: Any,
 ) -> bool:
     """Validate checkpoint-owned variant metadata and return layered mode."""
-    declared_pipeline = model_index.get("_class_name")
-    if declared_pipeline not in {_DESIGN_PIPELINE, _LAYERED_PIPELINE}:
-        raise ValueError(
-            "Ming-Image model_index.json must declare "
-            f"{_DESIGN_PIPELINE!r} or {_LAYERED_PIPELINE!r}, got {declared_pipeline!r}."
-        )
     declared_transformer = getattr(transformer_config, "_class_name", None)
     if declared_transformer != _VENDOR_TRANSFORMER_CLASS:
         raise ValueError(
@@ -66,25 +60,41 @@ def _validate_variant_config(
             f"_class_name={_VENDOR_TRANSFORMER_CLASS!r}, got {declared_transformer!r}. "
             "vLLM-Omni loads those weights through MingImageTransformer2DModel."
         )
-    is_layer_decomposition = declared_pipeline == _LAYERED_PIPELINE
-    expected_padding = "learned" if is_layer_decomposition else "zero_masked"
+
     alignment_padding_mode = getattr(transformer_config, "alignment_padding_mode", None)
-    if alignment_padding_mode != expected_padding:
-        raise ValueError(
-            f"{declared_pipeline} requires transformer alignment_padding_mode="
-            f"{expected_padding!r}, got {alignment_padding_mode!r}."
-        )
     multi_frame_output = getattr(transformer_config, "multi_frame_output", None)
-    if multi_frame_output is not is_layer_decomposition:
+    variant = (alignment_padding_mode, multi_frame_output)
+    if variant == ("zero_masked", False):
+        is_layer_decomposition = False
+    elif variant == ("learned", True):
+        is_layer_decomposition = True
+    else:
         raise ValueError(
-            f"{declared_pipeline} requires transformer multi_frame_output="
-            f"{is_layer_decomposition!r}, got {multi_frame_output!r}."
+            "Ming-Image transformer/config.json must use either "
+            "alignment_padding_mode='zero_masked' with multi_frame_output=False "
+            "or alignment_padding_mode='learned' with multi_frame_output=True; "
+            f"got alignment_padding_mode={alignment_padding_mode!r}, "
+            f"multi_frame_output={multi_frame_output!r}."
         )
+
+    declared_pipeline = (model_index or {}).get("_class_name")
+    if declared_pipeline is not None:
+        if declared_pipeline not in {_DESIGN_PIPELINE, _LAYERED_PIPELINE}:
+            raise ValueError(
+                "Ming-Image model_index.json must declare "
+                f"{_DESIGN_PIPELINE!r} or {_LAYERED_PIPELINE!r}, got {declared_pipeline!r}."
+            )
+        expected_pipeline = _LAYERED_PIPELINE if is_layer_decomposition else _DESIGN_PIPELINE
+        if declared_pipeline != expected_pipeline:
+            raise ValueError(
+                f"Ming-Image model_index.json declares {declared_pipeline!r}, but "
+                f"transformer/config.json describes {expected_pipeline!r}."
+            )
     return is_layer_decomposition
 
 
 class MingImageDiffusionPipeline(ZImagePipeline):
-    """Ming-Image model-index adapter around the canonical Z-Image loop."""
+    """Ming-Image component adapter around the canonical Z-Image loop."""
 
     supports_request_batch = False
 

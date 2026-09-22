@@ -79,8 +79,33 @@ def test_published_model_metadata_contract(
     assert _validate_variant_config(model_index, config.tf_model_config) is layered
 
 
+@pytest.mark.parametrize(
+    ("transformer_config", "layered"),
+    (
+        (
+            SimpleNamespace(
+                _class_name="DiffusionTransformer",
+                alignment_padding_mode="zero_masked",
+                multi_frame_output=False,
+            ),
+            False,
+        ),
+        (
+            SimpleNamespace(
+                _class_name="DiffusionTransformer",
+                alignment_padding_mode="learned",
+                multi_frame_output=True,
+            ),
+            True,
+        ),
+    ),
+)
+def test_variant_config_without_model_index(transformer_config, layered):
+    assert _validate_variant_config(None, transformer_config) is layered
+
+
 def test_variant_config_rejects_mixed_semantics():
-    with pytest.raises(ValueError, match="requires transformer alignment_padding_mode"):
+    with pytest.raises(ValueError, match="must use either"):
         _validate_variant_config(
             {"_class_name": "MingImageDiffusionPipeline"},
             SimpleNamespace(
@@ -201,6 +226,30 @@ def test_stage1_compile_uses_static_regional_cuda_graph(monkeypatch):
     }
 
 
+def test_explicit_pipeline_loads_component_config_without_model_index(tmp_path):
+    transformer = tmp_path / "transformer"
+    transformer.mkdir()
+    (transformer / "config.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "DiffusionTransformer",
+                "alignment_padding_mode": "zero_masked",
+                "multi_frame_output": False,
+            }
+        )
+    )
+
+    config = OmniDiffusionConfig(
+        model=str(tmp_path),
+        model_class_name="MingImageDiffusionPipeline",
+    )
+    config.enrich_config()
+
+    assert config.model_class_name == "MingImageDiffusionPipeline"
+    assert config.tf_model_config.alignment_padding_mode == "zero_masked"
+    assert config.tf_model_config.multi_frame_output is False
+
+
 def test_checkpoint_resolver_accepts_root_or_mllm_subfolder(tmp_path):
     root = tmp_path / "checkpoint"
     mllm = root / "mllm"
@@ -221,7 +270,7 @@ def test_checkpoint_resolver_downloads_mllm_and_sibling_mlp(monkeypatch):
     monkeypatch.setattr(checkpoint, "download_weights_from_hf_specific", _download)
 
     assert checkpoint.resolve_ming_image_model_root("org/model", "rev", None) == "/cache/model"
-    assert captured["allow_patterns"] == ["model_index.json", "mllm/**", "mlp/**"]
+    assert captured["allow_patterns"] == ["mllm/**", "mlp/**"]
     assert captured["revision"] == "rev"
     assert captured["require_all"] is True
 
