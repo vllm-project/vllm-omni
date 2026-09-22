@@ -2091,6 +2091,8 @@ async def generate_images(
                 extra_body["extra_params"] = request.extra_params
             if request.generator_device is not None:
                 extra_body["generator_device"] = request.generator_device
+            if request.layers is not None:
+                extra_body["layers"] = request.layers
             if request.lora is not None:
                 # Keep /images validation semantics: invalid LoRA should fail with 400.
                 _parse_lora_request(request.lora)
