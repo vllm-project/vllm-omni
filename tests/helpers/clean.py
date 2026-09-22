@@ -60,6 +60,12 @@ def pick_least_used_device_indices(num_devices: int) -> list[int]:
     return get_physical_device_indices(logical_indices)
 
 
+def _logical_to_physical(logical: int) -> int:
+    """Physical id for logs / nvidia-smi; ``logical`` if the env does not map it."""
+    mapped = get_physical_device_indices([logical])
+    return mapped[0] if mapped else logical
+
+
 def wait_for_gpu_memory_to_clear(
     *,
     devices: list[int],
@@ -67,11 +73,20 @@ def wait_for_gpu_memory_to_clear(
     threshold_ratio: float | None = None,
     timeout_s: float = 120,
 ) -> None:
+    """Wait until *logical* device ordinals are under the memory threshold.
+
+    ``devices`` are CUDA/NPU ordinals in the current process (``0..N-1``),
+    the same space as ``current_omni_platform.device()`` / ``mem_get_info()``.
+    Physical ids (``CUDA_VISIBLE_DEVICES``) are only used for log labels and
+    Whisper-worker matching — remapping them into ``device()`` raises
+    ``invalid device ordinal`` when the visible set is a subset (e.g. ``4,5``).
+    """
     assert threshold_bytes is not None or threshold_ratio is not None
-    devices = get_physical_device_indices(devices)
+    logical_devices = list(devices)
+    physical_by_logical = {logical: _logical_to_physical(logical) for logical in logical_devices}
     start_time = time.time()
 
-    device_list = ", ".join(str(d) for d in devices)
+    device_list = ", ".join(str(physical_by_logical[d]) for d in logical_devices)
     if threshold_bytes is not None:
         condition_str = f"Memory usage ≤ {threshold_bytes / 2**30:.2f} GiB (excl. Whisper worker)"
 
@@ -86,25 +101,27 @@ def wait_for_gpu_memory_to_clear(
             return used / total <= ratio
 
     print(f"[Device Memory Monitor] Waiting for device(s) {device_list} to free memory, Condition: {condition_str}")
-    whisper_allowance_gib, whisper_device = _whisper_vram_allowance()
-    if whisper_allowance_gib > 0 and whisper_device is not None:
+    whisper_allowance_gib, whisper_physical = _whisper_vram_allowance()
+    if whisper_allowance_gib > 0 and whisper_physical is not None:
         print(
             f"[Device Memory Monitor] Whisper worker allowance {whisper_allowance_gib:.1f}GiB "
-            f"on device {whisper_device}"
+            f"on device {whisper_physical}"
         )
 
     while True:
-        used_by_device: dict[int, tuple[float, float]] = {}
-        for device in devices:
-            with current_omni_platform.device(device):
-                free_bytes, total_bytes = current_omni_platform.mem_get_info()
-            used_by_device[device] = ((total_bytes - free_bytes) / 2**30, total_bytes / 2**30)
         output_raw: dict[int, tuple[float, float, float]] = {}
-        for device, (used_gib, total_gib) in used_by_device.items():
+        for logical in logical_devices:
+            with current_omni_platform.device(logical):
+                free_bytes, total_bytes = current_omni_platform.mem_get_info()
+            used_gib = (total_bytes - free_bytes) / 2**30
+            total_gib = total_bytes / 2**30
+            physical = physical_by_logical[logical]
             whisper_gib = (
-                min(used_gib, whisper_allowance_gib) if whisper_device is not None and device == whisper_device else 0.0
+                min(used_gib, whisper_allowance_gib)
+                if whisper_physical is not None and physical == whisper_physical
+                else 0.0
             )
-            output_raw[device] = (max(0.0, used_gib - whisper_gib), total_gib, whisper_gib)
+            output_raw[physical] = (max(0.0, used_gib - whisper_gib), total_gib, whisper_gib)
         print("[Device Memory Status] Current usage (engine view excludes Whisper worker):")
         for device_id, (used, total, whisper) in output_raw.items():
             ratio_pct = (used / total) * 100 if total > 0 else 0.0
