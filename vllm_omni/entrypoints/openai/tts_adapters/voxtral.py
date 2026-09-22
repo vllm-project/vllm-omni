@@ -22,6 +22,7 @@ class VoxtralTTSAdapter(ARTTSAdapter):
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
         self._build_prompt_async = make_async(self._build_prompt, executor=getattr(ctx.server, "_tts_executor", None))
+        self._encoder_loaded = None
 
     def _build_prompt(self, request: "OpenAICreateSpeechRequest") -> dict[str, Any]:
         """Build a Voxtral prompt for either a preset voice or inline reference audio."""
@@ -31,13 +32,24 @@ class VoxtralTTSAdapter(ARTTSAdapter):
         ref_audio = request.ref_audio
         if not request.voice and not ref_audio:
             raise ValueError("Voxtral requires either a voice name or ref_audio.")
-        if isinstance(ref_audio, str) and ref_audio.startswith("data:"):
-            _, _, ref_audio = ref_audio.partition(",")
+
+        if ref_audio is not None and not self._encoder_loaded:
+            validation_error = (
+                "Voice cloning with 'ref_audio' requires the full Voxtral checkpoint "
+                "with encoder weights. The open-source variant only supports "
+                "preset voices via the 'voice' parameter."
+            )
+            raise ValueError(validation_error)
+
         server = self.ctx.server
         if server._tts_tokenizer is None:
             from vllm.tokenizers import cached_tokenizer_from_config
 
             server._tts_tokenizer = cached_tokenizer_from_config(self.ctx.engine_client.model_config).instruct
+
+        if isinstance(ref_audio, str) and ref_audio.startswith("data:"):
+            _, _, ref_audio = ref_audio.partition(",")
+
         if request.voice is not None:
             tokenized = server._tts_tokenizer.encode_speech_request(
                 SpeechRequest(input=request.input, voice=request.voice)
@@ -45,6 +57,7 @@ class VoxtralTTSAdapter(ARTTSAdapter):
             prompt = tokens_input(prompt_token_ids=tokenized.tokens)
             prompt["additional_information"] = {"voice": [request.voice]}
             return prompt
+
         tokenized = server._tts_tokenizer.encode_speech_request(SpeechRequest(input=request.input, ref_audio=ref_audio))
         audio = tokenized.audios[0]
         return {
@@ -84,6 +97,13 @@ class VoxtralTTSAdapter(ARTTSAdapter):
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
+        # Cache encoder_loaded property to avoid RPC call on every request with ref_audio
+        if self._encoder_loaded is None:
+            result = await self.ctx.server.engine_client.collective_rpc("encoder_loaded")
+            self._encoder_loaded = any(
+                bool(x) for r in result if not isinstance(r, dict) for x in (r if isinstance(r, list) else [r])
+            )
+
         prompt = await self._build_prompt_async(request)
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="voxtral_tts")
 

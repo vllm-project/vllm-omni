@@ -204,6 +204,7 @@ class BreezeTTS2MimiCodec(nn.Module):
                 f"Breeze codec request id count {len(request_ids)} does not match input request count {len(requests)}"
             )
         valid: list[tuple[str, torch.Tensor, bool]] = []
+        valid_indices: list[int] = []
         for index, request_ids_tensor in enumerate(requests):
             runtime_info = (
                 runtime_additional_information[index]
@@ -238,6 +239,7 @@ class BreezeTTS2MimiCodec(nn.Module):
                 )
             frames = int(flat.numel()) // self._num_codebooks
             valid.append((state_id, flat.reshape(self._num_codebooks, frames), finished))
+            valid_indices.append(index)
 
         waveforms = [empty.to(device=ids.device)] * len(requests)
         sample_rates = [sr] * len(requests)
@@ -247,7 +249,6 @@ class BreezeTTS2MimiCodec(nn.Module):
                 multimodal_outputs={"model_outputs": waveforms, "sr": sample_rates},
             )
         states: list[dict[str, Any]] = []
-        valid_indices: list[int] = []
         max_frames = max(codes.shape[-1] for _, codes, _ in valid)
         batched_codes = valid[0][1].new_zeros((len(valid), self._num_codebooks, max_frames))
         for row, (state_id, row_codes, _) in enumerate(valid):
@@ -258,7 +259,6 @@ class BreezeTTS2MimiCodec(nn.Module):
                 self._decoder_state_cache[state_id] = state
             state.setdefault("prefix_frames", 0)
             states.append(state)
-            valid_indices.append(row)
 
         decoded = decoder.batched_chunked_decode(
             batched_codes,
@@ -353,6 +353,27 @@ class BreezeTTS2MimiCodec(nn.Module):
                     device_map=str(device),
                 )
                 self._sample_rate = int(self._audio_tokenizer.model.get_output_sample_rate())
+                if self._async_chunk:
+                    connector_config = getattr(self.vllm_config.model_config, "stage_connector_config", None)
+                    extra = (
+                        connector_config.get("extra", connector_config)
+                        if isinstance(connector_config, Mapping)
+                        else getattr(connector_config, "extra", None)
+                    )
+                    value = extra.get("breeze_codec_chunk_frames") if isinstance(extra, Mapping) else None
+                    try:
+                        chunk_frames = int(value) if value is not None else 8
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(f"Invalid Breeze codec_chunk_frames={value!r}") from exc
+                    if chunk_frames <= 0:
+                        raise ValueError(f"Breeze codec_chunk_frames must be positive, got {chunk_frames}")
+                    # Qwen treats chunks shorter than its configured window as
+                    # terminal tails and does not advance their rolling cache.
+                    # Match the producer's chunk size instead of its default 25.
+                    decoder = self._audio_tokenizer.model.decoder
+                    decoder._initial_codec_chunk_frames = chunk_frames
+                    decoder._incremental_chunk_frames = chunk_frames
+                    decoder._incremental_chunk_ramp = []
             for _ in weights:
                 pass
             tokenizer_module = getattr(self._audio_tokenizer, "model", None)

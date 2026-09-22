@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 
 from vllm_omni.metrics import OrchestratorAggregator
@@ -11,10 +14,12 @@ class ClientRequestState:
         request_id: str,
         external_request_id: str | None = None,
         queue: asyncio.Queue | None = None,
+        final_stage_id: int | None = None,
     ):
         self.request_id = request_id
         self.external_request_id = external_request_id
         self.stage_id: int | None = None
+        self.final_stage_id: int | None = final_stage_id
         self.queue = queue if queue is not None else asyncio.Queue()
         self.metrics: OrchestratorAggregator | None = None
         # Request-scoped idempotency guard for Prometheus failure counters.

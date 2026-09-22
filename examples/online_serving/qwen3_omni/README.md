@@ -14,6 +14,17 @@ Please refer to [README.md](../../../README.md)
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
+For a local deployment with multiple API frontend processes sharing one set
+of stage engines, add `--api-server-count`:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --api-server-count 2 --port 8091
+```
+
+This mode currently supports local EngineCore stages. It is not available
+with headless or remote stage deployments, and pure diffusion stages remain
+single-frontend.
+
 The default deployment configuration, situated at `vllm_omni/deploy/qwen3_omni_moe.yaml`, is resolved and loaded
 automatically via the model registry, obviating the `--deploy-config` flag in standard deployment topologies.
 Asynchronous chunk streaming operates as **enabled by default** within this bundled configuration.
@@ -156,7 +167,7 @@ parser defaults). If you don't pass a flag, the YAML value wins.
 > chunked vs end-to-end modes (e.g. qwen3_tts code2wav) dispatch
 > automatically based on that bool — no extra flag or variant yaml is
 > needed.
-
+>
 > ⚠️ **For multi-stage models that share GPUs (qwen3_omni_moe by default
 > shares cuda:1 between stages 1 and 2), avoid using global memory flags.**
 > A global `--gpu-memory-utilization 0.85` would apply to every stage and
@@ -309,24 +320,17 @@ python openai_realtime_client.py \
 Server VAD uses the pinned Silero v6.2 ONNX artifact from `istupakov/silero-vad-onnx` and never downloads model files while processing a session. Make the artifact available in the Hugging Face cache before startup, or configure a local artifact in the deployment YAML:
 
 ```yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
 duplex_session:
   server_vad_model_path: /models/silero_vad.onnx
 ```
 
-Start from the bundled Qwen3-Omni deployment YAML, add the fields above at the top level, and serve that complete configuration:
-
-```bash
-cp vllm_omni/deploy/qwen3_omni_moe.yaml /path/to/qwen3_omni_server_vad.yaml
-# Edit /path/to/qwen3_omni_server_vad.yaml and add duplex_session.
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
-  --omni \
-  --port 8091 \
-  --deploy-config /path/to/qwen3_omni_server_vad.yaml
-```
-
-Keep Qwen's default `session_mode: turn`; `duplex_session` enables the Realtime handler without changing scheduler
-semantics. Bare `/v1/realtime` selects that handler. The client uses `?duplex=0` only for the existing non-Server-VAD
-wire flow; `?duplex=1` remains a supported compatibility alias.
+For the engine-owned plugin, use an overlay based on
+`vllm_omni/deploy/qwen3_omni_duplex.yaml`, with `duplex_session.server_vad_model_path`
+pointing to your local artifact. See the [complete duplex setup](../realtime_web/README.md#qwen3-with-server-vad-automatic-turns).
+The default `qwen3_omni_moe.yaml` remains a turn deployment. Duplex mode serves
+`/v1/realtime?duplex=1` and `/v1/chat/completions`; the legacy STT handler requires
+a turn deployment.
 
 The Python client supports the following command-line arguments:
 
@@ -573,3 +577,53 @@ The gradio script supports the following arguments:
 - `--ip`: Host/IP for Gradio server (default: 127.0.0.1)
 - `--port`: Port for Gradio server (default: 7861)
 - `--share`: Share the Gradio demo publicly (creates a public link)
+
+## Browser voice call (shared realtime UI)
+
+Run these commands from the repository root with the vLLM-Omni environment activated.
+
+### Without VAD: manually submit each turn
+
+Start the backend:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
+```
+
+In another terminal, check backend readiness and start the UI:
+
+```bash
+curl --fail http://127.0.0.1:8091/health
+python -m examples.online_serving.qwen3_omni.realtime_web \
+    --backend ws://127.0.0.1:8091 --stt --port 7863
+```
+
+Open `http://localhost:7863`, start a session, speak, and press **Send turn**.
+`--stt` is the default. Each turn uses a separate connection without shared model
+history; the conversation shown in the browser is a local log.
+
+### With VAD: automatically submit after silence
+
+Start the backend with a Server VAD deployment overlay and a compatible Silero
+ONNX artifact, following the
+[complete VAD setup](../realtime_web/README.md#qwen3-with-server-vad-automatic-turns).
+After its health check succeeds, start the UI:
+
+```bash
+python -m examples.online_serving.qwen3_omni.realtime_web \
+    --backend ws://127.0.0.1:8091 --vad --port 7863
+```
+
+Speak and pause for 500 ms to submit automatically. `--vad` configures the client;
+it does not load a VAD model or change the backend deployment by itself.
+
+VAD mode keeps uploading audio during replies and supports speech interruption.
+The engine-owned Qwen duplex plugin maintains conversation history and tracks
+played replies through playback acknowledgements. Each committed utterance starts
+a new generation request; the model does not use native streaming-input KV decoding.
+STT mode pauses microphone upload while the reply is generated and played.
+In VAD mode, click **Camera** to upload sampled frames with your spoken question;
+see [camera setup and limits](../realtime_web/README.md#qwen-vad-camera-input).
+STT remains audio-only. To switch back to manual turns, use the default turn
+deployment, restart the UI with `--stt`, refresh the page, and reconnect. Stop the existing UI before reusing port 7863.
+See the [shared UI guide](../realtime_web/README.md) for HTTPS access and testing.

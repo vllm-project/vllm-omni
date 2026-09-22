@@ -1,12 +1,10 @@
 # MiniCPM-o 4.5 three-stage deploy on one large-memory GPU.
 pipeline: minicpmo_4_5
 async_chunk: true
-# Native full-duplex shares this profile with /v1/chat/completions. Every other
-# duplex_session knob keeps its runtime default.
+# Use minicpmo_4_5_turn.yaml to select the ordinary turn-based serving engine.
 session_mode: duplex
 # Keep the active window aligned with the session and stage capacities below.
 # A smaller window serializes first-packet generation for concurrent chat turns.
-active_stream_window: 4
 duplex_session:
   # Matches Stage 0/1 max_num_seqs below.
   max_sessions: 4
@@ -30,6 +28,7 @@ connectors:
       enable_hift_graph: true
       enable_cfm_graph: true
       cfm_max_graphs: 32
+      cfm_graph_bucket_frames: 16
 
 stages:
   - stage_id: 0
@@ -48,7 +47,7 @@ stages:
         fps: 1
         num_frames: 128
     limit_mm_per_prompt:
-      # Daily-Omni MiniCPM pack: up to 64 interleaved image/audio pairs (1fps).
+      # Daily-Omni: up to 64 interleaved image/audio pairs (1fps).
       image: 64
       audio: 64
       video: 1

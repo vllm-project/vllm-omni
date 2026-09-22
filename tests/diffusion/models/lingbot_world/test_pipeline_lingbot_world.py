@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import gc
+import os
 import weakref
 from pathlib import Path
 from threading import Lock
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from diffusers.utils.torch_utils import randn_tensor as _diffusers_randn_tensor
@@ -18,6 +20,7 @@ from torch import nn
 import vllm_omni.diffusion.models.lingbot_world.dmd_block as lingbot_dmd_block
 import vllm_omni.diffusion.models.lingbot_world.pipeline as lingbot_pipeline
 from tests.diffusion.models.wan2_2.conftest import noop_progress_bar
+from vllm_omni.diffusion.interaction.modality_handlers.camera import CameraSession
 from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
 from vllm_omni.diffusion.models.lingbot_world.actions import (
     integrate_lingbot_camera_actions,
@@ -28,6 +31,7 @@ from vllm_omni.diffusion.models.lingbot_world.camera import (
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.utils import StepRequestState
+from vllm_omni.experimental.ar_diffusion.capability import supports_chunk_step_grouping
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionControlInput,
     ARDiffusionTickRequest,
@@ -126,6 +130,10 @@ class _RecordingTransformer(nn.Module):
             sink_size=3,
         )
         self.blocks = nn.ModuleList([nn.Identity(), nn.Identity()])
+        for block in self.blocks:
+            # The spec reads head geometry from both attentions; cross-attention keeps every local head.
+            block.self_attn = SimpleNamespace(num_sp_heads=2)
+            block.cross_attn = SimpleNamespace(num_local_heads=2)
         self.calls: list[dict] = []
         self.cache_allocations: list[dict] = []
         self.raise_on_call = raise_on_call
@@ -145,6 +153,7 @@ class _RecordingTransformer(nn.Module):
             "cache_id": id(kwargs["cache"]),
             "start_frame": kwargs["start_frame"],
             "update_cache": kwargs["update_cache"],
+            "camera_cache": kwargs.get("camera_modulation_cache"),
         }
         self.calls.append(call)
         if self.raise_on_call == len(self.calls):
@@ -411,8 +420,10 @@ def _stub_pipeline_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
             intrinsics=value.intrinsics[:num_frames],
         )
 
-    def build_plucker_embedding(value, *, height, width, target_height, target_width, device, dtype):
-        del target_height, target_width
+    def build_plucker_embedding(
+        value, *, height, width, target_height, target_width, device, dtype, translation_scale=None
+    ):
+        del target_height, target_width, translation_scale
         frames = value.poses.shape[0]
         data = torch.arange(frames * 6 * height * width, device=device, dtype=torch.float32)
         return data.reshape(frames, 6, height, width).to(dtype=dtype)
@@ -531,14 +542,15 @@ def test_ar_diffusion_capability_uses_transformer_local_head_geometry() -> None:
     assert spec.sink_frames == 3
     assert [(branch.name, branch.local_index) for branch in spec.kv_branches] == [("main", 0)]
     assert spec.cross_attention_lengths == {"text": 512}
-    # One condition block, committed + pending encoder caches, and decoder state.
+    # One condition block, committed + pending encoder caches, the session's
+    # cached prompt embedding (512 tokens x text_dim 8 x fp32), and decoder state.
     # The stub encoder retains 2 RGB frames at 16x16 and 2 feature frames at 2x2.
     encoder_bytes = (2 * 3 * 16 * 16 + 2 * 16 * 2 * 2) * 4
-    assert spec.model_owned_state_bytes_per_session == 960 + 2 * encoder_bytes + 2_421_248
+    assert spec.model_owned_state_bytes_per_session == 960 + 384 + 2 * encoder_bytes + 2_421_248
 
 
 def test_session_admission_accounts_for_the_streaming_decoder_cache() -> None:
-    """Admission includes encoder state even when the decoder cannot stream."""
+    """Admission includes encoder state and the prompt embedding even when the decoder cannot stream."""
     module = _load_pipeline_module()
 
     def spec_pipeline():
@@ -557,13 +569,29 @@ def test_session_admission_accounts_for_the_streaming_decoder_cache() -> None:
     # than the image condition alone could account for.
     assert widened - small > 2_000_000
 
-    # Removing decoder support leaves the condition and both encoder histories.
+    # Removing decoder support leaves the condition, both encoder histories and
+    # the prompt-embedding cache.
     bare = spec_pipeline()
     for attribute in ("decoder", "post_quant_conv"):
         if hasattr(bare.vae, attribute):
             delattr(bare.vae, attribute)
     bare.vae._cached_conv_counts.pop("decoder")
-    assert bare.ar_diffusion_kv_cache_spec().model_owned_state_bytes_per_session == 960 + 2 * 6_656
+    assert bare.ar_diffusion_kv_cache_spec().model_owned_state_bytes_per_session == 960 + 384 + 2 * 6_656
+
+
+@pytest.mark.parametrize("sp_size", [1, 4])
+def test_session_admission_budgets_camera_modulation_per_rank(sp_size: int) -> None:
+    pipeline = _pipeline(_load_pipeline_module())
+    pipeline._ar_height, pipeline._ar_width = 480, 832
+    pipeline.od_config.parallel_config.ulysses_degree = sp_size
+    pipeline.transformer.config.num_layers = 40
+    pipeline.transformer.config.num_attention_heads = 40
+    pipeline.transformer.config.attention_head_dim = 128
+    pipeline.transformer._dtype = torch.bfloat16
+    forty_layers = pipeline.ar_diffusion_kv_cache_spec().model_owned_state_bytes_per_session
+    pipeline.transformer.config.num_layers = 1
+    one_layer = pipeline.ar_diffusion_kv_cache_spec().model_owned_state_bytes_per_session
+    assert forty_layers - one_layer == 2 * 39 * (4680 // sp_size) * 5120 * 2
 
 
 def test_preprocess_materializes_external_inputs_before_worker_execution(tmp_path: Path) -> None:
@@ -709,6 +737,99 @@ def test_component_discovery_uses_official_checkpoint_contract() -> None:
     assert module._loader_state.prefetch_calls == [("checkpoint", ("tokenizer", "text_encoder", "vae"), False)]
 
 
+def _ulysses_config(size: int):
+    parallel_config = _od_config().parallel_config
+    parallel_config.sequence_parallel_size = size
+    parallel_config.ulysses_degree = size
+    return _od_config(parallel_config=parallel_config)
+
+
+def _record_shard_install(monkeypatch, module, *, world_size: int):
+    """Stand in for the Ulysses group and the decoder patch; return what the install was asked for."""
+    installs: list[dict] = []
+    group = object()
+
+    def install(vae, group_arg, split_dim, *, dst):
+        installs.append({"vae": vae, "group": group_arg, "split_dim": split_dim, "dst": dst})
+
+    monkeypatch.setattr(module, "install_wan_spatial_shard_decode", install)
+    monkeypatch.setattr(module.LingBotWorldCausalDMDPipeline, "_vae_shard_group", lambda self: (group, world_size))
+    return installs, group
+
+
+def test_a_multi_rank_deployment_shards_the_decoder_across_the_ulysses_ranks(monkeypatch) -> None:
+    """Multi-rank deployments shard decode by default."""
+    module = _load_pipeline_module()
+    installs, group = _record_shard_install(monkeypatch, module, world_size=2)
+
+    pipeline = module.LingBotWorldCausalDMDPipeline(od_config=_ulysses_config(2))
+
+    # Along the width, and assembled on every rank: each rank's post_decode consumes the frame.
+    assert installs == [{"vae": pipeline.vae, "group": group, "split_dim": "width", "dst": None}]
+    assert pipeline._vae_shard_split_dim == "width"
+
+
+def test_a_single_rank_deployment_leaves_the_decoder_alone(monkeypatch) -> None:
+    module = _load_pipeline_module()
+    installs, _ = _record_shard_install(monkeypatch, module, world_size=1)
+
+    pipeline = module.LingBotWorldCausalDMDPipeline(od_config=_ulysses_config(1))
+
+    assert installs == [] and pipeline._vae_shard_split_dim is None
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("width, local_width", [(832, 208), (840, 216)])
+def test_streaming_decode_reservation_uses_padded_shards(monkeypatch, enabled, width, local_width):
+    module = _load_pipeline_module()
+    installs, _ = _record_shard_install(monkeypatch, module, world_size=4)
+    config = _ulysses_config(4)
+    config.model_config.update(lingbot_vae_spatial_sharding=enabled, ar_diffusion_height=480, ar_diffusion_width=width)
+    pipeline = module.LingBotWorldCausalDMDPipeline(od_config=config)
+    from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
+
+    # Exercise the real byte estimator without constructing a checkpoint VAE.
+    decoder = object.__new__(WanStreamingDecoder)
+    decoder._bytes_per_pixel_fp32 = 16.0
+    monkeypatch.setattr(pipeline, "_streaming_decoder", lambda: decoder)
+    expected_width = local_width if enabled else width
+    assert pipeline._streaming_decode_bytes_per_session() == 16 * 480 * expected_width
+    assert len(installs) == int(enabled)
+    assert pipeline._vae_shard_world_size == (4 if enabled else 1)
+    assert config.parallel_config.sequence_parallel_size == config.parallel_config.ulysses_degree == 4
+
+
+def test_disabling_vae_sharding_does_not_require_a_shard_group(monkeypatch):
+    module = _load_pipeline_module()
+    config = _ulysses_config(4)
+    config.model_config["lingbot_vae_spatial_sharding"] = False
+
+    def unexpected_group(self):
+        pytest.fail("disabled VAE sharding must not access its process group")
+
+    monkeypatch.setattr(module.LingBotWorldCausalDMDPipeline, "_vae_shard_group", unexpected_group)
+    pipeline = module.LingBotWorldCausalDMDPipeline(od_config=config)
+    assert pipeline._vae_shard_split_dim is None
+
+
+@pytest.mark.parametrize("value", ["false", 0, None])
+def test_vae_sharding_switch_requires_a_boolean(value):
+    module = _load_pipeline_module()
+    config = _ulysses_config(4)
+    config.model_config["lingbot_vae_spatial_sharding"] = value
+    with pytest.raises(ValueError, match="lingbot_vae_spatial_sharding must be a boolean"):
+        module.LingBotWorldCausalDMDPipeline(od_config=config)
+
+
+def test_vae_shard_refuses_a_group_of_the_wrong_size(monkeypatch) -> None:
+    module = _load_pipeline_module()
+    installs, _ = _record_shard_install(monkeypatch, module, world_size=4)
+
+    with pytest.raises(RuntimeError, match="sequence_parallel_size=2 but the Ulysses group has 4 ranks"):
+        module.LingBotWorldCausalDMDPipeline(od_config=_ulysses_config(2))
+    assert installs == []
+
+
 @pytest.mark.parametrize(
     ("field", "value", "feature"),
     [
@@ -730,8 +851,9 @@ def test_unsupported_parallel_modes_fail_before_component_loading(field: str, va
     assert module._loader_state.prefetch_calls == []
 
 
-def test_pure_ulysses_parallel_config_is_supported() -> None:
+def test_pure_ulysses_parallel_config_is_supported(monkeypatch) -> None:
     module = _load_pipeline_module()
+    _record_shard_install(monkeypatch, module, world_size=2)
     parallel_config = _od_config().parallel_config
     parallel_config.sequence_parallel_size = 2
     parallel_config.ulysses_degree = 2
@@ -767,13 +889,14 @@ def test_unsupported_sp_config_fails_before_component_loading(overrides):
     assert module._loader_state.prefetch_calls == []
 
 
-def test_unsupported_quantization_fails_before_component_loading() -> None:
+def test_quantization_reaches_transformer_factory() -> None:
     module = _load_pipeline_module()
+    quant_config = object()
 
-    with pytest.raises(NotImplementedError, match="quantization"):
-        module.LingBotWorldCausalDMDPipeline(od_config=_od_config(quantization_config=object()))
+    pipeline = module.LingBotWorldCausalDMDPipeline(od_config=_od_config(quantization_config=quant_config))
 
-    assert module._loader_state.prefetch_calls == []
+    assert pipeline.transformer is not None
+    assert _FakeTransformerFactory.last_call[1:] == (quant_config, "transformer")
 
 
 def test_official_scheduler_config_matches_fixed_dmd_contract() -> None:
@@ -1330,10 +1453,34 @@ def test_first_frame_condition_and_camera_fold_match_transformer_contract() -> N
     assert expected_camera.shape == (1, 384, 3, 2, 2)
 
 
-def test_fixed_dmd_transition_and_cache_commit_trace() -> None:
+@pytest.mark.parametrize("value", ["true", "false", 1, 0, None])
+def test_reuse_last_step_kv_rejects_non_boolean_config(value: object) -> None:
+    config = _od_config()
+    config.model_config["lingbot_reuse_last_step_kv"] = value
+    with pytest.raises(ValueError, match="lingbot_reuse_last_step_kv must be a bool"):
+        _pipeline(_load_pipeline_module(), od_config=config)
+
+
+def test_reuse_last_step_kv_is_fixed_per_instance(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_LINGBOT_REUSE_LAST_STEP_KV", "1")
+    module = _load_pipeline_module()
+    config = _od_config()
+    config.model_config["lingbot_reuse_last_step_kv"] = True
+    reuse = _pipeline(module, od_config=config)
+    default = _pipeline(module)
+    config.model_config["lingbot_reuse_last_step_kv"] = False
+    assert reuse._dmd_blocks.reuse_last_step_kv is True
+    assert default._dmd_blocks.reuse_last_step_kv is False
+    assert reuse._dmd_blocks is reuse._dmd_blocks
+
+
+@pytest.mark.parametrize("reuse_last_step_kv", [False, True])
+def test_fixed_dmd_transition_and_cache_commit_trace(reuse_last_step_kv: bool) -> None:
     module = _load_pipeline_module()
     transformer = _RecordingTransformer()
-    pipeline = _pipeline(module, transformer=transformer)
+    config = _od_config()
+    config.model_config["lingbot_reuse_last_step_kv"] = reuse_last_step_kv
+    pipeline = _pipeline(module, transformer=transformer, od_config=config)
 
     result = pipeline(_request())
 
@@ -1355,14 +1502,18 @@ def test_fixed_dmd_transition_and_cache_commit_trace() -> None:
             current = x0
     torch.testing.assert_close(result.output, current)
 
+    expected_timesteps = [timestep for timestep, _ in warped_schedule]
+    if not reuse_last_step_kv:
+        expected_timesteps.append(0.0)
     torch.testing.assert_close(
-        torch.cat([call["timestep"] for call in transformer.calls]),
-        torch.tensor([*(timestep for timestep, _ in warped_schedule), 0.0]),
+        torch.cat([call["timestep"] for call in transformer.calls]), torch.tensor(expected_timesteps)
     )
-    assert [call["update_cache"] for call in transformer.calls] == [False, False, False, False, True]
-    assert [call["start_frame"] for call in transformer.calls] == [0, 0, 0, 0, 0]
+    commit_flags = [False] * (len(expected_timesteps) - 1) + [True]
+    assert [call["update_cache"] for call in transformer.calls] == commit_flags
+    assert [call["start_frame"] for call in transformer.calls] == [0] * len(expected_timesteps)
     assert len({call["cache_id"] for call in transformer.calls}) == 1
-    torch.testing.assert_close(transformer.calls[-1]["hidden_states"][:, :16], result.output)
+    committed_latent = result.output + warped_schedule[-1][1] if reuse_last_step_kv else result.output
+    torch.testing.assert_close(transformer.calls[-1]["hidden_states"][:, :16], committed_latent)
 
 
 @pytest.mark.parametrize(
@@ -1669,7 +1820,6 @@ def test_typed_ticks_generate_one_global_block_and_return_standard_metadata(
         "applied_event_ids": [1],
     }
     assert pipeline._ar_sessions["world-1"].next_chunk_index == 2
-    assert pipeline._ar_sessions["world-1"].prompt == "enter the snowy valley"
     assert pipeline._ar_sessions["world-1"].camera_tail is not None
     assert pipeline._ar_sessions["world-1"].camera_tail.poses.shape == (1, 4, 4)
     expected_generator = torch.Generator(device="cpu").manual_seed(17)
@@ -1783,6 +1933,7 @@ def test_first_typed_yaw_action_uses_pre_action_identity_anchor(
         target_width=16,
         device=torch.device("cpu"),
         dtype=torch.float32,
+        translation_scale=None,  # None for camera_actions / action_script input (using max-norm)
     )[1:]
 
     assert not torch.equal(action_embedding, neutral_embedding)
@@ -1842,8 +1993,11 @@ def test_typed_ticks_keep_bounded_encoder_state_beyond_ten_chunks(
         pipeline(_request(sampling=sampling))
 
     assert pipeline.vae.encode_inputs == []
-    assert [video.shape[2] for video in pipeline.vae.encoder.inputs] == [1] + [4] * 32
+    # The stub encoder's history settles after its second block; the nine
+    # blocks after that reuse the settled condition without an encode.
+    assert [video.shape[2] for video in pipeline.vae.encoder.inputs] == [1] + [4] * 5
     assert all(torch.count_nonzero(video) == 0 for video in pipeline.vae.encoder.inputs[1:])
+    assert pipeline._ar_sessions["world-1"].condition_fixed_point is not None
     encoder_cache = pipeline._ar_sessions["world-1"].encoder_cache
     assert sum(t.numel() * t.element_size() for t in encoder_cache) == pipeline._condition_encoder_cache_bytes()
     assert pipeline.vae._enc_feat_map == ["module-owned"]
@@ -1939,6 +2093,76 @@ def test_condition_continues_real_causal_vae_beyond_initial_horizon(
     assert pipeline._ar_sessions == {}
 
 
+def test_condition_encoder_stops_at_its_fixed_point_and_restarts_with_the_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once a block returns the history it was given, later blocks reuse the condition without encoding.
+
+    The whole-clip encode is the reference for every block, so reusing the
+    stored condition is only allowed to be a speedup, never a change.
+    """
+    pipeline = _tiny_condition_pipeline(monkeypatch)
+    pipeline._ar_diffusion_kv_state = object()
+    blocks = 12
+    inputs = pipeline._parse_request(_request(sampling=_SamplingParams(num_frames=(blocks * 3 - 1) * 4 + 1)))
+    with torch.inference_mode():
+        expected = pipeline._prepare_condition(inputs, dtype=torch.float32)
+    encoder_calls = []
+    original_encoder = pipeline.vae.encoder.forward
+
+    def encoder(*args, **kwargs):
+        encoder_calls.append(len(seen))
+        return original_encoder(*args, **kwargs)
+
+    seen: list[torch.Tensor] = []
+
+    def generate_block(**kwargs):
+        index = len(seen) % blocks
+        torch.testing.assert_close(
+            kwargs["condition"], expected[:, :, index * 3 : (index + 1) * 3], rtol=1e-6, atol=1e-6
+        )
+        seen.append(kwargs["condition"])
+        return torch.zeros_like(kwargs["condition"][:, :16])
+
+    monkeypatch.setattr(pipeline.vae.encoder, "forward", encoder)
+    monkeypatch.setattr(pipeline, "_generate_block", generate_block)
+
+    def tick(index):
+        pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=index))))
+
+    settled_at = None
+    for index in range(blocks):
+        tick(index)
+        state = pipeline._ar_sessions["world-1"]
+        if settled_at is None and state.condition_fixed_point is not None:
+            settled_at = index
+        assert state.pending_encoder_cache is None and state.encoder_cache is not None
+    assert settled_at is not None and 0 < settled_at < blocks - 1, settled_at
+    # Three encoder passes per encoded block, none once the fixed point is stored.
+    assert encoder_calls == [index for index in range(settled_at + 1) for _ in range(3)]
+    # The stored condition is the session's own, not shared with the callers.
+    assert all(seen[settled_at] is not later for later in seen[settled_at + 1 :])
+
+    # A session restarted from chunk 0 encodes again from the source image.
+    pipeline.reset_ar_diffusion_session("world-1")
+    tick(0)
+    state = pipeline._ar_sessions["world-1"]
+    assert state.condition_fixed_point is None
+    assert encoder_calls[-3:] == [blocks] * 3
+
+
+def test_condition_encoder_fixed_point_is_released_with_the_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline = _tiny_condition_pipeline(monkeypatch)
+    pipeline._ar_diffusion_kv_state = object()
+    monkeypatch.setattr(pipeline, "_generate_block", lambda **kwargs: torch.zeros_like(kwargs["condition"][:, :16]))
+    for index in range(8):
+        pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=index))))
+    state = pipeline._ar_sessions["world-1"]
+    assert state.condition_fixed_point is not None
+    pipeline.close_ar_diffusion_session("world-1")
+    assert state.condition_fixed_point is None and state.encoder_cache is None
+
+
 def test_condition_encoder_interleaving_retry_and_reset(monkeypatch: pytest.MonkeyPatch) -> None:
     pipeline = _tiny_condition_pipeline(monkeypatch)
     pipeline._ar_diffusion_kv_state = object()
@@ -2015,6 +2239,7 @@ def test_stepwise_failed_chunk_releases_pending_encoder_on_close(monkeypatch: py
     transformer.raise_on_call = 1
     with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
         pipeline.prepare_encode(state)
+        pipeline.prepare_next_chunk(state)
         session = pipeline._ar_sessions[state.request_id]
         assert session.encoder_cache is None and session.pending_encoder_cache is not None
         with pytest.raises(RuntimeError, match="forced transformer failure"):
@@ -2037,6 +2262,7 @@ def test_stateful_condition_rejects_tiled_encoder(monkeypatch: pytest.MonkeyPatc
             state = _stepwise_state()
             with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
                 pipeline.prepare_encode(state)
+                pipeline.prepare_next_chunk(state)
     assert pipeline.vae.encoder.inputs == []
     assert all(s.encoder_cache is None and s.pending_encoder_cache is None for s in pipeline._ar_sessions.values())
 
@@ -2168,11 +2394,14 @@ def _stepwise_state(
 def _run_stepwise(pipeline, state):
     outputs = []
     pipeline.prepare_encode(state)
+    pipeline.prepare_next_chunk(state)
     while not state.request_denoise_completed:
         noise = pipeline.denoise_step(None, states=[state])
         pipeline.step_scheduler(state, noise)
         if state.chunk_denoise_completed:
             outputs.append(pipeline.post_decode(state))
+            if not state.request_denoise_completed:
+                pipeline.prepare_next_chunk(state)
     return outputs
 
 
@@ -2186,6 +2415,7 @@ def _stepwise_chunks(pipeline, state, ar_state):
     """
     with pipeline.bind_ar_diffusion_state(state.request_id, ar_state):
         pipeline.prepare_encode(state)
+        pipeline.prepare_next_chunk(state)
     while not state.request_denoise_completed:
         output = None
         with pipeline.bind_ar_diffusion_state(state.request_id, ar_state):
@@ -2193,8 +2423,44 @@ def _stepwise_chunks(pipeline, state, ar_state):
             pipeline.step_scheduler(state, noise)
             if state.chunk_denoise_completed:
                 output = pipeline.post_decode(state)
+                if not state.request_denoise_completed:
+                    pipeline.prepare_next_chunk(state)
         if output is not None:
             yield output
+
+
+def test_stepwise_block_shares_one_camera_cache_across_its_five_forwards() -> None:
+    """The four probes and the commit of one stepwise block reuse one camera cache; the next block gets its own.
+
+    Request mode creates one cache per loop; the stepwise path's forwards are
+    separate scheduler steps, so the pipeline holds the block's cache and
+    passes it to each one.
+    """
+    module = _load_pipeline_module()
+    transformer = _RecordingTransformer()
+    pipeline = _pipeline(module, transformer=transformer)
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+    state = _stepwise_state(num_frames=21)
+    state.sampling.output_type = "latent"
+
+    with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
+        outputs = _run_stepwise(pipeline, state)
+
+    assert len(outputs) == 2 and len(transformer.calls) == 10
+    caches = [call["camera_cache"] for call in transformer.calls]
+    assert all(c is not None for c in caches)
+    assert len({id(c) for c in caches[:5]}) == 1 and len({id(c) for c in caches[5:]}) == 1
+    assert caches[0] is not caches[5]
+    # The block's cache does not outlive its commit.
+    assert "camera_cache" not in state.extra
+
+
+def test_pipeline_declares_chunk_step_grouping() -> None:
+    """A realtime block's probes and commit may run without a scheduler cycle between them."""
+    module = _load_pipeline_module()
+    assert module.LingBotWorldCausalDMDPipeline.supports_chunk_step_grouping is True
+    assert supports_chunk_step_grouping(_pipeline(module))
 
 
 def test_pipeline_declares_step_execution_support() -> None:
@@ -2246,10 +2512,13 @@ def test_forward_rejects_a_stepwise_camera_action_script(extra_args) -> None:
         pipeline(_request(sampling=sampling))
 
 
-def test_stepwise_progress_metadata_and_commit_trace() -> None:
+@pytest.mark.parametrize("reuse_last_step_kv", [False, True])
+def test_stepwise_progress_metadata_and_commit_trace(reuse_last_step_kv: bool) -> None:
     module = _load_pipeline_module()
     transformer = _RecordingTransformer()
-    pipeline = _pipeline(module, transformer=transformer)
+    config = _od_config()
+    config.model_config["lingbot_reuse_last_step_kv"] = reuse_last_step_kv
+    pipeline = _pipeline(module, transformer=transformer, od_config=config)
     pipeline._ar_height = 16
     pipeline._ar_width = 16
     state = _stepwise_state(num_frames=21)
@@ -2263,8 +2532,9 @@ def test_stepwise_progress_metadata_and_commit_trace() -> None:
     assert [output.chunk_index for output in outputs] == [0, 1]
     assert all(output.total_chunks == 2 for output in outputs)
     assert outputs[-1].finished is True
-    assert [call["update_cache"] for call in transformer.calls] == [False, False, False, False, True] * 2
-    assert [call["start_frame"] for call in transformer.calls] == [0] * 5 + [3] * 5
+    calls_per_chunk = 4 if reuse_last_step_kv else 5
+    assert [call["update_cache"] for call in transformer.calls] == ([False] * (calls_per_chunk - 1) + [True]) * 2
+    assert [call["start_frame"] for call in transformer.calls] == [0] * calls_per_chunk + [3] * calls_per_chunk
     assert fake.commits == ["main", "main"]
     for chunk_index, output in enumerate(outputs):
         metadata = output.output["metadata"]["ar_diffusion"]
@@ -2325,7 +2595,10 @@ def test_stepwise_matches_tick_transformer_trace_and_latents(num_chunks) -> None
         torch.testing.assert_close(step_call["camera_hidden_states"], tick_call["camera_hidden_states"])
     assert stepwise_state.extra["condition"].shape[2] == 3
     assert pipeline.vae.encode_inputs == []
-    assert [video.shape[2] for video in pipeline.vae.encoder.inputs] == ([1] + [4] * (num_chunks * 3 - 1)) * 2
+    # The stub encoder's history settles after its second block, so both
+    # modes encode two blocks and reuse the settled condition after that.
+    encoded_blocks = min(num_chunks, 2)
+    assert [video.shape[2] for video in pipeline.vae.encoder.inputs] == ([1] + [4] * (encoded_blocks * 3 - 1)) * 2
     assert stepwise_fake.commits == ["main"] * num_chunks
     assert len(stepwise_outputs) == num_chunks and stepwise_outputs[-1].finished
     assert pipeline.vae.decode_inputs == []
@@ -2394,21 +2667,16 @@ def test_stepwise_emits_latents_without_touching_the_vae() -> None:
     assert pipeline.vae.decode_inputs == []
 
 
-def _capture_video_processor(monkeypatch) -> list[tuple[tuple[int, ...], str]]:
-    """Record what reaches postprocess_video, and name each chunk's output."""
-    import diffusers.video_processor as video_processor_module
+def _capture_pixel_conversion(monkeypatch) -> list[tuple[int, ...]]:
+    """Record each decoded block reaching the uint8 conversion, and name its output."""
+    module = _load_pipeline_module()
+    processed: list[tuple[int, ...]] = []
 
-    processed: list[tuple[tuple[int, ...], str]] = []
+    def uint8_frames(video):
+        processed.append(tuple(video.shape))
+        return f"frames-{len(processed)}"
 
-    class VideoProcessor:
-        def __init__(self, *, vae_scale_factor):
-            assert vae_scale_factor == 8
-
-        def postprocess_video(self, video, *, output_type):
-            processed.append((tuple(video.shape), output_type))
-            return f"frames-{len(processed)}"
-
-    monkeypatch.setattr(video_processor_module, "VideoProcessor", VideoProcessor)
+    monkeypatch.setattr(module, "_uint8_frames", uint8_frames)
     return processed
 
 
@@ -2422,7 +2690,7 @@ def _streaming_pipeline(module):
 def test_stepwise_decodes_each_chunk_for_streaming_consumers(monkeypatch) -> None:
     """A non-latent request must stream pixels under the primary "video" key."""
     module = _load_pipeline_module()
-    processed = _capture_video_processor(monkeypatch)
+    processed = _capture_pixel_conversion(monkeypatch)
     pipeline = _streaming_pipeline(module)
     state = _stepwise_state(num_frames=21)
     state.sampling.output_type = "np"
@@ -2431,7 +2699,7 @@ def test_stepwise_decodes_each_chunk_for_streaming_consumers(monkeypatch) -> Non
     with pipeline.bind_ar_diffusion_state(state.request_id, fake):
         outputs = _run_stepwise(pipeline, state)
 
-    assert [output_type for _, output_type in processed] == ["np", "np"]
+    assert processed == [(1, 3, 9, 16, 16), (1, 3, 12, 16, 16)]
     assert [output.output["payload"] for output in outputs] == [{"video": "frames-1"}, {"video": "frames-2"}]
     # Identity metadata survives the switch to pixel output.
     assert [output.output["metadata"]["ar_diffusion"]["chunk_index"] for output in outputs] == [0, 1]
@@ -2445,7 +2713,7 @@ def test_stepwise_chunks_continue_one_sessions_temporal_decode(monkeypatch) -> N
     the same latents would: 9 frames, then 12.
     """
     module = _load_pipeline_module()
-    processed = _capture_video_processor(monkeypatch)
+    processed = _capture_pixel_conversion(monkeypatch)
     pipeline = _streaming_pipeline(module)
     state = _stepwise_state(num_frames=21)
     state.sampling.output_type = "np"
@@ -2454,7 +2722,7 @@ def test_stepwise_chunks_continue_one_sessions_temporal_decode(monkeypatch) -> N
     with pipeline.bind_ar_diffusion_state(state.request_id, fake):
         _run_stepwise(pipeline, state)
 
-    assert [shape for shape, _ in processed] == [(1, 3, 9, 16, 16), (1, 3, 12, 16, 16)]
+    assert processed == [(1, 3, 9, 16, 16), (1, 3, 12, 16, 16)]
     # One opening frame for the session, not one per chunk.
     assert pipeline.vae.decoder.first_chunk_flags == [True] + [False] * 5
     # The whole-clip decode path is not involved, and the module-owned cache
@@ -2463,10 +2731,68 @@ def test_stepwise_chunks_continue_one_sessions_temporal_decode(monkeypatch) -> N
     assert pipeline.vae._feat_map == ["module-owned"]
 
 
+def test_prepare_next_chunk_rejects_live_camera_with_scripted_paths() -> None:
+    """Scripted/cached camera must not silently ignore mid-generation camera events."""
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module, transformer=_RecordingTransformer())
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+
+    # Scenario 1, input pre-scripted camera trajectory via action_script
+    state = _stepwise_state(num_frames=21)
+    with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
+        pipeline.prepare_encode(state)
+        assert state.extra.get("camera_action_script") is not None
+        state.interaction_sessions["camera"] = CameraSession(has_received_input=True)
+        with pytest.raises(ValueError, match="camera_action_script"):
+            pipeline.prepare_next_chunk(state)
+
+    # Scenario 2, input pre-scripted camera trajectory via embedding cache
+    poses = torch.eye(4).repeat(21, 1, 1)
+    trajectory = _CameraTrajectory(
+        poses=poses,
+        intrinsics=torch.tensor([[100.0, 100.0, 8.0, 8.0]]).repeat(21, 1),
+    )
+    state = _stepwise_state(num_frames=21)
+    state.sampling.extra_args["_lingbot_camera_trajectory"] = trajectory
+    state.sampling.extra_args.pop("_lingbot_camera_action_script")
+    with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):  # pyright: ignore[reportArgumentType]
+        pipeline.prepare_encode(state)
+        assert state.extra.get("camera_embedding_cache") is not None
+        state.interaction_sessions["camera"] = CameraSession(has_received_input=True)
+        with pytest.raises(ValueError, match="camera_embedding_cache"):
+            pipeline.prepare_next_chunk(state)
+
+
+def test_peek_chunk_media_matches_streaming_decoder_frame_counts(monkeypatch) -> None:
+    """Camera timelines must track the streaming decoder's 9-then-12 media counts."""
+    module = _load_pipeline_module()
+    _capture_pixel_conversion(monkeypatch)
+    pipeline = _streaming_pipeline(module)
+    state = _stepwise_state(num_frames=21)
+    state.sampling.output_type = "np"
+    state.sampling.fps = 16.0
+    fake = _FakeARState(state.request_id)
+
+    with pipeline.bind_ar_diffusion_state(state.request_id, fake):
+        pipeline.prepare_encode(state)
+        first = pipeline.peek_chunk_media(state)
+        assert (first.num_media_frames, first.fps, first.num_latent_frames) == (9, 16.0, 3)
+
+        pipeline.prepare_next_chunk(state)
+        while not state.chunk_denoise_completed:
+            noise = pipeline.denoise_step(None, states=[state])
+            pipeline.step_scheduler(state, noise)
+        pipeline.post_decode(state)
+
+        second = pipeline.peek_chunk_media(state)
+        assert (second.num_media_frames, second.fps, second.num_latent_frames) == (12, 16.0, 3)
+
+
 def test_streaming_decode_state_is_owned_by_the_session(monkeypatch) -> None:
     """Decoder state is keyed by request id and released with the AR session."""
     module = _load_pipeline_module()
-    _capture_video_processor(monkeypatch)
+    _capture_pixel_conversion(monkeypatch)
     pipeline = _streaming_pipeline(module)
     state = _stepwise_state(request_id="req-stream", num_frames=21)
     state.sampling.output_type = "np"
@@ -2490,7 +2816,7 @@ def test_streaming_decode_state_is_owned_by_the_session(monkeypatch) -> None:
 def test_streaming_decode_state_is_dropped_on_session_reset(monkeypatch) -> None:
     """A reset session must not resume the temporal context it just abandoned."""
     module = _load_pipeline_module()
-    _capture_video_processor(monkeypatch)
+    _capture_pixel_conversion(monkeypatch)
     pipeline = _streaming_pipeline(module)
     state = _stepwise_state(request_id="req-reset", num_frames=21)
     state.sampling.output_type = "np"
@@ -2514,7 +2840,7 @@ def test_streaming_decode_keeps_interleaved_sessions_isolated(monkeypatch) -> No
     interleaving the scheduler actually produces.
     """
     module = _load_pipeline_module()
-    processed = _capture_video_processor(monkeypatch)
+    processed = _capture_pixel_conversion(monkeypatch)
     pipeline = _streaming_pipeline(module)
     states = []
     for request_id in ("req-a", "req-b"):
@@ -2547,7 +2873,7 @@ def test_streaming_decode_keeps_interleaved_sessions_isolated(monkeypatch) -> No
     assert pipeline.vae.decoder.first_chunk_flags == (
         [True, False, False] + [True, False, False] + [False] * 3 + [False] * 3
     )
-    assert [shape for shape, _ in processed] == [
+    assert processed == [
         (1, 3, 9, 16, 16),
         (1, 3, 9, 16, 16),
         (1, 3, 12, 16, 16),
@@ -2558,7 +2884,7 @@ def test_streaming_decode_keeps_interleaved_sessions_isolated(monkeypatch) -> No
 def test_streaming_decode_failure_drops_the_half_advanced_cache(monkeypatch) -> None:
     """A failed chunk must not leave a cache a later chunk would continue from."""
     module = _load_pipeline_module()
-    _capture_video_processor(monkeypatch)
+    _capture_pixel_conversion(monkeypatch)
     pipeline = _streaming_pipeline(module)
     state = _stepwise_state(request_id="req-boom", num_frames=21)
     state.sampling.output_type = "np"
@@ -2592,13 +2918,14 @@ def test_streaming_decode_receives_rescaled_latents(monkeypatch) -> None:
     never reaches, so this asserts on what ``post_quant_conv`` received.
     """
     module = _load_pipeline_module()
-    _capture_video_processor(monkeypatch)
+    _capture_pixel_conversion(monkeypatch)
     pipeline = _streaming_pipeline(module)
     state = _stepwise_state(num_frames=21)
     state.sampling.output_type = "np"
 
     with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
         pipeline.prepare_encode(state)
+        pipeline.prepare_next_chunk(state)
         while not state.chunk_denoise_completed:
             pipeline.step_scheduler(state, pipeline.denoise_step(None, states=[state]))
         model_space = state.latents.clone()
@@ -2624,7 +2951,7 @@ def test_streaming_decode_is_reported_to_the_profiler(monkeypatch) -> None:
     perf regression in the streaming decoder would be too.
     """
     module = _load_pipeline_module()
-    _capture_video_processor(monkeypatch)
+    _capture_pixel_conversion(monkeypatch)
     pipeline = _pipeline(
         module,
         transformer=_RecordingTransformer(),
@@ -2652,21 +2979,18 @@ def test_streaming_decode_is_reported_to_the_profiler(monkeypatch) -> None:
 def test_streaming_decode_falls_back_when_the_vae_would_tile(monkeypatch) -> None:
     """Tiled decode drives its own cache, so a tiling shape keeps per-chunk decode."""
     module = _load_pipeline_module()
-    processed = _capture_video_processor(monkeypatch)
+    processed = _capture_pixel_conversion(monkeypatch)
     pipeline = _streaming_pipeline(module)
     # A latent of 2x2 exceeds a one-latent-cell tile, so vae.decode would tile.
     _enable_vae_tiling(pipeline, tile_sample_min=8)
-    outputs = [
-        pipeline._decode_chunk_to_pixels(torch.zeros(1, 16, 3, 2, 2), output_type="np", session_id="tiled")
-        for _ in range(2)
-    ]
+    outputs = [pipeline._decode_chunk_to_pixels(torch.zeros(1, 16, 3, 2, 2), session_id="tiled") for _ in range(2)]
 
     # One whole-clip decode per AR block, each seeing only that block's frames.
     assert [tuple(latents.shape) for latents in pipeline.vae.decode_inputs] == [(1, 16, 3, 2, 2)] * 2
     assert pipeline.vae.decoder.first_chunk_flags == []
     assert pipeline._streaming_decode_states == {}
     # Nine frames per chunk instead of 9 then 12: the frame loss being removed.
-    assert [shape for shape, _ in processed] == [(1, 3, 9, 16, 16), (1, 3, 9, 16, 16)]
+    assert processed == [(1, 3, 9, 16, 16), (1, 3, 9, 16, 16)]
     assert outputs == ["frames-1", "frames-2"]
 
 
@@ -2678,7 +3002,7 @@ def test_streaming_decode_survives_tiling_enabled_below_the_tile_threshold(monke
     on a configuration that would never have tiled.
     """
     module = _load_pipeline_module()
-    processed = _capture_video_processor(monkeypatch)
+    processed = _capture_pixel_conversion(monkeypatch)
     pipeline = _streaming_pipeline(module)
     # A 2x2 latent is within a tile this size, so vae.decode would not tile.
     _enable_vae_tiling(pipeline, tile_sample_min=256)
@@ -2690,7 +3014,7 @@ def test_streaming_decode_survives_tiling_enabled_below_the_tile_threshold(monke
 
     assert pipeline.vae.decode_inputs == []
     assert pipeline.vae.decoder.first_chunk_flags == [True] + [False] * 5
-    assert [shape for shape, _ in processed] == [(1, 3, 9, 16, 16), (1, 3, 12, 16, 16)]
+    assert processed == [(1, 3, 9, 16, 16), (1, 3, 12, 16, 16)]
 
 
 def test_registry_and_model_exports_resolve_official_pipeline_class_name() -> None:
@@ -2711,3 +3035,315 @@ def test_registry_and_model_exports_resolve_official_pipeline_class_name() -> No
     assert "from .pipeline import" in lingbot_init
     assert '"LingBotWorldCausalDMDPipeline"' in lingbot_init
     assert '"CausalLingBotWorldTransformer3DModel"' in lingbot_init
+
+
+# ---------------------------------------------------------------------------
+# a prompt is encoded once, whichever path asks for it
+# ---------------------------------------------------------------------------
+def _counting_text_encoder(pipeline) -> list[str]:
+    """Give ``pipeline`` its real encode_prompt over stubs that record each encode."""
+    del pipeline.encode_prompt  # _pipeline() replaces it; these tests need the real one
+    encoded: list[str] = []
+
+    def tokenizer(texts, **kwargs):
+        del kwargs
+        encoded.extend(texts)
+        return SimpleNamespace(
+            input_ids=torch.arange(512).view(1, 512),
+            attention_mask=torch.ones(1, 512, dtype=torch.long),
+        )
+
+    def text_encoder(input_ids, attention_mask):
+        del input_ids, attention_mask
+        return SimpleNamespace(last_hidden_state=torch.full((1, 512, 8), float(len(encoded))))
+
+    pipeline.tokenizer = tokenizer
+    pipeline.text_encoder = text_encoder
+    return encoded
+
+
+def test_the_text_encoder_runs_once_per_distinct_prompt() -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    encoded = _counting_text_encoder(pipeline)
+
+    def encode(prompt, *, length=512, dtype=torch.float32):
+        return pipeline.encode_prompt(prompt, max_sequence_length=length, dtype=dtype)
+
+    first = encode("move through the room")
+    assert encode("move through the room") is first
+    # The key is the text the tokenizer actually sees, so spacing alone is not new.
+    assert encode("  move   through the room ") is first
+    assert encoded == ["move through the room"]
+
+    encode("enter the snowy valley")
+    # dtype and sequence length change the tensor, so each is its own entry.
+    encode("move through the room", dtype=torch.float16)
+    encode("move through the room", length=256)
+    assert encoded == [
+        "move through the room",
+        "enter the snowy valley",
+        "move through the room",
+        "move through the room",
+    ]
+
+
+def test_the_prompt_encode_cache_is_bounded() -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    encoded = _counting_text_encoder(pipeline)
+    size = module._PROMPT_EMBEDS_CACHE_SIZE
+
+    for index in range(size + 1):
+        pipeline.encode_prompt(f"prompt {index}", max_sequence_length=512, dtype=torch.float32)
+    assert len(pipeline._prompt_embeds_cache) == size
+
+    # The oldest entry was the one evicted, so it is the one encoded again.
+    pipeline.encode_prompt("prompt 0", max_sequence_length=512, dtype=torch.float32)
+    pipeline.encode_prompt(f"prompt {size}", max_sequence_length=512, dtype=torch.float32)
+    assert encoded == [f"prompt {index}" for index in range(size + 1)] + ["prompt 0"]
+
+
+def test_realtime_ticks_reuse_the_encode_and_still_invalidate_on_a_prompt_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+    pipeline._ar_diffusion_kv_state = object()
+    encoded = _counting_text_encoder(pipeline)
+    invalidations: list[bool] = []
+
+    def ar_text_caches(prompt_embeds, *, invalidate):
+        del prompt_embeds
+        invalidations.append(invalidate)
+        return [SimpleNamespace()]
+
+    monkeypatch.setattr(pipeline, "_ar_text_caches", ar_text_caches)
+    monkeypatch.setattr(
+        pipeline,
+        "_generate_block",
+        lambda **kwargs: torch.randn((1, 16, 3, 2, 2), generator=kwargs["generator"]),
+    )
+
+    for chunk_index in range(3):
+        pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=chunk_index))))
+    switched = _prompt()
+    switched["prompt"] = "enter the snowy valley"
+    pipeline(
+        _request(
+            sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=3, prompt=switched["prompt"])),
+            prompt=switched,
+        )
+    )
+
+    assert encoded == ["move through the room", "enter the snowy valley"]
+    # A new prompt must still drop the cross-attention K/V built from the old one.
+    assert invalidations == [False, False, False, True]
+
+
+def test_stepwise_requests_with_the_same_prompt_share_one_encode() -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module, transformer=_RecordingTransformer())
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+    encoded = _counting_text_encoder(pipeline)
+
+    states = [_stepwise_state(request_id=request_id, num_frames=21) for request_id in ("req-a", "req-b")]
+    for state in states:
+        with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
+            pipeline.prepare_encode(state)
+
+    assert encoded == ["move through the room"]
+    assert states[0].prompt_embeds is states[1].prompt_embeds
+
+
+def test_session_text_caches_publish_key_only_after_a_successful_build() -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    state = module._LingBotARSessionState()
+    invalidations: list[bool] = []
+    fail_next = {"raise": False}
+
+    def fake_text_caches(prompt_embeds, *, invalidate):
+        invalidations.append(invalidate)
+        if fail_next["raise"]:
+            fail_next["raise"] = False
+            raise RuntimeError("injected failure inside _ar_text_caches")
+        return ["caches"]
+
+    pipeline._ar_text_caches = fake_text_caches
+    embeds = torch.ones(1, 512, 8)
+    caches = lambda prompt, length=512, e=embeds: pipeline._session_text_caches(  # noqa: E731
+        e, prompt=prompt, max_sequence_length=length, session_state=state
+    )
+
+    # First build of a session: runner state is empty -> no invalidation, key published.
+    caches("A")
+    assert invalidations == [False] and state.text_cache_key == ("A", 512, str(embeds.dtype))
+    assert state.text_cache_dirty is False
+    # Same inputs: reuse without invalidation.
+    caches("A")
+    assert invalidations == [False, False]
+    # Regression (Codex review): B's build fails after invalidating -> no key is
+    # left behind, so retrying A must invalidate again instead of consuming
+    # partial/mixed K/V.
+    fail_next["raise"] = True
+    with pytest.raises(RuntimeError, match="injected failure"):
+        caches("B")
+    assert state.text_cache_key is None and state.text_cache_dirty is True
+    caches("A")
+    assert invalidations[-2:] == [True, True] and state.text_cache_key == ("A", 512, str(embeds.dtype))
+    assert state.text_cache_dirty is False
+    # The key covers every embedding-defining input: same text, other length or dtype -> rebuild.
+    caches("A", length=256)
+    caches("A", e=embeds.to(torch.bfloat16))
+    assert invalidations[-2:] == [True, True]
+
+
+# ---------------------------------------------------------------------------
+# a source image is decoded once while the file behind it is unchanged
+# ---------------------------------------------------------------------------
+
+
+def _write_png(path, colour=(10, 20, 30)):
+    Image.new("RGB", (64, 64), colour).save(path)
+    return path
+
+
+def _counting_decode(module):
+    """Replace the file decode with a counter, so the tests measure decodes rather than pixels."""
+    decoded: list[str] = []
+    original = module._decode_source_image_file
+
+    def decode(path):
+        decoded.append(os.fspath(path))
+        return Image.new("RGB", (64, 64), (1, 2, 3))
+
+    module._decode_source_image_file = decode
+    return decoded, original
+
+
+def test_the_same_source_image_is_decoded_once(tmp_path: Path) -> None:
+    module = _load_pipeline_module()
+    module._decode_source_image_fingerprinted.cache_clear()
+    path = _write_png(tmp_path / "frame.png")
+    decoded, original = _counting_decode(module)
+    try:
+        first = module._load_source_image(path)
+        second = module._load_source_image(path)
+        assert decoded == [os.fspath(os.path.realpath(path))] or len(decoded) == 1
+        # Every caller owns its copy: mutating one must not reach the next caller or the cache.
+        assert first is not second
+        first.putpixel((0, 0), (255, 255, 255))
+        assert module._load_source_image(path).getpixel((0, 0)) == (1, 2, 3)
+        assert len(decoded) == 1
+    finally:
+        module._decode_source_image_file = original
+        module._decode_source_image_fingerprinted.cache_clear()
+
+
+def test_a_rewritten_source_image_is_decoded_again(tmp_path: Path) -> None:
+    module = _load_pipeline_module()
+    module._decode_source_image_fingerprinted.cache_clear()
+    path = _write_png(tmp_path / "frame.png")
+    decoded, original = _counting_decode(module)
+    try:
+        module._load_source_image(path)
+        module._load_source_image(path)
+        assert len(decoded) == 1
+        # Same path, different bytes: the mtime/size in the key must force a fresh decode.
+        os.utime(path, ns=(0, 0))
+        _write_png(path, colour=(200, 100, 50))
+        module._load_source_image(path)
+        assert len(decoded) == 2
+    finally:
+        module._decode_source_image_file = original
+        module._decode_source_image_fingerprinted.cache_clear()
+
+
+def test_an_image_rewritten_during_the_decode_is_never_cached(tmp_path: Path) -> None:
+    module = _load_pipeline_module()
+    module._decode_source_image_fingerprinted.cache_clear()
+    path = _write_png(tmp_path / "frame.png")
+    decoded: list[str] = []
+    original = module._decode_source_image_file
+
+    def decode_then_rewrite(p):
+        decoded.append(os.fspath(p))
+        _write_png(path, colour=(len(decoded), 0, 0))
+        os.utime(path, ns=(len(decoded) * 1_000_000, len(decoded) * 1_000_000))
+        return Image.new("RGB", (64, 64), (1, 2, 3))
+
+    module._decode_source_image_file = decode_then_rewrite
+    try:
+        module._load_source_image(path)
+        # The entry is keyed by the fingerprint taken before the decode, which the rewrite invalidated: the
+        # next call must decode again rather than serve the image that was decoded mid-rewrite.
+        module._load_source_image(path)
+        assert len(decoded) == 2
+    finally:
+        module._decode_source_image_file = original
+        module._decode_source_image_fingerprinted.cache_clear()
+
+
+def test_an_unstattable_path_keeps_upstream_validation(tmp_path: Path) -> None:
+    module = _load_pipeline_module()
+    module._decode_source_image_fingerprinted.cache_clear()
+    missing = tmp_path / "does-not-exist.png"
+    # The uncached path owns the error contract; caching must not change which exception a caller sees.
+    with pytest.raises(ValueError):
+        module._load_source_image(missing)
+    assert module._decode_source_image_fingerprinted.cache_info().currsize == 0
+
+
+def test_the_text_cache_is_sized_by_cross_attention_heads_not_the_self_attention_share() -> None:
+    """Cross-attention replicates heads per rank, so its pool must not inherit the self-attention head count."""
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    pipeline.transformer.blocks[0].self_attn = SimpleNamespace(num_sp_heads=1)
+    pipeline.transformer.blocks[0].cross_attn = SimpleNamespace(num_local_heads=4)
+
+    spec = pipeline.ar_diffusion_kv_cache_spec()
+
+    assert spec.num_kv_heads == 1
+    assert spec.cross_attention_kv_heads == {"text": 4}
+    assert spec.cross_attention_lengths == {"text": 512}
+
+
+@pytest.mark.parametrize("output_type", ["np", "pil"])
+def test_streamed_chunk_is_uint8_frames_whatever_pixel_output_type_was_asked(monkeypatch, output_type) -> None:
+    """A realtime tick delivers (F, H, W, 3) uint8 for every pixel output type; only latent differs."""
+    module = _load_pipeline_module()
+    pipeline = _streaming_pipeline(module)
+    state = _stepwise_state(num_frames=21)
+    state.sampling.output_type = output_type
+
+    with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
+        outputs = _run_stepwise(pipeline, state)
+
+    videos = [output.output["payload"]["video"] for output in outputs]
+    assert [type(video) for video in videos] == [np.ndarray, np.ndarray]
+    assert [video.dtype for video in videos] == [np.uint8, np.uint8]
+    assert [video.shape for video in videos] == [(9, 16, 16, 3), (12, 16, 16, 3)]
+
+
+def test_uint8_frames_match_the_pil_conversion_byte_for_byte() -> None:
+    """The device-side conversion is the PIL path's arithmetic, so the bytes are the same."""
+    from diffusers.video_processor import VideoProcessor
+
+    module = _load_pipeline_module()
+    generator = torch.Generator().manual_seed(7)
+    # Cover the clamp on both sides and values that sit exactly on rounding edges.
+    video = torch.rand(1, 3, 5, 8, 8, generator=generator) * 2.4 - 1.2
+    video[0, :, 0, 0, :4] = torch.tensor([-1.0, 1.0, 0.0, 1 / 255 - 1.0])
+
+    reference = VideoProcessor(vae_scale_factor=8).postprocess_video(video, output_type="pil")[0]
+    expected = np.stack([np.asarray(frame) for frame in reference])
+
+    frames = module._uint8_frames(video)
+
+    assert frames.dtype == np.uint8 and frames.shape == (5, 8, 8, 3)
+    assert frames.flags["C_CONTIGUOUS"]
+    np.testing.assert_array_equal(frames, expected)
