@@ -339,6 +339,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._request_audio_states: dict[str, dict[str, Any]] = {}
         self._request_codec_device_states: dict[str, TalkerCodecDeviceState] = {}
         self._request_codec_device_inputs: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        # Confirmed codec frames this model sampled, one entry per forwarded
+        # frame. Under K-step the scheduler's token stream carries the 0/1
+        # control rows the two-wide head emits instead, so streaming prompt
+        # recompute swaps its confirmed-token slice for these real ids.
+        self._request_codec_history: dict[str, list[int]] = {}
 
         self._init_native_talker(prefix)
 
@@ -568,6 +573,23 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         ids = info_dict.get("ids")
         previous_codes = ids.get("streaming_prompt_previous_codes") if isinstance(ids, Mapping) else None
+        if self._k_step_frames > 0 and previous_codes is not None:
+            # K-step: the scheduler's confirmed slice carries the 0/1 control
+            # rows the two-wide head emits, not codec ids -- feeding them to
+            # emb_code would silently rebuild the prompt from continue/stop
+            # markers (both have valid embeddings and pass the range check
+            # below). The model recorded the real frame it confirmed at each
+            # of those positions, one row per forwarded frame, so swap the
+            # values in. The slice only ever covers the frames confirmed
+            # since the current prompt, i.e. the tail of that history.
+            codec_history = getattr(self, "_request_codec_history", {}).get(request_id)
+            if codec_history is None or len(codec_history) < len(previous_codes):
+                raise ValueError(
+                    "K-step streaming prompt recompute is missing confirmed codec frames: "
+                    f"history={len(codec_history) if codec_history is not None else 0}, "
+                    f"confirmed={len(previous_codes)}"
+                )
+            previous_codes = codec_history[-len(previous_codes) :]
         if isinstance(previous_codes, torch.Tensor):
             code_ids = previous_codes.to(device=self.emb_code[0].weight.device, dtype=torch.long).reshape(-1)
         elif isinstance(previous_codes, (list, tuple)):
@@ -979,8 +1001,24 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     # vLLM schedules for the next step carry placeholder
                     # continue ids. Record this frame's sample so the decode
                     # preprocess embeds the real previous frame's codec id
-                    # (the k_last branch) instead of the placeholder.
+                    # (the k_last branch) instead of the placeholder, and keep
+                    # the confirmed-frame history that streaming prompt
+                    # recompute rebuilds its window from -- the scheduler's
+                    # token slice holds the placeholder ids.
                     state["last_code"] = sampled_id
+                    histories = getattr(self, "_request_codec_history", None)
+                    if not isinstance(histories, dict):
+                        # Instances built without __init__ (CPU tests,
+                        # subclasses) still need a place for the record -- the
+                        # readers at the recompute and cleanup sites already
+                        # tolerate a missing dict the same way.
+                        histories = {}
+                        self._request_codec_history = histories
+                    codec_history = histories.get(request_id)
+                    if codec_history is None:
+                        codec_history = []
+                        histories[request_id] = codec_history
+                    codec_history.append(sampled_id)
             else:
                 delta = empty_delta
             state["codes"] = codes
@@ -1278,11 +1316,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         ``_request_codec_device_states`` carries the step counter and the
         penalty window the EOS mask is derived from, and
         ``_request_codec_device_inputs`` carries the ``min_tokens`` copied at
-        first use. Leaving them behind means a recycled request id resumes with
-        another request's counters -- the EOS mask then holds or lifts at the
-        wrong frame, and ``_request_generators`` leaks a generator per request
-        on top of that. All three key off the same request id, so they are
-        dropped together with the rest.
+        first use. ``_request_codec_history`` carries the confirmed K-step
+        frames streaming prompt recompute reads. Leaving them behind means a
+        recycled request id resumes with another request's counters -- the EOS
+        mask then holds or lifts at the wrong frame, and
+        ``_request_generators`` leaks a generator per request on top of that.
+        All of them key off the same request id, so they are dropped together
+        with the rest.
         """
         request_audio_states = getattr(self, "_request_audio_states", {})
         request_condition_states = getattr(self, "_request_condition_states", {})
@@ -1290,6 +1330,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         penalty_freqs = getattr(self, "_penalty_freqs_dev", None)
         codec_device_states = getattr(self, "_request_codec_device_states", None)
         codec_device_inputs = getattr(self, "_request_codec_device_inputs", None)
+        codec_histories = getattr(self, "_request_codec_history", None)
         request_generators = getattr(self, "_request_generators", None)
         for request_id in self._deferred_cleanup_ids:
             request_audio_states.pop(request_id, None)
@@ -1302,6 +1343,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 codec_device_states.pop(request_id, None)
             if isinstance(codec_device_inputs, dict):
                 codec_device_inputs.pop(request_id, None)
+            if isinstance(codec_histories, dict):
+                codec_histories.pop(request_id, None)
             if isinstance(request_generators, dict):
                 request_generators.pop(request_id, None)
         self._deferred_cleanup_ids.clear()
