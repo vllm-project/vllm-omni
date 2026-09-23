@@ -12,8 +12,7 @@ from tests.helpers.stage_config import get_deploy_config_path
 MODEL = "BreezeBlue/Breeze-TTS-2"
 
 pytestmark = [
-    pytest.mark.core_model,
-    pytest.mark.advanced_model,
+    pytest.mark.slow,
     pytest.mark.tts,
     pytest.mark.parametrize(
         "omni_server",
