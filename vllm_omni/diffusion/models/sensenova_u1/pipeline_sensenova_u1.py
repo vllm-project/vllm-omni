@@ -136,7 +136,13 @@ def _smart_resize(
     min_pixels: int = 65536,
     max_pixels: int = 4194304,
 ) -> tuple[int, int]:
-    """Rescale so that H/W are divisible by *factor* and total pixels in [min, max]."""
+    """Rescale so that H/W are divisible by *factor* and total pixels stay
+    within ``max_pixels``.
+
+    The resource bound is hard: ceil-to-factor rounding on the upscale branch
+    is re-fitted by flooring whenever it would overshoot ``max_pixels``, so
+    the result may fall below ``min_pixels`` when the two bounds cannot both
+    hold (long/thin aspect ratios)."""
     if max(height, width) / min(height, width) > 200:
         raise ValueError(f"absolute aspect ratio must be < 200, got {max(height, width) / min(height, width)}")
     h_bar = max(factor, _round_by_factor(height, factor))
@@ -149,6 +155,14 @@ def _smart_resize(
         beta = math.sqrt(min_pixels / (height * width))
         h_bar = _ceil_by_factor(height * beta, factor)
         w_bar = _ceil_by_factor(width * beta, factor)
+        if h_bar * w_bar > max_pixels:
+            # Ceil-to-factor rounding can overshoot the resource bound on
+            # long/thin aspect ratios (e.g. 64x1000 against a 512x512 share
+            # lands at 160x2048, 1.25x the budget; 32x6304 at 64x7200, 1.76x).
+            # The pixel budget wins over the upscale floor: re-fit by flooring.
+            beta = math.sqrt((height * width) / max_pixels)
+            h_bar = max(factor, _floor_by_factor(height / beta, factor))
+            w_bar = max(factor, _floor_by_factor(width / beta, factor))
     return h_bar, w_bar
 
 
