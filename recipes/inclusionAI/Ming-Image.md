@@ -41,7 +41,7 @@ For layer decomposition, set `MODEL` to `inclusionAI/Ming-Image-0.1-Design-Layer
 
 ## Text-to-image
 
-Note that a prompt refiner is expected to describe the prompts with details; we will refine the example inputs soon.
+Note that a prompt refiner is expected to describe the prompts with details; we will refine with more example inputs soon.
 
 ```bash
 curl -s http://127.0.0.1:8091/v1/chat/completions \
@@ -92,7 +92,7 @@ curl -sS http://127.0.0.1:8091/v1/chat/completions \
 ## Layer decomposition
 
 Use the Design-Layer checkpoint and set `INPUT_IMAGE` to a local flattened design image.
-Note that the prompt should better depict each layer to be decomposed, we will refine the example inputs soon.
+Note that the prompt should better depict each layer to be decomposed, we will refine with more example inputs soon.
 
 ```bash
 MODEL=inclusionAI/Ming-Image-0.1-Design-Layer
