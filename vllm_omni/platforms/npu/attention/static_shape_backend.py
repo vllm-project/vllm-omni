@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Ascend attention backend that captures a decode step with constant host args.
 
 ``FULL_DECODE_ONLY`` captures a whole decode step, but
@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import torch
 import torch_npu
+from vllm.config import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import (
@@ -62,6 +63,29 @@ class OmniStaticShapeMetadataBuilder(AscendAttentionMetadataBuilder):
         self._omni_max_q_len = 1
         if spec is not None and getattr(spec, "num_speculative_tokens", 0):
             self._omni_max_q_len = 1 + int(spec.num_speculative_tokens)
+        # The runtime bucket is part of the dispatch key: it is only answerable
+        # where decode steps run as one FULL graph (FULL / FULL_DECODE_ONLY /
+        # FULL_AND_PIECEWISE), because those are the only modes that capture
+        # per-capacity decode graphs to look up. Under PIECEWISE or eager,
+        # setting it sends the wrapper after a per-capacity entry dict that was
+        # never captured, and the runtime capture attempt crashes vLLM's
+        # capturing-window check ("Cannot capture CUDA graphs in an
+        # inappropriate time"). With empty buckets build() leaves the bucket
+        # unset and every consumer (wrapper __call__, static-shape attention,
+        # prefill hook) takes its stock path -- the behaviour this stage would
+        # have had without the static-shape seam at all.
+        mode = self.vllm_config.compilation_config.cudagraph_mode
+        if self._omni_buckets and mode not in (
+            CUDAGraphMode.FULL,
+            CUDAGraphMode.FULL_DECODE_ONLY,
+            CUDAGraphMode.FULL_AND_PIECEWISE,
+        ):
+            logger.info(
+                "[minicpmo] static-shape decode graphs need FULL decode graphs "
+                "(cudagraph_mode=%s); keeping the stock attention path",
+                mode,
+            )
+            self._omni_buckets = ()
 
     def build(self, *args, **kwargs):
         attn_metadata = super().build(*args, **kwargs)
