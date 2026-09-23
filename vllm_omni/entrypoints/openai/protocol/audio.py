@@ -421,9 +421,23 @@ class CreateAudio(BaseModel):
         arbitrary_types_allowed = True
 
 
+class AudioChunkMetadata(BaseModel):
+    """Waveform dimensions after transforms, before encoding.
+
+    Frames count samples per channel, not interleaved scalar samples or bytes.
+    For compressed formats this excludes any padding introduced by the codec.
+    """
+
+    format: str = Field(min_length=1, strict=True)
+    sample_rate_hz: int = Field(gt=0, strict=True)
+    frame_count: int = Field(ge=0, strict=True)
+    channels: int = Field(gt=0, strict=True)
+
+
 class AudioResponse(BaseModel):
     audio_data: bytes | str
     media_type: str
+    audio_metadata: AudioChunkMetadata | None = None
 
 
 # --- Batch Speech Models ---

@@ -90,6 +90,7 @@ class PromptInteractionHandler(InteractionHandler):
     """
 
     modality: ClassVar[str] = "prompt"
+    lazy_initialize_session: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -113,16 +114,14 @@ class PromptInteractionHandler(InteractionHandler):
         )
 
     @override
-    def enqueue(
+    def validate_payload(
         self,
         state: StepRequestState,
         *,
         event_id: str,
-        received_at: float,
         payload: InteractionPayload,
         transition_chunks: int | None,
     ) -> None:
-        """Prompt updates are last-write-win and unbuffered at chunk boundary."""
         prompt = payload.get("prompt")
         if not isinstance(prompt, str) or not prompt:
             raise ValueError("prompt must be non-empty")
@@ -135,6 +134,27 @@ class PromptInteractionHandler(InteractionHandler):
         duration = DEFAULT_TRANSITION_CHUNKS if transition_chunks is None else transition_chunks
         if duration < 0:
             raise ValueError("transition_chunks must be >= 0")
+
+    @override
+    def enqueue(
+        self,
+        state: StepRequestState,
+        *,
+        event_id: str,
+        received_at: float,
+        payload: InteractionPayload,
+        transition_chunks: int | None,
+    ) -> None:
+        """Prompt updates are last-write-win and unbuffered at chunk boundary."""
+        self.validate_payload(
+            state,
+            event_id=event_id,
+            payload=payload,
+            transition_chunks=transition_chunks,
+        )
+        prompt = payload.get("prompt")
+        assert isinstance(prompt, str)
+        duration = DEFAULT_TRANSITION_CHUNKS if transition_chunks is None else transition_chunks
 
         target_prompt_embeds, _ = self._encode_prompt(
             prompt=prompt,
@@ -164,12 +184,13 @@ class PromptInteractionHandler(InteractionHandler):
         *,
         boundary_at: float,
         chunk_index: int | None = None,
-        num_frames: int | None = None,
+        num_media_frames: int | None = None,
         fps: float | None = None,
+        num_latent_frames: int | None = None,
     ) -> InteractionChunkMetadata | None:
         """Advance or start prompt interpolation before the next chunk."""
         # Prompt lerp is chunk-LWW; media timeline and caller chunk_index unused.
-        del chunk_index, num_frames, fps
+        del chunk_index, num_media_frames, fps, num_latent_frames
         session = state.interaction_sessions.get("prompt")
         assert isinstance(session, PromptSession)
 

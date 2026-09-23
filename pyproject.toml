@@ -66,14 +66,12 @@ dev = [
     "jiwer==4.0.0",
     "zhon==2.1.1",
     "zhconv==1.4.3",
-    "scipy==1.18.0",
     "funasr==1.3.29",
     "lpips==0.1.4", # for quantization fp8
     "orjson==3.11.9", # to make v1/embeddings API fast
     "voxcpm==2.0.3", # for VoxCPM2 path-locating in tests
     "torchdiffeq==0.2.5", # for covo_audio Test
     "FlagEmbedding==1.4.0", # for hunyuan_image3 tests
-    "s3tokenizer==0.3.0", # for tts test
     # Provides top-level cosyvoice2; do not co-install stepaudio2-minicpmo,
     # whose top-level stepaudio2 package conflicts with this distribution.
     "step-audio2==1.0.0", # Step-Audio2 / MiniCPM-o 4.5 Token2Wav (flashcosyvoice / hyperpyyaml)
@@ -121,6 +119,11 @@ quack = [
 # the CuTe/CUTLASS dependency is CUDA 13 and Blackwell specific.
 fa4 = [
     "flash-attn-4[cu13]==4.0.0b18",
+]
+
+# FastVideo VSA kernels for the supported Linux/Python 3.12 wheel environment.
+vsa = [
+    "fastvideo-kernel==0.3.4",
 ]
 
 docs = [
@@ -328,6 +331,7 @@ extend-ignore-identifiers-re = [
     ".*arange",
     ".*MoBA",
     ".*temperal_downsample",
+    ".*temperal_upsample",
     ".*_nd",
     ".*nd$",
     ".*EmbedND$",
@@ -376,6 +380,9 @@ ba = "ba"
 SER = "SER"
 # NumPy ndarray.flags.writeable (canonical flag name, not "writable").
 writeable = "writeable"
+# ARPAbet phoneme symbol (Fish Speech phoneme-control token example, e.g.
+# "IY0"), not a typo of "IT".
+IY = "IY"
 # "convnet" abbreviates convolutional network. It appears in the vendored Fish
 # Speech DAC codec identifiers (convnet_type, transconvnet_type) and is not a
 # typo of "convent".

@@ -16,6 +16,7 @@ from inspect import Signature, signature
 from pathlib import Path
 from types import SimpleNamespace
 
+import anyio
 import numpy as np
 import pytest
 import torch
@@ -25,14 +26,15 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from pytest_mock import MockerFixture
+from vllm.entrypoints.serve import create_error_response
 from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
 
+from vllm_omni.config.stage_config import StagePipelineConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler
 from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
 from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 from vllm_omni.entrypoints.openai import api_server as api_server_module
-from vllm_omni.entrypoints.openai import errors as openai_errors
 from vllm_omni.entrypoints.openai import serving_speech as serving_speech_module
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol.audio import (
@@ -503,6 +505,75 @@ class TestSpeechAPI:
         assert voice_info["mime_type"] == "audio/wav"
         assert voice_info["file_size"] == len(audio_content)
         response = client.delete("/v1/audio/voices/test_voice")
+
+    def test_upload_voice_rejects_builtin_name(self, client):
+        """A name colliding with a built-in or precomputed voice is rejected."""
+        handler = client.app.state.openai_serving_speech
+        handler._adapter.capabilities.supported_speakers = {"vivian"}
+        handler._adapter.capabilities.precomputed_speakers = {"ono_anna": {}}
+
+        files = {"audio_sample": ("test.wav", b"fake audio content" * 1000, "audio/wav")}
+        for reserved in ("Vivian", "ono_anna"):
+            response = client.post("/v1/audio/voices", files=files, data={"consent": "c1", "name": reserved})
+            assert response.status_code == 400
+            assert "reserved" in response.json()["detail"]
+        assert not handler.uploaded_speakers
+
+    def test_upload_voice_overwrites_same_name_by_default(self, client):
+        """Default policy: re-registering an uploaded name replaces it in place."""
+        files = {"audio_sample": ("test.wav", b"first take", "audio/wav")}
+        data = {"consent": "c1", "name": "test_voice_ow"}
+        assert client.post("/v1/audio/voices", files=files, data=data).status_code == 200
+
+        files = {"audio_sample": ("test.wav", b"second take, longer content", "audio/wav")}
+        response = client.post("/v1/audio/voices", files=files, data=data)
+        assert response.status_code == 200
+        assert response.json()["voice"]["file_size"] == len(b"second take, longer content")
+        client.delete("/v1/audio/voices/test_voice_ow")
+
+    def test_upload_voice_immutable_policy_requires_delete(self, client):
+        """VLLM_OMNI_SPEAKER_REGISTRATION_POLICY=immutable rejects duplicates until deleted."""
+        handler = client.app.state.openai_serving_speech
+        handler._registration_policy = "immutable"
+        try:
+            files = {"audio_sample": ("test.wav", b"fake audio content" * 1000, "audio/wav")}
+            data = {"consent": "c1", "name": "test_voice_imm"}
+            assert client.post("/v1/audio/voices", files=files, data=data).status_code == 200
+
+            response = client.post("/v1/audio/voices", files=files, data=data)
+            assert response.status_code == 400
+            assert "immutable" in response.json()["detail"]
+
+            assert client.delete("/v1/audio/voices/test_voice_imm").status_code == 200
+            assert client.post("/v1/audio/voices", files=files, data=data).status_code == 200
+        finally:
+            handler._registration_policy = "overwrite"
+            client.delete("/v1/audio/voices/test_voice_imm")
+
+    def test_invalid_registration_policy_fails_startup(self, mocker, monkeypatch, tmp_path):
+        """An unknown VLLM_OMNI_SPEAKER_REGISTRATION_POLICY is a configuration error, not a silent fallback."""
+        monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
+        monkeypatch.setenv("VLLM_OMNI_SPEAKER_REGISTRATION_POLICY", "append")
+        engine_client = mocker.MagicMock()
+        engine_client.default_sampling_params_list = [{}]
+        with pytest.raises(ValueError, match="VLLM_OMNI_SPEAKER_REGISTRATION_POLICY"):
+            OmniOpenAIServingSpeech(
+                engine_client=engine_client, models=mocker.MagicMock(), request_logger=mocker.MagicMock()
+            )
+
+    def test_restored_upload_shadowing_builtin_is_dropped(self, client):
+        """A pre-guard upload restored under a built-in name must not keep shadowing it."""
+        handler = client.app.state.openai_serving_speech
+        handler._adapter.capabilities.supported_speakers = {"vivian"}
+        handler._adapter.capabilities.precomputed_speakers = {}
+        handler.uploaded_speakers["vivian"] = {"name": "vivian", "file_path": "/tmp/vivian.safetensors"}
+        handler.uploaded_speakers["keep_me"] = {"name": "keep_me", "file_path": "/tmp/keep_me.safetensors"}
+
+        handler._drop_shadowing_uploads()
+
+        assert "vivian" not in handler.uploaded_speakers
+        assert "keep_me" in handler.uploaded_speakers
+        handler.uploaded_speakers.pop("keep_me")
 
     def test_upload_voice_with_ref_text(self, client, tmp_path):
         """Test voice upload with ref_text enables in-context cloning."""
@@ -1039,6 +1110,38 @@ class TestTTSMethods:
             asyncio.run(server._prepare_speech_generation(request))
         server.shutdown()
 
+    def test_prepare_speech_rejects_typed_non_tts_omni_model(self, mocker: MockerFixture):
+        """Typed Qwen3-Omni stages must hit the same talker guard as legacy stages."""
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.tts_max_instructions_length = None
+        mock_engine_client.stage_configs = [
+            SimpleNamespace(
+                stage_pipeline_config=StagePipelineConfig(stage_id=index, model_stage=model_stage),
+                model_config=SimpleNamespace(model_arch=None),
+                worker_type=worker_type,
+            )
+            for index, (model_stage, worker_type) in enumerate(
+                (
+                    ("thinker", "ar"),
+                    ("talker", "ar"),
+                    ("code2wav", "generation"),
+                )
+            )
+        ]
+
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+        request = OpenAICreateSpeechRequest(input="Hello world")
+        with pytest.raises(ValueError, match="only supported for dedicated TTS models"):
+            asyncio.run(server._prepare_speech_generation(request))
+        server.shutdown()
+
     def test_estimate_prompt_len_fallback(self, speech_server):
         """Test prompt length estimation falls back to 2048 when model is unavailable."""
         tts_params = {"text": ["Hello"], "task_type": ["CustomVoice"]}
@@ -1559,7 +1662,8 @@ class TestTTSMethods:
 
         assert first[1] == 24000
         assert second[1] == 24000
-        assert first[0] is second[0]
+        assert first[0] == second[0]
+        assert first[0] is not second[0]
         assert first[0][0] == pytest.approx(float(wav[0]), abs=1e-4)
         cache_key = first[2]
         assert speech_server._get_resolved_ref_audio_artifact_key(
@@ -1822,6 +1926,53 @@ class TestTTSMethods:
         assert prompt_a["prompt_token_ids"] == [1, 151700, 151700, 2]
         assert prompt_a["prompt_token_ids"] == prompt_b["prompt_token_ids"]
         assert prompt_a["additional_information"]["audio_placeholder_positions"].tolist() == [1, 2]
+        assert prompt_a["cache_salt"] != prompt_b["cache_salt"]
+        assert prompt_a["additional_information"]["ref_audio_cache_key"] == "key_aaa"
+        assert prompt_b["additional_information"]["ref_audio_cache_key"] == "key_bbb"
+
+    @pytest.mark.asyncio
+    async def test_higgs_v2_cache_salt_changes_for_same_shaped_reference_audio(self, speech_server, mocker):
+        """Higgs v2 must salt identical placeholder prompts by resolved audio content."""
+        build_voice_clone_prompt = mocker.patch(
+            "vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_tokenizer.build_voice_clone_prompt"
+        )
+        build_voice_clone_prompt.side_effect = lambda _processor, _input, wav, _sr, _ref_text: {
+            "prompt_token_ids": [1, 151700, 151700, 2],
+            "audio_input_ids": torch.tensor([[100 if wav[0] < 0.5 else 900, 2], [3, 4]], dtype=torch.long),
+            "audio_input_ids_mask": torch.ones(2, dtype=torch.bool),
+        }
+
+        speech_server._tts_model_type = "higgs_audio_v2"
+        speech_server._adapter = speech_server._get_tts_adapter()
+        speech_server._adapter._resolve_higgs_audio_v2_processor = mocker.AsyncMock(return_value=object())
+
+        req_a = OpenAICreateSpeechRequest(
+            input="hello",
+            ref_audio="file:///data/spk.wav",
+            ref_text="transcript",
+        )
+        req_b = OpenAICreateSpeechRequest(
+            input="hello",
+            ref_audio="file:///data/spk.wav",
+            ref_text="transcript",
+        )
+        speech_server._adapter._resolve_ref_audio = mocker.AsyncMock(
+            side_effect=[([0.1] * 48000, 24000, "key_aaa"), ([0.9] * 48000, 24000, "key_bbb")]
+        )
+
+        prompt_a = await speech_server._adapter._build_higgs_audio_v2_params(req_a)
+        prompt_b = await speech_server._adapter._build_higgs_audio_v2_params(req_b)
+
+        assert prompt_a["prompt_token_ids"] == [1, 151700, 151700, 2]
+        assert prompt_a["prompt_token_ids"] == prompt_b["prompt_token_ids"]
+        assert (
+            prompt_a["additional_information"]["audio_input_ids"].shape
+            == prompt_b["additional_information"]["audio_input_ids"].shape
+        )
+        assert not torch.equal(
+            prompt_a["additional_information"]["audio_input_ids"],
+            prompt_b["additional_information"]["audio_input_ids"],
+        )
         assert prompt_a["cache_salt"] != prompt_b["cache_salt"]
         assert prompt_a["additional_information"]["ref_audio_cache_key"] == "key_aaa"
         assert prompt_b["additional_information"]["ref_audio_cache_key"] == "key_bbb"
@@ -2241,6 +2392,7 @@ class TestTTSMethods:
 
         assert params["task_type"] == ["Base"]
         assert params["non_streaming_mode"] == [True]
+        assert "full_utterance_decode" not in params
 
     def test_build_tts_params_base_omits_non_streaming_mode_by_default(self, speech_server):
         """Base task should keep using the model default when no override is sent."""
@@ -2255,6 +2407,7 @@ class TestTTSMethods:
 
         assert params["task_type"] == ["Base"]
         assert "non_streaming_mode" not in params
+        assert "full_utterance_decode" not in params
 
     def test_build_tts_params_explicit_non_streaming_mode_overrides_voicedesign_default(self, speech_server):
         """Explicit false should not be replaced by the VoiceDesign fallback."""
@@ -2269,6 +2422,38 @@ class TestTTSMethods:
 
         assert params["task_type"] == ["VoiceDesign"]
         assert params["non_streaming_mode"] == [False]
+        assert "full_utterance_decode" not in params
+
+    def test_build_tts_params_streaming_voicedesign_keeps_prompt_mode_not_full_decode(self, speech_server):
+        """Streaming VoiceDesign defaults: prompt-mode True, no full_utterance_decode."""
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="VoiceDesign",
+            instructions="warm and calm",
+            stream=True,
+            response_format="pcm",
+        )
+
+        params = speech_server._build_tts_params(req)
+
+        assert params["task_type"] == ["VoiceDesign"]
+        assert params["non_streaming_mode"] == [True]
+        assert "full_utterance_decode" not in params
+
+    def test_build_tts_params_streaming_customvoice_explicit_non_streaming_mode_still_windowed(self, speech_server):
+        """Explicit non_streaming_mode=True must not inject full_utterance_decode."""
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            voice="Vivian",
+            non_streaming_mode=True,
+            stream=True,
+            response_format="pcm",
+        )
+
+        params = speech_server._build_tts_params(req)
+
+        assert params["non_streaming_mode"] == [True]
+        assert "full_utterance_decode" not in params
 
     def test_load_supported_speakers(self, mocker: MockerFixture):
         """Test _load_supported_speakers."""
@@ -3287,7 +3472,7 @@ class TestStreamingResponse:
         finalized_tts_params = {"_qwen3_tts_effective_max_tokens": [192]}
         captured: dict = {}
 
-        async def prepare(_request, request_id=None):
+        async def prepare(_request, request_id=None, arrival_time=None):
             return request_id, object(), finalized_tts_params
 
         async def generate_chunks(
@@ -3296,6 +3481,7 @@ class TestStreamingResponse:
             _response_format="pcm",
             raw_request=None,
             request_start_s=None,
+            request_arrival_ts=None,
             include_sample_rate=False,
             usage_acc=None,
             tts_params=None,
@@ -3758,6 +3944,8 @@ def test_api_server_create_speech_wraps_error_response_status(mocker: MockerFixt
 def _make_api_server_request(handler, *, method: str = "POST", path: str = "/v1/audio/voices") -> Request:
     app = FastAPI()
     app.state.openai_serving_speech = handler
+    app.state.api_server_count = 1
+    app.state.serving_tokenization = None
     scope = {
         "type": "http",
         "app": app,
@@ -3770,23 +3958,6 @@ def _make_api_server_request(handler, *, method: str = "POST", path: str = "/v1/
         "scheme": "http",
     }
     return Request(scope)
-
-
-def _patch_api_server_base(mocker: MockerFixture):
-    def _fake_create_error_response(message, err_type="BadRequestError", status_code=400, param=None):
-        return ErrorResponse(
-            error=ErrorInfo(
-                message=message,
-                type=err_type,
-                param=param,
-                code=getattr(status_code, "value", status_code),
-            )
-        )
-
-    fake_base = mocker.MagicMock()
-    fake_base.create_error_response.side_effect = _fake_create_error_response
-    mocker.patch.object(openai_errors, "base", return_value=fake_base)
-    return fake_base
 
 
 def _assert_openai_error_response(
@@ -3804,8 +3975,7 @@ def _assert_openai_error_response(
     assert message in body["error"]["message"]
 
 
-def test_api_server_list_voices_without_speech_handler_returns_404(mocker: MockerFixture):
-    _patch_api_server_base(mocker)
+def test_api_server_list_voices_without_speech_handler_returns_404():
     raw_request = _make_api_server_request(None, method="GET")
 
     response = asyncio.run(api_server_module.list_voices(raw_request))
@@ -3816,7 +3986,6 @@ def test_api_server_list_voices_without_speech_handler_returns_404(mocker: Mocke
 
 
 def test_api_server_upload_voice_value_error_returns_400(mocker: MockerFixture):
-    _patch_api_server_base(mocker)
     handler = mocker.MagicMock()
     handler.upload_voice = mocker.AsyncMock(side_effect=ValueError("Unsupported MIME type: audio/x-m4a"))
     raw_request = _make_api_server_request(handler)
@@ -3834,8 +4003,7 @@ def test_api_server_upload_voice_value_error_returns_400(mocker: MockerFixture):
     _assert_openai_error_response(response, status_code=400, message="Unsupported MIME type")
 
 
-def test_api_server_upload_voice_without_speech_handler_returns_404(mocker: MockerFixture):
-    _patch_api_server_base(mocker)
+def test_api_server_upload_voice_without_speech_handler_returns_404():
     raw_request = _make_api_server_request(None)
 
     response = asyncio.run(
@@ -3851,8 +4019,50 @@ def test_api_server_upload_voice_without_speech_handler_returns_404(mocker: Mock
     )
 
 
+@pytest.mark.parametrize("has_speech_handler", [True, False])
+@pytest.mark.parametrize("method", ["GET", "POST", "DELETE"])
+def test_voice_routes_without_tokenization(mocker: MockerFixture, method: str, has_speech_handler: bool):
+    handler = mocker.MagicMock() if has_speech_handler else None
+    if handler is not None:
+        handler._get_available_voices.return_value = []
+        handler.uploaded_speakers = {}
+        handler.delete_voice = mocker.AsyncMock(return_value=False)
+    app = _make_api_server_request(handler).app
+    app.add_api_route("/v1/audio/voices", api_server_module.list_voices, methods=["GET"])
+    app.add_api_route("/v1/audio/voices", api_server_module.upload_voice, methods=["POST"])
+    app.add_api_route("/v1/audio/voices/{name}", api_server_module.delete_voice, methods=["DELETE"])
+
+    with TestClient(app) as client:
+        if method == "POST":
+            response = client.post(
+                "/v1/audio/voices",
+                files={"consent": (None, "cons_test"), "name": (None, "probe")},
+            )
+        elif method == "DELETE":
+            response = client.delete("/v1/audio/voices/missing")
+        else:
+            response = client.get("/v1/audio/voices")
+
+    if not has_speech_handler:
+        status_code, err_type, message = 404, "NotFoundError", "The model does not support Speech API"
+    elif method == "POST":
+        status_code, err_type, message = (
+            400,
+            "BadRequestError",
+            "Either 'audio_sample' or 'speaker_embedding' must be provided",
+        )
+    elif method == "DELETE":
+        status_code, err_type, message = 404, "NotFoundError", "Voice 'missing' not found"
+    else:
+        assert response.status_code == 200
+        assert response.json() == {"voices": [], "uploaded_voices": []}
+        return
+
+    assert response.status_code == status_code
+    assert response.json() == {"error": {"message": message, "type": err_type, "param": None, "code": status_code}}
+
+
 def test_api_server_upload_voice_without_input_returns_400(mocker: MockerFixture):
-    _patch_api_server_base(mocker)
     raw_request = _make_api_server_request(mocker.MagicMock())
 
     response = asyncio.run(
@@ -3869,7 +4079,6 @@ def test_api_server_upload_voice_without_input_returns_400(mocker: MockerFixture
 
 
 def test_api_server_upload_voice_with_audio_and_embedding_returns_400(mocker: MockerFixture):
-    _patch_api_server_base(mocker)
     raw_request = _make_api_server_request(mocker.MagicMock())
 
     response = asyncio.run(
@@ -3886,7 +4095,6 @@ def test_api_server_upload_voice_with_audio_and_embedding_returns_400(mocker: Mo
 
 
 def test_api_server_upload_voice_exception_returns_500(mocker: MockerFixture):
-    _patch_api_server_base(mocker)
     handler = mocker.MagicMock()
     handler.upload_voice = mocker.AsyncMock(side_effect=RuntimeError("disk failed"))
     raw_request = _make_api_server_request(handler)
@@ -3915,7 +4123,6 @@ def test_api_server_upload_voice_with_no_adapter(
     tmp_path: Path,
 ):
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
-    _patch_api_server_base(mocker)
     engine_client = mocker.MagicMock()
     engine_client.errored = False
     engine_client.stage_configs = []
@@ -3942,8 +4149,7 @@ def test_api_server_upload_voice_with_no_adapter(
     assert response.status_code == 200
 
 
-def test_api_server_delete_voice_without_speech_handler_returns_404(mocker: MockerFixture):
-    _patch_api_server_base(mocker)
+def test_api_server_delete_voice_without_speech_handler_returns_404():
     raw_request = _make_api_server_request(None, method="DELETE", path="/v1/audio/voices/probe")
 
     response = asyncio.run(api_server_module.delete_voice("probe", raw_request))
@@ -3954,7 +4160,6 @@ def test_api_server_delete_voice_without_speech_handler_returns_404(mocker: Mock
 
 
 def test_api_server_delete_voice_value_error_returns_400(mocker: MockerFixture):
-    _patch_api_server_base(mocker)
     handler = mocker.MagicMock()
     handler.delete_voice = mocker.AsyncMock(side_effect=ValueError("Invalid voice name"))
     raw_request = _make_api_server_request(handler, method="DELETE", path="/v1/audio/voices/probe")
@@ -3965,7 +4170,6 @@ def test_api_server_delete_voice_value_error_returns_400(mocker: MockerFixture):
 
 
 def test_api_server_delete_voice_not_found_returns_404(mocker: MockerFixture):
-    _patch_api_server_base(mocker)
     handler = mocker.MagicMock()
     handler.delete_voice = mocker.AsyncMock(return_value=False)
     raw_request = _make_api_server_request(handler, method="DELETE", path="/v1/audio/voices/missing")
@@ -3981,7 +4185,6 @@ def test_api_server_delete_voice_not_found_returns_404(mocker: MockerFixture):
 
 
 def test_api_server_delete_voice_exception_returns_500(mocker: MockerFixture):
-    _patch_api_server_base(mocker)
     handler = mocker.MagicMock()
     handler.delete_voice = mocker.AsyncMock(side_effect=RuntimeError("disk failed"))
     raw_request = _make_api_server_request(handler, method="DELETE", path="/v1/audio/voices/probe")
@@ -3996,10 +4199,9 @@ def test_api_server_delete_voice_exception_returns_500(mocker: MockerFixture):
     )
 
 
-def test_api_server_create_speech_without_handler_returns_404(mocker: MockerFixture):
-    fake_base = _patch_api_server_base(mocker)
+def test_api_server_create_speech_without_handler_returns_404():
     raw_request = _make_api_server_request(None, path="/v1/audio/speech")
-    raw_request.app.state.serving_tokenization = fake_base
+    raw_request.app.state.serving_tokenization = SimpleNamespace(create_error_response=create_error_response)
     request = OpenAICreateSpeechRequest(input="Hello")
 
     response = asyncio.run(api_server_module.create_speech(request, raw_request))
@@ -4009,10 +4211,9 @@ def test_api_server_create_speech_without_handler_returns_404(mocker: MockerFixt
     )
 
 
-def test_api_server_create_speech_batch_without_handler_returns_404(mocker: MockerFixture):
-    fake_base = _patch_api_server_base(mocker)
+def test_api_server_create_speech_batch_without_handler_returns_404():
     raw_request = _make_api_server_request(None, path="/v1/audio/speech/batch")
-    raw_request.app.state.serving_tokenization = fake_base
+    raw_request.app.state.serving_tokenization = SimpleNamespace(create_error_response=create_error_response)
     request = BatchSpeechRequest(items=[SpeechBatchItem(input="hi")])
 
     response = asyncio.run(api_server_module.create_speech_batch(request, raw_request))
@@ -4077,11 +4278,10 @@ def test_api_server_create_speech_batch_omits_null_fields(mocker: MockerFixture)
     assert errored["error"] == "Input text cannot be empty"
 
 
-def test_api_server_create_audio_generate_without_handler_returns_404(mocker: MockerFixture):
-    fake_base = _patch_api_server_base(mocker)
+def test_api_server_create_audio_generate_without_handler_returns_404():
     raw_request = _make_api_server_request(None, path="/v1/audio/generate")
     raw_request.app.state.openai_serving_audio_generate = None
-    raw_request.app.state.serving_tokenization = fake_base
+    raw_request.app.state.serving_tokenization = SimpleNamespace(create_error_response=create_error_response)
     request = OpenAICreateAudioGenerateRequest(input="a bird singing")
 
     response = asyncio.run(api_server_module.create_audio_generate(request, raw_request))
@@ -4919,89 +5119,6 @@ class TestMingFlashOmniTTSServing:
         assert prompt["additional_information"]["voice_name"] == "test"
 
 
-@pytest.fixture
-def dots_tts_server(mocker: MockerFixture):
-    mocker.patch(
-        "vllm_omni.entrypoints.openai.tts_adapters.base.load_supported_speakers",
-        return_value=set(),
-    )
-    mocker.patch(
-        "vllm_omni.entrypoints.openai.tts_adapters.base.load_codec_frame_rate",
-        return_value=None,
-    )
-
-    mock_engine_client = mocker.MagicMock()
-    mock_engine_client.errored = False
-    mock_engine_client.model_config = mocker.MagicMock(
-        model="dots-studio/dots.tts-soar",
-    )
-    mock_engine_client.default_sampling_params_list = [
-        SimpleNamespace(max_tokens=2048, min_tokens=None, extra_args=None)
-    ]
-    mock_engine_client.tts_batch_max_items = 32
-    mock_engine_client.generate = mocker.MagicMock(return_value="generator")
-    mock_engine_client.stage_configs = [
-        SimpleNamespace(
-            engine_args=SimpleNamespace(model_stage="latent_generator", model_arch="DotsTTSForConditionalGeneration"),
-            tts_args={},
-        )
-    ]
-
-    mock_models = mocker.MagicMock()
-    mock_models.is_base_model.return_value = True
-
-    return OmniOpenAIServingSpeech(
-        engine_client=mock_engine_client,
-        models=mock_models,
-        request_logger=mocker.MagicMock(),
-    )
-
-
-class TestDotsTTSServing:
-    def test_dots_tts_prompt_validation(self, dots_tts_server):
-        request = OpenAICreateSpeechRequest(input="Hello", ref_text="Reference transcript")
-        error = dots_tts_server._validate_tts_request(request)
-        assert error is not None
-        assert "ref_text" in error
-
-        request = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
-        error = dots_tts_server._validate_tts_request(request)
-        assert error is not None
-        assert "ref_audio" in error
-
-        request = OpenAICreateSpeechRequest(input="Hello", voice="test")
-        error = dots_tts_server._validate_tts_request(request)
-        assert error is not None
-        assert "voice" in error
-
-        request = OpenAICreateSpeechRequest(input="Hello", speaker_embedding=[1, 2, 3])
-        error = dots_tts_server._validate_tts_request(request)
-        assert error is not None
-        assert "speaker_embedding" in error
-
-        request = OpenAICreateSpeechRequest(input="Hello", x_vector_only_mode=True)
-        error = dots_tts_server._validate_tts_request(request)
-        assert error is not None
-        assert "x_vector_only_mode" in error
-
-    def test_dots_tts_adapter_awaits_async_prompt_builder(self, dots_tts_server, mocker: MockerFixture):
-        build_prompt_async = mocker.patch.object(
-            dots_tts_server._adapter,
-            "_build_prompt_async",
-            new=mocker.AsyncMock(return_value={"prompt_token_ids": [1, 2, 3]}),
-        )
-        request = OpenAICreateSpeechRequest(input="Hello")
-        asyncio.run(dots_tts_server._prepare_speech_generation(request))
-        build_prompt_async.assert_awaited_once_with("Hello")
-
-    def test_dots_tts_adapter_apply_sampling_overrides(self, dots_tts_server, mocker: MockerFixture):
-        mocker.patch.object(dots_tts_server._adapter, "build", return_value=PreparedRequest(prompt="Hello"))
-        request = OpenAICreateSpeechRequest(input="Hello", max_new_tokens=10)
-        asyncio.run(dots_tts_server._prepare_speech_generation(request))
-        sampling_params_list = dots_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"]
-        assert sampling_params_list[0].max_tokens == 10
-
-
 class TestTTSAsyncOffloading:
     """Tests for event-loop-safe offloading of blocking TTS operations."""
 
@@ -5034,6 +5151,7 @@ class TestTTSAsyncOffloading:
             models=mock_models,
             request_logger=mocker.MagicMock(),
         )
+        server.uploaded_speakers = {}
         yield server
         server.shutdown()
 
@@ -5098,6 +5216,7 @@ class TestTTSAsyncOffloading:
 
     def test_prepare_speech_generation_awaits_voxtral_async(self, voxtral_server, mocker: MockerFixture):
         """Voxtral path in _prepare_speech_generation should call the async wrapper."""
+        voxtral_server._adapter._encoder_loaded = mocker.AsyncMock(return_value=False)
         voxtral_server._adapter._build_prompt_async = mocker.AsyncMock(
             return_value={
                 "prompt_token_ids": [1, 2, 3],
@@ -5176,6 +5295,52 @@ class TestTTSAsyncOffloading:
             for call in log_info.call_args_list
         )
 
+    @pytest.mark.parametrize("word_timestamps", [False, True])
+    def test_streaming_timestamps_retain_complete_audio(self, qwen3_tts_server, mocker, word_timestamps):
+        from vllm import SamplingParams
+        from vllm.sampling_params import RequestOutputKind
+
+        defaults = [SamplingParams(), SamplingParams()]
+        qwen3_tts_server.engine_client.default_sampling_params_list = defaults
+        qwen3_tts_server._adapter.validate = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._adapter._build_tts_params = mocker.MagicMock(
+            return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
+        )
+        qwen3_tts_server._adapter._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
+        request = OpenAICreateSpeechRequest(
+            input="hello", stream=True, response_format="pcm", word_timestamps=word_timestamps
+        )
+        asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+
+        params = qwen3_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"]
+        expected = RequestOutputKind.CUMULATIVE if word_timestamps else RequestOutputKind.DELTA
+        assert all(sp.output_kind == expected for sp in params)
+        assert all(sp.output_kind == RequestOutputKind.CUMULATIVE for sp in defaults)
+        assert all(sp is not original for sp, original in zip(params, defaults))
+
+    @pytest.mark.asyncio
+    async def test_cumulative_timestamp_audio_emits_each_sample_once(self, qwen3_tts_server):
+        audio = torch.linspace(-0.5, 0.5, 2400)
+
+        async def cumulative_generator():
+            for end in (800, 1600, 2400, 2400):
+                yield OmniRequestOutput(
+                    request_id="req-cumulative",
+                    final_output_type="audio",
+                    _multimodal_output={"audio": audio[:end], "sr": 24000},
+                )
+
+        chunks = [
+            chunk
+            async for chunk in qwen3_tts_server._generate_pcm_chunks(
+                cumulative_generator(), "req-cumulative", cumulative_audio=True
+            )
+        ]
+        assert len(chunks) == 3
+        assert len(b"".join(chunks)) == 2400 * 2
+        decoded = np.frombuffer(b"".join(chunks), dtype=np.int16)
+        assert np.all(np.diff(decoded.astype(np.int32)) >= 0)
+
     def test_prepare_speech_generation_treats_sse_as_streaming(self, qwen3_tts_server, mocker: MockerFixture):
         """stream_format=sse should request delta-style multimodal outputs."""
         qwen3_tts_server._adapter.validate = mocker.MagicMock(return_value=None)
@@ -5253,6 +5418,7 @@ class TestTTSAsyncOffloading:
         """FINAL_ONLY streaming for async_chunk=False is scoped to qwen3_tts only."""
         voxtral_server.engine_client.model_config.async_chunk = False
         mocker.patch.object(voxtral_server._get_tts_adapter(), "validate", return_value=None)
+        voxtral_server._adapter._encoder_loaded = mocker.AsyncMock(return_value=False)
         voxtral_server._adapter._build_prompt_async = mocker.AsyncMock(
             return_value={
                 "prompt_token_ids": [1, 2, 3],
@@ -5286,9 +5452,34 @@ class TestTTSAsyncOffloading:
 
         assert tts_params["task_type"] == ["VoiceDesign"]
         assert tts_params["non_streaming_mode"] == [False]
+        assert "full_utterance_decode" not in tts_params
         prompt = qwen3_tts_server.engine_client.generate.call_args.kwargs["prompt"]
         assert prompt["additional_information"] is tts_params
         assert prompt["additional_information"]["non_streaming_mode"] == [False]
+        assert "full_utterance_decode" not in prompt["additional_information"]
+
+    def test_prepare_speech_generation_qwen3_streaming_voicedesign_default_params(
+        self, qwen3_tts_server, mocker: MockerFixture
+    ):
+        """Streaming VoiceDesign defaults keep prompt-mode True without full_utterance_decode."""
+        qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
+
+        request = OpenAICreateSpeechRequest(
+            input="hello",
+            task_type="VoiceDesign",
+            instructions="warm and calm",
+            stream=True,
+            response_format="pcm",
+        )
+        _request_id, _generator, tts_params = asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+
+        assert tts_params["task_type"] == ["VoiceDesign"]
+        assert tts_params["non_streaming_mode"] == [True]
+        assert "full_utterance_decode" not in tts_params
+        prompt = qwen3_tts_server.engine_client.generate.call_args.kwargs["prompt"]
+        assert prompt["additional_information"]["non_streaming_mode"] == [True]
+        assert "full_utterance_decode" not in prompt["additional_information"]
 
     def test_prepare_speech_generation_qwen3_base_non_streaming_mode_true(
         self, qwen3_tts_server, mocker: MockerFixture
@@ -5311,18 +5502,21 @@ class TestTTSAsyncOffloading:
         assert tts_params["task_type"] == ["Base"]
         assert tts_params["ref_text"] == ["reference transcript"]
         assert tts_params["non_streaming_mode"] == [True]
+        assert "full_utterance_decode" not in tts_params
         prompt = qwen3_tts_server.engine_client.generate.call_args.kwargs["prompt"]
         assert prompt["additional_information"] is tts_params
         assert prompt["additional_information"]["non_streaming_mode"] == [True]
+        assert "full_utterance_decode" not in prompt["additional_information"]
 
-    def test_qwen3_repeated_ref_audio_hot_path_sends_cache_key_without_waveform(self, qwen3_tts_server):
-        """After a ref artifact is marked ready, repeated requests avoid ref_audio payload IPC."""
+    def test_qwen3_inline_ref_audio_hot_path_does_not_use_named_speaker_cache(self, qwen3_tts_server, mocker):
+        """An OpenAI-compatible voice does not identify an inline voice clone."""
+        ignored_voice_log = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts.logger.info")
         wav_list = [0.0] * 48000
         artifact_key = "a" * 40
         ref_audio = "data:audio/wav;base64,same"
         qwen3_tts_server._put_resolved_ref_audio(
             hashlib.sha1(ref_audio.encode("utf-8")).hexdigest(),
-            wav_list,
+            np.asarray(wav_list, dtype=np.float32),
             24000,
             artifact_key,
         )
@@ -5339,6 +5533,7 @@ class TestTTSAsyncOffloading:
 
         request = OpenAICreateSpeechRequest(
             input="hello",
+            voice="voice-a",
             task_type="Base",
             ref_audio=ref_audio,
             ref_text="reference",
@@ -5348,7 +5543,14 @@ class TestTTSAsyncOffloading:
         )
 
         assert request_id == "req-hot"
+        assert request.voice == "voice-a"
+        ignored_voice_log.assert_called_once_with(
+            "Ignoring voice=%r for Qwen3-TTS Base request because inline ref_audio takes precedence",
+            "voice-a",
+        )
         assert "ref_audio" not in tts_params
+        assert "speaker" not in tts_params
+        assert "voice_created_at" not in tts_params
         assert tts_params["_qwen3_tts_ref_audio_cache_key"] == [artifact_key]
         assert tts_params["ref_code_length"] == [50]
         prompt = qwen3_tts_server.engine_client.generate.call_args.kwargs["prompt"]
@@ -5358,9 +5560,9 @@ class TestTTSAsyncOffloading:
         qwen3_tts_server._ref_audio_resolve_cache_max_entries = 1
         qwen3_tts_server._ref_audio_resolve_cache_max_bytes = 1_000_000
 
-        qwen3_tts_server._put_resolved_ref_audio("ref-a", [0.0] * 8, 24000, "artifact-a")
+        qwen3_tts_server._put_resolved_ref_audio("ref-a", np.zeros(8, dtype=np.float32), 24000, "artifact-a")
         qwen3_tts_server._ref_audio_model_artifact_ready.add(("artifact-a", False))
-        qwen3_tts_server._put_resolved_ref_audio("ref-b", [0.0] * 8, 24000, "artifact-b")
+        qwen3_tts_server._put_resolved_ref_audio("ref-b", np.zeros(8, dtype=np.float32), 24000, "artifact-b")
 
         assert ("artifact-a", False) not in qwen3_tts_server._ref_audio_model_artifact_ready
         assert "artifact-b" in {entry[3] for entry in qwen3_tts_server._ref_audio_resolve_cache.values()}
@@ -5578,21 +5780,34 @@ class TestTTSAsyncOffloading:
 
     @pytest.mark.asyncio
     async def test_generate_audio_chunks_discards_ref_audio_artifact_warmup_on_close(self, qwen3_tts_server):
+        closed = asyncio.Event()
+
         async def pcm_generator():
-            yield SimpleNamespace(
-                multimodal_output={
-                    "audio": torch.zeros(16, dtype=torch.float32),
-                    "sr": 24000,
-                }
-            )
-            await asyncio.sleep(0)
+            try:
+                yield OmniRequestOutput(
+                    request_id="req-close",
+                    final_output_type="audio",
+                    _multimodal_output={
+                        "audio": torch.zeros(16, dtype=torch.float32),
+                        "sr": 24000,
+                    },
+                )
+            finally:
+                # Engine abort waits for stage acknowledgments. Retain an
+                # actual cancellation checkpoint to cover ASGI cancel scopes.
+                await anyio.sleep(0)
+                closed.set()
 
         qwen3_tts_server._request_ref_audio_artifact_keys["req-close"] = ("artifact-close", False)
 
-        stream = qwen3_tts_server._generate_audio_chunks(pcm_generator(), "req-close")
+        engine_stream = pcm_generator()
+        stream = qwen3_tts_server._generate_audio_chunks(engine_stream, "req-close")
         assert await anext(stream)
-        await stream.aclose()
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            await stream.aclose()
 
+        assert closed.is_set()
         assert "req-close" not in qwen3_tts_server._request_ref_audio_artifact_keys
         assert ("artifact-close", False) not in qwen3_tts_server._ref_audio_model_artifact_ready
 
@@ -5607,7 +5822,7 @@ class TestTTSAsyncOffloading:
     def test_qwen3_xvector_ready_artifact_does_not_enable_icl_artifact_only(self, qwen3_tts_server):
         # An x-vector-only artifact (speaker embedding, no ref_code) must not enable
         # the artifact-only path for a later ICL request with the same ref_audio (#5049).
-        qwen3_tts_server._put_resolved_ref_audio("ref-a", [0.0] * 8, 24000, "artifact-a")
+        qwen3_tts_server._put_resolved_ref_audio("ref-a", np.zeros(8, dtype=np.float32), 24000, "artifact-a")
         qwen3_tts_server._track_ref_audio_artifact_warmup("req-xvec", "artifact-a", x_vector_only=True)
         qwen3_tts_server._mark_ref_audio_artifact_ready_for_request("req-xvec")
 
@@ -5615,7 +5830,7 @@ class TestTTSAsyncOffloading:
         assert qwen3_tts_server._adapter._qwen3_tts_can_use_ref_audio_artifact_only(icl_params, "artifact-a") is False
 
     def test_qwen3_xvector_ready_artifact_still_reusable_by_xvector_request(self, qwen3_tts_server):
-        qwen3_tts_server._put_resolved_ref_audio("ref-a", [0.0] * 8, 24000, "artifact-a")
+        qwen3_tts_server._put_resolved_ref_audio("ref-a", np.zeros(8, dtype=np.float32), 24000, "artifact-a")
         qwen3_tts_server._track_ref_audio_artifact_warmup("req-xvec", "artifact-a", x_vector_only=True)
         qwen3_tts_server._mark_ref_audio_artifact_ready_for_request("req-xvec")
 
@@ -5623,7 +5838,7 @@ class TestTTSAsyncOffloading:
         assert qwen3_tts_server._adapter._qwen3_tts_can_use_ref_audio_artifact_only(xvec_params, "artifact-a") is True
 
     def test_qwen3_icl_ready_artifact_enables_icl_artifact_only(self, qwen3_tts_server):
-        qwen3_tts_server._put_resolved_ref_audio("ref-a", [0.0] * 8, 24000, "artifact-a")
+        qwen3_tts_server._put_resolved_ref_audio("ref-a", np.zeros(8, dtype=np.float32), 24000, "artifact-a")
         qwen3_tts_server._track_ref_audio_artifact_warmup("req-icl", "artifact-a", x_vector_only=False)
         qwen3_tts_server._mark_ref_audio_artifact_ready_for_request("req-icl")
 

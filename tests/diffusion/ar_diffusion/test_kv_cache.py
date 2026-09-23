@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for the AR-Diffusion KV cache helpers (Phase 1, PR-2).
 
 Covers the request adapter, the chunk-window spec/manager (registration + the
@@ -269,8 +270,13 @@ def test_compiled_paged_write_does_not_clone_the_pool():
     # drives the reinplace pass, so a drift here would silently test nothing.
     real_schema = torch.ops.vllm_omni.ar_diffusion_paged_write_attn.default._schema
     real_mutated = [arg.name for arg in real_schema.arguments if arg.alias_info and arg.alias_info.is_write]
-    assert real_mutated == ["key_pool", "value_pool"], (
+    # The staging buffers are mutated too when reuse_history_staging is on, but they are separate
+    # allocations and not what this test is about; the pools are what must not be cloned.
+    assert real_mutated[:2] == ["key_pool", "value_pool"], (
         f"the real paged-write op now mutates {real_mutated}; this test still models two pools"
+    )
+    assert set(real_mutated) - {"key_pool", "value_pool"} <= {"stage_key", "stage_value"}, (
+        f"unexpected mutated argument in the real paged-write op: {real_mutated}"
     )
 
     num_blocks, heads, dim = 8, 4, 16
@@ -357,6 +363,7 @@ def _make_tiny_capacity_kv(
     available_bytes: int,
     gpu_memory_fraction: float = 1.0,
     model_owned_state_bytes_per_session: int = 0,
+    reuse_history_staging: bool = False,
 ) -> ARDiffusionKVCache:
     return ARDiffusionKVCache(
         ARDiffusionKVConfig(
@@ -365,6 +372,7 @@ def _make_tiny_capacity_kv(
             window_chunks=3,
             sink_chunks=3,
             gpu_memory_fraction=gpu_memory_fraction,
+            reuse_history_staging=reuse_history_staging,
         ),
         num_layers=1,
         num_kv_heads=1,
@@ -380,6 +388,33 @@ def _make_tiny_capacity_kv(
         model_owned_state_bytes_per_session=model_owned_state_bytes_per_session,
         device=torch.device("cpu"),
     )
+
+
+def test_history_staging_is_reserved_in_the_kv_budget(monkeypatch):
+    """The per-layer staging pair is worker-wide memory allocated after admission; the budget must hold it."""
+    monkeypatch.setenv("VLLM_OMNI_AR_DIFFUSION_KV_GATHER", "1")
+    # Same geometry as the capacity-two test: 192 bytes fits two sessions exactly without staging.
+    plain = _make_tiny_capacity_kv(requested_capacity=2, available_bytes=192)
+    assert plain.session_capacity == 2 and plain.history_staging_reserved_bytes == 0
+
+    staged = _make_tiny_capacity_kv(requested_capacity=2, available_bytes=192, reuse_history_staging=True)
+    # 2 (K, V) x 1 layer x (sink 3 + window 3 + one action-capacity block) tokens x 1 head x 1 dim x 4 bytes.
+    assert staged.history_staging_reserved_bytes == 2 * 1 * 7 * 1 * 1 * 4
+    # It comes out of the same budget, so the second session no longer fits.
+    assert staged.session_capacity == 1
+    assert staged.num_blocks_total * 8 + staged.history_staging_reserved_bytes <= 192
+
+    # Boundary: one session fits at 128 bytes without staging; with staging the same budget is rejected
+    # up front instead of failing on the first forward.
+    _make_tiny_capacity_kv(requested_capacity=1, available_bytes=128)
+    with pytest.raises(ValueError, match="cannot fit one session"):
+        _make_tiny_capacity_kv(requested_capacity=1, available_bytes=128, reuse_history_staging=True)
+
+
+def test_history_staging_is_not_reserved_when_the_gather_path_is_off(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_AR_DIFFUSION_KV_GATHER", raising=False)
+    staged = _make_tiny_capacity_kv(requested_capacity=2, available_bytes=192, reuse_history_staging=True)
+    assert staged.history_staging_reserved_bytes == 0 and staged.session_capacity == 2
 
 
 def test_capacity_two_retains_both_windows_and_allocates_next_block():
@@ -606,3 +641,70 @@ def test_non_contiguous_branch_indices_rejected():
             kv_branches=(ARDiffusionKVBranchSpec("main", 1),),
             session_capacity=1,
         )
+
+
+def test_staged_window_reuse_matches_a_full_gather():
+    """Reusing the staged history must be byte-identical to re-gathering the whole window.
+
+    This is the property the optimisation rests on: the leading blocks were staged by an earlier forward of
+    the same AR block, so skipping them can only be correct if what is already there equals what a fresh
+    gather would write. The test stages once, mutates only the current chunk's blocks in the pool (what a
+    later probe of the same block does), restages the tail alone, and compares against a full gather.
+    """
+    from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import _stage_window
+
+    torch.manual_seed(0)
+    num_blocks, block_size, heads, dim = 6, 4, 2, 8
+    current_blocks = 2
+    key_cache = torch.randn(num_blocks, block_size, heads, dim)
+    value_cache = torch.randn(num_blocks, block_size, heads, dim)
+    block_ids = torch.tensor([5, 4, 3, 2, 1, 0])
+    stage_key = torch.zeros(num_blocks * block_size, heads, dim)
+    stage_value = torch.zeros(num_blocks * block_size, heads, dim)
+
+    _stage_window(stage_key, stage_value, key_cache, value_cache, block_ids, num_blocks, block_size, first_block=0)
+
+    # A later probe rewrites only the current chunk's blocks in the pool.
+    for slot in block_ids[num_blocks - current_blocks :]:
+        key_cache[slot] = torch.randn(block_size, heads, dim)
+        value_cache[slot] = torch.randn(block_size, heads, dim)
+
+    _stage_window(
+        stage_key,
+        stage_value,
+        key_cache,
+        value_cache,
+        block_ids,
+        num_blocks,
+        block_size,
+        first_block=num_blocks - current_blocks,
+    )
+
+    full_key = torch.zeros_like(stage_key)
+    full_value = torch.zeros_like(stage_value)
+    _stage_window(full_key, full_value, key_cache, value_cache, block_ids, num_blocks, block_size, first_block=0)
+
+    torch.testing.assert_close(stage_key, full_key, rtol=0, atol=0)
+    torch.testing.assert_close(stage_value, full_value, rtol=0, atol=0)
+
+
+def test_staged_window_tail_refresh_leaves_history_untouched():
+    """The tail restage must not write the history rows -- that is what makes it cheaper."""
+    from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import _stage_window
+
+    torch.manual_seed(1)
+    num_blocks, block_size, heads, dim = 5, 4, 1, 4
+    key_cache = torch.randn(num_blocks, block_size, heads, dim)
+    value_cache = torch.randn(num_blocks, block_size, heads, dim)
+    block_ids = torch.arange(num_blocks)
+    stage_key = torch.full((num_blocks * block_size, heads, dim), -1.0)
+    stage_value = torch.full((num_blocks * block_size, heads, dim), -1.0)
+
+    _stage_window(
+        stage_key, stage_value, key_cache, value_cache, block_ids, num_blocks, block_size, first_block=num_blocks - 1
+    )
+
+    history_rows = (num_blocks - 1) * block_size
+    assert (stage_key[:history_rows] == -1.0).all(), "history rows were rewritten by a tail restage"
+    assert (stage_value[:history_rows] == -1.0).all()
+    torch.testing.assert_close(stage_key[history_rows:], key_cache[-1].reshape(block_size, heads, dim), rtol=0, atol=0)

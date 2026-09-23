@@ -63,7 +63,7 @@ class _MossCodecStreamSession:
         self._cudagraph_wrapper: CUDAGraphStreamingDecoderWrapper | None = None
         batch_sizes = sorted({int(size) for size in (graph_batch_sizes or []) if 0 < int(size) <= self._state_capacity})
         frame_sizes = sorted({int(size) for size in (graph_frame_sizes or []) if int(size) > 0})
-        scratch_capacity = max(batch_sizes, default=0) if self._device.type == "cuda" else 0
+        scratch_capacity = max(batch_sizes, default=0) if self._device.type in ("cuda", "npu") else 0
         self._total_state_capacity = self._state_capacity + scratch_capacity
         self._state_slot_ids = torch.arange(
             self._total_state_capacity,
@@ -76,15 +76,29 @@ class _MossCodecStreamSession:
             raise RuntimeError("The streaming codec does not implement a decoder state pool.")
         with torch.no_grad():
             initialize_state_pool(self._state_capacity, scratch_capacity)
-        if batch_sizes and frame_sizes and self._device.type == "cuda":
-            self._cudagraph_wrapper = CUDAGraphStreamingDecoderWrapper(
-                codec,
-                state_capacity=self._state_capacity,
-                batch_sizes=batch_sizes,
-                frame_sizes=frame_sizes,
-                num_quantizers=self._n_vq,
-                vllm_config=vllm_config,
-            )
+        if batch_sizes and frame_sizes and self._device.type in ("cuda", "npu"):
+            if self._device.type == "npu":
+                from vllm_omni.platforms.npu.models.moss_tts_streaming_decode_wrapper import (
+                    NPUGraphStreamingDecoderWrapper,
+                )
+
+                self._cudagraph_wrapper = NPUGraphStreamingDecoderWrapper(
+                    codec,
+                    state_capacity=self._state_capacity,
+                    batch_sizes=batch_sizes,
+                    frame_sizes=frame_sizes,
+                    num_quantizers=self._n_vq,
+                    vllm_config=vllm_config,
+                )
+            else:
+                self._cudagraph_wrapper = CUDAGraphStreamingDecoderWrapper(
+                    codec,
+                    state_capacity=self._state_capacity,
+                    batch_sizes=batch_sizes,
+                    frame_sizes=frame_sizes,
+                    num_quantizers=self._n_vq,
+                    vllm_config=vllm_config,
+                )
             self._cudagraph_wrapper.warmup(self._device)
             self.reset_slots(list(range(self._state_capacity + scratch_capacity)))
             if not self._cudagraph_wrapper.is_ready:
@@ -767,7 +781,8 @@ class MossTTSCodecDecoder(nn.Module):
         )
 
         codec.eval()
-        if device.type != "cpu":
+        # The v1 quantizer emits FP32 tensors, so its decoder must remain FP32.
+        if device.type != "cpu" and isinstance(codec, MossAudioTokenizerV2Model):
             codec.decoder.to(dtype=torch.bfloat16)
         attention_backend = getattr(self.vllm_config.model_config.hf_config, "codec_attention_backend", "sdpa")
         if attention_backend != "sdpa":

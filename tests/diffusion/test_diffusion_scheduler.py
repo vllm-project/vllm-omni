@@ -11,6 +11,7 @@ import torch
 import vllm.v1.core.single_type_kv_cache_manager as native_kv_managers
 from pytest_mock import MockerFixture
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
+from vllm.v1.outputs import KVConnectorOutput
 
 from tests.helpers.kv_layout import build_kv_cache_tensor
 from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedError
@@ -134,6 +135,55 @@ def _attach_diffusion_kv(request: OmniDiffusionRequest, *, seq_len: int = 8) -> 
             seq_len=seq_len,
         ),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scheduler_cls", [RequestScheduler, StepScheduler])
+@pytest.mark.parametrize("failure", ["timeout", "registration"])
+async def test_single_native_kv_failure_reaches_output_stream(mocker, scheduler_cls, failure):
+    from vllm_omni.diffusion.diffusion_kv.kv_connector import KVTransferRegistrationError
+
+    scheduler = scheduler_cls()
+    _initialize_paged_scheduler(scheduler, max_num_seqs=1)
+    connector = mocker.Mock()
+    connector.get_num_new_matched_tokens.return_value = (4, True)
+    connector.request_finished.return_value = (False, None)
+    scheduler._kv_connector = connector
+    request = _make_request("failed")
+    _attach_diffusion_kv(request)
+    request.diffusion_kv_requests[0].prompt_token_ids = [1, 2, 3, 4]
+    request.kv_transfer_params = {"num_transfer_tokens": 4, "do_remote_prefill": True}
+    scheduler.add_request(request)
+    if failure == "registration":
+        mocker.patch(
+            "vllm_omni.diffusion.sched.base_scheduler.commit_kv_load",
+            side_effect=KVTransferRegistrationError("registration failed"),
+        )
+    engine = object.__new__(DiffusionEngine)
+    engine.scheduler = scheduler
+    engine.od_config = SimpleNamespace(diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER)
+    engine.execution_mode = (
+        DiffusionExecutionMode.STEP_BATCH if scheduler_cls is StepScheduler else DiffusionExecutionMode.REQUEST_BATCH
+    )
+    engine.abort_queue = queue.Queue()
+    engine._cv = threading.Condition()
+    engine.main_loop = asyncio.get_running_loop()
+    stream = asyncio.Queue()
+    engine._out_streams = {"failed": stream}
+    engine.executor = mocker.Mock()
+    engine.executor.prepare_kv_for_forward.return_value = KVConnectorOutput()
+    scheduled = scheduler.schedule()
+    engine._prepare_kv_for_forward(scheduled)
+    assert scheduled.scheduled_request_ids == []
+    output = BatchRunnerOutput.from_list([])
+    finished = scheduler.update_from_output(scheduled, output)
+    engine._emit_outputs(finished, scheduled.scheduled_request_ids, output)
+    terminal = await asyncio.wait_for(stream.get(), timeout=1)
+    assert terminal.finished
+    assert terminal.error == ("Timed out receiving diffusion KV" if failure == "timeout" else "registration failed")
+    assert scheduler.get_request_state("failed") is None
+    # Reporting failure must not recycle pages that the sender can still write.
+    assert scheduler._diffusion_kv_manager.has_request("failed") == (failure == "timeout")
 
 
 class _StubScheduler:
@@ -602,16 +652,22 @@ class TestRequestScheduler:
         assert sched_output.finished_req_ids == {"impossible"}
         assert _new_ids(sched_output) == ["schedulable"]
 
-    def test_diffusion_kv_internal_allocation_error_finishes_request(self, monkeypatch) -> None:
+    def test_diffusion_kv_internal_allocation_error_is_request_scoped(self, monkeypatch) -> None:
         _initialize_paged_scheduler(self.scheduler)
         request = _make_request("native-error")
         _attach_diffusion_kv(request)
         self.scheduler.add_request(request)
         manager = self.scheduler._diffusion_kv_manager
         assert manager is not None
+        reserve_request = manager.reserve_request
+        next_request = _make_request("after-error")
+        _attach_diffusion_kv(next_request)
+        self.scheduler.add_request(next_request)
 
         def raise_native_error(*args, **kwargs):
-            raise ValueError("native allocation bug")
+            if args[0] == "native-error":
+                raise ValueError("native allocation bug")
+            return reserve_request(*args, **kwargs)
 
         monkeypatch.setattr(
             manager,
@@ -619,14 +675,150 @@ class TestRequestScheduler:
             raise_native_error,
         )
 
-        sched_output = self.scheduler.schedule()
-
+        output = self.scheduler.schedule()
         state = self.scheduler.get_request_state("native-error")
-        assert state is not None
         assert state.status == DiffusionRequestStatus.FINISHED_ERROR
         assert state.error == "native allocation bug"
-        assert sched_output.finished_req_ids == {"native-error"}
-        assert sched_output.scheduled_request_ids == []
+        assert output.finished_req_ids == {"native-error"}
+        assert _new_ids(output) == ["after-error"]
+        assert not manager.has_request("native-error")
+
+    @pytest.mark.parametrize("action", ["abort", "timeout", "preempt"])
+    def test_diffusion_kv_loading_defers_free_and_blocks_preempt(self, mocker: MockerFixture, action: str) -> None:
+        _initialize_paged_scheduler(self.scheduler, num_blocks=5)
+        connector = mocker.Mock()
+        connector.get_num_new_matched_tokens.return_value = (4, True)
+        connector.request_finished.return_value = (False, None)
+        self.scheduler._kv_connector = connector
+        request = _make_request("loading")
+        request.diffusion_kv_requests = tuple(
+            DiffusionKVRequest(
+                f"loading/diffusion-kv/{i}",
+                sequence_id=i,
+                prefix_len=4,
+                target_len=4,
+                seq_len=8,
+                prompt_token_ids=[1, 2, 3, 4],
+            )
+            for i in range(2)
+        )
+        request.kv_transfer_params = {"num_transfer_tokens": 4, "do_remote_prefill": True}
+        manager = self.scheduler._diffusion_kv_manager
+        assert manager is not None
+        pool = manager.native_manager.block_pool
+        initial_free_blocks = pool.get_num_free_blocks()
+        self.scheduler.add_request(request)
+        scheduled = self.scheduler.schedule()
+        internal_ids = {f"loading/diffusion-kv/{i}" for i in range(2)}
+        assert scheduled.kv_transfer_request_ids == internal_ids
+        assert pool.get_num_free_blocks() == initial_free_blocks - 4
+        metadata = manager.get_metadata("loading")
+        state = self.scheduler.get_request_state("loading")
+        free_request = mocker.spy(manager, "free_request")
+
+        if action == "abort":
+            self.scheduler.finish_requests("loading", DiffusionRequestStatus.FINISHED_ABORTED)
+        elif action == "timeout":
+            assert self.scheduler.fail_incomplete_kv_loads(internal_ids) == {"loading"}
+            assert state.error == "Timed out receiving diffusion KV"
+        if action != "preempt":
+            assert state.is_finished()
+            assert self.scheduler.pop_request_state("loading") is state
+            with pytest.raises(ValueError, match="already active"):
+                self.scheduler.add_request(request)
+            assert self.scheduler.get_diffusion_kv_cleanup_targets(["loading"]) == []
+
+        # Empty, unrelated, and partial completion retain both CFG rows even
+        # after the frontend has consumed and popped the terminal request.
+        for finished in (set(), {"other/diffusion-kv/0"}, {"loading/diffusion-kv/0"}):
+            self.scheduler.update_kv_connector_output(KVConnectorOutput(finished_recving=finished))
+            assert "loading" in self.scheduler._kv_loading_request_ids
+            assert self.scheduler.preempt_request("loading") is False
+            assert not self.scheduler.completed_kv_drains()
+            assert manager.has_request("loading")
+            assert manager.get_metadata("loading") == metadata
+            assert pool.get_num_free_blocks() == initial_free_blocks - 4
+            free_request.assert_not_called()
+            connector.request_finished.assert_not_called()
+
+        # CFG completion may arrive in different polls, after rank aggregation.
+        self.scheduler.update_kv_connector_output(KVConnectorOutput(finished_recving={"loading/diffusion-kv/1"}))
+        assert "loading" not in self.scheduler._kv_loading_request_ids
+        if action == "preempt":
+            assert self.scheduler.preempt_request("loading") is True
+            assert state.status == DiffusionRequestStatus.PREEMPTED
+            assert manager.get_metadata("loading") == metadata
+            self.scheduler.finish_requests("loading", DiffusionRequestStatus.FINISHED_ABORTED)
+        else:
+            assert self.scheduler.completed_kv_drains() == {"loading"}
+            assert self.scheduler.get_diffusion_kv_cleanup_targets(["loading"]) == [
+                ("loading", metadata.allocation_generation)
+            ]
+            self.scheduler.release_kv_drains({"loading"})
+        assert not self.scheduler._running and not self.scheduler._waiting
+        assert self.scheduler._kv_finished_request_ids == internal_ids
+        assert connector.request_finished.call_count == 2
+        free_request.assert_called_once_with("loading")
+        assert not manager.has_request("loading")
+        assert pool.get_num_free_blocks() == initial_free_blocks
+
+    @pytest.mark.parametrize("cancel", [False, True])
+    def test_engine_timeout_keeps_serving_and_reclaims_late_receive(self, mocker, cancel):
+        _initialize_paged_scheduler(self.scheduler, num_blocks=16, max_num_seqs=2)
+        connector = mocker.Mock()
+        connector.get_num_new_matched_tokens.return_value = (4, True)
+        connector.request_finished.return_value = (False, None)
+        self.scheduler._kv_connector = connector
+        for rid in ("slow", "ready"):
+            req = _make_request(rid)
+            _attach_diffusion_kv(req)
+            req.diffusion_kv_requests[0].prompt_token_ids = [1, 2, 3, 4]
+            req.kv_transfer_params = {"num_transfer_tokens": 4, "do_remote_prefill": True}
+            self.scheduler.add_request(req)
+        scheduled = self.scheduler.schedule()
+        engine = object.__new__(DiffusionEngine)
+        engine.scheduler = self.scheduler
+        engine.od_config = SimpleNamespace(diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER)
+        engine.abort_queue = queue.Queue()
+        engine._cv = threading.Condition()
+        if cancel:
+            engine.abort_queue.put("slow")
+        engine.executor = mocker.Mock()
+        engine.executor.prepare_kv_for_forward.side_effect = [
+            KVConnectorOutput(finished_recving={"ready/diffusion-kv/0"}),
+            KVConnectorOutput(finished_recving={"slow/diffusion-kv/0"}),
+        ]
+        fail_engine = mocker.patch.object(engine, "_fail_engine")
+        engine._prepare_kv_for_forward(scheduled)
+        assert scheduled.scheduled_request_ids == ["ready"]
+        assert scheduled.finished_req_ids == {"slow"}
+        expected_status = DiffusionRequestStatus.FINISHED_ABORTED if cancel else DiffusionRequestStatus.FINISHED_ERROR
+        assert self.scheduler.get_request_state("slow").status == expected_status
+        assert self.scheduler._diffusion_kv_manager.has_request("slow")
+        engine._remove_diffusion_kv_requests(["slow"])
+        engine.executor.remove_diffusion_kv_requests.assert_not_called()
+        self.scheduler.pop_request_state("slow")
+        generation = self.scheduler._kv_request_generations["slow"]
+        engine._prepare_kv_for_forward(self.scheduler.schedule())
+        engine.executor.remove_diffusion_kv_requests.assert_called_once_with([("slow", generation)])
+        assert not self.scheduler._diffusion_kv_manager.has_request("slow")
+        assert self.scheduler._diffusion_kv_manager.has_request("ready")
+        fail_engine.assert_not_called()
+
+    def test_slow_kv_match_does_not_block_later_request(self, mocker):
+        _initialize_paged_scheduler(self.scheduler, max_num_seqs=2)
+        connector = mocker.Mock()
+        connector.get_num_new_matched_tokens.side_effect = lambda req, _: (
+            (None, False) if req.request_id.startswith("slow/") else (0, False)
+        )
+        self.scheduler._kv_connector = connector
+        for rid in ("slow", "ready"):
+            request = _make_request(rid)
+            _attach_diffusion_kv(request)
+            self.scheduler.add_request(request)
+        output = self.scheduler.schedule()
+        assert _new_ids(output) == ["ready"]
+        assert list(self.scheduler._waiting) == ["slow"]
 
     def test_diffusion_kv_preemption_retains_allocation(self) -> None:
         _initialize_paged_scheduler(self.scheduler, num_blocks=3)
@@ -1900,3 +2092,19 @@ class TestStepScheduler:
 
         with pytest.raises(ValueError):
             self.scheduler.add_request(request)
+
+
+class TestPendingFinishedRequestIds:
+    def test_reports_finished_ids_that_still_hold_state_without_clearing_them(self):
+        sched = RequestScheduler()
+        sched.initialize(SimpleNamespace(max_num_seqs=1, request_batch_max_wait_ms=0.0))
+        sched.add_request(_make_request("a"))
+        sched.add_request(_make_request("b"))
+
+        sched.finish_requests("a", DiffusionRequestStatus.FINISHED_ABORTED)
+        assert sched.pending_finished_request_ids() == {"a"}
+
+        sched.pop_request_state("a")
+        assert sched.pending_finished_request_ids() == set()
+        # The next wave still ships the id to the worker for its own cleanup.
+        assert sched.schedule().finished_req_ids == {"a"}

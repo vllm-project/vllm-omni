@@ -3,7 +3,61 @@
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
+
+
+@dataclass(frozen=True, slots=True)
+class MiniCPMO45DuplexWindowConfig:
+    """Stage-0 window settings matching the released checkpoint defaults."""
+
+    sliding_window_mode: str = "off"
+    basic_window_high_tokens: int = 8000
+    basic_window_low_tokens: int = 6000
+    context_previous_max_tokens: int = 500
+    context_max_units: int = 24
+
+    @classmethod
+    def from_mapping(cls, value: object) -> MiniCPMO45DuplexWindowConfig:
+        source = value if isinstance(value, dict) else {}
+
+        def integer(name: str, default: int) -> int:
+            raw = source.get(name, default)
+            if isinstance(raw, bool):
+                raise ValueError(f"{name} must be an integer")
+            try:
+                parsed = int(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} must be an integer") from exc
+            if parsed <= 0:
+                raise ValueError(f"{name} must be greater than zero")
+            return parsed
+
+        mode = source.get("sliding_window_mode", "off")
+        if mode not in {"off", "basic", "context"}:
+            raise ValueError("sliding_window_mode must be one of: off, basic, context")
+        config = cls(
+            sliding_window_mode=str(mode),
+            basic_window_high_tokens=integer("basic_window_high_tokens", 8000),
+            basic_window_low_tokens=integer("basic_window_low_tokens", 6000),
+            context_previous_max_tokens=integer("context_previous_max_tokens", 500),
+            context_max_units=integer("context_max_units", 24),
+        )
+        if config.basic_window_low_tokens >= config.basic_window_high_tokens:
+            raise ValueError("basic_window_low_tokens must be less than basic_window_high_tokens")
+        return config
+
+    def as_dict(self) -> dict[str, int | str]:
+        return {
+            "sliding_window_mode": self.sliding_window_mode,
+            "basic_window_high_tokens": self.basic_window_high_tokens,
+            "basic_window_low_tokens": self.basic_window_low_tokens,
+            "context_previous_max_tokens": self.context_previous_max_tokens,
+            "context_max_units": self.context_max_units,
+        }
 
 
 class MiniCPMO45DuplexPolicy:
@@ -26,10 +80,12 @@ class MiniCPMO45DuplexPolicy:
     SAMPLES_PER_AUDIO_TOKEN = 1600
     # Vision framing contract (omni duplex). Official streaming_prefill feeds
     # each frame as <image> + 64 resampler embeddings + </image> inside the
-    # unit, ahead of the unit's audio embeddings (max_slice_nums=1 in
-    # streaming, so exactly one 64-token block per frame). A unit may carry
-    # its base frame plus an optional stacked composite of the sub-frames
-    # captured inside that unit (2 blocks).
+    # unit, ahead of the unit's audio embeddings. A lone frame is one block.
+    # A unit carrying its base frame plus the stacked composite of the
+    # sub-frames captured inside it is processed with the official HD
+    # suggestion (max_slice_nums=[2, 1]): the base frame adds the patches the
+    # processor cuts for its size (two for a 960x540 capture, none for a frame
+    # that fits one 448x448 tile) and the composite adds one block.
     VISION_EMBEDS_PER_FRAME = 64
     VISION_TOKENS_PER_FRAME = VISION_EMBEDS_PER_FRAME + 2  # <image> + embeds + </image>
     DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK = 20
@@ -87,7 +143,7 @@ class MiniCPMO45DuplexPolicy:
     }
 
     @classmethod
-    def token_ids_from_tokenizer(cls, tokenizer: Any) -> dict[str, int]:
+    def token_ids_from_tokenizer(cls, tokenizer: PreTrainedTokenizerBase) -> dict[str, int]:
         convert = getattr(tokenizer, "convert_tokens_to_ids", None)
 
         def token_id(token: str) -> int:

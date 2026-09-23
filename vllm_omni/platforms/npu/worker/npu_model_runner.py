@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from functools import partial
 from typing import Any
@@ -20,7 +20,7 @@ from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable
 from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 
-from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
+from vllm_omni.core.prefix_cache import stage_prefix_cache_config
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms.npu._310p import is_310p
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -36,35 +36,32 @@ else:
 
 class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
     def initialize_kv_cache(self, kv_cache_config) -> None:
-        """Create the omni tensor prefix cache.
-
-        The omni prefix cache is used to store the hidden states of the prefix tokens
-        """
+        """Stage the omni prefix-cache config (hidden / mm tensors reused on hits)."""
         NPUModelRunner.initialize_kv_cache(self, kv_cache_config)
-        if self.omni_prefix_cache is None and self.cache_config.enable_prefix_caching:
-            # Read num_blocks back off self.kv_cache_config: vllm-ascend
-            # deepcopies the config it was handed, so the value it stored is the
-            # authoritative one, not our caller's argument.
-            num_blocks = self.kv_cache_config.num_blocks
-            self.omni_prefix_cache = OmniTensorPrefixCache(
-                num_blocks=num_blocks,
-                block_size=self.cache_config.block_size,
-                hidden_size=self.model_config.get_hidden_size(),
-                hs_dtype=self.dtype,
+        if getattr(self, "_omni_prefix_cache_cfg", None) is None:
+            # Same gate as the GPU runner (pooling stage, kv_consumer /
+            # kv_both, hybrid kv groups). Read the config back off
+            # self.kv_cache_config: vllm-ascend deepcopies the one it was
+            # handed, so the stored value is the authoritative one.
+            # Controller runs in eager mode on NPU (no CUDA streams:
+            # dispatch() completes the copy+scatter synchronously). Built once
+            # on the first step via the inherited _ensure_omni_prefix_cache.
+            cfg = stage_prefix_cache_config(
+                kv_cache_config=self.kv_cache_config,
+                cache_config=self.cache_config,
+                kv_transfer_config=getattr(self.vllm_config, "kv_transfer_config", None),
+                scheduler_config=self.scheduler_config,
+                model_config=self.model_config,
+                is_pooling_model=self.is_pooling_model,
+                speculative_config=self.speculative_config,
             )
-            logger.info(
-                "Initialized omni prefix cache on NPU (num_blocks=%d, block_size=%d, hidden_size=%d). "
-                "Hidden-state cache is pinned host memory of roughly %.1f GiB; each per-token "
-                "multimodal output key allocates another tensor of the same block shape.",
-                num_blocks,
-                self.cache_config.block_size,
-                self.model_config.get_hidden_size(),
-                num_blocks
-                * self.cache_config.block_size
-                * self.model_config.get_hidden_size()
-                * self.dtype.itemsize
-                / (1024**3),
-            )
+            if cfg is not None:
+                self._omni_prefix_cache_cfg = cfg
+                logger.info(
+                    "Initialized omni prefix cache on NPU (eager mode, num_blocks=%d, block_size=%d).",
+                    cfg.num_blocks,
+                    cfg.block_size,
+                )
 
     def load_model(self, *args, **kwargs) -> None:
         if is_310p():
@@ -84,6 +81,8 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             if callable(candidate):
                 override_fn = candidate
         self._sampled_token_ids_cpu_override = override_fn
+        self._snapshot_prefix_cache_model_policy(model)
+        self._pooler_payload_include_hidden_flag = bool(getattr(model, "omni_pooler_payload_include_hidden", True))
         self._omni_query_start_loc_model_kwarg = bool(getattr(model, "supports_omni_query_start_loc", False))
         self._maybe_enable_output_token_ids_for_model_sampler()
         self._init_talker_mtp()
@@ -126,6 +125,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         profile_seq_lens: int | None = None,
         profile_cpp: bool = False,
         randomize_inputs: bool = False,
+        skip_gdn_state_update: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.is_valid_runtime_mode()
@@ -257,7 +257,10 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                 self.query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
                 self.query_start_loc.copy_to_gpu()
                 if self._has_gdn:
-                    self.gdn_query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
+                    if skip_gdn_state_update:
+                        self.gdn_query_start_loc.np.fill(0)
+                    else:
+                        self.gdn_query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
                     self.gdn_query_start_loc.copy_to_gpu()
 
                 if not profile_cpp:
@@ -275,6 +278,12 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                 # rows as well so device-side metadata does not see stale block ids.
                 self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
+                # Invalidate slots before backends copy metadata for dummy execution.
+                if not is_graph_capturing:
+                    for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):
+                        blk_table = self.input_batch.block_table[kv_cache_gid]
+                        blk_table.slot_mapping.gpu.fill_(-1)
+
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
                 attn_metadata, _ = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -285,11 +294,10 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                     ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                     for_cudagraph_capture=is_graph_capturing,
                     num_scheduled_tokens_np=num_scheduled_tokens,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    batch_descriptor=batch_desc,
+                    skip_gdn_state_update=skip_gdn_state_update,
                 )
-                if not is_graph_capturing:
-                    for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):
-                        blk_table = self.input_batch.block_table[kv_cache_gid]
-                        blk_table.slot_mapping.gpu.fill_(-1)
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,

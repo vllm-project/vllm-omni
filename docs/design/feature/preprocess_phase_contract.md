@@ -42,7 +42,8 @@ Scheduler / current input batch
        prefill / other spans     single-token decode
           preprocess             preprocess or preprocess_decode_batch
               |                              |
-       prompt embedding              runner-managed talker_mtp
+       prompt embedding              decode embeddings
+              |                      talker_mtp (if present)
                   \                 /
                     model forward
 ```
@@ -96,8 +97,23 @@ computed per-row fields are not promised at that earlier boundary.
 ### Routing guarantee
 
 With `has_preprocess=True`, the batched decode hook is eligible only when it is
-callable, the runner has `talker_mtp`, the scheduled span is one token, and
+callable, the scheduled span is one token, and
 `_omni_is_prefill` is false. Otherwise the normal `preprocess` hook runs.
+
+The hook's return format depends on whether the runner manages MTP:
+
+| Runner capability | `preprocess_decode_batch` return tuple |
+| --- | --- |
+| Without `talker_mtp` | `(input_ids, inputs_embeds, updates)` |
+| With `talker_mtp` | `(input_ids, inputs_embeds, hidden_states, text_step, updates)` |
+
+Each tensor's batch dimension and each entry in the `updates` list correspond
+to one physical request row, including separate CFG branches. Non-MTP batches
+contain contiguous single-token decode spans; the runner flushes a batch before
+processing any other span. It copies embeddings into its existing input buffer
+and applies each update dictionary to the corresponding request. Returning the
+original `input_ids` object lets it skip an unchanged token-ID copy. The existing
+five-result MTP format remains supported.
 
 Runner-managed MTP is likewise restricted to single-token decode rows. A prefill
 row, including a one-token tail, is never added to that MTP batch: the runner
@@ -130,6 +146,8 @@ formalizes that existing behavior. Prefer upgrading the matching vLLM and
 vLLM-Omni release pair and consuming the explicit phase keys. Do not silently
 fall back to `input_ids.numel() > 1` when the model requires chunking correctness.
 For a custom or backported runtime, verify both metadata and MTP guards.
+Older runners can restrict `preprocess_decode_batch` to MTP models; a non-MTP
+model must retain its scalar `preprocess` implementation for those runtimes.
 
 ## Correctness and testing plan
 

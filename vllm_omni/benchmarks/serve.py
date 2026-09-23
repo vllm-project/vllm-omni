@@ -43,7 +43,7 @@ def _normalize_endpoint(endpoint: str | None) -> str | None:
 
 
 def _use_endpoint_backend_when_implicit(args: argparse.Namespace) -> None:
-    explicit_keys = getattr(args, "explicit_keys", frozenset())
+    explicit_keys: frozenset[str] = getattr(args, "explicit_keys", frozenset())
     if "backend" in explicit_keys:
         return
     # Upstream vLLM defaults --backend to "openai". Treat that non-explicit
@@ -63,6 +63,8 @@ def main(args: argparse.Namespace) -> dict[str, Any]:
         os.environ["SEED_TTS_WER_SAVE_ITEMS"] = "1"
     if getattr(args, "daily_omni_save_eval_items", False):
         os.environ["DAILY_OMNI_SAVE_EVAL_ITEMS"] = "1"
+    if getattr(args, "videomme_save_eval_items", False):
+        os.environ["VIDEOMME_SAVE_EVAL_ITEMS"] = "1"
     request_timeout_s = getattr(args, "omni_request_timeout_s", None)
     if request_timeout_s is not None:
         set_request_timeout_s(request_timeout_s)

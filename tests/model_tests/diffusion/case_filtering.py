@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Analogous to: https://github.com/vllm-project/vllm/blob/v0.23.0/tests/models/multimodal/generation/vlm_utils/case_filtering.py
 
@@ -45,7 +48,6 @@ def get_test_group_marks(model_name: str, test_group: list[DiffusionAccs] | None
             f"but the max CI device count is {MAX_CI_DEVICES}. "
         )
 
-    marks.extend(hardware_marks(res={"cuda": "L4"}, num_cards=required_devices))
     # hardware_marks only adds skipif for num_cards > 1, so we currently handle the single-device case
     # directly here. This should probably be handled in a more common way later on.
     assert current_omni_platform is not None and current_omni_platform.device_count is not None
@@ -53,8 +55,10 @@ def get_test_group_marks(model_name: str, test_group: list[DiffusionAccs] | None
     if current_omni_platform.is_cuda() and device_count < required_devices:
         marks.append(pytest.mark.skip(reason=f"Need {required_devices} devices, got {device_count}"))
     if required_devices > 1:
+        marks.extend(hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=required_devices))
         marks.append(pytest.mark.full_model)
     else:
+        marks.extend(hardware_marks(res={"cuda": "L4"}, num_cards=1))
         marks.append(pytest.mark.core_model)
     return marks
 

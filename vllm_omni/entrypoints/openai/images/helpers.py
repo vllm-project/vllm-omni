@@ -169,6 +169,14 @@ def _extract_images_from_result(result: Any) -> list[Any]:
     return [_normalize_image(img) for img in flattened]
 
 
+def _generated_size_str(images: list[Any], fallback: str | None) -> str | None:
+    """``"WxH"`` of the first generated image, or ``fallback`` when it is unknown."""
+    size = getattr(images[0], "size", None) if images else None
+    if isinstance(size, tuple) and len(size) == 2 and all(isinstance(value, Integral) for value in size):
+        return f"{size[0]}x{size[1]}"
+    return fallback
+
+
 async def _load_input_images(
     inputs: list[str],
     *,

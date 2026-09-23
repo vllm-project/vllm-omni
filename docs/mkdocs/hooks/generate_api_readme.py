@@ -25,8 +25,8 @@ CATEGORIES = {
     "clients": {
         "name": "Clients",
         "description": (
-            "Client libraries that talk to a running vLLM-Omni server "
-            "(the full-duplex Realtime client and its per-model session presets)."
+            "Client libraries for full-duplex sessions: the Realtime WebSocket client, "
+            "the in-process client over `DuplexOmni`, and the per-model session presets."
         ),
     },
     "inputs": {

@@ -53,7 +53,7 @@ def test_async_engine_consumes_disable_log_stats_before_resolution(monkeypatch: 
         )
 
     monkeypatch.setattr(
-        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
+        "vllm_omni.engine.omni_engine_base.load_and_resolve_stage_configs",
         fake_resolve,
     )
     engine = SimpleNamespace(_apply_strategy_lb_policy=lambda *args, **kwargs: None)

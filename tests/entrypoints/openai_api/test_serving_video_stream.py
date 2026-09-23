@@ -12,10 +12,15 @@ import json
 import threading
 import weakref
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import torch
 from PIL import Image
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
+from tests.helpers.serving_chat import build_serving_chat
+from vllm_omni.config.stage_config import StageConfig
 from vllm_omni.entrypoints.openai import video_stream_base, video_stream_envs
 from vllm_omni.entrypoints.openai.serving_video_stream import (
     QwenOmniStreamingVideoHandler,
@@ -140,6 +145,130 @@ async def test_receive_config_accepts_client_legacy_aliases():
     assert config.frame_filter_threshold == 0.87
 
 
+@pytest.fixture
+def run_sampling_session(monkeypatch):
+    async def run(config_overrides):
+        engine = MagicMock()
+        engine.stage_configs = [
+            StageConfig(stage_id=index, model_stage=name)
+            for index, name in enumerate(("thinker", "talker", "code2wav"))
+        ]
+        engine.default_sampling_params_list = [
+            SamplingParams(temperature=0.4, max_tokens=64, top_p=0.85),
+            SamplingParams(temperature=0.7, max_tokens=96),
+            SamplingParams(temperature=0.8, max_tokens=128),
+        ]
+
+        async def generate(**kwargs):
+            yield _text_result("answer")
+
+        engine.generate.side_effect = generate
+        handler = QwenOmniStreamingVideoHandler(
+            chat_service=build_serving_chat(engine_client=engine),
+            engine_client=engine,
+        )
+        monkeypatch.setattr(handler, "_preprocess_to_engine_prompt", AsyncMock(return_value={"prompt": "video"}))
+        ws = MockWebSocket(
+            [
+                json.dumps(
+                    {
+                        "type": "session.config",
+                        "model": "test",
+                        "modalities": ["text"],
+                        "enable_frame_filter": False,
+                        **config_overrides,
+                    }
+                ),
+                json.dumps({"type": "video.frame", "data": _b64(_make_jpeg())}),
+                json.dumps({"type": "video.query", "text": "describe"}),
+                json.dumps({"type": "video.done"}),
+            ]
+        )
+        await handler.handle_session(ws)
+        return ws, engine
+
+    return run
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_chunk_mode", ["on", "off"])
+@pytest.mark.parametrize("num_stage_overrides", [1, 3])
+async def test_video_sampling_params_reach_engine(
+    run_sampling_session, monkeypatch, async_chunk_mode, num_stage_overrides
+):
+    monkeypatch.setenv("VLLM_VIDEO_ASYNC_CHUNK", async_chunk_mode)
+    overrides = [
+        {"temperature": 0.2, "max_tokens": 1, "seed": 42},
+        {"temperature": 0.6, "max_tokens": 12},
+        {"temperature": 0.9, "max_tokens": 24},
+    ][:num_stage_overrides]
+
+    ws, engine = await run_sampling_session({"sampling_params_list": overrides})
+
+    assert not [msg for msg in ws.sent if msg["type"] == "error"]
+    engine.generate.assert_called_once()
+    params = engine.generate.call_args.kwargs["sampling_params_list"]
+    assert len(params) == 3
+    for index, param in enumerate(params):
+        assert isinstance(param, SamplingParams)
+        default = engine.default_sampling_params_list[index]
+        expected = (
+            overrides[index]
+            if index < len(overrides)
+            else {
+                "temperature": default.temperature,
+                "max_tokens": default.max_tokens,
+            }
+        )
+        assert param.temperature == expected["temperature"]
+        assert param.max_tokens == expected["max_tokens"]
+        assert param.output_kind == RequestOutputKind.DELTA
+        assert param is not default
+    assert params[0].seed == 42
+    assert all(param.output_kind == RequestOutputKind.CUMULATIVE for param in engine.default_sampling_params_list)
+    assert next(msg for msg in ws.sent if msg["type"] == "response.text.done")["text"] == "answer"
+
+
+@pytest.mark.asyncio
+async def test_video_sampling_params_provided_stage_uses_constructor_defaults(run_sampling_session):
+    ws, engine = await run_sampling_session({"sampling_params_list": [{"temperature": 0.2}]})
+
+    assert not [msg for msg in ws.sent if msg["type"] == "error"]
+    engine.generate.assert_called_once()
+    params = engine.generate.call_args.kwargs["sampling_params_list"]
+    constructor_defaults = SamplingParams()
+    assert params[0].temperature == 0.2
+    for field in ("max_tokens", "top_p"):
+        assert getattr(params[0], field) == getattr(constructor_defaults, field)
+        assert getattr(params[0], field) != getattr(engine.default_sampling_params_list[0], field)
+    assert len(params) == 3
+    for param, default in zip(params[1:], engine.default_sampling_params_list[1:]):
+        assert param.temperature == default.temperature
+        assert param.max_tokens == default.max_tokens
+        assert param.top_p == default.top_p
+        assert param is not default
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("config_overrides", [{}, {"sampling_params_list": None}, {"sampling_params_list": []}])
+async def test_video_sampling_params_omitted_preserve_engine_defaults(run_sampling_session, config_overrides):
+    ws, engine = await run_sampling_session(config_overrides)
+
+    assert not [msg for msg in ws.sent if msg["type"] == "error"]
+    engine.generate.assert_called_once()
+    assert engine.generate.call_args.kwargs.get("sampling_params_list") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_params", [{"temperature": -1}, {"max_tokens": 0}, {"unknown_sampling_option": 1}])
+async def test_video_sampling_params_invalid_do_not_reach_engine(run_sampling_session, invalid_params):
+    ws, engine = await run_sampling_session({"sampling_params_list": [invalid_params]})
+
+    engine.generate.assert_not_called()
+    assert any(msg["type"] == "error" for msg in ws.sent)
+    assert ws.sent[-1]["type"] == "session.done"
+
+
 @pytest.mark.asyncio
 async def test_video_frame_ack_reports_receiver_buffer_state():
     ws = MockWebSocket(
@@ -244,6 +373,200 @@ async def test_video_frames_consumed_is_emitted_after_engine_uses_frame_prompt()
     assert ws.sent.index(consumed) < next(
         index for index, message in enumerate(ws.sent) if message.get("type") == "response.text.delta"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "num_frames,bad_index,expected_indices",
+    [
+        pytest.param(2, 4, [0], id="bad-last-no-refill"),
+        pytest.param(1, 4, [], id="all-selected-frames-bad"),
+        pytest.param(8, 4, [0, 1, 2, 3], id="below-sampling-limit"),
+        pytest.param(2, 1, [0, 4], id="bad-frame-not-selected"),
+        pytest.param(2, 0, [4], id="bad-first-frame"),
+    ],
+)
+async def test_video_frames_consumed_excludes_bad_frame_in_query_snapshot(
+    monkeypatch, num_frames, bad_index, expected_indices
+):
+    """A query queued before bad-frame cleanup must report only its prompt images."""
+    query_queued = asyncio.Event()
+    decode_failed = asyncio.Event()
+    release_decode = asyncio.Event()
+    pong_blocked = asyncio.Event()
+    release_pong = asyncio.Event()
+    turn_done = asyncio.Event()
+    original_to_thread = asyncio.to_thread
+    bad_image = b"not-a-jpeg"
+    frames = [_make_jpeg(r=index * 40) for index in range(5)]
+    frames[bad_index] = bad_image
+    engine_prompts = []
+
+    class ObservedQueue(asyncio.Queue):
+        def put_nowait(self, item):
+            super().put_nowait(item)
+            if isinstance(item, dict):
+                if item.get("type") == "video.query":
+                    query_queued.set()
+                elif item.get("type") == "_internal.frame_decode_failed":
+                    decode_failed.set()
+
+    async def gated_to_thread(function, *args, **kwargs):
+        if function is video_stream_base._decode_frame_bytes and args[0] == bad_image:
+            await release_decode.wait()
+        return await original_to_thread(function, *args, **kwargs)
+
+    class BackpressuredWebSocket(TimedWebSocket):
+        async def send_json(self, data):
+            await super().send_json(data)
+            if data["type"] == "pong":
+                pong_blocked.set()
+                await release_pong.wait()
+            elif data["type"] == "response.text.done":
+                turn_done.set()
+
+    class OneOutputEngine:
+        async def generate(self, **kwargs):
+            engine_prompts.append(kwargs["prompt"])
+            yield _text_result("visible")
+
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
+        async def _preprocess_to_engine_prompt(self, request):
+            return {"messages": request.messages}
+
+    # Construct the client queue before observing the server's message queue.
+    ws = BackpressuredWebSocket()
+    monkeypatch.setattr(asyncio, "Queue", ObservedQueue)
+    monkeypatch.setattr(asyncio, "to_thread", gated_to_thread)
+    handler = CapturingHandler(chat_service=object(), engine_client=OneOutputEngine(), idle_timeout=5.0)
+    ws.put(
+        {
+            "type": "session.config",
+            "model": "test",
+            "modalities": ["text"],
+            "num_frames": num_frames,
+            "enable_frame_filter": False,
+        }
+    )
+    for index, frame in enumerate(frames):
+        ws.put({"type": "video.frame", "data": _b64(frame), "frame_id": f"frame-{index}", "pts_ms": index * 100})
+    ws.put({"type": "ping"})
+    ws.put({"type": "video.query", "text": "describe"})
+    task = asyncio.create_task(handler.handle_session(ws))
+    try:
+        # Hold the processor at a WebSocket send. Queue the query first, then
+        # finish the real failing decode so its cleanup lands behind the query.
+        await asyncio.wait_for(pong_blocked.wait(), timeout=5.0)
+        await asyncio.wait_for(query_queued.wait(), timeout=5.0)
+        release_decode.set()
+        await asyncio.wait_for(decode_failed.wait(), timeout=5.0)
+        release_pong.set()
+        await asyncio.wait_for(turn_done.wait(), timeout=5.0)
+        ws.put({"type": "video.done"})
+        await asyncio.wait_for(task, timeout=5.0)
+    finally:
+        release_decode.set()
+        release_pong.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert len(engine_prompts) == 1
+    images = [part for part in engine_prompts[0]["messages"][-1]["content"] if part["type"].startswith("image_")]
+    # Expected positions preserve sample-then-filter: do not refill a dropped
+    # position or shift the remaining metadata when a frame fails to decode.
+    assert len(images) == len(expected_indices)
+    for image, index in zip(images, expected_indices):
+        if image["type"] == "image_pil":
+            assert image["image_pil"].tobytes() == Image.open(io.BytesIO(frames[index])).convert("RGB").tobytes()
+        else:
+            assert image["image_url"]["url"] == f"data:image/jpeg;base64,{_b64(frames[index])}"
+    consumed_events = [message for message in ws.sent if message.get("type") == "video.frames.consumed"]
+    assert len(consumed_events) == 1
+    consumed = consumed_events[0]
+    expected_ids = [f"frame-{index}" for index in expected_indices]
+    assert consumed["frame_ids"] == expected_ids
+    assert [frame["frame_id"] for frame in consumed["frames"]] == expected_ids
+    assert [frame["pts_ms"] for frame in consumed["frames"]] == [index * 100 for index in expected_indices]
+    assert consumed["latest_pts_ms"] == (expected_indices[-1] * 100 if expected_indices else None)
+    assert {"type": "error", "message": "Frame decode failed"} in ws.sent
+    assert ws.sent[-1]["type"] == "session.done"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "num_frames,frame_ids,repeat_image,expected_indices",
+    [
+        pytest.param(2, ["f0", "f1", "f2", "f3", "f4"], False, [0, 4], id="stride-and-last"),
+        pytest.param(1, ["f0", "f1", "f2"], False, [2], id="last-only"),
+        pytest.param(8, ["f0", "f1", "f2"], False, [0, 1, 2], id="below-sampling-limit"),
+        pytest.param(2, [None, "f1", None, "f3", None], False, [0, 4], id="unidentified-selected-frames"),
+        pytest.param(2, [None, None, None], False, [0, 2], id="no-frame-ids"),
+        pytest.param(2, ["same", "same", "same"], False, [0, 2], id="repeated-frame-id"),
+        pytest.param(2, ["f0", "f1", "f2"], True, [0, 2], id="repeated-image"),
+    ],
+)
+async def test_video_frame_selection_preserves_uncached_frames(
+    monkeypatch, num_frames, frame_ids, repeat_image, expected_indices
+):
+    """Prewarm misses still use image URLs, with metadata paired by buffer position."""
+    engine_prompts = []
+    pending_decode = asyncio.Event()
+
+    async def blocked_to_thread(*args, **kwargs):
+        await pending_decode.wait()
+
+    monkeypatch.setattr(asyncio, "to_thread", blocked_to_thread)
+
+    class OneOutputEngine:
+        async def generate(self, **kwargs):
+            engine_prompts.append(kwargs["prompt"])
+            yield _text_result("visible")
+
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
+        async def _preprocess_to_engine_prompt(self, request):
+            return {"messages": request.messages}
+
+    frames = [_b64(_make_jpeg(r=0 if repeat_image else index * 40)) for index in range(len(frame_ids))]
+    messages = [
+        {
+            "type": "session.config",
+            "model": "test",
+            "modalities": ["text"],
+            "num_frames": num_frames,
+            "enable_frame_filter": False,
+        },
+        *[
+            {"type": "video.frame", "data": frame, "frame_id": frame_ids[index], "pts_ms": index * 100}
+            for index, frame in enumerate(frames)
+        ],
+        {"type": "video.query", "text": "describe"},
+        {"type": "video.done"},
+    ]
+    ws = MockWebSocket([json.dumps(message) for message in messages])
+    handler = CapturingHandler(chat_service=object(), engine_client=OneOutputEngine())
+    await asyncio.wait_for(handler.handle_session(ws), timeout=5.0)
+
+    assert not [message for message in ws.sent if message["type"] == "error"]
+    assert len(engine_prompts) == 1
+    content = engine_prompts[0]["messages"][-1]["content"]
+    assert content == [
+        *[
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{frames[index]}"}}
+            for index in expected_indices
+        ],
+        {"type": "text", "text": "describe"},
+    ]
+    consumed_events = [message for message in ws.sent if message["type"] == "video.frames.consumed"]
+    if not any(frame_ids):
+        assert consumed_events == []
+    else:
+        assert len(consumed_events) == 1
+        consumed = consumed_events[0]
+        assert consumed["frame_ids"] == [frame_ids[index] for index in expected_indices if frame_ids[index] is not None]
+        assert [frame["frame_id"] for frame in consumed["frames"]] == [frame_ids[index] for index in expected_indices]
+        assert [frame["pts_ms"] for frame in consumed["frames"]] == [index * 100 for index in expected_indices]
+        assert consumed["latest_pts_ms"] == expected_indices[-1] * 100
 
 
 @pytest.mark.asyncio
@@ -455,6 +778,54 @@ async def test_async_chunk_mode_is_read_by_engine_path_at_runtime(monkeypatch):
     )
     assert {"type": "response.text.done", "text": "hello"} in ws_off.sent
     assert not any(m.get("type") == "response.text.delta" for m in ws_off.sent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_chunk_mode", ["on", "off"])
+async def test_audio_events_use_output_audio_names(monkeypatch, async_chunk_mode):
+    class AudioEngine:
+        def generate(self, **_kwargs):
+            async def _gen():
+                yield _audio_result([torch.zeros(1)])
+
+            return _gen()
+
+    class AudioHandler(QwenOmniStreamingVideoHandler):
+        async def _preprocess_to_engine_prompt(self, request):
+            return {"prompt": "x"}
+
+    monkeypatch.setenv("VLLM_VIDEO_ASYNC_CHUNK", async_chunk_mode)
+    monkeypatch.setattr(
+        OmniStreamingVideoHandler,
+        "_encode_audio_wav_b64",
+        staticmethod(lambda _audio: "audio-b64"),
+    )
+
+    ws = MockWebSocket()
+    handler = AudioHandler(chat_service=object(), engine_client=AudioEngine())
+    config = StreamingVideoSessionConfig(model="test", modalities=["text", "audio"])
+
+    await handler._process_query_engine(
+        ws,
+        config,
+        [_b64(_make_jpeg())],
+        bytearray(),
+        [],
+        "describe",
+        "req-audio-events",
+        asyncio.Event(),
+        {},
+    )
+
+    audio_events = [message for message in ws.sent if "audio" in message.get("type", "")]
+    assert audio_events == [
+        {
+            "type": "response.output_audio.delta",
+            "data": "audio-b64",
+            "format": "wav",
+        },
+        {"type": "response.output_audio.done"},
+    ]
 
 
 @pytest.mark.asyncio

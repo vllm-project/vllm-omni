@@ -171,7 +171,7 @@ def test_huggingface_url_resolves_pinned_snapshot(tmp_path, monkeypatch):
         else pytest.fail("unexpected snapshot request")
     )
     monkeypatch.setattr(
-        "vllm.transformers_utils.repo_utils.hf_api",
+        "vllm_omni.transformers_utils.repo_utils.hf_api",
         lambda: api,
     )
     assert _resolve_checkpoint_root(

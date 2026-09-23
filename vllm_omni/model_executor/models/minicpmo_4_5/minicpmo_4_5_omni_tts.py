@@ -28,7 +28,10 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.engine.duplex.intermediate import get_tts_handoff
-from vllm_omni.model_executor.models.minicpmo_4_5 import MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
+from vllm_omni.model_executor.models.minicpmo_4_5 import (
+    MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
+    MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -48,13 +51,38 @@ _OFFLINE_CODEC_MAX_NEW_TOKENS = 2048
 # Without this, the single-vocab Sampler keeps the stage-1 request alive
 # until codec EOS / 4096 and Thinker never starts the next model turn.
 _DUPLEX_CODEC_TOKENS_PER_CHUNK = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
+_DUPLEX_TURN_END_CODEC_TOKENS = MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS
+#: Frames the Talker forwards per generate_chunk before its cadence EOS.
+_DUPLEX_CODEC_FRAMES_PER_CHUNK = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK - 1
+#: On a turn-end chunk the Talker's EOS is masked for this many steps after
+#: each 25-frame boundary: the model emits a cadence EOS there whether or not
+#: its text is spoken, while a genuine end of text shows up as an EOS anywhere
+#: else in the window.
+_DUPLEX_TURN_END_BOUNDARY_MASK_STEPS = 5
 
 
 def _native_duplex_chunk_budget(meta: Mapping[str, Any] | None) -> tuple[int, int]:
     """Return ``(max_tokens, min_tokens)`` for one native-duplex Talker request."""
-    boundary = isinstance(meta, Mapping) and (bool(meta.get("turn_start")) or bool(meta.get("turn_end")))
+    turn_start = isinstance(meta, Mapping) and bool(meta.get("turn_start"))
+    turn_end = isinstance(meta, Mapping) and bool(meta.get("turn_end"))
+    if turn_end:
+        # The turn-end chunk drains the text the Talker still owes: no floor
+        # (an early EOS means the text is spoken) and a multi-unit ceiling.
+        return _DUPLEX_TURN_END_CODEC_TOKENS, 0
     ceiling = _DUPLEX_CODEC_TOKENS_PER_CHUNK
-    return ceiling, 0 if boundary else ceiling
+    return ceiling, 0 if turn_start else ceiling
+
+
+def _turn_end_boundary_eos_masked(step: int) -> bool:
+    """Whether a turn-end chunk masks codec EOS at ``step`` forwarded frames.
+
+    The Talker emits a cadence EOS after every 25 frames regardless of the text
+    left, so a turn-end chunk ignores EOS in a short window after each boundary
+    and lets the model continue; EOS elsewhere ends the chunk as usual.
+    """
+    if step < _DUPLEX_CODEC_FRAMES_PER_CHUNK:
+        return False
+    return step % _DUPLEX_CODEC_FRAMES_PER_CHUNK < _DUPLEX_TURN_END_BOUNDARY_MASK_STEPS
 
 
 def blank_scheduler_prompt_for_penalties(
@@ -367,7 +395,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             code_ids = torch.as_tensor(previous_codes, device=self.emb_code[0].weight.device, dtype=torch.long)
         else:
             raise ValueError("streaming prompt recompute is missing confirmed codec ids")
-        if code_ids.numel() > _DUPLEX_CODEC_TOKENS_PER_CHUNK - 1:
+        if code_ids.numel() > _DUPLEX_TURN_END_CODEC_TOKENS - 1:
             raise ValueError(f"streaming prompt recompute has too many codec ids: {code_ids.numel()}")
         if code_ids.numel() and bool(((code_ids < 0) | (code_ids >= self._codec_eos_id)).any()):
             raise ValueError("streaming prompt recompute codec ids include an invalid or terminal token")
@@ -500,6 +528,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 "step": 0,
                 "max_tokens": max_tokens,
                 "min_tokens": min_tokens,
+                "turn_end_drain": bool(native_duplex and isinstance(meta, Mapping) and bool(meta.get("turn_end"))),
             }
             if retained_codes:
                 state["recent_codes"] = retained_codes
@@ -653,7 +682,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 # plane does not wait for a follow-up empty decode.
                 state["finished"] = True
             force_eos_rows[index] = chunk_done
-            mask_eos_rows[index] = not force_eos_rows[index] and min_tokens is not None and step < int(min_tokens)
+            mask_eos_rows[index] = not force_eos_rows[index] and (
+                (min_tokens is not None and step < int(min_tokens))
+                or (bool(state.get("turn_end_drain")) and _turn_end_boundary_eos_masked(step))
+            )
             terminal_flags[index] = torch.tensor(chunk_done, dtype=torch.bool)
 
         # Empty-speech rows, finished duplex chunks, and offline requests that

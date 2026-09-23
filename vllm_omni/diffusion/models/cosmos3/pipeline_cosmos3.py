@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 text/image/video/sound/action pipeline for vllm-omni.
 
 One pipeline class serves the Cosmos3 family modes. Output modality is selected
@@ -34,6 +34,7 @@ import math
 import os
 import time
 from collections.abc import Iterable, Mapping
+from contextlib import nullcontext
 from dataclasses import fields
 from typing import Any, ClassVar
 
@@ -950,6 +951,20 @@ class Cosmos3OmniDiffusersPipeline(
         model_path = od_config.model
         local_files_only = os.path.exists(model_path)
 
+        # Validate guidance parallelism from checkpoint metadata before loading
+        # components. Distilled checkpoints have only a conditional branch.
+        scheduler_config = FlowUniPCMultistepScheduler.load_config(
+            model_path,
+            subfolder="scheduler",
+            local_files_only=local_files_only,
+        )
+        self.is_distilled_model = scheduler_config.get("_class_name") == COSMOS3_DISTILLED_CHECKPOINT_SCHEDULER_CLASS
+        if self.is_distilled_model and od_config.parallel_config.cfg_parallel_size > 1:
+            raise ValueError(
+                "Distilled Cosmos3 checkpoints run without classifier-free guidance. "
+                "Set --cfg-parallel-size 1 and use --ulysses-degree for multi-GPU inference."
+            )
+
         # --- Tokenizer ---
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path,
@@ -1012,20 +1027,7 @@ class Cosmos3OmniDiffusersPipeline(
             logger.info("Cosmos3: session state manager enabled (max_sessions=%d)", mm_max_sessions)
 
         # --- Scheduler ---
-        # Distilled model differs from regular one only by scheduler,
-        # distilled one uses FlowMatchEulerDiscreteScheduler, while
-        # regular should use FlowUniPCMultistepScheduler
-
-        scheduler_config = FlowUniPCMultistepScheduler.load_config(
-            model_path,
-            subfolder="scheduler",
-            local_files_only=local_files_only,
-        )
-
-        scheduler_class_name = scheduler_config.get("_class_name")
-
-        self.is_distilled_model = False
-        if scheduler_class_name == COSMOS3_DISTILLED_CHECKPOINT_SCHEDULER_CLASS:
+        if self.is_distilled_model:
             fixed_step_config = scheduler_config.get("fixed_step_sampler_config")
             if not isinstance(fixed_step_config, dict) or fixed_step_config.get("sample_type") != "sde":
                 raise ValueError("Cosmos3 distilled scheduler requires fixed_step_sampler_config.sample_type=sde.")
@@ -1037,7 +1039,6 @@ class Cosmos3OmniDiffusersPipeline(
                 stochastic_sampling=True,
             )
             self._scheduler_init_t_list = list(t_list)
-            self.is_distilled_model = True
         else:
             # Preserve compatible solver settings from the checkpoint, but keep
             # the base shift neutral. The concrete request shift is applied when
@@ -1077,6 +1078,8 @@ class Cosmos3OmniDiffusersPipeline(
 
         self._guidance_scale = None
         self._num_timesteps = None
+        self._current_step_index = None
+        self._current_sigma = None
         self._cosmos3_branch_caches: dict[str, tuple[Any, Any]] | None = None
         self._robolab_transforms: dict[bool, Any] = {}
 
@@ -1293,17 +1296,24 @@ class Cosmos3OmniDiffusersPipeline(
         or a tuple in video, action, sound order for multimodal generation.
         """
         cache_key = kwargs.pop("_cosmos3_cache_key", None)
-        if cache_key is None:
-            return self.transformer(**kwargs)
+        context_name = str(kwargs.pop("_cache_context", "cond"))
 
-        branch_caches = self._cosmos3_branch_caches
-        if branch_caches is None:
-            return self.transformer(**kwargs)
-
-        cache_key = str(cache_key)
-        self.transformer.cached_kv, self.transformer.cached_freqs_gen = branch_caches.get(cache_key, (None, None))
-        prediction = self.transformer(**kwargs)
-        branch_caches[cache_key] = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
+        context_factory = getattr(self, "_cache_context_factory", None)
+        context = context_factory(context_name) if callable(context_factory) else nullcontext()
+        with context:
+            if cache_key is None:
+                prediction = self.transformer(**kwargs)
+            else:
+                branch_caches = self._cosmos3_branch_caches
+                if branch_caches is None:
+                    prediction = self.transformer(**kwargs)
+                else:
+                    cache_key = str(cache_key)
+                    self.transformer.cached_kv, self.transformer.cached_freqs_gen = branch_caches.get(
+                        cache_key, (None, None)
+                    )
+                    prediction = self.transformer(**kwargs)
+                    branch_caches[cache_key] = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
         return prediction
 
     def combine_multi_branch_cfg_noise(
@@ -1722,7 +1732,10 @@ class Cosmos3OmniDiffusersPipeline(
                 },
             },
         }
-        return DiffusionOutput(output=action_output)
+        return DiffusionOutput(
+            output=action_output,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
 
     @staticmethod
     def _truthy(value) -> bool:
@@ -1813,6 +1826,11 @@ class Cosmos3OmniDiffusersPipeline(
 
     def _resolve_guidance_scale(self, sp: OmniDiffusionSamplingParams, default: float) -> float:
         if self.is_distilled_model:
+            if sp.guidance_scale_provided and float(sp.guidance_scale) != 1.0:
+                logger.warning_once(
+                    "Distilled Cosmos3 checkpoints run without classifier-free guidance. "
+                    "The requested guidance_scale is overridden to 1.0; negative_prompt does not affect generation."
+                )
             return 1.0
         if sp.guidance_scale_provided:
             return float(sp.guidance_scale)
@@ -1836,6 +1854,29 @@ class Cosmos3OmniDiffusersPipeline(
     @property
     def num_timesteps(self):
         return self._num_timesteps
+
+    @property
+    def current_step_index(self):
+        return self._current_step_index
+
+    @property
+    def current_sigma(self):
+        return self._current_sigma
+
+    def _set_denoise_step_metadata(
+        self,
+        step_index: int,
+        timesteps: torch.Tensor,
+        scheduler: Any,
+    ) -> None:
+        self._current_step_index = step_index
+        self._num_timesteps = len(timesteps)
+        sigmas = getattr(scheduler, "sigmas", None)
+        self._current_sigma = sigmas[step_index] if sigmas is not None and step_index < len(sigmas) else None
+
+    def _clear_denoise_step_metadata(self) -> None:
+        self._current_step_index = None
+        self._current_sigma = None
 
     def _set_mixed_precision_step(self, step_index: int, num_steps: int) -> None:
         setter = getattr(self.transformer, "set_mixed_precision_step", None)
@@ -2845,6 +2886,7 @@ class Cosmos3OmniDiffusersPipeline(
                 # else uncond), so session keying loads/stores only this rank's branch.
                 cfg_rank_is_negative = get_classifier_free_guidance_rank() != 0
                 for step_index, t in enumerate(self.progress_bar(timesteps)):
+                    self._set_denoise_step_metadata(step_index, timesteps, step_scheduler)
                     self._set_mixed_precision_step(step_index, len(timesteps))
                     timestep = t.unsqueeze(0)
                     # Outside the interval, scale=1 makes the combined output equal
@@ -2856,6 +2898,7 @@ class Cosmos3OmniDiffusersPipeline(
                         do_true_cfg=True,
                         true_cfg_scale=step_scale,
                         positive_kwargs=dict(
+                            _cache_context="cond",
                             hidden_states=latents,
                             timestep=timestep,
                             text_ids=cond_ids,
@@ -2865,6 +2908,7 @@ class Cosmos3OmniDiffusersPipeline(
                             **shared_kwargs,
                         ),
                         negative_kwargs=dict(
+                            _cache_context="uncond",
                             hidden_states=latents,
                             timestep=timestep,
                             text_ids=uncond_ids,
@@ -2885,13 +2929,15 @@ class Cosmos3OmniDiffusersPipeline(
                 keep_uncond_for_cache = self._cache_requires_paired_cfg()
 
                 for step_index, t in enumerate(self.progress_bar(timesteps)):
+                    self._set_denoise_step_metadata(step_index, timesteps, step_scheduler)
                     self._set_mixed_precision_step(step_index, len(timesteps))
                     timestep = t.unsqueeze(0)
                     cfg_active = _cfg_active_at(t)
 
                     if not self._kv_load_und(kv_state, is_negative=False):
                         self.transformer.cached_kv, self.transformer.cached_freqs_gen = cond_cache
-                    noise_cond = self.transformer(
+                    noise_cond = self.predict_noise(
+                        _cache_context="cond",
                         hidden_states=latents,
                         timestep=timestep,
                         text_ids=cond_ids,
@@ -2908,7 +2954,8 @@ class Cosmos3OmniDiffusersPipeline(
                     if cfg_active or keep_uncond_for_cache:
                         if not self._kv_load_und(kv_state, is_negative=True):
                             self.transformer.cached_kv, self.transformer.cached_freqs_gen = uncond_cache
-                        noise_uncond = self.transformer(
+                        noise_uncond = self.predict_noise(
+                            _cache_context="uncond",
                             hidden_states=latents,
                             timestep=timestep,
                             text_ids=uncond_ids,
@@ -2940,10 +2987,12 @@ class Cosmos3OmniDiffusersPipeline(
                 # No CFG: a single cond branch per step. Bespoke (state None) keeps
                 # using the transformer-instance cache exactly as before.
                 for step_index, t in enumerate(self.progress_bar(timesteps)):
+                    self._set_denoise_step_metadata(step_index, timesteps, step_scheduler)
                     self._set_mixed_precision_step(step_index, len(timesteps))
                     timestep = t.unsqueeze(0)
                     self._kv_load_und(kv_state, is_negative=False)
-                    noise_pred = self.transformer(
+                    noise_pred = self.predict_noise(
+                        _cache_context="cond",
                         hidden_states=latents,
                         timestep=timestep,
                         text_ids=cond_ids,
@@ -2956,6 +3005,7 @@ class Cosmos3OmniDiffusersPipeline(
                         self._kv_capture_und(kv_state, is_negative=False)
                     _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
         finally:
+            self._clear_denoise_step_metadata()
             self._reset_mixed_precision()
             # Cosmos3 currently receives a unique request_id rather than a
             # reusable rollout session id. Retaining its state would only pin
@@ -3142,6 +3192,7 @@ class Cosmos3OmniDiffusersPipeline(
         self._cosmos3_branch_caches = {}
         try:
             for step_index, t in enumerate(self.progress_bar(timesteps)):
+                self._set_denoise_step_metadata(step_index, timesteps, self.scheduler)
                 self._set_mixed_precision_step(step_index, len(timesteps))
                 timestep = t.unsqueeze(0)
                 step_guidance = guidance_scale if _active_at(t, guidance_interval) else 1.0
@@ -3150,6 +3201,7 @@ class Cosmos3OmniDiffusersPipeline(
                 needs_control_cfg = step_control != 1.0
 
                 cond_full_kwargs = dict(
+                    _cache_context="cond",
                     hidden_states=latents,
                     timestep=timestep,
                     text_ids=cond_ids,
@@ -3163,6 +3215,7 @@ class Cosmos3OmniDiffusersPipeline(
                     branches_kwargs = [
                         cond_full_kwargs,
                         dict(
+                            _cache_context="cond_no_control",
                             hidden_states=latents,
                             timestep=timestep,
                             text_ids=cond_ids,
@@ -3172,6 +3225,7 @@ class Cosmos3OmniDiffusersPipeline(
                             **shared_kwargs,
                         ),
                         dict(
+                            _cache_context="uncond",
                             hidden_states=latents,
                             timestep=timestep,
                             text_ids=uncond_ids,
@@ -3197,6 +3251,7 @@ class Cosmos3OmniDiffusersPipeline(
                     branches_kwargs = [
                         cond_full_kwargs,
                         dict(
+                            _cache_context="cond_no_control",
                             hidden_states=latents,
                             timestep=timestep,
                             text_ids=cond_ids,
@@ -3220,6 +3275,7 @@ class Cosmos3OmniDiffusersPipeline(
                     branches_kwargs = [
                         cond_full_kwargs,
                         dict(
+                            _cache_context="uncond",
                             hidden_states=latents,
                             timestep=timestep,
                             text_ids=uncond_ids,
@@ -3254,6 +3310,7 @@ class Cosmos3OmniDiffusersPipeline(
                 )[0]
                 latents = velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
         finally:
+            self._clear_denoise_step_metadata()
             self._reset_mixed_precision()
             self._cosmos3_branch_caches = None
             self.transformer.reset_cache()
@@ -3558,6 +3615,7 @@ class Cosmos3OmniDiffusersPipeline(
                     "payload": {"video": output_video},
                     "metadata": {"video": {"fps": frame_rate}},
                 },
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             )
 
         full_output = torch.cat(output_chunks, dim=2)[:, :, :total_frames]
@@ -3584,6 +3642,7 @@ class Cosmos3OmniDiffusersPipeline(
                     "video": {"fps": frame_rate},
                 },
             },
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
     # -- Forward (main generation entry point) -------------------------------
@@ -4020,7 +4079,10 @@ class Cosmos3OmniDiffusersPipeline(
             if _is_rank_zero():
                 logger.info("Sound tokenizer decoded in %.2fs", time.time() - sound_decode_start)
                 logger.info("Total pipeline time: %.2fs", time.time() - pipeline_start)
-            return DiffusionOutput(output={"video": video, "audio": audio, "audio_sample_rate": sound_sample_rate})
+            return DiffusionOutput(
+                output={"video": video, "audio": audio, "audio_sample_rate": sound_sample_rate},
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            )
 
         if action_enabled:
             if action_latents is None or raw_action_dim is None or domain_id is None:
@@ -4040,6 +4102,10 @@ class Cosmos3OmniDiffusersPipeline(
                         },
                     },
                 },
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             )
 
-        return DiffusionOutput(output={"image": video} if is_t2i else {"video": video})
+        return DiffusionOutput(
+            output={"image": video} if is_t2i else {"video": video},
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -533,6 +536,10 @@ class Qwen3TTSConfig(PretrainedConfig):
         if any("Code2Wav" in str(a) for a in archs):
             if hasattr(config, "rope_parameters"):
                 delattr(config, "rope_parameters")
+            # Code2Wav doesn't use position embeddings, but vLLM validates
+            # max_model_len <= max_position_embeddings. Set a large value
+            # to allow the pipeline.yaml max_model_len (65536) to pass validation.
+            config.max_position_embeddings = 131072
         return config
 
 

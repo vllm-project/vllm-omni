@@ -135,11 +135,13 @@ class HiFTGraphWrapper:
         return speech, cache_source
 
 
-def _tensor_signature(value: torch.Tensor) -> tuple:
+def _tensor_signature(value: torch.Tensor | None) -> tuple:
+    if value is None:
+        return (None,)
     return tuple(value.shape), str(value.dtype), str(value.device)
 
 
-_DTYPE_MAP = {str(dtype): dtype for dtype in (torch.float32, torch.float16, torch.bfloat16, torch.float64)}
+_DTYPE_MAP = {str(dtype): dtype for dtype in (torch.float32, torch.float16, torch.bfloat16, torch.float64, torch.bool)}
 
 
 def _memory_snapshot(device: torch.device) -> tuple[int, int] | None:
@@ -231,7 +233,7 @@ class CFMGraphWrapper:
         return {**self._stats, "cache_size": len(self._cache)}
 
     def _call_graph_fn(self, args: tuple[torch.Tensor, ...]) -> torch.Tensor:
-        return self.graph_fn(args[0], args[1], None, args[2], args[3], args[4], args[5])
+        return self.graph_fn(args[0], args[1], args[6], args[2], args[3], args[4], args[5])
 
     def _eager(self, inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         self._stats["eager"] += 1
@@ -261,10 +263,21 @@ class CFMGraphWrapper:
         self.enabled = False
         self._flush()
 
-    def _capture(self, key: tuple) -> tuple | None:
-        """Capture a CUDA graph for the given key. Returns None on failure."""
+    def _capture(self, key: tuple, inputs: tuple | None = None) -> tuple | None:
+        """Capture a CUDA graph for the given key. Returns None on failure.
+
+        ``inputs`` should be the real tensors for this key whenever they are
+        available: the static buffers must be built from the values the graph
+        will actually run with. Zero-filled placeholders are only a fallback --
+        capturing with them bakes the placeholder branch into the graph (e.g. an
+        attention mask that looks like "nothing is masked").
+        """
         try:
-            static_inputs = _tensors_from_key(key)
+            static_inputs = (
+                tuple(None if tensor is None else tensor.detach().clone() for tensor in inputs)
+                if inputs is not None
+                else _tensors_from_key(key)
+            )
         except KeyError:
             # An unsupported dtype is a property of this shape alone, so run it
             # eager and keep the other shapes on graphs.
@@ -315,8 +328,9 @@ class CFMGraphWrapper:
         att_cache: torch.Tensor,
         cnn_out: torch.Tensor,
         att_out: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        inputs = (estimator_input, time_emb, cnn_cache, att_cache, cnn_out, att_out)
+        inputs = (estimator_input, time_emb, cnn_cache, att_cache, cnn_out, att_out, attn_mask)
         self._stats["calls"] += 1
 
         if not self.enabled or torch.cuda.is_current_stream_capturing() or estimator_input.device.type != "cuda":
@@ -330,7 +344,7 @@ class CFMGraphWrapper:
         if entry is None:
             if len(self._cache) >= self.max_graphs:
                 self._flush()
-            entry = self._capture(key)
+            entry = self._capture(key, inputs)
             if entry is None:
                 return self._eager(inputs)
             self._cache[key] = entry
@@ -339,7 +353,8 @@ class CFMGraphWrapper:
 
         static_inputs, static_output, graph = entry
         for static, current in zip(static_inputs, inputs, strict=True):
-            static.copy_(current)
+            if static is not None:
+                static.copy_(current)
         graph.replay()
         return (
             static_output.detach().clone(),

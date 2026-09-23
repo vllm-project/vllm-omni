@@ -54,7 +54,7 @@ def test_abort_async_waits_for_ack(mocker: MockerFixture):
     rpc_q: queue.Queue = queue.Queue()
     engine = _make_engine(request_q, rpc_q)
     mocker.patch(
-        "vllm_omni.engine.async_omni_engine.uuid.uuid4",
+        "vllm_omni.engine.omni_engine_base.uuid.uuid4",
         return_value=SimpleNamespace(hex="abort-rpc-1"),
     )
 
@@ -66,9 +66,10 @@ def test_abort_async_waits_for_ack(mocker: MockerFixture):
         assert msg.rpc_id == "abort-rpc-1"
         assert not task.done()
 
-        rpc_q.put(AbortResultMessage(rpc_id="abort-rpc-1", success=True))
+        partial_output = SimpleNamespace(request_id="req-a", finished=True)
+        rpc_q.put(AbortResultMessage(rpc_id="abort-rpc-1", success=True, abort_outputs=[partial_output]))
         result = await task
-        assert result == []
+        assert result == [partial_output]
 
     try:
         asyncio.run(_run())
@@ -81,7 +82,7 @@ def test_abort_async_raises_on_orchestrator_error(mocker: MockerFixture):
     rpc_q: queue.Queue = queue.Queue()
     engine = _make_engine(request_q, rpc_q)
     mocker.patch(
-        "vllm_omni.engine.async_omni_engine.uuid.uuid4",
+        "vllm_omni.engine.omni_engine_base.uuid.uuid4",
         return_value=SimpleNamespace(hex="abort-rpc-err"),
     )
 
@@ -109,7 +110,7 @@ def test_abort_async_times_out_without_result(mocker: MockerFixture):
     rpc_q: queue.Queue = queue.Queue()
     engine = _make_engine(request_q, rpc_q)
     mocker.patch(
-        "vllm_omni.engine.async_omni_engine.uuid.uuid4",
+        "vllm_omni.engine.omni_engine_base.uuid.uuid4",
         return_value=SimpleNamespace(hex="abort-rpc-timeout"),
     )
 
@@ -139,7 +140,7 @@ def test_abort_async_preserves_request_queue_backpressure(mocker: MockerFixture)
     rpc_q: queue.Queue = queue.Queue()
     engine = _make_engine(request_q, rpc_q)
     mocker.patch(
-        "vllm_omni.engine.async_omni_engine.uuid.uuid4",
+        "vllm_omni.engine.omni_engine_base.uuid.uuid4",
         return_value=SimpleNamespace(hex="blocked-abort"),
     )
 

@@ -15,6 +15,7 @@
 #     inference caches (TeaCache/TaylorSeer) are not ported.
 
 import itertools
+from collections import defaultdict
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
@@ -24,17 +25,25 @@ import torch.nn.functional as F
 from diffusers.models.embeddings import Timesteps, get_1d_rotary_pos_embed
 from einops import rearrange, repeat
 from vllm.logger import init_logger
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.platforms import current_platform
+from vllm.triton_utils import HAS_TRITON
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    _fused_cuda_supported,
+    fused_qk_norm_rope,
+    fused_qk_norm_rope_min_tokens,
+)
+from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.models.utils import make_attention_mask
 from vllm_omni.platforms import current_omni_platform
 
@@ -43,7 +52,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-RotaryEmbedding = tuple[torch.Tensor, torch.Tensor]
+# (cos, sin) — optionally (cos, sin, packed_table) where packed_table is the
+# fp32 [tokens, head_dim] = [cos(theta) | sin(theta)] layout the fused
+# qk-norm+RoPE op consumes; the eager path ignores the third element.
+RotaryEmbedding = tuple[torch.Tensor, ...]
 RotaryFrequencyTables = list[RotaryEmbedding]
 
 
@@ -56,9 +68,12 @@ def apply_rotary_emb(x: torch.Tensor, rotary_emb: RotaryEmbedding) -> torch.Tens
 
     Args:
         x: Query or key tensor of shape [B, S, H, D].
-        rotary_emb: Cosine and sine tensors, each shaped [B, S, D].
+        rotary_emb: Cosine and sine tensors, each shaped [B, S, D]. The tuple
+            may carry a third element (the packed table for the fused
+            qk-norm+RoPE path); it is ignored here, hence the indexed access
+            instead of tuple unpacking.
     """
-    freqs_cos, freqs_sin = rotary_emb
+    freqs_cos, freqs_sin = rotary_emb[0], rotary_emb[1]
     freqs_cos = freqs_cos.unsqueeze(2)
     freqs_sin = freqs_sin.unsqueeze(2)
 
@@ -71,6 +86,87 @@ def apply_rotary_emb(x: torch.Tensor, rotary_emb: RotaryEmbedding) -> torch.Tens
     sin = freqs_sin[..., ::2]
     x_out = torch.stack((x_even * cos - x_odd * sin, x_even * sin + x_odd * cos), dim=-1).flatten(3)
     return x_out.type_as(x)
+
+
+# The fused qk-norm+RoPE path is always on where the fast path exists; on
+# other platforms the eager chain below is the behaviour-identical fallback.
+_FUSED_QK_NORM_ROPE = HAS_TRITON and current_platform.is_cuda()
+
+# Boogu's default for the fused-path token gate: fuse only when a rotary table
+# spans at least this many positions (counted as B*S). Below the crossover a
+# request is host-bound and the fused path's per-call Python launch (custom-op
+# impl + Triton launcher) can cost more end-to-end than the kernel saves.
+# Measured on one H200: on the pre-#6871 main, 512^2 (1.1k tokens) paid
+# +191 ms/request and the crossover sat at ~2,350 tokens; on the current main
+# the 512^2 family measures as noise (+/-25 ms, sign-inconsistent) while
+# >=768^2 (2.3k tokens) gains. The crossover is host-dependent — re-benchmark
+# on your hardware and override with VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS
+# (0 = always fuse); see fused_qk_norm_rope_min_tokens().
+_FUSED_MIN_TOKENS = 2048
+
+
+def _with_packed_rope_table(rotary_emb: RotaryEmbedding) -> RotaryEmbedding:
+    """Append the packed fp32 table the fused qk-norm+RoPE op consumes.
+
+    ``freqs_cos``/``freqs_sin`` are theta-repeat-interleaved ``[B, S, D]``
+    (``cos[2i] == cos[2i+1] == cos(theta_i)``), so taking every even column
+    yields the theta-width halves and the packed table is
+    ``[B*S, D] = [cos(theta) | sin(theta)]``. Tables spanning fewer positions
+    (counted as ``B*S``) than the token gate — Boogu's ``_FUSED_MIN_TOKENS``
+    default, overridable through ``VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS``
+    (``0`` = always fuse) — are returned unchanged: without the third element
+    every consumer stays on the eager chain (this also keeps short tables like
+    the context refiner's off the fused path).
+    """
+    freqs_cos, freqs_sin = rotary_emb[0], rotary_emb[1]
+    if freqs_cos.shape[0] * freqs_cos.shape[1] < fused_qk_norm_rope_min_tokens(_FUSED_MIN_TOKENS):
+        return rotary_emb
+    packed = torch.cat((freqs_cos[..., ::2], freqs_sin[..., ::2]), dim=-1)
+    return freqs_cos, freqs_sin, packed.reshape(-1, freqs_cos.shape[-1]).float()
+
+
+def _qk_norm_rope(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    norm_q,
+    norm_k,
+    rotary_emb: RotaryEmbedding | None,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-head Q/K RMSNorm + RoPE + cast, fused into one kernel launch when
+    a packed rope table is present; otherwise the original eager chain."""
+    # Gate on the op's own fast-path predicate: when the fused CUDA kernel
+    # cannot run (dtype, device, or geometry outside even
+    # rotary_dim <= head_dim <= 256), the original chain below must be used
+    # bit-exactly rather than the op's internal eager fallback, whose rounding
+    # differs from vLLM's RMSNorm by one ulp on a fraction of elements.
+    if (
+        rotary_emb is not None
+        and len(rotary_emb) > 2
+        and rotary_emb[2] is not None
+        and _fused_cuda_supported(query, key, query.shape[-1], query.shape[-1], interleaved=True)
+    ):
+        batch, seq_len, num_heads, head_dim = query.shape
+        num_kv_heads = key.shape[2]
+        fused_q, fused_k = fused_qk_norm_rope(
+            query.view(batch * seq_len, num_heads, head_dim),
+            key.view(batch * seq_len, num_kv_heads, head_dim),
+            norm_q.weight,
+            norm_k.weight,
+            rotary_emb[2],
+            norm_q.variance_epsilon,
+            interleaved=True,
+        )
+        return (
+            fused_q.view(batch, seq_len, num_heads, head_dim),
+            fused_k.view(batch, seq_len, num_kv_heads, head_dim),
+        )
+    query = norm_q(query)
+    key = norm_k(key)
+    if rotary_emb is not None:
+        query = apply_rotary_emb(query, rotary_emb)
+        key = apply_rotary_emb(key, rotary_emb)
+    return query.to(dtype), key.to(dtype)
 
 
 def swiglu(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -166,7 +262,14 @@ class LuminaLayerNormContinuous(nn.Module):
 
 
 class LuminaFeedForward(nn.Module):
-    """SwiGLU feed-forward with tensor-parallel projections."""
+    """SwiGLU feed-forward with tensor-parallel projections.
+
+    The ``gate`` and ``input`` projections are fused into a single
+    ``MergedColumnParallelLinear`` (one GEMM instead of two), matching the
+    ``gate_up_proj`` convention used by the Hunyuan Image 3 port. The SwiGLU
+    activation keeps its float32 computation for numerical parity with
+    upstream.
+    """
 
     def __init__(
         self,
@@ -182,20 +285,13 @@ class LuminaFeedForward(nn.Module):
             inner_dim = int(ffn_dim_multiplier * inner_dim)
         inner_dim = multiple_of * ((inner_dim + multiple_of - 1) // multiple_of)
 
-        self.linear_1 = ColumnParallelLinear(
-            dim,
-            inner_dim,
+        self.gate_up_proj = MergedColumnParallelLinear(
+            input_size=dim,
+            output_sizes=[inner_dim, inner_dim],
             bias=False,
             quant_config=quant_config,
-            prefix=_join_prefix(prefix, "linear_1"),
-        )  # gate
-        self.linear_3 = ColumnParallelLinear(
-            dim,
-            inner_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=_join_prefix(prefix, "linear_3"),
-        )  # input
+            prefix=_join_prefix(prefix, "gate_up_proj"),
+        )
         self.linear_2 = RowParallelLinear(
             inner_dim,
             dim,
@@ -205,8 +301,8 @@ class LuminaFeedForward(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h1, _ = self.linear_1(x)
-        h2, _ = self.linear_3(x)
+        gate_up, _ = self.gate_up_proj(x)
+        h1, h2 = gate_up.chunk(2, dim=-1)
         out, _ = self.linear_2(swiglu(h1, h2))
         return out
 
@@ -499,28 +595,15 @@ class BooguImageSelfAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.head_dim = dim // num_attention_heads
-        kv_dim = self.head_dim * num_kv_heads
 
-        self.to_q = ColumnParallelLinear(
-            dim,
-            dim,
+        self.to_qkv = QKVParallelLinear(
+            hidden_size=dim,
+            head_size=self.head_dim,
+            total_num_heads=num_attention_heads,
+            total_num_kv_heads=num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            prefix=_join_prefix(prefix, "to_q"),
-        )
-        self.to_k = ColumnParallelLinear(
-            dim,
-            kv_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=_join_prefix(prefix, "to_k"),
-        )
-        self.to_v = ColumnParallelLinear(
-            dim,
-            kv_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=_join_prefix(prefix, "to_v"),
+            prefix=_join_prefix(prefix, "to_qkv"),
         )
         self.norm_q = RMSNorm(self.head_dim, eps=1e-5)
         self.norm_k = RMSNorm(self.head_dim, eps=1e-5)
@@ -532,8 +615,10 @@ class BooguImageSelfAttention(nn.Module):
             prefix=_join_prefix(prefix, "to_out"),
         )
 
-        self.num_local_heads = self.to_q.output_size_per_partition // self.head_dim
-        self.num_local_kv_heads = self.to_k.output_size_per_partition // self.head_dim
+        self.num_local_heads = self.to_qkv.num_heads
+        self.num_local_kv_heads = self.to_qkv.num_kv_heads
+        self.q_size = self.num_local_heads * self.head_dim
+        self.kv_size = self.num_local_kv_heads * self.head_dim
 
         self.attn = Attention(
             num_heads=self.num_local_heads,
@@ -551,21 +636,14 @@ class BooguImageSelfAttention(nn.Module):
     ) -> torch.Tensor:
         dtype = hidden_states.dtype
 
-        query, _ = self.to_q(hidden_states)
-        key, _ = self.to_k(hidden_states)
-        value, _ = self.to_v(hidden_states)
+        qkv, _ = self.to_qkv(hidden_states)
+        query, key, value = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         query = query.unflatten(-1, (self.num_local_heads, self.head_dim))
         key = key.unflatten(-1, (self.num_local_kv_heads, self.head_dim))
         value = value.unflatten(-1, (self.num_local_kv_heads, self.head_dim))
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-
-        if rotary_emb is not None:
-            query = apply_rotary_emb(query, rotary_emb)
-            key = apply_rotary_emb(key, rotary_emb)
-        query, key = query.to(dtype), key.to(dtype)
+        query, key = _qk_norm_rope(query, key, self.norm_q, self.norm_k, rotary_emb, dtype)
 
         attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
         attn_output = self.attn(query, key, value, attn_metadata)
@@ -595,50 +673,24 @@ class BooguImageJointAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.head_dim = dim // num_attention_heads
-        kv_dim = self.head_dim * num_kv_heads
 
-        self.img_to_q = ColumnParallelLinear(
-            dim,
-            dim,
+        self.img_to_qkv = QKVParallelLinear(
+            hidden_size=dim,
+            head_size=self.head_dim,
+            total_num_heads=num_attention_heads,
+            total_num_kv_heads=num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            prefix=_join_prefix(prefix, "img_to_q"),
+            prefix=_join_prefix(prefix, "img_to_qkv"),
         )
-        self.img_to_k = ColumnParallelLinear(
-            dim,
-            kv_dim,
+        self.instruct_to_qkv = QKVParallelLinear(
+            hidden_size=dim,
+            head_size=self.head_dim,
+            total_num_heads=num_attention_heads,
+            total_num_kv_heads=num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            prefix=_join_prefix(prefix, "img_to_k"),
-        )
-        self.img_to_v = ColumnParallelLinear(
-            dim,
-            kv_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=_join_prefix(prefix, "img_to_v"),
-        )
-
-        self.instruct_to_q = ColumnParallelLinear(
-            dim,
-            dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=_join_prefix(prefix, "instruct_to_q"),
-        )
-        self.instruct_to_k = ColumnParallelLinear(
-            dim,
-            kv_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=_join_prefix(prefix, "instruct_to_k"),
-        )
-        self.instruct_to_v = ColumnParallelLinear(
-            dim,
-            kv_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=_join_prefix(prefix, "instruct_to_v"),
+            prefix=_join_prefix(prefix, "instruct_to_qkv"),
         )
 
         self.norm_q = RMSNorm(self.head_dim, eps=1e-5)
@@ -669,8 +721,10 @@ class BooguImageJointAttention(nn.Module):
             prefix=_join_prefix(prefix, "to_out"),
         )
 
-        self.num_local_heads = self.img_to_q.output_size_per_partition // self.head_dim
-        self.num_local_kv_heads = self.img_to_k.output_size_per_partition // self.head_dim
+        self.num_local_heads = self.img_to_qkv.num_heads
+        self.num_local_kv_heads = self.img_to_qkv.num_kv_heads
+        self.q_size = self.num_local_heads * self.head_dim
+        self.kv_size = self.num_local_kv_heads * self.head_dim
 
         self.attn = Attention(
             num_heads=self.num_local_heads,
@@ -692,13 +746,13 @@ class BooguImageJointAttention(nn.Module):
         dtype = img_hidden_states.dtype
         batch_size = img_hidden_states.shape[0]
 
-        img_query, _ = self.img_to_q(img_hidden_states)
-        img_key, _ = self.img_to_k(img_hidden_states)
-        img_value, _ = self.img_to_v(img_hidden_states)
+        img_qkv, _ = self.img_to_qkv(img_hidden_states)
+        img_query, img_key, img_value = img_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        instruct_query, _ = self.instruct_to_q(instruct_hidden_states)
-        instruct_key, _ = self.instruct_to_k(instruct_hidden_states)
-        instruct_value, _ = self.instruct_to_v(instruct_hidden_states)
+        instruct_qkv, _ = self.instruct_to_qkv(instruct_hidden_states)
+        instruct_query, instruct_key, instruct_value = instruct_qkv.split(
+            [self.q_size, self.kv_size, self.kv_size], dim=-1
+        )
 
         query, key, value = _concat_instruction_image_features(
             [img_query, img_key, img_value],
@@ -711,13 +765,7 @@ class BooguImageJointAttention(nn.Module):
         key = key.view(batch_size, -1, self.num_local_kv_heads, self.head_dim)
         value = value.view(batch_size, -1, self.num_local_kv_heads, self.head_dim)
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-
-        if rotary_emb is not None:
-            query = apply_rotary_emb(query, rotary_emb)
-            key = apply_rotary_emb(key, rotary_emb)
-        query, key = query.to(dtype), key.to(dtype)
+        query, key = _qk_norm_rope(query, key, self.norm_q, self.norm_k, rotary_emb, dtype)
 
         attn_metadata = AttentionMetadata(attn_mask=joint_attention_mask) if joint_attention_mask is not None else None
         attn_output = self.attn(query, key, value, attn_metadata)
@@ -1053,6 +1101,44 @@ def _cal_preprocessed_instruction_feat_dim(instruction_feature_configs: dict) ->
         raise ValueError(f"Invalid reduce_type: {reduce_type}")
 
 
+# Packed (fused) projections vs. the logical sub-projections the diffusers
+# checkpoint stores, in the ``(param_name, shard_name, shard_id)`` form used
+# across vllm-omni. ``load_weights`` consumes it directly, and loader consumers
+# that discover it via ``stacked_params_mapping`` (LoRA, quantized loaders) get
+# the packed -> sub-layer relationship for free.
+#
+# The QKV entries stay leaf-scoped: each fused source (``to_q`` on the
+# self-attention module, ``img_to_q`` / ``instruct_to_q`` on the joint
+# attention) has a distinct leaf, and ``.to_q.`` cannot collide with
+# ``.img_to_q.`` because the preceding character is ``_`` rather than ``.``.
+# The FFN entries are path-qualified instead: ``linear_1`` also names the
+# timestep embedder and the ``norm_out`` projections, which must load 1:1 and
+# are not fused.
+_BOOGU_STACKED_PARAMS_MAPPING = (
+    # self-attention: noise / reference-image / context refiners, the
+    # single-stream blocks, and the double-stream image self-attention.
+    (".to_qkv.", ".to_q.", "q"),
+    (".to_qkv.", ".to_k.", "k"),
+    (".to_qkv.", ".to_v.", "v"),
+    # joint (instruction + image) attention of the double-stream blocks.
+    (".img_to_qkv.", ".img_to_q.", "q"),
+    (".img_to_qkv.", ".img_to_k.", "k"),
+    (".img_to_qkv.", ".img_to_v.", "v"),
+    (".instruct_to_qkv.", ".instruct_to_q.", "q"),
+    (".instruct_to_qkv.", ".instruct_to_k.", "k"),
+    (".instruct_to_qkv.", ".instruct_to_v.", "v"),
+    # feed-forward gate/up: ``linear_1`` is the gate (shard 0) and
+    # ``linear_3`` the input (shard 1), matching the packed order the SwiGLU
+    # activation consumes.
+    (".feed_forward.gate_up_proj.", ".feed_forward.linear_1.", 0),
+    (".feed_forward.gate_up_proj.", ".feed_forward.linear_3.", 1),
+    (".img_feed_forward.gate_up_proj.", ".img_feed_forward.linear_1.", 0),
+    (".img_feed_forward.gate_up_proj.", ".img_feed_forward.linear_3.", 1),
+    (".instruct_feed_forward.gate_up_proj.", ".instruct_feed_forward.linear_1.", 0),
+    (".instruct_feed_forward.gate_up_proj.", ".instruct_feed_forward.linear_3.", 1),
+)
+
+
 class BooguImageTransformer2DModel(nn.Module):
     """Boogu-Image transformer with mixed stream topology.
 
@@ -1078,6 +1164,10 @@ class BooguImageTransformer2DModel(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # Published here rather than in ``load_weights`` so loader consumers
+        # that only inspect the module tree (LoRA discovery, quantized weight
+        # loaders) always see the packed -> sub-layer relationship.
+        self.stacked_params_mapping = list(_BOOGU_STACKED_PARAMS_MAPPING)
         self.od_config = od_config
         cfg = od_config.tf_model_config
 
@@ -1449,6 +1539,11 @@ class BooguImageTransformer2DModel(nn.Module):
                     shift += ref_img_len
                     idx += 1
 
+            if _FUSED_QK_NORM_ROPE:
+                # The rebuilt per-reference-image tuple needs its own packed
+                # table; the forward-level tuples do not flow into this batch.
+                batch_ref_img_rotary_emb = _with_packed_rope_table(batch_ref_img_rotary_emb)
+
             for layer in self.ref_image_refiner:
                 batch_ref_image_hidden_states = layer(
                     batch_ref_image_hidden_states, batch_ref_img_mask, batch_ref_img_rotary_emb, batch_temb
@@ -1534,6 +1629,17 @@ class BooguImageTransformer2DModel(nn.Module):
             device,
         )
 
+        if _FUSED_QK_NORM_ROPE:
+            # One packed [cos|sin] table per rotary embedding that reaches an
+            # attention, built once per forward; the tuples grow a third
+            # element that the fused path consumes and the eager path ignores.
+            # (ref_img_rotary_emb is packed inside img_patch_embed_and_refine,
+            # on the rebuilt per-reference-image batch tuple.)
+            context_rotary_emb = _with_packed_rope_table(context_rotary_emb)
+            noise_rotary_emb = _with_packed_rope_table(noise_rotary_emb)
+            rotary_emb = _with_packed_rope_table(rotary_emb)
+            combined_img_rotary_emb = _with_packed_rope_table(combined_img_rotary_emb)
+
         # Context refinement.
         for layer in self.context_refiner:
             instruction_hidden_states = layer(instruction_hidden_states, instruction_attention_mask, context_rotary_emb)
@@ -1612,7 +1718,7 @@ class BooguImageTransformer2DModel(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load diffusers-named checkpoint weights into the native module.
 
-        Two name promotions relative to upstream (see step 8/10 findings):
+        Name promotions relative to upstream (see step 8/10 findings):
 
         - ``*.img_instruct_attn.processor.{img,instruct}_{to_q,to_k,to_v}`` /
           ``{instruct,img}_out`` -> drop ``.processor`` (upstream keeps the
@@ -1621,9 +1727,29 @@ class BooguImageTransformer2DModel(nn.Module):
         - ``*.to_out.0.weight`` -> ``*.to_out.weight`` (diffusers wraps the
           output projection in a ``ModuleList``; the native module uses a plain
           linear).
+
+        Packed Q/K/V and FFN gate/input matrices are folded onto the fused
+        ``QKVParallelLinear`` / ``MergedColumnParallelLinear`` parameters using
+        :attr:`stacked_params_mapping` — the same mapping loader consumers such
+        as LoRA discovery and quantized weight loaders read.
+
+        A fused parameter is only reported as loaded once *every* one of its
+        source matrices has arrived. The caller compares parameter names, so
+        reporting e.g. ``to_qkv`` complete after the first shard would let a
+        checkpoint carrying only ``to_q`` start up with the ``k``/``v`` slices
+        left uninitialized.
         """
+        stacked_params_mapping = self.stacked_params_mapping
+        # The shard ids each fused parameter is assembled from, keyed by the
+        # mapping entry that produces it.
+        expected_shards: dict[str, set[str | int]] = defaultdict(set)
+        for param_name, _weight_name, packed_shard_id in stacked_params_mapping:
+            expected_shards[param_name].add(packed_shard_id)
+
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        # Fused parameter -> (mapping entry that produced it, shards received).
+        fused_params: dict[str, tuple[str, set[str | int]]] = {}
 
         for name, loaded_weight in weights:
             original_name = name
@@ -1632,14 +1758,35 @@ class BooguImageTransformer2DModel(nn.Module):
             if ".to_out.0." in name:
                 name = name.replace(".to_out.0.", ".to_out.")
 
+            shard_id: str | int | None = None
+            matched_entry: str | None = None
+            for param_name, weight_name, packed_shard_id in stacked_params_mapping:
+                if weight_name in name:
+                    name = name.replace(weight_name, param_name)
+                    shard_id = packed_shard_id
+                    matched_entry = param_name
+                    break
+
             if name not in params_dict:
                 logger.warning("Skipping unexpected checkpoint weight %s", original_name)
                 continue
 
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
+            if matched_entry is None:
+                weight_loader(param, loaded_weight)
+            else:
+                weight_loader(param, loaded_weight, shard_id)
+                _, received = fused_params.setdefault(name, (matched_entry, set()))
+                received.add(shard_id)
             loaded_params.add(name)
+
+        # Withdraw any fused parameter that only received part of its source
+        # matrices, so the caller's "not initialized from checkpoint" check
+        # reports it as missing instead of accepting a half-filled parameter.
+        for name, (matched_entry, received) in fused_params.items():
+            if received != expected_shards[matched_entry]:
+                loaded_params.discard(name)
 
         unloaded_params = sorted(params_dict.keys() - loaded_params)
         if unloaded_params:

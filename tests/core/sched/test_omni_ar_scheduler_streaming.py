@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -16,7 +17,10 @@ import pytest
 import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.engine import FinishReason
+from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
@@ -63,6 +67,39 @@ def _make_update(prompt_token_ids: list[int] | None = None) -> StreamingUpdate:
         arrival_time=200.0,
         sampling_params=SamplingParams(max_tokens=16),
     )
+
+
+def _make_minicpm_window_update(
+    *,
+    seq: int,
+    mode: str,
+    high: int = 15,
+    low: int = 10,
+    context_max_units: int = 1,
+) -> StreamingUpdate:
+    update = _make_update([0] * 8)
+    update.model_intermediate_buffer = {
+        "duplex": {
+            "data_plane": True,
+            "seq": seq,
+            "runtime_config": {
+                "duplex_scheduler_token_id": 0,
+                "duplex_first_append_context_tokens": 3,
+                "duplex_window_prefix_tokens": 2,
+                "duplex_window_suffix_token_ids": [3],
+                "duplex_window_previous_marker_token_ids": [70, 71],
+                "duplex_window_special_token_ids": [99],
+                "duplex_window_config": {
+                    "sliding_window_mode": mode,
+                    "basic_window_high_tokens": high,
+                    "basic_window_low_tokens": low,
+                    "context_previous_max_tokens": 4,
+                    "context_max_units": context_max_units,
+                },
+            },
+        }
+    }
+    return update
 
 
 def _make_talker_adapter(
@@ -113,7 +150,7 @@ def _run_resumable_segment_stop(
     sched = MagicMock()
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
-    sched.structured_output_manager.should_advance.return_value = False
+    sched.structured_output_manager.accept_tokens.return_value = True
 
     def stop_request(request: Request, _token_ids: list[int]):
         request.status = RequestStatus.FINISHED_STOPPED
@@ -261,7 +298,7 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
     sched = MagicMock()
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
-    sched.structured_output_manager.should_advance.return_value = False
+    sched.structured_output_manager.accept_tokens.return_value = True
     sched._update_request_with_output.return_value = ([42], False)
     sched._process_kv_transfer_trigger.return_value = False
     sched.chunk_transfer_adapter = MagicMock()
@@ -344,7 +381,7 @@ def test_stale_async_frame_is_dropped_before_output_processing() -> None:
     sched = MagicMock()
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
-    sched.structured_output_manager.should_advance.return_value = False
+    sched.structured_output_manager.accept_tokens.return_value = True
 
     def discard_stale_output(request: Request, token_ids: list[int]) -> tuple[list[int], bool]:
         request.async_tokens_to_discard = 0
@@ -504,6 +541,225 @@ def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder()
     assert session._output_token_ids == []
     assert session.num_prompt_tokens == 8
     assert sched._new_prompt_len_snapshot[session.request_id] == 2
+
+
+def test_stage0_basic_window_rebuilds_below_low_watermark() -> None:
+    sched = _make_scheduler(stage_id=0)
+    session = _make_request()
+    session.prompt_token_ids = [0] * 9
+    session._all_token_ids.clear()
+    session._all_token_ids.extend(session.prompt_token_ids)
+    session.num_prompt_tokens = 9
+    session.append_output_token_ids([40])
+    session.num_computed_tokens = 10
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    update = _make_minicpm_window_update(seq=2, mode="basic")
+
+    sched._update_request_as_session(session, update)
+
+    assert session.prompt_token_ids == [0] * 9
+    assert session.num_computed_tokens == 0
+    assert update.model_intermediate_buffer["meta"]["replace_streaming_prompt"] is True
+    plan = update.model_intermediate_buffer["duplex"]["stage0_window"]
+    assert plan == {
+        "completed_token_ids": [40],
+        "replace": True,
+        "mode": "basic",
+        "drop_units": 1,
+        "dropped_tokens": 9,
+        "previous_token_ids": [],
+        "previous_marker_token_ids": [70, 71],
+        "replacement_prompt_len": 9,
+    }
+    sched._free_request_blocks.assert_called_once_with(session)
+
+
+def test_stage0_context_window_compacts_dropped_speech() -> None:
+    sched = _make_scheduler(stage_id=0)
+    session = _make_request()
+    session.prompt_token_ids = [0] * 9
+    session._all_token_ids.clear()
+    session._all_token_ids.extend(session.prompt_token_ids)
+    session.num_prompt_tokens = 9
+    session.append_output_token_ids([40])
+    session.num_computed_tokens = 10
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    first = _make_minicpm_window_update(seq=2, mode="context")
+    sched._update_request_as_session(session, first)
+    assert session.num_prompt_tokens == 18
+    assert first.model_intermediate_buffer["duplex"]["stage0_window"] == {"completed_token_ids": [40]}
+
+    session.append_output_token_ids([50])
+    session.num_computed_tokens = 19
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    second = _make_minicpm_window_update(seq=3, mode="context")
+    sched._update_request_as_session(session, second)
+
+    assert session.prompt_token_ids == [0] * 21
+    plan = second.model_intermediate_buffer["duplex"]["stage0_window"]
+    assert plan["completed_token_ids"] == [50]
+    assert plan["drop_units"] == 1
+    assert plan["previous_token_ids"] == [40]
+    # The worker embeds this exact marker, not a re-tokenized one, so the
+    # previous region is len(marker) + len(previous).
+    assert plan["previous_marker_token_ids"] == [70, 71]
+    assert plan["replacement_prompt_len"] == 21
+    assert getattr(session, "_minicpmo45_window_previous_len") == 3
+
+
+@pytest.mark.parametrize("cleared_outputs", [False, True])
+@pytest.mark.parametrize("in_flight", [0, 1])
+def test_stage0_window_uses_confirmed_span_and_terminator(cleared_outputs, in_flight) -> None:
+    sched = _make_scheduler(stage_id=0)
+    session = _make_request()
+    session.prompt_token_ids = [0] * 9
+    session._all_token_ids[:] = session.prompt_token_ids
+    session.num_prompt_tokens = 9
+    session.append_output_token_ids([40, 99])
+    session.num_computed_tokens = 10 + in_flight
+    session.num_output_placeholders = in_flight
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    if cleared_outputs:
+        # A stop without a queued append clears this before the next update.
+        session._output_token_ids.clear()
+    update = _make_minicpm_window_update(seq=2, mode="basic")
+
+    sched._update_request_as_session(session, update)
+
+    plan = update.model_intermediate_buffer["duplex"]["stage0_window"]
+    assert plan["completed_token_ids"] == [40]
+    assert plan["completed_terminator_token_id"] == 99
+    assert plan["replacement_prompt_len"] == 9
+    assert plan["dropped_tokens"] == 9
+
+
+def test_stage0_window_rebuild_that_overflows_max_model_len_finishes_the_session() -> None:
+    """A rebuilt window prompt is bounded by the client's window settings, not
+    by the model: a unit carrying camera frames is hundreds of tokens, and a
+    ``context`` window adds the ``previous`` region on top. The replacement
+    branch must therefore check ``replacement_prompt_len`` against
+    ``max_model_len - sample_room`` and finish the session with
+    ``context_length_exceeded``, exactly like a plain extension."""
+    sched = _make_live_session_scheduler(max_model_len=21)
+    session = _make_request()
+    session.prompt_token_ids = [0] * 9
+    session._all_token_ids[:] = [0] * 9
+    session.num_prompt_tokens = 9
+    session._output_token_ids[:] = [40]
+    session._all_token_ids.append(40)
+    session.num_computed_tokens = 10
+    session.num_output_placeholders = 0
+    _park_session(sched, session)
+    # The parked append state above is the frame before this update: one
+    # confirmed output token, fully computed.
+    session._output_token_ids[:] = [40]
+    session._all_token_ids[:] = [*session.prompt_token_ids, 40]
+    session.num_computed_tokens = 10
+    session.num_in_flight_tokens = 0
+    sched.num_sampled_tokens_per_step = 1
+    # The replacement plan rebuilds 21 tokens (retained context plus the
+    # append) and one step samples one more, so 21 leaves no room.
+    update = _make_minicpm_window_update(seq=2, mode="basic")
+    update.prompt_token_ids = [0] * 20
+    original_prompt = list(session.prompt_token_ids)
+
+    sched._update_request_as_session(session, update)
+
+    assert update.model_intermediate_buffer["duplex"]["stage0_window"]["replacement_prompt_len"] == 21
+    assert session.prompt_token_ids == original_prompt
+    assert session.num_prompt_tokens == 9
+    assert session.status == RequestStatus.FINISHED_ERROR
+    assert session.request_id not in sched.requests
+    assert sched.finished_req_ids == {session.request_id}
+    sched._free_request_blocks.assert_called_once_with(session)
+    client_index, reason = sched._streaming_context_overflow[session.request_id]
+    assert client_index == session.client_index
+    assert reason.startswith("context_length_exceeded: ")
+    assert "21 tokens" in reason and "max_model_len 21" in reason
+
+    engine_core_outputs = _run_idle_step(sched)
+
+    (output,) = engine_core_outputs[session.client_index].outputs
+    assert output.request_id == session.request_id
+    assert output.finish_reason == FinishReason.ERROR
+    assert output.stop_reason == reason
+
+
+def test_stage0_window_rebuild_that_leaves_room_to_sample_replaces_the_prompt() -> None:
+    """One slot above the plan fits: the replacement applies through the normal
+    replacement path."""
+    sched = _make_scheduler(stage_id=0)
+    sched.max_model_len = 25
+    sched.num_sampled_tokens_per_step = 1
+    session = _make_request()
+    session.prompt_token_ids = [0] * 9
+    session._all_token_ids[:] = session.prompt_token_ids
+    session.num_prompt_tokens = 9
+    session.append_output_token_ids([40])
+    session.num_computed_tokens = 10
+    session.num_output_placeholders = 0
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    update = _make_minicpm_window_update(seq=2, mode="basic")
+    update.prompt_token_ids = [0] * 20
+
+    sched._update_request_as_session(session, update)
+
+    assert update.model_intermediate_buffer["meta"]["replace_streaming_prompt"] is True
+    assert update.model_intermediate_buffer["duplex"]["stage0_window"]["replacement_prompt_len"] == 21
+    assert session.prompt_token_ids == [0] * 21
+    assert session.num_prompt_tokens == 21
+    assert session.num_computed_tokens == 0
+    assert session.status == RequestStatus.WAITING
+    sched._free_request_blocks.assert_called_once_with(session)
+    assert not getattr(sched, "_streaming_context_overflow", {})
+
+
+def test_stage0_window_open_start_zero_is_not_replaced_by_the_context_reserve() -> None:
+    """A recorded ``open_start`` of 0 is a legitimate empty context prefix. The
+    fallback must be an explicit ``is None`` check: treating 0 as missing
+    substitutes the context reserve, counts the suffix twice, and the worker's
+    rebuild-length check raises on the first replacement."""
+    session = SimpleNamespace(
+        num_prompt_tokens=9,
+        _all_token_ids=[0] * 9 + [40],
+        num_computed_tokens=10,
+        num_output_placeholders=0,
+        _minicpmo45_window_open_start=0,
+    )
+    update = _make_minicpm_window_update(seq=2, mode="basic")
+    update.prompt_token_ids = [0] * 21
+
+    assert OmniARScheduler._prepare_minicpmo45_stage0_window(
+        session, update, segment_output_ids=[40], completed_terminator=3
+    )
+
+    # open_start stays 0, so the reported unit spans the whole 12-token
+    # boundary instead of the 9 the context reserve would fold in.
+    plan = update.model_intermediate_buffer["duplex"]["stage0_window"]
+    assert plan["dropped_tokens"] == 12
+    assert plan["replacement_prompt_len"] == 19
+
+
+def test_stage0_window_open_start_falls_back_to_the_context_reserve_when_unset() -> None:
+    session = SimpleNamespace(
+        num_prompt_tokens=9,
+        _all_token_ids=[0] * 9 + [40],
+        num_computed_tokens=10,
+        num_output_placeholders=0,
+    )
+    update = _make_minicpm_window_update(seq=2, mode="basic")
+    update.prompt_token_ids = [0] * 21
+
+    assert OmniARScheduler._prepare_minicpmo45_stage0_window(
+        session, update, segment_output_ids=[40], completed_terminator=3
+    )
+
+    # fallback open_start is preserve_len 3 from duplex_first_append_context_tokens,
+    # so the unit is three tokens shorter.
+    plan = update.model_intermediate_buffer["duplex"]["stage0_window"]
+    assert plan["dropped_tokens"] == 9
+    assert plan["replacement_prompt_len"] == 22
 
 
 def test_explicit_streaming_payload_replaces_placeholder_prompt() -> None:
@@ -958,3 +1214,349 @@ def test_chunk_segment_cleanup_keeps_explicit_update_stage_parked(
     assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
     sched.skipped_waiting.remove_requests.assert_not_called()
     sched._enqueue_waiting_request.assert_not_called()
+
+
+def _make_live_session_scheduler(*, max_model_len: int) -> OmniARScheduler:
+    """A scheduler whose finish path is real: the queues, ``finish_requests``,
+    ``_free_request`` and the finished-request bookkeeping that wakes an idle
+    engine all run. Only block freeing and the encoder cache are mocked."""
+    sched = _make_admission_scheduler(max_model_len=max_model_len)
+    del sched._free_request  # the admission helper mocks it; run the real one
+    sched._omits_kv_transfer_cache = {}
+    sched.connector = None
+    sched.perf_metrics = None
+    sched.recompute_kv_load_failures = False
+    sched.finished_req_ids = set()
+    sched.finished_req_ids_dict = defaultdict(set)
+    sched.transfer_triggered_requests = set()
+    sched.active_kv_transfers = set()
+    sched.waiting_for_transfer_free = set()
+    sched.pending_stop_after_extraction = set()
+    sched.requests_needing_kv_transfer = {}
+    sched._kv_wait_start_ts = {}
+    sched.kv_cache_manager = SimpleNamespace(take_events=lambda: None, estimate_cached_tokens=lambda _request: 0)
+    return sched
+
+
+def _run_idle_step(sched: OmniARScheduler):
+    """One ``update_from_output`` with nothing scheduled: the step an idle
+    engine runs once ``has_finished_requests()`` reports a freed session."""
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={},
+        scheduled_spec_decode_tokens={},
+        num_invalid_spec_tokens=0,
+    )
+    model_runner_output = SimpleNamespace(
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=None,
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        cudagraph_stats=None,
+        req_id_to_index={},
+        routed_experts=None,
+    )
+    return OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
+
+
+def _park_session(sched: OmniARScheduler, session: Request) -> None:
+    """Put a session where a 1 fps video stream leaves it between appends:
+    prompt partly computed, waiting for streaming input, in admission."""
+    sched.requests[session.request_id] = session
+    session.append_output_token_ids([7, 8, 9])
+    session.num_computed_tokens = 6
+    session.num_output_placeholders = 0
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    sched.skipped_waiting.add_request(session)
+    sched.num_waiting_for_streaming_input = 1
+
+
+def test_stage0_streaming_update_that_overflows_max_model_len_finishes_the_session() -> None:
+    """A native duplex session grows its prompt on every append; once the
+    extension cannot fit the model the worker crashes copying the prompt.
+    The scheduler must drop the update and fail only this session, at once,
+    through the real finish path: a parked session does not make the engine
+    schedule, so what wakes the engine is the freed request showing up in
+    ``has_finished_requests()``, and the step that follows must carry one
+    explicit ERROR rather than the synthesized ABORT."""
+    sched = _make_live_session_scheduler(max_model_len=8)
+    session = _make_request()
+    _park_session(sched, session)
+
+    sched._update_request_as_session(session, _make_update([10, 20, 30]))
+
+    assert session.prompt_token_ids == [1, 2, 3]
+    assert session.num_prompt_tokens == 3
+    assert session.status == RequestStatus.FINISHED_ERROR
+    assert session.request_id not in sched.requests
+    assert len(sched.waiting) == 0
+    assert len(sched.skipped_waiting) == 0
+    assert sched.num_waiting_for_streaming_input == 0
+    sched._free_request_blocks.assert_called_once_with(session)
+    assert sched.finished_req_ids == {session.request_id}
+    assert sched.has_finished_requests()
+    client_index, reason = sched._streaming_context_overflow[session.request_id]
+    assert client_index == session.client_index
+    assert reason.startswith("context_length_exceeded: ")
+    assert "9 tokens" in reason and "max_model_len 8" in reason
+
+    engine_core_outputs = _run_idle_step(sched)
+
+    (output,) = engine_core_outputs[session.client_index].outputs
+    assert output.request_id == session.request_id
+    assert output.finish_reason == FinishReason.ERROR
+    assert output.stop_reason == reason
+    assert output.new_token_ids == []
+    assert engine_core_outputs[session.client_index].finished_requests == {session.request_id}
+    assert sched._streaming_context_overflow == {}
+    # Nothing is left to report once the error went out.
+    assert _run_idle_step(sched) == {}
+
+
+def test_stage0_streaming_update_that_fills_max_model_len_exactly_finishes_the_session() -> None:
+    """An exactly full prompt leaves no room for the token every duplex step
+    samples: upstream's running budget drops to -1, which ``schedule()`` does
+    not catch, so the exact fill is an overflow too."""
+    sched = _make_scheduler(stage_id=0)
+    sched.max_model_len = 8
+    sched.finish_requests = MagicMock()
+    session = _make_request()
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.append_output_token_ids([7, 8, 9])
+    session.num_computed_tokens = 6
+    session.num_output_placeholders = 0
+
+    sched._update_request_as_session(session, _make_update([10, 20]))
+
+    assert session.prompt_token_ids == [1, 2, 3]
+    assert session.num_prompt_tokens == 3
+    sched.finish_requests.assert_called_once_with((session.request_id,), RequestStatus.FINISHED_ERROR)
+    _, reason = sched._streaming_context_overflow[session.request_id]
+    assert "8 tokens" in reason and "max_model_len 8" in reason
+
+
+def test_stage0_streaming_update_that_leaves_room_to_sample_is_applied() -> None:
+    sched = _make_scheduler(stage_id=0)
+    sched.max_model_len = 9
+    sched.finish_requests = MagicMock()
+    session = _make_request()
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.append_output_token_ids([7, 8, 9])
+    session.num_computed_tokens = 6
+    session.num_output_placeholders = 0
+
+    sched._update_request_as_session(session, _make_update([10, 20]))
+
+    assert session.prompt_token_ids == [1, 2, 3, 7, 8, 9, 10, 20]
+    assert session.num_prompt_tokens == 8
+    assert session.status == RequestStatus.WAITING
+    sched.finish_requests.assert_not_called()
+    assert not getattr(sched, "_streaming_context_overflow", {})
+
+
+def test_stage0_streaming_update_keeps_room_for_every_token_sampled_per_step() -> None:
+    """With speculative decoding a step samples more than one token, and the
+    prompt must leave room for all of them."""
+    sched = _make_scheduler(stage_id=0)
+    sched.max_model_len = 9
+    sched.num_sampled_tokens_per_step = 2
+    sched.finish_requests = MagicMock()
+    session = _make_request()
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.append_output_token_ids([7, 8, 9])
+    session.num_computed_tokens = 6
+    session.num_output_placeholders = 0
+
+    sched._update_request_as_session(session, _make_update([10, 20]))
+
+    assert session.prompt_token_ids == [1, 2, 3]
+    sched.finish_requests.assert_called_once_with((session.request_id,), RequestStatus.FINISHED_ERROR)
+    assert "8 tokens" in sched._streaming_context_overflow[session.request_id][1]
+
+
+def test_stage0_streaming_update_overflow_counts_an_uncomputed_prompt() -> None:
+    """A preempted session keeps its prompt even though num_computed_tokens
+    fell behind it; the projection must use the longer of the two."""
+    sched = _make_scheduler(stage_id=0)
+    sched.max_model_len = 4
+    sched.finish_requests = MagicMock()
+    session = _make_request()
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.num_computed_tokens = 0
+
+    sched._update_request_as_session(session, _make_update([10, 20]))
+
+    assert session.prompt_token_ids == [1, 2, 3]
+    sched.finish_requests.assert_called_once()
+    assert "5 tokens" in sched._streaming_context_overflow[session.request_id][1]
+
+
+def _make_admission_scheduler(*, max_model_len: int) -> OmniARScheduler:
+    """A scheduler with real admission queues, so nothing about the terminal
+    handling below is mocked away except block freeing."""
+    sched = _make_scheduler(stage_id=0)
+    sched.max_model_len = max_model_len
+    sched.policy = SchedulingPolicy.FCFS
+    sched.waiting = create_request_queue(sched.policy)
+    sched.skipped_waiting = create_request_queue(sched.policy)
+    sched.running = []
+    sched.requests = {}
+    sched._free_request = MagicMock()  # needs a KV manager; not what this covers
+    return sched
+
+
+def _make_queued_stop(session: Request, update: StreamingUpdate) -> None:
+    """Put the request in the state upstream hands to _handle_stopped_request:
+    an append that arrived during generation is queued, and the stop status is
+    still on the request."""
+    from collections import deque
+
+    session.resumable = True
+    session.streaming_queue = deque([update])
+    session.status = RequestStatus.FINISHED_STOPPED
+
+
+def test_queued_streaming_update_that_overflows_does_not_return_to_admission() -> None:
+    sched = _make_admission_scheduler(max_model_len=4)
+    session = _make_request()
+    sched.requests[session.request_id] = session
+    session.num_computed_tokens = 3
+    _make_queued_stop(session, _make_update([10, 20]))
+
+    finished = sched._handle_stopped_request(session)
+
+    assert finished is True
+    assert len(sched.waiting) == 0
+    assert len(sched.skipped_waiting) == 0
+    assert session.status == RequestStatus.FINISHED_ERROR
+    assert session.resumable is False
+    assert "context_length_exceeded: " in sched._streaming_context_overflow[session.request_id][1]
+    # update_from_output frees every request reported as finished; freeing here
+    # as well deleted it from self.requests twice (KeyError in _free_blocks).
+    sched._free_request.assert_not_called()
+
+
+def test_queued_streaming_update_that_fits_still_resumes_the_session() -> None:
+    sched = _make_admission_scheduler(max_model_len=64)
+    session = _make_request()
+    sched.requests[session.request_id] = session
+    session.num_computed_tokens = 3
+    _make_queued_stop(session, _make_update([10, 20]))
+
+    finished = sched._handle_stopped_request(session)
+
+    assert finished is False
+    assert len(sched.waiting) == 1
+    assert session.status == RequestStatus.WAITING
+    assert not getattr(sched, "_streaming_context_overflow", {})
+    sched._free_request.assert_not_called()
+
+
+def test_queued_stop_with_a_recorded_overflow_still_leaves_admission() -> None:
+    """The overflow may already be on record when the stop is handled (an
+    earlier update of the same session). Upstream still re-enqueues the
+    request, so the override must take it back out either way instead of
+    leaving a FINISHED_ERROR request for admission to trip over."""
+    sched = _make_admission_scheduler(max_model_len=64)
+    session = _make_request()
+    sched.requests[session.request_id] = session
+    session.num_computed_tokens = 3
+    sched._streaming_context_overflow = {session.request_id: (session.client_index, "context_length_exceeded: earlier")}
+    _make_queued_stop(session, _make_update([10, 20]))  # this update itself fits
+
+    finished = sched._handle_stopped_request(session)
+
+    assert finished is True
+    assert len(sched.waiting) == 0
+    assert len(sched.skipped_waiting) == 0
+    assert session.status == RequestStatus.FINISHED_ERROR
+    assert session.resumable is False
+    sched._free_request.assert_not_called()
+
+
+def test_parked_stop_with_a_recorded_overflow_keeps_the_streaming_counter_balanced() -> None:
+    """Same as above with nothing queued: upstream parks the request as
+    waiting for streaming input and counts it; the dequeue must uncount it."""
+    from collections import deque
+
+    sched = _make_admission_scheduler(max_model_len=64)
+    session = _make_request()
+    sched.requests[session.request_id] = session
+    session.num_computed_tokens = 3
+    sched._streaming_context_overflow = {session.request_id: (session.client_index, "context_length_exceeded: earlier")}
+    session.resumable = True
+    session.streaming_queue = deque()
+    session.status = RequestStatus.FINISHED_STOPPED
+
+    finished = sched._handle_stopped_request(session)
+
+    assert finished is True
+    assert len(sched.skipped_waiting) == 0
+    assert sched.num_waiting_for_streaming_input == 0
+    assert session.status == RequestStatus.FINISHED_ERROR
+    sched._free_request.assert_not_called()
+
+
+def test_context_overflow_emits_an_error_output_with_the_reason() -> None:
+    sched = _make_scheduler(stage_id=0)
+    sched._streaming_context_overflow = {"req-a": (2, "context_length_exceeded: too long")}
+    outputs: dict[int, list] = {}
+
+    sched._emit_streaming_context_overflow_outputs(outputs)
+
+    (output,) = outputs[2]
+    assert output.request_id == "req-a"
+    assert output.finish_reason == FinishReason.ERROR
+    assert output.stop_reason == "context_length_exceeded: too long"
+    assert output.new_token_ids == []
+    assert sched._streaming_context_overflow == {}
+
+    sched._emit_streaming_context_overflow_outputs(outputs)
+    assert len(outputs[2]) == 1
+
+
+@pytest.mark.parametrize("native", [True, False])
+def test_async_chunk_reserves_parked_slots_during_ar_admission(monkeypatch, native) -> None:
+    sched = _make_scheduler(stage_id=1)
+    parked = SimpleNamespace(request_id="parked")
+    sched.requests = {"parked": parked}
+    sched.waiting = []
+    sched.running = []
+    sched._native_data_plane = native
+    sched.use_v2_model_runner = native
+    sched.max_num_running_reqs = 8
+    sched.input_coordinator = (
+        SimpleNamespace(_async_chunk=True, _waiting_for_chunk_running=[parked], restore_queues=lambda _w, _r: None)
+        if native
+        else None
+    )
+    sched.chunk_transfer_adapter = (
+        None
+        if native
+        else SimpleNamespace(
+            waiting_for_chunk_running_requests=[parked],
+            _held_non_active=[],
+            process_pending_chunks=lambda *_a, **_kw: None,
+            collect_failed_send_request_ids=lambda: {},
+            restore_queues=lambda *_a, **_kw: None,
+            postprocess_scheduler_output=lambda *_a, **_kw: None,
+        )
+    )
+    sched._consume_pending_connector_output = lambda model_mode: None
+    sched._process_pending_input_timeouts = lambda: None
+    sched._should_defer_waiting_admission = lambda: False
+    sched.get_finished_requests_needing_kv_transfer = lambda: {}
+    sched._wrap_omni_scheduler_output = lambda output, **_kwargs: output
+    observed_limits: list[int] = []
+
+    def fake_schedule(self, _throttle_prefills=False):
+        observed_limits.append(self.max_num_running_reqs)
+        return SimpleNamespace(scheduled_new_reqs=[])
+
+    monkeypatch.setattr(VLLMScheduler, "schedule", fake_schedule)
+
+    sched.schedule()
+
+    assert observed_limits == [7 if native else 8]
+    assert sched.max_num_running_reqs == 8

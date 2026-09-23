@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -362,6 +362,20 @@ def test_prepared_model_inputs_match_local_tokenization(
     local_inputs = pipeline.prepare_model_inputs(**common_kwargs)
     prepared_inputs = pipeline.prepare_model_inputs(**common_kwargs, prepared_layout=prepared_layout)
 
+    if with_reference_image:
+        # Preparation runs without a forward context. Coverage must come from
+        # the scheduler metadata copied onto this request, including every CFG row.
+        reused = pipeline.prepare_model_inputs(
+            **common_kwargs, prepared_layout=prepared_layout, kv_computed_tokens=(5,) * len(prefix_lens)
+        )
+        assert reused["cond_vae_images"] is None and reused["cond_vit_images"] is None
+        partial = pipeline.prepare_model_inputs(
+            **common_kwargs,
+            prepared_layout=prepared_layout,
+            kv_computed_tokens=(5,) * (len(prefix_lens) - 1) + (4,),
+        )
+        assert partial["cond_vae_images"] is not None and partial["cond_vit_images"] is not None
+
     comparable_fields = (
         "input_ids",
         "position_ids",
@@ -474,3 +488,33 @@ def test_paged_preprocess_attaches_layout_and_scheduler_kv_requests(monkeypatch)
         (12, 17, 32)
     ]
     assert len(tokenizer.calls) == 1
+
+
+@pytest.mark.parametrize("transfer_tokens, expected", [(9, [7, 5]), (4, [4, 4])])
+def test_cfg_rows_preserve_reusable_token_ids_and_native_transfer_boundary(transfer_tokens, expected):
+    from vllm_omni.diffusion.diffusion_kv.kv_connector import prepare_kv_requests
+
+    tokenizer, image_processor = _components([12, 14])
+    request = _request(guidance_scale=5.0)
+    layout = _prepare(request, tokenizer, image_processor)
+    layout.tokenizer_output.think_recaption_end_pos = [[7], [5]]
+    layout.tokenizer_output.uncond_cfg_start_pos = [[None], [5]]
+    rows = build_hunyuan_diffusion_kv_requests(request, layout)
+    assert [row.prompt_token_ids for row in rows] == [
+        layout.tokenizer_output.tokens[0, :7].tolist(),
+        layout.tokenizer_output.tokens[1, :5].tolist(),
+    ]
+    prepare_kv_requests(rows, {"num_transfer_tokens": transfer_tokens})
+    assert [row.num_prompt_tokens for row in rows] == expected
+    assert all(row.kv_transfer_params["num_transfer_tokens"] == transfer_tokens for row in rows)
+    layout.tokenizer_output.uncond_cfg_start_pos = [[5]]
+    with pytest.raises(ValueError, match="one boundary per CFG row"):
+        build_hunyuan_diffusion_kv_requests(request, layout)
+
+
+@pytest.mark.parametrize("computed, expected", [((8, 8), True), ((8, 5), False), ((0, 0), False), ((), False)])
+def test_native_image_reuse_requires_coverage_in_every_cfg_row(computed, expected):
+    from vllm_omni.diffusion.models.hunyuan_image3.request_layout import native_kv_covers_cond_images
+
+    output = TokenizerEncodeOutput(joint_image_slices=[[slice(2, 8)], [slice(2, 6)]])
+    assert native_kv_covers_cond_images(output, computed) is expected

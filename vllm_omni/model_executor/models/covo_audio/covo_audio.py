@@ -21,7 +21,6 @@ from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseProcessingInfo,
-    ProcessorInputs,
     PromptReplacement,
     PromptUpdateDetails,
 )
@@ -93,20 +92,6 @@ class CovoAudioDummyInputsBuilder(BaseDummyInputsBuilder[CovoAudioProcessingInfo
         # allocates memory for the worst-case MAX_AUDIO_TOKENS (188) tokens.
         dummy_audio = np.zeros((16000 * 30,), dtype=np.float32)
         return {"audio": [(dummy_audio, 16000)] * num_audios}
-
-    def get_dummy_processor_inputs(
-        self,
-        seq_len: int,
-        mm_counts: Mapping[str, int],
-        mm_options: Mapping[str, BaseDummyOptions] | None = None,
-    ) -> ProcessorInputs:
-        dummy_text = self.get_dummy_text(mm_counts)
-        dummy_mm_data = self.get_dummy_mm_data(seq_len, mm_counts, mm_options)
-        dummy_mm_items = self.info.parse_mm_data(dummy_mm_data)
-        return ProcessorInputs(
-            prompt=dummy_text,
-            mm_data_items=dummy_mm_items,
-        )
 
 
 class CovoAudioMultiModalProcessor(OmniMultiModalProcessor[CovoAudioProcessingInfo]):
@@ -186,7 +171,11 @@ class CovoAudioMultiModalProcessor(OmniMultiModalProcessor[CovoAudioProcessingIn
             )
 
         return [
-            PromptReplacement("audio", "<|cAUDIO|>", get_replacement),
+            PromptReplacement(
+                modality="audio",
+                target=[audio_token_id],
+                replacement=get_replacement,
+            ),
         ]
 
 

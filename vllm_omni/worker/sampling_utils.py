@@ -1,14 +1,109 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Sampling-state guards shared by the GPU and NPU AR model runners."""
+"""Sampling helpers shared by the GPU and NPU AR model runners."""
+
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
+from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.logits_processor import LogitsProcessors, MinTokensLogitsProcessor
 
 logger = init_logger(__name__)
 
-__all__ = ["clamp_prompt_ids_to_penalty_padding", "sanitize_min_tokens_stop_ids"]
+__all__ = [
+    "apply_fixed_seed_to_sampling_params",
+    "get_tts_local_seed",
+    "clamp_prompt_ids_to_penalty_padding",
+    "sanitize_min_tokens_stop_ids",
+    "sanitize_sampling_params_min_tokens_stop_ids",
+    "build_model_sampler_extra_args",
+    "call_model_sampler",
+]
+
+
+def get_tts_local_seed(sampling_params: Any) -> int | None:
+    """Return the explicit per-request Talker MTP seed, if configured."""
+    extra_args = getattr(sampling_params, "extra_args", None) if sampling_params is not None else None
+    seed = extra_args.get("tts_local_seed") if isinstance(extra_args, dict) else None
+    return int(seed) if seed is not None else None
+
+
+def apply_fixed_seed_to_sampling_params(
+    sampling_params: Any,
+    seed: int,
+    *,
+    seed_talker_mtp: bool,
+) -> None:
+    """Apply one request seed to a stage sampler and, for Talkers, its MTP RNG."""
+    seed = int(seed)
+    sampling_params.seed = seed
+    if not seed_talker_mtp:
+        return
+    extra_args = dict(getattr(sampling_params, "extra_args", None) or {})
+    extra_args["tts_local_seed"] = seed
+    sampling_params.extra_args = extra_args
+
+
+def sanitize_sampling_params_min_tokens_stop_ids(
+    sampling_params: SamplingParams,
+    logits_vocab: int,
+) -> None:
+    """Remove unreachable ids before MRv2 builds persistent min-token state.
+
+    MRv2 copies ``SamplingParams.all_stop_token_ids`` into GPU-resident
+    ``LogitBiasState`` when a request is registered. Narrow codec heads cannot
+    safely carry the text tokenizer EOS in that state. The engine-facing EOS
+    and explicit ``stop_token_ids`` fields remain unchanged; only the set used
+    by the sampler's min-token mask is normalized.
+    """
+    if sampling_params.min_tokens <= 0:
+        return
+    stop_token_ids = sampling_params.all_stop_token_ids
+    unreachable = {token_id for token_id in stop_token_ids if token_id < 0 or token_id >= logits_vocab}
+    if not unreachable:
+        return
+    stop_token_ids.difference_update(unreachable)
+    logger.warning_once(
+        "min_tokens: dropped stop token ids %s that exceed the logits vocabulary (%d); "
+        "the model head cannot emit them.",
+        str(sorted(unreachable)),
+        logits_vocab,
+    )
+
+
+def build_model_sampler_extra_args(input_batch: Any, requests: Any) -> list[dict | None]:
+    """Return per-request ``SamplingParams.extra_args`` in batch-row order."""
+    request_states = requests or {}
+    per_req_extra_args: list[dict | None] = []
+    for req_id in getattr(input_batch, "req_ids", []):
+        state = request_states.get(req_id)
+        params = getattr(state, "sampling_params", None)
+        per_req_extra_args.append(getattr(params, "extra_args", None))
+    return per_req_extra_args
+
+
+def call_model_sampler(
+    model: Any,
+    model_sample: Any,
+    logits: torch.Tensor,
+    sampling_metadata: Any,
+    *,
+    input_batch: Any,
+    requests: Any,
+) -> Any:
+    """Call an opted-in model sampler with per-request extra arguments.
+
+    The opt-in keeps the existing two-argument sampler contract unchanged for
+    every other model while allowing custom samplers to make row-local choices.
+    """
+    if not getattr(model, "model_sampler_wants_extra_args", False):
+        return model_sample(logits, sampling_metadata)
+    return model_sample(
+        logits,
+        sampling_metadata,
+        per_req_extra_args=build_model_sampler_extra_args(input_batch, requests),
+    )
 
 
 def clamp_prompt_ids_to_penalty_padding(prompt_token_ids: torch.Tensor, logits_vocab: int) -> torch.Tensor:

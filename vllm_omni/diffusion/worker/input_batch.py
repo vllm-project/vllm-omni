@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Diffusion input-batch structures following the MRV2-style vLLM layout.
 
 Request states remain the only persistent source of truth. Static tensors are
@@ -67,19 +67,26 @@ def _select_states(
         raise ValueError("Cannot build InputBatch from empty states.")
 
     if idx_mapping is None:
+        # The identity mapping is known on the host; build the device copy as
+        # a launch and the host copy from NumPy rather than reading the device
+        # tensor back. This runs on every step of every stepwise request, and
+        # a device-to-host read here would stall the host until the queued
+        # denoise work drained, so it must not be a synchronising operation.
         device = states[0].latents.device if states[0].latents is not None else None
         idx_mapping = torch.arange(len(states), dtype=torch.int32, device=device)
+        idx_mapping_np = np.arange(len(states), dtype=np.int32)
     else:
         if idx_mapping.ndim != 1:
             raise ValueError("idx_mapping must be a 1D tensor.")
         idx_mapping = idx_mapping.to(dtype=torch.int32)
+        idx_mapping_np = idx_mapping.detach().cpu().numpy()
 
     selected_states: list[StepRequestState] = []
-    for batch_idx, state_idx in enumerate(idx_mapping.tolist()):
+    for batch_idx, state_idx in enumerate(idx_mapping_np.tolist()):
         if state_idx < 0 or state_idx >= len(states):
             raise ValueError(f"idx_mapping[{batch_idx}]={state_idx} is out of range for states.")
         selected_states.append(states[state_idx])
-    return selected_states, idx_mapping, idx_mapping.detach().cpu().numpy()
+    return selected_states, idx_mapping, idx_mapping_np
 
 
 def _prepare_request_ids(states: Sequence[StepRequestState]) -> list[str]:

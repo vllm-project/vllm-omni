@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 
 from vllm_omni.diffusion import io_support
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
@@ -14,6 +15,22 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.mark.parametrize("model_class_name", ["DreamZeroPipeline", "LingBotWorldCausalDMDPipeline"])
+def test_observation_conditioned_startup_skips_generic_warmup(model_class_name: str) -> None:
+    """Observation-conditioned pipelines must not receive generic text requests."""
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig.__new__(OmniDiffusionConfig)
+    engine.od_config.model_class_name = model_class_name
+    engine.od_config.diffusion_load_format = "default"
+    engine.add_req_and_wait_for_response = Mock(side_effect=AssertionError("generic text warmup submitted"))
+    engine.close = Mock()
+
+    engine.run_startup_warmup()
+
+    engine.add_req_and_wait_for_response.assert_not_called()
+    engine.close.assert_not_called()
 
 
 @pytest.mark.parametrize("step_execution", [False, True])
@@ -203,6 +220,7 @@ def test_paged_kv_profile_requests_match_per_rank_batch(
         width=1024,
         guidance_scale=5.0,
         num_image_inputs=3,
+        num_frames=1,
     )
     engine._prepare_request_for_admission.assert_called_once_with(request)
 

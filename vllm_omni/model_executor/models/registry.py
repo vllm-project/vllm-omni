@@ -9,6 +9,8 @@ from vllm.model_executor.models.registry import (
 )
 
 _OMNI_MODELS = {
+    "BreezeForConditionalGeneration": ("breeze_tts_2", "modeling_breeze", "BreezeForConditionalGeneration"),
+    "BreezeCode2Wav": ("breeze_tts_2", "code2wav", "BreezeCode2Wav"),
     "Qwen2_5OmniForConditionalGeneration": (
         "qwen2_5_omni",
         "qwen2_5_omni",
@@ -87,6 +89,11 @@ _OMNI_MODELS = {
         "cosyvoice3",
         "CosyVoice3Model",
     ),
+    "AuKForConditionalGeneration": (
+        "auk",
+        "auk",
+        "AuKForConditionalGeneration",
+    ),
     "NemotronDenseForCausalLM": (
         "audex",
         "audex_thinker",
@@ -136,11 +143,6 @@ _OMNI_MODELS = {
         "mammoth_moda2",
         "mammoth_moda2",
         "MammothModa2Qwen3ForCausalLM",
-    ),
-    "MammothModa2DiTPipeline": (
-        "mammoth_moda2",
-        "pipeline_mammothmoda2_dit",
-        "MammothModa2DiTPipeline",
     ),
     "MammothModa2ForConditionalGeneration": (
         "mammoth_moda2",
@@ -321,12 +323,6 @@ _OMNI_MODELS = {
         "voxcpm2_talker",
         "VoxCPM2TalkerForConditionalGeneration",
     ),
-    ## dots.tts
-    "DotsTTSForConditionalGeneration": (
-        "dots_tts",
-        "dots_tts_talker",
-        "DotsTTSForConditionalGeneration",
-    ),
     ## Voxtral TTS
     "VoxtralTTSForConditionalGeneration": (
         "voxtral_tts",
@@ -395,11 +391,6 @@ _OMNI_MODELS = {
         "moss_tts",
         "modeling_moss_tts_codec",
         "MossTTSCodecDecoder",
-    ),
-    "DyninOmniForConditionalGeneration": (
-        "dynin_omni",
-        "dynin_omni",
-        "DyninOmniForConditionalGeneration",
     ),
     ## IndexTTS2
     "IndexTTS2TalkerForConditionalGeneration": (
@@ -471,10 +462,10 @@ _OMNI_MODELS = {
         "qwen3_vl",
         "AuraQwen3VLForConditionalGeneration",
     ),
-    "MiniMaxH3TextEncoder": (
+    "MiniMaxH3Encoder": (
         "minimax_h3",
-        "text_encoder",
-        "MiniMaxH3TextEncoder",
+        "encoder",
+        "MiniMaxH3Encoder",
     ),
     ## MiniMax-Music3 (text-to-music; AR talker -> flow-matching acoustic decoder)
     "MiniMaxMusic3TalkerForConditionalGeneration": (

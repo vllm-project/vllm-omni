@@ -1,0 +1,28 @@
+# Opt-in CUDA Model Runner V2 profile. The base profile retains V1.
+base_config: qwen3_tts_high_concurrency.yaml
+model_runner: v2
+
+platforms:
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  rocm:
+    model_runner: v1
+  musa:
+    model_runner: v1
+
+connectors:
+  connector_of_shared_memory:
+    extra:
+      # Keep unqualified prefix-graph optimizations disabled in this profile.
+      code_predictor_prefix_graphs: false
+      ref_audio_artifact_cache_max_entries: 1024
+      # Opt-in B2 codec graphs. Validate quality for the deployment workload.
+      decode_batch_max_size: 2
+      decode_cudagraph_batch_sizes: [1, 2]
+
+stages:
+  - stage_id: 1
+    # Enable the decoder's inner graphs; the generation runner stays eager.
+    enforce_eager: false

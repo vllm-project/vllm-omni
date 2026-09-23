@@ -8,6 +8,7 @@ import struct
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -564,6 +565,13 @@ class OmniKVTransferManager:
                             # the wrong process. Explicit sender_* YAML values
                             # are still preserved for standalone connector use.
 
+                    if c_type == "NixlConnector" and c_extra.get("role") == "receiver":
+                        # This manager receives on the shared incoming edge;
+                        # its YAML zmq_port belongs to the producer. NIXL treats
+                        # an explicit zmq_port as a local listener, even for a
+                        # receiver. Keep only the request-scoped sender_* endpoint.
+                        c_extra.pop("zmq_port", None)
+
                     logger.info(
                         "Initializing OmniConnector type=%s role=%s",
                         c_type,
@@ -922,7 +930,9 @@ class OmniKVTransferManager:
         The base host/port are also stored so that the receive path can
         construct per-rank metadata for heterogeneous TP scenarios.
         """
-        if not self.config.need_recv_cache:
+        # A stage can sit on the receiving end of a payload-only edge, where the
+        # sender endpoint still has to be applied even though no KV is expected.
+        if not self.config.need_recv_cache and (self.config.connector_config or {}).get("role") != "receiver":
             return
 
         actual_info = self._resolve_sender_info(sender_info, sender_stage_id=sender_stage_id)
@@ -1336,6 +1346,16 @@ class OmniKVTransferManager:
         except Exception:
             logger.exception("KV load failed for %s; falling back to sync receive", request_id)
             return None, 0
+
+    def wait_prefetch(self, timeout: float | None = None) -> bool:
+        """Block until no background prefetch is running; payloads stay consumable.
+
+        Returns False if a prefetch is still in flight when ``timeout`` expires.
+        """
+        futures = list(self._prefetch_futures.values())
+        if not futures:
+            return True
+        return not wait_futures(futures, timeout=timeout).not_done
 
     def _discard_future(self, request_id: str) -> None:
         """Cancel an unstarted prefetch or attach a callback to drop a running one."""

@@ -33,6 +33,11 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
+    resolve_wan_preencode_batch_frames,
+    resolve_wan_preencode_mp4,
+    resolve_wan_video_codec_options,
+)
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     load_transformer_config,
     load_wan_weights_with_optional_gate,
@@ -44,6 +49,7 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
 from vllm_omni.diffusion.offloader.config import DIT_COMPONENT, selected_offload_components
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.chunked_video import ChunkedVideoMP4Session
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
@@ -62,6 +68,10 @@ _S2V_DEFAULT_NEG_PROMPT = (
 # ---------------------------------------------------------------------------
 
 _AUDIO_VIDEO_RATE = 30
+
+# S2V generates at a fixed rate; the worker-side encoder and the post-process
+# payload must report the same one.
+S2V_OUTPUT_FPS = 16
 
 
 def _s2v_audio_condition_key(audio: str | np.ndarray | None) -> tuple[Any, ...]:
@@ -280,6 +290,10 @@ def get_wan22_s2v_post_process_func(
         if output_type == "latent":
             return video
 
+        if isinstance(video, list) and all(isinstance(item, (bytes, bytearray, memoryview)) for item in video):
+            # The worker already muxed the audio into these bytes.
+            return {"video": [bytes(item) for item in video], "audio": None, "fps": S2V_OUTPUT_FPS}
+
         processed_video = video_processor.postprocess_video(video, output_type=output_type)
 
         if audio_waveform is not None:
@@ -287,7 +301,7 @@ def get_wan22_s2v_post_process_func(
                 "video": processed_video,
                 "audio": audio_waveform,
                 "audio_sample_rate": audio_sr,
-                "fps": 16,
+                "fps": S2V_OUTPUT_FPS,
             }
         return processed_video
 
@@ -545,10 +559,10 @@ class Wan22S2VPipeline(
             self._init_original_format(model_path, dtype)
 
         # -- Scheduler --
-        flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 3.0  # S2V default
+        self._flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 3.0  # S2V default
         self.scheduler = FlowUniPCMultistepScheduler(
             num_train_timesteps=1000,
-            shift=flow_shift,
+            shift=1.0,
             prediction_type="flow_prediction",
         )
 
@@ -1177,6 +1191,13 @@ class Wan22S2VPipeline(
         )
         num_steps = common.num_inference_steps or num_inference_steps
         num_outputs_per_prompt = common.num_outputs_per_prompt or 1
+        # The request's output_type is what serving honours downstream; the keyword
+        # argument only carries a default for direct callers. Reading it here is what
+        # lets pre-encoding reject pil, pt, and latent instead of returning MP4 bytes
+        # to a caller that asked for frames.
+        output_type = common.output_type or output_type or "np"
+        preencode_mp4 = resolve_wan_preencode_mp4(common, output_type=output_type)
+        preencode_batch_frames = resolve_wan_preencode_batch_frames(common, default=1) if preencode_mp4 else 1
 
         if common.guidance_scale_provided:
             guidance_scale = common.guidance_scale
@@ -1315,170 +1336,207 @@ class Wan22S2VPipeline(
 
         # ---- 6. Multi-clip autoregressive denoising ----
         clips: list[torch.Tensor] = []
+        # Encode each finished clip while the next one denoises, instead of
+        # concatenating the whole video first.
+        mp4_session = (
+            ChunkedVideoMP4Session(
+                value_range=self.vae.chunk_value_range,
+                audio_waveforms=[raw_audio_waveforms[index // num_outputs_per_prompt] for index in range(batch_size)],
+                audio_sample_rate=raw_audio_sr,
+                fps=S2V_OUTPUT_FPS,
+                batch_frames=preencode_batch_frames,
+                video_codec_options=resolve_wan_video_codec_options(common),
+            )
+            if preencode_mp4
+            else None
+        )
         # Keep a pixel-space buffer of the trailing motion_frames for the
         # autoregressive connection between clips.
         videos_last_frames = torch.zeros([batch_size, 3, motion_frames, height, width], dtype=dtype, device=device)
 
-        for r in range(num_repeat):
-            clip_generators = _make_clip_generators(seeds, generators, r, device)
-            # -- Noise --
-            if r == 0 and request_latents is not None:
-                latents = request_latents.to(device=device, dtype=dtype)
-            else:
-                latents = torch.stack(
-                    [
-                        self.prepare_latents(
-                            infer_frames=infer_frames,
-                            height=height,
-                            width=width,
-                            motion_frames=motion_frames,
-                            lat_motion_frames=lat_motion_frames,
-                            dtype=dtype,
-                            device=device,
-                            generator=clip_generator,
-                        )
-                        for clip_generator in clip_generators
-                    ]
+        try:
+            for r in range(num_repeat):
+                clip_generators = _make_clip_generators(seeds, generators, r, device)
+                # -- Noise --
+                if r == 0 and request_latents is not None:
+                    latents = request_latents.to(device=device, dtype=dtype)
+                else:
+                    latents = torch.stack(
+                        [
+                            self.prepare_latents(
+                                infer_frames=infer_frames,
+                                height=height,
+                                width=width,
+                                motion_frames=motion_frames,
+                                lat_motion_frames=lat_motion_frames,
+                                dtype=dtype,
+                                device=device,
+                                generator=clip_generator,
+                            )
+                            for clip_generator in clip_generators
+                        ]
+                    )
+
+                # -- Scheduler --
+                self.scheduler.set_timesteps(num_steps, device=device, shift=self._flow_shift)
+                timesteps = self.scheduler.timesteps
+                self._num_timesteps = len(timesteps)
+
+                # -- Slice audio for this clip --
+                left_idx = r * infer_frames
+                right_idx = left_idx + infer_frames
+                audio_input = audio_emb[..., left_idx:right_idx]
+
+                # -- Pose condition for this clip --
+                # Default: zero condition (no pose driving)
+                # Shape: [B, C=16, T, H, W]
+                lat_h = height // self.vae_scale_factor_spatial
+                lat_w = width // self.vae_scale_factor_spatial
+                lat_target_frames = (infer_frames + 3 + motion_frames) // 4 - lat_motion_frames
+                cond_latents = torch.zeros(
+                    [batch_size, 16, lat_target_frames, lat_h, lat_w], dtype=dtype, device=device
                 )
 
-            # -- Scheduler --
-            self.scheduler.set_timesteps(num_steps, device=device)
-            timesteps = self.scheduler.timesteps
-            self._num_timesteps = len(timesteps)
+                # -- Clone motion latents for this clip --
+                input_motion_latents = motion_latents.clone()
 
-            # -- Slice audio for this clip --
-            left_idx = r * infer_frames
-            right_idx = left_idx + infer_frames
-            audio_input = audio_emb[..., left_idx:right_idx]
+                # Max sequence length for the transformer
+                max_seq_len = int(np.prod([lat_target_frames, lat_h, lat_w]) // 4)
 
-            # -- Pose condition for this clip --
-            # Default: zero condition (no pose driving)
-            # Shape: [B, C=16, T, H, W]
-            lat_h = height // self.vae_scale_factor_spatial
-            lat_w = width // self.vae_scale_factor_spatial
-            lat_target_frames = (infer_frames + 3 + motion_frames) // 4 - lat_motion_frames
-            cond_latents = torch.zeros([batch_size, 16, lat_target_frames, lat_h, lat_w], dtype=dtype, device=device)
-
-            # -- Clone motion latents for this clip --
-            input_motion_latents = motion_latents.clone()
-
-            # Max sequence length for the transformer
-            max_seq_len = int(np.prod([lat_target_frames, lat_h, lat_w]) // 4)
-
-            # -- Precompute audio embeddings once per clip --
-            mf = [motion_frames, lat_motion_frames]
-            # When CPU offload is active the transformer lives on CPU until
-            # its __call__ hook fires.  encode_audio() bypasses __call__,
-            # so move the audio sub-module to GPU explicitly.
-            _audio_enc = getattr(self.transformer, "casual_audio_encoder", None)
-            _audio_on_cpu = _audio_enc is not None and next(_audio_enc.parameters()).device.type == "cpu"
-            if _audio_on_cpu:
-                _audio_enc.to(device)
-            param_dtype = next(self.transformer.parameters()).dtype
-            with torch.amp.autocast(device.type, dtype=param_dtype):
-                positive_audio_emb = self.transformer.encode_audio(audio_input, mf)
-            do_true_cfg = self.do_classifier_free_guidance and negative_prompt_embeds is not None
-            if do_true_cfg:
+                # -- Precompute audio embeddings once per clip --
+                mf = [motion_frames, lat_motion_frames]
+                # When CPU offload is active the transformer lives on CPU until
+                # its __call__ hook fires.  encode_audio() bypasses __call__,
+                # so move the audio sub-module to GPU explicitly.
+                _audio_enc = getattr(self.transformer, "casual_audio_encoder", None)
+                _audio_on_cpu = _audio_enc is not None and next(_audio_enc.parameters()).device.type == "cpu"
+                if _audio_on_cpu:
+                    _audio_enc.to(device)
+                param_dtype = next(self.transformer.parameters()).dtype
                 with torch.amp.autocast(device.type, dtype=param_dtype):
-                    negative_audio_emb = self.transformer.encode_audio(0.0 * audio_input, mf)
-            else:
-                negative_audio_emb = None
-            if _audio_on_cpu:
-                _audio_enc.to("cpu")
+                    positive_audio_emb = self.transformer.encode_audio(audio_input, mf)
+                do_true_cfg = self.do_classifier_free_guidance and negative_prompt_embeds is not None
+                if do_true_cfg:
+                    with torch.amp.autocast(device.type, dtype=param_dtype):
+                        negative_audio_emb = self.transformer.encode_audio(0.0 * audio_input, mf)
+                else:
+                    negative_audio_emb = None
+                if _audio_on_cpu:
+                    _audio_enc.to("cpu")
 
-            # -- Denoising loop --
-            latents = self.diffuse(
-                latents=latents,
-                timesteps=timesteps,
-                prompt_embeds=prompt_embeds,
-                negative_prompt_embeds=negative_prompt_embeds,
-                guidance_scale=guidance_scale,
-                clip_generator=clip_generators,
-                dtype=dtype,
-                device=device,
-                max_seq_len=max_seq_len,
-                cond_latents=cond_latents,
-                input_motion_latents=input_motion_latents,
-                ref_latents=ref_latents,
-                motion_frames=mf,
-                drop_first_motion=drop_first_motion and r == 0,
-                positive_audio_emb=positive_audio_emb,
-                negative_audio_emb=negative_audio_emb,
-            )
-
-            # ---- Decode this clip ----
-            if self._should_release_dit_before_decode():
-                self.transformer.to("cpu")
-                current_omni_platform.empty_cache()
-
-            if not (drop_first_motion and r == 0):
-                decode_latents = torch.cat([motion_latents, latents], dim=2)
-            else:
-                decode_latents = torch.cat([ref_latents, latents], dim=2)
-
-            decode_latents = self._denormalize_latents(decode_latents)
-            decode_latents = decode_latents.to(self.vae.dtype)
-            clip_video = self.vae.decode(decode_latents, return_dict=False)[0]  # [1, C, T, H, W]
-
-            # Handle VAE patch parallel: only rank 0 gets result, broadcast to all ranks
-            # This is needed for S2V's autoregressive loop where all ranks need the decoded frames
-            if clip_video.numel() == 0:
-                # Non-rank0 received empty tensor from patch parallel decode
-                # Use the same broadcast mechanism as the VAE patch parallel code
-                import torch.distributed as dist
-
-                total_frames = decode_latents.shape[2]
-
-                # Create buffer for broadcast
-                clip_video = torch.empty(
-                    (batch_size, 3, total_frames, height, width),
-                    device=decode_latents.device,
-                    dtype=decode_latents.dtype,
+                # -- Denoising loop --
+                latents = self.diffuse(
+                    latents=latents,
+                    timesteps=timesteps,
+                    prompt_embeds=prompt_embeds,
+                    negative_prompt_embeds=negative_prompt_embeds,
+                    guidance_scale=guidance_scale,
+                    clip_generator=clip_generators,
+                    dtype=dtype,
+                    device=device,
+                    max_seq_len=max_seq_len,
+                    cond_latents=cond_latents,
+                    input_motion_latents=input_motion_latents,
+                    ref_latents=ref_latents,
+                    motion_frames=mf,
+                    drop_first_motion=drop_first_motion and r == 0,
+                    positive_audio_emb=positive_audio_emb,
+                    negative_audio_emb=negative_audio_emb,
                 )
 
-                # Get the VAE's patch parallel group (same one used in decode)
-                vae_pp_group = getattr(self.vae, "_vae_pp_group", None)
-                if vae_pp_group is not None:
-                    # Broadcast using the same group as VAE patch parallel
-                    dist.broadcast(clip_video, src=0, group=vae_pp_group)
+                # ---- Decode this clip ----
+                if self._should_release_dit_before_decode():
+                    self.transformer.to("cpu")
+                    current_omni_platform.empty_cache()
 
-            # Trim to the infer_frames of interest
-            clip_video = clip_video[:, :, -infer_frames:]
-            if drop_first_motion and r == 0:
-                # Drop the first 3 frames (artifact from ref_latents prepend)
-                clip_video = clip_video[:, :, 3:]
+                if not (drop_first_motion and r == 0):
+                    decode_latents = torch.cat([motion_latents, latents], dim=2)
+                else:
+                    decode_latents = torch.cat([ref_latents, latents], dim=2)
 
-            # ---- Update motion for next clip (autoregressive) ----
-            overlap_frames_num = min(motion_frames, clip_video.shape[2])
-            videos_last_frames = torch.cat(
-                [videos_last_frames[:, :, overlap_frames_num:], clip_video[:, :, -overlap_frames_num:]],
-                dim=2,
+                decode_latents = self._denormalize_latents(decode_latents)
+                decode_latents = decode_latents.to(self.vae.dtype)
+                clip_video = self.vae.decode(decode_latents, return_dict=False)[0]  # [1, C, T, H, W]
+                # Under VAE patch parallelism only the output-owning rank decodes a
+                # real clip; peers get an empty placeholder filled by the broadcast.
+                owns_output = clip_video.numel() > 0
+
+                # Handle VAE patch parallel: only rank 0 gets result, broadcast to all ranks
+                # This is needed for S2V's autoregressive loop where all ranks need the decoded frames
+                if clip_video.numel() == 0:
+                    # Non-rank0 received empty tensor from patch parallel decode
+                    # Use the same broadcast mechanism as the VAE patch parallel code
+                    import torch.distributed as dist
+
+                    total_frames = decode_latents.shape[2]
+
+                    # Create buffer for broadcast
+                    clip_video = torch.empty(
+                        (batch_size, 3, total_frames, height, width),
+                        device=decode_latents.device,
+                        dtype=decode_latents.dtype,
+                    )
+
+                    # Get the VAE's patch parallel group (same one used in decode)
+                    vae_pp_group = getattr(self.vae, "_vae_pp_group", None)
+                    if vae_pp_group is not None:
+                        # Broadcast using the same group as VAE patch parallel
+                        dist.broadcast(clip_video, src=0, group=vae_pp_group)
+
+                # Trim to the infer_frames of interest
+                clip_video = clip_video[:, :, -infer_frames:]
+                if drop_first_motion and r == 0:
+                    # Drop the first 3 frames (artifact from ref_latents prepend)
+                    clip_video = clip_video[:, :, 3:]
+
+                # ---- Update motion for next clip (autoregressive) ----
+                overlap_frames_num = min(motion_frames, clip_video.shape[2])
+                videos_last_frames = torch.cat(
+                    [videos_last_frames[:, :, overlap_frames_num:], clip_video[:, :, -overlap_frames_num:]],
+                    dim=2,
+                )
+                videos_last_frames = videos_last_frames.to(dtype=dtype, device=device)
+                # Only prepare motion latents if there's another clip coming
+                if r < num_repeat - 1:
+                    motion_latents = self.prepare_motion_latents(videos_last_frames, device=device).to(dtype=dtype)
+
+                if mp4_session is not None:
+                    # Every rank needs the frames for the motion loop above, but the
+                    # executor keeps only the owner's response, so a peer skips the
+                    # encode and finishes with no containers, like T2V's non-owners.
+                    if owns_output:
+                        mp4_session.push(clip_video)
+                else:
+                    clips.append(clip_video.cpu())
+
+                # Free VRAM between clips
+                if current_omni_platform.is_available():
+                    current_omni_platform.empty_cache()
+
+            # ---- Assemble the output ----
+            if mp4_session is not None:
+                output = mp4_session.finish()  # one progressive MP4 per batch entry
+            else:
+                output = torch.cat(clips, dim=2)  # [B, C, T_total, H, W]
+
+            outputs = split_diffusion_output_by_request(
+                DiffusionOutput(
+                    output=output,
+                    stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+                ),
+                req,
+                num_outputs_per_prompt=num_outputs_per_prompt,
             )
-            videos_last_frames = videos_last_frames.to(dtype=dtype, device=device)
-            # Only prepare motion latents if there's another clip coming
-            if r < num_repeat - 1:
-                motion_latents = self.prepare_motion_latents(videos_last_frames, device=device).to(dtype=dtype)
-
-            clips.append(clip_video.cpu())
-
-            # Free VRAM between clips
-            if current_omni_platform.is_available():
-                current_omni_platform.empty_cache()
-
-        # ---- Concatenate all clips ----
-        output = torch.cat(clips, dim=2)  # [B, C, T_total, H, W]
-
-        outputs = split_diffusion_output_by_request(
-            DiffusionOutput(
-                output=output,
-                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
-            ),
-            req,
-            num_outputs_per_prompt=num_outputs_per_prompt,
-        )
-        for request_output, raw_audio_waveform in zip(outputs, raw_audio_waveforms):
-            request_output.output = (request_output.output, raw_audio_waveform, raw_audio_sr)
-        return outputs
+            if mp4_session is not None:
+                # The waveform is already muxed into each container.
+                return outputs
+            for request_output, raw_audio_waveform in zip(outputs, raw_audio_waveforms):
+                request_output.output = (request_output.output, raw_audio_waveform, raw_audio_sr)
+            return outputs
+        except BaseException:
+            if mp4_session is not None:
+                mp4_session.abort()
+            raise
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return load_wan_weights_with_optional_gate(self, weights)

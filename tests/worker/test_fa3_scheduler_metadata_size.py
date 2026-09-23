@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Characterization of ``OmniGPUModelRunner.initialize_metadata_builders``.
 
 Upstream ``FlashAttentionMetadataBuilder`` pre-allocates ``scheduler_metadata``
@@ -19,13 +19,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-# The class ``super().initialize_metadata_builders`` dispatches to.
-_UPSTREAM_RUNNER = OmniGPUModelRunner.__mro__[1]
 
 
 def _builder(*, prealloc: int | None, max_num_splits: int) -> SimpleNamespace:
@@ -36,10 +34,14 @@ def _builder(*, prealloc: int | None, max_num_splits: int) -> SimpleNamespace:
 def _make_runner(monkeypatch, *, max_num_seqs: int, builders: list) -> OmniGPUModelRunner:
     # Stub the upstream initialize_metadata_builders; our fake runner already
     # carries the attn_groups the Omni override iterates over.
-    monkeypatch.setattr(_UPSTREAM_RUNNER, "initialize_metadata_builders", lambda self, *a, **k: None)
+    monkeypatch.setattr(GPUModelRunner, "initialize_metadata_builders", lambda self, *a, **k: None)
     runner = object.__new__(OmniGPUModelRunner)
     runner.scheduler_config = SimpleNamespace(max_num_seqs=max_num_seqs)
     runner.cache_config = SimpleNamespace(enable_prefix_caching=False)  # skip omni_prefix_cache branch
+    runner.vllm_config = SimpleNamespace(kv_transfer_config=None)
+    runner.model_config = SimpleNamespace()
+    runner.is_pooling_model = False
+    runner.speculative_config = None
     runner.attn_groups = [[SimpleNamespace(metadata_builders=builders)]]
     return runner
 

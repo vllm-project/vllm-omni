@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for OmniRequestState multimodal DELTA drain and consolidation guard."""
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -37,6 +38,21 @@ _DETOK = MagicMock(
     num_output_tokens=MagicMock(return_value=1),
 )
 _LOGPROBS = MagicMock(logprobs=None, cumulative_logprob=None, prompt_logprobs=None)
+
+
+@dataclass
+class _StreamingUpdate:
+    final: bool
+    prompt: object | None
+    prompt_token_ids: list[int]
+    arrival_time: float
+
+
+@dataclass
+class _FinishedRequestMetric:
+    request_id: str
+    mean_time_per_output_token: float
+
 
 _DEFAULT_STATE_KWARGS = dict(
     request_id="r",
@@ -128,6 +144,130 @@ def test_native_text_metrics_include_segment_generation_token_count(monkeypatch)
     )
 
     assert processor.pop_native_text_metrics("r")["num_generation_tokens"] == 27
+
+
+def test_native_text_metrics_exclude_cross_segment_gap(monkeypatch):
+    monkeypatch.setattr(VLLMOutputProcessor, "_update_stats_from_output", lambda *args, **kwargs: None)
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor._native_text_metrics_by_request = {}
+    processor.lora_states = {}
+    state = _make_state(RequestOutputKind.DELTA)
+    iteration_stats = MagicMock()
+
+    def update_segment(_output, timestamp, _was_prefilling, native_stats, *_args):
+        native_stats.num_generation_tokens = 2 if timestamp == 10.03 else 1
+        native_stats.first_token_ts = 10.02 if timestamp == 10.03 else timestamp
+        native_stats.last_token_ts = timestamp
+        native_stats.first_token_latency = 0.01
+
+    iteration_stats.update_from_output.side_effect = update_segment
+    processor._update_stats_from_output(
+        state,
+        MagicMock(),
+        10.0,
+        iteration_stats,
+    )
+    first_segment = processor.pop_native_text_metrics("r")
+    assert first_segment["vllm_tpot_ms"] == 0.0
+    assert first_segment["vllm_itls_ms"] == []
+
+    state.apply_streaming_update(
+        _StreamingUpdate(
+            final=False,
+            prompt=None,
+            prompt_token_ids=[],
+            arrival_time=10.01,
+        )
+    )
+    state.is_prefilling = True
+    processor._update_stats_from_output(
+        state,
+        MagicMock(),
+        10.02,
+        iteration_stats,
+    )
+    state.is_prefilling = False
+    processor._update_stats_from_output(
+        state,
+        MagicMock(),
+        10.03,
+        iteration_stats,
+    )
+    second_segment = processor.pop_native_text_metrics("r")
+
+    assert second_segment["num_generation_tokens"] == 2
+    assert second_segment["vllm_itls_ms"] == pytest.approx([10.0])
+    assert second_segment["vllm_tpot_ms"] == pytest.approx(10.0)
+
+
+def test_native_text_tpot_weights_multi_token_engine_output(monkeypatch):
+    monkeypatch.setattr(VLLMOutputProcessor, "_update_stats_from_output", lambda *args, **kwargs: None)
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor._native_text_metrics_by_request = {}
+    processor.lora_states = {}
+    state = _make_state(RequestOutputKind.DELTA)
+    iteration_stats = MagicMock()
+
+    def update_segment(_output, timestamp, _was_prefilling, native_stats, *_args):
+        native_stats.num_generation_tokens = 1 if timestamp == 10.0 else 4
+        native_stats.first_token_ts = 10.0
+        native_stats.last_token_ts = timestamp
+        native_stats.first_token_latency = 0.01
+
+    iteration_stats.update_from_output.side_effect = update_segment
+    state.is_prefilling = True
+    processor._update_stats_from_output(state, MagicMock(), 10.0, iteration_stats)
+    state.is_prefilling = False
+    processor._update_stats_from_output(state, MagicMock(), 10.03, iteration_stats)
+    record = processor.pop_native_text_metrics("r")
+
+    assert record["num_generation_tokens"] == 4
+    assert record["vllm_itls_ms"] == pytest.approx([30.0])
+    assert record["vllm_itl_ms"] == pytest.approx(30.0)
+    assert record["vllm_tpot_ms"] == pytest.approx(10.0)
+    assert "_tpot_elapsed_ms" not in record
+    assert "_tpot_intervals" not in record
+
+
+@pytest.mark.parametrize(
+    ("finished_tpot_s", "expected_tpot_ms"),
+    [(0.0, 19.0), (0.023, 23.0)],
+)
+def test_native_text_tpot_only_accepts_positive_finished_metric(
+    monkeypatch,
+    finished_tpot_s,
+    expected_tpot_ms,
+):
+    monkeypatch.setattr(VLLMOutputProcessor, "_update_stats_from_finished", lambda *args, **kwargs: None)
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor._native_text_metrics_by_request = {"r": {"vllm_tpot_ms": 19.0}}
+    state = _make_state(RequestOutputKind.DELTA)
+    iteration_stats = MagicMock()
+    iteration_stats.finished_requests = [
+        _FinishedRequestMetric(
+            request_id="r",
+            mean_time_per_output_token=finished_tpot_s,
+        )
+    ]
+
+    processor._update_stats_from_finished(
+        state,
+        FinishReason.STOP,
+        iteration_stats,
+    )
+
+    assert processor.pop_native_text_metrics("r")["vllm_tpot_ms"] == expected_tpot_ms
+
+
+def test_suppressed_native_tokens_use_authoritative_count_even_without_stats(monkeypatch):
+    monkeypatch.setattr(VLLMOutputProcessor, "_update_stats_from_output", lambda *args, **kwargs: None)
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor._native_text_metrics_by_request = {}
+    state = _make_state(RequestOutputKind.FINAL_ONLY)
+    processor._update_stats_from_output(
+        state, SimpleNamespace(new_token_ids=[2150], num_generation_tokens=2048), None, None
+    )
+    assert processor.pop_native_text_metrics("r")["num_generation_tokens"] == 2048
 
 
 def test_delta_drains_output_modality_per_step():
@@ -487,6 +627,7 @@ def test_no_detokenizer_process_outputs_returns_nonterminal_audio_chunk(monkeypa
         finish_reason=None,
         stop_reason=None,
         kv_transfer_params=None,
+        ec_transfer_params=None,
         routed_experts=None,
         num_cached_tokens=0,
     )
@@ -502,6 +643,7 @@ def _make_mm_only_output_processor(monkeypatch):
     processor = object.__new__(MultimodalOutputProcessor)
     processor.output_modality = OutputModality.AUDIO
     processor.request_states = {"r": _make_no_detok_state(RequestOutputKind.DELTA)}
+    processor.tracing_enabled = False
     monkeypatch.setattr(
         VLLMOutputProcessor,
         "process_outputs",
@@ -531,6 +673,7 @@ def _audio_engine_output(*, is_segment_finished: bool, is_last_chunk: bool):
         finish_reason=FinishReason.STOP,
         stop_reason=None,
         kv_transfer_params=None,
+        ec_transfer_params=None,
         routed_experts=None,
         num_cached_tokens=0,
         is_segment_finished=is_segment_finished,
@@ -759,3 +902,24 @@ def test_abort_snapshot_leaves_state_until_commit():
     assert "0_parent" not in processor.request_states
     assert "parent" not in processor.parent_requests
     assert "parent" not in processor.external_req_ids
+
+
+def test_cumulative_audio_terminal_output_supplies_full_aligner_waveform():
+    from vllm_omni.model_executor.stage_input_processors.forced_aligner import code2wav2aligner
+
+    state = _make_state(RequestOutputKind.CUMULATIVE)
+    for index, count in enumerate((800, 1200, 400)):
+        state.add_multimodal_tensor(torch.full((1, count), float(index)), mm_type=AUDIO)
+        output = state.make_request_output([index], None, FinishReason.STOP if index == 2 else None, None)
+        assert output is not None
+        if index < 2:
+            assert code2wav2aligner([output], {}) == []
+    prompt = {"additional_information": {"text": ["Hello world"], "language": ["English"]}}
+    aligned = code2wav2aligner([output], prompt)[0]
+    waveform, sr = aligned["multi_modal_data"]["audio"]
+    assert sr == 24000
+    assert waveform.shape == (2400,)
+    assert (waveform[:800] == 0).all()
+    assert (waveform[800:2000] == 1).all()
+    assert (waveform[2000:] == 2).all()
+    assert aligned["additional_information"]["aligner_audio_duration_ms"] == [100.0]

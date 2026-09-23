@@ -144,6 +144,14 @@ def test_npu_nightly_only_skips_all_l23() -> None:
     assert not decision.is_run("npu", "l3")
 
 
+def test_amd_nightly_only_skips_all_l23() -> None:
+    decision = _decision([".buildkite/amd/test-amd-nightly.yml"])
+    assert _is_yaml_gated(decision)
+    assert _all_l23_skipped(decision)
+    assert not decision.is_run("amd", "l2")
+    assert not decision.is_run("amd", "l3")
+
+
 def test_nightly_and_weekly_skips_all_l23() -> None:
     decision = _decision(
         [

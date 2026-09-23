@@ -9,7 +9,7 @@ Covers ``vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.llm2t
   - both inputs missing -> raises
   - structured model_intermediate_buffer carries the thinker ids and text
   - scheduler prompt tokens follow the selected TTS region or output tokens
-  - MiniCPM-o 4.5 TTS region detection on 151703 / 151704 tokens
+  - MiniCPM-o 4.5 TTS region detection on 151703 / 151704 / 151645 tokens
   - plain chat without TTS markers conditions on the generated assistant span
   - prompt arg is normalized to a list and ``multi_modal_data`` is gated by
     ``requires_multimodal_data``
@@ -260,13 +260,14 @@ class TestTtsRegionDetection:
         )
         return result[0]["model_intermediate_buffer"], hidden
 
-    def test_4_5_markers_detected(self) -> None:
+    @pytest.mark.parametrize("tts_end_id", [151704, 151645])
+    def test_4_5_markers_detected(self, tts_end_id: int) -> None:
         # prompt:        [10, 11]
-        # output:        [151703, 30, 31, 151704, 40]
-        # full sequence: [10, 11, 151703, 30, 31, 151704, 40]
+        # output:        [151703, 30, 31, end, 40]
+        # full sequence: [10, 11, 151703, 30, 31, end, 40]
         #                  0   1     2    3   4     5     6
-        # 4.5 BOS at idx 2 -> slice starts at 3; EOS at idx 5 -> slice ends at 5.
-        buffer, hidden = self._run([10, 11], [151703, 30, 31, 151704, 40])
+        # 4.5 BOS at idx 2 -> slice starts at 3; end at idx 5 -> slice ends at 5.
+        buffer, hidden = self._run([10, 11], [151703, 30, 31, tts_end_id, 40])
         assert buffer["ids"]["tts"] == [30, 31]
         assert torch.equal(torch.tensor(buffer["hidden_states"]["tts"]), hidden[3:5])
 

@@ -98,6 +98,32 @@ def test_mix_to_text_audio_001(omni_server, online_client) -> None:
 
 @pytest.mark.slow
 @pytest.mark.omni
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize("stream", [False, True])
+def test_audio_in_video_boundaries(omni_server, online_client, stream: bool) -> None:
+    """Interleaved video/audio input must not treat audio boundaries as image placeholders."""
+    # More than two seconds exercises multiple interleaved video/audio chunks.
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 128, embed_audio=True)['base64']}"
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        video_data_url=video_data_url,
+        content_text="Describe what you see and hear in this video in one sentence.",
+    )
+    responses = online_client.send_omni_request(
+        {
+            "model": omni_server.model,
+            "messages": messages,
+            "stream": stream,
+            "modalities": ["text"],
+            "use_audio_in_video": True,
+        }
+    )
+    assert responses[0].text_content
+
+
+@pytest.mark.slow
+@pytest.mark.omni
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_001(omni_server, online_client) -> None:
     """

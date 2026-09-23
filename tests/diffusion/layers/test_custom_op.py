@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for the CustomOp platform-dispatch base class."""
 
 import pytest
@@ -39,7 +39,7 @@ def test_forward_cuda_still_requires_an_implementation():
 
 def test_mot_rmsnorm_dispatches_on_xpu_without_an_override():
     """MoTRMSNorm relies on the inherited fallback (regression test)."""
-    from vllm_omni.diffusion.layers.mot.mot_layernorm import MoTRMSNorm
+    from vllm_omni.diffusion.models.bagel.mot.mot_layernorm import MoTRMSNorm
 
     assert "forward_xpu" not in MoTRMSNorm.__dict__
 

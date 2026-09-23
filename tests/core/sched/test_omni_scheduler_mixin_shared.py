@@ -1,9 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from collections import defaultdict
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
+from vllm.config import SchedulerConfig, VllmConfig
 from vllm.v1.engine import FinishReason
 
+from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.core.sched import omni_scheduler_mixin
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
@@ -86,8 +92,33 @@ def test_full_payload_coordinator_matches_legacy_gate(monkeypatch, stage_id, asy
     assert (scheduler.input_coordinator is not None) is enabled
 
 
+@pytest.mark.parametrize("async_chunk", [False, True])
+@pytest.mark.parametrize(("stage_id", "required"), [(0, False), (1, False), (1, True)])
+def test_native_data_plane_uses_the_selected_input_protocol(async_chunk, stage_id, required):
+    scheduler = _Scheduler()
+    model_config = object.__new__(OmniModelConfig)
+    model_config.stage_id = stage_id
+    model_config.async_chunk = async_chunk
+    model_config.requires_full_payload_input = required
+    model_config.supports_native_mrv2_data_plane = True
+    model_config.use_v2_model_runner = True
+    scheduler.vllm_config = object.__new__(VllmConfig)
+    scheduler.vllm_config.model_config = model_config
+    scheduler.vllm_config.scheduler_config = object.__new__(SchedulerConfig)
+    scheduler.vllm_config.scheduler_config.max_num_seqs = 1
+    scheduler._init_omni_io_scheduling_state()
+
+    assert scheduler._native_data_plane
+    if async_chunk or (stage_id > 0 and required):
+        assert scheduler.input_coordinator._async_chunk is async_chunk
+    else:
+        assert scheduler.input_coordinator is None
+    assert scheduler._async_chunk_transport_enabled() is async_chunk
+    assert scheduler.chunk_transfer_adapter is None
+
+
 def test_schedule_lifecycle_helpers_process_and_restore_both_input_paths():
-    calls = []
+    calls: list[tuple[Any, ...]] = []
     scheduler = _Scheduler()
     scheduler.waiting = ["waiting"]
     scheduler.running = ["running"]
@@ -115,7 +146,7 @@ def test_schedule_lifecycle_helpers_process_and_restore_both_input_paths():
         collect_failed_send_request_ids=_collect_failed_sends,
     )
     scheduler.input_coordinator = SimpleNamespace(
-        restore_queues=lambda waiting: calls.append(("restore-full", waiting))
+        restore_queues=lambda waiting, running: calls.append(("restore-full", waiting, running))
     )
 
     scheduler._process_pending_omni_inputs("ar")
@@ -130,7 +161,7 @@ def test_schedule_lifecycle_helpers_process_and_restore_both_input_paths():
         ("chunk-timeouts", omni_scheduler_mixin.DEFAULT_INPUT_WAIT_TIMEOUT_S),
         ("failed-sends",),
         ("restore-chunks", scheduler.waiting, scheduler.running, scheduler.requests),
-        ("restore-full", scheduler.waiting),
+        ("restore-full", scheduler.waiting, scheduler.running),
     ]
 
 

@@ -225,7 +225,7 @@ def _resolve_checkpoint_root(model: str, revision: str | None) -> str:
                 "MAGI-2 expects a local checkpoint directory or the official "
                 f"model ID {MAGI2_MODEL_ID!r}; got {model!r}."
             )
-        from vllm.transformers_utils.repo_utils import hf_api
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
         pinned_revision = revision or MAGI2_MODEL_REVISION
         logger.warning(
@@ -694,6 +694,24 @@ class Magi2Pipeline(
         """Expose TurboVAE through the shared distributed-VAE contract."""
 
         return self.video_decoder.module
+
+    def setup_compile(self) -> None:
+        """Compile the transformer regions; the attention and MoE kernels stay eager."""
+
+        granularity = self.od_config.diffusion_compile_granularity
+        if granularity != "regional":
+            logger.warning(
+                "MAGI-2 compiles the transformer regions itself; diffusion_compile_granularity=%r is ignored.",
+                granularity,
+            )
+
+        # The mHC connections chain bf16 ops that eager rounds after every op.
+        # Emulating those casts keeps the compiled rounding boundaries equal.
+        self.transformer.compile_regions(
+            fullgraph=True,
+            dynamic=self.od_config.diffusion_compile_dynamic,
+            options={"emulate_precision_casts": True},
+        )
 
     def load_weights(
         self,

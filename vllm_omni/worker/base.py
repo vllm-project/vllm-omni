@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Base worker class for vLLM-Omni with device-level GPU memory profiling."""
 
 from __future__ import annotations
@@ -58,6 +61,13 @@ class OmniGPUWorkerBase(GPUWorker):
                 worker_name=worker_name,
                 local_rank=self.local_rank,
             )
+        elif profiler_config and profiler_config.profiler == "cuda":
+            # OmniGPUWorkerBase replaces vLLM's torch profiler above; keep the
+            # native CUDA profiler wrapper available for Nsight Systems capture
+            # through the /start_profile and /stop_profile endpoints as well.
+            from vllm.profiler.wrapper import CudaProfilerWrapper
+
+            self.profiler = CudaProfilerWrapper(profiler_config)
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         """Override to set trace filename before starting the profiler.
@@ -308,3 +318,16 @@ class OmniGPUWorkerBase(GPUWorker):
                     pass
             tid = task.task_id if hasattr(task, "task_id") else "unknown"
             return OmniACK(task_id=tid, status="ERROR", error_msg=str(e))
+
+    def encoder_loaded(self) -> bool:
+        """Check if encoder weights are loaded in the model.
+
+        This method is exposed via collective_rpc to check encoder availability
+        for models that support voice cloning with reference audio.
+
+        Returns:
+            bool: True if encoder weights are available, False otherwise.
+        """
+        if hasattr(self.model_runner, "model") and hasattr(self.model_runner.model, "encoder_loaded"):
+            return self.model_runner.model.encoder_loaded()
+        return False

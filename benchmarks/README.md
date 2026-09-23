@@ -4,6 +4,11 @@ This directory contains benchmark suites for evaluating different model families
 
 ## Benchmark families
 
+### [Qwen2.5-Omni](qwen2_5_omni/README.md) — Embedding Wrapper Latency
+
+CPU-observed A/B timings for redundant text embedding removal, with real checkpoint
+embeddings, warmup, paired blocks, and embedding call-count validation.
+
 ### [TTS](tts/README.md) — Text-to-Speech
 
 Model-agnostic serving benchmarks for TTS models, including Qwen3-TTS and VoxCPM2.
@@ -35,6 +40,17 @@ LingBot-Video MoE transformer.
 
 - **Dense pipeline**: decoded-video MAE, MSE, PSNR, latency, and optional steady-state timings
 - **MoE transformer**: bitwise router, sparse-block, shared-expert, and full-transformer parity
+
+### [LingBot-World](lingbot_world/README.md) — Realtime Streaming Cadence
+
+Client-side benchmark for a `WS /v1/realtime/video` world-model session, where one
+request is a whole rollout and one AR block streams out as one video chunk. It
+measures a cadence rather than a throughput: there is exactly one session, and what
+matters is whether the next chunk arrives before the viewer finishes the last one.
+
+- **Layout**: `lingbot_world/benchmark_lingbot_world_realtime.py` (WS client), `lingbot_world/workload.py` (rollout and metric math), `lingbot_world/configs/` (single-GPU eager and Ulysses-4 compiled deploy configs)
+- **Workload**: built-in image-conditioned rollout with a generated camera script, or a JSON spec with per-chunk actions and mid-rollout prompt updates
+- **Key metrics**: TTFC (time to first chunk), steady-state chunk inter-arrival percentiles, VIDEO_RTF (wall seconds per video second; lower is better), chunk-deadline attainment, and simulated playback underruns
 
 ### [Distributed](distributed/omni_connectors/README.md) — RDMA Connector Testing
 

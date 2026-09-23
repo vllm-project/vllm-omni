@@ -39,7 +39,8 @@ from vllm_omni.distributed.omni_connectors.utils.serialization import (
 from vllm_omni.engine.async_omni_engine import StageRuntimeInfo
 from vllm_omni.engine.messages import ShutdownRequestMessage, StageSubmissionMessage
 from vllm_omni.engine.stage_init_utils import StageMetadata
-from vllm_omni.entrypoints.async_omni import AsyncEventResolver, AsyncOmni
+from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.async_omni_base import AsyncEventResolver
 from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput

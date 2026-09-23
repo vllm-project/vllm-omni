@@ -58,6 +58,7 @@ def _od_config(**overrides):
         gpu_memory_utilization=0.9,
         kv_cache_memory_bytes=None,
         max_num_seqs=1,
+        diffusion_kv_max_rows_per_request=1,
         max_num_batched_tokens=64,
         num_gpus=1,
     )

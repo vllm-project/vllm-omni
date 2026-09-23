@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """E2E tests for AsyncOmni Qwen-Image generation with trajectory_* fields.
 
@@ -21,6 +21,7 @@ import torch.distributed as dist
 from transformers import AutoTokenizer
 
 from tests.helpers.mark import hardware_test
+from vllm_omni.config.omni_config import VllmOmniDiffusionStageConfig
 from vllm_omni.diffusion.executor.uniproc_executor import UniProcDiffusionExecutor
 from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -136,6 +137,15 @@ async def _generate_once(
 
 def _assert_live_uniproc_worker(engine: AsyncOmni) -> None:
     """Default single-GPU path must use the in-process executor, not mp IPC."""
+    stage_configs = engine.engine.stage_configs
+    assert len(stage_configs) == 1
+    stage_config = stage_configs[0]
+    assert isinstance(stage_config, VllmOmniDiffusionStageConfig)
+    assert stage_config.model_config.model == MODEL
+    assert stage_config.model_config.enforce_eager is True
+    assert stage_config.scheduler_config.max_num_seqs == 1
+    assert stage_config.diffusion_config.custom_pipeline_args == {"pipeline_class": CUSTOM_PIPELINE_CLASS}
+    assert stage_config.diffusion_config.worker_extension_cls == WORKER_EXTENSION_CLASS
     clients = engine.engine.stage_clients
     assert len(clients) == 1
     client = clients[0]
