@@ -25,11 +25,7 @@ def uses_native_mrv2_data_plane(
     *,
     use_v2_model_runner: bool,
 ) -> bool:
-    return bool(
-        use_v2_model_runner
-        and getattr(model_config, "async_chunk", False)
-        and getattr(model_config, "supports_native_mrv2_data_plane", False)
-    )
+    return bool(use_v2_model_runner and getattr(model_config, "supports_native_mrv2_data_plane", False))
 
 
 def uses_full_payload_input_coordinator(model_config: Any) -> bool:

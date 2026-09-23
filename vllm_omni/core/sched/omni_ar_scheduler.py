@@ -217,16 +217,20 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         finished_status: RequestStatus,
     ) -> list[Request]:
         """Finish requests and discard any incomplete KV-wait timing."""
-        cleanup_ids: Iterable[str]
+        # Annotated explicitly so every branch keeps the same static type
+        # (typing-only; the runtime values are unchanged).
+        cleanup_ids: tuple[str, ...]
+        finish_request_ids: str | Iterable[str] | None
         if isinstance(request_ids, str):
             cleanup_ids = (request_ids,)
-            finish_request_ids: str | Iterable[str] | None = request_ids
+            finish_request_ids = request_ids
         elif request_ids is None:
             cleanup_ids = ()
             finish_request_ids = None
         else:
-            finish_request_ids = list(request_ids) if isinstance(request_ids, Iterator) else request_ids
-            cleanup_ids = tuple(finish_request_ids)
+            ids = list(request_ids) if isinstance(request_ids, Iterator) else request_ids
+            finish_request_ids = ids
+            cleanup_ids = tuple(ids)
 
         finished = super().finish_requests(finish_request_ids, finished_status)
         self._clear_kv_wait_starts(cleanup_ids)
@@ -515,14 +519,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
 
-        failed_kv_load_req_ids = None
+        failed_kv_load_req_ids: set[str] = set()
+        if kv_connector_output and getattr(kv_connector_output, "failed_recving", None):
+            # Upstream d43bb2f37f (HiSparse #53781): a receive failure is
+            # reported per request identity, so hybrid / multi-pool layouts
+            # whose numeric block ids overlap fail closed instead of recovering
+            # the wrong request. The helper returns an empty set when the
+            # failure is being recomputed, matching _handle_failed_kv_load_outputs.
+            failed_kv_load_req_ids.update(self._handle_failed_recving(kv_connector_output.failed_recving))
         if kv_connector_output and kv_connector_output.invalid_block_ids:
             # These blocks contain externally computed tokens that failed to
             # load. Identify affected requests and adjust their computed token
             # count to trigger recomputation of the invalid blocks.
-            failed_kv_load_req_ids = self._handle_invalid_blocks(
-                kv_connector_output.invalid_block_ids,
-                num_scheduled_tokens,
+            failed_kv_load_req_ids.update(
+                self._handle_invalid_blocks(
+                    kv_connector_output.invalid_block_ids,
+                    num_scheduled_tokens,
+                )
             )
 
         # Pre-process KV extraction acks so that the per-request loop below
@@ -755,6 +768,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if request.status != RequestStatus.FINISHED_ERROR:
                     request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
+            elif (
+                # Upstream parity: an encoder-only instance publishes
+                # embeddings instead of sampling, so it stops as soon as the
+                # whole prompt is consumed. Encoder inputs are never scheduled
+                # past a multi-modal item the encoder cache could not admit, so
+                # a consumed prompt also means every item in it was encoded.
+                # getattr: upstream Scheduler.__init__ sets is_mm_encoder_only,
+                # but SimpleNamespace/__new__ unit-test stubs may not carry it.
+                getattr(self, "is_mm_encoder_only", False) and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
+                request.status = RequestStatus.FINISHED_STOPPED
+                stopped = True
 
             # If criteria returns True, it means we must STOP the request.
             # If criteria returns False, it might have triggered a background
@@ -762,19 +787,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if not stopped and self._process_kv_transfer_trigger(request, new_token_ids):
                 stopped = True
 
-            if new_token_ids and self.structured_output_manager.should_advance(request):
-                struct_output_request = request.structured_output_request
-                assert struct_output_request is not None
-                assert struct_output_request.grammar is not None
-                if not struct_output_request.grammar.accept_tokens(req_id, new_token_ids):
-                    logger.error(
-                        "Unexpected: grammar rejected tokens %s for request %s. Terminating request.",
-                        new_token_ids,
-                        req_id,
-                    )
-                    request.status = RequestStatus.FINISHED_ERROR
-                    request.resumable = False
-                    stopped = True
+            if OmniSchedulerMixin._reject_invalid_grammar_tokens(self, request, new_token_ids):
+                stopped = True
 
             # Finalize prefill stats BEFORE stop handling (upstream v0.28
             # order): _free_request below releases the KV blocks, after which
@@ -926,6 +940,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             stopped_running_reqs,
             stopped_preempted_reqs,
         )
+
+        OmniSchedulerMixin._finish_error_requests(self, outputs)
 
         failed_requests = self._handle_failed_kv_load_outputs(
             failed_kv_load_req_ids,
@@ -1093,8 +1109,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             ),
             None,
         )
+        chunk_transfer_adapter = self.chunk_transfer_adapter
         update_streaming_prompt = getattr(
-            self.chunk_transfer_adapter,
+            chunk_transfer_adapter,
             "update_streaming_prompt_for_condition",
             None,
         )
@@ -1110,8 +1127,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # This streaming update has already been dequeued. Report the
                 # permanent contract failure so the next scheduling pass
                 # finishes only this request instead of crashing EngineCore.
-                if self.chunk_transfer_adapter is not None:
-                    self.chunk_transfer_adapter.record_receive_failure(req_id, str(exc))
+                # callable(update_streaming_prompt) above implies a live
+                # adapter; the assert narrows it for the type checker.
+                assert chunk_transfer_adapter is not None
+                chunk_transfer_adapter.record_receive_failure(req_id, str(exc))
                 return
             if replaced is not None:
                 if replaced:

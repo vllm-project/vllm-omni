@@ -51,6 +51,42 @@ class AsyncOmniEngine(OmniEngineBase):
             return value
         return [value]
 
+    _DEFAULT_MM_HASHER_ALGORITHM = "blake3"
+
+    def _resolve_mm_hasher_algorithm(self) -> str:
+        """Return the MM hash algorithm configured for stage 0.
+
+        Upstream vLLM 0.29 removed ``MultiModalHasher``'s ``_get_mm_hasher_algorithm``
+        helper and the ``VLLM_MM_HASHER_ALGORITHM`` env var; the algorithm now lives
+        only on ``MultiModalConfig.mm_hasher_algorithm`` (``--mm-hasher-algorithm``,
+        default ``"blake3"``). Resolve it from stage-0's config so the pre-computed
+        replica-scoped uuid uses the same algorithm as the stage-0 renderer built by
+        ``build_stage0_input_processor``. Falls back to the upstream default when the
+        engine has no stage config (unit tests built via ``object.__new__``) or the
+        model has no multimodal config.
+        """
+
+        stage_vllm_configs = getattr(self, "stage_vllm_configs", None) or []
+        if not stage_vllm_configs:
+            return self._DEFAULT_MM_HASHER_ALGORITHM
+
+        model_config = getattr(stage_vllm_configs[0], "model_config", None)
+        if model_config is None:
+            return self._DEFAULT_MM_HASHER_ALGORITHM
+
+        mm_config = None
+        get_multimodal_config = getattr(model_config, "get_multimodal_config", None)
+        if callable(get_multimodal_config):
+            try:
+                mm_config = get_multimodal_config()
+            except ValueError:
+                # Model is not multimodal.
+                mm_config = None
+        if mm_config is None:
+            mm_config = getattr(model_config, "multimodal_config", None)
+
+        return getattr(mm_config, "mm_hasher_algorithm", None) or self._DEFAULT_MM_HASHER_ALGORITHM
+
     def _ensure_stage_replica_mm_uuids(
         self,
         prompt: Any,
@@ -75,8 +111,9 @@ class AsyncOmniEngine(OmniEngineBase):
         if not isinstance(mm_data, dict) or not mm_data:
             return
 
-        from vllm.config.multimodal import _get_mm_hasher_algorithm
         from vllm.multimodal.hasher import MultiModalHasher
+
+        mm_hasher_algorithm = self._resolve_mm_hasher_algorithm()
 
         existing_uuids = prompt.get("multi_modal_uuids")
         if not isinstance(existing_uuids, dict):
@@ -102,7 +139,7 @@ class AsyncOmniEngine(OmniEngineBase):
                     base_uuid = None
                 else:
                     base_uuid = MultiModalHasher.hash_kwargs(
-                        _get_mm_hasher_algorithm(),
+                        mm_hasher_algorithm,
                         model_id=model_id,
                         **{modality: item},
                     )

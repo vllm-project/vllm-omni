@@ -11,7 +11,7 @@ Currently only the **GPU** backend is implemented. The backend is selected with 
 All functionality is provided by a single script and should be run from the repository root:
 
 | Subcommand | Description |
-|--------|------|
+| -------- | ------ |
 | `scripts/resource_monitor.sh start [--backend gpu\|cpu\|npu] [gpu_ids] [interval]` | Collect data in the background (currently only `gpu`: `nvidia-smi` writes CSV) |
 | `scripts/resource_monitor.sh finalize [--backend gpu\|cpu\|npu] [run_id]` | Bundle the current run, generate `report.html`, and print `GPU_MONITOR_BUNDLE_DIR=` / `RESOURCE_MONITOR_BUNDLE_DIR=` |
 | `scripts/resource_monitor.sh run [--backend gpu\|cpu\|npu] -- <command>` | Complete everything in one step: `start` -> run your command -> `finalize` |
@@ -23,7 +23,7 @@ All functionality is provided by a single script and should be run from the repo
 ## Environment Variables (monitoring script only)
 
 | Environment Variable | Description | Default |
-|----------|------|--------|
+| ---------- | ------ | -------- |
 | `RESOURCE_MONITOR_DATA_ROOT` | Root directory for monitoring data | `tests/dfx/stability/gpu_monitor_data` |
 | `RESOURCE_MONITOR_INTERVAL` | Sampling interval (seconds) | 5 |
 | `RESOURCE_MONITOR_LOG_INTERVAL` | Log print interval (seconds) | 15 |
@@ -83,8 +83,8 @@ echo "Report directory: $GPU_MONITOR_BUNDLE_DIR"
 
 - **Scripts**: `tests/dfx/stability/scripts/resource_monitor.sh` (entry point) and `scripts/generate_report.py` (called by `finalize` to generate HTML).
 - **Data directory**: `tests/dfx/stability/gpu_monitor_data/` by default (can be overridden with `RESOURCE_MONITOR_DATA_ROOT`).  
-  - Each run generates `run_<run_id>/gpu_metrics.csv`.  
-  - After `finalize`, you get `gpu_monitor_bundle_<run_id>/` containing `gpu_metrics.csv`, `report.html`, and `README.txt`.
+    - Each run generates `run_<run_id>/gpu_metrics.csv`.  
+    - After `finalize`, you get `gpu_monitor_bundle_<run_id>/` containing `gpu_metrics.csv`, `report.html`, and `README.txt`.
 - **View the report**: open `report.html` in the bundle directory with a browser to inspect memory usage curves and statistics.
 
 The script only generates `report.html` and CSV files. If you need to keep the report, archive or download it from the working directory yourself.

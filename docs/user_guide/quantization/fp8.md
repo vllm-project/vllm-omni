@@ -65,7 +65,17 @@ vLLM-Omni points that cache at `~/.cache/vllm_omni/quack` (override with
 `QUACK_CACHE_DIR`) instead of quack's default under `/tmp`, so it survives restarts.
 In containers, set `QUACK_CACHE_DIR` to a mounted/persistent path — or bake it into
 the image — so the first cold start does not recompile. The engine's startup dummy
-run already exercises the kernels, so with a warm cache the first real request is fast.
+run exercises the kernels, but new shapes, layouts, dtypes, or bias settings may
+still need compilation or tuning. The warmup helper uses inference mode and
+transposed weights without bias. Daemon workers compile candidates in-process
+while retaining autotuning and caching.
+
+Scale validation and Quack/FlashInfer dispatch run inside a PyTorch custom op.
+This keeps layer-specific scale addresses and validation-cache updates out of
+Dynamo tracing without introducing a graph break. Unpopulated scales and Quack
+failures still fall back to FlashInfer at runtime. CUDA graph capture additionally
+requires warming the dispatch with populated scales; Python validation and
+dispatch do not rerun during CUDA graph replay.
 
 To pre-warm specific shapes (e.g. at image build time):
 
