@@ -159,4 +159,7 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
         using_inductor = cc.backend == "inductor" and cc.mode != CompilationMode.NONE
         default = ["native"] if using_inductor else ["vllm_c", "native"]
 
-        return IrOpPriorityConfig.with_default(default)
+        # Mirrors upstream XPUPlatform defaults: `gelu_and_mul_sparse` has no XPU
+        # provider, so it must not fall back to `default` (which contains
+        # `vllm_c`) via IrOpPriorityConfig.with_default.
+        return IrOpPriorityConfig.with_default(default, gelu_and_mul_sparse=["native"])

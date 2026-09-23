@@ -248,9 +248,11 @@ The Diffusion Acceleration navigation groups the remaining guides as follows:
 | Compatibility | [Feature Compatibility](feature_compatibility.md) |
 | CPU offloading | [CPU Offloading](diffusion/cpu_offload.md) |
 | Cache acceleration | [TeaCache](diffusion/cache_acceleration/teacache.md), [Cache-DiT](diffusion/cache_acceleration/cache_dit.md) |
+| KV cache paging | [Scheduler-Managed Paged KV Cache](diffusion/paged_kv_cache.md) |
 | Parallelism | [Parallelism Overview](diffusion/parallelism/overview.md) |
 | Attention | [Attention Backends](diffusion/attention_backends.md) |
 | Compilation | [Regional Compilation](diffusion/regional_compilation.md) |
+| VAE decode | [Wan VAE Decoder Fast Path](diffusion/vae_fast_path.md) |
 | Video extension | [Frame Interpolation](diffusion/frame_interpolation.md) |
 | Startup | [Startup and Loading](diffusion/startup_and_loading.md) |
 | Adapters | [LoRA](diffusion/lora.md) |

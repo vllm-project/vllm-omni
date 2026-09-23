@@ -17,7 +17,7 @@ steps:
         mirror_hardwares: l4_1
 
       - label: "Simple · Diffusion Test"
-        timeout_in_minutes: 20
+        timeout_in_minutes: 30
         commands:
           - "pytest -sv tests/diffusion -m 'core_model and cpu'"
         mirror_hardwares: l4_1

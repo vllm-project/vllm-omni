@@ -24,7 +24,16 @@ def producer(monkeypatch):
     worker.shutdown = Mock()  # No hardware constructor, sockets or listener thread.
     worker.is_kv_consumer = False
     worker.tp_rank, worker.tp_size = 0, 1
-    worker.transfer_topo = SimpleNamespace(handshake_target_ranks=lambda size: list(range(size)))
+    worker.transfer_topo = SimpleNamespace(
+        handshake_target_ranks=lambda size: list(range(size)),
+        total_num_kv_heads=1,
+    )
+    # vLLM 0.30 send_kv_to_decode also reads the PP size (ce08bb5b34,
+    # #56033), the MLA/Mamba flags and the head-resharding validator.
+    worker.pp_size = 1
+    worker.use_mla = False
+    worker.kv_cache_config = SimpleNamespace(has_mamba_layers=False)
+    worker._validate_head_resharding_layout = Mock(return_value=None)
     worker.reqs_need_send, worker.finished_sending_reqs = {}, set()
     for name in (
         "kv_caches_base_addr",
@@ -42,7 +51,9 @@ def producer(monkeypatch):
     worker._send_blocks = Mock(return_value=0)
     worker.xfer_stats = Mock()
     worker._build_transfer_params = AsyncMock(return_value=([1], [2], [16], [], None))
-    monkeypatch.setattr(mc, "_align_transfer_regions", lambda *_: ([], [], None))
+    # vLLM ce08bb5b34 (#56033) calls _align_transfer_regions with the
+    # allow_partial_layers keyword; the stub must accept it.
+    monkeypatch.setattr(mc, "_align_transfer_regions", lambda *_, **__: ([], [], None))
     monkeypatch.setattr(mc, "_validate_asymmetric_region_lengths", lambda **_: None)
     monkeypatch.setattr(mc.envs, "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", 0.05)
     connector = object.__new__(mc.MooncakeConnector)

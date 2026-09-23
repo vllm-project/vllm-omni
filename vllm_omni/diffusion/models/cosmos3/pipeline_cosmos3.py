@@ -1730,7 +1730,10 @@ class Cosmos3OmniDiffusersPipeline(
                 },
             },
         }
-        return DiffusionOutput(output=action_output)
+        return DiffusionOutput(
+            output=action_output,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
 
     @staticmethod
     def _truthy(value) -> bool:
@@ -3610,6 +3613,7 @@ class Cosmos3OmniDiffusersPipeline(
                     "payload": {"video": output_video},
                     "metadata": {"video": {"fps": frame_rate}},
                 },
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             )
 
         full_output = torch.cat(output_chunks, dim=2)[:, :, :total_frames]
@@ -3636,6 +3640,7 @@ class Cosmos3OmniDiffusersPipeline(
                     "video": {"fps": frame_rate},
                 },
             },
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
     # -- Forward (main generation entry point) -------------------------------
@@ -4072,7 +4077,10 @@ class Cosmos3OmniDiffusersPipeline(
             if _is_rank_zero():
                 logger.info("Sound tokenizer decoded in %.2fs", time.time() - sound_decode_start)
                 logger.info("Total pipeline time: %.2fs", time.time() - pipeline_start)
-            return DiffusionOutput(output={"video": video, "audio": audio, "audio_sample_rate": sound_sample_rate})
+            return DiffusionOutput(
+                output={"video": video, "audio": audio, "audio_sample_rate": sound_sample_rate},
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            )
 
         if action_enabled:
             if action_latents is None or raw_action_dim is None or domain_id is None:
@@ -4092,6 +4100,10 @@ class Cosmos3OmniDiffusersPipeline(
                         },
                     },
                 },
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             )
 
-        return DiffusionOutput(output={"image": video} if is_t2i else {"video": video})
+        return DiffusionOutput(
+            output={"image": video} if is_t2i else {"video": video},
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
