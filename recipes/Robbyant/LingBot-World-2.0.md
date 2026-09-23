@@ -188,7 +188,9 @@ A served request may instead point at a pose/intrinsics trajectory with
 `extra_params.action_path`, which is resolved inside the trusted root set by
 `model_config.lingbot_action_root`; a server started without that root
 configured accepts only `camera_action_script` or mid-session camera
-interaction.
+interaction. `VLLM_OMNI_LINGBOT_ACTION_ROOT` is still read as a fallback when
+`model_config.lingbot_action_root` is unset, but it is deprecated and will be
+removed in a future release.
 
 Requested `width`/`height` must match `ar_diffusion_width`/`ar_diffusion_height`
 in the deploy config, because the AR cache geometry is fixed at load time.

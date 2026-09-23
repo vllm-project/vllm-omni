@@ -121,6 +121,7 @@ _MAX_SEQUENCE_LENGTH = 512
 # sequence -- a few MiB at 512 tokens -- so a handful covers a session's prompt
 # plus the switches it makes, at no meaningful cost next to its KV.
 _PROMPT_EMBEDS_CACHE_SIZE = 4
+_ACTION_ROOT_ENV = "VLLM_OMNI_LINGBOT_ACTION_ROOT"
 _PREPROCESSED_CAMERA_KEY = "_lingbot_camera_trajectory"
 _PREPROCESSED_CAMERA_ACTIONS_KEY = "_lingbot_camera_actions"
 _PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY = "_lingbot_camera_action_script"
@@ -402,6 +403,12 @@ def get_lingbot_world_pre_process_func(
 
     model_config = getattr(od_config, "model_config", None) or {}
     configured_action_root = model_config.get("lingbot_action_root")
+    if not configured_action_root and os.environ.get(_ACTION_ROOT_ENV):
+        logger.warning_once(
+            "VLLM_OMNI_LINGBOT_ACTION_ROOT is deprecated and will be removed in a future release. "
+            "Set model_config.lingbot_action_root instead."
+        )
+        configured_action_root = os.environ[_ACTION_ROOT_ENV]
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         prompt = request.prompt

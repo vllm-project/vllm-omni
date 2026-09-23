@@ -167,7 +167,7 @@ def test_inventory_matches_reviewed_snapshot_counts():
         EnvironmentVariableCategory.PUBLIC_OMNI: 32,
         EnvironmentVariableCategory.INHERITED_VLLM: 20,
         EnvironmentVariableCategory.PLATFORM_EXTERNAL: 29,
-        EnvironmentVariableCategory.MODEL_SPECIFIC: 92,
+        EnvironmentVariableCategory.MODEL_SPECIFIC: 93,
         EnvironmentVariableCategory.BENCHMARK_TRANSITIONAL: 21,
         EnvironmentVariableCategory.INTERNAL: 7,
     }
@@ -182,7 +182,7 @@ def test_inventory_matches_reviewed_snapshot_counts():
         ModelEnvironmentVariableDisposition.REQUEST_SCOPE: 5,
         ModelEnvironmentVariableDisposition.EXTERNAL: 0,
         ModelEnvironmentVariableDisposition.INTERNALIZE: 17,
-        ModelEnvironmentVariableDisposition.DEPRECATE_REMOVE: 4,
+        ModelEnvironmentVariableDisposition.DEPRECATE_REMOVE: 5,
     }
 
 
