@@ -274,6 +274,58 @@ def test_uaa_gqa_head_padding_preserves_the_query_to_kv_ratio(
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_uaa_prepends_kv_only_reference_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+    from vllm_omni.diffusion.attention.parallel import ulysses
+
+    class FakeGroup:
+        ulysses_group = object()
+        ulysses_world_size = 2
+        ulysses_rank = 0
+        ring_world_size = 1
+
+    calls = []
+
+    def fake_all_to_all(pg, tensor, **kwargs):
+        calls.append((tensor.clone(), kwargs["padded_head_cnt"]))
+        return tensor, tensor.shape[2]
+
+    monkeypatch.setattr(ulysses, "_ulysses_all_to_all_any_qkv", fake_all_to_all)
+    monkeypatch.setattr(ulysses, "get_ulysses_mode", lambda **kwargs: "advanced_uaa")
+    monkeypatch.setattr(
+        ulysses,
+        "_all_gather_int",
+        lambda pg, value, **kwargs: [value, value],
+    )
+    strategy = ulysses.UlyssesParallelAttention(FakeGroup(), scatter_idx=2, gather_idx=1, use_sync=False)
+    reference_k = torch.full((1, 1, 4, 2), 9.0)
+    reference_v = torch.full((1, 1, 4, 2), 7.0)
+    metadata = AttentionMetadata(
+        extra={
+            "ulysses_reference_kv": (reference_k, reference_v),
+            "reference_kv_global_rows": 2,
+        }
+    )
+
+    with set_forward_context():
+        query, key, value, _, _ = strategy.pre_attention(
+            torch.zeros(1, 3, 4, 2),
+            torch.ones(1, 3, 4, 2),
+            torch.full((1, 3, 4, 2), 2.0),
+            metadata,
+        )
+
+    assert query.shape[1] == 3
+    assert key.shape[1] == 4
+    assert value.shape[1] == 4
+    torch.testing.assert_close(key[:, :1], reference_k)
+    torch.testing.assert_close(value[:, :1], reference_v)
+    assert len(calls) == 4
+    assert calls[-1][0].shape[0] == 2
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_uaa_rejects_head_counts_that_are_not_a_gqa_shape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

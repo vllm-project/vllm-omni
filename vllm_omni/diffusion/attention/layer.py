@@ -443,6 +443,30 @@ class Attention(nn.Module):
         # For Ring: Concat joint_q
         query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
 
+        # MiniMax-H3 Tier2 stores reference K/V in the balanced layout produced
+        # by Ulysses. Keeping this hook at the generic post-parallel boundary
+        # avoids a model import in the parallel strategy and leaves other models
+        # untouched unless they explicitly provide the request-local state.
+        post_parallel_ref = (
+            attn_metadata.extra.get("minimax_h3_reference_kv_post_parallel") if attn_metadata is not None else None
+        )
+        if post_parallel_ref is not None:
+            if not isinstance(post_parallel_ref, tuple) or len(post_parallel_ref) != 3:
+                raise TypeError("minimax_h3_reference_kv_post_parallel must be a (state, layer_index, compact) tuple")
+            if self.use_ring:
+                raise NotImplementedError("post-Ulysses MiniMax-H3 reference KV requires ring_degree=1")
+            state, layer_index, compact = post_parallel_ref
+            processor = getattr(state, "process_post_parallel_layer", None)
+            if not callable(processor):
+                raise TypeError("MiniMax-H3 reference-KV state does not implement process_post_parallel_layer")
+            key, value = processor(
+                int(layer_index),
+                key,
+                value,
+                compact=bool(compact),
+                parallel_strategy=strategy.name,
+            )
+
         # Scheduler rows describe the logical sequence, while strict Ulysses
         # may append synthetic tokens solely to make the image shard divisible.
         # Remove those tokens after the all-to-all and put zero placeholders
