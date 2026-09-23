@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib
+import sys
 from functools import wraps
 from types import SimpleNamespace
 
@@ -534,12 +535,17 @@ def test_upsample_forward_only_fuses_nearest_2x() -> None:
             assert torch.equal(actual, expected)
 
 
-def test_rms_norm_vae_substitute_is_not_matched() -> None:
-    from vllm_omni.diffusion.layers.norm import RMSNormVAE
-
-    assert not fastpath_forwards.is_diffusers_rms_norm(RMSNormVAE(8, images=False))
+def test_rms_norm_vae_substitute_is_not_matched(monkeypatch: pytest.MonkeyPatch) -> None:
     _, vae = _build_pair(TINY_RESIDUAL, torch.float32)
     norm = vae.decoder.norm_out
+    for module in list(sys.modules.values()):
+        module_dict = getattr(module, "__dict__", None)
+        if module_dict is not None and "WanRMS_norm" in module_dict:
+            monkeypatch.setitem(module_dict, "WanRMS_norm", module_dict["WanRMS_norm"])
+
+    from vllm_omni.diffusion.models.wan2_2.norm import RMSNormVAE
+
+    assert not fastpath_forwards.is_diffusers_rms_norm(RMSNormVAE(8, images=False))
     assert fastpath_forwards.is_diffusers_rms_norm(norm)
 
 
