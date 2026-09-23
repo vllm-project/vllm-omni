@@ -1480,12 +1480,7 @@ def _stage_engine_overrides(stage_deploy: StageDeployConfig | None) -> dict[str,
         value = getattr(stage_deploy, name)
         if value is not None:
             overrides[name] = _copy_value(value)
-    overrides.update(
-        {
-            name: _copy_value(value)
-            for name, value in stage_deploy.engine_extras.items()
-        }
-    )
+    overrides.update({name: _copy_value(value) for name, value in stage_deploy.engine_extras.items()})
     return overrides
 
 

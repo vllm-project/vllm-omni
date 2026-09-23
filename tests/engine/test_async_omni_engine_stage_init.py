@@ -409,9 +409,7 @@ def test_initialize_local_diffusion_replica_scopes_runtime_env(monkeypatch):
     runtime_env_var = "VLLM_OMNI_TEST_STAGE_RUNTIME_ENV"
     device_env_var = current_omni_platform.device_control_env_var
     runtime._init_visible_devices_baseline = "0,1"
-    plan.metadata.runtime_cfg = OmniStageRuntimeConfig(
-        devices="0", env={runtime_env_var: "stage-value"}
-    )
+    plan.metadata.runtime_cfg = OmniStageRuntimeConfig(devices="0", env={runtime_env_var: "stage-value"})
     monkeypatch.delenv(runtime_env_var, raising=False)
     monkeypatch.setenv(device_env_var, "0,1")
 
@@ -554,9 +552,7 @@ def test_initialize_local_llm_replica_scopes_runtime_env(monkeypatch):
 
     runtime_env_var = "VLLM_OMNI_TEST_STAGE_RUNTIME_ENV"
     runtime._init_visible_devices_baseline = "0"
-    plan.metadata.runtime_cfg = OmniStageRuntimeConfig(
-        devices="0", env={runtime_env_var: "stage-value"}
-    )
+    plan.metadata.runtime_cfg = OmniStageRuntimeConfig(devices="0", env={runtime_env_var: "stage-value"})
     monkeypatch.setenv(runtime_env_var, "parent-value")
     # Pin the logical->physical device mapping so the assertion below is
     # deterministic regardless of the ambient CUDA_VISIBLE_DEVICES (which on a
@@ -1441,16 +1437,6 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
     assert captured_timeout == stage_init_timeout
 
 
-
-
-
-
-
-
-
-
-
-
 # A real snapshot subfolder always carries artifacts; empty directories would
 # assert the broken exists-means-complete predicate this suite regresses.
 _SUBDIR_ARTIFACT = {"language_model": "model.safetensors", "tokenizer": "tokenizer.json"}
@@ -1462,28 +1448,6 @@ def _make_snapshot(root, subdirs):
         folder.mkdir(parents=True, exist_ok=True)
         (folder / _SUBDIR_ARTIFACT.get(subdir, "data.bin")).write_text("x")
     return str(root)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def test_model_path_resolver_is_generic_and_model_owned(tmp_path):
@@ -1598,12 +1562,6 @@ def test_inject_kv_stage_info_updates_typed_connector_config():
     assert stage0.connector_config.omni_kv_config["connector_config"] == {"kv_connector": "P2pNcclConnector"}
     assert stage0.connector_config.omni_kv_config["engine_input_source"] == []
     assert stage0.connector_config.omni_kv_config["rank_mapping"] == {"from_tp": 4, "to_tp": 2}
-
-
-
-
-
-
 
 
 def test_omni_master_server_allocates_globally_unique_route_ports(monkeypatch):
