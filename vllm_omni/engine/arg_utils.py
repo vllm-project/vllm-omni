@@ -227,6 +227,22 @@ class OmniEngineArgs(EngineArgs):
     # for library callers (#7564); registered pipelines may consume it through
     # their own stage_cli_aliases or deploy YAML.
     text_encoder_tp_size: int | None = None
+    # Sibling diffusion parallel CLI knobs (#8037 / follow-up of #7564+#7652).
+    # ``serve`` registers them on the argparse namespace and OrchestratorArgs
+    # already declares them, but ``OmniEngineArgs.from_cli_args`` only keeps
+    # fields this dataclass declares — without these, the 11 values are
+    # silently reset to DiffusionParallelConfig defaults.
+    ulysses_degree: int | None = None
+    ulysses_mode: str = "strict"
+    ulysses_a2a_permute: bool | None = None
+    ring_degree: int | None = None
+    allgather_degree: int | None = None
+    use_hsdp: bool = False
+    hsdp_shard_size: int = -1
+    hsdp_replicate_size: int = 1
+    cfg_parallel_size: int = 1
+    vae_patch_parallel_size: int = 1
+    vae_parallel_mode: str = "tile"
 
     @classmethod
     def _add_omni_specific_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:

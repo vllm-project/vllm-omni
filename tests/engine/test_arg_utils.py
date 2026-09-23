@@ -581,3 +581,44 @@ def test_text_encoder_tp_size_reaches_default_diffusion_parallel_config():
 
     parallel_config = stage_cfg["engine_args"]["parallel_config"]
     assert parallel_config["text_encoder_tp_size"] == 2
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/8037
+@pytest.mark.parametrize(
+    ("knob", "value"),
+    [
+        ("ulysses_degree", 4),
+        ("ulysses_mode", "advanced_uaa"),
+        ("ulysses_a2a_permute", True),
+        ("ring_degree", 2),
+        ("allgather_degree", 8),
+        ("use_hsdp", True),
+        ("hsdp_shard_size", 2048),
+        ("hsdp_replicate_size", 2),
+        ("cfg_parallel_size", 2),
+        ("vae_patch_parallel_size", 2),
+        ("vae_parallel_mode", "spatial_shard_height"),
+    ],
+)
+def test_from_cli_args_preserves_diffusion_parallel_knobs(knob, value):
+    """Diffusion parallel CLI knobs must survive from_cli_args filtering.
+
+    ``#7652`` kept ``text_encoder_tp_size`` on ``OmniEngineArgs``; the eleven
+    sibling knobs registered by ``serve`` were still OrchestratorArgs-only and
+    were silently dropped when library callers built engine args via
+    ``OmniEngineArgs.from_cli_args`` (#8037).
+    """
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**{knob: value}))
+    assert getattr(engine_args, knob) == value
+
+    # Standalone ``use_hsdp=True`` needs an explicit shard size; DiffusionParallelConfig
+    # rejects auto-calc when every other parallel degree is still 1.
+    diffusion_kwargs: dict = {knob: value}
+    if knob == "use_hsdp":
+        diffusion_kwargs["hsdp_shard_size"] = 2048
+
+    stage_cfg = StageConfigFactory.create_default_diffusion(diffusion_kwargs)[0]
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel_config[knob] == value
