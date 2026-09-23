@@ -789,6 +789,18 @@ class OrchestratorBase:
             req_state = self.request_states.get(getattr(eco, "request_id", None))
             if req_state is None:
                 continue
+            if (
+                getattr(eco, "finish_reason", None) == FinishReason.ERROR
+                and not getattr(eco, "is_segment_finished", False)
+                and not req_state.session_owned
+            ):
+                reason = getattr(eco, "stop_reason", None)
+                await self._handle_stage_error(
+                    stage_id,
+                    eco,
+                    error=reason if isinstance(reason, str) and reason else "Stage request failed",
+                )
+                continue
             if req_state.streaming.enabled:
                 segment_finished = bool(getattr(eco, "is_segment_finished", False))
                 raw_mm = self._completion_multimodal_output(eco, None)
@@ -1200,7 +1212,7 @@ class OrchestratorBase:
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
-    async def _handle_stage_error(self, stage_id: int, output: Any) -> None:
+    async def _handle_stage_error(self, stage_id: int, output: Any, *, error: str | None = None) -> None:
         """Emit a frontend-visible error and clean up request state."""
         if self._cfg_tracker.is_companion(output.request_id):
             parent_id = self._cfg_tracker.get_parent_id(output.request_id) or output.request_id
@@ -1210,7 +1222,7 @@ class OrchestratorBase:
             ErrorMessage(
                 request_id=parent_id,
                 stage_id=stage_id,
-                error=output.error,
+                error=error if error is not None else output.error,
                 status_code=getattr(output, "error_status_code", None),
                 error_type=getattr(output, "error_type", None),
             )

@@ -200,6 +200,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         )
         self.init_omni_connectors(od_config, payload_transfer_manager, synchronous=True)
         self._kv_connector = None
+        from vllm_omni.diffusion.diffusion_kv.kv_connector import KVReceiveProgress, native_prefetch_enabled
+
+        self._kv_receive_progress = KVReceiveProgress() if native_prefetch_enabled(od_config) else None
 
         # Prefetch covers TP / SP / CFG-Parallel / HSDP.  Disabled when a CFG
         # companion KV collector is set (that KV is not backgrounded).
@@ -487,6 +490,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         from vllm_omni.diffusion.diffusion_kv.kv_connector import wait_for_kv_load
 
         timeout = self.od_config.kv_transfer_config.kv_connector_extra_config.get("transfer_timeout", 60.0)
+        if self._kv_receive_progress is not None:
+            return self._kv_receive_progress.prepare(self._kv_connector, scheduler_output, timeout)
         return wait_for_kv_load(self._kv_connector, scheduler_output, timeout)
 
     def install_diffusion_kv_metadata(self, metadata: DiffusionKVMetadata) -> bool:

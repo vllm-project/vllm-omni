@@ -353,6 +353,38 @@ def test_rope_shim_propagates_type_error():
         _make_safe_get_rope(broken_get_rope)(SimpleNamespace(uses_mrope=False), object())
 
 
+def test_rope_shim_constructs_sequential_mrope_state():
+    from vllm.platforms.cpu import CpuPlatform
+    from vllm.v1.worker.gpu.mm.rope import RopeState, get_rope_state
+
+    model = torch.nn.Module()
+    config = SimpleNamespace(uses_mrope=True, mrope_num_dims=3)
+    # Exercise the upstream constructor, including its argument contract, while
+    # keeping the backing buffers on CPU for this unit test.
+    with (
+        patch("vllm.platforms.current_platform", CpuPlatform()),
+        patch("vllm.v1.worker.gpu.buffer_utils.is_uva_available", return_value=False),
+    ):
+        rope = _make_safe_get_rope(get_rope_state)(
+            config,
+            model,
+            max_num_reqs=2,
+            max_num_tokens=8,
+            max_model_len=16,
+            device=torch.device("cpu"),
+        )
+
+    assert isinstance(rope, RopeState)
+    assert rope.get_positions(4).shape == (3, 4)
+    positions, delta = model.get_mrope_input_positions([11, 22, 33, 44], [])
+    torch.testing.assert_close(positions, torch.arange(4).expand(3, -1))
+    assert delta == 0
+    rope.init_prefill_positions(1, model, [11, 22, 33, 44], [])
+    assert rope.prefill_delta.np[1] == 0
+    assert rope.prefill_positions._staged_write_indices == [3, 4, 5]
+    assert rope.prefill_positions._staged_write_contents == [0, 1, 2, 3] * 3
+
+
 @pytest.mark.parametrize("output_key", [None, ("only_one",)])
 def test_mtp_requires_model_declared_output_key(output_key):
     state = _make_state()
