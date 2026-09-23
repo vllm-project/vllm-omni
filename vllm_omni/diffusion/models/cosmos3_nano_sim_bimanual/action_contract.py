@@ -23,11 +23,18 @@ from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, model
 
 AGIBOT_RAW_ACTION_DIM = 29
 CAMERA_RAW_ACTION_DIM = 9
+HAND_POSE_RAW_ACTION_DIM = 57
 NUM_EMBODIMENT_DOMAINS = 32
 AGIBOT_DOMAIN_ID = 15
 # Training-time floor on a quantile range; the runtime normalizer warns when a
 # scale sits close enough to it to indicate a degenerate channel.
 RANGE_FLOOR = 1e-8
+FRAMEWISE_DELTA_EQUATION = "T_i^-1 @ T_{i+1}"
+ANCHORED_DELTA_EQUATION = "T_{16*floor(i/16)}^-1 @ T_{i+1}"
+HAND_POSE_LAYOUT_ID = "hand_pose_fingertips_backward_framewise_rot6d_v1"
+# Hand-pose camera and wrist poses are framewise deltas, but fingertips are
+# absolute positions in the wrist frame of the target step.
+HAND_POSE_DELTA_EQUATION = "camera/wrists: T_i^-1 @ T_{i+1}; fingertips: wrist-local at i+1"
 
 
 def float32_value(value: float) -> float:
@@ -79,6 +86,8 @@ class ActionLayoutField(_StrictModel):
     size: StrictInt = Field(gt=0)
     unit: str
     representation: str | None = None
+    # Reference frame of position-only fields, e.g. wrist-local fingertips.
+    frame: str | None = None
     closed_value: StrictFloat | None = None
     open_value: StrictFloat | None = None
 
@@ -95,9 +104,14 @@ class ActionLayout(_StrictModel):
         "legacy_yam_fk_backward_framewise_rot6d_v1",
         "camera_pose_backward_framewise_rot6d_v1",
         "camera_pose_backward_chunk_anchored_16f_rot6d_v1",
+        "hand_pose_fingertips_backward_framewise_rot6d_v1",
     ]
     pose_convention: Literal["backward_framewise", "backward_chunk_anchored_16f"]
-    delta_equation: Literal["T_i^-1 @ T_{i+1}", "T_{16*floor(i/16)}^-1 @ T_{i+1}"]
+    delta_equation: Literal[
+        "T_i^-1 @ T_{i+1}",
+        "T_{16*floor(i/16)}^-1 @ T_{i+1}",
+        "camera/wrists: T_i^-1 @ T_{i+1}; fingertips: wrist-local at i+1",
+    ]
     rotation_representation: Literal["rot6d_columns"]
     fields: tuple[ActionLayoutField, ...]
 
@@ -258,7 +272,7 @@ class Cosmos3NanoSimBimanualEmbodimentContract(_StrictModel):
     """Per-embodiment raw action semantics."""
 
     domain_id: StrictInt = Field(ge=0, lt=NUM_EMBODIMENT_DOMAINS)
-    raw_action_dim: Literal[9, 20, 29]
+    raw_action_dim: Literal[9, 20, 29, 57]
     layout: ActionLayout
     normalizer: ActionNormalizerContract
 
@@ -270,6 +284,12 @@ class Cosmos3NanoSimBimanualEmbodimentContract(_StrictModel):
             raise ValueError(
                 f"Cosmos3-Nano-Sim-Bimanual normalizer dimension must equal raw_action_dim={self.raw_action_dim}, "
                 f"got {len(self.normalizer.transform.offset)}."
+            )
+        if (self.layout.id == HAND_POSE_LAYOUT_ID) != (self.raw_action_dim == HAND_POSE_RAW_ACTION_DIM):
+            raise ValueError(
+                "Cosmos3-Nano-Sim-Bimanual hand-pose layout and "
+                f"raw_action_dim={HAND_POSE_RAW_ACTION_DIM} must be used together; "
+                f"got layout {self.layout.id!r} with raw_action_dim={self.raw_action_dim}."
             )
         return self
 
@@ -346,7 +366,12 @@ class Cosmos3NanoSimBimanualActionSchema(_StrictModel):
         for name, contract in self.embodiments.items():
             anchored = self.inference_camera_profile is not None and name == "camera_pose"
             expected_convention = "backward_chunk_anchored_16f" if anchored else "backward_framewise"
-            expected_equation = "T_{16*floor(i/16)}^-1 @ T_{i+1}" if anchored else "T_i^-1 @ T_{i+1}"
+            if anchored:
+                expected_equation = ANCHORED_DELTA_EQUATION
+            elif contract.layout.id == HAND_POSE_LAYOUT_ID:
+                expected_equation = HAND_POSE_DELTA_EQUATION
+            else:
+                expected_equation = FRAMEWISE_DELTA_EQUATION
             if (
                 contract.layout.pose_convention != expected_convention
                 or contract.layout.delta_equation != expected_equation

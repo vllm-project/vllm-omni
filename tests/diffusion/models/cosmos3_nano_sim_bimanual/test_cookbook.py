@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from vllm_omni.diffusion.models.cosmos3.resolution import find_closest_target_size
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_contract import (
     Cosmos3NanoSimBimanualActionSchema,
+    canonical_sha256,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_inputs import (
     prepare_action_values,
@@ -80,6 +81,70 @@ def test_contract_rejects_tampering(field: str) -> None:
         payload["schema_version"] = 3
     with pytest.raises(ValidationError):
         Cosmos3NanoSimBimanualActionSchema.model_validate(payload)
+
+
+def resign(payload: dict) -> dict:
+    """Recompute the contract hash so a test isolates one semantic check."""
+    behavior = {
+        key: payload[key]
+        for key in (
+            "schema_version",
+            "action_tokens_per_frame",
+            "model_action_dim",
+            "num_embodiment_domains",
+            "default_embodiment",
+            "padding",
+            "inference_camera_profile",
+        )
+        if key in payload
+    }
+    behavior["embodiments"] = {
+        name: {
+            "domain_id": contract["domain_id"],
+            "raw_action_dim": contract["raw_action_dim"],
+            "layout": contract["layout"],
+            "normalizer_sha256": contract["normalizer"]["transform_sha256"],
+        }
+        for name, contract in payload["embodiments"].items()
+    }
+    payload["contract_sha256"] = canonical_sha256(behavior)
+    return payload
+
+
+def test_hand_pose_contract_loads_beside_agibot_and_camera() -> None:
+    payload = schema_payload("hand_pose")
+    assert resign(copy.deepcopy(payload))["contract_sha256"] == payload["contract_sha256"]
+    reparsed = Cosmos3NanoSimBimanualActionSchema.model_validate(payload)
+    assert reparsed.model_dump(mode="json", exclude_none=True) == payload
+    parsed = manifest("hand_pose").require_action_schema()
+    assert parsed.embodiment_to_domain == {"agibotworld": 15, "camera_pose": 2, "hand_pose": 3}
+    assert parsed.resolve_embodiment(None, 3) == "hand_pose"
+    assert parsed.raw_action_dim_for("hand_pose") == 57
+    assert parsed.resolve_embodiment("camera_pose", None) == "camera_pose"
+
+
+def test_hand_pose_raw_actions_normalize_and_pad() -> None:
+    contract = manifest("hand_pose").require_action_schema().normalizers["hand_pose"]
+    normalizer = ActionAffineNormalizer.from_contract(contract)
+    raw = torch.arange(3 * 57, dtype=torch.float32).reshape(3, 57) / 100
+    action = prepare_action_values(raw, width=57, model_width=64, action_space="raw", normalizer=normalizer)
+    offset, scale = torch.tensor(contract.transform.offset), torch.tensor(contract.transform.scale)
+    torch.testing.assert_close(action[:, :57], (raw - offset) / scale, rtol=0, atol=0)
+    assert torch.count_nonzero(action[:, 57:]) == 0
+
+
+@pytest.mark.parametrize(
+    "embodiment,key,value,message",
+    [
+        ("hand_pose", "delta_equation", "T_i^-1 @ T_{i+1}", "layout disagrees"),
+        ("agibotworld", "id", "hand_pose_fingertips_backward_framewise_rot6d_v1", "must be used together"),
+    ],
+)
+def test_hand_pose_layout_semantics(embodiment: str, key: str, value: str, message: str) -> None:
+    payload = schema_payload("hand_pose")
+    payload["embodiments"][embodiment]["layout"][key] = value
+    with pytest.raises(ValidationError, match=message):
+        Cosmos3NanoSimBimanualActionSchema.model_validate(resign(payload))
 
 
 def test_global_asinh_matches_quantile_formula() -> None:

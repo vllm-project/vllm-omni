@@ -5,6 +5,13 @@ v4 action contracts and normalizer data, without model weights. The v4 fixture
 records the statistics declaration, effective pose convention, and inference
 profile authority under `normalizer.source.pose_convention_override`.
 
+`hand_pose_action_schema.json` is a v4 contract emitted by the imaginaire4
+exporter at revision `9f82ca15512` for a resolved config containing
+`AgiBotWorldBetaDataset` and `HandPoseDataset` (`wrist_plus_finger_tips`), with
+`camera_pose` added and the cookbook camera profile. It declares the 57D
+`hand_pose` embodiment on domain 3, whose fingertip fields record their wrist
+reference frame.
+
 `camera_stone.npz` contains frozen regression vectors for four camera cases:
 `stone_w` (`w-61`), `stone_s` (`s-61`), `stone_up` (`up-61`), and `stone_left`
 (`left-61`). The vectors retain their original numerical values and archive
