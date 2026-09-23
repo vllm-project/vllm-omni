@@ -8,6 +8,7 @@ import signal
 import threading
 import time
 import weakref
+from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -77,6 +78,8 @@ def _make_executor(num_gpus: int = 1):
     executor._processes = []
     executor._is_failed = False
     executor._failure_callbacks = []
+    executor._completed_outputs = {}
+    executor._dropped_output_ids = OrderedDict()
     return executor, req_q, res_q
 
 
@@ -1551,6 +1554,8 @@ class TestMultiprocExecutorWorkerMonitor:
         executor._rpc_futures = {}
         executor._output_futures = {}
         executor._batch_split_map = {}
+        executor._completed_outputs = {}
+        executor._dropped_output_ids = OrderedDict()
 
         proc = _make_short_lived_process()
         executor._processes = [proc]
