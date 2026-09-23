@@ -58,6 +58,16 @@ def test_config_package_lazy_exports_still_resolve() -> None:
     assert register_pipeline is direct_register_pipeline
 
 
+def test_config_package_does_not_export_legacy_stage_bridge() -> None:
+    """The public config API exposes structured configs, not legacy adapters."""
+    import vllm_omni.config as config
+
+    assert "StageConfig" not in config.__all__
+    assert "merge_pipeline_deploy" not in config.__all__
+    assert not hasattr(config, "StageConfig")
+    assert not hasattr(config, "merge_pipeline_deploy")
+
+
 def test_npu_platform_defers_minimax_h3_encoder_patch() -> None:
     src = (REPO_ROOT / "vllm_omni" / "platforms" / "npu" / "platform.py").read_text(encoding="utf-8")
     init_start = src.index("def __init__(self) -> None:")
