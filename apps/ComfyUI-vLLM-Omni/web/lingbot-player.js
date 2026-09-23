@@ -33,6 +33,8 @@ export class VideoSession {
   constructor(video, report) {
     this.video = video;
     this.report = report;
+    this.playbackStarted = false;
+    this.startupBufferSeconds = 1;
     this.ws = null;
     this.source = null;
     this.buffer = null;
@@ -48,6 +50,9 @@ export class VideoSession {
     this.playbackTimer = null;
     this.lastPlaybackPosition = -1;
     this.lastProgress = 0;
+    video.addEventListener("play", () => {
+      if (this.source) this.playbackStarted = true;
+    });
     video.addEventListener("error", () => {
       if (this.source) this.fail(video.error?.message || "Video loading failed; check the page's media security policy.");
     });
@@ -71,9 +76,11 @@ export class VideoSession {
     const source = this.source = new MediaSource();
     this.url = URL.createObjectURL(source);
     this.video.src = this.url;
-    this.video.play().catch(error => {
-      if (this.source === source && error.name === "NotAllowedError") this.report("Click the video play button to allow playback.");
-    });
+    this.video.autoplay = false;
+    const fps = config.payload.fps || 16;
+    const windowSeconds = config.payload.streaming_buffer_seconds ?? 1.25;
+    // Leave room for the next chunk without waiting for more than the server can produce.
+    this.startupBufferSeconds = Math.min(1, Math.max(0, windowSeconds - 2 / fps));
     this.startTimer = setTimeout(() => this.fail("Timed out opening the video connection."), 15000);
     source.addEventListener("sourceopen", () => {
       if (this.source !== source) return;
@@ -167,7 +174,19 @@ export class VideoSession {
         this.queuedBytes -= data.byteLength;
         this.buffer.appendBuffer(data);
       } else if (this.done) this.source.endOfStream();
+      this.playWhenBuffered();
     } catch (error) { this.fail(error.message); }
+  }
+
+  playWhenBuffered() {
+    if (this.playbackStarted || this.stopping || !this.video.buffered?.length) return;
+    const ahead = this.video.buffered.end(this.video.buffered.length - 1) - this.video.currentTime;
+    if (!this.done && ahead < this.startupBufferSeconds) return;
+    this.playbackStarted = true;
+    const source = this.source;
+    this.video.play().catch(error => {
+      if (this.source === source && error.name === "NotAllowedError") this.report("Click the video play button to allow playback.");
+    });
   }
 
   stop() {
@@ -187,6 +206,7 @@ export class VideoSession {
   }
 
   dispose() {
+    this.playbackStarted = false;
     clearTimeout(this.startTimer);
     clearTimeout(this.stopTimer);
     clearInterval(this.pingTimer);

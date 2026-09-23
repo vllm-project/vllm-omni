@@ -137,3 +137,52 @@ test("appending a live fragment never discards its earlier reference frames", as
   video.dispatchEvent(new Event("ended"));
   assert.equal(reports.at(-1), "Playback complete.");
 });
+
+test("startup buffering starts once and lets complete short clips play", () => {
+  let end = 0.6, played = 0;
+  const video = Object.assign(new EventTarget(), {
+    currentTime: 0, buffered: { length: 1, end: () => end },
+    play: () => { played++; return Promise.resolve(); },
+  });
+  const session = new VideoSession(video, () => {});
+  session.playWhenBuffered();
+  assert.equal(played, 0);
+  end = 1.6;
+  session.playWhenBuffered();
+  session.playWhenBuffered();
+  assert.equal(played, 1);
+  session.playbackStarted = false;
+  session.done = true;
+  end = 0.6;
+  session.playWhenBuffered();
+  assert.equal(played, 2);
+});
+
+test("manual playback and pause during startup are not overridden by later buffering", () => {
+  let end = 0.6, played = 0;
+  const video = Object.assign(new EventTarget(), {
+    currentTime: 0, buffered: { length: 1, end: () => end },
+    play() { played++; this.dispatchEvent(new Event("play")); return Promise.resolve(); },
+  });
+  const session = new VideoSession(video, () => {});
+  session.source = { readyState: "open" };
+  session.playWhenBuffered();
+  video.play(); // Native controls can start before our startup threshold.
+  video.dispatchEvent(new Event("pause"));
+  end = 1.6;
+  session.playWhenBuffered();
+  assert.equal(played, 1);
+});
+
+test("stopping during startup does not start the buffered remainder", () => {
+  let played = 0;
+  const video = Object.assign(new EventTarget(), {
+    currentTime: 0, buffered: { length: 1, end: () => 1.6 },
+    play: () => { played++; return Promise.resolve(); },
+  });
+  const session = new VideoSession(video, () => {});
+  session.stopping = true;
+  session.done = true;
+  session.playWhenBuffered();
+  assert.equal(played, 0);
+});

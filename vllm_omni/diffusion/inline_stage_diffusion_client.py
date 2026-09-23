@@ -238,6 +238,11 @@ class InlineStageDiffusionClient(StageClientBase):
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
+        # Playback only updates condition-protected host state. A worker RPC
+        # may occupy the single executor thread for a whole GPU chunk.
+        if method == "update_streaming_playback":
+            return self._engine.update_streaming_playback(*args, **(kwargs or {}))
+
         loop = asyncio.get_running_loop()
 
         if method == "profile":
