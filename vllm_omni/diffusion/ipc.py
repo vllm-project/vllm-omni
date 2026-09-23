@@ -267,6 +267,7 @@ def _pack_diffusion_media(
         "__type__": _DIFFUSION_MEDIA_WIRE_TYPE,
         "schema_version": video.schema_version,
         "prepared_for_transport": True,
+        "metadata": media.metadata,
         "video": {
             "tensor": packed_tensor,
             "layout": video.spec.layout.value,
@@ -309,6 +310,7 @@ def _unpack_diffusion_media(packed: dict[str, Any]) -> DiffusionMediaOutput:
             schema_version=1,
         ),
         prepared_for_transport=True,
+        metadata=packed.get("metadata", {}),
     )
     media.validate()
     return media

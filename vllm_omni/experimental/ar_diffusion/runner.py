@@ -507,7 +507,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             raise RuntimeError("AR-Diffusion KV cache is permanently failed") from cache_failure
         if self.kv_cache is None:
             return super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
-        if self._ar_diffusion_capability is None:
+        capability = self._ar_diffusion_capability
+        if capability is None:
             raise RuntimeError("AR-Diffusion capability missing after KV cache initialization")
 
         session_id, extra_args, tick = self._request_session(req)
