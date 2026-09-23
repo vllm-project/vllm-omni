@@ -234,9 +234,9 @@ class OmniEngineArgs(EngineArgs):
     # ``DiffusionParallelConfig`` through the generic diffusion fallback.
     # Declared here for the same reason as ``text_encoder_tp_size`` above:
     # ``from_cli_args`` keeps only dataclass fields, so an undeclared knob is
-    # silently reset to its default (#7652). They also live in
-    # SHARED_FIELDS because the orchestrator sizes the deployment from the
-    # same values.
+    # silently reset to its default (#7652). They are also listed in
+    # SHARED_FIELDS because this change declares them on both classes, and
+    # invariant 1 below requires the overlap to stay a subset of that set.
     ulysses_degree: int | None = None
     ulysses_mode: str | None = None
     ulysses_a2a_permute: bool | None = None

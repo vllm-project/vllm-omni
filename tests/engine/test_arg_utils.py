@@ -603,32 +603,22 @@ DIFUSION_PARALLEL_KNBS = [
 
 
 # For https://github.com/vllm-project/vllm-omni/issues/8037
-def test_from_cli_args_preserves_diffusion_parallel_knobs():
-    """Every CLI-registered diffusion parallel knob must survive the filter.
+def test_from_cli_args_applies_diffusion_parallel_knobs():
+    """Every CLI-registered diffusion parallel knob must survive and be applied.
 
     ``OmniEngineArgs.from_cli_args`` keeps only dataclass fields, so a knob
     that ``OmniEngineArgs`` does not declare was silently reset to its
     ``DiffusionParallelConfig`` default (#7652 covered
-    ``text_encoder_tp_size`` alone).
+    ``text_encoder_tp_size`` alone). Every value in the table differs from that
+    default, so an ignored knob fails the second assertion too.
     """
+    from vllm_omni.config.config_factory import StageConfigFactory
+
     for knob, value in DIFUSION_PARALLEL_KNBS:
         engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**{knob: value}))
         assert getattr(engine_args, knob) == value, f"{knob} was dropped"
 
+        stage_cfg = StageConfigFactory.create_default_diffusion({knob: value})[0]
+        parallel_config = stage_cfg["engine_args"]["parallel_config"]
+        assert parallel_config[knob] == value, f"{knob} did not reach parallel_config"
 
-# For https://github.com/vllm-project/vllm-omni/issues/8037
-def test_diffusion_parallel_knob_reaches_default_diffusion_parallel_config():
-    """A preserved knob must land in DiffusionParallelConfig.
-
-    Forward one preserved explicit override to the generic diffusion fallback,
-    which resolves it through ``DiffusionParallelConfig.from_stage_overrides``.
-    """
-    from vllm_omni.config.config_factory import StageConfigFactory
-
-    knob = "cfg_parallel_size"
-    value = 2
-    engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**{knob: value}))
-    stage_cfg = StageConfigFactory.create_default_diffusion({knob: getattr(engine_args, knob)})[0]
-
-    parallel_config = stage_cfg["engine_args"]["parallel_config"]
-    assert parallel_config[knob] == value
