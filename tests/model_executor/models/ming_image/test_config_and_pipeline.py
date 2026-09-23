@@ -198,12 +198,12 @@ def test_two_stage_topology_and_request_metadata():
         assert should_init_extra_args_for_non_diffusion_stages(class_name)
 
 
-def test_stage1_compile_uses_static_regional_cuda_graph(monkeypatch):
+def test_stage1_compile_uses_configured_dynamic_regional_cuda_graph(monkeypatch):
     pipeline = MingImageDiffusionPipeline.__new__(MingImageDiffusionPipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.od_config = SimpleNamespace(
         diffusion_compile_granularity="regional",
-        diffusion_compile_dynamic=False,
+        diffusion_compile_dynamic=True,
     )
     pipeline.transformer = torch.nn.Identity()
     captured = {}
@@ -222,8 +222,9 @@ def test_stage1_compile_uses_static_regional_cuda_graph(monkeypatch):
     assert captured == {
         "mode": "reduce-overhead",
         "fullgraph": True,
-        "dynamic": False,
+        "dynamic": True,
     }
+    assert pipeline._uses_cudagraph_trees
 
 
 def test_explicit_pipeline_loads_component_config_without_model_index(tmp_path):

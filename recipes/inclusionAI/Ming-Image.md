@@ -129,7 +129,7 @@ jq -r '.choices[0].message.content[].image_url.url | split(",")[1]' response.jso
 
 ## Notes
 
-- The default deployment keeps Stage 0 eager and enables static regional
+- The default deployment keeps Stage 0 eager and enables dynamic regional
   compilation with CUDA Graph Trees for the repeated Stage 1 DiT blocks.
   The first request for each new image shape or layer count pays compilation
   and graph-capture cost; warm up every production shape before measuring or

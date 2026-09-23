@@ -138,6 +138,7 @@ class MingImageDiffusionPipeline(ZImagePipeline):
         self._num_frames_per_prompt = 1
         self._pending_prompt_embeds: list[torch.Tensor] | None = None
         self._pending_negative_prompt_embeds: list[torch.Tensor] | None = None
+        self._uses_cudagraph_trees = False
 
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -196,21 +197,19 @@ class MingImageDiffusionPipeline(ZImagePipeline):
 
     def setup_compile(self) -> None:
         # Keep request preparation, scheduling, and VAE work eager,
-        # while captures the fixed-shape block regions for replay.
+        # while capturing repeated DiT blocks for CUDAGraph Trees replay.
         if self.od_config.diffusion_compile_granularity != "regional":
             logger.warning(
                 "Ming-Image CUDA Graph uses regional DiT compilation; diffusion_compile_granularity=%r is ignored.",
                 self.od_config.diffusion_compile_granularity,
             )
-        if self.od_config.diffusion_compile_dynamic:
-            logger.warning("Ming-Image CUDA Graph requires static shapes; diffusion_compile_dynamic=True is ignored.")
-
         self.transformer = regionally_compile(
             self.transformer,
             mode="reduce-overhead",
             fullgraph=True,
-            dynamic=False,
+            dynamic=self.od_config.diffusion_compile_dynamic,
         )
+        self._uses_cudagraph_trees = True
 
     def encode_prompt(self, *args, **kwargs):
         del args, kwargs
