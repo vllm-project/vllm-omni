@@ -27,10 +27,7 @@ from vllm_omni.diffusion.forward_context import (
     set_forward_context_ref_latent,
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.model_loader.hub_prefetch import (
-    from_pretrained_with_prefetch,
-    prefetch_subfolders,
-)
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch
 from vllm_omni.diffusion.models.ming_image.condition import MingImageConditioning
 from vllm_omni.diffusion.models.ming_image.transformer import MingImageTransformer2DModel
 from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
@@ -46,6 +43,14 @@ logger = logging.getLogger(__name__)
 _DESIGN_PIPELINE = "MingImageDiffusionPipeline"
 _LAYERED_PIPELINE = "MingImageLayeredDiffusionPipeline"
 _VENDOR_TRANSFORMER_CLASS = "DiffusionTransformer"
+_DIFFUSION_REQUIRED_PATTERNS = [
+    "model_index.json",
+    "scheduler/**",
+    "transformer/**",
+    "vae/**",
+    "mlp/**",
+    "connector/**",
+]
 
 
 def _validate_variant_config(
@@ -111,8 +116,9 @@ class MingImageDiffusionPipeline(ZImagePipeline):
             model_path = download_weights_from_hf_specific(
                 model_name_or_path=model_path,
                 cache_dir=None,
-                allow_patterns=["*"],
+                allow_patterns=_DIFFUSION_REQUIRED_PATTERNS,
                 revision=od_config.revision,
+                require_all=True,
             )
         local_files_only = os.path.isdir(model_path)
         dtype = od_config.dtype
@@ -143,14 +149,12 @@ class MingImageDiffusionPipeline(ZImagePipeline):
             )
         ]
         subfolders = ["scheduler", "transformer", "vae"]
-        prefetch_subfolders(model_path, subfolders, local_files_only=local_files_only)
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model_path,
             subfolder="scheduler",
             local_files_only=local_files_only,
         )
-        self.scheduler.config["use_dynamic_shifting"] = True
 
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKLQwenImage.from_pretrained,
