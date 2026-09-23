@@ -1605,7 +1605,8 @@ async def test_first_audio_delta_carries_server_request_start_metrics() -> None:
 
 
 @pytest.mark.asyncio
-async def test_draining_audio_does_not_own_new_response_first_output_metrics() -> None:
+@pytest.mark.parametrize("old_text", ["first", "first later"])
+async def test_draining_audio_does_not_own_new_response_first_output_metrics(old_text: str) -> None:
     """AURA R1's late audio must not consume R2's accepted request-start clock."""
     from dataclasses import replace
 
@@ -1641,7 +1642,7 @@ async def test_draining_audio_does_not_own_new_response_first_output_metrics() -
         await h.settle()
 
         clock["now"] = 1001.2
-        old_events = await h.deliver_and_settle(tts_output(r1_request, samples=48000, text="first later"), stage_id=3)
+        old_events = await h.deliver_and_settle(tts_output(r1_request, samples=48000, text=old_text), stage_id=3)
         old_audio = find(old_events, "response.output_audio.delta")
         assert old_audio.response_id == r1
 
