@@ -275,8 +275,14 @@ class MingImageDiffusionPipeline(ZImagePipeline):
 
     @torch.inference_mode()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
-        extra = self._get_prompt_extra(req)
         sampling = req.sampling_params
+        if sampling.num_outputs_per_prompt != 1:
+            # TODO(yuanheng-zhao): enable after supporting batching
+            raise ValueError(
+                f"Ming-Image currently supports num_outputs_per_prompt=1 only, got {sampling.num_outputs_per_prompt}."
+            )
+
+        extra = self._get_prompt_extra(req)
         extra_args = sampling.extra_args or {}
 
         is_dummy_run = req.is_dummy_run()
