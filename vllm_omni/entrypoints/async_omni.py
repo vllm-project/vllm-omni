@@ -584,6 +584,16 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id in request_ids]
         await self._abort(internal_ids, timeout=timeout)
 
+    async def update_streaming_playback(self, request_id: str, position_seconds: float) -> None:
+        """Forward external-session playback progress to the diffusion engine."""
+        if self.num_stages != 1 or self.engine.get_stage_metadata(0).stage_type != "diffusion":
+            raise ValueError("playback feedback requires single-stage diffusion")
+        for state in list(self.request_states.values()):
+            if state.external_request_id == request_id:
+                await self._engine_core_rpc(
+                    "update_streaming_playback", stage_ids=[0], args=(state.request_id, position_seconds)
+                )
+
     async def submit_interaction_async(
         self,
         request_id: str,

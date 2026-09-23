@@ -67,6 +67,31 @@ test("keepalive covers model initialization and stops with the session", async (
   }
 });
 
+test("playback credit follows the video clock and stops on pause, stop, and completion", () => {
+  const video = Object.assign(new EventTarget(), { currentTime: 0 });
+  const session = new VideoSession(video, () => {});
+  const messages = [];
+  session.send = message => { messages.push(message); return true; };
+  session.sendPlayback();
+  assert.equal(messages.length, 0);
+  session.ready = true;
+  session.sendPlayback();
+  video.currentTime = 0.25;
+  session.sendPlayback();
+  session.sendPlayback(); // Paused video: no new credit.
+  video.currentTime = 0.1;
+  session.sendPlayback(); // A backwards seek cannot grant more credit.
+  assert.deepEqual(messages.map(m => m.position_seconds), [0, 0.25]);
+  assert.ok(messages.every(m => m.type === "session.playback"));
+  video.currentTime = 1;
+  session.stopping = true;
+  session.sendPlayback();
+  session.stopping = false;
+  session.done = true;
+  session.sendPlayback();
+  assert.equal(messages.length, 2);
+});
+
 test("camera velocity is FPS-independent and bounded on diagonals", () => {
   for (const fps of [8, 16, 24, 32]) {
     const camera = (keys, speed = 1) => cameraEvent(new Set(keys), "timed", { fps, speed }).interaction.event.multi_modal_data.camera.data;

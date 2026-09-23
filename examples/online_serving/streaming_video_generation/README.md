@@ -26,11 +26,14 @@ The `--diffusion-streaming-output` CLI flag is forwarded as `streaming_output=Tr
 | Server to client | `video.chunk_metadata` | JSON text: `{"type":"video.chunk_metadata","request_id":"...","kind":"media","transport_chunk_index":0,"generation_chunk_index":0,"num_frames":9,"byte_length":1234,"started_event_ids":[],"active_event_ids":[],"completed_event_ids":[]}` | Precedes each binary frame and describes the immediately following payload. |
 | Server to client | Video chunk | Binary WebSocket frame | Fragmented MP4 (`m4s`) video bytes. |
 | Client to server | `session.stop` | JSON text: `{"type":"session.stop"}` | Requests cancellation of the active session. |
+| Client to server | `session.playback` | JSON text: `{"type":"session.playback","position_seconds":1.25}` | Playback progress for sessions that opt into `streaming_buffer_seconds`. Position must be finite and non-negative. |
 | Client to server | `session.ping` | JSON text: `{"type":"session.ping"}` | Optional keepalive; refreshes the server stall clock. |
 | Server to client | `session.interaction.queued` | JSON text: `{"type":"session.interaction.queued","request_id":"...","event_id":"xxx"}` | Confirms the server queued the interaction for the active request. |
 | Server to client | `session.done` | JSON text: `{"type":"session.done","request_id":"...","chunks":3,"stopped":false}` | Ends a completed or stopped session. |
 | Server to client | `session.pong` | JSON text: `{"type":"session.pong"}` | Reply to `session.ping`. |
 | Server to client | `error` | JSON text: `{"type":"error","message":"..."}` | Reports invalid input, unsupported formats, inactive requests, unsupported prompt updates, generation failures, control-message errors, or stall timeout. |
+
+For interactive single-stage diffusion, set `streaming_buffer_seconds` in `session.start` (for example, `1.25`) and send `session.playback` as the displayed video playhead advances. The engine requires `streaming_output=True`, step execution, `max_num_seqs=1`, and an interactive chunked pipeline. Generation waits at chunk boundaries when generated media is this many seconds ahead; the bound may be exceeded by one in-flight chunk. No feedback means generation remains paused after filling the window. Controls, pings and cancellation still work while paused; releasing playback resumes generation. Backwards positions are ignored, and positions beyond generated media are clamped. Keep sending pings if playback is paused for a long time. Clients that omit this option retain unpaced generation.
 
 During generation the client normally sends only `session.start` and then receives binary chunks; silence on the client socket is expected. The server closes the session with a stall error only when there is no engine progress and no `session.ping` for about 60 seconds.
 

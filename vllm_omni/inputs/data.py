@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import copy
+import math
 import pprint
 from dataclasses import asdict, dataclass, field
 from typing import Any, TypeAlias
@@ -354,7 +355,20 @@ class OmniDiffusionSamplingParams:
     # first admits this request for execution.
     emit_request_lifecycle: bool = False
 
+    # Opt-in playback feedback for a single interactive video stream. The
+    # engine starts another chunk only while generated media is below this
+    # many seconds ahead of the client's reported playback position.
+    streaming_buffer_seconds: float | None = None
+
     def __post_init__(self) -> None:
+        buffer = self.streaming_buffer_seconds
+        if buffer is not None and (
+            isinstance(buffer, bool)
+            or not isinstance(buffer, (int, float))
+            or not math.isfinite(buffer)
+            or not 0 < buffer <= 10
+        ):
+            raise ValueError("streaming_buffer_seconds must be finite and in (0, 10]")
         if self.quality is not None and self.quality not in DIFFUSION_QUALITY_LEVELS:
             raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {self.quality!r}")
 

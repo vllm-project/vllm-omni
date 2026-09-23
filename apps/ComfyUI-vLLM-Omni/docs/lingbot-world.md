@@ -104,9 +104,9 @@ Open ComfyUI at `http://127.0.0.1:8188` and keep `server_url=ws://127.0.0.1:8000
 
 The current backend applies `camera.mode=velocity` deltas on the **latent control grid**, not once per output pixel frame. At 16 FPS, 1× means a 0.05-unit translation, 4° pitch or 6° yaw per latent step. The panel scales these values with requested FPS and normalizes diagonal translation. Coordinates remain the backend's local SE3 convention.
 
-Control changes apply at chunk boundaries; they cannot change frames already generated or buffered. Camera motion is generative, without a game engine's collision guarantees.
+Control changes apply immediately before the next chunk starts, after any playback wait; they cannot change frames already generated or buffered. Camera motion is generative, without a game engine's collision guarantees.
 
-The player sends `session.ping` every 20 seconds during lazy compilation. It leaves coded-frame eviction to the browser, rather than removing a fixed five-second history window that can destroy long-GOP reference frames. The unappended byte queue remains bounded. The buffer display is diagnostic; playback feedback/backpressure is not yet implemented.
+The player sends `session.ping` every 20 seconds during lazy compilation. It leaves coded-frame eviction to the browser, rather than removing a fixed five-second history window that can destroy long-GOP reference frames. The unappended byte queue remains bounded. Keyboard mode reports the video playhead every 100 ms and requests a 1.25-second generation window. The backend waits before starting another chunk when generated media is at least this far ahead; an in-flight chunk can extend the window by one chunk. Pausing playback therefore stops further generation once this bounded window fills, while keyboard controls and Stop remain available. The backend must support `streaming_buffer_seconds` and `session.playback`; older servers need upgrading before using this keyboard client.
 
 Sessions are finite. There is no open-ended generation mode, reconnect-and-resume, live prompt editing or recording output node. Increasing `num_frames` extends one rollout but does not preserve it after completion. Long-session memory, quality and input-to-display latency need real-model validation.
 

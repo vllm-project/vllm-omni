@@ -45,6 +45,8 @@ export class VideoSession {
     this.stopTimer = null;
     this.startTimer = null;
     this.pingTimer = null;
+    this.playbackTimer = null;
+    this.lastPlaybackPosition = -1;
     this.lastProgress = 0;
     video.addEventListener("error", () => {
       if (this.source) this.fail(video.error?.message || "Video loading failed; check the page's media security policy.");
@@ -88,8 +90,11 @@ export class VideoSession {
         ws.onopen = () => {
           if (this.ws !== ws) return;
           clearTimeout(this.startTimer);
-          this.send(config.payload);
+          this.send(config.keyboard
+            ? { ...config.payload, streaming_buffer_seconds: config.payload.streaming_buffer_seconds ?? 1.25 }
+            : config.payload);
           this.pingTimer = setInterval(() => this.send({ type: "session.ping" }), 20000);
+          if (config.keyboard) this.playbackTimer = setInterval(() => this.sendPlayback(), 100);
           this.report("Generating the first chunk…");
         };
         ws.onmessage = ({ data }) => {
@@ -101,7 +106,7 @@ export class VideoSession {
           } else if (!this.done && !this.stopping) {
             this.queue.push(data);
             this.queuedBytes += data.byteLength;
-            // ponytail: bounded client queue; server-side pacing is needed for long interactive rollouts.
+            // Guard bytes that have not yet reached MSE, independently of playback feedback.
             if (this.queuedBytes > 32 * 1024 * 1024) this.fail("Video backlog exceeded 32 MiB; restart with fewer frames.");
             else this.pump();
           }
@@ -131,12 +136,19 @@ export class VideoSession {
     } else if (message.type === "session.done") {
       clearTimeout(this.stopTimer);
       clearInterval(this.pingTimer);
+      clearInterval(this.playbackTimer);
       this.done = true;
       this.ready = false;
       this.report(message.stopped ? "Stopped." : "Generation complete; playing remaining video.");
       this.pump();
       this.ws.close();
     }
+  }
+
+  sendPlayback() {
+    const position = this.video.currentTime;
+    if (!this.ready || this.done || this.stopping || !Number.isFinite(position) || position < 0 || position <= this.lastPlaybackPosition) return;
+    if (this.send({ type: "session.playback", position_seconds: position })) this.lastPlaybackPosition = position;
   }
 
   send(message) {
@@ -178,6 +190,8 @@ export class VideoSession {
     clearTimeout(this.startTimer);
     clearTimeout(this.stopTimer);
     clearInterval(this.pingTimer);
+    clearInterval(this.playbackTimer);
+    this.lastPlaybackPosition = -1;
     const ws = this.ws;
     this.ws = null;
     if (ws) {
