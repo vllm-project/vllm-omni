@@ -22,14 +22,6 @@ def _terminal_config(stage_cfg: dict) -> OmniDiffusionConfig:
     return OmniDiffusionConfig.from_kwargs(**stage_cfg["engine_args"])
 
 
-
-
-
-
-
-
-
-
 @pytest.mark.parametrize(
     "stage_overrides",
     [
@@ -58,22 +50,6 @@ def test_stage_override_preserves_model_extras_for_default_diffusion_stage(mocke
     assert stage_configs[0].diffusion_config.extras["ltx2_use_conv_vae"] is True
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 @pytest.mark.parametrize("sampling_defaults", [{"0": {"guidance_scale": 7.5}}, '{"0":{"guidance_scale":7.5}}'])
 def test_generic_diffusion_sampling_defaults_remain_overridable(sampling_defaults):
     from vllm_omni.entrypoints.omni_base import OmniBase
@@ -93,28 +69,6 @@ def test_generic_diffusion_sampling_defaults_remain_overridable(sampling_default
     assert requested.guidance_scale == 2.0
     assert base.default_sampling_params_list[0].guidance_scale == 7.5
     assert base.sampling_constraints_list == [{}]
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def test_invalid_diffusion_offload_config_fails_before_model_loading(monkeypatch, mocker):
@@ -145,14 +99,6 @@ def test_invalid_diffusion_offload_config_fails_before_model_loading(monkeypatch
     load_model.assert_not_called()
 
 
-
-
-
-
-
-
-
-
 @pytest.mark.parametrize("bad_wait", ["nan", "inf", "-inf", "-1"])
 def test_serve_cli_rejects_invalid_request_batch_max_wait_ms(bad_wait: str):
     parser = TrackingArgumentParser()
@@ -169,8 +115,6 @@ def test_serve_cli_rejects_invalid_request_batch_max_wait_ms(bad_wait: str):
                 bad_wait,
             ]
         )
-
-
 
 
 def test_resolve_stage_configs_delegates_overrides_to_resolver(mocker):
@@ -221,8 +165,6 @@ def test_resolve_stage_configs_rejects_legacy_config_arguments(legacy_arg, value
             {legacy_arg: value},
             trust_remote_code=False,
         )
-
-
 
 
 @pytest.mark.parametrize("model_class_name", ["HeliosPipeline", "HunyuanVideo15Pipeline"])

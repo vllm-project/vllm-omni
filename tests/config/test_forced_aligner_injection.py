@@ -83,7 +83,6 @@ def test_inject_noop_without_forced_aligner():
 @pytest.mark.parametrize("async_chunk", [True, False])
 @pytest.mark.parametrize("cli_async_chunk", [None, True, False])
 def test_aligner_uses_completed_audio_without_disabling_upstream_chunks(async_chunk, cli_async_chunk):
-
     pipeline = _PIPELINE_REGISTRY["qwen3_tts"]
     deploy = DeployConfig(async_chunk=async_chunk)
     extended_pipeline, extended_deploy = inject_forced_aligner_stage(

@@ -76,10 +76,6 @@ class TestStageType:
         assert StageType("diffusion") == StageType.DIFFUSION
 
 
-
-
-
-
 class TestStageResolutionHelpers:
     """Tests for shared stage override / filtering helpers."""
 
@@ -200,8 +196,6 @@ class TestCosmos3PolicyPipeline:
         assert pipeline.diffusers_class_name is None
 
 
-
-
 class TestStagePipelineConfig:
     def test_frozen(self):
         s = StagePipelineConfig(stage_id=0, model_stage="a")
@@ -294,7 +288,6 @@ class TestPipelineRegistration:
             )
 
         assert pipeline_cfg is deploy_pipe
-
 
     def test_resolve_pipeline_matches_hf_architecture_fallback(self, clean_pipeline_registry):
         pipeline_key = "architecture_fallback_pipeline"
@@ -472,7 +465,6 @@ class TestPipelineRegistration:
         assert isinstance(omni_config, VllmOmniConfig)
         assert omni_config.stage_by_id(0).diffusion_config.model == "fake/model"
 
-
     def test_pipeline_registration(self, clean_pipeline_registry):
         """Ensure that we can register and create a custom pipeline config."""
         new_model_type = "new_model_type"
@@ -510,7 +502,6 @@ class TestPipelineRegistration:
             }
         assert pipe_cfg.model_type == new_model_type
 
-
     def test_resolve_when_autodetect_resolves_none(self):
         """Regression test for: https://github.com/vllm-project/vllm-omni/issues/4726"""
         deploy_path = get_deploy_config_path("ming_tts.yaml")
@@ -522,7 +513,6 @@ class TestPipelineRegistration:
         )
         assert resolved_config is not None
         assert len(resolved_config.stage_configs) > 0
-
 
     def test_structured_path_loads_explicit_deploy_config_once(self, clean_pipeline_registry, tmp_path):
         pipeline_key = "single_load_pipeline"
@@ -552,7 +542,6 @@ class TestPipelineRegistration:
             )
 
         mock_load.assert_called_once_with(deploy_path)
-
 
     def test_deploy_override_uses_correct_endpoint_restrictions(self, clean_pipeline_registry, tmp_path):
         """Ensure endpoint restrictions must come from the final pipeline
@@ -632,10 +621,6 @@ class TestDeployConfigLoading:
         with pytest.raises(ValueError, match=r"stage_args.*PipelineConfig.*stages"):
             load_deploy_config(deploy_path)
 
-
-
-
-
     def test_load_qwen3_omni_moe_deploy_config(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
         deploy = load_deploy_config(deploy_path)
@@ -643,7 +628,6 @@ class TestDeployConfigLoading:
         assert deploy.async_chunk is True
         assert deploy.connectors is not None
         assert deploy.platforms is not None
-
 
     def test_load_voxtral_tts_deploy_config_schema_fields(self):
         deploy_path = Path(get_deploy_config_path("voxtral_tts.yaml"))
@@ -669,10 +653,6 @@ class TestDeployConfigLoading:
         deploy = load_deploy_config(deploy_path)
         runtime_config = deploy.stages[0].engine_extras["hf_overrides"]["voxcpm2_runtime_config"]
         assert runtime_config == expected_runtime_config
-
-
-
-
 
     @pytest.mark.parametrize(
         "deploy_name",
@@ -831,16 +811,10 @@ class TestDeployConfigLoading:
         assert deploy.stages[0].tensor_parallel_size == 2
         assert deploy.stages[1].devices == "1"
 
-
-
     def test_no_bundled_legacy_stage_config_yamls(self):
         repo_root = Path(__file__).resolve().parents[2]
         stage_config_dir = repo_root / "vllm_omni" / "model_executor" / "stage_configs"
         assert not list(stage_config_dir.glob("*.yaml"))
-
-
-
-
 
     def test_mixed_schema_preserves_flat_fields(self):
         """Ensure flat fields are not dropped when engine_args are present."""
@@ -1208,7 +1182,6 @@ class TestQwen3TTSPipeline:
         # tts_args is passed through via extras
         assert s.extras["tts_args"]["max_instructions_length"] == 500
 
-
     def test_subtalker_sampling_params_deep_merge_preserves_base_keys(self):
         """Verify subtalker sampling params participate in stage deep-merge."""
         base = {
@@ -1316,8 +1289,6 @@ class TestMingFlashOmniPipeline:
         assert s.hf_config_name == "talker_config"
         assert s.tokenizer_subdir == "talker/llm"
 
-
-
     def test_thinker_only_pipeline_registered(self):
         p = resolve_pipeline_config("ming_flash_omni_thinker_only")
         assert isinstance(p, PipelineConfig)
@@ -1339,7 +1310,6 @@ class TestMingFlashOmniPipeline:
         assert s.engine_output_type == "text"
         assert s.hf_config_name == "llm_config"
         assert s.sampling_constraints["detokenize"] is True
-
 
     def test_image_pipeline_registered(self):
         p = OMNI_PIPELINES.get("ming_flash_omni_image")
@@ -1383,7 +1353,6 @@ class TestMingFlashOmniPipeline:
             module_path, _, attr = ref.rpartition(".")
             module = importlib.import_module(module_path)
             assert callable(getattr(module, attr))
-
 
 
 class TestBaseConfigInheritance:
@@ -1439,7 +1408,6 @@ class TestBaseConfigInheritance:
         # CI overrides max_tokens
         assert s0["max_tokens"] == 150
 
-
     def test_pure_inheritance_overlay(self, tmp_path):
         """An overlay with only ``base_config`` inherits everything."""
         base = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
@@ -1471,7 +1439,6 @@ class TestBaseConfigInheritance:
 class TestPlatformOverrides:
     """Test platform-specific deploy config overrides."""
 
-
     def test_qwen3_tts_rocm_disables_code2wav_outer_cudagraph(self):
         deploy_path = Path(get_deploy_config_path("qwen3_tts.yaml"))
 
@@ -1482,11 +1449,6 @@ class TestPlatformOverrides:
         rocm = _apply_platform_overrides(base, platform="rocm")
         assert rocm.stages[0].enforce_eager is None
         assert rocm.stages[1].enforce_eager is True
-
-
-
-
-
 
     def test_fish_speech_npu_uses_ascend_kv_block_size(self):
         deploy_path = Path(get_deploy_config_path("fish_qwen3_omni.yaml"))
@@ -1573,8 +1535,6 @@ class TestPlatformOverrides:
         assert deploy.stages[0].gpu_memory_utilization == 0.9
 
 
-
-
 class TestAuraOmniDeploy:
     def test_aura_omni_deploy_forces_pipeline_override(self):
         deploy_path = Path(get_deploy_config_path("aura_omni.yaml"))
@@ -1583,22 +1543,12 @@ class TestAuraOmniDeploy:
         assert deploy.pipeline == "aura_omni"
 
 
-
 class TestDeployCliOverrideFlow:
     """Test deploy-YAML baselines overridden by CLI runtime overrides."""
 
 
-
-
-
-
-
-
-
 class TestSamplingConstraintsPrecedence:
     """Test scalar constraint precedence and additive required stop tokens."""
-
-
 
 
 class TestPipelineConfigResolvers:

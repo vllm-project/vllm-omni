@@ -394,11 +394,6 @@ class StageConfigFactory:
             strategy_specs=strategy_specs,
         )
 
-
-
-
-
-
     @classmethod
     def _normalize_default_diffusion(
         cls,
@@ -457,7 +452,6 @@ class StageConfigFactory:
             model_class_name,
         )
         return engine_args, parallel_config, default_sampling_params, final_output_type
-
 
     @classmethod
     def create_typed_default_diffusion(

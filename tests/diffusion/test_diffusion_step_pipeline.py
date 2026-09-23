@@ -1491,7 +1491,6 @@ class TestIPC:
 class TestSupportedPipelines:
     """Step-execution protocol checks for supported pipelines."""
 
-
     def test_qwen_image_supports_step_execution(self):
         from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
         from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImagePipeline
