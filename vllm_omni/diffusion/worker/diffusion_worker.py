@@ -186,11 +186,16 @@ def _setup_diffusion_worker_proc_title_and_log_prefix(
 def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[None]:
     import vllm.model_executor.layers.quantization.modelopt as vllm_modelopt
 
-    linear_method_cls = getattr(quant_config, "LinearMethodCls", None)
-    if linear_method_cls in {
-        vllm_modelopt.ModelOptFp8LinearMethod,
-        vllm_modelopt.ModelOptFp8PcPtLinearMethod,
-    }:
+    # vLLM #49381 replaced the per-format ModelOpt linear methods with the
+    # generic ``ModelOptLinearMethod`` and removed the ``LinearMethodCls``
+    # attributes this used to match on. The same two formats are identified by
+    # the ModelOpt quant-algo string carried on the config
+    # (``ModelOptQuantConfigBase.quant_method``): "FP8" used to select
+    # ``ModelOptFp8LinearMethod`` and "FP8_PER_CHANNEL_PER_TOKEN" used to select
+    # ``ModelOptFp8PcPtLinearMethod``. "FP8_PB_WO" / "NVFP4" / "W4A16_NVFP4"
+    # were never matched here and still are not.
+    quant_algo = getattr(quant_config, "quant_method", None)
+    if quant_algo in ("FP8", "FP8_PER_CHANNEL_PER_TOKEN"):
         from vllm.platforms import current_platform
 
         if current_platform.is_cuda() and current_platform.has_device_capability(89):
@@ -801,6 +806,9 @@ class DiffusionWorker:
         Args:
             level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
         """
+        progress = getattr(getattr(self, "model_runner", None), "_kv_receive_progress", None)
+        if progress is not None and progress.submitted:
+            raise RuntimeError("Cannot sleep with live native KV prefetch reservations; finish requests first")
         # The config validator rejects sleep for the native paged path. Keep
         # this worker-side guard precise as well: test doubles and legacy
         # configs may expose arbitrary attributes through Mock/getattr.

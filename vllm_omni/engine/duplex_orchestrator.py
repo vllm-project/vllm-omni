@@ -90,6 +90,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             result_sink=self.rpc_async_queue,
             runtime_config=self.duplex_session_config,
             model_config=model_config,
+            log_stats=self.log_stats,
         )
 
     # ------------------------------------------------------------------ #
@@ -133,6 +134,8 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             logger.debug("[DuplexOrchestrator] stale stage binding ignored for %s stage-%s", request_id, stage_id)
             return
         req_state.stage_submit_ts[stage_id] = _time.time()
+        if req_state.request_timestamp <= 0.0:
+            req_state.request_timestamp = req_state.stage_submit_ts[stage_id]
         self._register_running_request(req_state)
         self.session_manager.register_request(request_id, req_state.session_id)
 
@@ -320,6 +323,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 prompt=None,
                 sampling_params_list=list(context.sampling_params),
                 final_stage_id=context.final_stage_id,
+                request_timestamp=_time.time(),
                 session_owned=True,
                 session_id=context.session_id,
                 fence=context.fence,
@@ -332,6 +336,8 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 request_state.config_generation = context.config_generation
             request_state.session_id = context.session_id
             request_state.fence = context.fence
+            if request_state.request_timestamp <= 0.0:
+                request_state.request_timestamp = _time.time()
         else:
             raise RuntimeError(f"request {context.request_id} is not session-owned")
         self._sync_bridge_state(request_state, context)
@@ -357,9 +363,6 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         if not isinstance(request_state, DuplexOrchestratorRequestState):
             raise RuntimeError(f"duplex request was not preregistered: {context.request_id}")
         request_state.streaming.enabled = submission.resumable
-        # Keep raw Stage0 prompt (additional_information / multi_modal_data) for
-        # stage input processors via process_engine_inputs.
-        request_state.prompt = dict(submission.prompt)
         if submission.resumable:
             request = build_engine_core_request_from_tokens(
                 request_id=context.request_id,
@@ -369,6 +372,11 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 resumable=True,
             )
         else:
+            # Keep raw Stage0 prompt (additional_information / multi_modal_data) for
+            # stage input processors via process_engine_inputs. Resumable requests
+            # leave it unset: their prompt is one append with Stage0's duplex
+            # buffer, which the async-chunk prewarm would copy downstream.
+            request_state.prompt = dict(submission.prompt)
             # Use the ordinary multimodal input processor for turn-model plugins.
             # Its CPU preprocessing runs off the session/orchestrator event loop.
             request = await asyncio.to_thread(
@@ -406,7 +414,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                         f"async-chunk prewarm failed for duplex request {context.request_id}; the request was aborted"
                     )
         request_state.stage_fences[context.stage_id] = context.fence
-        request_state.stage_submit_ts[context.stage_id] = _time.time()
+        now = _time.time()
+        request_state.stage_submit_ts[context.stage_id] = now
+        request_state.request_timestamp = now
         self._register_running_request(request_state)
         return DuplexStageSubmissionResult(
             request_id=context.request_id,
