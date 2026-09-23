@@ -1600,6 +1600,51 @@ async def test_first_audio_delta_carries_server_request_start_metrics() -> None:
 
 
 @pytest.mark.asyncio
+async def test_draining_audio_does_not_own_new_response_first_output_metrics() -> None:
+    """R1's late audio must not consume R2's accepted request-start clock."""
+    from dataclasses import replace
+
+    clock = {"now": 1000.0}
+    h = await open_harness(clock=lambda: clock["now"])
+    try:
+        h.session.capabilities = replace(h.session.capabilities, supports_concurrent_turn_requests=True)
+        await h.run(append_audio())
+        r1_request = h.stage0_request_id()
+        clock["now"] = 1000.2
+        await h.deliver_and_settle(tts_output(r1_request, samples=24000, text="first"))
+        r1 = h.session.active_response_id
+        assert r1 is not None
+        h.session.snapshot_active_response_for_drain()
+        h.session.bind_draining_request(r1_request, r1)
+
+        clock["now"] = 1001.0
+        h.session.mark_model_turn_request_started(1, clock["now"])
+        r2 = h.session.begin_response(turn_id=1)
+        r2_request = "duplex-new-turn"
+        h.session.bind_request(r2_request)
+        h.runner.emit({"type": "response.created", "response_id": r2, "epoch": h.session.epoch})
+        await h.settle()
+
+        clock["now"] = 1001.2
+        old_events = await h.deliver_and_settle(tts_output(r1_request, samples=48000, text="first later"))
+        old_audio = find(old_events, "response.output_audio.delta")
+        assert old_audio.response_id == r1
+
+        clock["now"] = 1001.8
+        new_events = await h.deliver_and_settle(tts_output(r2_request, samples=24000, text="second", turn_id=1))
+        new_audio = find(new_events, "response.output_audio.delta")
+        assert new_audio.response_id == r2
+        metrics = _response_request_metrics_of(new_audio)
+        assert metrics["ttft_ms"] == pytest.approx(800.0)
+        assert metrics["ttfp_ms"] == pytest.approx(800.0)
+        old_metadata = old_audio.to_realtime().get("metadata", {})
+        old_extensions = old_metadata.get("vllm_omni", {})
+        assert "response_request_metrics" not in old_extensions
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_stale_epoch_append_does_not_own_request_start() -> None:
     clock = {"now": 1000.0}
     h = await open_harness(clock=lambda: clock["now"])
