@@ -16,9 +16,9 @@ from vllm_omni.entrypoints.duplex.runtime_adapter import (
 )
 
 from tests.e2e.online_serving import personaplex_realtime_duplex as e2e_driver
+from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.stage_config import (
     load_deploy_config,
-    merge_pipeline_deploy,
 )
 from vllm_omni.engine.duplex.messages import DuplexFence
 from vllm_omni.model_executor.models.personaplex.duplex.config import DEFAULT_PERSONA
@@ -212,12 +212,11 @@ def test_personaplex_stage_engine_args(
     expected: bool,
 ) -> None:
     deploy_path = Path(__file__).parents[5] / "vllm_omni" / "deploy" / "personaplex.yaml"
-    stages = merge_pipeline_deploy(
-        PERSONAPLEX_PIPELINE,
-        load_deploy_config(deploy_path),
-    )
+    stages = VllmOmniConfig.from_pipeline_config(
+        PERSONAPLEX_PIPELINE, user_deploy_config=load_deploy_config(deploy_path)
+    ).stage_configs
 
-    assert [stage.yaml_engine_args.get(engine_arg) for stage in stages] == [
+    assert [getattr(stage.model_config, engine_arg) for stage in stages] == [
         expected,
         expected,
     ]
@@ -226,10 +225,10 @@ def test_personaplex_stage_engine_args(
 def test_personaplex_duplex_capacity_is_propagated_to_all_model_stages() -> None:
     deploy_path = Path(__file__).parents[5] / "vllm_omni" / "deploy" / "personaplex.yaml"
     deploy = load_deploy_config(deploy_path)
-    stages = merge_pipeline_deploy(PERSONAPLEX_PIPELINE, deploy)
+    stages = VllmOmniConfig.from_pipeline_config(PERSONAPLEX_PIPELINE, user_deploy_config=deploy).stage_configs
 
     assert deploy.duplex_session.max_sessions == 2
-    assert [stage.yaml_engine_args.get("duplex_max_sessions") for stage in stages] == [2, 2]
+    assert [stage.model_config.duplex_max_sessions for stage in stages] == [2, 2]
     assert "personaplex_codec_max_sessions" not in deploy.connectors["connector_of_shared_memory"]["extra"]
 
 

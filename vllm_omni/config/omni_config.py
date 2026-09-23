@@ -2,10 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Structured vLLM-Omni configuration classes.
 
-This module is additive for Phase 2 of RFC #4021.
-``VllmOmniConfig.from_pipeline_config`` builds the structured view from an
-already-resolved pipeline and deploy config so parity can be proven before
-later PRs cut consumers over to these classes.
+``VllmOmniConfig.from_pipeline_config`` resolves pipeline topology, deployment
+settings, parallel strategies, and CLI overrides into the runtime stage configs.
 """
 
 from __future__ import annotations
@@ -52,7 +50,6 @@ from vllm_omni.config.stage_config import (
     _select_processor_funcs,
     build_stage_runtime_overrides,
     load_deploy_config,
-    merge_pipeline_deploy,
     merge_sampling_constraints,
     normalize_pipeline_cli_overrides,
     reconcile_diffusion_attention_overrides,
@@ -84,17 +81,6 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
         "stage_id",
         "subparser",
         "tokenizer",
-    }
-)
-
-# Legacy deploy files can still carry StageConfig metadata in engine_extras.
-# Those values are not backend engine inputs, and the additive typed path keeps
-# sourcing their effective values from the immutable pipeline topology.
-_LEGACY_STAGE_METADATA_EXTRA_FIELDS = frozenset(
-    {
-        "final_output",
-        "final_output_type",
-        "is_comprehension",
     }
 )
 
@@ -279,7 +265,7 @@ class _ConnectorEngineOverrides(TypedDict, total=False):
 
 @dataclass(frozen=True)
 class _StageEngineValues:
-    """Typed projections of legacy flat per-stage ``yaml_engine_args``."""
+    """Typed groups of resolved per-stage engine overrides."""
 
     quantization: _QuantizationEngineOverrides
     model: _ModelEngineOverrides
@@ -297,7 +283,7 @@ class _StageEngineValues:
 
 @dataclass(frozen=True)
 class _DiffusionEngineOverrides:
-    """Validated diffusion projection of legacy flat per-stage engine args."""
+    """Validated diffusion-specific engine overrides."""
 
     _values: dict[str, Any]
 
@@ -518,8 +504,8 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     num_weight_load_threads: int = Field(default=4, ge=1)
     disable_autocast: bool = False
     # Per-stage checkpoint/tokenizer subdirectories under the model root
-    # (e.g. Audex stage 0 → checkpoint_folder_audiogen). Mirrors
-    # StagePipelineConfig.model_subdir/tokenizer_subdir on the legacy path.
+    # (e.g. Audex stage 0 → checkpoint_folder_audiogen). The topology and
+    # model config carry these paths through the typed resolver together.
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
     requires_full_payload_input: bool = False
@@ -1505,7 +1491,6 @@ def _stage_engine_overrides(stage_deploy: StageDeployConfig | None) -> dict[str,
         {
             name: _copy_value(value)
             for name, value in stage_deploy.engine_extras.items()
-            if name not in _LEGACY_STAGE_METADATA_EXTRA_FIELDS
         }
     )
     return overrides
@@ -1524,7 +1509,7 @@ def _stage_engine_values(
     if stage_cli_overrides:
         stage_cli_overrides = dict(stage_cli_overrides)
         if topology.execution_type == StageExecutionType.DIFFUSION:
-            # Mirror StageConfig.to_omegaconf so both projections resolve alike.
+            # Apply partial CLI mappings on top of deployment defaults.
             # CLI parallel fields move into the nested ``parallel_config`` dict,
             # otherwise the deploy YAML's nested values would win over flat CLI
             # flags when ``_build_parallel_config`` merges nested over flat.
@@ -2254,8 +2239,7 @@ class VllmOmniConfig:
         if strategy_specs:
             from vllm_omni.config.composable_parallel import apply_strategy_specs
 
-            strategy_stages = merge_pipeline_deploy(pipeline_cfg, copy.deepcopy(deploy), {})
-            strategy_result = apply_strategy_specs(strategy_stages, strategy_specs)
+            strategy_result = apply_strategy_specs(pipeline_cfg, deploy, strategy_specs)
             strategy_overrides: dict[str, Any] = {}
             axis_fields = {
                 "tp": "tensor_parallel_size",

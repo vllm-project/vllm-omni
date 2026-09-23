@@ -391,36 +391,16 @@ def _get_attr_or_item(obj: Any, key: str, default: Any = None) -> Any:
     return getattr(obj, key, default)
 
 
-def _tp_size_for_stage(stage_configs: Sequence[Any], stage_id: Any) -> int | None:
-    """Resolve tensor_parallel_size for *stage_id* from the loaded stage configs."""
-    id_strs = {str(stage_id)}
-    try:
-        id_strs.add(str(int(stage_id)))
-    except (TypeError, ValueError):
-        pass
-
+def _tp_size_for_stage(stage_configs: Sequence[BaseVllmOmniStageConfig], stage_id: Any) -> int | None:
+    """Resolve tensor parallel size from the typed stage configuration."""
     for stage_cfg in stage_configs:
-        if str(getattr(stage_cfg, "stage_id", None)) not in id_strs:
+        if str(stage_cfg.stage_id) != str(stage_id):
             continue
-        if isinstance(stage_cfg, BaseVllmOmniStageConfig):
-            try:
-                return max(1, int(stage_cfg.parallel_config.tensor_parallel_size))
-            except (TypeError, ValueError):
-                return 1
-        engine_args = getattr(stage_cfg, "engine_args", None)
-        if engine_args is None:
-            return 1
-        parallel_config = _get_attr_or_item(engine_args, "parallel_config")
-        if parallel_config is not None:
-            tp = _get_attr_or_item(parallel_config, "tensor_parallel_size", 1)
-        else:
-            tp = _get_attr_or_item(engine_args, "tensor_parallel_size", 1)
         try:
-            return max(1, int(tp))
+            return max(1, int(stage_cfg.parallel_config.tensor_parallel_size))
         except (TypeError, ValueError):
             return 1
     return None
-
 
 def _inject_inferred_kv_tp_topology(
     omni_kv: Any,
@@ -486,54 +466,25 @@ def _inject_inferred_kv_tp_topology(
         setattr(omni_kv, "rank_mapping", rank_mapping)
 
 
-def inject_kv_stage_info(stage_cfg: Any, stage_id: int, stage_configs: Sequence[Any] | None = None) -> None:
-    """Inject stage_id, engine_input_source, and inferred TP topology into omni_kv_config.
-
-    When *stage_configs* is provided, also infers from_tp/to_tp for
-    heterogeneous TP topologies so the KV transfer manager can compute
-    rank mappings automatically.
-    """
-    try:
-        connector_config = getattr(stage_cfg, "connector_config", None)
-        if connector_config is not None:
-            omni_kv = connector_config.omni_kv_config
-        else:
-            engine_args = stage_cfg.engine_args
-            if hasattr(engine_args, "get"):
-                omni_kv = engine_args.get("omni_kv_config", None)
-            else:
-                omni_kv = getattr(engine_args, "omni_kv_config", None)
-
-        if omni_kv is None:
-            return
-
-        if hasattr(omni_kv, "setdefault"):
-            omni_kv.setdefault("stage_id", stage_id)
-        elif hasattr(omni_kv, "__setitem__"):
-            if "stage_id" not in omni_kv:
-                omni_kv["stage_id"] = stage_id
-
-        engine_input_source = (
-            getattr(stage_cfg, "input_sources", None)
-            if connector_config is not None
-            else getattr(stage_cfg, "engine_input_source", None)
+def inject_kv_stage_info(
+    stage_cfg: BaseVllmOmniStageConfig,
+    stage_id: int,
+    stage_configs: Sequence[BaseVllmOmniStageConfig] | None = None,
+) -> None:
+    """Inject stage identity and inferred TP topology into typed KV config."""
+    omni_kv = stage_cfg.connector_config.omni_kv_config
+    if omni_kv is None:
+        return
+    if hasattr(omni_kv, "setdefault"):
+        omni_kv.setdefault("stage_id", stage_id)
+        omni_kv.setdefault("engine_input_source", list(stage_cfg.input_sources))
+    if stage_configs:
+        _inject_inferred_kv_tp_topology(
+            omni_kv,
+            stage_id=stage_id,
+            stage_configs=stage_configs,
+            engine_input_source=stage_cfg.input_sources,
         )
-        if engine_input_source is not None:
-            if hasattr(omni_kv, "setdefault"):
-                omni_kv.setdefault("engine_input_source", list(engine_input_source))
-            elif hasattr(omni_kv, "__setitem__") and "engine_input_source" not in omni_kv:
-                omni_kv["engine_input_source"] = list(engine_input_source)
-
-        if stage_configs:
-            _inject_inferred_kv_tp_topology(
-                omni_kv,
-                stage_id=stage_id,
-                stage_configs=stage_configs,
-                engine_input_source=engine_input_source,
-            )
-    except Exception as e:
-        logger.debug("Failed to inject stage info into omni_kv_config: %s", e)
-
 
 def inject_omni_kv_connector_config(
     engine_args_dict: dict[str, Any],
@@ -603,109 +554,6 @@ def _apply_rocm_attention_backend(
     engine_args["attention_backend"] = "TRITON_ATTN"
 
 
-def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
-    """Extract metadata through the active production legacy path.
-
-    Keep production callers on this path until RFC #4021 migrates the
-    engine-argument and stage-init consumers together.
-    """
-    stage_id: int = stage_config.stage_id
-    stage_type: Literal["llm", "diffusion"] = _get_attr_or_item(stage_config, "stage_type", "llm")
-    engine_args = stage_config.engine_args
-
-    _apply_rocm_attention_backend(engine_args, stage_type)
-
-    runtime_cfg = stage_config.runtime
-    engine_input_source: list[int] = _get_attr_or_item(stage_config, "engine_input_source", [])
-    final_output: bool = stage_config.final_output
-    final_output_type: str | None = stage_config.final_output_type
-
-    default_sp = _to_dict(_get_attr_or_item(stage_config, "default_sampling_params", {}))
-    # A pooling stage carries its task via default_pooling_params, set where the
-    # stage is declared.
-    default_pp = _to_dict(_get_attr_or_item(stage_config, "default_pooling_params", {}))
-    # A pooling stage is an LLM stage run with runner="pooling" (vLLM's
-    # is_pooling_model signal); pick params by that signal, not execution_type.
-    is_pooling = str(engine_args.get("runner", "")).lower() == "pooling"
-    default_params: OmniSamplingParams | PoolingParams
-    if stage_type == "diffusion":
-        default_params = OmniDiffusionSamplingParams(**default_sp)
-    elif is_pooling:
-        default_params = PoolingParams(**default_pp)
-    else:  # generative llm: ar / generation
-        default_params = SamplingParams(**default_sp)
-
-    custom_process_input_func: Callable | None = None
-    _cpif_path = _get_attr_or_item(stage_config, "custom_process_input_func")
-    if _cpif_path:
-        mod_path, fn_name = _cpif_path.rsplit(".", 1)
-        custom_process_input_func = getattr(importlib.import_module(mod_path), fn_name)
-
-    prompt_transform_func: Callable | None = None
-    _ptf_path = _get_attr_or_item(stage_config, "prompt_transform_func")
-    if _ptf_path:
-        _mod, _fn = _ptf_path.rsplit(".", 1)
-        prompt_transform_func = getattr(importlib.import_module(_mod), _fn)
-
-    prompt_expand_func: Callable | None = None
-    _pef_path = _get_attr_or_item(stage_config, "prompt_expand_func")
-    if _pef_path:
-        _mod, _fn = _pef_path.rsplit(".", 1)
-        prompt_expand_func = getattr(importlib.import_module(_mod), _fn)
-
-    cfg_kv_collect_func: Callable | None = None
-    _ckf_path = _get_attr_or_item(stage_config, "cfg_kv_collect_func")
-    if _ckf_path:
-        _mod, _fn = _ckf_path.rsplit(".", 1)
-        cfg_kv_collect_func = getattr(importlib.import_module(_mod), _fn)
-
-    model_stage = engine_args.get("model_stage")
-
-    if stage_type == "diffusion":
-        return StageMetadata(
-            stage_id=stage_id,
-            stage_type="diffusion",
-            engine_output_type=None,
-            is_comprehension=False,
-            requires_multimodal_data=False,
-            engine_input_source=engine_input_source,
-            final_output=final_output,
-            final_output_type=final_output_type,
-            default_sampling_params=default_params,
-            custom_process_input_func=custom_process_input_func,
-            model_stage=model_stage,
-            runtime_cfg=runtime_cfg,
-            prompt_transform_func=prompt_transform_func,
-            cfg_kv_collect_func=cfg_kv_collect_func,
-        )
-
-    engine_output_type = engine_args.get("engine_output_type")
-    is_comprehension = stage_config.is_comprehension
-    requires_multimodal_data = getattr(runtime_cfg, "requires_multimodal_data", False)
-
-    return StageMetadata(
-        stage_id=stage_id,
-        stage_type=stage_type,
-        engine_output_type=engine_output_type,
-        is_comprehension=is_comprehension,
-        requires_multimodal_data=requires_multimodal_data,
-        engine_input_source=engine_input_source,
-        final_output=final_output,
-        final_output_type=final_output_type,
-        default_sampling_params=default_params,
-        custom_process_input_func=custom_process_input_func,
-        model_stage=model_stage,
-        runtime_cfg=runtime_cfg,
-        prompt_transform_func=prompt_transform_func,
-        prompt_expand_func=prompt_expand_func,
-    )
-
-
-def extract_stage_metadata(stage_config: Any) -> StageMetadata:
-    """Preserve the legacy one-argument API for external callers."""
-    return extract_legacy_stage_metadata(stage_config)
-
-
 def _resolve_omni_metadata_hook(path: str | None) -> Callable | None:
     if not path:
         return None
@@ -713,10 +561,10 @@ def _resolve_omni_metadata_hook(path: str | None) -> Callable | None:
     return getattr(importlib.import_module(module_path), function_name)
 
 
-def extract_stage_metadata_from_omni_stage_config(
+def extract_stage_metadata(
     stage_config: BaseVllmOmniStageConfig,
 ) -> StageMetadata:
-    """Project one typed stage config into production runtime metadata."""
+    """Project one typed stage config into runtime metadata."""
     stage_type: Literal["llm", "diffusion"] = "diffusion" if stage_config.stage_type == StageType.DIFFUSION else "llm"
     pooling_config = stage_config.pooling_config
     if stage_type == "llm" and (pooling_config.runner or "").lower() == "pooling":
@@ -869,13 +717,8 @@ def split_devices_for_replicas(
     )
 
 
-def get_stage_tp_size(stage_cfg: Any) -> int:
-    """Extract tensor_parallel_size from a stage config object."""
-    engine_args = getattr(stage_cfg, "engine_args", {})
-    if hasattr(engine_args, "get"):
-        return int(engine_args.get("tensor_parallel_size", 1) or 1)
-    return int(getattr(engine_args, "tensor_parallel_size", 1) or 1)
-
+def get_stage_tp_size(stage_cfg: BaseVllmOmniStageConfig) -> int:
+    return max(1, int(stage_cfg.parallel_config.tensor_parallel_size or 1))
 
 def _get_local_llm_parallel_sizes(
     stage_cfg: Any,
@@ -889,15 +732,12 @@ def _get_local_llm_parallel_sizes(
     no local engines), and only fall back to the global DP width when it is
     unset.
     """
-    if engine_args is None:
-        engine_args = getattr(stage_cfg, "parallel_config", None)
-        if engine_args is None:
-            engine_args = getattr(stage_cfg, "engine_args", {})
-    tp_size = int(_get_attr_or_item(engine_args, "tensor_parallel_size", 1) or 1)
-    pp_size = int(_get_attr_or_item(engine_args, "pipeline_parallel_size", 1) or 1)
-    local_dp_size = _get_attr_or_item(engine_args, "data_parallel_size_local", None)
+    parallel = stage_cfg.parallel_config if engine_args is None else engine_args
+    tp_size = int(_get_attr_or_item(parallel, "tensor_parallel_size", 1) or 1)
+    pp_size = int(_get_attr_or_item(parallel, "pipeline_parallel_size", 1) or 1)
+    local_dp_size = _get_attr_or_item(parallel, "data_parallel_size_local", None)
     if local_dp_size is None:
-        local_dp_size = _get_attr_or_item(engine_args, "data_parallel_size", 1)
+        local_dp_size = _get_attr_or_item(parallel, "data_parallel_size", 1)
     return tp_size, int(local_dp_size if local_dp_size is not None else 1), pp_size
 
 
@@ -929,7 +769,7 @@ def get_stage_devices_per_replica(stage_cfg: Any, engine_args: Any | None = None
 
 
 def compute_replica_layout(
-    stage_configs: Sequence[Any],
+    stage_configs: Sequence[BaseVllmOmniStageConfig],
     *,
     allow_zero: bool = False,
 ) -> tuple[list[int], dict[int, list[str | None]]]:
@@ -950,12 +790,8 @@ def compute_replica_layout(
     """
     replicas_per_stage: list[int] = []
     for stage_cfg in stage_configs:
-        runtime_cfg = getattr(stage_cfg, "runtime_config", getattr(stage_cfg, "runtime", {}))
-        num_replicas = int(
-            runtime_cfg.get("num_replicas", 1)
-            if hasattr(runtime_cfg, "get")
-            else getattr(runtime_cfg, "num_replicas", 1)
-        )
+        runtime_cfg = stage_cfg.runtime_config
+        num_replicas = int(runtime_cfg.num_replicas or 1)
         if num_replicas < 0:
             raise ValueError(f"num_replicas must be >= 0, got {num_replicas}")
         replicas_per_stage.append(num_replicas if allow_zero else max(1, num_replicas))
@@ -965,10 +801,8 @@ def compute_replica_layout(
         num_replicas = replicas_per_stage[stage_id]
         if num_replicas <= 1:
             continue
-        runtime_cfg = getattr(stage_cfg, "runtime_config", getattr(stage_cfg, "runtime", {}))
-        devices_str = (
-            runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
-        )
+        runtime_cfg = stage_cfg.runtime_config
+        devices_str = runtime_cfg.devices
         devices_per_replica = get_stage_devices_per_replica(stage_cfg)
         replica_devices_map[stage_id] = split_devices_for_replicas(
             devices_str,
@@ -1162,8 +996,8 @@ def _project_omni_stage_engine_args(
         if value is not None:
             engine_args[name] = copy.deepcopy(value)
 
-    # The legacy builder always emits this key, including for pipelines such
-    # as Audex that intentionally defer architecture discovery to HF config.
+    # Preserve the explicit key even for pipelines such as Audex that defer
+    # architecture discovery to the HF config.
     engine_args["model_arch"] = copy.deepcopy(stage_config.model_config.model_arch)
     _maybe_set_qwen3_omni_moe_backend(
         engine_args,
@@ -1337,58 +1171,13 @@ def _finalize_engine_args_dict(
     return engine_args_dict
 
 
-def build_legacy_engine_args_dict(
-    stage_config: Any,
-    model: str,
-    stage_connector_spec: dict[str, Any] | None = None,
-    cli_tokenizer: str | None = None,
-) -> dict[str, Any]:
-    """Implement engine-argument building for the legacy stage representation."""
-    engine_args_dict = copy.deepcopy(_to_dict(stage_config.engine_args))
-    # Legacy configs can materialize an omitted optional TP size as None.
-    # Remove it from the detached adapter dict so the backend default applies
-    # without mutating stage_config.engine_args.
-    if engine_args_dict.get("tensor_parallel_size") is None:
-        engine_args_dict.pop("tensor_parallel_size", None)
-
-    default_sp = _to_dict(_get_attr_or_item(stage_config, "default_sampling_params", {}))
-    return _finalize_engine_args_dict(
-        engine_args_dict,
-        stage_type=_get_attr_or_item(stage_config, "stage_type", "llm"),
-        stage_id=stage_config.stage_id,
-        model=model,
-        stage_connector_spec=stage_connector_spec,
-        cli_tokenizer=cli_tokenizer,
-        has_sampling_extra_args=bool(default_sp.get("extra_args")),
-        sampling_extra_args_keys=_sampling_extra_args_keys(default_sp),
-    )
-
-
-def build_engine_args_dict(
-    stage_config: Any,
-    model: str,
-    stage_connector_spec: dict[str, Any] | None = None,
-    cli_tokenizer: str | None = None,
-) -> dict[str, Any]:
-    """Preserve the legacy engine-argument API for compatibility callers.
-
-    Typed runtime stages use ``build_engine_args_dict_from_omni_stage_config``.
-    """
-    return build_legacy_engine_args_dict(
-        stage_config,
-        model,
-        stage_connector_spec=stage_connector_spec,
-        cli_tokenizer=cli_tokenizer,
-    )
-
-
-def build_engine_args_dict_from_omni_stage_config(
+def project_engine_args(
     stage_config: BaseVllmOmniStageConfig,
     model: str,
     stage_connector_spec: dict[str, Any] | None = None,
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
-    """Project one typed production stage config into backend engine arguments."""
+    """Project one typed stage config into backend engine arguments."""
     engine_args_dict = _project_omni_stage_engine_args(stage_config)
     _apply_rocm_attention_backend(engine_args_dict, stage_config.stage_type)
     return _finalize_engine_args_dict(
@@ -1486,12 +1275,13 @@ def build_vllm_config(
         (vllm_config, executor_class)
     """
     if engine_args_dict is None:
-        engine_args_dict = (
-            build_engine_args_dict_from_omni_stage_config(
-                stage_config, model, stage_connector_spec=stage_connector_spec
+        if not isinstance(stage_config, BaseVllmOmniStageConfig):
+            raise TypeError(
+                "build_vllm_config requires a typed VllmOmniStageConfig; "
+                f"got {type(stage_config).__name__}"
             )
-            if isinstance(stage_config, BaseVllmOmniStageConfig)
-            else build_engine_args_dict(stage_config, model, stage_connector_spec=stage_connector_spec)
+        engine_args_dict = project_engine_args(
+            stage_config, model, stage_connector_spec=stage_connector_spec
         )
 
     filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
@@ -1965,27 +1755,20 @@ def get_stage_connector_spec(
     return {}
 
 
-def build_diffusion_config(
+def build_diffusion_stage_config(
     model: str,
-    stage_cfg: Any,
+    stage_cfg: BaseVllmOmniStageConfig,
     metadata: StageMetadata,
 ) -> Any:
-    """Build diffusion config for a stage."""
-    from vllm_omni.config.omni_config import extract_diffusion_stage_config_kwargs
+    """Build the diffusion backend config for a typed stage."""
 
-    engine_args_dict = (
-        build_engine_args_dict_from_omni_stage_config(stage_cfg, model)
-        if isinstance(stage_cfg, BaseVllmOmniStageConfig)
-        else build_engine_args_dict(stage_cfg, model)
-    )
-    stage_id = engine_args_dict.get("stage_id", metadata.stage_id)
-    diffusion_kwargs = extract_diffusion_stage_config_kwargs(
-        engine_args_dict,
-        stage_id=stage_id,
-        include_engine_adapter_metadata=True,
-    )
-    od_config = OmniDiffusionConfig(**{name: value for name, value in diffusion_kwargs.items() if value is not None})
+    engine_args_dict = project_engine_args(stage_cfg, model)
+    od_config = OmniDiffusionConfig.from_kwargs(**engine_args_dict)
 
+    # Diffusion KV profiling needs the request dimensions available during
+    # stage construction. Preserve explicit dimensions supplied by the stage
+    # config and only fill missing profile hints from its default sampling
+    # parameters.
     for dimension in ("height", "width"):
         value = getattr(metadata.default_sampling_params, dimension, None)
         if isinstance(value, int) and value > 0:
@@ -2031,7 +1814,7 @@ def initialize_diffusion_stage(
     """
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
-    od_config = build_diffusion_config(model, stage_cfg, metadata)
+    od_config = build_diffusion_stage_config(model, stage_cfg, metadata)
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, use_inline)
 
 

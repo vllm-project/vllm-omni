@@ -34,9 +34,9 @@ MINIMAX_MUSIC3_AUDIO_END_TOKEN_ID = 151670
 
 # MiniMax captions carry the full style description and run to roughly 5000
 # characters, an order of magnitude past the 500-character serving default.
-# ``tts_args`` is a pipeline-level stage extra, not a deploy-YAML field: it
-# reaches the serving layer through ``StageConfig.yaml_extras``, which is where
-# ``ServingSpeech._compute_max_instructions_length`` reads it from.
+# ``tts_args`` is a pipeline-level stage extra, not a deploy-YAML field:
+# ``ServingSpeech._compute_max_instructions_length`` reads it from the typed
+# stage's ``stage_pipeline_config.extras``.
 _MAX_INSTRUCTIONS_LENGTH = 20_000
 
 MINIMAX_MUSIC3_PIPELINE = PipelineConfig(

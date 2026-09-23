@@ -20,7 +20,6 @@ from typing import Any
 import msgspec
 import torch
 import zmq
-from omegaconf import OmegaConf
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_ports_list, zmq_socket_ctx
@@ -35,12 +34,11 @@ from vllm.v1.engine.utils import (
 )
 from vllm.v1.executor import Executor
 
-from vllm_omni.config.omni_config import BaseVllmOmniStageConfig
 from vllm_omni.distributed.omni_connectors.utils import initialization
 from vllm_omni.engine import stage_init_utils
 from vllm_omni.engine.stage_init_utils import (
     acquire_device_locks,
-    build_diffusion_config,
+    build_diffusion_stage_config,
     initialize_diffusion_stage,
     release_device_locks,
 )
@@ -72,9 +70,6 @@ def _serialize_stage_config(stage_config: Any) -> Any:
         return stage_config
     if isinstance(stage_config, torch.dtype):
         return str(stage_config).removeprefix("torch.")
-
-    if OmegaConf.is_config(stage_config):
-        return _serialize_stage_config(OmegaConf.to_container(stage_config, resolve=True))
 
     if dataclasses.is_dataclass(stage_config) and not isinstance(stage_config, type):
         return _serialize_stage_config(dataclasses.asdict(stage_config))
@@ -1530,18 +1525,14 @@ def launch_headless_diffusion_replicas(
         stage_id,
     )
 
-    metadata = (
-        stage_init_utils.extract_stage_metadata_from_omni_stage_config(stage_cfg)
-        if isinstance(stage_cfg, BaseVllmOmniStageConfig)
-        else stage_init_utils.extract_legacy_stage_metadata(stage_cfg)
-    )
+    metadata = stage_init_utils.extract_stage_metadata(stage_cfg)
     if omni_conn_cfg:
         inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
     # Headless single-stage launch must still infer cross-stage TP topology
     # from the loaded deploy config so heterogeneous KV routing keys match the
     # head process (e.g. from_tp=2, to_tp=1).
     stage_init_utils.inject_kv_stage_info(stage_cfg, stage_id, stage_configs)
-    od_config = stage_init_utils.build_diffusion_config(model, stage_cfg, metadata)
+    od_config = stage_init_utils.build_diffusion_stage_config(model, stage_cfg, metadata)
 
     logger.info(
         "[Headless] Launching %d diffusion replica(s) for stage %d via OmniMasterServer at %s:%d",
@@ -1613,7 +1604,7 @@ def launch_diffusion_stage_replica(
     from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 
     with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
-        od_config = build_diffusion_config(model, stage_config, metadata)
+        od_config = build_diffusion_stage_config(model, stage_config, metadata)
     parallel_config = getattr(od_config, "parallel_config", None)
     world_size = getattr(parallel_config, "world_size", 1)
     try:

@@ -508,7 +508,7 @@ class OrchestratorArgs:
       (a) orchestrator-only (never needed by a stage engine), OR
       (b) orchestrator-read-then-redistributed (e.g. ``async_chunk`` is read
           from CLI, written to ``DeployConfig``, then propagated to every
-          stage via ``merge_pipeline_deploy`` — not via direct kwargs
+          stage via the typed pipeline/deploy resolver — not via direct kwargs
           forwarding).
 
     Fields that BOTH orchestrator and engine genuinely need (e.g. ``model``,

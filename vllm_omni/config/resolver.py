@@ -46,7 +46,7 @@ class OmniConfigResolution:
 
 
 def _filter_dict_like_object(obj: dict | Any) -> dict:
-    """Convert a dict-like object while dropping OmegaConf-incompatible callables."""
+    """Convert a dict-like object while dropping non-serializable callables."""
     result = {}
     filtered_keys = []
     for key, value in obj.items():
@@ -62,7 +62,7 @@ def _filter_dict_like_object(obj: dict | Any) -> dict:
             result[key] = _convert_dataclasses_to_dict(value)
     if filtered_keys:
         logger.warning(
-            "Filtered out %d callable object(s) from base_engine_args that are not compatible with OmegaConf: %s.",
+            "Filtered out %d callable object(s) from base engine overrides: %s.",
             len(filtered_keys),
             filtered_keys,
         )
@@ -70,7 +70,7 @@ def _filter_dict_like_object(obj: dict | Any) -> dict:
 
 
 def _convert_dataclasses_to_dict(obj: Any) -> Any:
-    """Recursively convert caller values to OmegaConf-compatible types."""
+    """Recursively convert caller values to transport-compatible builtins."""
     # Check by class name before dict to cover both collections.Counter and
     # vllm.utils.Counter without importing either implementation.
     if hasattr(obj, "__class__") and obj.__class__.__name__ == "Counter":
@@ -101,16 +101,16 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
         return f"{module}.{qualname}" if module and qualname and module != "builtins" else qualname
     if callable(obj):
         logger.warning(
-            "Cannot convert callable %r to an OmegaConf-compatible value.",
+            "Cannot convert callable %r to a transport-compatible value.",
             obj,
         )
-        raise TypeError(f"callable {obj!r} is not an OmegaConf-compatible value")
+        raise TypeError(f"callable {obj!r} is not a transport-compatible value")
     if isinstance(obj, (list, tuple)):
         converted = []
         for item in obj:
             if callable(item):
                 logger.warning(
-                    "Filtered callable %r from an OmegaConf-compatible sequence.",
+                    "Filtered callable %r from a transport-compatible sequence.",
                     item,
                 )
                 continue
@@ -121,7 +121,7 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
             return _filter_dict_like_object(obj)
         except (TypeError, ValueError, AttributeError) as exc:
             logger.warning(
-                "Failed to convert dict-like %s to an OmegaConf-compatible mapping.",
+                "Failed to convert dict-like %s to a transport-compatible mapping.",
                 type(obj).__name__,
             )
             raise TypeError(f"cannot convert dict-like {type(obj).__name__}") from exc
