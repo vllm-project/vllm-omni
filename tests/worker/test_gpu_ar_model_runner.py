@@ -1012,7 +1012,9 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
     runner.omni_prefix_cache = object()
     runner.speculative_config = None
     runner.routed_experts_initialized = False
-    runner.requests = {}
+    runner.requests = {
+        req_id: SimpleNamespace(sampling_params=SamplingParams()) for req_id in runner.input_batch.req_ids
+    }
     runner.supports_mm_inputs = False
     runner.use_async_scheduling = False
     runner._omni_num_scheduled_tokens_np = None
