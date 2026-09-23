@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CosyVoice3 pipeline topology (frozen).
 
 Stage 0: Talker   — text prompt → speech tokens (LLM autoregressive).
@@ -12,6 +12,10 @@ Stage 1: Code2Wav — flow-matching decoder → acoustic features → waveform.
     through the shared-memory connector.
 """
 
+from vllm_omni.config.endpoint_policy import (
+    EndpointRestriction,
+    OmniServingCapability,
+)
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
@@ -24,6 +28,16 @@ COSYVOICE3_PIPELINE = PipelineConfig(
     model_type="cosyvoice3",
     default_deploy_config_name="cosyvoice3.yaml",
     model_arch="CosyVoice3Model",
+    endpoint_restrictions=(
+        EndpointRestriction(
+            OmniServingCapability.COMPLETIONS,
+            "CosyVoice3 does not support the Completions API.",
+        ),
+        EndpointRestriction(
+            OmniServingCapability.CHAT_COMPLETIONS,
+            "CosyVoice3 does not support the Chat Completions API.",
+        ),
+    ),
     stages=(
         StagePipelineConfig(
             stage_id=0,
