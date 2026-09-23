@@ -1418,6 +1418,7 @@ _DIFFUSION_ENGINE_ADAPTER_METADATA_FIELDS = frozenset(
         "inline_diffusion",
         "requires_full_payload_input",
         "sampling_extra_args_keys",
+        "scheduling_metadata_adapter",
         "session_mode",
     }
 )
