@@ -99,6 +99,7 @@ class DuplexSessionManager:
         result_sink: janus.AsyncQueue[EngineQueueMessage],
         runtime_config: DuplexSessionRuntimeConfig,
         model_config: ModelConfig | None,
+        log_stats: bool = False,
         clock: Callable[[], float] | None = None,
         executor: concurrent.futures.ThreadPoolExecutor | None = None,
     ) -> None:
@@ -106,6 +107,7 @@ class DuplexSessionManager:
         self.plugin = plugin
         self.stage_port = stage_port
         self.model_config = model_config
+        self.log_stats = bool(log_stats)
         self.runtime_config = runtime_config
         self._output_sink = output_sink
         self._result_sink = result_sink
@@ -499,6 +501,8 @@ class DuplexSessionManager:
                 lease=DuplexLeaseState(config=self._lease_config, generation=0, last_activity=self._clock()),
                 _clock=self._clock,
                 _runtime_config=dict(runtime_config),
+                num_stages=self.stage_port.stage_count,
+                log_stats=self.log_stats,
             )
             # Validates the plugin's sampling policy for this runtime config before admission.
             self.sampling_params_for(session)
@@ -600,9 +604,12 @@ class DuplexSessionManager:
         The session keeps its admission slot (``_closing``) until stage cleanup
         succeeded; a failed cleanup is retried by the reaper. For an explicit
         close the ``session.closed`` event is emitted only after the cleanup
-        attempt, so a client that sees it can open a replacement session at
-        once (the runner used to emit it before the stage requests were
-        aborted, which let a prompt reopen hit ``resource_exhausted``).
+        attempt, in a ``finally``, including when the cleanup failed (the
+        runner used to emit it before the stage requests were aborted). A
+        client that sees the event can normally open a replacement session
+        right away, but after a failed cleanup the slot is still held until
+        the reaper succeeds, so a prompt reopen can be refused with
+        ``resource_exhausted``.
         """
         session = runner.session
         submitted = tuple(session.resource_request_ids(submitted=True))

@@ -17,8 +17,22 @@ from vllm_omni.benchmarks.metrics.metrics import (
     print_stage_durations_metrics,
 )
 from vllm_omni.benchmarks.patch.patch import MixRequestFuncOutput
+from vllm_omni.metrics.definitions import stage_modality_flags
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
+
+
+def test_stage_modality_flags_match_print_stage():
+    text = stage_modality_flags("text", "")
+    audio = stage_modality_flags("", "audio")
+    stream = stage_modality_flags("latent", "stream")
+    video_frames = stage_modality_flags("video", "image")
+
+    assert text.is_text_stage and not text.is_audio_stage
+    assert audio.is_audio_stage and not audio.is_internal_stream_stage
+    assert stream.is_internal_stream_stage and not stream.is_text_stage
+    assert video_frames.is_video_stage and not video_frames.is_image_stage
+    assert not stage_modality_flags(None, None).is_text_stage
 
 
 def test_tpot_matches_mean_itl_per_request():

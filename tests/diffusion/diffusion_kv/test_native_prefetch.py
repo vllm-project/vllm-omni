@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from collections.abc import Iterator
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -530,23 +531,30 @@ def test_drain_after_terminal_request_state_was_popped(monkeypatch):
 
 
 @pytest.mark.parametrize("prefetch", [False, True])
-def test_real_active_connector_starts_required_load_before_polling(prefetch):
-    from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector
+def test_real_active_connector_starts_required_load_before_polling(prefetch, monkeypatch):
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
+    from vllm.v1.worker.gpu import kv_connector as native_kv_connector
 
     from vllm_omni.diffusion.diffusion_kv.kv_connector import wait_for_kv_load
 
-    active = object.__new__(ActiveKVConnector)
-    active._disabled = False
-    active._pending_load_start = False
-    active.kv_connector = Mock()
-    active.kv_connector.get_block_ids_with_load_errors.return_value = set()
-    active._start_load_kv = Mock()
+    connector = Mock(spec=KVConnectorBase_V1)
+    connector.get_block_ids_with_load_errors.return_value = set()
+    # Exercise upstream's compatibility adapter instead of returning an
+    # unconstrained Mock from the v0.30 get_transfer_results API.
+    connector.get_transfer_results.side_effect = lambda ids: KVConnectorBase_V1.get_transfer_results(connector, ids)
+    monkeypatch.setattr(native_kv_connector, "get_kv_transfer_group", lambda: connector)
+    context = object()
+    monkeypatch.setattr(native_kv_connector, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(native_kv_connector, "get_forward_context", lambda: context)
+    active = native_kv_connector.ActiveKVConnector(Mock(), {})
+
+    completions: Iterator[tuple[set[str], set[str]]] = iter([(set(), {"A0"}), (set(), set())])
 
     def finished(_):
-        active._start_load_kv.assert_called_once()
-        return set(), {"A0"}
+        connector.start_load_kv.assert_called_once_with(context)
+        return next(completions)
 
-    active.kv_connector.get_finished.side_effect = finished
+    connector.get_finished.side_effect = finished
     output = _output(submit=["A0"], required=["A0"], metadata=object())
     if prefetch:
         result = KVReceiveProgress().prepare(active, output, 1)
@@ -554,3 +562,6 @@ def test_real_active_connector_starts_required_load_before_polling(prefetch):
         output.kv_required_request_ids = None
         result = wait_for_kv_load(active, output, 1)
     assert result.finished_recving == {"A0"}
+    assert result.finished_sending == set()
+    connector.get_transfer_results.assert_called_once_with(set())
+    connector.start_load_kv.assert_called_once_with(context)

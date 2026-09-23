@@ -20,6 +20,7 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SeedTTSSampleRequest,
     SeedTTSTextSampleRequest,
 )
+from vllm_omni.benchmarks.patch import patch
 from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
     _add_combined_video_form_references,
@@ -432,6 +433,45 @@ async def test_bundled_first_text_chunk_uses_stage0_token_timings(mocker: Mocker
     assert output.itl == pytest.approx([0.010, 0.011, 0.012])
     assert output.text_latency - output.ttft == pytest.approx(0.033)
     assert output.tpot_measured is True
+
+
+@pytest.mark.asyncio
+async def test_streaming_error_chunk_marks_request_failed(mocker: MockerFixture):
+    """HTTP 200 streams can still terminate with an OpenAI error event."""
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=10,
+        output_len=20,
+    )
+    chunks = [
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"content": "partial response"}}],
+                "modality": "text",
+            }
+        ),
+        create_sse_chunk(
+            {
+                "error": {
+                    "message": "EngineCore encountered an issue",
+                    "type": "BadRequestError",
+                    "code": 400,
+                }
+            }
+        ),
+        b"data: [DONE]\n\n",
+    ]
+    mock_response = MockResponse(200, chunks)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert output.success is False
+    assert output.error == "EngineCore encountered an issue"
 
 
 @pytest.mark.asyncio
@@ -1438,6 +1478,42 @@ async def test_image_edits_stream_true_uses_sse_path(mocker: MockerFixture) -> N
 
 
 @pytest.mark.asyncio
+async def test_image_edits_stream_error_marks_request_failed(mocker: MockerFixture) -> None:
+    """HTTP 200 image-edit streams can terminate with an error event."""
+    sse_chunk = (
+        b'data: {"object":"image.edit.chunk","type":"ar_delta","delta":"partial"}\n\n'
+        b'data: {"object":"error","error":{"message":"image generation failed",'
+        b'"type":"server_error","code":500}}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    mock_response = MockResponse(200, [sse_chunk])
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    request = RequestFuncInput(
+        model="multi-stage-edit",
+        model_name="multi-stage-edit",
+        prompt="edit",
+        api_url="http://test.com/v1/images/edits",
+        prompt_len=2,
+        output_len=1,
+        multi_modal_content=[
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{_MIN_PNG_B64}"},
+            }
+        ],
+        extra_body={"stream": True},
+    )
+
+    output = await async_request_openai_image_edits_omni(request, mock_session, pbar=None)
+
+    assert output.success is False
+    assert output.error == "image generation failed"
+    assert output.generated_text == "partial"
+
+
+@pytest.mark.asyncio
 async def test_image_generations_e2el_includes_json_body_consume(mocker: MockerFixture) -> None:
     """E2EL must include body transfer/decode, not stop at HTTP headers."""
 
@@ -1936,3 +2012,36 @@ def test_image_metrics_persist_stage_durations_from_metrics() -> None:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
+
+
+def test_get_samples_forwards_upstream_multimodal_backends_kwarg(mocker: MockerFixture) -> None:
+    """The patched ``datasets.get_samples`` must stay call-compatible upstream.
+
+    Upstream ``vllm.benchmarks.datasets.get_samples`` takes a keyword-only
+    ``multimodal_backends`` (``vllm/benchmarks/throughput.py`` passes it) and
+    ``patch.py`` rebinds that symbol module-wide, so a non-omni request must
+    forward the keyword to the original implementation instead of raising
+    ``TypeError`` or silently dropping it.
+    """
+    calls: list[tuple[Namespace, object, dict]] = []
+
+    def fake_get_samples_old(args, tokenizer, **kwargs):
+        calls.append((args, tokenizer, kwargs))
+        return ["delegated"]
+
+    mocker.patch.object(patch, "get_samples_old", fake_get_samples_old)
+
+    args = Namespace(
+        dataset_name="random",
+        backend="vllm-chat",
+        dataset_path=None,
+        hf_name=None,
+    )
+    sentinel = object()
+    mm_backends = ("openai-chat", "openai-audio")
+
+    assert patch.get_samples(args, sentinel, multimodal_backends=mm_backends) == ["delegated"]
+    assert calls == [(args, sentinel, {"multimodal_backends": mm_backends})]
+    # No upstream kwargs: unchanged legacy delegate call.
+    assert patch.get_samples(args, sentinel) == ["delegated"]
+    assert calls[-1] == (args, sentinel, {})
