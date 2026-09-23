@@ -50,8 +50,6 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 _DEPLOY_DIR = Path(__file__).parents[2] / "vllm_omni" / "deploy"
 
 
-
-
 _LLM_BACKEND_FIELDS = frozenset(field.name for field in fields(OmniEngineArgs))
 _DIFFUSION_BACKEND_FIELDS = frozenset(field.name for field in fields(OmniDiffusionConfig))
 _TOPOLOGY_ONLY_ENGINE_ARGS = frozenset({"inline_diffusion"})
@@ -171,9 +169,7 @@ def test_qwen3_omni_nvfp4_ci_config_preserves_auto_moe_backend(tmp_path):
 
     for stage_id, expected_backend in ((0, "auto"), (1, "triton")):
         typed_stage = omni_config.stage_by_id(stage_id)
-        for engine_args in (
-            project_engine_args(typed_stage, str(tmp_path)),
-        ):
+        for engine_args in (project_engine_args(typed_stage, str(tmp_path)),):
             assert engine_args["moe_backend"] == expected_backend
 
 
@@ -677,10 +673,6 @@ def test_typed_engine_args_preserve_omni_kv_precedence(tmp_path, cli_overrides, 
 
     assert typed_stage.connector_config.omni_kv_config == expected
     assert typed_args["omni_kv_config"] == expected
-
-
-
-
 
 
 def test_typed_engine_args_own_rocm_attention_default(monkeypatch, tmp_path):

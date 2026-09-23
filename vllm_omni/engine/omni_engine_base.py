@@ -619,7 +619,6 @@ class OmniEngineBase:
             "prefill_engine_id": prefill_engine_id,
         }
 
-
     def _apply_strategy_lb_policy(self, derived: str | None, kwargs: dict[str, Any]) -> None:
         """Apply a strategy-derived ``omni_lb_policy`` to the engine.
 
@@ -648,7 +647,6 @@ class OmniEngineBase:
                 self._omni_lb_policy,
             )
             self._omni_lb_policy = str(derived)
-
 
     def _set_pipeline_runtime_config(
         self,

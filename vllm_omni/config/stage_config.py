@@ -969,8 +969,6 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
 PIPELINE_WIDE_ENGINE_FIELDS = _PIPELINE_WIDE_ENGINE_FIELDS
 
 
-
-
 def merge_sampling_constraints(
     sampling_params: Mapping[str, Any] | None,
     constraints: Mapping[str, Any],

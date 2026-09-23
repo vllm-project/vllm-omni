@@ -1685,8 +1685,6 @@ def test_video_output_transport_survives_stage_override_filtering() -> None:
     assert overrides["video_output_transport"] == transport
 
 
-
-
 def test_compact_offload_config_reaches_terminal_config(monkeypatch):
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
