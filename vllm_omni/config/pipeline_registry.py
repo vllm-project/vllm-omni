@@ -86,6 +86,7 @@ from vllm_omni.model_executor.models.ming_flash_omni.pipeline import (
     MING_FLASH_OMNI_THINKER_ONLY_PIPELINE,
     MING_FLASH_OMNI_TTS_PIPELINE,
 )
+from vllm_omni.model_executor.models.ming_image.pipeline import MING_IMAGE_PIPELINE
 from vllm_omni.model_executor.models.ming_tts.pipeline import (
     MING_TTS_MOE_PIPELINE,
     MING_TTS_PIPELINE,
@@ -187,6 +188,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "ming_flash_omni_tts": MING_FLASH_OMNI_TTS_PIPELINE,
     "ming_flash_omni_thinker_only": MING_FLASH_OMNI_THINKER_ONLY_PIPELINE,
     "ming_flash_omni_image": MING_FLASH_OMNI_IMAGE_PIPELINE,
+    "ming_image": MING_IMAGE_PIPELINE,
     "moss_tts_nano": MOSS_TTS_NANO_PIPELINE,
     "minimax_h3_disaggregated": MINIMAX_H3_PIPELINE,
     "omnivoice": OMNIVOICE_PIPELINE,
