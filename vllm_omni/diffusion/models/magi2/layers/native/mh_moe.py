@@ -2,13 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright (c) 2025-2026 SandAI. All Rights Reserved.
 
-"""Native multi-head MoE used by MAGI-2 Preview.
+"""Pure-PyTorch multi-head MoE implementation for MAGI-2 Preview.
 
-Adapted from SandAI's Apache-2.0 ``flash_mh_moe`` implementation and modified
-to use vLLM's existing expert-parallel group.  MAGI's routing is unusual: each
-of twelve 256-wide hidden-state heads independently selects experts from its
-own 256-expert bank.  It is therefore not representable by vLLM's conventional
-whole-token :class:`FusedMoE` primitive.
+This module owns the checkpoint-compatible module definition and is the
+functional fallback for every platform backend. Platform implementations
+inherit :class:`Magi2MultiHeadMoE` and override only ``_local_forward`` so the
+registered parameter hierarchy stays identical across backends.
 """
 
 from __future__ import annotations
@@ -21,11 +20,8 @@ from typing import Literal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from vllm.triton_utils import HAS_TRITON, tl, triton
 
-from vllm_omni.platforms import current_omni_platform
-
-from .parallel import Magi2ParallelGroup, ep_dispatch, ep_undispatch, get_magi2_ep_group
+from ...parallel import Magi2ParallelGroup, ep_dispatch, ep_undispatch
 
 RoutingScore = Literal["softmax", "sigmoid"]
 
@@ -48,11 +44,7 @@ def compute_topk_probs_and_indices(
     route_norm: bool = True,
     norm_eps: float = 1e-12,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Route independently for every ``[head, token]`` pair.
-
-    The auxiliary-free bias affects expert selection but deliberately does not
-    affect the returned routing probability, matching the training recipe.
-    """
+    """Route independently for every ``[head, token]`` pair."""
 
     if router_logits.ndim != 3:
         raise ValueError("router_logits must be [heads,tokens,experts]")
@@ -67,9 +59,6 @@ def compute_topk_probs_and_indices(
     selection_scores = router_scores
     if expert_bias is not None:
         selection_scores = selection_scores + expert_bias.view(router_logits.shape[0], 1, -1)
-    # Keep the reference's default sorted=True behavior.  Besides defining the
-    # route order for ties, this also fixes the reduction order used by the
-    # following L1 normalization.
     topk_indices = torch.topk(selection_scores, top_k, dim=-1).indices
     topk_probs = router_scores.gather(-1, topk_indices)
     if route_norm:
@@ -110,7 +99,7 @@ def torch_mh_moe_forward(
     w_up: torch.Tensor,
     w_down: torch.Tensor,
 ) -> torch.Tensor:
-    """Small-shape correctness oracle for the fused expert kernel."""
+    """Small-shape correctness oracle and platform-independent fallback."""
 
     if x.ndim != 3:
         raise ValueError("multi-head MoE input must be [tokens,heads,head_dim]")
@@ -133,248 +122,6 @@ def torch_mh_moe_forward(
     return output
 
 
-# vLLM's no-Triton placeholder exposes ``tl.constexpr`` as ``None``.
-_SWIGLU7_ALPHA = tl.constexpr(1.702) if HAS_TRITON else 1.702
-_SWIGLU7_LIMIT = tl.constexpr(7.0) if HAS_TRITON else 7.0
-_SWIGLU7_BIAS = tl.constexpr(1.0) if HAS_TRITON else 1.0
-
-
-@triton.jit
-def _swiglu7_kernel(gate, up, out_dtype: tl.constexpr):
-    gate_clamped = tl.minimum(gate, _SWIGLU7_LIMIT)
-    up_clamped = tl.maximum(tl.minimum(up, _SWIGLU7_LIMIT), -_SWIGLU7_LIMIT)
-    sigmoid = tl.sigmoid(_SWIGLU7_ALPHA * gate_clamped)
-    swish = gate_clamped * sigmoid
-    return (swish * (up_clamped + _SWIGLU7_BIAS)).to(out_dtype)
-
-
-@triton.jit
-def _binary_search_expert(
-    cumulative_tiles,
-    tile_id,
-    num_experts: tl.constexpr,
-    log2_num_experts: tl.constexpr,
-):
-    lo = 0
-    hi = num_experts
-    for _ in tl.static_range(0, log2_num_experts + 1):
-        mid = (lo + hi + 1) // 2
-        below = tl.load(cumulative_tiles + mid) <= tile_id
-        lo = tl.where(below, mid, lo)
-        hi = tl.where(below, hi, mid - 1)
-    return lo
-
-
-@triton.jit
-def _mh_moe_kernel(
-    x_ptr,
-    wg_ptr,
-    wu_ptr,
-    wd_ptr,
-    y_ptr,
-    gather_ids_ptr,
-    probs_ptr,
-    expert_offsets_ptr,
-    cumulative_tiles_ptr,
-    stride_x_s,
-    stride_x_h,
-    stride_x_dh,
-    stride_wg_e,
-    stride_wg_dh,
-    stride_wg_de,
-    stride_wu_e,
-    stride_wu_dh,
-    stride_wu_de,
-    stride_wd_e,
-    stride_wd_de,
-    stride_wd_dh,
-    stride_y_s,
-    stride_y_h,
-    stride_y_dh,
-    d_head: tl.constexpr,
-    d_expert: tl.constexpr,
-    num_heads: tl.constexpr,
-    num_flat_experts: tl.constexpr,
-    log2_num_experts: tl.constexpr,
-    block_t: tl.constexpr,
-    block_dh: tl.constexpr,
-    block_de: tl.constexpr,
-    acc_dtype: tl.constexpr,
-    deterministic: tl.constexpr = False,
-):
-    tile_id = tl.program_id(0)
-    total_tiles = tl.load(cumulative_tiles_ptr + num_flat_experts)
-    if tile_id >= total_tiles:
-        return
-
-    expert = _binary_search_expert(cumulative_tiles_ptr, tile_id, num_flat_experts, log2_num_experts)
-    expert_i64 = expert.to(tl.int64)
-    head = expert // (num_flat_experts // num_heads)
-    tile_in_expert = tile_id - tl.load(cumulative_tiles_ptr + expert)
-    token_start = tl.load(expert_offsets_ptr + expert) + tile_in_expert * block_t
-    expert_end = tl.load(expert_offsets_ptr + expert + 1)
-    count = tl.minimum(token_start + block_t, expert_end) - token_start
-
-    dh_block_offsets = tl.arange(0, block_dh)
-    de_block_offsets = tl.arange(0, block_de)
-    token_offsets = tl.arange(0, block_t)
-    dh_offsets = tl.arange(0, d_head)
-
-    token_positions = token_start + token_offsets
-    token_mask = token_offsets < count
-    # Token indices fit in int32, but multiplying a large packed-batch index by
-    # the hidden-width stride does not. Promote before computing element offsets.
-    gather_ids = tl.load(gather_ids_ptr + token_positions, mask=token_mask, other=0).to(tl.int64)
-    probabilities = tl.load(probs_ptr + token_positions, mask=token_mask, other=0.0)
-    x_base = gather_ids * stride_x_s + head * stride_x_h
-    output_acc = tl.zeros([block_t, d_head], dtype=acc_dtype)
-
-    for de_start in tl.range(0, d_expert, block_de):
-        de_offsets = de_start + de_block_offsets
-        gate_acc = tl.zeros([block_t, block_de], dtype=acc_dtype)
-        up_acc = tl.zeros([block_t, block_de], dtype=acc_dtype)
-        for dh_start in tl.static_range(0, d_head, block_dh):
-            local_dh = dh_start + dh_block_offsets
-            x_block = tl.load(
-                x_ptr + x_base[:, None] + local_dh[None, :] * stride_x_dh,
-                mask=token_mask[:, None],
-                other=0.0,
-            )
-            wg = tl.load(
-                wg_ptr
-                + expert_i64 * stride_wg_e
-                + local_dh[:, None] * stride_wg_dh
-                + de_offsets[None, :] * stride_wg_de
-            )
-            wu = tl.load(
-                wu_ptr
-                + expert_i64 * stride_wu_e
-                + local_dh[:, None] * stride_wu_dh
-                + de_offsets[None, :] * stride_wu_de
-            )
-            gate_acc += tl.dot(x_block, wg)
-            up_acc += tl.dot(x_block, wu)
-        hidden = _swiglu7_kernel(gate_acc, up_acc, wd_ptr.dtype.element_ty)
-        down = tl.load(
-            wd_ptr + expert_i64 * stride_wd_e + de_offsets[:, None] * stride_wd_de + dh_offsets[None, :] * stride_wd_dh
-        )
-        output_acc += tl.dot(hidden, down)
-    output_acc = output_acc * probabilities[:, None]
-
-    if deterministic:
-        output_ptrs = y_ptr + token_positions[:, None] * stride_y_s + dh_offsets[None, :] * stride_y_dh
-        tl.store(output_ptrs, output_acc.to(y_ptr.dtype.element_ty), mask=token_mask[:, None])
-    else:
-        output_base = gather_ids * stride_y_s + head * stride_y_h
-        output_ptrs = y_ptr + output_base[:, None] + dh_offsets[None, :] * stride_y_dh
-        tl.atomic_add(output_ptrs, output_acc.to(y_ptr.dtype.element_ty), mask=token_mask[:, None])
-
-
-def _deterministic_scatter(
-    sorted_output: torch.Tensor,
-    reference: torch.Tensor,
-    gather_ids: torch.Tensor,
-    expert_offsets: torch.Tensor,
-) -> torch.Tensor:
-    num_flat_experts = expert_offsets.numel() - 1
-    experts_per_head = num_flat_experts // reference.shape[1]
-    expert_lengths = torch.diff(expert_offsets)
-    head_values = torch.arange(num_flat_experts, device=gather_ids.device) // experts_per_head
-    head_ids = torch.repeat_interleave(head_values, expert_lengths)
-    scatter_ids = gather_ids.long() * reference.shape[1] + head_ids.long()
-    output = torch.zeros_like(reference).view(-1, reference.shape[-1])
-    output.scatter_add_(0, scatter_ids[:, None].expand_as(sorted_output), sorted_output.to(output.dtype))
-    return output.view_as(reference)
-
-
-def _select_block_config() -> tuple[int, int, int, int, int]:
-    """Return the reference kernel config, capped for pre-Blackwell GPUs."""
-
-    capability = current_omni_platform.get_device_capability()
-    if capability is not None and capability.major >= 10:  # Blackwell
-        return (128, 64, 32, 2, 8)
-    # BLOCK_T=128 needs 122,880 bytes of shared memory and is not safe on the
-    # qualified L20X path.  This is the reference kernel's portable config.
-    return (64, 64, 32, 2, 4)
-
-
-def triton_mh_moe_forward(
-    x: torch.Tensor,
-    gather_ids: torch.Tensor,
-    probs: torch.Tensor,
-    expert_offsets: torch.Tensor,
-    w_gate: torch.Tensor,
-    w_up: torch.Tensor,
-    w_down: torch.Tensor,
-    *,
-    deterministic: bool = False,
-) -> torch.Tensor:
-    """Fused gather/expert/scatter kernel for released MAGI dimensions."""
-
-    routed_tokens = gather_ids.numel()
-    if routed_tokens == 0:
-        return torch.zeros_like(x)
-    d_head, d_expert = x.shape[-1], w_down.shape[1]
-    block_t, block_dh, block_de, num_stages, num_warps = _select_block_config()
-    if d_head % block_dh or d_expert % block_de:
-        return torch_mh_moe_forward(x, gather_ids, probs, expert_offsets, w_gate, w_up, w_down)
-
-    if deterministic:
-        output = torch.empty((routed_tokens, 1, d_head), device=x.device, dtype=x.dtype)
-    else:
-        output = torch.zeros_like(x)
-    num_flat_experts = expert_offsets.numel() - 1
-    expert_tiles = (torch.diff(expert_offsets) + block_t - 1) // block_t
-    cumulative_tiles = torch.cat(
-        (torch.zeros(1, dtype=torch.int32, device=x.device), expert_tiles.cumsum(0, dtype=torch.int32))
-    )
-    # Match the reference launch bound.  Empty/excess programs return after
-    # comparing against ``cumulative_tiles[-1]`` inside the kernel.
-    grid = ((routed_tokens + block_t - 1) // block_t + num_flat_experts,)
-    log2_experts = max(1, math.ceil(math.log2(max(num_flat_experts, 1) + 1)))
-    _mh_moe_kernel[grid](
-        x,
-        w_gate,
-        w_up,
-        w_down,
-        output,
-        gather_ids,
-        probs,
-        expert_offsets,
-        cumulative_tiles,
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),
-        w_gate.stride(0),
-        w_gate.stride(1),
-        w_gate.stride(2),
-        w_up.stride(0),
-        w_up.stride(1),
-        w_up.stride(2),
-        w_down.stride(0),
-        w_down.stride(1),
-        w_down.stride(2),
-        output.stride(0),
-        output.stride(1),
-        output.stride(2),
-        d_head,
-        d_expert,
-        x.shape[1],
-        num_flat_experts,
-        log2_experts,
-        block_t,
-        block_dh,
-        block_de,
-        tl.float32,
-        deterministic,
-        num_stages=num_stages,
-        num_warps=num_warps,
-    )
-    if deterministic:
-        return _deterministic_scatter(output.view(routed_tokens, d_head), x, gather_ids, expert_offsets)
-    return output
-
-
 @dataclass(frozen=True)
 class Magi2MultiHeadMoEConfig:
     hidden_size: int
@@ -389,7 +136,7 @@ class Magi2MultiHeadMoEConfig:
 
 
 class Magi2MultiHeadMoE(nn.Module):
-    """Checkpoint-compatible MAGI-2 head-routed expert layer."""
+    """Checkpoint-compatible native MAGI-2 head-routed expert layer."""
 
     _EP_SHARDED_PARAMETER_NAMES = frozenset(
         {"gate", "W_gate", "W_up", "W_down", "router.expert_bias", "router.expert_bias_ema"}
@@ -410,7 +157,12 @@ class Magi2MultiHeadMoE(nn.Module):
         self.top_k = config.top_k
         self.d_head = config.hidden_size // config.num_heads
         self.d_expert = config.expert_intermediate_size
-        self.ep_group = ep_group or get_magi2_ep_group()
+        if ep_group is None:
+            # Resolve through the public layer API so tests and integrations
+            # keep one platform-neutral EP-group patch point.
+            from .. import get_magi2_ep_group
+            ep_group = get_magi2_ep_group()
+        self.ep_group = ep_group
         self.padded_num_heads = math.ceil(self.num_heads / self.ep_group.world_size) * self.ep_group.world_size
         self.local_num_heads = self.padded_num_heads // self.ep_group.world_size
         self.local_flatten_num_experts = self.local_num_heads * self.num_experts
@@ -429,10 +181,6 @@ class Magi2MultiHeadMoE(nn.Module):
             torch.empty(self.local_flatten_num_experts, self.d_expert, self.d_head, dtype=config.params_dtype)
         )
         self.router = nn.Module()
-        # Both tensors are released checkpoint entries.  Non-trainable
-        # Parameters let the DLO mmap path bind them on a meta-constructed
-        # model; persistent buffers are intentionally not mmap-loaded by the
-        # generic backend.
         self.router.expert_bias = nn.Parameter(
             torch.zeros(self.local_flatten_num_experts, dtype=torch.float32),
             requires_grad=False,
@@ -465,8 +213,6 @@ class Magi2MultiHeadMoE(nn.Module):
             )
         local = checkpoint_tensor[start:end]
         if local.shape[0] < self.local_flatten_num_experts:
-            # Uneven EP/head partitions require materialized zero padding;
-            # divisible production layouts keep the mmap-backed slice above.
             padding = torch.zeros(
                 (self.local_flatten_num_experts - local.shape[0], *local.shape[1:]),
                 dtype=local.dtype,
@@ -493,25 +239,18 @@ class Magi2MultiHeadMoE(nn.Module):
     def _local_forward(self, x_heads: torch.Tensor) -> torch.Tensor:
         probabilities, indices = self._route(x_heads)
         gather_ids, sorted_probs, offsets = global_sort_routes(probabilities, indices, self.num_experts)
-        if x_heads.is_cuda:
-            return triton_mh_moe_forward(
-                x_heads,
-                gather_ids,
-                sorted_probs,
-                offsets,
-                self.W_gate,
-                self.W_up,
-                self.W_down,
-                deterministic=os.environ.get("MAGI2_DETERMINISTIC", "0") == "1",
-            )
-        return torch_mh_moe_forward(x_heads, gather_ids, sorted_probs, offsets, self.W_gate, self.W_up, self.W_down)
+        return torch_mh_moe_forward(
+            x_heads,
+            gather_ids,
+            sorted_probs,
+            offsets,
+            self.W_gate,
+            self.W_up,
+            self.W_down,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.ep_group.world_size > 1 and self.ep_group.replicated_sequence:
-            # TP column-parallel ``split_linear`` already emits exactly this
-            # rank's contiguous MoE-head slice.  Compute it once and leave it
-            # sharded for the row-parallel ``merge_linear``; no token dispatch
-            # or head all-gather belongs on the true TP path.
             local_hidden_size = self.local_num_heads * self.d_head
             if x.shape[-1] != local_hidden_size:
                 raise ValueError(f"TP-local MAGI MoE input has width {x.shape[-1]}, expected {local_hidden_size}")
@@ -541,8 +280,9 @@ class Magi2MultiHeadMoE(nn.Module):
 __all__ = [
     "Magi2MultiHeadMoE",
     "Magi2MultiHeadMoEConfig",
+    "RoutingScore",
     "compute_topk_probs_and_indices",
     "global_sort_routes",
+    "swiglu7_pair",
     "torch_mh_moe_forward",
-    "triton_mh_moe_forward",
 ]
