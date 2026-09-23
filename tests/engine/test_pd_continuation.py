@@ -342,6 +342,7 @@ def test_async_admission_allows_consumer_only(monkeypatch, producer):
         params = PDDisaggregationMixin._prepare_prefill_sampling_params("req", _params())
         req = OmniRequest("req", [1, 2, 3], params, None)
     scheduler = OmniARAsyncScheduler.__new__(OmniARAsyncScheduler)
+    scheduler.requests = {}
     scheduler.scheduler_config = SimpleNamespace(async_scheduling=True)
     scheduler.vllm_config = SimpleNamespace(
         speculative_config=None, parallel_config=SimpleNamespace(pipeline_parallel_size=1)
