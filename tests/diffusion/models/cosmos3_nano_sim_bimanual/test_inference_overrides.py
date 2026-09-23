@@ -204,7 +204,7 @@ def test_override_changes_session_fingerprint():
 def test_revision_deployment_is_opt_in():
     root = SOURCE.parents[3]
     original = yaml.safe_load((root / "vllm_omni/deploy/cosmos3_nano_sim_bimanual.yaml").read_text())
-    selected = yaml.safe_load((root / "vllm_omni/deploy/cosmos3_nano_sim_bimanual_i4.yaml").read_text())
+    selected = yaml.safe_load((root / "vllm_omni/deploy/cosmos3_nano_sim_bimanual_full_history.yaml").read_text())
     assert "inference_overrides" not in original["stages"][0]["model_config"]
     config = Cosmos3NanoSimBimanualInferenceConfig.from_od_config(
         SimpleNamespace(model_config=selected["stages"][0]["model_config"]), manifest()

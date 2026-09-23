@@ -36,7 +36,7 @@ has no media. Supply both flags to request any policy-valid explicit canvas.
 ## Inference overrides
 
 For `nvidia/Cosmos3-Nano-Sim-Bimanual@1d95a0b5b19d49a24aceebf578cf5e85db310ac0`,
-use `--deploy-config vllm_omni/deploy/cosmos3_nano_sim_bimanual_i4.yaml`.
+use `--deploy-config vllm_omni/deploy/cosmos3_nano_sim_bimanual_full_history.yaml`.
 With a conditioning image, every generated chunk uses two denoising steps:
 `[1, 0.8333333333333334]`. Frame 0 is encoded from the image. The four-step
 schedule applies only when generating frame 0 without an image. Full history
@@ -49,12 +49,12 @@ python examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos3_nano_sim_bim
   --model /checkpoints/cosmos3-nano-sim-bimanual-diffusers \
   --jsonl agibot_eval_257f_npz/samples.jsonl \
   --sample-index 0 \
-  --deploy-config vllm_omni/deploy/cosmos3_nano_sim_bimanual_i4.yaml \
+  --deploy-config vllm_omni/deploy/cosmos3_nano_sim_bimanual_full_history.yaml \
   --num-frames 257 --height 480 --width 640 --fps 30 --seed 42 \
   --output outputs/agibot_257f.mp4
 ```
 
-For normalized i4 action sidecars, use `--input-format cookbook` instead of the
+For checkpoint-normalized action sidecars, use `--input-format cookbook` instead of the
 raw-action NPZ path. This also formats the action prompt and selects the
 action-conditioned image preprocessing:
 
@@ -62,14 +62,13 @@ action-conditioned image preprocessing:
 python examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos3_nano_sim_bimanual.py \
   --model /checkpoints/cosmos3-nano-sim-bimanual-diffusers \
   --jsonl /data/agibot.jsonl --input-format cookbook --sample-index 0 \
-  --deploy-config vllm_omni/deploy/cosmos3_nano_sim_bimanual_i4.yaml \
+  --deploy-config vllm_omni/deploy/cosmos3_nano_sim_bimanual_full_history.yaml \
   --resolution 480 --num-frames 901 --fps 30 --seed 42 \
   --output outputs/agibot_901f.mp4
 ```
 
-For comparisons with i4, supply an initial image already at the target canvas
-(832×480 for 16:9). i4 removes reflection padding from its encoded latents;
-this helper retains the requested canvas.
+Supply an initial image already at the target canvas (832×480 for 16:9)
+to avoid reflection padding in the generated video.
 
 Overrides live under `stages[0].model_config.inference_overrides`. The last
 `frame_sigma_schedules` entry repeats; chunk starts select schedules by absolute
