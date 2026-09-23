@@ -208,6 +208,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                 continue
             plane.register_request(request_data)
         plane.register_receivers(list(getattr(scheduler_output, "pending_input_registrations", [])))
+        if not getattr(self.model_config, "async_chunk", False):
+            plane.recv_full_payload_inputs(scheduler_output)
         natural_terminal_req_ids = set(getattr(scheduler_output, "data_plane_terminal_req_ids", set()))
         aborted_req_ids = set(getattr(scheduler_output, "finished_req_ids", set())).difference(natural_terminal_req_ids)
         if natural_terminal_req_ids:

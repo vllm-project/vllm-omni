@@ -5,6 +5,7 @@ import asyncio
 import re
 from types import SimpleNamespace
 
+import anyio
 import pytest
 from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -541,6 +542,87 @@ def test_generate_cancellation_converges_after_engine_shutdown_starts(mocker):
         assert submitted_request_ids[0].startswith("cancel-shutdown-")
         assert omni.request_states == {}
         engine.request_queue.sync_q.put.assert_not_called()
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.cpu
+def test_generate_waits_for_abort_inside_cancelled_asgi_scope():
+    async def run_test():
+        submitted = anyio.Event()
+        acknowledged = []
+
+        async def add_request(**kwargs):
+            submitted.set()
+
+        async def abort(request_ids, timeout=None):
+            assert timeout == async_omni_mod.ABORT_TIMEOUT_S
+            await anyio.sleep(0)
+            acknowledged.extend(request_ids)
+
+        omni = get_async_omni_instance(fake_add_request=add_request, fake_abort_request=abort)
+
+        async def collect():
+            async for _ in omni.generate(
+                prompt={"prompt": "prompt"},
+                request_id="cancel-asgi",
+                sampling_params_list=[SamplingParams()],
+                output_modalities=["image"],
+            ):
+                pass
+
+        async with anyio.create_task_group() as group:
+            group.start_soon(collect)
+            await submitted.wait()
+            group.cancel_scope.cancel()
+        assert len(acknowledged) == 1 and acknowledged[0].startswith("cancel-asgi-")
+        assert omni.request_states == {}
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.cpu
+def test_generate_bounds_abort_inside_cancelled_asgi_scope(monkeypatch):
+    monkeypatch.setattr(async_omni_mod, "ABORT_TIMEOUT_S", 0.05)
+
+    async def run_test():
+        submitted = anyio.Event()
+        abort_started = anyio.Event()
+        abort_finished = anyio.Event()
+
+        async def add_request(**kwargs):
+            submitted.set()
+
+        async def abort(request_ids, timeout=None):
+            assert len(request_ids) == 1
+            assert timeout == 0.05
+            abort_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                abort_finished.set()
+
+        omni = get_async_omni_instance(fake_add_request=add_request, fake_abort_request=abort)
+
+        async def collect():
+            async for _ in omni.generate(
+                prompt={"prompt": "prompt"},
+                request_id="cancel-asgi-hanging-abort",
+                sampling_params_list=[SamplingParams()],
+                output_modalities=["image"],
+            ):
+                pass
+
+        async def cancel_request():
+            async with anyio.create_task_group() as group:
+                group.start_soon(collect)
+                await submitted.wait()
+                group.cancel_scope.cancel()
+
+        await asyncio.wait_for(cancel_request(), timeout=1.0)
+        assert abort_started.is_set()
+        assert abort_finished.is_set()
+        assert omni.request_states == {}
 
     asyncio.run(run_test())
 

@@ -15,6 +15,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
+from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker_v2.model_states import init_omni_model_state
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
@@ -53,6 +54,8 @@ def test_add_requests_empty_admission_and_stop_id_sanitization():
 
 def test_prepare_native_data_plane_terminal_abort_split_and_warmup_skip():
     runner = _make_runner()
+    runner.model_config = object.__new__(OmniModelConfig)
+    runner.model_config.async_chunk = True
     plane = SimpleNamespace(
         register_request=MagicMock(),
         register_receivers=MagicMock(),
@@ -76,6 +79,19 @@ def test_prepare_native_data_plane_terminal_abort_split_and_warmup_skip():
     plane.register_receivers.assert_called_once_with([handle])
     plane.request_terminal.assert_called_once_with({"r0"})
     plane.abort_requests.assert_called_once_with({"aborted"})
+
+
+def test_full_payload_receive_is_polled_without_scheduled_tokens(mocker):
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model_config = object.__new__(OmniModelConfig)
+    runner.model_config.async_chunk = False
+    plane = mocker.Mock()
+    runner._omni_data_plane = plane
+    scheduler_output = SchedulerOutput.make_empty()
+
+    runner._prepare_native_data_plane(scheduler_output)
+
+    plane.recv_full_payload_inputs.assert_called_once_with(scheduler_output)
 
 
 @pytest.mark.parametrize("output_form", ["tuple", "omni"])
