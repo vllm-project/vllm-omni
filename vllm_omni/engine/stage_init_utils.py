@@ -391,7 +391,7 @@ def _get_attr_or_item(obj: Any, key: str, default: Any = None) -> Any:
     return getattr(obj, key, default)
 
 
-def _tp_size_for_stage(stage_configs: Sequence[BaseVllmOmniStageConfig], stage_id: Any) -> int | None:
+def _tp_size_for_stage(stage_configs: Sequence[BaseVllmOmniStageConfig], stage_id: int | str) -> int | None:
     """Resolve tensor parallel size from the typed stage configuration."""
     for stage_cfg in stage_configs:
         if str(stage_cfg.stage_id) != str(stage_id):
@@ -401,6 +401,7 @@ def _tp_size_for_stage(stage_configs: Sequence[BaseVllmOmniStageConfig], stage_i
         except (TypeError, ValueError):
             return 1
     return None
+
 
 def _inject_inferred_kv_tp_topology(
     omni_kv: Any,
@@ -485,6 +486,7 @@ def inject_kv_stage_info(
             stage_configs=stage_configs,
             engine_input_source=stage_cfg.input_sources,
         )
+
 
 def inject_omni_kv_connector_config(
     engine_args_dict: dict[str, Any],
@@ -719,6 +721,7 @@ def split_devices_for_replicas(
 
 def get_stage_tp_size(stage_cfg: BaseVllmOmniStageConfig) -> int:
     return max(1, int(stage_cfg.parallel_config.tensor_parallel_size or 1))
+
 
 def _get_local_llm_parallel_sizes(
     stage_cfg: Any,
@@ -1277,12 +1280,9 @@ def build_vllm_config(
     if engine_args_dict is None:
         if not isinstance(stage_config, BaseVllmOmniStageConfig):
             raise TypeError(
-                "build_vllm_config requires a typed VllmOmniStageConfig; "
-                f"got {type(stage_config).__name__}"
+                f"build_vllm_config requires a typed VllmOmniStageConfig; got {type(stage_config).__name__}"
             )
-        engine_args_dict = project_engine_args(
-            stage_config, model, stage_connector_spec=stage_connector_spec
-        )
+        engine_args_dict = project_engine_args(stage_config, model, stage_connector_spec=stage_connector_spec)
 
     filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
     if api_process_count != 1 or api_process_rank != 0:

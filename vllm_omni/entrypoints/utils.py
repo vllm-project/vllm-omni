@@ -12,13 +12,14 @@ from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.config.config_factory import with_trust_remote_code_override
+from vllm_omni.config.omni_config import BaseVllmOmniStageConfig
 from vllm_omni.inputs.data import OmniSamplingParams
 
 logger = init_logger(__name__)
 
 
 def inject_omni_kv_config(
-    stage: Any,
+    stage: BaseVllmOmniStageConfig,
     omni_conn_cfg: dict[str, Any],
     omni_from: str,
     omni_to: str,
@@ -28,6 +29,7 @@ def inject_omni_kv_config(
     omni_conf_dict = dict(connector_config.omni_kv_config or {})
     omni_conf_dict.update(connector_config=omni_conn_cfg, omni_from_stage=omni_from, omni_to_stage=omni_to)
     connector_config.omni_kv_config = omni_conf_dict
+
 
 def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
     """Parse and validate the shape of per-stage JSON overrides."""
