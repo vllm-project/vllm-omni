@@ -674,6 +674,12 @@ class OmniRunner:
         self.seed = seed
         self._prompt_len_estimate_cache: dict[str, Any] = {}
         self.omni: Any = None
+        # Keep cleanup scoped to processes started by this runner.  A global
+        # process-name scan can terminate another user's engine on shared CI
+        # hosts when startup fails before ``omni`` is fully initialized.
+        self._runner_baseline_child_pids: set[int] = {
+            proc.pid for proc in psutil.Process(os.getpid()).children(recursive=True) if proc.pid != os.getpid()
+        }
         try:
             from vllm_omni.entrypoints.omni import Omni
 
@@ -916,14 +922,19 @@ class OmniRunner:
 
     def _cleanup_process(self):
         try:
-            keywords = ["enginecore"]
+            # Include descendants created during startup, while never scanning
+            # or touching unrelated users' processes.
             matched = []
-            for proc in psutil.process_iter(["pid", "name", "cmdline", "username"]):
+            root = psutil.Process(os.getpid())
+            current_children = root.children(recursive=True)
+            owned_pids = {proc.pid for proc in current_children if proc.pid not in self._runner_baseline_child_pids}
+            for pid in owned_pids:
                 try:
+                    proc = psutil.Process(pid)
                     cmdline = " ".join(proc.cmdline()).lower() if proc.cmdline() else ""
                     name = proc.name().lower()
-                    if any(k in cmdline for k in keywords) or any(k in name for k in keywords):
-                        print(f"Found vllm process: PID={proc.pid}, cmd={cmdline[:100]}")
+                    if "enginecore" in cmdline or "enginecore" in name:
+                        print(f"Found runner vllm process: PID={proc.pid}, cmd={cmdline[:100]}")
                         matched.append(proc)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass

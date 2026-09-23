@@ -155,14 +155,14 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         (``moss_tts_local_codec`` / ``moss_tts_codec``); prefer a stage whose
         ``model_stage`` mentions "codec", else anchor on the last stage. The
         runtime mapping accepts the resolved ``runtime_config`` object, the
-        omegaconf ``runtime`` mapping, and the legacy ``yaml_runtime`` dict.
+        typed ``runtime_config``.
         """
         stages = list(getattr(self.engine_client, "stage_configs", None) or ())
         if not stages:
             return None
         codec_stages = [s for s in stages if "codec" in str(getattr(s, "model_stage", "") or "")]
         anchor = codec_stages[-1] if codec_stages else stages[-1]
-        for attr in ("runtime_config", "runtime", "yaml_runtime"):
+        for attr in ("runtime_config",):
             runtime_cfg = getattr(anchor, attr, None)
             if runtime_cfg is None:
                 continue

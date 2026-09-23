@@ -14,7 +14,7 @@ from vllm_omni.config.omni_config import (
 from vllm_omni.config.pipeline_registry import resolve_pipeline_config
 from vllm_omni.config.stage_config import load_deploy_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+from vllm_omni.engine.stage_init_utils import project_engine_args
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -37,7 +37,7 @@ def test_sleep_deploy_resolves_expected_stages(diffusion_only, tp_size):
         if not is_diffusion:
             assert stage.cache_config.gpu_memory_utilization == 0.8
         if is_diffusion:
-            engine_args = build_engine_args_dict_from_omni_stage_config(stage, "test-bagel")
+            engine_args = project_engine_args(stage, "test-bagel")
             terminal = OmniDiffusionConfig.from_kwargs(
                 **extract_diffusion_stage_config_kwargs(
                     engine_args, stage_id=stage.stage_id, include_engine_adapter_metadata=True

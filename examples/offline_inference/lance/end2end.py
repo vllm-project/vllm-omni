@@ -79,8 +79,8 @@ def parse_args():
     )
     # Lance is single-stage diffusion — no deploy YAML needed.  Required
     # engine knobs (``pipeline``, ``enforce_eager``, ``trust_remote_code``,
-    # ``max_num_seqs=1`` …) are passed as flat kwargs to ``Omni`` below
-    # and ``create_default_diffusion`` materializes the stage config.
+    # ``max_num_seqs=1`` …) are passed as flat kwargs to ``Omni`` below and
+    # resolved into the typed diffusion stage config.
 
     return p.parse_args()
 
