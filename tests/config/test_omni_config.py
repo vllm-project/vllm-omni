@@ -1478,7 +1478,7 @@ def test_from_pipeline_config_rejects_reserved_diffusion_kv_mode(tmp_path):
 @pytest.mark.parametrize("key_container", [list, tuple])
 def test_diffusion_stage_payload_keys_roundtrip(source, key_container):
     from vllm_omni.diffusion.data import OmniDiffusionConfig
-    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+    from vllm_omni.engine.stage_init_utils import project_engine_args
 
     topology_keys = {
         "stage_input_payload_keys": ("conditioning", "metadata"),
@@ -1507,7 +1507,7 @@ def test_diffusion_stage_payload_keys_roundtrip(source, key_container):
     if source == "default":
         expected = dict.fromkeys(topology_keys, ())
     restored_stage = ForkingPickler.loads(ForkingPickler.dumps(stage))
-    engine_args = build_engine_args_dict_from_omni_stage_config(restored_stage, model="test-model")
+    engine_args = project_engine_args(restored_stage, model="test-model")
     diffusion_kwargs = omni_config_module.extract_diffusion_stage_config_kwargs(
         engine_args, stage_id=restored_stage.stage_id, include_engine_adapter_metadata=True
     )
