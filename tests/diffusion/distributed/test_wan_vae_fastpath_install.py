@@ -535,7 +535,7 @@ def test_upsample_forward_only_fuses_nearest_2x() -> None:
 
 
 def test_rms_norm_vae_substitute_is_not_matched() -> None:
-    from vllm_omni.diffusion.layers.norm import RMSNormVAE
+    from vllm_omni.diffusion.models.wan2_2.norm import RMSNormVAE
 
     assert not fastpath_forwards.is_diffusers_rms_norm(RMSNormVAE(8, images=False))
     _, vae = _build_pair(TINY_RESIDUAL, torch.float32)
