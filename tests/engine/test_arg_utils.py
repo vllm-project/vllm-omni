@@ -581,3 +581,54 @@ def test_text_encoder_tp_size_reaches_default_diffusion_parallel_config():
 
     parallel_config = stage_cfg["engine_args"]["parallel_config"]
     assert parallel_config["text_encoder_tp_size"] == 2
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/8037
+# The diffusion parallel knobs the serve CLI registers and the engine must keep
+# when engine args come from parsed CLI args. Values are not the
+# DiffusionParallelConfig defaults, so a silently reset knob fails the check.
+DIFUSION_PARALLEL_KNBS = [
+    ("ulysses_degree", 4),
+    ("ulysses_mode", "advanced_uaa"),
+    ("ulysses_a2a_permute", True),
+    ("ring_degree", 2),
+    ("allgather_degree", 8),
+    ("use_hsdp", True),
+    ("hsdp_shard_size", 2048),
+    ("hsdp_replicate_size", 2),
+    ("cfg_parallel_size", 2),
+    ("vae_patch_parallel_size", 2),
+    ("vae_parallel_mode", "spatial_shard_height"),
+]
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/8037
+def test_from_cli_args_preserves_diffusion_parallel_knobs():
+    """Every CLI-registered diffusion parallel knob must survive the filter.
+
+    ``OmniEngineArgs.from_cli_args`` keeps only dataclass fields, so a knob
+    that ``OmniEngineArgs`` does not declare was silently reset to its
+    ``DiffusionParallelConfig`` default (#7652 covered
+    ``text_encoder_tp_size`` alone).
+    """
+    for knob, value in DIFUSION_PARALLEL_KNBS:
+        engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**{knob: value}))
+        assert getattr(engine_args, knob) == value, f"{knob} was dropped"
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/8037
+def test_diffusion_parallel_knob_reaches_default_diffusion_parallel_config():
+    """A preserved knob must land in DiffusionParallelConfig.
+
+    Forward one preserved explicit override to the generic diffusion fallback,
+    which resolves it through ``DiffusionParallelConfig.from_stage_overrides``.
+    """
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    knob = "cfg_parallel_size"
+    value = 2
+    engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**{knob: value}))
+    stage_cfg = StageConfigFactory.create_default_diffusion({knob: getattr(engine_args, knob)})[0]
+
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel_config[knob] == value
