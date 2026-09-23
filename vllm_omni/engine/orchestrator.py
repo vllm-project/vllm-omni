@@ -2036,13 +2036,28 @@ class OrchestratorBase:
             else:
                 await self._forward_to_next_stage(req_id, stage_id, raw_output, req_state)
 
-    def _build_pd_decode_params(self, req_id: str, sp: Any) -> Any:
+    def _build_pd_decode_params(self, req_id: str, sp: Any, prefill_prompt: Any | None = None) -> Any:
         """Build decode-side sampling params with KV transfer params for PD routing.
 
         Clones the sampling params and injects kv_transfer_params that tell the
         decode engine where to pull the KV cache from (prefill engine's bootstrap addr).
         """
         sp = sp.clone()
+        processed_params = (
+            prefill_prompt.get("sampling_params")
+            if isinstance(prefill_prompt, dict)
+            else getattr(prefill_prompt, "sampling_params", None)
+        )
+        if isinstance(processed_params, SamplingParams):
+            # Decode bypasses InputProcessor, which resolves the model EOS and
+            # generation-config stop IDs on the producer's cloned parameters.
+            # Inherit only that stop metadata: P also changes detokenization,
+            # stop strings and transport settings that must remain D-owned.
+            if not sp.ignore_eos:
+                sp._eos_token_id = processed_params.eos_token_id
+                sp.stop_token_ids = list(dict.fromkeys([*sp.stop_token_ids, *processed_params.stop_token_ids]))
+            # Even ignore_eos requests need model EOS IDs in the min_tokens mask.
+            sp._all_stop_token_ids.update(processed_params.all_stop_token_ids)
         if sp.extra_args is None:
             sp.extra_args = {}
 
@@ -2342,10 +2357,9 @@ class OrchestratorBase:
 
         # PD disaggregation: rebuild decode from the processed prefill request.
         if self._pd_pair is not None and (src_stage_id, next_logical) == self._pd_pair:
-            params = self._build_pd_decode_params(req_id, params)
-
             if req_state.pd_prefill_prompt is None:
                 raise RuntimeError(f"[Orchestrator][PD] Missing processed prefill prompt for req={req_id}")
+            params = self._build_pd_decode_params(req_id, params, req_state.pd_prefill_prompt)
             pd_decode_prompt, pd_decode_mm_features = _pd_decode_input_from_prefill_prompt(req_state.pd_prefill_prompt)
             request = build_engine_core_request_from_tokens(
                 request_id=req_id,
