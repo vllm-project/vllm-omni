@@ -137,7 +137,7 @@ def _make_scheduler_stub(requests: list[_Request]) -> SimpleNamespace:
         running=list(requests),
         waiting=_RequestQueue(),
         skipped_waiting=_RequestQueue(),
-        structured_output_manager=SimpleNamespace(should_advance=lambda _request: False),
+        structured_output_manager=SimpleNamespace(accept_tokens=lambda _request, _token_ids: True),
         transfer_triggered_requests=set(),
         active_kv_transfers=set(),
         pending_stop_after_extraction=set(),

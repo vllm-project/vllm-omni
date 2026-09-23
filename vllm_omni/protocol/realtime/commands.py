@@ -54,7 +54,8 @@ class UpdateSession(RealtimeCommand):
 class AppendAudio(RealtimeCommand):
     wire_type: ClassVar[str] = "input_audio_buffer.append"
     #: Raw audio bytes in ``format`` at ``sample_rate_hz`` (base64 only on the wire).
-    audio: bytes
+    #: Empty means video-only / frames-only append (validated against duplex capabilities).
+    audio: bytes = b""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

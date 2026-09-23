@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from importlib import import_module
 from typing import TYPE_CHECKING
 
@@ -170,6 +171,25 @@ class DuplexDataPlane(ABC):
 EncodeAudio = Callable[[object, int, str, float | None], str | None]
 
 
+@dataclass(frozen=True, slots=True)
+class PartialStageForward:
+    """One downstream update the orchestrator should submit.
+
+    ``close_only`` is a final update with no new sentence. ``output`` is the
+    model-built payload; the orchestrator does not interpret its text.
+
+    ``queue_close_after`` means this chunk still has text, but Stage1 has
+    finished and an earlier sentence is already in flight. The text must be
+    submitted resumable. A non-resumable submit is an end sentinel
+    (``StreamingUpdate.from_request`` returns None) and aborts that sentence.
+    """
+
+    output: object
+    is_final_update: bool
+    close_only: bool = False
+    queue_close_after: bool = False
+
+
 class DuplexModelPlugin(ABC):
     """Everything vLLM-Omni needs to know about one full-duplex model.
 
@@ -236,6 +256,98 @@ class DuplexModelPlugin(ABC):
         segment_output_metadata: dict[str, object],
         output: object,
     ) -> DuplexOutputDecision | None: ...
+
+    def project_intermediate_output(
+        self,
+        *,
+        stage_id: int,
+        output: object,
+        context: object,
+    ) -> bool:
+        """Return True to project this intermediate stage to the client.
+
+        Unlike ``decide_output``, projecting does **not** short-circuit the
+        pipeline: the stage output is still forwarded to the next stage.
+        Default is off. Orthogonal to ``projects_intermediate_outputs``
+        (Qwen3 Stage0); this hook is per-stage.
+        """
+        del stage_id, output, context
+        return False
+
+    def user_transcript(
+        self,
+        *,
+        stage_id: int,
+        output: object,
+        prompt: object,
+        finished: bool,
+    ) -> str | None:
+        """ASR text to show as the user's words, or None.
+
+        Default models do not surface Stage0. AURA uses this for a spoken
+        turn only; vision-follow commits stay off the transcript.
+        """
+        del stage_id, output, prompt, finished
+        return None
+
+    def plan_partial_stage_output(
+        self,
+        orchestrator: object,
+        stage_id: int,
+        replica_id: int,
+        output: object,
+        req_state: object,
+    ) -> PartialStageForward | None:
+        """Return a Talker update the orchestrator should submit, or None.
+
+        Default models do not split Stage1 text. The orchestrator owns the
+        actual ``_forward_to_next_stage`` call.
+        """
+        del orchestrator, stage_id, replica_id, output, req_state
+        return None
+
+    def partial_stage_followup(self, plan: PartialStageForward, req_state: object) -> PartialStageForward | None:
+        """Optional second submit after ``plan`` has already been forwarded.
+
+        Default models have nothing to add. AURA uses this to queue the
+        end sentinel only after the last sentence text is already resumable.
+        """
+        del plan, req_state
+        return None
+
+    def commit_model_context(self, *, session_id: str | None, assistant_text: str) -> None:
+        """Persist model-context history at a turn boundary. Default is a no-op.
+
+        This is not playback-ACK history. A model that keeps its own prompt
+        transcript implements this; the session runner only decides when.
+        """
+        del session_id, assistant_text
+
+    def release_concurrent_turn_requests(
+        self,
+        *,
+        stage_id: int,
+        segment_finished: bool,
+        output: object,
+        context: object,
+    ) -> bool:
+        """Return True when the next user commit may start while prior TTS drains.
+
+        The plugin chooses when that is safe. The runner must not hard-code a
+        stage id. Default off. Unlike barge-in, this path must not cancel the
+        old TTS.
+        """
+        del stage_id, segment_finished, output, context
+        return False
+
+    def draining_stage_ids(self, *, stage_count: int) -> frozenset[int]:
+        """Output stages that may keep running after the next user turn starts.
+
+        Empty means a concurrent turn does not overlap a previous output
+        stage. Shared lifecycle reads this instead of assuming a stage layout.
+        """
+        del stage_count
+        return frozenset()
 
     # ---- session policy (was ServingRuntimeAdapter) ----
 

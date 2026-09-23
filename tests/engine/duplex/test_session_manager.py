@@ -51,6 +51,7 @@ from vllm_omni.engine.duplex.plugin import (
     PcmAppendReservation,
 )
 from vllm_omni.engine.duplex.session import manager as session_manager_module
+from vllm_omni.engine.duplex.session.context import DuplexSessionTasks
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
@@ -196,7 +197,11 @@ class FakePlugin(DuplexModelPlugin):
 
     def capabilities(self, *, max_sessions: int) -> DuplexCapabilities:
         del max_sessions
-        return DuplexCapabilities(supports_input_append=True, supports_core_resumable_request=True)
+        # Resident Stage0 ids (MiniCPM-shaped); AURA opts out via supports_core_resumable_request=False.
+        return DuplexCapabilities(
+            supports_input_append=True,
+            supports_core_resumable_request=True,
+        )
 
     def validate_client_extra_body(self, extra_body: object) -> None:
         pass
@@ -409,7 +414,8 @@ async def test_open_answers_with_capabilities_and_emits_session_created() -> Non
         assert result.session_id == "sid-open"
         assert result.lease_generation == 0
         assert result.capabilities == DuplexCapabilities(
-            supports_input_append=True, supports_core_resumable_request=True
+            supports_input_append=True,
+            supports_core_resumable_request=True,
         )
         assert result.public_session is not None
         assert result.public_session["id"] == "sid-open"
@@ -1028,6 +1034,40 @@ async def test_append_bytes_are_reserved_at_admission_until_the_runner_dequeues(
         gate.set()
 
 
+async def test_append_admission_counts_audio_and_video_frame_bytes() -> None:
+    """Manager reserves len(audio)+Σlen(frame); video bytes count toward the same limit."""
+    async with Harness.create(max_sessions=1, max_pending_input_bytes_per_session=20) as harness:
+        await harness.open("sid-av")
+        harness.events()
+        session = harness.session("sid-av")
+        runner = harness.manager.runners["sid-av"]
+        gate = asyncio.Event()
+        runner._mailbox.put_nowait(_Internal("wait", {"gate": gate}))
+        runner._on_internal = lambda item: gate.wait()  # type: ignore[method-assign]
+        await asyncio.sleep(0)
+
+        # Default caps require audio; attach video to a non-empty audio unit.
+        frame_a = "aaaa"
+        frame_b = "bbbbbb"
+        audio = b"1234"
+        expected = len(audio) + len(frame_a) + len(frame_b)
+        harness.command(
+            "sid-av",
+            AppendAudio(audio=audio, video_frames=(frame_a, frame_b), event_id="evt-av"),
+        )
+        assert session.pending_input_bytes == expected
+        # Second append that would exceed the limit is backpressured.
+        harness.command(
+            "sid-av",
+            AppendAudio(audio=b"x" * 10, video_frames=("yyyyyyyyyy",), event_id="evt-over"),
+        )
+        errors = [event for event in harness.events("sid-av") if isinstance(event, ErrorEvent)]
+        assert [error.code for error in errors] == ["input_backpressure"]
+        assert errors[0].related_event_id == "evt-over"
+        assert session.pending_input_bytes == expected
+        gate.set()
+
+
 async def test_expired_session_retains_the_admission_slot_until_cleanup_succeeds() -> None:
     async with Harness.create(max_sessions=1, idle_ttl_s=1.0) as harness:
         await harness.open("sid-expired")
@@ -1573,3 +1613,34 @@ async def test_reaper_loop_survives_one_cleanup_failure(first_cleanup_delay: flo
     finally:
         shutdown.set()
         await asyncio.wait_for(task, timeout=5.0)
+
+
+# --------------------------------------------------------------------------- #
+# Cancellation waits                                                          #
+# --------------------------------------------------------------------------- #
+
+
+async def test_cancel_append_tasks_absorbs_a_task_that_outlives_the_wait() -> None:
+    """The wait after cancelling is allowed to time out; that is not an error.
+
+    On Python 3.10 the timeout arrives as ``asyncio.TimeoutError``, which is a
+    different class from the builtin ``TimeoutError`` until 3.11.
+    """
+
+    async def outlives_the_first_cancel() -> bool:
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            await asyncio.sleep(1)
+            raise
+        return True
+
+    tasks = DuplexSessionTasks()
+    task = asyncio.create_task(outlives_the_first_cancel())
+    await asyncio.sleep(0)
+    tasks.track_append_task(task, epoch=0, final=False, response_bound=False)
+    tasks.append_tail = task
+
+    assert await tasks.cancel_append_tasks(timeout_s=0.05) is True
+    assert tasks.append_tail is None
+    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5.0)

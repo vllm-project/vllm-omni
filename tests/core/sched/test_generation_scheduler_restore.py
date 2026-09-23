@@ -66,18 +66,25 @@ def _make_generation_scheduler(waiting_request, *, use_v2_model_runner=False):
     scheduler.log_stats = False
     scheduler.scheduler_config = SimpleNamespace(enable_chunked_prefill=True)
     scheduler.num_lookahead_tokens = 0
+    scheduler.num_spec_tokens = 0
+    scheduler.dynamic_sd_lookup = None
+    scheduler.reset_preempted_req_ids = set()
     scheduler.kv_cache_manager = SimpleNamespace(
         new_step_starts=lambda: None,
         allocate_slots=lambda *args, **kwargs: SimpleNamespace(get_block_ids=lambda: ([1],)),
         get_num_common_prefix_blocks=lambda request_id: [0],
-        take_new_block_ids=lambda: None,
+        take_new_block_ids=lambda: [],
+        take_boundary_state_offloads=lambda: {},
     )
     scheduler.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
     scheduler.use_v2_model_runner = use_v2_model_runner
     scheduler._retains_state_across_chunks = False
     scheduler.needs_kv_cache_zeroing = False
     scheduler.finished_req_ids = set()
-    scheduler.encoder_cache_manager = SimpleNamespace(get_freed_mm_hashes=lambda: [])
+    scheduler.encoder_cache_manager = SimpleNamespace(
+        get_freed_mm_hashes=lambda: [],
+        get_manager_metadata=lambda: None,
+    )
     scheduler.connector = None
     scheduler.ec_connector = None
     scheduler.prev_step_scheduled_req_ids = set()

@@ -94,6 +94,13 @@ class DuplexCapabilities:
     supports_stage_resumption: bool = False
     supports_scheduler_native_append: bool = False
     supports_core_resumable_request: bool = False
+    # Prior assistant TTS may keep draining while a new user commit is admitted.
+    # Not barge-in (which aborts prior TTS).
+    supports_concurrent_turn_requests: bool = False
+    #: Input modality contract. Defaults match audio-primary duplex (e.g. MiniCPM):
+    #: audio required, video optional when attached to an audio unit.
+    required_input_modalities: frozenset[str] = field(default_factory=lambda: frozenset({"audio"}))
+    optional_input_modalities: frozenset[str] = field(default_factory=lambda: frozenset({"video"}))
     supports_stage_connector_handoff: bool = False
     supports_independent_io_streams: bool = False
     supports_realtime_endpoint: bool = False
@@ -142,6 +149,9 @@ class DuplexCapabilities:
             "supports_stage_resumption": self.supports_stage_resumption,
             "supports_scheduler_native_append": self.supports_scheduler_native_append,
             "supports_core_resumable_request": self.supports_core_resumable_request,
+            "supports_concurrent_turn_requests": self.supports_concurrent_turn_requests,
+            "required_input_modalities": sorted(self.required_input_modalities),
+            "optional_input_modalities": sorted(self.optional_input_modalities),
             "supports_stage_connector_handoff": self.supports_stage_connector_handoff,
             "supports_independent_io_streams": self.supports_independent_io_streams,
             "supports_realtime_endpoint": self.supports_realtime_endpoint,
@@ -165,6 +175,29 @@ class DuplexCapabilities:
             "chunk_period_ms": self.chunk_period_ms,
             "target_barge_in_latency_ms": self.target_barge_in_latency_ms,
         }
+
+    def accepts_input_modality(self, modality: str) -> bool:
+        return modality in self.required_input_modalities or modality in self.optional_input_modalities
+
+    def allows_video_without_audio(self) -> bool:
+        """Whether video without speech/audio is legal turn content (AURA video-compulsory)."""
+        return self.accepts_input_modality("video") and "audio" not in self.required_input_modalities
+
+    def validate_append_modalities(self, *, has_audio: bool, has_video: bool) -> str | None:
+        """Return an error message when the append modalities violate this contract."""
+        if not has_audio and not has_video:
+            return "input_audio_buffer.append requires audio and/or video_frames"
+        if has_audio and not self.accepts_input_modality("audio"):
+            return "This duplex model does not accept audio input"
+        if has_video and not self.accepts_input_modality("video"):
+            return "This duplex model does not accept video_frames"
+        if "audio" in self.required_input_modalities and not has_audio:
+            return "This duplex model requires audio on input_audio_buffer.append"
+        if "video" in self.required_input_modalities and not has_video:
+            return "This duplex model requires video_frames on input_audio_buffer.append"
+        if has_video and not has_audio and not self.allows_video_without_audio():
+            return "This duplex model requires audio; video-only append is not allowed"
+        return None
 
 
 @dataclass

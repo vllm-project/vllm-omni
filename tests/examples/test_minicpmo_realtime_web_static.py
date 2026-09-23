@@ -240,3 +240,18 @@ def test_playback_worklet_fades_terminal_drain_to_zero():
         capture_output=True,
         text=True,
     )
+
+
+def test_aura_camera_preview_size_is_not_shared() -> None:
+    aura = (STATIC_ROOT / "profiles" / "aura_ptt.js").read_text(encoding="utf-8")
+    app = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    minicpm = (STATIC_ROOT / "profiles" / "minicpm_native.js").read_text(encoding="utf-8")
+    qwen = (STATIC_ROOT / "profiles" / "qwen3_turn.js").read_text(encoding="utf-8")
+    html = (APP_ROOT / "index.html").read_text(encoding="utf-8")
+
+    assert "cameraPreviewLarge: true" in aura
+    assert "cameraPreviewLarge" not in minicpm
+    assert "cameraPreviewLarge" not in qwen
+    assert "profile.cameraPreviewLarge" in app
+    assert "camera-preview-break" not in app
+    assert "width:96px;height:72px" in html

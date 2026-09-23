@@ -28,6 +28,12 @@ _MINICPMO45_PROCESSOR_LOAD_LOCK = Lock()
 
 
 @dataclass
+class _MiniCPMO45WindowUnit:
+    embeds: list[Any] = field(default_factory=list)
+    token_ids: list[int] = field(default_factory=list)
+
+
+@dataclass
 class _MiniCPMO45Stage0SessionState:
     session_id: str
     #: Any: MiniCPM-o remote-code processor (transformers, no importable type).
@@ -36,6 +42,14 @@ class _MiniCPMO45Stage0SessionState:
     audio_chunk_idx: int = 0
     context_embeds: list[torch.Tensor] = field(default_factory=list)
     context_token_ids: list[int] = field(default_factory=list)
+    context_prefix_embeds: list[Any] = field(default_factory=list)
+    context_prefix_token_ids: list[int] = field(default_factory=list)
+    context_suffix_embeds: list[Any] = field(default_factory=list)
+    context_suffix_token_ids: list[int] = field(default_factory=list)
+    window_units: list[_MiniCPMO45WindowUnit] = field(default_factory=list)
+    window_enabled: bool = False
+    pending_window_unit: _MiniCPMO45WindowUnit | None = None
+    pending_window_generated_tokens: list[int] = field(default_factory=list)
     current_turn_ended: bool = True
     prepared_append_identity: tuple[int | None, int] | None = None
     prepared_inputs_embeds: torch.Tensor | None = None
@@ -142,6 +156,11 @@ class MiniCPMO45Stage0DuplexRuntime:
         *,
         runtime_config: dict[str, object] | None = None,
     ) -> None:
+        window_config = (runtime_config or {}).get("duplex_window_config")
+        state.window_enabled = isinstance(window_config, dict) and window_config.get("sliding_window_mode", "off") in {
+            "basic",
+            "context",
+        }
         if not self._stage_runtime_ready():
             return
         self._require_special_token_ids()
@@ -157,17 +176,26 @@ class MiniCPMO45Stage0DuplexRuntime:
             (runtime_config or {}).get("initial_user_text"),
         )
         for token_id in self._encode_text(prefix):
-            state.context_embeds.append(self._embed_token(token_id))
+            embed = self._embed_token(token_id)
+            state.context_embeds.append(embed)
             state.context_token_ids.append(token_id)
+            state.context_prefix_embeds.append(embed)
+            state.context_prefix_token_ids.append(token_id)
         if ref_audio is not None:
             ref_audio_embeds = self._stage_ref_audio_embeddings(ref_audio, state=state)
             if ref_audio_embeds is not None:
                 ref_audio_embeds = self._as_2d_tensor(ref_audio_embeds)
+                placeholder_ids = [self.unit_token_id] * int(ref_audio_embeds.shape[0])
                 state.context_embeds.append(ref_audio_embeds)
-                state.context_token_ids.extend([self.unit_token_id] * int(ref_audio_embeds.shape[0]))
+                state.context_token_ids.extend(placeholder_ids)
+                state.context_prefix_embeds.append(ref_audio_embeds)
+                state.context_prefix_token_ids.extend(placeholder_ids)
         for token_id in self._encode_text(suffix):
-            state.context_embeds.append(self._embed_token(token_id))
+            embed = self._embed_token(token_id)
+            state.context_embeds.append(embed)
             state.context_token_ids.append(token_id)
+            state.context_suffix_embeds.append(embed)
+            state.context_suffix_token_ids.append(token_id)
 
     def _stage_prefill_embeddings_only(
         self,
@@ -179,6 +207,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         seq: int | None = None,
         is_speech: bool = False,
         final: bool = False,
+        stage0_window: dict[str, object] | None = None,
     ) -> dict[str, object]:
         """Build scheduler-owned Stage0 input embeddings for one audio append.
 
@@ -199,6 +228,16 @@ class MiniCPMO45Stage0DuplexRuntime:
             result["input_token_ids"] = list(state.prepared_input_token_ids)
             return result
         self._require_special_token_ids()
+        if isinstance(stage0_window, dict):
+            completed_ids = stage0_window.get("completed_token_ids")
+            if isinstance(completed_ids, list):
+                state.pending_window_generated_tokens = [int(token_id) for token_id in completed_ids]
+            completed_terminator = stage0_window.get("completed_terminator_token_id")
+            if isinstance(completed_terminator, int):
+                # Async sampling can overwrite the worker's pending token
+                # after the scheduler accepted a segment stop. Rebuild from
+                # the scheduler's canonical boundary, just like its content.
+                state.pending_terminator_token = completed_terminator
         if audio_waveform is None or len(audio_waveform) == 0:
             return self._stage_prefill_result(False, start_time, "empty audio")
         state.audio_buffer = np.concatenate([state.audio_buffer, np.asarray(audio_waveform, dtype=np.float32)])
@@ -279,12 +318,25 @@ class MiniCPMO45Stage0DuplexRuntime:
                 # the closure; the model's listen/speak policy depends on
                 # seeing its own past decisions in context.
                 pending_terminator = state.pending_terminator_token
+                closure_token_ids: list[int] = []
                 if pending_terminator is not None and units_built == 0:
                     state.pending_terminator_token = None
                     embed_parts.append(self._embed_token(pending_terminator))
                     token_ids.append(int(pending_terminator))
+                    closure_token_ids.append(int(pending_terminator))
                 embed_parts.append(self._embed_token(self.unit_end_token_id))
                 token_ids.append(self.unit_end_token_id)
+                closure_token_ids.append(self.unit_end_token_id)
+                if units_built == 0:
+                    self._finalize_window_unit(state, closure_token_ids)
+                elif state.pending_window_unit is not None:
+                    # Internal processor chunks belong to this same append.
+                    state.pending_window_unit.embeds.extend(
+                        self._embed_token(token_id) for token_id in closure_token_ids
+                    )
+                    state.pending_window_unit.token_ids.extend(closure_token_ids)
+            unit_embed_start = len(embed_parts)
+            unit_token_start = len(token_ids)
             embed_parts.append(self._embed_token(self.unit_token_id))
             token_ids.append(self.unit_token_id)
             if frame_blocks:
@@ -311,6 +363,11 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.audio_buffer = state.audio_buffer[consumed_samples:]
             state.audio_chunk_idx += 1
             units_built += 1
+            if state.window_enabled:
+                if state.pending_window_unit is None:
+                    state.pending_window_unit = _MiniCPMO45WindowUnit()
+                state.pending_window_unit.embeds.extend(embed_parts[unit_embed_start:])
+                state.pending_window_unit.token_ids.extend(token_ids[unit_token_start:])
             chunk_size = self._streaming_chunk_size(processor)
         # Match official streaming_prefill: per chunk feed ONLY <unit>+audio. The assistant
         # turn is opened once at session init; re-emitting the turn-open prefix per chunk
@@ -320,6 +377,9 @@ class MiniCPMO45Stage0DuplexRuntime:
 
         import torch
 
+        window_result = self._window_replacement_parts(state, stage0_window)
+        if window_result is not None:
+            embed_parts, token_ids = window_result
         inputs_embeds = torch.cat([self._as_2d_tensor(embed) for embed in embed_parts], dim=0)
         result = self._stage_prefill_result(True, start_time)
         result.update(
@@ -332,6 +392,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "uses_model_runner_scheduler": True,
                 "runner_kv_backed": True,
                 "runtime_impl": "scheduler_data_plane",
+                "stage0_window_replaced": window_result is not None,
             }
         )
         if is_speech and (append_identity is None or state.pending_speech_append_identity != append_identity):
@@ -343,6 +404,85 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.prepared_input_token_ids = list(token_ids)
             state.prepared_result = {k: v for k, v in result.items() if k not in {"inputs_embeds", "input_token_ids"}}
         return result
+
+    def _finalize_window_unit(
+        self,
+        state: _MiniCPMO45Stage0SessionState,
+        closure_token_ids: list[int],
+    ) -> None:
+        pending = state.pending_window_unit
+        if not state.window_enabled or pending is None:
+            state.pending_window_unit = None
+            state.pending_window_generated_tokens.clear()
+            return
+        generated = list(state.pending_window_generated_tokens)
+        token_ids = [*pending.token_ids, *generated, *closure_token_ids]
+        embeds = list(pending.embeds)
+        embeds.extend(self._embed_token(token_id) for token_id in generated)
+        embeds.extend(self._embed_token(token_id) for token_id in closure_token_ids)
+        state.window_units.append(_MiniCPMO45WindowUnit(embeds=embeds, token_ids=token_ids))
+        state.pending_window_unit = None
+        state.pending_window_generated_tokens.clear()
+
+    def _window_replacement_parts(
+        self,
+        state: _MiniCPMO45Stage0SessionState,
+        stage0_window: dict[str, Any] | None,
+    ) -> tuple[list[Any], list[int]] | None:
+        if not isinstance(stage0_window, dict) or stage0_window.get("replace") is not True:
+            return None
+        try:
+            drop_units = max(0, int(stage0_window.get("drop_units", 0)))
+        except (TypeError, ValueError):
+            return None
+        if drop_units > len(state.window_units):
+            raise RuntimeError(
+                "MiniCPM-o Stage-0 window history is shorter than the scheduler drop plan: "
+                f"drop={drop_units}, completed={len(state.window_units)}"
+            )
+        del state.window_units[:drop_units]
+
+        mode = stage0_window.get("mode")
+        embeds: list[Any] = []
+        token_ids: list[int] = []
+        previous_ids: list[int] = []
+        if mode == "context":
+            embeds.extend(state.context_prefix_embeds)
+            token_ids.extend(state.context_prefix_token_ids)
+            previous = stage0_window.get("previous_token_ids")
+            previous_ids = [int(token_id) for token_id in previous] if isinstance(previous, list) else []
+            if previous_ids:
+                # The plan carries the marker ids the scheduler sized the
+                # `previous` region from. Re-tokenizing here would be a second
+                # source of truth and could disagree with that length.
+                marker = stage0_window.get("previous_marker_token_ids")
+                marker_ids = [int(token_id) for token_id in marker] if isinstance(marker, list) else []
+                embeds.extend(self._embed_token(token_id) for token_id in [*marker_ids, *previous_ids])
+                token_ids.extend(marker_ids)
+                token_ids.extend(previous_ids)
+            embeds.extend(state.context_suffix_embeds)
+            token_ids.extend(state.context_suffix_token_ids)
+        else:
+            embeds.extend(state.context_embeds)
+            token_ids.extend(state.context_token_ids)
+        for unit in state.window_units:
+            embeds.extend(unit.embeds)
+            token_ids.extend(unit.token_ids)
+        if state.pending_window_unit is not None:
+            embeds.extend(state.pending_window_unit.embeds)
+            token_ids.extend(state.pending_window_unit.token_ids)
+        expected = stage0_window.get("replacement_prompt_len")
+        if isinstance(expected, int) and expected != len(token_ids):
+            unit_lengths = [len(unit.token_ids) for unit in state.window_units]
+            pending_len = len(state.pending_window_unit.token_ids) if state.pending_window_unit is not None else 0
+            raise RuntimeError(
+                "MiniCPM-o Stage-0 window rebuild length mismatch: "
+                f"worker={len(token_ids)}, scheduler={expected}, mode={mode}, "
+                f"prefix={len(state.context_prefix_token_ids)}, "
+                f"suffix={len(state.context_suffix_token_ids)}, previous={len(previous_ids)}, "
+                f"units={unit_lengths}, pending={pending_len}, drop={drop_units}"
+            )
+        return embeds, token_ids
 
     @staticmethod
     def _stage_prefill_result(success: bool, start_time: float, reason: str = "") -> dict[str, object]:

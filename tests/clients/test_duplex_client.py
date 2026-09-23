@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import struct
 import wave
 from collections.abc import Callable
 from typing import Any
@@ -33,6 +34,7 @@ from vllm_omni.clients.duplex import (
     ReconnectPolicy,
     SessionConfig,
     SessionResumed,
+    SessionUpdated,
     build_realtime_url,
     chunk_period_ms,
     duplex_unit_boundary_ms,
@@ -40,6 +42,7 @@ from vllm_omni.clients.duplex import (
     read_pcm16_wav,
     reference_audio_data_url,
     summarize_session_request_metrics,
+    summarize_stage_metrics,
     write_pcm16_wav,
 )
 from vllm_omni.clients.inline_duplex import InlineDuplexClient
@@ -798,6 +801,52 @@ async def test_inline_client_submits_typed_commands_in_order():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [True, False])
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"input_audio_format": "pcm_f32le", "sample_rate_hz": 24_000},
+        {"audio": {"input": {"format": "pcm_f32le", "sample_rate_hz": 24_000}}},
+    ],
+)
+async def test_inline_input_defaults_change_only_after_session_updated(accepted, patch):
+    client, omni = make_inline_client()
+    patch = {**patch, "overlap_silence_rms": 0.1}
+    async with client:
+        handle = omni.handles[0]
+        previous_session = dict(client.session_info)
+        await client.send({"type": "session.update", "session": patch})
+        # Sending a patch is not an acknowledgement of its acceptance.
+        assert client.session_info == previous_session
+        assert client._input_defaults().input_sample_rate_hz == 16_000
+        updated_session = {**previous_session, **patch}
+        event: dict[str, object] = (
+            {"type": "session.updated", "session": updated_session}
+            if accepted
+            else {"type": "error", "error": {"code": "invalid_session_update", "message": "rejected"}}
+        )
+        handle.feed(event)
+        received = await client.wait_for("session.updated" if accepted else "error", timeout_s=2.0)
+        assert isinstance(received, SessionUpdated if accepted else ErrorEvent)
+
+        pcm = struct.pack("<f", 0.05) * 16
+        await client.send({"type": "input_audio_buffer.append", "audio": _b64(pcm)})
+        command = handle.commands[-1]
+        assert isinstance(command, duplex_commands.AppendAudio)
+        assert command.format == "pcm_f32le"
+        if accepted:
+            assert client.session_info == updated_session
+            assert command.audio == pcm
+            assert command.sample_rate_hz == 24_000
+            assert command.is_speech is False
+        else:
+            assert client.session_info == previous_session
+            assert len(command.audio) == 2 * len(pcm)  # Still decoded as pcm16.
+            assert command.sample_rate_hz == 16_000
+            assert command.is_speech is True
+
+
+@pytest.mark.asyncio
 async def test_inline_session_close_maps_to_handle_close():
     client, omni = make_inline_client()
     async with client:
@@ -1018,6 +1067,7 @@ def test_event_collector_reports_engine_token_and_audio_intervals():
             "max": 18.0,
         },
     }
+    assert timing["stages"] == {"0": timing["stage0_tokens"]}
     assert timing["audio_output"] == {
         "source": "client_monotonic_receive",
         "chunk_count": 3,
@@ -1270,6 +1320,152 @@ def test_summarize_session_request_metrics_averages_audio_turns():
         "ttft_ms": {"count": 2, "mean": 200.0, "p50": 100.0, "p99": 300.0},
         "ttfp_ms": {"count": 2, "mean": 300.0, "p50": 200.0, "p99": 400.0},
         "rtf": {"count": 2, "mean": 0.6, "p50": 0.5, "p99": 0.7},
+    }
+
+
+def test_event_collector_reports_all_engine_stages():
+    collector = EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
+    collector.add(
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "resp-a",
+            "delta": base64.b64encode(b"audio").decode("ascii"),
+            "sample_rate_hz": 16_000,
+            "metadata": {
+                "audio_duration_ms": 80,
+                "vllm_omni": {
+                    "stage_metrics": {
+                        "0": {
+                            "final_output_type": "text",
+                            "num_tokens_out": 4,
+                            "vllm_ttft_ms": 120.0,
+                            "vllm_tpot_ms": 15.0,
+                            "vllm_itls_ms": [10.0, 20.0],
+                        },
+                        "1": {
+                            "output_unit_type": "stream",
+                            "output_unit_count": 8,
+                            "serving_time_to_first_output_ms": 40.0,
+                            "time_per_output_unit_ms": 5.0,
+                            "inter_output_latencies_ms": [5.0],
+                        },
+                    }
+                },
+            },
+        },
+        received_at_s=10.2,
+    )
+    collector.add(
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "resp-a",
+            "delta": base64.b64encode(b"audio").decode("ascii"),
+            "sample_rate_hz": 16_000,
+            "metadata": {
+                "audio_duration_ms": 160,
+                "vllm_omni": {
+                    "stage_metrics": {
+                        "2": {
+                            "final_output_type": "audio",
+                            "output_unit_type": "audio",
+                            "serving_time_to_first_output_ms": 80.0,
+                            "output_unit_count": 2,
+                            "audio_generated_frames": 2,
+                            "audio_duration_s": 0.08,
+                        }
+                    }
+                },
+            },
+        },
+        received_at_s=10.3,
+    )
+
+    timing = collector.timing_summary(after_s=10.0, response_id="resp-a")
+
+    assert list(timing["stages"]) == ["0", "1", "2"]
+    assert timing["stages"]["0"] is timing["stage0_tokens"]
+    assert timing["stages"]["0"]["ttft_ms"] == 120.0
+    assert "ttft_ms" not in timing["stages"]["1"]
+    assert timing["stages"]["1"]["ttfc_ms"] == 40.0
+    assert timing["stages"]["1"]["tpop_ms"] == 5.0
+    assert "ttft_ms" not in timing["stages"]["2"]
+    assert timing["stages"]["2"]["ttfp_ms"] == 80.0
+
+
+def test_audio_stage_omits_missing_or_zero_ttfp():
+    def _audio_stage_timing(serving_time: object) -> dict[str, object]:
+        collector = EventCollector()
+        collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
+        stage_2: dict[str, object] = {
+            "final_output_type": "audio",
+            "output_unit_type": "audio",
+            "output_unit_count": 1,
+            "audio_generated_frames": 1,
+            "audio_duration_s": 0.08,
+        }
+        if serving_time is not None:
+            stage_2["serving_time_to_first_output_ms"] = serving_time
+        collector.add(
+            {
+                "type": "response.output_audio.delta",
+                "response_id": "resp-a",
+                "delta": base64.b64encode(b"audio").decode("ascii"),
+                "sample_rate_hz": 16_000,
+                "metadata": {
+                    "audio_duration_ms": 80,
+                    "vllm_omni": {"stage_metrics": {"2": stage_2}},
+                },
+            },
+            received_at_s=10.2,
+        )
+        return collector.timing_summary(after_s=10.0, response_id="resp-a")["stages"]["2"]
+
+    assert "ttfp_ms" not in _audio_stage_timing(None)
+    assert "ttfp_ms" not in _audio_stage_timing(0.0)
+    assert _audio_stage_timing(80.0)["ttfp_ms"] == 80.0
+
+
+def test_summarize_session_request_metrics_groups_stages():
+    summary = summarize_session_request_metrics(
+        [
+            {
+                "ttft_ms": 100.0,
+                "stages": {
+                    "0": {"ttft_ms": 10.0, "tpot_ms": 2.0},
+                    "1": {"ttfc_ms": 20.0, "tpop_ms": 0.0},
+                },
+            },
+            {
+                "ttft_ms": 300.0,
+                "stages": {
+                    "0": {"ttft_ms": 30.0, "tpot_ms": 6.0},
+                    "1": {"ttfc_ms": 40.0, "tpop_ms": 8.0},
+                    "2": {"ttfp_ms": 50.0},
+                },
+            },
+        ],
+        session_id="sess-1",
+    )
+
+    assert summary["stages"] == {
+        "0": {
+            "ttft_ms": {"count": 2, "mean": 20.0, "p50": 10.0, "p99": 30.0},
+            "tpot_ms": {"count": 2, "mean": 4.0, "p50": 2.0, "p99": 6.0},
+        },
+        "1": {
+            "ttfc_ms": {"count": 2, "mean": 30.0, "p50": 20.0, "p99": 40.0},
+            "tpop_ms": {"count": 1, "mean": 8.0, "p50": 8.0, "p99": 8.0},
+        },
+        "2": {
+            "ttfp_ms": {"count": 1, "mean": 50.0, "p50": 50.0, "p99": 50.0},
+        },
+    }
+    assert summarize_stage_metrics([{"stage0_tokens": {"ttft_ms": 12.0, "tpot_ms": 3.0}}]) == {
+        "0": {
+            "ttft_ms": {"count": 1, "mean": 12.0, "p50": 12.0, "p99": 12.0},
+            "tpot_ms": {"count": 1, "mean": 3.0, "p50": 3.0, "p99": 3.0},
+        }
     }
 
 

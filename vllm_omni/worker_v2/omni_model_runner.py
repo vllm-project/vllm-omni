@@ -402,6 +402,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
         context_len: int = 0,
+        valid_dummy_state_slots: bool = False,
     ) -> Any:
         if not dummy_run:
             self._prepare_native_data_plane(scheduler_output)
@@ -478,7 +479,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 max_query_len=batch_desc.max_query_len,
             )
             if not skip_attn_for_dummy_run:
-                block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
+                block_tables, slot_mappings = self.prepare_dummy_attn(input_batch, valid_dummy_state_slots)
                 if context_len:
                     set_dummy_context(
                         input_batch,
@@ -608,6 +609,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             dp_sync=dp_sync,
             ec_connector_output=ec_connector_output,
             routed_experts=routed_experts,
+            cudagraph_stats=None,
         )
 
         assert isinstance(hidden_states, torch.Tensor)

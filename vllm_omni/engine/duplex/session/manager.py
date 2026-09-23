@@ -99,6 +99,7 @@ class DuplexSessionManager:
         result_sink: janus.AsyncQueue[EngineQueueMessage],
         runtime_config: DuplexSessionRuntimeConfig,
         model_config: ModelConfig | None,
+        log_stats: bool = False,
         clock: Callable[[], float] | None = None,
         executor: concurrent.futures.ThreadPoolExecutor | None = None,
     ) -> None:
@@ -106,6 +107,7 @@ class DuplexSessionManager:
         self.plugin = plugin
         self.stage_port = stage_port
         self.model_config = model_config
+        self.log_stats = bool(log_stats)
         self.runtime_config = runtime_config
         self._output_sink = output_sink
         self._result_sink = result_sink
@@ -286,8 +288,18 @@ class DuplexSessionManager:
             )
             return
         if isinstance(command, AppendAudio):
+            has_audio = bool(command.audio)
+            has_video = bool(command.video_frames)
+            modality_error = session.capabilities.validate_append_modalities(has_audio=has_audio, has_video=has_video)
+            if modality_error is not None:
+                self.emit(
+                    session,
+                    self._error_event("invalid_input_modality", modality_error, command=command),
+                )
+                return
             limit = int(self.runtime_config.max_pending_input_bytes_per_session)
-            if not session.reserve_input_bytes(len(command.audio), limit=limit):
+            pending_bytes = len(command.audio) + sum(len(frame) for frame in command.video_frames)
+            if not session.reserve_input_bytes(pending_bytes, limit=limit):
                 self.emit(
                     session,
                     self._error_event(
@@ -425,9 +437,8 @@ class DuplexSessionManager:
         if stage_id >= self.stage_port.stage_count:
             return None
         effective_fence = fence or session.fence
-        request_id = self.stage_request_id(
-            effective_fence, stage_id=stage_id, resumable=session.capabilities.supports_core_resumable_request
-        )
+        resumable = session.capabilities.supports_core_resumable_request
+        request_id = self.stage_request_id(effective_fence, stage_id=stage_id, resumable=resumable)
         session.reserve_stage_request(stage_id, request_id, fence=effective_fence)
         context = DuplexStageRequestContext(
             request_id=request_id,
@@ -490,6 +501,8 @@ class DuplexSessionManager:
                 lease=DuplexLeaseState(config=self._lease_config, generation=0, last_activity=self._clock()),
                 _clock=self._clock,
                 _runtime_config=dict(runtime_config),
+                num_stages=self.stage_port.stage_count,
+                log_stats=self.log_stats,
             )
             # Validates the plugin's sampling policy for this runtime config before admission.
             self.sampling_params_for(session)
@@ -591,9 +604,12 @@ class DuplexSessionManager:
         The session keeps its admission slot (``_closing``) until stage cleanup
         succeeded; a failed cleanup is retried by the reaper. For an explicit
         close the ``session.closed`` event is emitted only after the cleanup
-        attempt, so a client that sees it can open a replacement session at
-        once (the runner used to emit it before the stage requests were
-        aborted, which let a prompt reopen hit ``resource_exhausted``).
+        attempt, in a ``finally``, including when the cleanup failed (the
+        runner used to emit it before the stage requests were aborted). A
+        client that sees the event can normally open a replacement session
+        right away, but after a failed cleanup the slot is still held until
+        the reaper succeeds, so a prompt reopen can be refused with
+        ``resource_exhausted``.
         """
         session = runner.session
         submitted = tuple(session.resource_request_ids(submitted=True))
@@ -690,7 +706,9 @@ class DuplexSessionManager:
         while not shutdown_event.is_set():
             try:
                 await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
-            except TimeoutError:
+            # The timeout is this loop's tick. asyncio.TimeoutError is not the builtin
+            # TimeoutError before Python 3.11, so catch both or the tick escapes the loop.
+            except (TimeoutError, asyncio.TimeoutError):
                 try:
                     await self.reap_expired()
                 except Exception:

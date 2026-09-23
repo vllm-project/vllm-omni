@@ -470,6 +470,7 @@ class StageDeployConfig:
     step_execution: bool | None = None
     vae_use_slicing: bool | None = None
     vae_use_tiling: bool | None = None
+    vae_fast_path: str | None = None
     boundary_ratio: float | None = None
     flow_shift: float | None = None
     diffusion_kv_cache_dtype: str | None = None
@@ -525,10 +526,12 @@ class DuplexSessionRuntimeConfig:
     # parse, and goes away with the PR that ports the last of them.
     completed_append_cache_size: int = 256
     server_vad_model_path: str | None = None
-    # Startup warmup: run this many silent 80 ms-style frames through a
-    # throwaway realtime session before real clients are admitted, so
-    # one-time costs (kernel JIT, first prefill/decode paths, codec caches)
-    # never land on the first user. 0 disables the warmup.
+    # Startup warmup, before real ``/v1/realtime`` clients are admitted.
+    # Audio-primary models run this many silent frames; 0 disables that path.
+    # Video-required models (AURA) still run one short non-silent audio chunk
+    # plus one image when this is 0, so ASR, vision, Talker and Code2Wav
+    # compile their real shapes. The empty per-stage JIT registry does not.
+    # A negative value disables every startup warmup.
     warmup_frames: int = 0
 
     def __post_init__(self) -> None:

@@ -58,6 +58,10 @@ class DuplexRunState:
     runtime_closed: bool = False
     #: Request id of the resumable data-plane stream currently bound to the session.
     stream_request_id: str | None = None
+    #: Plugin signaled that the next user commit may start while the current
+    #: assistant audio is still draining. Cleared on barge-in/cancel, or when
+    #: the next ephemeral turn begins. Orthogonal to barge-in (which aborts).
+    concurrent_turn_requests_released: bool = False
 
 
 class RunnerServices(Protocol):
@@ -137,7 +141,8 @@ class DuplexSessionTasks:
             task.cancel()
         try:
             await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout_s)
-        except TimeoutError:
+        # asyncio.TimeoutError is not the builtin TimeoutError before Python 3.11.
+        except (TimeoutError, asyncio.TimeoutError):
             pass
         if cancelled_tail is not None and self.append_tail is cancelled_tail:
             self.append_tail = None
