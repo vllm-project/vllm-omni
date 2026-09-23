@@ -83,6 +83,8 @@ class UnifiedPrepare(nn.Module):
         cap_sin: torch.Tensor,
         x_item_seqlens: list[int],
         cap_item_seqlens: list[int],
+        x_attn_mask: torch.Tensor,
+        cap_attn_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Combine x and cap tensors into unified sequences.
 
@@ -112,8 +114,9 @@ class UnifiedPrepare(nn.Module):
         unified_cos = pad_sequence(unified_cos, batch_first=True, padding_value=0.0)
         unified_sin = pad_sequence(unified_sin, batch_first=True, padding_value=0.0)
         unified_attn_mask = torch.zeros((bsz, unified_max_item_seqlen), dtype=torch.bool, device=device)
-        for i, seq_len in enumerate(unified_item_seqlens):
-            unified_attn_mask[i, :seq_len] = 1
+        for i, (x_len, cap_len) in enumerate(zip(x_item_seqlens, cap_item_seqlens)):
+            unified_attn_mask[i, :x_len] = x_attn_mask[i, :x_len]
+            unified_attn_mask[i, x_len : x_len + cap_len] = cap_attn_mask[i, :cap_len]
 
         return unified, unified_cos, unified_sin, unified_attn_mask
 
@@ -1076,13 +1079,17 @@ class ZImageTransformer2DModel(CachedTransformer):
         # Prepare unified tensors via UnifiedPrepare module
         # This enables _cp_plan to shard outputs via split_output=True
         unified, unified_cos, unified_sin, unified_attn_mask = self.unified_prepare(
-            x, x_cos, x_sin, cap_feats, cap_cos, cap_sin, x_item_seqlens, cap_item_seqlens
+            x,
+            x_cos,
+            x_sin,
+            cap_feats,
+            cap_cos,
+            cap_sin,
+            x_item_seqlens,
+            cap_item_seqlens,
+            x_attn_mask,
+            cap_attn_mask,
         )
-        if self.alignment_padding_mode == ZERO_MASKED_PADDING:
-            for i, (x_len, cap_len) in enumerate(zip(x_item_seqlens, cap_item_seqlens)):
-                unified_attn_mask[i, :x_len].masked_fill_(x_inner_pad_mask[i], False)
-                unified_attn_mask[i, x_len : x_len + cap_len].masked_fill_(cap_inner_pad_mask[i], False)
-
         # Main transformer blocks
         for layer in self.layers:
             unified = layer(unified, unified_attn_mask, unified_cos, unified_sin, adaln_input)
