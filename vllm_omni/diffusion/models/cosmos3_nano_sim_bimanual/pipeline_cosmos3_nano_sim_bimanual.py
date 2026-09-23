@@ -634,11 +634,16 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         self._states.move_to_end(session_id)
         return state
 
+    def _prompt_token_limit(self, sp: Any, prompt_data: Any) -> int:
+        return self.manifest.text_cache_max_len
+
     def _ensure_text_kv(
         self,
         state: Cosmos3NanoSimBimanualSessionState,
         text_ids: torch.Tensor,
         text_mask: torch.Tensor,
+        *,
+        max_length: int | None = None,
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         cached = state.text_kv_by_branch.get(self._MAIN_BRANCH)
         if cached is not None:
@@ -650,11 +655,9 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             cached = [(entry["k"], entry["v"]) for entry in pooled]
         else:
             raw_kv, real_len = self.transformer.encode_und_kv(text_ids, text_mask)
-            if real_len > self.manifest.text_cache_max_len:
-                raise ValueError(
-                    "Cosmos3-Nano-Sim-Bimanual prompt exceeds text_cache_max_len: "
-                    f"{real_len} > {self.manifest.text_cache_max_len}."
-                )
+            limit = self.manifest.text_cache_max_len if max_length is None else max_length
+            if real_len > limit:
+                raise ValueError(f"{type(self).__name__} prompt exceeds token limit: {real_len} > {limit}.")
             if paged_state is None:
                 cached = raw_kv
             else:
@@ -1291,10 +1294,10 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             fps=fps,
         )
         real_text_kv_len = int(text_mask[0].sum().item())
-        if real_text_kv_len > self.manifest.text_cache_max_len:
+        prompt_token_limit = self._prompt_token_limit(sp, prompt_data)
+        if real_text_kv_len > prompt_token_limit:
             raise ARDiffusionRequestRejectedError(
-                "Cosmos3-Nano-Sim-Bimanual prompt exceeds text_cache_max_len: "
-                f"{real_text_kv_len} > {self.manifest.text_cache_max_len}."
+                f"{type(self).__name__} prompt exceeds token limit: {real_text_kv_len} > {prompt_token_limit}."
             )
         fingerprint = self._fingerprint(
             text_ids,
@@ -1397,7 +1400,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             state.initialize(fingerprint)
         if tick and state.tick_output_type is None:
             state.tick_output_type = tick_output_type
-        text_kv = self._ensure_text_kv(state, text_ids, text_mask)
+        text_kv = self._ensure_text_kv(state, text_ids, text_mask, max_length=prompt_token_limit)
 
         terminal_request = close_session or not tick
         seed = self._resolve_seed(sp, sp.generator if isinstance(sp.generator, torch.Generator) else None)

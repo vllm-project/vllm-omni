@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, TypeAdapter, field_validator, model_validator
 
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_contract import (
     Cosmos3NanoSimBimanualActionSchema,
@@ -35,13 +35,11 @@ class Cosmos3NanoSimBimanualControlVideoConditioning(BaseModel):
     transfer_control_attention_mode: Literal["causal_control_with_rgb_history"]
     share_vision_temporal_positions: Literal[True]
     system_prompt_id: Literal["cosmos3_transfer_v1"]
-    emphasize_control_in_prompt: Literal[True]
-    no_eviction: Literal[True]
+    emphasize_control_in_prompt: StrictBool
+    no_eviction: StrictBool
 
     @field_validator(
         "share_vision_temporal_positions",
-        "emphasize_control_in_prompt",
-        "no_eviction",
         mode="before",
     )
     @classmethod

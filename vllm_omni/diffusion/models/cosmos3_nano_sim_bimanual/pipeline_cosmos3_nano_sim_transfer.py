@@ -63,6 +63,9 @@ class _TransferRequestContract:
     hint_config: Mapping[str, Any]
     control_video: Any
     num_pixel_frames: int
+    window_frames: int
+    sink_frames: int
+    emphasize_control_in_prompt: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,13 +163,19 @@ def resolve_cosmos3_nano_sim_transfer_geometry(
             _default_transfer_resolution(policy),
         ),
     )
-    source_hw = _transfer_media_hw(_transfer_media_source(sampling_params, prompt_data))
-    if source_hw is None:
-        source_hw = policy.default_resolution
     try:
-        target_width, target_height = find_closest_target_size(*source_hw, resolution)
-    except ValueError as exc:
-        raise ValueError(f"Cosmos3-Nano-Sim-Transfer resolution bucket is invalid: {resolution!r}.") from exc
+        aspect_ratio = _request_value(sampling_params, prompt_data, "aspect_ratio")
+        if aspect_ratio is not None:
+            target_width, target_height = VIDEO_RES_SIZE_INFO[str(resolution)][str(aspect_ratio)]
+        else:
+            source_hw = _transfer_media_hw(_transfer_media_source(sampling_params, prompt_data))
+            if source_hw is None:
+                source_hw = policy.default_resolution
+            target_width, target_height = find_closest_target_size(*source_hw, resolution)
+    except (KeyError, ValueError) as exc:
+        raise ValueError(
+            f"Cosmos3-Nano-Sim-Transfer invalid resolution/aspect_ratio: {resolution!r}/{aspect_ratio!r}."
+        ) from exc
     geometry = policy.resolve(target_height, target_width)
 
     requested_height = getattr(sampling_params, "height", None)
@@ -181,10 +190,10 @@ def resolve_cosmos3_nano_sim_transfer_geometry(
     return geometry
 
 
-def _strict_frame_count(value: Any) -> int:
+def _strict_integer(value: Any, name: str = "num_frames") -> int:
     if isinstance(value, bool) or not isinstance(value, Integral):
         raise ARDiffusionRequestRejectedError(
-            f"Cosmos3-Nano-Sim-Transfer num_frames must be an integer without coercion, got {value!r}."
+            f"Cosmos3-Nano-Sim-Transfer {name} must be an integer without coercion, got {value!r}."
         )
     return int(value)
 
@@ -205,6 +214,7 @@ def format_cosmos3_nano_sim_transfer_prompt(
     fps: float,
     height: int,
     width: int,
+    emphasize_control_in_prompt: bool = True,
 ) -> str:
     """Replicate the reference non-AR full-clip Transfer prompt."""
 
@@ -226,8 +236,37 @@ def format_cosmos3_nano_sim_transfer_prompt(
         formatted = formatted.strip()
         resolution_text = COSMOS3_RESOLUTION_TEMPLATE.format(height=height, width=width)
         formatted = formatted.rstrip(".") + ". " + resolution_text
-    suffix = COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE.format(hint_names=hint)
-    return f"{formatted.rstrip()} {suffix}"
+    if emphasize_control_in_prompt:
+        suffix = COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE.format(hint_names=hint)
+        return f"{formatted.rstrip()} {suffix}"
+    return formatted
+
+
+def _trim_transfer_history(
+    history: list[tuple[torch.Tensor, torch.Tensor]],
+    *,
+    tokens_per_frame: int,
+    window_frames: int,
+    sink_frames: int,
+) -> None:
+    """Select paired sinks and recent past before the next control forward.
+
+    W includes S sink frames and the current temporal frame. A past frame
+    occupies two entries (control, generated latent). The current control is
+    appended afterwards, so denoising and clean commit additionally see C_t.
+    Positions in the retained K/V remain absolute; eviction never renumbers RoPE.
+    """
+    sink_tokens = 2 * sink_frames * tokens_per_frame
+    recent_tokens = 2 * (window_frames - sink_frames - 1) * tokens_per_frame
+    for layer_idx, (key, value) in enumerate(history):
+        if key.shape[1] <= sink_tokens + recent_tokens:
+            continue
+
+        def select(tensor: torch.Tensor) -> torch.Tensor:
+            prefix = tensor[:, :sink_tokens]
+            return torch.cat((prefix, tensor[:, -recent_tokens:]), dim=1) if recent_tokens else prefix.clone()
+
+        history[layer_idx] = (select(key), select(value))
 
 
 def get_cosmos3_nano_sim_transfer_pre_process_func(od_config: OmniDiffusionConfig):
@@ -311,7 +350,7 @@ def get_cosmos3_nano_sim_transfer_ir_op_priority_func(od_config: OmniDiffusionCo
 
 
 class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
-    """Full-clip Transfer inference using the dense causal-history oracle."""
+    """Transfer inference with dense full history or paired sliding history."""
 
     _transformer_cls_override: ClassVar[type[Cosmos3NanoSimTransferTransformer]] = Cosmos3NanoSimTransferTransformer
 
@@ -325,10 +364,8 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
 
     def _init_conditioning(self, od_config: OmniDiffusionConfig) -> None:
         contract = self.manifest.require_control_video_conditioning()
-        if self.manifest.sink_frames != 0:
-            raise ValueError("Cosmos3-Nano-Sim-Transfer requires sink_frames=0.")
-        if not contract.no_eviction:
-            raise ValueError("Cosmos3-Nano-Sim-Transfer requires no_eviction=True.")
+        if self.manifest.chunk_size != 1 and (self.manifest.sink_frames != 0 or not contract.no_eviction):
+            raise ValueError("Cosmos3-Nano-Sim-Transfer sliding history requires chunk_size=1.")
         if not bool(getattr(od_config, "enforce_eager", False)):
             raise ValueError(
                 "Cosmos3-Nano-Sim-Transfer requires enforce_eager=True; compiled execution is unsupported."
@@ -402,6 +439,31 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
     ) -> int:
         del sp, prompt_data
         return conditioning_request.num_pixel_frames
+
+    def _prompt_token_limit(self, sp: Any, prompt_data: Any) -> int:
+        # Dense text K/V is sized to the prompt, unlike the fixed paged pool.
+        limit = _strict_integer(
+            self._request_param(sp, prompt_data, "max_prompt_tokens", self.manifest.text_cache_max_len),
+            "max_prompt_tokens",
+        )
+        if limit <= 0:
+            raise ARDiffusionRequestRejectedError("max_prompt_tokens must be positive.")
+        return limit
+
+    def _append_dense_kv(
+        self,
+        state: Cosmos3NanoSimBimanualSessionState,
+        current_kv: list[tuple[torch.Tensor, torch.Tensor]],
+        geometry: Cosmos3NanoSimBimanualGeometry,
+    ) -> None:
+        # Transfer trims complete pairs before C_t, not individual entries at
+        # each append. Keep C_t for all denoise steps and the clean commit.
+        history = state.dense_kv_by_branch.get(self._MAIN_BRANCH)
+        if history is None:
+            state.dense_kv_by_branch[self._MAIN_BRANCH] = [(k.detach(), v.detach()) for k, v in current_kv]
+        else:
+            for idx, ((old_k, old_v), (new_k, new_v)) in enumerate(zip(history, current_kv, strict=True)):
+                history[idx] = (torch.cat((old_k, new_k), dim=1), torch.cat((old_v, new_v), dim=1))
 
     def _validate_conditioning_request(
         self,
@@ -492,32 +554,53 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
                 "Cosmos3-Nano-Sim-Transfer requires share_vision_temporal_positions=True."
             )
         emphasize = _strict_bool(
-            self._request_param(sp, prompt_data, "emphasize_control_in_prompt", True),
+            self._request_param(
+                sp,
+                prompt_data,
+                "emphasize_control_in_prompt",
+                self.manifest.require_control_video_conditioning().emphasize_control_in_prompt,
+            ),
             "emphasize_control_in_prompt",
         )
-        if not emphasize:
-            raise ARDiffusionRequestRejectedError(
-                "Cosmos3-Nano-Sim-Transfer requires emphasize_control_in_prompt=True."
-            )
 
-        num_pixel_frames = _strict_frame_count(self._request_param(sp, prompt_data, "num_frames", 1))
-        if num_pixel_frames < 17 or (num_pixel_frames - 1) % 16 != 0:
+        window = _strict_integer(
+            self._request_param(sp, prompt_data, "kv_cache_inference_size", self.manifest.window_frames),
+            "kv_cache_inference_size",
+        )
+        sink = _strict_integer(
+            self._request_param(sp, prompt_data, "attention_sink_size", self.manifest.sink_frames),
+            "attention_sink_size",
+        )
+        if window <= 0 or not 0 <= sink < window:
+            raise ARDiffusionRequestRejectedError("Require kv_cache_inference_size > attention_sink_size >= 0.")
+        if self.manifest.chunk_size != 1 and sink != 0:
+            raise ARDiffusionRequestRejectedError("Transfer sink history requires chunk_size=1.")
+
+        num_pixel_frames = _strict_integer(self._request_param(sp, prompt_data, "num_frames", 1))
+        frame_stride = self.manifest.temporal_compression_factor * self.manifest.chunk_size
+        minimum_frames = 1 if self.manifest.chunk_size == 1 else 1 + frame_stride
+        if num_pixel_frames < minimum_frames or (num_pixel_frames - 1) % frame_stride != 0:
             raise ARDiffusionRequestRejectedError(
-                "Cosmos3-Nano-Sim-Transfer requires F >= 17 and (F - 1) % 16 == 0 "
+                f"Cosmos3-Nano-Sim-Transfer requires F >= {minimum_frames} and (F - 1) % {frame_stride} == 0 "
                 f"pixel frames; got F={num_pixel_frames}."
             )
         latent_frames = (num_pixel_frames - 1) // self.manifest.temporal_compression_factor + 1
         required_history_frames = 2 * latent_frames + 1
-        if required_history_frames > self.manifest.window_frames:
+        # Framewise inference uses window/sink retention regardless of
+        # conditioning.no_eviction. Chunkwise inference requires full-history capacity.
+        if self.manifest.chunk_size != 1 and required_history_frames > window:
             raise ARDiffusionRequestRejectedError(
                 "Cosmos3-Nano-Sim-Transfer full history exceeds the artifact's no-eviction window: "
-                f"required {required_history_frames}, configured {self.manifest.window_frames}."
+                f"required {required_history_frames}, configured {window}."
             )
         return _TransferRequestContract(
             hint=hint,
             hint_config=hint_config,
             control_video=control_video,
             num_pixel_frames=num_pixel_frames,
+            window_frames=window,
+            sink_frames=sink,
+            emphasize_control_in_prompt=emphasize,
         )
 
     def _conditioning_fingerprint(self, request: _TransferRequestContract) -> tuple[tuple[str, Any], ...]:
@@ -525,6 +608,9 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
             ("control_hint", request.hint),
             ("clip_num_frames", request.num_pixel_frames),
             ("control_contract_sha256", self.manifest.conditioning_digest),
+            ("window_frames", request.window_frames),
+            ("sink_frames", request.sink_frames),
+            ("emphasize_control_in_prompt", request.emphasize_control_in_prompt),
         )
 
     def _build_prompt_tokens(
@@ -548,6 +634,7 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
             fps=fps,
             height=geometry.height,
             width=geometry.width,
+            emphasize_control_in_prompt=request.emphasize_control_in_prompt,
         )
         return self._tokenize_prompt(
             formatted,
@@ -658,6 +745,15 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
         measure_tick_latency: bool,
     ) -> torch.Tensor:
         del request_start_frame
+        if self.manifest.chunk_size == 1:
+            history = state.dense_kv_by_branch.get(self._MAIN_BRANCH)
+            if history is not None:
+                _trim_transfer_history(
+                    history,
+                    tokens_per_frame=geometry.vision_tokens_per_frame,
+                    window_frames=conditioning.request.window_frames,
+                    sink_frames=conditioning.request.sink_frames,
+                )
         control_chunk = conditioning.control_latents[:, :, chunk_start:chunk_end]
         with self._timed_tick_stage(
             tick_durations,

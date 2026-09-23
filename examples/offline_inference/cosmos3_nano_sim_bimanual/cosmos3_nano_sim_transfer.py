@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Run Cosmos3-Nano-Sim-Transfer from an imaginaire4 Transfer JSON record."""
+"""Run Cosmos3-Nano-Sim-Transfer from a Transfer JSON record."""
 
 from __future__ import annotations
 
@@ -52,6 +52,17 @@ def _resolve_path(value: Any, base_dir: Path) -> Any:
         return value
     path = Path(value)
     return str(path if path.is_absolute() else base_dir / path)
+
+
+def _load_prompt(record: dict[str, Any], input_dir: Path, prompt_path: Path | None = None) -> str:
+    """Keep structured captions intact for the pipeline's metadata formatter."""
+    if prompt_path is None and record.get("prompt_path") is not None:
+        prompt_path = Path(_resolve_path(record["prompt_path"], input_dir))
+    if prompt_path is not None:
+        text = prompt_path.read_text()
+        return json.dumps(json.loads(text)) if prompt_path.suffix.lower() == ".json" else text.strip()
+    prompt = record.get("prompt", "")
+    return json.dumps(prompt) if isinstance(prompt, dict) else str(prompt)
 
 
 def _load_video_frames(value: str, *, max_frames: int) -> list[Image.Image]:
@@ -120,18 +131,30 @@ def _video_frames(video: Any) -> list[np.ndarray]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Converted Cosmos3-Nano-Sim-Transfer Diffusers directory.")
-    parser.add_argument("--input-json", type=Path, required=True, help="imaginaire4 Transfer JSON record.")
+    parser.add_argument("--input-json", type=Path, required=True, help="Transfer JSON record.")
     parser.add_argument("--deploy-config", default="vllm_omni/deploy/cosmos3_nano_sim_transfer.yaml")
     parser.add_argument("--output", type=Path, default=Path("cosmos3_nano_sim_transfer.mp4"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--resolution",
         choices=("256", "480", "704", "720"),
-        default="480",
-        help="Cosmos3 Transfer bucket family; aspect ratio is inferred from the prioritized control source.",
+        default=None,
+        help="Cosmos3 Transfer bucket family; defaults to the JSON record's resolution or 480.",
     )
     parser.add_argument("--fps", type=float, default=None)
     parser.add_argument("--num-frames", type=int, default=None)
+    parser.add_argument("--prompt-path", type=Path, help="Override the record's caption with this text or JSON file.")
+    parser.add_argument("--aspect-ratio", choices=("16,9", "4,3", "1,1", "3,4", "9,16"))
+    parser.add_argument(
+        "--kv-cache-inference-size", type=int, help="K/V history window; defaults to the checkpoint configuration."
+    )
+    parser.add_argument(
+        "--attention-sink-size", type=int, help="Number of initial control/latent frame pairs to retain."
+    )
+    parser.add_argument("--emphasize-control-in-prompt", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--max-prompt-tokens", type=int, default=4096, help="Dense text K/V limit; captions are never truncated."
+    )
     parser.add_argument("--output-type", choices=("video", "latent"), default="video")
     return parser.parse_args()
 
@@ -156,7 +179,7 @@ def main() -> None:
 
     num_frames = _resolve_num_frames(args.num_frames, record)
     fps = _resolve_fps(args.fps, record)
-    prompt_data: dict[str, Any] = {"prompt": str(record.get("prompt", ""))}
+    prompt_data: dict[str, Any] = {"prompt": _load_prompt(record, args.input_json.parent, args.prompt_path)}
     vision_path = record.get("vision_path")
     if vision_path is not None:
         resolved_vision = _resolve_path(vision_path, args.input_json.parent)
@@ -168,9 +191,17 @@ def main() -> None:
         "session_id": f"transfer-{args.input_json.stem}",
         "reset": True,
         "close_session": True,
-        "resolution": args.resolution,
+        "resolution": _first_not_none(args.resolution, record.get("resolution"), "480"),
+        "max_prompt_tokens": args.max_prompt_tokens,
         hint: hint_config,
     }
+    for name in ("aspect_ratio", "kv_cache_inference_size", "attention_sink_size", "emphasize_control_in_prompt"):
+        value = _first_not_none(getattr(args, name), record.get(name))
+        if value is not None:
+            extra_args[name] = value
+    for name in ("control_guidance", "num_first_chunk_conditional_frames", "share_vision_temporal_positions"):
+        if name in record:
+            extra_args[name] = record[name]
     omni = Omni(
         model=args.model,
         model_class_name="Cosmos3NanoSimTransferPipeline",
@@ -189,7 +220,10 @@ def main() -> None:
         generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed),
         extra_args=extra_args,
     )
-    result = _unwrap_video(omni.generate(prompt_data, sampling_params))
+    try:
+        result = _unwrap_video(omni.generate(prompt_data, sampling_params))
+    finally:
+        omni.close()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     if args.output_type == "latent":
         torch.save(result, args.output)

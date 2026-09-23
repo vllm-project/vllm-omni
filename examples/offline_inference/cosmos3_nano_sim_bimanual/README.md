@@ -11,7 +11,7 @@ exported raw dimension, layout, and normalizer before being padded to 64
 dimensions. Mixed-layout checkpoints select the entry through `domain_name` or
 a unique `domain_id`; when neither is supplied, the artifact's declared default
 is used. Supply `domain_name` when several normalizers share one domain ID.
-For checkpoints containing multiple legacy YAM datasets, select `abc_yam`,
+For checkpoints containing multiple YAM datasets, select `abc_yam`,
 `molmoact2_yam`, or `xdof_yam` by name because all three use domain 16 while
 retaining distinct normalizers.
 
@@ -35,28 +35,45 @@ has no media. Supply both flags to request any policy-valid explicit canvas.
 
 ## Cosmos3-Nano-Sim-Transfer
 
-`cosmos3_nano_sim_transfer.py` accepts the imaginaire4 Transfer JSON shape:
-`prompt`, optional `vision_path`, `num_frames`, and exactly one of `edge`,
+`cosmos3_nano_sim_transfer.py` accepts Transfer JSON records: `prompt` or
+`prompt_path`, optional `vision_path`, `num_frames`, and exactly one of `edge`,
 `blur`, `depth`, or `seg`. Edge and blur can be computed from `vision_path`;
 depth and segmentation records normally provide `control_path` inside the
-selected hint object. T1 accepts only full clips with `F >= 17` and
-`(F - 1) % 16 == 0` and runs through the dense oracle deployment.
+selected hint object. Relative caption and control paths are resolved against
+the input JSON directory. Structured JSON captions are preserved without truncation.
+
 The Transfer source priority is the input vision clip, then `control_video`,
 then the selected hint's `control` or `control_path`. Its aspect ratio is
-snapped to the requested canonical bucket family and the resulting dimensions
+snapped to the requested canonical bucket family unless `aspect_ratio` is
+explicitly supplied. CLI resolution takes precedence over the JSON record;
+the fallback is 480. The resulting dimensions
 are validated by the same Cosmos3-Nano-Sim-Bimanual policy used during model execution.
 
 ```bash
 python examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos3_nano_sim_transfer.py \
-  --model /checkpoints/cosmos3-nano-sim-transfer-diffusers \
-  --input-json /data/transfer_video_edge.json \
+  --model nvidia/Cosmos3-Nano-Sim-Depth \
+  --input-json /data/sim_transfer_depth.json \
   --resolution 480 \
-  --num-frames 97 \
+  --num-frames 121 \
+  --fps 30 \
+  --kv-cache-inference-size 30 \
+  --attention-sink-size 3 \
+  --no-emphasize-control-in-prompt \
+  --max-prompt-tokens 4096 \
   --seed 42 \
   --output cosmos3_nano_sim_transfer.mp4
 ```
 
-Export Transfer through the same two imaginaire4 stages described in the
+Window, sink, emphasis, and aspect-ratio CLI options override the same JSON
+fields. Omitted window/sink/emphasis settings come from the checkpoint.
+`--prompt-path` overrides the record's caption. `--max-prompt-tokens` defaults
+to 4096 in this example; requests through the pipeline retain the artifact's
+text limit unless they explicitly set `extra_args.max_prompt_tokens`.
+
+Inference uses eager execution with dense K/V. Control hints are VAE-encoded
+up front, then consumed in chunks sized by the checkpoint configuration.
+
+Export Transfer through the two conversion stages described in the
 [Bimanual recipe](../../../recipes/cosmos3/Cosmos3-Nano-Sim-Bimanual.md), using
 `--cosmos3-nano-sim-bimanual` with the Transfer experiment and checkpoint.
 The exporter detects `conditioning.mode="control_video"` and writes
