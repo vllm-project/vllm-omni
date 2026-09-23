@@ -11,9 +11,12 @@ respect to each other. Backend execution and transport stay with StagePool.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
+from typing import Any
 
 from .config import TailAwareSchedulingConfig
+from .estimation import estimate_service_time_s
 
 
 class TailAwareQueueFullError(ValueError):
@@ -23,13 +26,19 @@ class TailAwareQueueFullError(ValueError):
 @dataclass(frozen=True)
 class Decision:
     replica_id: int
+    is_tail: bool = False
 
 
 @dataclass
 class _Request:
     request_id: str
+    sequence: int
+    arrival_s: float
+    estimated_service_s: float
     future: asyncio.Future[Decision]
+    deferred: bool = False
     decision: Decision | None = None
+    bound_s: float | None = None
     terminal_error: BaseException | None = None
 
 
@@ -37,10 +46,11 @@ class _Request:
 class _Replica:
     replica_id: int
     active: _Request | None = None
+    latency_ema_s: float = 0.0
 
 
 class TailAwareController:
-    """Central FIFO admission for one local diffusion stage.
+    """Central admission and dispatch for one local diffusion stage.
 
     Each replica executes one request at a time without preemption. Selection
     only affects requests still waiting in the central queue.
@@ -58,20 +68,21 @@ class TailAwareController:
         self.config = config
         self._replicas = {replica_id: _Replica(replica_id) for replica_id in replica_ids}
         self._requests: dict[str, _Request] = {}
-        self._pending: list[_Request] = []
+        self._pending_normals: list[_Request] = []
         self._loop: asyncio.AbstractEventLoop | None = None
         self._drain_handle: asyncio.Handle | None = None
         self._closed = False
+        self.arrival_counter = 0
 
     @property
     def pending_count(self) -> int:
-        return len(self._pending)
+        return len(self._pending_normals)
 
     @property
     def active_count(self) -> int:
         return len(self._requests) - self.pending_count
 
-    async def acquire(self, request_id: str) -> Decision:
+    async def acquire(self, request_id: str, sampling_params: Any, model_class_name: str) -> Decision:
         """Reserve an execution slot, or wait centrally until one is available."""
         loop = asyncio.get_running_loop()
         if self._loop is not None and loop is not self._loop:
@@ -87,9 +98,18 @@ class TailAwareController:
             raise ValueError(f"Duplicate in-flight request_id: {request_id!r}")
         if self.pending_count >= self.config.max_pending_requests:
             raise TailAwareQueueFullError("tail-aware pending request limit reached")
-        request = _Request(request_id=request_id, future=loop.create_future())
+        estimate_s = estimate_service_time_s(sampling_params, model_class_name, self.config.hardware_profile)
+        now_s = time.perf_counter()
+        self.arrival_counter += 1
+        request = _Request(
+            request_id=request_id,
+            sequence=self.arrival_counter,
+            arrival_s=now_s,
+            estimated_service_s=estimate_s,
+            future=loop.create_future(),
+        )
         self._requests[request_id] = request
-        self._pending.append(request)
+        self._pending_normals.append(request)
         self._schedule_drain()
         try:
             decision = await request.future
@@ -103,11 +123,18 @@ class TailAwareController:
                 self.cancel(request_id)
             raise
 
-    def complete(self, request_id: str) -> None:
-        """Release dispatched work once and admit the next waiting request."""
+    def complete(self, request_id: str, success: bool = True) -> None:
+        """Release dispatched work once; only successes update replica latency."""
         request = self._requests.get(request_id)
         if request is None or request.decision is None:
             return
+        now_s = time.perf_counter()
+        replica = self._replicas.get(request.decision.replica_id)
+        if success and replica is not None and request.bound_s is not None:
+            elapsed = max(now_s - request.bound_s, 0.0)
+            replica.latency_ema_s = (
+                elapsed if replica.latency_ema_s <= 0 else 0.9 * replica.latency_ema_s + 0.1 * elapsed
+            )
         self._forget(request)
         self._schedule_drain()
 
@@ -158,7 +185,7 @@ class TailAwareController:
     def _forget(self, request: _Request) -> None:
         self._requests.pop(request.request_id, None)
         if request.decision is None:
-            self._pending.remove(request)
+            self._pending_normals.remove(request)
             return
         replica = self._replicas.get(request.decision.replica_id)
         if replica is not None and replica.active is request:
@@ -177,15 +204,38 @@ class TailAwareController:
             return
         # Task cancellation cancels an awaited future before its coroutine's
         # cleanup runs. Never bind such an entry during this intervening turn.
-        for request in tuple(self._pending):
+        for request in tuple(self._pending_normals):
             if request.future.cancelled():
                 self._forget(request)
-        while self._pending:
+        while self._pending_normals:
+            now_s = time.perf_counter()
             available = [replica for replica in self._replicas.values() if replica.active is None]
             if not available:
                 break
-            replica = min(available, key=lambda r: r.replica_id)
-            request = self._pending.pop(0)
-            request.decision = Decision(replica.replica_id)
-            replica.active = request
-            request.future.set_result(request.decision)
+            replica = min(available, key=lambda r: (r.latency_ema_s, r.replica_id))
+            selected = self._select_request(replica.replica_id, now_s)
+            self._bind(selected, replica, now_s)
+
+    def _bind(self, request: _Request, replica: _Replica, now_s: float) -> None:
+        assert replica.active is None
+        self._pending_normals.remove(request)
+        request.decision = Decision(replica.replica_id, request.deferred)
+        request.bound_s = now_s
+        replica.active = request
+        request.future.set_result(request.decision)
+
+    def _select_request(self, replica_id: int, now_s: float) -> _Request:
+        depth = len(self._pending_normals)
+        beta = (
+            self.config.band_risk_beta
+            if self.config.band_min_pending <= depth <= self.config.band_max_pending
+            else self.config.risk_beta
+        )
+        return min(
+            self._pending_normals,
+            key=lambda request: (
+                -(now_s - request.arrival_s + beta * request.estimated_service_s),
+                request.sequence,
+                request.request_id,
+            ),
+        )

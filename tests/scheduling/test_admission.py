@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,12 +13,13 @@ pytestmark = [pytest.mark.cpu, pytest.mark.core_model, pytest.mark.diffusion, py
 
 
 def _controller(replica_ids=(7,), limit=8):
-    settings = TailAwareSchedulingConfig(enabled=True, max_pending_requests=limit)
+    settings = TailAwareSchedulingConfig(enabled=True, max_pending_requests=limit, hardware_profile="910B2")
     return TailAwareController(list(replica_ids), settings)
 
 
 def _acquire(policy, request_id):
-    return policy.acquire(request_id)
+    params = SimpleNamespace(width=512, height=512, num_inference_steps=20)
+    return policy.acquire(request_id, params, model_class_name="QwenImagePipeline")
 
 
 async def test_fifo_bounded_single_slot_replicas():

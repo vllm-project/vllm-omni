@@ -125,7 +125,7 @@ class OmniEngineBase:
     _enable_orch_monitor: bool = False
     _client_config: OmniClientConfig | None = None
     _tail_aware_scheduling_config: dict[str, Any] | None = None
-    _tail_aware_scheduling_enabled: bool = False
+    _tail_aware_model_class: str | None = None
     # Lazily created by get_output_blocking_async().
     _output_drain_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
@@ -291,9 +291,10 @@ class OmniEngineBase:
         )
         from vllm_omni.engine.tail_aware_runtime import prepare_tail_aware_stages
 
-        self._tail_aware_scheduling_enabled = prepare_tail_aware_stages(
+        self._tail_aware_model_class = prepare_tail_aware_stages(
             self.stage_configs,
             self._tail_aware_scheduling_config,
+            model=self.model,
             distributed=self.single_stage_mode or self._omni_master_address is not None,
             async_chunk=self.async_chunk,
             session_mode=getattr(self.deploy_config, "session_mode", "turn"),
@@ -402,9 +403,10 @@ class OmniEngineBase:
 
         self.num_stages = len(self.stage_configs)
         self.stage_pools = self._runtime.stage_pools
-        if self._tail_aware_scheduling_enabled:
+        if self._tail_aware_model_class is not None:
             self.stage_pools[0].configure_tail_aware_scheduling(
                 self._tail_aware_scheduling_config,
+                model_class_name=self._tail_aware_model_class,
             )
         self.stage_clients = [
             cast(StageClient, pool.stage_client) for pool in self.stage_pools if pool.stage_client is not None
