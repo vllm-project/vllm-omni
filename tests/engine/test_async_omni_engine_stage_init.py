@@ -407,6 +407,7 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_
     import vllm_omni.engine.omni_engine_base as engine_mod
 
     engine = object.__new__(AsyncOmniEngine)
+    engine._pd_pair = None
     engine.stage_configs = [types.SimpleNamespace()]
     engine.model = "dummy-model"
     engine.config_path = "dummy-config"
@@ -446,6 +447,7 @@ def test_async_omni_engine_initialize_stages_retains_stage0_prompt_transform(mon
     import vllm_omni.engine.omni_engine_base as engine_mod
 
     engine = object.__new__(AsyncOmniEngine)
+    engine._pd_pair = None
     engine.stage_configs = [types.SimpleNamespace()]
     engine.model = "dummy-model"
     engine.config_path = "dummy-config"

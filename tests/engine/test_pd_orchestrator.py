@@ -176,7 +176,7 @@ async def test_pd_forward_carries_processed_stop_metadata(resume):
     )
     orchestrator.stage_pools = [None, decode_pool]
     orchestrator._next_stage_already_submitted = Mock(return_value=False)
-    orchestrator._record_duplex_stage_submission = Mock()
+    orchestrator._on_stage_submitted = Mock()
     orchestrator._emit_tx_edge = Mock()
     state = SimpleNamespace(
         sampling_params_list=[logical, logical],
