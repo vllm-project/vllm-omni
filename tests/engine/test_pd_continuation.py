@@ -19,6 +19,7 @@ from vllm.v1.request import RequestStatus
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.output import OmniNewRequestData
 from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.engine.pd_continuation import (
     PD_PREFILL_KEY,
     PD_RESUME_KEY,
@@ -213,6 +214,37 @@ def test_terminal_first_token_waits_for_kv_then_finishes_without_forward(
     assert req.num_computed_tokens == 1236  # No y1 forward or extra sampling.
     assert req.num_output_placeholders == 0
     assert not req.pd_output_prefix_pending
+    scheduler._finish_pd_terminal_receives()
+    assert len(scheduler._pd_completed_outputs) == 1
+
+
+@pytest.mark.parametrize("token", [2, 3])
+@pytest.mark.parametrize("scheduler_cls", [OmniARScheduler, OmniARAsyncScheduler])
+def test_processed_eos_first_token_waits_for_kv_then_finishes(token, scheduler_cls):
+    logical = _params(max_tokens=8)
+    producer = PDDisaggregationMixin._prepare_prefill_sampling_params("req", logical)
+    producer.update_from_generation_config({"eos_token_id": [2, 3]}, eos_token_id=2)
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator._pd_kv_params = {}
+    orchestrator._pd_bootstrap_addr = "127.0.0.1:25201"
+    orchestrator._pd_prefill_engine_id = "prefill-engine"
+    decode = orchestrator._build_pd_decode_params("req", logical, SimpleNamespace(sampling_params=producer))
+    req = _request(params=decode, token=token)
+    scheduler = _receiver(req, scheduler_cls)
+    scheduler.prefix_replay_tokens = 0
+
+    scheduler._finish_pd_terminal_receives()
+    scheduler._free_request.assert_not_called()
+    assert scheduler.waiting == [req]
+
+    scheduler.finished_recving_kv_req_ids.add("req")
+    scheduler._finish_pd_terminal_receives()
+    assert not scheduler.waiting
+    assert req.num_computed_tokens == req.pd_continuation.prompt_len
+    assert req.num_output_tokens == 1
+    assert not req.pd_output_prefix_pending
+    assert scheduler._pd_completed_outputs[0][1].new_token_ids == [token]
+    assert scheduler._pd_completed_outputs[0][1].finish_reason == FinishReason.STOP
     scheduler._finish_pd_terminal_receives()
     assert len(scheduler._pd_completed_outputs) == 1
 
