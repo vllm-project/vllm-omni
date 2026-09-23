@@ -33,6 +33,50 @@ Omit both `--height` and `--width` to infer an aligned, aspect-preserving
 canvas from the input media, or to use the deployment default when the record
 has no media. Supply both flags to request any policy-valid explicit canvas.
 
+## Inference overrides
+
+For `nvidia/Cosmos3-Nano-Sim-Bimanual@1d95a0b5b19d49a24aceebf578cf5e85db310ac0`,
+use `--deploy-config vllm_omni/deploy/cosmos3_nano_sim_bimanual_i4.yaml`.
+With a conditioning image, every generated chunk uses two denoising steps:
+`[1, 0.8333333333333334]`. Frame 0 is encoded from the image. The four-step
+schedule applies only when generating frame 0 without an image. Full history
+is retained for up to 901 video frames at 480 resolution.
+
+For the preprocessed AgiBot NPZ example:
+
+```bash
+python examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos3_nano_sim_bimanual.py \
+  --model /checkpoints/cosmos3-nano-sim-bimanual-diffusers \
+  --jsonl agibot_eval_257f_npz/samples.jsonl \
+  --sample-index 0 \
+  --deploy-config vllm_omni/deploy/cosmos3_nano_sim_bimanual_i4.yaml \
+  --num-frames 257 --height 480 --width 640 --fps 30 --seed 42 \
+  --output outputs/agibot_257f.mp4
+```
+
+For normalized i4 action sidecars, use `--input-format cookbook` instead of the
+raw-action NPZ path. This also formats the action prompt and selects the
+action-conditioned image preprocessing:
+
+```bash
+python examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos3_nano_sim_bimanual.py \
+  --model /checkpoints/cosmos3-nano-sim-bimanual-diffusers \
+  --jsonl /data/agibot.jsonl --input-format cookbook --sample-index 0 \
+  --deploy-config vllm_omni/deploy/cosmos3_nano_sim_bimanual_i4.yaml \
+  --resolution 480 --num-frames 901 --fps 30 --seed 42 \
+  --output outputs/agibot_901f.mp4
+```
+
+For comparisons with i4, supply an initial image already at the target canvas
+(832×480 for 16:9). i4 removes reflection padding from its encoded latents;
+this helper retains the requested canvas.
+
+Overrides live under `stages[0].model_config.inference_overrides`. The last
+`frame_sigma_schedules` entry repeats; chunk starts select schedules by absolute
+latent-frame index. `history_mode: full` requires `max_num_frames`; longer
+rollouts are rejected. Sliding mode accepts `kv_cache_inference_size` and
+`attention_sink_size`. Omitted settings retain the artifact defaults.
+
 ## Action-sidecar and camera inputs
 
 Use `--input-format cookbook` with one JSON object per line. For a checkpoint
@@ -113,9 +157,9 @@ or camera duration/resolution prompt fields. Set custom camera
 
 Requests require `F >= 2` and `(F - 1) % 4 == 0`; there is no silent temporal
 realignment. Use 61 frames for smoke tests, 901 for the cookbook, and 1801 for
-endurance tests, with matching sidecar lengths. The effective sampler remains
-four-step distilled SDE with guidance 1.0. Guidance and shift overrides do not
-change this distilled path.
+endurance tests, with matching sidecar lengths. The default sampler uses the exported
+distilled SDE schedule with guidance 1.0; the deployment above explicitly
+overrides the frame schedules. Guidance and shift overrides do not change this path.
 
 The deployment retains its configured guardrail behavior. To match the
 cookbook's explicit `--no-guardrails` parity configuration, copy the deployment

@@ -364,6 +364,7 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
         condition_vision: bool = False,
         null_action_frame_indexes: tuple[int, ...] = (),
         frame_causal: bool = False,
+        history_window: tuple[int, int] | None = None,
     ) -> Cosmos3NanoSimBimanualTransformerOutput:
         """Denoise or clean-commit one current chunk.
 
@@ -483,7 +484,7 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
                     tokens_per_frame=actual_tokens_per_frame,
                     action_tokens_per_frame=action_count,
                     null_action_frame_indexes=null_action_frame_indexes,
-                    clean_history_window=(self.manifest.sink_frames, self.manifest.window_frames)
+                    clean_history_window=history_window or (self.manifest.sink_frames, self.manifest.window_frames)
                     if frame_causal
                     else None,
                 )
