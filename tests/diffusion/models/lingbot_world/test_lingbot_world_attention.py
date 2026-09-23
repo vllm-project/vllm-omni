@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import importlib.util
 import math
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -33,6 +33,10 @@ _STUBBED_MODULE_NAMES = (
     "vllm_omni.diffusion",
     "vllm_omni.diffusion.attention",
     "vllm_omni.diffusion.attention.layer",
+    "vllm_omni.diffusion.distributed",
+    "vllm_omni.diffusion.distributed.comm",
+    "vllm_omni.diffusion.distributed.parallel_state",
+    "vllm_omni.diffusion.distributed.sp_plan",
     "vllm_omni.diffusion.layers",
     "vllm_omni.diffusion.layers.norm",
     "vllm_omni.diffusion.layers.rope",
@@ -58,6 +62,58 @@ def _install_vllm_stubs() -> None:
     distributed.get_tensor_model_parallel_world_size = lambda: 1
     distributed.tensor_model_parallel_all_reduce = lambda value: value
 
+    class _SeqAllToAll4D:
+        @staticmethod
+        def apply(group, value, scatter_idx, gather_idx, use_sync=False):
+            del group, scatter_idx, gather_idx, use_sync
+            return value
+
+    setattr(
+        sys.modules["vllm_omni.diffusion.distributed.comm"],
+        "SeqAllToAll4D",
+        _SeqAllToAll4D,
+    )
+
+    def _all_to_all_5D(value, scatter_idx=3, gather_idx=1, group=None, use_sync=False):
+        # Single-rank stub: the fused q/k/v exchange is the identity when N == 1.
+        del scatter_idx, gather_idx, group, use_sync
+        return value
+
+    setattr(
+        sys.modules["vllm_omni.diffusion.distributed.comm"],
+        "all_to_all_5D",
+        _all_to_all_5D,
+    )
+
+    def get_sp_group():
+        return SimpleNamespace(
+            ulysses_world_size=1,
+            ulysses_rank=0,
+            ulysses_group=None,
+        )
+
+    setattr(
+        sys.modules["vllm_omni.diffusion.distributed.parallel_state"],
+        "get_sp_group",
+        get_sp_group,
+    )
+
+    class _SequenceParallelInput:
+        def __init__(self, split_dim, expected_dims=None, split_output=False, auto_pad=False):
+            self.split_dim = split_dim
+            self.expected_dims = expected_dims
+            self.split_output = split_output
+            self.auto_pad = auto_pad
+
+    class _SequenceParallelOutput:
+        def __init__(self, gather_dim, expected_dims=None):
+            self.gather_dim = gather_dim
+            self.expected_dims = expected_dims
+
+    sp_plan = sys.modules["vllm_omni.diffusion.distributed.sp_plan"]
+    setattr(sp_plan, "SequenceParallelInput", _SequenceParallelInput)
+    setattr(sp_plan, "SequenceParallelOutput", _SequenceParallelOutput)
+
     def set_weight_attrs(weight: torch.Tensor, attrs: dict) -> None:
         for name, value in attrs.items():
             setattr(weight, name, value)
@@ -78,6 +134,8 @@ def _install_vllm_stubs() -> None:
             **kwargs,
         ) -> None:
             super().__init__()
+            self.quant_config = kwargs.pop("quant_config", None)
+            self.prefix = kwargs.pop("prefix", "")
             del kwargs
             self.return_bias = return_bias
             self.weight = nn.Parameter(torch.empty(output_size, input_size))
@@ -108,6 +166,8 @@ def _install_vllm_stubs() -> None:
             **kwargs,
         ) -> None:
             super().__init__()
+            self.quant_config = kwargs.pop("quant_config", None)
+            self.prefix = kwargs.pop("prefix", "")
             del kwargs
             self.num_heads = total_num_heads
             self.num_kv_heads = total_num_kv_heads or total_num_heads
@@ -541,3 +601,51 @@ def test_tp_rmsnorm_weight_loader_selects_rank_shard(monkeypatch: pytest.MonkeyP
     norm.weight.weight_loader(norm.weight, torch.tensor([10.0, 20.0, 30.0, 40.0]))
 
     torch.testing.assert_close(norm.weight, torch.tensor([30.0, 40.0]))
+
+
+@pytest.mark.parametrize("attention_class", ["LingBotSelfAttention"])
+def test_ulysses_rejects_non_divisible_head_count(monkeypatch, attention_class):
+    module = _load_module()
+    monkeypatch.setattr(
+        module,
+        "get_sp_group",
+        lambda: SimpleNamespace(
+            ulysses_world_size=3,
+            ulysses_rank=0,
+            ulysses_group=None,
+        ),
+    )
+    with pytest.raises(ValueError, match="heads must be divisible"):
+        getattr(module, attention_class)(dim=8, num_heads=4)
+
+
+def test_supplied_camera_modulation_matches_computing_it_inline() -> None:
+    """Passing a prebuilt modulation must be arithmetically identical to letting the block build its own."""
+    module = _load_module()
+    torch.manual_seed(0)
+    block = module.LingBotAttentionBlock(dim=4, num_heads=2, prefix="blocks.0")
+    camera = torch.randn(1, 3, 4)
+
+    scale, shift = block.camera_modulation(camera)
+    inline_scale, inline_shift = block.camera_modulation(camera)
+
+    torch.testing.assert_close(scale, inline_scale, rtol=0, atol=0)
+    torch.testing.assert_close(shift, inline_shift, rtol=0, atol=0)
+
+
+def test_the_camera_modulation_reads_only_the_camera_tokens() -> None:
+    """The reuse window is only sound because the modulation depends on nothing else that varies per forward."""
+    module = _load_module()
+    torch.manual_seed(0)
+    block = module.LingBotAttentionBlock(dim=4, num_heads=2, prefix="blocks.0")
+    camera = torch.randn(1, 3, 4)
+
+    first = block.camera_modulation(camera)
+    # Same camera, different everything else a forward would carry: the modulation cannot move.
+    second = block.camera_modulation(camera.clone())
+
+    torch.testing.assert_close(first[0], second[0], rtol=0, atol=0)
+    torch.testing.assert_close(first[1], second[1], rtol=0, atol=0)
+    # A different camera must move it, or the cache key would be hiding a real dependency.
+    other = block.camera_modulation(camera + 1)
+    assert not torch.equal(first[0], other[0])

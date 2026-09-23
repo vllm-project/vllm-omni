@@ -58,7 +58,15 @@ class SupportsChunkedVAEDecode(Protocol):
     Implementations must drain decoding before surfacing callback errors. In a
     distributed VAE, every rank invokes the method so collectives stay in
     lockstep, while ``on_chunk`` is called only on the rank that owns output.
+
+    ``chunk_value_range`` is the closed interval the delivered floats occupy,
+    which differs per checkpoint: a Wan VAE emits ``(-1.0, 1.0)`` while a
+    MiniMax-H3 VAE reverts through its processor to ``(0.0, 1.0)``. A consumer
+    cannot quantize chunks to pixels without it, so it is part of the
+    capability rather than knowledge each consumer hard-codes per model.
     """
+
+    chunk_value_range: ClassVar[tuple[float, float]]
 
     def decode_with_chunks(
         self,
@@ -84,6 +92,13 @@ class SupportsStepExecution(Protocol):
     ``prepare_encode()`` (one-time request setup), ``denoise_step()``
     (one denoise forward), ``step_scheduler()`` (one scheduler update),
     and ``post_decode()`` (final decode).
+
+    A pipeline may additionally set the optional class attribute
+    ``supports_chunk_step_grouping = True`` to declare that its request state
+    may advance through every denoise step of its current chunk without a
+    serving-scheduler cycle in between (a capability, not a policy: the runner
+    that owns the scheduling decision chooses whether to group steps). It is
+    optional so it does not become part of the runtime protocol check.
     """
 
     supports_step_execution: ClassVar[bool] = True
@@ -143,10 +158,10 @@ class SupportsInteractionApply(Protocol):
     """Optional protocol for pipelines with unified mid-generation, chunk-boundary hooks."""
 
     def peek_chunk_media(self, state: StepRequestState) -> ChunkMediaSpec:
-        """Return the media timeline represented by the upcoming/current chunk.
+        """Return the media timeline and latent frame count for the upcoming/current chunk.
 
         Useful when interaction handler needs interpolation/integration on a frame-by-frame basis,
-        or for backpressure/pacing.
+        and/or for backpressure/pacing.
         """
         ...
 

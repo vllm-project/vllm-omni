@@ -338,6 +338,9 @@ class HunyuanImage3Pipeline(
     supports_step_execution: ClassVar[bool] = True
     supports_request_batch = False
     support_image_input = True
+    # The warmup request's blank image routes this AR+diffusion model down its
+    # image-edit path, where the token block cannot match the latent patch grid.
+    dummy_run_num_frames: ClassVar[int] = 0
     _dit_modules: ClassVar[list[str]] = ["model"]
     _encoder_modules: ClassVar[list[str]] = ["vision_model"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -364,6 +367,8 @@ class HunyuanImage3Pipeline(
 
     def __init__(self, od_config: OmniDiffusionConfig) -> None:
         self.hf_config = get_config(od_config.model, trust_remote_code=True)
+        self.hf_config.cfg_distilled = _config_flag(self.hf_config, "cfg_distilled")
+        self.hf_config.use_meanflow = _config_flag(self.hf_config, "use_meanflow")
         super().__init__(self.hf_config)
         # update diffusion config
         self.generation_config = GenerationConfig.from_pretrained(od_config.model)
@@ -454,11 +459,10 @@ class HunyuanImage3Pipeline(
 
         # Note: guidance_emb and timestep_r_emb are no longer skipped
         # to support HunyuanImage-3.0-Distil and MeanFlow distilled models
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=skip_prefixes,
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(
+            weights, mapper=WeightsMapper(orig_to_new_prefix={name: None for name in (skip_prefixes or ())})
         )
-        return loader.load_weights(weights)
 
     def prepare_seed(self, seed=None, batch_size=1):
         # random seed
@@ -1280,7 +1284,9 @@ class HunyuanImage3Pipeline(
 
         # 4. Encode conditional images
         # Skip encoding if AR KV reuse is enabled
-        has_ar_kv = kwargs.get("ar_kv_data")
+        has_ar_kv = kwargs.get("ar_kv_data") or request_layout_utils.native_kv_covers_cond_images(
+            output, kwargs.get("kv_computed_tokens", ())
+        )
         if batch_cond_image_info is not None and len(batch_cond_image_info[0]) > 0 and not has_ar_kv:
             cond_vae_images, cond_timestep, cond_vit_images = self._encode_cond_image(
                 batch_cond_image_info, cfg_factor[mode], generator=generator
@@ -1892,6 +1898,7 @@ class HunyuanImage3Pipeline(
         pipe._guidance_scale = guidance_scale
         pipe._guidance_rescale = getattr(sampling, "guidance_rescale", 0.0)
 
+        ar_kv_kwargs = self._extract_ar_kv_from_sampling(sampling)
         model_kwargs = self.prepare_model_inputs(
             prompt=prompt,
             cot_text=cot_text,
@@ -1904,8 +1911,10 @@ class HunyuanImage3Pipeline(
             batch_cond_image_info=batch_cond_image_info,
             bot_task=tokenizer_bot_task,
             prepared_layout=request_layout_utils.get_hunyuan_prepared_layout(state),
+            kv_computed_tokens=state.extra.get("kv_computed_tokens", ()),
+            **ar_kv_kwargs,
         )
-        model_kwargs.update(self._extract_ar_kv_from_sampling(sampling))
+        model_kwargs.update(ar_kv_kwargs)
         model_kwargs["use_cache"] = False
 
         input_ids = model_kwargs.pop("input_ids")
@@ -2335,6 +2344,7 @@ class HunyuanImage3Pipeline(
             batch_cond_image_info=batch_cond_image_info,
             bot_task=tokenizer_bot_task,
             prepared_layout=request_layout_utils.get_hunyuan_prepared_layout(req.requests[0]),
+            kv_computed_tokens=getattr(req.requests[0], "kv_computed_tokens", ()),
             **ar_kv_kwargs,
         )
 

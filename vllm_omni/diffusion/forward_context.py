@@ -282,6 +282,47 @@ def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
                 ensure_active(step_idx)
 
 
+def get_paged_kv_computed_tokens() -> tuple[int, ...]:
+    runtime = _forward_context.paged_kv_runtime if _forward_context is not None else None
+    if runtime is None:
+        return ()
+    return tuple(row.kv_start_pos for row in runtime.metadata.prefill_rows)
+
+
+@contextmanager
+def paged_kv_prefill(sequence_id: int, num_tokens: int):
+    from dataclasses import replace
+
+    runtime = get_forward_context().paged_kv_runtime
+    if runtime is None:
+        raise RuntimeError("Paged KV prefill requires an active runtime")
+    rows = runtime.metadata.prefill_rows
+    matching_rows = [row for row in rows if row.sequence_id == sequence_id]
+    if len(matching_rows) != 1:
+        raise ValueError(
+            f"Paged KV prefill requires exactly one active row for sequence {sequence_id}; found {len(matching_rows)}"
+        )
+    row = matching_rows[0]
+    if type(num_tokens) is not int or not row.kv_start_pos < num_tokens <= row.seq_len:
+        raise ValueError(
+            "Paged KV prefill target must extend the active prefix without exceeding its allocation: "
+            f"start={row.kv_start_pos}, target={num_tokens!r}, allocated={row.seq_len}"
+        )
+    prefill = replace(row, query_len=num_tokens - row.kv_start_pos, seq_len=num_tokens)
+    batch = runtime.adapter.prepare_batch((prefill,))
+    with runtime.adapter.activate(batch):
+        yield
+    runtime.metadata = replace(
+        runtime.metadata,
+        prefill_rows=tuple(
+            replace(item, kv_start_pos=num_tokens, query_len=item.seq_len - num_tokens)
+            if item.sequence_id == sequence_id
+            else item
+            for item in rows
+        ),
+    )
+
+
 def set_forward_context_denoise_timestep(timestep: float | None) -> None:
     """Set the normalized (descending, 1 -> 0) denoise timestep.
 

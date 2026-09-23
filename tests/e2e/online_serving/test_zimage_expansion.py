@@ -19,7 +19,7 @@ import pytest
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 MODEL = "Tongyi-MAI/Z-Image-Turbo"
 PROMPT = "A high-detail studio photo of an orange tabby cat sitting on a laptop keyboard."

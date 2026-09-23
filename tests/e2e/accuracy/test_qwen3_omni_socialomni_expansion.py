@@ -62,7 +62,7 @@ def socialomni_dataset_root() -> Path:
     return root
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
 @pytest.mark.parametrize("omni_server", [SERVER_PARAMS], indirect=True)
 def test_socialomni_mini_without_judges(socialomni_dataset_root: Path, omni_server, tmp_path: Path) -> None:
     result = subprocess.run(

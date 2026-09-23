@@ -14,13 +14,14 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.interface import supports_step_execution
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
+from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, KVPrefetchJob
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVCacheSpec,
     SupportsARDiffusionPipeline,
     SupportsARDiffusionWarmup,
+    supports_chunk_step_grouping,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
@@ -93,9 +94,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             self._warmup_ar_rollout()
 
     def _available_memory_bytes(self) -> int:
-        if self.device is None or torch.device(self.device).type != "cuda":
-            raise RuntimeError("AR-Diffusion KV preallocation currently requires a CUDA device")
-        return int(torch.cuda.mem_get_info(self.device)[0])
+        if self.device is None:
+            raise RuntimeError("AR-Diffusion KV preallocation requires an initialized device")
+        return current_omni_platform.get_free_memory(torch.device(self.device))
 
     def _preallocate_kv_cache(self, *, available_bytes: int | None = None) -> None:
         """Build pools solely from the pipeline capability and runner config."""
@@ -144,6 +145,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             kv_branches=spec.kv_branches,
             session_capacity=spec.session_capacity,
             cross_attention_lengths=spec.cross_attention_lengths,
+            cross_attention_kv_heads=spec.cross_attention_kv_heads,
             frames_per_block=spec.frames_per_block,
             max_scratch_tokens_per_branch=spec.max_scratch_tokens_per_branch,
             model_owned_state_bytes_per_session=spec.model_owned_state_bytes_per_session,
@@ -163,7 +165,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             config.window_chunks,
             config.sink_chunks,
             [(kv_branch.name, kv_branch.local_index) for kv_branch in spec.kv_branches],
-            spec.cross_attention_lengths,
+            {
+                name: (length, spec.cross_attention_kv_heads.get(name, spec.num_kv_heads))
+                for name, length in spec.cross_attention_lengths.items()
+            },
             self._session_capacity,
             spec.session_capacity,
         )
@@ -337,6 +342,90 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         raise RuntimeError(
             "ARDiffusionModelRunner does not support request-batch execution; use request mode with max_num_seqs=1."
         )
+
+    def _groups_chunk_steps(self, scheduler_output: DiffusionSchedulerOutput) -> bool:
+        """Policy: does this stepwise call run the scheduled request's chunk to its boundary?
+
+        Only on the realtime AR path, for a lone streaming request of a
+        pipeline that declares ``supports_chunk_step_grouping``. The session's
+        KV is bound for the whole call and the scheduler regains control at
+        every chunk boundary, which is where this path's interactions are
+        applied anyway; what it gives up is the chance to act between two
+        steps of one chunk.
+        """
+        return (
+            bool(self.od_config.streaming_output)
+            and len(scheduler_output.scheduled_request_ids) == 1
+            and supports_chunk_step_grouping(self.pipeline)
+        )
+
+    def _execute_stepwise_core(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        *,
+        record_output_peak_memory: bool,
+        in_diffusion_kv_memory_profile: bool = False,
+    ) -> BatchRunnerOutput:
+        """Run the shared single-step core once, or repeatedly until the chunk boundary.
+
+        The shared runner keeps its one-step-per-call semantics. When the
+        grouping policy applies, the remaining steps of the request's current
+        chunk are driven from here with a continuation of the scheduler
+        output: the request is presented as a cached request, with nothing
+        new to admit, nothing to retire and no connector work, so every
+        further step is exactly what the next scheduler cycle would have
+        asked for. Grouping the probes and the commit of one block this way
+        drops the scheduler/executor round trips between them.
+
+        The loop stops at the first call that emits a result (a chunk or an
+        error), finishes the request, or leaves it without state; the base
+        core already handles a mid-chunk failure or interrupt by finishing
+        the request with an error and dropping its state.
+        """
+        output = super()._execute_stepwise_core(
+            scheduler_output,
+            record_output_peak_memory=record_output_peak_memory,
+            in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
+        )
+        if not self._groups_chunk_steps(scheduler_output):
+            return output
+        request_id = scheduler_output.scheduled_request_ids[0]
+        continuation = dataclasses.replace(
+            scheduler_output,
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData(request_ids=[request_id]),
+            finished_req_ids=set(),
+            kv_prefetch_job=None,
+            kv_connector_metadata=None,
+        )
+        if not self._chunk_step_pending(output, request_id):
+            return output
+        max_steps = self.state_cache[request_id].chunk_num_steps
+        if max_steps is None:
+            return output
+        steps = 1
+        while self._chunk_step_pending(output, request_id):
+            if steps >= max_steps:
+                self.state_cache.pop(request_id)
+                runner_output = output.get_request_output(request_id)
+                assert runner_output is not None
+                runner_output.finished = True
+                runner_output.result = DiffusionOutput(error=f"Chunk did not complete within {max_steps} denoise steps")
+                break
+            steps += 1
+            output = super()._execute_stepwise_core(
+                continuation,
+                record_output_peak_memory=record_output_peak_memory,
+                in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
+            )
+        return output
+
+    def _chunk_step_pending(self, output: BatchRunnerOutput, request_id: str) -> bool:
+        """More steps of the request's current chunk remain after ``output``."""
+        runner_output = output.get_request_output(request_id)
+        if runner_output is None or runner_output.finished or runner_output.result is not None:
+            return False
+        return request_id in self.state_cache
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Bind runner-owned KV for one stepwise invocation, then inherit the step loop."""

@@ -231,6 +231,26 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
                         "with compute capability 9.x. Select a compatible backend."
                     )
 
+            if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
+                # Same loader/cache as execution (Hub versions 1 then 2). A missing
+                # torch/CUDA variant used to degrade silently to native/SDPA (#6971).
+                hub_repo = (
+                    "kernels-community/flash-attn3"
+                    if backend_upper == "FLASH_ATTN_3_HUB"
+                    else "kernels-community/flash-attn2"
+                )
+                try:
+                    from vllm_omni.diffusion.attention.backends.flash_attn_hub import _get_hub_module
+
+                    _get_hub_module(hub_repo)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"{backend_upper} was explicitly selected, but {hub_repo} has no "
+                        "compatible build for this torch/CUDA (or failed to load). "
+                        "Install kernels>=0.16.1 so stable-ABI variants resolve, or select "
+                        "a different attention backend."
+                    ) from e
+
             if backend_upper == "FLASH_ATTN" and not flash_attn_supported:
                 if is_blackwell:
                     reason = (
@@ -429,4 +449,12 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         if envs.VLLM_USE_OINK_OPS:
             rms_norm = ["oink"] + default
 
-        return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm, fused_add_rms_norm=rms_norm)
+        # Mirrors upstream CudaPlatformBase defaults: `gelu_and_mul_sparse` is
+        # implemented by `triton` and `native` only, so it must not fall back to
+        # `default` (which contains `vllm_c`) via IrOpPriorityConfig.with_default.
+        return IrOpPriorityConfig.with_default(
+            default,
+            rms_norm=rms_norm,
+            fused_add_rms_norm=rms_norm,
+            gelu_and_mul_sparse=["triton", "native"],
+        )

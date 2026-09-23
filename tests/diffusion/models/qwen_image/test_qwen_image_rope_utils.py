@@ -1,7 +1,9 @@
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import QwenEmbedRope
+from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
+    QwenEmbedRope,
+)
 from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]

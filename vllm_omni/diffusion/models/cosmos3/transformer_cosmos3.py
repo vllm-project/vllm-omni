@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 VFM Transformer for vllm-omni.
 
 Implements the Mixture-of-Transformers architecture with two pathways:
@@ -14,7 +14,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 import torch.distributed as dist
@@ -39,6 +39,12 @@ from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, Seque
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.norm import RMSNorm as _VllmRMSNorm
 from vllm_omni.platforms import current_omni_platform
+
+from .mixed_precision import (
+    Cosmos3MixedPrecisionConfig,
+    Cosmos3MixedPrecisionRuntime,
+    resolve_mixed_precision_config,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
@@ -134,6 +140,26 @@ def _od_config_get(od_config: Any, key: str, default: Any = None) -> Any:
             return found
     value = _tf_config_get(tf_model_config, key, None)
     return default if value is None else value
+
+
+def _validate_mixed_precision_runtime(
+    config: Cosmos3MixedPrecisionConfig | None,
+    od_config: OmniDiffusionConfig,
+) -> None:
+    if config is None:
+        return
+    if get_tensor_model_parallel_world_size() != 1:
+        raise ValueError("Cosmos3 mixed precision currently supports tensor parallel size 1 only")
+    if int(getattr(od_config, "max_num_seqs", 1)) != 1:
+        raise ValueError("Cosmos3 mixed precision currently supports one active request per worker")
+    if bool(getattr(od_config, "enable_distributed_layerwise_offload", False)):
+        raise ValueError(
+            "Cosmos3 mixed precision does not support distributed layer-wise offload "
+            "because its direct loader bypasses ModelOpt post-load transformations"
+        )
+    parallel_config = getattr(od_config, "parallel_config", None)
+    if bool(getattr(parallel_config, "use_hsdp", False)):
+        raise ValueError("Cosmos3 mixed precision has not validated live backend weights under HSDP")
 
 
 def _as_bool(value: Any) -> bool:
@@ -401,7 +427,7 @@ class TimestepEmbedder(nn.Module):
         max_period: int = 10000,
     ) -> None:
         super().__init__()
-        # Following diffusers naming pattern here for checkpoint compatibility.
+        # Preserve checkpoint-compatible parameter names.
         self.linear_1 = nn.Linear(frequency_embedding_size, hidden_size, bias=True)
         self.act = nn.SiLU()
         self.linear_2 = nn.Linear(hidden_size, hidden_size, bias=True)
@@ -1079,6 +1105,28 @@ class Cosmos3GenSPPrepare(nn.Module):
         return hidden_gen, freqs_cos, freqs_sin
 
 
+class _GenPrepared(NamedTuple):
+    """GEN-pathway state shared by normal and cached execution."""
+
+    hidden_gen: torch.Tensor
+    time_embed: torch.Tensor
+    t: int
+    h: int
+    w: int
+    s_video: int
+    s_control: int
+    s_action: int
+    s_sound: int
+    has_control: bool
+    has_action: bool
+    has_sound: bool
+    action_domain_ids: torch.Tensor | None
+    ulysses_size: int
+    use_multi_control_attention: bool
+    multi_control_token_sizes: tuple[int, ...] | None
+    multi_control_weights: tuple[float, ...] | None
+
+
 class Cosmos3VFMTransformer(nn.Module):
     """Cosmos3 VFM Transformer: UND language model + GEN denoising layers.
 
@@ -1241,6 +1289,19 @@ class Cosmos3VFMTransformer(nn.Module):
 
         dtype = od_config.dtype
         quant_config = getattr(od_config, "quantization_config", None) if od_config else None
+        mixed_precision_config, mixed_precision_source = resolve_mixed_precision_config(od_config)
+        if mixed_precision_config is None:
+            if mixed_precision_source == "additional_config_disabled":
+                logger.info("Cosmos3 checkpoint mixed-precision policy disabled by additional_config")
+        else:
+            logger.info(
+                "Cosmos3 mixed precision active (source=%s): first_steps=%d last_steps=%d reasoner=%s",
+                mixed_precision_source,
+                mixed_precision_config.first_steps,
+                mixed_precision_config.last_steps,
+                mixed_precision_config.reasoner,
+            )
+        _validate_mixed_precision_runtime(mixed_precision_config, od_config)
 
         self.language_model = self._language_model_cls(
             hidden_size=self.hidden_size,
@@ -1299,6 +1360,11 @@ class Cosmos3VFMTransformer(nn.Module):
                 for i in range(self.num_hidden_layers)
             ]
         )
+
+        self.mixed_precision_runtime: Cosmos3MixedPrecisionRuntime | None = None
+        if mixed_precision_config is not None:
+            self.mixed_precision_runtime = Cosmos3MixedPrecisionRuntime(mixed_precision_config)
+            self.mixed_precision_runtime.install(self)
 
         self.norm_moe_gen = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
         self.gen_sp_prepare = Cosmos3GenSPPrepare()
@@ -1631,6 +1697,61 @@ class Cosmos3VFMTransformer(nn.Module):
         pad = (-(base + sound_frames)) % ulysses_size
         return sound_frames + pad
 
+    def _run_gen_layers(
+        self,
+        hidden_gen: torch.Tensor,
+        *,
+        s_video: int,
+        s_control: int,
+        s_action: int,
+        s_sound: int,
+        has_action: bool,
+        has_sound: bool,
+        has_control: bool,
+        ulysses_size: int,
+        use_multi_control_attention: bool,
+        multi_control_token_sizes: tuple[int, ...] | None,
+        multi_control_weights: tuple[float, ...] | None,
+    ) -> torch.Tensor:
+        """Run the complete GEN decoder between full-layout boundaries."""
+        if self.cached_kv is None or self.cached_freqs_gen is None:
+            raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
+        freqs_cos, freqs_sin = self.cached_freqs_gen
+        if not use_multi_control_attention:
+            hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
+        freqs_gen = (freqs_cos, freqs_sin)
+
+        if len(self.gen_layers) == len(self.cached_kv):
+            for layer, (k_und, v_und) in zip(self.gen_layers, self.cached_kv, strict=True):
+                hidden_gen = layer(
+                    hidden_gen,
+                    k_und=k_und,
+                    v_und=v_und,
+                    freqs_cos=freqs_cos,
+                    freqs_sin=freqs_sin,
+                    control_token_sizes=multi_control_token_sizes,
+                    control_weights=multi_control_weights,
+                )
+                # Cache-dit's block wrapper may return a tuple; unwrap it.
+                if isinstance(hidden_gen, tuple):
+                    hidden_gen = hidden_gen[0]
+        else:
+            # Cache-dit patches gen_layers to a grouped wrapper.
+            for layer in self.gen_layers:
+                hidden_gen = layer(
+                    hidden_gen,
+                    cached_kv=self.cached_kv,
+                    freqs_gen=freqs_gen,
+                    control_token_sizes=multi_control_token_sizes,
+                    control_weights=multi_control_weights,
+                )
+                if isinstance(hidden_gen, tuple):
+                    hidden_gen = hidden_gen[0]
+
+        if not use_multi_control_attention:
+            hidden_gen = self.gen_sp_gather(hidden_gen)
+        return hidden_gen
+
     # -- Forward -------------------------------------------------------------
 
     def forward(
@@ -1653,7 +1774,51 @@ class Cosmos3VFMTransformer(nn.Module):
         transfer_share_vision_temporal_positions: bool = True,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Run the shared Cosmos3 GEN preprocess, stack, and postprocess path."""
+        if kwargs:
+            raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(kwargs)}")
+        prep = self._gen_preprocess(
+            hidden_states,
+            timestep,
+            text_ids,
+            text_mask,
+            video_shape,
+            fps=fps,
+            action_latents=action_latents,
+            action_domain_ids=action_domain_ids,
+            action_noisy_mask=action_noisy_mask,
+            action_start_frame_offset=action_start_frame_offset,
+            action_fps=action_fps,
+            sound_latents=sound_latents,
+            noisy_frame_mask=noisy_frame_mask,
+            control_latents=control_latents,
+            control_weights=control_weights,
+            transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
+        )
+        return self._gen_postprocess(self._run_gen_stack(prep), prep)
+
+    def _gen_preprocess(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        text_ids: torch.Tensor,
+        text_mask: torch.Tensor,
+        video_shape: tuple[int, int, int],
+        fps: float | None = None,
+        action_latents: torch.Tensor | None = None,
+        action_domain_ids: torch.Tensor | None = None,
+        action_noisy_mask: torch.Tensor | None = None,
+        action_start_frame_offset: int = 1,
+        action_fps: float | None = None,
+        sound_latents: torch.Tensor | None = None,
+        noisy_frame_mask: torch.Tensor | None = None,
+        control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
+        control_weights: list[float] | tuple[float, ...] | torch.Tensor | None = None,
+        transfer_share_vision_temporal_positions: bool = True,
+    ) -> _GenPrepared:
         """
+        Prepare the packed GEN sequence before its cacheable execution region.
+
         Args:
             hidden_states: [B, C, t, h, w] noisy latents
             timestep: [B] diffusion timestep
@@ -1676,13 +1841,9 @@ class Cosmos3VFMTransformer(nn.Module):
                 transfer controls. Values are normalized to sum to one.
 
         Returns:
-            [B, C, t, h, w] velocity prediction, or
-            tuple outputs in video, action, sound order when action/sound streams
-            are provided. Transfer-control streams condition the video prediction
-            and are not returned.
+            Packed GEN inputs and metadata consumed by the shared execution and
+            postprocessing helpers.
         """
-        if kwargs:
-            raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(kwargs)}")
         t, h, w = video_shape
         hp, wp, _, _ = self._pad_to_patch_size(h, w)
         text_lengths = text_mask.sum(dim=1)
@@ -1882,79 +2043,90 @@ class Cosmos3VFMTransformer(nn.Module):
                 hidden_parts.append(hidden_sound)
             hidden_gen = torch.cat(hidden_parts, dim=1)
 
-            # Run GEN layers.  UND K/V (replicated) is passed to each layer;
-            # the Cosmos3CrossAttention forwards them as joint_key/value so the
-            # framework Attention handles the Ulysses head-slicing internally.
-            if self.cached_kv is None or self.cached_freqs_gen is None:
-                raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
-            freqs_cos, freqs_sin = self.cached_freqs_gen
-            if not use_multi_control_attention:
-                hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
-            freqs_gen = (freqs_cos, freqs_sin)
+            return _GenPrepared(
+                hidden_gen=hidden_gen,
+                time_embed=time_embed,
+                t=t,
+                h=h,
+                w=w,
+                s_video=s_video,
+                s_control=s_control,
+                s_action=s_action,
+                s_sound=s_sound,
+                has_control=has_control,
+                has_action=has_action,
+                has_sound=has_sound,
+                action_domain_ids=action_domain_ids,
+                ulysses_size=ulysses_size,
+                use_multi_control_attention=use_multi_control_attention,
+                multi_control_token_sizes=multi_control_token_sizes,
+                multi_control_weights=multi_control_weights,
+            )
 
-            if len(self.gen_layers) == len(self.cached_kv):
-                for layer, (k_und, v_und) in zip(self.gen_layers, self.cached_kv, strict=True):
-                    hidden_gen = layer(
-                        hidden_gen,
-                        k_und=k_und,
-                        v_und=v_und,
-                        freqs_cos=freqs_cos,
-                        freqs_sin=freqs_sin,
-                        control_token_sizes=multi_control_token_sizes,
-                        control_weights=multi_control_weights,
-                    )
-                    # Cache-dit's block wrapper may return a tuple; unwrap it.
-                    if isinstance(hidden_gen, tuple):
-                        hidden_gen = hidden_gen[0]
-            else:
-                # Cache-dit patches gen_layers to a grouped wrapper.
-                for layer in self.gen_layers:
-                    hidden_gen = layer(
-                        hidden_gen,
-                        cached_kv=self.cached_kv,
-                        freqs_gen=freqs_gen,
-                        control_token_sizes=multi_control_token_sizes,
-                        control_weights=multi_control_weights,
-                    )
-                    if isinstance(hidden_gen, tuple):
-                        hidden_gen = hidden_gen[0]
+    def _run_gen_stack(self, prep: _GenPrepared) -> torch.Tensor:
+        """Execute the cacheable full-layout GEN stack, including final norm."""
+        hidden_gen = self._run_gen_layers(
+            prep.hidden_gen,
+            s_video=prep.s_video,
+            s_control=prep.s_control,
+            s_action=prep.s_action,
+            s_sound=prep.s_sound,
+            has_action=prep.has_action,
+            has_sound=prep.has_sound,
+            has_control=prep.has_control,
+            ulysses_size=prep.ulysses_size,
+            use_multi_control_attention=prep.use_multi_control_attention,
+            multi_control_token_sizes=prep.multi_control_token_sizes,
+            multi_control_weights=prep.multi_control_weights,
+        )
+        return self.norm_moe_gen(hidden_gen)
 
-            if not use_multi_control_attention:
-                hidden_gen = self.gen_sp_gather(hidden_gen)
+    def _gen_postprocess(
+        self,
+        hidden_gen: torch.Tensor,
+        prep: _GenPrepared,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Project an already-normalized packed GEN state to model outputs."""
+        if not prep.has_action and not prep.has_sound and not prep.has_control:
+            return self.unpatchify(self.proj_out(hidden_gen), prep.t, prep.h, prep.w)
 
-            # Final norm and project back to latent space
-            hidden_gen = self.norm_moe_gen(hidden_gen)
-            if not has_action and not has_sound and not has_control:
-                return self.unpatchify(self.proj_out(hidden_gen), t, h, w)
-
-            split_sizes = []
-            if has_control:
-                split_sizes.append(s_control)
-            split_sizes.append(s_video)
-            if has_action:
-                split_sizes.append(s_action)
-            if has_sound:
-                split_sizes.append(s_sound)
-            split_hidden = hidden_gen.split(split_sizes, dim=1)
-            split_idx = 0
-            if has_control:
-                split_idx += 1
-            hidden_video = split_hidden[split_idx]
+        split_sizes = []
+        if prep.has_control:
+            split_sizes.append(prep.s_control)
+        split_sizes.append(prep.s_video)
+        if prep.has_action:
+            split_sizes.append(prep.s_action)
+        if prep.has_sound:
+            split_sizes.append(prep.s_sound)
+        split_hidden = hidden_gen.split(split_sizes, dim=1)
+        split_idx = 0
+        if prep.has_control:
             split_idx += 1
-            video_pred = self.unpatchify(self.proj_out(hidden_video), t, h, w)
-            if has_control:
-                return video_pred
-            outputs: list[torch.Tensor] = [video_pred]
-            if has_action:
-                hidden_action = split_hidden[split_idx]
-                split_idx += 1
-                assert action_domain_ids is not None
-                outputs.append(self.unpack_action(self.action_proj_out(hidden_action, action_domain_ids)))
-            if has_sound:
-                hidden_sound = split_hidden[split_idx]
-                outputs.append(self.unpack_sound(self.audio_proj_out(hidden_sound)))
-            return tuple(outputs)
+        hidden_video = split_hidden[split_idx]
+        split_idx += 1
+        video_pred = self.unpatchify(self.proj_out(hidden_video), prep.t, prep.h, prep.w)
+        if prep.has_control:
+            return video_pred
+
+        outputs: list[torch.Tensor] = [video_pred]
+        if prep.has_action:
+            hidden_action = split_hidden[split_idx]
+            split_idx += 1
+            assert prep.action_domain_ids is not None
+            outputs.append(self.unpack_action(self.action_proj_out(hidden_action, prep.action_domain_ids)))
+        if prep.has_sound:
+            hidden_sound = split_hidden[split_idx]
+            outputs.append(self.unpack_sound(self.audio_proj_out(hidden_sound)))
+        return tuple(outputs)
 
     def post_load_weights(self) -> None:
         """Post-load processing: ensure correct dtypes."""
         self.time_embedder.to(torch.float32)
+
+    def set_mixed_precision_step(self, step_index: int, num_steps: int) -> None:
+        if self.mixed_precision_runtime is not None:
+            self.mixed_precision_runtime.set_step(step_index, num_steps)
+
+    def reset_mixed_precision(self) -> None:
+        if self.mixed_precision_runtime is not None:
+            self.mixed_precision_runtime.reset()

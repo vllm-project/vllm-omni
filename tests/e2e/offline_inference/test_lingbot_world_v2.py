@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """End-to-end smoke test for LingBot-World v2 generation."""
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ _OMNI_RUNNER_PARAM = (
 )
 
 pytestmark = [
-    pytest.mark.slow,
+    pytest.mark.full_model,
     pytest.mark.diffusion,
     pytest.mark.skipif(
         not _HAS_INPUT_ASSETS,
@@ -47,7 +47,7 @@ pytestmark = [
 ]
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 def test_lingbot_world_v2_tp1_one_block(omni_runner_handler: OmniRunnerHandler) -> None:
     """Load the real checkpoint and generate one causal block on one GPU."""
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 
@@ -11,6 +11,7 @@ from vllm.platforms.xpu import XPUPlatform
 
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
+from vllm_omni.platforms.xpu.patch import apply_patches
 
 logger = init_logger(__name__)
 
@@ -30,6 +31,10 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
     """
 
     _omni_enum = OmniPlatformEnum.XPU
+
+    def __init__(self):
+        super().__init__()
+        apply_patches()
 
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
@@ -150,4 +155,7 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
         using_inductor = cc.backend == "inductor" and cc.mode != CompilationMode.NONE
         default = ["native"] if using_inductor else ["vllm_c", "native"]
 
-        return IrOpPriorityConfig.with_default(default)
+        # Mirrors upstream XPUPlatform defaults: `gelu_and_mul_sparse` has no XPU
+        # provider, so it must not fall back to `default` (which contains
+        # `vllm_c`) via IrOpPriorityConfig.with_default.
+        return IrOpPriorityConfig.with_default(default, gelu_and_mul_sparse=["native"])

@@ -374,6 +374,12 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         elif params["task_type"][0] == "VoiceDesign":
             params["non_streaming_mode"] = [True]
 
+        # Do not set ``full_utterance_decode`` here. That flag is an explicit
+        # Code2Wav emit opt-in (offline / advanced callers via
+        # additional_information) and must stay independent of prompt-mode
+        # ``non_streaming_mode`` (#4198 / #6898). Online serving keeps the
+        # default windowed async-chunk path (incl. #5202 incremental decode).
+
         return params
 
     def _estimate_prompt_len(self, tts_params: dict[str, Any]) -> int:
@@ -425,6 +431,14 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         Qwen3-TTS ref-audio artifact tracked after ``generate()``.
         """
         server = self.ctx.server
+        # Inline Base cloning derives its voice from ref_audio, not the
+        # OpenAI-compatible voice label.
+        if has_inline_ref_audio and request.task_type == "Base" and request.voice is not None:
+            logger.info(
+                "Ignoring voice=%r for Qwen3-TTS Base request because inline ref_audio takes precedence",
+                request.voice,
+            )
+            request = request.model_copy(update={"voice": None})
         qwen3_ref_audio_warmup_artifact_key: str | None = None
         tts_params = self._build_tts_params(request)
         # Resolve ref_audio (explicit or auto-set for uploaded voices)

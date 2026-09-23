@@ -23,6 +23,7 @@ from typing import Any, NamedTuple
 import numpy as np
 import psutil
 import yaml
+from filelock import FileLock, Timeout
 from vllm import TextPrompt
 from vllm.logger import init_logger
 
@@ -36,6 +37,8 @@ from vllm_omni.config.stage_config import resolve_deploy_yaml
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+SERVER_STARTUP_TIMEOUT_S = 1200
 
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
@@ -170,9 +173,54 @@ class OmniServer:
         self.use_omni = use_omni
         self.proc: subprocess.Popen | None = None
         self.host = "127.0.0.1"
+        self._auto_port = port is None
+        self._port_lock: FileLock | None = None
         self.port = get_open_port() if port is None else port
 
+    def _reserve_port(self) -> None:
+        # bind(0)/close does not reserve a port across concurrent pytest workers.
+        # Keep an advisory lock until teardown, including the long import phase
+        # before the subprocess binds its HTTP socket. Never unlink lock files:
+        # another worker may already have the same inode open.
+        for attempt in range(128):
+            if attempt:
+                self.port = get_open_port(self.host)
+            lock_path = Path(tempfile.gettempdir()) / f"vllm-omni-test-port-{os.getuid()}-{self.port}.lock"
+            lock = FileLock(lock_path)
+            try:
+                lock.acquire(timeout=0)
+            except Timeout as error:
+                if not self._auto_port:
+                    raise RuntimeError(f"HTTP test port {self.port} is already reserved") from error
+                continue
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    probe.bind((self.host, self.port))
+            except OSError as error:
+                lock.release()
+                if not self._auto_port or error.errno != errno.EADDRINUSE:
+                    raise
+                continue
+            self._port_lock = lock
+            return
+        raise RuntimeError("Could not reserve an HTTP test port after 128 attempts")
+
+    def _owns_listening_port(self) -> bool:
+        assert self.proc is not None
+        try:
+            parent = psutil.Process(self.proc.pid)
+            processes = [parent, *parent.children(recursive=True)]
+            return any(
+                conn.status == psutil.CONN_LISTEN and conn.laddr.port == self.port
+                for process in processes
+                for conn in process.net_connections(kind="tcp")
+            )
+        except psutil.NoSuchProcess:
+            # A child can exit between enumeration and inspecting its sockets.
+            return False
+
     def _start_server(self) -> None:
+        self._reserve_port()
         env = os.environ.copy()
         if self.env_dict is not None:
             env.update(self.env_dict)
@@ -200,15 +248,19 @@ class OmniServer:
             cwd=_omni_subprocess_cwd(),
         )
 
-        max_wait = 1200
-        start_time = time.time()
-        while time.time() - start_time < max_wait:
+        max_wait = SERVER_STARTUP_TIMEOUT_S
+        # System clock corrections must not shorten or extend startup waits.
+        start_time = time.monotonic()
+        while time.monotonic() - start_time < max_wait:
             ret = self.proc.poll()
             if ret is not None:
                 raise RuntimeError(f"Server processes exited with code {ret} before becoming ready.")
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(1)
-                if sock.connect_ex((self.host, self.port)) == 0:
+                if sock.connect_ex((self.host, self.port)) == 0 and self._owns_listening_port():
+                    ret = self.proc.poll()
+                    if ret is not None:
+                        raise RuntimeError(f"Server processes exited with code {ret} before becoming ready.")
                     startup_s = time.perf_counter() - startup_t0
                     if self.log_stats:
                         print(
@@ -368,9 +420,14 @@ class OmniServer:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.proc:
-            self._kill_process_tree(self.proc.pid)
-        cleanup_test_environment()
+        try:
+            if self.proc:
+                self._kill_process_tree(self.proc.pid)
+        finally:
+            if self._port_lock is not None:
+                self._port_lock.release()
+                self._port_lock = None
+            cleanup_test_environment()
 
 
 class OmniServerStageCli(OmniServer):
@@ -496,9 +553,10 @@ class OmniServerStageCli(OmniServer):
             for replica_id in range(self.stage_replica_counts.get(stage_id, 1)):
                 self._launch_stage(stage_id, headless=True, replica_id=replica_id)
 
-        max_wait = 1200
-        start_time = time.time()
-        while time.time() - start_time < max_wait:
+        max_wait = SERVER_STARTUP_TIMEOUT_S
+        # System clock corrections must not shorten or extend startup waits.
+        start_time = time.monotonic()
+        while time.monotonic() - start_time < max_wait:
             self._ensure_stage_processes_alive()
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(1)
@@ -968,7 +1026,6 @@ def iter_omni_server(
                 raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")
             if stage_config_path is None:
                 raise ValueError("omni_server with use_stage_cli=True requires a stage_config_path")
-            server_args += ["--deploy-config", stage_config_path]
 
             with OmniServerStageCli(
                 model,
@@ -1113,6 +1170,7 @@ def pi0_openpi_run_policy_session(
     prompt: str = PI0_OPENPI_DEFAULT_PROMPT,
     session_id: str | None = None,
     num_steps: int = 2,
+    num_inference_steps: int | None = None,
 ) -> dict[str, Any]:
     """Connect, read handshake metadata, send ``num_steps`` observations."""
     import uuid
@@ -1131,6 +1189,8 @@ def pi0_openpi_run_policy_session(
         actions = []
         for _ in range(num_steps):
             payload = pi0_make_dummy_obs(prompt=prompt, session_id=session_id)
+            if num_inference_steps is not None:
+                payload["sampling_params"] = {"num_inference_steps": num_inference_steps}
             payload["endpoint"] = "infer"
             conn.send(packer.pack(payload))
             actions.append(_pi0_decode_action_response(conn.recv()))

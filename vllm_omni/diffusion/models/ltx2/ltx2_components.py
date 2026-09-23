@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video, FlowMatchEulerDiscreteScheduler
-from diffusers.models.autoencoders.ltx2_diffusion_decoder import LTX2VideoVaeNeighborhoodNattenProcessor
 from diffusers.pipelines.ltx2 import LTX2TextConnectors
 from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
@@ -36,12 +35,6 @@ from vllm_omni.transformers_utils.repo_utils import hf_api
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
-from .ltx2_diffusion_decoder import (
-    LTX25_NATIVE_ARTIFACT_REVISION,
-    LTX25_NATIVE_DIFFUSION_DECODER_FILENAME,
-    LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID,
-)
-from .ltx2_diffusion_decoder_distributed import DistributedLTX2VideoDiffusionDecoderModel
 from .ltx2_request import LTXCheckpointKind, validate_ltx_checkpoint
 from .ltx2_transformer import (
     LTX2VideoTransformer3DModel,
@@ -49,6 +42,13 @@ from .ltx2_transformer import (
     apply_split_rotary_emb,
     to_ltx_padding_mask,
 )
+from .vae.decoder import (
+    LTX25_NATIVE_ARTIFACT_REVISION,
+    LTX25_NATIVE_DIFFUSION_DECODER_FILENAME,
+    LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID,
+    LTX2VideoVaeNeighborhoodNattenProcessor,
+)
+from .vae.distributed import DistributedLTX2VideoDiffusionDecoderModel
 
 try:
     from diffusers.pipelines.ltx2.vocoder import LTX2VocoderWithBWE
@@ -298,7 +298,7 @@ def _create_ltx25_natten_processor() -> LTX2VideoVaeNeighborhoodNattenProcessor:
     except (ImportError, OSError, RuntimeError, ValueError) as exc:
         raise RuntimeError(
             "LTX-2.5 DiffVAE requires the shi-labs/natten Hub kernel. "
-            "Install kernels==0.15.2, use a supported GPU, leave "
+            "Install kernels==0.16.1, use a supported GPU, leave "
             "DIFFUSERS_DISABLE_REMOTE_CODE unset, and allow Hub access during kernel initialization."
         ) from exc
 
@@ -662,7 +662,7 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         revision=revision,
     )
     if profile.text_encoder_cls is None:
-        raise ImportError("LTX-2.5 requires Gemma4UnifiedForConditionalGeneration; install transformers>=5.10.1,<5.15.")
+        raise ImportError("LTX-2.5 requires Gemma4UnifiedForConditionalGeneration; install transformers>=5.13.0,<5.15.")
     with torch.device("cpu"):
         pipeline.text_encoder = _load_component(
             profile.text_encoder_cls,

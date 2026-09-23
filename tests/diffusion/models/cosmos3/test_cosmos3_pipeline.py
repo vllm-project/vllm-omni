@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
+import json
 import sys
 import types
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -19,6 +22,20 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.experimental.world_models.session_state import SessionStateManager
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical_name"),
+    [
+        ("galbot", "embodiment_b"),
+        ("agibot_gear_gripper", "embodiment_c_gripper"),
+        ("agibot_gear_gripper_ext", "embodiment_c_gripper_ext"),
+    ],
+)
+def test_action_domain_table_preserves_legacy_aliases(alias: str, canonical_name: str) -> None:
+    from vllm_omni.diffusion.models.cosmos3.action import resolve_domain_id
+
+    assert resolve_domain_id(domain_name=alias) == resolve_domain_id(domain_name=canonical_name)
 
 
 def test_pipeline_declares_layerwise_offload_components() -> None:
@@ -69,6 +86,7 @@ class StubScheduler:
         flow_shift: float = 1.0,
     ) -> None:
         self.timesteps = torch.tensor(timesteps or [9, 3], dtype=torch.int64)
+        self.sigmas = self.timesteps.float() / 10
         self.config = SimpleNamespace(
             num_train_timesteps=1000,
             flow_shift=flow_shift,
@@ -97,6 +115,7 @@ class StubScheduler:
         else:
             assert num_inference_steps is not None
             self.timesteps = torch.arange(num_inference_steps, 0, -1, dtype=torch.int64, device=device)
+        self.sigmas = self.timesteps.float()
 
     def step(self, noise_pred: torch.Tensor, timestep: torch.Tensor, latents: torch.Tensor, **kwargs):
         del kwargs
@@ -234,7 +253,7 @@ def passthrough_progress_bar(iterable):
 
 @pytest.fixture(autouse=True)
 def fake_cosmos3_guardrails(monkeypatch: pytest.MonkeyPatch):
-    module = types.ModuleType("vllm_omni.diffusion.models.cosmos3.guardrails")
+    module: Any = types.ModuleType("vllm_omni.diffusion.models.cosmos3.guardrails")
     module.is_guardrails_enabled = lambda od_config, sampling_params=None: False
     module.ensure_initialized = lambda od_config: None
     module.check_text_safety = lambda text: None
@@ -267,6 +286,8 @@ def make_cosmos3_pipeline():
         pipeline.is_edge_model = False
         pipeline._guidance_scale = None
         pipeline._num_timesteps = None
+        pipeline._current_step_index = None
+        pipeline._current_sigma = None
         pipeline._cosmos3_branch_caches = None
         pipeline._cache_dit_requires_paired_cfg = False
         pipeline._sound_tokenizer = None
@@ -284,7 +305,7 @@ def sequential_cfg_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def make_sampling_params(**overrides: Any) -> SimpleNamespace:
-    values = {
+    values: dict[str, Any] = {
         "height": None,
         "width": None,
         "num_frames": None,
@@ -361,23 +382,31 @@ def _capture_tokenize_calls(pipeline: Any) -> list[dict[str, Any]]:
 
 
 @pytest.mark.parametrize(
-    ("provided", "value", "default", "is_distilled", "expected"),
+    ("provided", "value", "default", "is_distilled", "expected", "expected_warning"),
     [
-        (False, 1.0, 7.0, False, 7.0),
-        (True, 1.0, 7.0, False, 1.0),
-        (True, 4.5, 7.0, False, 4.5),
-        (False, 1.0, 7.0, True, 1.0),
-        (True, 4.5, 7.0, True, 1.0),
+        (False, 1.0, 7.0, False, 7.0, False),
+        (True, 1.0, 7.0, False, 1.0, False),
+        (True, 4.5, 7.0, False, 4.5, False),
+        (False, 1.0, 7.0, True, 1.0, False),
+        (True, 1.0, 7.0, True, 1.0, False),
+        (True, 4.5, 7.0, True, 1.0, True),
+        (True, 0.0, 7.0, True, 1.0, True),
     ],
 )
 def test_resolve_guidance_scale(
     make_cosmos3_pipeline,
+    monkeypatch: pytest.MonkeyPatch,
     provided: bool,
     value: float,
     default: float,
     is_distilled: bool,
     expected: float,
+    expected_warning: bool,
 ) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    warning_once = Mock()
+    monkeypatch.setattr(pipeline_cosmos3.logger, "warning_once", warning_once)
     pipeline = make_cosmos3_pipeline()
     pipeline.is_distilled_model = is_distilled
     sp = make_sampling_params(
@@ -386,6 +415,12 @@ def test_resolve_guidance_scale(
     )
 
     assert pipeline._resolve_guidance_scale(sp, default) == expected
+    if expected_warning:
+        warning_once.assert_called_once()
+        assert "overridden to 1.0" in warning_once.call_args.args[0]
+        assert "negative_prompt does not affect generation" in warning_once.call_args.args[0]
+    else:
+        warning_once.assert_not_called()
 
 
 def test_distilled_generation_accepts_t2i_and_i2v(make_cosmos3_pipeline) -> None:
@@ -477,6 +512,69 @@ def test_forward_threads_request_id_to_robolab(make_cosmos3_pipeline) -> None:
 
     assert pipeline.forward(request) is expected
     assert captured["session_id"] == "robolab-request-7"
+
+
+@pytest.mark.parametrize("format_prompt_as_json", [False, True])
+def test_robolab_input_builder_threads_prompt_format_and_uses_wam(
+    make_cosmos3_pipeline,
+    monkeypatch: pytest.MonkeyPatch,
+    format_prompt_as_json: bool,
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline.transformer = StubCosmos3Transformer(action_gen=True, action_dim=64)
+    captured: dict[str, Any] = {}
+
+    def fake_transform(sample, resolution):
+        captured["sample_mode"] = sample["mode"]
+        captured["resolution"] = resolution
+        sample["sequence_plan"] = SimpleNamespace(
+            condition_frame_indexes_action=[0],
+            action_start_frame_offset=1,
+        )
+        sample["raw_action_dim"] = torch.tensor(8)
+        sample["image_size"] = torch.tensor([16, 16, 16, 16])
+        if format_prompt_as_json:
+            sample["ai_caption"] = {"actions": {"instruction": sample["ai_caption"]}}
+        return sample
+
+    def fake_get_transform(*, format_prompt_as_json: bool):
+        captured["format_prompt_as_json"] = format_prompt_as_json
+        return fake_transform
+
+    pipeline._get_robolab_transform = fake_get_transform
+    monkeypatch.setattr(pipeline_cosmos3, "get_robolab_domain_id", lambda name: 8)
+    obs = {
+        "prompt": "Pick up the cube.",
+        "observation/image": np.zeros((16, 16, 3), dtype=np.uint8),
+        "observation/joint_position": np.zeros(7, dtype=np.float32),
+        "observation/gripper_position": np.zeros(1, dtype=np.float32),
+    }
+    sampling_params = make_sampling_params(
+        extra_args={
+            "robot_obs": obs,
+            "action_chunk_size": 2,
+            "image_height": 16,
+            "image_width": 16,
+            "format_prompt_as_json": format_prompt_as_json,
+        }
+    )
+
+    inputs = pipeline._build_robolab_policy_inputs(sampling_params, request_id="request-1")
+
+    assert inputs is not None
+    assert captured == {
+        "sample_mode": "wam",
+        "resolution": "480",
+        "format_prompt_as_json": format_prompt_as_json,
+    }
+    assert inputs.domain_id == 8
+    assert inputs.raw_action_dim == 8
+    if format_prompt_as_json:
+        assert json.loads(inputs.prompt) == {"actions": {"instruction": "Pick up the cube."}}
+    else:
+        assert inputs.prompt == "Pick up the cube."
 
 
 @pytest.mark.parametrize(
@@ -657,6 +755,7 @@ def _make_od_config(
         custom_pipeline_args={},
         model_config=model_config or {},
         tf_model_config=tf_model_config,
+        parallel_config=SimpleNamespace(cfg_parallel_size=1, ulysses_degree=1),
     )
 
 
@@ -692,6 +791,7 @@ def test_pipeline_init_uses_flow_unipc_with_cosmos3_defaults(stub_real_pipeline_
     assert pipeline._engine_init_flow_shift == 2.5
 
 
+@pytest.mark.parametrize("cfg_parallel_size,ulysses_degree", [(1, 1), (1, 2), (2, 1), (2, 2)])
 @pytest.mark.parametrize(
     ("scheduler_class_name", "expected_distilled"),
     [
@@ -705,6 +805,8 @@ def test_pipeline_resolves_scheduler_class_from_checkpoint_file(
     monkeypatch: pytest.MonkeyPatch,
     scheduler_class_name: str,
     expected_distilled: bool,
+    cfg_parallel_size: int,
+    ulysses_degree: int,
 ) -> None:
     import json
 
@@ -717,7 +819,7 @@ def test_pipeline_resolves_scheduler_class_from_checkpoint_file(
     t_list = [1.0, 0.75, 0.5, 0.25]
     scheduler_dir = tmp_path / "scheduler"
     scheduler_dir.mkdir()
-    scheduler_config = {"_class_name": scheduler_class_name}
+    scheduler_config: dict[str, Any] = {"_class_name": scheduler_class_name}
     if expected_distilled:
         scheduler_config["fixed_step_sampler_config"] = {"sample_type": "sde", "t_list": t_list}
     (scheduler_dir / "scheduler_config.json").write_text(json.dumps(scheduler_config))
@@ -753,6 +855,20 @@ def test_pipeline_resolves_scheduler_class_from_checkpoint_file(
 
     od_config = _make_od_config(sound_gen=False)
     od_config.model = str(tmp_path)
+    od_config.parallel_config.cfg_parallel_size = cfg_parallel_size
+    od_config.parallel_config.ulysses_degree = ulysses_degree
+    if expected_distilled and cfg_parallel_size > 1:
+        monkeypatch.setattr(
+            pipeline_cosmos3.AutoTokenizer,
+            "from_pretrained",
+            lambda *args, **kwargs: pytest.fail("component loading must not start for distilled CFG parallelism"),
+        )
+        with pytest.raises(ValueError, match="Set --cfg-parallel-size 1 and use --ulysses-degree"):
+            Cosmos3OmniDiffusersPipeline(od_config=od_config)
+        assert StubFlowMatchScheduler.from_config_calls == []
+        assert StubFlowUniPCScheduler.from_config_calls == []
+        return
+
     pipeline = Cosmos3OmniDiffusersPipeline(od_config=od_config)
 
     assert pipeline.is_distilled_model is expected_distilled
@@ -1420,7 +1536,7 @@ def test_ir_op_priority_hook_preserves_platform_fields(monkeypatch: pytest.Monke
         fused_add_rms_norm: list[str]
         custom_op: list[str]
 
-    fake_kernel = types.ModuleType("vllm.config.kernel")
+    fake_kernel: Any = types.ModuleType("vllm.config.kernel")
     fake_kernel.IrOpPriorityConfig = FakeIrOpPriorityConfig
     monkeypatch.setitem(sys.modules, fake_kernel.__name__, fake_kernel)
 
@@ -2043,6 +2159,47 @@ def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> N
     torch.testing.assert_close(action_result, torch.full((), 44.0).expand_as(action_result))
 
 
+def test_diffuse_publishes_exact_seacache_metadata_and_cfg_contexts(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.scheduler.sigmas = torch.tensor([0.91, 0.17])
+    observations: list[tuple[str, int | None, float | None, int | None]] = []
+
+    class RecordingHook:
+        @contextmanager
+        def cache_context(self, name: str):
+            sigma = pipeline.current_sigma
+            observations.append(
+                (
+                    name,
+                    pipeline.current_step_index,
+                    None if sigma is None else float(sigma),
+                    pipeline.num_timesteps,
+                )
+            )
+            yield
+
+    pipeline._cache_context_factory = RecordingHook().cache_context
+    pipeline.diffuse(
+        latents=torch.zeros(1, 2, 1, 1, 1),
+        timesteps=torch.tensor([900, 100]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=3.0,
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0},
+    )
+
+    assert observations == [
+        ("cond", 0, pytest.approx(0.91), 2),
+        ("uncond", 0, pytest.approx(0.91), 2),
+        ("cond", 1, pytest.approx(0.17), 2),
+        ("uncond", 1, pytest.approx(0.17), 2),
+    ]
+    assert pipeline.current_step_index is None
+    assert pipeline.current_sigma is None
+
+
 def test_diffuse_drops_session_when_progress_iteration_fails(make_cosmos3_pipeline) -> None:
     pipeline = make_cosmos3_pipeline()
     pipeline._use_session_state = True
@@ -2100,6 +2257,53 @@ def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_
     assert "control_weights" not in pipeline.transformer.calls[1]["kwargs"]
     assert pipeline.transformer.calls[2]["kwargs"]["control_weights"] == [1.0]
     torch.testing.assert_close(result, torch.full_like(latents, 254.0))
+
+
+def test_diffuse_transfer_uses_named_seacache_contexts(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.scheduler.sigmas = torch.tensor([0.42])
+    contexts: list[tuple[str, int | None, float | None, int | None]] = []
+
+    class RecordingHook:
+        @contextmanager
+        def cache_context(self, name: str):
+            sigma = pipeline.current_sigma
+            contexts.append(
+                (
+                    name,
+                    pipeline.current_step_index,
+                    None if sigma is None else float(sigma),
+                    pipeline.num_timesteps,
+                )
+            )
+            yield
+
+    pipeline._cache_context_factory = RecordingHook().cache_context
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    velocity_mask = torch.ones(1, 1, 1, 1, 1)
+    pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([7]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=3.0,
+        control_guidance=1.5,
+        control_guidance_interval=None,
+        control_latents=[torch.zeros_like(latents)],
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "noisy_frame_mask": velocity_mask},
+        velocity_mask=velocity_mask,
+        condition_latents=torch.zeros_like(latents),
+    )
+
+    assert contexts == [
+        ("cond", 0, pytest.approx(0.42), 1),
+        ("cond_no_control", 0, pytest.approx(0.42), 1),
+        ("uncond", 0, pytest.approx(0.42), 1),
+    ]
+    assert pipeline.current_step_index is None
+    assert pipeline.current_sigma is None
 
 
 def test_diffuse_transfer_rejects_session_state_manager(make_cosmos3_pipeline) -> None:
@@ -2472,7 +2676,7 @@ def test_diffuse_keeps_paired_cfg_when_cache_dit_active(make_cosmos3_pipeline) -
 
 class TestForwardRouting:
     def _install_forward_stubs(self, pipeline):
-        captured: dict[str, object] = {"diffuse_calls": [], "prepare_calls": []}
+        captured: dict[str, Any] = {"diffuse_calls": [], "prepare_calls": []}
 
         def fake_format(
             prompt,
