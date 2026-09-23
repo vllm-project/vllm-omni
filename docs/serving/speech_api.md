@@ -6,6 +6,7 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 - **Fish Speech S2 Pro** (`fishaudio/s2-pro`) -- Dual-AR TTS with DAC codec. Supports text-to-speech and voice cloning via reference audio. Output: 44.1 kHz.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
 - **CosyVoice3** (`FunAudioLLM/Fun-CosyVoice3-0.5B-2512`) -- 2-stage talker + flow-matching code2wav. Voice cloning via `ref_audio` + `ref_text` (no presets). Output: 24 kHz.
+- **Gepard-1.0** (`nineninesix/gepard-1.0`) -- single-stage native-AR TTS with a 22.05 kHz NanoCodec. Zero-shot default voice only.
 
 See the [Supported Models](#supported-models) section below for the full list, including OmniVoice, VoxCPM2, MOSS-TTS-Nano, and Breeze-TTS-2.
 
@@ -40,11 +41,16 @@ vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --port 8091
 # CosyVoice3 (voice cloning only — supply ref_audio + ref_text per request)
 vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
     --omni --port 8091 --trust-remote-code
+
+# Gepard-1.0 (zero-shot default voice; packaged gepard.yaml)
+vllm-omni serve nineninesix/gepard-1.0 --omni --port 8091 --trust-remote-code \
+    --stage-init-timeout 900 \
+    --deploy-config vllm_omni/deploy/gepard.yaml
 ```
 
 ### Generate Speech
 
-**Using curl:**
+**Qwen3-TTS CustomVoice, using curl:**
 
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \
@@ -56,7 +62,24 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     }' --output output.wav
 ```
 
-**Using Python:**
+**Gepard-1.0, using curl:**
+
+Gepard accepts `input` (required), `voice` (`"default"`), `response_format`,
+`stream` / `stream_format`, `max_new_tokens`, and `seed`. Unsupported fields
+include `speed`, `language`, `instructions`, `task_type`, `ref_audio`,
+`ref_text`, `extra_params`, and `word_timestamps`.
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello, this is Gepard speaking.",
+        "voice": "default",
+        "seed": 7
+    }' --output output.wav
+```
+
+**Qwen3-TTS CustomVoice, using Python:**
 
 ```python
 import httpx
@@ -265,6 +288,19 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 ```
 
 Fields `ref_text` and `speaker_description` are omitted when not provided at upload time.
+
+**Naming rules:**
+
+- Names that collide with one of the model's built-in or precomputed voices are rejected (400). Voice
+  files already on disk under such a name are ignored at startup with a warning, so an upload can never
+  shadow a built-in voice.
+- Re-uploading an existing uploaded name overwrites it in place (the previous audio file is
+  deleted). Set `VLLM_OMNI_SPEAKER_REGISTRATION_POLICY=immutable` on the server to reject duplicates instead,
+  requiring an explicit `DELETE /v1/audio/voices/{name}` before re-registering — useful when the
+  endpoint is reachable by multiple writers and silent overwrites are a risk.
+- The voice registry has no per-user ownership: any client that can reach the endpoint can
+  overwrite (default policy) or delete any uploaded voice. For multi-tenant deployments, add
+  authentication at a proxy and namespace voice names per user (e.g. `{user}.{name}`).
 
 **Usage Example:**
 
@@ -498,6 +534,15 @@ are cached in-process with a shared LRU so repeated requests with the same
 all TTS model types; deleting a voice invalidates every model-type slot at
 once.
 
+Decoded reference waveforms use a separate LRU cache of owned, contiguous
+float32 arrays at the source sampling rate. Its byte budget counts numeric
+buffers (four bytes per mono sample), excluding cache metadata. Numeric storage
+avoids retaining a Python float object for every sample during garbage
+collection. MOSS reference encoding consumes these arrays directly; other
+list-based interfaces, including MOSS Nano, receive temporary lists that are
+not retained in the resolve cache. The MOSS reference encoder also releases
+completed batch inputs before waiting for more work.
+
 ### Precomputed Custom Voices
 
 Qwen3-TTS Base and VoxCPM2 can load offline-precomputed voices at startup.
@@ -545,6 +590,7 @@ by `GET /v1/audio/voices`. Valid precomputed voices can be used in
 | ---------- | --------- | ------------- |
 | `SPEAKER_SAMPLES_DIR` | `~/.cache/vllm-omni/speakers` | Directory for persisted uploaded speakers (`.safetensors` files). |
 | `SPEAKER_MAX_UPLOADED` | `1000` | Maximum number of uploaded speakers kept on disk. Upload requests past the cap return 400. |
+| `VLLM_OMNI_SPEAKER_REGISTRATION_POLICY` | `overwrite` | `immutable` rejects re-uploading an existing uploaded name (400) until it is deleted; any other value fails startup. |
 
 The in-memory LRU has a fixed 512 MiB byte budget.
 
@@ -761,6 +807,28 @@ Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` ne
 | ------- | ------------- |
 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | Voice cloning from `ref_audio` + `ref_text`. No built-in voice presets — upload a voice or pass `ref_audio`/`ref_text` per request. |
 
+### Gepard-1.0
+
+| Model | Description |
+| ----- | ----------- |
+| `nineninesix/gepard-1.0` | Zero-shot native-AR TTS. 22.05 kHz mono. `voice` must be omitted or `"default"`. |
+
+Gepard request fields:
+
+| Field | Behavior |
+| ----- | -------- |
+| `input` | Required. Empty/whitespace-only returns 400. |
+| `voice` | Omitted or `"default"` only. Other values 400. |
+| `response_format` | `wav` default. Non-streaming: `wav`/`pcm`/`flac`/`mp3`. `opus` returns 400 (22.05 kHz is not an Opus sample rate). Streaming: `pcm`/`wav` only. |
+| `stream` / `stream_format` | SSE (`speech.audio.*`) and raw `audio` byte streaming. |
+| `speed` | Must be `1.0`. Gepard has no native speed control. |
+| `max_new_tokens` | Frame budget (1 token = 1 frame = 1024 samples ≈ 46.4 ms). Default 1000 from deploy YAML; adapter bounds 1..4096. |
+| `seed` | Optional. Reaches the in-model 32-head sampler. The packaged YAML currently pins `seed: 42`, so serving is deterministic by default until that pin is removed. |
+| `extra_params` | Any key returns 400, including `temperature`/`top_p`/`top_k`. |
+| Cloning / style fields | `ref_audio`, `ref_text`, `speaker_embedding`, `instructions`, `language`, `task_type`, `word_timestamps`, and similar declared-but-unsupported fields return 400. |
+
+See the [Gepard section of the online TTS hub](../user_guide/examples/online_serving/text_to_speech.md#gepard-10) for launch commands. Native-AR recompute preemption is a known limitation under concurrency.
+
 ### OmniVoice
 
 | Model | Description |
@@ -903,22 +971,24 @@ Use `/v1/audio/voices` to list available voices for the loaded model.
 ## Orchestration Loop (experimental)
 
 Multi-stage omni deployments route stage outputs through a single orchestrator
-loop. By default that loop polls every stage replica on a 1 ms cadence. An
-opt-in event-driven mode replaces the poll with one reader task per live stage
+loop. The legacy loop polls every stage replica on a 1 ms cadence. The
+event-driven mode replaces the poll with one reader task per live stage
 replica awaiting its client directly, and switches the serving-side
-final-output drain to a condition-variable wakeup at the same time.
+final-output drain to a condition-variable wakeup at the same time. Qwen3-TTS
+uses this mode by default; other pipelines keep the legacy poll unless enabled.
 
 **Configuration (environment variables):**
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | `0` (off) | Switches the orchestration loop and the final-output drain from the legacy 1 ms poll to event-driven wakeups. Enabled by `1`, `true`, `yes`, or `on`, matched case-insensitively after surrounding whitespace is stripped; any other value leaves it off. |
+| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | On for Qwen3-TTS; off for other pipelines | Switches the orchestration loop and the final-output drain from the legacy 1 ms poll to event-driven wakeups. An explicit value wins; otherwise the pipeline default computed at engine initialization is used. The override is resolved at orchestrator construction and separately when the final-output drain starts. `1`, `true`, `yes`, or `on` enables it, ignoring case and surrounding whitespace; other values select the legacy poll loop. |
 
-Set it on the process that runs the orchestrator (stage 0 of an omni
-deployment) before starting the server:
+Set it on the process that runs the orchestrator (stage 0 of an omni deployment)
+before starting the server when overriding the pipeline default. For example,
+explicitly disable event-driven orchestration for Qwen3-TTS:
 
 ```bash
-export VLLM_OMNI_EVENT_DRIVEN_ORCH=1
+VLLM_OMNI_EVENT_DRIVEN_ORCH=0 \
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
     --omni \
     --port 8091
@@ -928,8 +998,9 @@ The server logs the selected loop mode and its reader/poller counts once at
 startup, so you can confirm which loop is live.
 
 Routing, output ordering, and terminal-state behavior are identical on both
-loops; only the poll cadence changes. Leaving the variable unset keeps the
-legacy poll loop, which is the supported default.
+loops; only the poll cadence changes. Leaving the variable unset selects the
+pipeline default: event-driven for Qwen3-TTS, and legacy polling for other
+pipelines, including Qwen3-Omni.
 
 **Known limitations:**
 

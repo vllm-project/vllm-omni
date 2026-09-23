@@ -353,9 +353,14 @@ modes can resolve the same `None` value to different schedules.
   Cache-DiT on any selected component. Prompt-embedding cache is also
   incompatible when the text encoder uses `allgather`. Rank-local cache hits
   could otherwise make ranks enter different weight collectives.
-- Per-tensor online FP8 linears use the ordinary loader and can run with either
-  DiT transfer path. With DiT `allgather`, every rank temporarily materializes
-  the complete FP8 model in host memory before DLO retains only its shard.
+- Per-tensor online FP8, INT8, and MXFP8 linears use the ordinary loader and
+  can run with either DiT transfer path. With DiT `allgather`, every rank
+  temporarily materializes the complete quantized model in host memory before
+  DLO retains only its shard. Layers too wide for the NPU quantization kernel
+  (`npu_quant_matmul` rejects an output dimension past 65535) stay
+  unquantized and load straight into host memory under offload-after-quant —
+  their runtime layout is a plain contiguous bf16 weight, the same layout DLO
+  shards on the ordinary path, so they are allowed under `allgather` too.
   Other online quantization methods require rank-local transfer for the
   affected component until their runtime layouts are validated.
 - Resident leading layers require DiT `rank-local` transfer and a model

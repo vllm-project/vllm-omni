@@ -39,6 +39,21 @@ DEFAULT_TTS_LANGUAGES = frozenset(
 )
 
 
+def resolve_stage_model_path(engine_client: Any) -> str | None:
+    """Prefer typed stage model overrides, then legacy and served-model values."""
+    stages = getattr(engine_client, "stage_configs", ()) or ()
+    for stage in stages:
+        model_path = getattr(getattr(stage, "model_config", None), "model", None)
+        if model_path:
+            return str(model_path)
+    for stage in stages:
+        model_path = getattr(getattr(stage, "engine_args", None), "model", None)
+        if model_path:
+            return str(model_path)
+    model_path = getattr(engine_client, "model", None)
+    return str(model_path) if model_path else None
+
+
 def conditioning_cache_salt(request: "OpenAICreateSpeechRequest", tts_params: dict | None = None) -> str:
     """Stable hash of the real Stage 0 conditioning for the prefix cache.
 

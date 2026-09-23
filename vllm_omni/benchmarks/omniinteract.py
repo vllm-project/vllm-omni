@@ -417,6 +417,13 @@ def _has_post_commit_decision(
 # refusal is harmless — record it instead of failing the case.
 _TOLERATED_ERROR_CODES = frozenset({"playback_ack_too_late"})
 
+# ``session.close`` carries no reason of its own, so the server stamps the
+# terminal event with the reason it inferred for it. Anything else on a
+# ``session.closed`` after our own close request means the session ended for a
+# reason we did not ask for (a disconnect, a lease timeout, a shutdown), which
+# is what this guard is looking for.
+_CLIENT_CLOSE_REASONS = frozenset({"client_close"})
+
 
 def _error_code(event: dict[str, object]) -> str | None:
     error = event.get("error")
@@ -452,7 +459,7 @@ def _raise_if_session_terminated(
             event_type == "session.closed"
             and explicit_close_from is not None
             and index >= explicit_close_from
-            and reason is None
+            and (reason is None or reason in _CLIENT_CLOSE_REASONS)
         )
         if expected:
             continue
@@ -826,7 +833,7 @@ def write_batch_artifacts(
     )
 
 
-def _websocket_url(config: OmniInteractBenchmarkConfig, session_id: str) -> str:
+def _websocket_url(config: OmniInteractBenchmarkConfig) -> str:
     endpoint = (
         config.endpoint
         if urlsplit(config.endpoint).scheme
@@ -834,13 +841,7 @@ def _websocket_url(config: OmniInteractBenchmarkConfig, session_id: str) -> str:
     )
     from vllm_omni.clients.duplex import build_realtime_url
 
-    return build_realtime_url(
-        endpoint,
-        config.model,
-        autostart=False,
-        native_duplex=True,
-        session_id=session_id,
-    )
+    return build_realtime_url(endpoint, config.model, autostart=False)
 
 
 class _RealtimeSession:
@@ -855,7 +856,7 @@ class _RealtimeSession:
 
     _MAX_FRAME_BYTES = 64 * 1024 * 1024
 
-    def __init__(self, config: OmniInteractBenchmarkConfig, session_id: str, reference_audio: str) -> None:
+    def __init__(self, config: OmniInteractBenchmarkConfig, reference_audio: str) -> None:
         from vllm_omni.clients.duplex import DuplexClient, EventCollector, SessionConfig
 
         self.session_config = SessionConfig(
@@ -864,12 +865,11 @@ class _RealtimeSession:
             playback_commit_policy="ack_only",
             idle_timeout_s=float(config.timeout_s),
             extra_body={
-                "native_duplex": True,
                 "force_listen_count": 0,
                 **(config.extra_body or {}),
             },
         )
-        self.url = _websocket_url(config, session_id)
+        self.url = _websocket_url(config)
         headers = dict(config.extra_headers or {})
 
         async def connect(url: str) -> WebSocketTransport:
@@ -886,7 +886,6 @@ class _RealtimeSession:
             self.url,
             model=config.model,
             config=self.session_config,
-            session_id=session_id,
             reconnect=None,
             heartbeat_interval_s=None,
             handshake_timeout_s=min(config.timeout_s, 20.0),
@@ -969,6 +968,42 @@ def _populate_response_metrics(
     result.duplex_session_metrics = bundle.session_metrics
 
 
+def _session_capabilities(client: _RealtimeSession) -> dict[str, object]:
+    info = getattr(getattr(client, "_client", None), "session_info", None)
+    if isinstance(info, dict) and isinstance(info.get("capabilities"), dict):
+        return info["capabilities"]
+    for event in client.events.events:
+        if event.get("type") != "session.created":
+            continue
+        session = event.get("session")
+        if isinstance(session, dict) and isinstance(session.get("capabilities"), dict):
+            return session["capabilities"]
+    return {}
+
+
+def _wants_annotation_video_clock(client: _RealtimeSession) -> bool:
+    """Video-required turn-commit sessions use the AURA annotation clock.
+
+    The shared 1 FPS soundtrack path is unchanged unless both capability bits
+    are set. The AURA module is imported only in that case.
+    """
+    caps = _session_capabilities(client)
+    required = caps.get("required_input_modalities") or ()
+    if isinstance(required, str):
+        required = (required,)
+    try:
+        video_required = "video" in {str(item) for item in required}
+    except TypeError:
+        return False
+    if not video_required or not caps.get("supports_turn_commit_only"):
+        return False
+    from vllm_omni.model_executor.models.aura_omni.benchmarks.omniinteract_clock import (
+        wants_annotation_video_clock,
+    )
+
+    return wants_annotation_video_clock(caps)
+
+
 async def run_omniinteract_case(
     case: OmniInteractCase,
     config: OmniInteractBenchmarkConfig,
@@ -1013,7 +1048,7 @@ async def run_omniinteract_case(
             frames = prepared_input.video_frames
         if not any(frames):
             raise ValueError(f"No video frames were decoded from {case.video_path}")
-        async with _RealtimeSession(config, session_id, reference_audio) as client:
+        async with _RealtimeSession(config, reference_audio) as client:
             session_from = 0  # the collector holds only this session's events
             pcm = _ensure_final_commit_tail(pcm, client.events.events)
             playback = _Playback()
@@ -1021,10 +1056,38 @@ async def run_omniinteract_case(
             try:
                 input_duration_s = len(pcm) / (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
                 upload_timeout_s = config.timeout_s + input_duration_s
-                try:
-                    chunks, frame_count, mean_lag, max_lag = await asyncio.wait_for(
-                        stream_inputs(client, pcm, frames, playback), timeout=upload_timeout_s
+                if _wants_annotation_video_clock(client):
+                    from vllm_omni.model_executor.models.aura_omni.benchmarks.omniinteract_clock import (
+                        ANNOTATION_VIDEO_FPS,
+                        stream_annotation_clock,
                     )
+
+                    duration, _, frames = await asyncio.to_thread(
+                        prepare_media,
+                        case.video_path,
+                        ANNOTATION_VIDEO_FPS,
+                        timeout_s=config.media_timeout_s,
+                        max_duration_s=config.max_video_duration_s,
+                    )
+                    if not any(frames):
+                        raise ValueError(f"No video frames were decoded from {case.video_path}")
+                    upload_timeout_s = config.timeout_s + duration
+                    stream = stream_annotation_clock(
+                        client,
+                        frames,
+                        playback,
+                        video_path=case.video_path,
+                        fps=ANNOTATION_VIDEO_FPS,
+                    )
+                    logger.info(
+                        "OmniInteract annotation video clock: video=%s fps=%s",
+                        case.video_path.name,
+                        ANNOTATION_VIDEO_FPS,
+                    )
+                else:
+                    stream = stream_inputs(client, pcm, frames, playback)
+                try:
+                    chunks, frame_count, mean_lag, max_lag = await asyncio.wait_for(stream, timeout=upload_timeout_s)
                 except asyncio.TimeoutError as exc:
                     raise TimeoutError(f"Realtime upload timed out after {upload_timeout_s:g}s") from exc
                 commit_from = len(client.events.events)

@@ -17,6 +17,7 @@ Common `PipelineConfig` fields include:
 | ------- | ------------- |
 | `model_type` | Pipeline identifier used during model and config resolution. |
 | `default_deploy_config_name` | Bundled deploy YAML loaded when the user does not pass `deploy_config`. |
+| `duplex_plugin` | Dotted path of the model's `DuplexModelPlugin`. Set only for full-duplex models; it makes `vllm-omni serve` run the model through `DuplexOmni` (a server whose every surface runs on a duplex session) and the engine host a `DuplexOrchestrator` with the plugin loaded. |
 | `model_arch` | Default Hugging Face architecture for the pipeline. |
 | `hf_architectures` | Architecture names used to identify checkpoints whose `model_type` is shared. |
 | `hf_config_predicate` | Optional predicate used to select between pipelines with otherwise identical HF metadata. |
@@ -52,7 +53,7 @@ The new deploy schema lives under `vllm_omni/deploy/` and is paired with a froze
 | ------- | ------ | ---------- | --------- | ------------- |
 | `base_config` | str (path) | optional | — | Overlay parent (relative or absolute). `stages:` / `platforms:` deep-merged by stage_id; other scalars overlay-wins. Intended for user-authored overlays; prod yamls stay flat. |
 | `async_chunk` | bool | optional | `true` | Enable chunked streaming between stages. Pin to `false` if the pipeline runs end-to-end. |
-| `session_mode` | str | optional | `"turn"` | Session behavior. MiniCPM-o 4.5 deploy YAMLs set `"duplex"` so `/v1/realtime` and chat share the same profile. |
+| `session_mode` | str | optional | `"turn"` | Session behavior. For pipelines with a `duplex_plugin`, explicitly select `"duplex"` for the duplex engine or `"turn"` for the ordinary online serving stack. The shipped MiniCPM-o 4.5 default remains `"duplex"`. See [Full Duplex](../serving/full_duplex_api.md#enable-full-duplex). |
 | `active_stream_window` | int | optional | `0` | Number of active downstream stream slots; `0` preserves all-stream cycling. |
 | `duplex_session` | dict | optional | runtime defaults | Full-duplex session lifecycle, buffering, replay, and capacity limits. |
 | `connectors` | dict | optional | `null` | Named connector specs (`{name, extra}`). Referenced by each stage's `input_connectors` / `output_connectors`. See [Connector schema](#connector-schema). |
@@ -289,3 +290,96 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/depl
 
 !!! important
     We are actively iterating on the definition of deployment configurations, and we welcome feedback from users and developers.
+
+## Qwen3-TTS with Model Runner V2
+
+Qwen3-TTS runs the native CUDA Model Runner V2 pipeline by default on vLLM
+0.29.0. MRV2 is an experimental feature for this model: the bundled default
+profile selects it on CUDA only, and its scheduler and delivery paths are
+still being qualified. Set `model_runner: v1` in a copy of the deploy config
+to opt out; the `platforms:` sections of `qwen3_tts.yaml` keep V1 on NPU, XPU,
+ROCm and MUSA. Select one of these deployment profiles:
+
+| Profile | Runner | Code2Wav graph batches | Intended use |
+| --- | --- | --- | --- |
+| `qwen3_tts.yaml` | V2 (default) | Existing defaults | Shipped default; experimental |
+| `qwen3_tts_mrv2.yaml` | V2 | B1 | Explicit MRV2 profile (same runner selection as the default) |
+| `qwen3_tts_high_concurrency_mrv2.yaml` | V2 | B1, B2 | Opt-in throughput tuning |
+| `qwen3_tts_high_concurrency_mrv2_b4.yaml` | V2 | B1, B2, B3, B4 | Experimental throughput / buffered playback |
+| `qwen3_tts_high_concurrency.yaml` | V1 | Existing defaults | V1 high-concurrency control |
+
+```bash
+# MRV2 is the default; pass a copy with `model_runner: v1` to force V1.
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni \
+  --deploy-config /path/to/qwen3_tts_v1.yaml
+```
+
+The V2 profiles bound Talker prefill to 512 tokens per step and select the
+Talker AR runner and the Code2Wav generation
+runner together. Native inter-stage delivery carries codec payloads directly;
+request-owned snapshots preserve buffers through asynchronous completion and
+CUDA graph reuse. Terminal completion waits for upstream stage metrics before
+releasing request state. Platform sections retain V1 on NPU, XPU, ROCm and MUSA;
+this change does not qualify MRV2 on those backends or enable other model families.
+Selecting V2 for a stage without `supports_native_mrv2_data_plane` emits a warning
+when pipeline and deployment settings are merged. That stage retains the legacy
+transport path; the warning does not establish support for that combination.
+
+MRV2 model hooks use capability declarations rather than architecture or stage
+names. Omni lifecycle flags select the model state, and `_returns_tuple` declares
+the capture output contract. The optional batched predictor hook is `mtp`, with
+an explicit `mtp_output_key` (a string or two-part payload key), optional
+`mtp_validity_key`, and `mtp_graph_safe`/`mtp_disable_graph` capture controls.
+Its inputs are token IDs, embeddings, previous hidden states and per-row
+conditioning; it returns updated embeddings and prediction codes. Models may
+supply `mtp_sampling_params` and `get_mtp_seed(sampling_params)` for model-local explicit seeds, and declare
+`mtp_accepts_per_row_generators`, `mtp_accepts_req_infos`, or `mtp_sample_uniforms`
+(with `mtp_sample_steps` and `mtp_sample_vocab_size`) as needed. Qwen3-TTS retains
+its existing `talker_mtp` entry point for V1.
+
+### Included performance work
+
+- Request snapshots have a fast path for immutable scalar leaves, including
+  waveform lists. Mutable containers, aliases and cycles keep deep-copy
+  semantics. This is not the historical shallow `dict(prompt)` experiment.
+- The API reference cache holds owned float32 arrays with a default capacity
+  of 1024 entries and a 512 MiB waveform-payload budget. Cache hits return
+  independent lists. Qwen3-TTS model artifact caches also default to 1024
+  entries. These caches have different owners and eviction policies; equal
+  entry limits do not make them a single coherent cache.
+- Talker state stays on GPU where its lifecycle allows it. BOS/EOS projections
+  are cached in their projection dtype and invalidated on weight loading.
+- Code2Wav packs CPU codec inputs before device transfer. Optional B2/B4 graph
+  buckets batch compatible requests without sharing their per-request state.
+- Native output materialization runs in a bounded worker and drains before
+  closing the data plane. The existing control-only shortcut avoids launching
+  model work for a step that has only lifecycle events.
+
+MTP prefix re-prefill remains disabled in the high-concurrency V2 profile.
+Adding more graph shapes increases compilation cost and has not established a
+stable end-to-end gain for this extracted version.
+
+### Decoder batches and playback
+
+Changing `decode_cudagraph_batch_sizes` selects the captured batch buckets.
+Keep `decode_batch_max_size` consistent with the intended maximum too; the
+stateful graph path currently groups according to the captured buckets, while
+the stateless path also uses the explicit maximum.
+
+B4 remains experimental. First-packet latency alone does not establish
+uninterrupted playback. Validate inter-chunk arrival times, buffering, WER and
+speaker similarity before adopting either batching preset for a production
+workload. Floating-point decoder outputs can differ across batch sizes; this PR
+does not claim bitwise or quality equivalence.
+
+### Optional MPS deployment
+
+NVIDIA MPS is an optional operator setting for colocated CUDA processes, not a
+YAML option or a library default. This PR does not establish a throughput or
+first-packet latency benefit from MPS. Measure the exact deployment with and
+without MPS before enabling it.
+
+Use only assigned GPUs and an independent MPS pipe directory. A private MPS
+server does not provide exclusive GPU ownership or MIG isolation. For a
+single-GPU deployment, explicitly place both stages on that GPU; the supplied
+high-concurrency profile places its two stages on different GPUs by default.

@@ -9,6 +9,7 @@ import inspect
 import os
 import threading
 from collections import defaultdict, deque
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -21,6 +22,7 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
 )
 from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_connector_spec
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import get_local_tp_rank, get_omni_replica_id
+from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger("vllm_omni.worker.omni_connector_model_runner_mixin")
 
@@ -69,12 +71,33 @@ def should_accumulate_full_payload_output(model_config, custom_process_func) -> 
         return False
     if getattr(model_config, "async_chunk", False):
         return False
-    if getattr(model_config, "final_output", False):
-        return False
     next_stage_func = getattr(model_config, "custom_process_next_stage_input_func", None)
     if not isinstance(next_stage_func, str) or not next_stage_func:
         return False
     return getattr(model_config, "model_stage", None) is not None
+
+
+class _SendCompletion:
+    """One connector task's delivery acknowledgement."""
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._error: BaseException | None = None
+
+    def mark_in_flight(self) -> bool:
+        return True
+
+    def set_result(self) -> None:
+        self._event.set()
+
+    def set_error(self, error: BaseException) -> None:
+        self._error = error
+        self._event.set()
+
+    def wait(self) -> None:
+        self._event.wait()
+        if self._error is not None:
+            raise self._error
 
 
 class _OmniConnectorRuntimeMixin:
@@ -166,6 +189,8 @@ class _OmniConnectorRuntimeMixin:
         self._stage_id: int = stage_id if isinstance(stage_id, int) else 0
 
         self._custom_process_func_path, self._custom_process_func = self._load_custom_func(model_config)
+        self._custom_process_batch_func = self._load_custom_batch_func(self._custom_process_func)
+        self._custom_process_payload_kwarg = self._connector_payload_kwarg(self._custom_process_func)
         self._custom_process_supports_is_finished = self._custom_process_supports_is_finished_kwarg()
         logger.debug(
             "[Stage-%s] init_omni_connectors: async_chunk=%s, custom_process_func=%s, connector=%s, func_path=%s",
@@ -229,6 +254,7 @@ class _OmniConnectorRuntimeMixin:
         self._pending_save_reqs: dict[str, deque] = {}
         self._pending_save_counts: dict[str, int] = defaultdict(int)
         self._deferred_send_cleanup: set[str] = set()
+        self._connector_send_error_sink: Callable[[BaseException], None] | None = None
         # -- per-cycle output accumulator --
         self._chunk_ready_req_ids: set[str] = set()
         self._chunk_finished_req_ids: set[str] = set()
@@ -247,6 +273,9 @@ class _OmniConnectorRuntimeMixin:
         self._local_stage_payload_cache: dict[str, dict[str, Any]] = {}
         # Lightweight scheduling metadata pending delivery to the Scheduler.
         self._local_request_metadata: dict[str, dict[str, Any]] = {}
+        # Optional same-process control-plane fast path. Payload tensors remain
+        # runner-owned; only OmniConnectorOutput readiness is published.
+        self._omni_connector_output_sink: Callable[[OmniConnectorOutput], None] | None = None
 
         # -- persistent set of request IDs whose chunk stream is complete --
         # Prevents re-registration after the finish sentinel has been received.
@@ -270,6 +299,7 @@ class _OmniConnectorRuntimeMixin:
         self._kv_triggered_requests: set[str] = set()
 
         self._lock = threading.Lock()
+        self._omni_connector_output_drain_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._work_available = threading.Event()
 
@@ -364,6 +394,7 @@ class _OmniConnectorRuntimeMixin:
                 self._put_req_chunk.pop(k, None)
                 self._send_side_request_payload.pop(k, None)
                 self._code_prompt_token_ids.pop(k, None)
+                getattr(self, "_qwen3_tts_emitted_frames", {}).pop(k, None)
                 self._cached_ic.pop(k, None)
                 self._ramp_chunk_count.pop(k, None)
                 self._adaptive_states.pop(k, None)
@@ -384,6 +415,10 @@ class _OmniConnectorRuntimeMixin:
         self._cleanup_recv_delivery_state(req_id)
 
     def _drop_send_side_payload_state(self, req_id: str, ext_id: str | None) -> None:
+        watermark = getattr(self, "_qwen3_tts_emitted_frames", {})
+        watermark.pop(req_id, None)
+        if ext_id is not None:
+            watermark.pop(ext_id, None)
         if ext_id is not None:
             self._send_side_request_payload.pop(ext_id, None)
             self._cached_ic.pop(ext_id, None)
@@ -594,31 +629,12 @@ class _OmniConnectorRuntimeMixin:
 
         return None, None
 
-    @staticmethod
-    def _is_connector_payload_builder(func: Any) -> bool:
+    @classmethod
+    def _is_connector_payload_builder(cls, func: Any) -> bool:
         """Whether *func* matches the mixin payload-builder contract."""
-        try:
-            signature = inspect.signature(func)
-        except (TypeError, ValueError):
-            return False
+        return cls._connector_payload_kwarg(func) is not None
 
-        params = signature.parameters
-        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
-            return True
-
-        required = {"transfer_manager", "pooling_output", "request"}
-        supported = {
-            name
-            for name, param in params.items()
-            if param.kind
-            in (
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                inspect.Parameter.KEYWORD_ONLY,
-            )
-        }
-        return required.issubset(supported)
-
-    def _resolve_external_req_id(self, request: Any, fallback_req_id: str) -> str:
+    def _resolve_external_req_id(self, request: Any, fallback_req_id: str | None) -> str:
         """Resolve the external request ID consistently.
 
         Checks ``_request_ids_mapping`` first (populated by
@@ -626,7 +642,7 @@ class _OmniConnectorRuntimeMixin:
         ``external_req_id`` attribute, and finally to the given
         ``fallback_req_id``.
         """
-        mapped = self._request_ids_mapping.get(fallback_req_id)
+        mapped = self._request_ids_mapping.get(fallback_req_id) if fallback_req_id is not None else None
         if mapped is not None:
             return mapped
         if request is not None:
@@ -634,6 +650,8 @@ class _OmniConnectorRuntimeMixin:
             ext = getattr(request, "external_req_id", None)
             if ext is not None:
                 return ext
+        if fallback_req_id is None:
+            raise ValueError("Connector request has neither an external nor an internal request ID")
         return fallback_req_id
 
     def _resolve_next_stage_id(self, model_config: Any) -> int:
@@ -1073,3 +1091,67 @@ class _OmniConnectorRuntimeMixin:
     ) -> str:
         """Build connector key that includes rank info for KV transfers."""
         return f"{req_id}_{from_stage}_{chunk_id}_{from_rank}_{to_rank}"
+
+    @staticmethod
+    def _connector_payload_kwarg(func: Any) -> str | None:
+        """Resolve the model output argument used by a connector builder.
+
+        Full-payload builders historically name it ``pooling_output`` while
+        async-chunk builders name it ``multimodal_output``. Both represent the
+        runner-owned per-step inter-stage payload and share the same transport
+        contract.
+        """
+        if func is None:
+            return None
+        try:
+            signature = inspect.signature(func)
+        except (TypeError, ValueError):
+            return None
+
+        params = signature.parameters
+        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+            return "pooling_output"
+
+        supported = {
+            name
+            for name, param in params.items()
+            if param.kind
+            in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        }
+        if not {"transfer_manager", "request"}.issubset(supported):
+            return None
+        if "pooling_output" in supported:
+            return "pooling_output"
+        if "multimodal_output" in supported:
+            return "multimodal_output"
+        return None
+
+    @staticmethod
+    def _load_custom_batch_func(custom_process_func: Any | None) -> Any | None:
+        """Resolve an optional ``<scalar_builder>_batch`` peer."""
+        if custom_process_func is None:
+            return None
+        module_name = getattr(custom_process_func, "__module__", None)
+        func_name = getattr(custom_process_func, "__name__", None)
+        if not module_name or not func_name:
+            return None
+        try:
+            module = importlib.import_module(module_name)
+            batch_func = getattr(module, f"{func_name}_batch", None)
+        except ImportError:
+            logger.debug(
+                "Could not import batch connector payload builder for %s.%s",
+                module_name,
+                func_name,
+                exc_info=True,
+            )
+            return None
+        return batch_func if callable(batch_func) else None
+
+    def _create_send_completion(self, *, request_id: str, put_key: str) -> Any:
+        """Create a delivery completion; MRv2 overrides this with a ticket."""
+        del request_id, put_key
+        return _SendCompletion()

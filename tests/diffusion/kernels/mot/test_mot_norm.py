@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # ruff: noqa: N803, E741
 """Layer-level correctness & performance test for MoTRMSNorm.
 
@@ -20,7 +23,7 @@ import torch
 from vllm import ir
 from vllm.config import VllmConfig, set_current_vllm_config
 
-from vllm_omni.diffusion.layers.mot.mot_layernorm import MoTRMSNorm
+from vllm_omni.diffusion.models.bagel.mot.mot_layernorm import MoTRMSNorm
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.gpu]
 

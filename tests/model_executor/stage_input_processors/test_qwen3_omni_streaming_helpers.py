@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for Qwen3-Omni streaming thinker→talker / talker→codec helpers (PR #2581)."""
 
 from __future__ import annotations
@@ -356,7 +356,7 @@ def test_accumulator_concat_default_when_no_replace_keys() -> None:
     class _StubMixin(OmniConnectorModelRunnerMixin):
         def __init__(self):
             self._pending_full_payload_send = {}
-            self._full_payload_replace_keys_cached = frozenset()
+            self._full_payload_replace_keys_cached: frozenset[str] = frozenset()
 
     stub = _StubMixin()
     stub.accumulate_full_payload_output(
@@ -413,51 +413,6 @@ def test_covo_audio_llm2code2wav_full_payload_smoke() -> None:
     assert payload is not None
     assert payload["codes"]["audio"] == [5, 6]
     assert payload["meta"]["finished"].item() is True
-
-
-def test_dynin_omni_token_only_smoke() -> None:
-    """Smoke: dynin_omni token-only builders return placeholders."""
-    from vllm_omni.model_executor.stage_input_processors.dynin_omni import (
-        token2text_to_token2image_token_only,
-    )
-
-    class _Out:
-        def __init__(self, tids, mm=None):
-            self.token_ids = tids
-            self.multimodal_output = mm
-
-    class _Wrapper:
-        def __init__(self, tids, mm=None):
-            self.outputs = [_Out(tids, mm)]
-            self.request_id = "r0"
-
-    class _Stage:
-        def __init__(self, outs):
-            self.engine_outputs = outs
-
-    src = [_Wrapper([10, 11, 12])]
-    out = token2text_to_token2image_token_only([_Stage(src)], [0])
-    assert len(out) == 1
-    assert len(out[0]["prompt_token_ids"]) == 3
-    assert out[0]["additional_information"] is None
-
-
-def test_dynin_omni_full_payload_smoke() -> None:
-    """Smoke: dynin_omni producer-side payload builder returns nested OmniPayload + carries metadata."""
-    from types import SimpleNamespace
-
-    from vllm_omni.model_executor.stage_input_processors.dynin_omni import (
-        token2text_to_token2image_full_payload,
-    )
-
-    pooling = {"token_ids": [1, 2, 3]}
-    req = SimpleNamespace(output_token_ids=[], additional_information={"speaker": ["alice"]})
-    payload = token2text_to_token2image_full_payload(None, pooling, req)
-    assert payload is not None
-    assert payload["codes"]["audio"] == [1, 2, 3]
-    assert payload["meta"]["finished"].item() is True
-    # additional_information is normalized + carried forward (speaker stays list-wrapped).
-    assert payload.get("speaker") == ["alice"]
 
 
 def test_qwen2_5_omni_talker2code2wav_token_only_smoke() -> None:

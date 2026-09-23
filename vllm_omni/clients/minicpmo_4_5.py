@@ -13,7 +13,7 @@ __all__ = ["create_duplex_session_config"]
 
 def create_duplex_session_config(*, ref_audio: str | None = None, **overrides: object) -> SessionConfig:
     """Session preset matching the MiniCPM-o 4.5 native duplex deployment."""
-    extra_body: dict[str, object] = {"native_duplex": True, "force_listen_count": 0}
+    extra_body: dict[str, object] = {"force_listen_count": 0}
     extra_body.update(overrides.pop("extra_body", {}))
     config = SessionConfig(
         ref_audio=ref_audio,

@@ -7,7 +7,9 @@
 # https://github.com/feifeibear/long-context-attention/blob/main/yunchang/attention/layer.py
 
 
+from collections.abc import Mapping
 from dataclasses import replace
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -16,7 +18,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
@@ -83,6 +85,10 @@ class Attention(nn.Module):
         custom_attention: nn.Module | None = None,
         # Preserve dense FP32 inference for models opting into CUDA auto fallback.
         allow_fp32_fallback: bool = False,
+        # Model-owned implementation subclasses, keyed by backend name.
+        # Keep the platform-selected backend and its capabilities unchanged.
+        # Each override must preserve the selected implementation's contract.
+        impl_overrides: Mapping[str, type[AttentionImpl]] | None = None,
     ):
         super().__init__()
 
@@ -181,8 +187,18 @@ class Attention(nn.Module):
                 self.backend_pref = attn_backend_cls.get_name()
                 logger.debug("Attention(role=%s) → platform default (%s)", role, self.backend_pref)
 
-            self.attn_backend = attn_backend_cls
+            self.attn_backend: type[AttentionBackend] | None = attn_backend_cls
             self.attn_impl_cls = self.attn_backend.get_impl_cls()
+            if impl_overrides is not None:
+                override = impl_overrides.get(attn_backend_cls.get_name())
+                if override is not None:
+                    if not issubclass(override, self.attn_impl_cls):
+                        raise TypeError(
+                            f"Attention implementation override {override.__qualname__} must subclass "
+                            f"the selected implementation {self.attn_impl_cls.__qualname__} "
+                            f"for backend {attn_backend_cls.__qualname__}"
+                        )
+                    self.attn_impl_cls = override
             self.attention = self.attn_impl_cls(
                 num_heads=num_heads,
                 head_size=head_size,
@@ -197,7 +213,7 @@ class Attention(nn.Module):
             )
             # Compatibility kernels run inside shared dispatch, between the
             # parallel strategy's input preparation and output restoration.
-            self.sdpa_fallback = SDPABackend.get_impl_cls()(
+            self.sdpa_fallback: AttentionImpl | None = SDPABackend.get_impl_cls()(
                 num_heads=num_heads,
                 head_size=head_size,
                 softmax_scale=softmax_scale,
@@ -299,12 +315,13 @@ class Attention(nn.Module):
     def _init_kv_cache_quantization(self, config) -> None:
         if config is None or self._has_custom_attention:
             return
+        assert self.attn_backend is not None
         dtype = getattr(config, "diffusion_kv_cache_dtype", None)
         if dtype == "auto":
             dtype = None
         parallel_config = getattr(config, "parallel_config", None)
         ring_degree = getattr(parallel_config, "ring_degree", 1)
-        if dtype:
+        if dtype and dtype != "float":
             if ring_degree > 1:
                 raise ValueError(
                     "KV quantization is not compatible with ring attention "
@@ -321,13 +338,15 @@ class Attention(nn.Module):
         self._kv_cache_dtype = dtype
         self._kv_cache_skip_steps = getattr(config, "diffusion_kv_cache_skip_step_indices", None)
         self._kv_cache_skip_layers = getattr(config, "diffusion_kv_cache_skip_layer_indices", None)
+        if self._kv_cache_skip_layers and self.layer_idx is None and not self._disable_kv_quant:
+            raise ValueError("Attention quantization skip_layers requires a parseable transformer block index.")
 
     def _should_apply_kv_cache_quant(self) -> bool:
         skip_steps = self._kv_cache_skip_steps
         skip_layers = self._kv_cache_skip_layers
         if skip_steps is not None:
             step_idx = get_forward_context().denoise_step_idx if is_forward_context_available() else None
-            if step_idx is not None and step_idx in skip_steps:
+            if skip_steps and (step_idx is None or step_idx in skip_steps):
                 return False
         if skip_layers is not None:
             if self.layer_idx is not None and self.layer_idx in skip_layers:
@@ -335,18 +354,21 @@ class Attention(nn.Module):
         return True
 
     def _with_kv_cache_dtype(self, attn_metadata: AttentionMetadata | None) -> AttentionMetadata | None:
-        kv_cache_dtype = self._kv_cache_dtype
-        if kv_cache_dtype is None or self._disable_kv_quant or not self._should_apply_kv_cache_quant():
-            if attn_metadata is None or "kv_cache_dtype" not in attn_metadata.extra:
-                return attn_metadata
-            extra = dict(attn_metadata.extra)
-            extra.pop("kv_cache_dtype", None)
-            return replace(attn_metadata, extra=extra)
-
+        disabled = self._disable_kv_quant or not self._should_apply_kv_cache_quant()
+        dtype = self._kv_cache_dtype
+        if dtype in (None, "float"):
+            dtype = None
+        elif disabled:
+            dtype = "float"
+        if dtype is None and (attn_metadata is None or "kv_cache_dtype" not in attn_metadata.extra):
+            return attn_metadata
+        extra = dict(attn_metadata.extra) if attn_metadata is not None else {}
+        # Recompute per forward so shared metadata cannot retain another step's policy.
+        extra.pop("kv_cache_dtype", None)
+        if dtype is not None:
+            extra["kv_cache_dtype"] = dtype
         if attn_metadata is None:
-            return AttentionMetadata(extra={"kv_cache_dtype": kv_cache_dtype})
-        extra = dict(attn_metadata.extra)
-        extra["kv_cache_dtype"] = kv_cache_dtype
+            return AttentionMetadata(extra=extra) if extra else None
         return replace(attn_metadata, extra=extra)
 
     def forward(
@@ -400,6 +422,7 @@ class Attention(nn.Module):
             )
         use_paged_attention = paged_adapter is not None and self.paged_kv_cache_role is not None
         if use_paged_attention and not getattr(self.attn_backend, "supports_paged_kv", False):
+            assert self.attn_backend is not None
             raise NotImplementedError(
                 f"Diffusion paged KV requires an Omni backend with paged support; "
                 f"selected {self.attn_backend.get_name()}"
@@ -496,7 +519,7 @@ class Attention(nn.Module):
 
     def _run_local_attention(self, query, key, value, attn_metadata):
         if self._has_custom_attention:
-            return self.attention(query, key, value, attn_metadata)
+            return cast(nn.Module, self.attention)(query, key, value, attn_metadata)
 
         self._assert_metadata_compatible(attn_metadata)
 
@@ -506,7 +529,7 @@ class Attention(nn.Module):
             and query.dtype == torch.float32
             and query.ndim == 4
             and not self.backend_explicit
-            and self.attn_backend.get_name() == "FLASH_ATTN"
+            and cast(type[AttentionBackend], self.attn_backend).get_name() == "FLASH_ATTN"
             and (
                 attn_metadata is None
                 or (
@@ -519,7 +542,7 @@ class Attention(nn.Module):
             )
         ):
             logger.warning_once("Using SDPA for this layer's FP32 input with automatic CUDA FlashAttention selection.")
-            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+            return cast(AttentionImpl, self.sdpa_fallback).forward(query, key, value, attn_metadata)
 
         in_kv_memory_profile = is_forward_context_available() and get_forward_context().in_diffusion_kv_memory_profile
         # The startup KV-capacity profile needs tensor shapes, not a paged
@@ -531,14 +554,14 @@ class Attention(nn.Module):
             self._scheduler_paged_kv
             and self.paged_kv_cache_role is not None
             and in_kv_memory_profile
-            and self.attn_backend.get_name() == "FLASH_ATTN"
+            and cast(type[AttentionBackend], self.attn_backend).get_name() == "FLASH_ATTN"
             and not current_omni_platform.supports_diffusion_dense_flash_attention()
         ):
             logger.warning_once(
                 "The startup KV memory profile is using SDPA because dense FLASH_ATTN is unavailable. "
                 "Formal paged requests still use the platform-native paged attention backend."
             )
-            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+            return cast(AttentionImpl, self.sdpa_fallback).forward(query, key, value, attn_metadata)
 
         return self.attention.forward(query, key, value, attn_metadata)
 

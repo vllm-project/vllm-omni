@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -168,7 +167,7 @@ def _extract_frames(path: str | Path, timestamps: list[float]) -> list[bytes]:
     for timestamp in timestamps:
         try:
             frame = extract_jpeg(path, timestamp=timestamp)
-        except (OSError, subprocess.CalledProcessError, ValueError):
+        except (OSError, ValueError):
             continue
         if frame.startswith(b"\xff\xd8"):
             frames.append(frame)

@@ -14,7 +14,10 @@ Scenario (see ``barge_in_client_flow.md`` for the diagram)
 
 The demo is model-neutral: it drives any duplex model through the public
 :class:`vllm_omni.clients.duplex.DuplexClient` over
-``/v1/realtime?duplex=1``. Model-specific session shape comes from the
+``/v1/realtime?duplex=1``, or — with ``--inline`` — through
+:class:`vllm_omni.clients.inline_duplex.InlineDuplexClient` on an in-process
+:class:`vllm_omni.entrypoints.duplex_omni.DuplexOmni` (no server needed; the
+model loads in this process). Model-specific session shape comes from the
 per-model presets under ``vllm_omni.clients.<model>`` selected with
 ``--preset`` (default ``minicpmo_4_5``, whose model decides listen/speak on
 its own — no VAD).
@@ -30,6 +33,15 @@ then:
         --question-wav question_16k.wav \
         --interrupt-wav follow_up_16k.wav \
         --output-dir ./duplex_out
+
+or, without a server, in-process (``--deploy-config`` is optional and defaults
+to the model's bundled duplex profile):
+
+    python barge_in_client.py --inline \
+        --model /path/to/MiniCPM-o-4_5 \
+        --ref-audio /path/to/reference_voice.wav \
+        --question-wav question_16k.wav \
+        --interrupt-wav follow_up_16k.wav
 
 Input WAVs must be mono 16 kHz PCM16; when a preset's session takes a
 different capture format (the PersonaPlex preset streams 24 kHz float32),
@@ -55,6 +67,7 @@ if str(REPO_ROOT) not in sys.path:
 from vllm_omni.clients.duplex import (  # noqa: E402
     AudioFormat,
     DuplexClient,
+    DuplexClientBase,
     EventCollector,
     SessionConfig,
     acknowledge_collected_playback,
@@ -139,6 +152,39 @@ def _fold_responses(collector: EventCollector) -> dict[str, dict[str, object]]:
     return out
 
 
+def _make_client(args: argparse.Namespace, config: SessionConfig) -> DuplexClientBase:
+    """Websocket client by default; ``--inline`` drives an in-process DuplexOmni."""
+    if not args.inline:
+        return DuplexClient(
+            args.url,
+            model=args.model,
+            config=config,
+            reconnect=None,
+            heartbeat_interval_s=None,
+            handshake_timeout_s=args.timeout_s,
+        )
+    # Imported lazily: the in-process path loads the model (and its engine
+    # dependencies) in this process, which the websocket path never needs.
+    from vllm_omni.clients.inline_duplex import InlineDuplexClient
+    from vllm_omni.entrypoints.duplex_omni import DuplexOmni
+
+    # Models shipped with custom HF code (MiniCPM-o) need trust_remote_code to
+    # resolve their pipeline; harmless for the others.
+    omni_kwargs: dict[str, object] = {"model": args.model, "trust_remote_code": True}
+    if args.deploy_config:
+        omni_kwargs["deploy_config"] = args.deploy_config
+    omni = DuplexOmni(**omni_kwargs)
+    client = InlineDuplexClient(
+        omni,
+        model=args.model,
+        config=config,
+        handshake_timeout_s=args.timeout_s,
+    )
+    # The client owns no engine; stop the in-process one when the run ends.
+    client.owned_omni = omni  # type: ignore[attr-defined]
+    return client
+
+
 async def run(args: argparse.Namespace) -> int:
     config = _session_config(args.preset, ref_audio_path=args.ref_audio)
     question = _convert_to_session_format(read_pcm16_wav(Path(args.question_wav)), config.input_audio)
@@ -148,105 +194,117 @@ async def run(args: argparse.Namespace) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     collector = EventCollector()
-    client = DuplexClient(
-        args.url,
-        model=args.model,
-        config=config,
-        reconnect=None,
-        heartbeat_interval_s=None,
-        handshake_timeout_s=args.timeout_s,
-    )
+    client = _make_client(args, config)
     # GREET: open the voice session (handshake happens on enter).
-    async with client:
-        consume_task = asyncio.create_task(collector.consume(client))
+    try:
+        async with client:
+            consume_task = asyncio.create_task(collector.consume(client))
 
-        # ASK: stream the question at realtime pace, then commit the turn.
-        # The model decides on its own to answer (no VAD).
-        print("[1] streaming question ...", file=sys.stderr)
-        await client.stream_pcm(question, chunk_ms=chunk_ms)
-        await client.commit(create_response=False)
-        await wait_for_condition(
-            lambda: collector.count("response.created") > 0,
-            timeout_s=args.timeout_s,
-            label="first response.created",
-        )
-        print("[1] assistant is answering", file=sys.stderr)
+            # ASK: stream the question at realtime pace, then commit the turn.
+            # The model decides on its own to answer (no VAD).
+            print("[1] streaming question ...", file=sys.stderr)
+            await client.stream_pcm(question, chunk_ms=chunk_ms)
+            await client.commit(create_response=False)
+            await wait_for_condition(
+                lambda: collector.count("response.created") > 0,
+                timeout_s=args.timeout_s,
+                label="first response.created",
+            )
+            print("[1] assistant is answering", file=sys.stderr)
 
-        # Let the answer play for a moment, as a listening user would.
-        await asyncio.sleep(args.listen_s)
+            # Let the answer play for a moment, as a listening user would.
+            await asyncio.sleep(args.listen_s)
 
-        # INTERRUPT: talk over the assistant while its audio still streams.
-        # The serving overlap policy decides: enough overlapped speech barges
-        # in (the first response is cancelled) or a short remark is deferred
-        # until the model yields the turn.
-        print("[2] interrupting mid-answer ...", file=sys.stderr)
-        ids_before_interrupt = set(collector.response_ids)
-        await client.stream_pcm(interrupt, chunk_ms=chunk_ms)
-        await client.commit(create_response=False)
+            # INTERRUPT: talk over the assistant while its audio still streams.
+            # The serving overlap policy decides: enough overlapped speech barges
+            # in (the first response is cancelled) or a short remark is deferred
+            # until the model yields the turn.
+            print("[2] interrupting mid-answer ...", file=sys.stderr)
+            ids_before_interrupt = set(collector.response_ids)
+            await client.stream_pcm(interrupt, chunk_ms=chunk_ms)
+            await client.commit(create_response=False)
 
-        # ANSWER AGAIN: wait for a response created *after* the interruption
-        # to finish. The first answer may still be streaming here; matching on
-        # any response.done would let its completion satisfy the wait and cut
-        # off the actual follow-up answer at close.
-        def follow_up_answer_done() -> bool:
-            return any(
-                event.get("type") == "response.done"
-                and collector.response_id(event) is not None
-                and collector.response_id(event) not in ids_before_interrupt
-                for event in collector.events
+            # ANSWER AGAIN: wait for a response created *after* the interruption
+            # to finish. The first answer may still be streaming here; matching on
+            # any response.done would let its completion satisfy the wait and cut
+            # off the actual follow-up answer at close.
+            def follow_up_answer_done() -> bool:
+                return any(
+                    event.get("type") == "response.done"
+                    and collector.response_id(event) is not None
+                    and collector.response_id(event) not in ids_before_interrupt
+                    for event in collector.events
+                )
+
+            await wait_for_condition(
+                follow_up_answer_done,
+                timeout_s=args.timeout_s,
+                label="response.done for the response answering the interruption",
             )
 
-        await wait_for_condition(
-            follow_up_answer_done,
-            timeout_s=args.timeout_s,
-            label="response.done for the response answering the interruption",
-        )
+            # HANG UP: report playback, close the session cleanly.
+            await acknowledge_collected_playback(client, collector)
+            await client.close(timeout_s=args.timeout_s)
+            try:
+                await asyncio.wait_for(consume_task, timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                consume_task.cancel()
 
-        # HANG UP: report playback, close the session cleanly.
-        await acknowledge_collected_playback(client, collector)
-        await client.close(timeout_s=args.timeout_s)
-        try:
-            await asyncio.wait_for(consume_task, timeout=5.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            consume_task.cancel()
-
-    # Report: one WAV per response; statuses show what the overlap did.
-    responses = _fold_responses(collector)
-    summary: list[dict[str, object]] = []
-    for index, (response_id, item) in enumerate(responses.items(), start=1):
-        audio = item["audio"]
-        assert isinstance(audio, bytes)
-        sample_rate_hz = int(item["sample_rate_hz"])  # type: ignore[arg-type]
-        wav_path = output_dir / f"response_{index}_{item['status']}.wav"
-        if audio:
-            write_pcm16_wav(wav_path, audio, sample_rate_hz=sample_rate_hz)
-        summary.append(
-            {
-                "response_id": response_id,
-                "status": item["status"],
-                "audio_s": round(len(audio) / (sample_rate_hz * 2), 2),
-                "text": item["text"],
-                "wav": wav_path.name if audio else None,
-            }
+        # Report: one WAV per response; statuses show what the overlap did.
+        responses = _fold_responses(collector)
+        summary: list[dict[str, object]] = []
+        for index, (response_id, item) in enumerate(responses.items(), start=1):
+            audio = item["audio"]
+            assert isinstance(audio, bytes)
+            sample_rate_hz = int(item["sample_rate_hz"])  # type: ignore[arg-type]
+            wav_path = output_dir / f"response_{index}_{item['status']}.wav"
+            if audio:
+                write_pcm16_wav(wav_path, audio, sample_rate_hz=sample_rate_hz)
+            summary.append(
+                {
+                    "response_id": response_id,
+                    "status": item["status"],
+                    "audio_s": round(len(audio) / (sample_rate_hz * 2), 2),
+                    "text": item["text"],
+                    "wav": wav_path.name if audio else None,
+                }
+            )
+        (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False))
+        (output_dir / "events.jsonl").write_text(
+            "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in collector.events),
+            encoding="utf-8",
         )
-    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False))
-    (output_dir / "events.jsonl").write_text(
-        "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in collector.events),
-        encoding="utf-8",
-    )
-    print(json.dumps(summary, indent=2, ensure_ascii=False))
-    cancelled = sum(1 for item in summary if item["status"] == "cancelled")
-    print(
-        f"\n{len(summary)} responses ({cancelled} interrupted); outputs in {output_dir}",
-        file=sys.stderr,
-    )
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        cancelled = sum(1 for item in summary if item["status"] == "cancelled")
+        print(
+            f"\n{len(summary)} responses ({cancelled} interrupted); outputs in {output_dir}",
+            file=sys.stderr,
+        )
+    finally:
+        owned_omni = getattr(client, "owned_omni", None)
+        if owned_omni is not None:
+            owned_omni.shutdown()
     return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--url", default="ws://127.0.0.1:8099/v1/realtime")
-    parser.add_argument("--model", default="openbmb/MiniCPM-o-4_5")
+    parser.add_argument(
+        "--model",
+        default="openbmb/MiniCPM-o-4_5",
+        help="served model name, or the model path with --inline",
+    )
+    parser.add_argument(
+        "--inline",
+        action="store_true",
+        help="run the model in this process through DuplexOmni + InlineDuplexClient instead of connecting to --url",
+    )
+    parser.add_argument(
+        "--deploy-config",
+        default=None,
+        help="deploy YAML for --inline (default: the model's bundled profile)",
+    )
     parser.add_argument(
         "--preset",
         choices=["minicpmo_4_5", "personaplex", "none"],

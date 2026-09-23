@@ -26,11 +26,10 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_realtime_client_builds_explicit_native_duplex_url():
+def test_realtime_client_removes_obsolete_duplex_url_parameters():
     url = build_realtime_url(
         "ws://localhost:8099/v1/realtime?custom=1&duplex=0&model=stale&native_duplex=0&session_id=stale",
         "openbmb/MiniCPM-o-4_5",
-        session_id="session-a",
     )
 
     query = parse_qs(urlsplit(url).query)
@@ -38,8 +37,6 @@ def test_realtime_client_builds_explicit_native_duplex_url():
         "custom": ["1"],
         "duplex": ["1"],
         "model": ["openbmb/MiniCPM-o-4_5"],
-        "native_duplex": ["1"],
-        "session_id": ["session-a"],
     }
 
 
@@ -56,16 +53,28 @@ def test_seed_tts_initial_text_is_part_of_native_duplex_context():
     )
 
 
-def test_realtime_client_builds_resume_only_url_when_autostart_disabled():
+@pytest.mark.parametrize("scheme, expected_scheme", [("http", "ws"), ("https", "wss"), ("ws", "ws"), ("wss", "wss")])
+def test_realtime_client_preserves_resume_url(scheme, expected_scheme):
     url = build_realtime_url(
-        "ws://localhost:8099/v1/realtime?duplex=1&autostart=1",
-        "openbmb/MiniCPM-o-4_5",
+        f"{scheme}://localhost:8099/v1/realtime?model=existing&resume=1&custom=&autostart=1#fragment",
+        None,
         autostart=False,
     )
 
-    query = parse_qs(urlsplit(url).query)
-    assert query["autostart"] == ["0"]
-    assert query["native_duplex"] == ["1"]
+    parts = urlsplit(url)
+    assert (parts.scheme, parts.netloc, parts.path, parts.fragment) == (
+        expected_scheme,
+        "localhost:8099",
+        "/v1/realtime",
+        "fragment",
+    )
+    assert parse_qs(parts.query, keep_blank_values=True) == {
+        "model": ["existing"],
+        "resume": ["1"],
+        "custom": [""],
+        "duplex": ["1"],
+        "autostart": ["0"],
+    }
 
 
 @pytest.mark.asyncio
@@ -90,6 +99,8 @@ async def test_realtime_client_configure_omits_ref_audio_by_default():
     session = client.sent[0]["session"]
     assert "ref_audio" not in session
     assert session["idle_timeout_s"] == 900
+    assert "session_id" not in session
+    assert session["extra_body"] == {"auto_response": True, "force_listen_count": 0}
 
 
 @pytest.mark.asyncio
@@ -209,7 +220,7 @@ async def test_realtime_client_configure_sends_seed_tts_text_condition():
 
 
 @pytest.mark.asyncio
-async def test_realtime_client_configure_explicit_tts_opts_out_of_native_duplex():
+async def test_realtime_client_configure_disables_auto_response_without_obsolete_opt_in():
     class Client(RealtimeDuplexClient):
         def __init__(self):
             super().__init__("ws://unused")
@@ -220,20 +231,22 @@ async def test_realtime_client_configure_explicit_tts_opts_out_of_native_duplex(
             self.events.add({"type": "session.created"})
 
     client = Client()
+    extra_body = {"ref_audio": "data:audio/wav;base64,AAAA", "native_duplex": False}
 
     await client.configure(
         "openbmb/MiniCPM-o-4_5",
-        native_duplex=False,
         auto_response=False,
-        extra_body={"ref_audio": "data:audio/wav;base64,AAAA"},
+        extra_body=extra_body,
         timeout_s=1,
     )
 
     session_extra_body = client.sent[0]["session"]["extra_body"]
     assert session_extra_body == {
         "ref_audio": "data:audio/wav;base64,AAAA",
-        "native_duplex": False,
+        "auto_response": False,
+        "force_listen_count": 0,
     }
+    assert extra_body == {"ref_audio": "data:audio/wav;base64,AAAA", "native_duplex": False}
 
 
 def test_realtime_event_collector_partitions_audio_by_response():

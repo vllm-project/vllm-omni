@@ -417,6 +417,63 @@ def test_collect_duplex_session_metrics_matches_omniinteract_window():
     assert report["duplex_stream_ttfp_ms"]["mean"] == 300.0
 
 
+def test_collect_duplex_session_metrics_keeps_all_engine_stages():
+    collector = EventCollector()
+    audio = {
+        "type": "response.output_audio.delta",
+        "response_id": "r1",
+        "format": "pcm16",
+        "delta": base64.b64encode(bytes((1, 0)) * 2400).decode(),
+        "sample_rate_hz": 24_000,
+        "metadata": {
+            "audio_duration_ms": 100,
+            "vllm_omni": {
+                "stage_metrics": {
+                    "0": {
+                        "final_output_type": "text",
+                        "num_tokens_out": 4,
+                        "vllm_ttft_ms": 12.0,
+                        "vllm_tpot_ms": 3.0,
+                        "vllm_itls_ms": [3.0],
+                    },
+                    "1": {
+                        "output_unit_type": "stream",
+                        "output_unit_count": 8,
+                        "serving_time_to_first_output_ms": 40.0,
+                        "time_per_output_unit_ms": 5.0,
+                        "inter_output_latencies_ms": [5.0],
+                    },
+                    "2": {
+                        "final_output_type": "audio",
+                        "serving_time_to_first_output_ms": 80.0,
+                    },
+                }
+            },
+        },
+    }
+    collector.add({"type": "response.created", "response": {"id": "r1"}}, received_at_s=10.1)
+    collector.add(
+        {"type": "response.output_text.delta", "response_id": "r1", "delta": "Done."},
+        received_at_s=10.2,
+    )
+    collector.add(audio, received_at_s=10.3)
+    collector.add({"type": "response.done", "response": {"id": "r1"}}, received_at_s=10.4)
+    bundle = collect_duplex_session_metrics(collector, stream_start=10.0, session_id="sample")
+    stages = bundle.request_metrics[0]["stages"]
+    assert list(stages) == ["0", "1", "2"]
+    assert stages["0"] == bundle.request_metrics[0]["stage0_tokens"]
+    assert stages["1"]["ttfc_ms"] == 40.0
+    assert stages["1"]["tpop_ms"] == 5.0
+    assert stages["2"]["ttfp_ms"] == 80.0
+    assert bundle.session_metrics["stages"]["0"]["tpot_ms"]["mean"] == 3.0
+    assert bundle.session_metrics["stages"]["2"]["ttfp_ms"]["mean"] == 80.0
+    report = build_duplex_metrics_report(
+        request_metrics=bundle.request_metrics,
+        session_metrics=[bundle.session_metrics],
+    )
+    assert "duplex_stream_stages" not in report
+
+
 def test_judge_exercises_openai_http_schema():
     requests = []
 

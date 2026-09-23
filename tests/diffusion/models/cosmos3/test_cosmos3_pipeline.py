@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
 import json
 import sys
 import types
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -85,6 +86,7 @@ class StubScheduler:
         flow_shift: float = 1.0,
     ) -> None:
         self.timesteps = torch.tensor(timesteps or [9, 3], dtype=torch.int64)
+        self.sigmas = self.timesteps.float() / 10
         self.config = SimpleNamespace(
             num_train_timesteps=1000,
             flow_shift=flow_shift,
@@ -113,6 +115,7 @@ class StubScheduler:
         else:
             assert num_inference_steps is not None
             self.timesteps = torch.arange(num_inference_steps, 0, -1, dtype=torch.int64, device=device)
+        self.sigmas = self.timesteps.float()
 
     def step(self, noise_pred: torch.Tensor, timestep: torch.Tensor, latents: torch.Tensor, **kwargs):
         del kwargs
@@ -250,7 +253,7 @@ def passthrough_progress_bar(iterable):
 
 @pytest.fixture(autouse=True)
 def fake_cosmos3_guardrails(monkeypatch: pytest.MonkeyPatch):
-    module = types.ModuleType("vllm_omni.diffusion.models.cosmos3.guardrails")
+    module: Any = types.ModuleType("vllm_omni.diffusion.models.cosmos3.guardrails")
     module.is_guardrails_enabled = lambda od_config, sampling_params=None: False
     module.ensure_initialized = lambda od_config: None
     module.check_text_safety = lambda text: None
@@ -283,6 +286,8 @@ def make_cosmos3_pipeline():
         pipeline.is_edge_model = False
         pipeline._guidance_scale = None
         pipeline._num_timesteps = None
+        pipeline._current_step_index = None
+        pipeline._current_sigma = None
         pipeline._cosmos3_branch_caches = None
         pipeline._cache_dit_requires_paired_cfg = False
         pipeline._sound_tokenizer = None
@@ -300,7 +305,7 @@ def sequential_cfg_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def make_sampling_params(**overrides: Any) -> SimpleNamespace:
-    values = {
+    values: dict[str, Any] = {
         "height": None,
         "width": None,
         "num_frames": None,
@@ -814,7 +819,7 @@ def test_pipeline_resolves_scheduler_class_from_checkpoint_file(
     t_list = [1.0, 0.75, 0.5, 0.25]
     scheduler_dir = tmp_path / "scheduler"
     scheduler_dir.mkdir()
-    scheduler_config = {"_class_name": scheduler_class_name}
+    scheduler_config: dict[str, Any] = {"_class_name": scheduler_class_name}
     if expected_distilled:
         scheduler_config["fixed_step_sampler_config"] = {"sample_type": "sde", "t_list": t_list}
     (scheduler_dir / "scheduler_config.json").write_text(json.dumps(scheduler_config))
@@ -1531,7 +1536,7 @@ def test_ir_op_priority_hook_preserves_platform_fields(monkeypatch: pytest.Monke
         fused_add_rms_norm: list[str]
         custom_op: list[str]
 
-    fake_kernel = types.ModuleType("vllm.config.kernel")
+    fake_kernel: Any = types.ModuleType("vllm.config.kernel")
     fake_kernel.IrOpPriorityConfig = FakeIrOpPriorityConfig
     monkeypatch.setitem(sys.modules, fake_kernel.__name__, fake_kernel)
 
@@ -2154,6 +2159,47 @@ def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> N
     torch.testing.assert_close(action_result, torch.full((), 44.0).expand_as(action_result))
 
 
+def test_diffuse_publishes_exact_seacache_metadata_and_cfg_contexts(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.scheduler.sigmas = torch.tensor([0.91, 0.17])
+    observations: list[tuple[str, int | None, float | None, int | None]] = []
+
+    class RecordingHook:
+        @contextmanager
+        def cache_context(self, name: str):
+            sigma = pipeline.current_sigma
+            observations.append(
+                (
+                    name,
+                    pipeline.current_step_index,
+                    None if sigma is None else float(sigma),
+                    pipeline.num_timesteps,
+                )
+            )
+            yield
+
+    pipeline._cache_context_factory = RecordingHook().cache_context
+    pipeline.diffuse(
+        latents=torch.zeros(1, 2, 1, 1, 1),
+        timesteps=torch.tensor([900, 100]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=3.0,
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0},
+    )
+
+    assert observations == [
+        ("cond", 0, pytest.approx(0.91), 2),
+        ("uncond", 0, pytest.approx(0.91), 2),
+        ("cond", 1, pytest.approx(0.17), 2),
+        ("uncond", 1, pytest.approx(0.17), 2),
+    ]
+    assert pipeline.current_step_index is None
+    assert pipeline.current_sigma is None
+
+
 def test_diffuse_drops_session_when_progress_iteration_fails(make_cosmos3_pipeline) -> None:
     pipeline = make_cosmos3_pipeline()
     pipeline._use_session_state = True
@@ -2211,6 +2257,53 @@ def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_
     assert "control_weights" not in pipeline.transformer.calls[1]["kwargs"]
     assert pipeline.transformer.calls[2]["kwargs"]["control_weights"] == [1.0]
     torch.testing.assert_close(result, torch.full_like(latents, 254.0))
+
+
+def test_diffuse_transfer_uses_named_seacache_contexts(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.scheduler.sigmas = torch.tensor([0.42])
+    contexts: list[tuple[str, int | None, float | None, int | None]] = []
+
+    class RecordingHook:
+        @contextmanager
+        def cache_context(self, name: str):
+            sigma = pipeline.current_sigma
+            contexts.append(
+                (
+                    name,
+                    pipeline.current_step_index,
+                    None if sigma is None else float(sigma),
+                    pipeline.num_timesteps,
+                )
+            )
+            yield
+
+    pipeline._cache_context_factory = RecordingHook().cache_context
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    velocity_mask = torch.ones(1, 1, 1, 1, 1)
+    pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([7]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=3.0,
+        control_guidance=1.5,
+        control_guidance_interval=None,
+        control_latents=[torch.zeros_like(latents)],
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "noisy_frame_mask": velocity_mask},
+        velocity_mask=velocity_mask,
+        condition_latents=torch.zeros_like(latents),
+    )
+
+    assert contexts == [
+        ("cond", 0, pytest.approx(0.42), 1),
+        ("cond_no_control", 0, pytest.approx(0.42), 1),
+        ("uncond", 0, pytest.approx(0.42), 1),
+    ]
+    assert pipeline.current_step_index is None
+    assert pipeline.current_sigma is None
 
 
 def test_diffuse_transfer_rejects_session_state_manager(make_cosmos3_pipeline) -> None:
@@ -2583,7 +2676,7 @@ def test_diffuse_keeps_paired_cfg_when_cache_dit_active(make_cosmos3_pipeline) -
 
 class TestForwardRouting:
     def _install_forward_stubs(self, pipeline):
-        captured: dict[str, object] = {"diffuse_calls": [], "prepare_calls": []}
+        captured: dict[str, Any] = {"diffuse_calls": [], "prepare_calls": []}
 
         def fake_format(
             prompt,

@@ -55,20 +55,18 @@ class TestRegistryDeclaration:
         assert pipeline.model_type == _PIPELINE_KEY
         assert pipeline.model_arch == "MiniCPMO45OmniForConditionalGeneration"
 
-    def test_native_duplex_control_is_explicit_without_a_fixed_session_cap(self) -> None:
+    def test_duplex_plugin_is_declared_without_a_fixed_session_cap(self) -> None:
         pipeline = OMNI_PIPELINES[_PIPELINE_KEY]
-        assert pipeline.duplex_control_enabled is True
-        assert pipeline.duplex_serving_adapter == (
-            "vllm_omni.model_executor.models.minicpmo_4_5.duplex.serving_adapter.MiniCPMO45ServingRuntimeAdapter"
+        assert pipeline.duplex_plugin == (
+            "vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin.MiniCPMO45DuplexPlugin"
         )
         assert not hasattr(pipeline, "max_native_duplex_sessions")
 
-    def test_ordinary_pipeline_defaults_to_no_duplex_control(self) -> None:
+    def test_ordinary_pipeline_declares_no_duplex_plugin(self) -> None:
         pipeline = PipelineConfig(
             model_type="ordinary", stages=(StagePipelineConfig(stage_id=0, model_stage="a", final_output=True),)
         )
-        assert pipeline.duplex_control_enabled is False
-        assert pipeline.duplex_serving_adapter is None
+        assert pipeline.duplex_plugin is None
         assert not hasattr(pipeline, "max_native_duplex_sessions")
 
 
@@ -180,7 +178,7 @@ class TestDeployTopology:
                 0.18,
             ]
             assert sum(memory_utilizations) <= 0.9 + 1e-6
-            # Daily-Omni minicpm-interleave: up to 64 image/audio items (+ optional video).
+            # Keep the default Daily-Omni budget; Video-MME overrides stage 0 explicitly.
             assert stages[0].yaml_engine_args["limit_mm_per_prompt"] == {
                 "image": 64,
                 "audio": 64,

@@ -14,6 +14,7 @@ Builder rules:
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 
 import numpy as np
@@ -345,6 +346,8 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     ref_blocks: Sequence[Mapping[str, object]],
     audio_channel: int = 2,
     seq_len: int | None = None,
+    temporal_offset: float = 0.0,
+    media_time_origin: int | None = None,
 ) -> dict[str, object]:
     """General ref2va-family packed layout.
 
@@ -353,12 +356,22 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     - ``{"kind": "audio", "ref_audio_t": T}``
     - ``{"kind": "video"|"video_audio", "ref_audio_t": T,
        "latent_t": RT, "latent_h": RH, "latent_w": RW}``
+    - Internal ``latent_guide``: a final AV condition block on the target's
+      spatial grid and temporal origin, without advancing the reference clock.
 
     Video-bearing blocks pack their audio rows immediately before their video
     rows; both share the same temporal origin and advance by the longer of the
     audio and video spans. Standalone audio advances the target origin by its
     own T, and image blocks advance it by one integer slot.
+
+    ``temporal_offset`` is the window origin in 40-Hz RoPE units. It shifts
+    target AV, reference AV and latent guides together, leaving text, static
+    images, padding and all spatial coordinates unchanged.
     """
+    if not math.isfinite(temporal_offset) or temporal_offset < 0:
+        raise ValueError("temporal_offset must be finite and non-negative")
+    if media_time_origin is not None and media_time_origin < text_len:
+        raise ValueError("media_time_origin must follow the text prefix")
     if not isinstance(ref_blocks, Sequence) or isinstance(ref_blocks, (str, bytes)):
         raise ValueError("ref_blocks must be a sequence")
 
@@ -383,11 +396,15 @@ def minimax_h3_packed_sequence_ref2va_blocks(
             rows = rt * audio_channel
             item = {"kind": kind, "ref_audio_t": rt, "audio_rows": rows}
             ref_audio_rows += rows
-        elif kind in ("video", "video_audio"):
+        elif kind in ("video", "video_audio", "latent_guide"):
             rt = _positive_int(raw, "ref_audio_t", path, allow_zero=True)
             vt = _positive_int(raw, "latent_t", path)
             vh = _positive_int(raw, "latent_h", path)
             vw = _positive_int(raw, "latent_w", path)
+            if kind == "latent_guide" and (
+                index != len(ref_blocks) - 1 or (vh, vw) != (latent_h, latent_w) or vt > latent_t or rt > audio_t
+            ):
+                raise ValueError("latent_guide must be last, match the target canvas, and fit its AV lengths")
             frame_rows = (vh // _PATCH_H) * (vw // _PATCH_W)
             audio_rows = rt * audio_channel
             video_rows = vt * frame_rows
@@ -447,7 +464,7 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     # device-to-host synchronization.
     video_spans: list[dict[str, object]] = []
     for item in block_slices:
-        if item["kind"] in ("video", "video_audio"):
+        if item["kind"] in ("video", "video_audio", "latent_guide"):
             visual_sl = item["visual_sl"]
             assert isinstance(visual_sl, slice)
             video_spans.append(
@@ -485,7 +502,7 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     hh, ww = torch.meshgrid(h_grid, w_grid, indexing="ij")
     target_frame = torch.stack([hh.reshape(-1), ww.reshape(-1)], dim=-1)
 
-    t_cursor = float(text_len)
+    t_cursor = float(text_len if media_time_origin is None else media_time_origin)
     for item in block_slices:
         kind = str(item["kind"])
         if kind == "image":
@@ -567,7 +584,8 @@ def minimax_h3_packed_sequence_ref2va_blocks(
             rv_g[:, :, 0] = _video_t_grid(vt, t_cursor)[:, None]
             rv_g[:, :, 1:] = rv_frame[None]
             g[visual_sl] = rv_g.reshape(-1, 3)
-            t_cursor += max(float(ref_t), _video_t_span(vt))
+            if kind != "latent_guide":
+                t_cursor += max(float(ref_t), _video_t_span(vt))
 
     input_ids[audio_sl] = MINIMAX_H3_AUDIO_ID
     input_ids[audio_sl.start] = MINIMAX_H3_AUDIO_FIRST_ID
@@ -590,6 +608,13 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     video_g[:, :, 0] = _video_t_grid(latent_t, t_cursor)[:, None]
     video_g[:, :, 1:] = target_frame[None]
     g[video_sl] = video_g.reshape(-1, 3)
+
+    if temporal_offset:
+        g[audio_mask, 0] += temporal_offset
+        g[video_sl, 0] += temporal_offset
+        for item in block_slices:
+            if item["kind"] in ("video", "video_audio", "latent_guide"):
+                g[item["visual_sl"], 0] += temporal_offset
 
     target_img_pos = _range_for_slice(video_sl)
     target_audio_pos = _range_for_slice(audio_sl)

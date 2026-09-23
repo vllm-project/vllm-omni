@@ -20,12 +20,14 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     _CODEC_PENALTY_WINDOW,
     _DUPLEX_CODEC_TOKENS_PER_CHUNK,
+    _DUPLEX_TURN_END_CODEC_TOKENS,
     _OFFLINE_CODEC_MAX_NEW_TOKENS,
     _REPETITION_PENALTY_CHUNK_SIZE,
     MiniCPMO45OmniTTSForConditionalGeneration,
     _apply_batched_repetition_penalty,
     _native_duplex_chunk_budget,
     _restore_weight_norm_weight,
+    _turn_end_boundary_eos_masked,
     blank_scheduler_prompt_for_penalties,
 )
 from vllm_omni.utils.mm_outputs import to_payload_element
@@ -453,7 +455,9 @@ def test_sample_leaves_unforced_rows_to_the_sampler(mocker) -> None:
 def test_native_duplex_chunk_budget_masks_eos_until_generate_chunk_is_full() -> None:
     assert _native_duplex_chunk_budget({}) == (_DUPLEX_CODEC_TOKENS_PER_CHUNK, _DUPLEX_CODEC_TOKENS_PER_CHUNK)
     assert _native_duplex_chunk_budget({"turn_start": True}) == (_DUPLEX_CODEC_TOKENS_PER_CHUNK, 0)
-    assert _native_duplex_chunk_budget({"turn_end": True}) == (_DUPLEX_CODEC_TOKENS_PER_CHUNK, 0)
+    # The turn-end chunk drains the owed text: no floor, multi-unit ceiling.
+    assert _native_duplex_chunk_budget({"turn_end": True}) == (_DUPLEX_TURN_END_CODEC_TOKENS, 0)
+    assert _DUPLEX_TURN_END_CODEC_TOKENS > _DUPLEX_CODEC_TOKENS_PER_CHUNK
 
     talker = _make_talker()
     talker._request_audio_states["req-chunk"] = {
@@ -1097,3 +1101,43 @@ def test_request_cleanup_evicts_decode_state() -> None:
 
     assert "req-done" not in talker._request_audio_states
     assert "req-done" not in talker._request_condition_states
+
+
+def test_turn_end_drain_masks_only_the_cadence_eos() -> None:
+    # Early EOS (text spoken before the first boundary) is allowed.
+    assert not _turn_end_boundary_eos_masked(0)
+    assert not _turn_end_boundary_eos_masked(18)
+    assert not _turn_end_boundary_eos_masked(24)
+    # The cadence EOS right after each 25-frame boundary is masked for a short window.
+    assert _turn_end_boundary_eos_masked(25)
+    assert _turn_end_boundary_eos_masked(29)
+    assert not _turn_end_boundary_eos_masked(30)
+    assert not _turn_end_boundary_eos_masked(49)
+    assert _turn_end_boundary_eos_masked(50)
+    assert not _turn_end_boundary_eos_masked(60)
+
+    talker = _make_talker()
+    talker._request_audio_states["req-drain"] = {
+        "finished": False,
+        "step": 25,
+        "max_tokens": _DUPLEX_TURN_END_CODEC_TOKENS,
+        "min_tokens": 0,
+        "turn_end_drain": True,
+    }
+    output = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[{"request_id": "req-drain", "codes": {"audio": torch.empty(0)}}],
+        request_token_spans=[(0, 1)],
+    )
+    logits = talker.compute_logits(output.text_hidden_states)
+    assert logits[0, 7].item() == float("-inf")
+    assert output.multimodal_outputs["meta"]["finished"][0].item() is False
+
+    talker._request_audio_states["req-drain"]["step"] = 30
+    output = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[{"request_id": "req-drain", "codes": {"audio": torch.empty(0)}}],
+        request_token_spans=[(0, 1)],
+    )
+    logits = talker.compute_logits(output.text_hidden_states)
+    assert torch.isfinite(logits[0, 7])

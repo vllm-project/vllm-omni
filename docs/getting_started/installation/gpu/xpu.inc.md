@@ -24,7 +24,7 @@ DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.xpu -t vllm-omni-xpu --shm-s
 ```
 
 This layers vLLM-Omni on top of the published `vllm/vllm-openai-xpu:<VLLM_VERSION>`
-base image, which Docker pulls automatically. To target a different vLLM release,
+base image (v0.30.0 by default), which Docker pulls automatically. To target a different vLLM release,
 pass `--build-arg VLLM_VERSION=<tag>`. If that tag has not been published yet, build
 the base from upstream's own Dockerfile first and point the build at it:
 

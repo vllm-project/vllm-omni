@@ -431,7 +431,13 @@ def test_update_states_carries_prepared_layout() -> None:
     request.prepared_layout = prepared_layout
     scheduler_output = SimpleNamespace(
         finished_req_ids=set(),
-        scheduled_new_reqs=[SimpleNamespace(request_id=request.request_id, req=request)],
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                request_id=request.request_id,
+                req=request,
+                diffusion_kv_metadata=None,
+            )
+        ],
         scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
     )
 

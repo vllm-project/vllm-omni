@@ -1087,6 +1087,12 @@ async def _run_warmups(
 
     warmup_tasks = [asyncio.create_task(limited_warmup_request_func(req)) for req in warmup_requests]
     warmup_outputs = await asyncio.gather(*warmup_tasks)
+    failed_count = sum(not output.success for output in warmup_outputs)
+    if failed_count:
+        raise RuntimeError(
+            f"{failed_count}/{len(warmup_outputs)} warmup requests failed; "
+            "check server logs before running the benchmark."
+        )
     return list(zip(warmup_requests, warmup_outputs))
 
 
@@ -1455,7 +1461,7 @@ async def benchmark(args):
         print(f"Metrics saved to {args.output_file}")
 
 
-if __name__ == "__main__":
+def build_parser():
     parser = argparse.ArgumentParser(description="Benchmark serving for diffusion models.")
     parser.add_argument(
         "--base-url",
@@ -1637,6 +1643,10 @@ if __name__ == "__main__":
         action="store_true",
         help="Request stage duration metrics from endpoints that support return_stage_metrics.",
     )
+    return parser
 
+
+if __name__ == "__main__":
+    parser = build_parser()
     args = parser.parse_args()
     asyncio.run(benchmark(args))

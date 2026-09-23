@@ -46,6 +46,7 @@ def _serving(metrics: _MetricsStub, *, adapter=None) -> OmniOpenAIServingSpeech:
     serving._tts_model_type = "qwen3_tts"
     serving.engine_client = SimpleNamespace(mod_metrics=metrics, request_states={})
     serving._get_tts_adapter = lambda: adapter
+    serving._speech_output_policies = {}
     serving.create_audio = lambda audio_obj: SimpleNamespace(
         audio_data=b"\0\0" * int(audio_obj.audio_tensor.size),
         media_type="audio/pcm",

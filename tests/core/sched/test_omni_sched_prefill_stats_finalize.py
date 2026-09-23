@@ -56,7 +56,7 @@ def _make_sched(request: Request) -> MagicMock:
     sched.requests = {request.request_id: request}
     sched.perf_metrics = None
     sched.defer_block_free = False
-    sched.structured_output_manager.should_advance.return_value = False
+    sched.structured_output_manager.accept_tokens.return_value = True
     sched._process_kv_transfer_trigger.return_value = False
     sched._maybe_decode_pooling_output.return_value = None
     sched._handle_stopped_request.return_value = True

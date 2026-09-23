@@ -30,20 +30,16 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
-_SKIP_ISSUE_6417 = pytest.mark.skip(
-    reason="https://github.com/vllm-project/vllm-omni/issues/6417",
-)
-
 pytestmark = [
+    pytest.mark.advanced_model,
     pytest.mark.slow,
     pytest.mark.tts,
-    _SKIP_ISSUE_6417,
 ]
 
 MODEL = "OpenMOSS-Team/MOSS-TTS-Realtime"
 REF_AUDIO_URL = "https://raw.githubusercontent.com/OpenMOSS/MOSS-TTS/HEAD/assets/audio/reference_zh_1.wav"
-# Voice-clone output is not reliably transcribed by the Whisper check used at
-# full_model run_level; assert non-trivial WAV payload size instead.
+# Reject a response that contains only a header or a very short audio payload.
+# Advanced and full runs also validate the transcript.
 _MIN_AUDIO_BYTES = 10_000
 
 
@@ -77,7 +73,9 @@ def get_prompt(prompt_type: str = "text") -> str:
     """
     prompts = {
         "text": "Hello, this is a real-time voice cloning demo for testing.",
-        "chinese": "你好，这是一段实时语音合成测试。",
+        # Match the offline test prompt. Whisper-small can transcribe "一段"
+        # as "一本", which makes this short sample fail the similarity check.
+        "chinese": "你好，这是语音合成测试。",
     }
     return prompts.get(prompt_type, prompts["text"])
 
@@ -94,7 +92,7 @@ tts_server_params = [
 ]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_001(omni_server, online_client, ref_audio_data_url) -> None:
     """
@@ -105,9 +103,8 @@ def test_text_to_audio_001(omni_server, online_client, ref_audio_data_url) -> No
     Input Setting: stream=False
     Datasets: single request
 
-    NOTE: ``min_audio_bytes`` skips Whisper transcript similarity — cloned
-    voice output is often empty or mismatched under ASR without indicating a
-    real serving regression.
+    ``min_audio_bytes`` adds a payload-size check. It does not disable the
+    transcript check used by advanced and full runs.
     """
     request_config = {
         "model": omni_server.model,
@@ -121,7 +118,7 @@ def test_text_to_audio_001(omni_server, online_client, ref_audio_data_url) -> No
     online_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_002_streaming(omni_server, online_client, ref_audio_data_url) -> None:
     """
@@ -150,7 +147,7 @@ def test_text_to_audio_002_streaming(omni_server, online_client, ref_audio_data_
     online_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_003_chinese(omni_server, online_client, ref_audio_data_url) -> None:
     """
@@ -161,7 +158,8 @@ def test_text_to_audio_003_chinese(omni_server, online_client, ref_audio_data_ur
     Input Setting: stream=False
     Datasets: single request
 
-    NOTE: same ``min_audio_bytes`` rationale as test_text_to_audio_001.
+    ``min_audio_bytes`` adds a payload-size check. It does not disable the
+    transcript check used by advanced and full runs.
     """
     request_config = {
         "model": omni_server.model,

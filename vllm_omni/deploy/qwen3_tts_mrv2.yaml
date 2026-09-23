@@ -1,0 +1,20 @@
+# Explicit CUDA Model Runner V2 profile. `qwen3_tts.yaml` now selects V2 by
+# default (experimental); this file is kept for scripts that name the MRV2
+# profile explicitly and for the platform fallbacks below.
+base_config: qwen3_tts.yaml
+model_runner: v2
+
+platforms:
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  rocm:
+    model_runner: v1
+  musa:
+    model_runner: v1
+
+stages:
+  - stage_id: 0
+    # Bound per-step prefill work, matching the high-concurrency TTS profile.
+    max_num_batched_tokens: 512

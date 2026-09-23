@@ -682,6 +682,7 @@ class TestCodePredictorGraphReplay:
             return_proj_buf=False,
         )
         predictor._prefix_graphs_enabled = False
+        predictor._prefix_reprefill_enabled = False
         predictor._bucket_pos_ids = {1: torch.arange(4).unsqueeze(0)}
         graph = mocker.Mock()
         graph_output = torch.zeros(1, 4, 4)
@@ -1362,3 +1363,38 @@ class TestCodePredictorFusedProjections:
 
         with pytest.raises(RuntimeError, match="missing fused parameters"):
             model.load_weights(weights)
+
+
+class TestMTPExecutionBuckets:
+    """Outer MRv2 MTP graph buckets must align with the predictor bucket set."""
+
+    def test_configure_mtp_execution_buckets(self, mocker: MockerFixture, loaded_target_classes) -> None:
+        _ = loaded_target_classes
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
+
+        cp_config, _ = _make_tiny_config(loaded_target_classes)
+        vllm_config = _make_vllm_config(mocker, max_num_seqs=4)
+        wrapper = common_mod.CodePredictorWrapper(
+            vllm_config=vllm_config,
+            cp_config=cp_config,
+            wrapper_config=common_mod.CodePredictorWrapperConfig(use_cuda_graphs=False),
+            talker_hidden_size=cp_config.hidden_size,
+        )
+
+        # Default keeps the legacy power-of-two derivation.
+        assert wrapper._execution_batch_buckets is None
+        assert wrapper._batch_bucket_sizes() == [1, 2, 4]
+
+        wrapper.configure_mtp_execution_buckets([3, 1, 3, 0, 9])
+        assert wrapper._batch_bucket_sizes() == [1, 3, 4]  # deduplicate/filter declaration and retain max
+
+        with pytest.raises(RuntimeError, match="before the first warmup"):
+            wrapper2 = common_mod.CodePredictorWrapper(
+                vllm_config=vllm_config,
+                cp_config=cp_config,
+                wrapper_config=common_mod.CodePredictorWrapperConfig(use_cuda_graphs=False),
+                talker_hidden_size=cp_config.hidden_size,
+            )
+            wrapper2._bucket_sizes = [1, 2, 4]  # stand-in for warmed-up state
+            wrapper2.configure_mtp_execution_buckets([3])

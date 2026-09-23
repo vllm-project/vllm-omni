@@ -17,7 +17,6 @@ import hashlib
 import io
 import json
 import sys
-import uuid
 import wave
 from pathlib import Path
 
@@ -266,8 +265,6 @@ async def _run_demo_process(
         str(args.chunk_ms),
         "--timeout-s",
         str(args.timeout_s),
-        "--session-id",
-        f"duplex-pair-{label}-{uuid.uuid4().hex}",
     ]
     if args.no_realtime_pacing:
         command.append("--no-realtime-pacing")

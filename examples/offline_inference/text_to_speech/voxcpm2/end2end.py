@@ -1,7 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Offline VoxCPM2 inference example (native AR pipeline).
 
 Uses the single-stage native AR config (voxcpm2.yaml).
-Requires the `voxcpm` package or VLLM_OMNI_VOXCPM_CODE_PATH env var.
+Requires the `voxcpm` package (pip install voxcpm).
 """
 
 from __future__ import annotations

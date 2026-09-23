@@ -1,14 +1,22 @@
-"""Test that OmniGenerationScheduler restores chunk-waiting requests
-even when the OmniNewRequestData rewrapping fails.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-Regression test: if process_pending_chunks() moves requests into
-internal deques but restore_queues() is not called due to an exception,
-those requests are permanently orphaned.
-"""
+"""Chunk-lifecycle coverage for OmniGenerationScheduler: restore on error,
+native terminal state, in-flight no-resubmission, slot release on finish,
+and single scheduling of a terminal empty-prompt chunk."""
 
 from collections import deque
+from types import SimpleNamespace
 
 import pytest
+import torch
+from vllm import SamplingParams
+from vllm.v1.core.sched.interface import PauseState
+from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+from vllm.v1.request import Request, RequestStatus
+
+from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler, _has_async_chunk_payload_to_run
+from vllm_omni.engine.serialization import serialize_additional_information
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -20,22 +28,160 @@ class FakeAdapter:
         self.waiting_for_chunk_waiting_requests = deque()
         self.waiting_for_chunk_running_requests = deque()
         self.restore_called = False
+        self.done_request_ids = set()
 
-    def process_pending_chunks(self, waiting, running):
-        """Simulate moving requests out of the scheduler queues."""
-        # Move one request from running into internal deque
+    def process_pending_chunks(self, waiting, running, scheduler_requests=None):
         if running:
             req = running.pop()
             self.waiting_for_chunk_running_requests.append(req)
 
+    def is_done_receiving_chunks(self, request_id):
+        return request_id in self.done_request_ids
+
+    def collect_failed_send_request_ids(self):
+        return {}
+
     def restore_queues(self, waiting, running, scheduler_requests=None):
-        """Put requests back."""
         self.restore_called = True
         running.extend(self.waiting_for_chunk_running_requests)
         self.waiting_for_chunk_running_requests = deque()
 
     def postprocess_scheduler_output(self, output):
         pass
+
+
+def _make_generation_scheduler(waiting_request, *, use_v2_model_runner=False):
+    scheduler = OmniGenerationScheduler.__new__(OmniGenerationScheduler)
+    scheduler.max_num_scheduled_tokens = 8
+    scheduler.max_num_running_reqs = 1
+    scheduler._pause_state = PauseState.UNPAUSED
+    scheduler.running = []
+    scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.waiting.add_request(waiting_request)
+    scheduler.skipped_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.requests = {waiting_request.request_id: waiting_request}
+    scheduler.policy = SchedulingPolicy.FCFS
+    scheduler.chunk_transfer_adapter = FakeAdapter()
+    scheduler.input_coordinator = None
+    scheduler.log_stats = False
+    scheduler.scheduler_config = SimpleNamespace(enable_chunked_prefill=True)
+    scheduler.num_lookahead_tokens = 0
+    scheduler.num_spec_tokens = 0
+    scheduler.dynamic_sd_lookup = None
+    scheduler.reset_preempted_req_ids = set()
+    scheduler.kv_cache_manager = SimpleNamespace(
+        new_step_starts=lambda: None,
+        allocate_slots=lambda *args, **kwargs: SimpleNamespace(get_block_ids=lambda: ([1],)),
+        get_num_common_prefix_blocks=lambda request_id: [0],
+        take_new_block_ids=lambda: [],
+        take_boundary_state_offloads=lambda: {},
+    )
+    scheduler.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
+    scheduler.use_v2_model_runner = use_v2_model_runner
+    scheduler._retains_state_across_chunks = False
+    scheduler.needs_kv_cache_zeroing = False
+    scheduler.finished_req_ids = set()
+    scheduler.encoder_cache_manager = SimpleNamespace(
+        get_freed_mm_hashes=lambda: [],
+        get_manager_metadata=lambda: None,
+    )
+    scheduler.connector = None
+    scheduler.ec_connector = None
+    scheduler.prev_step_scheduled_req_ids = set()
+    scheduler._pending_finish_reqs = []
+    scheduler._consume_pending_connector_output = lambda model_mode: None
+    scheduler._process_pending_input_timeouts = lambda: None
+    scheduler._make_cached_request_data = lambda **kwargs: SimpleNamespace(
+        req_ids=[],
+        resumed_req_ids=[],
+        new_token_ids=[],
+        all_token_ids=[],
+        new_block_ids=[],
+        num_computed_tokens=[],
+        num_output_tokens=[],
+    )
+    scheduler._update_after_schedule = lambda output: None
+    scheduler._wrap_omni_scheduler_output = lambda output: output
+    return scheduler
+
+
+def _chunk_request(request_id, **kwargs):
+    defaults = dict(
+        request_id=request_id,
+        prompt_token_ids=[1],
+        num_computed_tokens=0,
+        num_in_flight_tokens=0,
+        status=None,
+        sampling_params=None,
+        pooling_params=None,
+        mm_features=None,
+        lora_request=None,
+        prompt_is_token_ids=True,
+        additional_information=None,
+        external_req_id=request_id,
+        prefill_stats=None,
+        record_event=lambda *args, **kwargs: None,
+    )
+    defaults.update(kwargs)
+    return SimpleNamespace(**defaults)
+
+
+def test_chunk_lifecycle_no_resubmit_and_state_survives_requeue(monkeypatch) -> None:
+    # Native plane: a completed payload without a new chunk is never executed
+    # again; requeued requests keep WAITING_FOR_CHUNK and their token counts.
+    scheduler = _make_generation_scheduler(_chunk_request("unused"))
+    monkeypatch.setattr("vllm_omni.core.sched.omni_generation_scheduler.create_request_queue", create_request_queue)
+    scheduler._native_data_plane = True
+    scheduler.chunk_transfer_adapter = None
+    scheduler.input_coordinator = SimpleNamespace(
+        _async_chunk=True, finished_requests=set(), restore_queues=lambda *args, **kwargs: None
+    )
+    scheduler.running = []
+    scheduler.waiting = create_request_queue(scheduler.policy)
+    scheduler.skipped_waiting = create_request_queue(scheduler.policy)
+
+    completed = Request("completed", [1, 2], SamplingParams(max_tokens=4), pooling_params=None)
+    completed.status = RequestStatus.RUNNING
+    completed.num_computed_tokens = 2
+    scheduler.running = [completed]
+    scheduler.requests = {"completed": completed}
+    scheduler.input_coordinator.finished_requests.add("completed")  # terminal payload, no new chunk
+
+    assert scheduler._is_done_receiving_chunks("completed")
+    assert not scheduler._is_done_receiving_chunks("unknown")
+    output = scheduler.schedule()
+    assert not output.num_scheduled_tokens
+    assert scheduler._pending_finish_reqs == [completed]
+
+    completed.status = RequestStatus.WAITING_FOR_CHUNK
+    scheduler._pending_finish_reqs = []
+    scheduler._requeue_completed_native_chunks()
+    assert completed.status == RequestStatus.WAITING_FOR_CHUNK
+    assert completed.num_computed_tokens == 2
+    assert not scheduler.running
+
+
+def test_generation_scheduler_schedules_terminal_empty_prompt_chunk_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    waiting = _chunk_request(
+        "terminal",
+        prompt_token_ids=[],
+        num_prompt_tokens=0,
+        additional_information=serialize_additional_information(
+            {"codes": {"audio": torch.tensor([[1, 2, 3]], dtype=torch.long)}}
+        ),
+    )
+    scheduler = _make_generation_scheduler(waiting)
+    scheduler.chunk_transfer_adapter.done_request_ids.add("terminal")
+    scheduler.requests = {"terminal": waiting}
+    assert _has_async_chunk_payload_to_run(waiting)
+    # A terminal codec request with an empty prompt is still scheduled exactly once.
+    monkeypatch.setattr("vllm_omni.core.sched.omni_generation_scheduler.create_request_queue", create_request_queue)
+
+    output = OmniGenerationScheduler.schedule(scheduler)
+
+    assert output.num_scheduled_tokens == {"terminal": 1}
+    assert output.scheduled_new_reqs[0].req_id == "terminal"
+    assert scheduler._pending_finish_reqs == []
 
 
 class TestRestoreQueuesOnError:

@@ -142,6 +142,37 @@ def test_native_duplex_speak_segment_reaches_split_talker() -> None:
     assert info["duplex"]["turn_id"] == 7
 
 
+@pytest.mark.parametrize("folded_decisions", [0, 1, 2])
+@pytest.mark.parametrize("bos_in_prompt", [False, True])
+def test_native_duplex_tts_bos_aligns_after_window_rebuild(folded_decisions, bos_in_prompt) -> None:
+    prompt_ids = [101] * 10
+    output_ids = [9303] * folded_decisions + [9301, 21, 22, 9308]
+    if bos_in_prompt:
+        prompt_ids[-1] = 9301
+        output_ids = [21, 22, 9308]
+    rows = len(prompt_ids) + len(output_ids) - folded_decisions
+    latent = torch.arange(rows * 4, dtype=torch.float32).reshape(rows, 4)
+    source = _output(
+        prompt_ids=prompt_ids,
+        output_ids=output_ids,
+        latent=latent,
+        multimodal_output={
+            "duplex_prompt_token_ids": prompt_ids,
+            "meta": {
+                "tts_bos_token_id": 9301,
+                "tts_eos_token_id": 9302,
+                "listen_token_id": 9303,
+                "speak_token_id": 9304,
+                "chunk_eos_token_id": 9308,
+            },
+        },
+    )
+    converted = llm2tts([source], prompt=[{}], _streaming_context=SimpleNamespace(bridge_states={}))[0]
+    info = converted["model_intermediate_buffer"]
+    assert info["ids"]["tts"] == [21, 22]
+    torch.testing.assert_close(torch.as_tensor(info["hidden_states"]["tts"]), latent[-3:-1])
+
+
 def test_native_duplex_continuation_appends_only_new_talker_condition() -> None:
     prompt_ids = [101, 102]
     token_ids = {

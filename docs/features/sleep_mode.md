@@ -9,9 +9,11 @@ This feature is inherited from [vLLM’s Sleep Mode](https://blog.vllm.ai/2025/1
 ## 1. Feature Documentation
 
 ### Overview
+
 Omni Sleep Mode provides a mechanism to "sleep" specific model stages. When a stage enters sleep, its physical VRAM is reclaimed by the system, while the process state is preserved for rapid "wake-up" without full re-initialization.
 
 ### Sleep Levels
+
 We support two levels of hibernation to balance recovery speed and memory efficiency:
 
 | Level | Name | Mechanism | Recovery Speed | Memory Freed |
@@ -29,15 +31,67 @@ Omni Sleep Mode is optimized for high-performance computing backends:
 * **Huawei NPU**: Supported via Ascend memory scavenging.
 
 ### Hardware Requirements
+
 * **Memory Considerations**: System RAM must be sufficient to hold offloaded weights during sleep.
 * **TP Support**: Tensor Parallel groups synchronize sleep/wake transitions across all workers.
 
----
+### Quiescing a busy diffusion stage: `pause_generation(mode="keep")`
 
+`sleep()` on a diffusion stage is a worker-level RPC: it offloads memory but does not stop the
+stage's scheduler, so a stage that still has queued requests must be made quiet first. Aborting
+discards the batch that is running. `pause_generation(mode="keep")` keeps it instead:
+
+* The batch that is already running finishes on the weights it started with and its outputs are
+  delivered normally.
+* Requests that have not started stay queued and run after `resume_generation()`, on whatever
+  weights are loaded by then. A request never continues denoising across a weight change.
+* The call returns only after every replica has acknowledged: the batch that was running has
+  finished executing, its asynchronous output copies are done, and the device is synchronized; its
+  outputs are then delivered on the normal path. On a non-preemptible backend that acknowledgement
+  arrives at the next batch boundary, so expect it to take as long as the remaining batch.
+* Control RPCs (`list_loras`, `sleep`, `wake_up`, `resume_generation`) keep working while paused.
+
+Recommended order for a weight update on a diffusion stage:
+
+```python
+await engine.pause_generation(mode="keep", clear_cache=False)
+await engine.sleep(level=1)          # optional: free memory for the trainer
+await engine.wake_up()               # admission stays closed until resume
+# install new weights here
+await engine.resume_generation()
+```
+
+Support matrix and limits:
+
+| Configuration | `mode="keep"` |
+| :--- | :--- |
+| Request-level execution (`step_execution=False`) with the in-process (`uni`) executor | Supported |
+| Request-level execution with the multi-process (`mp`) executor, including asynchronous output | Supported; the acknowledgement waits for the output copies |
+| Request-level execution with asynchronous KV prefetch | Supported; the acknowledgement joins any prefetch still in flight |
+| Step-level execution (`step_execution=True` / streaming output) | Not supported: the call raises `NotImplementedError` |
+| `mode="abort"` / `mode="wait"` / `wait_for_inflight_requests=True` on a diffusion stage | Unchanged: frontend admission is paused only |
+
+Behavior notes:
+
+* Callers that already passed `mode="keep"` for a diffusion stage used to get an immediate return
+  that only closed frontend admission. They now also stop the backend and wait for the ACK.
+* A timeout or error from `pause_generation` means the pause did **not** complete; the scheduler
+  stays closed and the caller must retry the pause or call `resume_generation()` explicitly. Do not
+  sleep or mutate weights after a failed pause.
+* `resume_generation(stage_ids=...)` that leaves another paused stage closed (an AR stage, or a
+  keep-paused diffusion stage) keeps frontend admission closed as well, so new requests cannot
+  queue on a stage that will not schedule them. Admission reopens once every stage paused by
+  `pause_generation` has been resumed.
+* `clear_cache` has no diffusion-specific effect.
+* Without a pause call nothing changes: no barrier runs and batching, abort and output ordering are
+  as before.
+
+---
 
 ## 2. Usage Examples
 
 ### Python API Example
+
 You can programmatically control the lifecycle of stages using the `AsyncOmni` engine.
 
 ```python
@@ -65,6 +119,7 @@ if __name__ == "__main__":
 ```
 
 ### server command Example
+
 Start the server with sleep mode enabled:
 
 The first method
@@ -92,9 +147,6 @@ python3 -m vllm_omni.entrypoints.openai.api_server \
 
 ```
 
-
-
-
 ### Test Scenarios & Commands
 
 #### Scenario 1: LLM Engine Sleep
@@ -113,9 +165,8 @@ curl -X POST http://localhost:8000/v1/omni/sleep \
 
 Tip: Open a new terminal and run rocm-smi or nvidia-smi or to observe the immediate drop in VRAM usage.
 
-
-
 #### Scenario 2: Diffusion Sleep
+
 Objective: Verify VRAM reclamation for Stage 1 (Diffusion).
 
 Trigger sleep (Level 1 or Level 2) via client:
@@ -128,9 +179,8 @@ curl -X POST http://localhost:8000/v1/omni/sleep \
 
 ```
 
-
-
 #### Scenario 3: Multi-Stage Coordinated Stress Test
+
 Objective: Test concurrent sleep and rapid wake-up across multiple stages.
 
 Concurrent Sleep (Stage 0 & 1):
@@ -143,7 +193,6 @@ curl -X POST http://localhost:8000/v1/omni/sleep \
 
 ```
 
-
 Rapid Wake-up:
 
 ```
@@ -154,8 +203,8 @@ curl -X POST http://localhost:8000/v1/omni/wakeup \
 
 ```
 
-
 #### Scenario 4: Full Lifecycle Memory Audit & Functional Integrity
+
 Objective: Audit the complete flow from Sleep to Wake-up followed by an Inference validation.
 
 Check Initial State: Observe baseline VRAM usage.
@@ -196,11 +245,7 @@ curl -X POST http://localhost:8000/v1/images/generations \
 
 ```
 
-
-
-
 ## 3. API Reference
-
 
 ### Methods
 
@@ -208,8 +253,8 @@ curl -X POST http://localhost:8000/v1/images/generations \
 | :--- | :--- | :--- | :--- |
 | **sleep** | `stage_ids: List[int], level: int` | `List[OmniACK]` | Triggers hibernation for specified stages. |
 | **wake_up** | `stage_ids: List[int]` | `List[OmniACK]` | Reloads weights and re-maps memory. |
-
-
+| **pause_generation** | `mode: str, stage_ids: List[int]` | `None` | Stops admission; with `mode="keep"` also stops diffusion schedulers and returns after their ACK. |
+| **resume_generation** | `stage_ids: List[int]` | `None` | Reopens paused schedulers, then admission. |
 
 ### OmniACK Dataclass Fields
 
@@ -233,7 +278,8 @@ The metadata field is a dynamic dictionary containing hardware-specific telemetr
 }
 ```
 
-#### Core Utility:
+#### Core Utility
+
 **VRAM Reclamation Audit (total_freed_gib)**: Converts raw freed_bytes into human-readable GiB. It serves as the primary metric to verify that Level 2 sleep has successfully purged model weights from VRAM.
 
 **Residual & Fragmentation Monitoring (rank_residual_gib)**: Reports the remaining VRAM footprint after memory de-mapping. A low residual value (e.g., 2.07 GiB) confirms a successful "clean" state, ensuring the device is ready for high-memory co-located tasks like training or diffusion pipelines.

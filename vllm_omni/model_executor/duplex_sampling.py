@@ -19,7 +19,6 @@ class DuplexSamplingRow:
     row_idx: int
     request_id: str
     session_id: str | None
-    incarnation: int
     seq: int | None
     payload: dict[str, object] | None
     max_tokens: int | None
@@ -74,10 +73,6 @@ class DuplexSamplingHelper:
             if not isinstance(session_id, str) or not session_id:
                 session_id = None
             try:
-                incarnation = int(duplex.get("incarnation", 0))
-            except (TypeError, ValueError):
-                incarnation = 0
-            try:
                 seq = int(duplex.get("seq"))
             except (TypeError, ValueError):
                 seq = None
@@ -95,7 +90,6 @@ class DuplexSamplingHelper:
                     row_idx=row_idx,
                     request_id=req_id,
                     session_id=session_id,
-                    incarnation=incarnation,
                     seq=seq,
                     payload=payload,
                     max_tokens=max_tokens if max_tokens > 0 else None,

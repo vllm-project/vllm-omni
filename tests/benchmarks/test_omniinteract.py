@@ -198,6 +198,12 @@ def test_response_metrics_include_engine_tpot_and_stream_window():
         "tpot_ms": {"count": 2, "mean": 15.0, "p50": 10.0, "p99": 20.0},
         "ttfp_ms": {"count": 2, "mean": 300.0, "p50": 200.0, "p99": 400.0},
         "rtf": {"count": 2, "mean": 2.0, "p50": 2.0, "p99": 2.0},
+        "stages": {
+            "0": {
+                "ttft_ms": {"count": 2, "mean": 0.0, "p50": 0.0, "p99": 0.0},
+                "tpot_ms": {"count": 2, "mean": 15.0, "p50": 10.0, "p99": 20.0},
+            }
+        },
         "stream_ttft_ms": 200.0,
         "stream_ttfp_ms": 300.0,
         "stream_rtf": 8.333333,
@@ -467,6 +473,27 @@ def test_tolerated_playback_ack_rejection_is_a_warning_not_a_failure():
         oi._raise_if_session_terminated(collector, 0, warnings=warnings)
 
 
+def test_our_own_close_is_expected_even_though_the_server_stamps_a_reason():
+    """``session.close`` is answered with ``session.closed`` carrying ``client_close``.
+
+    The guard exists to catch a session that ended for a reason we did not ask
+    for. A close we requested is not that, whether or not the server names it.
+    """
+    collector = _collector(({"type": "session.closed", "reason": "client_close"}, 1.0))
+    oi._raise_if_session_terminated(collector, 0, explicit_close_from=0)
+
+    collector = _collector(({"type": "session.closed", "event": {"reason": "client_close"}}, 1.0))
+    oi._raise_if_session_terminated(collector, 0, explicit_close_from=0)
+
+    collector = _collector(({"type": "session.closed", "reason": "disconnect"}, 1.0))
+    with pytest.raises(RuntimeError, match="Unexpected session.closed: disconnect"):
+        oi._raise_if_session_terminated(collector, 0, explicit_close_from=0)
+
+    collector = _collector(({"type": "session.expired", "reason": "timeout"}, 1.0))
+    with pytest.raises(RuntimeError, match="session.expired: timeout"):
+        oi._raise_if_session_terminated(collector, 0, explicit_close_from=0)
+
+
 @pytest.mark.parametrize(
     ("event", "match"),
     [
@@ -561,8 +588,8 @@ class _RealtimeClient(oi._RealtimeSession):
 
     instances: list[_RealtimeClient] = []
 
-    def __init__(self, config: oi.OmniInteractBenchmarkConfig, session_id: str, reference_audio: str):
-        super().__init__(config, session_id, reference_audio)
+    def __init__(self, config: oi.OmniInteractBenchmarkConfig, reference_audio: str):
+        super().__init__(config, reference_audio)
         self.acks: list[tuple[str, int]] = []
         self.instances.append(self)
 
@@ -621,7 +648,7 @@ async def test_public_runner_executes_one_prepared_session(tmp_path: Path, monke
     assert "autostart=0" in _RealtimeClient.instances[-1].url
     session_config = _RealtimeClient.instances[-1].session_config
     assert session_config.extra_body["custom"] == "value"
-    assert session_config.extra_body["native_duplex"] is True
+    assert "native_duplex" not in session_config.extra_body
     assert session_config.ref_audio == "data:audio/wav;base64,ref"
     acks = _RealtimeClient.instances[-1].acks
     # Cumulative acks for the one response: an optional 0 ms checkpoint the

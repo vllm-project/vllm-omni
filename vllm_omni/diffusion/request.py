@@ -70,6 +70,8 @@ class OmniDiffusionRequest:
     # Opaque native vLLM connector parameters. The Orchestrator and Scheduler
     # transport this bag without interpreting local pages or block IDs.
     kv_transfer_params: dict[str, Any] | None = None
+    # Worker-populated scheduler reuse boundaries, available before encoding.
+    kv_computed_tokens: tuple[int, ...] = ()
     # A model preprocessor may keep selected requests on the legacy full-forward
     # path even when the engine is globally configured for step execution.
     use_step_execution: bool = True

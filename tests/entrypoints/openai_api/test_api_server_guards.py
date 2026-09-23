@@ -42,8 +42,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import signal
+from argparse import Namespace
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -59,10 +63,77 @@ from vllm_omni.entrypoints.serve.utils import errors as serve_errors
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+
+@dataclass
+class _FakeParallelConfig:
+    _api_process_rank: int
+
+
+@dataclass
+class _FakeVllmConfig:
+    parallel_config: _FakeParallelConfig
+
+
+def test_omni_api_worker_sets_parent_death_signal_before_validation(mocker):
+    args = _minimal_args(_omni_stage_client_configs=[{"stage_addresses": {}}])
+    death_signal = mocker.patch.object(api_server, "set_death_signal")
+
+    with pytest.raises(RuntimeError, match="client configuration"):
+        api_server.run_omni_api_server_worker_proc(
+            "127.0.0.1:8000",
+            mocker.Mock(),
+            args,
+            {"client_count": 2, "client_index": -1},
+        )
+
+    death_signal.assert_called_once_with(signal.SIGTERM)
+
+
+@pytest.mark.asyncio
+async def test_omni_run_server_worker_forwards_client_config(monkeypatch):
+    captured: dict[str, object] = {}
+
+    @asynccontextmanager
+    async def fake_build_async_omni(*_args, **kwargs):
+        captured.update(kwargs)
+        yield _FakeEngineClient(vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=1)))
+
+    monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
+    monkeypatch.setattr(api_server, "build_openai_app", lambda *_args: FastAPI())
+    monkeypatch.setattr(api_server, "omni_init_app_state", lambda *_args: asyncio.sleep(0))
+    monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda *_args: None)
+
+    async def fake_storage_start() -> None:
+        return None
+
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
+
+    async def fake_serve_http(app, **_kwargs):
+        assert app.state.api_server_count == 2
+        task = asyncio.create_task(asyncio.sleep(0))
+        await asyncio.sleep(0)
+        return task
+
+    monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
+
+    args = _minimal_args(model="dummy")
+    config = {"client_count": 2, "client_index": 1, "stage_addresses": {}}
+
+    await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), args, config)
+    assert captured["client_config"] is config
+
+
 # FastAPI/Starlette auto-adds HEAD on every GET route. Including HEAD here
 # would invent ("HEAD", path) entries for every GET and fail the current census.
 # TODO: extend this set and the expected census if @router.head / @router.options appear.
 _HTTP_METHODS = {"GET", "POST", "DELETE", "PUT", "PATCH"}
+
+
+def test_profiler_endpoints_detect_typed_stage_config():
+    stage = SimpleNamespace(profiler_config=SimpleNamespace(profiler="torch"))
+
+    assert api_server._should_enable_profiler_endpoints([stage])
+
 
 # Exact Omni router census on main. Update intentionally when routes change.
 _EXPECTED_ROUTER_ROUTES = {
@@ -494,7 +565,7 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     Fails if HTTP requests lose ``request_timestamp``, or WebSocket scopes
     start getting stamped / mutated incorrectly.
     """
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
     def fake_build_openai_app(args, supported_tasks):
         return FastAPI()
@@ -522,8 +593,8 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), _minimal_args())
     middleware = captured["served_app"]
 
-    http_scope = {"type": "http", "state": {}}
-    ws_scope = {"type": "websocket"}
+    http_scope: dict[str, Any] = {"type": "http", "state": {}}
+    ws_scope: dict[str, Any] = {"type": "websocket"}
 
     async def _receive():
         return {"type": "http.disconnect"}
@@ -619,6 +690,48 @@ async def test_realtime_route_defaults_to_configured_duplex_handler(
     assert calls == [expected_handler]
 
 
+@pytest.mark.parametrize("path", ["/v1/duplex", "/v1/realtime", "/v1/realtime?duplex=1"])
+def test_multi_api_duplex_reconnect_rejected_on_each_worker(path: str) -> None:
+    class SessionHandler:
+        async def handle_realtime_session(self, _websocket) -> None:
+            pytest.fail("Multi-API requests must not access process-local sessions")
+
+    class PendingWarmup:
+        def is_set(self) -> bool:
+            raise AssertionError("Multi-API rejection must not wait for duplex warmup")
+
+    # Separate apps represent workers with independent frontend registries.
+    # Opening on A then reconnecting to B must reject at the same boundary.
+    for worker_index in (0, 1):
+        app = FastAPI()
+        app.state.api_server_count = 2
+        app.state.api_server_index = worker_index
+        app.state.openai_serving_duplex = SessionHandler()
+        app.state.duplex_warmup_done = PendingWarmup()
+        app.include_router(api_server.router)
+        with TestClient(app) as client, client.websocket_connect(path) as websocket:
+            assert websocket.receive_json()["code"] == "multi_api_duplex_unsupported"
+            with pytest.raises(WebSocketDisconnect) as exc:
+                websocket.receive_text()
+            assert exc.value.code == 1008
+
+
+@pytest.mark.parametrize("path", ["/v1/duplex", "/v1/realtime?duplex=1"])
+def test_single_api_duplex_session_still_reaches_handler(path: str) -> None:
+    class SessionHandler:
+        async def handle_realtime_session(self, websocket) -> None:
+            await websocket.accept()
+            await websocket.send_json({"type": "session.created"})
+            await websocket.close()
+
+    app = FastAPI()
+    app.state.api_server_count = 1
+    app.state.openai_serving_duplex = SessionHandler()
+    app.include_router(api_server.router)
+    with TestClient(app) as client, client.websocket_connect(path) as websocket:
+        assert websocket.receive_json() == {"type": "session.created"}
+
+
 def test_health_without_engine_returns_stable_unhealthy_response() -> None:
     """Lock ``/health`` with no engine initialized.
 
@@ -708,6 +821,38 @@ def test_speech_without_handler_preserves_not_found_http_error() -> None:
     assert exc_info.value.detail == "The model does not support Speech API"
 
 
+@pytest.mark.asyncio
+async def test_multi_api_rejects_runtime_voice_upload() -> None:
+    app = FastAPI()
+    app.state.api_server_count = 2
+    raw_request = _request_for(app, method="POST", path="/v1/audio/voices")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await api_server.upload_voice(
+            raw_request,
+            audio_sample=None,
+            speaker_embedding=None,
+            consent="consent-id",
+            name="probe",
+        )
+
+    assert exc_info.value.status_code == 409
+    assert "process-local frontend state" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_multi_api_rejects_sleep_route() -> None:
+    app = FastAPI()
+    app.state.api_server_count = 2
+    raw_request = _request_for(app, method="POST", path="/v1/omni/sleep")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await api_server.omni_sleep(api_server.OmniSleepRequest(stage_ids=[0]), raw_request)
+
+    assert exc_info.value.status_code == 409
+    assert "process-local frontend state" in exc_info.value.detail
+
+
 def test_engine_error_json_response_includes_request_and_stage_fields(monkeypatch) -> None:
     """Lock shared ``EngineGenerateError`` JSON fields used by Omni handlers.
 
@@ -776,11 +921,10 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
     engine = _FakeEngineClient(stage_configs=[stage])
 
     def _for_diffusion_factory(label: str):
-        @classmethod
         def _factory(cls, *args, **kwargs):
             return _marker(label)
 
-        return _factory
+        return classmethod(_factory)
 
     monkeypatch.setattr(api_server.OmniOpenAIServingChat, "for_diffusion", _for_diffusion_factory("chat"))
     monkeypatch.setattr(api_server.OmniOpenAIServingChatBatch, "for_diffusion", _for_diffusion_factory("chat_batch"))
@@ -821,13 +965,11 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch) -> 
     speech_kwargs = {}
 
     def _for_diffusion_factory(label: str):
-        @classmethod
         def _factory(cls, *args, **kwargs):
             return _marker(label)
 
-        return _factory
+        return classmethod(_factory)
 
-    @classmethod
     def _speech_factory(cls, *args, **kwargs):
         speech_kwargs.update(kwargs)
         return _marker("speech")
@@ -841,7 +983,7 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch) -> 
     )
     monkeypatch.setattr(api_server.OmniOpenAIServingVideo, "for_diffusion", _for_diffusion_factory("video"))
     monkeypatch.setattr(api_server.OmniStreamingVideoOutputHandler, "__init__", lambda self, *a, **k: None)
-    monkeypatch.setattr(api_server.OmniOpenAIServingSpeech, "for_diffusion", _speech_factory)
+    monkeypatch.setattr(api_server.OmniOpenAIServingSpeech, "for_diffusion", classmethod(_speech_factory))
     monkeypatch.setattr(
         api_server.ServingRealtimeRobotOpenPI,
         "create_policy_server",
@@ -920,7 +1062,6 @@ async def test_multistage_app_state_key_snapshot(monkeypatch) -> None:
     monkeypatch.setattr(api_server, "create_streaming_video_handler", lambda **_k: _marker("streaming_video"))
     monkeypatch.setattr(api_server, "OpenAIServingRealtime", _FakeCtor)
     monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeCtor)
-    monkeypatch.setattr(api_server, "should_enable_duplex_endpoint", lambda *_a, **_k: False)
 
     state = State()
     await api_server.omni_init_app_state(engine, state, _minimal_args())
@@ -931,3 +1072,57 @@ async def test_multistage_app_state_key_snapshot(monkeypatch) -> None:
         must_be_wired=_MULTISTAGE_MUST_BE_WIRED,
         must_be_none=_MULTISTAGE_MUST_BE_NONE,
     )
+
+
+@pytest.mark.parametrize("count", [None, 0, -1, "2", True])
+def test_process_local_guard_rejects_unknown_topology(count):
+    app = FastAPI()
+    if count is not None:
+        app.state.api_server_count = count
+    # CLI args cannot substitute for missing/invalid actual runtime state.
+    app.state.args = Namespace(api_server_count=1)
+    with pytest.raises(HTTPException) as exc:
+        api_server._reject_process_local_state_with_multiple_api_workers(_request_for(app), "Sleep")
+    assert exc.value.status_code == 503
+
+
+@pytest.mark.parametrize(
+    "requested,config,expected",
+    [(None, None, 1), (1, None, 1), (2, {"client_count": 2}, 2), (None, {"client_count": 2}, 2)],
+)
+def test_api_topology_resolved_from_launch(requested, config, expected):
+    assert api_server._resolve_api_server_count(Namespace(api_server_count=requested), config) == expected
+
+
+@pytest.mark.parametrize("requested,config", [(2, None), (2, {}), (2, {"client_count": 1}), (2, {"client_count": "2"})])
+def test_api_topology_rejects_inconsistent_launch(requested, config):
+    with pytest.raises(ValueError):
+        api_server._resolve_api_server_count(Namespace(api_server_count=requested), config)
+
+
+@pytest.mark.parametrize("count,status", [(2, 409), (None, 503)])
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("POST", "/v1/videos"),
+        ("GET", "/v1/videos"),
+        ("GET", "/v1/videos/job"),
+        ("GET", "/v1/videos/job/content"),
+        ("DELETE", "/v1/videos/job"),
+    ],
+)
+def test_video_lifecycle_guard_precedes_processing(monkeypatch, count, status, method, path):
+    from fastapi.testclient import TestClient
+
+    app = FastAPI()
+    if count is not None:
+        app.state.api_server_count = count
+    app.include_router(api_server.router)
+
+    async def forbidden_form():
+        pytest.fail("video form processing must not run before topology rejection")
+
+    app.dependency_overrides[api_server._parse_video_form] = forbidden_form
+    with TestClient(app) as client:
+        response = client.request(method, path)
+    assert response.status_code == status

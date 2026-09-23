@@ -27,7 +27,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 @dataclass
 class _EngineClientStub:
-    stage_configs: list[dict[str, object]]
+    stage_configs: list[object]
 
 
 @dataclass
@@ -147,6 +147,37 @@ async def test_chat_reference_audio_reaches_code2wav_transport(
     assert code2wav_payload is not None
     torch.testing.assert_close(code2wav_payload.codes.ref, torch.from_numpy(reference_waveform))
     assert code2wav_payload.meta.ref_audio_sr == 16000
+
+
+@pytest.mark.asyncio
+async def test_typed_stage_enables_reference_audio(
+    serving_chat: OmniOpenAIServingChat,
+    mocker: MockerFixture,
+) -> None:
+    reference_audio_url = "data:audio/wav;base64,AAAA"
+    reference_waveform = np.array([0.25, -0.5], dtype=np.float32)
+    serving_chat.engine_client = _EngineClientStub(
+        [
+            SimpleNamespace(
+                model_config=SimpleNamespace(model_arch="MiniCPMO45OmniForConditionalGeneration"),
+                model_stage="llm",
+            )
+        ]
+    )
+    serving_chat.model_config = _ModelConfigStub()
+    engine_prompt: TokensPrompt = {"type": "tokens", "prompt_token_ids": [1]}
+    media_connector = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_chat.MediaConnector",
+    ).return_value
+    media_connector.fetch_audio_async = mocker.AsyncMock(return_value=(reference_waveform, 16000))
+
+    await serving_chat._attach_minicpmo45_reference_audio(
+        engine_prompt,
+        _chat_request(reference_audio_url),
+    )
+
+    media_connector.fetch_audio_async.assert_awaited_once_with(reference_audio_url)
+    assert MINICPMO45_REFERENCE_AUDIO_KEY in cast(dict[str, object], engine_prompt)
 
 
 @pytest.mark.parametrize("request_shape", ["extra_body", "model_extra"])

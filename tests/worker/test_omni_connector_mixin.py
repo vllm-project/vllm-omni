@@ -397,7 +397,7 @@ class TestLoadCustomFuncSelection(unittest.TestCase):
     def test_skips_non_payload_stage_input_processors_for_full_payload_mode(self):
         incompatible_paths = [
             "vllm_omni.model_executor.stage_input_processors.mimo_audio.llm2code2wav",
-            "vllm_omni.model_executor.stage_input_processors.mammoth_moda2.ar2dit",
+            "vllm_omni.model_executor.stage_input_processors.mammoth_moda2.ar2diffusion",
             "vllm_omni.model_executor.stage_input_processors.cosyvoice3.text2flow",
             "vllm_omni.model_executor.stage_input_processors.glm_image.ar2diffusion",
         ]
@@ -1724,3 +1724,16 @@ class TestSendRetry(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.parametrize(
+    "fallback,external,expected", [("r", None, "mapped"), (None, "ext", "ext"), (None, None, None)]
+)
+def test_resolve_request_id_requires_internal_or_external_id(fallback, external, expected):
+    host = SimpleNamespace(_request_ids_mapping={"r": "mapped"})
+    request = SimpleNamespace(external_req_id=external)
+    if expected is None:
+        with pytest.raises(ValueError, match="request ID"):
+            OmniConnectorModelRunnerMixin._resolve_external_req_id(host, request, fallback)
+    else:
+        assert OmniConnectorModelRunnerMixin._resolve_external_req_id(host, request, fallback) == expected

@@ -71,8 +71,10 @@ Alternatively, use the convenience script:
 ```
 
 The bundled deploy config (`vllm_omni/deploy/qwen3_tts.yaml`) enables async
-chunking for low first-audio latency. For advanced deployment tuning, pass a
-custom deploy config:
+chunking for low first-audio latency, and selects the experimental Model
+Runner V2 on CUDA. Copy it and set `model_runner: v1` to run V1; NPU, XPU,
+ROCm and MUSA keep V1 through the `platforms:` sections. For advanced
+deployment tuning, pass a custom deploy config:
 
 ```bash
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \

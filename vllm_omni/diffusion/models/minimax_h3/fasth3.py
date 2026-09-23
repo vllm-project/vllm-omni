@@ -102,6 +102,7 @@ _MODEL_LEVEL_TARGETS = {
     "time_embedder.linear_2": "time_embedder.proj_out",
     "norm_out.linear": "final_layer.adaln_proj.linear",
     "norm_out.norm": "final_layer.norm",
+    "token_refiner.final_norm": "token_refiner.final_norm",
 }
 
 # Per-block adapter suffix -> (native suffix, how a delta enters the native
@@ -115,6 +116,8 @@ _BLOCK_TARGETS = {
     "attn.to_v": ("attn.qkv_proj", _QKV_V),
     "attn.to_out.0": ("attn.out_proj", _PLAIN),
     "attn.to_gate_compress": ("attn.to_gate_compress", _PLAIN),
+    "attn.norm_q": ("attn.q_norm", _PLAIN),
+    "attn.norm_k": ("attn.k_norm", _PLAIN),
     "ff.net.0.proj": ("mlp.fc1", _SWAP_HALVES),
     "ff.net.2": ("mlp.fc2", _PLAIN),
     "adaln_proj.linear": ("adaln_proj.linear", _PLAIN),

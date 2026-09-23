@@ -32,7 +32,6 @@ from huggingface_hub import hf_hub_download, snapshot_download
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
 from tests.e2e.accuracy.helpers import reset_artifact_dir
-from tests.helpers import skip_if_gated_repo_inaccessible
 from tests.helpers.mark import hardware_test
 
 OFFICIAL_REPOSITORY = "https://github.com/Lightricks/LTX-2.git"
@@ -303,32 +302,6 @@ def _resolve_ltx25_image() -> Path:
     )
 
 
-def _require_ltx25_model_access() -> None:
-    configured_omni_model = os.environ.get("VLLM_TEST_LTX25_MODEL")
-    if not (configured_omni_model and Path(configured_omni_model).exists()):
-        omni_model = configured_omni_model or LTX25_OMNI_MODEL_ID
-        omni_revision = os.environ.get("VLLM_TEST_LTX25_MODEL_REVISION")
-        if omni_revision is None and omni_model == LTX25_OMNI_MODEL_ID:
-            omni_revision = LTX25_OMNI_MODEL_REVISION
-        skip_if_gated_repo_inaccessible(
-            omni_model,
-            revision=omni_revision,
-            filename="model_index.json",
-        )
-
-    configured_official_model = os.environ.get("VLLM_TEST_LTX25_OFFICIAL_MODEL")
-    if not (configured_official_model and Path(configured_official_model).exists()):
-        official_model = configured_official_model or LTX25_OFFICIAL_MODEL_ID
-        official_revision = os.environ.get("VLLM_TEST_LTX25_OFFICIAL_MODEL_REVISION")
-        if official_revision is None and official_model == LTX25_OFFICIAL_MODEL_ID:
-            official_revision = LTX25_OFFICIAL_MODEL_REVISION
-        skip_if_gated_repo_inaccessible(
-            official_model,
-            revision=official_revision,
-            filename=LTX25_OFFICIAL_COMMON_FILES["text_encoder"],
-        )
-
-
 def _ltx25_request(image: Path | None = None) -> dict[str, object]:
     request: dict[str, object] = {
         "prompt": LTX25_PROMPT,
@@ -475,7 +448,6 @@ def _assert_strict_similarity(
 @pytest.mark.parametrize("task", ["t2v", "i2v"])
 def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path, task: str) -> None:
     """Compare Omni with official canonical DiffVAE and matching connector weights."""
-    _require_ltx25_model_access()
     artifact_parent = accuracy_artifact_root / "ltx_official"
     output_root = reset_artifact_dir(artifact_parent / f"ltx2_5_distilled_{task}")
     official_root, official_revision = _ltx25_official_source(artifact_parent)
@@ -600,7 +572,6 @@ def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path
 @pytest.mark.parametrize("pipeline_mode", ["full_one_stage", "full_two_stage"])
 def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pipeline_mode: str) -> None:
     """Compare raw official Full/SFT and DiffVAE weights with Omni."""
-    _require_ltx25_model_access()
     artifact_parent = accuracy_artifact_root / "ltx_official"
     output_root = reset_artifact_dir(artifact_parent / f"ltx2_5_{pipeline_mode}_{task}")
     model_class_name = {

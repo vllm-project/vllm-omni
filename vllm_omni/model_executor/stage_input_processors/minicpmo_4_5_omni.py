@@ -16,7 +16,10 @@ from vllm_omni.engine.duplex.intermediate import (
     set_tts_handoff,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
-from vllm_omni.model_executor.models.minicpmo_4_5 import MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
+from vllm_omni.model_executor.models.minicpmo_4_5 import (
+    MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
+    MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
 
 logger = logging.getLogger(__name__)
@@ -690,9 +693,6 @@ def _native_duplex_data_plane_metadata(streaming_context) -> dict[str, object] |
     session_id = duplex_state.get("session_id")
     if isinstance(session_id, str) and session_id:
         metadata["session_id"] = session_id
-    incarnation = duplex_state.get("incarnation")
-    if isinstance(incarnation, int):
-        metadata["incarnation"] = incarnation
     epoch = duplex_state.get("epoch")
     if isinstance(epoch, int):
         metadata["epoch"] = epoch
@@ -865,8 +865,25 @@ def llm2tts(
                     special_token_ids.get("chunk_eos_token_id"),
                     special_token_ids.get("chunk_tts_eos_token_id"),
                 }
-            tts_token_ids_slice = torch.tensor(full_token_ids[tts_bos_idx:end_idx], dtype=torch.long)
-            tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
+            if is_native_duplex_handoff:
+                # Earlier unforwarded decisions may already be folded into
+                # the rebuilt prompt while still appearing in this delta.
+                # Align the explicit tts_bos path by the segment's end, just
+                # like the native speak/text paths below, rather than adding
+                # those decisions to the prompt a second time.
+                out_start = tts_bos_idx - prompt_token_ids_len
+                out_end = tts_eos_idx - prompt_token_ids_len if tts_eos_idx is not None else len(llm_output_ids)
+                hidden_base = int(thinker_hidden_states.shape[0]) - len(llm_output_ids)
+                if hidden_base >= 0 and out_end > out_start:
+                    tts_token_ids_slice = torch.tensor(llm_output_ids[out_start:out_end], dtype=torch.long)
+                    tts_hidden_slice = (
+                        thinker_hidden_states[hidden_base + out_start : hidden_base + out_end]
+                        .to(torch.float32)
+                        .contiguous()
+                    )
+            else:
+                tts_token_ids_slice = torch.tensor(full_token_ids[tts_bos_idx:end_idx], dtype=torch.long)
+                tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
         elif is_native_duplex_handoff:
             # Official MiniCPM-o duplex does not prefill an assistant
             # <|tts_bos|> boundary before generation. A segment delta can
@@ -1013,7 +1030,11 @@ def llm2tts(
             handoff_meta = model_intermediate_buffer.setdefault("meta", {})
             handoff_meta["next_stage_prompt_len"] = condition_length
             if is_native_duplex_handoff:
-                handoff_meta["next_stage_generation_tokens"] = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
+                handoff_meta["next_stage_generation_tokens"] = (
+                    MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS
+                    if native_turn_end_handoff
+                    else MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
+                )
                 bridge_states = getattr(_streaming_context, "bridge_states", None)
                 handoff_state = bridge_states.get("minicpmo45_tts_handoff") if isinstance(bridge_states, dict) else None
                 if not isinstance(handoff_state, dict) or handoff_state.get("request_id") != str(llm_output.request_id):

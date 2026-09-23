@@ -13,7 +13,7 @@ import asyncio
 import contextlib
 import multiprocessing.connection
 import signal
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -33,7 +33,10 @@ from vllm.v1.engine.utils import (
 )
 from vllm.v1.utils import shutdown
 
-from vllm_omni.diffusion.data import DiffusionRequestAbortedError
+from vllm_omni.diffusion.data import (
+    DiffusionRequestAbortedError,
+    is_diffusion_request_started_output,
+)
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.utils.serialization import (
@@ -163,6 +166,7 @@ class StageDiffusionProc:
         prompt: Any,
         sampling_params_dict: dict,
         kv_sender_info: dict[str, Any] | None = None,
+        on_request_started: Callable[[OmniRequestOutput], Awaitable[None]] | None = None,
         kv_transfer_params: dict[str, Any] | None = None,
     ) -> OmniRequestOutput:
         """Build a diffusion request and consume DiffusionEngine.step_streaming() to completion."""
@@ -180,7 +184,13 @@ class StageDiffusionProc:
         # return the final output.
         result = None
         async for results in self._engine.step_streaming(request):
-            result = results[0]
+            output = results[0]
+            if is_diffusion_request_started_output(output) and on_request_started is not None:
+                if not output.request_id:
+                    output.request_id = request_id
+                await on_request_started(output)
+                continue
+            result = output
         if result is None:
             raise RuntimeError("Diffusion execution finished without output.")
         if not result.request_id:
@@ -354,11 +364,16 @@ class StageDiffusionProc:
             """Process a single diffusion request and send the response."""
             try:
                 if not self._od_config.streaming_output:
+
+                    async def _send_request_started(output: OmniRequestOutput) -> None:
+                        await response_socket.send(encoder.encode({"type": "result", "output": output}))
+
                     result = await self._process_request(
                         request_id,
                         prompt,
                         sampling_params_dict,
                         kv_sender_info=kv_sender_info,
+                        on_request_started=_send_request_started,
                         kv_transfer_params=kv_transfer_params,
                     )
                     await response_socket.send(encoder.encode({"type": "result", "output": result}))

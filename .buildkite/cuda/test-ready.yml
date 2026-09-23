@@ -17,7 +17,7 @@ steps:
         mirror_hardwares: l4_1
 
       - label: "Simple · Diffusion Test"
-        timeout_in_minutes: 20
+        timeout_in_minutes: 30
         commands:
           - "pytest -sv tests/diffusion -m 'core_model and cpu'"
         mirror_hardwares: l4_1
@@ -37,6 +37,12 @@ steps:
   - group: ":card_index_dividers: Diffusion Test"
     depends_on: upload-ready-pipeline
     steps:
+
+      - label: "Diffusion · FlashAttention Test"
+        timeout_in_minutes: 20
+        commands:
+          - timeout 15m pytest -s -v tests/diffusion/attention/ -m 'core_model and cuda and L4 and cards_1' --run-level "core_model"
+        mirror_hardwares: l4_1
 
       - label: "Diffusion · Offloader Test"
         commands:
@@ -96,7 +102,7 @@ steps:
     commands:
       - |
         timeout 15m bash -c "
-                  pytest -sv tests/engine/ tests/model_executor/ tests/worker/test_batched_omni_output.py -m 'core_model and cuda' --run-level 'core_model'
+                  pytest -sv tests/engine/ tests/model_executor/ tests/worker/test_batched_omni_output.py tests/worker_v2/ -m 'core_model and cuda' --run-level 'core_model'
         "
     mirror_hardwares: l4_1
 
@@ -240,5 +246,15 @@ steps:
             timeout 40m bash -c "
               export VLLM_IMAGE_FETCH_TIMEOUT=60
               pytest -s -v tests/e2e/online_serving/test_hunyuan_video_15_expansion.py -m 'core_model and diffusion' --run-level 'core_model'
+            "
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · LingBot-Video Test"
+        source_file_dependencies: diffusion_lingbot_function
+        commands:
+          - |
+            timeout 40m bash -c "
+              export VLLM_IMAGE_FETCH_TIMEOUT=60
+              pytest -s -v tests/e2e/online_serving/test_lingbot_video.py -m 'core_model and cuda' --run-level 'core_model'
             "
         mirror_hardwares: h100_1

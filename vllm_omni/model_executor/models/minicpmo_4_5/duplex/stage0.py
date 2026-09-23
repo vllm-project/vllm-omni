@@ -6,14 +6,21 @@ from __future__ import annotations
 import base64
 import copy
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from threading import Lock
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
+from numpy.typing import NDArray
 
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+
+if TYPE_CHECKING:
+    import torch
+    from PIL import Image
+    from torch import nn
 
 _MINICPMO45_SPECIAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS
 _MINICPMO45_OPTIONAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.OPTIONAL_TOKEN_FIELDS
@@ -21,19 +28,35 @@ _MINICPMO45_PROCESSOR_LOAD_LOCK = Lock()
 
 
 @dataclass
+class _MiniCPMO45WindowUnit:
+    embeds: list[Any] = field(default_factory=list)
+    token_ids: list[int] = field(default_factory=list)
+
+
+@dataclass
 class _MiniCPMO45Stage0SessionState:
     session_id: str
+    #: Any: MiniCPM-o remote-code processor (transformers, no importable type).
     streaming_processor: Any | None = None
-    audio_buffer: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    audio_buffer: NDArray[np.float32] = field(default_factory=lambda: np.array([], dtype=np.float32))
     audio_chunk_idx: int = 0
-    context_embeds: list[Any] = field(default_factory=list)
+    context_embeds: list[torch.Tensor] = field(default_factory=list)
     context_token_ids: list[int] = field(default_factory=list)
+    context_prefix_embeds: list[Any] = field(default_factory=list)
+    context_prefix_token_ids: list[int] = field(default_factory=list)
+    context_suffix_embeds: list[Any] = field(default_factory=list)
+    context_suffix_token_ids: list[int] = field(default_factory=list)
+    window_units: list[_MiniCPMO45WindowUnit] = field(default_factory=list)
+    window_enabled: bool = False
+    pending_window_unit: _MiniCPMO45WindowUnit | None = None
+    pending_window_generated_tokens: list[int] = field(default_factory=list)
     current_turn_ended: bool = True
     prepared_append_identity: tuple[int | None, int] | None = None
-    prepared_inputs_embeds: Any | None = None
+    prepared_inputs_embeds: torch.Tensor | None = None
     prepared_input_token_ids: list[int] = field(default_factory=list)
-    prepared_result: dict[str, Any] = field(default_factory=dict)
-    audio_past_key_values: Any | None = None
+    prepared_result: dict[str, object] = field(default_factory=dict)
+    #: Opaque transformers cache, handed back to the model unchanged.
+    audio_past_key_values: object | None = None
     pending_terminator_token: int | None = None
     last_terminator_token: int | None = None
     pending_speech_context: bool = False
@@ -59,7 +82,7 @@ class MiniCPMO45Stage0DuplexRuntime:
     image_start_token_id: int = -1
     image_end_token_id: int = -1
 
-    def __init__(self, stage_model: Any, *, model_path: str | None = None, device: str = "cuda") -> None:
+    def __init__(self, stage_model: nn.Module, *, model_path: str | None = None, device: str = "cuda") -> None:
         self.stage_model = stage_model
         self.model_path = model_path
         self.device = device
@@ -85,7 +108,7 @@ class MiniCPMO45Stage0DuplexRuntime:
     def _configure_streaming_processor(
         self,
         state: _MiniCPMO45Stage0SessionState | None = None,
-    ) -> Any | None:
+    ) -> Any | None:  # Any: MiniCPM-o remote-code processor
         processor = self.processor
         if processor is None:
             return None
@@ -129,10 +152,15 @@ class MiniCPMO45Stage0DuplexRuntime:
     def _prepare_session_context(
         self,
         state: _MiniCPMO45Stage0SessionState,
-        session_config: dict[str, Any],
+        session_config: dict[str, object],
         *,
-        runtime_config: dict[str, Any] | None = None,
+        runtime_config: dict[str, object] | None = None,
     ) -> None:
+        window_config = (runtime_config or {}).get("duplex_window_config")
+        state.window_enabled = isinstance(window_config, dict) and window_config.get("sliding_window_mode", "off") in {
+            "basic",
+            "context",
+        }
         if not self._stage_runtime_ready():
             return
         self._require_special_token_ids()
@@ -148,29 +176,39 @@ class MiniCPMO45Stage0DuplexRuntime:
             (runtime_config or {}).get("initial_user_text"),
         )
         for token_id in self._encode_text(prefix):
-            state.context_embeds.append(self._embed_token(token_id))
+            embed = self._embed_token(token_id)
+            state.context_embeds.append(embed)
             state.context_token_ids.append(token_id)
+            state.context_prefix_embeds.append(embed)
+            state.context_prefix_token_ids.append(token_id)
         if ref_audio is not None:
             ref_audio_embeds = self._stage_ref_audio_embeddings(ref_audio, state=state)
             if ref_audio_embeds is not None:
                 ref_audio_embeds = self._as_2d_tensor(ref_audio_embeds)
+                placeholder_ids = [self.unit_token_id] * int(ref_audio_embeds.shape[0])
                 state.context_embeds.append(ref_audio_embeds)
-                state.context_token_ids.extend([self.unit_token_id] * int(ref_audio_embeds.shape[0]))
+                state.context_token_ids.extend(placeholder_ids)
+                state.context_prefix_embeds.append(ref_audio_embeds)
+                state.context_prefix_token_ids.extend(placeholder_ids)
         for token_id in self._encode_text(suffix):
-            state.context_embeds.append(self._embed_token(token_id))
+            embed = self._embed_token(token_id)
+            state.context_embeds.append(embed)
             state.context_token_ids.append(token_id)
+            state.context_suffix_embeds.append(embed)
+            state.context_suffix_token_ids.append(token_id)
 
     def _stage_prefill_embeddings_only(
         self,
         state: _MiniCPMO45Stage0SessionState,
-        audio_waveform: Any,
+        audio_waveform: NDArray[np.float32] | None,
         *,
-        video_frames: list[Any] | None = None,
+        video_frames: list[Image.Image] | None = None,
         epoch: int | None = None,
         seq: int | None = None,
         is_speech: bool = False,
         final: bool = False,
-    ) -> dict[str, Any]:
+        stage0_window: dict[str, object] | None = None,
+    ) -> dict[str, object]:
         """Build scheduler-owned Stage0 input embeddings for one audio append.
 
         Unlike the legacy worker-control path, this method never calls an eager
@@ -190,6 +228,16 @@ class MiniCPMO45Stage0DuplexRuntime:
             result["input_token_ids"] = list(state.prepared_input_token_ids)
             return result
         self._require_special_token_ids()
+        if isinstance(stage0_window, dict):
+            completed_ids = stage0_window.get("completed_token_ids")
+            if isinstance(completed_ids, list):
+                state.pending_window_generated_tokens = [int(token_id) for token_id in completed_ids]
+            completed_terminator = stage0_window.get("completed_terminator_token_id")
+            if isinstance(completed_terminator, int):
+                # Async sampling can overwrite the worker's pending token
+                # after the scheduler accepted a segment stop. Rebuild from
+                # the scheduler's canonical boundary, just like its content.
+                state.pending_terminator_token = completed_terminator
         if audio_waveform is None or len(audio_waveform) == 0:
             return self._stage_prefill_result(False, start_time, "empty audio")
         state.audio_buffer = np.concatenate([state.audio_buffer, np.asarray(audio_waveform, dtype=np.float32)])
@@ -217,7 +265,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         # Omni duplex: encode this append's camera frames so the first unit can
         # carry them, mirroring official streaming_prefill (feed <unit>, then
         # every frame_list entry as its own <image> block, then the audio).
-        frame_blocks: list[Any] = []
+        frame_blocks: list[list[torch.Tensor]] = []
         if video_frames:
             self._require_vision_token_ids()
             encoded_frames = self._stage_vision_embeddings(video_frames)
@@ -227,7 +275,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                 return self._stage_prefill_result(False, start_time, "streaming vision embedding failed")
             frame_blocks = encoded_frames
 
-        embed_parts: list[Any] = []
+        embed_parts: list[torch.Tensor] = []
         token_ids: list[int] = []
         if state.audio_chunk_idx == 0 and state.context_embeds:
             embed_parts.extend(state.context_embeds)
@@ -270,12 +318,25 @@ class MiniCPMO45Stage0DuplexRuntime:
                 # the closure; the model's listen/speak policy depends on
                 # seeing its own past decisions in context.
                 pending_terminator = state.pending_terminator_token
+                closure_token_ids: list[int] = []
                 if pending_terminator is not None and units_built == 0:
                     state.pending_terminator_token = None
                     embed_parts.append(self._embed_token(pending_terminator))
                     token_ids.append(int(pending_terminator))
+                    closure_token_ids.append(int(pending_terminator))
                 embed_parts.append(self._embed_token(self.unit_end_token_id))
                 token_ids.append(self.unit_end_token_id)
+                closure_token_ids.append(self.unit_end_token_id)
+                if units_built == 0:
+                    self._finalize_window_unit(state, closure_token_ids)
+                elif state.pending_window_unit is not None:
+                    # Internal processor chunks belong to this same append.
+                    state.pending_window_unit.embeds.extend(
+                        self._embed_token(token_id) for token_id in closure_token_ids
+                    )
+                    state.pending_window_unit.token_ids.extend(closure_token_ids)
+            unit_embed_start = len(embed_parts)
+            unit_token_start = len(token_ids)
             embed_parts.append(self._embed_token(self.unit_token_id))
             token_ids.append(self.unit_token_id)
             if frame_blocks:
@@ -302,6 +363,11 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.audio_buffer = state.audio_buffer[consumed_samples:]
             state.audio_chunk_idx += 1
             units_built += 1
+            if state.window_enabled:
+                if state.pending_window_unit is None:
+                    state.pending_window_unit = _MiniCPMO45WindowUnit()
+                state.pending_window_unit.embeds.extend(embed_parts[unit_embed_start:])
+                state.pending_window_unit.token_ids.extend(token_ids[unit_token_start:])
             chunk_size = self._streaming_chunk_size(processor)
         # Match official streaming_prefill: per chunk feed ONLY <unit>+audio. The assistant
         # turn is opened once at session init; re-emitting the turn-open prefix per chunk
@@ -311,6 +377,9 @@ class MiniCPMO45Stage0DuplexRuntime:
 
         import torch
 
+        window_result = self._window_replacement_parts(state, stage0_window)
+        if window_result is not None:
+            embed_parts, token_ids = window_result
         inputs_embeds = torch.cat([self._as_2d_tensor(embed) for embed in embed_parts], dim=0)
         result = self._stage_prefill_result(True, start_time)
         result.update(
@@ -323,6 +392,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "uses_model_runner_scheduler": True,
                 "runner_kv_backed": True,
                 "runtime_impl": "scheduler_data_plane",
+                "stage0_window_replaced": window_result is not None,
             }
         )
         if is_speech and (append_identity is None or state.pending_speech_append_identity != append_identity):
@@ -335,8 +405,87 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.prepared_result = {k: v for k, v in result.items() if k not in {"inputs_embeds", "input_token_ids"}}
         return result
 
+    def _finalize_window_unit(
+        self,
+        state: _MiniCPMO45Stage0SessionState,
+        closure_token_ids: list[int],
+    ) -> None:
+        pending = state.pending_window_unit
+        if not state.window_enabled or pending is None:
+            state.pending_window_unit = None
+            state.pending_window_generated_tokens.clear()
+            return
+        generated = list(state.pending_window_generated_tokens)
+        token_ids = [*pending.token_ids, *generated, *closure_token_ids]
+        embeds = list(pending.embeds)
+        embeds.extend(self._embed_token(token_id) for token_id in generated)
+        embeds.extend(self._embed_token(token_id) for token_id in closure_token_ids)
+        state.window_units.append(_MiniCPMO45WindowUnit(embeds=embeds, token_ids=token_ids))
+        state.pending_window_unit = None
+        state.pending_window_generated_tokens.clear()
+
+    def _window_replacement_parts(
+        self,
+        state: _MiniCPMO45Stage0SessionState,
+        stage0_window: dict[str, Any] | None,
+    ) -> tuple[list[Any], list[int]] | None:
+        if not isinstance(stage0_window, dict) or stage0_window.get("replace") is not True:
+            return None
+        try:
+            drop_units = max(0, int(stage0_window.get("drop_units", 0)))
+        except (TypeError, ValueError):
+            return None
+        if drop_units > len(state.window_units):
+            raise RuntimeError(
+                "MiniCPM-o Stage-0 window history is shorter than the scheduler drop plan: "
+                f"drop={drop_units}, completed={len(state.window_units)}"
+            )
+        del state.window_units[:drop_units]
+
+        mode = stage0_window.get("mode")
+        embeds: list[Any] = []
+        token_ids: list[int] = []
+        previous_ids: list[int] = []
+        if mode == "context":
+            embeds.extend(state.context_prefix_embeds)
+            token_ids.extend(state.context_prefix_token_ids)
+            previous = stage0_window.get("previous_token_ids")
+            previous_ids = [int(token_id) for token_id in previous] if isinstance(previous, list) else []
+            if previous_ids:
+                # The plan carries the marker ids the scheduler sized the
+                # `previous` region from. Re-tokenizing here would be a second
+                # source of truth and could disagree with that length.
+                marker = stage0_window.get("previous_marker_token_ids")
+                marker_ids = [int(token_id) for token_id in marker] if isinstance(marker, list) else []
+                embeds.extend(self._embed_token(token_id) for token_id in [*marker_ids, *previous_ids])
+                token_ids.extend(marker_ids)
+                token_ids.extend(previous_ids)
+            embeds.extend(state.context_suffix_embeds)
+            token_ids.extend(state.context_suffix_token_ids)
+        else:
+            embeds.extend(state.context_embeds)
+            token_ids.extend(state.context_token_ids)
+        for unit in state.window_units:
+            embeds.extend(unit.embeds)
+            token_ids.extend(unit.token_ids)
+        if state.pending_window_unit is not None:
+            embeds.extend(state.pending_window_unit.embeds)
+            token_ids.extend(state.pending_window_unit.token_ids)
+        expected = stage0_window.get("replacement_prompt_len")
+        if isinstance(expected, int) and expected != len(token_ids):
+            unit_lengths = [len(unit.token_ids) for unit in state.window_units]
+            pending_len = len(state.pending_window_unit.token_ids) if state.pending_window_unit is not None else 0
+            raise RuntimeError(
+                "MiniCPM-o Stage-0 window rebuild length mismatch: "
+                f"worker={len(token_ids)}, scheduler={expected}, mode={mode}, "
+                f"prefix={len(state.context_prefix_token_ids)}, "
+                f"suffix={len(state.context_suffix_token_ids)}, previous={len(previous_ids)}, "
+                f"units={unit_lengths}, pending={pending_len}, drop={drop_units}"
+            )
+        return embeds, token_ids
+
     @staticmethod
-    def _stage_prefill_result(success: bool, start_time: float, reason: str = "") -> dict[str, Any]:
+    def _stage_prefill_result(success: bool, start_time: float, reason: str = "") -> dict[str, object]:
         return {
             "success": success,
             "prefill_success": success,
@@ -347,14 +496,14 @@ class MiniCPMO45Stage0DuplexRuntime:
         }
 
     @staticmethod
-    def _as_2d_tensor(value: Any) -> Any:
+    def _as_2d_tensor(value: torch.Tensor) -> torch.Tensor:
         if value.ndim == 1:
             return value.unsqueeze(0)
         if value.ndim == 3 and value.shape[0] == 1:
             return value.squeeze(0)
         return value
 
-    def _embed_token(self, token_id: int) -> Any:
+    def _embed_token(self, token_id: int) -> torch.Tensor:
         import torch
 
         token = torch.tensor([int(token_id)], dtype=torch.long, device=self._model_device())
@@ -362,7 +511,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         embeds = embedder(token)
         return self._as_2d_tensor(embeds)
 
-    def _token_embedding_dtype(self) -> Any:
+    def _token_embedding_dtype(self) -> torch.dtype | None:
         """dtype of the decoder token embeddings, the unit's reference dtype.
 
         Official ``get_vllm_embedding`` casts vision hidden states to the token
@@ -376,7 +525,7 @@ class MiniCPMO45Stage0DuplexRuntime:
             return dtype
         return getattr(next(self.thinker.parameters()), "dtype", None)
 
-    def _token_embedder(self) -> Any:
+    def _token_embedder(self) -> Callable[[torch.Tensor], torch.Tensor]:
         nested_embed = getattr(getattr(getattr(self.thinker, "llm", None), "model", None), "embed_tokens", None)
         if callable(nested_embed):
             return nested_embed
@@ -391,7 +540,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                     return embedder
         raise AttributeError("MiniCPM-o stage0 model does not expose token embeddings")
 
-    def _model_device(self) -> Any:
+    def _model_device(self) -> torch.device | str:
         try:
             return next(self.thinker.parameters()).device
         except Exception:
@@ -402,14 +551,14 @@ class MiniCPMO45Stage0DuplexRuntime:
             pass
         return self.device
 
-    def _streaming_chunk_size(self, processor: Any | None = None) -> int:
+    def _streaming_chunk_size(self, processor: Any | None = None) -> int:  # Any: remote-code processor
         processor = processor or self.processor
         get_chunk = getattr(processor, "get_streaming_chunk_size", None)
         if callable(get_chunk):
             return int(get_chunk())
         return 16000
 
-    def _sample_rate(self, processor: Any | None = None) -> int:
+    def _sample_rate(self, processor: Any | None = None) -> int:  # Any: remote-code processor
         processor = processor or self.processor
         return int(
             self._stage_param(
@@ -418,7 +567,7 @@ class MiniCPMO45Stage0DuplexRuntime:
             )
         )
 
-    def _first_chunk_samples(self, default_chunk_size: int, processor: Any | None = None) -> int:
+    def _first_chunk_samples(self, default_chunk_size: int, processor: Any | None = None) -> int:  # Any: processor
         processor = processor or self.processor
         if getattr(processor, "_streaming_mel_processor", None) is None:
             return default_chunk_size
@@ -427,7 +576,7 @@ class MiniCPMO45Stage0DuplexRuntime:
     def _pad_first_audio_chunk_if_needed(
         self,
         state: _MiniCPMO45Stage0SessionState,
-        processor: Any | None = None,
+        processor: Any | None = None,  # Any: remote-code processor
     ) -> None:
         if state.audio_chunk_idx != 0 or len(state.audio_buffer) == 0:
             return
@@ -440,7 +589,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         padding: np.ndarray = np.zeros(first_chunk_samples - len(state.audio_buffer), dtype=np.float32)
         state.audio_buffer = np.concatenate([padding, state.audio_buffer])
 
-    def _stage_param(self, name: str, default: Any) -> Any:
+    def _stage_param(self, name: str, default: object) -> Any:  # Any: attribute read off the remote-code model
         for target in (self.stage_model, self.thinker, getattr(self.thinker, "llm", None)):
             value = getattr(target, name, None)
             if value is not None:
@@ -455,7 +604,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         chunk_idx: int,
         default_chunk_size: int,
         *,
-        processor: Any | None = None,
+        processor: Any | None = None,  # Any: remote-code processor
     ) -> int:
         processor = processor or self.processor
         if chunk_idx != 0:
@@ -472,11 +621,11 @@ class MiniCPMO45Stage0DuplexRuntime:
 
     def _process_streaming_audio(
         self,
-        audio_chunk: Any,
+        audio_chunk: NDArray[np.float32],
         chunk_idx: int,
         *,
-        processor: Any | None = None,
-    ) -> Any:
+        processor: Any | None = None,  # Any: remote-code processor
+    ) -> Any:  # Any: transformers BatchFeature (or the dict fallback below)
         processor = processor or self.processor
         process = getattr(processor, "process_audio_streaming", None)
         if callable(process):
@@ -488,10 +637,10 @@ class MiniCPMO45Stage0DuplexRuntime:
 
     def _stage_audio_embeddings(
         self,
-        batch_feature: Any,
+        batch_feature: Any,  # Any: transformers BatchFeature
         *,
         state: _MiniCPMO45Stage0SessionState | None = None,
-    ) -> Any | None:
+    ) -> torch.Tensor | None:
         if hasattr(batch_feature, "to"):
             batch_feature = batch_feature.to(self.device)
         self._ensure_dynamic_cache_compat()
@@ -534,17 +683,17 @@ class MiniCPMO45Stage0DuplexRuntime:
                 self.thinker.audio_past_key_values = previous_audio_past_key_values
 
     @staticmethod
-    def _decode_ref_audio_from_session_config(session_config: dict[str, Any]) -> Any | None:
+    def _decode_ref_audio_from_session_config(session_config: dict[str, object]) -> NDArray[np.float32] | None:
         from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input import decode_native_ref_audio_from_config
 
         return decode_native_ref_audio_from_config({"extra_body": session_config})
 
     def _stage_ref_audio_embeddings(
         self,
-        ref_audio: Any,
+        ref_audio: NDArray[np.float32],
         *,
         state: _MiniCPMO45Stage0SessionState | None = None,
-    ) -> Any | None:
+    ) -> torch.Tensor | None:
         process_audio = getattr(self.processor, "process_audio", None)
         if callable(process_audio):
             batch_feature = process_audio([ref_audio])
@@ -606,16 +755,16 @@ class MiniCPMO45Stage0DuplexRuntime:
         DynamicCache.get_usable_length = get_usable_length  # type: ignore[attr-defined]
 
     @staticmethod
-    def _cat_nested_tensors(value: Any) -> Any | None:
+    def _cat_nested_tensors(value: object) -> torch.Tensor | None:
         import torch
 
-        tensors = []
+        tensors: list[torch.Tensor] = []
 
-        def collect(item: Any) -> None:
+        def collect(item: object) -> None:
             if item is None:
                 return
             if hasattr(item, "detach"):
-                tensors.append(item)
+                tensors.append(cast("torch.Tensor", item))
                 return
             if isinstance(item, dict):
                 for child in item.values():
@@ -655,7 +804,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         }
 
     @staticmethod
-    def _load_processor_from_path(model_path: str | None) -> Any | None:
+    def _load_processor_from_path(model_path: str | None) -> Any | None:  # Any: remote-code AutoProcessor
         if not model_path:
             return None
         try:
@@ -752,7 +901,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         return self.stage_padding_token_id()
 
     @staticmethod
-    def _decode_audio_payload(payload: dict[str, Any]) -> Any:
+    def _decode_audio_payload(payload: dict[str, object]) -> NDArray[np.float32]:
         audio = payload.get("audio") or payload.get("data")
         if not isinstance(audio, str):
             raise ValueError("audio append payload requires base64 audio")
@@ -762,7 +911,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         return np.frombuffer(base64.b64decode(audio), dtype=np.float32)
 
     @staticmethod
-    def _decode_video_frames_payload(payload: dict[str, Any]) -> list[Any]:
+    def _decode_video_frames_payload(payload: dict[str, object]) -> list[Image.Image]:
         """Decode omni-duplex camera frames (base64 JPEG/PNG) to PIL images."""
         frames = payload.get("video_frames")
         if not isinstance(frames, list) or not frames:
@@ -771,7 +920,7 @@ class MiniCPMO45Stage0DuplexRuntime:
 
         from PIL import Image
 
-        decoded: list[Any] = []
+        decoded: list[Image.Image] = []
         for frame_b64 in frames:
             if not isinstance(frame_b64, str) or not frame_b64:
                 continue
@@ -826,7 +975,7 @@ class MiniCPMO45Stage0DuplexRuntime:
             return [1]
         return [2] + [1] * (frame_count - 1)
 
-    def _encode_processed_vision(self, processed: Any) -> list[Any] | None:
+    def _encode_processed_vision(self, processed: Any) -> list[torch.Tensor] | None:  # Any: BatchFeature
         targets = (self.stage_model, self.thinker, getattr(self.stage_model, "model", None))
         for target in targets:
             if target is None:
@@ -842,8 +991,8 @@ class MiniCPMO45Stage0DuplexRuntime:
                 device, dtype = vpm_param.device, vpm_param.dtype
                 pixel_nested = processed["pixel_values"]
                 tgt_nested = processed["tgt_sizes"]
-                flat_pixels: list[Any] = []
-                flat_tgt: list[Any] = []
+                flat_pixels: list[torch.Tensor] = []
+                flat_tgt: list[torch.Tensor] = []
                 for image_slices, image_tgt in zip(pixel_nested, tgt_nested):
                     for slice_pixels in image_slices:
                         flat_pixels.append(slice_pixels.to(device=device, dtype=dtype))
@@ -858,7 +1007,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                 return None
             expected = MiniCPMO45DuplexPolicy.VISION_EMBEDS_PER_FRAME
             embed_dtype = self._token_embedding_dtype()
-            out: list[Any] = []
+            out: list[torch.Tensor] = []
             for block in hidden:
                 block_2d = self._as_2d_tensor(block)
                 if int(block_2d.shape[0]) != expected:
@@ -869,7 +1018,7 @@ class MiniCPMO45Stage0DuplexRuntime:
             return out
         return None
 
-    def _stage_vision_embeddings(self, frames: list[Any]) -> list[list[Any]] | None:
+    def _stage_vision_embeddings(self, frames: list[Image.Image]) -> list[list[torch.Tensor]] | None:
         """Encode camera frames for omni duplex via the loaded vision tower.
 
         Official ``streaming_prefill`` encodes each ``frame_list`` entry as its
@@ -883,7 +1032,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         process_image = getattr(self.processor, "process_image", None)
         if not callable(process_image):
             return None
-        out: list[list[Any]] = []
+        out: list[list[torch.Tensor]] = []
         for frame, max_slices in zip(frames, self._official_max_slice_nums(len(frames))):
             try:
                 processed = process_image([frame], max_slice_nums=max_slices)

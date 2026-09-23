@@ -384,12 +384,19 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
     )
-    parser.add_argument(
+    quantization_group = parser.add_mutually_exclusive_group()
+    quantization_group.add_argument(
         "--quantization",
         type=str,
         default=None,
         choices=["fp8", "mxfp8", "mxfp4", "mxfp4_dualscale", "int8"],
         help="Quantization method for the transformer. mxfp8: W8A8 MXFP8 (NPU). mxfp4: W4A4 MXFP4 (NPU). mxfp4_dualscale: W4A4 MXFP4 dual-scale + BF16 fallback mixed (NPU). fp8: online FP8 (GPU).",
+    )
+    quantization_group.add_argument(
+        "--quantization-config",
+        type=json.loads,
+        default=None,
+        help='Quantization JSON, e.g. \'{"method":"mxfp4","w4a8_fallback_steps":[0,2]}\'.',
     )
 
     # Distributed and parallel execution
@@ -572,6 +579,8 @@ def main():
         omni_kwargs["flow_shift"] = args.flow_shift
     if args.quantization is not None:
         omni_kwargs["quantization"] = args.quantization
+    if args.quantization_config is not None:
+        omni_kwargs["quantization_config"] = args.quantization_config
     if args.cache_backend is not None:
         omni_kwargs["cache_backend"] = args.cache_backend
         omni_kwargs["cache_config"] = cache_config

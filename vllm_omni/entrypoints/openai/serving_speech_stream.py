@@ -483,6 +483,7 @@ class OmniStreamingSpeechHandler:
                 include_sample_rate=True,
                 tts_params=tts_params,
                 collect=collect,
+                cumulative_audio=True,
             )
         ) as stream:
             async for chunk, chunk_sample_rate in stream:

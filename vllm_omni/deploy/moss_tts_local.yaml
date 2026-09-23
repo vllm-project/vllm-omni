@@ -64,3 +64,14 @@ stages:
       max_tokens: 65536
       seed: 42
       repetition_penalty: 1.0
+
+# Stage 1 NPU override: PIECEWISE cudagraph for NPUGraph capture; set enforce_eager: true to disable.
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+          # Re-declared: _apply_platform_overrides() wholesale-replaces compilation_config.
+          cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
+          cudagraph_num_of_warmups: 1

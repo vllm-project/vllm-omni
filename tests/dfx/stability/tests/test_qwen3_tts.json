@@ -12,6 +12,7 @@
                 }
             },
             "local_model",
+            "slow",
             "tts"
         ],
         "server_params": {

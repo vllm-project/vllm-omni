@@ -81,6 +81,7 @@ def collect_duplex_session_metrics(
             measurement_origin=_REQUEST_MEASUREMENT_ORIGIN,
         )
         raw_metric = timing.get("request_metrics")
+        stages = timing.get("stages")
         stage0 = timing.get("stage0_tokens")
         metric: dict[str, object] = {
             "session_id": session_id,
@@ -90,10 +91,17 @@ def collect_duplex_session_metrics(
         if isinstance(raw_metric, dict):
             metric.update(raw_metric)
             metric["rtf"] = audio_rtf_from_raw_metric(raw_metric)
+        copied_stages: dict[str, dict[str, object]] = {}
+        if isinstance(stages, dict):
+            for stage_id, stage_snapshot in stages.items():
+                if isinstance(stage_snapshot, dict):
+                    copied_stages[str(stage_id)] = dict(stage_snapshot)
+        if copied_stages:
+            metric["stages"] = copied_stages
         if isinstance(stage0, dict):
             metric["stage0_tokens"] = dict(stage0)
             output_tokens += int(stage0.get("output_token_count") or 0)
-        if isinstance(raw_metric, dict) or isinstance(stage0, dict):
+        if isinstance(raw_metric, dict) or copied_stages or isinstance(stage0, dict):
             request_metrics.append(metric)
     session_metrics = summarize_session_request_metrics(
         request_metrics,
