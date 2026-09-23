@@ -1528,6 +1528,7 @@ def launch_headless_diffusion_replicas(
     omni_conn_cfg, omni_from, omni_to = initialization.resolve_omni_kv_config_for_stage(
         omni_transfer_config,
         stage_id,
+        stage_cfg,
     )
 
     metadata = (

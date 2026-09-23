@@ -12,6 +12,7 @@ from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.omni_config import VllmOmniDiffusionStageConfig, extract_diffusion_stage_config_kwargs
 from vllm_omni.config.resolver import OmniConfigResolution, resolve_omni_config
 from vllm_omni.diffusion.data import AttentionConfig, OmniDiffusionConfig
+from vllm_omni.distributed.omni_connectors.utils.config import StageConnectorPlan
 from vllm_omni.engine import stage_init_utils
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand
@@ -913,7 +914,7 @@ def test_generic_diffusion_structured_stage_reaches_standard_startup(mocker):
 
     mocker.patch.object(runtime_module, "prepare_engine_environment")
     mocker.patch.object(runtime_module, "load_omni_transfer_config_for_model", return_value=None)
-    mocker.patch.object(runtime_module, "get_stage_connector_spec", return_value={})
+    mocker.patch.object(runtime_module, "get_stage_connector_plan", return_value=StageConnectorPlan())
     mocker.patch.object(runtime_module, "resolve_omni_kv_config_for_stage", return_value=(None, None, None))
 
     def _initialize_typed_stage(stage_id, model, stage_config, metadata, **kwargs):

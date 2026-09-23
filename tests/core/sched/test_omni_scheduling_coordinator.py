@@ -23,6 +23,7 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_native_mrv2_data_plane,
 )
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
+from vllm_omni.engine import ConnectorEndpoint
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -61,7 +62,7 @@ def _make_request(req_id: str, status: str = "waiting") -> SimpleNamespace:
         num_output_placeholders=0,
         _all_token_ids=[],
         _output_token_ids=[],
-        payload_sender_info=None,
+        sender_info=None,
     )
 
 
@@ -314,17 +315,17 @@ class TestWaitingForInputTransition(unittest.TestCase):
         self.assertEqual(len(coord.pending_input_registrations), 1)
         self.assertEqual(coord.pending_input_registrations[0].request_id, "r1")
 
-    def test_pending_input_registration_carries_payload_sender_info(self):
+    def test_pending_input_registration_carries_sender_info(self):
         coord = OmniSchedulingCoordinator(stage_id=1)
         req = _make_request("r1", status=RequestStatus.WAITING_FOR_INPUT)
-        req.payload_sender_info = {"host": "10.0.0.1", "zmq_port": 50051}
+        req.sender_info = ConnectorEndpoint(host="10.0.0.1", zmq_port=50051)
         waiting = MockQueue([req])
 
         coord.process_pending_full_payload_inputs(waiting, set())
 
         self.assertEqual(
-            coord.pending_input_registrations[0].payload_sender_info,
-            {"host": "10.0.0.1", "zmq_port": 50051},
+            coord.pending_input_registrations[0].sender_info,
+            ConnectorEndpoint(host="10.0.0.1", zmq_port=50051),
         )
 
     def test_idle_cycles_retain_received_marker_before_request_appears(self):

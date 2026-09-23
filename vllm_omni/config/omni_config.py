@@ -1328,7 +1328,7 @@ _DIFFUSION_STAGE_METADATA_FIELDS = frozenset(
         "model_stage",
         "retains_state_across_chunks",
         "scheduler_cls",
-        "stage_connector_spec",
+        "stage_connector_plan",
         "worker_type",
     }
 )

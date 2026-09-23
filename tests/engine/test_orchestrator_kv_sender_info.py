@@ -4,12 +4,18 @@
 import asyncio
 from collections.abc import Callable
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from vllm import SamplingParams
 from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
 
+from vllm_omni.distributed.omni_connectors.utils.config import (
+    ConnectorSpec,
+    StageConnectorPlan,
+    StageConnectorSpec,
+)
+from vllm_omni.engine import ConnectorEndpoint
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.messages import OutputMessage
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
@@ -108,50 +114,57 @@ def test_stage_engine_core_client_builds_payload_sender_info_after_base_init(
     assert client.get_payload_sender_info() is None
 
 
-@pytest.mark.parametrize("outgoing", [False, True])
+@pytest.mark.parametrize("inbound_edge", [False, True])
 @pytest.mark.parametrize("base_port", [None, 48000])
-def test_payload_sender_endpoint_matches_resolver_with_unequal_replicas(outgoing, base_port):
-    from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
-    from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_connector_spec
+def test_payload_sender_endpoint_matches_resolver_with_unequal_replicas(inbound_edge, base_port):
+    """A replica advertises the port it actually binds, not the config default.
 
-    edge = {"host": "10.0.0.2", "from_stage": 1}
-    if base_port is not None:
-        edge["zmq_port"] = base_port
-    extra = (
-        {
-            "role": "receiver",
-            "host": "10.0.0.1",
-            "zmq_port": 47000,
-            "from_stage": 0,
-            "outgoing": edge,
-        }
-        if outgoing
-        else {"role": "sender", **edge}
+    The static consumer-side config cannot know which producer replica a
+    request is bound to, so its ``sender_zmq_port`` is the replica-0 port.
+    The request-scoped endpoint must carry this replica's own port instead.
+    """
+    from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+    from vllm_omni.distributed.omni_connectors.utils.config import (
+        ConnectorSpec,
+        OmniTransferConfig,
+        StageConnectorPlan,
+        StageConnectorSpec,
     )
+    from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_stage_connector_plan
+
+    edge_extra = {"host": "10.0.0.2"}
+    if base_port is not None:
+        edge_extra["zmq_port"] = base_port
+    outbound = StageConnectorSpec(1, 2, ConnectorSpec(name="NixlConnector", extra=edge_extra))
+    inbound = (
+        StageConnectorSpec(
+            0,
+            1,
+            ConnectorSpec(name="NixlConnector", extra={"host": "10.0.0.1", "zmq_port": 47000}),
+        )
+        if inbound_edge
+        else None
+    )
+
     client = object.__new__(StageEngineCoreClient)
     client.stage_id = 1
     client.replica_id = 3
-    client.vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(stage_connector_config={"name": "NixlConnector", "extra": extra})
-    )
-    producer = resolve_connector_spec(
-        ConnectorSpec(name="NixlConnector", extra=extra),
-        stage_id=1,
-        role=extra["role"],
-        replica_id=client.replica_id,
-    )
-    consumer = resolve_connector_spec(
-        ConnectorSpec(name="NixlConnector", extra=edge), stage_id=2, role="receiver", replica_id=7
+    client._stage_connector_plan = StageConnectorPlan(inbound=inbound, outbound=outbound)
+    client._payload_sender_info = None
+    client._payload_sender_info_initialized = False
+
+    producer = OmniConnectorFactory.materialize_connector_spec(outbound, "sender", 1, 0, client.replica_id)
+    consumer_plan = resolve_stage_connector_plan(
+        OmniTransferConfig(connectors={("1", "2"): ConnectorSpec(name="NixlConnector", extra=dict(edge_extra))}),
+        2,
     )
 
-    sender_info = client._build_payload_sender_info()
+    sender_info = client.get_payload_sender_info()
 
-    assert sender_info == {
-        "host": "10.0.0.2",
-        "zmq_port": (50051 if base_port is None else base_port) + 3 * 1024 + 1,
-    }
-    assert sender_info["zmq_port"] == producer.extra["zmq_port"]
-    assert sender_info["zmq_port"] != consumer.extra["sender_zmq_port"]
+    assert sender_info is not None
+    assert sender_info.host == "10.0.0.2"
+    assert sender_info.zmq_port == producer.extra["zmq_port"]
+    assert sender_info.zmq_port != consumer_plan.inbound.spec.extra["sender_zmq_port"]
 
 
 def test_stage_engine_core_client_builds_kv_sender_info_from_tcp_address():
@@ -239,7 +252,18 @@ def test_forward_to_diffusion_attaches_kv_sender_info():
     orchestrator = object.__new__(Orchestrator)
     diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
     sender_pool = _build_sender_pool(0, {"host": "10.0.0.2", "zmq_port": 50151})
-    diffusion_pool = StagePool(1, diffusion_stage)
+    diffusion_pool = StagePool(
+        1,
+        diffusion_stage,
+        stage_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                stage_id=1,
+                stage_connector_plan=StageConnectorPlan(
+                    inbound=StageConnectorSpec(0, 1, ConnectorSpec("SharedMemoryConnector"))
+                ),
+            )
+        ),
+    )
 
     orchestrator.num_stages = 2
     orchestrator.stage_pools = [sender_pool, diffusion_pool]
@@ -254,6 +278,7 @@ def test_forward_to_diffusion_attaches_kv_sender_info():
     )
 
     output = SimpleNamespace(request_id="req-1", finished=True)
+    sender_pool.select_replica_id("req-1")
     asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-1", sender_pool.stage_id, output, req_state))
 
     assert diffusion_stage.calls[0]["request_id"] == "req-1"
@@ -283,6 +308,7 @@ def test_forward_to_diffusion_uses_engine_input_source_for_kv_sender_info():
     )
 
     output = SimpleNamespace(request_id="req-3", finished=True)
+    source_pool.select_replica_id("req-3")
     asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-3", previous_pool.stage_id, output, req_state))
 
     assert diffusion_stage.calls[0]["kv_sender_info"] == {
@@ -293,7 +319,7 @@ def test_forward_to_diffusion_uses_engine_input_source_for_kv_sender_info():
 def test_forward_to_diffusion_returns_terminal_error_for_empty_custom_inputs():
     orchestrator = object.__new__(Orchestrator)
     diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
-    diffusion_stage.custom_process_input_func = lambda *_args, **_kwargs: []
+    diffusion_stage.custom_process_input_func = cast(Any, lambda *_args, **_kwargs: [])
     sender_pool = _build_sender_pool(0, {"host": "10.0.0.2", "zmq_port": 50151})
     diffusion_pool = StagePool(1, diffusion_stage)
 
@@ -339,7 +365,18 @@ def test_prewarm_diffusion_attaches_kv_sender_info():
     orchestrator = object.__new__(Orchestrator)
     diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
     sender_pool = _build_sender_pool(0, {"host": "10.0.0.3", "zmq_port": 50151})
-    diffusion_pool = StagePool(1, diffusion_stage)
+    diffusion_pool = StagePool(
+        1,
+        diffusion_stage,
+        stage_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                stage_id=1,
+                stage_connector_plan=StageConnectorPlan(
+                    inbound=StageConnectorSpec(0, 1, ConnectorSpec("SharedMemoryConnector"))
+                ),
+            )
+        ),
+    )
 
     orchestrator.stage_pools = [sender_pool, diffusion_pool]
     orchestrator.num_stages = 2
@@ -363,8 +400,16 @@ def test_prewarm_diffusion_attaches_kv_sender_info():
 
 def test_prewarm_submits_bound_payload_endpoint_for_concurrent_replicas():
     orchestrator = object.__new__(Orchestrator)
-    endpoints = {"a": {"host": "10.0.0.2", "zmq_port": 52099}, "b": {"host": "10.0.0.3", "zmq_port": 54147}}
+    endpoints = {
+        "a": ConnectorEndpoint(host="10.0.0.2", zmq_port=52099),
+        "b": ConnectorEndpoint(host="10.0.0.3", zmq_port=54147),
+    }
+
+    async def pick_or_select(key):
+        return {"a": 2, "b": 4}[key]
+
     source = SimpleNamespace(
+        _pick_or_select=pick_or_select,
         get_bound_client=lambda key: SimpleNamespace(get_payload_sender_info=lambda: endpoints[key]),
         get_bound_replica_id=lambda key: {"a": 2, "b": 4}[key],
     )
@@ -377,7 +422,7 @@ def test_prewarm_submits_bound_payload_endpoint_for_concurrent_replicas():
     target = SimpleNamespace(
         stage_type="llm",
         stage_client=SimpleNamespace(engine_input_source=[0]),
-        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(hf_config=None, max_model_len=64)),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(hf_config=None, max_model_len=64, stage_id=1)),
         submit_initial=submit,
         get_bound_replica_id=lambda key: {"a": 7, "b": 1}[key],
     )
@@ -413,7 +458,7 @@ def test_prewarm_submits_bound_payload_endpoint_for_concurrent_replicas():
     from vllm_omni.engine import OmniEngineCoreRequest
 
     assert all(isinstance(request, OmniEngineCoreRequest) for request in submitted.values())
-    assert {key: request.payload_sender_info for key, request in submitted.items()} == endpoints
+    assert {key: request.sender_info for key, request in submitted.items()} == endpoints
 
 
 @pytest.mark.asyncio

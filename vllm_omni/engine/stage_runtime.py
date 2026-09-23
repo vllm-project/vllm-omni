@@ -58,7 +58,7 @@ from vllm_omni.engine.stage_init_utils import (
     device_overlap_group_keys,
     extract_legacy_stage_metadata,
     extract_stage_metadata_from_omni_stage_config,
-    get_stage_connector_spec,
+    get_stage_connector_plan,
     inject_kv_stage_info,
     inject_omni_kv_connector_config,
     load_omni_transfer_config_for_model,
@@ -718,12 +718,15 @@ class StageRuntime:
                     "orchestrator indexes stage pools by stage_id."
                 )
 
-            stage_connector_spec = get_stage_connector_spec(
+            stage_connector_plan = get_stage_connector_plan(
                 omni_transfer_config=omni_transfer_config,
                 stage_id=stage_id,
-                async_chunk=self._async_chunk,
             )
-            omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
+            omni_kv_connector = resolve_omni_kv_config_for_stage(
+                omni_transfer_config,
+                stage_id,
+                stage_cfg,
+            )
             num_replicas = replicas_per_stage[stage_idx]
             launch_mode = self._get_launch_mode(stage_id)
 
@@ -732,18 +735,21 @@ class StageRuntime:
             executor_class = None
             engine_args_dict = None
             if base_metadata.stage_type != "diffusion":
+                # The stable adapter entry point still receives the same
+                # legacy stage object as replica planning. Its implementation
+                # switches only at the coordinated RFC #4021 cutover.
                 engine_args_dict = (
                     build_engine_args_dict_from_omni_stage_config(
                         stage_cfg,
                         self._model,
-                        stage_connector_spec=stage_connector_spec,
+                        stage_connector_plan=stage_connector_plan,
                         cli_tokenizer=self._tokenizer,
                     )
                     if isinstance(stage_cfg, BaseVllmOmniStageConfig)
                     else build_engine_args_dict(
                         stage_cfg,
                         self._model,
-                        stage_connector_spec=stage_connector_spec,
+                        stage_connector_plan=stage_connector_plan,
                         cli_tokenizer=self._tokenizer,
                     )
                 )
@@ -760,7 +766,7 @@ class StageRuntime:
                 stage_vllm_config, executor_class = build_vllm_config(
                     stage_cfg,
                     self._model,
-                    stage_connector_spec=stage_connector_spec,
+                    stage_connector_plan=stage_connector_plan,
                     engine_args_dict=engine_args_dict,
                     api_process_count=self._client_count,
                     api_process_rank=self._api_process_rank,
@@ -801,7 +807,7 @@ class StageRuntime:
                         launch_mode=launch_mode,
                         stage_cfg=replica_cfg,
                         metadata=replica_metadata,
-                        stage_connector_spec=stage_connector_spec,
+                        stage_connector_plan=stage_connector_plan,
                         omni_kv_connector=omni_kv_connector,
                         stage_vllm_config=replica_vllm_config,
                         executor_class=executor_class,

@@ -18,11 +18,12 @@ from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
 from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_streaming_input_prompt
+from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory, StageConnectorSet
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
-from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
+from vllm_omni.engine import ConnectorEndpoint
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -446,9 +447,9 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
 
         monkeypatch.setattr(OmniTransferAdapterBase, "__init__", _fake_base_init)
         monkeypatch.setattr(
-            OmniChunkTransferAdapter,
-            "create_connector",
-            classmethod(lambda cls, _model_config: connector),
+            OmniConnectorFactory,
+            "create_stage_connectors",
+            lambda *_args, **_kwargs: StageConnectorSet(receive=connector, send=connector),
         )
 
         hf_config = SimpleNamespace(
@@ -465,6 +466,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
                 )
             )
         model_config = SimpleNamespace(
+            stage_id=stage_id,
             worker_type=model_mode,
             max_num_seqs=max_num_seqs,
             max_model_len=max_model_len,
@@ -517,35 +519,6 @@ def test_talker_streaming_policy_is_scoped_to_tts_stage(build_adapter, stage_id:
     assert adapter._streaming_prompt_recompute_on_capacity is False
 
 
-@pytest.mark.parametrize(
-    ("raw_cfg", "expected_name", "expected_extra"),
-    [
-        (None, "SharedMemoryConnector", {}),
-        (SimpleNamespace(name="YuanrongConnector", extra={"k": "v"}), "YuanrongConnector", {"k": "v"}),
-    ],
-)
-def test_create_connector_config_parsing(monkeypatch, raw_cfg, expected_name, expected_extra):
-    captured = {}
-
-    def _fake_create(spec):
-        captured["spec"] = spec
-        return "ok"
-
-    monkeypatch.setattr(
-        "vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter"
-        ".OmniConnectorFactory.create_connector",
-        _fake_create,
-    )
-
-    model_config = SimpleNamespace(stage_connector_config=raw_cfg) if raw_cfg is not None else SimpleNamespace()
-    connector = OmniChunkTransferAdapter.create_connector(model_config)
-
-    assert connector == "ok"
-    assert isinstance(captured["spec"], ConnectorSpec)
-    assert captured["spec"].name == expected_name
-    assert captured["spec"].extra == {**expected_extra, "stage_id": 0}
-
-
 def test_load_poll(build_adapter):
     adapter, connector = build_adapter(stage_id=2, model_mode="ar")
     request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
@@ -575,7 +548,7 @@ def test_load_poll(build_adapter):
 def test_load_poll_uses_request_scoped_payload_sender_endpoint(build_adapter):
     adapter, connector = build_adapter(stage_id=2, model_mode="ar")
     request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
-    request.payload_sender_info = {"host": "10.0.0.1", "zmq_port": 50051}
+    request.sender_info = ConnectorEndpoint(host="10.0.0.1", zmq_port=50051)
     connector.get.return_value = None
 
     adapter._poll_single_request(_dequeue_load_entry(adapter, request))
@@ -591,9 +564,9 @@ def test_load_poll_uses_request_scoped_payload_sender_endpoint(build_adapter):
 def test_load_poll_keeps_concurrent_payload_sender_endpoints_distinct(build_adapter):
     adapter, connector = build_adapter(stage_id=2, model_mode="ar")
     first = _req("req-1", RequestStatus.WAITING)
-    first.payload_sender_info = {"host": "10.0.0.1", "zmq_port": 50051}
+    first.sender_info = ConnectorEndpoint(host="10.0.0.1", zmq_port=50051)
     second = _req("req-2", RequestStatus.WAITING)
-    second.payload_sender_info = {"host": "10.0.0.2", "zmq_port": 51051}
+    second.sender_info = ConnectorEndpoint(host="10.0.0.2", zmq_port=51051)
     connector.get.return_value = None
 
     second_entry = _dequeue_load_entry(adapter, second)
@@ -1932,7 +1905,7 @@ def test_cleanup_and_reregister_discards_inflight_old_segment_chunk(build_adapte
     get_started = threading.Event()
     release_get = threading.Event()
 
-    def blocking_get(*_args):
+    def blocking_get(*_args, **_kwargs):
         get_started.set()
         assert release_get.wait(timeout=5)
         return (

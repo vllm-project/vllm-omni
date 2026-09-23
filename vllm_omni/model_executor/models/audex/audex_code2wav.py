@@ -109,7 +109,7 @@ class AudexCode2Wav(nn.Module):
         self._sessions: dict[str, AudexCausalSpeechDecoderSession] = {}
 
     def _connector_extra_config(self) -> dict[str, Any]:
-        connector_cfg = getattr(self.vllm_config.model_config, "stage_connector_config", None)
+        connector_cfg = getattr(self.vllm_config.model_config, "stage_input_connector_config", None)
         if isinstance(connector_cfg, dict):
             extra = connector_cfg.get("extra", connector_cfg)
             return extra if isinstance(extra, dict) else {}

@@ -14,6 +14,7 @@ import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.engine import ConnectorEndpoint
 from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
@@ -103,13 +104,17 @@ class FakePrewarmPool:
 
     stage_type = "llm"
 
-    def __init__(self, role: str) -> None:
-        self.stage_client = SimpleNamespace()
+    def __init__(self, role: str, stage_id: int) -> None:
+        self.stage_client = self
         self._bound_request_ids: set[str] = set()
         self.stage_vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(
                 max_model_len=64,
-                stage_connector_config={"extra": {"role": role}},
+                stage_id=stage_id,
+                stage_connector_config={
+                    "name": "SharedMemoryConnector",
+                    "extra": {"role": role},
+                },
             )
         )
         self.submitted: list[Any] = []
@@ -119,11 +124,18 @@ class FakePrewarmPool:
         self._bound_request_ids.add(request_id)
         return 0
 
+    async def _pick_or_select(self, request_id):
+        self._bound_request_ids.add(request_id)
+        return 0
+
     def get_bound_replica_id(self, request_id):
         return 0 if request_id in self._bound_request_ids else None
 
     def get_bound_client(self, request_id):
         return self.stage_client if self.get_bound_replica_id(request_id) is not None else None
+
+    def get_payload_sender_info(self):
+        return None
 
 
 def _request_output(request_id: str) -> RequestOutput:
@@ -146,6 +158,23 @@ def _request_output(request_id: str) -> RequestOutput:
         metrics=None,
         lora_request=None,
     )
+
+
+def test_payload_sender_info_comes_from_the_bound_producer_replica() -> None:
+    expected = ConnectorEndpoint(host="10.0.0.9", zmq_port=52000)
+    bound_client = SimpleNamespace(get_payload_sender_info=lambda: expected)
+    fallback_client = SimpleNamespace(
+        get_payload_sender_info=lambda: ConnectorEndpoint(host="10.0.0.1", zmq_port=51000)
+    )
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.stage_pools = [
+        SimpleNamespace(
+            stage_client=fallback_client,
+            get_bound_client=lambda request_id: bound_client if request_id == "req-1" else None,
+        )
+    ]
+
+    assert orchestrator._build_payload_sender_info(0, "req-1") is expected
 
 
 @pytest.mark.asyncio
@@ -206,14 +235,14 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("payload_sender_info", [None, {"host": "10.0.0.2", "zmq_port": 52099}])
+@pytest.mark.parametrize("payload_sender_info", [None, ConnectorEndpoint(host="10.0.0.2", zmq_port=52099)])
 async def test_async_prewarm_skips_outgoing_only_stage(payload_sender_info) -> None:
     orchestrator = object.__new__(Orchestrator)
-    stage0 = FakePrewarmPool("sender")
-    stage1 = FakePrewarmPool("sender")
-    stage2 = FakePrewarmPool("receiver")
+    stage0 = FakePrewarmPool("sender", 0)
+    stage1 = FakePrewarmPool("sender", 1)
+    stage2 = FakePrewarmPool("receiver", 2)
     if payload_sender_info is not None:
-        stage1.stage_client.get_payload_sender_info = MagicMock(return_value=payload_sender_info)
+        stage1.get_payload_sender_info = MagicMock(return_value=payload_sender_info)
     orchestrator.stage_pools = [stage0, stage1, stage2]
     orchestrator._emit_tx_edge = lambda **_kwargs: None
     orchestrator._on_stage_submitted = MagicMock()
@@ -231,13 +260,14 @@ async def test_async_prewarm_skips_outgoing_only_stage(payload_sender_info) -> N
     )
 
     assert prewarmed is True
+    # An outgoing-only stage is never pre-submitted, but it is selected so the
+    # downstream stage can address the producer replica bound to this request.
     assert stage1.submitted == []
-    assert stage1.get_bound_client("req-prewarm") is None
     assert len(stage2.submitted) == 1
     assert stage2.get_bound_client("req-prewarm") is stage2.stage_client
-    assert stage2.submitted[0].payload_sender_info == payload_sender_info
+    assert stage2.submitted[0].sender_info == payload_sender_info
     if payload_sender_info is not None:
-        stage1.stage_client.get_payload_sender_info.assert_called_once_with()
+        stage1.get_payload_sender_info.assert_called_once_with()
     assert stage2.submitted[0].external_req_id == "req-prewarm"
     assert stage2.submitted[0].resumable is True
     assert 1 not in req_state.stage_submit_ts
@@ -258,10 +288,10 @@ async def test_async_prewarm_skips_stage_with_custom_process_input_func() -> Non
     the turn-based Orchestrator base.
     """
     orchestrator = object.__new__(DuplexOrchestrator)
-    stage0 = FakePrewarmPool("sender")
-    stage1 = FakePrewarmPool("receiver")  # would receive chunks if role alone decided
+    stage0 = FakePrewarmPool("sender", 0)
+    stage1 = FakePrewarmPool("receiver", 1)  # would receive chunks if role alone decided
     stage1.stage_client = SimpleNamespace(custom_process_input_func=lambda *a, **k: None)
-    stage2 = FakePrewarmPool("receiver")
+    stage2 = FakePrewarmPool("receiver", 2)
     orchestrator.stage_pools = [stage0, stage1, stage2]
     orchestrator._emit_tx_edge = lambda **_kwargs: None
     orchestrator._on_stage_submitted = MagicMock()
@@ -295,7 +325,7 @@ async def test_async_route_forwards_to_outgoing_only_stage() -> None:
         has_companions=lambda _request_id: False,
     )
     stage0 = SimpleNamespace(final_output=False)
-    stage1 = FakePrewarmPool("sender")
+    stage1 = FakePrewarmPool("sender", 1)
     orchestrator.stage_pools = [stage0, stage1]
     orchestrator._forward_to_next_stage = AsyncMock()
     req_state = OrchestratorRequestState(

@@ -385,6 +385,10 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 context.stage_id,
                 dict(submission.prompt),
                 context.stage_sampling_params,
+                # The orchestrator feeds this turn directly, so the request
+                # carries no upstream producer endpoint (stage 0 resolves to
+                # none; a later stage names the stage that precedes it).
+                sender_stage_id=context.stage_id - 1,
                 resumable=False,
             )
             if self.request_states.get(context.request_id) is not request_state:

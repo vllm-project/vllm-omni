@@ -330,7 +330,7 @@ class GLMTTSDiTForGeneration(nn.Module):
 
     @staticmethod
     def _connector_chunk_config(vllm_config: VllmConfig) -> tuple[int, int]:
-        cc = getattr(vllm_config.model_config, "stage_connector_config", None)
+        cc = getattr(vllm_config.model_config, "stage_input_connector_config", None)
         extra = (cc or {}).get("extra") if isinstance(cc, dict) else getattr(cc, "extra", None)
         if not isinstance(extra, dict):
             return 25, 25

@@ -19,6 +19,7 @@ from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime i
     logger,
     should_accumulate_full_payload_output,
 )
+from vllm_omni.engine import ConnectorEndpoint
 from vllm_omni.outputs import OmniConnectorOutput
 
 if TYPE_CHECKING:
@@ -391,7 +392,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
     @property
     def connector(self) -> Any | None:
-        return self._omni_connector
+        """Backward-compatible single-connector view."""
+        connectors = getattr(self, "_connectors", None)
+        return connectors.connector if connectors is not None else None
 
     # ------------------------------------------------------------------ #
     #  full_payload_mode (recv_full_payload_inputs / send_full_payload_outputs)
@@ -448,27 +451,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         _custom_process_func, both of which are set at init time. Avoid
         the per-step dynamic import inside the model decode loop.
         """
-        if getattr(self, "_omni_connector", None) is None:
-            # No connector at all: send_full_payload_outputs would no-op.
-            # Skip the per-step accumulator+build that would otherwise be
-            # silently discarded.  Defends against a terminal stage whose
-            # custom_process_input_func has a *_full_payload derivative in
-            # the same module, even in pipelines that don't configure any
-            # connector at all.
-            #
-            # Known limitation: a *terminal-consumer* stage that has a
-            # connector configured for receiving upstream input is NOT
-            # caught here -- ``_omni_connector`` is non-None for it, and
-            # ``_load_custom_func`` may still resolve a ``*_full_payload``
-            # derivative from this stage's ``custom_process_input_func``.
-            # In that case the accumulator builds payloads that
-            # ``send_full_payload_outputs`` later drops via its own
-            # connector-side checks (wasted CPU, not a functional bug).
-            # A topology-aware gate (explicit producer field or pipeline
-            # is_terminal info) would close the gap; that change is out
-            # of scope for this PR.
-            self._should_accumulate_full_payload_output_cached = False
-            return False
         cached = getattr(self, "_should_accumulate_full_payload_output_cached", None)
         if cached is not None:
             return cached
@@ -661,7 +643,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
         Returns list of request IDs successfully enqueued.
         """
-        if self._omni_connector is None:
+        connectors = getattr(self, "_connectors", None)
+        if connectors is None or connectors.send is None:
             logger.debug("[Stage-%s] send_full_payload_outputs: connector is None, skip", self._stage_id)
             return []
         if not self.is_data_transfer_rank():
@@ -812,7 +795,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         ``connector.put()`` is done by the background save thread.
         Non-KV data is identical across TP ranks; only rank 0 sends.
         """
-        if self._omni_connector is None:
+        connectors = getattr(self, "_connectors", None)
+        if connectors is None or connectors.send is None:
             logger.warning("[Stage-%s] send_chunk: connector is None", self._stage_id)
             return False
         if not self.is_data_transfer_rank():
@@ -982,9 +966,10 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
     def _poll_single_request(self, req_id: str, *, publish_ready: bool = True) -> bool:
         """Poll connector for one chunk of a request (non-blocking)."""
-        connector = self._omni_connector
-        if connector is None:
+        connectors = getattr(self, "_connectors", None)
+        if connectors is None or connectors.receive is None:
             return False
+        connector = connectors.receive
 
         if self._async_chunk and self._model_mode != "ar":
             with self._lock:
@@ -999,18 +984,14 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 )
                 return False
 
-        target_stage_id = self._stage_id - 1
+        target_stage_id = self._previous_stage_id
+        if target_stage_id is None:
+            raise RuntimeError(f"Stage {self._stage_id} has no inbound connector edge")
         chunk_id = self._get_req_chunk[req_id]
         external_req_id = self._request_ids_mapping.get(req_id, req_id)
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
-        request = self._pending_load_reqs.get(req_id)
-        sender_info = getattr(request, "payload_sender_info", None)
-        metadata = None
-        if isinstance(sender_info, dict):
-            host = sender_info.get("host")
-            port = sender_info.get("zmq_port")
-            if host and port:
-                metadata = {"source_host": str(host), "source_port": int(port)}
+        sender_info = getattr(self._pending_load_reqs.get(req_id), "sender_info", None)
+        metadata = sender_info.as_metadata() if isinstance(sender_info, ConnectorEndpoint) else None
 
         if self._async_chunk:
             result = self._recv_async_chunk_result(
@@ -1233,9 +1214,10 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         **without** decrementing ``_pending_save_counts`` so the caller can
         retry or clean up.
         """
-        connector = self._omni_connector
-        if connector is None:
+        connectors = getattr(self, "_connectors", None)
+        if connectors is None or connectors.send is None:
             return True
+        connector = connectors.send
 
         request_id = task["request_id"]
         payload_data = task.get("data")
@@ -1512,7 +1494,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         D2H copies across requests. Models without one retain the scalar
         builder contract.
         """
-        if not entries or self._omni_connector is None:
+        connectors = getattr(self, "_connectors", None)
+        if not entries or connectors is None or connectors.send is None:
             return 0
         if not self.is_data_transfer_rank():
             return len(entries)

@@ -16,12 +16,13 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import ConstantList
 
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
+from vllm_omni.engine import ConnectorEndpoint
 
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..factory import OmniConnectorFactory
-from ..utils.config import ConnectorSpec, stage_receives_chunks
-from ..utils.initialization import resolve_connector_spec
-from ..utils.kv_utils import get_local_tp_rank, get_omni_replica_id
+from ..utils.config import stage_receives_chunks
+from ..utils.initialization import connector_plan_from_model_config
+from ..utils.kv_utils import get_omni_replica_id
 from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
 
@@ -53,16 +54,8 @@ class _LoadEntry:
 
     def __init__(self, request: Request) -> None:
         self.request = request
-        sender_info = getattr(request, "payload_sender_info", None)
-        self.source_metadata = None
-        if isinstance(sender_info, dict):
-            host = sender_info.get("host")
-            port = sender_info.get("zmq_port")
-            if host and port:
-                self.source_metadata = {
-                    "source_host": str(host),
-                    "source_port": int(port),
-                }
+        sender_info = getattr(request, "sender_info", None)
+        self.source_metadata = sender_info.as_metadata() if isinstance(sender_info, ConnectorEndpoint) else None
 
     @property
     def request_id(self) -> str:
@@ -168,7 +161,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 "race to evict it).",
                 self._active_window,
             )
-        self.connector = self.create_connector(model_config)
+        self._stage_id = int(getattr(model_config, "stage_id", 0))
+        connector_plan = connector_plan_from_model_config(model_config)
+        self._previous_stage_id = connector_plan.inbound.from_stage if connector_plan.inbound is not None else None
+        self._next_stage_id = connector_plan.outbound.to_stage if connector_plan.outbound is not None else None
+        self._connectors = OmniConnectorFactory.create_stage_connectors(
+            connector_plan,
+            stage_id=self._stage_id,
+            replica_id=get_omni_replica_id(),
+        )
         self.receives_chunks = stage_receives_chunks(model_config)
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
@@ -283,31 +284,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if getattr(request, "prefill_stats", None) is None:
             request.prefill_stats = PrefillStats()
 
-    @classmethod
-    def create_connector(cls, model_config: Any):
-        connector_config = getattr(model_config, "stage_connector_config", None)
-        if connector_config is None:
-            connector_config = {}
-        elif not isinstance(connector_config, dict):
-            connector_config = {
-                "name": getattr(connector_config, "name", None),
-                "extra": getattr(connector_config, "extra", {}),
-            }
-
-        connector_spec = ConnectorSpec(
-            name=connector_config.get("name", "SharedMemoryConnector"),
-            extra=connector_config.get("extra", {}),
-        )
-        stage_id = int(getattr(model_config, "stage_id", connector_spec.extra.get("stage_id", 0)))
-        role = connector_spec.extra.get("role")
-        resolved_spec = resolve_connector_spec(
-            connector_spec,
-            stage_id=stage_id,
-            role=str(role) if role is not None else None,
-            local_rank=get_local_tp_rank(),
-            replica_id=get_omni_replica_id(),
-        )
-        return OmniConnectorFactory.create_connector(resolved_spec)
+    @property
+    def connector(self):
+        """Backward-compatible single-connector view."""
+        return self._connectors.connector
 
     def load_async(self, request: Request):
         """Register a request for asynchronous chunk retrieval.
@@ -321,9 +301,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         Args:
             request: The request object needing data.
         """
-        stage_id = self.connector.stage_id
-
-        if stage_id == 0 or not self.receives_chunks:
+        if self._stage_id == 0 or not self.receives_chunks:
             return
         if not hasattr(request, "additional_information"):
             request.additional_information = None
@@ -404,6 +382,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 because ``finish_requests`` skips requests that already report
                 ``is_finished()``. See ``_finish_parked_streaming_session``.
         """
+        if self._connectors.send is None:
+            raise RuntimeError(f"Stage {self._stage_id} has no outbound connector")
         is_finished = force_request_finished or (request.is_finished() and not request.resumable)
         if not hasattr(self, "_segment_generation"):
             self._segment_generation = defaultdict(int)
@@ -491,8 +471,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     def _poll_single_request(self, entry: _LoadEntry):
         request = entry.request
-        stage_id = self.connector.stage_id
-        target_stage_id = stage_id - 1
+        stage_id = self._stage_id
+        connector = self._connectors.receive
+        target_stage_id = self._previous_stage_id
+        if connector is None or target_stage_id is None:
+            return False
         req_id = request.request_id
         with self._receiver_state_lock:
             if self._registered_load_entries.get(req_id) is not entry:
@@ -503,14 +486,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         # Use timeout=0 for non-blocking poll
         try:
-            result = self.connector.get(
+            result = connector.get(
                 str(target_stage_id),
                 str(stage_id),
                 connector_get_key,
                 entry.source_metadata,
             )
         except Exception as e:
-            logger.error(f"SharedMemoryConnector get failed for req {connector_get_key}: {e}")
+            logger.error(f"{type(connector).__name__} get failed for req {connector_get_key}: {e}")
             with self._receiver_state_lock:
                 if self._registered_load_entries.get(req_id) is not entry:
                     return True
@@ -756,8 +739,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         request = task["request"]
         is_finished = task["is_finished"]
         is_segment_finished = task["is_segment_finished"]
-        stage_id = self.connector.stage_id
-        next_stage_id = stage_id + 1
+        stage_id = self._stage_id
+        connector = self._connectors.send
+        next_stage_id = self._next_stage_id
+        if connector is None or next_stage_id is None:
+            raise RuntimeError(f"Stage {stage_id} has no outbound connector")
         external_req_id = request.external_req_id
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
@@ -813,7 +799,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             logger.debug("Skipping cancelled chunk for request %s before connector put", external_req_id)
             return
 
-        success, size, metadata = self.connector.put(
+        success, size, metadata = connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
             put_key=connector_put_key,
@@ -1056,7 +1042,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """
         if not self.receives_chunks:
             return
-        if self.connector.stage_id == 0:
+        if self._stage_id == 0:
             return
 
         # Purge deque entries whose request was freed mid-flight (abort →
@@ -1455,11 +1441,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """
         if not self.receives_chunks:
             return
-        stage_id = self.connector.stage_id
-
-        if stage_id == 0:
+        if self._stage_id == 0:
             return
-
         if requests is not None:
             self.attach_cached_additional_information(scheduler_output, requests)
         self._clear_chunk_ready(scheduler_output)

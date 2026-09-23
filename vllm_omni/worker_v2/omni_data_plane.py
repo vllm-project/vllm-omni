@@ -96,7 +96,9 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         self._start_output_worker(max_pending_batches=_NATIVE_OUTPUT_QUEUE_DEPTH)
 
     def _connector_delivery_timeout(self) -> float:
-        config = getattr(getattr(self, "_omni_connector", None), "config", None)
+        connectors = getattr(self, "_connectors", None)
+        connector = connectors.connector if connectors is not None else None
+        config = getattr(connector, "config", None)
         extra = config.get("extra", {}) if isinstance(config, dict) else {}
         value = extra.get("delivery_timeout_s", _DEFAULT_DELIVERY_TIMEOUT_S)
         try:
@@ -565,15 +567,23 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         self._work_available.set()
 
         close_errors: list[BaseException] = []
-        connector = getattr(self, "_omni_connector", None)
+        connectors = getattr(self, "_connectors", None)
 
         def close_connector() -> None:
-            if connector is None:
+            if connectors is None:
                 return
-            try:
-                connector.close()
-            except BaseException as error:
-                close_errors.append(error)
+            # Close each direction directly rather than via
+            # ``StageConnectorSet.close()``: that helper logs and swallows,
+            # and this caller reports close failures to its own shutdown path.
+            # A dual-role stage shares one connector across both directions.
+            targets = [connectors.receive] if connectors.receive is not None else []
+            if connectors.send is not None and connectors.send is not connectors.receive:
+                targets.append(connectors.send)
+            for connector in targets:
+                try:
+                    connector.close()
+                except BaseException as error:
+                    close_errors.append(error)
 
         close_thread = threading.Thread(
             target=close_connector,

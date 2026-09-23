@@ -12,6 +12,7 @@ import ctypes
 import sys
 import time
 import types
+from unittest.mock import patch
 
 import msgspec
 import pytest
@@ -65,11 +66,11 @@ def test_wait_for_metadata_stops_at_deadline(monkeypatch):
     assert calls == [("missing", None)] * 2
 
 
-@pytest.mark.parametrize("async_chunk", [False, True])
-def test_three_stage_incoming_and_outgoing_endpoints(nixl_connector_cls, async_chunk):
+def test_three_stage_incoming_and_outgoing_endpoints(nixl_connector_cls):
+    from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
     from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec, OmniTransferConfig
-    from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_connector_spec
-    from vllm_omni.engine.stage_init_utils import get_stage_connector_spec
+    from vllm_omni.distributed.omni_connectors.utils.kv_utils import kv_zmq_port
+    from vllm_omni.engine.stage_init_utils import get_stage_connector_plan
 
     config = OmniTransferConfig(
         connectors={
@@ -77,23 +78,33 @@ def test_three_stage_incoming_and_outgoing_endpoints(nixl_connector_cls, async_c
             ("1", "2"): ConnectorSpec(name="NixlConnector", extra={"host": "127.0.0.1", "zmq_port": PORT + 10}),
         }
     )
+    incoming_port = kv_zmq_port(PORT, 0, local_rank=0, replica_id=0)
+    outgoing_port = kv_zmq_port(PORT + 10, 1, local_rank=0, replica_id=0)
     connectors = []
     try:
         for stage in range(3):
-            spec = get_stage_connector_spec(config, stage, async_chunk)
-            resolved = resolve_connector_spec(ConnectorSpec(**spec), stage_id=stage, role=spec["extra"]["role"])
-            connectors.append(nixl_connector_cls(resolved.extra))
+            plan = get_stage_connector_plan(omni_transfer_config=config, stage_id=stage)
+            created = []
+            with patch.object(
+                OmniConnectorFactory,
+                "create_connector",
+                side_effect=lambda spec: created.append(nixl_connector_cls(spec.extra)) or created[-1],
+            ):
+                OmniConnectorFactory.create_stage_connectors(plan, stage_id=stage)
+            # A middle stage shares one connector across both directions.
+            assert len(created) == 1
+            connectors.append(created[0])
         first, middle, last = connectors
-        assert middle._sender_zmq_port == PORT
+        assert middle._sender_zmq_port == incoming_port
         assert middle._serving_handshake
-        assert middle._zmq_port == PORT + 11
+        assert middle._zmq_port == outgoing_port
         first.put("0", "1", "incoming", torch.ones(1))
         incoming = _wait_for_metadata(middle, "incoming")
-        assert incoming["sender_zmq_port"] == PORT
+        assert incoming["sender_zmq_port"] == incoming_port
         assert incoming["generation"] == first._published["incoming"]["generation"]
         middle.put("1", "2", "outgoing", torch.ones(1))
         outgoing = _wait_for_metadata(last, "outgoing")
-        assert outgoing["sender_zmq_port"] == PORT + 11
+        assert outgoing["sender_zmq_port"] == outgoing_port
         assert outgoing["generation"] == middle._published["outgoing"]["generation"]
     finally:
         for connector in reversed(connectors):
@@ -201,26 +212,35 @@ def test_manager_receiver_preserves_explicit_standalone_sender(producer, need_re
 
 
 def test_middle_stage_advertises_its_outgoing_replica_endpoint():
+    from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+    from vllm_omni.distributed.omni_connectors.utils.config import (
+        ConnectorSpec,
+        StageConnectorPlan,
+        StageConnectorSpec,
+    )
+    from vllm_omni.engine import ConnectorEndpoint
     from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
 
     client = object.__new__(StageEngineCoreClient)
     client.stage_id = 1
     client.replica_id = 3
-    client.vllm_config = types.SimpleNamespace(
-        model_config=types.SimpleNamespace(
-            stage_connector_config={
-                "name": "NixlConnector",
-                "extra": {
-                    "role": "receiver",
-                    "host": "10.0.0.1",
-                    "zmq_port": 47000,
-                    "from_stage": 0,
-                    "outgoing": {"host": "10.0.0.2", "zmq_port": 48000, "from_stage": 1},
-                },
-            }
-        )
+    outbound = StageConnectorSpec(
+        from_stage=1,
+        to_stage=2,
+        spec=ConnectorSpec(name="NixlConnector", extra={"host": "10.0.0.2", "zmq_port": 48000}),
     )
-    assert client._build_payload_sender_info() == {"host": "10.0.0.2", "zmq_port": 51073}
+    client._stage_connector_plan = StageConnectorPlan(outbound=outbound)
+    client._payload_sender_info = None
+    client._payload_sender_info_initialized = False
+
+    expected_port = OmniConnectorFactory.materialize_connector_spec(
+        outbound,
+        "sender",
+        1,
+        0,
+        3,
+    ).extra["zmq_port"]
+    assert client.get_payload_sender_info() == ConnectorEndpoint(host="10.0.0.2", zmq_port=expected_port)
 
 
 @pytest.mark.parametrize("direct", [False, True])

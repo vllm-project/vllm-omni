@@ -131,11 +131,11 @@ class YuanrongTransferEngineConnector(OmniConnectorBase):
         self.sender_zmq_port = self._resolve_optional_port(sender_zmq_port, "sender_zmq_port")
 
         role = str(config.get("role", "sender")).lower()
-        if role not in {"sender", "receiver"}:
+        if role not in {"sender", "receiver", "dual"}:
             raise ValueError(
-                f"Invalid role={role!r} for YuanrongTransferEngineConnector. Expected 'sender' or 'receiver'."
+                f"Invalid role={role!r} for YuanrongTransferEngineConnector. Expected 'sender', 'receiver', or 'dual'."
             )
-        self.can_put = role == "sender"
+        self.can_put = role in {"sender", "dual"}
 
         self.engine = TransferEngine()
         local_endpoint = f"{self.host}:{self.rpc_port}"

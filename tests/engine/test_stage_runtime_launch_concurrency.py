@@ -16,6 +16,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.utils import CoreEngineProcManager, EngineZmqAddresses
 
 from vllm_omni.config.stage_config import StageConfig
+from vllm_omni.distributed.omni_connectors.utils.config import StageConnectorPlan
 from vllm_omni.engine import stage_init_utils, stage_runtime
 from vllm_omni.engine.stage_engine_startup import StageReplicaResources
 from vllm_omni.engine.stage_init_utils import LogicalStageInitPlan, ReplicaInitPlan, StageMetadata
@@ -72,7 +73,7 @@ def _plan(stage_id: int, device: str) -> LogicalStageInitPlan:
         launch_mode="local",
         stage_cfg=StageConfig(stage_id=stage_id, model_stage="dummy", yaml_runtime=metadata.runtime_cfg),
         metadata=metadata,
-        stage_connector_spec={},
+        stage_connector_plan=StageConnectorPlan(),
         omni_kv_connector=(None, None, None),
         stage_vllm_config=VllmConfig(),
         executor_class=object,

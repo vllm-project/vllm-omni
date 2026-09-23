@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 import torch
 
+from vllm_omni.distributed.omni_connectors.factory import StageConnectorSet
 from vllm_omni.worker_v2.delivery import DeliveryCancelledError, DeliveryState, OmniDeliveryManager
 from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
 from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane
@@ -173,7 +174,7 @@ def _gated_connector():
 
 def _start_save_thread(plane, connector):
     plane.__dict__.update(
-        _omni_connector=connector,
+        _connectors=StageConnectorSet(receive=connector, send=connector),
         _stage_id=0,
         _next_stage_id=1,
         _lock=threading.Lock(),

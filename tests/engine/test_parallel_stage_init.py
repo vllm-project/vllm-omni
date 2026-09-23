@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+from vllm_omni.distributed.omni_connectors.utils.config import StageConnectorPlan
 from vllm_omni.engine.stage_admission import (
     ADMISSION_EXEMPT,
     DeviceLedger,
@@ -79,7 +80,7 @@ def _llm_replica(stage_id: int, replica_id: int, devices: str | None, *, vllm_co
         launch_mode="local",
         stage_cfg=stage_cfg,
         metadata=metadata,
-        stage_connector_spec={},
+        stage_connector_plan=StageConnectorPlan(),
         omni_kv_connector=(None, None, None),
         stage_vllm_config=vllm_config,
         executor_class=object,
