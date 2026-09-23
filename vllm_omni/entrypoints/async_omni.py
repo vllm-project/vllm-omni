@@ -14,8 +14,9 @@ import asyncio
 import time
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
+import anyio
 from vllm import TokensPrompt
 from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.logger import init_logger
@@ -74,6 +75,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         ... ):
         ...     print(output)
     """
+
+    engine: AsyncOmniEngine
 
     def _create_engine(self, **engine_kwargs: Any) -> AsyncOmniEngine:
         return AsyncOmniEngine(**engine_kwargs)
@@ -265,7 +268,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 first_chunk_submitted = asyncio.get_running_loop().create_future()
                 input_stream_task = await self._add_streaming_input_request(
                     request_id=request_id,
-                    input_stream=prompt,
+                    input_stream=cast(AsyncGenerator, prompt),
                     sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id_for_e2e,
                     final_output_stage_ids=final_output_stage_ids,
@@ -285,7 +288,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     lora_request=lora_request,
                 )
             submit_ts = time.time()
-            req_state.metrics.stage_first_ts[0] = submit_ts
+            stage_first_ts = cast(list[float | None], req_state.metrics.stage_first_ts)
+            stage_first_ts[0] = submit_ts
             req_start_ts[request_id] = submit_ts
             if admitting:
                 await self._release_generate_admission()
@@ -310,7 +314,10 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
         except (asyncio.CancelledError, GeneratorExit):
             self._record_request_failure_once(request_id, reason="client_disconnect")
-            await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
+            # ASGI cancellation also affects subsequent awaits. Shield the
+            # bounded engine abort before removing the local request state.
+            with anyio.CancelScope(shield=True):
+                await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
         except Exception as e:
@@ -359,6 +366,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # only check thinker's sampling params now
         stage0_params = sampling_params_list[0]
         self._validate_streaming_input_sampling_params(stage0_params)
+        stage0_params = cast(SamplingParams, stage0_params)
         req_state = self.request_states[request_id]
         has_submitted_first_chunk = False
 
@@ -801,7 +809,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         async with self._pause_cond:
             return self._paused
 
-    async def start_profile(
+    # EngineClient exposes async operations; OmniBase implements the sync API.
+    async def start_profile(  # type: ignore[override]
         self,
         profile_prefix: str | None = None,
         stages: list[int] | None = None,
@@ -816,7 +825,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         """
         return await self.collective_rpc(method="profile", args=(True, profile_prefix), stage_ids=stages)
 
-    async def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
+    async def stop_profile(self, stages: list[int] | None = None) -> list[Any]:  # type: ignore[override]
         """Stop profiling specified stages.
 
         Uses vLLM-compatible profile(is_start=False) interface.
@@ -1103,10 +1112,14 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         """Get tokenizer for the comprehension stage."""
         stage_index = self._get_comprehension_stage_index()
         if stage_index is not None:
-            tokenizer = self.engine.output_processors[stage_index].tokenizer
+            processor = self.engine.output_processors[stage_index]
+            assert processor is not None
+            tokenizer = processor.tokenizer
             if tokenizer is not None:
                 return tokenizer
-        return self.input_processor.tokenizer  # type: ignore[return-value]
+        processor = self.input_processor
+        assert processor is not None
+        return processor.tokenizer
 
     async def is_tracing_enabled(self) -> bool:
         """Check if tracing is enabled."""
