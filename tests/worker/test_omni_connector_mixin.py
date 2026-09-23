@@ -988,7 +988,7 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
         host._stage_id = 2
         host._local_rank = 1
         host._pending_load_reqs["r1"] = object()
-        payload = {"tok": [10], "finished": torch.tensor(True)}
+        payload = {"tok": [10], "meta": {"finished": torch.tensor(True)}}
         tp_group = _FakeTPGroup(world_size=2, rank_in_group=1, follower_result={"r1": payload})
 
         with patch.object(host, "_get_local_tp_group", return_value=tp_group):
