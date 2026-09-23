@@ -82,7 +82,8 @@ class VoxtralTTSAdapter(ARTTSAdapter):
 
         if request.voice is not None:
             request.voice = request.voice.lower()
-            available_speakers = server._get_available_speakers()
+            available_speakers = set(self.capabilities.supported_speakers)
+            available_speakers.update(self.capabilities.precomputed_speakers)
             if available_speakers and request.voice not in available_speakers:
                 return f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(available_speakers))}"
 

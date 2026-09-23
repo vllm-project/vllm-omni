@@ -44,7 +44,8 @@ def _async_output(req_ids=("req-0",), **overrides) -> OmniAsyncOutput:
     return OmniAsyncOutput(**(kwargs | overrides))
 
 
-def test_async_output_blocking_event_and_routing_masks(monkeypatch) -> None:
+@pytest.mark.parametrize("compact_width", [1, 2])
+def test_async_output_blocking_event_and_routing_masks(monkeypatch, compact_width) -> None:
     event_kwargs = []
     monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
 
@@ -53,7 +54,12 @@ def test_async_output_blocking_event_and_routing_masks(monkeypatch) -> None:
         return _FakeEvent()
 
     monkeypatch.setattr(torch.cuda, "Event", make_event)
-    masks = SamplingMaskTensors(torch.tensor([[5], [0]], dtype=torch.uint8), torch.tensor([2, 0]), 4)
+    masks = SamplingMaskTensors(
+        token_ids=torch.tensor([[0, 2], [0, 0]], dtype=torch.int32)[:, :compact_width],
+        packed_mask=torch.tensor([[5], [0]], dtype=torch.uint8),
+        counts=torch.tensor([2, 0]),
+        vocab_size=4,
+    )
     sampler_output = SamplerOutput(torch.tensor([[2], [0]]), None, None, torch.tensor([1, 0]), None, masks)
     routed = RoutedExpertsTensors(torch.tensor([[[2, 3]], [[4, 5]]]), torch.tensor([7, 9]))
 
@@ -65,7 +71,9 @@ def test_async_output_blocking_event_and_routing_masks(monkeypatch) -> None:
         routed_experts=routed,
     ).get_output()
     assert event_kwargs == [{"blocking": True}]  # blocking event by default
-    assert output.sampled_token_ids == [[2], []] and output.sampling_masks.cu_num_generated_tokens == [0, 1, 1]
+    assert output.sampled_token_ids == [[2], []]
+    assert output.sampling_masks.to_nested_list() == [[0, 2], []]
+    np.testing.assert_array_equal(output.sampling_masks.offsets, [0, 2, 2])
     np.testing.assert_array_equal(output.routed_experts.routing_data, [[[2, 3]], [[4, 5]]])
     np.testing.assert_array_equal(output.routed_experts.slot_mapping, [7, 9])
     np.testing.assert_array_equal(output.sampling_masks.token_ids, [0, 2])

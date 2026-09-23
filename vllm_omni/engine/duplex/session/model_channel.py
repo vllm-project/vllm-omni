@@ -46,6 +46,7 @@ from vllm_omni.engine.duplex.contracts import (
 from vllm_omni.engine.duplex.plugin import (
     DuplexRuntimeConfigError,
     coerce_int,
+    payload_turn_id,
 )
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext, StageOutput
@@ -192,6 +193,7 @@ class ModelChannel:
             return True, False
         if expected_epoch is not None and session.epoch != expected_epoch:
             return True, False
+        self._mark_accepted_append_request_start(payload)
         # Commit timing state before returned output events can clear the
         # silence-continuation chain (e.g. a terminal turn-end).
         if on_append_accepted is not None:
@@ -207,6 +209,16 @@ class ModelChannel:
             await self._close_from_runtime(close_reason)
             return False, emitted_response
         return True, emitted_response
+
+    def _mark_accepted_append_request_start(self, payload: object) -> None:
+        """Stamp TTFT/TTFP origin only after the data plane accepted this append."""
+        session = self._ctx.session
+        turn_id = payload_turn_id(payload)
+        if turn_id is None:
+            turn_id = (
+                session.active_response_turn_id if session.active_response_turn_id is not None else session.turn_id
+            )
+        session.mark_model_turn_request_started(turn_id, session._clock())
 
     async def _append_via_data_plane(
         self,
@@ -471,8 +483,9 @@ class ModelChannel:
             context=context,
         )
 
-    @staticmethod
-    def stage_metrics_snapshot(stage_id: int, metrics: object, output: object) -> dict[str, dict[str, object]] | None:
+    def stage_metrics_snapshot(
+        self, stage_id: int, metrics: object, output: object
+    ) -> dict[str, dict[str, object]] | None:
         if not isinstance(metrics, StageRequestStats):
             return None
         event = metrics
@@ -482,6 +495,7 @@ class ModelChannel:
             final_output_type = getattr(output, "final_output_type", None)
             if isinstance(final_output_type, str):
                 event = replace(event, final_output_type=final_output_type)
+        self._ctx.session.observe_stage_request_stats(stage_id, event)
         try:
             merged = OrchestratorAggregator._merge_stage_metric_event(None, event)
         except Exception:
@@ -927,7 +941,16 @@ class ModelChannel:
         if response_id is None:
             response_id = session.begin_response(turn_id=model_turn_id)
             response_created = True
-            self._out.emit(self.response_created_payload(response_id, epoch=session.epoch))
+        response_request_metrics = session.mark_response_first_outputs(
+            observed_at_s=session._clock(),
+            has_text=has_text,
+            has_audio=has_audio,
+        )
+        if response_created:
+            created_payload = self.response_created_payload(response_id, epoch=session.epoch)
+            if response_request_metrics:
+                created_payload["response_request_metrics"] = response_request_metrics
+            self._out.emit(created_payload)
         stage_metrics = model_result.get("stage_metrics")
         response_stage_metrics = session.accumulate_response_stage_metrics(
             stage_metrics if isinstance(stage_metrics, Mapping) else None
@@ -942,7 +965,12 @@ class ModelChannel:
                 "end_of_turn": end_of_turn,
                 "model_speak": True,
             }
-            self._attach_runtime_metadata(speak_payload, model_result, stage_metrics=response_stage_metrics)
+            self._attach_runtime_metadata(
+                speak_payload,
+                model_result,
+                stage_metrics=response_stage_metrics,
+                response_request_metrics=response_request_metrics,
+            )
             self._out.emit(speak_payload)
         target_id = draining_response_id if draining_response_id not in (None, session.active_response_id) else None
         previous_sent_ms = session.playback_for_response(target_id).sent_ms
@@ -1013,7 +1041,12 @@ class ModelChannel:
         sample_rate_hz = model_result.get("sample_rate_hz") or model_result.get("audio_sample_rate_hz")
         if isinstance(sample_rate_hz, int | float) and int(sample_rate_hz) > 0:
             payload["sample_rate_hz"] = int(sample_rate_hz)
-        self._attach_runtime_metadata(payload, model_result, stage_metrics=response_stage_metrics)
+        self._attach_runtime_metadata(
+            payload,
+            model_result,
+            stage_metrics=response_stage_metrics,
+            response_request_metrics=response_request_metrics,
+        )
         self._out.emit(payload)
         if (
             not end_of_turn
@@ -1138,6 +1171,7 @@ class ModelChannel:
         model_result: dict[str, object],
         *,
         stage_metrics: Mapping[str, object] | None = None,
+        response_request_metrics: Mapping[str, object] | None = None,
     ) -> None:
         metadata: dict[str, object] = {}
         runtime_impl = model_result.get("runtime_impl")
@@ -1160,6 +1194,8 @@ class ModelChannel:
                 for stage_id, values in effective_stage_metrics.items()
                 if isinstance(values, Mapping)
             }
+        if response_request_metrics:
+            metadata["response_request_metrics"] = dict(response_request_metrics)
         if metadata:
             payload["vllm_omni"] = metadata
 

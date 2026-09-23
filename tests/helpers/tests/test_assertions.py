@@ -11,6 +11,7 @@ from tests.helpers.assertions import (
     _resolve_audio_transcript,
     assert_audio_speech_response,
 )
+from tests.helpers.client import OmniResponse
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -73,6 +74,26 @@ def test_resolve_transcript_leaves_language_unset_by_default(monkeypatch):
 
     assert captured["language"] is None
     assert captured["model_size"] == "small"
+
+
+def test_resolve_transcript_uses_configured_primary_model(monkeypatch):
+    captured = _capture_transcribe(monkeypatch)
+    response = OmniResponse(audio_content=None, audio_bytes=b"fake-wav")
+
+    _resolve_audio_transcript(
+        response,
+        {
+            "input": "你好",
+            "response_format": "wav",
+            "transcript_language": "zh",
+            "transcript_model": "large-v3",
+        },
+        "advanced_model",
+        speech_api=True,
+    )
+
+    assert captured["model_size"] == "large-v3"
+    assert captured["language"] == "zh"
 
 
 @pytest.mark.parametrize(

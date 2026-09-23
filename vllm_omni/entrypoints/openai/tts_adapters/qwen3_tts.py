@@ -431,6 +431,14 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         Qwen3-TTS ref-audio artifact tracked after ``generate()``.
         """
         server = self.ctx.server
+        # Inline Base cloning derives its voice from ref_audio, not the
+        # OpenAI-compatible voice label.
+        if has_inline_ref_audio and request.task_type == "Base" and request.voice is not None:
+            logger.info(
+                "Ignoring voice=%r for Qwen3-TTS Base request because inline ref_audio takes precedence",
+                request.voice,
+            )
+            request = request.model_copy(update={"voice": None})
         qwen3_ref_audio_warmup_artifact_key: str | None = None
         tts_params = self._build_tts_params(request)
         # Resolve ref_audio (explicit or auto-set for uploaded voices)

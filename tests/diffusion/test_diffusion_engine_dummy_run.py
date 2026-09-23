@@ -220,6 +220,7 @@ def test_paged_kv_profile_requests_match_per_rank_batch(
         width=1024,
         guidance_scale=5.0,
         num_image_inputs=3,
+        num_frames=1,
     )
     engine._prepare_request_for_admission.assert_called_once_with(request)
 

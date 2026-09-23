@@ -117,6 +117,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
         context_len: int = 0,
+        valid_dummy_state_slots: bool = False,
     ) -> Any:
         if not dummy_run:
             self._handle_kv_transfer_pre(scheduler_output)
@@ -127,6 +128,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             skip_attn_for_dummy_run=skip_attn_for_dummy_run,
             is_profile=is_profile,
             context_len=context_len,
+            valid_dummy_state_slots=valid_dummy_state_slots,
         )
 
     # ------------------------------------------------------------------
@@ -756,7 +758,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
             del token_ids[num_tokens:]
         self.model_runner_output.sampled_token_ids = sampled_token_ids
         if self.sampling_mask_tensors is not None:
-            self.model_runner_output.sampling_masks = self.sampling_mask_tensors.tolists(self.num_sampled_tokens_np)
+            self.model_runner_output.sampling_masks = self.sampling_mask_tensors.tolists()
         if self.routed_experts_cpu is not None:
             self.model_runner_output.routed_experts = self.routed_experts_cpu.tolists()
         self.model_runner_output.sampled_token_ids_materialized = True

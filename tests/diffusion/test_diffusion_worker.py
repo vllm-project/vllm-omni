@@ -48,6 +48,7 @@ def mock_gpu_worker(mocker: MockerFixture, mock_od_config):
     worker = DiffusionWorker(local_rank=0, rank=0, od_config=mock_od_config)
     # Mock the model_runner with pipeline
     worker.model_runner = mocker.Mock()
+    worker.model_runner._kv_receive_progress = None
     worker.model_runner.pipeline = mocker.Mock()
     worker.device = torch.device("cuda", 0)
     worker._sleep_saved_buffers = {}

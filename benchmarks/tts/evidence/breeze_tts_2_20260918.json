@@ -1,0 +1,757 @@
+{
+  "measurement_scope": "Historical measurements for PR7752, not a main-branch comparison or a measurement of subsequent review fixes.",
+  "environment": {
+    "gpu": "NVIDIA H100 80 GB",
+    "gpu_count": 1,
+    "python": "3.12",
+    "pytorch": "2.13.0+cu132",
+    "vllm": "0.29.0",
+    "transformers": "5.14.1",
+    "nsight_systems": "2026.5.1"
+  },
+  "model": {
+    "id": "BreezeBlue/Breeze-TTS-2",
+    "revision": "3e28c5151381a722f1d8661b4118c298caa77aa4"
+  },
+  "workload": {
+    "texts": [
+      "Hello, this is Breeze TTS 2 running on vLLM Omni.",
+      "你好，今天天气很好，我们一起出去走走吧。"
+    ],
+    "alternating_texts": true,
+    "seed": 42,
+    "guidance_scale": 1.0,
+    "repetition_penalty": 1.1,
+    "top_p": 1.0,
+    "sampled": {
+      "temperature": 0.9,
+      "top_k": 50
+    },
+    "greedy": {
+      "temperature": 0.0,
+      "top_k": 0
+    },
+    "stream": false,
+    "response_format": "pcm",
+    "sample_rate": 24000,
+    "channels": 1,
+    "pcm_bits": 16
+  },
+  "cumulative_diagnostic": {
+    "baseline_sha": "5bda85c371e8c0c7728c2f7f5865d3ddd79b9d99",
+    "combined_sha": "37a04897cf8566c63e82eb13c27c064b9bcd4222",
+    "intermediate_variants": "Ordered patch subsets of the combined commit, not independent commits.",
+    "patch_sha256": {
+      "batched_eos": "2f107ea8e890e03cc138ef2f69e693e3474d3aaf0eb4051c00886cbaa9785b3d",
+      "greedy_graph": "4e783313260ddc2e36c8a74ba9d95dc5d78338443612ebf89854e31b8be6933b",
+      "batched_embedding": "90557e4ec73fdedcff51fd717d5e8c6477e71087fd97ac52534542234f5d1d3a"
+    },
+    "sequence_slots": 8,
+    "kv_gib": 2,
+    "codec_chunk_frames": 16,
+    "max_new_tokens": 48,
+    "temperature": 0.0,
+    "cohorts_per_variant": 1,
+    "nsight_injection_present": true,
+    "collection_enabled": false,
+    "warmup": "Two eight-request full-response warmups, then four full-response 64-request cohorts, each preceded by one concurrency-sized warmup.",
+    "variants": [
+      {
+        "variant": "baseline",
+        "makespan_s": 0.9672094583511353,
+        "requests": 8,
+        "concurrency": 8,
+        "audio_s": 30.72,
+        "failures": 0
+      },
+      {
+        "variant": "plus_batched_eos",
+        "makespan_s": 0.9280132218264043,
+        "requests": 8,
+        "concurrency": 8,
+        "audio_s": 30.72,
+        "failures": 0
+      },
+      {
+        "variant": "plus_greedy_graph",
+        "makespan_s": 0.8857334200292826,
+        "requests": 8,
+        "concurrency": 8,
+        "audio_s": 30.72,
+        "failures": 0
+      },
+      {
+        "variant": "plus_batched_embedding",
+        "makespan_s": 0.8435833756811917,
+        "requests": 8,
+        "concurrency": 8,
+        "audio_s": 30.72,
+        "failures": 0
+      }
+    ],
+    "limits": [
+      "Single cumulative diagnostic samples; no repeat spread.",
+      "Nsight injection remains when collection is disabled.",
+      "The final variant used graph tracing configuration; prior variants used node tracing configuration.",
+      "Do not interpret these timings as isolated uninstrumented per-optimization gains."
+    ]
+  },
+  "mechanical_attribution": {
+    "batched_eos": {
+      "stage0_stream_synchronization_calls": [
+        773,
+        438
+      ],
+      "device_to_host_copies": [
+        841,
+        506
+      ],
+      "capture_mode": "node"
+    },
+    "greedy_graph": {
+      "radix_sort_kernels": [
+        735,
+        0
+      ],
+      "capture_mode": "node"
+    },
+    "combined_graph_capture": {
+      "captured_wall_ms": [
+        955.4114495404065,
+        855.6996420957148
+      ],
+      "gpu_envelope_ms": [
+        926.633897,
+        826.396835
+      ],
+      "activity_upper_ms": [
+        651.130806,
+        628.864685
+      ],
+      "idle_lower_ms": [
+        275.50309100000004,
+        197.53215
+      ],
+      "stage0_explicit_kernel_launch_count": [
+        7087,
+        6198
+      ],
+      "stage0_graph_launch_count": [
+        156,
+        156
+      ]
+    },
+    "limits": [
+      "Host API durations overlap GPU activity and are not additional idle time.",
+      "Graph envelopes hide internal gaps: activity is an upper bound and idle is a lower bound.",
+      "Stage 1 has eight versus nine graph launches across the graph-mode traces.",
+      "No separate final-capacity stage breakdown was measured."
+    ]
+  },
+  "combined_uninstrumented_ab": {
+    "baseline_sha": "5bda85c371e8c0c7728c2f7f5865d3ddd79b9d99",
+    "head_sha": "37a04897cf8566c63e82eb13c27c064b9bcd4222",
+    "sequence_slots": 8,
+    "kv_gib": 2,
+    "codec_chunk_frames": 16,
+    "requests_per_group": 64,
+    "max_new_tokens": 384,
+    "baseline_rounds": 2,
+    "head_rounds": 1,
+    "profiler_configured": false,
+    "nsight_injection_present": false,
+    "warmup": "One excluded 64-request full-response wave for each temperature/concurrency family, plus an excluded 2*C-request full-response cohort before every group.",
+    "rows": [
+      {
+        "build": "plain-baseline",
+        "phase": "round-0",
+        "temperature": 0.0,
+        "concurrency": 8,
+        "requests": 64,
+        "makespan_s": 10.77213971177116,
+        "req_per_s": 5.941252314994074,
+        "aggregate_rtf": 0.030157166046391827,
+        "audio_s": 357.2,
+        "caps": 0,
+        "failures": 0,
+        "endpoint_trimmed_audio_s": 305.88,
+        "endpoint_trimmed_aggregate_rtf": 0.03521688149526337,
+        "quiet_tail_at_least_3s": 7,
+        "max_quiet_tail_s": 3.24
+      },
+      {
+        "build": "plain-baseline",
+        "phase": "round-0",
+        "temperature": 0.0,
+        "concurrency": 16,
+        "requests": 64,
+        "makespan_s": 11.076066234149039,
+        "req_per_s": 5.778224745774739,
+        "aggregate_rtf": 0.029092420240988227,
+        "audio_s": 380.72,
+        "caps": 2,
+        "failures": 0,
+        "endpoint_trimmed_audio_s": 315.48,
+        "endpoint_trimmed_aggregate_rtf": 0.035108616185333584,
+        "quiet_tail_at_least_3s": 6,
+        "max_quiet_tail_s": 26.04
+      },
+      {
+        "build": "plain-baseline",
+        "phase": "round-0",
+        "temperature": 0.9,
+        "concurrency": 8,
+        "requests": 64,
+        "makespan_s": 8.603743681218475,
+        "req_per_s": 7.438622345259851,
+        "aggregate_rtf": 0.03389435739528236,
+        "audio_s": 253.84,
+        "caps": 0,
+        "failures": 0,
+        "endpoint_trimmed_audio_s": 239.02,
+        "endpoint_trimmed_aggregate_rtf": 0.035995915325991445,
+        "quiet_tail_at_least_3s": 0,
+        "max_quiet_tail_s": 1.3
+      },
+      {
+        "build": "plain-baseline",
+        "phase": "round-0",
+        "temperature": 0.9,
+        "concurrency": 16,
+        "requests": 64,
+        "makespan_s": 8.66502623911947,
+        "req_per_s": 7.386013409984042,
+        "aggregate_rtf": 0.033143460216950235,
+        "audio_s": 261.44,
+        "caps": 0,
+        "failures": 0,
+        "endpoint_trimmed_audio_s": 242.14,
+        "endpoint_trimmed_aggregate_rtf": 0.03578519137325296,
+        "quiet_tail_at_least_3s": 0,
+        "max_quiet_tail_s": 1.3
+      },
+      {
+        "build": "plain-baseline",
+        "phase": "round-1",
+        "temperature": 0.0,
+        "concurrency": 8,
+        "requests": 64,
+        "makespan_s": 13.904579282738268,
+        "req_per_s": 4.602800178172402,
+        "aggregate_rtf": 0.0392784725501081,
+        "audio_s": 354.0,
+        "caps": 1,
+        "failures": 0,
+        "endpoint_trimmed_audio_s": 285.36,
+        "endpoint_trimmed_aggregate_rtf": 0.048726448285457906,
+        "quiet_tail_at_least_3s": 8,
+        "max_quiet_tail_s": 25.38
+      },
+      {
+        "build": "plain-baseline",
+        "phase": "round-1",
+        "temperature": 0.0,
+        "concurrency": 16,
+        "requests": 64,
+        "makespan_s": 10.060411099344492,
+        "req_per_s": 6.361569061941222,
+        "aggregate_rtf": 0.02935460754944121,
+        "audio_s": 342.72,
+        "caps": 0,
+        "failures": 0,
+        "endpoint_trimmed_audio_s": 289.04,
+        "endpoint_trimmed_aggregate_rtf": 0.03480629359031446,
+        "quiet_tail_at_least_3s": 10,
+        "max_quiet_tail_s": 3.16
+      },
+      {
+        "build": "plain-baseline",
+        "phase": "round-1",
+        "temperature": 0.9,
+        "concurrency": 8,
+        "requests": 64,
+        "makespan_s": 8.535738762002438,
+        "req_per_s": 7.4978864494894575,
+        "aggregate_rtf": 0.033363581777683074,
+        "audio_s": 255.84,
+        "caps": 0,
+        "failures": 0,
+        "endpoint_trimmed_audio_s": 237.9,
+        "endpoint_trimmed_aggregate_rtf": 0.03587952401009852,
+        "quiet_tail_at_least_3s": 0,
+        "max_quiet_tail_s": 2.12
+      },
+      {
+        "build": "plain-baseline",
+        "phase": "round-1",
+        "temperature": 0.9,
+        "concurrency": 16,
+        "requests": 64,
+        "makespan_s": 8.584469985216856,
+        "req_per_s": 7.4553234049642105,
+        "aggregate_rtf": 0.033355882752629996,
+        "audio_s": 257.36,
+        "caps": 0,
+        "failures": 0,
+        "endpoint_trimmed_audio_s": 242.57999999999998,
+        "endpoint_trimmed_aggregate_rtf": 0.035388201769382704,
+        "quiet_tail_at_least_3s": 0,
+        "max_quiet_tail_s": 1.94
+      },
+      {
+        "build": "plain-batched",
+        "phase": "round-0",
+        "temperature": 0.0,
+        "concurrency": 8,
+        "requests": 64,
+        "makespan_s": 12.983129982370883,
+        "req_per_s": 4.929473870083891,
+        "aggregate_rtf": 0.03320153943936907,
+        "audio_s": 391.04,
+        "caps": 2,
+        "failures": 0,
+        "endpoint_trimmed_audio_s": 312.72,
+        "endpoint_trimmed_aggregate_rtf": 0.041516788124747,
+        "quiet_tail_at_least_3s": 11,
+        "max_quiet_tail_s": 28.4
+      },
+      {
+        "build": "plain-batched",
+        "phase": "round-0",
+        "temperature": 0.0,
+        "concurrency": 16,
+        "requests": 64,
+        "makespan_s": 9.772029620129615,
+        "req_per_s": 6.549304749155183,
+        "aggregate_rtf": 0.027698496655696188,
+        "audio_s": 352.8,
+        "caps": 1,
+        "failures": 0,
+        "endpoint_trimmed_audio_s": 286.26,
+        "endpoint_trimmed_aggregate_rtf": 0.034136902187275955,
+        "quiet_tail_at_least_3s": 6,
+        "max_quiet_tail_s": 26.04
+      },
+      {
+        "build": "plain-batched",
+        "phase": "round-0",
+        "temperature": 0.9,
+        "concurrency": 8,
+        "requests": 64,
+        "makespan_s": 8.171920725144446,
+        "req_per_s": 7.831696140061215,
+        "aggregate_rtf": 0.03169376638669115,
+        "audio_s": 257.84,
+        "caps": 0,
+        "failures": 0,
+        "endpoint_trimmed_audio_s": 241.72,
+        "endpoint_trimmed_aggregate_rtf": 0.03380738344011437,
+        "quiet_tail_at_least_3s": 0,
+        "max_quiet_tail_s": 1.22
+      },
+      {
+        "build": "plain-batched",
+        "phase": "round-0",
+        "temperature": 0.9,
+        "concurrency": 16,
+        "requests": 64,
+        "makespan_s": 8.02551719499752,
+        "req_per_s": 7.974563937124526,
+        "aggregate_rtf": 0.030886380830501534,
+        "audio_s": 259.84000000000003,
+        "caps": 0,
+        "failures": 0,
+        "endpoint_trimmed_audio_s": 243.0,
+        "endpoint_trimmed_aggregate_rtf": 0.03302681973250008,
+        "quiet_tail_at_least_3s": 0,
+        "max_quiet_tail_s": 1.78
+      }
+    ],
+    "limits": [
+      "Ranges compare the head sample with two baseline samples; they are not confidence intervals.",
+      "Full-response greedy output lengths and frame-limit incidence vary, so no general greedy throughput gain is claimed.",
+      "No transcription was run on these historical A/B outputs."
+    ]
+  },
+  "capacity": {
+    "runtime_sha": "7bc0b3e3a2e41ef44e8efb30fd927e93bf6a48a7",
+    "main_base_sha": "6bda549ac23a667efbe44a54cf3f6d57e6e24da2",
+    "sequence_slots": [
+      8,
+      16,
+      32
+    ],
+    "kv_gib": [
+      2,
+      4,
+      8
+    ],
+    "codec_graph_buckets": [
+      [
+        1,
+        2,
+        4,
+        8
+      ],
+      [
+        1,
+        2,
+        4,
+        8,
+        16
+      ],
+      [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32
+      ]
+    ],
+    "backbone_capture_sizes": [
+      1,
+      2,
+      4,
+      8,
+      32,
+      64,
+      128,
+      256
+    ],
+    "codec_chunk_frames": 16,
+    "requests_per_group": 128,
+    "cohorts_per_point": 1,
+    "excluded_warmups_per_configuration": {
+      "cohorts": 4,
+      "requests_per_cohort": 64,
+      "covers": "Both client concurrency levels and both sampling settings"
+    },
+    "profiler_configured": false,
+    "nsight_injection_present": false,
+    "rows": [
+      {
+        "slots": 8,
+        "concurrency": 8,
+        "observed_peak_client_requests": 8,
+        "temperature": 0.0,
+        "max_new_tokens": 384,
+        "requests": 128,
+        "failures": 0,
+        "req_per_s": 6.7812081269297915,
+        "makespan_s": 18.87569259107113,
+        "aggregate_rtf": 0.02841355459879445,
+        "audio_s": 664.32,
+        "near_cap_count": 0,
+        "exact_cap_count": 0,
+        "fixed48_verified": null
+      },
+      {
+        "slots": 8,
+        "concurrency": 16,
+        "observed_peak_client_requests": 16,
+        "temperature": 0.0,
+        "max_new_tokens": 384,
+        "requests": 128,
+        "failures": 0,
+        "req_per_s": 5.8798058352164615,
+        "makespan_s": 21.76942633604631,
+        "aggregate_rtf": 0.029975526459636356,
+        "audio_s": 726.24,
+        "near_cap_count": 2,
+        "exact_cap_count": 2,
+        "fixed48_verified": null
+      },
+      {
+        "slots": 8,
+        "concurrency": 8,
+        "observed_peak_client_requests": 8,
+        "temperature": 0.9,
+        "max_new_tokens": 384,
+        "requests": 128,
+        "failures": 0,
+        "req_per_s": 7.72991106982811,
+        "makespan_s": 16.559052082709968,
+        "aggregate_rtf": 0.0320365502296664,
+        "audio_s": 516.88,
+        "near_cap_count": 0,
+        "exact_cap_count": 0,
+        "fixed48_verified": null
+      },
+      {
+        "slots": 8,
+        "concurrency": 16,
+        "observed_peak_client_requests": 16,
+        "temperature": 0.9,
+        "max_new_tokens": 384,
+        "requests": 128,
+        "failures": 0,
+        "req_per_s": 7.945057322591292,
+        "makespan_s": 16.110645248088986,
+        "aggregate_rtf": 0.030958196095482296,
+        "audio_s": 520.4,
+        "near_cap_count": 0,
+        "exact_cap_count": 0,
+        "fixed48_verified": null
+      },
+      {
+        "slots": 8,
+        "concurrency": 8,
+        "observed_peak_client_requests": 8,
+        "temperature": 0.0,
+        "max_new_tokens": 48,
+        "requests": 128,
+        "failures": 0,
+        "req_per_s": 9.850579526557848,
+        "makespan_s": 12.994159344118088,
+        "aggregate_rtf": 0.026436684863521503,
+        "audio_s": 491.52,
+        "near_cap_count": 128,
+        "exact_cap_count": 128,
+        "fixed48_verified": true
+      },
+      {
+        "slots": 8,
+        "concurrency": 16,
+        "observed_peak_client_requests": 16,
+        "temperature": 0.0,
+        "max_new_tokens": 48,
+        "requests": 128,
+        "failures": 0,
+        "req_per_s": 10.665146583658053,
+        "makespan_s": 12.00171033712104,
+        "aggregate_rtf": 0.02441754218978076,
+        "audio_s": 491.52,
+        "near_cap_count": 128,
+        "exact_cap_count": 128,
+        "fixed48_verified": true
+      },
+      {
+        "slots": 16,
+        "concurrency": 16,
+        "observed_peak_client_requests": 16,
+        "temperature": 0.0,
+        "max_new_tokens": 384,
+        "requests": 128,
+        "failures": 0,
+        "req_per_s": 7.754874623816668,
+        "makespan_s": 16.505747186020017,
+        "aggregate_rtf": 0.023979758231665527,
+        "audio_s": 688.32,
+        "near_cap_count": 1,
+        "exact_cap_count": 1,
+        "fixed48_verified": null
+      },
+      {
+        "slots": 16,
+        "concurrency": 32,
+        "observed_peak_client_requests": 32,
+        "temperature": 0.0,
+        "max_new_tokens": 384,
+        "requests": 128,
+        "failures": 0,
+        "req_per_s": 10.104109318018903,
+        "makespan_s": 12.668113138061017,
+        "aggregate_rtf": 0.018577125085143444,
+        "audio_s": 681.92,
+        "near_cap_count": 1,
+        "exact_cap_count": 1,
+        "fixed48_verified": null
+      },
+      {
+        "slots": 16,
+        "concurrency": 16,
+        "observed_peak_client_requests": 16,
+        "temperature": 0.9,
+        "max_new_tokens": 384,
+        "requests": 128,
+        "failures": 0,
+        "req_per_s": 10.920674745703012,
+        "makespan_s": 11.72088748915121,
+        "aggregate_rtf": 0.021831484669108944,
+        "audio_s": 536.88,
+        "near_cap_count": 0,
+        "exact_cap_count": 0,
+        "fixed48_verified": null
+      },
+      {
+        "slots": 16,
+        "concurrency": 32,
+        "observed_peak_client_requests": 32,
+        "temperature": 0.9,
+        "max_new_tokens": 384,
+        "requests": 128,
+        "failures": 0,
+        "req_per_s": 11.210975235811437,
+        "makespan_s": 11.417383172083646,
+        "aggregate_rtf": 0.02120613516360261,
+        "audio_s": 538.4,
+        "near_cap_count": 0,
+        "exact_cap_count": 0,
+        "fixed48_verified": null
+      },
+      {
+        "slots": 16,
+        "concurrency": 16,
+        "observed_peak_client_requests": 16,
+        "temperature": 0.0,
+        "max_new_tokens": 48,
+        "requests": 128,
+        "failures": 0,
+        "req_per_s": 15.14487085057202,
+        "makespan_s": 8.451706274878234,
+        "aggregate_rtf": 0.017195040435543284,
+        "audio_s": 491.52,
+        "near_cap_count": 128,
+        "exact_cap_count": 128,
+        "fixed48_verified": true
+      },
+      {
+        "slots": 16,
+        "concurrency": 32,
+        "observed_peak_client_requests": 32,
+        "temperature": 0.0,
+        "max_new_tokens": 48,
+        "requests": 128,
+        "failures": 0,
+        "req_per_s": 16.563937910502617,
+        "makespan_s": 7.727630995213985,
+        "aggregate_rtf": 0.015721905507840955,
+        "audio_s": 491.52,
+        "near_cap_count": 128,
+        "exact_cap_count": 128,
+        "fixed48_verified": true
+      },
+      {
+        "slots": 32,
+        "concurrency": 32,
+        "observed_peak_client_requests": 32,
+        "temperature": 0.0,
+        "max_new_tokens": 384,
+        "requests": 128,
+        "failures": 0,
+        "req_per_s": 15.246181432777554,
+        "makespan_s": 8.395544849336147,
+        "aggregate_rtf": 0.012390119317202106,
+        "audio_s": 677.6,
+        "near_cap_count": 0,
+        "exact_cap_count": 0,
+        "fixed48_verified": null
+      },
+      {
+        "slots": 32,
+        "concurrency": 64,
+        "observed_peak_client_requests": 64,
+        "temperature": 0.0,
+        "max_new_tokens": 384,
+        "requests": 128,
+        "failures": 0,
+        "req_per_s": 11.166074835908939,
+        "makespan_s": 11.463294119108468,
+        "aggregate_rtf": 0.015826284127331107,
+        "audio_s": 724.32,
+        "near_cap_count": 1,
+        "exact_cap_count": 1,
+        "fixed48_verified": null
+      },
+      {
+        "slots": 32,
+        "concurrency": 32,
+        "observed_peak_client_requests": 32,
+        "temperature": 0.9,
+        "max_new_tokens": 384,
+        "requests": 128,
+        "failures": 0,
+        "req_per_s": 17.17219888865503,
+        "makespan_s": 7.453908543102443,
+        "aggregate_rtf": 0.014336645143680651,
+        "audio_s": 519.92,
+        "near_cap_count": 0,
+        "exact_cap_count": 0,
+        "fixed48_verified": null
+      },
+      {
+        "slots": 32,
+        "concurrency": 64,
+        "observed_peak_client_requests": 64,
+        "temperature": 0.9,
+        "max_new_tokens": 384,
+        "requests": 128,
+        "failures": 0,
+        "req_per_s": 17.514343665613783,
+        "makespan_s": 7.3082955572754145,
+        "aggregate_rtf": 0.013677750331777613,
+        "audio_s": 534.32,
+        "near_cap_count": 0,
+        "exact_cap_count": 0,
+        "fixed48_verified": null
+      },
+      {
+        "slots": 32,
+        "concurrency": 32,
+        "observed_peak_client_requests": 32,
+        "temperature": 0.0,
+        "max_new_tokens": 48,
+        "requests": 128,
+        "failures": 0,
+        "req_per_s": 25.82908453652114,
+        "makespan_s": 4.955653763841838,
+        "aggregate_rtf": 0.010082303393232905,
+        "audio_s": 491.52,
+        "near_cap_count": 128,
+        "exact_cap_count": 128,
+        "fixed48_verified": true
+      },
+      {
+        "slots": 32,
+        "concurrency": 64,
+        "observed_peak_client_requests": 64,
+        "temperature": 0.0,
+        "max_new_tokens": 48,
+        "requests": 128,
+        "failures": 0,
+        "req_per_s": 28.81314277607874,
+        "makespan_s": 4.442417163401842,
+        "aggregate_rtf": 0.00903812085653044,
+        "audio_s": 491.52,
+        "near_cap_count": 128,
+        "exact_cap_count": 128,
+        "fixed48_verified": true
+      }
+    ],
+    "limits": [
+      "This scales slots, KV reservation and codec graph buckets together.",
+      "One cohort per point; no repeated capacity samples or confidence intervals.",
+      "The 48-frame cohorts deliberately truncate speech and are excluded from full-utterance quality claims.",
+      "Peak device memory was not measured.",
+      "No capacity claim extends to cloning, CFG guidance above one, long prompts or other GPUs."
+    ]
+  },
+  "quality": {
+    "full_response_pcm_checked": 1536,
+    "sampled_full_responses": 768,
+    "sampled_frame_limit_hits": 0,
+    "sampled_quiet_tails_at_least_three_seconds": 0,
+    "greedy_frame_limit_hits": 5,
+    "asr_selected_unique_clips": 47,
+    "asr_selected_sampled_clips": 24,
+    "sampled_asr": "All selected sampled transcripts matched after accounting for TTS 2 versus TTS2 spacing.",
+    "endpoint_method": "Trim leading/trailing quiet using 20 ms RMS windows at or below -40 dBFS; keep internal pauses and original makespans.",
+    "limits": [
+      "ASR selects median-duration and longest English/Chinese clips per group, deduplicated by WAV hash.",
+      "Selected ASR and endpoint measurements do not establish perceptual quality parity.",
+      "Capped greedy clips have extra ASR words with unreliable tail alignment.",
+      "No listening or MOS assessment was performed."
+    ]
+  },
+  "metrics": {
+    "requests_per_second": "Completed requests divided by cohort wall time",
+    "aggregate_rtf": "Cohort wall time divided by total returned audio duration",
+    "timing_exclusions": [
+      "PCM validation",
+      "hashing",
+      "WAV file writes",
+      "post-timing audio analysis"
+    ]
+  }
+}

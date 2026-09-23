@@ -1380,6 +1380,8 @@ def test_text_encoder_linear_delegates_quantization_to_vllm_factory():
     method = UnquantizedLinearMethod()
     quant_config = Mock()
     quant_config.get_quant_method.return_value = method
+    # vLLM 0.30: no online quantization for this checkpoint-quantized layer
+    quant_config.online_quantization_config = None
     prefix = "text_encoder.text_model.layers.0.mlp.gate_up_proj"
 
     with (
@@ -1396,7 +1398,9 @@ def test_text_encoder_linear_delegates_quantization_to_vllm_factory():
         )
 
     assert linear.quant_method is method
-    quant_config.get_quant_method.assert_called_once_with(linear, prefix=prefix)
+    # vLLM 0.30 resolves the method through resolve_quant_method(), which calls
+    # get_quant_method(layer, prefix) POSITIONALLY; 0.29 passed prefix= by keyword.
+    quant_config.get_quant_method.assert_called_once_with(linear, prefix)
 
 
 def test_distributed_layerwise_offload_stages_vae_component():

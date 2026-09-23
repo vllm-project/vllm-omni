@@ -74,7 +74,7 @@ def _make_safe_get_rope(orig_get_rope):
             return None
         if not hasattr(mdl, "get_mrope_input_positions"):
             mdl.get_mrope_input_positions = types.MethodType(_default_mrope_positions, mdl)
-        return RopeState(num_dims=3, has_delta=True, **kwargs)
+        return RopeState(num_dims=3, **kwargs)
 
     return _safe_get_rope
 

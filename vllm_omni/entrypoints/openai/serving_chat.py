@@ -2437,6 +2437,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         kv_transfer_params = None
         response_metrics: dict[str, Any] | None = None
 
+        # For text+audio requests the audio final output shares output
+        # indexes with the text final output. Collect audio choices and
+        # merge them into the matching text choice after the loop instead
+        # of appending duplicate-index choices (#7376).
+        pending_audio_choices: list[OmniChatCompletionResponseChoice] = []
+
         # Build requested modalities set for filtering
         requested_modalities = (
             set(request.modalities) if hasattr(request, "modalities") and request.modalities else None
@@ -2486,9 +2492,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         )
                     ]
             elif omni_outputs.final_output_type == "audio":
-                choices_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
-                if isinstance(choices_data, ErrorResponse):
-                    return choices_data
+                audio_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
+                if isinstance(audio_data, ErrorResponse):
+                    return audio_data
+                pending_audio_choices.extend(audio_data)
+                choices_data = []
             elif omni_outputs.final_output_type == "image":
                 choices_data = self._create_image_choice(omni_outputs, role, request, stream=False)
             else:
@@ -2506,6 +2514,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if extra:
                     response_metrics.update(extra)
             choices.extend(choices_data)
+
+        if pending_audio_choices:
+            choices = self._merge_audio_choices(choices, pending_audio_choices)
 
         response_metrics = self._filter_stage_metrics_detail(response_metrics, request)
 
@@ -2818,6 +2829,37 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         kv_transfer_params = final_res.kv_transfer_params
 
         return choices, usage, prompt_logprobs, prompt_token_ids, kv_transfer_params
+
+    def _merge_audio_choices(
+        self,
+        choices: list[ChatCompletionResponseChoice],
+        audio_choices: list[OmniChatCompletionResponseChoice],
+    ) -> list[ChatCompletionResponseChoice]:
+        """Fold audio outputs into the matching text choice (#7376).
+
+        A non-streaming chat request with ``modalities=["text", "audio"]``
+        produces two final outputs (text and audio) whose entries share the
+        same output index. Appending both as separate choices yields
+        duplicate ``index`` values, and clients that read ``choices[0]``
+        never see the audio. Merge the audio object and its metadata into
+        the choice with the matching index; audio-only requests (no text
+        choice) keep the standalone audio choice.
+        """
+        for audio_choice in audio_choices:
+            for i, existing in enumerate(choices):
+                if existing.index != audio_choice.index:
+                    continue
+                merged = OmniChatCompletionResponseChoice(
+                    **existing.model_dump(exclude={"message"}),
+                    message=existing.message,
+                    audio_metadata=audio_choice.audio_metadata,
+                )
+                merged.message.audio = audio_choice.message.audio
+                choices[i] = merged
+                break
+            else:
+                choices.append(audio_choice)
+        return choices
 
     def _create_audio_choice(
         self, omni_outputs: OmniRequestOutput, role: str, request: ChatCompletionRequest, stream: bool = False

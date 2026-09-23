@@ -286,8 +286,11 @@ output   DuplexOrchestrator._intercept_stage_output -> runner.on_stage_output ->
 detach   DuplexOmni.detach_session -> touch(DETACH): engine-owned disconnect grace; expiry -> SessionExpired
 resume   DuplexOmni.resume_session(expected_lease_generation) -> lease CAS; the existing handle is re-entered
 close    DuplexOmni.close_session -> close RPC; the manager tears the runner down, then the stage cleanup
-         (abort submitted requests, release reserved ids), then SessionClosed, then the RPC result: seeing
-         the event means the admission slot is free (it is held until the cleanup succeeded)
+         (abort submitted requests, release reserved ids), then SessionClosed, then the RPC result.
+         SessionClosed is emitted after the cleanup attempt (in a finally), so it is also sent when the
+         stage cleanup failed; in that case the admission slot is intentionally retained and the cleanup
+         is retried by the reaper, and opening a replacement session can still be refused with
+         resource_exhausted. Seeing the event therefore does not by itself guarantee a free slot.
 reap     DuplexSessionManager.reaper_loop: idle TTL / disconnect grace expiry, cleanup retries
 ```
 

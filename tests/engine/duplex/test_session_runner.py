@@ -46,9 +46,10 @@ from vllm_omni.engine.duplex.messages import (
     DuplexSessionEventMessage,
     OpenDuplexSessionMessage,
 )
+from vllm_omni.engine.duplex.session.engine_session import RESPONSE_REQUEST_MEASUREMENT_ORIGIN
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
-from vllm_omni.metrics.stats import StageRequestStats, StageStats
+from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats, StageStats
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -202,6 +203,7 @@ async def open_harness(
     runtime_config: DuplexSessionRuntimeConfig | None = None,
     stage_count: int = 2,
     clock: Any = None,
+    log_stats: bool = False,
 ) -> Harness:
     plugin = MiniCPMO45DuplexPlugin(_fake_encode_audio)
     port = RecordingStagePort(stage_count=stage_count)
@@ -214,6 +216,7 @@ async def open_harness(
         result_sink=results,
         runtime_config=runtime_config or DuplexSessionRuntimeConfig(),
         model_config=None,
+        log_stats=log_stats,
         clock=clock,
     )
     body: dict[str, object] = {"auto_response": auto_response, **(extra_body or {})}
@@ -1394,6 +1397,144 @@ async def test_stage0_metrics_from_several_units_are_summed_into_one_response() 
         events = await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hi"))
         stage_metrics = _stage_metrics_of(find(events, "response.output_audio.delta"))
         assert stage_metrics["0"]["num_tokens_out"] == 7
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_response_done_logs_orchestrator_stage_table(monkeypatch: pytest.MonkeyPatch) -> None:
+    logged: list[OrchestratorAggregator] = []
+
+    def _capture(self: OrchestratorAggregator) -> dict[str, object]:
+        logged.append(self)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", _capture)
+    h = await open_harness(log_stats=True)
+    try:
+        assert h.session.log_stats is True
+        assert h.session.num_stages == 2
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        h.deliver(
+            SimpleNamespace(
+                request_id=request_id,
+                finished=False,
+                outputs=[SimpleNamespace(text="hi", token_ids=[11], multimodal_output={})],
+                multimodal_output={},
+            ),
+            stage_id=0,
+            metrics=stage_stats(stage_id=0, request_id=request_id, num_tokens_out=3),
+        )
+        assert await h.settle() == []
+
+        events = await h.deliver_and_settle(
+            tts_output(request_id, samples=24000, text="hi", turn_end=True),
+            metrics=stage_stats(stage_id=1, request_id=request_id, num_tokens_out=4),
+        )
+        done = find(events, "response.done")
+        assert done.status == "completed"
+        assert len(logged) == 1
+        aggregator = logged[0]
+        assert aggregator.num_stages == 2
+        stage_ids = [event.stage_id for event in aggregator.stage_events[done.response_id]]
+        assert stage_ids == [0, 1]
+        assert done.response_id in aggregator.e2e_done
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_duplex_stage_request_stamps_wall_clock_request_timestamp() -> None:
+    """serving_time_to_first_output_ms is (first_output_ts - request_timestamp)*1000.
+
+    Duplex used to leave request_timestamp at 0, so the table printed unix_ts*1000.
+    """
+    from tests.engine.test_duplex_orchestrator import (
+        SESSION_ID as ORCH_SESSION_ID,
+    )
+    from tests.engine.test_duplex_orchestrator import (
+        _build,
+        _close,
+        _open,
+        _stage0_request_id,
+    )
+    from vllm_omni.engine.duplex_orchestrator import DuplexOrchestratorRequestState
+
+    orchestrator, _, rpc_q, _ = _build()
+    try:
+        result = await _open(orchestrator, rpc_q)
+        assert result.ok
+        state = orchestrator.request_states[_stage0_request_id()]
+        assert isinstance(state, DuplexOrchestratorRequestState)
+        assert state.request_timestamp > 1_000_000_000.0
+    finally:
+        if ORCH_SESSION_ID in orchestrator.session_manager.runners:
+            await _close(orchestrator, rpc_q)
+        await orchestrator.session_manager.shutdown()
+
+
+def _response_request_metrics_of(event: object) -> dict[str, object]:
+    """Server request-start clocks as the client reads them off one wire event."""
+    payload = event.to_realtime()
+    metadata = payload.get("metadata")
+    assert isinstance(metadata, dict), payload
+    vllm_omni = metadata.get("vllm_omni")
+    assert isinstance(vllm_omni, dict), metadata
+    metrics = vllm_omni.get("response_request_metrics")
+    assert isinstance(metrics, dict), vllm_omni
+    return metrics
+
+
+@pytest.mark.asyncio
+async def test_first_audio_delta_carries_server_request_start_metrics() -> None:
+    clock = {"now": 1000.0}
+    h = await open_harness(clock=lambda: clock["now"])
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        clock["now"] = 1001.3
+        events = await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hi"))
+        metrics = _response_request_metrics_of(find(events, "response.output_audio.delta"))
+        assert metrics["source"] == "server_monotonic_request_start"
+        assert metrics["measurement_origin"] == dict(RESPONSE_REQUEST_MEASUREMENT_ORIGIN)
+        assert metrics["ttft_ms"] == pytest.approx(1300.0)
+        assert metrics["ttfp_ms"] == pytest.approx(1300.0)
+        speak_metrics = _response_request_metrics_of(find(events, "response.speak"))
+        assert speak_metrics["ttft_ms"] == pytest.approx(1300.0)
+        assert speak_metrics["ttfp_ms"] == pytest.approx(1300.0)
+
+        clock["now"] = 1002.0
+        later = await h.deliver_and_settle(tts_output(request_id, samples=48000, text="hello"))
+        later_payload = find(later, "response.output_audio.delta").to_realtime()
+        later_metadata = later_payload.get("metadata")
+        later_vllm_omni = later_metadata.get("vllm_omni") if isinstance(later_metadata, dict) else None
+        later_metrics = later_vllm_omni.get("response_request_metrics") if isinstance(later_vllm_omni, dict) else None
+        assert later_metrics is None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_stale_epoch_append_does_not_own_request_start() -> None:
+    clock = {"now": 1000.0}
+    h = await open_harness(clock=lambda: clock["now"])
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        clock["now"] = 1000.5
+        append_ok, emitted = await h.runner.model.append_runtime_input(
+            {"duplex_turn_id": 0},
+            final=False,
+            expected_epoch=h.session.epoch + 1,
+        )
+        assert append_ok is True
+        assert emitted is False
+        clock["now"] = 1001.3
+        events = await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hi"))
+        metrics = _response_request_metrics_of(find(events, "response.output_audio.delta"))
+        assert metrics["ttft_ms"] == pytest.approx(1300.0)
+        assert metrics["ttfp_ms"] == pytest.approx(1300.0)
     finally:
         await close_harness(h)
 

@@ -308,6 +308,24 @@ async def test_append_submits_the_resumable_stage0_request_and_counts_it_running
 
 
 @pytest.mark.asyncio
+async def test_resumable_append_prompt_does_not_reach_prewarmed_stages() -> None:
+    # A resumable append carries Stage0's duplex buffer. The async-chunk
+    # prewarm copies ``request_state.prompt`` into downstream placeholders,
+    # so that buffer must not end up there (#7962).
+    orchestrator, clients, rpc_q, _ = _build(stages=2)
+    orchestrator.async_chunk = True
+    orchestrator._stage_receives_async_chunks = lambda stage_id: stage_id > 0  # type: ignore[method-assign]
+    await _open(orchestrator, rpc_q)
+
+    await _submit(orchestrator, _append_audio())
+
+    assert clients[0].add_request_calls[0][0].model_intermediate_buffer
+    assert len(clients[1].add_request_calls) == 1
+    assert clients[1].add_request_calls[0][0].model_intermediate_buffer is None
+    await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_session_update_refreshes_the_next_append_sampling_params() -> None:
     orchestrator, clients, rpc_q, _ = _build()
     await _open(orchestrator, rpc_q)

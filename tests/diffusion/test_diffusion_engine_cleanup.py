@@ -38,6 +38,7 @@ def _make_engine() -> DiffusionEngine:
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._out_streams = {}
     engine._closed = False
+    engine._shutting_down = False
     engine._shutdown_complete = False
     engine.abort_queue = queue.Queue()
     engine._loop_started = False
@@ -379,3 +380,22 @@ def test_close_defers_resource_shutdown_until_worker_thread_stops() -> None:
     engine.executor.shutdown.assert_called_once()
     assert engine._shutdown_complete is True
     assert engine._loop_started is False
+
+
+def test_fail_engine_does_not_reenter_when_executor_shutdown_fails() -> None:
+    engine = _make_engine()
+    shutdown_error = RuntimeError("worker shutdown failed")
+    engine.executor.shutdown.side_effect = shutdown_error
+    engine.scheduler.close = Mock()
+    engine._fail_pending_rpcs = Mock()
+
+    with pytest.raises(RuntimeError, match="worker shutdown failed"):
+        engine._fail_engine(RuntimeError("engine failed"))
+
+    engine._fail_engine(RuntimeError("follow-up failure"))
+
+    engine.executor.shutdown.assert_called_once_with()
+    engine.scheduler.close.assert_not_called()
+    assert engine._closed is True
+    assert engine._shutting_down is True
+    assert engine._shutdown_complete is False

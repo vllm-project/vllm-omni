@@ -198,6 +198,12 @@ def test_response_metrics_include_engine_tpot_and_stream_window():
         "tpot_ms": {"count": 2, "mean": 15.0, "p50": 10.0, "p99": 20.0},
         "ttfp_ms": {"count": 2, "mean": 300.0, "p50": 200.0, "p99": 400.0},
         "rtf": {"count": 2, "mean": 2.0, "p50": 2.0, "p99": 2.0},
+        "stages": {
+            "0": {
+                "ttft_ms": {"count": 2, "mean": 0.0, "p50": 0.0, "p99": 0.0},
+                "tpot_ms": {"count": 2, "mean": 15.0, "p50": 10.0, "p99": 20.0},
+            }
+        },
         "stream_ttft_ms": 200.0,
         "stream_ttfp_ms": 300.0,
         "stream_rtf": 8.333333,
