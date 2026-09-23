@@ -139,16 +139,11 @@ platforms:
         enable_prefix_caching: true
         compilation_config:
           # A full decode-step graph keeps in-graph sampling and multi-frame
-<<<<<<< HEAD
-          # expansion: with PIECEWISE the K-step replay trips vLLM's capture-time
-          # guard (CUDA graph capturing detected at an inappropriate time) and
-          # stage 1 dies.
-=======
           # expansion. The static-shape builder gates its runtime buckets on
           # the decode graph mode, so PIECEWISE also runs (K included,
           # verified on 910B1) but K's RTF win is FULL-only there. Measured
-          # on 910B3: -32.6% RTF versus PIECEWISE.
->>>>>>> a125d09d1 (fix(minicpmo_4_5): keep static-shape decode buckets FULL-decode-only)
+          # on 910B1: PIECEWISE without K is +75% RTF at 32/1 versus
+          # FULL_DECODE_ONLY with K=8.
           cudagraph_mode: FULL_DECODE_ONLY
       - stage_id: 1
         # Concurrency cap raised from 4 to 8; the override block only covered
