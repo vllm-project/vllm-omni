@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any, NamedTuple
 
 import pytest
 import pytest_asyncio
@@ -197,12 +198,24 @@ def _is_engine_worker_proc(proc) -> bool:
     return any(marker in blob for marker in _ENGINE_CHILD_MARKERS)
 
 
-def _snapshot_engine_child_pids() -> list[int]:
-    """PIDs of engine workers under this pytest process (before shutdown).
+class _EngineWorkerSnap(NamedTuple):
+    """Pre-shutdown worker handle. ``proc`` already caches identity."""
+
+    proc: Any
+    pid: int
+    create_time: float
+
+
+def _snapshot_engine_workers() -> list[_EngineWorkerSnap]:
+    """Engine workers under this pytest process (before shutdown).
 
     ``DiffusionWorker`` is started ``daemon=True``. After StagePool joins
     ``StageDiffusionProc``, that worker is reparented to PID 1 and a later
     ``children(recursive=True)`` scan misses it while it still holds VRAM.
+
+    Keep the original ``psutil.Process`` (and its cached ``create_time``)
+    across ``engine.shutdown()``. Rebuilding ``Process(pid)`` after exit
+    can bind to a reused PID and ``kill()`` an unrelated process.
     """
     try:
         import psutil
@@ -212,36 +225,49 @@ def _snapshot_engine_child_pids() -> list[int]:
         children = psutil.Process().children(recursive=True)
     except psutil.Error:
         return []
-    pids: list[int] = []
+    snaps: list[_EngineWorkerSnap] = []
     for proc in children:
         try:
             if _is_engine_worker_proc(proc):
-                pids.append(proc.pid)
+                snaps.append(_EngineWorkerSnap(proc, proc.pid, proc.create_time()))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-    return pids
+    return snaps
 
 
-def _reap_engine_pids(pids: list[int]) -> None:
-    """SIGKILL snapshot PIDs even if they were reparented after shutdown."""
+def _same_engine_worker(snap: _EngineWorkerSnap) -> bool:
+    """True only if ``snap.proc`` is still the original worker, not a reused PID."""
+    try:
+        import psutil
+    except ImportError:
+        return False
+    try:
+        if not snap.proc.is_running():
+            return False
+        return snap.proc.pid == snap.pid and snap.proc.create_time() == snap.create_time
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+
+
+def _reap_engine_workers(snaps: list[_EngineWorkerSnap]) -> None:
+    """SIGKILL leftover snapshot workers even if they were reparented."""
     try:
         import psutil
     except ImportError:
         return
 
-    procs = []
-    for pid in pids:
-        try:
-            procs.append(psutil.Process(pid))
-        except psutil.NoSuchProcess:
-            continue
-    print(f"[sleep_mode] engine worker snapshot pids={pids} still_alive={[p.pid for p in procs]}")
+    procs = [snap.proc for snap in snaps if _same_engine_worker(snap)]
+    print(
+        f"[sleep_mode] engine worker snapshot pids={[snap.pid for snap in snaps]} still_alive={[p.pid for p in procs]}"
+    )
     if not procs:
         return
     # shutdown() already tried a graceful exit. SIGTERM + 5s here just
     # delays SIGKILL on CUDA workers that ignore it.
     for proc in procs:
         try:
+            if not proc.is_running():
+                continue
             proc.kill()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
@@ -252,9 +278,9 @@ async def _shutdown_engine_and_clear_gpu(engine: AsyncOmni) -> None:
     """Shut down the engine, reap leftover workers, then run shared cleanup."""
     from tests.helpers.clean import cleanup_test_environment
 
-    leftover_pids = _snapshot_engine_child_pids()
+    leftover_workers = _snapshot_engine_workers()
     engine.shutdown()
-    _reap_engine_pids(leftover_pids)
+    _reap_engine_workers(leftover_workers)
     cleanup_test_environment()
 
 
