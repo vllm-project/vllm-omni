@@ -597,6 +597,9 @@ def test_execute_stepwise_streaming_returns_chunks_at_boundaries(monkeypatch):
     runner.od_config.step_execution = True
     req = _make_request()
     req.request_id = "req"
+    req.external_req_id = "external-req"
+    sent = []
+    runner._maybe_send_stage_payload = lambda requests, outputs: sent.append((requests[0].external_req_id, outputs))
 
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
     monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
@@ -610,6 +613,7 @@ def test_execute_stepwise_streaming_returns_chunks_at_boundaries(monkeypatch):
 
     first = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
     assert first.get_request_output("req").result is None
+    assert sent == []
 
     scheduler_output = SimpleNamespace(
         finished_req_ids=set(),
@@ -619,11 +623,13 @@ def test_execute_stepwise_streaming_returns_chunks_at_boundaries(monkeypatch):
     second = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
     assert second.get_request_output("req").result == chunks[0]
     assert second.get_request_output("req").finished is False
+    assert sent == []
 
     DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
     fourth = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
     assert fourth.get_request_output("req").result == chunks[1]
     assert fourth.get_request_output("req").finished is True
+    assert sent == [("external-req", [chunks[1]])]
 
 
 @pytest.mark.core_model
@@ -783,7 +789,7 @@ def test_execute_model_passes_single_request_batch_to_non_admission_pipeline(mon
     req = _make_request()
 
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
-    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
 
     output = DiffusionModelRunner.execute_model(runner, req)
 
@@ -800,7 +806,7 @@ def test_execute_model_accepts_bare_diffusion_output_from_single_request_pipelin
     req = _make_request()
 
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
-    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
 
     output = DiffusionModelRunner.execute_model(runner, req)
 

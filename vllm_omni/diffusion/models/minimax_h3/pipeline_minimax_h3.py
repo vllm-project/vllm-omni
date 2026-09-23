@@ -2012,6 +2012,10 @@ class MiniMaxH3Pipeline(
         additional_information = raw_prompt.get("additional_information") or {}
         encoder_output = additional_information.get("encoder_output")
         if encoder_output is None:
+            # Preserve main's text-only handoff for deployments that still
+            # encode media locally; a supplied unified payload takes priority.
+            encoder_output = additional_information.get("text_encoder_output")
+        if encoder_output is None:
             return None
         if not isinstance(encoder_output, Mapping):
             raise OmniClientError("MiniMax H3 encoder output must be a mapping")
@@ -2210,6 +2214,12 @@ class MiniMaxH3Pipeline(
                     self._validate_turbo_sampling(sampling, turbo_spec)
                 if has_native_lora:
                     self._validate_native_sampling(sampling, task=task)
+                if self._fasth3 is not None:
+                    self._fasth3.check_request(
+                        sampling,
+                        video_shift=self.default_video_shift,
+                        audio_shift=self.default_audio_shift,
+                    )
                 text_conditioning = self._extract_text_conditioning(raw_prompt)
                 if require_external_text and text_conditioning is None:
                     raise OmniClientError(

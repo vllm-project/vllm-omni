@@ -1063,6 +1063,15 @@ class OmniDiffusionConfig:
     # Model-specific function for collecting CFG KV caches (set at runtime)
     cfg_kv_collect_func: Any | None = None
 
+    # Conditioning keys fetched from the upstream stage over the omni connector
+    # rather than carried inline through the orchestrator. Empty disables the
+    # worker-side connector receive path.
+    stage_input_payload_keys: tuple[str, ...] = ()
+
+    # Keys handed to the next stage over the omni connector. Empty disables the
+    # worker-side connector send path.
+    stage_output_payload_keys: tuple[str, ...] = ()
+
     # Quantization: str method name, dict config, QuantizationConfig, or None.
     # str is resolved to {"method": <str>} internally.
     # Per-component: {"transformer": {"method": "fp8"}, "vae": None}
@@ -1186,6 +1195,8 @@ class OmniDiffusionConfig:
             materialize_legacy_offload_flags,
         )
 
+        self.stage_input_payload_keys = tuple(self.stage_input_payload_keys)
+        self.stage_output_payload_keys = tuple(self.stage_output_payload_keys)
         if self.vae_fast_path not in VAE_FAST_PATH_LEVELS:
             raise ValueError(f"vae_fast_path must be one of {list(VAE_FAST_PATH_LEVELS)}, got {self.vae_fast_path!r}")
         if self.diffusion_compile_granularity not in {"regional", "full"}:
@@ -1497,6 +1508,29 @@ class OmniDiffusionConfig:
         self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
         self.supports_mixed_reference_inputs = metadata.supports_mixed_reference_inputs
 
+    def _load_component_transformer_config(self) -> bool:
+        """Load a registered pipeline's component-level DiT configuration."""
+        from vllm.transformers_utils.config import get_hf_file_to_dict
+
+        from vllm_omni.model_extras import get_transformer_config_subfolder
+
+        transformer_subfolder = get_transformer_config_subfolder(
+            self.model_class_name,
+            model=self.model,
+            revision=self.revision,
+        )
+        tf_config_dict = get_hf_file_to_dict(
+            f"{transformer_subfolder}/config.json",
+            self.model,
+            revision=self.revision,
+        )
+        if tf_config_dict is None:
+            tf_config_dict = get_hf_file_to_dict("unet/config.json", self.model, revision=self.revision)
+        if tf_config_dict is None:
+            return False
+        self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
+        return True
+
     @staticmethod
     def _looks_like_lance_subfolder(model: str | None) -> bool:
         """Return True when ``--model`` points at a Lance per-component subfolder.
@@ -1563,23 +1597,7 @@ class OmniDiffusionConfig:
                             exc,
                         )
                 else:
-                    from vllm_omni.model_extras import get_transformer_config_subfolder
-
-                    transformer_subfolder = get_transformer_config_subfolder(
-                        self.model_class_name,
-                        model=self.model,
-                        revision=self.revision,
-                    )
-                    tf_config_dict = get_hf_file_to_dict(
-                        f"{transformer_subfolder}/config.json",
-                        self.model,
-                        revision=self.revision,
-                    )
-                    if tf_config_dict is None:
-                        tf_config_dict = get_hf_file_to_dict("unet/config.json", self.model, revision=self.revision)
-                    if tf_config_dict is not None:
-                        self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
-                    else:
+                    if not self._load_component_transformer_config():
                         self.set_tf_model_config(TransformerConfig())
             else:
                 raise FileNotFoundError("Diffusers pipeline index not found")
@@ -1613,6 +1631,23 @@ class OmniDiffusionConfig:
                     if self._looks_like_lance_subfolder(self.model):
                         self.model_class_name = "LancePipeline"
                         self.set_tf_model_config(TransformerConfig())
+                        self.update_multimodal_support()
+                        return
+                    # An explicit topology or CLI override can select a native,
+                    # registered pipeline whose repository contains component
+                    # configs but no root HF config or Diffusers index. Trust
+                    # that explicit class selection only when its component
+                    # transformer config is present.
+                    from vllm_omni.diffusion.registry import DiffusionModelRegistry
+
+                    if (
+                        self.model_class_name in DiffusionModelRegistry.get_supported_archs()
+                        and self._load_component_transformer_config()
+                    ):
+                        logger.info(
+                            "Using explicitly selected diffusion pipeline %r with component-level configuration.",
+                            self.model_class_name,
+                        )
                         self.update_multimodal_support()
                         return
                     raise ValueError(f"Could not find config.json or a Diffusers pipeline index for {self.model}")

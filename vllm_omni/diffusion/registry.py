@@ -204,6 +204,11 @@ _DIFFUSION_MODELS = {
         "pipeline_ming_imagegen",
         "MingImagePipeline",
     ),
+    "MingImageDiffusionPipeline": (
+        "ming_image",
+        "pipeline",
+        "MingImageDiffusionPipeline",
+    ),
     "SanaWmPipeline": (
         "sana_wm",
         "pipeline_sana_wm",
@@ -390,6 +395,7 @@ _DIFFUSION_MODELS = {
         "Krea2Pipeline",
     ),
 }
+_DIFFUSION_MODELS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_MODELS["MingImageDiffusionPipeline"]
 
 
 DiffusionModelRegistry = _ModelRegistry(
@@ -663,6 +669,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "BagelPipeline": "get_bagel_post_process_func",
     "LancePipeline": "get_lance_post_process_func",
     "MingImagePipeline": "get_ming_image_post_process_func",
+    "MingImageDiffusionPipeline": "get_ming_image_post_process_func",
     "InternVLAA1Pipeline": "get_internvla_a1_post_process_func",
     "Pi0Pipeline": "get_pi0_post_process_func",
     "Pi05Pipeline": "get_pi05_post_process_func",
@@ -696,6 +703,9 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Krea2Pipeline": "get_krea2_post_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image3_post_process_func",
 }
+_DIFFUSION_POST_PROCESS_FUNCS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_POST_PROCESS_FUNCS[
+    "MingImageDiffusionPipeline"
+]
 
 _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
     # arch: ir_op_priority_func
