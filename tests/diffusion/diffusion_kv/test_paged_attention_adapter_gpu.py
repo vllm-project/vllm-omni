@@ -106,11 +106,9 @@ def _native_adapter(num_rows: int = 1):
             vllm_config,
             device,
         )
-        runner_kv_caches: list[torch.Tensor | list[torch.Tensor]] = []
-        # vLLM 0.29 dropped attn_groups and cache_dtype here: the layout now
-        # comes from the resolved CacheConfig.kv_cache_layout inside the call.
+        # f2aad6aa70 (#56888): init_kv_cache no longer mutates a runner list;
+        # first arg is forward_context and the allocated caches are returned.
         init_kv_cache(
-            runner_kv_caches,
             vllm_config.compilation_config.static_forward_context,
             kv_cache_config,
             device,

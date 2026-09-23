@@ -208,6 +208,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                 continue
             plane.register_request(request_data)
         plane.register_receivers(list(getattr(scheduler_output, "pending_input_registrations", [])))
+        if not getattr(self.model_config, "async_chunk", False):
+            plane.recv_full_payload_inputs(scheduler_output)
         natural_terminal_req_ids = set(getattr(scheduler_output, "data_plane_terminal_req_ids", set()))
         aborted_req_ids = set(getattr(scheduler_output, "finished_req_ids", set())).difference(natural_terminal_req_ids)
         if natural_terminal_req_ids:
@@ -402,6 +404,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
         context_len: int = 0,
+        valid_dummy_state_slots: bool = False,
     ) -> Any:
         if not dummy_run:
             self._prepare_native_data_plane(scheduler_output)
@@ -478,7 +481,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 max_query_len=batch_desc.max_query_len,
             )
             if not skip_attn_for_dummy_run:
-                block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
+                block_tables, slot_mappings = self.prepare_dummy_attn(input_batch, valid_dummy_state_slots)
                 if context_len:
                     set_dummy_context(
                         input_batch,
@@ -608,6 +611,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             dp_sync=dp_sync,
             ec_connector_output=ec_connector_output,
             routed_experts=routed_experts,
+            cudagraph_stats=None,
         )
 
         assert isinstance(hidden_states, torch.Tensor)

@@ -48,6 +48,8 @@ def _bare_plane(*, delivery_timeout_s=1.0, shutdown_timeout_s=1.0):
         _native_output_closed=False,
         _native_outputs_in_flight=defaultdict(int),
         _native_terminal_pending=set(),
+        _async_chunk=True,
+        _pending_full_payload_send={},
         _put_req_chunk=defaultdict(int),
         _ramp_chunk_count=defaultdict(int),
         _delivery_manager=OmniDeliveryManager(
@@ -80,6 +82,76 @@ def plane():
     yield p
     if getattr(p, "_native_output_worker", None) is not None:
         p._stop_output_worker()
+
+
+def test_full_payload_waits_for_terminal_and_last_deferred_frame(plane):
+    plane._async_chunk = False
+    plane._full_payload_replace_keys_cached = frozenset({"codes.ref"})
+    request = _new_request()
+    request.resumable = False
+    plane.register_request(request)
+    first = torch.tensor([[1, 2]])
+    last = torch.tensor([[3, 4]])
+    ref = torch.tensor([[5, 6]])
+    plane.reserve_outputs(["internal"])
+    assert _complete(plane, [{"codes.audio": first, "codes.ref": ref}], token=21) == 0
+    assert not plane.record.batches
+
+    plane.reserve_outputs(["internal"])
+    assert plane.request_terminal({"internal"}) == 0
+    assert not plane.record.cleaned
+    assert _complete(plane, [{"codes.audio": last, "codes.ref": ref}], token=2150) == 1
+
+    [(snapshot, payload)] = plane.record.batches[0]
+    assert snapshot.is_finished()
+    assert snapshot.output_token_ids == [21, 2150]
+    torch.testing.assert_close(payload["codes.audio"], torch.cat([first, last]))
+    torch.testing.assert_close(payload["codes.ref"], ref)
+    assert plane.record.cleaned == ["internal"]
+    assert not plane._pending_full_payload_send
+    assert plane.request_terminal({"internal"}) == 0
+
+
+def test_full_payload_abort_discards_partial_and_late_outputs(plane):
+    plane._async_chunk = False
+    plane._full_payload_replace_keys_cached = frozenset()
+    plane.register_request(_new_request())
+    assert _complete(plane, [{"codes.audio": torch.tensor([[1, 2]])}]) == 0
+    plane.reserve_outputs(["internal"])
+    assert plane.abort_requests({"internal"}) == 1
+    [(snapshot, payload)] = plane.record.batches[0]
+    assert snapshot.is_finished() and payload is None
+    assert _complete(plane, [{"codes.audio": torch.tensor([[3, 4]])}]) == 0
+    assert len(plane.record.batches) == 1
+    assert not plane._pending_full_payload_send
+
+
+def test_full_payload_qwen_builder_receives_complete_codec(raw_plane, monkeypatch):
+    from vllm_omni.model_executor.stage_input_processors.qwen3_tts import talker2code2wav_full_payload
+
+    raw_plane._async_chunk = False
+    raw_plane._omni_connector = object()
+    raw_plane._request_ids_mapping = {}
+    raw_plane._custom_process_func = talker2code2wav_full_payload
+    raw_plane._custom_process_batch_func = None
+    monkeypatch.setattr(raw_plane, "is_data_transfer_rank", lambda: True)
+    sent = []
+
+    def publish(entries, **kwargs):
+        sent.extend(entries)
+        return len(entries)
+
+    monkeypatch.setattr(raw_plane, "_publish_chunk_cohort", publish)
+    raw_plane.register_request(_new_request())
+    for token in (21, 22, 2150):
+        _complete(raw_plane, [{"codes.audio": torch.full((1, 16), token)}], token=token)
+    assert not sent
+    assert raw_plane.request_terminal({"internal"}) == 1
+    [(request, payload)] = sent
+    assert request.output_token_ids == [21, 22, 2150]
+    assert payload["meta"]["finished"].item()
+    # EOS is filtered, and the two remaining frames are codebook-major.
+    assert payload["codes"]["audio"].tolist() == [21, 22] * 16
 
 
 def _gated_connector():
