@@ -1377,6 +1377,30 @@ def test_sync_transfer_overlap_allocates_receive_buffer_on_non_output_rank() -> 
     assert torch.equal(overlap, torch.ones_like(overlap))
 
 
+def test_transfer_control_downsample_suppresses_aliasing() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    rows, cols = torch.meshgrid(torch.arange(8), torch.arange(8), indexing="ij")
+    checkerboard = ((rows + cols) % 2 * 255).to(torch.uint8)
+    frames = torch.stack([checkerboard, 255 - checkerboard]).unsqueeze(0).expand(3, -1, -1, -1)
+    resized = transfer.resize_center_crop_uint8_cthw(frames, 3, 3)
+
+    assert resized.shape == (3, 2, 3, 3)
+    assert resized.dtype == torch.uint8
+    # A subpixel checkerboard should average to grey, not produce a new pattern.
+    torch.testing.assert_close(resized.float(), torch.full((3, 2, 3, 3), 127.5), rtol=0, atol=4)
+
+
+def test_transfer_control_center_crop_rounds_odd_margin() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    frames = torch.arange(7, dtype=torch.uint8).view(1, 1, 7, 1).expand(3, 1, 7, 4)
+    cropped = transfer.resize_center_crop_uint8_cthw(frames, 4, 4)
+
+    assert cropped.shape == (3, 1, 4, 4)
+    assert cropped[0, 0, :, 0].tolist() == [2, 3, 4, 5]
+
+
 def test_transfer_edge_uses_rgb_canny(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.diffusion.models.cosmos3 import transfer
 

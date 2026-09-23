@@ -527,10 +527,14 @@ def resize_center_crop_uint8_cthw(frames: torch.Tensor, height: int, width: int)
     scale = max(width / orig_w, height / orig_h)
     resize_h = int(np.ceil(scale * orig_h))
     resize_w = int(np.ceil(scale * orig_w))
+    # Antialias before quantizing back to uint8; aliasing changes the control
+    # signal. Center-crop uses rounded offsets when a margin is odd.
     frames_tchw = frames.permute(1, 0, 2, 3).to(dtype=torch.float32)
-    resized = F.interpolate(frames_tchw, size=(resize_h, resize_w), mode="bilinear", align_corners=False)
-    top = (resize_h - height) // 2
-    left = (resize_w - width) // 2
+    resized = F.interpolate(
+        frames_tchw, size=(resize_h, resize_w), mode="bilinear", align_corners=False, antialias=True
+    )
+    top = int(round((resize_h - height) / 2.0))
+    left = int(round((resize_w - width) / 2.0))
     cropped = resized[:, :, top : top + height, left : left + width]
     return cropped.round().clamp(0, 255).to(torch.uint8).permute(1, 0, 2, 3).contiguous()
 
