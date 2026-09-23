@@ -269,6 +269,7 @@ def test_schedule_wrapper_transfers_rng_to_worker(monkeypatch, scheduler_cls):
     monkeypatch.setattr(Scheduler, "schedule", lambda self, throttle_prefills=False: upstream, raising=False)
     scheduler = scheduler_cls.__new__(scheduler_cls)
     scheduler.requests = {"req": request}
+    scheduler.max_num_running_reqs = 1
     scheduler.waiting, scheduler.running = [], []
     scheduler.chunk_transfer_adapter = scheduler.input_coordinator = None
     scheduler._finish_pd_terminal_receives = Mock()

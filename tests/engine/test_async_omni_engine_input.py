@@ -172,7 +172,8 @@ def test_build_add_request_message_preserves_additional_information(mocker: Mock
 def test_build_add_request_message_prepares_mooncake_prefill_params(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)
-    engine.default_sampling_params_list = [params]
+    decode_params = SamplingParams(max_tokens=8)
+    engine.default_sampling_params_list = [params, decode_params]
     engine._pd_pair = (0, 1)
     engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
     engine.supported_tasks = ("generate",)
@@ -185,7 +186,7 @@ def test_build_add_request_message_prepares_mooncake_prefill_params(mocker: Mock
     msg = engine._build_add_request_message(
         request_id="req-pd",
         prompt={"prompt_token_ids": [1, 2, 3]},
-        sampling_params_list=[params],
+        sampling_params_list=[params, decode_params],
         final_stage_id=2,
     )
 
@@ -198,6 +199,8 @@ def test_build_add_request_message_prepares_mooncake_prefill_params(mocker: Mock
     assert input_processor.process_inputs.call_args.kwargs["params"] is prefill_params
     assert params.max_tokens == 8
     assert params.extra_args is None
+    assert msg.sampling_params_list[1] is decode_params
+    assert decode_params.max_tokens == 8 and decode_params.extra_args is None
 
 
 def test_build_add_request_message_preserves_model_intermediate_buffer(mocker: MockerFixture):

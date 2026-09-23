@@ -168,8 +168,11 @@ class _Queue(list):
 
 def _receiver(req, scheduler_cls=OmniARScheduler):
     scheduler = scheduler_cls.__new__(scheduler_cls)
+    scheduler.vllm_config = SimpleNamespace(kv_transfer_config=None)
+    scheduler.defer_block_free = False
     scheduler._spec_token_placeholders = []
     scheduler.max_model_len = 4096
+    scheduler.prefix_replay_tokens = 0
     scheduler.requests = {req.request_id: req}
     scheduler.waiting = _Queue([req])
     scheduler.skipped_waiting = _Queue()
@@ -231,7 +234,6 @@ def test_processed_eos_first_token_waits_for_kv_then_finishes(token, scheduler_c
     decode = orchestrator._build_pd_decode_params("req", logical, SimpleNamespace(sampling_params=producer))
     req = _request(params=decode, token=token)
     scheduler = _receiver(req, scheduler_cls)
-    scheduler.prefix_replay_tokens = 0
 
     scheduler._finish_pd_terminal_receives()
     scheduler._free_request.assert_not_called()
@@ -540,6 +542,8 @@ def test_producer_output_carries_rng_with_connector_completion(rng_state):
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
     scheduler.requests = {"req": req}
     scheduler.running = [req]
+    scheduler.vllm_config = SimpleNamespace(model_config=SimpleNamespace())
+    scheduler._native_data_plane = False
     scheduler.max_model_len = 4096
     scheduler.perf_metrics = None
     scheduler.connector = None
@@ -548,7 +552,10 @@ def test_producer_output_carries_rng_with_connector_completion(rng_state):
     scheduler._handle_stopped_request = Mock(return_value=True)
     connector_params = {"remote_engine_id": "P", "transfer_id": "xfer-req"}
     scheduler._free_request = Mock(return_value=(connector_params, None))
-    scheduler.structured_output_manager = SimpleNamespace(should_advance=lambda req: False)
+    scheduler.structured_output_manager = SimpleNamespace(
+        should_advance=lambda req: False,
+        accept_tokens=lambda req, token_ids: True,
+    )
     scheduler.chunk_transfer_adapter = None
     scheduler._new_prompt_len_snapshot = {}
     scheduler.waiting_for_transfer_free = set()
