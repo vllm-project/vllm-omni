@@ -29,7 +29,10 @@ HUNYUAN_IMAGE3_PIPELINE = PipelineConfig(
             input_sources=(),
             final_output=True,
             final_output_type="text",
-            owns_tokenizer=False,
+            # The AR stage owns the tokenizer and is the comprehension stage
+            # used by the serving layer.  Keep this topology fact here so the
+            # deploy YAML only contains deployment knobs.
+            owns_tokenizer=True,
             requires_multimodal_data=True,
             model_arch=_HUNYUAN_IMAGE3_MODEL_ARCH,
             engine_output_type="latent",

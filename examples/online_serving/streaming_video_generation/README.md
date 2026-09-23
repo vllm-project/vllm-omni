@@ -14,7 +14,7 @@ vllm serve BestWishYsh/Helios-Distilled \
   --port 8000
 ```
 
-The `--diffusion-streaming-output` CLI flag is forwarded as `streaming_output=True` in the default diffusion stage `engine_args`, then loaded by `OmniDiffusionConfig.from_kwargs()`.
+The `--diffusion-streaming-output` CLI flag is forwarded as `streaming_output=True` in the default diffusion stage config, then loaded by `OmniDiffusionConfig.from_kwargs()`.
 
 ## WebSocket Protocol
 

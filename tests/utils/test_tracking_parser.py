@@ -5,13 +5,11 @@
 
 import argparse
 import json
-from unittest.mock import patch
 
 import pytest
 import yaml
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import (
     DeployConfig,
@@ -632,102 +630,3 @@ def test_cli_overrides_config(tmp_path):
     assert isinstance(ns, TrackingNamespace)
     assert "foo" in ns.explicit_keys
     assert ns.foo == 200
-
-
-### Integration tests for arg resolution through StageConfigFactory
-#
-# These tests still target the transitional legacy StageConfig path because the
-# current runtime reads explicit CLI values from ``stage.runtime_overrides``.
-# After RFC #4021 migrates engine startup to consume ``VllmOmniConfig`` directly,
-# these assertions should move to the structured config/runtime boundary and the
-# ``_create_legacy_from_registry`` calls should be removed.
-def test_explicit_cli_arg_reaches_runtime_overrides(mock_stages):
-    """Explicitly passed CLI values reach runtime_overrides on all stages."""
-    p = TrackingArgumentParser()
-    p.add_argument("--max-num-seqs", type=int, default=64)
-    ns = p.parse_args(["--max-num-seqs", "999"])
-
-    explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages, _ = StageConfigFactory._create_legacy_from_registry(
-        _TEST_PIPELINE,
-        explicit_kwargs,
-        deploy_config_path=mock_stages,
-    )
-    for stage in stages:
-        assert stage.runtime_overrides.get("max_num_seqs") == 999
-
-
-def test_omitted_default_not_in_runtime_overrides(mock_stages):
-    """Omitted defaults are overridden by deploy config values"""
-    p = TrackingArgumentParser()
-    p.add_argument("--max-num-seqs", type=int, default=64)
-    ns = p.parse_args([])
-
-    explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages, _ = StageConfigFactory._create_legacy_from_registry(
-        _TEST_PIPELINE,
-        explicit_kwargs,
-        deploy_config_path=mock_stages,
-    )
-    for stage in stages:
-        assert stage.runtime_overrides == {}
-
-
-def test_config_file_args_reach_runtime_overrides(mock_stages):
-    """Args from --config YAML must be treated as explicitly passed and
-    flow through to runtime_overrides."""
-    p = TrackingArgumentParser()
-    p.add_argument("--max-num-seqs", type=int, default=64)
-    p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    with patch(
-        "vllm.utils.argparse_utils.FlexibleArgumentParser.load_config_file", return_value=["--max-num-seqs", "999"]
-    ):
-        ns = p.parse_args(["--config", "fake.yaml"])
-
-    explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages, _ = StageConfigFactory._create_legacy_from_registry(
-        _TEST_PIPELINE,
-        explicit_kwargs,
-        deploy_config_path=mock_stages,
-    )
-    for stage in stages:
-        assert stage.runtime_overrides.get("max_num_seqs") == 999
-        assert "gpu_memory_utilization" not in stage.runtime_overrides
-
-
-def test_per_stage_override_routes_correctly(mock_stages):
-    """Ensure stage_<N>_<key> only affects the targeted stage."""
-    p = TrackingArgumentParser()
-    p.add_argument("--stage-0-gpu-memory-utilization", type=float)
-    ns = p.parse_args(["--stage-0-gpu-memory-utilization", "0.42"])
-
-    explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages, _ = StageConfigFactory._create_legacy_from_registry(
-        _TEST_PIPELINE,
-        explicit_kwargs,
-        deploy_config_path=mock_stages,
-    )
-    assert stages[0].runtime_overrides == {"gpu_memory_utilization": 0.42}
-    assert stages[1].runtime_overrides == {}
-    assert stages[2].runtime_overrides == {}
-
-
-def test_explicit_args_omitted_from_yaml(mock_stages):
-    """Ensure only passed args end up in runtime overrides (regardless of whether
-    they are defined in the yaml config)."""
-    p = TrackingArgumentParser()
-    p.add_argument("--enforce-eager", action="store_true")
-    p.add_argument("--max-num-seqs", type=int, default=64)
-    p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    # NOTE: enforce eager is not set in the mock config yaml.
-    ns = p.parse_args(["--enforce-eager"])
-
-    explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages, _ = StageConfigFactory._create_legacy_from_registry(
-        _TEST_PIPELINE,
-        explicit_kwargs,
-        deploy_config_path=mock_stages,
-    )
-
-    for stage in stages:
-        assert stage.runtime_overrides == {"enforce_eager": True}

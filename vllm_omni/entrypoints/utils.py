@@ -12,51 +12,22 @@ from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.config.config_factory import with_trust_remote_code_override
-from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.inputs.data import OmniSamplingParams
 
 logger = init_logger(__name__)
 
 
-def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: str, omni_to: str) -> None:
-    """Inject connector configuration into stage engine arguments."""
-    typed_connector_config = getattr(stage, "connector_config", None)
-    if typed_connector_config is not None:
-        omni_conf_dict = dict(typed_connector_config.omni_kv_config or {})
-        omni_conf_dict.update(connector_config=omni_conn_cfg, omni_from_stage=omni_from, omni_to_stage=omni_to)
-        typed_connector_config.omni_kv_config = omni_conf_dict
-        return
-
-    # Prepare omni_kv_config dict
-    omni_conf_dict = {}
-    try:
-        # Access engine_args safely (might be OmegaConf or dict)
-        existing_args = stage.engine_args
-        if hasattr(existing_args, "get"):
-            _oc = existing_args.get("omni_kv_config", None)
-            if _oc:
-                if hasattr(_oc, "items"):  # dict-like
-                    omni_conf_dict = dict(_oc)
-                else:  # object?
-                    omni_conf_dict = _to_dict(_oc)
-    except Exception:
-        omni_conf_dict = {}
-
-    # Inject connector info
-    omni_conf_dict["connector_config"] = omni_conn_cfg
-    omni_conf_dict["omni_from_stage"] = omni_from
-    omni_conf_dict["omni_to_stage"] = omni_to
-
-    # Write back to engine_args
-    try:
-        if hasattr(stage.engine_args, "__setitem__"):
-            stage.engine_args["omni_kv_config"] = omni_conf_dict
-        else:
-            setattr(stage.engine_args, "omni_kv_config", omni_conf_dict)
-    except Exception as e:
-        # Fallback for OmegaConf or similar if direct set fails?
-        logger.error(f"Failed to inject omni connector config into stage: {e}")
-
+def inject_omni_kv_config(
+    stage: Any,
+    omni_conn_cfg: dict[str, Any],
+    omni_from: str,
+    omni_to: str,
+) -> None:
+    """Inject connector metadata into a typed stage connector config."""
+    connector_config = stage.connector_config
+    omni_conf_dict = dict(connector_config.omni_kv_config or {})
+    omni_conf_dict.update(connector_config=omni_conn_cfg, omni_from_stage=omni_from, omni_to_stage=omni_to)
+    connector_config.omni_kv_config = omni_conf_dict
 
 def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
     """Parse and validate the shape of per-stage JSON overrides."""
@@ -110,8 +81,8 @@ def prepare_stage_config_inputs(
     """Normalize model/config arguments before resolving stage configs.
 
     The standard API worker, multi-API parent, and headless entrypoint must
-    apply the same legacy-key filtering, trust-remote-code precedence, and
-    config-file extraction before calling :func:`resolve_omni_config`.
+    apply the same deprecated-key rejection, trust-remote-code precedence,
+    and config-file extraction before calling :func:`resolve_omni_config`.
     """
     resolved_model = model
     if snapshot_model:

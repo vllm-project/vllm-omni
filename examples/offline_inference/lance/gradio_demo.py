@@ -308,8 +308,8 @@ def _init_models(
     if use_sp:
         # Per the post-#3483 API, parallel knobs flow through *flat*
         # ``ulysses_degree`` / ``ring_degree`` kwargs on the Omni
-        # constructor; ``_apply_diffusion_parallel_runtime_overrides``
-        # moves them into a nested ``parallel_config`` dict for the stage.
+        # constructor; the typed resolver moves them into the nested
+        # ``parallel_config`` dict for the stage.
         img_kwargs["ulysses_degree"] = ulysses_degree
     if use_replicas:
         img_kwargs["stage_0_num_replicas"] = replicas_per_omni

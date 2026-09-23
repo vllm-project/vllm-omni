@@ -5,7 +5,7 @@ In vLLM-Omni, the `composable_parallel` system layers a declarative *parallel st
 Strategies are intentionally narrow: each one only writes the axes it declares, leaving every other engine arg untouched. This makes a strategy file a small, reusable overlay you can swap independently of the deploy YAML (see `configuration/stage_configs.md`).
 
 !!! note
-    Composable parallel is **opt-in**. Passing `--strategy-config <path/to/strategy.yaml>` overlays the derived sizing onto the registry-merged stages *before* any CLI overrides are applied. When `--strategy-config` is omitted, stages remain exactly as their deploy YAML produces them.
+    Composable parallel is **opt-in**. Passing `--strategy-config <path/to/strategy.yaml>` overlays the derived sizing onto the deploy settings *before* any CLI overrides are applied. When `--strategy-config` is omitted, typed stages remain exactly as their deploy YAML produces them.
 
 ## Top-level schema reference
 
@@ -33,7 +33,7 @@ Two additional `StrategySpec` slots — `layer_hook_specs` and `kernel_specs` �
 
 | Flag | Description |
 |------|-------------|
-| `--strategy-config PATH` | Path to a `strategy.yaml`. Only takes effect on registry-based deploy paths (`--deploy-config` or the bundled default deploy YAML). Its derived sizing is overlaid onto the merged stages *before* CLI overrides. |
+| `--strategy-config PATH` | Path to a `strategy.yaml`. Only takes effect on registry-based deploy paths (`--deploy-config` or the bundled default deploy YAML). Its derived sizing is overlaid onto deploy settings *before* CLI overrides. |
 | `--omni-lb-policy POLICY` | Orchestrator-wide load-balancer policy. Strategy-derived from any `stage_replica` axis; an explicit CLI value wins and must match the derived one or `AsyncOmniEngine` raises `Conflicting load-balancer policy` at construction. |
 
 ## Sub-schemas
@@ -88,12 +88,12 @@ Full pattern hierarchy: `TakeRank`, `Union`, `GatherDim`, `AllGather`, `StitchSp
 
 From highest to lowest, when the same axis is touched by multiple layers:
 
-1. **CLI overrides** (`--tensor-parallel-size`, `--stage-overrides`, `--omni-lb-policy`, etc.). A CLI value always wins; a warning is emitted whenever it overrides a strategy-declared axis (see `_reconcile_strategy_with_cli` in `vllm_omni/config/config_factory.py`).
-2. **Strategy YAML** (`--strategy-config`). Derived sizing is written onto the merged stages with *conflict-on-explicit* semantics — if the deploy YAML already set a value to something different, application raises `StrategyApplyError`.
+1. **CLI overrides** (`--tensor-parallel-size`, `--stage-overrides`, `--omni-lb-policy`, etc.). A CLI value always wins; a warning is emitted whenever it overrides a strategy-declared axis while `VllmOmniConfig.from_pipeline_config` builds the typed stage configs.
+2. **Strategy YAML** (`--strategy-config`). Derived sizing is written onto deploy settings with *conflict-on-explicit* semantics — if the deploy YAML already set a value to something different, application raises `StrategyApplyError`.
 3. **Deploy YAML** (`--deploy-config` or the bundled `vllm_omni/deploy/<model_type>.yaml`).
 4. **Parser defaults.**
 
-After CLI overrides land, the device-layout guard re-runs (`check_device_layout`, called from `_reconcile_strategy_with_cli`) against the *effective* `tp * dp * pp * num_replicas` and the resolved `devices` string, so a `devices` value passed through `--stage-overrides` or a `--tensor-parallel-size` value that conflicts with the strategy's world size cannot slip past the pre-spawn check.
+After CLI overrides land, the device-layout guard re-runs (`check_device_layout`) against the *effective* `tp * dp * pp * num_replicas` and the resolved `devices` string, so a `devices` value passed through `--stage-overrides` or a `--tensor-parallel-size` value that conflicts with the strategy's world size cannot slip past the pre-spawn check.
 
 ## Worked example
 
@@ -210,7 +210,7 @@ Strategy keys MUST be `model_stage` *names* (strings), the same labels defined b
     Use the `model_stage` name (e.g. `thinker`) instead.
 
 !!! warning "Mixing CLI overrides with a strategy on the same axis"
-    A strategy is meant to be the single writer for the axes it declares. If a CLI override (`--tensor-parallel-size 2`, `--stage-overrides '{"0": {"tensor_parallel_size": 2}}'`) sets the same axis, the **CLI value wins** and a warning is emitted from `_reconcile_strategy_with_cli`. The device-layout guard then re-runs against the effective layout, so a CLI override that breaks `tp * dp * pp * num_replicas` will still fail fast at config time.
+    A strategy is meant to be the single writer for the axes it declares. If a CLI override (`--tensor-parallel-size 2`, `--stage-overrides '{"0": {"tensor_parallel_size": 2}}'`) sets the same axis, the **CLI value wins** and a warning is emitted while `VllmOmniConfig.from_pipeline_config` resolves the typed stages. The device-layout guard then re-runs against the effective layout, so a CLI override that breaks `tp * dp * pp * num_replicas` will still fail fast at config time.
 
 !!! warning "Conflicting `omni_lb_policy` across stages"
     `omni_lb_policy` is a single pipeline-wide knob. If two `stage_replica` axes in different stages derive different policies, `apply_strategy_specs` raises:
