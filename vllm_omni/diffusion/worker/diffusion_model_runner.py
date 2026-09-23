@@ -66,6 +66,7 @@ from vllm_omni.diffusion.sched.interface import (
 )
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.stage_payload import DiffusionStagePayloadMixin
 from vllm_omni.diffusion.worker.utils import (
     BatchRunnerOutput,
     RunnerOutput,
@@ -78,7 +79,6 @@ from vllm_omni.diffusion.worker.utils import (
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
-from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniInteractionPrompt
@@ -148,7 +148,7 @@ def _normalize_pipeline_outputs(
     return outputs
 
 
-class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
+class DiffusionModelRunner(DiffusionStagePayloadMixin):
     """
     Model runner that handles model loading and execution for diffusion models.
 
@@ -194,11 +194,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.state_cache: dict[str, StepRequestState] = {}
 
         # Initialize KV cache manager for connector management.
+        payload_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
         self.kv_transfer_manager = (
-            OmniKVTransferManager.from_od_config(od_config)
-            if getattr(od_config, "kv_transfer_config", None) is None
-            else None
+            payload_transfer_manager if getattr(od_config, "kv_transfer_config", None) is None else None
         )
+        self.init_omni_connectors(od_config, payload_transfer_manager, synchronous=True)
         self._kv_connector = None
         from vllm_omni.diffusion.diffusion_kv.kv_connector import KVReceiveProgress, native_prefetch_enabled
 
@@ -629,6 +629,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         kv_prefetch_job: KVPrefetchJob | None = None,
         use_prefetch: bool = False,
     ) -> None:
+        # Fetch upstream conditioning before anything else: the pipeline reads
+        # it out of the prompt during the forward below.
+        self._maybe_recv_stage_payload(req)
+
         if self.kv_transfer_manager is None:
             self._initialize_generator(req.sampling_params)
             return
@@ -843,6 +847,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             ):
                 cache_summary(self.pipeline, details=True)
 
+        self._maybe_send_stage_payload(reqs, outputs)
+
         return self._runner_output_from_outputs(reqs, outputs)
 
     def _attach_stepwise_metadata(
@@ -1039,12 +1045,14 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 new_request_ids.append(request_id)
                 if request_id in self.state_cache:
                     raise ValueError(f"Received duplicate new-request payload for cached request {request_id}.")
+                self._maybe_recv_stage_payload(sched_new_req.req)
                 new_state = StepRequestState(
                     request_id=request_id,
                     sampling=copy.deepcopy(sched_new_req.req.sampling_params),
                     prompt=sched_new_req.req.prompt,
                     kv_sender_info=sched_new_req.req.kv_sender_info,
                     prepared_layout=getattr(sched_new_req.req, "prepared_layout", None),
+                    external_req_id=getattr(sched_new_req.req, "external_req_id", None),
                 )
                 if sched_new_req.diffusion_kv_metadata is not None:
                     new_state.extra["kv_computed_tokens"] = tuple(
@@ -1387,6 +1395,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                                 if self.od_config.streaming_output
                                 else req.denoise_completed
                             )
+                            if finished and result is not None:
+                                self._maybe_send_stage_payload([req], [result])
                             runner_output_list.append(
                                 RunnerOutput(
                                     request_id=req.request_id,
