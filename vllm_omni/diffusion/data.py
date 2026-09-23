@@ -1467,7 +1467,6 @@ class OmniDiffusionConfig:
 
     def _load_component_transformer_config(self) -> bool:
         """Load a registered pipeline's component-level DiT configuration."""
-        # TODO(yuanheng-zhao): remove this func after Ming-Image diffusers style is supported
         from vllm.transformers_utils.config import get_hf_file_to_dict
 
         from vllm_omni.model_extras import get_transformer_config_subfolder
