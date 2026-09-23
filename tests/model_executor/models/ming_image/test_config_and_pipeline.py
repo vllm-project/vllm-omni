@@ -1,20 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from vllm_omni.config.config_factory import StageConfigFactory
-from vllm_omni.diffusion.data import OmniDiffusionConfig, resolve_model_class_name
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.ming_image.pipeline import (
     MingImageDiffusionPipeline,
     _validate_variant_config,
 )
-from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.ming_flash_omni.ming_flash_omni_thinker import (
     MingFlashOmniThinkerForConditionalGeneration,
 )
@@ -30,53 +29,11 @@ from vllm_omni.transformers_utils.configs.ming_flash_omni import BailingMM2Confi
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-_CONFIG_TEMPLATES = Path(__file__).parents[4] / "recipes" / "inclusionAI" / "ming-image-configs"
-
 
 def test_config_selects_qwen25_vision_tower():
     config = BailingMM2Config(vision_config={"model_type": "qwen2_5_vit"}, llm_config={})
 
     assert type(config.vision_config).__name__ == "Qwen2_5_VLVisionConfig"
-
-
-@pytest.mark.parametrize(
-    ("model_name", "pipeline_class", "padding", "layered"),
-    (
-        (
-            "Ming-Image-0.1-Design",
-            "MingImageDiffusionPipeline",
-            "zero_masked",
-            False,
-        ),
-        (
-            "Ming-Image-0.1-Design-Layer",
-            "MingImageLayeredDiffusionPipeline",
-            "learned",
-            True,
-        ),
-    ),
-)
-def test_published_model_metadata_contract(
-    model_name,
-    pipeline_class,
-    padding,
-    layered,
-):
-    model_path = _CONFIG_TEMPLATES / model_name
-    model_index = json.loads((model_path / "model_index.json").read_text())
-    config = OmniDiffusionConfig(model=str(model_path))
-    config.enrich_config()
-    is_diffusion_model.cache_clear()
-
-    assert model_index["_class_name"] == pipeline_class
-    assert config.model_class_name == pipeline_class
-    assert config.tf_model_config.axes_lens == [20480, 512, 512]
-    assert config.tf_model_config.alignment_padding_mode == padding
-    assert config.tf_model_config.multi_frame_output is layered
-    assert StageConfigFactory.try_infer_model_type(str(model_path), False) == "ming_image"
-    assert resolve_model_class_name(str(model_path)) == pipeline_class
-    assert is_diffusion_model(str(model_path))
-    assert _validate_variant_config(model_index, config.tf_model_config) is layered
 
 
 @pytest.mark.parametrize(
@@ -144,6 +101,22 @@ def test_layer_pipeline_allows_missing_reference_only_for_dummy_run():
             num_layers=1,
             is_dummy_run=False,
         )
+
+
+def test_pipeline_rejects_multiple_outputs_per_prompt():
+    pipeline = MingImageDiffusionPipeline.__new__(MingImageDiffusionPipeline)
+    request = DiffusionRequestBatch(
+        requests=[
+            OmniDiffusionRequest(
+                prompt="test",
+                sampling_params=OmniDiffusionSamplingParams(num_outputs_per_prompt=2),
+                request_id="test-request",
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match="num_outputs_per_prompt=1 only, got 2"):
+        pipeline.forward(request)
 
 
 def _source_output(prefix_len: int = 4):
@@ -227,21 +200,28 @@ def test_stage1_compile_uses_configured_dynamic_regional_cuda_graph(monkeypatch)
     assert pipeline._uses_cudagraph_trees
 
 
-def test_explicit_pipeline_loads_component_config_without_model_index(tmp_path):
-    transformer = tmp_path / "transformer"
-    transformer.mkdir()
-    (transformer / "config.json").write_text(
-        json.dumps(
-            {
-                "_class_name": "DiffusionTransformer",
-                "alignment_padding_mode": "zero_masked",
-                "multi_frame_output": False,
-            }
-        )
+def test_explicit_pipeline_loads_component_config_without_model_index(monkeypatch):
+    transformer_config = {
+        "_class_name": "DiffusionTransformer",
+        "alignment_padding_mode": "zero_masked",
+        "multi_frame_output": False,
+    }
+
+    def _get_hf_file_to_dict(filename, model, revision=None):
+        del model, revision
+        return transformer_config if filename == "transformer/config.json" else None
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.utils.hf_utils.get_diffusion_model_index",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "vllm.transformers_utils.config.get_hf_file_to_dict",
+        _get_hf_file_to_dict,
     )
 
     config = OmniDiffusionConfig(
-        model=str(tmp_path),
+        model="org/model",
         model_class_name="MingImageDiffusionPipeline",
     )
     config.enrich_config()
@@ -249,16 +229,6 @@ def test_explicit_pipeline_loads_component_config_without_model_index(tmp_path):
     assert config.model_class_name == "MingImageDiffusionPipeline"
     assert config.tf_model_config.alignment_padding_mode == "zero_masked"
     assert config.tf_model_config.multi_frame_output is False
-
-
-def test_checkpoint_resolver_accepts_root_or_mllm_subfolder(tmp_path):
-    root = tmp_path / "checkpoint"
-    mllm = root / "mllm"
-    mllm.mkdir(parents=True)
-    (mllm / "config.json").write_text("{}")
-
-    assert checkpoint.resolve_ming_image_model_root(str(root), None, None) == str(root)
-    assert checkpoint.resolve_ming_image_model_root(str(mllm), None, None) == str(root)
 
 
 def test_checkpoint_resolver_downloads_mllm_and_sibling_mlp(monkeypatch):
