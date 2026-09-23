@@ -1987,6 +1987,10 @@ def build_diffusion_config(
         if isinstance(value, int) and value > 0:
             od_config.additional_config.setdefault(f"diffusion_kv_profile_{dimension}", value)
 
+    if od_config.distributed_executor_backend == "ray":
+        runtime_env = _to_dict(_get_attr_or_item(metadata.runtime_cfg, "env", {}) or {})
+        od_config.ray_worker_env = {str(key): str(value) for key, value in runtime_env.items()}
+
     num_devices_per_stage = od_config.parallel_config.world_size
     device_control_env = current_omni_platform.device_control_env_var
     visible_devices_str = os.environ.get(device_control_env) if device_control_env else None
@@ -1996,7 +2000,10 @@ def build_diffusion_config(
     else:
         physical_devices = list(range(current_omni_platform.get_device_count()))
 
-    if len(physical_devices) < num_devices_per_stage:
+    # Ray validates cluster-wide GPU availability through its placement
+    # group. The stage driver only sees the GPUs on its own node, so a local
+    # device-count check would reject every valid multi-node configuration.
+    if od_config.distributed_executor_backend != "ray" and len(physical_devices) < num_devices_per_stage:
         raise ValueError(
             f"Stage {metadata.stage_id} requires {num_devices_per_stage} device(s) based on parallel_config, "
             f"but {len(physical_devices)} device(s) are available: {physical_devices}"

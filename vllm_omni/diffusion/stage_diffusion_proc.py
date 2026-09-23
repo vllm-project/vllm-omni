@@ -752,6 +752,7 @@ class StageDiffusionProcManager:
         )
         proc.start()
         self.proc = proc
+        self.distributed_executor_backend = od_config.distributed_executor_backend
         self.addresses = addresses
         self.manager_stopped = False
         self.failed_proc_name: str | None = None
@@ -789,6 +790,7 @@ class StageDiffusionProcManager:
         )
         proc.start()
         self.proc = proc
+        self.distributed_executor_backend = od_config.distributed_executor_backend
         self.addresses = addresses
         self.manager_stopped = False
         self.failed_proc_name = None
@@ -826,6 +828,12 @@ class StageDiffusionProcManager:
     def shutdown(self, timeout: float | None = None) -> None:
         self.manager_stopped = True
         shutdown([self.proc], timeout=timeout)
+
+    def wait_for_shutdown(self, timeout: float | None = None) -> bool:
+        """Wait for subprocess cleanup without sending a termination signal."""
+        self.manager_stopped = True
+        self.proc.join(timeout)
+        return not self.proc.is_alive()
 
     def sentinels(self) -> list[int]:
         return [self.proc.sentinel]

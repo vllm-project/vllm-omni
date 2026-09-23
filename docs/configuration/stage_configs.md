@@ -78,7 +78,44 @@ explicit CLI or stage override, or the downstream vLLM engine default.
 Note: for the diffusion path, an omitted `distributed_executor_backend` selects
 `uni` on a single GPU (in-process worker, no MessageQueue / `/dev/shm` output
 segments) and `mp` when `num_gpus > 1`. Set `mp` explicitly to keep a worker
-subprocess on one GPU. `ray` / `external_launcher` are not fully supported yet.
+subprocess on one GPU. Set `ray` for Ray-managed single- or multi-node
+diffusion workers. `external_launcher` is not supported yet.
+
+The diffusion `ray` backend runs one worker actor per GPU and supports workers
+spanning Ray nodes. Enable it in the deploy YAML:
+
+```yaml
+distributed_executor_backend: ray
+```
+
+The executor reuses Ray when already initialized; otherwise it calls
+`ray.init()`, which handles cluster discovery or local startup and respects
+`RAY_ADDRESS`. There is no diffusion-specific address setting. Ray must be
+installed on every node.
+
+Ray diffusion workers receive the driver's `VLLM_*`, `OMNI_*`, `DIFFUSION_*`,
+`NCCL_*`, `TORCH_NCCL_*`, `UCX_*`, and Hugging Face environment settings,
+plus `PYTHONPATH`, `CUDA_LAUNCH_BLOCKING`, and `OMP_NUM_THREADS`.
+Explicit stage `runtime.env` entries are also forwarded and take precedence.
+Device visibility, rank/rendezvous settings, worker host addresses, and `RAY_*`
+variables are excluded so each worker retains its own assignment and identity.
+
+For multiple nodes, start the cluster before launching Omni. For example,
+with head IP `10.0.0.1`:
+
+```bash
+# On the head node:
+ray start --head --node-ip-address=10.0.0.1 --port=6379
+
+# On each additional worker node:
+ray start --address=10.0.0.1:6379
+
+# On the host launching Omni (MODEL and my_deploy.yaml are placeholders):
+RAY_ADDRESS=10.0.0.1:6379 vllm serve MODEL --omni --deploy-config my_deploy.yaml
+```
+
+Omni creates actors on the resources of that cluster; it does not start Ray
+on additional machines.
 
 ### Stage fields
 

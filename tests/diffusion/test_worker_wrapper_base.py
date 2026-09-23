@@ -568,3 +568,60 @@ class TestCustomPipelineWorkerExtension:
         # Verify load_model was called twice with different pipelines
         assert wrapper.worker.load_model.call_count == 2
         assert wrapper.worker.init_lora_manager.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ("init_method", "rank", "local_rank", "expected_addr", "expected_port"),
+    [
+        (None, 1, 1, "localhost", "12345"),
+        ("tcp://10.0.0.2:23456", 7, 0, "unrelated-host", "9999"),
+    ],
+)
+def test_worker_rendezvous_preserves_local_device_rank(
+    monkeypatch, init_method, rank, local_rank, expected_addr, expected_port
+):
+    """TCP rendezvous must not confuse a global rank with the actor's GPU index."""
+    import os
+    from contextlib import nullcontext
+    from unittest.mock import Mock
+
+    from vllm_omni.diffusion.worker import diffusion_worker as worker_module
+
+    class ReachedRendezvousError(Exception):
+        pass
+
+    worker = object.__new__(DiffusionWorker)
+    worker.rank = rank
+    worker.local_rank = local_rank
+    worker.distributed_init_method = init_method
+    worker.od_config = SimpleNamespace(num_gpus=8, master_port=12345, moe_backend="auto")
+    config = SimpleNamespace(kernel_config=SimpleNamespace(ir_op_priority=None))
+    platform = Mock()
+    platform.get_torch_device.return_value = "cuda:0"
+    rendezvous = Mock(side_effect=ReachedRendezvousError)
+    monkeypatch.setenv("MASTER_ADDR", "unrelated-host")
+    monkeypatch.setenv("MASTER_PORT", "9999")
+    # Restore these variables after init_device publishes the worker identity.
+    for key in ("LOCAL_RANK", "RANK", "WORLD_SIZE"):
+        monkeypatch.setenv(key, "stale")
+    monkeypatch.setattr(worker_module, "current_omni_platform", platform)
+    monkeypatch.setattr(worker_module, "create_diffusion_vllm_config", Mock(return_value=config))
+    monkeypatch.setattr(worker_module, "_resolve_ir_op_priority", Mock(return_value=[]))
+    monkeypatch.setattr(worker_module, "set_forward_context", lambda **kwargs: nullcontext())
+    monkeypatch.setattr(worker_module, "set_current_vllm_config", lambda config: nullcontext())
+    monkeypatch.setattr(worker_module, "init_distributed_environment", rendezvous)
+
+    with pytest.raises(ReachedRendezvousError):
+        worker.init_device()
+
+    rendezvous.assert_called_once_with(
+        world_size=8,
+        rank=rank,
+        distributed_init_method=init_method or "env://",
+        local_rank=local_rank,
+    )
+    platform.get_torch_device.assert_called_once_with(local_rank)
+    assert os.environ["MASTER_ADDR"] == expected_addr
+    assert os.environ["MASTER_PORT"] == expected_port
+    assert os.environ["LOCAL_RANK"] == str(local_rank)
+    assert os.environ["RANK"] == str(rank)

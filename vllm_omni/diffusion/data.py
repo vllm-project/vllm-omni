@@ -993,6 +993,9 @@ class OmniDiffusionConfig:
     # Worker extension class for custom functionality
     worker_extension_cls: str | None = None
 
+    # Internal transport of explicit stage runtime.env to remote Ray actors.
+    ray_worker_env: dict[str, str] = field(default_factory=dict, init=False, repr=False)
+
     # Custom pipeline arguments for custom pipelines
     custom_pipeline_args: dict[str, Any] | None = None
 

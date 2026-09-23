@@ -1187,6 +1187,44 @@ class TestStageDiffusionClientErrorPropagation:
         client = self._make_client()
         client.check_health()
 
+    def test_local_shutdown_uses_existing_signal_path(self):
+        client = self._make_client()
+        client._zmq_ctx = MagicMock()
+        client._proc_manager.distributed_executor_backend = "mp"
+        client._proc_manager.wait_for_shutdown = MagicMock()
+        client._proc_manager.shutdown = MagicMock()
+        client.shutdown()
+        client._proc_manager.wait_for_shutdown.assert_not_called()
+        client._proc_manager.shutdown.assert_called_once_with(timeout=10)
+
+    def test_shutdown_waits_for_clean_subprocess_exit(self):
+        client = self._make_client()
+        client._zmq_ctx = MagicMock()
+        client._proc_manager.distributed_executor_backend = "ray"
+        client._proc_manager.wait_for_shutdown = MagicMock(return_value=True)
+        client._proc_manager.shutdown = MagicMock()
+
+        client.shutdown()
+
+        client._request_socket.send.assert_called_once()
+        client._proc_manager.wait_for_shutdown.assert_called_once_with(timeout=10)
+        client._proc_manager.shutdown.assert_not_called()
+        client._request_socket.close.assert_called_once_with(linger=0)
+        client._response_socket.close.assert_called_once_with(linger=0)
+        client._zmq_ctx.term.assert_called_once_with()
+
+    def test_shutdown_uses_signals_only_after_clean_exit_timeout(self):
+        client = self._make_client()
+        client._zmq_ctx = MagicMock()
+        client._proc_manager.distributed_executor_backend = "ray"
+        client._proc_manager.wait_for_shutdown = MagicMock(return_value=False)
+        client._proc_manager.shutdown = MagicMock()
+
+        client.shutdown()
+
+        client._proc_manager.wait_for_shutdown.assert_called_once_with(timeout=10)
+        client._proc_manager.shutdown.assert_called_once_with(timeout=10)
+
     def test_get_output_raises_engine_dead_when_dead(self):
         """When ``_engine_dead`` is True and the output queue is empty,
         ``get_diffusion_output_nowait`` must raise ``EngineDeadError``."""
@@ -1678,3 +1716,29 @@ class TestDrainResponsesDeathSentinel:
         assert output.request_id == "req-fail"
         assert output.error == "gpu fault"
         assert output.finished is True
+
+
+@pytest.mark.parametrize("backend", ["ray", "mp"])
+def test_engine_close_interrupts_only_ray_before_join(backend):
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = SimpleNamespace(distributed_executor_backend=backend)
+    engine._cv = threading.Condition()
+    engine._closed = False
+    engine._shutdown_complete = False
+    engine.stop_event = threading.Event()
+    engine._out_streams = {}
+    interrupted = threading.Event()
+    engine.executor = MagicMock()
+    engine.executor.shutdown.side_effect = interrupted.set
+    engine.scheduler = MagicMock()
+    engine.worker_thread = MagicMock()
+    engine.worker_thread.is_alive.side_effect = [True, False]
+
+    def join(timeout):
+        assert engine._closed
+        assert interrupted.is_set() == (backend == "ray")
+
+    engine.worker_thread.join.side_effect = join
+    engine.close()
+    assert engine._shutdown_complete
+    engine.scheduler.close.assert_called_once()
