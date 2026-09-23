@@ -587,7 +587,7 @@ def test_text_encoder_tp_size_reaches_default_diffusion_parallel_config():
 # The diffusion parallel knobs the serve CLI registers and the engine must keep
 # when engine args come from parsed CLI args. Values are not the
 # DiffusionParallelConfig defaults, so a silently reset knob fails the check.
-DIFUSION_PARALLEL_KNBS = [
+DIFFUSION_PARALLEL_KNBS = [
     ("ulysses_degree", 4),
     ("ulysses_mode", "advanced_uaa"),
     ("ulysses_a2a_permute", True),
@@ -614,11 +614,10 @@ def test_from_cli_args_applies_diffusion_parallel_knobs():
     """
     from vllm_omni.config.config_factory import StageConfigFactory
 
-    for knob, value in DIFUSION_PARALLEL_KNBS:
+    for knob, value in DIFFUSION_PARALLEL_KNBS:
         engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**{knob: value}))
         assert getattr(engine_args, knob) == value, f"{knob} was dropped"
 
         stage_cfg = StageConfigFactory.create_default_diffusion({knob: value})[0]
         parallel_config = stage_cfg["engine_args"]["parallel_config"]
         assert parallel_config[knob] == value, f"{knob} did not reach parallel_config"
-
