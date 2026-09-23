@@ -8,10 +8,8 @@ import sys
 import types
 from dataclasses import fields, replace
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
-from pydantic.fields import FieldInfo
 from transformers import Qwen3OmniMoeConfig
 from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
@@ -39,19 +37,12 @@ from vllm_omni.config.stage_config import (
     StageDeployConfig,
     StageExecutionType,
     StagePipelineConfig,
-    StageType,
-    build_stage_runtime_overrides,
     load_deploy_config,
-    merge_pipeline_deploy,
 )
 from vllm_omni.diffusion.data import AttentionConfig, OmniDiffusionConfig
 from vllm_omni.engine import stage_init_utils
 from vllm_omni.engine.arg_utils import OmniEngineArgs
-from vllm_omni.engine.stage_init_utils import (
-    build_engine_args_dict,
-    build_engine_args_dict_from_omni_stage_config,
-    build_legacy_engine_args_dict,
-)
+from vllm_omni.engine.stage_init_utils import project_engine_args
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -59,24 +50,6 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 _DEPLOY_DIR = Path(__file__).parents[2] / "vllm_omni" / "deploy"
 
 
-def _effective_backend_values(config_cls: type, engine_args: dict) -> dict[str, object]:
-    backend_fields = fields(config_cls)
-    backend_field_names = {backend_field.name for backend_field in backend_fields}
-    # This is a schema/normalization comparison, not a Hub download test.
-    with (
-        patch("vllm.engine.arg_utils.get_model_path", side_effect=lambda model, *_: model),
-        patch("vllm_omni.diffusion.data.get_model_path", side_effect=lambda model, *_: model),
-    ):
-        backend_config = config_cls(
-            **{name: copy.deepcopy(value) for name, value in engine_args.items() if name in backend_field_names}
-        )
-    effective_values: dict[str, object] = {}
-    for backend_field in backend_fields:
-        value = getattr(backend_config, backend_field.name)
-        if isinstance(value, FieldInfo):
-            value = value.get_default(call_default_factory=True)
-        effective_values[backend_field.name] = value
-    return effective_values
 
 
 _LLM_BACKEND_FIELDS = frozenset(field.name for field in fields(OmniEngineArgs))
@@ -84,9 +57,6 @@ _DIFFUSION_BACKEND_FIELDS = frozenset(field.name for field in fields(OmniDiffusi
 _TOPOLOGY_ONLY_ENGINE_ARGS = frozenset({"inline_diffusion"})
 _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
     {
-        "final_output",
-        "use_v2_model_runner",
-        "supports_native_mrv2_data_plane",
         "active_stream_window",
         "codec_frame_rate_hz",
         "custom_voice_dir",
@@ -95,6 +65,7 @@ _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
         "enable_broadcast_weight_load",
         "enable_multithread_weight_load",
         "env",
+        "final_output",
         "has_sampling_extra_args",
         "log_level",
         "log_stats",
@@ -107,9 +78,11 @@ _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
         "parallel_config",
         "pooling_output_decoder",
         "silence_ban_frames",
+        "supports_native_mrv2_data_plane",
         "subtalker_sampling_params",
         "task_type",
         "tokenizer_subdir",
+        "use_v2_model_runner",
     }
 )
 
@@ -190,7 +163,6 @@ def test_qwen3_omni_nvfp4_ci_config_preserves_auto_moe_backend(tmp_path):
         updates={"stages": {0: {"moe_backend": "auto"}}},
     )
     deploy = load_deploy_config(nvfp4_deploy)
-    legacy_stages = merge_pipeline_deploy(pipeline, copy.deepcopy(deploy))
     omni_config = VllmOmniConfig.from_pipeline_config(
         pipeline,
         user_deploy_config=copy.deepcopy(deploy),
@@ -198,11 +170,9 @@ def test_qwen3_omni_nvfp4_ci_config_preserves_auto_moe_backend(tmp_path):
     )
 
     for stage_id, expected_backend in ((0, "auto"), (1, "triton")):
-        legacy_stage = next(stage for stage in legacy_stages if stage.stage_id == stage_id)
         typed_stage = omni_config.stage_by_id(stage_id)
         for engine_args in (
-            build_engine_args_dict(legacy_stage.to_omegaconf(), str(tmp_path)),
-            build_engine_args_dict_from_omni_stage_config(typed_stage, str(tmp_path)),
+            project_engine_args(typed_stage, str(tmp_path)),
         ):
             assert engine_args["moe_backend"] == expected_backend
 
@@ -298,29 +268,19 @@ def _engine_arg_inputs(tmp_path: Path) -> tuple[PipelineConfig, DeployConfig, st
     return pipeline, deploy, str(parent_model)
 
 
-def _legacy_and_typed_stages(
+def _typed_stages(
     pipeline: PipelineConfig,
     deploy: DeployConfig,
     model: str,
     cli_overrides: dict[str, object] | None = None,
 ):
     resolved_cli_overrides = {"model": model, **(cli_overrides or {})}
-    legacy_stage_configs = merge_pipeline_deploy(
-        pipeline,
-        copy.deepcopy(deploy),
-    )
-    for stage in legacy_stage_configs:
-        stage.runtime_overrides = build_stage_runtime_overrides(
-            stage.stage_id,
-            resolved_cli_overrides,
-        )
-    legacy_stages = [stage.to_omegaconf() for stage in legacy_stage_configs]
     omni_config = VllmOmniConfig.from_pipeline_config(
         pipeline,
         user_deploy_config=copy.deepcopy(deploy),
         cli_overrides=resolved_cli_overrides,
     )
-    return legacy_stages, omni_config
+    return omni_config
 
 
 def test_llm_stage_engine_field_schema_tracks_upstream_engine_args():
@@ -397,7 +357,7 @@ def test_mammoth_fp8_kv_deploy_projects_only_ar_stage(monkeypatch):
 
     pipeline = OMNI_PIPELINES["mammoth_moda2"]
     deploy = load_deploy_config(_DEPLOY_DIR / "mammoth_moda2_fp8_kv.yaml")
-    legacy_stages, omni_config = _legacy_and_typed_stages(
+    omni_config = _typed_stages(
         pipeline,
         deploy,
         model="test-model",
@@ -406,9 +366,8 @@ def test_mammoth_fp8_kv_deploy_projects_only_ar_stage(monkeypatch):
     assert deploy.stages[0].engine_extras["kv_cache_dtype"] == "fp8_e4m3"
     assert "kv_cache_dtype" not in deploy.stages[1].engine_extras
 
-    legacy_args = [build_legacy_engine_args_dict(stage, "test-model") for stage in legacy_stages]
     typed_args = [
-        build_engine_args_dict_from_omni_stage_config(
+        project_engine_args(
             omni_config.stage_by_id(stage_id),
             "test-model",
         )
@@ -419,12 +378,10 @@ def test_mammoth_fp8_kv_deploy_projects_only_ar_stage(monkeypatch):
     dit_stage = omni_config.stage_by_id(1)
 
     assert ar_stage.stage_pipeline_config.execution_type == StageExecutionType.LLM_AR
-    assert legacy_args[0]["kv_cache_dtype"] == "fp8_e4m3"
     assert ar_stage.cache_config.cache_dtype == "fp8_e4m3"
     assert "cache_dtype" in ar_stage.cache_config._omni_explicit_fields
     assert typed_args[0]["kv_cache_dtype"] == "fp8_e4m3"
 
-    assert "kv_cache_dtype" not in legacy_args[1]
     assert dit_stage.cache_config.cache_dtype == "auto"
     assert "cache_dtype" not in dit_stage.cache_config._omni_explicit_fields
     assert "kv_cache_dtype" not in typed_args[1]
@@ -457,7 +414,7 @@ def test_typed_llm_engine_args_preserve_upstream_config_objects(tmp_path, stage_
     )
 
     stage_config = omni_config.stage_by_id(stage_id)
-    typed_args = build_engine_args_dict_from_omni_stage_config(stage_config, model)
+    typed_args = project_engine_args(stage_config, model)
 
     assert isinstance(stage_config.compilation_config, VllmCompilationConfig)
     assert isinstance(typed_args["compilation_config"], VllmCompilationConfig)
@@ -470,21 +427,15 @@ def test_typed_llm_engine_args_preserve_upstream_config_objects(tmp_path, stage_
     assert typed_args["profiler_config"].profiler == "cuda"
 
 
-def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
+def test_typed_llm_engine_args_project_backend_settings(tmp_path):
     pipeline, deploy, model = _engine_arg_inputs(tmp_path)
-    legacy_stages, omni_config = _legacy_and_typed_stages(pipeline, deploy, model)
+    omni_config = _typed_stages(pipeline, deploy, model)
     connector_spec = {"name": "SharedMemoryConnector", "extra": {"mode": "test"}}
     cli_tokenizer = "/external/tokenizer"
 
     typed_args_by_stage = {}
     for stage_id in (0, 1):
-        legacy_args = build_legacy_engine_args_dict(
-            legacy_stages[stage_id],
-            model,
-            stage_connector_spec=connector_spec,
-            cli_tokenizer=cli_tokenizer,
-        )
-        typed_args = build_engine_args_dict_from_omni_stage_config(
+        typed_args = project_engine_args(
             omni_config.stage_by_id(stage_id),
             model,
             stage_connector_spec=connector_spec,
@@ -492,8 +443,6 @@ def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
         )
         typed_args_by_stage[stage_id] = typed_args
 
-        expected_args = {name: value for name, value in legacy_args.items() if name not in _TOPOLOGY_ONLY_ENGINE_ARGS}
-        assert {name: typed_args[name] for name in expected_args} == expected_args
         assert _TOPOLOGY_ONLY_ENGINE_ARGS.isdisjoint(typed_args)
 
     thinker_args = typed_args_by_stage[0]
@@ -534,22 +483,21 @@ def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
 
 def test_typed_diffusion_engine_args_use_structured_diffusion_config(tmp_path):
     pipeline, deploy, model = _engine_arg_inputs(tmp_path)
-    legacy_stages, omni_config = _legacy_and_typed_stages(pipeline, deploy, model)
+    omni_config = _typed_stages(pipeline, deploy, model)
 
-    legacy_args = build_legacy_engine_args_dict(legacy_stages[2], model)
-    typed_args = build_engine_args_dict_from_omni_stage_config(
+    typed_args = project_engine_args(
         omni_config.stage_by_id(2),
         model,
     )
 
-    assert typed_args["stage_id"] == legacy_args["stage_id"] == 2
-    assert typed_args["model"] == legacy_args["model"] == str(tmp_path / "diffusion-model")
+    assert typed_args["stage_id"] == 2
+    assert typed_args["model"] == str(tmp_path / "diffusion-model")
     assert omni_config.stage_by_id(2).diffusion_config.model == str(tmp_path / "diffusion-model")
-    assert typed_args["model_stage"] == legacy_args["model_stage"] == "dit"
-    assert typed_args["model_arch"] == legacy_args["model_arch"] == "TypedDiffusionPipeline"
-    assert typed_args["model_class_name"] == legacy_args["model_class_name"] == "TypedDiffusionPipeline"
-    assert typed_args["engine_backend"] == legacy_args["engine_backend"] == "test.diffusion.Engine"
-    assert typed_args["enable_session_state_manager"] is legacy_args["enable_session_state_manager"] is True
+    assert typed_args["model_stage"] == "dit"
+    assert typed_args["model_arch"] == "TypedDiffusionPipeline"
+    assert typed_args["model_class_name"] == "TypedDiffusionPipeline"
+    assert typed_args["engine_backend"] == "test.diffusion.Engine"
+    assert typed_args["enable_session_state_manager"] is True
     assert typed_args["parallel_config"]["tensor_parallel_size"] == 2
     assert typed_args["parallel_config"]["vae_parallel_mode"] == "spatial_shard_height"
     assert isinstance(typed_args["diffusion_attention_config"], AttentionConfig)
@@ -565,20 +513,23 @@ def test_engine_args_consume_stage_diffusion_attention_shorthand(tmp_path):
         diffusion_attention_config=None,
         diffusion_attention_backend="TORCH_SDPA",
     )
-    legacy_stages, omni_config = _legacy_and_typed_stages(pipeline, deploy, model)
+    omni_config = _typed_stages(pipeline, deploy, model)
 
-    legacy_args = build_legacy_engine_args_dict(legacy_stages[2], model)
-    typed_args = build_engine_args_dict_from_omni_stage_config(
+    typed_args = project_engine_args(
         omni_config.stage_by_id(2),
         model,
     )
 
-    for engine_args in (legacy_args, typed_args):
+    for engine_args in (typed_args,):
         assert engine_args.get("diffusion_attention_backend") is None
         assert isinstance(engine_args["diffusion_attention_config"], AttentionConfig)
         assert engine_args["diffusion_attention_config"].default.backend == "TORCH_SDPA"
         od_config = OmniDiffusionConfig.from_kwargs(
-            **extract_diffusion_stage_config_kwargs(engine_args, stage_id=2, include_engine_adapter_metadata=True)
+            **extract_diffusion_stage_config_kwargs(
+                engine_args,
+                stage_id=2,
+                include_engine_adapter_metadata=True,
+            )
         )
         assert od_config.diffusion_attention_config.default.backend == "TORCH_SDPA"
 
@@ -594,26 +545,29 @@ def test_engine_args_consume_stage_diffusion_attention_shorthand(tmp_path):
 def test_engine_args_apply_cli_attention_shorthand_over_yaml_config(tmp_path, yaml_attention_config):
     pipeline, deploy, model = _engine_arg_inputs(tmp_path)
     deploy.stages[2] = replace(deploy.stages[2], diffusion_attention_config=yaml_attention_config)
-    legacy_stages, omni_config = _legacy_and_typed_stages(
+    omni_config = _typed_stages(
         pipeline,
         deploy,
         model,
         cli_overrides={"stage_2_diffusion_attention_backend": "TORCH_SDPA"},
     )
 
-    legacy_args = build_legacy_engine_args_dict(legacy_stages[2], model)
-    typed_args = build_engine_args_dict_from_omni_stage_config(
+    typed_args = project_engine_args(
         omni_config.stage_by_id(2),
         model,
     )
 
-    for engine_args in (legacy_args, typed_args):
+    for engine_args in (typed_args,):
         assert engine_args.get("diffusion_attention_backend") is None
         attention_config = engine_args["diffusion_attention_config"]
         assert attention_config.default.backend == "TORCH_SDPA"
         assert attention_config.per_role["cross"].backend == "SAGE_ATTN"
         od_config = OmniDiffusionConfig.from_kwargs(
-            **extract_diffusion_stage_config_kwargs(engine_args, stage_id=2, include_engine_adapter_metadata=True)
+            **extract_diffusion_stage_config_kwargs(
+                engine_args,
+                stage_id=2,
+                include_engine_adapter_metadata=True,
+            )
         )
         assert od_config.diffusion_attention_config.default.backend == "TORCH_SDPA"
 
@@ -626,10 +580,9 @@ def test_typed_engine_args_preserve_explicit_backend_default_overrides(tmp_path)
     thinker_deploy.gpu_memory_utilization = 0.75
     thinker_deploy.disable_hybrid_kv_cache_manager = False
     thinker_deploy.async_scheduling = False
-    legacy_stages, omni_config = _legacy_and_typed_stages(pipeline, deploy, model)
+    omni_config = _typed_stages(pipeline, deploy, model)
 
-    legacy_args = build_legacy_engine_args_dict(legacy_stages[0], model)
-    typed_args = build_engine_args_dict_from_omni_stage_config(
+    typed_args = project_engine_args(
         omni_config.stage_by_id(0),
         model,
     )
@@ -642,9 +595,7 @@ def test_typed_engine_args_preserve_explicit_backend_default_overrides(tmp_path)
         "async_scheduling": False,
     }
 
-    assert {name: legacy_args[name] for name in expected} == expected
     assert {name: typed_args[name] for name in expected} == expected
-    assert legacy_args["moe_backend"] == "triton"
     assert typed_args["moe_backend"] == "triton"
 
 
@@ -659,20 +610,18 @@ def test_typed_engine_args_preserve_inherited_model_and_load_cli_fields(tmp_path
         "download_dir": str(tmp_path / "downloads"),
     }
     cli_overrides = {f"stage_0_{name}" if stage_scoped else name: value for name, value in expected.items()}
-    legacy_stages, omni_config = _legacy_and_typed_stages(
+    omni_config = _typed_stages(
         pipeline,
         deploy,
         model,
         cli_overrides,
     )
 
-    legacy_args = build_legacy_engine_args_dict(legacy_stages[0], model)
-    typed_args = build_engine_args_dict_from_omni_stage_config(
+    typed_args = project_engine_args(
         omni_config.stage_by_id(0),
         model,
     )
 
-    assert {name: legacy_args[name] for name in expected} == expected
     assert {name: typed_args[name] for name in expected} == expected
 
 
@@ -687,16 +636,15 @@ def test_typed_engine_args_preserve_deploy_subdirectory_precedence(tmp_path):
             "tokenizer_subdir": "override-tokenizer",
         }
     )
-    legacy_stages, omni_config = _legacy_and_typed_stages(pipeline, deploy, model)
+    omni_config = _typed_stages(pipeline, deploy, model)
 
     typed_stage = omni_config.stage_by_id(0)
-    legacy_args = build_legacy_engine_args_dict(legacy_stages[0], model)
-    typed_args = build_engine_args_dict_from_omni_stage_config(typed_stage, model)
+    typed_args = project_engine_args(typed_stage, model)
 
     assert typed_stage.model_config.model_subdir == "override-model"
     assert typed_stage.model_config.tokenizer_subdir == "override-tokenizer"
-    assert typed_args["model"] == legacy_args["model"] == str(stage_model / "override-model")
-    assert typed_args["tokenizer"] == legacy_args["tokenizer"] == str(stage_model / "override-tokenizer")
+    assert typed_args["model"] == str(stage_model / "override-model")
+    assert typed_args["tokenizer"] == str(stage_model / "override-tokenizer")
 
 
 @pytest.mark.parametrize(
@@ -710,71 +658,36 @@ def test_typed_engine_args_preserve_deploy_subdirectory_precedence(tmp_path):
     ],
     ids=["topology-over-deploy", "cli-over-topology"],
 )
-def test_typed_engine_args_preserve_legacy_omni_kv_precedence(tmp_path, cli_overrides, expected):
+def test_typed_engine_args_preserve_omni_kv_precedence(tmp_path, cli_overrides, expected):
     pipeline, deploy, model = _engine_arg_inputs(tmp_path)
     thinker = replace(
         pipeline.stages[0],
         omni_kv_config={"need_recv_cache": True},
     )
     pipeline = replace(pipeline, stages=(thinker, *pipeline.stages[1:]))
-    legacy_stages, omni_config = _legacy_and_typed_stages(
+    omni_config = _typed_stages(
         pipeline,
         deploy,
         model,
         cli_overrides,
     )
 
-    legacy_args = build_legacy_engine_args_dict(legacy_stages[0], model)
     typed_stage = omni_config.stage_by_id(0)
-    typed_args = build_engine_args_dict_from_omni_stage_config(typed_stage, model)
+    typed_args = project_engine_args(typed_stage, model)
 
     assert typed_stage.connector_config.omni_kv_config == expected
-    assert typed_args["omni_kv_config"] == legacy_args["omni_kv_config"] == expected
+    assert typed_args["omni_kv_config"] == expected
 
 
-def test_build_engine_args_dict_preserves_legacy_api(tmp_path):
-    pipeline, deploy, model = _engine_arg_inputs(tmp_path)
-    legacy_stages, _ = _legacy_and_typed_stages(pipeline, deploy, model)
-    connector_spec = {"name": "SharedMemoryConnector", "extra": {}}
-
-    compatibility_args = build_engine_args_dict(
-        copy.deepcopy(legacy_stages[0]),
-        model,
-        stage_connector_spec=connector_spec,
-        cli_tokenizer="/external/tokenizer",
-    )
-    explicitly_legacy_args = build_legacy_engine_args_dict(
-        copy.deepcopy(legacy_stages[0]),
-        model,
-        stage_connector_spec=connector_spec,
-        cli_tokenizer="/external/tokenizer",
-    )
-
-    assert compatibility_args == explicitly_legacy_args
 
 
-def test_legacy_engine_args_drop_none_tp_without_mutating_stage_config():
-    stage_config = types.SimpleNamespace(
-        stage_id=0,
-        stage_type="llm",
-        engine_args={"tensor_parallel_size": None},
-        default_sampling_params={},
-    )
-
-    engine_args = build_legacy_engine_args_dict(
-        stage_config,
-        model="test-model",
-    )
-
-    assert "tensor_parallel_size" not in engine_args
-    assert stage_config.engine_args == {"tensor_parallel_size": None}
 
 
 def test_typed_engine_args_own_rocm_attention_default(monkeypatch, tmp_path):
     from vllm_omni import platforms
 
     pipeline, deploy, model = _engine_arg_inputs(tmp_path)
-    legacy_stages, omni_config = _legacy_and_typed_stages(pipeline, deploy, model)
+    omni_config = _typed_stages(pipeline, deploy, model)
     monkeypatch.setattr(platforms.current_omni_platform, "is_rocm", lambda: True)
     aiter_module = types.ModuleType("vllm._aiter_ops")
     setattr(
@@ -784,13 +697,11 @@ def test_typed_engine_args_own_rocm_attention_default(monkeypatch, tmp_path):
     )
     monkeypatch.setitem(sys.modules, "vllm._aiter_ops", aiter_module)
 
-    legacy_args = build_legacy_engine_args_dict(legacy_stages[1], model)
-    typed_args = build_engine_args_dict_from_omni_stage_config(
+    typed_args = project_engine_args(
         omni_config.stage_by_id(1),
         model,
     )
 
-    assert "attention_backend" not in legacy_args
     assert typed_args["attention_backend"] == "TRITON_ATTN"
 
 
@@ -798,78 +709,17 @@ def test_typed_ming_image_engine_args_defer_diffusion_batch_default():
     pipeline = resolve_pipeline_config("ming_flash_omni_image")
     assert pipeline is not None
     deploy = load_deploy_config(_DEPLOY_DIR / "ming_flash_omni_image.yaml")
-    legacy_stages, omni_config = _legacy_and_typed_stages(
+    omni_config = _typed_stages(
         pipeline,
         deploy,
         model="/tmp",
     )
 
-    legacy_args = build_legacy_engine_args_dict(legacy_stages[1], model="/tmp")
-    typed_args = build_engine_args_dict_from_omni_stage_config(
+    typed_args = project_engine_args(
         omni_config.stage_by_id(1),
         model="/tmp",
     )
     typed_backend_args = {name: value for name, value in typed_args.items() if name in _DIFFUSION_BACKEND_FIELDS}
 
-    assert "max_num_seqs" not in legacy_args
     assert "max_num_seqs" not in typed_args
     assert OmniDiffusionConfig(**typed_backend_args).max_num_seqs == 1
-
-
-def _fake_model_root(pipeline, tmp_path):
-    """A model directory carrying every subfolder the pipeline's stages declare.
-
-    Stage init fails closed when a declared ``model_subdir``/``tokenizer_subdir``
-    is not a real directory, because the joined path would otherwise reach
-    HuggingFace as a malformed repo id (issue #6638).
-    """
-    root = tmp_path / "model"
-    root.mkdir(exist_ok=True)
-    for stage in pipeline.stages:
-        for subdir in (stage.model_subdir, stage.tokenizer_subdir):
-            if subdir:
-                (root / subdir).mkdir(parents=True, exist_ok=True)
-    return str(root)
-
-
-@pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))
-def test_typed_engine_args_match_current_registry_backend_semantics(model_type, tmp_path):
-    pipeline = resolve_pipeline_config(model_type)
-    if pipeline is None:
-        pytest.skip(f"Pipeline {model_type!r} requires an HF config to resolve")
-
-    deploy = (
-        load_deploy_config(_DEPLOY_DIR / pipeline.default_deploy_config_name)
-        if pipeline.default_deploy_config_name is not None
-        else DeployConfig()
-    )
-    model = _fake_model_root(pipeline, tmp_path)
-    legacy_stages, omni_config = _legacy_and_typed_stages(
-        pipeline,
-        deploy,
-        model=model,
-    )
-
-    for legacy_stage in legacy_stages:
-        stage_id = legacy_stage.stage_id
-        legacy_args = build_legacy_engine_args_dict(legacy_stage, model=model)
-        typed_args = build_engine_args_dict_from_omni_stage_config(
-            omni_config.stage_by_id(stage_id),
-            model=model,
-        )
-        if legacy_stage.stage_type == StageType.DIFFUSION:
-            backend_fields = _DIFFUSION_BACKEND_FIELDS
-            backend_config_cls = OmniDiffusionConfig
-        else:
-            backend_fields = _LLM_BACKEND_FIELDS
-            backend_config_cls = OmniEngineArgs
-
-        backend_fields -= _TOPOLOGY_ONLY_ENGINE_ARGS
-        missing_fields = (legacy_args.keys() & backend_fields) - typed_args.keys()
-        assert not missing_fields, f"{model_type} stage {stage_id} lost backend fields: {sorted(missing_fields)}"
-
-        legacy_effective_args = _effective_backend_values(backend_config_cls, legacy_args)
-        typed_effective_args = _effective_backend_values(backend_config_cls, typed_args)
-        assert typed_effective_args == legacy_effective_args, (
-            f"{model_type} stage {stage_id} changed effective backend arguments"
-        )

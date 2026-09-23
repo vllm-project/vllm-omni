@@ -92,7 +92,7 @@ SANA_WM_NATIVE_MAX_TOKENS = (
 )
 # The NVlabs production inference settings for this release. They belong in the
 # model rather than in a deploy YAML: single-stage diffusion models resolve
-# through ``create_default_diffusion``, which never reads a YAML's
+# through the typed generic diffusion resolver, which never reads a YAML's
 # ``default_sampling_params``, so a caller that omits either field lands here.
 SANA_WM_DEFAULT_NUM_INFERENCE_STEPS = 60
 SANA_WM_DEFAULT_GUIDANCE_SCALE = 5.0

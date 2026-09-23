@@ -17,15 +17,12 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from omegaconf import OmegaConf
 from pydantic import ValidationError
 from transformers import PretrainedConfig, Qwen3OmniMoeConfig
 from vllm.engine.arg_utils import EngineArgs
 
-from tests.helpers.mock import patch_hf_snapshot_download
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
-from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -297,7 +294,7 @@ def test_remote_tokenizer_subfolder_download_does_not_report_failure(tmp_path, m
     baseline_config = Mock()
     warning = mocker.patch("vllm_omni.engine.arg_utils.logger.warning")
 
-    patch_hf_snapshot_download(monkeypatch, lambda *args, **kwargs: str(tmp_path), hf_home=tmp_path)
+    monkeypatch.setattr("huggingface_hub.HfApi.snapshot_download", lambda *args, **kwargs: str(tmp_path))
     monkeypatch.setattr(OmniEngineArgs, "_patch_empty_hf_config", lambda *args, **kwargs: None)
     monkeypatch.setattr(EngineArgs, "create_model_config", lambda _self: baseline_config)
     monkeypatch.setattr(
@@ -535,49 +532,3 @@ def test_non_override_ar_stage_inputs_embeds_size_matches_hidden_size():
 
 
 # For https://github.com/vllm-project/vllm-omni/issues/3293
-def test_tensor_parallel_size_none_is_handled():
-    """Ensure the tensor parallel size of None isn't forwarded."""
-    engine_args = OmegaConf.create({"stage_id": 0, "engine_args": {"tensor_parallel_size": None}})
-    args = build_engine_args_dict(
-        engine_args,
-        model="Qwen/Qwen2-VL-2B-Instruct",
-    )
-    assert isinstance(args, dict)
-    assert "tensor_parallel_size" not in args
-
-
-# For https://github.com/vllm-project/vllm-omni/issues/7564
-def test_from_cli_args_preserves_text_encoder_tp_size():
-    """`--text-encoder-tp-size` must survive from_cli_args field filtering.
-
-    Library callers build engine args via ``OmniEngineArgs.from_cli_args``;
-    the dataclass field filter drops any namespace attribute the dataclass
-    does not declare, silently resetting the diffusion text-encoder TP to 1.
-    """
-    engine_args = OmniEngineArgs.from_cli_args(
-        SimpleNamespace(text_encoder_tp_size=2),
-    )
-    assert engine_args.text_encoder_tp_size == 2
-
-
-# For https://github.com/vllm-project/vllm-omni/issues/7564
-def test_text_encoder_tp_size_reaches_default_diffusion_parallel_config():
-    """The preserved CLI value must land in DiffusionParallelConfig.
-
-    Forward the preserved explicit override to the generic diffusion
-    fallback, which resolves it through
-    ``DiffusionParallelConfig.from_stage_overrides``. Serializing all engine
-    defaults would also forward unrelated LLM-only fields to strict diffusion
-    ingress, unlike the explicit-kwargs library entrypoint.
-    """
-    from vllm_omni.config.config_factory import StageConfigFactory
-
-    engine_args = OmniEngineArgs.from_cli_args(
-        SimpleNamespace(text_encoder_tp_size=2),
-    )
-    stage_cfg = StageConfigFactory.create_default_diffusion(
-        {"text_encoder_tp_size": engine_args.text_encoder_tp_size},
-    )[0]
-
-    parallel_config = stage_cfg["engine_args"]["parallel_config"]
-    assert parallel_config["text_encoder_tp_size"] == 2

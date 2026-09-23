@@ -126,8 +126,6 @@ Core scheduling and caching components.
 Configuration classes.
 
 - [vllm_omni.config.model.OmniModelConfig][]
-- [vllm_omni.config.stage_config.StageConfig][]
-- [vllm_omni.config.stage_config.StageConfigFactory][]
 - [vllm_omni.config.stage_config.StageType][]
 - [vllm_omni.diffusion.cache.teacache.config.TeaCacheConfig][]
 - [vllm_omni.distributed.omni_connectors.utils.config.ConnectorSpec][]

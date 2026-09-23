@@ -102,11 +102,6 @@ fails during engine initialization.
 | Validation coverage | PD entrypoint tests and the PD deploy overlay in online end-to-end tests are temporarily disabled during migration |
 | Performance | No non-regression or throughput/latency result is established for the current path |
 
-Because these pieces are still converging, the previous legacy `stage_args` YAML
-and `vllm serve` command have been removed. The serve CLI now accepts the
-deploy-based `stages:` schema, so retaining the legacy recipe would imply a
-launch path that current `main` rejects.
-
 ## Configuration contract under development
 
 The intended deploy integration starts from the

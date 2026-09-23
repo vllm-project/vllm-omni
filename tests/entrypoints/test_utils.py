@@ -15,9 +15,7 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.config.composable_parallel import (
     Broadcast,
-    FanInByStage,
     MeshAxisSpec,
-    RouteByStage,
     StrategySpec,
     TakeRank,
 )
@@ -460,7 +458,7 @@ class TestResolveOmniConfig:
         assert stage.final_output_type == "video"
 
     def test_generic_diffusion_stage_overrides_reach_typed_backend(self, mocker: MockerFixture):
-        from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+        from vllm_omni.engine.stage_init_utils import project_engine_args
 
         mocker.patch("vllm_omni.config.resolver.StageConfigFactory.create_from_model", return_value=None)
         mocker.patch(
@@ -487,7 +485,7 @@ class TestResolveOmniConfig:
             strategy_config_path=None,
         )
         stage = resolved.stage_by_id(0)
-        engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="/models/LTX-2.5-Diffusers")
+        engine_args = project_engine_args(stage, model="/models/LTX-2.5-Diffusers")
 
         assert stage.runtime_config.devices == "2,3"
         assert stage.parallel_config.world_size == 2
@@ -496,73 +494,6 @@ class TestResolveOmniConfig:
         assert engine_args["extras"]["keep"] == "global"
         assert engine_args["streaming_output"] is True
 
-    def test_registered_pipeline_uses_structured_metadata_and_preserves_override_trust(self, mocker: MockerFixture):
-        endpoint_restriction = SimpleNamespace(name="chat")
-        typed_stage = SimpleNamespace(stage_id=1)
-        structured_config = SimpleNamespace(
-            orchestrator_config=SimpleNamespace(
-                deploy_config_path="/resolved/deploy.yaml",
-                omni_lb_policy="round_robin",
-            ),
-            pipeline_config=SimpleNamespace(endpoint_restrictions=(endpoint_restriction,)),
-            stage_configs=(typed_stage,),
-            strategy_omni_lb_policy="round-robin",
-        )
-        create_structured = mocker.patch(
-            "vllm_omni.config.resolver.StageConfigFactory.create_from_model",
-            return_value=structured_config,
-        )
-        create_legacy = mocker.patch(
-            "vllm_omni.config.resolver.StageConfigFactory.create_legacy_stage_configs_from_model",
-        )
-        strategy_specs = {
-            "stage_1": [
-                StrategySpec(
-                    "stage_replica",
-                    MeshAxisSpec("stage_replica", 2),
-                    RouteByStage("round_robin"),
-                    FanInByStage(),
-                )
-            ]
-        }
-        load_strategy = mocker.patch(
-            "vllm_omni.config.resolver._load_strategy_specs",
-            return_value=strategy_specs,
-        )
-        apply_strategy = mocker.patch(
-            "vllm_omni.config.composable_parallel.apply_strategy_specs",
-            return_value=SimpleNamespace(omni_lb_policy="round_robin"),
-        )
-
-        resolved = resolve_omni_config(
-            "dummy-model",
-            trust_remote_code=None,
-            deploy_config_path="deploy.yaml",
-            cli_overrides={"dtype": "bfloat16", "trust_remote_code": True},
-            stage_overrides={"1": {"tensor_parallel_size": 2}},
-            strategy_config_path="strategy.yaml",
-        )
-
-        expected_overrides = {
-            "dtype": "bfloat16",
-            "trust_remote_code": True,
-            "stage_1_tensor_parallel_size": 2,
-        }
-        create_structured.assert_called_once_with(
-            "dummy-model",
-            trust_remote_code=None,
-            cli_overrides=expected_overrides,
-            deploy_config_path="deploy.yaml",
-            strategy_specs=strategy_specs,
-        )
-        create_legacy.assert_not_called()
-        load_strategy.assert_called_once_with("strategy.yaml")
-        apply_strategy.assert_not_called()
-        assert resolved.config_path == "/resolved/deploy.yaml"
-        assert resolved.pipeline_config is structured_config.pipeline_config
-        assert resolved.omni_lb_policy == "round-robin"
-        assert resolved.endpoint_restrictions == (endpoint_restriction,)
-        assert resolved.stage_configs == (typed_stage,)
 
     def test_tp_only_strategy_does_not_report_default_lb_policy_as_derived(self, mocker: MockerFixture):
         structured_config = SimpleNamespace(

@@ -20,7 +20,8 @@ from PIL import Image
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from tests.helpers.serving_chat import build_serving_chat
-from vllm_omni.config.stage_config import StageConfig
+from vllm_omni.config.omni_config import VllmOmniARStageConfig
+from vllm_omni.config.stage_config import StagePipelineConfig
 from vllm_omni.entrypoints.openai import video_stream_base, video_stream_envs
 from vllm_omni.entrypoints.openai.serving_video_stream import (
     QwenOmniStreamingVideoHandler,
@@ -150,7 +151,7 @@ def run_sampling_session(monkeypatch):
     async def run(config_overrides):
         engine = MagicMock()
         engine.stage_configs = [
-            StageConfig(stage_id=index, model_stage=name)
+            VllmOmniARStageConfig(stage_pipeline_config=StagePipelineConfig(stage_id=index, model_stage=name))
             for index, name in enumerate(("thinker", "talker", "code2wav"))
         ]
         engine.default_sampling_params_list = [
