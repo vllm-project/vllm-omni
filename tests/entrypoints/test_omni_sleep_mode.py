@@ -3,10 +3,12 @@
 
 """Entrypoint sleep-mode coverage on small models plus H100 BAGEL.
 
-Layering (tiny DiT before 7B on the same L4 so residual thinker weights cannot
-OOM the diffusion suite):
-1. Diffusion sleep/wake/generate — ``riverclouds/qwen_image_random`` on L4
-2. AR protocol (#4473) — ``Qwen/Qwen2.5-Omni-7B`` thinker-only on L4
+Layering (AR before tiny DiT on the same L4). Thinker lives in a child
+``StageEngineCoreProc`` that shutdown can reap; tiny DiT is an inline
+UniProc ``DiffusionWorker`` in pytest and leftover VRAM cannot be killed
+(#8016). DiT-then-7B OOMs (6.78 GiB leftover + 16.78 GiB weights > 22 GiB).
+1. AR protocol (#4473) — ``Qwen/Qwen2.5-Omni-7B`` thinker-only on L4
+2. Diffusion sleep/wake/generate — ``riverclouds/qwen_image_random`` on L4
 3. Light multistage orchestration — thinker-only AR + tiny DiT on L4×2
 4. BAGEL BagelPipeline TP=2 / coordinated dual-engine — H100, ``full_model``
 """
@@ -32,10 +34,10 @@ logger = logging.getLogger("OmniTest")
 MODEL_DIFF = "riverclouds/qwen_image_random"
 MODEL_AR = "Qwen/Qwen2.5-Omni-7B"
 MODEL_BAGEL = "ByteDance-Seed/BAGEL-7B-MoT"
-# Sleep/wake on 24 GiB L4 needs CPU-offload headroom. The thinker-only CI overlay
-# is the abort-test profile (util 0.90 / max_model_len 16384); 16.78 GiB weights
-# already left 0 KV at util 0.85. Match the L4×2 fixture below.
-_AR_SLEEP_GPU_MEMORY_UTILIZATION = 0.45
+# Thinker weights are 16.78 GiB. On L4 (22 GiB) util 0.45 only budgets 9.9 GiB
+# so device-level KV profiling reports 0.0 GiB and StageEngineCoreProc dies.
+# Keep abort-test util 0.90; cap len/batch at 2048 so the leftover ~3 GiB KV fits.
+_AR_SLEEP_GPU_MEMORY_UTILIZATION = 0.90
 _AR_SLEEP_MAX_MODEL_LEN = 2048
 _AR_SLEEP_MAX_NUM_BATCHED_TOKENS = 2048
 AR_STAGE_CONFIG = modify_stage_config(
@@ -268,67 +270,7 @@ def _module_device_cleanup():
 
 
 # ---------------------------------------------------------------------------
-# 1) Diffusion sleep/wake/generate — qwen_image_random (L4)
-# ---------------------------------------------------------------------------
-
-
-@pytest_asyncio.fixture(scope="class", loop_scope="class")
-async def diffusion_engine():
-    """Shared tiny diffusion engine on L4."""
-    engine = AsyncOmni(
-        model=MODEL_DIFF,
-        enable_sleep_mode=True,
-        tensor_parallel_size=1,
-        enforce_eager=True,
-        dtype="bfloat16",
-        gpu_memory_utilization=0.5,
-        stage_init_timeout=1200,
-    )
-    yield engine
-    await _shutdown_engine_and_clear_gpu(engine)
-
-
-class TestOmniDiffusionSleepMode:
-    """Diffusion worker sleep/wake on ``qwen_image_random`` (TP=1)."""
-
-    @pytest.mark.advanced_model
-    @pytest.mark.omni
-    @pytest.mark.asyncio(loop_scope="class")
-    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-    async def test_diffusion_sleep_handshake(self, diffusion_engine: AsyncOmni):
-        try:
-            acks = await diffusion_engine.sleep(level=1)
-            assert acks is not None
-            assert all(get_ack_info(ack, "status") == "SUCCESS" for ack in acks)
-            await diffusion_engine.wake_up()
-        finally:
-            await _ensure_awake(diffusion_engine)
-
-    @pytest.mark.omni
-    @pytest.mark.core_model
-    @pytest.mark.asyncio(loop_scope="class")
-    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-    async def test_diffusion_sleep_wake_generate(self, diffusion_engine: AsyncOmni):
-        try:
-            acks = await diffusion_engine.sleep(level=1)
-            assert acks is not None
-            assert all(get_ack_info(ack, "status") == "SUCCESS" for ack in acks)
-            await diffusion_engine.wake_up()
-            await diffusion_engine.resume_generation()
-            output = None
-            async for item in diffusion_engine.generate(
-                "test",
-                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, height=256, width=256),
-            ):
-                output = item
-            assert output is not None, "generate after sleep/wake produced no output"
-            assert output.images and output.images[0] is not None, "generate after sleep/wake produced no image"
-        finally:
-            await _ensure_awake(diffusion_engine)
-
-
-# ---------------------------------------------------------------------------
-# 2) AR protocol — Omni thinker-only (L4)
+# 1) AR protocol — Omni thinker-only (L4)
 # ---------------------------------------------------------------------------
 
 
@@ -405,6 +347,66 @@ class TestOmniArSleepMode:
             assert second_acks == [], f"Duplicate wake_up() should return [] but got {second_acks}"
         finally:
             await _ensure_awake(ar_engine, [0])
+
+
+# ---------------------------------------------------------------------------
+# 2) Diffusion sleep/wake/generate — qwen_image_random (L4)
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture(scope="class", loop_scope="class")
+async def diffusion_engine():
+    """Shared tiny diffusion engine on L4."""
+    engine = AsyncOmni(
+        model=MODEL_DIFF,
+        enable_sleep_mode=True,
+        tensor_parallel_size=1,
+        enforce_eager=True,
+        dtype="bfloat16",
+        gpu_memory_utilization=0.5,
+        stage_init_timeout=1200,
+    )
+    yield engine
+    await _shutdown_engine_and_clear_gpu(engine)
+
+
+class TestOmniDiffusionSleepMode:
+    """Diffusion worker sleep/wake on ``qwen_image_random`` (TP=1)."""
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @pytest.mark.asyncio(loop_scope="class")
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    async def test_diffusion_sleep_handshake(self, diffusion_engine: AsyncOmni):
+        try:
+            acks = await diffusion_engine.sleep(level=1)
+            assert acks is not None
+            assert all(get_ack_info(ack, "status") == "SUCCESS" for ack in acks)
+            await diffusion_engine.wake_up()
+        finally:
+            await _ensure_awake(diffusion_engine)
+
+    @pytest.mark.omni
+    @pytest.mark.core_model
+    @pytest.mark.asyncio(loop_scope="class")
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    async def test_diffusion_sleep_wake_generate(self, diffusion_engine: AsyncOmni):
+        try:
+            acks = await diffusion_engine.sleep(level=1)
+            assert acks is not None
+            assert all(get_ack_info(ack, "status") == "SUCCESS" for ack in acks)
+            await diffusion_engine.wake_up()
+            await diffusion_engine.resume_generation()
+            output = None
+            async for item in diffusion_engine.generate(
+                "test",
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, height=256, width=256),
+            ):
+                output = item
+            assert output is not None, "generate after sleep/wake produced no output"
+            assert output.images and output.images[0] is not None, "generate after sleep/wake produced no image"
+        finally:
+            await _ensure_awake(diffusion_engine)
 
 
 # ---------------------------------------------------------------------------
