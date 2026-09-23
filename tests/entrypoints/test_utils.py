@@ -269,8 +269,17 @@ class TestFilterDataclassKwargs:
             "unknown_field": "drop_me",
         }
 
-        with caplog.at_level(logging.WARNING, logger="vllm_omni.entrypoints.utils"):
-            result = filter_dataclass_kwargs(OmniEngineArgs, kwargs)
+        # vLLM's configured ``vllm_omni`` parent logger stops propagation at
+        # its own handler, so pytest's root capture handler does not see this
+        # record on vLLM 0.30. Attach the capture handler to the emitting
+        # logger while preserving the production logger configuration.
+        emit_logger = logging.getLogger("vllm_omni.entrypoints.utils")
+        emit_logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.WARNING, logger="vllm_omni.entrypoints.utils"):
+                result = filter_dataclass_kwargs(OmniEngineArgs, kwargs)
+        finally:
+            emit_logger.removeHandler(caplog.handler)
 
         assert "model" in result
         assert "stage_id" in result
@@ -493,7 +502,6 @@ class TestResolveOmniConfig:
         assert engine_args["extras"]["ltx2_use_conv_vae"] is True
         assert engine_args["extras"]["keep"] == "global"
         assert engine_args["streaming_output"] is True
-
 
     def test_tp_only_strategy_does_not_report_default_lb_policy_as_derived(self, mocker: MockerFixture):
         structured_config = SimpleNamespace(

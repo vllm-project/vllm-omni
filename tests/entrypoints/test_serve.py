@@ -849,6 +849,7 @@ def _make_stage_cfg(stage_id: int, stage_type: str) -> SimpleNamespace:
         # inherits the launcher's CUDA_VISIBLE_DEVICES.
         runtime=None,
         engine_args={},
+        connector_config=SimpleNamespace(async_chunk=False),
     )
 
 
@@ -859,7 +860,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     from vllm_omni.engine.stage_engine_startup import StageRegistrationResponse
 
     stage_cfg = _make_stage_cfg(0, stage_type="llm")
-    stage_cfg.engine_args["async_chunk"] = True
+    stage_cfg.connector_config.async_chunk = True
     parallel_config = SimpleNamespace(
         data_parallel_size_local=1,
         data_parallel_rank=0,
@@ -1109,7 +1110,9 @@ def test_run_headless_generic_diffusion_launches_structured_stage(mocker: Mocker
         captured.update(replica_kwargs=kwargs)
         return SimpleNamespace(exitcode=None)
 
-    mocker.patch.object(startup_module.stage_init_utils, "build_diffusion_stage_config", side_effect=_build_diffusion_stage_config)
+    mocker.patch.object(
+        startup_module.stage_init_utils, "build_diffusion_stage_config", side_effect=_build_diffusion_stage_config
+    )
     mocker.patch.object(startup_module, "launch_headless_replica_group", side_effect=_launch_replica_group)
     mocker.patch.object(startup_module, "launch_headless_diffusion_replica", side_effect=_launch_replica)
 
