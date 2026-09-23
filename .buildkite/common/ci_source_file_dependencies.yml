@@ -398,6 +398,8 @@ source_file_dependencies:
   diffusion_hunyuan_image3_accuracy:
     - *hunyuan_image3
     - tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py
+    - tests/e2e/accuracy/test_hunyuan_image3_lora.py
+    - vllm_omni/diffusion/lora/
 
   diffusion_hunyuan_image3_perf:
     - *hunyuan_image3

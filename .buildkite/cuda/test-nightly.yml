@@ -263,7 +263,7 @@ steps:
         commands:
           - export HUNYUAN_IMAGE3_MODEL="tencent/HunyuanImage-3.0-Instruct"
           - export HUNYUAN_IMAGE3_DEVICES="0,1,2,3"
-          - pytest -s -v tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py -m "full_model and H100 and B200 and cards_4" --run-level full_model
+          - pytest -s -v tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py tests/e2e/accuracy/test_hunyuan_image3_lora.py -m "full_model and H100 and B200 and cards_4" --run-level full_model
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image · Single-GPU"
         source_file_dependencies: diffusion_qwen_image_perf
