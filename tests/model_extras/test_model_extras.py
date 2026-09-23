@@ -497,6 +497,27 @@ def test_bagel_image_to_image_prompt_builder() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_qwen_image_21_image_to_image_prompt_builder() -> None:
+    dummy_image = Image.new("RGBA", (64, 64))
+    result = build_image_to_image_prompt(
+        "QwenImage21Pipeline",
+        prompt="make it dance",
+        negative_prompt="blurry",
+        input_image=dummy_image,
+        height=1024,
+        width=768,
+    )
+    assert result == {
+        "prompt": "make it dance",
+        "multi_modal_data": {"image": dummy_image},
+        "height": 1024,
+        "width": 768,
+        "negative_prompt": "blurry",
+    }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_unknown_pipeline_preserves_canonical_text_to_image_prompt() -> None:
     canonical_prompt = {"prompt": "a cat", "modalities": ["image"]}
     assert (

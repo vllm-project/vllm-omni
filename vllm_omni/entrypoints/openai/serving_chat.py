@@ -3561,7 +3561,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     chunk = ImageEditImageChunk(
                         data=image_data,
                         output_format=output_format,
-                        size=size,
+                        size=f"{images[0].width}x{images[0].height}",
                         created=created,
                         model=model,
                         metrics=metrics,

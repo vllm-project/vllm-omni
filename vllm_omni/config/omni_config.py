@@ -851,6 +851,10 @@ class _DiffusionConfigProjection:
     pin_cpu_memory: bool = True
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
     diffusion_compile_dynamic: bool = Field(default=True, strict=True)
+    # Mirrors OmniDiffusionConfig.enable_cuda_graph_decode; enforced by the
+    # model (Qwen-Image-2.1) together with enforce_eager, which lives in the
+    # shared engine config.
+    enable_cuda_graph_decode: bool = True
     fa_deterministic: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False

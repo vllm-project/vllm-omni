@@ -1,4 +1,4 @@
-﻿# FP8 Quantization
+# FP8 Quantization
 
 ## Overview
 
@@ -95,6 +95,7 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 | Model | HF models | Online | Pre-calibrated | Recommendation | `ignored_layers` | Text-Encoder quantization |
 |-------|-----------|:-------:|:------:|----------------|------------------|------------------|
 | Qwen-Image | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Yes | Yes | Skip sensitive image-stream MLPs when quality regresses | `img_mlp` | |
+| Qwen-Image-2.1 | `Qwen/Qwen-Image-2.1` | Yes | Not validated | Skip image-stream MLPs for best fidelity; all-layer FP8 is loadable but composition drifts on some prompts. On Blackwell GB200 FP8 saves ~17% peak memory but is not faster than BF16 at 1024x1024. Text encoder FP8 covers the language model only — the vision tower and LM head stay BF16 | `img_mlp` | ✅︎ (language model only) |
 | Wan2.2 | Wan2.2 diffusion pipelines | Not validated | Not validated | Validate against BF16 before documenting as supported | TBD | |
 | LTX-2 | `Lightricks/LTX-2`, `rootonchair/LTX-2-19b-distilled` | Yes | Not validated | Transformer only; use dynamic phase LoRA for ordinary two-stage | None | |
 | LTX-2.3 | `diffusers/LTX-2.3-Diffusers`, `diffusers/LTX-2.3-Distilled-Diffusers` | Yes | Not validated | Transformer only; use dynamic phase LoRA for ordinary two-stage | None | |

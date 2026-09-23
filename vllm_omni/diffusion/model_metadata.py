@@ -26,6 +26,8 @@ class DiffusionModelMetadata:
 # FLUX.2 Klein supports up to four reference images.
 FLUX2_KLEIN_MAX_INPUT_IMAGES = 4
 QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
+# Qwen-Image 2.1 image-conditioned generation caps condition images at 4.
+QWEN_IMAGE_21_MAX_INPUT_IMAGES = 4
 # Upstream HunyuanImage-3.0 "Multi-Image Fusion" caps reference images at 3.
 HUNYUAN_IMAGE3_MAX_INPUT_IMAGES = 3
 # Boogu-Image editing (TI2I) supports a single reference image for now.
@@ -40,6 +42,12 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "QwenImageEditPlusPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES,
+    ),
+    # Qwen-Image 2.1 handles both text-to-image (no image) and
+    # image-conditioned requests through the same pipeline class.
+    "QwenImage21Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=QWEN_IMAGE_21_MAX_INPUT_IMAGES,
     ),
     "HunyuanImage3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,

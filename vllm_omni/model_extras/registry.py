@@ -75,6 +75,9 @@ from vllm_omni.model_extras.ming_flash_omni import (
 from vllm_omni.model_extras.ming_flash_omni import (
     build_text_to_image_prompt as build_ming_flash_omni_text_to_image_prompt,
 )
+from vllm_omni.model_extras.qwen_image_21 import (
+    build_image_to_image_prompt as build_qwen_image_21_image_to_image_prompt,
+)
 from vllm_omni.model_extras.sana_video import SANA_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.sensenova_u1 import (
     SENSENOVA_U1_EXTRA_BODY_PARAMS,
@@ -298,6 +301,9 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "init_extra_args_for_non_diffusion_stages": MING_FLASH_OMNI_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
         "text_to_image_prompt_builder": build_ming_flash_omni_text_to_image_prompt,
         "image_to_image_prompt_builder": build_ming_flash_omni_image_to_image_prompt,
+    },
+    "QwenImage21Pipeline": {
+        "image_to_image_prompt_builder": build_qwen_image_21_image_to_image_prompt,
     },
 }
 

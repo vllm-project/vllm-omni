@@ -45,6 +45,21 @@ def _roundtrip_diffusion_config(**kwargs) -> OmniDiffusionConfig:
     return OmniDiffusionConfig(**{name: value for name, value in diffusion_kwargs.items() if value is not None})
 
 
+def test_direct_config_extras_are_independent_dicts():
+    first = OmniDiffusionConfig(model="test-model")
+    second = OmniDiffusionConfig(model="test-model")
+
+    assert first.extras.get("prefix_kv_cache_dtype") is None
+    first.extras["prefix_kv_cache_dtype"] = "fp8"
+    assert second.extras == {}
+
+
+def test_direct_config_preserves_explicit_extras():
+    config = OmniDiffusionConfig(model="test-model", extras={"prefix_kv_cache_dtype": "fp8"})
+
+    assert config.extras["prefix_kv_cache_dtype"] == "fp8"
+
+
 class TestParallelConfigPropagation:
     """Core regression tests: parallel_config must survive serialization."""
 

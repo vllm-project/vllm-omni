@@ -14,6 +14,7 @@ import time
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from multiprocessing.process import BaseProcess
 from multiprocessing.synchronize import Event
 from typing import TYPE_CHECKING, Any, cast
 
@@ -149,7 +150,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     _rpc_wave_id: int = 0
 
     def _init_executor(self) -> None:
-        self._processes: list[mp.Process] = []
+        self._processes: list[BaseProcess] = []
         self._closed = False
         self._is_failed = False
         self._failure_callbacks: list[Callable[[], None]] = []
@@ -158,7 +159,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._rpc_wave_id: int = 0
 
         num_workers = cast(int, self.od_config.num_gpus)
-        self.wake_events = [mp.Event() for _ in range(num_workers)]
+        self._mp_context = mp.get_context("spawn")
+        self.wake_events = [self._mp_context.Event() for _ in range(num_workers)]
 
         self._broadcast_mq = self._init_broadcast_queue(num_workers)
         broadcast_handle = self._broadcast_mq.export_handle()
@@ -345,7 +347,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self,
         broadcast_handle: Handle,
         wake_events: list[Event],
-    ) -> tuple[list[mp.Process], list[Handle]]:
+    ) -> tuple[list[BaseProcess], list[Handle]]:
         od_config = self.od_config
         logger.info("Starting server...")
 
@@ -354,8 +356,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # N-GPU run oversubscribes the host by N x core_count. Honours a
         # user-provided OMP_NUM_THREADS.
         set_multiprocessing_worker_envs()
-        mp.set_start_method("spawn", force=True)
-        processes = []
+        processes: list[BaseProcess] = []
 
         # Extract worker_extension_cls and custom_pipeline_args from od_config
         worker_extension_cls = od_config.worker_extension_cls
@@ -366,9 +367,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         scheduler_pipe_writers = []
 
         for i in range(num_gpus):
-            reader, writer = mp.Pipe(duplex=False)
+            reader, writer = self._mp_context.Pipe(duplex=False)
             scheduler_pipe_writers.append(writer)
-            process = mp.Process(
+            process = self._mp_context.Process(
                 target=WorkerProc.worker_main,
                 args=(
                     i,  # rank

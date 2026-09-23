@@ -17,7 +17,7 @@ import zmq
 from vllm.v1.engine.exceptions import EngineDeadError
 
 import vllm_omni.diffusion.worker.diffusion_worker as diffusion_worker_module
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE
@@ -35,6 +35,38 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _signal_worker_ready(_rank, _config, writer, _broadcast, wake_event, *_args):
+    assert mp.get_start_method() == "spawn"
+    wake_event.set()
+    writer.send({"status": "ready", "result_handle": "ready"})
+    writer.close()
+
+
+@pytest.mark.skipif("fork" not in mp.get_all_start_methods(), reason="Requires a fork default context")
+def test_executor_spawns_workers_with_compatible_events(mocker):
+    previous_method = mp.get_start_method(allow_none=True)
+    executor = object.__new__(MultiprocDiffusionExecutor)
+    executor.od_config = OmniDiffusionConfig(model="test-model", step_execution=True)
+    broadcast = mocker.Mock()
+    broadcast.export_handle.return_value = None
+    mocker.patch.object(executor, "_init_broadcast_queue", return_value=broadcast)
+    mocker.patch.object(executor, "_init_result_queue")
+    mocker.patch.object(executor, "_start_worker_monitor")
+    mocker.patch.object(WorkerProc, "worker_main", new=_signal_worker_ready)
+    try:
+        mp.set_start_method("fork", force=True)
+        executor._init_executor()
+        for process in executor._processes:
+            process.join(timeout=30)
+            assert process.exitcode == 0
+        assert all(event.is_set() for event in executor.wake_events)
+        assert mp.get_start_method() == "fork"
+    finally:
+        if getattr(executor, "_finalizer", None) is not None:
+            executor.shutdown()
+        mp.set_start_method(previous_method, force=True)
 
 
 # ───────────────────────────────────────────── helpers ─────────────────────
