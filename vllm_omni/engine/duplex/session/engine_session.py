@@ -960,11 +960,14 @@ class DuplexEngineSession:
     def mark_response_first_outputs(
         self,
         *,
+        response_id: str | None,
         observed_at_s: float,
         has_text: bool,
         has_audio: bool,
     ) -> dict[str, object]:
-        """Return server-monotonic TTF metrics newly observed for the active response."""
+        """Observe first outputs only when their owner is the active response."""
+        if response_id is None or response_id != self.active_response_id:
+            return {}
         started_at_s = self._response.active_response_request_started_at_s
         if started_at_s is None:
             return {}
