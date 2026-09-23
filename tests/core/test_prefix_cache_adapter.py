@@ -98,6 +98,43 @@ def test_resumed_block_snapshot_is_immutable():
     assert event.block_ids == ((7, 8),)
 
 
+@pytest.mark.parametrize("field", ["num_computed_tokens", "new_block_ids", "num_output_tokens"])
+def test_cached_request_parallel_fields_must_have_one_entry_per_request(field):
+    values = {
+        "req_ids": ["r1", "r2"],
+        "num_computed_tokens": [8, 8],
+        "new_block_ids": [[[1, 2]], [[3, 4]]],
+        "num_output_tokens": [0, 0],
+    }
+    values[field] = values[field][:1]
+    with pytest.raises(ValueError, match=field):
+        PrefixCacheSchedulerAdapter().translate_scheduler_output(
+            output(resumed={"r1"}, cached=values)
+        )
+
+
+def test_resumed_request_must_have_cached_payload():
+    with pytest.raises(ValueError, match="missing from req_ids"):
+        PrefixCacheSchedulerAdapter().translate_scheduler_output(
+            output(resumed={"missing"}, cached={"req_ids": ["other"]})
+        )
+
+
+def test_resumed_request_ids_are_normalized_before_membership_check():
+    events = PrefixCacheSchedulerAdapter().translate_scheduler_output(
+        output(
+            resumed={7},
+            cached={
+                "req_ids": ["7"],
+                "num_computed_tokens": [8],
+                "new_block_ids": [[[1, 2]]],
+                "num_output_tokens": [0],
+            },
+        )
+    )
+    assert events[0].req_id == "7"
+
+
 def test_same_id_terminal_and_new_is_started():
     adapter = PrefixCacheSchedulerAdapter()
     adapter.translate_scheduler_output(output(new=[SimpleNamespace(req_id="r")]))
@@ -118,3 +155,16 @@ def test_write_layout_uses_post_order_batch_and_slots():
     ]
     with pytest.raises(AttributeError):
         layout.writes = ()
+
+
+def test_write_layout_rejects_slot_count_mismatch():
+    class BrokenView(FakeView):
+        def step_slots_cpu(self, req_ids, num_scheduled):
+            import torch
+
+            return torch.tensor([20], dtype=torch.long)
+
+    with pytest.raises(ValueError, match="slot count"):
+        PrefixCacheSchedulerAdapter().build_write_layout(
+            BrokenView(), num_scheduled_tokens={"b": 2, "a": 1}
+        )

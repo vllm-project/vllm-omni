@@ -85,14 +85,34 @@ class PrefixCacheSchedulerAdapter:
     def _blocks_value(blocks: Any) -> tuple[tuple[int, ...], ...]:
         if blocks is None:
             return ()
+        if not isinstance(blocks, (list, tuple)):
+            raise TypeError(f"block_ids must be a sequence, got {type(blocks).__name__}")
         if blocks and isinstance(blocks[0], int):
             return (tuple(int(block) for block in blocks),)
-        return tuple(tuple(int(block) for block in group) for group in blocks)
+        groups = []
+        for group in blocks:
+            if not isinstance(group, (list, tuple)):
+                raise TypeError("block_ids must be a flat sequence or a sequence of groups")
+            groups.append(tuple(int(block) for block in group))
+        return tuple(groups)
+
+    @staticmethod
+    def _cached_field(cached: Any, name: str, req_ids: tuple[Any, ...]) -> tuple[Any, ...]:
+        """Read one parallel cached-request field with an early contract check."""
+        value = tuple(getattr(cached, name, ()) or ())
+        # Empty optional fields are valid in synthetic/older scheduler
+        # outputs. Once a field is present, however, it must describe every
+        # cached request; silently defaulting a missing row changes ownership.
+        if value and len(value) != len(req_ids):
+            raise ValueError(
+                f"scheduled_cached_reqs.{name} has {len(value)} entries for {len(req_ids)} req_ids"
+            )
+        return value
 
     def translate_scheduler_output(self, scheduler_output: Any) -> tuple[PrefixCacheRequestEvent, ...]:
         events: list[PrefixCacheRequestEvent] = []
         cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
-        resumed = set(getattr(cached, "resumed_req_ids", ()) or ()) if cached is not None else set()
+        resumed = {str(req_id) for req_id in (getattr(cached, "resumed_req_ids", ()) or ())} if cached is not None else set()
         aborted = set(getattr(scheduler_output, "aborted_req_ids", ()) or ())
         scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
         terminal_ids = {
@@ -103,15 +123,22 @@ class PrefixCacheSchedulerAdapter:
         cached_by_id: dict[str, tuple[int, Any, int]] = {}
         if cached is not None:
             req_ids = tuple(getattr(cached, "req_ids", ()) or ())
-            computed = tuple(getattr(cached, "num_computed_tokens", ()) or ())
-            new_blocks = tuple(getattr(cached, "new_block_ids", ()) or ())
-            output_tokens = tuple(getattr(cached, "num_output_tokens", ()) or ())
+            computed = self._cached_field(cached, "num_computed_tokens", req_ids)
+            new_blocks = self._cached_field(cached, "new_block_ids", req_ids)
+            output_tokens = self._cached_field(cached, "num_output_tokens", req_ids)
             for index, req_id in enumerate(req_ids):
                 cached_by_id[str(req_id)] = (
-                    int(computed[index]) if index < len(computed) else 0,
-                    new_blocks[index] if index < len(new_blocks) else None,
-                    int(output_tokens[index]) if index < len(output_tokens) else 0,
+                    int(computed[index]) if computed else 0,
+                    new_blocks[index] if new_blocks else None,
+                    int(output_tokens[index]) if output_tokens else 0,
                 )
+
+        missing_resumed = resumed - set(cached_by_id)
+        if missing_resumed:
+            raise ValueError(
+                "scheduled_cached_reqs.resumed_req_ids missing from req_ids: "
+                f"{sorted(str(req_id) for req_id in missing_resumed)}"
+            )
 
         for data in getattr(scheduler_output, "scheduled_new_reqs", ()) or ():
             req_id = self._req_id(data)
@@ -135,7 +162,6 @@ class PrefixCacheSchedulerAdapter:
             )
 
         for req_id in resumed:
-            req_id = str(req_id)
             self._observed_req_ids.add(req_id)
             hit_end, block_ids, num_output_tokens = cached_by_id.get(req_id, (0, None, 0))
             events.append(
@@ -176,6 +202,12 @@ class PrefixCacheSchedulerAdapter:
             offsets[req_id] = (cursor, cursor + count)
             cursor += count
         slots = group_view.step_slots_cpu(list(req_order), dict(num_scheduled_tokens))
+        expected_rows = cursor
+        actual_rows = int(slots.numel())
+        if actual_rows != expected_rows:
+            raise ValueError(
+                f"write layout slot count {actual_rows} does not match scheduled row count {expected_rows}"
+            )
         writes: list[PrefixCacheWrite] = []
         cursor = 0
         for req_id in req_order:
