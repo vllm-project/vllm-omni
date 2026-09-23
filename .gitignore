@@ -245,6 +245,7 @@ datasets/
 !recipes/cosmos3/negative_prompt.json
 !tests/dfx/perf/tests/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
+!tools/cosmos3_fl2v/testdata/**/*.json
 *.jsonl
 *.parquet
 
