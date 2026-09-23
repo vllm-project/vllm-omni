@@ -43,6 +43,22 @@ def get_padding(kernel_size, dilation=1):
     return int((kernel_size * dilation - dilation) / 2)
 
 
+def _normalize_folded_weight(module: nn.Module, name: str = "weight") -> None:
+    """Keep ordinary Parameters; replace plain or inference tensors.
+
+    In inference_mode, the legacy API can leave an inference Parameter,
+    while the parametrization API can leave a plain inference tensor.
+    Rebuild those outside inference_mode so they remain usable afterward.
+    """
+    weight = getattr(module, name)
+    if isinstance(weight, nn.Parameter) and not weight.is_inference():
+        return
+    with torch.inference_mode(False):
+        frozen = nn.Parameter(weight.detach().clone(), requires_grad=False)
+    delattr(module, name)
+    module.register_parameter(name, frozen)
+
+
 def _fold_weight_norm(module: nn.Module) -> int:
     """Fold one weight-normalized layer into a plain ``weight``, in place.
 
@@ -55,20 +71,12 @@ def _fold_weight_norm(module: nn.Module) -> int:
         # Removes every parametrization registered on "weight"; only
         # weight_norm is applied to the layers in this module.
         parametrize.remove_parametrizations(module, "weight", leave_parametrized=True)
-        weight = module.weight
-        if not isinstance(weight, nn.Parameter):
-            # Under no_grad/inference_mode, leave_parametrized registers a plain
-            # (possibly inference) tensor instead of a Parameter. Normalize so
-            # callers in any grad mode get the same semantics and the weight
-            # stays usable outside the fold's grad context.
-            with torch.inference_mode(False):
-                frozen = nn.Parameter(weight.detach().clone(), requires_grad=False)
-            del module.weight
-            module.register_parameter("weight", frozen)
+        _normalize_folded_weight(module)
         return 1
     for hook in list(module._forward_pre_hooks.values()):
         if isinstance(hook, WeightNorm):
             remove_legacy_weight_norm(module, name=hook.name)
+            _normalize_folded_weight(module, hook.name)
             return 1
     return 0
 
@@ -609,9 +617,9 @@ class HiFTGenerator(nn.Module):
         """Fold the generator's frozen weight norms into plain weights.
 
         Returns how many convolutions were folded. ``source_downs`` and
-        ``m_source`` carry no weight norm; ``f0_predictor`` is excluded:
-        it is pinned to CPU for precision, so it is left parametrized and
-        folding it is tracked separately in RFC #6870 (C5).
+        ``m_source`` carry no weight norm. ``f0_predictor`` is excluded:
+        causal inference runs it on CPU for precision, and folding it is
+        tracked separately in RFC #6870 (C5).
         """
         folded = 0
         for layer in self.ups:

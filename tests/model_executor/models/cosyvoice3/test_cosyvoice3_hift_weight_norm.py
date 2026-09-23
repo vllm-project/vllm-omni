@@ -125,8 +125,12 @@ def test_hift_fold_preserves_audio_and_leaves_f0_unchanged(weight_norm_api, caus
         torch.testing.assert_close(value, f0_state[name], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("legacy_checkpoint", [False, True])
-def test_load_weights_folds_loaded_not_initial_weights(tmp_path, legacy_checkpoint):
+@pytest.mark.parametrize(
+    "weight_norm_api,legacy_checkpoint",
+    [("parametrized", False), ("parametrized", True), ("legacy", True)],
+    indirect=["weight_norm_api"],
+)
+def test_load_weights_folds_loaded_not_initial_weights(tmp_path, weight_norm_api, legacy_checkpoint):
     from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
 
     # Exercise the real loader with a small vocoder and synthetic checkpoints.
@@ -135,10 +139,18 @@ def test_load_weights_folds_loaded_not_initial_weights(tmp_path, legacy_checkpoi
     model = CosyVoice3Code2Wav.__new__(CosyVoice3Code2Wav)
     nn.Module.__init__(model)
     model.flow_model = nn.Linear(2, 2)
-    model.hift = _make_hift()
+    # Start in training mode to check the loader's transition to eval.
+    model.hift = _make_hift().train()
+    assert model.hift.training
+    conv = model.hift.conv_pre
+    assert hasattr(conv, "weight_g") == (weight_norm_api == "legacy")
     state = {name: value.clone() for name, value in model.hift.state_dict().items()}
-    state["conv_pre.parametrizations.weight.original0"].mul_(2)
-    expected_weight = model.hift.conv_pre.weight.detach().clone() * 2
+    gain = "weight_g" if weight_norm_api == "legacy" else "parametrizations.weight.original0"
+    state[f"conv_pre.{gain}"].mul_(2)
+    expected_weight = conv.weight.detach().clone() * 2
+    assert not torch.equal(conv.weight, expected_weight)
+    # No forward before loading: a legacy fold must recompute from the loaded
+    # g/v parameters, not reuse the cached effective weight from construction.
     flow_state = {name: torch.ones_like(value) for name, value in model.flow_model.state_dict().items()}
     if legacy_checkpoint:
         state = {
@@ -155,6 +167,7 @@ def test_load_weights_folds_loaded_not_initial_weights(tmp_path, legacy_checkpoi
     torch.testing.assert_close(model.hift.conv_pre.weight, expected_weight, rtol=0, atol=0)
     # Production loads in normal grad mode, so the folded weight is a Parameter.
     assert isinstance(model.hift.conv_pre.weight, nn.Parameter)
+    assert not model.hift.conv_pre.weight.is_inference()
     assert not any(
         _has_weight_norm(module) for name, module in model.hift.named_modules() if not name.startswith("f0_predictor.")
     )
@@ -165,19 +178,60 @@ def test_load_weights_folds_loaded_not_initial_weights(tmp_path, legacy_checkpoi
         torch.testing.assert_close(value, flow_state[name], rtol=0, atol=0)
 
 
-def test_fold_under_inference_mode_stays_usable_outside_it():
-    """Folding inside inference_mode must not leak inference tensors: the
-    materialized weight stays a frozen Parameter and forward keeps working
-    in a normal/no_grad context (pre-hardening this raised RuntimeError)."""
+@pytest.mark.parametrize(
+    "fold_context",
+    [torch.enable_grad, torch.no_grad, torch.inference_mode],
+    ids=["grad", "no_grad", "inference_mode"],
+)
+def test_fold_stays_usable_outside_grad_context(weight_norm_api, fold_context):
+    """Both APIs must leave non-inference Parameters usable by autograd."""
     block = hifigan.ResBlock(channels=4).eval()
-    x = torch.randn(1, 4, 12)
-    with torch.inference_mode():
-        assert block.remove_weight_norm() == 6
-    assert isinstance(block.convs1[0].weight, nn.Parameter)
-    assert not block.convs1[0].weight.requires_grad
+    x = torch.randn(1, 4, 12, requires_grad=True)
+    assert hasattr(block.convs1[0], "weight_g") == (weight_norm_api == "legacy")
     with torch.no_grad():
-        out = block(x)
-    assert torch.isfinite(out).all()
+        before = block(x)
+    with fold_context():
+        assert block.remove_weight_norm() == 6
+        assert block.remove_weight_norm() == 0
+    for conv in (*block.convs1, *block.convs2):
+        assert isinstance(conv.weight, nn.Parameter)
+        assert not conv.weight.is_inference()
+    # no_grad would hide the failure when autograd tries to save a weight.
+    out = block(x)
+    torch.testing.assert_close(out, before, rtol=0, atol=0)
+    out.sum().backward()
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+
+
+@pytest.mark.parametrize("sampling_rate", [22050, 24000])
+def test_fold_preserves_multichunk_audio_and_finalize(weight_norm_api, sampling_rate):
+    from tests.model_executor.models.cosyvoice3.test_cosyvoice3_incremental_hift import _make_model
+
+    hift = _make_hift(sampling_rate=sampling_rate)
+    model = _make_model(hift, window_len=64)
+    mel = torch.randn(1, 80, 192)
+    chunks = mel.split(24, dim=-1)
+
+    def stream():
+        cache = None
+        audio = []
+        window_shifted = False
+        for i, chunk in enumerate(chunks):
+            speech, cache = model._stream_hift_from_feat(chunk, cache_state=cache, finalize=i == len(chunks) - 1)
+            audio.append(speech)
+            if cache is not None:
+                window_shifted |= cache["mel_offset"] > 0
+        assert window_shifted
+        assert cache is None
+        return torch.cat(audio, dim=-1)
+
+    before = stream()
+    assert hift.remove_weight_norm() == 41
+    after = stream()
+    assert before.numel() > 0
+    assert torch.isfinite(before).all()
+    torch.testing.assert_close(after, before, rtol=0, atol=0)
 
 
 def test_shipped_config_generator_folds_exactly_77_layers():

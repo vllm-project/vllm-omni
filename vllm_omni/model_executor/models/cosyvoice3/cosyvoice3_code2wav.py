@@ -519,14 +519,9 @@ class CosyVoice3Code2Wav(nn.Module):
         }
         self.hift.load_state_dict(hift_state_dict, strict=True)
         self.hift.to(device)
-        # Inference weights are frozen: fold g*v/||v|| once here instead of
-        # recomputing it in every convolution on every streamed chunk.
-        # Must stay after load_state_dict: folding rewrites the state_dict
-        # keys (parametrizations.weight.original0/1 -> weight), so this is a
-        # one-time post-load transform. A second load_weights() with the
-        # original checkpoint fails the strict load_state_dict loudly; no
-        # in-tree path reloads (sleep/wake restores physical pages, and
-        # level-2 wake is NotImplementedError in async_omni.py).
+        # Fold after loading and device placement to avoid recomputing weights
+        # for every chunk. Folding changes state_dict keys, so reloading the
+        # original checkpoint into this instance is unsupported.
         folded = self.hift.remove_weight_norm()
         logger.info("Folded %d weight-norm layers in HiFT generator", folded)
         if folded == 0:
