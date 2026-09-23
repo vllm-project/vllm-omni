@@ -204,7 +204,7 @@ def _make_adapter(
 
     config = SimpleNamespace(
         name="vllm-config",
-        model_config=SimpleNamespace(dtype=torch.float32),
+        model_config=SimpleNamespace(dtype=torch.float32, rswa_window=None),
     )
     adapter = DiffusionPagedAttentionAdapter(
         vllm_config=config,
@@ -1247,7 +1247,7 @@ def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads
     config = SimpleNamespace(
         attention_config=SimpleNamespace(backend=None, backend_per_kind=original_backend_per_kind, use_non_causal=True),
         parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp_size, decode_context_parallel_size=1),
-        model_config=SimpleNamespace(dtype=torch.float16),
+        model_config=SimpleNamespace(dtype=torch.float16, rswa_window=None),
         cache_config=SimpleNamespace(cache_dtype="auto", user_specified_block_size=False),
         kv_transfer_config=None,
         speculative_config=None,
