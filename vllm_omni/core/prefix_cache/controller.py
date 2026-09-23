@@ -516,8 +516,12 @@ class OmniPrefixCacheController:
         self._worker: threading.Thread | None = None
         self._staging_pool = StagingBufferPool(config.staging_depth, config.staging_capacity_tokens)
         if not self._eager:
-            self._copy_stream = torch.cuda.Stream()
-            self._read_stream = torch.cuda.Stream()
+            # The queue/committer path is useful on CPU too: it gives tests
+            # and CPU-only deployments the same lifecycle as CUDA without
+            # constructing CUDA streams that cannot exist there.
+            if torch.cuda.is_available():
+                self._copy_stream = torch.cuda.Stream()
+                self._read_stream = torch.cuda.Stream()
             self._worker = threading.Thread(target=self._worker_loop, name="omni-prefix-cache-committer", daemon=True)
             self._worker.start()
 
@@ -562,7 +566,7 @@ class OmniPrefixCacheController:
             )
         slot = self._staging_pool.claim(step_holder, self._config.staging_claim_timeout_s)
         try:
-            pin = not self._eager
+            pin = not self._eager and torch.cuda.is_available()
             views: dict[str, torch.Tensor] = {}
             event: torch.cuda.Event | None = None
             if self._eager or all(t.device.type == "cpu" for t in tensors.values()):
@@ -929,7 +933,16 @@ class OmniPrefixCacheController:
                 by_key.setdefault(k, []).append(chunk)
         pending: list[tuple[str, list[_WriteChunk], list[torch.Tensor]]] = []
         if self._copy_stream is None:
-            raise OmniPrefixCacheUnmatchError("deferred prefix cache copy requires a CUDA copy stream")
+            # CPU async mode still uses the same task state machine; only the
+            # device-to-host operation is synchronous inside the worker.
+            rows_out = [
+                (chunk, key, tensor.detach().clone())
+                for chunk in task.chunks
+                for key, tensor in chunk.tensors.items()
+            ]
+            task.set_host_tensor(rows_out)
+            self._release_staged_bytes(task)
+            return
         with torch.cuda.stream(self._copy_stream):
             if task.freeze_event is not None:
                 self._copy_stream.wait_event(task.freeze_event)

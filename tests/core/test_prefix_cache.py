@@ -1793,8 +1793,12 @@ def test_read_plan_prefetch_toggle_has_identical_sparse_results():
     assert torch.equal(results[0], torch.zeros(4, 2))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="real async controller requires a CUDA stream")
 def test_eager_and_async_controller_have_identical_read_plans():
+    """The same read plan must produce the same result with either committer.
+
+    The async controller deliberately has a CPU implementation too, so this
+    contract is exercised in CPU CI rather than being CUDA-only coverage.
+    """
     def execute(async_controller: bool):
         mgr, view = make_manager(controller_eager=not async_controller)
 
