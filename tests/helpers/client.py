@@ -1445,6 +1445,8 @@ class OnlineOmniClient:
           - min_audio_bytes: optional minimum ``len(audio_bytes)`` checked in ``assert_audio_speech_response``
           - transcript_expected_text: local expected spoken text; defaults to ``input``
           - transcript_model: primary Whisper model for content checks; defaults to ``small``
+          - transcript_pcm_sample_rate: local-only opt-in to transcribe mono int16 PCM;
+            must be the actual output sample rate, also used for HNR
           - timeout: request timeout in seconds (float, optional, default 120.0)
           - stream: whether to use streaming API (bool, optional, default False)
 

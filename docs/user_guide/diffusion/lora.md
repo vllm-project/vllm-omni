@@ -27,6 +27,21 @@ The `adapter_config.json` file contains metadata about the LoRA adapter, includi
 - `lora_alpha`: LoRA alpha scaling factor
 - `target_modules`: List of module names to apply LoRA to
 
+Every module supplied by a PEFT adapter must bind successfully when the adapter
+is activated. If any module cannot bind, activation raises an error naming the
+unbound modules and resets the LoRA layers to avoid leaving the adapter partly
+active. An adapter may still target only some projections of a fused layer, such
+as Q and V without K, as long as all supplied modules bind.
+
+Previously, some adapters activated even when unmatched modules were silently
+dropped. Those adapters now fail at activation. For example, in-memory tensor
+adapters for Qwen-Image, Boogu-Image, and Wan can contain checkpoint keys such
+as `to_out.0` where the engine expects `to_out`. PEFT checkpoints with extra
+unbound keys also fail at activation if those keys pass the loader's earlier
+validation; unsupported module suffixes may already fail during loading.
+Checkpoint-to-engine name mapping is tracked in [#8001](https://github.com/vllm-project/vllm-omni/issues/8001);
+until it is available, adapter keys must resolve to supported engine modules.
+
 ## Quick Start
 
 ### Offline Inference
