@@ -435,11 +435,14 @@ def _stage0_stop_token_ids(tokenizer: PreTrainedTokenizerBase | None) -> list[in
     if tokenizer is None:
         return []
     out: list[int] = []
+    # ``turn_eos`` is deliberately not a stop token: the official Talker
+    # conditions on the hidden state produced *after* ``<|turn_eos|>`` is fed,
+    # so Stage 0 must forward it once and stop on the unit terminator that the
+    # policy forces on the following step.
     stop_token_fields = (
         "chunk_eos_token_id",
         "chunk_tts_eos_token_id",
         "listen_token_id",
-        "turn_eos_token_id",
     )
     for field in stop_token_fields:
         token = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS[field]

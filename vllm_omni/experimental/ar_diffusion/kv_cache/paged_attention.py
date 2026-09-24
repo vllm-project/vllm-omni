@@ -264,6 +264,7 @@ class ARDiffusionPagedForwardContext:
         # gather path -- their only consumer -- is switched on.
         if not self.kv_cache.history_staging:
             return
+        assert self.block_table is not None
         if action_len or self.block_table.shape[0] != 1:
             # Action tokens live in scratch blocks outside the video window; staging them is not modelled.
             return
@@ -291,12 +292,14 @@ class ARDiffusionPagedForwardContext:
         self.stage_first_block = self.kv_len // self.block_size - self.num_current_video_blocks
 
     def history_staging(self, layer_idx: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """This layer's staging pair, narrowed to this forward's staged window (a prefix of the manager's buffer)."""
+        """Return the manager-owned tensors marked static for CUDA Graph input mutation.
+
+        Fresh prefix views lose the bases' static-address annotation. Narrow the
+        window inside the attention custom op instead of at the compiled boundary.
+        """
         if not self.staging_enabled:
             return None, None
-        key, value = self.kv_cache.history_staging[layer_idx]
-        tokens = int(self.max_seq_len)
-        return key[:tokens], value[:tokens]
+        return self.kv_cache.history_staging[layer_idx]
 
     def layer_inputs(self, layer_idx: int) -> ARDiffusionPagedLayerInputs:
         if not getattr(self, "_prepared", False):
@@ -435,12 +438,11 @@ def _stage_window(stage_key, stage_value, key_cache, value_cache, block_ids, n_b
     earlier forward of the same AR block and cannot have changed since.
     """
     ids = block_ids[first_block:]
-    blocks = n_blocks - first_block
-    stage_key.view(n_blocks, block_size, *key_cache.shape[2:])[first_block:].copy_(
-        key_cache.index_select(0, ids).view(blocks, block_size, *key_cache.shape[2:])
-    )
-    stage_value.view(n_blocks, block_size, *value_cache.shape[2:])[first_block:].copy_(
-        value_cache.index_select(0, ids).view(blocks, block_size, *value_cache.shape[2:])
+    # Write directly into the caller-owned window, avoiding an intermediate
+    # gathered tensor and its copy on every layer and denoising step.
+    torch.index_select(key_cache, 0, ids, out=stage_key.view(n_blocks, block_size, *key_cache.shape[2:])[first_block:])
+    torch.index_select(
+        value_cache, 0, ids, out=stage_value.view(n_blocks, block_size, *value_cache.shape[2:])[first_block:]
     )
 
 
@@ -522,7 +524,7 @@ def ar_diffusion_paged_attention(
         # vLLM's seqused_k/fa_version API. The ROCm flash-attn paged kernel also
         # requires 128-token blocks, while AR-Diffusion uses frame-aligned
         # 16-token blocks, so gather the visible blocks on-device first.
-        flash_attn_varlen_func = _rocm_flash_attn_varlen_func()
+        rocm_flash_attn_varlen_func = _rocm_flash_attn_varlen_func()
         cu_seqlens_k = torch.cat([seq_lens.new_zeros(1), torch.cumsum(seq_lens, dim=0, dtype=torch.int32)])
         positions = torch.arange(int(max_seq_len), device=query_flat.device)
         logical_blocks = torch.div(positions, key_cache.shape[1], rounding_mode="floor")
@@ -533,7 +535,7 @@ def ar_diffusion_paged_attention(
         valid = positions.unsqueeze(0) < seq_lens.unsqueeze(1)
         packed_k = gathered_k[valid]
         packed_v = gathered_v[valid]
-        out = flash_attn_varlen_func(
+        out = rocm_flash_attn_varlen_func(
             q=query_flat,
             k=packed_k,
             v=packed_v,
@@ -579,8 +581,10 @@ def ar_diffusion_paged_attention(
             # byte-for-byte what a full gather would produce. When the history did move -- new block,
             # slid window, different session -- reuse_history is 0 and the whole window is re-gathered,
             # which is the same work the unstaged path always does.
-            k_flat = stage_key
-            v_flat = stage_value
+            # Keep the marked base tensors as graph inputs, but only stage the
+            # active prefix when the manager allocated a larger capacity.
+            k_flat = stage_key[:max_seq_len]
+            v_flat = stage_value[:max_seq_len]
             if reuse_history:
                 # The caller's metadata must describe a block-aligned current chunk inside the staged
                 # window; anything else is a wrong offset, not a reason to quietly restage everything.
@@ -621,12 +625,12 @@ def ar_diffusion_paged_attention(
             fa_version=fa_version,
         )
     else:
-        from vllm.vllm_flash_attn import flash_attn_varlen_func
+        from vllm.vllm_flash_attn import flash_attn_varlen_func as paged_flash_attn_varlen_func
 
         fa_version = _resolve_fa_version(query_flat.shape[-1])
 
         out = torch.empty_like(query_flat)
-        flash_attn_varlen_func(
+        paged_flash_attn_varlen_func(
             q=query_flat,
             k=key_cache,
             v=value_cache,

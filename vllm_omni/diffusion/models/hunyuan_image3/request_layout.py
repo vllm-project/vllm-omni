@@ -8,7 +8,9 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 
+from vllm_omni.diffusion.diffusion_kv.kv_cache_utils import get_cache_namespace, hash_prefix_cache_value
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -357,7 +359,7 @@ def build_hunyuan_diffusion_kv_requests(
     request: OmniDiffusionRequest,
     prepared_layout: HunyuanPreparedLayout,
 ) -> tuple[DiffusionKVRequest, ...]:
-    """Build one persistent Scheduler KV request per Hunyuan execution row."""
+    """Build allocation-only KV requests, even when prefix caching is disabled."""
 
     tokenizer_output = prepared_layout.tokenizer_output
     cfg_factor = hunyuan_cfg_factor(
@@ -408,7 +410,15 @@ def build_hunyuan_diffusion_kv_requests(
             prefix_len=int(prefix_row[-1].item()),
             target_len=target_len,
             seq_len=int(valid_row[-1].item()),
-            prompt_token_ids=tokenizer_output.tokens[sequence_id, : reusable_lens[sequence_id]].tolist(),
+            # Native AR -> DiT transfer needs token IDs to describe the
+            # transferred prefix.  Local paged prefix caching does not: its
+            # identity is attached later by ``prepare_hunyuan_prefix_cache``.
+            # Keep this conversion out of the disabled/local-only path.
+            prompt_token_ids=(
+                tokenizer_output.tokens[sequence_id, : reusable_lens[sequence_id]].tolist()
+                if request.kv_transfer_params is not None
+                else None
+            ),
             # Prompt and reference-image tokens are already embedded in this
             # row's primary self-attention sequence. Hunyuan therefore has no
             # independently projected cross/joint-attention KV context.
@@ -416,6 +426,93 @@ def build_hunyuan_diffusion_kv_requests(
         )
         for sequence_id, (prefix_row, valid_row) in enumerate(zip(prefix_positions, real_pos))
     )
+
+
+def prepare_hunyuan_prefix_cache(request: OmniDiffusionRequest) -> None:
+    """Attach native MM identities / positions when Engine enables caching.
+
+    This is model input adaptation, not a hashing framework. All reference
+    inputs are hashed once, then reused by VAE/ViT subspans and CFG rows. The
+    native block hasher consumes these ranges directly, without token extras.
+    """
+
+    layout = get_hunyuan_prepared_layout(request)
+    if layout is None or not request.diffusion_kv_requests:
+        raise ValueError("Hunyuan prefix caching requires prepared layout and KV requests")
+    sampling = request.sampling_params
+    _, _, _, images, _ = extract_hunyuan_prompt_inputs(
+        [request.prompt], sampling.extra_args or {}, request_id=request.request_id, allow_cond_image=True
+    )
+    reference_digest = None
+    if images:
+        # Match Worker: an explicitly supplied generator overrides the seed.
+        # Conditional VAE samples latents, so image bytes alone are not enough.
+        if sampling.generator is not None:
+            generators = sampling.generator if isinstance(sampling.generator, list) else [sampling.generator]
+            random_state: object = (
+                "generator-state",
+                tuple((str(generator.device), generator.get_state()) for generator in generators),
+            )
+        elif sampling.seed is not None:
+            random_state = ("seed", int(sampling.seed), str(sampling.generator_device or "worker-default"))
+        else:
+            random_state = ("request-local-random-state", request.request_id)
+        # Preserve the conservative whole-reference-set policy. Splitting
+        # independent image identities also needs the VAE RNG sequence modeled.
+        reference_digest = hash_prefix_cache_value(
+            (
+                "hunyuan-reference-v1",
+                [[joint_image_info_to_payload(image) for image in row] for row in images],
+                random_state,
+            )
+        )
+
+    namespace = get_cache_namespace("hunyuan-image3-primary-v4", sampling)
+    output = layout.tokenizer_output
+    joint_rows = output.joint_image_slices or [[] for _ in range(layout.num_branches)]
+    prepared = []
+    for row in request.diffusion_kv_requests:
+        if row.block_hashes or row.num_computed_tokens:
+            raise ValueError("Hunyuan cache inputs must be prepared before KV execution")
+        joint_spans = [(int(span.start or 0), int(span.stop or 0)) for span in joint_rows[row.sequence_id]]
+        features = []
+        for image_slice, (height, width) in layout.rope_image_info[row.sequence_id]:
+            start = int(image_slice.start or 0)
+            end = int(image_slice.stop or output.tokens.shape[1])
+            if start >= row.prefix_len or end <= 0:
+                continue
+            # Joint spans enclose VAE + separator + ViT; RoPE lists subspans.
+            is_reference = any(joint_start <= start and end <= joint_end for joint_start, joint_end in joint_spans)
+            if is_reference and reference_digest is None:
+                raise ValueError("Hunyuan reference-image prefix is missing its canonical inputs")
+            identifier = hash_prefix_cache_value(
+                (
+                    "hunyuan-image-span-v2",
+                    start,
+                    end,
+                    int(height),
+                    int(width),
+                    is_reference,
+                    reference_digest if is_reference else None,
+                )
+            ).hex()
+            features.append(
+                MultiModalFeatureSpec(
+                    data=None,
+                    modality="image",
+                    identifier=identifier,
+                    mm_position=PlaceholderRange(offset=start, length=end - start),
+                )
+            )
+        # Raw model inputs remain in request.prompt/prepared_layout; data=None
+        # here does not imply an encoder hit. These are Scheduler-only KV keys.
+        tokens = tuple(output.tokens[row.sequence_id, : row.prefix_len].tolist())
+        prepared.append((row, tokens, sorted(features, key=lambda feature: feature.mm_position.offset)))
+
+    for row, tokens, features in prepared:
+        row.cache_token_ids = tokens
+        row.mm_features = features
+        row.cache_namespace = namespace
 
 
 def get_hunyuan_prepared_layout(source: Any) -> HunyuanPreparedLayout | None:

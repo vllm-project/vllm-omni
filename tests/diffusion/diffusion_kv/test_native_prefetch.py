@@ -256,7 +256,11 @@ def _scheduler(monkeypatch, num_blocks=24):
         kv_cache_config=config,
         scheduler_block_size=4,
         hash_block_size=4,
-        kv_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64), max_in_flight_tokens=64),
+        kv_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(max_model_len=64),
+            max_in_flight_tokens=64,
+            cache_config=SimpleNamespace(enable_prefix_caching=False),
+        ),
     )
     return scheduler, connector
 

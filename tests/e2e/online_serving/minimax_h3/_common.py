@@ -267,8 +267,8 @@ def turbo_form(seed: int) -> dict[str, str]:
         "height": str(HEIGHT),
         "fps": str(FPS),
         # The public Turbo artifact has four denoiser evaluations but its API
-        # contract requests five sigma points.
-        "num_inference_steps": "5",
+        # contract requests four denoiser evaluations (five sigma points).
+        "num_inference_steps": "4",
         "flow_shift": "6",
         "seed": str(seed),
         "extra_params": json.dumps(

@@ -8,7 +8,7 @@ Covers: cache → reuse flow, AR KV injection, CFG (sequential & parallel), SP, 
 from __future__ import annotations
 
 import math
-from contextlib import ExitStack, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -59,7 +59,7 @@ class MockAttention(nn.Module):
 @contextmanager
 def patched_mgr_env(sp_size=1):
     target = _TRANSFORMER_MODULE
-    patches = [
+    patches: list[AbstractContextManager] = [
         patch(f"{target}.get_sequence_parallel_world_size", return_value=sp_size),
         patch(f"{target}.get_allgather_parallel_world_size", return_value=sp_size),
         patch(f"{target}.get_ulysses_parallel_world_size", return_value=1, create=True),
@@ -242,6 +242,39 @@ def test_legacy_tensor_prefix_still_uses_dense_cache_and_reuse() -> None:
     assert mgr.attn.calls[-1][1].shape == (1, prefix_len + first_len, NUM_HEADS, HEAD_DIM)
 
 
+@pytest.mark.parametrize("prefix_len", [0, 19])
+@pytest.mark.parametrize("prompt_query_len", [0, 3])
+def test_paged_sp_splits_uncached_queries(prefix_len, prompt_query_len) -> None:
+    from vllm_omni.diffusion.forward_context import override_paged_kv_adapter, set_forward_context
+
+    mgr = _make_cache_mgr(sp_size=2)
+    mgr.attn.paged_kv_active = True
+    shard_image_size = IMAGE_TOKEN_LEN // 2
+    query_len = prompt_query_len + shard_image_size
+    query = torch.randn(2 * query_len, NUM_HEADS, HEAD_DIM)
+    key, value = _make_known_kv(2 * query_len)
+    with set_forward_context(), override_paged_kv_adapter(object()):
+        output = mgr(
+            query,
+            key,
+            value,
+            first_step=True,
+            query_lens=[query_len] * 2,
+            seq_lens=[prefix_len + query_len] * 2,
+            shard_image_size=shard_image_size,
+            full_attn_spans=[[(prefix_len + prompt_query_len, prefix_len + query_len)]] * 2,
+        )
+
+    torch.testing.assert_close(output, query)
+    metadata = mgr.attn.paged_metadata[0]
+    torch.testing.assert_close(
+        metadata.joint_key, key.reshape(2, query_len, NUM_KV_HEADS, HEAD_DIM)[:, :prompt_query_len]
+    )
+    assert metadata.joint_query.shape[1] == prompt_query_len
+    assert mgr.attn.paged_calls[0][0].shape[1] == shard_image_size
+    assert mgr.image_kv_cache_map is None
+
+
 def test_scheduler_paged_kv_runs_piecewise_for_first_and_later_steps() -> None:
     from vllm_omni.diffusion.forward_context import override_paged_kv_adapter, set_forward_context
 
@@ -391,6 +424,7 @@ def test_no_ar_kv(bs):
         gen_timestep_scatter_index=_gen_timestep_index(bs, prompt_len),
     )
 
+    assert mgr.image_kv_cache_map is not None
     cached_key, cached_value = mgr.image_kv_cache_map
     # 3 prompt tokens cached per batch
     assert cached_key.shape == (bs, prompt_len, NUM_KV_HEADS, HEAD_DIM)
@@ -478,12 +512,14 @@ def test_ar_kv_no_cfg(sp_size):
         gen_timestep_scatter_index=_gen_timestep_index(bs, current_start),
     )
 
+    assert mgr.image_kv_cache_map is not None
     cached_key, cached_value = mgr.image_kv_cache_map
     if sp_size == 1:
         # cached = ar(5) + prompt(3) = 8
         expected_cached_len = 8
     else:
         # cached = seq_len - shard_image_size = 17 - 4 = 13
+        assert shard_image_size is not None
         expected_cached_len = seq_len - shard_image_size
 
     assert cached_key.shape == (bs, expected_cached_len, NUM_KV_HEADS, HEAD_DIM)
