@@ -685,7 +685,7 @@ def test_typed_engine_args_own_rocm_attention_default(monkeypatch, tmp_path):
     setattr(
         aiter_module,
         "rocm_aiter_ops",
-        types.SimpleNamespace(is_enabled=lambda: False),
+        types.SimpleNamespace(is_enabled=lambda: True),
     )
     monkeypatch.setitem(sys.modules, "vllm._aiter_ops", aiter_module)
 

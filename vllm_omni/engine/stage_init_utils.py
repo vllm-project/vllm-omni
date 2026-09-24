@@ -544,10 +544,6 @@ def _apply_rocm_attention_backend(
     ):
         return
 
-    from vllm._aiter_ops import rocm_aiter_ops
-
-    if rocm_aiter_ops.is_enabled():
-        engine_args["attention_backend"] = "ROCM_AITER_FA"
     # Before vLLM v0.19.0, the default attention backend is TRITON_ATTN for ROCm.
     # Since vLLM v0.19.0, the default attention backend is ROCM_ATTN for ROCm.
     # However, the compatibility of ROCM_ATTN with Omni is not guaranteed.
