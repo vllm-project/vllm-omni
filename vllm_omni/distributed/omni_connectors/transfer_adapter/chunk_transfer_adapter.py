@@ -653,6 +653,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                         continue
                     info[key] = value
                 request.additional_information = info
+                if replace_snapshot:
+                    # New/resumed requests forward this field with priority
+                    # over additional_information. Replace the prewarm session
+                    # payload too, so chunk zero retains its codec metadata.
+                    request.model_intermediate_buffer = info
                 request.num_computed_tokens = 0
 
                 # Empty chunk with more data expected: keep polling.

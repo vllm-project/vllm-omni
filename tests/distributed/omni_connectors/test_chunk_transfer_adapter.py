@@ -1646,6 +1646,37 @@ def test_load_poll_generation_segment_marker_replaces_previous_chunk(build_adapt
     assert request.request_id in adapter.segment_finished_requests
 
 
+@pytest.mark.parametrize("cache_epoch", [0, 1])
+def test_generation_first_chunk_replaces_prewarm_runner_payload(build_adapter, cache_epoch):
+    from vllm_omni.core.sched.output import OmniNewRequestData
+
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req("req-first-chunk", RequestStatus.WAITING)
+    request.model_intermediate_buffer = {"duplex": {"data_plane": True}, "global_request_id": "session"}
+    connector.get.return_value = (
+        {
+            "codes": {"audio": torch.tensor([7, 8, 9, 10])},
+            "meta": {
+                "cache_epoch": cache_epoch,
+                "chunk_seq": 0,
+                "code_flat_numel": 4,
+                "replace_runtime_additional_information": True,
+            },
+        },
+        1,
+    )
+
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
+    scheduled = OmniNewRequestData.from_request(request, block_ids=([0],))
+
+    # New/resumed requests prioritize model_intermediate_buffer in the runner;
+    # it must carry the same codec snapshot as cached-request updates.
+    assert scheduled.model_intermediate_buffer == scheduled.additional_information
+    assert scheduled.model_intermediate_buffer["meta"]["cache_epoch"] == cache_epoch
+    assert scheduled.model_intermediate_buffer["meta"]["chunk_seq"] == 0
+    assert scheduled.prompt_token_ids == [7, 8, 9, 10]
+
+
 def test_load_poll_generation_empty_replacement_snapshot_is_ready(build_adapter):
     adapter, connector = build_adapter(stage_id=2, model_mode="generation")
     request = _req("req-empty-marker", RequestStatus.WAITING, external_req_id="external-empty-marker")
