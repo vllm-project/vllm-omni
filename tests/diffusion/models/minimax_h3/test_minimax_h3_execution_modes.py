@@ -17,7 +17,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 @pytest.fixture
-def pipeline():
+def pipeline(monkeypatch):
+    # These CPU tests exercise conditioning, not device allocator cleanup.
+    monkeypatch.setattr(MiniMaxH3Pipeline, "_release_stage_cache", lambda self: None)
     model = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(model)
     model.load_text_encoder = True
@@ -119,7 +121,8 @@ def test_prepare_encode_uses_the_same_mode_and_conditioning(pipeline, task, load
     assert pipeline.prepare_encode(state) is state
     assert state.latents is not None
     assert state.latents.shape[1] == 96
-    assert state.total_steps == 1
+    # num_inference_steps counts denoiser evaluations, not sigma boundaries.
+    assert state.total_steps == request.sampling_params.num_inference_steps
     assert pipeline.encode_prompt.call_count == int(load_text_encoder)
     assert pipeline.video_vae.encode_image.call_count == int(load_text_encoder and task != "t2va")
 
