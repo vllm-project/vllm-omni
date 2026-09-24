@@ -16,6 +16,7 @@ For the full list of supported architectures across all modalities, see
 
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
 | --- | --- | --- | --- | --- | --- |
+| AuK / AuK-Flash | assembled local bundle | ✓ (`ref_audio`) | HTTP audio after full generation | — | — |
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | — |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | Gepard-1.0 | `nineninesix/gepard-1.0` | — (zero-shot default voice) | ✓ (PCM / WAV stream) | `default` only | — |
@@ -96,6 +97,41 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 22.05 kHz for Gepard, 24 kHz for the others).
 
 For full request-shape documentation (all parameters, response formats, error codes), see the [Speech API reference](https://github.com/vllm-project/vllm-omni/tree/main/docs/serving/speech_api.md).
+
+---
+
+## AuK / AuK-Flash
+
+AuK serves speech generation and reference-voice synthesis at 24 kHz. Assemble a local bundle before serving:
+
+```bash
+python tools/prepare_auk_checkpoint.py \
+    --auk-dir ckpts/AuK --qwen-dir ckpts/Qwen2.5-Omni-3B --out ckpts/auk-omni
+MODEL=ckpts/auk-omni bash examples/online_serving/text_to_speech/auk/run_server.sh
+```
+
+AuK accepts the complete instruction after you fill in the [local recipe template](../../../../recipes/Tencent/AuK-H100.md#supported-model-contract) or the [official AuK cookbook](https://github.com/Tencent-Hunyuan/AuK/blob/main/docs/COOKBOOK.md). Pass it in `instructions` and leave `input` empty. For instruct TTS, fill in `Generate speech based on the following description: "{voice description}". The content to speak is: "{text}".`; for zero-shot TTS, editing, enhancement and separation, use the corresponding complete instruction from the cookbook. Set `duration_seconds` for text-only generation; with `ref_audio`, omitting it keeps the source length.
+
+For compatibility with clients that can only send `input`, AuK treats an input-only request as the complete instruction and logs a recommendation to move it to `instructions` with `input=""`.
+
+`extra_params` accepts `num_inference_steps`, `guidance_scale`, `sway`, `t_grid`, and `vae_sample`; `seed` is a top-level field.
+
+```bash
+python examples/online_serving/text_to_speech/auk/speech_client.py \
+    --model ckpts/auk-omni \
+    --instructions 'Generate speech based on the following description: "A calm young woman speaking warmly and slowly.". The content to speak is: "Welcome back, how was your day?".' \
+    --duration-seconds 3 --seed 7
+```
+
+Complete-instruction editing also does not need a separate text argument:
+
+```bash
+python examples/online_serving/text_to_speech/auk/speech_client.py \
+    --model ckpts/auk-omni --instructions "Keep pure speech voice, remove noise and reverberation." \
+    --ref-audio noisy.wav --seed 7 --output clean.wav
+```
+
+The client accepts local reference files, URLs, and data URLs. `--stream` writes signed 16-bit 24 kHz PCM after the complete waveform is ready. See `speech_client.py --help` for editing and sampling options.
 
 ---
 

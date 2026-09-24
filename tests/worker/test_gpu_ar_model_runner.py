@@ -214,6 +214,9 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     )
 
     class Adapter:
+        def normalize(self, request):
+            return
+
         def validate(self, request):
             return None
 

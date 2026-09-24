@@ -8,11 +8,22 @@ Pure-Python registry/resolution logic; no model or GPU resources are loaded.
 import asyncio
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
+import torch
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
+from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
+from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
+from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters import (
     TTS_ADAPTER_REGISTRY,
     ARTTSAdapter,
@@ -22,6 +33,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     detect_tts_model_type,
     resolve_adapter,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.auk import AuKAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import resolve_stage_model_path
 from vllm_omni.entrypoints.openai.tts_adapters.covo_audio import CovoAudioAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.higgs_audio_v2 import HiggsAudioV2Adapter
@@ -42,10 +54,12 @@ from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import (
 )
 from vllm_omni.entrypoints.openai.tts_adapters.step_audio2 import StepAudio2Adapter
 from vllm_omni.entrypoints.openai.tts_adapters.voxtral import VoxtralTTSAdapter
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.indextts2 import prompt_utils
 from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
     INDEXTTS25_TOKENIZER_FILE,
 )
+from vllm_omni.model_executor.stage_input_processors.auk import encoder2dit
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -70,6 +84,7 @@ EXPECTED_MODEL_TYPES = {
     "step_audio2",
     "indextts2",
     "indextts2_5",
+    "auk",
     "gepard",
 }
 
@@ -97,6 +112,310 @@ def test_resolve_qwen3_tts_class():
 def test_resolve_unknown_returns_none():
     assert resolve_adapter("not_a_real_model") is None
     assert resolve_adapter(None) is None
+
+
+@pytest.fixture
+def auk_adapter(mocker):
+    server = mocker.Mock(spec=OmniOpenAIServingSpeech)
+    server._max_instructions_length = 4096
+    server._validate_ref_audio_format.return_value = None
+    server._resolve_ref_audio = AsyncMock(return_value=([0.1] * 480, 24000, "key"))
+    return AuKAdapter(SpeechServingContext(server=server))
+
+
+def test_auk_adapter_detection(mocker):
+    assert detect_tts_model_type("encoder", "AuKForConditionalGeneration") == "auk"
+    assert AuKAdapter.stage_keys == frozenset({"encoder"})
+
+    server = mocker.Mock(spec=OmniOpenAIServingSpeech)
+    server._diffusion_mode = False
+    server._tts_model_type = detect_tts_model_type("encoder", "AuKForConditionalGeneration")
+    server._adapter = None
+    server.engine_client = SimpleNamespace()
+
+    adapter = OmniOpenAIServingSpeech._get_tts_adapter(server)
+    assert isinstance(adapter, AuKAdapter)
+    server._drop_shadowing_uploads.assert_called_once_with()
+
+
+def test_auk_source_length_default_and_complete_instruction(auk_adapter):
+    request = OpenAICreateSpeechRequest(
+        input="",
+        ref_audio="reference.wav",
+        ref_text="Accepted transcript",
+        instructions="Change the pitch by one semitone.",
+        extra_params={"sway": -0.5, "t_grid": [0, 0.25, 1], "vae_sample": True},
+    )
+    assert auk_adapter.validate(request) is None
+    prepared = asyncio.run(auk_adapter.build(request, [], True))
+    assert "Change the pitch by one semitone." in prepared.prompt["prompt"]
+    assert "content to speak" not in prepared.prompt["prompt"]
+    knobs = prepared.prompt["additional_information"]["auk"]
+    assert knobs["gen_seconds"] is None
+    assert knobs["vae_sample"] is True
+    assert knobs["t_grid"] == [0, 0.25, 1]
+    auk_adapter.ctx.server._resolve_ref_audio.assert_awaited_once_with("reference.wav")
+
+
+@pytest.mark.parametrize(
+    "t_grid",
+    [
+        [],
+        [0.0],
+        [0.0, 0.0],
+        [0.5, 0.25],
+        [0.0, float("nan")],
+        [0.0, float("inf")],
+        [0.0, "invalid"],
+        "0,1",
+    ],
+)
+def test_auk_rejects_invalid_t_grid_before_dispatch(auk_adapter, t_grid):
+    request = OpenAICreateSpeechRequest(
+        input="Say the following: 'target text'",
+        duration_seconds=2,
+        extra_params={"t_grid": t_grid},
+    )
+
+    error = auk_adapter.validate(request)
+
+    assert error == "AuK extra_params.t_grid must contain at least two finite, strictly increasing values"
+    auk_adapter.ctx.server._resolve_ref_audio.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("task_type", "expected_instruction"),
+    [
+        ("CustomVoice", 'Say the following: "target text"'),
+        ("Base", 'Say the following with the same voice: "target text"'),
+    ],
+)
+def test_auk_task_type_normalizes_benchmark_text(auk_adapter, task_type, expected_instruction, mocker):
+    warning_once = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.auk.logger.warning_once")
+    request = OpenAICreateSpeechRequest(
+        input="target text",
+        task_type=task_type,
+        duration_seconds=2,
+        ref_audio="reference.wav" if task_type == "Base" else None,
+    )
+
+    server = mocker.Mock(spec=OmniOpenAIServingSpeech)
+    server._validate_speech_sample_rate.return_value = None
+    server._get_tts_adapter.return_value = auk_adapter
+    assert OmniOpenAIServingSpeech._validate_tts_request(server, request) is None
+
+    assert request.input == ""
+    assert request.instructions == expected_instruction
+    assert request.task_type is None
+    warning_once.assert_called_once()
+    assert "prefer a complete `instructions` prompt" in warning_once.call_args.args[0]
+
+    auk_adapter.normalize(request)
+
+    assert request.instructions == expected_instruction
+    warning_once.assert_called_once()
+
+
+def test_auk_task_type_quotes_embedded_delimiters(auk_adapter):
+    request = OpenAICreateSpeechRequest(
+        input='It\'s called "AuK"\\Flash',
+        task_type="CustomVoice",
+        duration_seconds=2,
+    )
+
+    auk_adapter.normalize(request)
+
+    assert request.instructions == 'Say the following: "It\'s called \\"AuK\\"\\\\Flash"'
+    assert request.task_type is None
+
+
+def test_auk_task_type_preserves_explicit_instructions(auk_adapter, mocker):
+    warning_once = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.auk.logger.warning_once")
+    warning = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.auk.logger.warning")
+    request = OpenAICreateSpeechRequest(
+        input="target text",
+        task_type="Base",
+        instructions="Use this complete AuK instruction.",
+        duration_seconds=2,
+    )
+
+    server = mocker.Mock(spec=OmniOpenAIServingSpeech)
+    server._validate_speech_sample_rate.return_value = None
+    server._get_tts_adapter.return_value = auk_adapter
+    assert OmniOpenAIServingSpeech._validate_tts_request(server, request) is None
+
+    assert request.input == ""
+    assert request.instructions == "Use this complete AuK instruction."
+    assert request.task_type is None
+    warning_once.assert_called_once()
+    warning.assert_called_once()
+    assert "without applying another task template" in warning.call_args.args[0]
+
+
+def test_auk_task_type_does_not_double_wrap_preformatted_input(auk_adapter, mocker):
+    warning_once = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.auk.logger.warning_once")
+    warning = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.auk.logger.warning")
+    instruction = "Say the following with the same voice: 'target text'"
+    request = OpenAICreateSpeechRequest(
+        input=instruction,
+        task_type="Base",
+        duration_seconds=2,
+        ref_audio="reference.wav",
+    )
+    server = mocker.Mock(spec=OmniOpenAIServingSpeech)
+    server._validate_speech_sample_rate.return_value = None
+    server._get_tts_adapter.return_value = auk_adapter
+
+    assert OmniOpenAIServingSpeech._validate_tts_request(server, request) is None
+
+    assert request.input == ""
+    assert request.instructions == instruction
+    assert request.task_type is None
+    warning_once.assert_called_once()
+    warning.assert_called_once()
+    assert "already contains a complete task instruction" in warning.call_args.args[0]
+
+
+def test_auk_sampling_overrides_reach_stage1_pipeline(auk_adapter, mocker):
+    """Exercise one request from the Speech adapter through stage-1 admission."""
+
+    class RecordingDiffusionStage:
+        stage_type = "diffusion"
+        final_output = True
+        engine_input_source = [0]
+        requires_multimodal_data = False
+        custom_process_input_func = staticmethod(encoder2dit)
+
+        def __init__(self) -> None:
+            self.request: OmniDiffusionRequest | None = None
+
+        async def add_request_async(self, request_id, prompt, sampling_params, **_kwargs) -> None:
+            # Match the stage-client wire boundary and the receiving diffusion
+            # process, where params are serialized then reconstructed before
+            # creating the request consumed by the pipeline.
+            wire_params = StageDiffusionClient._sampling_params_to_dict(sampling_params)
+            self.request = OmniDiffusionRequest(
+                prompt=prompt,
+                sampling_params=StageDiffusionProc._reconstruct_sampling_params(
+                    object.__new__(StageDiffusionProc), wire_params
+                ),
+                request_id=request_id,
+            )
+
+    defaults = [SamplingParams(max_tokens=1), OmniDiffusionSamplingParams(seed=0, num_inference_steps=32)]
+    request = OpenAICreateSpeechRequest(
+        input="",
+        instructions='Generate speech based on the following description: "A calm voice". The content to speak is: "Hello".',
+        duration_seconds=2,
+        seed=9,
+        extra_params={
+            "num_inference_steps": 4,
+            "guidance_scale": 1.5,
+            "sway": -0.5,
+            "t_grid": [0.0, 0.25, 1.0],
+            "vae_sample": True,
+        },
+    )
+    prepared = asyncio.run(auk_adapter.build(request, defaults, False))
+    updated = auk_adapter.apply_sampling_overrides(defaults, request)
+    assert defaults[1].num_inference_steps == 32
+    assert defaults[1].seed == 0
+    assert updated[0].max_tokens == 1
+
+    source_stage = SimpleNamespace(
+        stage_type="llm",
+        final_output=False,
+        get_kv_sender_info=lambda: None,
+    )
+    diffusion_stage = RecordingDiffusionStage()
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.stage_pools = [StagePool(0, source_stage), StagePool(1, diffusion_stage)]
+    orchestrator._cfg_tracker = CfgCompanionTracker()
+    orchestrator.duplex_control_plane = None
+    orchestrator._running_counter = None
+
+    req_state = OrchestratorRequestState(
+        request_id="auk-sampling-override",
+        prompt=prepared.prompt,
+        sampling_params_list=updated,
+        final_stage_id=1,
+    )
+    encoder_output = SimpleNamespace(
+        request_id=req_state.request_id,
+        finished=True,
+        multimodal_output={"hidden_states": {"output": torch.ones(3, 4)}},
+        outputs=[],
+    )
+    asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, req_state.request_id, 0, encoder_output, req_state))
+
+    received = diffusion_stage.request
+    assert received is not None
+    assert received.prompt["prompt_embeds"].shape == (3, 4)
+    assert received.prompt["additional_information"]["auk"] == {
+        "gen_seconds": 2,
+        "sway": -0.5,
+        "t_grid": [0.0, 0.25, 1.0],
+        "vae_sample": True,
+        "has_audio": False,
+    }
+    assert received.sampling_params.num_inference_steps == 4
+    assert received.sampling_params.guidance_scale == 1.5
+    assert received.sampling_params.guidance_scale_provided is True
+    assert received.sampling_params.seed == 9
+
+    runner = mocker.Mock(spec=DiffusionModelRunner)
+    runner.device = torch.device("cpu")
+    DiffusionModelRunner._initialize_generator(runner, received.sampling_params)
+    assert received.sampling_params.generator.initial_seed() == 9
+
+    pipeline_params = DiffusionRequestBatch(requests=[received]).sampling_params
+    assert pipeline_params is received.sampling_params
+    assert pipeline_params.generator.initial_seed() == 9
+
+
+def test_auk_instructions_take_precedence_over_input(auk_adapter, mocker):
+    warning = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.auk.logger.warning")
+    request = OpenAICreateSpeechRequest(
+        input="ignored input",
+        instructions='Generate speech based on the following description: "Speak warmly". The content to speak is: "Hello".',
+        duration_seconds=2,
+    )
+    assert auk_adapter.validate(request) is None
+    prepared = asyncio.run(auk_adapter.build(request, [], False))
+    prompt = prepared.prompt
+    assert 'Generate speech based on the following description: "Speak warmly".' in prompt["prompt"]
+    assert 'The content to speak is: "Hello".' in prompt["prompt"]
+    assert "|<no_prompt_audio>|" in prompt["prompt"]
+    assert prompt["additional_information"]["auk"]["gen_seconds"] == 2
+    warning.assert_called_once()
+    assert "using the complete `instructions`" in warning.call_args.args[0]
+
+
+def test_auk_input_only_is_treated_as_complete_instruction(auk_adapter, mocker):
+    warning = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.auk.logger.warning")
+    request = OpenAICreateSpeechRequest(
+        input="Say the following with the same voice: 'Hello world.'",
+        ref_audio="reference.wav",
+        duration_seconds=2,
+    )
+    assert auk_adapter.validate(request) is None
+    prepared = asyncio.run(auk_adapter.build(request, [], True))
+    assert "Say the following with the same voice: 'Hello world.'" in prepared.prompt["prompt"]
+    assert warning.call_count == 1
+    assert 'Prefer `input=""`' in warning.call_args.args[0]
+
+
+def test_auk_complete_instruction_does_not_require_spoken_text(auk_adapter):
+    request = OpenAICreateSpeechRequest(
+        input="",
+        instructions="Replace 'morning' with 'evening' in the source recording.",
+        ref_audio="reference.wav",
+    )
+    assert auk_adapter.validate(request) is None
+    prepared = asyncio.run(auk_adapter.build(request, [], True))
+    assert prepared.prompt["prompt"].count("Replace 'morning'") == 1
+    assert "Generate speech based on" not in prepared.prompt["prompt"]
+    assert prepared.prompt["additional_information"]["auk"]["gen_seconds"] is None
 
 
 def test_stage_model_path_prefers_typed_override():

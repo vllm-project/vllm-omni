@@ -223,13 +223,16 @@ def build_pipeline(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline_auk, "AuKTransformer", _StubTransformer)
     monkeypatch.setattr(pipeline_auk, "AuKVAE", _StubVAE)
 
-    def _build(variant: str = "base") -> tuple[AuKPipeline, list[dict[str, Any]]]:
+    def _build(
+        variant: str = "base", *, model_config: dict[str, Any] | None = None
+    ) -> tuple[AuKPipeline, list[dict[str, Any]]]:
         calls: list[dict[str, Any]] = []
         monkeypatch.setattr(pipeline_auk, "sample_latents", _stub_sampler(calls))
         od_config = OmniDiffusionConfig(
             model=str(_write_checkpoint(tmp_path, variant)),
             dtype=torch.float32,
             model_class_name="AuKPipeline",
+            model_config=model_config or {},
         )
         return AuKPipeline(od_config=od_config), calls
 
@@ -270,6 +273,20 @@ def _silence(seconds: float, sample_rate: int = SAMPLE_RATE) -> tuple[np.ndarray
 @pytest.mark.core_model
 @pytest.mark.cpu
 class TestRequestParsing:
+    @pytest.mark.parametrize(
+        "model_config, expected_slots",
+        [({}, 32), ({"max_dit_graphs": 1}, 1), ({"max_dit_graphs": 3}, 3), ({"max_dit_graphs": 64}, 64)],
+    )
+    def test_max_dit_graphs_reaches_lazy_cache(self, build_pipeline, model_config, expected_slots):
+        pipeline, _ = build_pipeline(model_config=model_config)
+        assert pipeline.cudagraph_wrapper.max_graphs == expected_slots
+        assert not pipeline.cudagraph_wrapper._cache
+
+    @pytest.mark.parametrize("max_dit_graphs", [0, -1, True, False, 1.5, "3", None])
+    def test_invalid_max_dit_graphs_is_rejected(self, build_pipeline, max_dit_graphs):
+        with pytest.raises(ValueError, match="AuK max_dit_graphs must be a positive integer"):
+            build_pipeline(model_config={"max_dit_graphs": max_dit_graphs})
+
     def test_pipeline_declares_audio_output(self, build_pipeline):
         pipeline, _ = build_pipeline()
 
@@ -295,6 +312,7 @@ class TestRequestParsing:
         assert calls[0]["ref"].shape == (1, 100, LATENT_DIM)
         assert calls[0]["ref_mask"].shape == (1, 100)
         assert calls[0]["c_mask"].shape == (1, 8)
+        assert calls[0]["sampler"] is pipeline.cudagraph_wrapper
         assert outputs[0].output.shape == (300 * HOP,)
         assert outputs[0].output.dtype is torch.float32
 

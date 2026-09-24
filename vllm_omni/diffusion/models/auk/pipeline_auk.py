@@ -27,6 +27,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.auk.auk_transformer import AuKTransformer, dit_state_dict, sample_latents
 from vllm_omni.diffusion.models.auk.auk_vae import AuKVAE
+from vllm_omni.diffusion.models.auk.cudagraph_wrapper import AuKCUDAGraphWrapper
 from vllm_omni.diffusion.models.interface import (
     SupportAudioInput,
     SupportAudioOutput,
@@ -138,6 +139,9 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         super().__init__()
         del prefix  # Weights are not namespaced: one checkpoint, one pipeline.
         self.od_config = od_config
+        max_dit_graphs = od_config.model_config.get("max_dit_graphs", 32)
+        if isinstance(max_dit_graphs, bool) or not isinstance(max_dit_graphs, int) or max_dit_graphs < 1:
+            raise ValueError("AuK max_dit_graphs must be a positive integer")
         self.device = get_local_device()
         self.dtype = getattr(od_config, "dtype", None) or torch.bfloat16
 
@@ -182,6 +186,9 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         self.dit.load_state_dict(_read_dit_weights(model_dir, self.dtype), strict=True)
         self.dit = self.dit.to(device=self.device).eval()
         self.dit.requires_grad_(False)
+        self.cudagraph_wrapper = AuKCUDAGraphWrapper(
+            self.dit, enabled=not od_config.enforce_eager, max_graphs=max_dit_graphs
+        )
 
         logger.info(
             "AuK pipeline ready: variant=%s dtype=%s latent_dim=%d hop=%d sample_rate=%d",
@@ -427,6 +434,7 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
                     device=self.device,
                     dtype=torch.float32,
                     generator=generator,
+                    sampler=self.cudagraph_wrapper,
                 )
 
             latents = latents.float()
