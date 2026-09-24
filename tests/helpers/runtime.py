@@ -150,6 +150,7 @@ class OmniServerParams(NamedTuple):
     use_stage_cli: bool = False
     init_timeout: int | None = None
     stage_init_timeout: int | None = None  # None: fixture supplies default (600 s)
+    startup_timeout: int = SERVER_STARTUP_TIMEOUT_S
 
 
 class OmniServer:
@@ -163,8 +164,10 @@ class OmniServer:
         port: int | None = None,
         env_dict: dict[str, str] | None = None,
         use_omni: bool = True,
+        startup_timeout: int = SERVER_STARTUP_TIMEOUT_S,
     ) -> None:
         cleanup_test_environment()
+        self.startup_timeout = startup_timeout
         self.model = model
         args = list(serve_args)
         self.serve_args = args
@@ -248,7 +251,7 @@ class OmniServer:
             cwd=_omni_subprocess_cwd(),
         )
 
-        max_wait = SERVER_STARTUP_TIMEOUT_S
+        max_wait = self.startup_timeout
         # System clock corrections must not shorten or extend startup waits.
         start_time = time.monotonic()
         while time.monotonic() - start_time < max_wait:
@@ -442,8 +445,11 @@ class OmniServerStageCli(OmniServer):
         stage_ids: list[int] | None = None,
         port: int | None = None,
         env_dict: dict[str, str] | None = None,
+        startup_timeout: int = SERVER_STARTUP_TIMEOUT_S,
     ) -> None:
-        super().__init__(model, serve_args or [], port=port, env_dict=env_dict, use_omni=True)
+        super().__init__(
+            model, serve_args or [], port=port, env_dict=env_dict, use_omni=True, startup_timeout=startup_timeout
+        )
         self.stage_config_path = stage_config_path
         self.master_port = get_open_port()
         resolved_cfg = resolve_deploy_yaml(stage_config_path)
@@ -553,7 +559,7 @@ class OmniServerStageCli(OmniServer):
             for replica_id in range(self.stage_replica_counts.get(stage_id, 1)):
                 self._launch_stage(stage_id, headless=True, replica_id=replica_id)
 
-        max_wait = SERVER_STARTUP_TIMEOUT_S
+        max_wait = self.startup_timeout
         # System clock corrections must not shorten or extend startup waits.
         start_time = time.monotonic()
         while time.monotonic() - start_time < max_wait:
@@ -1033,6 +1039,7 @@ def iter_omni_server(
                 server_args,
                 port=port,
                 env_dict=params.env_dict,
+                startup_timeout=params.startup_timeout,
             ) as server:
                 if model != original_model:
                     server.model = original_model
@@ -1050,6 +1057,7 @@ def iter_omni_server(
                     port=port,
                     env_dict=params.env_dict,
                     use_omni=params.use_omni,
+                    startup_timeout=params.startup_timeout,
                 )
                 if port
                 else OmniServer(
@@ -1057,6 +1065,7 @@ def iter_omni_server(
                     server_args,
                     env_dict=params.env_dict,
                     use_omni=params.use_omni,
+                    startup_timeout=params.startup_timeout,
                 )
             ) as server:
                 if model != original_model:

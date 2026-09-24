@@ -520,6 +520,21 @@ async def _get_output_message(orchestrator_fixture: OrchestratorFixture, *, time
             return msg
 
 
+async def _get_error_message(orchestrator_fixture: OrchestratorFixture, *, timeout: float = 2.0) -> ErrorMessage:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            msg = orchestrator_fixture.output_sync_q.get_nowait()
+        except queue.Empty:
+            await asyncio.sleep(0.01)
+            continue
+        if isinstance(msg, ErrorMessage):
+            return msg
+        if isinstance(msg, OutputMessage):
+            raise AssertionError("Received OutputMessage instead of ErrorMessage")
+    raise AssertionError("Timed out waiting for orchestrator error")
+
+
 async def _get_rpc_message(
     orchestrator_fixture: OrchestratorFixture,
     *,
@@ -1006,19 +1021,11 @@ async def test_async_chunk_raw_terminal_error_preserved_and_finishes_once(orches
         await _wait_for(lambda: len(stage1.add_request_calls) == 1)
         stage1.push_engine_core_outputs(_error_engine_core_outputs(request_id, reason))
 
-        error_msg = await _get_output_message(orchestrator_fixture)
+        error_msg = await _get_error_message(orchestrator_fixture)
 
-        assert error_msg.request_id == request_id
-        assert error_msg.stage_id == 1
-        assert error_msg.finished is True
-        engine_output = error_msg.engine_outputs
-        assert isinstance(engine_output, OmniRequestOutput)
-        assert engine_output.error == reason
-        assert engine_output.error_status_code == 500
-        assert engine_output.error_type == "server_error"
-        assert engine_output.finished is True
-        # Not downgraded to the empty successful STOP completion.
-        assert engine_output.outputs == []
+        assert isinstance(error_msg, ErrorMessage)
+        assert (error_msg.request_id, error_msg.stage_id, error_msg.error) == (request_id, 1, reason)
+        assert error_msg.fatal is False
         await _wait_for(lambda: request_id not in orchestrator_fixture.orchestrator.request_states)
         # abort=True cleanup reached every stage holding the request.
         assert stage0.abort_calls == [[request_id]]
@@ -1069,13 +1076,11 @@ async def test_async_chunk_raw_terminal_error_multi_final_stage_fails_fast(orche
 
         # Without fail-fast the fallback would wait for stage-2 forever and
         # this get would time out.
-        error_msg = await _get_output_message(orchestrator_fixture)
+        error_msg = await _get_error_message(orchestrator_fixture)
 
-        assert error_msg.request_id == request_id
-        assert error_msg.stage_id == 1
-        assert error_msg.finished is True
-        assert error_msg.engine_outputs.error == reason
-        assert error_msg.engine_outputs.error_status_code == 500
+        assert isinstance(error_msg, ErrorMessage)
+        assert (error_msg.request_id, error_msg.stage_id, error_msg.error) == (request_id, 1, reason)
+        assert error_msg.fatal is False
         await _wait_for(lambda: request_id not in orchestrator_fixture.orchestrator.request_states)
         # The still-running final stage was aborted with the request.
         assert stage2.abort_calls == [[request_id]]
@@ -1160,14 +1165,11 @@ async def test_async_chunk_non_final_stage_error_fails_request(orchestrator_fact
         reason = "stage 0 blew up"
         stage0.push_engine_core_outputs(_error_engine_core_outputs(request_id, reason))
 
-        error_msg = await _get_output_message(orchestrator_fixture)
+        error_msg = await _get_error_message(orchestrator_fixture)
 
-        assert error_msg.request_id == request_id
-        assert error_msg.stage_id == 0
-        assert error_msg.finished is True
-        assert error_msg.engine_outputs.error == reason
-        assert error_msg.engine_outputs.error_status_code == 500
-        assert error_msg.engine_outputs.error_type == "server_error"
+        assert isinstance(error_msg, ErrorMessage)
+        assert (error_msg.request_id, error_msg.stage_id, error_msg.error) == (request_id, 0, reason)
+        assert error_msg.fatal is False
         await _wait_for(lambda: request_id not in orchestrator_fixture.orchestrator.request_states)
         assert stage0.abort_calls == [[request_id]]
         assert stage1.abort_calls == [[request_id]]
@@ -2229,6 +2231,47 @@ async def test_abort_retry_does_not_repeat_successful_stage_abort():
     assert first.physical_abort_calls == 1
     assert second.physical_abort_calls == 2
     assert second.bound == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage_id", [0, 1])
+async def test_raw_stage_error_reaches_caller_before_normal_terminal_routing(mocker, stage_id):
+    pools = _build_stage_pools([[FakeStageClient()], [FakeStageClient()]])
+    for pool in pools:
+        mocker.patch.object(pool, "process_llm_raw_outputs", new_callable=mocker.AsyncMock, return_value=[])
+    output_queue: asyncio.Queue[ErrorMessage] = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=output_queue,
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[],
+    )
+    orchestrator.stage_pools = pools
+    orchestrator.request_states["stuck"] = OrchestratorRequestState(request_id="stuck", final_stage_id=1)
+    mocker.patch.object(orchestrator, "_handle_kv_ready_raw_outputs", new_callable=mocker.AsyncMock)
+    cleanup = mocker.patch.object(orchestrator, "_cleanup_request_ids", new_callable=mocker.AsyncMock)
+    normal_terminal = mocker.patch.object(
+        orchestrator, "_apply_raw_terminal_stage_finish", new_callable=mocker.AsyncMock
+    )
+    reason = "Timed out waiting for connector input after 5s"
+    raw = EngineCoreOutputs(
+        outputs=[
+            OmniEngineCoreOutput(
+                request_id="stuck", new_token_ids=[], finish_reason=FinishReason.ERROR, stop_reason=reason
+            )
+        ]
+    )
+    terminal_outputs: dict[str, Any] = {}
+
+    await orchestrator._process_llm_stage_outputs(stage_id, 0, raw, terminal_outputs)
+
+    error = output_queue.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert (error.request_id, error.stage_id, error.error) == ("stuck", stage_id, reason)
+    cleanup.assert_awaited_once_with(["stuck"], abort=True, release_owners=True)
+    normal_terminal.assert_not_awaited()
+    assert not terminal_outputs
+    assert output_queue.empty()
 
 
 @pytest.mark.asyncio

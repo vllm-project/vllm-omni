@@ -794,8 +794,22 @@ class OrchestratorBase:
 
             segment_finished = bool(getattr(eco, "is_segment_finished", False))
 
+            # A non-session ERROR is fatal to the whole request. Handle it
+            # before normal terminal routing so it reaches the client once.
+            if (
+                getattr(eco, "finish_reason", None) == FinishReason.ERROR
+                and not segment_finished
+                and not req_state.session_owned
+            ):
+                reason = getattr(eco, "stop_reason", None)
+                await self._handle_stage_error(
+                    stage_id,
+                    eco,
+                    error=reason if isinstance(reason, str) and reason else "Stage request failed",
+                )
+                continue
+
             # Only streaming requests maintain the per-stage segment snapshot.
-            # Raw-terminal and duplex error handling below applies to all requests.
             if req_state.streaming.enabled:
                 raw_mm = self._completion_multimodal_output(eco, None)
                 req_state.streaming.segments[stage_id] = StreamingSegmentState(
@@ -809,12 +823,7 @@ class OrchestratorBase:
                     None,
                 )
 
-            # ERROR is request-fatal regardless of which pipeline stage
-            # produced it. Keep it separate from final-stage completion
-            # tracking so a non-final stage cannot leave the request hanging.
-            if getattr(eco, "finish_reason", None) == FinishReason.ERROR and not segment_finished:
-                raw_terminal_outputs[req_state.request_id] = eco
-            elif await self._apply_raw_terminal_stage_finish(
+            if await self._apply_raw_terminal_stage_finish(
                 stage_id,
                 eco,
                 req_state,
@@ -1231,7 +1240,7 @@ class OrchestratorBase:
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
-    async def _handle_stage_error(self, stage_id: int, output: Any) -> None:
+    async def _handle_stage_error(self, stage_id: int, output: Any, *, error: str | None = None) -> None:
         """Emit a frontend-visible error and clean up request state."""
         if self._cfg_tracker.is_companion(output.request_id):
             parent_id = self._cfg_tracker.get_parent_id(output.request_id) or output.request_id
@@ -1241,7 +1250,7 @@ class OrchestratorBase:
             ErrorMessage(
                 request_id=parent_id,
                 stage_id=stage_id,
-                error=output.error,
+                error=error if error is not None else output.error,
                 status_code=getattr(output, "error_status_code", None),
                 error_type=getattr(output, "error_type", None),
             )
@@ -2357,20 +2366,20 @@ class OrchestratorBase:
             else:
                 diffusion_prompt = req_state.prompt
 
+            submit_kwargs = self._diffusion_submit_kwargs(req_id, src_stage_id, next_client, req_state, output)
+            payload_sender_info = self._build_payload_sender_info(src_stage_id, request_id=req_id)
+            if payload_sender_info is not None:
+                submit_kwargs["payload_sender_info"] = payload_sender_info
             if already_submitted:
-                replica_id = await next_pool.submit_update(req_id, req_state, diffusion_prompt)
+                replica_id = await next_pool.submit_update(
+                    req_id, req_state, diffusion_prompt, submit_kwargs=submit_kwargs
+                )
             else:
                 replica_id = await next_pool.submit_initial(
                     req_id,
                     req_state,
                     diffusion_prompt,
-                    submit_kwargs=self._diffusion_submit_kwargs(
-                        req_id,
-                        src_stage_id,
-                        next_client,
-                        req_state,
-                        output,
-                    ),
+                    submit_kwargs=submit_kwargs,
                     params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
                 )
             self._on_stage_submitted(

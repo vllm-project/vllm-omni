@@ -60,6 +60,21 @@ class OmniConnectorBase(ABC):
         """Clean up resources for a request."""
         pass
 
+    def get_with_deadline(
+        self,
+        from_stage: str,
+        to_stage: str,
+        get_key: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        deadline: float,
+    ) -> tuple[Any, int] | None:
+        """Receive with a monotonic deadline; blocking backends must override this."""
+        raise NotImplementedError(f"{type(self).__name__} does not support deadline-aware receive")
+
+    def abandon_get(self, get_key: str) -> None:
+        """Retire unresolved discovery attempts; never cancel an active DMA READ."""
+
     @abstractmethod
     def health(self) -> dict[str, Any]:
         """Return health status and metrics."""
