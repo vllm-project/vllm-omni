@@ -830,7 +830,7 @@ class TestTTSMethods:
         resolve_adapter.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_create_speech_cuda_oom_returns_service_unavailable(
+    async def test_create_speech_cuda_oom_returns_internal_server_error(
         self,
         speech_server,
         mocker: MockerFixture,
@@ -845,8 +845,8 @@ class TestTTSMethods:
         response = await speech_server.create_speech(OpenAICreateSpeechRequest(input="Hello"))
 
         assert isinstance(response, ErrorResponse)
-        assert response.error.code == HTTPStatus.SERVICE_UNAVAILABLE
-        assert response.error.type == "ServiceUnavailableError"
+        assert response.error.code == HTTPStatus.INTERNAL_SERVER_ERROR
+        assert response.error.type == "InternalServerError"
 
     @pytest.mark.asyncio
     async def test_create_speech_unexpected_failure_returns_internal_server_error(
@@ -3635,7 +3635,7 @@ class TestAsyncOmniSupportedTasks:
 
 @pytest.mark.parametrize(
     ("status_code", "err_type"),
-    [(HTTPStatus.BAD_REQUEST, "BadRequestError"), (HTTPStatus.SERVICE_UNAVAILABLE, "ServiceUnavailableError")],
+    [(HTTPStatus.BAD_REQUEST, "BadRequestError"), (HTTPStatus.INTERNAL_SERVER_ERROR, "InternalServerError")],
 )
 def test_api_server_create_speech_wraps_error_response_status(
     mocker: MockerFixture,
