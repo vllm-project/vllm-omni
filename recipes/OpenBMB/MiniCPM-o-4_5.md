@@ -1,6 +1,6 @@
 # MiniCPM-o 4.5
 
-> Online serving and offline inference for omni multimodal chat
+> Online full-duplex and chat-completions serving, and offline inference, for omni multimodal chat
 > (text / image / audio / video → text + 24 kHz speech)
 
 ## Summary
@@ -9,8 +9,12 @@
 - Model: [`openbmb/MiniCPM-o-4_5`](https://huggingface.co/openbmb/MiniCPM-o-4_5)
 - Task: Omni multimodal chat — accepts text / image / audio / video input;
   emits text and 24 kHz mono speech in the same response
-- Mode: Online serving via the OpenAI-compatible `/v1/chat/completions`
-  API (plus Gradio demo), and offline inference via `Omni.generate`
+- Mode: Online full-duplex serving over the OpenAI Realtime protocol
+  (`/v1/realtime?duplex=1`, alias `/v1/duplex`), the OpenAI-compatible
+  `/v1/chat/completions` API (plus Gradio demo) on the same server, and
+  offline turn-based inference via `Omni.generate`. Besides those the server
+  exposes only `/v1/models` and `/health`; the other turn-based HTTP routes
+  are not available on a duplex deployment.
 - Maintainer: [`@tc-mb`](https://github.com/tc-mb) (MiniCPM-V / MiniCPM-o team)
 
 ## When to use this recipe
@@ -18,9 +22,10 @@
 Use this recipe as a known-good starting point for serving
 `openbmb/MiniCPM-o-4_5` on vLLM-Omni. MiniCPM-o 4.5 is the omni member
 of the MiniCPM-o family — it runs a multimodal thinker, a streaming
-MiniCPMTTS codec talker, and a separate batched Code2Wav stage so a single
-`/v1/chat/completions` call can return text and 24 kHz speech in one
-shot. The recommended batching deploy isolates the Thinker on GPU 0 and
+MiniCPMTTS codec talker, and a separate batched Code2Wav stage, so a live
+duplex session streams text and 24 kHz speech while it keeps listening, and a
+single `/v1/chat/completions` call returns both in one shot. The
+recommended batching deploy isolates the Thinker on GPU 0 and
 co-locates Talker and Code2Wav on GPU 1; 1-GPU, 3-GPU, and 8x4090 layouts are
 also provided.
 
@@ -28,16 +33,19 @@ also provided.
 
 - Default deploy configs (auto-loaded by HF `model_type=minicpmo` +
   `hf_config.version="4.5"`):
-  - Default single-GPU compatibility layout (auto-loaded):
+    - Default single-GPU compatibility layout (auto-loaded):
     [`vllm_omni/deploy/minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
-  - Recommended 2-GPU continuous-batching layout:
+    - Recommended 2-GPU continuous-batching layout:
     [`vllm_omni/deploy/minicpmo_4_5_2gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_2gpu.yaml),
-  - 3-GPU layout:
+    - 3-GPU layout:
     [`vllm_omni/deploy/minicpmo_4_5_3gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_3gpu.yaml)
-  - 8x RTX 4090 layout:
+    - 8x RTX 4090 layout:
     [`vllm_omni/deploy/minicpmo_4_5_8x4090.yaml`](../../vllm_omni/deploy/minicpmo_4_5_8x4090.yaml)
-- Online example + Gradio demo:
+- Online examples (Realtime CLI demo, browser client, barge-in client,
+  chat-completions client, curl script, Gradio demo):
   [`examples/online_serving/minicpmo/`](../../examples/online_serving/minicpmo/)
+- Duplex API and Python client docs:
+  [`docs/serving/realtime_duplex_api.md`](../../docs/serving/realtime_duplex_api.md)
 - Offline end-to-end example:
   [`examples/offline_inference/minicpmo/`](../../examples/offline_inference/minicpmo/)
 - Pipeline / talker source:
@@ -71,6 +79,35 @@ single-GPU entry point; `minicpmo_4_5_2gpu.yaml` is the recommended
 two-GPU profile. The removed fused two-stage implementation is not retained as
 a fallback because it would duplicate state machines and correctness paths.
 
+### Graph execution
+
+Graph boundaries follow each stage's state model:
+
+| Stage | Graph mode on Ascend | Eager boundary |
+| --- | --- | --- |
+| 0 Thinker | vLLM `PIECEWISE` | multimodal preprocessing and output routing |
+| 1 Talker | vLLM `PIECEWISE` | conditioning preprocessing, codec sampling, request-state updates |
+| 2 Code2Wav | inner exact-shape NPUGraph for the CFM DiT estimator | encoder, timestep embedding, HiFT/RNG, request parsing, stream-state commit |
+
+Stage 2 keeps `enforce_eager: true` for the generation runner because its
+Python request metadata and per-request cache dictionaries are not valid
+outer-graph inputs. The backend captures only the deterministic CFM DiT
+estimator, with an exact graph key for each tensor shape. Timestep embedding
+stays eager because the upstream implementation creates a CPU frequency tensor;
+HiFT stays eager because it generates random phase. The graph cache stores up
+to 32 entries by default, after which unseen shapes run eagerly.
+
+An ACL graph capture failure is fatal to that Stage-2 process because older
+torch-npu releases can leave allocator and RNG capture state invalid. Restart
+the service after a capture failure. To run without capture, set
+`code2wav_enable_npu_graph: false` under the Stage-2
+`platforms.npu.stages[].additional_config` block before startup. Tune the cache
+limit there with `code2wav_max_npu_graphs`. Graph mode also requires
+`ASCEND_LAUNCH_BLOCKING` to be unset or set to `0`.
+
+The inner NPUGraph is independent of the outer runner setting, so do not use a
+global `--enforce-eager` override when Stage 0/1 `PIECEWISE` replay is desired.
+
 ## GPU
 
 ### 1 x GPU (default — single command)
@@ -97,8 +134,19 @@ video. Use the two-GPU profile for production throughput.
 ```bash
 vllm serve openbmb/MiniCPM-o-4_5 --omni \
     --trust-remote-code \
+    --chat-template vllm_omni/transformers_utils/chat_templates/minicpmo45_native.jinja \
+    --chat-template-content-format openai \
     --host 0.0.0.0 --port 8099
 ```
+
+Run these commands from the repository root. The bundled chat template
+matches the Hugging Face `chat(omni_mode=True)` content layout: media and text
+parts are concatenated without adding separators, while whitespace explicitly
+included in a text part is preserved. This matters for speech generation because
+an inserted newline changes the Thinker condition passed to Talker. For image
+questions, place the image before the question, as in the native image-chat
+layout. Continue to request `use_tts_template: true` and
+`enable_thinking: false` for spoken answers.
 
 The deploy config is auto-loaded by the model registry — no
 `--deploy-config` flag needed for this default single-GPU layout.
@@ -139,6 +187,13 @@ as one aggregated chunk, so the table reports Stage 0 metrics.
 
 #### Verification
 
+**Health and model listing**:
+
+```bash
+curl http://localhost:8099/health
+curl http://localhost:8099/v1/models
+```
+
 **Quick smoke test (text-only output)**:
 
 ```bash
@@ -151,8 +206,31 @@ curl http://localhost:8099/v1/chat/completions \
     }'
 ```
 
-**Text + speech in one response** (the headline 4.5 feature). The model
-bridge conditions the Talker from the generated assistant span, so the
+**One duplex turn over the Realtime WebSocket** (text + speech stream back
+while the session keeps listening):
+
+```bash
+python examples/online_serving/minicpmo/realtime_duplex_demo.py \
+    --url ws://localhost:8099/v1/realtime?duplex=1 \
+    --model openbmb/MiniCPM-o-4_5 \
+    --input-wav /path/to/input_16k_mono_pcm16.wav \
+    --ref-audio /path/to/MiniCPM-o-Demo/assets/ref_audio/ref_minicpm_signature.wav \
+    --output-dir /tmp/minicpmo_realtime_duplex_demo
+```
+
+The demo prints transcript deltas as they arrive and saves the streamed
+24 kHz audio to WAV files. The same session shape is available from Python
+through `vllm_omni.clients.duplex.DuplexClient` (over the server) or
+`vllm_omni.clients.inline_duplex.InlineDuplexClient` (in-process, no server;
+`examples/online_serving/barge_in_client.py --inline`).
+
+**Barge-in**: `examples/online_serving/barge_in_client.py` plays a question,
+interrupts the answer with a second WAV and checks that the first response is
+cancelled and the second one is answered.
+
+**Text + speech in one response over `/v1/chat/completions`** (the headline
+4.5 feature, served by the ordinary chat service on the duplex engine). The
+model bridge conditions the Talker from the generated assistant span, so the
 generic serving layer does not inject MiniCPM-specific template defaults.
 `use_tts_template=true` remains supported when explicitly requested:
 
@@ -203,6 +281,12 @@ python examples/online_serving/minicpmo/gradio_demo.py \
 Open `http://<host>:7862` and try a text prompt with the **"Generate
 speech output (TTS)"** checkbox on / off.
 
+**Turn-based generation** is also available offline
+(`examples/offline_inference/minicpmo/`, `Omni.generate`).
+
+The Daily-Omni numbers above were measured on the `/v1/chat/completions`
+route.
+
 #### Notes
 
 - Memory budget: Thinker, Talker, and Code2Wav reserve 0.55, 0.15, and
@@ -211,9 +295,9 @@ speech output (TTS)"** checkbox on / off.
   model processes still share one CUDA device.
 - `--trust-remote-code` is required — the HF repo ships a custom
   `MiniCPMO` config / model class.
-- Stage 0 Thinker and Stage 1 Talker enable vLLM CUDA Graphs. Stage 2 remains
-  eager because its request-owned Flow/HiFT caches and variable chunk/cache
-  shapes are not yet exposed through a static exact-shape graph wrapper.
+- Stage 0 Thinker and Stage 1 Talker enable vLLM CUDA Graphs. Stage 2 keeps its
+  request orchestration eager while using inner CFM and HiFT CUDA Graphs. On
+  Ascend, the exact-shape CFM DiT estimator instead uses inner NPUGraph replay.
 - All default stages use `max_num_seqs: 4` to reduce cross-process GPU
   contention. Talker AR
   state and Code2Wav caches are request-owned; Code2Wav batches only
@@ -224,8 +308,8 @@ speech output (TTS)"** checkbox on / off.
 - `StageRequestStats.batch_size` is a request-scoped placeholder, not the
   scheduler's execution batch.
 - Single-GPU co-location trades throughput for hardware density: Stage 0/1
-  CUDA Graph replay and eager Stage 2 vocoder kernels compete across three
-  CUDA contexts. Use the 8x4090 config or a custom multi-GPU mapping for
+  CUDA Graph replay and Stage 2 vocoder kernels compete across three CUDA
+  contexts. Use the 8x4090 config or a custom multi-GPU mapping for
   throughput-sensitive serving.
 
 ### 8 x RTX 4090 24GB (consumer-GPU layout)
@@ -242,6 +326,8 @@ uses GPU 5. GPUs 6–7 are left free.
 vllm serve openbmb/MiniCPM-o-4_5 --omni \
     --deploy-config vllm_omni/deploy/minicpmo_4_5_8x4090.yaml \
     --trust-remote-code \
+    --chat-template vllm_omni/transformers_utils/chat_templates/minicpmo45_native.jinja \
+    --chat-template-content-format openai \
     --host 0.0.0.0 --port 8099
 ```
 
@@ -284,9 +370,13 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
   and defaults to deterministic seed 42. Stage-1 deploy sampling parameters
   control only vLLM's binary continue/stop token.
 
-- **Output audio**: 24 kHz mono WAV inside the OpenAI-style
-  `message.audio.data` (base64). The Gradio demo's WAV player decodes
-  this automatically.
+- **Output audio**: 24 kHz mono. On `/v1/chat/completions` it is base64 WAV
+  inside the OpenAI-style `message.audio.data` (the Gradio demo's WAV player
+  decodes this automatically); on a duplex session it streams as base64
+  `response.audio.delta` events; offline `Omni.generate` returns WAV.
+- **Response choices**: on `/v1/chat/completions` text and audio are separate
+  choices. SDK clients should select the choice whose `message.audio.data` is
+  populated rather than assuming `choices[0]` contains audio.
 
 - **Routing**: MiniCPM-o 4.5 and 2.6 both ship `architectures=
   ["MiniCPMO"]` in HF config; routing is disambiguated by
@@ -298,6 +388,3 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
 - **Async chunking**: enabled in all deploy configs. Talker sends
   25-code chunks with three-code left context to Code2Wav through
   `SharedMemoryConnector`; terminal chunks flush held lookahead state.
-- **Response choices**: text and audio are separate choices. SDK clients
-  should select the choice whose `message.audio.data` is populated rather
-  than assuming `choices[0]` contains audio.

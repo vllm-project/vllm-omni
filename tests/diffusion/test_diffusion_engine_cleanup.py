@@ -12,6 +12,7 @@ import pytest
 from vllm_omni.diffusion import diffusion_engine as diffusion_engine_module
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import DiffusionRequestStatus, RequestScheduler
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -37,6 +38,7 @@ def _make_engine() -> DiffusionEngine:
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._out_streams = {}
     engine._closed = False
+    engine._shutting_down = False
     engine._shutdown_complete = False
     engine.abort_queue = queue.Queue()
     engine._loop_started = False
@@ -86,6 +88,50 @@ def test_emit_step_outputs_finalizes_finished_request_without_stream() -> None:
     engine._emit_outputs({request_id}, [request_id], SimpleNamespace(get_request_output=lambda _request_id: None))
 
     assert engine.scheduler.get_request_state(request_id) is None
+
+
+def _make_kv_cleanup_engine(mode: DiffusionKVCacheMode) -> tuple[DiffusionEngine, Mock]:
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = SimpleNamespace(diffusion_kv_mode=mode)
+    cleanup = Mock()
+    engine.executor = SimpleNamespace(remove_diffusion_kv_requests=cleanup)
+    return engine, cleanup
+
+
+def test_paged_terminal_output_clears_worker_rows() -> None:
+    engine, cleanup = _make_kv_cleanup_engine(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    engine._finalize_finished_request = lambda request_id, *_args: request_id
+    engine._put_output = lambda *_args: None
+
+    engine._emit_finished_outputs({"req-0", "req-1"})
+
+    cleanup.assert_called_once()
+    assert set(cleanup.call_args.args[0]) == {"req-0", "req-1"}
+
+
+def test_paged_abort_clears_worker_rows_before_scheduler_free() -> None:
+    engine, cleanup = _make_kv_cleanup_engine(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    engine.scheduler = SimpleNamespace(
+        get_request_state=lambda _request_id: None,
+        finish_requests=Mock(side_effect=AssertionError("unknown request must not be logically freed")),
+    )
+
+    engine._abort_requests(["req-idle", "req-idle"])
+
+    cleanup.assert_called_once_with(["req-idle"])
+    engine.scheduler.finish_requests.assert_not_called()
+
+
+def test_dense_terminal_and_abort_paths_skip_worker_row_cleanup() -> None:
+    engine, cleanup = _make_kv_cleanup_engine(DiffusionKVCacheMode.DENSE_LEGACY)
+    engine._finalize_finished_request = lambda request_id, *_args: request_id
+    engine._put_output = lambda *_args: None
+    engine.scheduler = SimpleNamespace(get_request_state=lambda _request_id: None)
+
+    engine._emit_finished_outputs({"req-0"})
+    engine._abort_requests(["req-idle"])
+
+    cleanup.assert_not_called()
 
 
 def test_init_accepts_custom_scheduler(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -161,7 +207,81 @@ def test_scheduler_initialization_failure_closes_scheduler_and_executor(monkeypa
     assert exc_info.value is initialization_error
     custom_scheduler.initialize.assert_called_once_with(od_config)
     custom_scheduler.close.assert_called_once_with()
+
+
+def test_init_shuts_down_executor_when_kv_control_plane_initialization_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_executor = SimpleNamespace(shutdown=Mock())
+    monkeypatch.setattr(DiffusionEngine, "_init_process_hooks", lambda self, config: None)
+    monkeypatch.setattr(
+        DiffusionEngine,
+        "_resolve_execution_mode",
+        lambda self, config: DiffusionExecutionMode.REQUEST_BATCH,
+    )
+    monkeypatch.setattr(
+        DiffusionEngine, "_init_executor", lambda self, config: setattr(self, "executor", fake_executor)
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.initialize_diffusion_kv_control_plane",
+        Mock(side_effect=RuntimeError("KV initialization failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="KV initialization failed"):
+        DiffusionEngine(SimpleNamespace())
+
     fake_executor.shutdown.assert_called_once_with()
+
+
+def test_paged_init_profiles_before_scheduler_initialization(monkeypatch: pytest.MonkeyPatch) -> None:
+    events = []
+    expected_profile_requests = [object()]
+    fake_executor = SimpleNamespace(shutdown=Mock())
+    kv_cache_config = object()
+    kv_vllm_config = object()
+    od_config = SimpleNamespace(diffusion_kv_mode="paged_scheduler")
+
+    monkeypatch.setattr(DiffusionEngine, "_init_process_hooks", lambda self, config: None)
+    monkeypatch.setattr(
+        DiffusionEngine,
+        "_resolve_execution_mode",
+        lambda self, config: DiffusionExecutionMode.REQUEST_BATCH,
+    )
+    monkeypatch.setattr(
+        DiffusionEngine,
+        "_init_executor",
+        lambda self, config: setattr(self, "executor", fake_executor),
+    )
+    monkeypatch.setattr(
+        DiffusionEngine,
+        "_prepare_diffusion_kv_profile_requests",
+        lambda self: events.append("prepare-profile") or expected_profile_requests,
+    )
+
+    def initialize(executor, config, *, profile_requests):
+        events.append("profile-workers")
+        assert executor is fake_executor
+        assert config is od_config
+        assert profile_requests is expected_profile_requests
+        return kv_cache_config, 16, 16, kv_vllm_config
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.initialize_diffusion_kv_control_plane",
+        initialize,
+    )
+
+    def init_scheduler(self, config, scheduler, *args, **kwargs):
+        events.append("initialize-scheduler")
+        self.scheduler = SimpleNamespace(close=Mock())
+
+    monkeypatch.setattr(DiffusionEngine, "_init_scheduler", init_scheduler)
+    monkeypatch.setattr(DiffusionEngine, "_init_runtime_state", lambda self: None)
+    monkeypatch.setattr(DiffusionEngine, "_init_execute_fn", lambda self: None)
+    monkeypatch.setattr(DiffusionEngine, "_log_execution_mode", lambda self, config: None)
+
+    DiffusionEngine(od_config)
+
+    assert events == ["prepare-profile", "profile-workers", "initialize-scheduler"]
 
 
 @pytest.mark.asyncio
@@ -260,3 +380,55 @@ def test_close_defers_resource_shutdown_until_worker_thread_stops() -> None:
     engine.executor.shutdown.assert_called_once()
     assert engine._shutdown_complete is True
     assert engine._loop_started is False
+
+
+def test_fail_engine_does_not_reenter_when_executor_shutdown_fails() -> None:
+    engine = _make_engine()
+    shutdown_error = RuntimeError("worker shutdown failed")
+    engine.executor.shutdown.side_effect = shutdown_error
+    engine.scheduler.close = Mock()
+    engine._fail_pending_rpcs = Mock()
+
+    with pytest.raises(RuntimeError, match="worker shutdown failed"):
+        engine._fail_engine(RuntimeError("engine failed"))
+
+    engine._fail_engine(RuntimeError("follow-up failure"))
+
+    engine.executor.shutdown.assert_called_once_with()
+    engine.scheduler.close.assert_not_called()
+    assert engine._closed is True
+    assert engine._shutting_down is True
+    assert engine._shutdown_complete is False
+
+
+def test_finalize_aborted_request_drops_pending_async_output() -> None:
+    """An aborted request with a pending async output must be drained (#6413).
+
+    The aborted branch of _finalize_finished_request returns before the
+    async_output_id branch, so without draining, the worker's late OUTPUT_READY
+    is cached in the executor's _completed_outputs forever. The engine must tell
+    the executor to drop that output id.
+    """
+    engine = _make_engine()
+    engine.executor = SimpleNamespace(drop_output=Mock())
+    request_id = engine.scheduler.add_request(_make_request("aborted-async"))
+    engine.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+
+    runner_output = SimpleNamespace(result=None, async_output_id="aid-async-1")
+    output = engine._finalize_finished_request(request_id, runner_output)
+
+    assert output.aborted is True
+    engine.executor.drop_output.assert_called_once_with("aid-async-1")
+
+
+def test_finalize_aborted_request_without_async_output_skips_drop() -> None:
+    """No async output pending -> nothing to drop; drop_output not called."""
+    engine = _make_engine()
+    engine.executor = SimpleNamespace(drop_output=Mock())
+    request_id = engine.scheduler.add_request(_make_request("aborted-plain"))
+    engine.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+
+    output = engine._finalize_finished_request(request_id)
+
+    assert output.aborted is True
+    engine.executor.drop_output.assert_not_called()

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """DreamZero pipeline for vllm-omni.
 
@@ -17,11 +17,11 @@ import re as re_module
 from collections import OrderedDict
 from collections.abc import Iterable
 from contextlib import contextmanager
+from typing import ClassVar
 
 import numpy as np
 import torch
 import torch.nn as nn
-from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer, UMT5Config, UMT5EncoderModel
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
@@ -67,9 +67,13 @@ from vllm_omni.experimental.world_models.session_state import (
     resolve_session_state_config,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 logger = logging.getLogger(__name__)
 MAX_DREAMZERO_SESSIONS = 64
+# Shipped DreamZero geometry retains 24 Wan VAE causal-convolution cache
+# entries. This is the measured persistent CUDA upper bound per live session.
+DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION = 603 * 1024 * 1024
 
 # The pipeline's per-session state is a bespoke ``DreamZeroState`` by default, or
 # a ``DreamZeroStateAdapter`` view when the opt-in session manager is enabled.
@@ -118,6 +122,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     methods below. The runner binds one session state only for ``forward()``.
     """
 
+    # Generic warmup cannot synthesize robot observations. AR-Diffusion uses
+    # ar_diffusion_warmup_requests() for model-specific warmup instead.
+    dummy_run_num_frames: ClassVar[int] = 0
+
     _POSITIVE_BRANCH = "positive"
     _NEGATIVE_BRANCH = "negative"
     _ar_diffusion_kv_state = None
@@ -149,6 +157,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             session_capacity=MAX_DREAMZERO_SESSIONS,
             cross_attention=tuple(cross_attention),
             max_scratch_tokens_per_branch=int(transformer.num_action_per_block + transformer.num_state_per_block),
+            model_owned_state_bytes_per_session=DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION,
         )
 
     @contextmanager
@@ -577,7 +586,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 return json.load(f)
 
         try:
-            json_path = hf_hub_download(model_path, relative_path)
+            json_path = hf_api().hf_hub_download(model_path, relative_path)
             with open(json_path) as f:
                 return json.load(f)
         except Exception:
@@ -654,10 +663,6 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         Wan ``feat_cache`` mutation is incompatible with CUDAGraph capture.
         DiT blocks use per-block ``fullgraph=True``.
         """
-        if not torch.cuda.is_available():
-            logger.info("DreamZero setup_compile skipped: CUDA not available.")
-            return
-
         from vllm_omni.diffusion.models.dreamzero.wan_vae_feat_cache_patch import (
             apply_wan_vae_feat_cache_tensor_patch,
         )
@@ -715,7 +720,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     def warmup_compile(self) -> None:
         """Warm up compiled text/image/VAE paths before timed inference."""
-        if not torch.cuda.is_available():
+        if not torch.accelerator.is_available():
             return
 
         state = self.state
@@ -796,12 +801,12 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         latents: tuple[torch.Tensor, torch.Tensor],
         do_true_cfg: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Post-step sync: .contiguous() + cuda.synchronize()"""
+        """Post-step sync: .contiguous() + accelerator stream synchronize"""
         latents = tuple(t.contiguous() for t in latents)
         if do_true_cfg and get_classifier_free_guidance_world_size() > 1:
-            device = next((t.device for t in latents if t.is_cuda), None)
+            device = next((t.device for t in latents if t.device.type != "cpu"), None)
             if device is not None:
-                torch.cuda.current_stream(device).synchronize()
+                torch.accelerator.current_stream(device).synchronize()
         return latents
 
     # -----------------------------------------------------------------------

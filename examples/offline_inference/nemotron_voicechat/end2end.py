@@ -67,7 +67,7 @@ def main() -> None:
     parser.add_argument("--output-dir", default="results/nemotron_voicechat")
     parser.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT)
     parser.add_argument(
-        "--stage-configs-path",
+        "--deploy-config",
         default=None,
         help=(
             "Deploy yaml override. Pass vllm_omni/deploy/nemotron_labs_voicechat_streaming.yaml "
@@ -134,8 +134,8 @@ def main() -> None:
     ]
 
     omni_kwargs: dict = {}
-    if args.stage_configs_path:
-        omni_kwargs["stage_configs_path"] = args.stage_configs_path
+    if args.deploy_config:
+        omni_kwargs["deploy_config"] = args.deploy_config
     omni = Omni(model=str(ckpt), trust_remote_code=True, **omni_kwargs)
     outputs = omni.generate(inputs, sampling_params_list)
 

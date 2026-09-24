@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """``omni_snapshot_download`` must honor vLLM's ``VLLM_USE_MODELSCOPE`` semantics.
 
-vLLM treats the flag as enabled only for the literal string ``"true"``
-(case-insensitive). Reading ``os.environ`` directly made every non-empty value
-truthy, so an explicit opt-out such as ``VLLM_USE_MODELSCOPE=0`` still took the
-ModelScope path.
+vLLM treats the flag as enabled for the literal strings ``"1"`` or ``"true"``
+(case-insensitive; see vllm.envs). Reading ``os.environ`` directly made every
+non-empty value truthy, so an explicit opt-out such as ``VLLM_USE_MODELSCOPE=0``
+still took the ModelScope path.
 """
 
 import sys
@@ -127,7 +127,7 @@ def download_backend(monkeypatch: pytest.MonkeyPatch):
     return run
 
 
-@pytest.mark.parametrize("value", ["0", "1", "False", "false", "no", "off"])
+@pytest.mark.parametrize("value", ["0", "False", "false", "no", "off"])
 def test_non_true_values_do_not_enable_modelscope(monkeypatch, download_backend, value):
     monkeypatch.setenv("VLLM_USE_MODELSCOPE", value)
 
@@ -135,7 +135,7 @@ def test_non_true_values_do_not_enable_modelscope(monkeypatch, download_backend,
     assert download_backend() == "huggingface"
 
 
-@pytest.mark.parametrize("value", ["true", "True", "TRUE"])
+@pytest.mark.parametrize("value", ["1", "true", "True", "TRUE"])
 def test_true_values_enable_modelscope(monkeypatch, download_backend, value):
     monkeypatch.setenv("VLLM_USE_MODELSCOPE", value)
 

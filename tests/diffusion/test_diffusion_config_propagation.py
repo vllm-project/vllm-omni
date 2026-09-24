@@ -1,27 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests that parallel_config survives the create_default_diffusion roundtrip.
 
 Regression tests for https://github.com/vllm-project/vllm-omni/issues/1862
 """
 
+import json
 from collections.abc import Mapping
 
 import pytest
 import torch
 
 from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.omni_config import extract_diffusion_stage_config_kwargs
 from vllm_omni.diffusion.data import (
     DiffusionParallelConfig,
     OmniDiffusionConfig,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.model_metadata import (
+    FLUX2_KLEIN_MAX_INPUT_IMAGES,
     HUNYUAN_IMAGE3_MAX_INPUT_IMAGES,
     QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture(autouse=True)
+def _local_model_paths(monkeypatch):
+    # These tests exercise config transport, not model repository resolution.
+    monkeypatch.setattr("vllm_omni.diffusion.data.get_model_path", lambda model, revision: model)
 
 
 def _roundtrip_diffusion_config(**kwargs) -> OmniDiffusionConfig:
@@ -33,7 +42,8 @@ def _roundtrip_diffusion_config(**kwargs) -> OmniDiffusionConfig:
     """
     stages = StageConfigFactory.create_default_diffusion(kwargs)
     engine_args = dict(stages[0]["engine_args"])
-    return OmniDiffusionConfig.from_kwargs(**engine_args)
+    diffusion_kwargs = extract_diffusion_stage_config_kwargs(engine_args, stage_id=0)
+    return OmniDiffusionConfig(**{name: value for name, value in diffusion_kwargs.items() if value is not None})
 
 
 class TestParallelConfigPropagation:
@@ -50,9 +60,7 @@ class TestParallelConfigPropagation:
         stages = StageConfigFactory.create_default_diffusion({"parallel_config": pc, "model": "x"})
         assert stages[0]["runtime"]["devices"] == "0,1,2,3"
 
-        # Let __post_init__ reconstruct from dict (real code path)
-        ea = dict(stages[0]["engine_args"])
-        od = OmniDiffusionConfig.from_kwargs(**ea)
+        od = _roundtrip_diffusion_config(parallel_config=pc, model="x")
         assert od.parallel_config.tensor_parallel_size == 4
         assert od.parallel_config.world_size == 4
 
@@ -92,6 +100,30 @@ class TestParallelConfigPropagation:
         od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
         assert od.num_gpus == 2
 
+    def test_dp_is_inferred_from_num_gpus(self):
+        pc = DiffusionParallelConfig(tensor_parallel_size=2, ulysses_degree=2)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=8)
+        assert od.parallel_config.data_parallel_size == 2
+        assert od.parallel_config.world_size == 8
+
+    def test_explicit_dp_is_validated_against_num_gpus(self):
+        pc = DiffusionParallelConfig(tensor_parallel_size=2, data_parallel_size=2)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4)
+        assert od.parallel_config.data_parallel_size == 2
+
+        with pytest.raises(ValueError, match="does not match WORLD-derived value"):
+            OmniDiffusionConfig.from_kwargs(
+                model="x",
+                parallel_config=DiffusionParallelConfig(tensor_parallel_size=2, data_parallel_size=2),
+                num_gpus=8,
+            )
+
+    def test_hsdp_does_not_infer_ordinary_dp(self):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_shard_size=4)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4)
+        assert od.parallel_config.data_parallel_size == 1
+        assert od.parallel_config.world_size == 4
+
 
 class TestCreateDefaultDiffusion:
     """Verify engine_args structure from create_default_diffusion."""
@@ -107,11 +139,20 @@ class TestCreateDefaultDiffusion:
 
     def test_dtype_serialized_as_string(self):
         stages = StageConfigFactory.create_default_diffusion({"dtype": torch.float16, "model": "x"})
-        assert stages[0]["engine_args"]["dtype"] == "torch.float16"
+        assert stages[0]["engine_args"]["dtype"] == "float16"
 
     def test_cache_backend_defaults_to_none(self):
         stages = StageConfigFactory.create_default_diffusion({"model": "x"})
         assert stages[0]["engine_args"]["cache_backend"] == "none"
+
+    def test_explicit_none_cache_backend_canonicalizes_to_none(self):
+        """Regression for #7032: ``cache_backend=None`` (e.g. an example CLI default)
+        must reach the pipeline as the canonical ``"none"`` string."""
+        od = _roundtrip_diffusion_config(model="x", cache_backend=None)
+        assert od.cache_backend == "none"
+
+        od = OmniDiffusionConfig.from_kwargs(model="x", cache_backend=None)
+        assert od.cache_backend == "none"
 
     def test_single_gpu_default_devices(self):
         stages = StageConfigFactory.create_default_diffusion({"model": "x"})
@@ -125,10 +166,44 @@ class TestCreateDefaultDiffusion:
         assert ea["enforce_eager"] is True
         assert ea["lora_path"] == "/tmp/lora"
 
-    def test_diffusion_kv_mode_roundtrip(self):
-        od = _roundtrip_diffusion_config(model="x", diffusion_kv_mode="paged_scheduler")
+    def test_diffusion_kv_mode_roundtrip(self, monkeypatch):
+        from vllm_omni.platforms import current_omni_platform
+
+        monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+        od = _roundtrip_diffusion_config(
+            model="x",
+            diffusion_kv_mode="paged_scheduler",
+            diffusion_kv_max_rows_per_request=2,
+        )
 
         assert od.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
+        assert od.diffusion_kv_max_rows_per_request == 2
+
+    def test_diffusion_kv_sizing_fields_roundtrip(self, monkeypatch):
+        monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda self: 29500)
+        od = _roundtrip_diffusion_config(
+            model="x",
+            kv_cache_memory_bytes=4096,
+            gpu_memory_utilization=0.75,
+            max_num_batched_tokens=2048,
+            max_model_len=4096,
+        )
+
+        assert od.kv_cache_memory_bytes == 4096
+        assert od.gpu_memory_utilization == 0.75
+        assert od.max_num_batched_tokens == 2048
+        assert od.max_model_len == 4096
+
+    @pytest.mark.parametrize(
+        ("field_name", "value"),
+        [
+            ("enable_sleep_mod", None),
+            ("enable_lora", True),
+        ],
+    )
+    def test_unowned_raw_field_is_rejected(self, field_name, value):
+        with pytest.raises(ValueError, match=field_name):
+            StageConfigFactory.create_default_diffusion({"model": "x", field_name: value})
 
 
 def test_qwen_image_edit_plus_sets_generic_multimodal_limit():
@@ -138,6 +213,29 @@ def test_qwen_image_edit_plus_sets_generic_multimodal_limit():
 
     assert od_config.supports_multimodal_inputs is True
     assert od_config.max_multimodal_image_inputs == QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES
+
+
+def test_vae_fast_path_roundtrip():
+    assert _roundtrip_diffusion_config(model="x").vae_fast_path == "lossless"
+    od = _roundtrip_diffusion_config(model="x", vae_fast_path="channels_last")
+    assert od.vae_fast_path == "channels_last"
+
+
+def test_invalid_vae_fast_path_is_rejected():
+    with pytest.raises(ValueError, match="vae_fast_path"):
+        OmniDiffusionConfig(model="x", vae_fast_path="fast")
+
+
+def test_flux2_klein_sets_generic_multimodal_limit():
+    od_config = OmniDiffusionConfig(
+        model="black-forest-labs/FLUX.2-klein-9B",
+        model_class_name="Flux2KleinPipeline",
+    )
+
+    od_config.update_multimodal_support()
+
+    assert od_config.supports_multimodal_inputs is True
+    assert od_config.max_multimodal_image_inputs == FLUX2_KLEIN_MAX_INPUT_IMAGES
 
 
 def test_task_type_roundtrip():
@@ -167,6 +265,21 @@ def test_architecture_name_resolves_via_pipeline_class_fallback():
 
     assert hunyuan_od_config.supports_multimodal_inputs is True
     assert hunyuan_od_config.max_multimodal_image_inputs == HUNYUAN_IMAGE3_MAX_INPUT_IMAGES
+
+
+def test_architecture_only_checkpoint_propagates_multimodal_limit(tmp_path):
+    """A config.json-only checkpoint must expose its image-input capability."""
+    (tmp_path / "config.json").write_text(
+        json.dumps({"architectures": ["HunyuanImage3ForCausalMM"]}),
+        encoding="utf-8",
+    )
+
+    od_config = OmniDiffusionConfig(model=str(tmp_path))
+    od_config.enrich_config()
+
+    assert od_config.model_class_name == "HunyuanImage3ForCausalMM"
+    assert od_config.supports_multimodal_inputs is True
+    assert od_config.max_multimodal_image_inputs == HUNYUAN_IMAGE3_MAX_INPUT_IMAGES
 
 
 def test_additional_config_roundtrip():

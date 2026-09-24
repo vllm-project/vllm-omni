@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from importlib.util import find_spec
 
 import torch
@@ -34,9 +37,6 @@ class LayerNorm(nn.LayerNorm, CustomOp):
         return self.forward_native(x)
 
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(x)
-
-    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_native(x)
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
@@ -85,7 +85,10 @@ class RMSNorm(CustomOp):
     def forward_cuda(
         self,
         x: torch.Tensor,
-    ) -> torch.Tensor:
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is not None:
+            return self.forward_native(x, residual)
         # During torch.compile tracing, fused_rms_norm writes to `out` in-place
         # (returns None) and accesses self.weight.data, which is a DTensor under
         # HSDP. Both patterns confuse inductor's compute_ancestors scheduler.
@@ -101,7 +104,10 @@ class RMSNorm(CustomOp):
     def forward_hip(
         self,
         x: torch.Tensor,
-    ) -> torch.Tensor:
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is not None:
+            return self.forward_native(x, residual)
         if torch.compiler.is_compiling():
             return self.forward_native(x)
         try:
@@ -112,7 +118,10 @@ class RMSNorm(CustomOp):
     def forward_musa(
         self,
         x: torch.Tensor,
-    ) -> torch.Tensor:
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is not None:
+            return self.forward_native(x, residual)
         # Preserve the aten::rms_norm graph so dynamic Inductor can fuse the
         # H3 Q/K norm with its inline RoPE path on MUSA.
         return F.rms_norm(
@@ -125,104 +134,35 @@ class RMSNorm(CustomOp):
     def forward_npu(
         self,
         x: torch.Tensor,
-    ) -> torch.Tensor:
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         import torch_npu
+
+        if residual is not None:
+            output, _, updated_residual = torch_npu.npu_add_rms_norm(
+                x,
+                residual,
+                self.weight,
+                self.variance_epsilon,
+            )
+            return output, updated_residual
 
         output = torch_npu.npu_rms_norm(x, gamma=self.weight, epsilon=self.variance_epsilon)[0]
 
         return output
 
-    def forward_xpu(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.forward_native(x)
-
     def forward_native(
         self,
         x: torch.Tensor,
-    ) -> torch.Tensor:
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is not None:
+            residual = residual + x
+            x = residual
         input_dtype = x.dtype
         x = x.to(torch.float32)
         variance = x.pow(2).mean(-1, keepdim=True)
         out = x * torch.rsqrt(variance + self.variance_epsilon)
         out = self.weight.to(torch.float32) * out
-        return out.to(input_dtype)
-
-
-class RMSNormVAE(CustomOp):
-    """Root Mean Square Layer Normalization for Channel-First or Last"""
-
-    def __init__(
-        self,
-        dim: int,
-        channel_first: bool = True,
-        images: bool = True,
-        bias: bool = False,
-        epsilon: float = 1e-6,
-    ) -> None:
-        super().__init__()
-        broadcastable_dims = (1, 1, 1) if not images else (1, 1)
-        shape = (dim, *broadcastable_dims) if channel_first else (dim,)
-
-        self.channel_first = channel_first
-        self.scale = dim**0.5
-        self.gamma = nn.Parameter(torch.ones(shape))
-        self.bias = nn.Parameter(torch.zeros(shape)) if bias else None
-        self.epsilon = epsilon
-
-        self.gamma_rmsnorm = None
-
-    def forward_cuda(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.forward_native(x)
-
-    def forward_hip(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.forward_native(x)
-
-    def forward_npu(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        import torch_npu
-
-        if self.gamma_rmsnorm is None:
-            self.gamma_rmsnorm = self.gamma.reshape(-1)
-
-        if self.channel_first:
-            x = x.transpose(1, -1)
-            out = torch_npu.npu_rms_norm(x, self.gamma_rmsnorm, epsilon=self.epsilon)[0].transpose(1, -1)
-        else:
-            out = torch_npu.npu_rms_norm(x, self.gamma_rmsnorm, epsilon=self.epsilon)[0]
-
-        if self.bias is not None:
-            out = out + self.bias
-        return out
-
-    def forward_xpu(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.forward_native(x)
-
-    def forward_native(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        out = (
-            F.normalize(
-                x,
-                dim=(1 if self.channel_first else -1),
-                eps=self.epsilon,
-            )
-            * self.scale
-            * self.gamma
-        )
-        if self.bias is not None:
-            out = out + self.bias
-        return out
+        out = out.to(input_dtype)
+        return (out, residual) if residual is not None else out

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -26,17 +26,34 @@ from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, Pipe
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
+from vllm_omni.diffusion.media import (
+    DiffusionMediaOutput,
+    VideoMediaOutput,
+    VideoTensorEncoding,
+    VideoTensorLayout,
+    VideoTensorSpec,
+    VideoValueRange,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
+    resolve_wan_output_fps,
+    resolve_wan_preencode_batch_frames,
+    resolve_wan_preencode_mp4,
+    resolve_wan_video_codec_options,
+    wan_preencoded_mp4_payload,
+)
 from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
-from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
+from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention, WanTransformer3DModel
+from vllm_omni.diffusion.offloader import OffloadPlan
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.chunked_video import decode_to_mp4
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
@@ -44,13 +61,17 @@ from vllm_omni.platforms import current_omni_platform
 logger = logging.getLogger(__name__)
 DEBUG_PERF = False
 WAN_SAMPLE_SOLVER_CHOICES = {"unipc", "euler"}
+FASTWAN_DMD_TIMESTEPS = (1000.0, 757.0, 522.0)
+FASTWAN_DMD_SCHEDULER_SHIFT = 8.0
 
 
 def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
     if sample_solver == "unipc":
+        # Keep native Wan's unshifted training endpoints; set_timesteps applies
+        # the requested shift to the interpolated inference sigmas.
         return FlowUniPCMultistepScheduler(
             num_train_timesteps=1000,
-            shift=flow_shift,
+            shift=1.0,
             prediction_type="flow_prediction",
         )
     if sample_solver == "euler":
@@ -62,6 +83,30 @@ def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
     raise ValueError(
         f"Unsupported Wan sample_solver: {sample_solver}. Expected one of: {sorted(WAN_SAMPLE_SOLVER_CHOICES)}"
     )
+
+
+def load_wan_weights_with_optional_gate(model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    """Load Wan weights and discard optional VSA gates absent from the checkpoint."""
+    gate_param_names = {name for name, _ in model.named_parameters() if ".to_gate_compress." in name}
+    has_gate_compress_weights = False
+
+    def tracked_weights():
+        nonlocal has_gate_compress_weights
+        for name, weight in weights:
+            if ".to_gate_compress." in name:
+                has_gate_compress_weights = True
+            yield name, weight
+
+    loaded_weights = AutoWeightsLoader(model).load_weights(tracked_weights())
+    setattr(model, "has_gate_compress_weights", has_gate_compress_weights)
+    if not has_gate_compress_weights:
+        for module in model.modules():
+            if isinstance(module, WanSelfAttention):
+                module.to_gate_compress = None
+
+    # Optional gate parameters are absent from public FullAttn/DMD checkpoints.
+    loaded_weights.update(gate_param_names)
+    return loaded_weights
 
 
 def resolve_wan_sample_solver(req: OmniDiffusionRequest, default: str = "unipc") -> str:
@@ -129,9 +174,9 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
     else:
         # Try to download config from HF Hub
         try:
-            from huggingface_hub import hf_hub_download
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
-            config_path = hf_hub_download(
+            config_path = hf_api().hf_hub_download(
                 repo_id=model_path,
                 filename=f"{subfolder}/config.json",
             )
@@ -142,8 +187,36 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
     return {}
 
 
+def resolve_wan_transformer_quant_config(
+    config: dict, quant_config: QuantizationConfig | None, component: str
+) -> QuantizationConfig | None:
+    """Resolve the expert before applying its checkpoint's storage contract."""
+    from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+    from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+
+    # Wan experts are siblings: "transformer_2" must not inherit "transformer"
+    # through the generic layer-prefix resolver. Select the whole expert name.
+    component_quant_config = (
+        quant_config.component_configs.get(component, quant_config.default_config)
+        if isinstance(quant_config, ComponentQuantizationConfig)
+        else quant_config
+    )
+    quantization_disabled = isinstance(quant_config, ComponentQuantizationConfig) and component_quant_config is None
+    resolved_quant_config = resolve_quant_config_from_disk(component_quant_config, config.get("quantization_config"))
+    if quantization_disabled and resolved_quant_config is not None:
+        raise ValueError(
+            f"Quantization is disabled for component {component!r}, but its checkpoint declares quantization. "
+            "Use a BF16 checkpoint for this component or enable its matching quantization method."
+        )
+    return resolved_quant_config
+
+
 def create_transformer_from_config(
-    config: dict, quant_config: QuantizationConfig | None = None, prefix: str = ""
+    config: dict,
+    quant_config: QuantizationConfig | None = None,
+    prefix: str = "",
+    *,
+    component: str = "transformer",
 ) -> WanTransformer3DModel:
     """Create WanTransformer3DModel from config dict."""
     kwargs: dict = {}
@@ -179,11 +252,7 @@ def create_transformer_from_config(
     if "pos_embed_seq_len" in config:
         kwargs["pos_embed_seq_len"] = config["pos_embed_seq_len"]
 
-    if "quantization_config" in config:
-        from vllm_omni.quantization.factory import resolve_quant_config_from_disk
-
-        quant_config = resolve_quant_config_from_disk(quant_config, config["quantization_config"])
-
+    quant_config = resolve_wan_transformer_quant_config(config, quant_config, component)
     if quant_config is not None:
         kwargs["quant_config"] = quant_config
     if prefix:
@@ -208,6 +277,9 @@ def get_wan22_post_process_func(
             output_type = sampling_params.output_type
         if output_type == "latent":
             return video
+        encoded = wan_preencoded_mp4_payload(video)
+        if encoded is not None:
+            return encoded
         video_metadata = {}
         if sampling_params is not None and getattr(sampling_params, "enable_frame_interpolation", False):
             video, multiplier = interpolate_video_tensor(
@@ -282,6 +354,13 @@ def get_wan22_pre_process_func(
     return pre_process_func
 
 
+_WAN_TEXT_ENCODER_OFFLOAD_PLAN = OffloadPlan(
+    encoder_component_types={"text_encoder": "text_encoder"},
+    encoder_block_attrs={"text_encoder": ("encoder.block",)},
+    encoder_dlo_weight_replication=frozenset({"text_encoder"}),
+)
+
+
 class Wan22Pipeline(
     nn.Module,
     PipelineParallelMixin,
@@ -296,6 +375,7 @@ class Wan22Pipeline(
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+    _offload_plan = _WAN_TEXT_ENCODER_OFFLOAD_PLAN
 
     def __init__(
         self,
@@ -314,6 +394,7 @@ class Wan22Pipeline(
 
         # Read model_index.json to detect expand_timesteps mode (for TI2V-5B)
         self.expand_timesteps = False
+        self.is_dmd = False
         self.has_transformer_2 = False
         if local_files_only:
             model_index_path = os.path.join(model, "model_index.json")
@@ -321,18 +402,20 @@ class Wan22Pipeline(
                 with open(model_index_path) as f:
                     model_index = json.load(f)
                     self.expand_timesteps = model_index.get("expand_timesteps", False)
+                    self.is_dmd = model_index.get("_class_name") == "WanDMDPipeline"
             # Check if this is a two-stage model (MoE with transformer_2)
             transformer_2_path = os.path.join(model, "transformer_2")
             self.has_transformer_2 = os.path.exists(transformer_2_path)
         else:
             # For remote models, download and read model_index.json
             try:
-                from huggingface_hub import hf_hub_download
+                from vllm_omni.transformers_utils.repo_utils import hf_api
 
-                model_index_path = hf_hub_download(repo_id=model, filename="model_index.json")
+                model_index_path = hf_api().hf_hub_download(repo_id=model, filename="model_index.json")
                 with open(model_index_path) as f:
                     model_index = json.load(f)
                     self.expand_timesteps = model_index.get("expand_timesteps", False)
+                    self.is_dmd = model_index.get("_class_name") == "WanDMDPipeline"
                     # Check transformer_2 from model_index
                     transformer_2_info = model_index.get("transformer_2", [None, None])
                     self.has_transformer_2 = transformer_2_info[0] is not None
@@ -412,15 +495,19 @@ class Wan22Pipeline(
         # Initialize transformers with correct config (weights loaded via load_weights)
         if load_transformer:
             transformer_config = load_transformer_config(model, "transformer", local_files_only)
-            self.transformer = self._create_transformer(transformer_config)
+            self.transformer = self._create_transformer(transformer_config, component="transformer")
         else:
             self.transformer = None
 
         if load_transformer_2:
             transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
-            self.transformer_2 = self._create_transformer(transformer_2_config)
+            self.transformer_2 = self._create_transformer(transformer_2_config, component="transformer_2")
         else:
             self.transformer_2 = None
+
+        for transformer in (self.transformer, self.transformer_2):
+            if transformer is not None:
+                transformer.preserve_vsa_all_blocks = self.is_dmd
 
         # Store the active transformer config
         if load_transformer:
@@ -430,8 +517,14 @@ class Wan22Pipeline(
         else:
             raise RuntimeError("No transformer loaded")
 
-        self._sample_solver = "unipc"
-        self._flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
+        self._sample_solver = "euler" if self.is_dmd else "unipc"
+        self._flow_shift = (
+            FASTWAN_DMD_SCHEDULER_SHIFT
+            if self.is_dmd
+            else od_config.flow_shift
+            if od_config.flow_shift is not None
+            else 5.0
+        )
         self.scheduler = build_wan_scheduler(self._sample_solver, self._flow_shift)
 
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if getattr(self, "vae", None) else 4
@@ -446,10 +539,17 @@ class Wan22Pipeline(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
 
-    def _create_transformer(self, config: dict) -> WanTransformer3DModel:
+    def _create_transformer(self, config: dict, component: str = "transformer") -> WanTransformer3DModel:
         """Create a transformer from a config dict. Respects od_config.quantization_config."""
         quant_config = getattr(self.od_config, "quantization_config", None)
-        return create_transformer_from_config(config, quant_config=quant_config)
+        # Startup metadata describes the first expert, not a user policy for both.
+        if getattr(self.od_config, "quantization_config_is_auto_detected", False):
+            quant_config = None
+        return create_transformer_from_config(
+            config,
+            quant_config=quant_config,
+            component=component,
+        )
 
     @property
     def guidance_scale(self):
@@ -480,6 +580,7 @@ class Wan22Pipeline(
         attention_kwargs: dict[str, Any],
         latent_condition: torch.Tensor | None = None,
         first_frame_mask: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
@@ -561,7 +662,20 @@ class Wan22Pipeline(
                     cfg_normalize=False,
                 )
 
-                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                if self.is_dmd:
+                    pred_clean = self.scheduler.predict_clean(noise_pred, latents, t).to(noise_pred.dtype)
+                    if step_idx + 1 < len(timesteps):
+                        noise = randn_tensor(
+                            latents.shape,
+                            generator=generator,
+                            device=latents.device,
+                            dtype=pred_clean.dtype,
+                        )
+                        latents = self.scheduler.add_noise(pred_clean, noise, timesteps[step_idx + 1])
+                    else:
+                        latents = pred_clean
+                else:
+                    latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
                 pbar.update()
 
         return latents
@@ -600,13 +714,23 @@ class Wan22Pipeline(
         mod_value = self.vae_scale_factor_spatial * patch_size[1]  # 16*2=32 for TI2V, 8*2=16 for I2V
         height = (height // mod_value) * mod_value
         width = (width // mod_value) * mod_value
-        num_steps = 40 if common.num_inference_steps is None else common.num_inference_steps
+        if self.is_dmd:
+            # The checkpoint was distilled for these three transitions. Ignore
+            # request-level step counts, including the engine's 1-step warmup.
+            num_steps = len(FASTWAN_DMD_TIMESTEPS)
+        else:
+            num_steps = 40 if common.num_inference_steps is None else common.num_inference_steps
 
         output_type = common.output_type or "np"
+        preencode_mp4 = resolve_wan_preencode_mp4(common, output_type=output_type)
+        preencode_batch_frames = resolve_wan_preencode_batch_frames(common) if preencode_mp4 else 17
         num_outputs_per_prompt = common.num_outputs_per_prompt or 1
         attention_kwargs: dict | None = None
 
-        guidance_low, guidance_high = resolve_wan_guidance_scales(common, default_guidance_scale=4.0)
+        guidance_low, guidance_high = resolve_wan_guidance_scales(
+            common,
+            default_guidance_scale=1.0 if self.is_dmd else 4.0,
+        )
 
         # record guidance for properties
         self._guidance_scale = guidance_low
@@ -685,17 +809,22 @@ class Wan22Pipeline(
             current_omni_platform.synchronize()
             _t_text_enc_ms = (time.perf_counter() - _t_text_enc_start) * 1000
 
-        first_request = req.requests[0]
-        sample_solver = resolve_wan_sample_solver(first_request, default=self._sample_solver)
-        flow_shift = resolve_wan_flow_shift(first_request, self.od_config)
-        if sample_solver != self._sample_solver or abs(flow_shift - self._flow_shift) > 1e-6:
-            self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
-            self._sample_solver = sample_solver
-            self._flow_shift = flow_shift
+        if self.is_dmd:
+            timesteps = torch.tensor(FASTWAN_DMD_TIMESTEPS, device=device, dtype=torch.float32)
+        else:
+            first_request = req.requests[0]
+            sample_solver = resolve_wan_sample_solver(first_request, default=self._sample_solver)
+            flow_shift = resolve_wan_flow_shift(first_request, self.od_config)
+            if sample_solver != self._sample_solver or abs(flow_shift - self._flow_shift) > 1e-6:
+                self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
+                self._sample_solver = sample_solver
+                self._flow_shift = flow_shift
 
-        # Timesteps
-        self.scheduler.set_timesteps(num_steps, device=device)
-        timesteps = self.scheduler.timesteps
+            if sample_solver == "unipc":
+                self.scheduler.set_timesteps(num_steps, device=device, shift=flow_shift)
+            else:
+                self.scheduler.set_timesteps(num_steps, device=device)
+            timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
         boundary_timestep = None
         if boundary_ratio is not None:
@@ -817,6 +946,7 @@ class Wan22Pipeline(
             attention_kwargs=attention_kwargs,
             latent_condition=latent_condition,
             first_frame_mask=first_frame_mask,
+            generator=generator,
         )
 
         # Wan2.2 is prone to out of memory errors when predicting large videos
@@ -834,6 +964,7 @@ class Wan22Pipeline(
 
         if DEBUG_PERF:
             _t_decode_start = time.perf_counter()
+        media = None
         if output_type == "latent":
             output = latents
         else:
@@ -847,7 +978,36 @@ class Wan22Pipeline(
                 latents.device, latents.dtype
             )
             latents = latents / latents_std + latents_mean
-            output = self.vae.decode(latents, return_dict=False)[0]
+            if preencode_mp4:
+                output = decode_to_mp4(
+                    self.vae,
+                    latents,
+                    fps=resolve_wan_output_fps(common),
+                    batch_frames=preencode_batch_frames,
+                    video_codec_options=resolve_wan_video_codec_options(common),
+                )
+            else:
+                decoded = self.vae.decode(latents, return_dict=False)[0]
+                # Distributed VAE decode uses broadcast_result=False, so only the
+                # output-owning rank receives the full [B, C, T, H, W] video; other
+                # ranks get an empty placeholder. Emit typed media only from the
+                # owning rank and keep the placeholder on the legacy output field, so
+                # the media batch-dimension check in split_diffusion_output_by_request
+                # does not trip on every non-owner rank.
+                if decoded.dim() == 5:
+                    output = None
+                    media = DiffusionMediaOutput(
+                        video=VideoMediaOutput(
+                            tensor=decoded,
+                            spec=VideoTensorSpec(
+                                layout=VideoTensorLayout.BCTHW,
+                                encoding=VideoTensorEncoding.NORMALIZED_FLOAT,
+                                value_range=VideoValueRange.NEGATIVE_ONE_TO_ONE,
+                            ),
+                        )
+                    )
+                else:
+                    output = decoded
 
         if DEBUG_PERF:
             current_omni_platform.synchronize()
@@ -874,6 +1034,7 @@ class Wan22Pipeline(
         return split_diffusion_output_by_request(
             DiffusionOutput(
                 output=output,
+                media=media,
                 stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             ),
             req,
@@ -1003,9 +1164,7 @@ class Wan22Pipeline(
         return latents
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights using AutoWeightsLoader for vLLM integration."""
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return load_wan_weights_with_optional_gate(self, weights)
 
     def check_inputs(
         self,

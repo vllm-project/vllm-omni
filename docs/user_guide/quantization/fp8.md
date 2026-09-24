@@ -65,7 +65,17 @@ vLLM-Omni points that cache at `~/.cache/vllm_omni/quack` (override with
 `QUACK_CACHE_DIR`) instead of quack's default under `/tmp`, so it survives restarts.
 In containers, set `QUACK_CACHE_DIR` to a mounted/persistent path — or bake it into
 the image — so the first cold start does not recompile. The engine's startup dummy
-run already exercises the kernels, so with a warm cache the first real request is fast.
+run exercises the kernels, but new shapes, layouts, dtypes, or bias settings may
+still need compilation or tuning. The warmup helper uses inference mode and
+transposed weights without bias. Daemon workers compile candidates in-process
+while retaining autotuning and caching.
+
+Scale validation and Quack/FlashInfer dispatch run inside a PyTorch custom op.
+This keeps layer-specific scale addresses and validation-cache updates out of
+Dynamo tracing without introducing a graph break. Unpopulated scales and Quack
+failures still fall back to FlashInfer at runtime. CUDA graph capture additionally
+requires warming the dispatch with populated scales; Python validation and
+dispatch do not rerun during CUDA graph replay.
 
 To pre-warm specific shapes (e.g. at image build time):
 
@@ -92,7 +102,7 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 | FLUX.1 | `black-forest-labs/FLUX.1-dev`, `black-forest-labs/FLUX.1-schnell` | Yes | Yes | All layers | None | |
 | FLUX.2-dev | `black-forest-labs/FLUX.2-dev` | Yes | Not validated | All layers | None | ✅︎ |
 | FLUX.2-klein | `black-forest-labs/FLUX.2-klein-4B` | Yes | Yes | All layers | None | |
-| HunyuanImage-3.0 | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` | Yes | Yes | All layers; use the Hunyuan stage config for multi-stage runs | None | |
+| HunyuanImage-3.0 | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` | Yes | Yes | All layers; use the Hunyuan deploy config for multi-stage runs | None | |
 | HunyuanVideo-1.5 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v`, `720p_t2v`, `480p_i2v` | Yes | Yes | All layers | None | |
 | Cosmos3 | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | Yes | Not validated | All layers | None | |
 | MiniMax-H3 | `MiniMaxAI/MiniMax-H3` (`FL2VA` / `Ref2VA`) | Yes | Not validated | `quantization="fp8"` quantizes eligible DiT and text-encoder linears; mixed-precision input/output heads stay FP32 | None | ✅︎ |
@@ -178,6 +188,24 @@ python text_to_image.py --model <your-model> --quantization fp8
 python text_to_image.py --model <your-model> --quantization fp8 --ignored-layers "img_mlp"
 vllm serve <your-model> --omni --quantization fp8
 ```
+
+### Distributed layerwise offload
+
+Per-tensor online FP8 linears can be combined with DLO's default AllGather path:
+
+```bash
+vllm serve <your-model> \
+  --omni \
+  --quantization fp8 \
+  --enable-distributed-layerwise-offload
+```
+
+Direct checkpoint mmap is not used for this combination. Each rank runs the
+ordinary loader to create the final FP8 weights and scales before DLO shards
+them, so startup temporarily materializes the complete FP8 model in host memory
+on every rank. Runtime DLO host residency is sharded normally. Use
+`--dlo-no-use-allgather` when the synchronized AllGather request-wave contract
+does not fit the workload.
 
 ## Parameters
 

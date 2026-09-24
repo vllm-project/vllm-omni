@@ -1,9 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from collections import defaultdict
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
+from vllm.config import SchedulerConfig, VllmConfig
 from vllm.v1.engine import FinishReason
 
+from vllm_omni.config.model import OmniModelConfig
+from vllm_omni.core.sched import omni_scheduler_mixin
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
 
@@ -14,24 +21,132 @@ class _Scheduler(OmniSchedulerMixin):
     pass
 
 
+def test_async_chunk_adapter_initializes_for_stage_zero_sender_and_stage_one_receiver(monkeypatch):
+    created_adapters = []
+
+    def adapter_factory(config):
+        adapter = SimpleNamespace(vllm_config=config)
+        created_adapters.append(adapter)
+        return adapter
+
+    monkeypatch.setattr(omni_scheduler_mixin, "OmniChunkTransferAdapter", adapter_factory)
+
+    def init_scheduler(**model_config):
+        scheduler = _Scheduler()
+        scheduler.vllm_config = SimpleNamespace(model_config=SimpleNamespace(**model_config))
+        scheduler._init_omni_io_scheduling_state()
+        return scheduler
+
+    producer = init_scheduler(
+        stage_id=0,
+        async_chunk=True,
+        requires_full_payload_input=False,
+        custom_process_next_stage_input_func="test.pipeline.produce_async_chunk",
+    )
+    receiver = init_scheduler(
+        stage_id=1,
+        async_chunk=True,
+        requires_full_payload_input=True,
+        custom_process_next_stage_input_func=None,
+    )
+    terminal_stage = init_scheduler(
+        stage_id=2,
+        async_chunk=True,
+        requires_full_payload_input=False,
+        custom_process_next_stage_input_func=None,
+    )
+
+    assert producer.chunk_transfer_adapter is not None
+    assert receiver.chunk_transfer_adapter is not None
+    assert terminal_stage.chunk_transfer_adapter is not None
+    assert receiver.input_coordinator is None
+    assert len(created_adapters) == 3
+
+
+@pytest.mark.parametrize(
+    ("stage_id", "async_chunk", "required", "enabled"),
+    [
+        (0, False, True, False),
+        (1, True, True, False),
+        (1, False, False, False),
+        (1, False, True, True),
+    ],
+)
+def test_full_payload_coordinator_matches_legacy_gate(monkeypatch, stage_id, async_chunk, required, enabled):
+    monkeypatch.setattr(
+        omni_scheduler_mixin,
+        "OmniChunkTransferAdapter",
+        lambda _config: SimpleNamespace(),
+    )
+    scheduler = _Scheduler()
+    scheduler.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            stage_id=stage_id,
+            async_chunk=async_chunk,
+            requires_full_payload_input=required,
+        )
+    )
+
+    scheduler._init_omni_io_scheduling_state()
+
+    assert (scheduler.input_coordinator is not None) is enabled
+
+
+@pytest.mark.parametrize("async_chunk", [False, True])
+@pytest.mark.parametrize(("stage_id", "required"), [(0, False), (1, False), (1, True)])
+def test_native_data_plane_uses_the_selected_input_protocol(async_chunk, stage_id, required):
+    scheduler = _Scheduler()
+    model_config = object.__new__(OmniModelConfig)
+    model_config.stage_id = stage_id
+    model_config.async_chunk = async_chunk
+    model_config.requires_full_payload_input = required
+    model_config.supports_native_mrv2_data_plane = True
+    model_config.use_v2_model_runner = True
+    scheduler.vllm_config = object.__new__(VllmConfig)
+    scheduler.vllm_config.model_config = model_config
+    scheduler.vllm_config.scheduler_config = object.__new__(SchedulerConfig)
+    scheduler.vllm_config.scheduler_config.max_num_seqs = 1
+    scheduler._init_omni_io_scheduling_state()
+
+    assert scheduler._native_data_plane
+    if async_chunk or (stage_id > 0 and required):
+        assert scheduler.input_coordinator._async_chunk is async_chunk
+    else:
+        assert scheduler.input_coordinator is None
+    assert scheduler._async_chunk_transport_enabled() is async_chunk
+    assert scheduler.chunk_transfer_adapter is None
+
+
 def test_schedule_lifecycle_helpers_process_and_restore_both_input_paths():
-    calls = []
+    calls: list[tuple[Any, ...]] = []
     scheduler = _Scheduler()
     scheduler.waiting = ["waiting"]
     scheduler.running = ["running"]
     scheduler.requests = {"request": object()}
     scheduler._consume_pending_connector_output = lambda mode: calls.append(("consume", mode))
     scheduler._process_pending_input_timeouts = lambda: calls.append(("timeouts",))
+
+    def _collect_timed_out(timeout_s):
+        calls.append(("chunk-timeouts", timeout_s))
+        return set()
+
+    def _collect_failed_sends():
+        calls.append(("failed-sends",))
+        return {}
+
     scheduler.chunk_transfer_adapter = SimpleNamespace(
+        receives_chunks=True,
         process_pending_chunks=lambda waiting, running, scheduler_requests: calls.append(
             ("process", waiting, running, scheduler_requests)
         ),
         restore_queues=lambda waiting, running, scheduler_requests: calls.append(
             ("restore-chunks", waiting, running, scheduler_requests)
         ),
+        collect_timed_out_request_ids=_collect_timed_out,
+        collect_failed_send_request_ids=_collect_failed_sends,
     )
     scheduler.input_coordinator = SimpleNamespace(
-        restore_queues=lambda waiting: calls.append(("restore-full", waiting))
+        restore_queues=lambda waiting, running: calls.append(("restore-full", waiting, running))
     )
 
     scheduler._process_pending_omni_inputs("ar")
@@ -41,8 +156,12 @@ def test_schedule_lifecycle_helpers_process_and_restore_both_input_paths():
         ("consume", "ar"),
         ("timeouts",),
         ("process", scheduler.waiting, scheduler.running, scheduler.requests),
+        # The chunk deadline runs after chunks are applied, so a chunk that
+        # arrived this cycle resets the clock before it is measured (R1.1).
+        ("chunk-timeouts", omni_scheduler_mixin.DEFAULT_INPUT_WAIT_TIMEOUT_S),
+        ("failed-sends",),
         ("restore-chunks", scheduler.waiting, scheduler.running, scheduler.requests),
-        ("restore-full", scheduler.waiting),
+        ("restore-full", scheduler.waiting, scheduler.running),
     ]
 
 

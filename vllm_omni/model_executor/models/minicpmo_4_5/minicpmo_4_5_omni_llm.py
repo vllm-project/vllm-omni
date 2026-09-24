@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from:
 # https://huggingface.co/openbmb/MiniCPM-o-4_5/blob/main/modeling_minicpmo.py
 #
@@ -17,12 +17,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import math
 import os
 import warnings
-from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Annotated, Any, Literal, TypeAlias
 
@@ -135,6 +135,13 @@ def _encode_tokens(tokenizer: Any, prompt: str) -> list[int]:
 
 
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
+
+from vllm_omni.model_executor.models.model_local_kv import (
+    ModelLocalKVScope,
+    ModelLocalKVSpec,
+    RowDriver,
+    spec_from_hf_config,
+)
 
 logger = init_logger(__name__)
 hf_logger = logging.get_logger(__name__)
@@ -300,6 +307,10 @@ class ConditionalChatTTSConfig(PretrainedConfig):
         self.top_p = top_p
         self.top_k = top_k
         self.repetition_penalty = repetition_penalty
+        # Talker stage is a single-vocab codec LM: vLLM's Sampler and
+        # embed_tokens both address this table, not the Thinker text vocab.
+        self.vocab_size = int(num_audio_tokens)
+        self.eos_token_id = int(num_audio_tokens) - 1
 
 
 class MiniCPMOConfig(Qwen2Config):
@@ -2505,6 +2516,17 @@ def _in_projection(
     return linear(q, w_q, b_q), linear(k, w_k, b_k), linear(v, w_v, b_v)
 
 
+def _get_audio_cache_length(past_key_values: Any) -> int:
+    cache = getattr(past_key_values, "self_attention_cache", past_key_values)
+    get_seq_length = getattr(cache, "get_seq_length", None)
+    if callable(get_seq_length):
+        try:
+            return int(get_seq_length())
+        except TypeError:
+            return int(get_seq_length(0))
+    return int(cache[0][0].shape[2])
+
+
 # Copied from transformers.models.whisper.modeling_whisper.WhisperEncoderLayer and add use_cache for streaming inference
 class MiniCPMWhisperEncoderLayer(nn.Module):
     def __init__(self, config: WhisperConfig, layer_idx: int = None):
@@ -2516,6 +2538,10 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
             dropout=config.attention_dropout,
             config=config,
             layer_idx=layer_idx,
+        )
+        attention_parameters = inspect.signature(self.self_attn.forward).parameters
+        self._past_key_values_kwarg = (
+            "past_key_values" if "past_key_values" in attention_parameters else "past_key_value"
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.dropout = config.dropout
@@ -2554,16 +2580,18 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
         """
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        attn_out = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            layer_head_mask=layer_head_mask,
-            output_attentions=output_attentions,
-            past_key_value=past_key_values,
-        )
+        attention_kwargs = {
+            "hidden_states": hidden_states,
+            "attention_mask": attention_mask,
+            "layer_head_mask": layer_head_mask,
+            "output_attentions": output_attentions,
+            self._past_key_values_kwarg: past_key_values,
+        }
+        attn_out = self.self_attn(**attention_kwargs)
         hidden_states = attn_out[0]
         attn_weights = attn_out[1] if len(attn_out) > 1 else None
-        past_key_values = attn_out[2] if len(attn_out) > 2 else None
+        if len(attn_out) > 2:
+            past_key_values = attn_out[2]
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
 
@@ -2599,6 +2627,51 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
         self.layers = nn.ModuleList(
             [MiniCPMWhisperEncoderLayer(config, layer_idx=i) for i in range(config.encoder_layers)]
         )
+
+    def model_local_kv_specs(self) -> list[ModelLocalKVSpec]:
+        """Declare the streaming encoder's self-attention cache.
+
+        Bounded by learned position embeddings, not by ``max_model_len``: the
+        cache cannot outgrow ``embed_positions``, and past that point the
+        forward pass repeats the last position rather than extending.
+
+        Whisper is encoder-only self-attention here, so kv-heads equal
+        attention heads. Layer count is read off the built ``self.layers``
+        rather than the config, so a partially built encoder reports what it
+        actually has.
+
+        Declared per session, not per sequence. Each streaming session state
+        owns its own ``audio_past_key_values`` and the encoder runs at batch
+        size one, so ``max_num_seqs`` is the wrong number here.
+
+        One session is the unit rather than the configured cap, because the cap
+        is not visible from the model and the setting that carries it cannot
+        distinguish "duplex off" from "one session" -- so a cap-scaled figure
+        would report a cache that a non-duplex deployment never allocates. An
+        earlier revision grew a capacity driver and an engine-side field to
+        carry that number for this one declarer; the arithmetic is a
+        multiplication the reader can do when they need the ceiling.
+        """
+        return [
+            spec_from_hf_config(
+                self.config,
+                name="whisper_encoder_self_attn",
+                dtype=self.conv1.weight.dtype,
+                layers=len(self.layers),
+                kv_heads=self.config.encoder_attention_heads,
+                head_dim=self.config.d_model // self.config.encoder_attention_heads,
+                physical_capacity_positions=int(self.embed_positions.weight.shape[0]),
+                capacity_source="embed_positions rows (max_source_positions)",
+                scope=ModelLocalKVScope.SESSION,
+                rows=RowDriver.FIXED,
+                rows_fixed=1,
+                rows_reason="one EncoderDecoderCache per streaming session, encoder runs at batch size 1",
+                allocation_note=(
+                    "only allocated on the streaming path, where use_cache is set; scales with the "
+                    "configured duplex session cap"
+                ),
+            )
+        ]
 
     def forward(
         self,
@@ -2769,7 +2842,7 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
                 past_key_values = EncoderDecoderCache(past_key_values, DynamicCache())
             else:
                 pass
-            past_key_values_length = past_key_values.self_attention_cache.get_usable_length(inputs_embeds.shape[1])
+            past_key_values_length = _get_audio_cache_length(past_key_values)
             if inputs_embeds.shape[1] + past_key_values_length > embed_pos.shape[0]:
                 logger.warning("seems the audio is longer than 30s. repeating the last part of the audio")
                 embed_pos_front = embed_pos[past_key_values_length:, :]
@@ -3288,7 +3361,7 @@ class MiniCPMOAudioEmbeddingItems(DictEmbeddingItems):
     ) -> None:
         super().__init__(
             data,
-            modality="image",
+            modality="audio",
             required_fields={"audio_embeds"},
             fields_factory=fields_factory,
         )
@@ -3381,84 +3454,46 @@ class MiniCPMOMultiModalDataParser(MultiModalDataParser):
 class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45OmniLLMProcessingInfo]):
     """Multimodal processor for MiniCPM-o thinker stage."""
 
-    def _apply_hf_processor_main(
-        self,
-        prompt: str | list[int],
-        mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object],
-        *,
-        enable_hf_prompt_update: bool,
-    ) -> tuple[list[int], BatchFeature, bool]:
-        """
-        MiniCPM-O reimplements this to avoid calling HF processor with text-only
-        when enable_hf_prompt_update=False. The MiniCPM processor asserts
-        len(image_tags) == len(image_sizes) and fails if given placeholder text
-        without corresponding image data (e.g. during profiling/cache-miss path).
-        """
-        use_tts = hf_processor_mm_kwargs.get("use_tts", False)
-        hf_processor_mm_kwargs = {k: v for k, v in hf_processor_mm_kwargs.items() if k != "use_tts"}
-        if isinstance(prompt, str):
-            if use_tts:
-                prompt = prompt + self._TTS_SUFFIX
-            if enable_hf_prompt_update:
-                return self._apply_hf_processor_text_mm(
-                    prompt_text=prompt,
-                    mm_items=mm_items,
-                    hf_processor_mm_kwargs=hf_processor_mm_kwargs,
-                    tokenization_kwargs=tokenization_kwargs,
-                )
-            tokenizer = self.info.get_tokenizer()
-            prompt_ids = _encode_tokens(tokenizer, prompt)
-        else:
-            prompt_ids = self._apply_hf_processor_tokens_only(prompt)
-            if use_tts:
-                tokenizer = self.info.get_tokenizer()
-                tts_ids = tokenizer.convert_tokens_to_ids(["<|spk_bos|>", "<|spk|>", "<|spk_eos|>", "<|tts_bos|>"])
-                prompt_ids = list(prompt_ids) + tts_ids
-
-        mm_processed_data = self._apply_hf_processor_mm_only(
-            mm_items=mm_items,
-            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
-            tokenization_kwargs=tokenization_kwargs,
-        )
-
-        return prompt_ids, mm_processed_data, False
-
     _TTS_SUFFIX = "<|spk_bos|><|spk|><|spk_eos|><|tts_bos|>"
 
-    def _call_hf_processor(
+    def apply(self, inputs, timing_ctx):
+        hf_processor_mm_kwargs = inputs.hf_processor_mm_kwargs
+        if hf_processor_mm_kwargs.get("use_tts", False):
+            tokenizer = self.info.get_tokenizer()
+            tts_ids = tokenizer.convert_tokens_to_ids(["<|spk_bos|>", "<|spk|>", "<|spk_eos|>", "<|tts_bos|>"])
+            inputs = replace(
+                inputs,
+                prompt=[*inputs.prompt, *tts_ids],
+                hf_processor_mm_kwargs={
+                    key: value for key, value in hf_processor_mm_kwargs.items() if key != "use_tts"
+                },
+            )
+        return super().apply(inputs, timing_ctx)
+
+    def _apply_hf_processor_main(
         self,
-        prompt: str,
-        mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
     ) -> BatchFeature:
+        """
+        Process each modality independently because the MiniCPM processor
+        asserts that image tags and image sizes have matching lengths.
+        """
+        valid_mm_items = mm_items.select({key for key, count in mm_items.get_all_counts().items() if count > 0})
+        mm_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
+
         tokenizer = self.info.get_tokenizer()
-
-        use_tts = mm_kwargs.get("use_tts", False)
-        mm_kwargs = {k: v for k, v in mm_kwargs.items() if k != "use_tts"}
-        if use_tts:
-            prompt = prompt + self._TTS_SUFFIX
-
-        input_ids = torch.tensor([tokenizer.encode(prompt, **tok_kwargs)])
-        mm_inputs = self.process_mm_inputs(mm_data, mm_kwargs, tok_kwargs)
-
-        return BatchFeature(
+        prompt_text = self.dummy_inputs.get_dummy_text(mm_items.get_all_counts())
+        input_ids = torch.tensor([tokenizer.encode(prompt_text)])
+        mm_inputs = self.process_mm_inputs(mm_data, hf_processor_mm_kwargs)
+        processed_data = BatchFeature(
             {
                 "input_ids": input_ids,
                 **mm_inputs,
             }
         )
-
-    def _hf_processor_applies_updates(
-        self,
-        prompt_text: str,
-        mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object],
-    ) -> bool:
-        return False
+        processed_data.update(passthrough_data)
+        return processed_data
 
     def get_image_prompt_texts(
         self,
@@ -3506,7 +3541,6 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
         self,
         mm_data: Mapping[str, object],
         mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
     ) -> Mapping[str, NestedTensors]:
         if (audios := mm_data.get("audios")) is None:
             return {}
@@ -3518,11 +3552,10 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
         if isinstance(parsed_audios, MiniCPMOAudioEmbeddingItems):
             audio_inputs = {}
         else:
-            audio_inputs = self._base_call_hf_processor(
+            audio_inputs = self._call_hf_processor_on_prompts(
                 prompts=[self.info.audio_pattern] * len(parsed_audios),
                 mm_data={"audios": [[audio] for audio in parsed_audios]},
                 mm_kwargs={**mm_kwargs, "chunk_input": True},
-                tok_kwargs=tok_kwargs,
                 out_keys={"audio_features", "audio_feature_lens"},
             )
 
@@ -3547,7 +3580,6 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
         self,
         mm_data: Mapping[str, object],
         mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
     ) -> Mapping[str, NestedTensors]:
         if (images := mm_data.get("images")) is None:
             return {}
@@ -3559,11 +3591,10 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
         if isinstance(parsed_images, MiniCPMVImageEmbeddingItems):
             image_inputs = {}
         else:
-            image_inputs = self._base_call_hf_processor(
+            image_inputs = self._call_hf_processor_on_prompts(
                 prompts=[self.info.image_pattern] * len(parsed_images),
                 mm_data={"images": [[image] for image in parsed_images]},
                 mm_kwargs=mm_kwargs,
-                tok_kwargs=tok_kwargs,
                 out_keys={"pixel_values", "image_sizes", "tgt_sizes"},
             )
         return image_inputs
@@ -3572,7 +3603,6 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
         self,
         mm_data: Mapping[str, object],
         mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
     ) -> Mapping[str, NestedTensors]:
         if (videos := mm_data.get("videos")) is None:
             return {}
@@ -3584,14 +3614,13 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
         if isinstance(parsed_videos, MiniCPMVVideoEmbeddingItems):
             video_inputs = {}
         else:
-            video_inputs = self._base_call_hf_processor(
+            video_inputs = self._call_hf_processor_on_prompts(
                 prompts=[self.info.image_pattern * len(video) for video in parsed_videos],
                 mm_data={"images": list(parsed_videos)},
                 mm_kwargs={
                     **mm_kwargs,
                     "max_slice_nums": self.info.get_video_max_slice_num(),
                 },
-                tok_kwargs=tok_kwargs,
                 out_keys={"pixel_values", "image_sizes", "tgt_sizes"},
             )
 
@@ -3603,48 +3632,30 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
         self,
         mm_data: Mapping[str, object],
         mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
     ) -> Mapping[str, NestedTensors]:
         return {
-            **self.process_images(mm_data, mm_kwargs, tok_kwargs),
-            **self.process_videos(mm_data, mm_kwargs, tok_kwargs),
-            **self.process_audios(mm_data, mm_kwargs, tok_kwargs),
+            **self.process_images(mm_data, mm_kwargs),
+            **self.process_videos(mm_data, mm_kwargs),
+            **self.process_audios(mm_data, mm_kwargs),
         }
 
-    def _base_call_hf_processor(
+    def _call_hf_processor_on_prompts(
         self,
         prompts: list[str],
         mm_data: Mapping[str, Sequence[object]],
         mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
         *,
         out_keys: set[str],
     ) -> dict[str, NestedTensors]:
-        mm_kwargs = {k: v for k, v in mm_kwargs.items() if k != "use_tts"}
-        # This processor supports zipping prompt and mm_data together
-        if self.info.get_model_version() in {(2, 6), (4, 0), (4, 5)}:
-            inputs = super()._call_hf_processor(
-                prompt=prompts,  # type: ignore
-                mm_data=mm_data,
-                mm_kwargs=mm_kwargs,
-                tok_kwargs=tok_kwargs,
-            )
-        else:
-            inputs = defaultdict[str, list[torch.Tensor]](list)
+        from vllm.model_executor.models.minicpmv import MiniCPMVMultiModalProcessor
 
-            for i, prompt in enumerate(prompts):
-                inputs_one = super()._call_hf_processor(
-                    prompt=prompt,
-                    mm_data={k: v[i] for k, v in mm_data.items()},
-                    mm_kwargs=mm_kwargs,
-                    tok_kwargs=tok_kwargs,
-                )
-
-                for k, v in inputs_one.items():
-                    assert len(v) == 1, (k, len(v))
-                    inputs[k].append(v[0])
-
-        return {k: inputs[k] for k in out_keys}
+        return MiniCPMVMultiModalProcessor._call_hf_processor_on_prompts(
+            self,
+            prompts,
+            mm_data,
+            {key: value for key, value in mm_kwargs.items() if key != "use_tts"},
+            out_keys=out_keys,
+        )
 
     def _get_prompt_updates(
         self,
@@ -3666,6 +3677,17 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
                 additional_placeholders.append((modality, sub_pattern))
         placeholders += additional_placeholders
 
+        # vLLM 0.29 removed PromptUpdateDetails.select_text: prompt updates are
+        # token oriented now, so encode the replacement text and select the unk
+        # placeholder positions by token id instead of by text.
+        unk_token_id = tokenizer.convert_tokens_to_ids("<unk>")
+
+        def _select_unk_positions(text: str) -> PromptUpdateDetails:
+            return PromptUpdateDetails.select_token_id(
+                tokenizer.encode(text, add_special_tokens=False),
+                unk_token_id,
+            )
+
         image_max_slice_nums = hf_processor_mm_kwargs.get("max_slice_nums")
         image_use_image_id = hf_processor_mm_kwargs.get("use_image_id")
 
@@ -3674,14 +3696,13 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
 
             image_size = images.get_image_size(item_idx)
 
-            return PromptUpdateDetails.select_text(
+            return _select_unk_positions(
                 self.get_image_prompt_texts(
                     image_size,
                     item_idx,
                     max_slice_nums=None if image_max_slice_nums is None else int(image_max_slice_nums),  # type: ignore[arg-type]
                     use_image_id=None if image_use_image_id is None else bool(image_use_image_id),
-                ),
-                "<unk>",
+                )
             )
 
         def get_video_replacement(item_idx: int):
@@ -3690,17 +3711,18 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
             frame_size = videos.get_frame_size(item_idx)
             num_frames = videos.get_num_frames(item_idx)
 
-            return PromptUpdateDetails.select_text(
-                self.get_video_prompt_texts(frame_size, num_frames),
-                "<unk>",
-            )
+            return _select_unk_positions(self.get_video_prompt_texts(frame_size, num_frames))
 
         get_replacement = {
             "image": get_image_replacement,
             "video": get_video_replacement,
         }
         base_updates = [
-            PromptReplacement(modality=modality, target=pattern, replacement=get_replacement[modality])
+            PromptReplacement(
+                modality=modality,
+                target=tokenizer.encode(pattern, add_special_tokens=False),
+                replacement=get_replacement[modality],
+            )
             for modality, pattern in placeholders
         ]
 
@@ -3711,20 +3733,21 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
 
             if isinstance(audios, MiniCPMOAudioEmbeddingItems):
                 single_audio_embeds = audios.get(item_idx)["audio_embeds"]
-                audio_len = self.info.get_audio_len_by_num_chunks(sum(map(len, single_audio_embeds)))
+                # One item is ``(s, h)``, so its leading dim is the audio embedding count.
+                audio_len = self.info.get_audio_len_by_num_chunks(len(single_audio_embeds))
             else:
                 audio_len = audios.get_audio_length(item_idx)
 
-            return PromptUpdateDetails.select_text(
-                self.get_audio_prompt_texts(audio_len),
-                "<unk>",
-            )
+            return _select_unk_positions(self.get_audio_prompt_texts(audio_len))
 
         return [
             *base_updates,
             PromptReplacement(
                 modality="audio",
-                target=audio_placeholder,
+                target=tokenizer.encode(
+                    audio_placeholder,
+                    add_special_tokens=False,
+                ),
                 replacement=get_audio_replacement,
             ),
         ]
@@ -3774,11 +3797,17 @@ class MiniCPMOAudioFeatureInputs(TensorSchema):
 
     audio_feature_lens: Annotated[
         torch.Tensor | list[torch.Tensor],
-        TensorShape("bn", "s"),
+        TensorShape("bn", "s", dynamic_dims={"s"}),
     ]
     """
     This should be feature length of each audio slice,
     which equals to `audio_features.shape[-1]`
+
+    Each audio in the batch may be split into a different number of slices
+    (e.g. audio >30s splits into multiple slices while shorter audio doesn't),
+    so `s` must be dynamic: batching audios with different slice counts is a
+    normal, valid input and is already handled below via `hstack` + per-audio
+    iteration, not a schema violation.
     """
 
 
@@ -3919,7 +3948,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         else:
             text_config = Qwen2Config.from_dict(config_dict)
             llm_arch = "Qwen2ForCausalLM"
-        from vllm_omni.experimental.fullduplex.minicpmo45.compat import (
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.compat import (
             patch_minicpmo_remote_config,
         )
 
@@ -4468,7 +4497,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             return []
 
         if self.audio_past_key_values is not None:
-            cache_length = self.audio_past_key_values[0][0].shape[2]
+            cache_length = _get_audio_cache_length(self.audio_past_key_values)
             apm_max_len = self.apm.embed_positions.weight.shape[0]
             if cache_length + current_seq_len >= apm_max_len:
                 logger.warning(
@@ -4480,7 +4509,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
         past_len = 0
         if self.audio_past_key_values is not None:
-            past_len = self.audio_past_key_values[0][0].shape[2]
+            past_len = _get_audio_cache_length(self.audio_past_key_values)
         total_seq_len = past_len + current_seq_len
         audio_attention_mask = torch.zeros(
             (batch_size, 1, current_seq_len, total_seq_len),
@@ -4551,6 +4580,10 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
                 multimodal_embeddings += tuple(audio_embeddings)
         return multimodal_embeddings
 
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        """vLLM V1 encoder profiling calls this; the inherited Protocol stub returns None."""
+        return self.get_multimodal_embeddings(**kwargs)
+
     def get_input_embeddings(
         self,
         input_ids: torch.Tensor,
@@ -4578,9 +4611,6 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
-        """Forward pass through thinker model."""
-        text_inputs_embeds = None
-
         if intermediate_tensors is not None:
             inputs_embeds = None
 
@@ -4588,22 +4618,12 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         elif inputs_embeds is None:
             multimodal_embeddings = self.get_multimodal_embeddings(**kwargs)
             inputs_embeds = self.get_input_embeddings(input_ids, multimodal_embeddings)
-            text_inputs_embeds = self.get_input_embeddings(
-                input_ids,
-                (
-                    [(torch.zeros_like(embeddings), "image") for embeddings in multimodal_embeddings]
-                    if multimodal_embeddings is not None
-                    else None
-                ),
-            )
             input_ids = None
-        else:
-            text_inputs_embeds = inputs_embeds
 
         # Forward through language model
         hidden_states = self.llm.model(input_ids, positions, intermediate_tensors, inputs_embeds=inputs_embeds)
 
-        return text_inputs_embeds, hidden_states.unsqueeze(0) if hidden_states.ndim == 2 else hidden_states
+        return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         """Compute logits from hidden states."""

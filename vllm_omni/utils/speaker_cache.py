@@ -10,6 +10,7 @@ import json
 import os
 import threading
 from collections import OrderedDict
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -131,7 +132,7 @@ def _first_dim(tensor: torch.Tensor | None) -> int:
     return int(tensor.shape[0])
 
 
-def _validate_qwen3_tts_profile(
+def validate_qwen3_tts_profile(
     profile: dict[str, Any],
     tensors: dict[str, torch.Tensor],
     *,
@@ -164,7 +165,7 @@ def _validate_qwen3_tts_profile(
     return None
 
 
-def _validate_voxcpm2_profile(profile: dict[str, Any], tensors: dict[str, torch.Tensor]) -> str | None:
+def validate_voxcpm2_profile(profile: dict[str, Any], tensors: dict[str, torch.Tensor]) -> str | None:
     # Successful validation also normalizes/augments `profile` for serving metadata.
     ref_audio_feat = tensors.get("ref_audio_feat")
     audio_feat = tensors.get("audio_feat")
@@ -207,7 +208,7 @@ def load_validated_profile_tensors(
     profile: dict[str, Any],
     *,
     expected_model_type: str,
-    qwen3_embedding_dim: int | None = None,
+    validate_profile: Callable[[dict[str, Any], dict[str, torch.Tensor]], str | None],
 ) -> dict[str, torch.Tensor] | None:
     tensors = _load_profile_tensors(profile)
     error = None
@@ -215,12 +216,8 @@ def load_validated_profile_tensors(
         error = "safetensors file could not be loaded"
     elif str(profile.get("model_type") or expected_model_type or "") != expected_model_type:
         error = f"model_type={profile.get('model_type')!r}, expected={expected_model_type!r}"
-    elif expected_model_type == "qwen3_tts":
-        error = _validate_qwen3_tts_profile(profile, tensors, expected_embedding_dim=qwen3_embedding_dim)
-    elif expected_model_type == "voxcpm2":
-        error = _validate_voxcpm2_profile(profile, tensors)
     else:
-        error = f"unsupported custom voice model_type={expected_model_type!r}"
+        error = validate_profile(profile, tensors)
 
     if error is not None:
         logger.warning("Skipping custom %s voice %s: %s", expected_model_type, profile.get("name"), error)

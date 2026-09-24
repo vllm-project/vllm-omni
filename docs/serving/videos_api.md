@@ -41,7 +41,7 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 ### Endpoints
 
 | Endpoint | Method | Description |
-|----------|--------|-------------|
+| ---------- | -------- | ------------- |
 | `/v1/videos` | `POST` | Create an asynchronous video generation job |
 | `/v1/videos/sync` | `POST` | Generate a video synchronously and return raw video bytes |
 | `/v1/videos/{video_id}` | `GET` | Retrieve job status and metadata |
@@ -56,7 +56,7 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 #### OpenAI-style fields
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `prompt` | string | **required** | Text prompt for video generation |
 | `model` | string | server's model | Optional model name |
 | `seconds` | string | null | Requested clip duration in seconds |
@@ -66,11 +66,17 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 #### vLLM-Omni extension fields
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `input_reference` | file | null | Uploaded reference image or video for image-to-video/video-to-video requests |
+| `control_reference` | file | null | Optional uploaded image/video control, up to 512 MiB, for models that declare control-upload support |
+| `control_type` | string | null | Model control name associated with `control_reference`; currently Cosmos3 supports `edge`, `blur`, `depth`, `seg`, and `wsm` |
 | `image_reference` | string | null | JSON-encoded reference image payload; do not combine with `input_reference` or `video_reference` |
 | `video_reference` | string | null | JSON-encoded reference video payload; do not combine with `input_reference` or `image_reference` |
 | `audio_reference` | string | null | JSON-encoded audio reference for speech-to-video: `{"audio_url": "..."}` — supports HTTP(s) URLs or base64 data URLs |
+| `source_video` | file | null | MiniMax H3 latent-edit source video (`.mp4` or `.mov`, up to 512 MiB) |
+| `source_audio` | file | null | Optional MiniMax H3 latent-edit source audio (`.wav` or `.mp3`, up to 512 MiB) |
+| `video_noise_mask` | file | null | UTF-8 JSON MiniMax H3 video mask; `0` preserves and `1` regenerates a token |
+| `audio_noise_mask` | file | null | UTF-8 JSON MiniMax H3 audio mask; `0` preserves and `1` regenerates a token |
 | `width` | integer | model default | Output video width |
 | `height` | integer | model default | Output video height |
 | `num_frames` | integer | 1 | Number of generated frames |
@@ -106,6 +112,16 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 
 The final content is available from `/v1/videos/{video_id}/content` after the
 job status becomes `completed`.
+
+`queued` means the request is still waiting for diffusion scheduler admission.
+The status changes to `in_progress` when the scheduler first selects the
+request for execution.
+
+`DELETE /v1/videos/{video_id}` issues a bounded engine abort
+(`VLLM_OMNI_ABORT_TIMEOUT`, default 2s), then cancels the frontend
+task. Cancellation cleanup is also bounded and best-effort: it confirms
+the abort was queued, and the current request batch may still drain.
+The job is then re-read so a completed save is not orphaned.
 
 ### Synchronous Response
 
@@ -161,11 +177,89 @@ are not implemented yet. Models may expose additional V2V controls through
 `extra_params`. For example, Cosmos3 supports
 `condition_frame_indexes_vision` and `condition_video_keep` to select which
 decoded reference frames are used as clean conditioning. Cosmos3 transfer mode
-also accepts `edge`, `blur`, `depth`, `seg`, or `wsm` control hints plus
-transfer options such as `control_path`, `control_guidance`,
-`control_guidance_interval`, `num_video_frames_per_chunk`,
-`num_conditional_frames`, `show_control_condition`, and `show_input`; see the
-Cosmos3 recipe for complete examples.
+also accepts `edge`, `blur`, `depth`, `seg`, or `wsm` control hints. Each hint
+may specify its own `control_path` and `control_weight`. Request-level transfer
+options include
+`control_guidance`, `control_guidance_interval`,
+`emphasize_control_in_prompt`, `num_video_frames_per_chunk`,
+`num_conditional_frames`, `show_control_condition`, and `show_input`. Transfer
+uses its transfer-specific system prompt and, by default, appends a
+control-adherence directive to the positive prompt. It adds duration/FPS and
+resolution metadata to both CFG branches but does not add a negative prompt
+automatically. The Cosmos3 recipe includes an optional reference negative
+prompt and shows how to pass it. Set `emphasize_control_in_prompt`,
+`use_duration_template`, or `use_resolution_template` to `false` to disable the
+corresponding addition. `negative_metadata_mode` accepts `same`, `inverse`, or
+`none` and defaults to `same` for transfer. See the Cosmos3 recipe for complete
+examples.
+
+A client that cannot place the control on the server filesystem can upload one
+control with `control_reference` and identify it with `control_type`. The API
+streams the upload to request-scoped storage, supplies its path to the model,
+and removes it after synchronous or asynchronous generation completes. Other
+options for the selected control can remain in `extra_params`; do not also set
+`control` or `control_path` there. Uploads larger than 512 MiB are rejected.
+
+```bash
+curl -s http://localhost:8091/v1/videos/sync \
+  -F "prompt=Preserve the scene while following the world-state control" \
+  -F "input_reference=@input.mp4;type=video/mp4" \
+  -F "control_reference=@wsm.mp4;type=video/mp4" \
+  -F "control_type=wsm" \
+  -F 'extra_params={"wsm":{"control_weight":1.0}}' \
+  -o output.mp4
+```
+
+HTTP redirects for `image_reference.image_url` follow vLLM's
+`VLLM_MEDIA_URL_ALLOW_REDIRECTS` setting. Before starting the server, set it to
+`1` (the default) to allow redirects or `0` to reject them. A redirect target
+can differ from the original host, and vLLM-Omni does not yet fully implement
+upstream vLLM's media URL allowlist protection. Deployments should therefore
+treat remote media URLs as untrusted and choose this setting as part of their
+URL access policy.
+
+### MiniMax H3 Latent-Mask Editing
+
+MiniMax H3 accepts request-scoped source media and video/audio noise masks.
+At least one mask is required. A nontrivial `video_noise_mask` requires
+`source_video`, while a nontrivial `audio_noise_mask` requires either
+`source_audio` or a `source_video` with an audio stream. Mask values are in
+`[0, 1]`: `0` preserves the source, `1` regenerates it, and fractional values
+blend the two behaviors. Exact all-one masks are no-ops and do not require a
+source. Source uploads without a mask are rejected. Masks may be a JSON scalar
+or arrays matching the H3 latent/token grid; pixel-resolution masks must be
+resized or pooled by the client before upload.
+
+For an aligned output of `F` frames at `W x H`, the video latent grid is
+`[Tv, H/16, W/16]`, where `Tv = 2 + 5 * ((F - 5) / 17)`. The video mask may be
+a scalar, a flat token vector, `[Tv, H/32, W/32]`, or the full latent grid. For
+the model input, timestep, and velocity, a full-grid mask is max-pooled over
+each 2x2 spatial token and fractional values are rounded upward to 1/256
+levels. The final x0 restore uses the original, unquantized mask, so full-grid
+masks retain cell-level preservation inside a model token. The audio length is
+`Ta = round(F * 40 / 24)`, and its mask may be a scalar, `[Ta]`, `[2, Ta]`, or
+a flat `2 * Ta` vector. If source audio is short, its missing latent tail is
+forced to mask value `1` so H3 generates that portion. Each mask must be sent
+as a UTF-8 JSON file part and is limited to 8 MiB. A file may contain either a
+JSON scalar or an array.
+
+```bash
+curl -s http://localhost:8091/v1/videos/sync \
+  -F "prompt=Partially restyle the complete clip and soundtrack" \
+  -F 'extra_params={"task":"t2va","duration":4.0,"aspect_ratio":"16:9"}' \
+  -F "source_video=@source.mp4;type=video/mp4" \
+  -F "source_audio=@source.wav;type=audio/wav" \
+  -F "video_noise_mask=@video-mask.json;type=application/json" \
+  -F "audio_noise_mask=@audio-mask.json;type=application/json" \
+  -o edited.mp4
+```
+
+For example, each mask file in the request above may contain the JSON scalar
+`0.5`.
+
+The server streams source files to temporary request-scoped storage and removes
+them after synchronous or asynchronous generation finishes. Models that do not
+declare latent-mask editing support reject these fields.
 
 ### Speech-to-Video
 
@@ -185,7 +279,6 @@ curl -s http://localhost:8091/v1/videos \
   -F "fps=16"
 ```
 
-
 ### Synchronous Generation
 
 ```bash
@@ -197,6 +290,48 @@ curl -X POST http://localhost:8091/v1/videos/sync \
   -F "fps=16" \
   -o output.mp4
 ```
+
+## Output Encoding
+
+These `extra_params` control how the server turns decoded frames into MP4 bytes.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `preencode_mp4` | boolean | false | Encode the MP4 on the worker while the VAE is still decoding, instead of after the full video is materialized |
+| `preencode_batch_frames` | positive integer | 17 (H3, Wan T2V/I2V); 1 (Wan S2V) | Minimum accumulated frames per worker transfer/encoding batch; used only with `preencode_mp4=true` |
+| `video_codec_options` | object | null | Encoder options passed through to the H.264 encoder, such as `{"preset": "ultrafast", "threads": "0"}` |
+
+With `preencode_mp4` enabled, each committed VAE chunk leaves the accelerator and
+is encoded while later chunks are still decoding, so host transfer and CPU
+encoding overlap the remaining decode instead of following it. The response is
+unchanged: the same complete MP4, byte-for-byte equivalent frames.
+
+```bash
+curl -X POST http://localhost:8091/v1/videos/sync \
+  -F "prompt=A small robot walking through a neon city" \
+  -F 'extra_params={"preencode_mp4": true, "preencode_batch_frames": 33, "video_codec_options": {"preset": "ultrafast"}}' \
+  -o output.mp4
+```
+
+Set `preencode_batch_frames` in `extra_params` (or `extra_args` for offline
+sampling) to tune batching. The worker accumulates complete VAE chunks until
+it has at least this many frames, then transfers and encodes them together.
+It always flushes the final partial batch. This is a threshold, not an exact
+chunk length: a value of 1 submits every native chunk immediately, and a value
+smaller than a native chunk does not split it. Larger values reduce transfers
+but retain more frames on the accelerator and delay encoding. The VAE decode
+window and output frame count stay unchanged. Wan S2V keeps its existing
+per-clip behavior by default. Zero, negative, fractional, boolean, string, and
+null values are rejected when pre-encoding is enabled.
+
+`preencode_mp4` applies to the complete-MP4 response paths only. The
+`/v1/realtime/video` WebSocket endpoint rejects it, because that path already
+overlaps encoding through its own incremental fragmented-MP4 encoder. Wan also
+rejects it together with `enable_frame_interpolation`, which needs the decoded
+frames the pre-encoded path no longer materializes.
+
+Support is per model: MiniMax-H3 and Wan 2.2 (T2V, I2V, and S2V) implement it,
+and other models ignore the flag and take the full-decode path.
 
 ## Storage
 

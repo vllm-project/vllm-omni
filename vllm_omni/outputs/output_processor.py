@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from collections.abc import Iterable
 from dataclasses import fields as dataclass_fields
 from typing import Any
 
@@ -24,7 +28,7 @@ from vllm_omni.outputs.multimodal_accumulation import (
     is_non_final_delta_audio_chunk,
     replace_snapshot_keys,
 )
-from vllm_omni.outputs.output_modality import OutputModality, get_accumulation_strategy
+from vllm_omni.outputs.output_modality import OutputModality
 
 logger = init_logger(__name__)
 
@@ -55,12 +59,27 @@ def _modality_to_type_string(modality: OutputModality) -> str:
     return "text"
 
 
+_TPOT_ELAPSED_MS = "_tpot_elapsed_ms"
+_TPOT_INTERVALS = "_tpot_intervals"
+
+
 def _mean_time_per_output_token_ms(stats: RequestStateStats) -> float:
     output_intervals = stats.num_generation_tokens - 1
     if output_intervals <= 0:
         return 0.0
     decode_time_s = max(stats.last_token_ts - stats.first_token_ts, 0.0)
     return decode_time_s * 1000.0 / float(output_intervals)
+
+
+def _accumulate_segment_tpot(record: dict[str, object], *, elapsed_ms: float, new_tokens: int) -> None:
+    """Weight one decode step by its token count. ITL stays one sample per step."""
+    if new_tokens <= 0:
+        return
+    total_elapsed_ms = float(record.get(_TPOT_ELAPSED_MS) or 0.0) + elapsed_ms
+    total_intervals = int(record.get(_TPOT_INTERVALS) or 0) + new_tokens
+    record[_TPOT_ELAPSED_MS] = total_elapsed_ms
+    record[_TPOT_INTERVALS] = total_intervals
+    record["vllm_tpot_ms"] = total_elapsed_ms / float(total_intervals)
 
 
 class OmniRequestState(RequestState):
@@ -121,8 +140,8 @@ class OmniRequestState(RequestState):
         """Consolidate accumulated tensor lists into single tensors.
 
         Uses TensorAccumulationStrategy derived from the output modality
-        to determine concatenation behavior. Metadata values always use
-        REPLACE (keep latest).
+        (with any per-key override applied) to determine concatenation
+        behavior. Metadata values always use REPLACE (keep latest).
         """
         if self.mm_accumulated.is_empty:
             return
@@ -131,10 +150,9 @@ class OmniRequestState(RequestState):
             modality = OutputModality.from_string(self.mm_type)
         except (ValueError, KeyError):
             modality = OutputModality.TEXT
-        strategy = get_accumulation_strategy(modality)
 
         try:
-            self.mm_accumulated.consolidate_tensors(strategy)
+            self.mm_accumulated.consolidate_tensors(modality)
             self.mm_accumulated.consolidate_metadata()
         except (RuntimeError, TypeError, KeyError):
             logger.exception("Error consolidating multimodal tensors")
@@ -148,6 +166,8 @@ class OmniRequestState(RequestState):
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
+        ec_transfer_params: dict[str, Any] | None = None,
+        *,
         routed_experts: Any = None,
     ) -> OmniRequestOutput | PoolingRequestOutput | None:
         """Create a request output from generation results.
@@ -162,8 +182,13 @@ class OmniRequestState(RequestState):
             finish_reason: Optional finish reason indicating why generation stopped
             stop_reason: Optional stop reason (token ID or stop string)
             kv_transfer_params: Optional KV cache transfer parameters
+            ec_transfer_params: Optional encoder-cache transfer parameters
+                (6th positional, matching upstream RequestState so that
+                super().process_outputs() calls do not misroute it).
             routed_experts: Optional MoE routed-expert ids for this step,
                 attached to the completion output for generation stages
+                (omni-specific keyword; upstream moved this accumulation
+                into RequestState.routed_experts_chunks).
 
         Returns:
             OmniRequestOutput or PoolingRequestOutput if output should be
@@ -177,6 +202,7 @@ class OmniRequestState(RequestState):
                 finish_reason,
                 stop_reason,
                 kv_transfer_params,
+                ec_transfer_params,
             )
 
         is_delta = self.output_kind == RequestOutputKind.DELTA
@@ -230,6 +256,7 @@ class OmniRequestState(RequestState):
             outputs,
             finished,
             kv_transfer_params,
+            ec_transfer_params,
         )
 
     def _new_completion_output(
@@ -309,6 +336,7 @@ class OmniRequestState(RequestState):
         outputs: list,
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
+        ec_transfer_params: dict[str, Any] | None = None,
     ) -> RequestOutput | PoolingRequestOutput:
         """Create request output, handling no-detokenizer generation stages.
 
@@ -323,6 +351,7 @@ class OmniRequestState(RequestState):
                 outputs,
                 finished,
                 kv_transfer_params,
+                ec_transfer_params,
             )
 
         # No-detokenizer path: build RequestOutput directly.
@@ -341,7 +370,9 @@ class OmniRequestState(RequestState):
             outputs=outputs,
             finished=finished,
             kv_transfer_params=kv_transfer_params,
+            ec_transfer_params=ec_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
+            num_cache_creation_tokens=self.num_cache_creation_tokens,
             metrics=self.stats,
         )
 
@@ -413,9 +444,122 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         )
 
     def pop_native_text_metrics(self, request_id: str) -> dict[str, Any]:
-        return self._native_text_metrics_by_request.pop(request_id, {})
+        record = self._native_text_metrics_by_request.pop(request_id, {})
+        record.pop(_TPOT_ELAPSED_MS, None)
+        record.pop(_TPOT_INTERVALS, None)
+        return record
 
     def abort_requests(self, request_ids, internal: bool) -> list[str]:
+        aborted_ids, _outputs = self.abort_requests_collecting_outputs(request_ids, internal=internal)
+        return aborted_ids
+
+    def abort_requests_collecting_outputs(
+        self,
+        request_ids: Iterable[str],
+        *,
+        internal: bool,
+        commit_state: bool = True,
+    ) -> tuple[list[str], list[RequestOutput | PoolingRequestOutput]]:
+        """Abort requests and return terminal abort outputs with partial tokens.
+
+        Mirrors upstream ``OutputProcessor.abort_requests``, but also returns
+        abort ``RequestOutput`` objects when ``queue`` is ``None`` (Omni stage
+        pools register OP state without a collector queue).
+
+        Terminal abort outputs use ``RequestOutputKind.CUMULATIVE`` so DELTA
+        streaming requests still surface the full prefix generated so far.
+        ``new_token_ids`` is the detokenizer prefix: Omni's
+        ``make_request_output`` writes that list onto ``CompletionOutput.token_ids``.
+
+        When ``commit_state`` is False, processor mappings stay in place so a
+        failed physical EngineCore abort can retry with the same prefix.
+        """
+        request_ids = list(request_ids)
+        if commit_state:
+            for request_id in request_ids:
+                if internal:
+                    req_state = self.request_states.get(request_id)
+                    if req_state is not None:
+                        self._native_text_metrics_by_request.pop(req_state.external_req_id, None)
+                else:
+                    self._native_text_metrics_by_request.pop(request_id, None)
+
+        internal_req_ids: list[str] = []
+        for request_id in request_ids:
+            if internal:
+                internal_req_ids.append(request_id)
+                if commit_state:
+                    if req_state := self.request_states.get(request_id):
+                        external_req_id = req_state.external_req_id
+                        internal_ids = self.external_req_ids.get(external_req_id)
+                        if internal_ids is not None:
+                            try:
+                                internal_ids.remove(request_id)
+                            except ValueError:
+                                pass
+                            if not internal_ids:
+                                self.external_req_ids.pop(external_req_id, None)
+            elif commit_state:
+                if internal_ids := self.external_req_ids.pop(request_id, []):
+                    internal_req_ids.extend(internal_ids)
+            else:
+                internal_req_ids.extend(self.external_req_ids.get(request_id, []))
+
+        request_ids_to_abort: list[str] = []
+        abort_outputs: list[RequestOutput | PoolingRequestOutput] = []
+        for request_id in internal_req_ids:
+            req_state = (
+                self.request_states.pop(request_id, None) if commit_state else self.request_states.get(request_id)
+            )
+            if req_state is not None:
+                if commit_state:
+                    self.lora_states.request_finished(request_id, req_state.lora_name)
+                request_ids_to_abort.append(request_id)
+                original_kind = req_state.output_kind
+                req_state.output_kind = RequestOutputKind.CUMULATIVE
+                detok = req_state.detokenizer
+                new_token_ids = list(detok.output_token_ids) if detok is not None else []
+                saved_children = None
+                if not commit_state and req_state.parent_req is not None:
+                    saved_children = set(req_state.parent_req.child_requests)
+                try:
+                    request_output = req_state.make_request_output(
+                        new_token_ids=new_token_ids,
+                        pooling_output=None,
+                        finish_reason=FinishReason.ABORT,
+                        stop_reason=None,
+                        kv_transfer_params=None,
+                    )
+                finally:
+                    req_state.output_kind = original_kind
+                    if saved_children is not None and req_state.parent_req is not None:
+                        req_state.parent_req.child_requests = saved_children
+                if request_output is not None:
+                    abort_outputs.append(request_output)
+                    if commit_state and req_state.queue is not None:
+                        req_state.queue.put(request_output)
+                if commit_state:
+                    parent_req = req_state.parent_req
+                    if parent_req is not None:
+                        parent_req.child_requests.discard(request_id)
+                        if not parent_req.child_requests:
+                            self.parent_requests.pop(parent_req.request_id, None)
+            elif parent := self.parent_requests.get(request_id):
+                if parent.child_requests:
+                    child_reqs = list(parent.child_requests)
+                    child_aborted, child_outputs = self.abort_requests_collecting_outputs(
+                        child_reqs,
+                        internal=True,
+                        commit_state=commit_state,
+                    )
+                    request_ids_to_abort.extend(child_aborted)
+                    abort_outputs.extend(child_outputs)
+                if commit_state:
+                    self.parent_requests.pop(request_id, None)
+        return request_ids_to_abort, abort_outputs
+
+    def commit_aborted_request_state(self, request_ids: Iterable[str], *, internal: bool) -> None:
+        """Drop processor mappings after a successful physical EngineCore abort."""
         request_ids = list(request_ids)
         for request_id in request_ids:
             if internal:
@@ -424,7 +568,37 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                     self._native_text_metrics_by_request.pop(req_state.external_req_id, None)
             else:
                 self._native_text_metrics_by_request.pop(request_id, None)
-        return super().abort_requests(request_ids, internal)
+
+        internal_req_ids: list[str] = []
+        for request_id in request_ids:
+            if internal:
+                internal_req_ids.append(request_id)
+                if req_state := self.request_states.get(request_id):
+                    external_req_id = req_state.external_req_id
+                    internal_ids = self.external_req_ids.get(external_req_id)
+                    if internal_ids is not None:
+                        try:
+                            internal_ids.remove(request_id)
+                        except ValueError:
+                            pass
+                        if not internal_ids:
+                            self.external_req_ids.pop(external_req_id, None)
+            elif internal_ids := self.external_req_ids.pop(request_id, []):
+                internal_req_ids.extend(internal_ids)
+
+        for request_id in internal_req_ids:
+            req_state = self.request_states.pop(request_id, None)
+            if req_state is not None:
+                self.lora_states.request_finished(request_id, req_state.lora_name)
+                parent_req = req_state.parent_req
+                if parent_req is not None:
+                    parent_req.child_requests.discard(request_id)
+                    if not parent_req.child_requests:
+                        self.parent_requests.pop(parent_req.request_id, None)
+            elif parent := self.parent_requests.get(request_id):
+                if parent.child_requests:
+                    self.commit_aborted_request_state(list(parent.child_requests), internal=True)
+                self.parent_requests.pop(request_id, None)
 
     def add_request(
         self,
@@ -510,10 +684,18 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
             # Accumulate multimodal tensors regardless of path.
             if isinstance(req_state, OmniRequestState):
+                mm_type = getattr(eco, "output_type", None) or default_mm_type
+
                 mm_output = getattr(eco, "multimodal_output", None)
                 if mm_output is not None:
-                    mm_type = getattr(eco, "output_type", None) or default_mm_type
                     req_state.add_multimodal_tensor(mm_output, mm_type)
+
+                # Omni AR stages carry model payloads alongside text tokens in
+                # pooling_output. Preserve the payload, then clear the field so
+                # upstream still runs the normal detokenization path.
+                if eco.pooling_output is not None and req_state.detokenizer is not None:
+                    req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
+                    eco.pooling_output = None
 
             # Route: if no detokenizer and no pooling output, handle locally
             # to avoid upstream's assert on detokenizer.
@@ -523,20 +705,22 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 upstream_outputs.append(eco)
 
         # Handle multimodal-only outputs (generation stages) locally.
-        mm_request_outputs = self._process_mm_only_outputs(
+        mm_request_outputs, mm_reqs_to_abort = self._process_mm_only_outputs(
             mm_only_outputs,
             engine_core_timestamp=engine_core_timestamp,
             iteration_stats=iteration_stats,
         )
 
         # Delegate text/pooling outputs to upstream.
-        processed = super().process_outputs(
+        upstream_processed = super().process_outputs(
             upstream_outputs,
             engine_core_timestamp=engine_core_timestamp,
             iteration_stats=iteration_stats,
         )
-        processed.request_outputs.extend(mm_request_outputs)
-        return processed
+        return OutputProcessorOutput(
+            request_outputs=mm_request_outputs + upstream_processed.request_outputs,
+            reqs_to_abort=mm_reqs_to_abort + upstream_processed.reqs_to_abort,
+        )
 
     def _process_mm_only_outputs(
         self,
@@ -544,32 +728,36 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         *,
         engine_core_timestamp: float | None = None,
         iteration_stats: IterationStats | None = None,
-    ) -> list[OmniRequestOutput | PoolingRequestOutput]:
+    ) -> tuple[list[OmniRequestOutput | PoolingRequestOutput], list[str]]:
         """Handle outputs from generation stages that have no detokenizer.
 
         These cannot go through upstream process_outputs because it asserts
         detokenizer is not None when pooling_output is None.
         """
         request_outputs: list[OmniRequestOutput | PoolingRequestOutput] = []
+        reqs_to_abort: list[str] = []
         for eco in engine_core_outputs:
             req_state = self.request_states.get(eco.request_id)
             if req_state is None or not isinstance(req_state, OmniRequestState):
                 continue
 
-            new_token_ids = eco.new_token_ids
-            finish_reason = eco.finish_reason
-            stop_reason = eco.stop_reason
-            kv_transfer_params = eco.kv_transfer_params
-            routed_experts = eco.routed_experts
             self._update_stats_from_output(
                 req_state,
                 eco,
                 engine_core_timestamp,
                 iteration_stats,
             )
+
+            new_token_ids = eco.new_token_ids
+            finish_reason = eco.finish_reason
+            stop_reason = eco.stop_reason
+            kv_transfer_params = eco.kv_transfer_params
+            ec_transfer_params = eco.ec_transfer_params
+            routed_experts = eco.routed_experts
             prefill_stats = getattr(eco, "prefill_stats", None)
             if prefill_stats is not None:
                 req_state.num_cached_tokens = prefill_stats.num_cached_tokens
+                req_state.num_cache_creation_tokens = prefill_stats.num_cache_creation_tokens
             req_state.is_prefilling = False
 
             is_non_final_audio_chunk = (
@@ -583,7 +771,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 finish_reason,
                 stop_reason,
                 kv_transfer_params,
-                routed_experts,
+                ec_transfer_params,
+                routed_experts=routed_experts,
             ):
                 if req_state.queue is not None:
                     req_state.queue.put(request_output)
@@ -593,12 +782,17 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             is_segment_finished = bool(getattr(eco, "is_segment_finished", False))
             if finish_reason is not None and not is_segment_finished and not is_non_final_audio_chunk:
                 self._finish_request(req_state)
+                if not getattr(eco, "finished", True):
+                    reqs_to_abort.append(eco.request_id)
                 self._update_stats_from_finished(
                     req_state,
                     finish_reason,
                     iteration_stats,
                 )
-        return request_outputs
+                if self.tracing_enabled:
+                    self.do_tracing(eco, req_state, iteration_stats)
+
+        return request_outputs, reqs_to_abort
 
     def _update_stats_from_output(
         self,
@@ -610,6 +804,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         was_prefilling = req_state.is_prefilling
         native_stats = req_state.native_text_stats if isinstance(req_state, OmniRequestState) else None
         previous_last_token_ts = native_stats.last_token_ts if native_stats is not None else 0.0
+        previous_num_generation_tokens = int(native_stats.num_generation_tokens) if native_stats is not None else 0
 
         # NOTE: We pass ``None`` for  *iteration_stats* to the parent so that
         # the upstream's ``_update_stats_from_output`` logs stats via its own
@@ -626,6 +821,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             None,
         )
 
+        reported_count = getattr(engine_core_output, "num_generation_tokens", None)
+        if isinstance(reported_count, int) and not isinstance(reported_count, bool) and reported_count >= 0:
+            self._native_text_metric_record(req_state.external_req_id)["num_generation_tokens"] = reported_count
+
         if iteration_stats is None or engine_core_timestamp is None or native_stats is None:
             return
 
@@ -638,7 +837,11 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             req_state.lora_name,
         )
         record = self._native_text_metric_record(req_state.external_req_id)
-        record["num_generation_tokens"] = int(native_stats.num_generation_tokens)
+        record["num_generation_tokens"] = (
+            reported_count
+            if isinstance(reported_count, int) and not isinstance(reported_count, bool) and reported_count >= 0
+            else int(native_stats.num_generation_tokens)
+        )
         if was_prefilling:
             record["vllm_ttft_ms"] = max(float(native_stats.first_token_latency) * 1000.0, 0.0)
             return
@@ -648,7 +851,13 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             itls_ms = record.setdefault("vllm_itls_ms", [])
             itls_ms.append(itl_ms)
             record["vllm_itl_ms"] = sum(itls_ms) / float(len(itls_ms))
-        record["vllm_tpot_ms"] = _mean_time_per_output_token_ms(native_stats)
+            _accumulate_segment_tpot(
+                record,
+                elapsed_ms=itl_ms,
+                new_tokens=max(int(native_stats.num_generation_tokens) - previous_num_generation_tokens, 0),
+            )
+        elif not record["vllm_itls_ms"]:
+            record["vllm_tpot_ms"] = _mean_time_per_output_token_ms(native_stats)
 
     def _update_stats_from_finished(
         self,
@@ -676,6 +885,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         finished_request = iteration_stats.finished_requests[-1]
         if finished_request.request_id != req_state.external_req_id:
             return
-        self._native_text_metric_record(req_state.external_req_id)["vllm_tpot_ms"] = (
-            float(finished_request.mean_time_per_output_token) * 1000.0
-        )
+        finished_tpot_ms = float(finished_request.mean_time_per_output_token) * 1000.0
+        record = self._native_text_metric_record(req_state.external_req_id)
+        if finished_tpot_ms > 0 and not record.get("vllm_itls_ms"):
+            record["vllm_tpot_ms"] = finished_tpot_ms

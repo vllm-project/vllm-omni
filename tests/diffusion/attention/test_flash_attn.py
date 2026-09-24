@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Test script for FlashAttention backend with padding handling.
@@ -16,17 +16,44 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.attention.backends.utils import fa  # noqa: E402
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 is_gpu = current_omni_platform.is_cuda_alike() or current_omni_platform.is_xpu()
 HAS_FLASH_ATTN = fa.HAS_FLASH_ATTN
 flash_attn_func = fa.flash_attn_func  # noqa: N813
+
+
+@pytest.mark.parametrize(
+    ("device_major", "requested", "supported", "expected"),
+    [
+        (8, None, frozenset((2, 3, 4)), 2),
+        (9, None, frozenset((2, 3, 4)), 3),
+        (10, None, frozenset((2, 3, 4)), 4),
+        (12, None, frozenset((2, 3, 4)), 4),
+        (9, None, frozenset((2,)), 2),
+        (10, None, frozenset((2, 3)), 3),
+        (9, "2", frozenset((2, 3, 4)), 2),
+        (9, "4", frozenset((2, 3, 4)), 4),
+    ],
+)
+@pytest.mark.cpu
+def test_versioned_flash_attention_selection(device_major, requested, supported, expected):
+    assert fa._choose_vllm_flash_attn_version(device_major, requested, supported) == expected
+
+
+@pytest.mark.cpu
+def test_versioned_flash_attention_selection_rejects_invalid_or_unavailable_version():
+    with pytest.raises(ValueError, match="must be 2, 3, or 4"):
+        fa._choose_vllm_flash_attn_version(9, "5", frozenset((2, 3, 4)))
+    with pytest.raises(RuntimeError, match="FlashAttention 4 is unavailable"):
+        fa._choose_vllm_flash_attn_version(9, "4", frozenset((2, 3)))
 
 
 def create_attention_mask(batch_size: int, seq_len: int, valid_len: int, device: torch.device) -> torch.Tensor:
@@ -68,7 +95,8 @@ def pad_tensor(tensor: torch.Tensor, target_seq_len: int, pad_value: float = 0.0
     return torch.cat([tensor, padding], dim=1)
 
 
-@pytest.mark.skipif(not is_gpu, reason="FlashAttention requires CUDA or XPU")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.skipif(not is_gpu, reason="FlashAttention requires an accelerator")
 def test_padding_equivalence():
     """
     Case 1: Test that padded and unpadded inputs produce similar outputs.
@@ -161,7 +189,8 @@ def test_padding_equivalence():
     print("✓ Case 1 PASSED: Padded and unpadded outputs are very close!")
 
 
-@pytest.mark.skipif(not is_gpu, reason="FlashAttention requires CUDA or XPU")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.skipif(not is_gpu, reason="FlashAttention requires an accelerator")
 def test_fa_vs_sdpa():
     """
     Case 2: Compare FlashAttention and SDPA backends with padding.
@@ -278,7 +307,8 @@ def test_fa_vs_sdpa():
     print("✓ Case 2 PASSED: FA and SDPA outputs are very close!")
 
 
-@pytest.mark.skipif(not is_gpu, reason="FlashAttention requires CUDA or XPU")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.skipif(not is_gpu, reason="FlashAttention requires an accelerator")
 def test_flash_attn_func_preferred_over_varlen():
     """Test flash_attn_func availability and basic forward call."""
     if not HAS_FLASH_ATTN:
@@ -308,6 +338,101 @@ def test_flash_attn_func_preferred_over_varlen():
     print("✓ flash_attn_func forward works correctly!")
 
 
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.skipif(not is_gpu, reason="FlashAttention requires an accelerator")
+@pytest.mark.parametrize("k_len", [40, 256])
+def test_cross_attn_key_padding_vs_sdpa(k_len):
+    """
+    Case 3: Cross-attention with a key-padding mask.
+
+    The mask covers only the key sequence; every query position must attend
+    to the valid keys. FA and SDPA outputs should be very close. k_len=256
+    covers equal Q/K lengths, which must not be mistaken for self-attention,
+    and valid key lengths differ per batch element.
+    """
+    device = torch.device(current_omni_platform.device_type)
+    dtype = torch.bfloat16
+
+    batch_size = 2
+    q_len = 256
+    valid_lens = (17, 29)
+    num_heads = 8
+    head_dim = 64
+
+    fa_impl = FlashAttentionImpl(
+        num_heads=num_heads, head_size=head_dim, softmax_scale=1.0 / (head_dim**0.5), causal=False, role="cross"
+    )
+    sdpa_impl = SDPAImpl(num_heads=num_heads, head_size=head_dim, softmax_scale=1.0 / (head_dim**0.5), causal=False)
+
+    torch.manual_seed(7)
+    query = torch.randn(batch_size, q_len, num_heads, head_dim, device=device, dtype=dtype)
+    key = torch.randn(batch_size, k_len, num_heads, head_dim, device=device, dtype=dtype)
+    value = torch.randn(batch_size, k_len, num_heads, head_dim, device=device, dtype=dtype)
+
+    attn_mask = torch.zeros(batch_size, k_len, dtype=torch.bool, device=device)
+    for i, valid_len in enumerate(valid_lens):
+        attn_mask[i, :valid_len] = True
+    attn_metadata = AttentionMetadata(attn_mask=attn_mask)
+
+    output_fa = fa_impl.forward(query=query, key=key, value=value, attn_metadata=attn_metadata)
+    output_sdpa = sdpa_impl.forward(query=query, key=key, value=value, attn_metadata=attn_metadata)
+
+    max_diff = torch.max(torch.abs(output_fa - output_sdpa)).item()
+    mean_diff = torch.mean(torch.abs(output_fa - output_sdpa)).item()
+
+    print("\n=== Case 3: Cross-Attention Key-Padding FA vs SDPA ===")
+    print(f"Max absolute difference: {max_diff:.6f}")
+    print(f"Mean absolute difference: {mean_diff:.6f}")
+
+    # Match the platform-specific comparison used by test_fa_vs_sdpa above.
+    if current_omni_platform.is_rocm():
+        # AITER FlashAttention and PyTorch SDPA use different BF16 reduction
+        # implementations on ROCm, so individual values can differ by one BF16
+        # step even though the outputs agree within the expected relative error.
+        torch.testing.assert_close(output_fa, output_sdpa, rtol=1e-2, atol=1.5e-2)
+    else:
+        assert max_diff < 0.01, f"Max difference {max_diff} exceeds threshold 0.01"
+        assert mean_diff < 0.001, f"Mean difference {mean_diff} exceeds threshold 0.001"
+
+    print("✓ Case 3 PASSED: FA and SDPA cross-attention outputs are very close!")
+
+
+@pytest.mark.cpu
+def test_varlen_masked_routing_by_role(monkeypatch):
+    """The unpad route is picked by role, not Q/K length equality; runs without a GPU."""
+    calls = []
+
+    def fake_varlen_func(q, k, v, **kwargs):
+        calls.append((q.shape[0], kwargs["cu_seqlens_q"], kwargs["cu_seqlens_k"]))
+        return q
+
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen_func)
+
+    batch_size, seq_len, num_heads, head_dim = 2, 4, 2, 8
+    query = torch.randn(batch_size, seq_len, num_heads, head_dim)
+    metadata = AttentionMetadata(attn_mask=torch.tensor([[True, True, False, False], [True, True, True, False]]))
+
+    cross_impl = FlashAttentionImpl(
+        num_heads=num_heads, head_size=head_dim, softmax_scale=0.5, causal=False, role="cross"
+    )
+    output = cross_impl.forward_cuda(query, query, query, metadata)
+    assert output.shape == query.shape
+    num_q_rows, cu_seqlens_q, cu_seqlens_k = calls[-1]
+    assert num_q_rows == batch_size * seq_len
+    assert cu_seqlens_q.tolist() == [0, 4, 8]
+    assert cu_seqlens_k.tolist() == [0, 2, 5]
+
+    self_impl = FlashAttentionImpl(num_heads=num_heads, head_size=head_dim, softmax_scale=0.5, causal=False)
+    output = self_impl.forward_cuda(query, query, query, metadata)
+    assert output.shape == query.shape
+    num_q_rows, cu_seqlens_q, cu_seqlens_k = calls[-1]
+    assert num_q_rows == 5
+    assert cu_seqlens_q.tolist() == [0, 2, 5]
+    assert cu_seqlens_k.tolist() == [0, 2, 5]
+
+
+@pytest.mark.cpu
 def test_piecewise_flash_attn_uses_varlen_fallback(monkeypatch):
     calls = []
 
@@ -338,6 +463,7 @@ def test_piecewise_flash_attn_uses_varlen_fallback(monkeypatch):
     assert calls[0]["softmax_scale"] == 0.5
 
 
+@pytest.mark.cpu
 def test_packed_varlen_metadata_bypasses_mask_unpadding(monkeypatch):
     calls = []
 
@@ -370,6 +496,7 @@ def test_packed_varlen_metadata_bypasses_mask_unpadding(monkeypatch):
     assert calls[0][3]["max_seqlen_q"] == 6
 
 
+@pytest.mark.cpu
 def test_packed_varlen_metadata_must_be_complete(monkeypatch):
     monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
     impl = FlashAttentionImpl(num_heads=2, head_size=4, softmax_scale=0.5, causal=False)
@@ -387,11 +514,12 @@ def test_packed_varlen_metadata_must_be_complete(monkeypatch):
 #   - boundary resolution in ``_resolve_packed_seq_npu`` (pure Python, no device
 #     sync, no MindIE-SD import);
 #   - env dispatch in ``forward_fa_npu`` (which op a packed forward takes);
+#   - native torch_npu dispatch for right-down causal attention;
 #   - the laser input pre-scaling math in ``_forward_prefix_kv_slice_npu``.
 #
-# They run on CPU without a real NPU by injecting a fake ``mindiesd`` module
-# into ``sys.modules`` (same pattern as ``test_paged_attention`` /
-# ``benchmarks/conftest``). No production code is exercised for real kernels.
+# They run on CPU without a real NPU by injecting fake ``mindiesd`` and
+# ``torch_npu`` modules into ``sys.modules`` (same pattern as
+# ``test_paged_attention`` / ``benchmarks/conftest``). No real kernel runs.
 
 
 def _npu_impl(causal: bool = False) -> FlashAttentionImpl:
@@ -413,9 +541,19 @@ def _fake_mindiesd(monkeypatch, *, attention_forward=None, attention_forward_var
     return fake
 
 
+def _fake_torch_npu(monkeypatch, *, npu_fusion_attention=None):
+    """Install the minimal torch_npu surface used by causal NPU attention."""
+    fake = SimpleNamespace(
+        npu_fusion_attention=npu_fusion_attention or Mock(return_value=(torch.zeros(1), None, None, None, 0, 0, 0)),
+    )
+    monkeypatch.setitem(sys.modules, "torch_npu", fake)
+    return fake
+
+
 # --- Test group A: boundary resolution (_resolve_packed_seq_npu) -------------
 
 
+@pytest.mark.cpu
 def test_resolve_packed_seq_accepts_real_plus_pad_contract():
     impl = _npu_impl()
     q = torch.randn(1, 8, 2, 4)
@@ -425,6 +563,7 @@ def test_resolve_packed_seq_accepts_real_plus_pad_contract():
     assert impl._resolve_packed_seq_npu(q, q, extra) == ([5, 8], [5, 8])
 
 
+@pytest.mark.cpu
 def test_resolve_packed_seq_single_document_no_padding():
     impl = _npu_impl()
     q = torch.randn(1, 8, 2, 4)
@@ -448,6 +587,7 @@ def test_resolve_packed_seq_single_document_no_padding():
         "pad_longer_than_real",
     ],
 )
+@pytest.mark.cpu
 def test_resolve_packed_seq_rejects_malformed_metadata(case):
     """Any metadata outside the exact [real, pad] contract returns None so the
     caller falls back to the masked path."""
@@ -504,6 +644,7 @@ def _npu_impl_with_mocked_paths() -> tuple[FlashAttentionImpl, torch.Tensor]:
     return impl, sentinel
 
 
+@pytest.mark.cpu
 def test_npu_env_unset_uses_varlen(monkeypatch):
     monkeypatch.delenv("MINDIE_SD_FA_TYPE", raising=False)
     _fake_mindiesd(monkeypatch)
@@ -516,6 +657,7 @@ def test_npu_env_unset_uses_varlen(monkeypatch):
     impl._forward_prefix_kv_slice_npu.assert_not_called()
 
 
+@pytest.mark.cpu
 def test_npu_env_laser_uses_slice(monkeypatch):
     monkeypatch.setenv("MINDIE_SD_FA_TYPE", "ascend_laser_attention")
     _fake_mindiesd(monkeypatch)
@@ -529,6 +671,7 @@ def test_npu_env_laser_uses_slice(monkeypatch):
 
 
 @pytest.mark.parametrize("fa_type", ["prompt_flash_attn", "fused_attn_score", "ascend_laser_attenton", "garbage"])
+@pytest.mark.cpu
 def test_npu_env_non_laser_value_falls_back_to_varlen(monkeypatch, fa_type):
     """Locks in the CURRENT dispatch behavior (PR #5891).
 
@@ -549,6 +692,7 @@ def test_npu_env_non_laser_value_falls_back_to_varlen(monkeypatch, fa_type):
     impl._forward_prefix_kv_slice_npu.assert_not_called()
 
 
+@pytest.mark.cpu
 def test_npu_varlen_opt_in_unset_takes_mask_path(monkeypatch):
     """Models that do not set ``npu_attn_varlen`` (e.g. Wan/Cosmos) keep using
     the existing masked attention_forward path; the new branches are skipped."""
@@ -569,9 +713,115 @@ def test_npu_varlen_opt_in_unset_takes_mask_path(monkeypatch):
     assert out is fake_forward.return_value
 
 
-# --- Test group C: laser input pre-scaling in _forward_prefix_kv_slice_npu --
+# --- Test group C: native NPU causal attention dispatch ----------------------
 
 
+@pytest.mark.parametrize(
+    ("query_length", "key_length", "expected_inner_precise"),
+    [(4, 4, 0), (2, 4, 0), (4, 2, 2)],
+)
+@pytest.mark.cpu
+def test_npu_causal_uses_native_right_down_mode(
+    monkeypatch,
+    query_length,
+    key_length,
+    expected_inner_precise,
+):
+    expected_out = torch.randn(1, query_length, 2, 4)
+    fusion_attention = Mock(return_value=(expected_out, None, None, None, 0, 0, 0))
+    fake_torch_npu = _fake_torch_npu(monkeypatch, npu_fusion_attention=fusion_attention)
+    impl = FlashAttentionImpl(num_heads=8, head_size=4, softmax_scale=0.5, causal=True)
+    query = torch.randn(1, query_length, 2, 4)
+    key = torch.randn(1, key_length, 2, 4)
+
+    out = impl.forward_fa_npu(query, key, key)
+
+    fake_torch_npu.npu_fusion_attention.assert_called_once()
+    args, kwargs = fake_torch_npu.npu_fusion_attention.call_args
+    assert torch.equal(args[0], query)
+    assert torch.equal(args[1], key)
+    assert torch.equal(args[2], key)
+    assert all(tensor.is_contiguous() for tensor in args[:3])
+    assert kwargs["head_num"] == query.shape[2]
+    assert kwargs["input_layout"] == "BSND"
+    assert kwargs["scale"] == 0.5
+    assert kwargs["keep_prob"] == 1.0
+    assert kwargs["sparse_mode"] == 3
+    assert kwargs["inner_precise"] == expected_inner_precise
+
+    block_mask = kwargs["atten_mask"]
+    assert block_mask.shape == (2048, 2048)
+    assert block_mask.dtype == torch.bool
+    assert block_mask.is_contiguous()
+    expected_corner = torch.tensor(
+        [
+            [False, True, True, True],
+            [False, False, True, True],
+            [False, False, False, True],
+            [False, False, False, False],
+        ]
+    )
+    assert torch.equal(block_mask[:4, :4], expected_corner)
+    assert out is expected_out
+
+
+@pytest.mark.cpu
+def test_npu_causal_composes_explicit_keep_mask(monkeypatch):
+    expected_out = torch.randn(1, 4, 2, 4)
+    fusion_attention = Mock(return_value=(expected_out, None, None, None, 0, 0, 0))
+    fake_torch_npu = _fake_torch_npu(monkeypatch, npu_fusion_attention=fusion_attention)
+    impl = FlashAttentionImpl(num_heads=2, head_size=4, softmax_scale=0.5, causal=True)
+    query = torch.randn(1, 4, 2, 4)
+    key_keep_mask = torch.tensor([[True, False, True, True]])
+
+    out = impl.forward_fa_npu(
+        query,
+        query,
+        query,
+        AttentionMetadata(attn_mask=key_keep_mask),
+    )
+
+    fake_torch_npu.npu_fusion_attention.assert_called_once()
+    kwargs = fake_torch_npu.npu_fusion_attention.call_args.kwargs
+    assert kwargs["sparse_mode"] == 1
+    assert kwargs["inner_precise"] == 2
+    expected_block_mask = torch.tensor(
+        [
+            [
+                [
+                    [False, True, True, True],
+                    [False, True, True, True],
+                    [False, True, False, True],
+                    [False, True, False, False],
+                ]
+            ]
+        ]
+    )
+    assert torch.equal(kwargs["atten_mask"], expected_block_mask)
+    assert kwargs["atten_mask"].is_contiguous()
+    assert out is expected_out
+
+
+@pytest.mark.cpu
+def test_npu_noncausal_without_explicit_mask_stays_unmasked(monkeypatch):
+    captured: dict = {}
+
+    def fake_attention_forward(query, key, value, **kwargs):
+        captured.update(kwargs)
+        return torch.zeros_like(query)
+
+    _fake_mindiesd(monkeypatch, attention_forward=fake_attention_forward)
+    query = torch.randn(1, 4, 2, 4)
+
+    _npu_impl(causal=False).forward_fa_npu(query, query, query)
+
+    assert captured["attn_mask"] is None
+
+
+# --- Test group D: laser input pre-scaling in _forward_prefix_kv_slice_npu --
+
+
+@pytest.mark.cpu
 def test_prefix_kv_slice_applies_laser_input_scaling(monkeypatch):
     monkeypatch.setenv("MINDIE_SD_FA_TYPE", "ascend_laser_attention")
     captured: dict = {}
@@ -610,6 +860,7 @@ def test_prefix_kv_slice_applies_laser_input_scaling(monkeypatch):
     torch.testing.assert_close(out, torch.ones(1, 8, 2, 4) * 256.0)
 
 
+@pytest.mark.cpu
 def test_prefix_kv_slice_no_scaling_without_factor(monkeypatch):
     monkeypatch.setenv("MINDIE_SD_FA_TYPE", "ascend_laser_attention")
     captured: dict = {}

@@ -1,5 +1,7 @@
 # Diffusion Advanced Features
 
+<!-- markdownlint-disable MD028 MD060 -->
+
 ## Table of Contents
 
 - [Overview](#overview)
@@ -30,6 +32,29 @@ Cache methods trade minimal quality for significant speedup. Quality loss is typ
 | **[TeaCache](diffusion/cache_acceleration/teacache.md)** | Adaptive caching using modulated inputs | Quick setup, balanced quality/speed on single GPU |
 | **[Cache-DiT](diffusion/cache_acceleration/cache_dit.md)** | Multiple caching techniques: DBCache, TaylorSeer, SCM | Fine-grained control, tunable quality-speed tradeoff |
 
+#### Diffusion KV Prefix Caching
+
+[KV prefix caching](../design/feature/prefix_caching.md#diffusion-kv-prefix-caching)
+reuses stable context KV across requests, rather than approximating denoise
+steps. Enable `diffusion_kv_mode: paged_scheduler` and `enable_prefix_caching: true`
+on the HunyuanImage3 standalone DiT stage. This is separate from the AR stage-output
+cache, TeaCache and Cache-DiT.
+
+| Model / combination | Scope |
+|---------------------|-------|
+| HunyuanImage3 standalone DiT | Stable text/reference-image prefix reuse; dynamic image tokens are excluded |
+| TP4/SP1 + EP, CFGP1 | Validated reference-image prefix hits |
+| TP2/SP2 (Ulysses) + EP, CFGP1 | Validated reference-image prefix hits; CFG guidance does not require CFG parallelism |
+| Other SP/TP combinations, CFGP>1 | Prefix-hit E2E accuracy not yet validated |
+| AR-imported KV / cross-stage missing-page transfer | Not covered by local prefix caching |
+| Sleep mode | Rejected with prefix caching; discarded KV pages would leave stale cache hits |
+| TeaCache / Cache-DiT, offload, quantization | Not validated with prefix hits |
+| Step execution | Not supported with HunyuanImage3 paged KV; use request-level execution |
+| Other diffusion models | No prefix-cache model adapter yet |
+
+This table describes prefix-cache scope; the general parallelism tables below do
+not establish prefix-hit compatibility. Floating-point kernel differences still
+require accuracy validation. `dense_legacy` remains the default.
 
 #### Lossless Acceleration
 
@@ -71,7 +96,6 @@ Extension methods add specialized capabilities to diffusion models beyond standa
 |--------|-------------|----------|
 | **[LoRA Inference](diffusion/lora.md)** | Enables inference with Low-Rank Adaptation (LoRA) adapters weights | Reinforcement learning extensions |
 | **[Frame Interpolation](diffusion/frame_interpolation.md)** | Inserts intermediate video frames after generation for smoother motion | Video generation pipelines that need higher temporal smoothness |
-
 
 ### Execution Modes
 
@@ -116,7 +140,8 @@ The following tables show which models support each feature:
 
 | Model                    | ⚡TeaCache | ⚡Cache-DiT | 🔀SP (Ulysses & Ring) | 🔀CFG-Parallel | 🔀Tensor-Parallel | 🔀Pipeline-Parallel | 🔀HSDP | 💾CPU Offload (Layerwise) | 💾VAE-Patch-Parallel | 💾Quantization | 🔄Step Execution |
 |--------------------------|:---------:|:----------:|:---------------------:|:--------------:|:-----------------:|:-------------------:|:------:|:-------------------------:|:--------------------:|:--------------:|:----------------:|
-| **Bagel**                |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |          ❌           |       ❌        |        ❌         |
+| **Bagel**                |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |          ❌           |       ❌        |        ✅         |
+| **Boogu-Image**          |     ❌     |     ❌      |           ❌           |       ✅        |         ❌         |          ❌          |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **FLUX.1-dev**           |     ✅     |     ✅      |           ❌           |       ✅        |         ✅         |          ❌          |   ✅    |             ❌             |          ❌           |       ✅        |        ❌         |
 | **FLUX.1-schnell**       |     ❌     |     ✅      |           ❌           |       ✅        |         ✅         |          ❌          |   ✅    |             ❌             |          ❌           |       ✅        |        ❌         |
 | **FLUX.2-klein**         |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ❌             |          ❌           |       ✅        |        ❌         |
@@ -124,12 +149,12 @@ The following tables show which models support each feature:
 | **FLUX.2-dev**           |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |          ✅           |       ❌        |        ❌         |
 | **GLM-Image**            |     ❌     |     ❌      |           ❌           |       ✅        |         ✅         |          ❌          |   ✅    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **Hidream-I1-Full**        |     ❌     |     ❌      |           ❌           |       ❌        |         ✅         |          ❌          |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
+| **HiDream-O1-Image**     |     ❌     |     ✅      |           ❌           |       ❌        |         ✅         |          ❌          |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **HunyuanImage3**        |     ❌     |     ✅      |           ❌           |       ❌        |         ✅         |          ❌          |   ❌    |             ❌             |          ❌           |       ✅        |        ✅*        |
 | **Krea 2**               |     ❌     |     ✅      |           ❌           |       ❌        |         ❌         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **LongCat-Image**        |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **LongCat-Image-Edit**   |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
-| **MagiHuman**            |     ❌     |     ❌      |           ❌           |       ❓        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
-| **MammothModa2(T2I)**    |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |          ❌          |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
+| **MammothModa2(T2I)**    |     ❌     |     ✅      |           ❌           |       ❌        |         ❌         |          ❌          |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **Nextstep_1(T2I)**      |     ❓     |     ❓      |           ❌           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **OmniGen2**             |     ❌     |     ✅      |           ✅           |       ❌        |         ✅         |          ❌          |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **Ovis-Image**           |     ❌     |     ✅      |           ❌           |       ✅        |         ❌         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
@@ -138,7 +163,7 @@ The following tables show which models support each feature:
 | **Qwen-Image-Edit**      |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **Qwen-Image-Edit-2509** |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |        ✅ (decode)         |          ✅           |       ❌        |        ❌         |
 | **Qwen-Image-Layered**   |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
-| **SenseNova-U1**         |     ❌     |     ✅      |           ❌           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
+| **SenseNova-U1 / U1.5**  |     ❌     |     ✅      |           ❌           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **Stable-Diffusion-XL**  |     ❌     |     ❌      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **Stable-Diffusion3.5**  |     ❌     |     ✅      |           ❌           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **Z-Image**              |     ✅     |     ✅      |           ✅           |       ❓        |   ✅ (TP=2 only)   |          ❌          |   ✅    |             ❌             |      ✅ (decode)      |       ✅        |        ❌         |
@@ -146,11 +171,14 @@ The following tables show which models support each feature:
 | **Cosmos3**              |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ✅        |        ❌         |
 
 > Notes:
+>
 > 1. Nextstep_1(T2I) does not support cache acceleration methods such as TeaCache or Cache-DiT.
-> 2. `Tongyi-MAI/Z-Image-Turbo` and `SII-GAIR/daVinci-MagiHuman-Base-1080p` are distilled models with minimal NFEs; CFG-Parallel is not necessary.
+> 2. `Tongyi-MAI/Z-Image-Turbo` is a distilled model with minimal NFEs; CFG-Parallel is not necessary.
 > 3. Cosmos3 T2I uses `Cosmos3OmniDiffusersPipeline` with `modalities=["image"]`. Model-level CPU offload swaps the nested UND reasoner and GEN generator pathways; layerwise offload remains available for blockwise GEN/UND offload.
 > 4. Krea 2 currently supports single-GPU inference plus LoRA, Cache-DiT, HSDP, CPU/layerwise offload, and VAE-patch-parallel (decode). TP/SP/CFG-Parallel are not yet wired. The few-step distilled (Turbo) checkpoint uses `is_distilled=true` (fixed timestep shift `mu=1.15`); generate at 2048x2048 by default with `num_inference_steps≈8` and `guidance_scale=0`. The Raw checkpoint uses 1024x1024, `num_inference_steps=28`, and `guidance_scale=4.5`.
 > 5. HunyuanImage3 supports step execution. Multi-request step execution requires `TORCH_SDPA`; see [Diffusion Execution Modes](diffusion/execution_modes.md#step-execution).
+> 6. BAGEL step execution supports image generation with `bagel.yaml`, `bagel_think.yaml`, and `bagel_single_stage.yaml`; two-stage Thinker execution and explicit single-stage text output remain on their existing complete-request paths. Image requests require `num_inference_steps >= 2`. BAGEL step execution cannot currently be combined with sequence parallelism or a diffusion cache backend; see [Diffusion Execution Modes](diffusion/execution_modes.md#step-execution).
+> 7. MammothModa2 runs its DiT stage on the diffusion runner (`StageExecutionType.DIFFUSION`); Cache-DiT is enabled through the standard diffusion-stage knobs on the stage entry of the deploy YAML (`cache_backend: cache_dit`, plus optional `cache_config` / `enable_cache_dit_summary`). The runner installs the backend at startup and the pipeline adopts it per request. Only the repeated main-layer stack is cached; requests with `text_guidance_scale = 1.0` bypass the cache hooks.
 
 ### VideoGen
 
@@ -159,30 +187,37 @@ The following tables show which models support each feature:
 | **Wan2.2**                   |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ✅         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ❌        |        ❌         |
 | **Wan2.2-S2V**               |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ❌        |        ❌         |
 | **Wan2.1-VACE**              |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
-| **LTX-2**                    |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
-| **LTX-2.3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
-| **LTX-2.5**                  |     ❌     | ❓ (one-stage) | ❓ (Ulysses only) | ✅ (Full only) |         ❓         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |    ❓ (FP8)     |        ❌         |
+| **LTX-2**                    |     ❌     |     ✅      | ✅ (Ulysses only) |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
+| **LTX-2.3**                  |     ❌     |     ✅      | ✅ (Ulysses only) |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
+| **LTX-2.5**                  |     ❌     | ❓ (one-stage) | ✅* (Ulysses only) | ✅ (Full only) |         ❓         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |    ❓ (FP8)     |        ❌         |
+|  **SANA-Video-2B T2V I2V**   |     ❌     |     ❌      |   ✅ (`--usp`, frame-sharded)   |       ✅       |  ✅ (TP=2 only)   |         ❌         |   ❌   |            ❌             |          ❌          |       ❌       |        ❌        |
 | **Helios**                   |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ✅*        |
 | **HunyuanVideo-1.5 T2V I2V** |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
-| **DreamID-Omni**             |     ❌     |     ❌      |           ❌           |       ✅        |         ❌         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **Cosmos3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 | **LongCat-Video-Avatar-1.5** |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **MiniMax-H3**               | ✅ (FL2VA) |     ✅      |           ✅           |       ❌        |       ✅ (DiT/TE)  |         ❌         |   ✅    |             ✅             |       ✅ (tile)       |      ✅ (DiT)      |        ❌         |
+| **MAGI-2 Preview**           |     ❌     |     ✅      |      ✅ (Ulysses)       |    ✅ (2-way)   |         ✅         |         ❌         |   ✅    | ✅ (1-GPU/LW; DLO DP-AG/SP no-AG) |       ✅ (tile)       |       ❌        |        ❌         |
+| **SANA-WM**                  |     ❌     |     ❌      |          ❌<sup>5</sup> |       ✅        |         ✅         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
+
+> Notes:
+> 5. SANA-WM cannot support sequence parallelism: its bidirectional gated delta
+> recurrence carries state across frames, so a rank cannot denoise a slice of
+> the token sequence in isolation. Doing so would need a distributed scan or
+> an all-gather before every GDN block. The remaining ❌ columns are simply
+> unvalidated on this model, not known-broken.
 
 > **Step execution note:** Helios supports single-request step execution only;
 > use `max_num_seqs=1`.
-
 **Frame Interpolation Support**
 
-- **Supported**: Wan2.2 text-to-video, image-to-video, and TI2V pipelines
-- **Not supported**: Wan2.1-VACE, LTX-2, LTX-2.3, LTX-2.5, Helios, HunyuanVideo-1.5, DreamID-Omni
+- **Supported**: Wan2.2 text-to-video, image-to-video, and TI2V pipelines; SANA-Video-2B native text-to-video and image-to-video pipelines
+- **Not supported**: Wan2.1-VACE, LTX-2, LTX-2.3, LTX-2.5, Helios, HunyuanVideo-1.5, DreamID-Omni, SANA-WM; SANA-Video-2B Diffusers-adapter text-to-video and image-to-video pipelines
 
 ### AudioGen
 
 | Model                 | ⚡TeaCache | ⚡Cache-DiT | 🔀SP (Ulysses & Ring) | 🔀CFG-Parallel | 🔀Tensor-Parallel | 🔀Pipeline-Parallel | 🔀HSDP | 💾CPU Offload (Layerwise) | 💾VAE-Patch-Parallel | 💾Quantization | 🔄Step Execution |
 |-----------------------|:---------:|:----------:|:---------------------:|:--------------:|:-----------------:|:-------------------:|:------:|:-------------------------:|:--------------------:|:--------------:|:----------------:|
 | **Stable-Audio-Open** |     ✅     |     ❌      |           ❓           |       ❓        |         ❌         |          ❌          |   ✅    |             ✅             |          ❌           |       ✅        |        ❌         |
-
 
 ## Feature Compatibility
 
@@ -222,7 +257,6 @@ The following tables show which models support each feature:
     5. The compatibility matrix uses FP8 as the representative quantization method.
     6. Step Execution is not compatible with any diffusion cache backend. LoRA is supported, but each scheduled batch must use a single adapter (requests with different `lora_request` or `lora_scale` are kept in separate batches).
 
-
 ## Multi-Thread Weight Loading
 
 The loading guide now lives at [Diffusion Startup and
@@ -238,9 +272,11 @@ The Diffusion Acceleration navigation groups the remaining guides as follows:
 | Compatibility | [Feature Compatibility](feature_compatibility.md) |
 | CPU offloading | [CPU Offloading](diffusion/cpu_offload.md) |
 | Cache acceleration | [TeaCache](diffusion/cache_acceleration/teacache.md), [Cache-DiT](diffusion/cache_acceleration/cache_dit.md) |
+| KV cache paging | [Scheduler-Managed Paged KV Cache](diffusion/paged_kv_cache.md) |
 | Parallelism | [Parallelism Overview](diffusion/parallelism/overview.md) |
 | Attention | [Attention Backends](diffusion/attention_backends.md) |
 | Compilation | [Regional Compilation](diffusion/regional_compilation.md) |
+| VAE decode | [Wan VAE Decoder Fast Path](diffusion/vae_fast_path.md) |
 | Video extension | [Frame Interpolation](diffusion/frame_interpolation.md) |
 | Startup | [Startup and Loading](diffusion/startup_and_loading.md) |
 | Adapters | [LoRA](diffusion/lora.md) |

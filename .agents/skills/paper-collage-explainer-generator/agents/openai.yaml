@@ -1,0 +1,4 @@
+interface:
+  display_name: "Paper Collage Explainers"
+  short_description: "Animate editorial paper metaphors with tactile SFX"
+  default_prompt: "Use $paper-collage-explainer-generator to prepare the requested H3 prompts or video with the available tools."

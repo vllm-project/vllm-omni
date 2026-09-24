@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -92,9 +92,8 @@ def test_moe_ep_maps_diffusion_sp_cfg_dp_to_vllm_groups(monkeypatch):
     monkeypatch.setattr(parallel_state, "get_forward_context", lambda: fake_forward_context)
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", fake_init_model_parallel_group)
     monkeypatch.setattr(parallel_state, "init_vllm_model_parallel_group", fake_init_vllm_model_parallel_group)
-    monkeypatch.setattr(parallel_state, "init_dit_group", lambda *_args, **_kwargs: None)
 
-    for name in ("_DP", "_CFG", "_SP", "_PP", "_FS", "_EXPERT_PARALLEL_GROUP_RANKS"):
+    for name in ("_DP", "_CFG", "_SP", "_PP", "_EXPERT_PARALLEL_GROUP_RANKS"):
         monkeypatch.setattr(parallel_state, name, None)
     for name in ("_TP", "_PCP", "_DP", "_EP", "_PP"):
         monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)
@@ -197,6 +196,47 @@ def test_moe_ep_maps_diffusion_sp_cfg_dp_to_vllm_groups(monkeypatch):
 
 @pytest.mark.cpu
 @pytest.mark.core_model
+@pytest.mark.parametrize(
+    ("fully_shard_degree", "error_message"),
+    [(0, "fully_shard_degree must be positive"), (3, "must be divisible by fully_shard_degree")],
+)
+def test_invalid_hsdp_shard_size_fails_before_group_creation(monkeypatch, fully_shard_degree: int, error_message: str):
+    """Reject invalid HSDP shard sizes before allocating any process groups."""
+    world_size = 4
+    created_groups: list[object] = []
+
+    def fail_if_group_created(*args, **kwargs):
+        del args, kwargs
+        created_groups.append(object())
+        raise AssertionError("a process group was created before HSDP validation")
+
+    fake_world_group = SimpleNamespace(
+        rank_in_group=0,
+        local_rank=0,
+        device_group=object(),
+    )
+    monkeypatch.setattr(parallel_state.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(parallel_state.torch.distributed, "get_world_size", lambda: world_size)
+    monkeypatch.setattr(parallel_state, "get_world_group", lambda: fake_world_group)
+    monkeypatch.setattr(parallel_state, "init_model_parallel_group", fail_if_group_created)
+
+    for name in ("_DP", "_CFG", "_SP", "_PP", "_FS", "_HSDP_REPLICATE", "_EXPERT_PARALLEL_GROUP_RANKS"):
+        monkeypatch.setattr(parallel_state, name, None)
+    for name in ("_TP", "_PCP", "_DP", "_EP", "_PP"):
+        monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)
+
+    with pytest.raises(ValueError, match=error_message):
+        parallel_state.initialize_model_parallel(
+            fully_shard_degree=fully_shard_degree,
+            use_hsdp=True,
+            backend="gloo",
+        )
+
+    assert created_groups == []
+
+
+@pytest.mark.cpu
+@pytest.mark.core_model
 def test_cfg_parallel_keeps_diffusion_dp_without_ep(monkeypatch):
     """Without EP, keep diffusion DP and retain rank metadata for MC2."""
     local_rank = 0
@@ -229,9 +269,8 @@ def test_cfg_parallel_keeps_diffusion_dp_without_ep(monkeypatch):
     monkeypatch.setattr(parallel_state.torch.distributed, "new_group", lambda ranks: tuple(ranks))
     monkeypatch.setattr(parallel_state, "get_world_group", lambda: fake_world_group)
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", fake_init_model_parallel_group)
-    monkeypatch.setattr(parallel_state, "init_dit_group", lambda *_args, **_kwargs: None)
 
-    for name in ("_DP", "_CFG", "_SP", "_PP", "_FS", "_EXPERT_PARALLEL_GROUP_RANKS"):
+    for name in ("_DP", "_CFG", "_SP", "_PP", "_EXPERT_PARALLEL_GROUP_RANKS"):
         monkeypatch.setattr(parallel_state, name, None)
     for name in ("_TP", "_PCP", "_DP", "_EP", "_PP"):
         monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)
@@ -257,6 +296,33 @@ def test_cfg_parallel_keeps_diffusion_dp_without_ep(monkeypatch):
     assert parallel_state._EXPERT_PARALLEL_GROUP_RANKS == [
         [0, 1, 2, 3, 4, 5, 6, 7],
     ]
+
+
+@pytest.mark.cpu
+@pytest.mark.core_model
+def test_destroy_model_parallel_clears_vllm_pipeline_group(monkeypatch):
+    """A destroyed diffusion PP group must not block the next initialization."""
+
+    class _DestroyableGroup:
+        def __init__(self) -> None:
+            self.destroy_calls = 0
+
+        def destroy(self) -> None:
+            self.destroy_calls += 1
+
+    pipeline_group = _DestroyableGroup()
+    for name in ("_DP", "_CFG", "_SP"):
+        monkeypatch.setattr(parallel_state, name, None)
+    monkeypatch.setattr(parallel_state, "_PP", pipeline_group)
+    monkeypatch.setattr(parallel_state, "_EXPERT_PARALLEL_GROUP_RANKS", None)
+    for name in ("_DP", "_PCP", "_TP", "_EP"):
+        monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)
+    monkeypatch.setattr(parallel_state.vllm_parallel_state, "_PP", pipeline_group, raising=False)
+
+    parallel_state.destroy_model_parallel()
+
+    assert pipeline_group.destroy_calls == 1
+    assert parallel_state.vllm_parallel_state._PP is None
 
 
 @pytest.mark.cpu
@@ -295,9 +361,8 @@ def test_non_moe_ep_fails_before_vllm_ep_remap(monkeypatch):
     monkeypatch.setattr(parallel_state, "get_world_group", lambda: fake_world_group)
     monkeypatch.setattr(parallel_state, "get_forward_context", lambda: fake_forward_context)
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", fake_init_model_parallel_group)
-    monkeypatch.setattr(parallel_state, "init_dit_group", lambda *_args, **_kwargs: None)
 
-    for name in ("_DP", "_CFG", "_SP", "_PP", "_FS", "_EXPERT_PARALLEL_GROUP_RANKS"):
+    for name in ("_DP", "_CFG", "_SP", "_PP", "_EXPERT_PARALLEL_GROUP_RANKS"):
         monkeypatch.setattr(parallel_state, name, None)
     for name in ("_TP", "_PCP", "_DP", "_EP", "_PP"):
         monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)

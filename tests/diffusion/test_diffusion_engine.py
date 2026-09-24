@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
 import queue
@@ -15,7 +15,12 @@ from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.diffusion_engine as diffusion_engine_module
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import (
+    DIFFUSION_REQUEST_LIFECYCLE_KEY,
+    DIFFUSION_REQUEST_STARTED,
+    DiffusionOutput,
+    OmniDiffusionConfig,
+)
 from vllm_omni.diffusion.diffusion_engine import (
     DiffusionEngine,
     DiffusionExecutionMode,
@@ -183,11 +188,36 @@ def _make_request_mode_sched_output(*request_ids: str) -> RealDiffusionScheduler
     )
 
 
+@pytest.mark.cpu
+def test_request_started_output_is_emitted_only_for_opted_in_requests() -> None:
+    sched_output = _make_request_mode_sched_output("tracked", "untracked")
+    sched_output.scheduled_new_reqs[0].req.sampling_params.emit_request_lifecycle = True
+    engine = object.__new__(DiffusionEngine)
+    emitted = []
+    engine._put_output = lambda request_id, output: emitted.append((request_id, output))
+
+    engine._emit_request_started_outputs(sched_output)
+
+    assert len(emitted) == 1
+    request_id, output = emitted[0]
+    assert request_id == "tracked"
+    assert output.request_started is True
+    assert output.finished is False
+    [formatted] = engine.postprocess_output(sched_output.scheduled_new_reqs[0].req, output)
+    assert formatted.custom_output == {
+        DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED,
+    }
+    assert formatted.finished is False
+
+
 class TestRequestBatchCapability:
     pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
-    def test_supports_request_batch_uses_registered_model_class(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        od_config = SimpleNamespace(model_class_name="BatchPipeline", custom_pipeline_args=None)
+    @pytest.mark.parametrize("custom_pipeline_args", [None, {}, {"components_path": "/tmp/anima-components"}])
+    def test_supports_request_batch_uses_registered_model_class(
+        self, monkeypatch: pytest.MonkeyPatch, custom_pipeline_args: dict[str, Any] | None
+    ) -> None:
+        od_config = SimpleNamespace(model_class_name="BatchPipeline", custom_pipeline_args=custom_pipeline_args)
 
         monkeypatch.setattr(
             diffusion_engine_module.DiffusionModelRegistry,
@@ -196,6 +226,59 @@ class TestRequestBatchCapability:
         )
 
         assert diffusion_engine_module.supports_request_batch(od_config) is True
+
+    def test_engine_rejects_multi_seq_diffusers_using_adapter_capability(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+    ) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="QwenImagePipeline",
+            custom_pipeline_args=None,
+            diffusion_load_format="diffusers",
+            streaming_output=False,
+            max_num_seqs=2,
+        )
+        registry_load = mocker.Mock(
+            side_effect=lambda model_class_name: (
+                _SingleRequestPipeline if model_class_name == "DiffusersAdapterPipeline" else _BatchCapablePipeline
+            )
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            registry_load,
+        )
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        with pytest.raises(ValueError, match="max_num_seqs=1"):
+            engine._resolve_execution_mode(od_config)
+
+        registry_load.assert_called_once_with("DiffusersAdapterPipeline")
+
+    def test_engine_prefers_batch_capable_custom_pipeline_over_diffusers_adapter(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+    ) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="QwenImagePipeline",
+            custom_pipeline_args={"pipeline_class": _BatchCapablePipeline},
+            diffusion_load_format="diffusers",
+            streaming_output=False,
+            max_num_seqs=2,
+        )
+        registry_load = mocker.Mock(return_value=_SingleRequestPipeline)
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            registry_load,
+        )
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+
+        assert engine._resolve_execution_mode(od_config) is DiffusionExecutionMode.REQUEST_BATCH
+        registry_load.assert_not_called()
 
     def test_supports_request_batch_uses_custom_pipeline_class(self, monkeypatch: pytest.MonkeyPatch) -> None:
         od_config = SimpleNamespace(
@@ -291,14 +374,16 @@ class TestRequestBatchCapability:
             diffusion_engine_module.supports_request_batch(od_config)
         registry_load.assert_not_called()
 
+    @pytest.mark.parametrize("custom_pipeline_args", [None, {}, {"components_path": "/tmp/anima-components"}])
     def test_engine_uses_request_batch_mode_for_single_request_pipeline(
         self,
         monkeypatch: pytest.MonkeyPatch,
         mocker: MockerFixture,
+        custom_pipeline_args: dict[str, Any] | None,
     ) -> None:
         od_config = SimpleNamespace(
             model_class_name="SinglePipeline",
-            custom_pipeline_args=None,
+            custom_pipeline_args=custom_pipeline_args,
             streaming_output=False,
             max_num_seqs=1,
         )
@@ -547,6 +632,34 @@ class TestDiffusionCompileConfig:
             ),
             ({"enable_cpu_offload": True}, "CPU offload"),
             ({"enable_layerwise_offload": True}, "layerwise offload"),
+            (
+                {
+                    "diffusion_offload_config": {
+                        "mode": "module",
+                        "components": ["dit"],
+                    }
+                },
+                "CPU offload",
+            ),
+            (
+                {
+                    "diffusion_offload_config": {
+                        "mode": "layer",
+                        "components": ["dit"],
+                    }
+                },
+                "layerwise offload",
+            ),
+            (
+                {
+                    "diffusion_offload_config": {
+                        "mode": "layer",
+                        "components": ["dit"],
+                        "layer_options": {"dit": {"weight_transfer": "allgather"}},
+                    }
+                },
+                "distributed layerwise offload",
+            ),
         ],
     )
     def test_full_compile_rejects_incompatible_features(self, kwargs, feature) -> None:
@@ -555,6 +668,34 @@ class TestDiffusionCompileConfig:
                 model="test",
                 diffusion_compile_granularity="full",
                 **kwargs,
+            )
+
+    def test_raw_parallel_mapping_is_normalized_before_allgather_cache_validation(self) -> None:
+        with pytest.raises(ValueError, match="rank-local cache decisions"):
+            OmniDiffusionConfig(
+                model="test",
+                num_gpus=2,
+                parallel_config={"data_parallel_size": 2},
+                cache_backend="tea_cache",
+                diffusion_offload_config={
+                    "mode": "layer",
+                    "components": ["dit"],
+                    "layer_options": {"dit": {"weight_transfer": "allgather"}},
+                },
+            )
+
+    def test_auto_dp_is_resolved_before_encoder_prompt_cache_validation(self) -> None:
+        with pytest.raises(ValueError, match="rank-local cache hits"):
+            OmniDiffusionConfig(
+                model="test",
+                num_gpus=2,
+                parallel_config={"data_parallel_size": None},
+                enable_prompt_embed_cache=True,
+                diffusion_offload_config={
+                    "mode": "layer",
+                    "components": ["text_encoder"],
+                    "layer_options": {"text_encoder": {"weight_transfer": "allgather"}},
+                },
             )
 
 

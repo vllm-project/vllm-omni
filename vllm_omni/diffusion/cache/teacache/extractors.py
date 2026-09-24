@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Model-specific extractors for TeaCache.
@@ -13,6 +13,7 @@ all model-specific information needed for generic caching, including preprocessi
 transformer execution, and postprocessing logic.
 """
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -198,7 +199,7 @@ def extract_qwen_context(
     hidden_states, vid_freqs, txt_freqs = module.image_rope_prepare(hidden_states, img_shapes, txt_seq_lens)
     image_rotary_emb = (vid_freqs, txt_freqs)
 
-    timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype)
+    timestep = torch.as_tensor(timestep, device=hidden_states.device, dtype=hidden_states.dtype)
 
     # Call modulate_index_prepare instead of handling timestep directly.
     # For zero_cond_t=False: timestep unchanged, modulate_index=None.
@@ -443,6 +444,7 @@ def extract_zimage_context(
         cap_pos_ids,
         x_inner_pad_mask,
         cap_inner_pad_mask,
+        _cap_feats_2,
     ) = module.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
 
     # Process image patches through embedder and noise refiner
@@ -617,6 +619,8 @@ def extract_flux2_klein_context(
     # ============================================================================
     dtype = hidden_states.dtype
 
+    if encoder_hidden_states is None:
+        raise ValueError("Flux2Klein requires encoder_hidden_states")
     num_txt_tokens = encoder_hidden_states.shape[1]
 
     timestep = timestep.to(dtype=dtype) * 1000
@@ -723,11 +727,11 @@ def extract_flux2_klein_context(
 def extract_longcat_context(
     module: nn.Module,  # LongCatImageTransformer2DModel
     hidden_states,
-    timestep,
-    guidance,
-    encoder_hidden_states,
-    txt_ids,
-    img_ids,
+    encoder_hidden_states=None,
+    timestep=None,
+    img_ids=None,
+    txt_ids=None,
+    guidance=None,
     **kwargs,
 ) -> CacheContext:
     """Extract the cache context for LongCat Image.
@@ -1259,12 +1263,10 @@ def extract_minimax_h3_context(
     preprocessing via ``_embed``, cacheable ``blocks`` loop, and
     ``final_layer`` postprocessing with row selection and update masks.
     """
+    from vllm_omni.diffusion.layers.indexed_modulation import indexed_scale_shift_
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
-        _BF16_DTYPE,
         _FORWARD_SUPPORTED_KWARGS,
         MINIMAX_H3_ADALN_MODALITY_NUM,
-        _build_rope_table,
-        _modulate_scale_shift,
         _required_kwarg,
     )
 
@@ -1305,6 +1307,9 @@ def extract_minimax_h3_context(
     psp = _required_kwarg(kwargs, "packed_seq_params")
     cu_seqlens = module._psp_field(psp, "packed_seq_params", "cu_seqlens_q").to(torch.int32)
     max_seqlen = int(module._psp_field(psp, "packed_seq_params", "max_seqlen_q"))
+    # Mirror forward()'s host-side scalar so the refiner sees the number of
+    # packed requests without reading cu_seqlens off-device.
+    num_requests = int(module._psp_optional(psp, "num_requests", 1))
     refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
     refiner_cu = module._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
     refiner_max = int(module._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
@@ -1318,8 +1323,20 @@ def extract_minimax_h3_context(
     if inverse_indices.shape[0] != seq_len:
         raise ValueError(f"inverse_indices must be [{seq_len}], got {list(inverse_indices.shape)}")
     device = x.device
-
-    rope_table = _build_rope_table(module.rope(img_position_ids).to(device))
+    local_span = module._rope_local_span(seq_len)
+    local_start, local_len = local_span
+    rope_table = kwargs.get("rope_table")
+    if rope_table is None:
+        rope_table = module.prepare_rope_table(
+            img_position_ids,
+            seq_len=seq_len,
+        )
+    else:
+        module._validate_prepared_rope_table(
+            rope_table,
+            local_len=local_len,
+            device=device,
+        )
 
     decoder_input, t_emb = module._embed(
         x=x,
@@ -1331,31 +1348,62 @@ def extract_minimax_h3_context(
         text_pos=text_pos.to(device),
         refiner_cu_seqlens=refiner_cu.to(device),
         refiner_max_seqlen=refiner_max,
+        num_requests=num_requests,
         seq_len=seq_len,
         device=device,
-        local_span=(0, seq_len),
+        local_span=local_span,
     )
 
     combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
     inverse_indices = inverse_indices.to(device)
     cu_seqlens = cu_seqlens.to(device)
 
+    # In strict SP, _embed already returns this rank's packed rows while
+    # combined_indices still describes the full packed sequence. TeaCache uses
+    # the first block's modulation as part of its rank-local cache state, so
+    # the modulation indices must be sliced to the same local layout. Keep the
+    # full indices below: local_sp_prepare owns the global-to-local conversion
+    # for transformer-block inputs.
+    state_combined_indices = combined_indices.narrow(0, local_start, local_len)
+    if local_len == seq_len:
+        state_combined_indices = combined_indices
+
     shift_msa, scale_msa, *_ = module.blocks[0].adaln_proj(t_emb)
-    modulated_hidden = module.blocks[0].norm1(decoder_input)
-    modulated_input = _modulate_scale_shift(
-        modulated_hidden,
+    modulated_input = module.blocks[0].norm1(decoder_input)
+    modulated_input = indexed_scale_shift_(
+        modulated_input,
         shift_msa,
         scale_msa,
-        combined_indices,
-        dtype=_BF16_DTYPE,
+        state_combined_indices,
     )
 
-    def run_transformer_blocks() -> tuple[torch.Tensor, ...]:
-        hidden, block_rope, block_combined = module.sp_prepare(
-            decoder_input,
-            rope_table,
-            combined_indices,
+    def synchronize_cache_decision(local_should_compute: bool) -> bool:
+        if local_len == seq_len:
+            return local_should_compute
+
+        from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+
+        decision = torch.tensor(
+            int(local_should_compute),
+            dtype=torch.int32,
+            device=device,
         )
+        get_sp_group().all_reduce(decision, op=torch.distributed.ReduceOp.MAX)
+        return bool(decision.item())
+
+    def run_transformer_blocks() -> tuple[torch.Tensor, ...]:
+        if local_len == seq_len:
+            hidden, block_rope, block_combined = module.sp_prepare(
+                decoder_input,
+                rope_table,
+                combined_indices,
+            )
+        else:
+            hidden, block_rope, block_combined = module.local_sp_prepare(
+                decoder_input,
+                rope_table,
+                combined_indices,
+            )
         for block in module.blocks:
             hidden = block(
                 hidden,
@@ -1367,15 +1415,36 @@ def extract_minimax_h3_context(
                 packed_total=seq_len,
                 video_layout=video_layout,
             )
-        hidden = module.sp_gather(hidden)
+        # TeaCache stores residuals as block_output - decoder_input. Strict SP
+        # must keep both tensors rank-local until postprocess projects local
+        # rows to compact logits and gathers them exactly once.
+        if local_len == seq_len:
+            hidden = module.sp_gather(hidden)
         return (hidden,)
 
     def postprocess(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        video_logits, audio_logits = module.final_layer(
-            hidden,
-            t_emb=t_emb,
-            inverse_indices=inverse_indices,
-        )
+        if local_len == seq_len:
+            video_logits, audio_logits = module.final_layer(
+                hidden,
+                t_emb=t_emb,
+                inverse_indices=inverse_indices,
+            )
+        else:
+            local_inverse_indices = inverse_indices.narrow(
+                0,
+                local_start,
+                local_len,
+            )
+            video_logits, audio_logits = module.final_layer(
+                hidden,
+                t_emb=t_emb,
+                inverse_indices=local_inverse_indices,
+            )
+            compact_logits = torch.cat((video_logits, audio_logits), dim=-1)
+            compact_logits = module.sp_gather(compact_logits)
+            video_width = module.arch.latents_dim * math.prod(module.arch.patch_size)
+            video_logits = compact_logits[..., :video_width]
+            audio_logits = compact_logits[..., video_width:]
         video_logits = video_logits.index_select(0, infer_out_pos.to(device))
         audio_logits = audio_logits.index_select(0, audio_pos.to(device))
         if not skip_mask_out_condition:
@@ -1394,6 +1463,80 @@ def extract_minimax_h3_context(
         temb=t_emb,
         run_transformer_blocks=run_transformer_blocks,
         postprocess=postprocess,
+        extra_states={
+            "synchronize_cache_decision": synchronize_cache_decision,
+        },
+    )
+
+
+def extract_cosmos3_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    timestep: torch.Tensor,
+    text_ids: torch.Tensor,
+    text_mask: torch.Tensor,
+    video_shape: tuple[int, int, int],
+    fps: float | None = None,
+    action_latents: torch.Tensor | None = None,
+    action_domain_ids: torch.Tensor | None = None,
+    action_noisy_mask: torch.Tensor | None = None,
+    action_start_frame_offset: int = 1,
+    action_fps: float | None = None,
+    sound_latents: torch.Tensor | None = None,
+    noisy_frame_mask: torch.Tensor | None = None,
+    control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
+    control_weights: list[float] | tuple[float, ...] | torch.Tensor | None = None,
+    transfer_share_vision_temporal_positions: bool = True,
+    **kwargs: Any,
+) -> CacheContext:
+    """Build the shared cache execution context for Cosmos3's GEN pathway."""
+    if kwargs:
+        raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(kwargs)}")
+
+    prep = module._gen_preprocess(
+        hidden_states,
+        timestep,
+        text_ids,
+        text_mask,
+        video_shape,
+        fps=fps,
+        action_latents=action_latents,
+        action_domain_ids=action_domain_ids,
+        action_noisy_mask=action_noisy_mask,
+        action_start_frame_offset=action_start_frame_offset,
+        action_fps=action_fps,
+        sound_latents=sound_latents,
+        noisy_frame_mask=noisy_frame_mask,
+        control_latents=control_latents,
+        control_weights=control_weights,
+        transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
+    )
+
+    def run_transformer_blocks() -> tuple[torch.Tensor, ...]:
+        return (module._run_gen_stack(prep),)
+
+    def postprocess(hidden: torch.Tensor) -> Any:
+        return module._gen_postprocess(hidden, prep)
+
+    if control_latents is None:
+        controls: list[torch.Tensor] = []
+    elif isinstance(control_latents, torch.Tensor):
+        controls = [control_latents]
+    else:
+        controls = list(control_latents)
+
+    return CacheContext(
+        # SeaCache uses the separate inputs in extra_states for its decision.
+        modulated_input=prep.hidden_gen,
+        hidden_states=prep.hidden_gen,
+        encoder_hidden_states=None,
+        temb=prep.time_embed,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+        extra_states={
+            "sea_cache_latents": [*controls, hidden_states],
+            "sea_cache_noisy_frame_mask": noisy_frame_mask,
+        },
     )
 
 
@@ -1406,6 +1549,8 @@ def extract_minimax_h3_context(
 EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "QwenImageTransformer2DModel": extract_qwen_context,
     "Bagel": extract_bagel_context,
+    "Cosmos3EdgeVFMTransformer": extract_cosmos3_context,
+    "Cosmos3VFMTransformer": extract_cosmos3_context,
     "ZImageTransformer2DModel": extract_zimage_context,
     "Flux2Klein": extract_flux2_klein_context,
     "StableAudioDiTModel": extract_stable_audio_context,
@@ -1452,16 +1597,15 @@ def register_extractor(transformer_cls_name: str, extractor_fn: Callable) -> Non
     EXTRACTOR_REGISTRY[transformer_cls_name] = extractor_fn
 
 
-def get_extractor(transformer_cls_name: str) -> Callable:
+def get_extractor(transformer_type: str | type) -> Callable:
     """
     Get extractor function for given transformer class.
 
-    This function looks up the extractor based on the exact transformer_cls_name string,
-    which should match the transformer type in the pipeline (i.e., pipeline.transformer.__class__.__name__).
+    String lookups match an exact registered name. Type lookups also check base
+    classes so runtime wrappers such as FSDP retain the underlying model extractor.
 
     Args:
-        transformer_cls_name: Transformer class name (e.g., "QwenImageTransformer2DModel")
-                                Must exactly match a key in EXTRACTOR_REGISTRY.
+        transformer_type: Transformer class name or runtime type.
 
     Returns:
         Extractor function with signature (module, *args, **kwargs) -> CacheContext
@@ -1474,14 +1618,18 @@ def get_extractor(transformer_cls_name: str) -> Callable:
         >>> extractor = get_extractor("QwenImageTransformer2DModel")
         >>> ctx = extractor(transformer, hidden_states, encoder_hidden_states, timestep, ...)
     """
-    # Direct lookup - no substring matching
-    if transformer_cls_name in EXTRACTOR_REGISTRY:
-        return EXTRACTOR_REGISTRY[transformer_cls_name]
+    candidate_names: tuple[str, ...]
+    if isinstance(transformer_type, str):
+        candidate_names = (transformer_type,)
+    else:
+        candidate_names = tuple(candidate.__name__ for candidate in transformer_type.__mro__)
+    for candidate_name in candidate_names:
+        if candidate_name in EXTRACTOR_REGISTRY:
+            return EXTRACTOR_REGISTRY[candidate_name]
 
-    # No match found
     available_types = list(EXTRACTOR_REGISTRY.keys())
     raise ValueError(
-        f"Unknown model type: '{transformer_cls_name}'. "
+        f"Unknown model type: '{transformer_type}'. "
         f"Available types: {available_types}\n"
         f"To add support for a new model, use register_extractor() or add to EXTRACTOR_REGISTRY."
     )

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage-1 Code2Wav model for PersonaPlex (Moshi finetune).
 
 This is the ``LLM_GENERATION`` codec stage of the 2-stage PersonaPlex pipeline.
@@ -23,7 +23,7 @@ Layout contract (mirrors ``Qwen3TTSCode2Wav``):
 The Mimi decoder is the transformers ``MimiModel`` (kyutai/mimi weights), not
 in vLLM's safetensors loader, so they are loaded eagerly in ``load_weights``
 part of the vLLM weights iterator (the codec owns its own checkpoint; see the
-experimental fullduplex package for the same pattern).
+``duplex`` subpackage of this model folder for the same pattern).
 """
 
 from __future__ import annotations
