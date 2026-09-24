@@ -350,11 +350,11 @@ def test_large_offset_small_variance(dtype):
 #
 # Which path a case takes is a function of the device, not just the shape:
 # split = min(ceil(waves * SMs / groups), ceil(spatial / 4096)). Some cases above
-# do cross into the split path incidentally -- test_hunyuan_vae_config's 128x128
-# row reaches split=4 on any of L4/A10G/H100 -- but incidentally is the problem:
-# none of them pin it, so on a narrower device they would quietly fall back to
-# the unsplit kernel and still pass. The cases below pin the environment so the
-# split path is exercised deterministically, and assert that premise.
+# do cross into the split path incidentally -- test_hunyuan_vae_config's B=1,
+# 128x128 row reaches split=4 on any of L4/A10G/H100 -- but incidentally is the
+# problem: none of them pin it, so on a narrower device they would quietly fall
+# back to the unsplit kernel and still pass. The cases below pin the environment
+# so the split path is exercised deterministically, and assert that premise.
 
 
 def _split_of(x, num_groups=32):
@@ -408,6 +408,31 @@ def test_split_reduction_ragged_tail(monkeypatch):
 
     assert _split_of(x) > 1, "test premise: this shape should take the split path"
     assert (H * W) % 4096 != 0, "test premise: spatial size must not be chunk-aligned"
+
+    fused_out = fused_group_norm_silu(x, weight, bias, 32, 1e-6)
+    ref_out = F.silu(F.group_norm(x, 32, weight, bias, 1e-6))
+    torch.testing.assert_close(fused_out, ref_out, rtol=1e-5, atol=1e-6)
+
+
+def test_split_reduction_batched(monkeypatch):
+    """B > 1 on the split path, so the batch term of every index is non-zero.
+
+    The other split cases run at B=1, where ``n_idx = (pid // SPLIT) // num_groups``
+    is always 0: a wrong batch offset, or workspace rows indexed by group instead
+    of by (batch, group), would pass every one of them. The samples get different
+    scales and offsets so that normalizing one with the other's statistics is far
+    outside tolerance, and the spatial size is the ragged one from above.
+    """
+    monkeypatch.setenv(_SPLIT_WAVES_ENV, "8")
+    torch.manual_seed(0)
+    B, C, H, W = 2, 64, 96, 130
+    x = torch.randn(B, C, H, W, device="cuda", dtype=torch.float32)
+    x = x * torch.tensor([1.0, 2.0], device="cuda").view(B, 1, 1, 1)
+    x = x + torch.tensor([0.0, 0.5], device="cuda").view(B, 1, 1, 1)
+    weight = torch.randn(C, device="cuda")
+    bias = torch.randn(C, device="cuda")
+
+    assert _split_of(x) > 1, "test premise: this shape should take the split path"
 
     fused_out = fused_group_norm_silu(x, weight, bias, 32, 1e-6)
     ref_out = F.silu(F.group_norm(x, 32, weight, bias, 1e-6))
