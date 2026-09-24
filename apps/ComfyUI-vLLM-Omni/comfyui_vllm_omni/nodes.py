@@ -15,11 +15,14 @@ from .utils.types import (
     MAX_REFERENCE_AUDIOS,
     MAX_REFERENCE_IMAGES,
     MAX_REFERENCE_VIDEOS,
+    MINIMAX_H3_CONTROL_TYPES,
     AudioFormat,
     AutoregressionSamplingParams,
     DiffusionSamplingParams,
     FastH3Deployment,
     LatentMaskEditing,
+    MiniMaxH3Control,
+    MiniMaxH3ControlType,
     MiniMaxH3ModelSpecificParams,
     QwenTTSModelSpecificParams,
     VideoReferences,
@@ -27,6 +30,7 @@ from .utils.types import (
 )
 from .utils.validators import (
     add_sampling_parameters_to_stage,
+    validate_minimax_h3_control,
     validate_model_and_sampling_params_types,
 )
 
@@ -209,6 +213,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
                 "first_frame": ("IMAGE",),
                 "last_frame": ("IMAGE",),
                 "references": ("VIDEO_REFERENCES",),
+                "control": ("MINIMAX_H3_CONTROL",),
                 "sampling_params": ("SAMPLING_PARAMS",),
                 "lora": ("REMOTE_LORA",),
                 "model_params": ("VIDEO_PARAMS",),
@@ -230,6 +235,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         first_frame=None,
         last_frame=None,
         references=None,
+        control=None,
         fast_h3=None,
         **_kwargs,
     ) -> str | Literal[True]:
@@ -246,6 +252,13 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
             return (
                 "FastH3 Preview supports T2VA only; disconnect frame, first_frame, last_frame, and references inputs."
             )
+        if control is not None and any(value is not None for value in (frame, first_frame, last_frame, references)):
+            return "MiniMax-H3 control cannot be combined with frame, keyframes, or references."
+        if control is not None:
+            try:
+                validate_minimax_h3_control(control)
+            except ValueError as exc:
+                return str(exc)
         return True
 
     async def generate(
@@ -262,6 +275,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         first_frame: torch.Tensor | None = None,
         last_frame: torch.Tensor | None = None,
         references: dict | None = None,
+        control: MiniMaxH3Control | None = None,
         sampling_params: dict | list[dict] | None = None,
         model_params: dict | None = None,
         lora: dict | None = None,
@@ -347,6 +361,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
             first_frame=first_frame,
             last_frame=last_frame,
             references=references,
+            control=control,
             width=width,
             height=height,
             num_frames=num_frames,
@@ -1000,6 +1015,73 @@ class VLLMOmniMiniMaxH3Params:
         params = MiniMaxH3ModelSpecificParams(kwargs)
         params["type"] = "minimax_h3"
         return (params,)
+
+
+class VLLMOmniMiniMaxH3Control:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "control_type": (list(MINIMAX_H3_CONTROL_TYPES),),
+                "strength": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 10.0,
+                        "step": 0.01,
+                        "tooltip": "Controls the selected mode's conditioning strength.",
+                    },
+                ),
+            },
+            "optional": {
+                "control_video": (
+                    "VIDEO",
+                    {"tooltip": "Required for structure modes; optional for inpaint."},
+                ),
+                "source_video": (
+                    "VIDEO",
+                    {"tooltip": "Optional source video; requires mask or mask_video."},
+                ),
+                "mask": (
+                    "MASK",
+                    {"tooltip": "Static mask; white/1 marks areas to regenerate. Do not combine with mask_video."},
+                ),
+                "mask_video": (
+                    "VIDEO",
+                    {"tooltip": "Temporal mask video; do not combine with mask."},
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("MINIMAX_H3_CONTROL",)
+    RETURN_NAMES = ("control",)
+    FUNCTION = "get_control"
+    CATEGORY = "vLLM-Omni/Video Params"
+
+    def get_control(
+        self,
+        control_type: MiniMaxH3ControlType,
+        strength: float,
+        control_video: VideoInput | None = None,
+        source_video: VideoInput | None = None,
+        mask: torch.Tensor | None = None,
+        mask_video: VideoInput | None = None,
+    ):
+        control = MiniMaxH3Control(
+            control_type=control_type,
+            control_context_scale=strength,
+        )
+        if control_video is not None:
+            control["control_video"] = control_video
+        if source_video is not None:
+            control["source_video"] = source_video
+        if mask is not None:
+            control["mask"] = mask
+        if mask_video is not None:
+            control["mask_video"] = mask_video
+        validate_minimax_h3_control(control)
+        return (control,)
 
 
 class VLLMOmniVideoReferences:

@@ -27,21 +27,47 @@ from .format import (
     bytes_to_video,
     image_tensor_to_base64,
     image_tensor_to_png_bytes,
+    mask_tensor_to_png_bytes,
     video_to_base64,
     video_to_bytes,
 )
 from .latent_mask import scalar_mask_to_json, video_mask_to_grid_json
 from .logger import get_logger, pretty_printer
-from .models import lookup_model_spec
+from .models import lookup_model_spec, lookup_params_builder
 from .types import (
     MAX_REFERENCE_AUDIOS,
     MAX_REFERENCE_IMAGES,
     MAX_REFERENCE_VIDEOS,
     MAX_TOTAL_REFERENCES,
+    MINIMAX_H3_CONTROL_TYPES,
     AudioFormat,
+    MiniMaxH3Control,
 )
+from .validators import validate_minimax_h3_control
 
 logger = get_logger(__name__)
+
+
+# crf=0 is lossless, not a default: 1px structure hints must survive the encode.
+MINIMAX_H3_CONTROL_VIDEO_ENCODING = {"format": "mp4", "codec": "h264", "crf": 0}
+
+
+def _add_video_upload(
+    form: aiohttp.FormData,
+    field_name: str,
+    video: VideoInput,
+    filename: str,
+    *,
+    format: str | None = None,
+    codec: str | None = None,
+    crf: float | None = None,
+) -> None:
+    form.add_field(
+        field_name,
+        video_to_bytes(video, filename, format=format, codec=codec, crf=crf),
+        filename=filename,
+        content_type="video/mp4",
+    )
 
 
 async def url_json(session: aiohttp.ClientSession, url: str, verb: str = "get", **kwargs) -> dict[str, Any]:
@@ -281,6 +307,7 @@ class VLLMOmniClient:
         first_frame: torch.Tensor | None = None,
         last_frame: torch.Tensor | None = None,
         references: dict | None = None,
+        control: MiniMaxH3Control | None = None,
         sampling_params: dict | None = None,
         model_params: dict | None = None,
         lora: dict | None = None,
@@ -296,12 +323,20 @@ class VLLMOmniClient:
         """
         if frame is not None and references is not None:
             raise ValueError("Provide only one of frame or references, not both.")
+        if control is not None and any(value is not None for value in (frame, first_frame, last_frame, references)):
+            raise ValueError("MiniMax-H3 control cannot be combined with frame, keyframes, or references.")
+        if control is not None:
+            validate_minimax_h3_control(control)
+            conflicting_namespaces = set(extra_params) & set(MINIMAX_H3_CONTROL_TYPES)
+            if conflicting_namespaces:
+                conflicts = ", ".join(sorted(conflicting_namespaces))
+                raise ValueError(f"Conflicting MiniMax-H3 control namespaces: {conflicts}.")
         if frame is not None and (first_frame is not None or last_frame is not None):
             raise ValueError("Provide either frame or first_frame/last_frame, not both.")
         if references is not None and (first_frame is not None or last_frame is not None):
             raise ValueError("Provide either first_frame/last_frame or references, not both.")
 
-        spec, matched_pattern = lookup_model_spec(spec_model or model)
+        _, matched_pattern = lookup_model_spec(spec_model or model)
         if (first_frame is not None or last_frame is not None) and (
             matched_pattern is None or "MiniMax-H3" not in matched_pattern
         ):
@@ -388,6 +423,52 @@ class VLLMOmniClient:
                 content_type="image/png",
             )
 
+        if control is not None:
+            control_type = control["control_type"]
+            form.add_field("control_type", control_type)
+            control_video = control.get("control_video")
+            if control_video is not None:
+                control_filename = "control.mp4"
+                _add_video_upload(
+                    form,
+                    "control_reference",
+                    control_video,
+                    control_filename,
+                    **MINIMAX_H3_CONTROL_VIDEO_ENCODING,
+                )
+            source_video = control.get("source_video")
+            if source_video is not None:
+                source_filename = "source.mp4"
+                _add_video_upload(
+                    form,
+                    "source_reference",
+                    source_video,
+                    source_filename,
+                    **MINIMAX_H3_CONTROL_VIDEO_ENCODING,
+                )
+            mask = control.get("mask")
+            if mask is not None:
+                mask_filename = "mask.png"
+                form.add_field(
+                    "mask_reference",
+                    mask_tensor_to_png_bytes(mask, mask_filename),
+                    filename=mask_filename,
+                    content_type="image/png",
+                )
+            mask_video = control.get("mask_video")
+            if mask_video is not None:
+                mask_filename = "mask.mp4"
+                _add_video_upload(
+                    form,
+                    "mask_reference",
+                    mask_video,
+                    mask_filename,
+                    **MINIMAX_H3_CONTROL_VIDEO_ENCODING,
+                )
+            extra_params = {
+                **extra_params,
+                control_type: {"control_context_scale": control["control_context_scale"]},
+            }
         # === latent-mask editing (MiniMax H3) ===
         if latent_edit is not None:
             source_video = latent_edit.get("source_video")
@@ -445,11 +526,12 @@ class VLLMOmniClient:
                 )
 
         # === model specific params. Either use a specialized builder, or add flattened fields as-is ===
+        model_params_type = None
         if model_params is not None:
             model_params = dict(model_params)
-            model_params.pop("type", None)
+            model_params_type = model_params.pop("type", None)
 
-        params_builder = spec.get("params_builder") if spec else None
+        params_builder = lookup_params_builder(spec_model or model, model_params_type)
         if params_builder is not None:
             form_fields = params_builder(
                 model_params or {},

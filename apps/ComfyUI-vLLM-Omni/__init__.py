@@ -22,6 +22,7 @@ from .comfyui_vllm_omni.nodes import (
     VLLMOmniGenerateMusic,
     VLLMOmniGenerateVideo,
     VLLMOmniLatentMaskEditing,
+    VLLMOmniMiniMaxH3Control,
     VLLMOmniMiniMaxH3Params,
     VLLMOmniMiniMaxH3TemporalMask,
     VLLMOmniQwenTTSParams,
@@ -45,6 +46,7 @@ NODE_CLASS_MAPPINGS = {
     "VLLMOmniGenerateMusic": VLLMOmniGenerateMusic,
     "VLLMOmniVoiceClone": VLLMOmniVoiceClone,
     "VLLMOmniVideoReferences": VLLMOmniVideoReferences,
+    "VLLMOmniMiniMaxH3Control": VLLMOmniMiniMaxH3Control,
     "VLLMOmniLatentMaskEditing": VLLMOmniLatentMaskEditing,
     # === Params ===
     "VLLMOmniARSampling": VLLMOmniARSampling,
@@ -68,6 +70,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VLLMOmniGenerateMusic": "Generate Music",
     "VLLMOmniVoiceClone": "TTS Voice Cloning",
     "VLLMOmniVideoReferences": "Video References",
+    "VLLMOmniMiniMaxH3Control": "MiniMax-H3 Control",
     "VLLMOmniLatentMaskEditing": "Latent Mask Editing",
     # === Params ===
     "VLLMOmniARSampling": "AR Sampling Params",
