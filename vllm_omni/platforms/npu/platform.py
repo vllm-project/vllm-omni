@@ -391,6 +391,10 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         return free, total
 
     @classmethod
+    def memory_reserved(cls, device: torch.device | int | None = None) -> int:
+        return int(torch.npu.memory_reserved(device))
+
+    @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         device_props = torch.npu.get_device_properties(device_id)
         return device_props.total_memory
