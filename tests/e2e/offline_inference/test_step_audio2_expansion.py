@@ -6,7 +6,6 @@ E2E expansion tests for Step-Audio2 offline inference (nightly CI).
 Full-model inference with audio input and audio output.
 """
 
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -15,11 +14,12 @@ import pytest
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio
 from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.outputs import OmniRequestOutput
 
 MODEL = "stepfun-ai/Step-Audio-2-mini"
-STAGE_CONFIG = str(Path(__file__).parent / "stage_configs" / "step_audio2_ci.yaml")
-TEST_PARAMS = [(MODEL, STAGE_CONFIG)]
+DEPLOY_CONFIG = get_deploy_config_path("step_audio2_ci.yaml")
+TEST_PARAMS = [(MODEL, DEPLOY_CONFIG, {"trust_remote_code": True})]
 
 pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
@@ -63,8 +63,8 @@ def _assert_non_empty_text_output(outputs: list[OmniRequestOutput]) -> None:
 
     text_output = next((o for o in outputs if o.final_output_type == "text"), None)
     assert text_output is not None
-    assert text_output.request_output is not None
-    text_content = text_output.request_output.outputs[0].text
+    assert text_output is not None
+    text_content = text_output.outputs[0].text
     assert text_content is not None
     assert len(text_content.strip()) > 0
 
@@ -81,8 +81,8 @@ def test_audio_to_text_and_audio(omni_runner: OmniRunner) -> None:
 
     audio_output = next((o for o in outputs if o.final_output_type == "audio"), None)
     if audio_output is not None:
-        assert audio_output.request_output is not None
-        audio_tensor = audio_output.request_output.outputs[0].multimodal_output.get("audio")
+        assert audio_output is not None
+        audio_tensor = audio_output.outputs[0].multimodal_output.get("audio")
         if audio_tensor is not None:
             assert audio_tensor.numel() > 0
 

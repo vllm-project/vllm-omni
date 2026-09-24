@@ -9,7 +9,6 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      shm_threshold_bytes: 65536
       codec_streaming: true
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
@@ -65,6 +64,15 @@ stages:
       repetition_penalty: 1.0
 
 platforms:
+  npu:
+    # Ascend paged attention only accepts 128-token cache blocks
+    # (AscendAttentionBackend.get_supported_kernel_block_sizes() == [128]),
+    # while vLLM's CacheConfig default is 16. Without this override stage 0
+    # aborts during KV-cache init with:
+    #   ValueError: No common block size for 16.
+    stages:
+      - stage_id: 0
+        block_size: 128
   xpu:
     stages:
       # Verified on Intel Arc B60.

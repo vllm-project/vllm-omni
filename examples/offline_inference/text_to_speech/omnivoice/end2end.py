@@ -135,7 +135,7 @@ def run_e2e():
     print(f"Received {len(outputs)} outputs.")
     for i, output in enumerate(outputs):
         try:
-            ro = output.request_output
+            ro = output
             if ro is None:
                 print("No request_output found.")
                 continue

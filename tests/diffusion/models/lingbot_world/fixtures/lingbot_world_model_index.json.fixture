@@ -1,0 +1,13 @@
+{
+  "_class_name": "LingBotWorldCausalDMDPipeline",
+  "_diffusers_version": "0.35.0.dev0",
+  "boundary_ratio": 0.9,
+  "image_encoder": [null, null],
+  "image_processor": [null, null],
+  "scheduler": ["diffusers", "UniPCMultistepScheduler"],
+  "text_encoder": ["transformers", "UMT5EncoderModel"],
+  "tokenizer": ["transformers", "T5TokenizerFast"],
+  "transformer": ["diffusers", "CausalLingBotWorldTransformer3DModel"],
+  "transformer_2": [null, null],
+  "vae": ["diffusers", "AutoencoderKLWan"]
+}

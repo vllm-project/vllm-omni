@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import math
 import time
 from collections import OrderedDict
+from enum import Enum
 from typing import get_args
 
 import torch
 import torch.nn as nn
-from vllm.config.lora import MaxLoRARanks
+from vllm.config.lora import LoRAConfig, MaxLoRARanks
 from vllm.logger import init_logger
 from vllm.lora.layers import BaseLayerWithLoRA
 from vllm.lora.lora_model import LoRAModel
@@ -22,7 +23,6 @@ from vllm.lora.utils import (
 )
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 
-from vllm_omni.config.lora import LoRAConfig
 from vllm_omni.diffusion.lora.utils import (
     _expand_expected_modules_for_packed_layers,
     _match_target_modules,
@@ -31,6 +31,11 @@ from vllm_omni.diffusion.lora.utils import (
 from vllm_omni.lora.utils import stable_lora_int_id
 
 logger = init_logger(__name__)
+
+
+class LoRABackend(str, Enum):
+    PEFT = "peft"
+    DISTILL = "distill"
 
 
 class DiffusionLoRAManager:
@@ -42,6 +47,11 @@ class DiffusionLoRAManager:
 
     # Valid max allowed ranks for LoRA in vLLM
     _VALID_MAX_RANKS: list[int] = sorted(get_args(MaxLoRARanks))
+
+    # Adapter whose weights are still uploaded while gated off. Class-level so
+    # a manager built without __init__ (some tests use object.__new__) reads as
+    # "nothing suspended" instead of raising.
+    _suspended_adapter_id: int | None = None
 
     def __init__(
         self,
@@ -63,6 +73,12 @@ class DiffusionLoRAManager:
         self.pipeline = pipeline
         self.device = device
         self.dtype = dtype
+        od_config = getattr(pipeline, "od_config", None)
+        # DLO owns the base-weight lifecycle. Keep request-switchable LoRA
+        # sidecars resident instead of rebuilding DLO host shards per request.
+        self._resident_lora_device = (
+            device if getattr(od_config, "enable_distributed_layerwise_offload", False) is True else None
+        )
 
         # Cache supported/expected module suffixes once, before any layer
         # replacement happens. After LoRA layers are injected, the original
@@ -284,29 +300,41 @@ class DiffusionLoRAManager:
         lora_path = get_adapter_absolute_path(lora_request.lora_path)
         logger.debug("Resolved LoRA path: %s", lora_path)
 
-        peft_helper = PEFTHelper.from_local_dir(
-            lora_path,
-            max_position_embeddings=None,  # no need in diffusion
-            tensorizer_config_dict=lora_request.tensorizer_config_dict,
-        )
+        model_loader = getattr(self.pipeline, "_load_diffusion_lora_adapter", None)
+        loaded = None
+        if callable(model_loader):
+            loaded = model_loader(
+                lora_request=lora_request,
+                lora_path=lora_path,
+                dtype=self.dtype,
+            )
+
+        if loaded is None:
+            peft_helper = PEFTHelper.from_local_dir(
+                lora_path,
+                max_position_embeddings=None,  # no need in diffusion
+                tensorizer_config_dict=lora_request.tensorizer_config_dict,
+            )
+
+            lora_model = LoRAModel.from_local_checkpoint(
+                lora_path,
+                expected_lora_modules=self._expected_lora_modules,
+                peft_helper=peft_helper,
+                lora_model_id=lora_request.lora_int_id,
+                device="cpu",  # consistent w/ vllm's behavior
+                dtype=self.dtype,
+                model_vocab_size=None,
+                tensorizer_config_dict=lora_request.tensorizer_config_dict,
+                weights_mapper=None,
+            )
+        else:
+            lora_model, peft_helper = loaded
 
         logger.info(
             "Loaded PEFT config: r=%d, lora_alpha=%d, target_modules=%s",
             peft_helper.r,
             peft_helper.lora_alpha,
             peft_helper.target_modules,
-        )
-
-        lora_model = LoRAModel.from_local_checkpoint(
-            lora_path,
-            expected_lora_modules=self._expected_lora_modules,
-            peft_helper=peft_helper,
-            lora_model_id=lora_request.lora_int_id,
-            device="cpu",  # consistent w/ vllm's behavior
-            dtype=self.dtype,
-            model_vocab_size=None,
-            tensorizer_config_dict=lora_request.tensorizer_config_dict,
-            weights_mapper=None,
         )
 
         logger.info(
@@ -366,21 +394,26 @@ class DiffusionLoRAManager:
             fully_sharded_loras=False,
         )
 
-        # Default denoising components plus any a pipeline opts into via
-        # ``_lora_components`` (opt-in; other pipelines unchanged).
+        # Components scanned for LoRA-capable layers: framework defaults,
+        # declared DiT components, and any a pipeline opts into via
+        # ``_lora_components``. The defaults only cover the generic diffusers
+        # naming convention: ``transformer`` (plus ``transformer_2`` for
+        # dual-DiT pipelines such as Wan2.2) and ``unet`` for SDXL-style
+        # pipelines. Model-specific attribute names must be declared by the
+        # pipeline itself via ``_dit_modules`` or ``_lora_components``.
         #
-        # NOTE: SDXL-style pipelines expose the denoiser as ``unet``.
-        # Without scanning this component, adapters can load/activate while
-        # effectively applying to zero layers, producing base-identical output.
+        # NOTE: if the denoiser component is not scanned here, adapters can
+        # load/activate while effectively applying to zero layers, producing
+        # base-identical output.
         default_components = (
             "transformer",
             "transformer_2",
-            "dit",
-            "bagel",
             "unet",
         )
+        declared_components = tuple(getattr(self.pipeline, "_dit_modules", ()) or ())
         extra_components = tuple(getattr(self.pipeline, "_lora_components", ()) or ())
-        for component_name in (*default_components, *extra_components):
+        component_names = dict.fromkeys((*default_components, *declared_components, *extra_components))
+        for component_name in component_names:
             if not hasattr(self.pipeline, component_name):
                 continue
             component = getattr(self.pipeline, component_name)
@@ -431,6 +464,13 @@ class DiffusionLoRAManager:
                 )
 
                 if lora_layer is not module and isinstance(lora_layer, BaseLayerWithLoRA):
+                    if self._resident_lora_device is not None:
+                        set_buffer_device = getattr(lora_layer, "_set_diffusion_lora_buffer_device", None)
+                        if not callable(set_buffer_device):
+                            raise RuntimeError(
+                                f"{type(lora_layer).__name__} cannot keep dynamic LoRA buffers resident for DLO"
+                            )
+                        set_buffer_device(self._resident_lora_device)
                     replace_submodule(component, module_name, lora_layer)
                     self._lora_modules[full_module_name] = lora_layer
                     logger.debug("Replaced layer: %s -> %s", full_module_name, type(lora_layer).__name__)
@@ -461,9 +501,11 @@ class DiffusionLoRAManager:
             fully_sharded_loras=False,
         )
 
-        # Recreate per-layer buffers with the new maximum rank.
+        # Recreate per-layer buffers with the new maximum rank. The previous
+        # upload is gone, so nothing may be re-armed afterwards.
         for lora_layer in self._lora_modules.values():
             lora_layer.create_lora_weights(max_loras=1, lora_config=lora_config, model_config=None)
+        self._suspended_adapter_id = None
 
         # Re-apply active adapter if needed (buffers were reset).
         if self._active_adapter_id is not None:
@@ -506,7 +548,21 @@ class DiffusionLoRAManager:
             return lora_weights
 
         module_suffix = full_module_name.split(".")[-1]
-        return lora_model.get_lora(module_suffix)
+        lora_weights = lora_model.get_lora(module_suffix)
+        if lora_weights is not None:
+            return lora_weights
+
+        # Model-scoped namespace aliases. HunyuanImage-3 registers the DiT
+        # under ``transformer.layers.*`` (``self.transformer`` aliases
+        # ``self.model``) while PEFT adapters use ``model.layers.*``.
+        name_aliases = getattr(self.pipeline, "_get_diffusion_lora_name_aliases", None)
+        if callable(name_aliases):
+            for alias in name_aliases(full_module_name) or []:
+                lora_weights = lora_model.get_lora(alias)
+                if lora_weights is not None:
+                    return lora_weights
+
+        return None
 
     def _is_active_at_scale(self, adapter_id: int, scale: float) -> bool:
         """True if the adapter_id is active and the current scale matches."""
@@ -515,13 +571,17 @@ class DiffusionLoRAManager:
         matches_scale = self._adapter_scales.get(adapter_id) == rounded_scale
         return is_active and matches_scale
 
-    def _activate_adapter(self, adapter_id: int, scale: float) -> None:
-        if self._is_active_at_scale(adapter_id, scale):
-            logger.debug("Adapter %d already active at scale %.3f skipping", adapter_id, scale)
-            return
+    def _bind_adapter_weights(self, lora_model: LoRAModel, scale: float) -> None:
+        binding_validator = getattr(self.pipeline, "_validate_diffusion_lora_binding", None)
+        # Track bindings unconditionally. The zero-binding guard below needs this
+        # bookkeeping on every pipeline, not only the ones that supply a validator.
+        lora_names_by_id = {id(weights): name for name, weights in lora_model.loras.items()}
+        bound_lora_names: set[str] = set()
 
-        logger.info("Activating adapter: id=%d", adapter_id)
-        lora_model = self._registered_adapters[adapter_id]
+        def _record_bound(weights: LoRALayerWeights | PackedLoRALayerWeights) -> None:
+            name = lora_names_by_id.get(id(weights))
+            if name is not None:
+                bound_lora_names.add(name)
 
         # activate weights in each LoRA layer
         for full_module_name, lora_layer in self._lora_modules.items():
@@ -563,6 +623,9 @@ class DiffusionLoRAManager:
                         lora_b_list.append(sub_lora.lora_b * scale)
 
                     lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
+                    for sub_lora in sub_loras:
+                        if sub_lora is not None:
+                            _record_bound(sub_lora)
                     logger.debug(
                         "Activated packed LoRA for %s via submodules=%s (scale=%.2f)",
                         full_module_name,
@@ -581,6 +644,7 @@ class DiffusionLoRAManager:
                     for b in lora_weights.lora_b
                 ]
                 lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
+                _record_bound(lora_weights)
                 logger.debug(
                     "Activated packed LoRA for %s (scale=%.2f)",
                     full_module_name,
@@ -596,21 +660,50 @@ class DiffusionLoRAManager:
                     lora_layer.reset_lora(0)
                     continue
 
-                total = sum(output_slices)
-                if lora_weights.lora_b.shape[0] != total:
-                    logger.warning(
-                        "Skipping LoRA for %s due to shape mismatch: lora_b[0]=%d != sum(output_slices)=%d",
-                        full_module_name,
-                        lora_weights.lora_b.shape[0],
-                        total,
+                # HunyuanImage-3 fused ``qkv_proj`` LoRA-B rows are
+                # GQA-interleaved in the checkpoint (per-KV-head
+                # [Q-group, K, V]); de-interleave them to the block layout
+                # [all Q, all K, all V] the QKV output slices expect. The
+                # checkpoint sizes exclude replicated KV heads; set_lora()
+                # selects the appropriate Q shard and shared KV shard.
+                deinterleave = getattr(self.pipeline, "_deinterleave_fused_qkv_lora_b", None)
+                if isinstance(getattr(lora_layer, "base_layer", None), QKVParallelLinear) and callable(deinterleave):
+                    deinterleaved = deinterleave(lora_weights.lora_b)
+                    base = lora_layer.base_layer
+                    output_sizes = (
+                        base.total_num_heads * base.head_size,
+                        base.total_num_kv_heads * base.head_size,
+                        base.total_num_kv_heads * base.v_head_size,
                     )
-                    lora_layer.reset_lora(0)
-                    continue
+                    if (
+                        deinterleaved is None
+                        or len(output_sizes) != n_slices
+                        or deinterleaved.shape[0] != sum(output_sizes)
+                    ):
+                        logger.warning(
+                            "Skipping LoRA for %s: cannot establish HunyuanImage-3 fused-QKV layout",
+                            full_module_name,
+                        )
+                        lora_layer.reset_lora(0)
+                        continue
+                    b_splits = list(torch.split(deinterleaved, list(output_sizes), dim=0))
+                else:
+                    total = sum(output_slices)
+                    if lora_weights.lora_b.shape[0] != total:
+                        logger.warning(
+                            "Skipping LoRA for %s due to shape mismatch: lora_b[0]=%d != sum(output_slices)=%d",
+                            full_module_name,
+                            lora_weights.lora_b.shape[0],
+                            total,
+                        )
+                        lora_layer.reset_lora(0)
+                        continue
+                    b_splits = list(torch.split(lora_weights.lora_b, list(output_slices), dim=0))
 
-                b_splits = list(torch.split(lora_weights.lora_b, list(output_slices), dim=0))
                 lora_a_list = [lora_weights.lora_a] * n_slices
                 lora_b_list = [b * scale for b in b_splits]
                 lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
+                _record_bound(lora_weights)
                 logger.debug(
                     "Activated fused LoRA for packed layer %s (scale=%.2f)",
                     full_module_name,
@@ -620,6 +713,7 @@ class DiffusionLoRAManager:
 
             scaled_lora_b = lora_weights.lora_b * scale
             lora_layer.set_lora(index=0, lora_a=lora_weights.lora_a, lora_b=scaled_lora_b)
+            _record_bound(lora_weights)
             logger.debug(
                 "Activated LoRA for %s: lora_a shape=%s, lora_b shape=%s, scale=%.2f",
                 full_module_name,
@@ -628,6 +722,54 @@ class DiffusionLoRAManager:
                 scale,
             )
 
+        if not bound_lora_names:
+            raise ValueError(
+                f"LoRA adapter {lora_model.id} applies to no layer: expected target modules in "
+                f"{sorted(self._expected_lora_modules)} but received {sorted(lora_model.loras)}. "
+                "Activating it would leave the base model unchanged."
+            )
+
+        if callable(binding_validator):
+            binding_validator(
+                lora_model=lora_model,
+                bound_lora_names=frozenset(bound_lora_names),
+            )
+
+    def _reset_lora_layers(self) -> None:
+        for lora_layer in self._lora_modules.values():
+            lora_layer.reset_lora(0)
+        self._suspended_adapter_id = None
+
+    def _activate_adapter(self, adapter_id: int, scale: float) -> None:
+        if self._is_active_at_scale(adapter_id, scale):
+            logger.debug("Adapter %d already active at scale %.3f skipping", adapter_id, scale)
+            return
+
+        if self._suspended_adapter_id == adapter_id and self._adapter_scales.get(
+            adapter_id
+        ) == DiffusionLoRAManager._get_rounded_scale(scale):
+            # Weights are still uploaded from an earlier activation; re-arming
+            # the masks avoids rebuilding and re-uploading every layer.
+            for lora_layer in self._lora_modules.values():
+                lora_layer.resume_lora()
+            self._suspended_adapter_id = None
+            self._active_adapter_id = adapter_id
+            logger.debug("Re-armed suspended adapter %d", adapter_id)
+            return
+
+        logger.info("Activating adapter: id=%d", adapter_id)
+        lora_model = self._registered_adapters[adapter_id]
+        # Binding overwrites slot 0 incrementally. Invalidate the fast-path
+        # state before the first mutation and leave every wrapper inactive if
+        # any set_lora() call or model validator fails.
+        self._active_adapter_id = None
+        self._suspended_adapter_id = None
+        try:
+            self._bind_adapter_weights(lora_model, scale)
+        except Exception:
+            self._reset_lora_layers()
+            raise
+
         self._active_adapter_id = adapter_id
         self._update_adapter_scale(adapter_id, scale)
 
@@ -635,9 +777,10 @@ class DiffusionLoRAManager:
         if self._active_adapter_id is None:
             logger.debug("All adapters already inactive")
             return
-        logger.info("Deactivating all adapters: %d layers", len(self._lora_modules))
+        logger.info("Suspending all adapters: %d layers", len(self._lora_modules))
         for lora_layer in self._lora_modules.values():
-            lora_layer.reset_lora(0)
+            lora_layer.suspend_lora()
+        self._suspended_adapter_id = self._active_adapter_id
         self._active_adapter_id = None
         logger.debug("All adapters deactivated")
 
@@ -703,6 +846,11 @@ class DiffusionLoRAManager:
         logger.info("Removing adapter: id=%d", adapter_id)
         if self._active_adapter_id == adapter_id:
             self._deactivate_all_adapters()
+
+        if self._suspended_adapter_id == adapter_id:
+            # The adapter is going away, so the upload can never be resumed.
+            # Tear it down instead of leaving it in the stacked buffers.
+            self._reset_lora_layers()
 
         del self._registered_adapters[adapter_id]
         self._adapter_scales.pop(adapter_id, None)

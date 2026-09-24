@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for generation streaming session replacement.
 
 These tests pin the behavior of `_update_request_as_session` against
@@ -9,6 +12,8 @@ update payloads early.
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -17,7 +22,10 @@ import pytest
 # isort: off
 import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
 from vllm.sampling_params import SamplingParams
-from vllm.v1.engine import EngineCoreEventType
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.engine import EngineCoreEventType, FinishReason
+from vllm.v1.metrics.stats import PrefillStats
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
@@ -50,6 +58,18 @@ class _SchedulerStub(OmniGenerationScheduler):
         raise AssertionError("unexpected enqueue for skipped_waiting miss")
 
 
+class _AsyncChunkStopSchedulerStub(OmniGenerationScheduler):
+    def __init__(self) -> None:
+        self.num_waiting_for_streaming_input = 0
+        self.chunk_transfer_adapter = SimpleNamespace(receives_chunks=True)
+        self.enqueued: list[Request] = []
+        self.enqueued_statuses: list[RequestStatus] = []
+
+    def _enqueue_waiting_request(self, session: Request) -> None:
+        self.enqueued.append(session)
+        self.enqueued_statuses.append(session.status)
+
+
 def _make_request(**kwargs) -> Request:
     sp = SamplingParams(max_tokens=8)
     defaults = dict(
@@ -75,6 +95,169 @@ def _make_update(**kwargs) -> StreamingUpdate:
     )
     defaults.update(kwargs)
     return StreamingUpdate(**defaults)
+
+
+def test_generation_scheduler_records_prefill_stats_for_metrics() -> None:
+    request = _make_request(prompt_token_ids=[1, 2, 3, 4])
+    request.prefill_stats = PrefillStats()
+
+    OmniGenerationScheduler._record_prefill_stats(request)
+
+    assert request.prefill_stats.num_prompt_tokens == 4
+    assert request.prefill_stats.num_computed_tokens == 4
+    assert request.prefill_stats.num_cached_tokens == 0
+
+
+def test_resumable_generation_stop_marks_segment_boundary() -> None:
+    session = _make_request(request_id="req-generation-segment")
+    session.status = RequestStatus.RUNNING
+    session.resumable = True
+    session.num_computed_tokens = len(session.prompt_token_ids)
+    # schedule() has counted this step's token as in flight; update_from_output()
+    # must settle it before handling the segment boundary.
+    session.num_in_flight_tokens = 1
+
+    sched = MagicMock()
+    sched.requests = {session.request_id: session}
+    sched.perf_metrics = None
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        is_done_receiving_chunks=lambda _request_id: True,
+        segment_finished_requests={session.request_id},
+    )
+
+    def rearm_resumable_request(request: Request) -> bool:
+        request.status = RequestStatus.WAITING
+        return False
+
+    sched._handle_stopped_request.side_effect = rearm_resumable_request
+    sched.running = [session]
+    sched.waiting = MagicMock()
+    sched.skipped_waiting = MagicMock()
+    sched.structured_output_manager.accept_tokens.return_value = True
+    # Async scheduling can observe the segment boundary in the next schedule()
+    # before this model output is applied and defer the same request for finish.
+    # update_from_output() must not re-arm the resumable request twice.
+    sched._pending_finish_reqs = [session]
+    sched.recompute_kv_load_failures = False
+    sched.connector = None
+    sched.kv_cache_manager.take_events.return_value = None
+    sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
+    sched.finished_req_ids_dict = {}
+    sched.make_stats.return_value = None
+
+    scheduler_output = MagicMock(spec=SchedulerOutput)
+    scheduler_output.num_scheduled_tokens = {session.request_id: 1}
+    scheduler_output.scheduled_spec_decode_tokens = {}
+    scheduler_output.num_invalid_spec_tokens = 0
+
+    model_runner_output = MagicMock(spec=ModelRunnerOutput)
+    model_runner_output.sampled_token_ids = [[]]
+    model_runner_output.logprobs = None
+    model_runner_output.prompt_logprobs_dict = {}
+    model_runner_output.pooler_output = None
+    model_runner_output.num_nans_in_logits = None
+    model_runner_output.kv_connector_output = None
+    model_runner_output.cudagraph_stats = None
+    model_runner_output.req_id_to_index = {session.request_id: 0}
+    model_runner_output.routed_experts = None
+
+    outputs = OmniGenerationScheduler.update_from_output(
+        sched,
+        scheduler_output,
+        model_runner_output,
+    )
+
+    output = outputs[session.client_index].outputs[0]
+    assert output.finish_reason is not None
+    assert output.is_segment_finished is True
+    sched._handle_stopped_request.assert_called_once_with(session)
+    assert sched._pending_finish_reqs == []
+
+
+@pytest.mark.parametrize("prompt_complete", [False, True])
+def test_rejected_grammar_finishes_and_frees_generation_request(prompt_complete: bool) -> None:
+    session = _make_request(request_id="req-generation-segment")
+    session.status = RequestStatus.RUNNING
+    session.resumable = True
+    session.num_computed_tokens = len(session.prompt_token_ids) if prompt_complete else 1
+    # schedule() has counted this step's token as in flight; update_from_output()
+    # must settle it before handling the segment boundary.
+    session.num_in_flight_tokens = 1
+
+    sched = MagicMock()
+    sched.requests = {session.request_id: session}
+    sched.perf_metrics = None
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        is_done_receiving_chunks=lambda _request_id: True,
+        segment_finished_requests={session.request_id},
+    )
+
+    sched._async_chunk_transport_enabled.return_value = False
+    sched._native_data_plane = False
+    sched._handle_stopped_request.return_value = True
+    sched._free_request.return_value = (None, None)
+    sched.chunk_transfer_adapter.cleanup = MagicMock()
+    sched.running = [session]
+    sched._remove_stopped_requests_from_queues.side_effect = lambda running, preempted: (
+        OmniSchedulerMixin._remove_stopped_requests_from_queues(sched, running, preempted)
+    )
+    sched.waiting = MagicMock()
+    sched.skipped_waiting = MagicMock()
+    sched.structured_output_manager.accept_tokens.return_value = False
+    sched._pending_finish_reqs = []
+    sched.recompute_kv_load_failures = False
+    sched.connector = None
+    sched.kv_cache_manager.take_events.return_value = None
+    sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
+    sched.finished_req_ids_dict = {}
+    sched.make_stats.return_value = None
+
+    scheduler_output = MagicMock(spec=SchedulerOutput)
+    scheduler_output.num_scheduled_tokens = {session.request_id: 1}
+    scheduler_output.scheduled_spec_decode_tokens = {}
+    scheduler_output.num_invalid_spec_tokens = 0
+
+    model_runner_output = MagicMock(spec=ModelRunnerOutput)
+    model_runner_output.sampled_token_ids = [[7]]
+    model_runner_output.logprobs = None
+    model_runner_output.prompt_logprobs_dict = {}
+    model_runner_output.pooler_output = None
+    model_runner_output.num_nans_in_logits = None
+    model_runner_output.kv_connector_output = None
+    model_runner_output.cudagraph_stats = None
+    model_runner_output.req_id_to_index = {session.request_id: 0}
+    model_runner_output.routed_experts = None
+
+    outputs = OmniGenerationScheduler.update_from_output(
+        sched,
+        scheduler_output,
+        model_runner_output,
+    )
+
+    output = outputs[session.client_index].outputs[0]
+    assert output.finish_reason == session.get_finished_reason() == FinishReason.ERROR
+    assert not output.is_segment_finished
+    assert session.status == RequestStatus.FINISHED_ERROR
+    assert session.resumable is False
+    sched._handle_stopped_request.assert_called_once_with(session)
+    sched._free_request.assert_called_once_with(session)
+    sched.chunk_transfer_adapter.cleanup.assert_called_once()
+    assert session not in sched.running
+
+
+def test_async_chunk_resumable_stop_rearms_connector_polling() -> None:
+    sched = _AsyncChunkStopSchedulerStub()
+    session = _make_request(request_id="req-async-chunk-next-segment")
+    session.status = RequestStatus.FINISHED_STOPPED
+    session.resumable = True
+
+    finished = sched._handle_stopped_request(session)
+
+    assert finished is False
+    assert sched.enqueued == [session]
+    assert sched.enqueued_statuses == [RequestStatus.WAITING]
+    assert session.status == RequestStatus.WAITING
+    assert sched.num_waiting_for_streaming_input == 0
 
 
 class TestReplaceSessionWithStreamingUpdate:
@@ -302,12 +485,13 @@ class TestRealignRequestStatusToQueues:
         assert stale.status == RequestStatus.RUNNING
         assert clean.status == RequestStatus.RUNNING
 
-    def test_finished_request_is_skipped(self) -> None:
+    def test_non_resumable_finished_request_is_skipped(self) -> None:
         """Already-finished requests must not be touched -- they may
         have legitimate finished statuses (FINISHED_STOPPED etc.) that
         a status flip would corrupt.
         """
         req = _make_request(request_id="req-finished")
+        req.resumable = False
         req.status = RequestStatus.FINISHED_STOPPED
 
         sched = _RealignSchedulerStub(

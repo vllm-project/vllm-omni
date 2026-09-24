@@ -9,6 +9,9 @@ import torch
 
 from vllm_omni.utils.audio import mel_filter_bank, peak_normalize
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
 # Parameter combinations used across the codebase.
 _PARAM_SETS = [
     # Qwen3-TTS talker / speaker encoder (sr=24000)

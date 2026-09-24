@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -173,16 +176,13 @@ class Qwen3TTSTalkerCodePredictorConfig(PretrainedConfig):
     model_type = "qwen3_tts_talker_code_predictor"
     keys_to_ignore_at_inference = ["past_key_values"]
 
-    # Default tensor parallel plan for base model `Qwen3TTSTalkerCodePredictor`
-    base_model_tp_plan = {
-        "layers.*.self_attn.q_proj": "colwise",
-        "layers.*.self_attn.k_proj": "colwise",
-        "layers.*.self_attn.v_proj": "colwise",
-        "layers.*.self_attn.o_proj": "rowwise",
-        "layers.*.mlp.gate_proj": "colwise",
-        "layers.*.mlp.up_proj": "colwise",
-        "layers.*.mlp.down_proj": "rowwise",
-    }
+    # The code predictor currently runs TP=1.  Do not advertise a tensor
+    # parallel plan for the packed qkv/gate_up projections until the fused
+    # loader and ``_split_qkv`` path are taught TP-aware packing/sharding:
+    # a generic colwise split of the plain ``nn.Linear`` would split the
+    # packed [q, k, v] layout across ranks instead of preserving each rank's
+    # local q/k/v groups.
+    base_model_tp_plan = {}
     base_model_pp_plan = {
         "embed_tokens": (["input_ids"], ["inputs_embeds"]),
         "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
@@ -536,6 +536,10 @@ class Qwen3TTSConfig(PretrainedConfig):
         if any("Code2Wav" in str(a) for a in archs):
             if hasattr(config, "rope_parameters"):
                 delattr(config, "rope_parameters")
+            # Code2Wav doesn't use position embeddings, but vLLM validates
+            # max_model_len <= max_position_embeddings. Set a large value
+            # to allow the pipeline.yaml max_model_len (65536) to pass validation.
+            config.max_position_embeddings = 131072
         return config
 
 

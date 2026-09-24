@@ -1,16 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections import defaultdict
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+from vllm_omni.data_entry_keys import serialize_payload
 from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
     talker2code2wav_async_chunk,
     text2flow_full_payload,
     text2flow_token_only,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _source_output(request_id: str, prompt_ids: list[int], out_ids: list[int], mm: dict, finished: bool = True):
@@ -148,6 +152,36 @@ def test_talker2code2wav_async_chunk_final_payload_uses_absolute_token_offset():
     assert payload.embed.speech_token is not None
     assert payload.embed.speech_feat is not None
     assert payload.embed.embedding is not None
+
+
+def test_talker2code2wav_async_chunk_decodes_bfloat16_conditioning():
+    speech_feat = torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.bfloat16)
+    additional_information = serialize_payload(
+        {
+            "embed": {
+                "speech_token": torch.tensor([[11]], dtype=torch.long),
+                "speech_feat": speech_feat,
+                "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.bfloat16),
+            }
+        }
+    )
+    request = SimpleNamespace(
+        external_req_id="rid-bfloat16",
+        output_token_ids=[1],
+        additional_information=additional_information,
+        is_finished=lambda: True,
+    )
+
+    payload = talker2code2wav_async_chunk(
+        transfer_manager=_transfer_manager(),
+        multimodal_output=None,
+        request=request,
+        is_finished=True,
+    )
+
+    assert payload is not None
+    assert payload.embed.speech_feat.dtype == torch.bfloat16
+    assert torch.equal(payload.embed.speech_feat, speech_feat)
 
 
 def test_talker2code2wav_async_chunk_emits_eof_when_finished_without_valid_codes():

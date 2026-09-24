@@ -15,6 +15,9 @@ from vllm_omni.entrypoints.openai.video_stream_session import (
     VideoStreamSession,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
 # ---------------------------------------------------------------------------
 # VideoStreamConfig
 # ---------------------------------------------------------------------------

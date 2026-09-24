@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Comprehensive tests of diffusion features that are available in online serving mode
 and are supported by the following model:
@@ -25,12 +28,12 @@ from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import (
     OmniServer,
     OmniServerParams,
-    OpenAIClientHandler,
+    OnlineOmniClient,
     dummy_messages_from_mix_data,
 )
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 MODEL = os.environ.get("GLM_IMAGE_MODEL_PATH", "zai-org/GLM-Image")
 
@@ -152,7 +155,7 @@ MODES = ["t2i", "i2i"]
 def test_glm_image(
     omni_server: OmniServer,
     mode: str,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
 ):
     """GLM-Image diffusion feature coverage for t2i and i2i on two H100s."""
 
@@ -180,4 +183,4 @@ def test_glm_image(
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)

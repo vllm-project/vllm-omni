@@ -46,6 +46,8 @@ htmlcov/
 .cache
 nosetests.xml
 coverage.xml
+coverage-*.xml
+coverage-*.xml.gz
 *.cover
 *.py,cover
 .hypothesis/
@@ -240,10 +242,14 @@ data/
 datasets/
 *.csv
 *.json
+!recipes/cosmos3/negative_prompt.json
 !tests/dfx/perf/tests/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
-!tests/assets/soulxsinger/*.json
+# Omni-DuplexEval CI config JSON (e.g. accuracy/omni_duplex_eval)
+!tests/e2e/accuracy/omni_duplex_eval/*.json
 *.jsonl
+# Shared Hunyuan IT2I input for accuracy tests and vllm bench.
+!tests/assets/hunyuan_image3/it2i.jsonl
 *.parquet
 
 # Output files
@@ -252,6 +258,7 @@ outputs/
 results/
 generated/
 output_*/
+/tests/e2e/accuracy/artifacts/
 
 # Configuration overrides
 configs/local.yaml
@@ -259,7 +266,6 @@ configs/production.yaml
 configs/development.yaml
 
 # Docker
-.dockerignore
 Dockerfile.dev
 discussion
 tmp_test
@@ -276,3 +282,6 @@ tests/.ci_generated/
 
 # Local Lance precision-matching dump scripts (not part of the repo)
 lance_compare/
+
+# Linting binaries downloaded by local pre-commit hooks
+shellcheck*/

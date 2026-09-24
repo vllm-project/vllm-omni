@@ -8,6 +8,11 @@ lightweight local checkout. Runtime audio quality still requires a CUDA test.
 
 from pathlib import Path
 
+import pytest
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
 REPO_ROOT = Path(__file__).resolve().parents[4]
 RUNNER = REPO_ROOT / "vllm_omni" / "worker" / "gpu_ar_model_runner.py"
 RUNNER_ASSISTED_METADATA = REPO_ROOT / "vllm_omni" / "worker" / "runner_assisted_metadata.py"
@@ -69,7 +74,9 @@ def test_ar_runner_without_model_hook_stays_on_normal_path():
     assert "exceptException" not in compact_request_source
 
     set_context_source = source[source.index("def _set_runner_assisted_full_attention_metadata_context") :]
-    set_context_source = set_context_source[: set_context_source.index("def _deferred_prefix_cache_mm_keys")]
+    set_context_source = set_context_source[
+        : set_context_source.index("def _prepare_prefix_cache_pooler_payload_sources")
+    ]
     assert "except Exception" not in set_context_source
 
 

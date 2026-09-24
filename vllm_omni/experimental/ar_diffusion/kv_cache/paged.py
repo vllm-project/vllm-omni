@@ -91,22 +91,51 @@ def allocate_kv_pool_with_views(
     head_dim: int,
     dtype: torch.dtype,
     device: torch.device,
-) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+) -> tuple[list[list[torch.Tensor]], list[torch.Tensor], list[torch.Tensor]]:
     """Allocate vLLM-style paged KV pools plus flat slot-write views.
 
-    The owning tensor follows FlashAttention's block-table cache layout:
-    ``(2, num_blocks, block_size, num_kv_heads, head_dim)``, where dim-0 is
-    ``[K, V]``.  The flat K/V views keep ``slot = block_id * block_size +
-    offset`` writes simple without changing the kernel-facing cache layout.
+    Each cache keeps FlashAttention's block-table layout,
+    ``(num_blocks, block_size, num_kv_heads, head_dim)``. The flat K/V views
+    keep ``slot = block_id * block_size + offset`` writes simple without
+    changing the kernel-facing layout, and ``kv_pools[layer][0]`` /
+    ``[1]`` still address K and V.
+
+    K and V are allocated separately rather than as the two halves of one
+    ``(2, ...)`` tensor. Sharing one allocation makes them views of the same
+    storage, and the paged-write custom op declares both as mutated. Inductor's
+    reinplace pass can then re-inplace only the first of the two -- the second
+    hits the "mutated arg aliases a graph input" case in
+    ``_inductor/fx_passes/reinplace.py`` -- so ``auto_functionalized_v2``'s
+    clone of the whole V pool survives into the compiled graph. That clone is
+    one full pool per compiled region per denoising step.
     """
-    kv_pools: list[torch.Tensor] = []
+    kv_pools: list[list[torch.Tensor]] = []
     k_pools: list[torch.Tensor] = []
     v_pools: list[torch.Tensor] = []
+    cache_shape = (num_blocks, block_size, num_kv_heads, head_dim)
+    flat_shape = (num_blocks * block_size, num_kv_heads, head_dim)
     for _ in range(num_layers):
-        kv = torch.empty(2, num_blocks, block_size, num_kv_heads, head_dim, dtype=dtype, device=device)
-        kv_pools.append(kv)
-        k_pools.append(kv[0].reshape(num_blocks * block_size, num_kv_heads, head_dim))
-        v_pools.append(kv[1].reshape(num_blocks * block_size, num_kv_heads, head_dim))
+        # The flat slot views are what the paged-write custom op mutates inside the
+        # compiled block graphs, so they must be the *base* allocations: dynamo only
+        # honours mark_static_address on the tensor object it sees as a graph input,
+        # and a view of a static base is still classified as a mutated input, which
+        # makes inductor skip CUDA graphs for every block ("skipping cudagraphs due
+        # to mutated inputs"). The block-table layout is therefore the view here.
+        k = torch.empty(flat_shape, dtype=dtype, device=device)
+        v = torch.empty(flat_shape, dtype=dtype, device=device)
+        for pool in (k, v):
+            # Block 0 is the manager's null block: block tables are tail-padded with
+            # it and it is never written. The contiguous-K/V gather path may read
+            # (masked) rows from it, so it must hold finite values; every other
+            # block is fully written before it is read.
+            pool[:block_size].zero_()
+            # Session-lifetime storage: tell dynamo/inductor the address is static so
+            # CUDA-graph trees (mode="reduce-overhead") mutate it in place instead of
+            # copying ~300 MB per layer per replay (or skipping the graph).
+            torch._dynamo.mark_static_address(pool)
+        kv_pools.append([k.view(cache_shape), v.view(cache_shape)])
+        k_pools.append(k)
+        v_pools.append(v)
     return kv_pools, k_pools, v_pools
 
 
@@ -153,7 +182,7 @@ def chunk_window_skipped_tokens(
     Pure function so the eviction policy is unit-testable without constructing a
     manager. Two strategies:
 
-    - ``reset_at_boundary`` (DreamZero): at each chunk boundary everything past
+    - ``reset_at_boundary``: at each chunk boundary everything past
       the sink is dropped.
     - otherwise (VGGT-style sliding replace): keep the last ``window`` tokens
       (plus the sink); the skip count snaps down to a chunk boundary so a chunk
@@ -182,6 +211,47 @@ class ChunkWindowManager(SlidingWindowManager):
             sliding_window=self.sliding_window,
             sink_chunks=spec.sink_chunks,
             reset_at_boundary=spec.reset_at_boundary,
+        )
+
+    def compact_block_table(self, request_id: str) -> int:
+        """Remove the evicted gap after the sink; return its size in tokens.
+
+        Call only after commit/eviction, then shift the request's storage
+        position by the returned amount. Physical pages and model positions
+        are unchanged, including any allocated but not yet committed tail.
+        """
+        if self.enable_caching:
+            raise RuntimeError("AR block-table compaction requires prefix caching to be disabled")
+        blocks = self.req_to_blocks.get(request_id, [])
+        start = self.kv_cache_spec.sink_chunks
+        end = start
+        while end < len(blocks) and blocks[end] == self._null_block:
+            end += 1
+        if end == start:
+            return 0
+        del blocks[start:end]
+        if request_id in self.num_cached_block:
+            cached = self.num_cached_block[request_id]
+            self.num_cached_block[request_id] = min(cached, start) + max(0, cached - end)
+        return (end - start) * self.block_size
+
+    def remove_skipped_blocks(
+        self,
+        request_id: str,
+        total_computed_tokens: int,
+        num_prompt_tokens: int | None = None,
+    ) -> None:
+        """Free the middle gap while preserving the leading attention sink."""
+        del num_prompt_tokens
+        num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
+        if num_skipped_tokens <= 0:
+            return
+        sink_blocks = self.kv_cache_spec.sink_chunks
+        num_skipped_blocks = num_skipped_tokens // self.block_size
+        self._remove_blocks_in_range(
+            request_id,
+            sink_blocks,
+            sink_blocks + num_skipped_blocks,
         )
 
 

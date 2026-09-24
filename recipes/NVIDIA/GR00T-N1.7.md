@@ -44,7 +44,7 @@ vllm serve nvidia/GR00T-N1.7-3B \
   --host 127.0.0.1 \
   --port 8000 \
   --served-model-name gr00t-n1d7 \
-  --stage-configs-path vllm_omni/deploy/Gr00tN1d7.yaml
+  --deploy-config vllm_omni/deploy/Gr00tN1d7.yaml
 ```
 
 Notes:
@@ -69,8 +69,13 @@ Notes:
 ## Verification
 
 ```python
-from tests.gr00t.openpi_client_helper import run_policy_session, validate_session_result
-validate_session_result(run_policy_session(host="127.0.0.1", port=8000))
+from tests.helpers.runtime import OpenAIClientHandler
+
+handler = OpenAIClientHandler(host="127.0.0.1", port=8000, log_stats=False)
+response = handler.send_robot_openpi_ws_request(
+    {"run_default_policy_session": True, "session_id": "gr00t-smoke"}
+)[0]
+assert response.operation_responses[-1]["status"] == "reset successful"
 ```
 
 Or run the e2e test suite:

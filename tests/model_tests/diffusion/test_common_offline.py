@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from pathlib import Path
+
 import pytest
 
 from tests.model_tests.diffusion.case_filtering import get_parametrized_options
@@ -8,18 +13,20 @@ from tests.model_tests.diffusion.config_types import (
 )
 from tests.model_tests.diffusion.model_settings import DIFFUSION_TEST_SETTINGS
 from tests.model_tests.diffusion.task_runners import (
+    run_and_validate_determinism,
     run_and_validate_image_to_image_request,
-    run_and_validate_text_to_image_determinism,
-    run_and_validate_text_to_image_multi_output,
+    run_and_validate_image_to_video_request,
+    run_and_validate_multi_output,
     run_and_validate_text_to_image_request,
+    run_and_validate_text_to_video_request,
 )
 
 # NOTE : Hardware marks are added dynamically based on test requirements
-pytestmark = [pytest.mark.diffusion]
+pytestmark = [pytest.mark.diffusion, pytest.mark.xdist]
 
 
 @pytest.mark.parametrize(
-    "model_name,accelerations,supported_tasks,check_multioutput,check_determinism",
+    "model_name,accelerations,supported_tasks,check_multioutput,check_determinism,check_i2v_t2v_divergence",
     get_parametrized_options(DIFFUSION_TEST_SETTINGS),
 )
 def test_pipeline_on_supported_tasks(
@@ -28,6 +35,7 @@ def test_pipeline_on_supported_tasks(
     supported_tasks: list[DiffusionTasks],
     check_multioutput: bool,
     check_determinism: bool,
+    check_i2v_t2v_divergence: bool,
     tiny_model_paths: dict[str, str],
     subtests,
 ):
@@ -41,18 +49,29 @@ def test_pipeline_on_supported_tasks(
     # since starting the server can take 10+ seconds, even for tiny models.
     #
     # NOTE: Be sure to install pytest-subtests if you're running on pytest < 9
+    settings = DIFFUSION_TEST_SETTINGS[model_name]
+    model_path = tiny_model_paths[model_name]
+    model_kwargs = {}
+    if settings.checkpoint_filename is not None:
+        model_path = str(Path(model_path) / settings.checkpoint_filename)
+        model_kwargs["model_class_name"] = model_name
     omni = build_omni_from_diff_accelerations(
         accelerations=accelerations,
-        model=tiny_model_paths[model_name],
+        model=model_path,
         enforce_eager=True,
+        **model_kwargs,
     )
     try:
         for task_type in supported_tasks:
-            with subtests.test(msg=task_type):
+            with subtests.test(msg=task_type.value):
                 if task_type == DiffusionTasks.TEXT_TO_IMAGE:
                     run_and_validate_text_to_image_request(omni)
                 elif task_type == DiffusionTasks.IMAGE_TO_IMAGE:
                     run_and_validate_image_to_image_request(omni)
+                elif task_type == DiffusionTasks.TEXT_TO_VIDEO:
+                    run_and_validate_text_to_video_request(omni)
+                elif task_type == DiffusionTasks.IMAGE_TO_VIDEO:
+                    run_and_validate_image_to_video_request(omni, check_t2v_divergence=check_i2v_t2v_divergence)
                 else:
                     raise ValueError(f"Task type {task_type} is not yet supported")
 
@@ -60,10 +79,12 @@ def test_pipeline_on_supported_tasks(
         # since checking it on every extra acceleration configuration is redundant
         # (see case_filtering).
         if check_determinism:
-            with subtests.test(msg="determinism"):
-                run_and_validate_text_to_image_determinism(omni)
+            for task_type in supported_tasks:
+                with subtests.test(msg=f"determinism[{task_type}]"):
+                    run_and_validate_determinism(omni, task_type)
         if check_multioutput:
-            with subtests.test(msg="multi_output"):
-                run_and_validate_text_to_image_multi_output(omni)
+            for task_type in supported_tasks:
+                with subtests.test(msg=f"multi_output[{task_type}]"):
+                    run_and_validate_multi_output(omni, task_type)
     finally:
         omni.close()

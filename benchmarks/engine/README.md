@@ -25,7 +25,7 @@ python benchmarks/engine/queue_handoff_latency.py --poll-ms 1.0 --messages 3000 
 
 ### Representative result
 
-```
+```text
 == per-message wakeup latency (producer thread -> async consumer) ==
   OLD poll : mean=  573.8us  p50=  574.7us  p99= 1103.6us  max= 1280.8us
   NEW await: mean=  144.7us  p50=   96.3us  p99=  398.3us  max=  585.1us

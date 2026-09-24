@@ -1,0 +1,150 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="600" viewBox="0 0 1024 600" role="img" aria-labelledby="title desc">
+  <title id="title">Qwen3-Omni Talker step gap before and after asynchronous output materialization</title>
+  <desc id="desc">Before the optimization, synchronous D2H copy, per-request payload construction, streaming payload handoff, and connector-signal drain separate consecutive Talker forward and sample steps by about 2.8 milliseconds. After the optimization, that Omni output work runs on a background builder while the next Talker step executes, leaving a boundary of about 41 microseconds for snapshot, D2H enqueue, state update, and sampled-token feedback.</desc>
+  <defs>
+    <marker id="time-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+    <marker id="red-end" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#b91c1c"/>
+    </marker>
+    <marker id="red-start" viewBox="0 0 10 10" refX="2" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+      <path d="M 10 0 L 0 5 L 10 10 z" fill="#b91c1c"/>
+    </marker>
+    <marker id="blue-end" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb"/>
+    </marker>
+    <style>
+      .canvas { fill: #ffffff; stroke: #e5e7eb; }
+      .title { font: 700 22px system-ui, -apple-system, Segoe UI, sans-serif; fill: #111827; }
+      .subtitle { font: 500 13px system-ui, -apple-system, Segoe UI, sans-serif; fill: #64748b; }
+      .phase { font: 700 16px system-ui, -apple-system, Segoe UI, sans-serif; fill: #1f2937; }
+      .phase-sub { font: 500 12px system-ui, -apple-system, Segoe UI, sans-serif; fill: #64748b; }
+      .lane { font: 600 12px system-ui, -apple-system, Segoe UI, sans-serif; fill: #374151; }
+      .block-title { font: 700 10px system-ui, -apple-system, Segoe UI, sans-serif; letter-spacing: .25px; fill: #ffffff; }
+      .block-op { font: 500 9.5px system-ui, -apple-system, Segoe UI, sans-serif; fill: #ffffff; }
+      .axis { font: 500 11px system-ui, -apple-system, Segoe UI, sans-serif; fill: #94a3b8; }
+      .measure { font: 700 12px system-ui, -apple-system, Segoe UI, sans-serif; fill: #b91c1c; }
+      .inset-title { font: 700 11px system-ui, -apple-system, Segoe UI, sans-serif; fill: #475569; }
+      .inset-step { font: 600 10px system-ui, -apple-system, Segoe UI, sans-serif; fill: #ffffff; }
+      .note-title { font: 700 12px system-ui, -apple-system, Segoe UI, sans-serif; fill: #1e3a8a; }
+      .note-text { font: 500 10.5px system-ui, -apple-system, Segoe UI, sans-serif; fill: #475569; }
+      .stat-cap { font: 600 11px system-ui, -apple-system, Segoe UI, sans-serif; fill: #64748b; }
+      .stat-big { font: 800 16px system-ui, -apple-system, Segoe UI, sans-serif; fill: #111827; }
+      .stat-sub { font: 500 11px system-ui, -apple-system, Segoe UI, sans-serif; fill: #64748b; }
+      .before-card { fill: #eef4ff; stroke: #c7dbf6; }
+      .after-card { fill: #eafaf0; stroke: #bfe7cf; }
+      .talker { fill: #16a34a; }
+      .sync-output { fill: #ea580c; }
+      .async-output { fill: #2563eb; }
+      .zoom-card { fill: #fff7f7; stroke: #f3caca; }
+      .note-card { fill: #eff6ff; stroke: #bfdbfe; }
+      .stat-blue { fill: #eef4ff; stroke: #c7dbf6; }
+      .stat-green { fill: #eafaf0; stroke: #bfe7cf; }
+      .stat-gray { fill: #f4f5f7; stroke: #e2e5ea; }
+      .guide { stroke: #e2e8f0; stroke-width: 1; }
+      .time-line { stroke: #64748b; stroke-width: 1.3; fill: none; marker-end: url(#time-arrow); }
+      .measure-line { stroke: #b91c1c; stroke-width: 1.4; marker-start: url(#red-start); marker-end: url(#red-end); }
+      .zoom-lead { stroke: #dc2626; stroke-width: 1.15; stroke-dasharray: 4 3; fill: none; }
+      .handoff { stroke: #2563eb; stroke-width: 1.3; stroke-dasharray: 3 2; fill: none; marker-end: url(#blue-end); }
+    </style>
+  </defs>
+
+  <rect x="14" y="14" width="996" height="572" rx="14" class="canvas"/>
+
+  <text x="44" y="52" class="title">Async output: what moves off the Talker decode path</text>
+  <text x="44" y="74" class="subtitle">Qwen3-Omni Talker stage &#183; consecutive decode steps in a fixed profiler window</text>
+
+  <!-- ===================== BEFORE ===================== -->
+  <rect x="44" y="94" width="144" height="110" rx="10" class="before-card"/>
+  <text x="60" y="120" class="phase">Before</text>
+  <text x="60" y="139" class="phase-sub">Omni output built</text>
+  <text x="60" y="156" class="phase-sub">synchronously on the</text>
+  <text x="60" y="173" class="phase-sub">AR critical path</text>
+
+  <text x="206" y="122" class="lane">AR path</text>
+  <line x1="300" y1="88" x2="300" y2="210" class="guide"/>
+
+  <rect x="300" y="104" width="190" height="54" rx="5" class="talker"/>
+  <text x="395" y="124" text-anchor="middle" class="block-title">TALKER STAGE &#183; STEP N</text>
+  <text x="395" y="145" text-anchor="middle" class="block-op">forward &#8594; sample</text>
+
+  <rect x="490" y="104" width="250" height="54" rx="5" class="sync-output"/>
+  <text x="615" y="120" text-anchor="middle" class="block-title">SYNC OMNI OUTPUT &#183; STEP N</text>
+  <text x="615" y="138" text-anchor="middle" class="block-op">D2H &#8594; per-request slice / payload build</text>
+  <text x="615" y="152" text-anchor="middle" class="block-op">streaming handoff &#8594; connector-signal drain</text>
+
+  <rect x="740" y="104" width="220" height="54" rx="5" class="talker"/>
+  <text x="850" y="124" text-anchor="middle" class="block-title">TALKER STAGE &#183; STEP N+1</text>
+  <text x="850" y="145" text-anchor="middle" class="block-op">forward &#8594; sample</text>
+
+  <line x1="490" y1="174" x2="740" y2="174" class="measure-line"/>
+  <text x="615" y="194" text-anchor="middle" class="measure">~2.8 ms GPU gap: output work is inline</text>
+
+  <!-- ===================== AFTER ===================== -->
+  <rect x="44" y="218" width="144" height="140" rx="10" class="after-card"/>
+  <text x="60" y="244" class="phase">After</text>
+  <text x="60" y="263" class="phase-sub">Only step feedback</text>
+  <text x="60" y="280" class="phase-sub">stays inline; payload</text>
+  <text x="60" y="297" class="phase-sub">work runs in the</text>
+  <text x="60" y="314" class="phase-sub">background</text>
+
+  <text x="206" y="254" class="lane">Talker GPU</text>
+  <text x="206" y="326" class="lane">Output builder</text>
+  <line x1="300" y1="212" x2="300" y2="370" class="guide"/>
+
+  <rect x="300" y="226" width="235" height="54" rx="5" class="talker"/>
+  <text x="418" y="246" text-anchor="middle" class="block-title">TALKER STAGE &#183; STEP N</text>
+  <text x="418" y="267" text-anchor="middle" class="block-op">forward &#8594; sample</text>
+
+  <rect x="540" y="226" width="235" height="54" rx="5" class="talker"/>
+  <text x="658" y="246" text-anchor="middle" class="block-title">TALKER STAGE &#183; STEP N+1</text>
+  <text x="658" y="267" text-anchor="middle" class="block-op">forward &#8594; sample</text>
+
+  <path d="M 535 280 L 548 298" class="handoff"/>
+  <rect x="540" y="298" width="360" height="58" rx="5" class="async-output"/>
+  <text x="720" y="315" text-anchor="middle" class="block-title">BACKGROUND OMNI OUTPUT &#183; STEP N</text>
+  <text x="720" y="334" text-anchor="middle" class="block-op">wait for D2H &#8594; per-request slice / payload build</text>
+  <text x="720" y="349" text-anchor="middle" class="block-op">streaming handoff &#8594; connector-signal drain</text>
+
+  <line x1="300" y1="366" x2="930" y2="366" class="time-line"/>
+  <text x="922" y="382" text-anchor="end" class="axis">time</text>
+
+  <!-- leads from the real 41 us boundary to the magnified inset -->
+  <line x1="535" y1="280" x2="485" y2="424" class="zoom-lead"/>
+  <line x1="540" y1="280" x2="525" y2="424" class="zoom-lead"/>
+
+  <!-- ===================== 41 µs BOUNDARY ===================== -->
+  <rect x="300" y="386" width="400" height="92" rx="10" class="zoom-card"/>
+  <text x="316" y="404" class="inset-title">Zoom &#183; Talker step boundary (magnified)</text>
+
+  <rect x="320" y="416" width="165" height="26" rx="4" class="talker"/>
+  <rect x="525" y="416" width="155" height="26" rx="4" class="talker"/>
+  <text x="403" y="433" text-anchor="middle" class="inset-step">Talker step N</text>
+  <text x="603" y="433" text-anchor="middle" class="inset-step">Talker step N+1</text>
+
+  <line x1="485" y1="452" x2="525" y2="452" class="measure-line"/>
+  <text x="505" y="469" text-anchor="middle" class="measure">~41 &#181;s</text>
+
+  <rect x="720" y="386" width="240" height="92" rx="10" class="note-card"/>
+  <text x="736" y="405" class="note-title">Inline at the ~41 &#181;s boundary</text>
+  <text x="736" y="424" class="note-text">&#8226; eager Talker state update</text>
+  <text x="736" y="441" class="note-text">&#8226; output snapshot + D2H enqueue</text>
+  <text x="736" y="458" class="note-text">&#8226; sampled-token feedback</text>
+
+  <!-- ===================== SUMMARY ===================== -->
+  <rect x="44" y="494" width="296" height="70" rx="9" class="stat-blue"/>
+  <text x="60" y="514" class="stat-cap">Step-to-step gap</text>
+  <text x="60" y="538" class="stat-big">2.8 ms &#8594; 41 &#181;s</text>
+  <text x="60" y="555" class="stat-sub">~68&#215; tighter</text>
+
+  <rect x="356" y="494" width="296" height="70" rx="9" class="stat-green"/>
+  <text x="372" y="514" class="stat-cap">Talker GPU</text>
+  <text x="372" y="538" class="stat-big">next step starts immediately</text>
+  <text x="372" y="555" class="stat-sub">decode workers stay busy</text>
+
+  <rect x="668" y="494" width="312" height="70" rx="9" class="stat-gray"/>
+  <text x="684" y="514" class="stat-cap">Background builder</text>
+  <text x="684" y="538" class="stat-big">materializes Omni output</text>
+  <text x="684" y="555" class="stat-sub">payload work overlaps the next Talker step</text>
+</svg>

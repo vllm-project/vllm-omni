@@ -131,7 +131,7 @@ def test_sensenova_u1_lora_scale_and_deactivation(tmp_path) -> None:
     """Validate LoRA effect, scale sensitivity, bounded perturbation, and clean deactivation."""
     lora_request = _make_file_lora_request(tmp_path / "sensenova_lora")
 
-    with OmniRunner(MODEL, stage_configs_path=None) as runner:
+    with OmniRunner(MODEL) as runner:
         omni = runner.omni
         baseline = _generate(omni)
         img_1x = _generate(omni, lora_request, lora_scale=1.0)

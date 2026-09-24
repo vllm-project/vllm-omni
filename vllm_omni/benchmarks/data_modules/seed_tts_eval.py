@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Seed-TTS WER aligned with Bytedance ``seed-tts-eval`` / ``run_wer.py``.
 
 Matches the published protocol (see Hugging Face dataset card and
@@ -54,6 +57,8 @@ import string
 import tempfile
 import threading
 import wave
+from copy import copy
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -123,10 +128,24 @@ def _get_eval_device() -> str:
         return explicit
     try:
         import torch
-
-        return "cuda:0" if torch.cuda.is_available() else "cpu"
     except ImportError:
         return "cpu"
+
+    if torch.cuda.is_available():
+        return "cuda:0"
+
+    # Ascend: ``torch.npu`` only exists once ``torch_npu`` has been imported, which does
+    # not necessarily happen in the benchmark client process. Without this branch the
+    # eval silently lands on CPU, where Whisper-large-v3 needs hours for a full Seed-TTS
+    # run and the CI job is killed by its timeout instead of reporting a WER.
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        pass
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return "npu:0"
+
+    return "cpu"
 
 
 def _punctuation_all() -> str:
@@ -313,7 +332,8 @@ def _ensure_utmos_jit_model() -> Any | None:
             return _utmos_jit_model
         try:
             import torch
-            from huggingface_hub import hf_hub_download
+
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
             repo = os.environ.get("SEED_TTS_UTMOS_HF_REPO", "balacoon/utmos").strip() or "balacoon/utmos"
             fname = os.environ.get("SEED_TTS_UTMOS_JIT_FILE", "utmos.jit").strip() or "utmos.jit"
@@ -322,7 +342,7 @@ def _ensure_utmos_jit_model() -> Any | None:
                 repo,
                 fname,
             )
-            path = hf_hub_download(repo_id=repo, filename=fname, repo_type="model")
+            path = hf_api().hf_hub_download(repo_id=repo, filename=fname, repo_type="model")
 
             # TODO The model weights in UTMOS must be loaded in cuda:0; otherwise, the model execution will fail.
             want = "cuda:0"
@@ -444,25 +464,33 @@ def _transcribe_en_f32_16k(wav_f32: np.ndarray) -> str:
         return ""
     with _lock:
         assert _en_processor is not None and _en_model is not None and _device is not None
+        # Whisper's default feature extraction truncates at 30 seconds. Keep
+        # abnormal tails so WER evaluates the complete generated response.
+        long_audio = len(wav_f32) > 30 * 16000
+        processor_kwargs = {"truncation": False, "padding": "longest"} if long_audio else {}
         try:
             inputs = _en_processor(
                 wav_f32,
                 sampling_rate=16000,
                 return_tensors="pt",
                 return_attention_mask=True,
+                **processor_kwargs,
             )
         except TypeError:
-            inputs = _en_processor(wav_f32, sampling_rate=16000, return_tensors="pt")
+            inputs = _en_processor(wav_f32, sampling_rate=16000, return_tensors="pt", **processor_kwargs)
         input_features = inputs.input_features.to(_device)
         attention_mask = getattr(inputs, "attention_mask", None)
         if attention_mask is None and isinstance(inputs, dict):
             attention_mask = inputs.get("attention_mask")
         generate_kwargs: dict[str, Any] = {}
+        if long_audio:
+            generate_kwargs["return_timestamps"] = True
         if attention_mask is not None:
             generate_kwargs["attention_mask"] = attention_mask.to(_device)
         with torch.no_grad():
             try:
-                forced = _en_processor.get_decoder_prompt_ids(language="english", task="transcribe")
+                prompt_kwargs = {"no_timestamps": False} if long_audio else {}
+                forced = _en_processor.get_decoder_prompt_ids(language="english", task="transcribe", **prompt_kwargs)
                 predicted_ids = _en_model.generate(input_features, forced_decoder_ids=forced, **generate_kwargs)
             except Exception:
                 predicted_ids = _en_model.generate(
@@ -512,6 +540,41 @@ def _missing_deps_message(lang: str) -> str | None:
     return None
 
 
+def _expand_seed_tts_turn_outputs(
+    input_requests: list[SeedTTSSampleRequest],
+    outputs: list[Any],
+) -> tuple[list[SeedTTSSampleRequest], list[Any]]:
+    """Expand grouped Realtime sessions into one request/output pair per turn."""
+    expanded_requests: list[SeedTTSSampleRequest] = []
+    expanded_outputs: list[Any] = []
+    for request, output in zip(input_requests, outputs, strict=True):
+        turns = request.seed_tts_turns
+        if not turns:
+            expanded_requests.append(request)
+            expanded_outputs.append(output)
+            continue
+        turn_pcm = getattr(output, "tts_turn_pcm_bytes", None)
+        session_pcm = getattr(output, "tts_output_pcm_bytes", None)
+        for turn_index, turn in enumerate(turns):
+            turn_request = replace(
+                request,
+                seed_tts_utterance_id=turn.utterance_id,
+                seed_tts_turns=(),
+            )
+            turn_request.prompt = turn.target_text
+            expanded_requests.append(turn_request)
+            turn_output = copy(output)
+            if isinstance(turn_pcm, list) and turn_index < len(turn_pcm):
+                turn_output.tts_output_pcm_bytes = turn_pcm[turn_index]
+            elif len(turns) == 1:
+                # openai-chat-omni Seed-TTS only fills the session-level PCM field.
+                turn_output.tts_output_pcm_bytes = session_pcm
+            else:
+                turn_output.tts_output_pcm_bytes = None
+            expanded_outputs.append(turn_output)
+    return expanded_requests, expanded_outputs
+
+
 def compute_seed_tts_wer_metrics(
     input_requests: list[SampleRequest],
     outputs: list[Any],
@@ -524,6 +587,8 @@ def compute_seed_tts_wer_metrics(
         return None
     if not all(isinstance(r, SeedTTSSampleRequest) for r in input_requests):
         return None
+    session_count = len(input_requests)
+    input_requests, outputs = _expand_seed_tts_turn_outputs(input_requests, outputs)
 
     first = input_requests[0]
     assert isinstance(first, SeedTTSSampleRequest)
@@ -759,6 +824,8 @@ def compute_seed_tts_wer_metrics(
 
     result: dict[str, Any] = {
         "seed_tts_eval_protocol": "seed-tts-eval",
+        "seed_tts_session_count": session_count,
+        "seed_tts_turn_count": len(input_requests),
         "seed_tts_content_evaluated": len(errs),
         "seed_tts_content_error_mean": statistics.fmean(errs) if errs else None,
         "seed_tts_content_error_median": statistics.median(errs) if errs else None,

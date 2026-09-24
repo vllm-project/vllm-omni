@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """VoxCPM2 AR talker — PagedAttention pipeline with per-request state.
 
 Architecture:
@@ -42,9 +42,11 @@ from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
     iter_custom_voice_profiles,
     load_validated_profile_tensors,
+    validate_voxcpm2_profile,
 )
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 
+from .lora import merge_voxcpm2_lora
 from .minicpm4_paged import MiniCPM4PagedForVoxCPM2, MiniCPM4PagedResidualLM
 from .runtime_config import _VoxCPM2RuntimeConfig
 from .voxcpm2_import_utils import import_voxcpm2_core
@@ -75,6 +77,7 @@ class _ForwardContextLike(Protocol):
 class VoxCPM2PreprocessInput(TypedDict, total=False):
     additional_information: dict[str, Any]
     request_id: str
+    _omni_seed: int | None
     text_token_ids: list[list[int]]
     reference_audio: object
     ref_audio: object
@@ -157,7 +160,7 @@ def build_voxcpm2_prompt(
     """Build a VoxCPM2 prefill prompt whose ``prompt_token_ids`` length matches
     the talker-side prefill length.
 
-    Used by both online serving (``serving_speech._build_voxcpm2_prompt``) and
+    Used by both online serving (``VoxCPM2Adapter._build_prompt``) and
     the offline example, so the talker-side length assertion never fires.
     """
     ids = split_multichar_chinese(tokenizer.encode(text, add_special_tokens=True), split_map)
@@ -248,6 +251,10 @@ def _encode_raw_audio(
 @dataclasses.dataclass
 class _RequestState:
     request_id: str
+    # Per-request CFM noise generator, seeded once from the request's seed at
+    # first prefill chunk (runner passes it as ``_omni_seed``). None means the
+    # request carried no seed and draws noise from the global RNG stream.
+    cfm_generator: torch.Generator | None = None
     curr_embed_for_next: torch.Tensor | None = None
     prev_feat_embed: torch.Tensor | None = None
     curr_prefix_feat_cond: torch.Tensor | None = None
@@ -264,10 +271,12 @@ class _RequestState:
     decode_step_count: int = 0
     request_start_time: float = 0.0
     prefill_completed: bool = False
+    is_last_prefill_chunk: bool = False
     prompt_cache: dict | None = None
     prefill_masks: tuple | None = None
     is_stopping: bool = False
     precomputed_is_stopping: bool | None = None
+    prefill_embeds: torch.Tensor | None = None
 
 
 @dataclasses.dataclass
@@ -348,20 +357,44 @@ class _PendingAudioCopy:
 # ===================================================================
 
 
+class _TimingEvent(Protocol):
+    def record(self) -> None: ...
+
+    def elapsed_time(self, end_event: _TimingEvent) -> float: ...
+
+
 class _PerfTimer:
-    __slots__ = ("_enabled", "_timers", "_counts", "_starts", "_pairs")
+    __slots__ = (
+        "_enabled",
+        "_device_module",
+        "_timers",
+        "_counts",
+        "_starts",
+        "_pairs",
+    )
 
     def __init__(self, enabled: bool = False):
         self._enabled = enabled
+        self._device_module = None
+        if enabled:
+            device_module = torch.get_device_module(current_omni_platform.get_torch_device())
+            if not hasattr(device_module, "Event"):
+                logger.warning_once(
+                    "VoxCPM2 profiler disabled: the current device does not provide accelerator timing events"
+                )
+                self._enabled = False
+            else:
+                self._device_module = device_module
         self._timers: dict[str, float] = {}
         self._counts: dict[str, int] = {}
-        self._starts: dict[str, torch.cuda.Event] = {}
-        self._pairs: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+        self._starts: dict[str, _TimingEvent] = {}
+        self._pairs: list[tuple[str, _TimingEvent, _TimingEvent]] = []
 
     def start(self, name: str) -> None:
         if not self._enabled:
             return
-        evt = torch.cuda.Event(enable_timing=True)
+        assert self._device_module is not None
+        evt = self._device_module.Event(enable_timing=True)
         evt.record()
         self._starts[name] = evt
 
@@ -369,7 +402,8 @@ class _PerfTimer:
         if not self._enabled or name not in self._starts:
             return
         start_evt = self._starts.pop(name)
-        end_evt = torch.cuda.Event(enable_timing=True)
+        assert self._device_module is not None
+        end_evt = self._device_module.Event(enable_timing=True)
         end_evt.record()
         self._pairs.append((name, start_evt, end_evt))
 
@@ -378,7 +412,18 @@ class _PerfTimer:
             return
         torch.accelerator.synchronize()
         for name, s, e in self._pairs:
-            self._timers[name] = self._timers.get(name, 0.0) + s.elapsed_time(e)
+            try:
+                elapsed_ms = s.elapsed_time(e)
+            except RuntimeError as error:
+                # An event recorded during accelerator graph capture may not
+                # own a runtime recorder. Profiling must not fail inference.
+                logger.warning_once(
+                    "VoxCPM2 profiler discarded invalid event pair %r: %s",
+                    name,
+                    error,
+                )
+                continue
+            self._timers[name] = self._timers.get(name, 0.0) + elapsed_ms
             self._counts[name] = self._counts.get(name, 0) + 1
         self._pairs.clear()
 
@@ -831,6 +876,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self.vllm_config = vllm_config
         self.config = vllm_config.model_config.hf_config
         self._runtime_config = _VoxCPM2RuntimeConfig.from_vllm_config(vllm_config)
+        self._startup_lora_applied = False
+        if self._runtime_config.startup_lora_path and vllm_config.load_config.load_format == "dummy":
+            raise ValueError("VoxCPM2 startup LoRA requires real base weights; load_format=dummy is unsupported")
         global _ENABLE_NVTX_PROFILE
         _ENABLE_NVTX_PROFILE = self._runtime_config.enable_nvtx_profile
 
@@ -961,7 +1009,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         loaded = 0
         for profile in iter_custom_voice_profiles(custom_voice_dir, expected_model_type="voxcpm2"):
-            tensors = load_validated_profile_tensors(profile, expected_model_type="voxcpm2")
+            tensors = load_validated_profile_tensors(
+                profile,
+                expected_model_type="voxcpm2",
+                validate_profile=validate_voxcpm2_profile,
+            )
             if tensors is None:
                 continue
 
@@ -1187,14 +1239,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._feat_encoder_for_unified_capture = compiled
         return compiled
 
-    def _setup_torch_compile(self) -> None:
-        if not self._enable_torch_compile:
+    def _setup_execution_optimizations(self) -> None:
+        if getattr(self, "_eager_optimizations_applied", False):
             return
         tts = self.tts
         estimator = tts.feat_decoder.estimator
-        if hasattr(estimator, "_compiled"):
-            return
-
         targets: list[str] = []
         cfg = self._runtime_config
 
@@ -1213,6 +1262,24 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         if cfg.enable_loc_dit_zero_dt_cache and not getattr(tts.feat_decoder, "mean_mode", False):
             if _install_locdit_zero_dt_cache(estimator):
                 targets.append("LocDiT zero-dt embedding cache")
+
+        # The rewrites above are regular eager PyTorch operations. Ascend does
+        # not support TorchInductor, but still benefits from fused projections
+        # and the cached delta-time embedding.
+        self._eager_optimizations_applied = True
+        if targets:
+            logger.info("VoxCPM2: eager optimizations applied to: %s", ", ".join(targets))
+        if self._enable_torch_compile:
+            self._setup_torch_compile()
+
+    def _setup_torch_compile(self) -> None:
+        tts = self.tts
+        estimator = tts.feat_decoder.estimator
+        if hasattr(estimator, "_compiled"):
+            return
+
+        targets: list[str] = []
+        cfg = self._runtime_config
 
         external_cfm_capture = self._enable_cfm_cuda_graph or self._enable_unified_decode_graph
         if cfg.enable_loc_dit_layer_nvtx:
@@ -1644,8 +1711,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         with _NvtxRange("voxcpm2.cfm.graph_copy_cond"):
             graph.cond.copy_(cond)
         with _NvtxRange("voxcpm2.cfm.graph_noise"):
-            if self._deterministic_cfm_noise:
-                self._fill_deterministic_cfm_noise(state, graph.noise)
+            if self._has_deterministic_cfm_noise(state):
+                self._fill_deterministic_cfm_noise_for_state(state, graph.noise)
             else:
                 graph.noise.normal_()
         with _NvtxRange("voxcpm2.cfm.graph_replay"):
@@ -1673,8 +1740,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         dtype = self._side_dtype
 
         self._setup_cfm_buffers()
-        if self._enable_torch_compile:
-            self._setup_torch_compile()
+        self._setup_execution_optimizations()
         self.model.precompute_fused_qkv()
         self.residual_model.precompute_fused_qkv()
 
@@ -1867,6 +1933,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 g.prefix_feat_cond[last : last + 1].expand(graph_size - num_reqs, -1, -1)
             )
         g.cfm_noise.normal_()
+        # Seeded rows overwrite their slice from their own generator, so the
+        # noise a seeded request sees does not depend on batch composition.
+        for i, state in enumerate(states[:num_reqs]):
+            if state.cfm_generator is not None:
+                g.cfm_noise[i : i + 1].normal_(generator=state.cfm_generator)
         self._perf.stop("unified.copy_inputs")
 
         self._perf.start("unified.replay")
@@ -2054,7 +2125,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
             if is_prefill:
                 flush_decode_fsq_batch()
-                res_input, meta = self._prepare_residual_prefill(state, req_hidden, dev)
+                res_input, meta = self._prepare_residual_prefill(state, req_hidden, dev, req_pos)
             elif state.prefill_completed:
                 if (
                     self._enable_batched_fsq_fusion
@@ -2141,7 +2212,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     offset += n
 
                     if is_prefill:
-                        prefill_batch.append((state, meta, res_out))
+                        if state.is_last_prefill_chunk:
+                            prefill_batch.append((state, meta, res_out))
                     else:
                         self._finish_decode(state, meta, res_out)
                         decoded_states.append(state)
@@ -2152,20 +2224,28 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     for state, meta, res_out in prefill_batch:
                         self._finish_prefill(state, meta, res_out, dev)
 
-                collect_states = [state for state, _, _ in req_metas]
-                self._precompute_stop_flags_for_audio_collect(collect_states)
-                ready_audio_by_req = self._drain_ready_audio_copies_for_states(collect_states)
-                audio_by_req = self._collect_audio_batch(
-                    collect_states,
-                    initial_delayed_chunks_by_req={
-                        state.request_id: ready_audio_by_req.get(state.request_id)
-                        for state, is_prefill, _ in req_metas
-                        if not is_prefill
-                    },
-                )
+                collect_states = [
+                    state for state, is_prefill, _ in req_metas if not is_prefill or state.is_last_prefill_chunk
+                ]
+                audio_by_req: dict[str, torch.Tensor | None] = {}
+                if collect_states:
+                    self._precompute_stop_flags_for_audio_collect(collect_states)
+                    ready_audio_by_req = self._drain_ready_audio_copies_for_states(collect_states)
+                    audio_by_req = self._collect_audio_batch(
+                        collect_states,
+                        initial_delayed_chunks_by_req={
+                            state.request_id: ready_audio_by_req.get(state.request_id)
+                            for state, is_prefill, _ in req_metas
+                            if not is_prefill
+                        },
+                    )
                 for state, is_prefill, _ in req_metas:
-                    self._results_queue.append((state.request_id, state.precomputed_stop_logits))
-                    self._audio_queue.append((state.request_id, audio_by_req.get(state.request_id)))
+                    if is_prefill and not state.is_last_prefill_chunk:
+                        self._results_queue.append((state.request_id, None))
+                        self._audio_queue.append((state.request_id, None))
+                    else:
+                        self._results_queue.append((state.request_id, state.precomputed_stop_logits))
+                        self._audio_queue.append((state.request_id, audio_by_req.get(state.request_id)))
 
         self._pending_requests.clear()
         self._flush_deferred_cleanup()
@@ -2179,17 +2259,20 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         state: _RequestState,
         base_lm_out: torch.Tensor,
         dev: torch.device,
+        req_pos: torch.Tensor,
     ) -> tuple[torch.Tensor, _PrefillResidualMeta]:
         tts = self.tts
         text_mask, feat_mask, feat, feat_embed = state.prefill_masks
-        state.prefill_masks = None
-
+        text_mask = text_mask[:, req_pos]
+        feat_mask = feat_mask[:, req_pos]
+        feat = feat[:, req_pos]
+        feat_embed = feat_embed[:, req_pos]
         tts_len = text_mask.shape[1]
         scaffold_len = base_lm_out.shape[0]
         assert scaffold_len == tts_len, (
             f"voxcpm2 prefill length mismatch: scaffold_len={scaffold_len} tts_len={tts_len}; "
             "caller must pad prompt_token_ids to the full prefill length "
-            "(see serving_speech._build_voxcpm2_prompt or the offline example)."
+            "(see VoxCPM2Adapter._build_prompt or the offline example)."
         )
         enc_out = base_lm_out.unsqueeze(0)
 
@@ -2297,14 +2380,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         with _NvtxRange("voxcpm2.cfm"):
             if self._cfm_buffers is not None:
                 if self._enable_cfm_cuda_graph and dit_h.device.type == current_omni_platform.device_type:
-                    if self._deterministic_cfm_noise and not self._enable_cfm_prealloc_output:
+                    if self._has_deterministic_cfm_noise(state) and not self._enable_cfm_prealloc_output:
                         graph = self._get_cfm_cuda_graph(dit_h, cond)
                         with _NvtxRange("voxcpm2.cfm.graph_copy_mu"):
                             graph.mu.copy_(dit_h)
                         with _NvtxRange("voxcpm2.cfm.graph_copy_cond"):
                             graph.cond.copy_(cond)
                         with _NvtxRange("voxcpm2.cfm.graph_noise"):
-                            self._fill_deterministic_cfm_noise(state, graph.noise)
+                            self._fill_deterministic_cfm_noise_for_state(state, graph.noise)
                         with _NvtxRange("voxcpm2.cfm.graph_replay"):
                             graph.graph.replay()
                         with _NvtxRange("voxcpm2.cfm.graph_output_clone"):
@@ -2312,9 +2395,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     if not self._enable_cfm_prealloc_output:
                         return self._run_cfm_cuda_graph(dit_h, cond).transpose(1, 2)
                     return self._run_cfm_cuda_graph_to_state_buffer(state, dit_h, cond)
-                if self._deterministic_cfm_noise:
+                if self._has_deterministic_cfm_noise(state):
                     noise = self._cfm_buffers.noise[: dit_h.shape[0]]
-                    self._fill_deterministic_cfm_noise(state, noise)
+                    self._fill_deterministic_cfm_noise_for_state(state, noise)
                     return _optimized_solve_euler_with_noise(
                         self.tts.feat_decoder,
                         dit_h,
@@ -2346,6 +2429,23 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 cfg_value=self._cfg_value,
             ).transpose(1, 2)
 
+    def _has_deterministic_cfm_noise(self, state: _RequestState) -> bool:
+        """Whether this request's CFM noise is drawn deterministically."""
+        return state.cfm_generator is not None or self._deterministic_cfm_noise
+
+    def _fill_deterministic_cfm_noise_for_state(self, state: _RequestState, out: torch.Tensor) -> None:
+        """Deterministically fill ``out`` for a request with deterministic noise.
+
+        A request-level seed wins: the noise stream is a pure function of the
+        seed, so identical text + seed reproduces byte-identical audio
+        regardless of batch composition or request id. The replay-only
+        ``deterministic_cfm_noise`` hash applies otherwise.
+        """
+        if state.cfm_generator is not None:
+            out.normal_(generator=state.cfm_generator)
+        else:
+            self._fill_deterministic_cfm_noise(state, out)
+
     def _fill_deterministic_cfm_noise(self, state: _RequestState, out: torch.Tensor) -> None:
         """Fill CFM noise deterministically for benchmark replay only."""
         request_key = state.request_id.split("_", 1)[0]
@@ -2368,8 +2468,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._perf.start("prefill_tail_batch")
         tts = self.tts
         self._setup_cfm_buffers()
-        if self._enable_torch_compile:
-            self._setup_torch_compile()
+        self._setup_execution_optimizations()
 
         dit_hs: list[torch.Tensor] = []
         conds: list[torch.Tensor] = []
@@ -2390,10 +2489,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         batched_cond = torch.cat(conds, dim=0)
         b = batched_dit_h.shape[0]
 
-        if self._deterministic_cfm_noise and self._cfm_buffers is not None:
+        any_seeded = any(state.cfm_generator is not None for state, _, _ in batch)
+        if (self._deterministic_cfm_noise or any_seeded) and self._cfm_buffers is not None:
             noise = self._cfm_buffers.noise[:b]
             for i, (state, _, _) in enumerate(batch):
-                self._fill_deterministic_cfm_noise(state, noise[i : i + 1])
+                if self._has_deterministic_cfm_noise(state):
+                    self._fill_deterministic_cfm_noise_for_state(state, noise[i : i + 1])
+                else:
+                    noise[i : i + 1].normal_()
         else:
             noise = torch.randn(
                 b,
@@ -2424,6 +2527,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             state.decode_step_count = 0
             state.request_start_time = time.perf_counter()
             state.prefill_completed = True
+            state.prefill_masks = None
+            state.prefill_embeds = None
+            state.prompt_cache = None
 
         self._perf.stop("prefill_tail_batch")
         if self._enable_profiling:
@@ -2451,8 +2557,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._perf.stop("prefill.dit_proj")
 
         self._setup_cfm_buffers()
-        if self._enable_torch_compile:
-            self._setup_torch_compile()
+        self._setup_execution_optimizations()
 
         pred_feat = self._run_cfm_for_state(state, dit_h, prefix_feat_cond.transpose(1, 2).contiguous())
 
@@ -2465,6 +2570,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         state.decode_step_count = 0
         state.request_start_time = time.perf_counter()
         state.prefill_completed = True
+        state.prefill_embeds = None
+        state.prefill_masks = None
+        state.prompt_cache = None
         self._perf.stop("prefill_tail")
 
         if logger.isEnabledFor(logging.DEBUG):
@@ -2525,10 +2633,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             with _NvtxRange("voxcpm2.dit_proj"):
                 dit_h = dit_proj(lm_h, batch_out)
             cond = pfc.transpose(1, 2).contiguous()
-            if self._deterministic_cfm_noise and self._cfm_buffers is not None:
+            any_seeded = any(state.cfm_generator is not None for state in states)
+            if (self._deterministic_cfm_noise or any_seeded) and self._cfm_buffers is not None:
                 noise = self._cfm_buffers.noise[: dit_h.size(0)]
                 for i, state in enumerate(states):
-                    self._fill_deterministic_cfm_noise(state, noise[i : i + 1])
+                    if self._has_deterministic_cfm_noise(state):
+                        self._fill_deterministic_cfm_noise_for_state(state, noise[i : i + 1])
+                    else:
+                        noise[i : i + 1].normal_()
                 pred_feat = _optimized_solve_euler_with_noise(
                     self.tts.feat_decoder,
                     dit_h,
@@ -2993,9 +3105,18 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     merged_cpu = merged.detach().cpu().float()
                     mm["model_outputs"] = list(merged_cpu.split(sizes))
                     mm["sr"] = [sr for _ in ready_req_ids]
+                    # Dense mode still yields a strict SUBSET of the batch when
+                    # some requests emit no audio this step (e.g. prefill
+                    # phase). Without the marker the runner indexes these
+                    # per-request lists by batch position and misroutes audio
+                    # across requests; the marker declares meta.req_id
+                    # alignment.
+                    mm["meta"] = {"req_id": ready_req_ids, "sparse_audio": ["1"]}
                 else:
                     mm["model_outputs"] = list(audio_by_req.values())
                     mm["sr"] = [sr for _ in audio_by_req]
+                    # Same subset hazard as the coalesce branch above.
+                    mm["meta"] = {"req_id": list(audio_by_req), "sparse_audio": ["1"]}
             elif self._uses_sparse_audio_outputs():
                 mm["model_outputs"] = []
                 mm["sr"] = []
@@ -3033,7 +3154,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         span_len = int(input_ids.shape[0])
         dev = input_ids.device
         req_id = info_dict.get("request_id", "default")
-        is_prefill = span_len > 1
+        is_prefill = bool(info_dict.get("_omni_is_prefill", span_len > 1))
 
         if is_prefill:
             # Do not evict state here: _pending_requests is a per-step prefix,
@@ -3056,22 +3177,38 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 token_ids = token_ids[1:]
 
             state = self._get_or_create_state(req_id)
-            state.decode_pad = None
-            state.prefill_completed = False
-            state.decode_step_count = 0
-            state.precomputed_stop_logits = None
-            state.precomputed_is_stopping = None
-            state.last_audio_patch_gpu = None
-            if not hasattr(state, "pending_audio_chunks_gpu"):
-                state.pending_audio_chunks_gpu = []
-            if not hasattr(state, "pending_audio_copies"):
-                state.pending_audio_copies = []
-            state.pending_audio_chunks_gpu.clear()
-            state.pending_audio_copies.clear()
-            state.curr_embed_for_next = None
-            state.prev_feat_embed = None
-            state.curr_prefix_feat_cond = None
-            state.is_stopping = False
+            num_computed_tokens = int(info_dict.get("_omni_num_computed_tokens", 0))
+            is_first_prefill_chunk = num_computed_tokens == 0
+            if is_first_prefill_chunk:
+                state.decode_pad = None
+                state.prefill_completed = False
+                state.is_last_prefill_chunk = False
+                state.decode_step_count = 0
+                state.precomputed_stop_logits = None
+                state.precomputed_is_stopping = None
+                state.last_audio_patch_gpu = None
+                # SamplingParams.seed reaches vLLM's own sampler but never the
+                # CFM noise draws below, so a seeded request threads its seed
+                # into a dedicated generator here (same pattern as gepard).
+                state.cfm_noise_step = 0
+                state.cfm_generator = None
+                seed = info_dict.get("_omni_seed")
+                if seed is not None:
+                    state.cfm_generator = torch.Generator(device=self._device)
+                    state.cfm_generator.manual_seed(int(seed))
+                if not hasattr(state, "pending_audio_chunks_gpu"):
+                    state.pending_audio_chunks_gpu = []
+                if not hasattr(state, "pending_audio_copies"):
+                    state.pending_audio_copies = []
+                state.pending_audio_chunks_gpu.clear()
+                state.pending_audio_copies.clear()
+                state.curr_embed_for_next = None
+                state.prev_feat_embed = None
+                state.curr_prefix_feat_cond = None
+                state.is_stopping = False
+                state.prompt_cache = None
+                state.prefill_embeds = None
+                state.prefill_masks = None
 
             # Voice clone / continuation
             ref_audio = info_dict.get("reference_audio") or info_dict.get("ref_audio")
@@ -3088,13 +3225,12 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 voice_profile = voice_profile[0] if voice_profile else None
             requires_precomputed_cache = isinstance(voice_profile, dict)
 
-            state.prompt_cache = None
             voice_name = info_dict.get("voice_name")
             if isinstance(voice_name, list):
                 voice_name = voice_name[0] if voice_name else None
             _created_at = int(info_dict.get("voice_created_at") or 0)
 
-            if voice_name:
+            if state.prompt_cache is None and voice_name:
                 _cache_key = self._speaker_cache.make_cache_key(
                     voice_name, model_type="voxcpm2", created_at=_created_at
                 )
@@ -3131,14 +3267,24 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     _key = self._speaker_cache.make_cache_key(voice_name, model_type="voxcpm2", created_at=_created_at)
                     self._speaker_cache.put(_key, {"ref_audio_feat": state.prompt_cache["ref_audio_feat"].cpu()})
                     logger.debug("Speaker cache STORE for VoxCPM2 speaker '%s'", voice_name)
-
-            inputs = self._build_prefill_inputs(token_ids, dev, req_id)
-            tts = self.tts
-            feat_embed = tts.enc_to_lm_proj(tts.feat_encoder(inputs.audio_feat))
-            text_embed = self.model.embed_input_ids(inputs.text_token.to(dev))
-            text_mask, feat_mask = inputs.text_mask, inputs.audio_mask
-            embeds = (text_mask.unsqueeze(-1) * text_embed + feat_mask.unsqueeze(-1) * feat_embed).squeeze(0)
-            state.prefill_masks = (text_mask, feat_mask, inputs.audio_feat, feat_embed)
+            if state.prefill_embeds is None or state.prefill_masks is None:
+                inputs = self._build_prefill_inputs(token_ids, dev, req_id)
+                tts = self.tts
+                feat_embed = tts.enc_to_lm_proj(tts.feat_encoder(inputs.audio_feat))
+                text_embed = self.model.embed_input_ids(inputs.text_token.to(dev))
+                text_mask, feat_mask = inputs.text_mask, inputs.audio_mask
+                embeds = (text_mask.unsqueeze(-1) * text_embed + feat_mask.unsqueeze(-1) * feat_embed).squeeze(0)
+                state.prefill_masks = (text_mask, feat_mask, inputs.audio_feat, feat_embed)
+                state.prefill_embeds = embeds
+            chunk_end = num_computed_tokens + span_len
+            state.is_last_prefill_chunk = chunk_end == state.prefill_embeds.shape[0]
+            if chunk_end > state.prefill_embeds.shape[0]:
+                raise ValueError(
+                    "VoxCPM2 chunked prefill exceeds the constructed prompt: "
+                    f"request_id={req_id} start={num_computed_tokens} end={chunk_end} "
+                    f"prompt_len={state.prefill_embeds.shape[0]}"
+                )
+            embeds = state.prefill_embeds[num_computed_tokens:chunk_end]
         else:
             state = self._active_states.get(req_id)
             curr = state.curr_embed_for_next if state else None
@@ -3234,6 +3380,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
     hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"base_lm.": "model."})
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if self._startup_lora_applied:
+            raise ValueError("Reloading VoxCPM2 weights with a startup LoRA is unsupported; restart the server")
+
         def _base_lm_only(ws):
             for name, tensor in ws:
                 if name.startswith("base_lm."):
@@ -3247,6 +3396,13 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         # params as loaded so AutoWeightsLoader's strict check doesn't flag
         # them as missing from the checkpoint.
         loaded |= {name for name, _ in self.named_parameters() if name.startswith(("_tts.", "residual_model."))}
+
+        if adapter_path := self._runtime_config.startup_lora_path:
+            merged = merge_voxcpm2_lora(
+                adapter_path, base_lm=self.model, residual_lm=self.residual_model, tts=self._tts
+            )
+            self._startup_lora_applied = True
+            logger.info("Merged VoxCPM2 startup LoRA from %s into %d linear layers", adapter_path, merged)
 
         logger.info(
             "Loaded VoxCPM2 (patch=%d, feat_dim=%d, dtype=%s)", self._patch_size, self._feat_dim, self._side_dtype

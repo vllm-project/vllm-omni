@@ -1,6 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for DFX runner metadata field exclusion."""
 
 import json
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,7 +20,7 @@ def test_task_excluded_from_cli_args():
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
         "percentile-metrics": "audio_rtf,audio_ttfp",
-        "baseline": {"mean_audio_rtf": [0.5]},
+        "baseline": {"H100": {"mean_audio_rtf": [0.5]}},
     }
     exclude_keys = {
         "request_rate",
@@ -103,7 +108,7 @@ def test_resolve_pytest_marks_hardware_dict_with_extra():
     assert "H100" in names
     assert "cuda" in names
     assert "gpu" in names
-    assert "distributed_cuda" in names
+    assert "cards_2" in names
     assert "full_model" in names
     assert "diffusion" in names
     assert "local_model" in names
@@ -119,35 +124,6 @@ def test_resolve_pytest_marks_rejects_legacy_object_format():
                 "marks": ["full_model"],
             }
         )
-
-
-def test_extract_mark_resource_label():
-    from tests.dfx.conftest import extract_mark_resource_label
-
-    assert extract_mark_resource_label(None) == "na"
-    assert (
-        extract_mark_resource_label(
-            [
-                {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}},
-                "full_model",
-            ]
-        )
-        == "H100"
-    )
-    assert (
-        extract_mark_resource_label(
-            [
-                {
-                    "hardware_marks": {
-                        "res": {"cuda": "H100", "rocm": "MI325"},
-                        "num_cards": 2,
-                    }
-                },
-                "diffusion",
-            ]
-        )
-        == "H100-MI325"
-    )
 
 
 def test_resource_label_for_filename():
@@ -167,16 +143,14 @@ def test_hardware_json_value():
     assert hardware_json_value(None) == ""
 
 
-def test_extract_configs_resource_label(monkeypatch):
-    from tests.dfx.conftest import extract_configs_resource_label, get_runtime_resource_label
+def test_get_runtime_resource_label(monkeypatch):
+    from tests.dfx.conftest import get_runtime_resource_label
 
     monkeypatch.setattr(
         "tests.dfx.conftest._read_runtime_device_name",
         lambda *, device_id=0: "NVIDIA H100 80GB HBM3",
     )
-    get_runtime_resource_label(refresh=True)
-    assert extract_configs_resource_label([]) == "H100"
-    get_runtime_resource_label(refresh=True)
+    assert get_runtime_resource_label(refresh=True) == "H100"
     monkeypatch.setattr(
         "tests.dfx.conftest._read_runtime_device_name",
         lambda *, device_id=0: "Ascend910B2",
@@ -223,6 +197,7 @@ def test_create_unique_server_pytest_params_applies_marks(tmp_path):
     assert len(by_id["test_with_mark"].values) == 1
     assert isinstance(by_id["test_with_mark"].values[0], tuple)
     assert any(m.name == "H100" for m in by_id["test_with_mark"].marks)
+    assert not any(m.name == "B200" for m in by_id["test_with_mark"].marks)
     assert not any(m.name == "H100" for m in by_id["test_without_mark"].marks)
 
 
@@ -230,15 +205,85 @@ def test_is_diffusion_perf_config():
     from tests.dfx.conftest import is_diffusion_perf_config
 
     assert not is_diffusion_perf_config(
-        {"test_name": "omni_a", "mark": [{"hardware_marks": {"res": {"cuda": "H100"}}}, "omni"]}
+        {
+            "test_name": "omni_a",
+            "mark": [{"hardware_marks": {"res": {"cuda": "H100"}}}, "omni"],
+            "benchmark_params": [{"dataset_name": "random", "endpoint": "/v1/chat/completions"}],
+        }
     )
     assert is_diffusion_perf_config(
         {
             "test_name": "diff_a",
             "server_type": "vllm-omni",
             "mark": [{"hardware_marks": {"res": {"cuda": "H100"}}}, "diffusion"],
+            "benchmark_params": [{"task": "t2i", "dataset": "random"}],
         }
     )
+    videos_cfg = {
+        "test_name": "diff_videos",
+        "server_type": "vllm-omni",
+        "mark": [{"hardware_marks": {"res": {"cuda": "H100"}}}, "diffusion"],
+        "benchmark_params": [{"task": "t2v", "dataset_name": "random", "endpoint": "/v1/videos"}],
+    }
+    assert not is_diffusion_perf_config(videos_cfg)
+    custom_edits_cfg = {
+        "test_name": "diff_custom_edits",
+        "server_type": "vllm-omni",
+        "benchmark_endpoint": "/v1/images/edits",
+        "benchmark_params": [{"dataset": "custom", "task": "ti2i"}],
+    }
+    assert is_diffusion_perf_config(custom_edits_cfg)
+
+
+def test_merge_omni_default_server_args_respects_json():
+    from tests.dfx.perf.scripts.run_benchmark import _merge_omni_default_server_args
+
+    extra = ("--stage-init-timeout", "1800", "--init-timeout", "1800", "--usp", "4")
+    assert _merge_omni_default_server_args(extra, use_omni=True) == []
+    assert _merge_omni_default_server_args((), use_omni=True) == [
+        "--stage-init-timeout",
+        "600",
+        "--init-timeout",
+        "900",
+    ]
+    assert _merge_omni_default_server_args((), use_omni=False) == []
+    # Only fill the missing default; keep JSON's other timeouts.
+    assert _merge_omni_default_server_args(("--stage-init-timeout=1800",), use_omni=True) == [
+        "--init-timeout",
+        "900",
+    ]
+
+
+def test_prefix_benchmark_uses_unified_runner(monkeypatch):
+    from pathlib import Path
+
+    from tests.dfx.conftest import is_diffusion_perf_config, load_benchmark_configs
+    from tests.dfx.perf.scripts import run_benchmark
+
+    configs = load_benchmark_configs(str(Path(__file__).with_name("test_hunyuan_image3_prefix_caching.json")))
+    assert len(configs) == 3
+    assert all(not is_diffusion_perf_config(config) for config in configs)
+    assert all(config["benchmark_params"] == configs[0]["benchmark_params"] for config in configs)
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", configs)
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        assert "--name" not in kwargs["args"]
+        assert "--warmup-dataset-path" not in kwargs["args"]
+        assert "tests/assets/hunyuan_image3/it2i.jsonl" in kwargs["args"]
+        assert kwargs["num_warmups"] == 2
+        return {"completed": 8}
+
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    for config in configs:
+        for params in config["benchmark_params"]:
+            run_benchmark.test_performance_benchmark(
+                SimpleNamespace(host="localhost", port=8000, model="test-model"),
+                {"test_name": config["test_name"], "params": params},
+            )
+    assert len(calls) == 3
 
 
 def test_benchmark_param_id_suffix_from_task_eval_phase():
@@ -254,8 +299,9 @@ def test_benchmark_param_id_suffix_from_task_eval_phase():
     ]
 
 
-def test_create_paired_omni_benchmark_pytest_params(tmp_path):
+def test_paired_omni_benchmark_reuses_server_and_preserves_case_metadata(tmp_path, monkeypatch):
     from tests.dfx.conftest import create_paired_omni_benchmark_pytest_params
+    from tests.dfx.perf.scripts import run_benchmark
 
     configs = [
         {
@@ -285,3 +331,406 @@ def test_create_paired_omni_benchmark_pytest_params(tmp_path):
     assert bench_row == ("test_tts", 0)
     assert any(m.name == "tts" for m in by_id["test_tts-p0"].marks)
     assert not any(m.name == "tts" for m in by_id["test_omni-p0"].marks)
+
+    omni_p0_server = by_id["test_omni-p0"].values[0]
+    omni_p1_server = by_id["test_omni-p1"].values[0]
+    tts_server = by_id["test_tts-p0"].values[0]
+    assert omni_p0_server == omni_p1_server
+    assert omni_p0_server != tts_server
+
+    events = []
+
+    @contextmanager
+    def fake_start(server_param):
+        events.append(("start", server_param))
+        yield object()
+        events.append(("stop", server_param))
+
+    monkeypatch.setattr(run_benchmark, "_start_omni_server", fake_start)
+    active_context = run_benchmark._SingleActiveContext()
+    try:
+        first = run_benchmark.omni_server.__wrapped__(
+            SimpleNamespace(param=omni_p0_server),
+            active_context,
+        )
+        second = run_benchmark.omni_server.__wrapped__(
+            SimpleNamespace(param=omni_p1_server),
+            active_context,
+        )
+        assert first is second
+        assert events == [("start", omni_p0_server)]
+
+        third = run_benchmark.omni_server.__wrapped__(
+            SimpleNamespace(param=tts_server),
+            active_context,
+        )
+        assert third is not first
+        assert events == [
+            ("start", omni_p0_server),
+            ("stop", omni_p0_server),
+            ("start", tts_server),
+        ]
+    finally:
+        active_context.close()
+
+
+def test_run_benchmark_persists_distinct_benchmark_params_name(tmp_path, monkeypatch):
+    """Two benchmark_params under one test_name must keep distinct saved identity."""
+    import io
+    from pathlib import Path
+
+    from tests.dfx import conftest as dfx_conftest
+
+    result_dir = tmp_path / "results"
+    result_dir.mkdir()
+    monkeypatch.setenv("BENCHMARK_DIR", str(result_dir))
+
+    class _FakePopen:
+        def __init__(self, command, **kwargs):
+            self.stdout = io.StringIO("")
+            self.stderr = io.StringIO("")
+            result_dir_idx = command.index("--result-dir")
+            filename_idx = command.index("--result-filename")
+            out = Path(command[result_dir_idx + 1]) / command[filename_idx + 1]
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps({"completed": 3, "request_throughput": 0.01}), encoding="utf-8")
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(dfx_conftest.subprocess, "Popen", _FakePopen)
+
+    shared_test = "test_wan22_i2v_usp2"
+    name_a = "832x480_frames81_steps4"
+    name_b = "1280x720_frames121_steps4"
+
+    result_a = dfx_conftest.run_benchmark(
+        args=["--host", "127.0.0.1", "--port", "8000"],
+        test_name=shared_test,
+        flow=1,
+        dataset_name="random-mm",
+        num_prompt=10,
+        random_input_len=8,
+        random_output_len=1,
+        resource_label="H800",
+        benchmark_params_name=name_a,
+    )
+    result_b = dfx_conftest.run_benchmark(
+        args=["--host", "127.0.0.1", "--port", "8000"],
+        test_name=shared_test,
+        flow=1,
+        dataset_name="random-mm",
+        num_prompt=10,
+        random_input_len=8,
+        random_output_len=1,
+        resource_label="H800",
+        benchmark_params_name=name_b,
+    )
+
+    assert result_a["test_name"] == shared_test
+    assert result_b["test_name"] == shared_test
+    assert result_a["name"] == name_a
+    assert result_b["name"] == name_b
+    assert "benchmark_params" not in result_a
+    assert "benchmark_params" not in result_b
+
+    files = sorted(p.name for p in result_dir.glob("result_*.json"))
+    assert len(files) == 2
+    assert any(name_a in name for name in files)
+    assert any(name_b in name for name in files)
+    assert files[0] != files[1]
+
+    def omni_group_key(record: dict) -> tuple:
+        return (
+            record.get("model_id") or "",
+            record.get("test_name") or "",
+            record.get("name") or "",
+            record.get("dataset_name") or "",
+            record.get("max_concurrency") if record.get("max_concurrency") is not None else 0,
+            record.get("num_prompts") if record.get("num_prompts") is not None else 0,
+        )
+
+    assert omni_group_key(result_a) != omni_group_key(result_b)
+
+
+def test_is_hardware_nested_baseline():
+    from tests.dfx.conftest import (
+        _RUNTIME_DEVICE_ALIASES,
+        is_hardware_nested_baseline,
+    )
+    from tests.helpers.mark import get_hardware_mark_list
+
+    hardware_marks = get_hardware_mark_list()
+    assert hardware_marks
+    assert {"H100", "L4", "A3", "MI325", "B200"} <= hardware_marks
+    assert "cuda" not in hardware_marks
+    assert "full_model" not in hardware_marks
+
+    # Runtime aliases are a full static list (independent of baseline allowlist).
+    assert "H100" in _RUNTIME_DEVICE_ALIASES
+    assert "A100" in _RUNTIME_DEVICE_ALIASES
+
+    assert is_hardware_nested_baseline(
+        {
+            "H100": {"mean_ttft_ms": [1.0, 2.0], "mean_e2el_ms": [10.0, 20.0]},
+            "A3": {"mean_ttft_ms": [0.9, 1.8], "mean_e2el_ms": [9.0, 18.0]},
+        }
+    )
+    # Custom metric names under a known hardware label are allowed.
+    assert is_hardware_nested_baseline({"H100": {"custom_stage_ms": 12.0, "foo_bar": [1.0, 2.0]}})
+    assert is_hardware_nested_baseline({"A3": {"request_throughput": 0.5}})
+    # Flat metric maps / concurrency-keyed maps are not hardware-nested.
+    assert not is_hardware_nested_baseline({"mean_ttft_ms": [1.0, 2.0], "mean_e2el_ms": [10.0, 20.0]})
+    assert not is_hardware_nested_baseline({"mean_ttft_ms": {"1": 1.0, "32": 2.0}})
+    assert not is_hardware_nested_baseline({})
+    # Alias-only labels (not [hardware-resource] markers) are rejected for baselines.
+    assert not is_hardware_nested_baseline({"A100": {"throughput_qps": 1.0}})
+    # Unknown top-level hardware label is rejected.
+    assert not is_hardware_nested_baseline({"UnknownGPU": {"throughput_qps": 1.0}})
+    # Empty per-hardware metric map is rejected.
+    assert not is_hardware_nested_baseline({"H100": {}})
+
+
+def test_resolve_baseline_for_sweep_keeps_all_hardware_for_one_concurrency():
+    from tests.dfx.conftest import resolve_baseline_for_sweep
+
+    baseline = {
+        "H100": {
+            "mean_ttft_ms": [96.4, 140.8, 271.9, 362.3, 507.8],
+            "mean_e2el_ms": [18507.0, 28365.0, 31907.0, 48161.0, 72630.0],
+        },
+        "A3": {
+            "mean_ttft_ms": [90.0, 130.0, 250.0, 340.0, 480.0],
+            "mean_e2el_ms": [17000.0, 26000.0, 30000.0, 45000.0, 70000.0],
+        },
+    }
+    # max_concurrency=[1,4,8,16,32] -> index 4 is concurrency 32
+    got = resolve_baseline_for_sweep(baseline, sweep_index=4)
+    assert got == {
+        "H100": {"mean_ttft_ms": 507.8, "mean_e2el_ms": 72630.0},
+        "A3": {"mean_ttft_ms": 480.0, "mean_e2el_ms": 70000.0},
+    }
+    # First sweep step keeps both hardware buckets too.
+    got0 = resolve_baseline_for_sweep(baseline, sweep_index=0)
+    assert set(got0) == {"H100", "A3"}
+    assert got0["H100"]["mean_ttft_ms"] == 96.4
+    assert got0["A3"]["mean_ttft_ms"] == 90.0
+
+
+def test_resolve_baseline_for_sweep_rejects_flat_baseline():
+    from tests.dfx.conftest import resolve_baseline_for_sweep
+
+    with pytest.raises(ValueError, match=r"hardware-nested.*pyproject\.toml"):
+        resolve_baseline_for_sweep(
+            {"throughput_qps": [0.4, 0.6], "latency_mean": [1.0, 2.0]},
+            sweep_index=1,
+        )
+
+
+def test_resolve_baseline_for_sweep_rejects_unknown_hardware_label():
+    from tests.dfx.conftest import resolve_baseline_for_sweep
+
+    with pytest.raises(ValueError, match=r"Unknown hardware label\(s\): \['A100'\].*pyproject\.toml"):
+        resolve_baseline_for_sweep(
+            {"A100": {"throughput_qps": 1.0}},
+            sweep_index=0,
+        )
+
+
+def test_resolve_baseline_for_sweep_supports_list_and_scalar_under_hardware():
+    from tests.dfx.conftest import resolve_baseline_for_sweep
+
+    # Sweep-aligned lists under each hardware bucket (canonical form).
+    listed = {
+        "H100": {"throughput_qps": [0.4, 0.6, 0.8], "latency_mean": [1.0, 2.0, 3.0]},
+        "A3": {"throughput_qps": [0.5, 0.7, 0.9], "latency_mean": [0.9, 1.8, 2.7]},
+    }
+    assert resolve_baseline_for_sweep(listed, sweep_index=1) == {
+        "H100": {"throughput_qps": 0.6, "latency_mean": 2.0},
+        "A3": {"throughput_qps": 0.7, "latency_mean": 1.8},
+    }
+
+    # Scalars under hardware stay as-is (single-concurrency cases).
+    scalar = {"H100": {"throughput_qps": 0.5}}
+    assert resolve_baseline_for_sweep(scalar, sweep_index=0) == {"H100": {"throughput_qps": 0.5}}
+    # Custom metric names are preserved.
+    custom = {"H100": {"custom_stage_ms": [10.0, 20.0]}}
+    assert resolve_baseline_for_sweep(custom, sweep_index=1) == {"H100": {"custom_stage_ms": 20.0}}
+    assert resolve_baseline_for_sweep(None) == {}
+    assert resolve_baseline_for_sweep({}) == {}
+
+
+def test_resolve_baseline_value_errors():
+    from tests.dfx.conftest import resolve_baseline_value
+
+    with pytest.raises(ValueError, match="sweep_index"):
+        resolve_baseline_value([1.0, 2.0], sweep_index=None)
+    with pytest.raises(IndexError):
+        resolve_baseline_value([1.0], sweep_index=1)
+    with pytest.raises(TypeError, match="not supported"):
+        resolve_baseline_value({"1": 0.4}, sweep_index=0)
+
+
+def test_diffusion_build_run_params_resolves_baseline_per_sweep(tmp_path, monkeypatch):
+    """``_build_run_params`` / ``_iter_sweep_runs`` narrow list baselines per concurrency."""
+    import importlib
+    import sys
+
+    cfg = tmp_path / "mini_diffusion_perf.json"
+    cfg.write_text(
+        json.dumps(
+            [
+                {
+                    "test_name": "test_mini",
+                    "server_type": "vllm-omni",
+                    "mark": [
+                        {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}},
+                        "diffusion",
+                        "full_model",
+                    ],
+                    "server_params": {"model": "m/mini"},
+                    "benchmark_params": [{"name": "p0", "num-prompts": 1, "max-concurrency": 1}],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "argv", ["pytest", "--test-config-file", str(cfg)])
+    sys.modules.pop("tests.dfx.perf.scripts.run_diffusion_benchmark", None)
+    from tests.dfx.perf.scripts import run_diffusion_benchmark as rdb
+
+    importlib.reload(rdb)
+
+    params = {
+        "name": "c_sweep",
+        "dataset": "random",
+        "task": "t2i",
+        "num-prompts": [8, 16, 32],
+        "max-concurrency": [1, 8, 32],
+        "baseline": {
+            "H100": {"throughput_qps": [0.1, 0.2, 0.3], "latency_mean": [10.0, 20.0, 30.0]},
+            "A3": {"throughput_qps": [0.11, 0.22, 0.33], "latency_mean": [9.0, 19.0, 29.0]},
+        },
+    }
+    run32 = rdb._build_run_params(
+        params,
+        num_prompts=32,
+        max_concurrency=32,
+        request_rate="inf",
+        sweep_index=2,
+    )
+    assert run32["max-concurrency"] == 32
+    assert run32["baseline"] == {
+        "H100": {"throughput_qps": 0.3, "latency_mean": 30.0},
+        "A3": {"throughput_qps": 0.33, "latency_mean": 29.0},
+    }
+
+    sweeps = rdb._iter_sweep_runs(params)
+    assert len(sweeps) == 3
+    assert sweeps[2]["params"]["max-concurrency"] == 32
+    assert sweeps[2]["params"]["baseline"]["H100"]["throughput_qps"] == 0.3
+    assert "A3" in sweeps[2]["params"]["baseline"]
+    assert not isinstance(sweeps[2]["params"]["baseline"]["H100"]["throughput_qps"], list)
+
+
+def test_omni_duplex_expected_audio_turns_accepts_complete_session():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result(
+        {
+            "completed": 1,
+            "duplex_session_metrics": [{"audio_turn_count": 4}],
+        },
+        {"expected_duplex_audio_turns_per_session": 4},
+        1,
+    )
+
+
+def test_omni_duplex_expected_audio_turns_rejects_incomplete_session():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="emitted 4 audio turns"):
+        assert_result(
+            {
+                "completed": 1,
+                "duplex_session_metrics": [{"audio_turn_count": 3}],
+            },
+            {"expected_duplex_audio_turns_per_session": 4},
+            1,
+        )
+
+
+def test_num_warmups_preserves_explicit_zero():
+    from tests.dfx.perf.scripts.run_benchmark import _resolve_num_warmups
+
+    assert _resolve_num_warmups({}, default=4) == 4
+    assert _resolve_num_warmups({"num_warmups": 0}, default=4) == 0
+
+
+def test_omniinteract_result_accepts_complete_artifacts():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result(
+        {
+            "completed": 4,
+            "omniinteract": {"total": 4, "success": 4, "failed": 0, "artifacts_complete": True},
+        },
+        {"dataset_name": "omniinteract"},
+        4,
+    )
+
+
+def test_omniinteract_result_rejects_incomplete_artifacts():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="artifacts are incomplete"):
+        assert_result(
+            {
+                "completed": 4,
+                "omniinteract": {"total": 4, "success": 4, "failed": 0, "artifacts_complete": False},
+            },
+            {"dataset_name": "omniinteract"},
+            4,
+        )
+
+
+def test_omni_tpot_baseline_accepts_measured_finite_sample():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result(
+        {
+            "completed": 1,
+            "Hardware": "H100",
+            "num_tpot_samples": 1,
+            "mean_tpot_ms": 10.0,
+        },
+        {"baseline": {"H100": {"mean_tpot_ms": 20.0}}},
+        1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_tpot_samples", "mean_tpot_ms", "match"),
+    [
+        (None, 10.0, "no measurable TPOT samples"),
+        (0, float("nan"), "no measurable TPOT samples"),
+        (1, float("nan"), "mean_tpot_ms is not finite"),
+    ],
+)
+def test_omni_tpot_baseline_rejects_missing_or_nonfinite_sample(num_tpot_samples, mean_tpot_ms, match):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result = {
+        "completed": 1,
+        "Hardware": "H100",
+        "mean_tpot_ms": mean_tpot_ms,
+    }
+    if num_tpot_samples is not None:
+        result["num_tpot_samples"] = num_tpot_samples
+
+    with pytest.raises(AssertionError, match=match):
+        assert_result(
+            result,
+            {"baseline": {"H100": {"mean_tpot_ms": 20.0}}},
+            1,
+        )

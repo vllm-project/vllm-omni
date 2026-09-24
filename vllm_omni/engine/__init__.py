@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Engine components for vLLM-Omni.
 """
@@ -75,6 +78,11 @@ class OmniEngineCoreRequest(EngineCoreRequest):
 
     # Optional additional information dictionary (serialized)
     additional_information: AdditionalInformationPayload | None = None
+    # Runner-owned runtime payload. This is materialized directly into
+    # GPUModelRunner.model_intermediate_buffer instead of using the deprecated
+    # additional_information request transport.
+    model_intermediate_buffer: dict[str, Any] | None = None
+    payload_sender_info: dict[str, Any] | None = None
 
     @classmethod
     def from_request(
@@ -83,6 +91,8 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         *,
         prompt_embeds: torch.Tensor | None = None,
         additional_information: AdditionalInformationPayload | None = None,
+        model_intermediate_buffer: dict[str, Any] | None = None,
+        payload_sender_info: dict[str, Any] | None = None,
     ) -> "OmniEngineCoreRequest":
         """Clone an EngineCoreRequest into an OmniEngineCoreRequest with optional payload overrides."""
 
@@ -90,6 +100,10 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             prompt_embeds = request.prompt_embeds
         if additional_information is None:
             additional_information = getattr(request, "additional_information", None)
+        if model_intermediate_buffer is None:
+            model_intermediate_buffer = getattr(request, "model_intermediate_buffer", None)
+        if payload_sender_info is None:
+            payload_sender_info = getattr(request, "payload_sender_info", None)
 
         return cls(
             request_id=request.request_id,
@@ -113,6 +127,8 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
             additional_information=additional_information,
+            model_intermediate_buffer=model_intermediate_buffer,
+            payload_sender_info=payload_sender_info,
         )
 
 
@@ -121,10 +137,19 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     # pooling_output is inherited from EngineCoreOutput as torch.Tensor | None
     # and retains its original vLLM semantics for pooling/embedding tasks.
     multimodal_output: dict[str, torch.Tensor] | None = None
+    # Bytes-serialized carrier for a dict-shaped pooling_output (MR V2 cross-stage
+    # hidden/codec handoff). vLLM strictly decodes ``pooling_output`` as a
+    # ``torch.Tensor``, so a per-request dict payload cannot ride that field. The
+    # producer (OmniARScheduler) sets ``pooling_output=None`` and serializes the
+    # dict here; the consumer (StagePool._poll_stage_raw) rehydrates it back into
+    # ``pooling_output`` after decode. Tensor pooling outputs are unaffected.
+    pooling_output_payload: AdditionalInformationPayload | None = None
     # Finished flag for streaming input segment
     is_segment_finished: bool | None = False
     # Streaming update prompt length
     new_prompt_len_snapshot: int | None = None
+    # Authoritative segment count when the native plane suppresses token IPC.
+    num_generation_tokens: int | None = None
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):

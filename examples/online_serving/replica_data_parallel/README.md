@@ -12,7 +12,7 @@ This example uses `Wan-AI/Wan2.2-TI2V-5B-Diffusers` with one GPU per replica.
 
 | File | Purpose |
 |------|---------|
-| `wan2_2_ti2v_dp.yaml` | Diffusion stage config; `runtime.num_replicas` + `runtime.devices` drive the fan-out. |
+| `wan2_2_ti2v_dp.yaml` | Deploy config; `num_replicas` + `devices` drive the fan-out. |
 | `run_server.sh` | Substitutes `NUM_REPLICAS` / `DEVICES` into the config and serves. |
 | `bench_replica_dp.py` | Replica-agnostic load driver; reports throughput, latency, and a per-input isolation check. |
 
@@ -82,10 +82,9 @@ output under `N>=2` concurrency must match its own single-replica baseline.
 - `runtime.num_replicas: N` fans out `N` replicas; `runtime.devices` assigns their
   GPUs. With `tensor_parallel_size = 1`, list one GPU per replica
   (`num_replicas * tensor_parallel_size` entries, pool mode).
-- Replica fan-out here comes from the stage config, not a CLI flag. (The headless /
+- Replica fan-out here comes from the deploy config, not a CLI flag. (The headless /
   multi-runtime launch path uses the process-local `--omni-dp-size-local`, which
   requires `--stage-id`.)
-- This recipe serves via `--stage-configs-path`. Expressing replica-DP under the
-  newer `--deploy-config` schema is part of the ongoing serving-config alignment
-  (see the diffusion parallelism guide and the `#4707` discussion); `num_replicas`
-  is accepted by both paths.
+- This recipe serves via `--deploy-config`. Replica fan-out comes from the deploy
+  config's `num_replicas` / `devices`; stage topology comes from the registered
+  `WanPipeline`.

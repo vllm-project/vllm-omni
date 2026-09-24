@@ -3,6 +3,8 @@
 
 
 import torch
+from vllm.config import VllmConfig
+from vllm.config.kernel import IrOpPriorityConfig
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
 from vllm_musa.platform import MUSAPlatformBase
@@ -31,10 +33,6 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
         return "vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker"
 
     @classmethod
-    def get_default_stage_config_path(cls) -> str:
-        return "vllm_omni/deploy"
-
-    @classmethod
     def has_flash_attn_package(cls) -> bool:
         from vllm_omni.diffusion.attention.backends.utils.fa import is_flash_attn_installed
 
@@ -45,6 +43,7 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
         cls,
         selected_backend: str | None,
         head_size: int,
+        allow_trtllm_default: bool = False,
     ) -> str:
         """Get the diffusion attention backend class path for MUSA platform.
 
@@ -54,7 +53,8 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
             selected_backend: User-selected backend name (e.g., "FLASH_ATTN",
                 "TORCH_SDPA"). If None, uses platform default.
             head_size: Attention head size.
-
+            allow_trtllm_default: Does not support TRTLLM backend;
+                arg accepted for signature parity but unused.
         Returns:
             Fully qualified class path of the selected backend.
         """
@@ -78,6 +78,7 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
 
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
+            cls.validate_diffusion_attn_backend(backend_upper)
             if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
                 logger.warning(
                     "HuggingFace kernels-backed FlashAttention is "
@@ -113,6 +114,15 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
         return True
 
     @classmethod
+    def get_default_stage_config_path(cls) -> str:
+        return "vllm_omni/deploy"
+
+    @classmethod
+    def supports_talker_mtp_graph_capture(cls) -> bool:
+        """MUSA keeps Qwen3 talker MTP outside its dedicated FULL graph."""
+        return False
+
+    @classmethod
     def supports_float64(cls) -> bool:
         """MUSA does not support float64 yet."""
         return False
@@ -134,7 +144,7 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
     @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
         """Get the compute capability of the MUSA device."""
-        major, minor = torch.cuda.get_device_capability(device_id)
+        major, minor = torch.musa.get_device_capability(device_id)
         return DeviceCapability(major=major, minor=minor)
 
     @classmethod
@@ -153,6 +163,16 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
         torch.musa.synchronize()
 
     @classmethod
+    def record_device_event(cls) -> torch.Event | None:
+        try:
+            event = torch.musa.Event()
+            event.record()
+            return event
+        except Exception:
+            logger.warning("Failed to record MUSA device event for cross-stream sync")
+            return None
+
+    @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:
         free, _ = torch.musa.mem_get_info(device)
         return free
@@ -165,3 +185,26 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return torch.musa.get_device_name(device_id)
+
+    @classmethod
+    def set_device_control_env_var(cls, devices: str | int | None) -> None:
+        import os
+
+        os.environ["MUSA_VISIBLE_DEVICES"] = devices
+
+    @classmethod
+    def unset_device_control_env_var(cls) -> None:
+        import os
+
+        os.environ.pop("MUSA_VISIBLE_DEVICES", None)
+
+    @classmethod
+    def get_default_ir_op_priority(cls, vllm_config: VllmConfig) -> IrOpPriorityConfig:
+        """Prefer native ops while compiling, otherwise prefer vLLM kernels."""
+        from vllm.config.compilation import CompilationMode
+
+        cc = vllm_config.compilation_config
+        using_inductor = cc.backend == "inductor" and cc.mode != CompilationMode.NONE
+        default = ["native"] if using_inductor else ["vllm_c", "native"]
+
+        return IrOpPriorityConfig.with_default(default)

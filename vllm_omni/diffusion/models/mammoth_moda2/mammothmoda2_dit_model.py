@@ -1,4 +1,5 @@
-import math
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import torch
 import torch.nn.functional as F
@@ -6,27 +7,14 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.attention_processor import Attention
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_utils import ModelMixin
-from einops import rearrange, repeat
+from einops import rearrange
 from torch import nn
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
-from .rope_real import RotaryPosEmbedReal
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
 
-try:
-    from transformers.modeling_flash_attention_utils import (  # type: ignore
-        flash_attn_varlen_func,  # pyright: ignore[reportAttributeAccessIssue]
-        is_flash_attn_available,
-    )
-except Exception:  # pragma: no cover - best-effort compatibility
-    flash_attn_varlen_func = None  # type: ignore[assignment]
-
-    def is_flash_attn_available() -> bool:  # type: ignore[override]
-        return False
-
-
-from .rope_real import apply_real_rotary_emb
-
-_HAS_FLASH_ATTN_VARLEN = bool(is_flash_attn_available()) and flash_attn_varlen_func is not None
+from .rope_real import RotaryPosEmbedReal, apply_real_rotary_emb
 
 
 class LuminaRMSNormZero(nn.Module):
@@ -189,6 +177,7 @@ class SimpleQFormerImageRefiner(nn.Module):
     def __init__(
         self,
         hidden_size: int,
+        output_hidden_size: int | None = None,
         num_queries: int = 128,
         num_layers: int = 2,
         num_heads: int | None = None,
@@ -196,6 +185,8 @@ class SimpleQFormerImageRefiner(nn.Module):
         norm_eps: float = 1e-5,
     ) -> None:
         super().__init__()
+        input_hidden_size = hidden_size
+        hidden_size = output_hidden_size or hidden_size
         self.hidden_size = hidden_size
         self.num_queries = num_queries
         # ensure num_heads divides hidden_size
@@ -203,8 +194,8 @@ class SimpleQFormerImageRefiner(nn.Module):
             num_heads = max(1, hidden_size // 128)
         self.num_heads = self._choose_valid_num_heads(hidden_size, num_heads)
         self.input_proj = nn.Sequential(
-            Qwen2RMSNorm(hidden_size, eps=norm_eps),
-            nn.Linear(hidden_size, hidden_size, bias=True),
+            Qwen2RMSNorm(input_hidden_size, eps=norm_eps),
+            nn.Linear(input_hidden_size, hidden_size, bias=True),
         )
 
         # Learnable query embeddings
@@ -275,9 +266,14 @@ class SimpleQFormerImageRefiner(nn.Module):
 
 
 class AttnProcessor:
-    def __init__(self) -> None:
-        if not hasattr(F, "scaled_dot_product_attention"):
-            raise ImportError("AttnProcessor requires PyTorch 2.0+ (F.scaled_dot_product_attention).")
+    """Self-attention for the MammothModa2 DiT through the shared Omni attention layer.
+
+    The model-specific parts stay here: the projections, the per-head QK RMSNorm
+    and the interleaved real RoPE. The kernel, the padding mask and the
+    grouped-query heads are the shared backend's job, so K/V are handed over
+    with their native head count instead of being replicated to the query
+    head count first.
+    """
 
     def __call__(
         self,
@@ -286,118 +282,55 @@ class AttnProcessor:
         encoder_hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         image_rotary_emb: torch.Tensor | None = None,
-        base_sequence_length: int | None = None,
     ) -> torch.Tensor:
         batch_size, sequence_length, _ = hidden_states.shape
 
-        # Get Query-Key-Value Pair
         query = attn.to_q(hidden_states)
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
 
-        query_dim = query.shape[-1]
-        inner_dim = key.shape[-1]
-        head_dim = query_dim // attn.heads
+        head_dim = query.shape[-1] // attn.heads
+        kv_heads = key.shape[-1] // head_dim
         dtype = query.dtype
 
-        # Get key-value heads
-        kv_heads = inner_dim // head_dim
+        if sequence_length == 0 or key.shape[1] == 0:
+            # The pipeline's default unconditional branch is a text stream with
+            # zero tokens (negative_prompt_embeds has no rows), so under CFG the
+            # context refiner attends over an empty sequence. SDPA returns an
+            # empty tensor for that; the flash-attention varlen fallback builds
+            # cu_seqlens with arange(step=seq_len) and rejects step 0. Nothing
+            # to attend to either way, so hand the projection an empty input.
+            empty = query.new_zeros(batch_size, sequence_length, attn.heads * head_dim)
+            return attn.to_out[1](attn.to_out[0](empty))
 
-        # Reshape tensors for attention computation
         query = query.view(batch_size, -1, attn.heads, head_dim)
         key = key.view(batch_size, -1, kv_heads, head_dim)
         value = value.view(batch_size, -1, kv_heads, head_dim)
 
-        # Apply Query-Key normalization
         if attn.norm_q is not None:
             query = attn.norm_q(query)
         if attn.norm_k is not None:
             key = attn.norm_k(key)
 
-        # Apply Rotary Position Embeddings
         if image_rotary_emb is not None:
             query = apply_real_rotary_emb(query, image_rotary_emb[0], image_rotary_emb[1])
             key = apply_real_rotary_emb(key, image_rotary_emb[0], image_rotary_emb[1])
 
         query, key = query.to(dtype), key.to(dtype)
 
-        # Calculate attention scale
-        if base_sequence_length is not None:
-            softmax_scale = math.sqrt(math.log(sequence_length, base_sequence_length)) * attn.scale
-        else:
-            softmax_scale = attn.scale
-
-        if _HAS_FLASH_ATTN_VARLEN and attention_mask is not None and hidden_states.is_cuda:
-            # Flash-Attn varlen expects packed tokens + cu_seqlens. Here we only need
-            # the self-attention case (q/k/v share the same padding mask).
+        if attention_mask is not None:
             attention_mask = attention_mask.to(torch.bool)
-            seqlens = attention_mask.sum(dim=-1, dtype=torch.int32)
-            indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
-            max_seqlen = int(seqlens.max().item())
-            cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
 
-            query_states = query.reshape(batch_size * sequence_length, attn.heads, head_dim)[indices]
-            key_states = key.reshape(batch_size * sequence_length, kv_heads, head_dim)[indices]
-            value_states = value.reshape(batch_size * sequence_length, kv_heads, head_dim)[indices]
+        attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
+        hidden_states = attn.omni_attn(query, key, value, attn_metadata)
 
-            if kv_heads < attn.heads:
-                key_states = repeat(key_states, "l h c -> l (h k) c", k=attn.heads // kv_heads)
-                value_states = repeat(value_states, "l h c -> l (h k) c", k=attn.heads // kv_heads)
+        if attention_mask is not None:
+            # Padded rows carry nothing downstream; keep them at zero as the
+            # previous varlen path did, since neither backend does it for us.
+            hidden_states = hidden_states * attention_mask[:, :, None, None]
 
-            attn_output_unpad = flash_attn_varlen_func(
-                query_states,
-                key_states,
-                value_states,
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-                dropout_p=0.0,
-                causal=False,
-                softmax_scale=softmax_scale,
-            )
+        hidden_states = hidden_states.reshape(batch_size, sequence_length, attn.heads * head_dim).type_as(query)
 
-            out = torch.zeros(
-                (batch_size * sequence_length, attn.heads, head_dim),
-                device=attn_output_unpad.device,
-                dtype=attn_output_unpad.dtype,
-            )
-            out[indices] = attn_output_unpad
-            hidden_states = out.view(batch_size, sequence_length, attn.heads, head_dim).flatten(-2)
-            hidden_states = hidden_states.type_as(query)
-        else:
-            # PyTorch SDPA path.
-            attn_mask = None
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(torch.bool)
-                attn_mask = attention_mask.view(batch_size, 1, 1, -1)
-
-            query = query.transpose(1, 2)  # [B, H, S, D]
-            key = key.transpose(1, 2)  # [B, H_kv, S, D]
-            value = value.transpose(1, 2)
-
-            if kv_heads < attn.heads:
-                key = key.repeat_interleave(attn.heads // kv_heads, dim=1)
-                value = value.repeat_interleave(attn.heads // kv_heads, dim=1)
-
-            hidden_states = F.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask=attn_mask,
-                dropout_p=0.0,
-                is_causal=False,
-                scale=softmax_scale,
-            )
-
-            if attention_mask is not None:
-                # Keep padding tokens consistent with the flash-varlen path (zero output).
-                hidden_states = hidden_states * attention_mask[:, None, :, None]
-
-            hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
-            hidden_states = hidden_states.type_as(query)
-
-        # Apply output projection
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
 
@@ -438,6 +371,18 @@ class TransformerBlock(nn.Module):
         # 显式使用 transformers 的 Qwen2RMSNorm，避免依赖 diffusers 内部创建的 `RMSNorm` 再做递归替换。
         self.attn.norm_q = Qwen2RMSNorm(self.head_dim, eps=1e-5)
         self.attn.norm_k = Qwen2RMSNorm(self.head_dim, eps=1e-5)
+        # The kernel itself runs through the shared Omni attention layer: backend
+        # selection, padding-mask handling and native grouped-query heads live
+        # there. It owns no parameters, so checkpoint keys are unchanged. The
+        # diffusers Attention above is kept for its projections and QK norms.
+        self.attn.omni_attn = OmniAttention(
+            num_heads=num_attention_heads,
+            head_size=self.head_dim,
+            causal=False,
+            softmax_scale=self.attn.scale,
+            num_kv_heads=num_kv_heads,
+            allow_fp32_fallback=True,
+        )
 
         # Initialize feed-forward network
         self.feed_forward = LuminaFeedForward(
@@ -662,11 +607,32 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         batch_size: int,
         height: int,
         width: int,
+        ar_image_hidden_states: torch.Tensor | None = None,
+        ar_image_attention_mask: torch.Tensor | None = None,
     ):
         device = hidden_states.device
         p = self.config.patch_size
 
         temb, text_hidden_states = self.time_caption_embed(timestep, text_hidden_states, hidden_states.dtype)
+        image_embedder = getattr(self.time_caption_embed, "image_embedder", None)
+        if image_embedder is not None and ar_image_hidden_states is not None:
+            if ar_image_attention_mask is None:
+                ar_image_attention_mask = torch.ones(
+                    ar_image_hidden_states.shape[:2],
+                    dtype=torch.bool,
+                    device=ar_image_hidden_states.device,
+                )
+            image_hidden_states = image_embedder(
+                ar_image_hidden_states,
+                ~ar_image_attention_mask.bool(),
+            )
+            image_attention_mask = torch.ones(
+                image_hidden_states.shape[:2],
+                dtype=torch.bool,
+                device=image_hidden_states.device,
+            )
+            text_hidden_states = torch.cat([text_hidden_states, image_hidden_states], dim=1)
+            text_attention_mask = torch.cat([text_attention_mask, image_attention_mask], dim=1)
 
         img_tokens = rearrange(hidden_states, "b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=p, p2=p)
         img_tokens = self.x_embedder(img_tokens)
@@ -699,6 +665,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         return (
             temb,
             text_hidden_states,
+            text_attention_mask,
             img_tokens,
             img_mask,
             img_len,
@@ -728,8 +695,16 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         return text_hidden_states, img_tokens
 
     def _apply_transformer_layers(self, hidden_states, attention_mask, rotary_emb, temb):
+        # Call blocks with keyword arguments: Cache-DiT's Pattern_3 wrapper
+        # re-invokes blocks as block(hidden_states, **kwargs), so the cached
+        # and uncached paths share this exact calling convention.
         for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask, rotary_emb, temb)
+            hidden_states = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                image_rotary_emb=rotary_emb,
+                temb=temb,
+            )
         return hidden_states
 
     def forward(
@@ -740,6 +715,8 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         freqs_cis: torch.Tensor,
         text_attention_mask: torch.Tensor,
         ref_image_hidden_states: list[list[torch.Tensor]] | None = None,
+        ar_image_hidden_states: torch.Tensor | None = None,
+        ar_image_attention_mask: torch.Tensor | None = None,
         return_dict: bool = False,
     ) -> torch.Tensor:
         batch_size, height, width = self._validate_inputs(
@@ -749,6 +726,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         (
             temb,
             text_hidden_states,
+            text_attention_mask,
             img_tokens,
             img_mask,
             img_len,
@@ -766,6 +744,8 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             batch_size,
             height,
             width,
+            ar_image_hidden_states,
+            ar_image_attention_mask,
         )
 
         text_hidden_states, img_tokens = self._apply_refiners(

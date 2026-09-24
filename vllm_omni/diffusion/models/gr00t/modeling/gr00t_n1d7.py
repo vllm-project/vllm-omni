@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import logging
-import os
 from typing import Any
 
 import torch
@@ -138,26 +137,22 @@ class Gr00tN1d7ActionHead(nn.Module):
             state_features: [B, state_horizon, input_embedding_dim]
             embodiment_id: [B] (embodiment IDs)
             backbone_output: Output from the backbone model
+            options: ``generator`` (a ``torch.Generator`` on the model device) draws
+                the initial action noise; ``None`` leaves ``torch.randn`` on the
+                global RNG, as upstream Isaac-GR00T does. The ``rtc_*`` keys drive
+                real-time chunking when ``action_input`` carries a previous chunk.
         """
         vl_embeds = backbone_features
 
         batch_size = vl_embeds.shape[0]
         device = vl_embeds.device
-        _seed_env = os.environ.get("GR00T_NOISE_SEED")
-        if _seed_env is not None:
-            _gen = torch.Generator(device=device).manual_seed(int(_seed_env))
-            actions = torch.randn(
-                size=(batch_size, self.config.action_horizon, self.action_dim),
-                dtype=vl_embeds.dtype,
-                device=device,
-                generator=_gen,
-            )
-        else:
-            actions = torch.randn(
-                size=(batch_size, self.config.action_horizon, self.action_dim),
-                dtype=vl_embeds.dtype,
-                device=device,
-            )
+        generator = options.get("generator") if options else None
+        actions = torch.randn(
+            size=(batch_size, self.config.action_horizon, self.action_dim),
+            dtype=vl_embeds.dtype,
+            device=device,
+            generator=generator,
+        )
 
         dt = 1.0 / self.num_inference_timesteps
         vel_strength = torch.ones_like(actions)

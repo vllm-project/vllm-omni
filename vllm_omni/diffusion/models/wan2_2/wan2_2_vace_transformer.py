@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """VACE variant of WanTransformer3DModel for conditional video generation."""
 
@@ -61,6 +61,7 @@ class VaceWanTransformerBlock(WanTransformerBlock):
         temb: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         hidden_states_mask: torch.Tensor | None = None,
+        vsa_dit_seq_shape: tuple[int, int, int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.proj_in is not None:
             control_hidden_states = self.proj_in(control_hidden_states)
@@ -72,6 +73,7 @@ class VaceWanTransformerBlock(WanTransformerBlock):
             temb,
             rotary_emb,
             hidden_states_mask,
+            vsa_dit_seq_shape,
         )
 
         conditioning_states = self.proj_out(control_hidden_states)
@@ -250,6 +252,7 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
             )
 
         # VACE: embed context and run conditioning blocks
+        vsa_dit_seq_shape = (post_patch_num_frames, post_patch_height, post_patch_width)
         vace_hints = None
         if vace_context is not None and self.vace_blocks is not None:
             full_seq_len = hidden_states.shape[1] * sp_size
@@ -263,6 +266,7 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
                     timestep_proj,
                     rotary_emb,
                     hidden_states_mask,
+                    vsa_dit_seq_shape,
                 )
                 vace_hints.append(conditioning_states)
 
@@ -278,6 +282,7 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
                 timestep_proj,
                 rotary_emb,
                 hidden_states_mask,
+                vsa_dit_seq_shape,
             )
             if vace_hints is not None and self.vace_layers_mapping is not None and i in self.vace_layers_mapping:
                 vace_idx = self.vace_layers_mapping[i]

@@ -40,6 +40,7 @@ Committers have write access and merge rights. They typically have deep expertis
 - [@Isotr0py](https://github.com/Isotr0py): Diffusion and Quantization
 - [@linyueqian](https://github.com/linyueqian): TTS and Omni Support
 - [@lishunyang12](https://github.com/lishunyang12): Quantization and Configuration
+- [@NickCao](https://github.com/NickCao): CI, Tests, Entrypoint, and TTS Model Support
 - [@princepride](https://github.com/princepride): Diffusion and Omni Support
 - [@RuixiangMa](https://github.com/RuixiangMa): Diffusion models, parallel, cache, and docs
 - [@SamitHuang](https://github.com/SamitHuang): RL, Diffusion, and cache
@@ -51,31 +52,11 @@ Committers have write access and merge rights. They typically have deep expertis
 - [@ZJY0516](https://github.com/ZJY0516): Diffusion attention backend, kernel fusion, and CustomOp
 - [@yuanheng-zhao](https://github.com/yuanheng-zhao): Diffusion cache, offload, and Omni Support
 
-## Diffusion Workload Division
+## Reviewer Routing
 
-This section breaks down diffusion-related responsibilities. If you have PRs touching these areas, please ping the listed owners for review.
+For path-based reviewer routing, consult [`.github/CODEOWNERS`](https://github.com/vllm-project/vllm-omni/blob/main/.github/CODEOWNERS). Detailed subsystem boundaries and safe-change guidance live in the [module design documents](../design/index.md#module-design-documents).
 
-### Runtime-related
-
-- Diffusion models: @RuixiangMa, @wtomin, @xuechendi
-
-### Optimization
-
-- Parallel: @RuixiangMa, @wtomin
-- Attention backend: @ZJY0516
-- Cache: @yuanheng-zhao, @RuixiangMa, @SamitHuang
-- Offload: @yuanheng-zhao
-- Intel GPU support: @xuechendi
-- Quantization: @lishunyang12, @david6666666
-- Kernel fusion / communication-computation: @ZJY0516
-
-### Docs & Test
-
-- Diffusion docs: @RuixiangMa, @wtomin
-
-## Meetings
-
-Committers hold **bi-weekly meetings** to discuss future directions and collaborations of the project.
+`CODEOWNERS` is operational routing metadata, not a governance or approval policy. Being listed does not grant committer status or merge rights, and it does not mean every listed reviewer must approve a change. The maintainer roster above is authoritative for project roles and merge rights.
 
 ## Committer Nomination Process
 

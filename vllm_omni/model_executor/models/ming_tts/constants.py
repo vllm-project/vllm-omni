@@ -43,6 +43,7 @@ LLM_VOCAB_SIZE = 151936
 AGGREGATOR_HIDDEN_SIZE = 1024
 VAE_PATCH_SIZE = 4
 SAMPLE_RATE = 44100
+SPEAKER_EMBEDDING_DIM = 192  # CAMPPlus output width and speaker projection input width
 
 # AudioVAE frame/hop geometry (confirmed)
 AUDIO_FRAME_HOP = 882  # enc input_dim / hop_size / dec output_dim
@@ -73,6 +74,9 @@ KEY_LAST_STOP_PROB = "ming_last_stop_prob"
 KEY_NEXT_EMBEDS = "ming_next_embeds"
 KEY_PROMPT_LATENTS = "ming_prompt_latents"
 KEY_SPEAKER_EMBEDDING = "ming_speaker_embedding"
+KEY_SPEAKER_WAVEFORM = "ming_speaker_waveform"
+KEY_SPEAKER_WAVEFORM_LENGTHS = "ming_speaker_waveform_lengths"
+KEY_SPEAKER_SAMPLE_RATES = "ming_speaker_sample_rates"
 KEY_REQUEST_ID = "ming_request_id"
 KEY_CHUNK_ID = "ming_chunk_id"
 KEY_CFG = "ming_cfg"

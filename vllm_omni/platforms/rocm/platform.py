@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import torch
 from vllm import envs
@@ -30,7 +30,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
     when the selected_backend is not specified.
 
     So the behaviour of the attention backend overriding logic currently lives in
-    extract_stage_metadata in `vllm_omni/engine/stage_init_utils.py`
+    extract_legacy_stage_metadata in `vllm_omni/engine/stage_init_utils.py`
 
     ```
     if current_omni_platform.is_rocm():
@@ -75,7 +75,21 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         cls,
         selected_backend: str | None,
         head_size: int,
+        allow_trtllm_default: bool = False,
     ) -> str:
+        """Get the diffusion attention backend class path for ROCm platform.
+
+        ROCm supports FLASH_ATTN via the aiter library, and SDPA as fallback.
+
+        Args:
+            selected_backend: User-selected backend name (e.g., "FLASH_ATTN",
+                "TORCH_SDPA"). If None, uses platform default.
+            head_size: Attention head size.
+            allow_trtllm_default: Does not support TRTLLM backend;
+                arg accepted for signature parity but unused.
+        Returns:
+            Fully qualified class path of the selected backend.
+        """
         from vllm._aiter_ops import is_aiter_found_and_supported
 
         # Check if aiter is available for Flash Attention support
@@ -88,6 +102,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
 
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
+            cls.validate_diffusion_attn_backend(backend_upper)
             if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
                 logger.warning(
                     "HuggingFace kernels-backed FlashAttention is "
@@ -146,6 +161,16 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         torch.accelerator.synchronize()
 
     @classmethod
+    def record_device_event(cls) -> torch.Event | None:
+        try:
+            event = torch.Event()
+            event.record()
+            return event
+        except Exception:
+            logger.warning("Failed to record device event for cross-stream sync")
+            return None
+
+    @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:
         free, _ = torch.cuda.mem_get_info(device)
         return free
@@ -193,4 +218,12 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         else:
             rms_norm = default
 
-        return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm, fused_add_rms_norm=rms_norm)
+        # Mirrors upstream RocmPlatform defaults: `gelu_and_mul_sparse` has no
+        # ROCm-specific provider, so it must not fall back to `default` (which
+        # contains `vllm_c`) via IrOpPriorityConfig.with_default.
+        return IrOpPriorityConfig.with_default(
+            default,
+            rms_norm=rms_norm,
+            fused_add_rms_norm=rms_norm,
+            gelu_and_mul_sparse=["native"],
+        )

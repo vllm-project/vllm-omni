@@ -1,0 +1,119 @@
+# AURA duplex Realtime smoke (local weights, session_mode: duplex).
+# Stage1 = /workspace/models/AURA + AuraQwen3VLForConditionalGeneration (AURA v1 / Qwen3-VL).
+pipeline: aura_omni
+# Qwen3-TTS Stage2→3 codec handoff requires async_chunk=true (same as native /
+# duplex explore). async_chunk=false reaches talker/code_predictor then never
+# delivers audio to Stage3/client.
+async_chunk: true
+session_mode: duplex
+duplex_session:
+  max_sessions: 1
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 72
+      # Match native/duplex explore. initial=1 can stall Code2Wav on the first
+      # undersized chunk (observed hang after "Code2Wav codec: frames=1").
+      initial_codec_chunk_frames: 8
+      decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.08
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: true
+    async_scheduling: true
+    max_model_len: 4096
+    max_num_batched_tokens: 2048
+    devices: "0"
+    model: /workspace/models/Qwen3-ASR-1.7B
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 256
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.55
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: true
+    async_scheduling: true
+    max_model_len: 32768
+    max_num_batched_tokens: 8192
+    devices: "0"
+    model: /workspace/models/AURA
+    model_arch: AuraQwen3VLForConditionalGeneration
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 256
+      repetition_penalty: 1.0
+      stop_token_ids: [151669, 151645]
+
+  - stage_id: 2
+    # Allow prior TTS to drain while the next Talker starts (not assumed 1).
+    max_num_seqs: 2
+    gpu_memory_utilization: 0.12
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    # Stage1→2 is orchestrator-fed via aura2tts (custom_process_input_func).
+    # A from_stage_1 SHM edge parks Talker in WAITING_FOR_CHUNK and clears
+    # additional_information.text → Missing Qwen3-TTS text conditioning.
+    # Only Stage2→3 codec handoff needs a connector.
+    output_connectors:
+      to_stage_3: connector_of_shared_memory
+    model: /workspace/models/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    default_sampling_params:
+      temperature: 0.5
+      top_k: 50
+      # 12Hz × 240 ≈ 20s. Stay under the smoke 25s audio gate so a missed
+      # 2150 (English/quotes humming) cannot overlap the next vision-follow.
+      max_tokens: 240
+      min_tokens: 8
+      repetition_penalty: 1.05
+      # Qwen3-TTS Talker codec EOS — without this Talker can run to max_tokens
+      # (~26s garbage audio while Stage1 text was correct).
+      stop_token_ids: [2150]
+    subtalker_sampling_params:
+      do_sample: true
+      temperature: 0.5
+      top_k: 50
+      top_p: 1.0
+
+  - stage_id: 3
+    max_num_seqs: 2
+    gpu_memory_utilization: 0.12
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 16384
+    max_model_len: 16384
+    devices: "0"
+    input_connectors:
+      from_stage_2: connector_of_shared_memory
+    model: /workspace/models/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 16384
+      seed: 42
+      repetition_penalty: 1.0

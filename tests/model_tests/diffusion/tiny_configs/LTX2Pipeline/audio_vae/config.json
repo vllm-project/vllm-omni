@@ -1,0 +1,25 @@
+{
+  "_class_name": "AutoencoderKLLTX2Audio",
+  "_diffusers_version": "0.37.0.dev0",
+  "attn_resolutions": null,
+  "base_channels": 128,
+  "causality_axis": "height",
+  "ch_mult": [
+    1,
+    2,
+    4
+  ],
+  "double_z": true,
+  "dropout": 0.0,
+  "in_channels": 2,
+  "is_causal": true,
+  "latent_channels": 8,
+  "mel_bins": 64,
+  "mel_hop_length": 160,
+  "mid_block_add_attention": false,
+  "norm_type": "pixel",
+  "num_res_blocks": 1,
+  "output_channels": 2,
+  "resolution": 256,
+  "sample_rate": 16000
+}

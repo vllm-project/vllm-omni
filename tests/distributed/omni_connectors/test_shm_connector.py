@@ -2,7 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for SharedMemoryConnector focusing on TP / CFG / metadata fallback."""
 
+import fcntl
+import os
+import time
+
 import pytest
+import torch
 
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import (
     SharedMemoryConnector,
@@ -13,7 +18,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 @pytest.fixture()
 def connector():
-    c = SharedMemoryConnector({"shm_threshold_bytes": 0})
+    c = SharedMemoryConnector({})
     yield c
     c.close()
 
@@ -22,6 +27,15 @@ def connector():
 
 
 class TestKeyBasedReadWrite:
+    def test_deadline_receive_does_not_wait_for_writer_lock(self, connector):
+        key = "deadline_locked_payload"
+        connector.put("0", "1", key, {"value": 7})
+        with open(f"/dev/shm/shm_{key}_lockfile.lock", "rb+") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            assert connector.get_with_deadline("0", "1", key, deadline=time.monotonic() + 1) is None
+        assert connector.get_with_deadline("0", "1", key, deadline=time.monotonic() - 1) is None
+        assert connector.get_with_deadline("0", "1", key, deadline=time.monotonic() + 1)[0] == {"value": 7}
+
     def test_put_then_get_by_key(self, connector):
         data = {"hello": "world", "n": 42}
         ok, size, meta = connector.put("s0", "s1", "test_key_1", data)
@@ -36,6 +50,30 @@ class TestKeyBasedReadWrite:
         assert obj == data
         assert rsize == size
         assert "test_key_1" not in connector._pending_keys
+        assert connector._metrics["gets"] == 1
+
+    def test_tensor_payload_removes_lock_file(self, connector):
+        key = "tensor_payload"
+        payload = torch.ones(2, 2)
+        ok, _, metadata = connector.put("s0", "s1", key, payload)
+        assert ok
+
+        result = connector.get("s0", "s1", key, metadata=metadata)
+
+        assert result is not None
+        assert torch.equal(result[0], payload)
+        assert not os.path.exists(f"/dev/shm/shm_{key}_lockfile.lock")
+
+    def test_falsey_payload_removes_lock_file(self, connector):
+        key = "falsey_payload"
+        ok, _, metadata = connector.put("s0", "s1", key, 0)
+        assert ok
+
+        result = connector.get("s0", "s1", key, metadata=metadata)
+
+        assert result is not None
+        assert result[0] == 0
+        assert not os.path.exists(f"/dev/shm/shm_{key}_lockfile.lock")
 
     def test_get_nonexistent_key_returns_none(self, connector):
         result = connector.get("s0", "s1", "no_such_key_xyz", metadata=None)

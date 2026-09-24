@@ -36,6 +36,7 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import calculate_
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
+from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
@@ -263,9 +264,8 @@ class QwenImageEditPipeline(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
         # ``from_pretrained_with_prefetch`` re-prefetches and retries on a
-        # half-written cache (missing-shard ``OSError`` *and* the default
-        # -config size-mismatch ``RuntimeError`` that ``retry_on_missing_shard``
-        # could not recover) instead of crashing the worker.
+        # half-written cache (missing-shard ``OSError`` and the default
+        # -config size-mismatch ``RuntimeError``) instead of crashing the worker.
         self.text_encoder = from_pretrained_with_prefetch(
             Qwen2_5_VLForConditionalGeneration.from_pretrained,
             model,
@@ -373,51 +373,6 @@ class QwenImageEditPipeline(
         split_result = torch.split(selected, valid_lengths.tolist(), dim=0)
 
         return split_result
-
-    def _get_qwen_prompt_embeds(
-        self,
-        prompt: str | list[str] = None,
-        image: torch.Tensor | None = None,
-        dtype: torch.dtype | None = None,
-    ):
-        dtype = dtype or self.text_encoder.dtype
-
-        prompt = [prompt] if isinstance(prompt, str) else prompt
-
-        template = self.prompt_template_encode
-        drop_idx = self.prompt_template_encode_start_idx
-        txt = [template.format(e) for e in prompt]
-
-        model_inputs = self.processor(
-            text=txt,
-            images=image,
-            padding=True,
-            return_tensors="pt",
-        ).to(self.device)
-
-        outputs = self.text_encoder(
-            input_ids=model_inputs.input_ids,
-            attention_mask=model_inputs.attention_mask,
-            pixel_values=model_inputs.pixel_values,
-            image_grid_thw=model_inputs.image_grid_thw,
-            output_hidden_states=True,
-        )
-
-        hidden_states = outputs.hidden_states[-1]
-        split_hidden_states = self._extract_masked_hidden(hidden_states, model_inputs.attention_mask)
-        split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
-        attn_mask_list = [torch.ones(e.size(0), dtype=torch.long, device=e.device) for e in split_hidden_states]
-        max_seq_len = max([e.size(0) for e in split_hidden_states])
-        prompt_embeds = torch.stack(
-            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))]) for u in split_hidden_states]
-        )
-        encoder_attention_mask = torch.stack(
-            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in attn_mask_list]
-        )
-
-        prompt_embeds = prompt_embeds.to(dtype=dtype, device=self.device)
-
-        return prompt_embeds, encoder_attention_mask
 
     def _get_qwen_prompt_embeds(
         self,
@@ -816,10 +771,8 @@ class QwenImageEditPipeline(
         if self.attention_kwargs is None:
             self._attention_kwargs = {}
 
-        txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
-        negative_txt_seq_lens = (
-            negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
-        )
+        txt_seq_lens = txt_seq_lens_from_embeds(prompt_embeds)
+        negative_txt_seq_lens = txt_seq_lens_from_embeds(negative_prompt_embeds)
 
         latents = self.diffuse(
             prompt_embeds,

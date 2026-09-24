@@ -5,6 +5,9 @@
 Main entry points for vLLM-Omni inference and serving.
 
 - [vllm_omni.entrypoints.async_omni.AsyncOmni][]
+- [vllm_omni.entrypoints.async_omni_base.AsyncOmniBase][]
+- [vllm_omni.entrypoints.duplex_omni.DuplexOmni][]
+- [vllm_omni.entrypoints.duplex_omni.DuplexSessionHandle][]
 - [vllm_omni.engine.cfg_companion_tracker.CfgCompanionTracker][]
 - [vllm_omni.entrypoints.cli.benchmark.base.OmniBenchmarkSubcommandBase][]
 - [vllm_omni.entrypoints.cli.benchmark.main.OmniBenchmarkSubcommand][]
@@ -14,6 +17,38 @@ Main entry points for vLLM-Omni inference and serving.
 - [vllm_omni.entrypoints.omni.Omni][]
 - [vllm_omni.entrypoints.omni_base.OmniBase][]
 - [vllm_omni.entrypoints.pd_utils.PDDisaggregationMixin][]
+
+## Clients
+
+Client libraries for full-duplex sessions: the Realtime WebSocket client, the in-process client over `DuplexOmni`, and the per-model session presets.
+
+- [vllm_omni.clients.duplex.AudioDelta][]
+- [vllm_omni.clients.duplex.AudioFormat][]
+- [vllm_omni.clients.duplex.ConnectionResumed][]
+- [vllm_omni.clients.duplex.DuplexClient][]
+- [vllm_omni.clients.duplex.DuplexClientBase][]
+- [vllm_omni.clients.duplex.DuplexClientError][]
+- [vllm_omni.clients.duplex.DuplexConnectionError][]
+- [vllm_omni.clients.duplex.DuplexEvent][]
+- [vllm_omni.clients.duplex.DuplexProtocolError][]
+- [vllm_omni.clients.duplex.DuplexSessionClosedError][]
+- [vllm_omni.clients.duplex.ErrorEvent][]
+- [vllm_omni.clients.duplex.EventCollector][]
+- [vllm_omni.clients.duplex.ListenDecision][]
+- [vllm_omni.clients.duplex.ReconnectPolicy][]
+- [vllm_omni.clients.duplex.ResponseCreated][]
+- [vllm_omni.clients.duplex.ResponseDone][]
+- [vllm_omni.clients.duplex.ResponseHandle][]
+- [vllm_omni.clients.duplex.SessionClosed][]
+- [vllm_omni.clients.duplex.SessionConfig][]
+- [vllm_omni.clients.duplex.SessionCreated][]
+- [vllm_omni.clients.duplex.SessionExpired][]
+- [vllm_omni.clients.duplex.SessionResumed][]
+- [vllm_omni.clients.duplex.SpeakDecision][]
+- [vllm_omni.clients.duplex.TextDelta][]
+- [vllm_omni.clients.duplex.TranscriptDelta][]
+- [vllm_omni.clients.duplex.WebSocketTransport][]
+- [vllm_omni.clients.inline_duplex.InlineDuplexClient][]
 
 ## Inputs
 
@@ -62,7 +97,6 @@ Engine classes for offline and online inference.
 
 Core scheduling and caching components.
 
-- [vllm_omni.core.sched.omni_ar_scheduler.KVCacheTransferData][]
 - [vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler][]
 - [vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler][]
 - [vllm_omni.core.sched.output.OmniCachedRequestData][]
@@ -131,7 +165,7 @@ Worker classes and model runners for distributed inference.
 - [vllm_omni.diffusion.worker.diffusion_worker.DiffusionWorker][]
 - [vllm_omni.diffusion.worker.diffusion_worker.WorkerProc][]
 - [vllm_omni.diffusion.worker.diffusion_worker.WorkerWrapperBase][]
-- [vllm_omni.diffusion.worker.utils.DiffusionRequestState][]
+- [vllm_omni.diffusion.worker.utils.StepRequestState][]
 - [vllm_omni.diffusion.worker.utils.RunnerOutput][]
 - [vllm_omni.platforms.npu.worker.npu_ar_model_runner.ExecuteModelState][]
 - [vllm_omni.platforms.npu.worker.npu_ar_model_runner.NPUARModelRunner][]

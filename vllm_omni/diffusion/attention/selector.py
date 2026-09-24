@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Diffusion attention backend selector.
 
@@ -24,6 +24,10 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
 
 logger = init_logger(__name__)
+
+# SequenceParallel auto-pad probes mask support before Attention layers exist,
+# so it has no real head_dim. Callers must not treat this sentinel as geometry.
+HEAD_SIZE_UNKNOWN = -1
 
 
 def _load_backend_cls(cls_path: str) -> type[AttentionBackend]:
@@ -51,18 +55,20 @@ def _load_backend_cls(cls_path: str) -> type[AttentionBackend]:
 def _cached_get_backend_cls(
     backend_name: str | None,
     head_size: int,
+    allow_trtllm_default: bool = True,
 ) -> type[AttentionBackend]:
-    """Cache backend class resolution by (backend_name, head_size).
+    """Cache backend class resolution by (backend_name, head_size, allow_trtllm_default).
 
     This ensures platform validation (compute capability checks, package
-    availability, etc.) runs only once per unique (backend_name, head_size)
-    combination, avoiding repeated log messages.
+    availability, etc.) runs only once per unique combination, avoiding
+    repeated log messages.
     """
     from vllm_omni.platforms import current_omni_platform
 
     backend_cls_path = current_omni_platform.get_diffusion_attn_backend_cls(
         selected_backend=backend_name,
         head_size=head_size,
+        allow_trtllm_default=allow_trtllm_default,
     )
     return _load_backend_cls(backend_cls_path)
 
@@ -97,6 +103,7 @@ def get_attn_backend_for_role(
     head_size: int,
     attention_config: AttentionConfig | None = None,
     role_category: str | None = None,
+    allow_trtllm_default: bool = True,
 ) -> tuple[type[AttentionBackend], AttentionSpec | None]:
     """
     Get attention backend for a specific attention role.
@@ -140,7 +147,7 @@ def get_attn_backend_for_role(
         return backend_cls, spec
 
     # 2. Platform default
-    backend_cls = _cached_get_backend_cls(None, head_size)
+    backend_cls = _cached_get_backend_cls(None, head_size, allow_trtllm_default)
     _log_backend_resolution(
         role=role,
         role_category=role_category,
@@ -148,3 +155,29 @@ def get_attn_backend_for_role(
         source="platform default",
     )
     return backend_cls, None
+
+
+def get_attn_backend_for_capability(
+    role: str,
+    attention_config: AttentionConfig | None = None,
+    role_category: str | None = None,
+) -> type[AttentionBackend]:
+    """Resolve the backend class for capability queries such as mask support.
+
+    SequenceParallel auto-pad does not know ``head_size``. Explicit
+    ``AttentionConfig`` selections are loaded from the registry without
+    geometry validation, so CUDNN_ATTN is not rejected for the unknown
+    sentinel. Platform defaults still consult the platform with
+    ``HEAD_SIZE_UNKNOWN``.
+    """
+    spec = None
+    if attention_config is not None:
+        spec, _ = attention_config.resolve_with_source(
+            role=role,
+            role_category=role_category,
+        )
+    if spec is not None:
+        from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+
+        return DiffusionAttentionBackendEnum[spec.backend.upper()].get_class()
+    return _cached_get_backend_cls(None, HEAD_SIZE_UNKNOWN)

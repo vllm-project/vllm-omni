@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """GLM-TTS DiT (Diffusion Transformer) Model.
 
 Flow Matching model that converts speech tokens to mel-spectrogram.
@@ -305,6 +305,21 @@ class FeedForward(nn.Module):
         return self.ff(x)
 
 
+# These backends reject float32 Q/K/V. GLM-TTS runs its DiT stage in float32
+# (the wrapper keeps the Euler ODE state in float32), so automatically
+# selected incompatible backends must not receive its attention tensors.
+# This includes cuDNN and FlashInfer selected on Blackwell. Explicit backend
+# choices retain the shared layer's fail-fast contract instead of being
+# silently replaced here. Mirrors the MiniMax Music 3 fix (#7354).
+_FLOAT32_UNSUPPORTED_BACKENDS = {
+    "FLASH_ATTN",
+    "FLASH_ATTN_HUB",
+    "FLASH_ATTN_3_HUB",
+    "CUDNN_ATTN",
+    "FLASHINFER_ATTN",
+}
+
+
 class DiTAttention(nn.Module):
     """Attention module using diffusion infrastructure."""
 
@@ -327,12 +342,19 @@ class DiTAttention(nn.Module):
             softmax_scale=self.scale,
             causal=False,
         )
+        backend = getattr(self.attn, "attn_backend", None)
+        backend_name = backend.get_name() if backend is not None else None
+        self._auto_float32_sdpa = (
+            backend is not None
+            and not getattr(self.attn, "backend_explicit", False)
+            and backend_name in _FLOAT32_UNSUPPORTED_BACKENDS
+        )
 
     def forward(
         self,
         x: torch.Tensor,
         padding_mask: torch.Tensor | None = None,
-        rope=None,
+        rope: tuple[torch.Tensor, torch.Tensor | float] | None = None,
         attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len = x.shape[0], x.shape[1]
@@ -369,6 +391,23 @@ class DiTAttention(nn.Module):
                 is_causal=False,
             )
             out = out.permute(0, 2, 1, 3)  # [B, T, H, D]
+        elif self._auto_float32_sdpa and query.dtype == torch.float32:
+            # The automatically selected backend rejects float32 Q/K/V, and
+            # GLM-TTS decodes in float32, so route through SDPA for this input.
+            # Explicit backend choices keep the shared layer's fail-fast
+            # behavior (matches MiniMax Music 3, #7354).
+            q = query.transpose(1, 2)  # [B, H, T, D]
+            k = key.transpose(1, 2)
+            v = value.transpose(1, 2)
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=self.scale,
+            )
+            out = out.transpose(1, 2)  # [B, T, H, D]
         else:
             out = self.attn(query, key, value, attn_metadata=None)
         out = out.view(batch_size, seq_len, self.inner_dim)
@@ -406,7 +445,7 @@ class DiTBlock(nn.Module):
         x: torch.Tensor,
         t: torch.Tensor,
         padding_mask: torch.Tensor | None = None,
-        rope=None,
+        rope: tuple[torch.Tensor, torch.Tensor | float] | None = None,
         attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Pre-norm & modulation for attention
@@ -575,6 +614,8 @@ class GLMTTSDiT(nn.Module):
         is_causal: bool = False,
         attn_mask: torch.Tensor | None = None,
         block_pattern: list[int] | None = None,
+        text_embed: torch.Tensor | None = None,
+        rope: tuple[torch.Tensor, torch.Tensor | float] | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -588,6 +629,9 @@ class GLMTTSDiT(nn.Module):
             is_causal: Use block-causal attention
             attn_mask: Custom attention mask (overrides is_causal)
             block_pattern: Token-level block sizes for block-causal mask
+            text_embed: Precomputed text embedding (must already be in model
+                dtype); skips the internal embedding + ConvNeXt pass
+            rope: Precomputed rotary embedding tuple for ``seq_len``
 
         Returns:
             Predicted mel-spectrogram [B, T, mel_dim]
@@ -610,13 +654,21 @@ class GLMTTSDiT(nn.Module):
             time_emb = torch.cat([time_emb, spkr_emb], dim=-1)
 
         # Text embedding - ensure cast to model dtype
-        text_embed = self.text_emb_layer(text, seq_len, text_lens=text_lens).to(model_dtype)
+        if text_embed is None:
+            text_embed = self.text_emb_layer(text, seq_len, text_lens=text_lens).to(model_dtype)
+        else:
+            # A precomputed text_embed replaces `text` entirely, so its length must
+            # match middle_point; a mismatch would apply the wrong rotary/mask silently.
+            assert text_embed.shape[1] == seq_len, (
+                f"precomputed text_embed len {text_embed.shape[1]} != seq_len {seq_len}"
+            )
 
         # Input projection
         x = self.emb_concator(middle_point, condition, text_embed, drop_audio_cond=False)
 
         # Rotary embeddings
-        rope = self.rotary_embed.forward_from_seq_len(seq_len)
+        if rope is None:
+            rope = self.rotary_embed.forward_from_seq_len(seq_len)
 
         # Build block-causal mask when is_causal and no explicit attn_mask
         if attn_mask is None and is_causal and block_pattern is not None:
