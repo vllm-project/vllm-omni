@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Framework boundaries for Talker codec sampling.
 
 Production stochastic sampling uses a logits-filter boundary implemented in
@@ -99,7 +102,9 @@ def prepare_codec_logits(
         remove = remove.scatter(-1, sorted_indices, remove)
         logits.masked_fill_(remove, float("-inf"))
     if top_k > 0:
-        keep = min(VOCAB_SIZE, max(int(top_k), int(min_tokens_to_keep)))
+        # Honor the request's explicit top_k exactly: min_tokens_to_keep is a
+        # top_p-only floor (vLLM semantics), not a top_k widening.
+        keep = min(VOCAB_SIZE, int(top_k))
         threshold = torch.topk(logits, keep, dim=-1).values[..., -1, None]
         logits.masked_fill_(logits < threshold, float("-inf"))
     return logits

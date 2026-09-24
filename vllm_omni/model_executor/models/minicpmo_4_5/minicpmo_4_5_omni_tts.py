@@ -1167,6 +1167,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 value = getattr(sampling_params, attr, None)
                 if value is not None:
                     state[key] = value
+        # The K-step codec sampler is the only min-length guard left (the NPU
+        # runner neutralizes vLLM's MinTokensLogitsProcessor), so the request
+        # floor must reach it. Pin only a positive floor: the engine default 0
+        # means "no extra floor" and would otherwise overwrite the stage's
+        # resolved codec minimum.
+        if state.get("min_tokens") is None:
+            requested = getattr(sampling_params, "min_tokens", None)
+            if requested is None:
+                requested = getattr(sampling_params, "min_new_tokens", None)
+            if requested is not None and int(requested) > 0:
+                state["min_tokens"] = int(requested)
 
     def _request_generator(self, request_id: str, device: torch.device) -> torch.Generator:
         generator = self._request_generators.get(request_id)

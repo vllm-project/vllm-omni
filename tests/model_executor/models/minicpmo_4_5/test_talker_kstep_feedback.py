@@ -53,6 +53,7 @@ def _make_talker(*, k_step_frames: int, scripted_samples: list[int]):
     model._codec_eos_id = _EOS_ID
     model._request_audio_states = {}
     model._request_codec_history = {}
+    model._request_generators = {}
     emb = nn.Embedding(_NUM_AUDIO_TOKENS, 4)
     with torch.no_grad():
         emb.weight.zero_()
@@ -534,3 +535,95 @@ def test_default_sampling_params_feed_codec_resolution():
     resolved3 = resolve_codec_sampling_params(None, tts_config)
     assert resolved3["top_k"] == 100
     assert resolved3["seed"] == 42
+
+
+def test_request_min_tokens_reaches_codec_state():
+    """A positive request ``min_tokens`` floor reaches the K-step state.
+
+    The NPU runner neutralizes vLLM's MinTokensLogitsProcessor, so the
+    in-model codec sampler is the only min-length guard left (PR #7929
+    review). The engine default 0 means "no extra floor" and must not
+    overwrite the stage-resolved codec minimum.
+    """
+    model = _make_talker(k_step_frames=8, scripted_samples=[42])
+    model._codec_min_tokens = 50
+
+    base = dict(temperature=0.8, top_k=25, top_p=0.85, repetition_penalty=1.05, seed=None)
+    state = {"step": 0}
+    model._merge_request_codec_params(state, SimpleNamespace(min_tokens=100, **base))
+    assert state["min_tokens"] == 100
+
+    # 0 (engine default) is not a floor: the key stays unset so the K-step
+    # loop keeps falling back to the stage-resolved minimum.
+    state_zero = {"step": 0}
+    model._merge_request_codec_params(state_zero, SimpleNamespace(min_tokens=0, **base))
+    assert "min_tokens" not in state_zero
+
+    # The min_new_tokens alias is honored too.
+    state_alias = {"step": 0}
+    model._merge_request_codec_params(state_alias, SimpleNamespace(min_new_tokens=7, **base))
+    assert state_alias["min_tokens"] == 7
+
+
+def test_top_k_filter_honors_explicit_top_k():
+    """top_k is kept exact; min_tokens_to_keep is a top_p-only floor.
+
+    Passing min_tokens_to_keep=3 must not widen an explicit top_k of 1 or 2
+    -- otherwise K-step sampling changes the single-frame contract (top_k=1
+    would no longer be greedy) (PR #7929 review).
+    """
+    from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
+        make_device_state,
+        prepare_codec_logits,
+    )
+
+    logits = torch.full((1, _NUM_AUDIO_TOKENS), -1.0)
+    logits[0, 10] = 5.0
+    logits[0, 11] = 4.0
+    logits[0, 12] = 3.0
+    device_state = make_device_state(torch.zeros(0, dtype=torch.int32), step=0, max_tokens=100, finished=False)
+    kwargs = dict(
+        state=device_state,
+        min_tokens=torch.tensor([0]),
+        temperature=torch.tensor([0.8]),
+        repetition_penalty=torch.tensor([1.0]),
+        eos_token_id=_EOS_ID,
+        top_p=1.0,
+        min_tokens_to_keep=3,
+    )
+    for top_k, expected in ((1, 1), (2, 2)):
+        filtered = prepare_codec_logits(logits.clone(), top_k=top_k, **kwargs)
+        assert int(torch.isfinite(filtered).sum()) == expected
+
+
+def test_eos_window_mask_hides_codec_eos():
+    """``eos_window_masked=True`` masks codec EOS regardless of the step.
+
+    This is the turn-end drain path: duplex meta ``turn_end`` pins
+    ``state["turn_end_drain"]`` (tts preprocess), the K-step loop forwards it
+    as ``eos_window_masked``, and the sampler must hide EOS so the chunk can
+    drain its remaining cadence frames instead of ending early.
+    """
+    from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
+        make_device_state,
+        prepare_codec_logits,
+    )
+
+    logits = torch.full((1, _NUM_AUDIO_TOKENS), 1.0)
+    logits[0, _EOS_ID] = 10.0
+    device_state = make_device_state(torch.zeros(0, dtype=torch.int32), step=5, max_tokens=100, finished=False)
+    kwargs = dict(
+        state=device_state,
+        min_tokens=torch.tensor([0]),
+        temperature=torch.tensor([0.8]),
+        repetition_penalty=torch.tensor([1.0]),
+        eos_token_id=_EOS_ID,
+        top_p=1.0,
+        top_k=0,
+    )
+    # step >= min_tokens: EOS is eligible and keeps its dominant logit.
+    unmasked = prepare_codec_logits(logits.clone(), eos_window_masked=False, **kwargs)
+    assert unmasked[0, _EOS_ID] != float("-inf")
+    # Drain window: EOS is forced out even though the step allows it.
+    masked = prepare_codec_logits(logits.clone(), eos_window_masked=True, **kwargs)
+    assert masked[0, _EOS_ID] == float("-inf")
