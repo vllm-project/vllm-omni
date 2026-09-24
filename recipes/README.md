@@ -49,6 +49,7 @@ recipes/
 | [`BosonAI/Higgs-Audio-V3-TTS.md`](./BosonAI/Higgs-Audio-V3-TTS.md) | Online + offline multilingual TTS with voice cloning | 1x H100 80GB |
 | [`BreezeBlue/Breeze-TTS-2.md`](./BreezeBlue/Breeze-TTS-2.md) | Online + offline TTS (plain / voice design / voice clone / voice direction, streaming PCM) | 1x NVIDIA L20 48GB |
 | [`ByteDance/Lance.md`](./ByteDance/Lance.md) | Unified AR+diffusion: text/img/video gen + understanding (Lance 3B) | 1x B300 / A100 80GB |
+| [`circlestone-labs/Anima.md`](./circlestone-labs/Anima.md) | Native single-file text-to-image serving | 1x AMD MI300X |
 | [`fishaudio/Fish-Speech-S2-Pro.md`](./fishaudio/Fish-Speech-S2-Pro.md) | Online serving for TTS | 1x A800 80GB |
 | [`Helios/Helios.md`](./Helios/Helios.md) | Text-to-video, image-to-video, and video-to-video generation | 1x NVIDIA H20 |
 | [`HiDream-ai/HiDream-O1-Image.md`](./HiDream-ai/HiDream-O1-Image.md) | Text-to-image with shared offline example | 1x or 2x H100 80GB |
@@ -75,7 +76,7 @@ recipes/
 | [`cosmos3/Cosmos3-Edge.md`](./cosmos3/Cosmos3-Edge.md) | T2I / T2V / I2V + action (Physical-AI) generation on the Nemotron-based Edge transformer | 1x GPU (~8 GiB) |
 | [`cosmos3/Cosmos3-Super.md`](./cosmos3/Cosmos3-Super.md) | 64B T2I / T2V / I2V / V2V generation (+ optional audio) / Action policy | 8x H200/H100/A100 / 2x H200 / B300 |
 | [`OpenBMB/MiniCPM-o-4_5.md`](./OpenBMB/MiniCPM-o-4_5.md) | Online full-duplex serving and offline inference for omni multimodal chat (text / image / audio / video → text + 24 kHz speech) | 2x A100/H100 80GB / 3x mid-tier GPU / 8x RTX 4090 24GB |
-| [`OpenBMB/VoxCPM2.md`](./OpenBMB/VoxCPM2.md) | Online + offline TTS with native AR pipeline (48 kHz, 30+ languages) | 1x RTX 4090 24GB |
+| [`OpenBMB/VoxCPM2.md`](./OpenBMB/VoxCPM2.md) | Online + offline TTS with native AR pipeline (48 kHz, 30+ languages) | 1x RTX 4090 24GB / 1x Ascend 910B3 64GB |
 | [`OpenMOSS/MOSS-TTS.md`](./OpenMOSS/MOSS-TTS.md) | Online + offline multilingual TTS (MOSS-TTS family, 8B) | 1x H100 80GB |
 | [`OpenMOSS/MOSS-TTS-Nano-NPU.md`](./OpenMOSS/MOSS-TTS-Nano-NPU.md) | Online multilingual voice-cloned TTS | 1x Ascend 910B3 64GB |
 | [`NVIDIA/Nemotron-Labs-Audex.md`](./NVIDIA/Nemotron-Labs-Audex.md) | TTS / text-to-audio / audio understanding / cascaded S2S (Audex 2B + 30B-A3B) | 1x H100 80GB |

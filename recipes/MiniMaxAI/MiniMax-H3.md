@@ -825,7 +825,7 @@ at most 15 seconds combined.
 | FL2VA | first image, last image, or ordered first+last images | at most 2 images; `frame_indices` is `[0]`, `[-1]`, or `[0,-1]` |
 | Ref2VA | image-only, image+image, image+video, video+audio, and mixed image/video/audio | images ≤9, videos ≤3, audios ≤3, total references ≤12; audio requires a visual reference |
 
-The H3 output contract is 4–15 seconds at 24 FPS, stereo 32 kHz audio, and a
+The default H3 output contract is 4–15 seconds at 24 FPS, stereo 32 kHz audio, and a
 32-pixel canvas multiple. T2VA requires one named output ratio from `21:9`,
 `16:9`, `4:3`, `1:1`, `3:4`, or `9:16`. FL2VA always follows the first input
 image's ratio and ignores a generic `aspect_ratio` override. Ref2VA defaults to
@@ -835,6 +835,152 @@ default. `short_edge` controls the 768-pixel canvas and must be `768`.
 `seed + output_index`. The asynchronous endpoint returns all
 outputs; the synchronous raw-MP4 endpoint returns the first output when more
 than one is requested.
+
+## Long video and driving audio
+
+Set `extra_params.long_video=true` to opt into durations above 15 seconds.
+Ref2VA long-video requests now default to latent continuation with global
+temporal RoPE positions (A+B), described below. Set `long_video_mode=full`
+explicitly to sample the entire target latent at once for comparison. Both modes
+retain the native `17n+5` video-frame grid, `5n+2` video-latent grid, and 40 Hz
+audio latents. A request for 75 seconds becomes 1,807 frames (75.292 seconds at
+24 FPS). In full mode, attention cost and activation memory grow with the full
+sequence length. Reference-video and reference-audio limits remain unchanged.
+Other task types retain full-mode behavior. Requests are limited to 30 seconds
+in full mode and 300 seconds in continuation mode; without `long_video=true`,
+the limit remains 15 seconds. The limits cover duration aliases and explicit
+`num_frames`, and externally encoded requests are checked again before diffusion.
+Native frame-grid alignment can round the output slightly above the requested
+limit. These are request sanity bounds, not a guarantee that a given resolution
+fits GPU memory. Full mode still allocates the whole sequence, and continuation
+retains cumulative latents and reference inputs.
+
+Use `audio_mode=lock_source` with one `audio_reference` to drive generation
+with a soundtrack, rather than treating it as a short reference. The encoder
+places that waveform in the target audio latent, crops or zero-pads its two
+channels independently to the output duration, and keeps those rows clean
+(timestep 1) throughout sampling. This mode does not insert an `<Audio 1>`
+reference tag. It supports request and step execution; the default `native`
+mode continues generating audio normally. Returned audio is the audio VAE's
+reconstruction, not a byte-for-byte copy of the input recording.
+
+Against a Ref2VA server, using the same asset-server setup as above:
+
+```bash
+curl --fail-with-body -sS -X POST "${API_URL}" \
+  -F 'prompt=<prompt.txt' \
+  -F 'width=960' -F 'height=544' -F 'fps=24' \
+  -F 'num_inference_steps=50' -F 'flow_shift=12' -F 'seed=19960422' \
+  -F 'extra_params={"task":"ref2va","duration":75,"long_video":true,"audio_mode":"lock_source","audio_flow_shift":3,"preencode_mp4":true,"preencode_batch_frames":17}' \
+  -F "input_reference=@${REF_IMAGE};type=image/png" \
+  -F "audio_reference={\"audio_url\":\"${AUDIO_URL}\"}" \
+  -o long-video.mp4
+```
+
+`preencode_mp4` decodes and muxes temporal chunks on the worker, avoiding a
+full decoded long video in the API process. It does not reduce the denoiser's
+sequence length. For Turbo adapters, use the matching adapter's step count
+and flow shift from the Turbo table below.
+
+The [RunningHub workflow](https://www.runninghub.cn/post/2100530217365364737/)
+uses T8's `MiniMaxH3AudioConditioningT8`, a full-length latent, and
+`MiniMaxH3DualClockSamplerT8`; its `remix_source` strength is zero, equivalent
+to source locking. This differs from rolling-overlap continuation nodes.
+See [T8 conditioning](https://github.com/T8mars/comfyui-minimax-h3-audio-T8)
+and [ComfyUI H3 masking](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/ldm/minimax/model.py).
+The workflow's custom Dasiwa weights, Sol attention, and T8-specific LoRA are
+not supplied by this feature.
+
+### Latent-tail continuation with global temporal positions (A+B)
+
+`long_video=true` selects this mode by default for Ref2VA. It can also be selected
+explicitly with `long_video_mode=continuation`. This experimental mode supports
+Ref2VA request execution with uncached denoising (`quality=lossless`); step
+execution is rejected. Use `long_video_mode=full` explicitly for whole-target
+sampling, including requests up to 30 seconds that require step execution.
+Continuation currently rejects latent-mask editing (`video_noise_mask` or
+`audio_noise_mask` with retained source regions). Full mode supports editing;
+`audio_mode=lock_source` cannot be combined with audio latent-mask editing.
+
+```json
+{
+  "task": "ref2va",
+  "duration": 75,
+  "long_video": true,
+  "long_video_mode": "continuation",
+  "continuation_window_frames": 277,
+  "continuation_overlap_frames": 22,
+  "audio_mode": "lock_source",
+  "audio_flow_shift": 3,
+  "preencode_mp4": true,
+  "preencode_batch_frames": 17
+}
+```
+
+These defaults sample seven windows for a 1,807-frame output. Each continuation
+uses the preceding AV latent tail as fixed condition rows at the new target's
+time origin, samples a fresh unmasked target, discards its hidden overlap, and
+appends only the new suffix. The reference image and full prompt remain present
+in every window. Both window and overlap use the `17n+5` frame grid; the window
+must be 107..345 frames and larger than the overlap. A final window may be shorter.
+Audio boundaries are rounded on the cumulative 24 FPS / 40 Hz timeline to avoid
+drift; a locked driving track is sliced separately for each stereo channel.
+
+Before RoPE evaluation, every window adds `start_frame * 40 / 24` to the temporal
+position IDs of its target audio/video, reference audio/video, and latent-tail
+guides. The start includes the overlap (not just the newly appended frames).
+Text, static image references, spatial coordinates, and padding remain unchanged.
+Offsets retain fractional precision independently of rounded audio slice indices.
+For the default windows starting at frames 0, 255, 510, the added positions are
+0, 425, 850. This follows the media-only global-offset convention in
+[LongMedia temporal positioning](https://github.com/vizart-vj/ComfyUI-MiniMax-H3-LongMedia/blob/main/temporal_positioning.py).
+The shifted layout is constructed once per window and then used by all denoising
+steps and sequence-parallel ranks; no RoPE-frequency scaling is applied.
+
+For a narrative with different scenes, pass `continuation_prompts` as a JSON
+list containing exactly one non-empty prompt string per planned window (seven
+strings for the default 75-second request). These prompts are independently
+encoded with the same reference assets and selected in window order. Shot times
+inside each prompt describe that local window, including its hidden overlap.
+This option requires a local text encoder; external-encoder stage execution is
+not supported. Media positions use one shared origin after the longest encoded
+text prefix, so different prompt lengths do not shift the global AV clock.
+Without this list, the request's single prompt is reused as before.
+
+The cumulative latent is decoded once after all windows. Denoising memory is
+bounded by the window, while cumulative latent storage still grows with duration.
+This follows the [ComfyUI latent-tail continuation algorithm](https://github.com/ttulttul/ComfyUI-Minimax-H3-Continuation).
+Global positions can still exceed the model's trained temporal range. This
+mode does not guarantee seamless cuts or adherence to absolute shot timestamps in
+a repeated prompt. For comparison, keep the model, seed, prompt, source media,
+steps, shifts, and output size fixed, changing only `long_video_mode`.
+
+For a reproducible approximately 20-second comparison, use a request-mode
+Ref2VA server with caching disabled and the same `prompt.txt` and `REF_IMAGE`
+for both requests. Use a single prompt without `continuation_prompts` so that
+both modes receive identical text. The commands below generate native audio:
+
+```bash
+for mode in full continuation; do
+  curl --fail-with-body -sS --max-time 14400 "${API_URL}" \
+    -F 'prompt=<prompt.txt' \
+    -F "input_reference=@${REF_IMAGE};type=image/png" \
+    -F 'width=960' -F 'height=544' -F 'fps=24' \
+    -F 'num_inference_steps=50' -F 'flow_shift=12' -F 'seed=19960422' \
+    -F 'quality=lossless' \
+    -F "extra_params={\"task\":\"ref2va\",\"duration\":20,\"long_video\":true,\"long_video_mode\":\"${mode}\",\"audio_flow_shift\":3,\"preencode_mp4\":true}" \
+    -o "h3-20s-${mode}.mp4" || break
+done
+```
+
+Both outputs should contain 481 frames (20.042 seconds at 24 FPS).
+Continuation uses windows `[0,277)` and `[255,481)`; inspect frames 276/277
+(about 11.54 seconds) for visual and audio discontinuities. Compare the complete
+clips for motion, identity, prompt adherence, and sound, not just frame similarity:
+the trajectories differ by design. Report the tested commit, checkpoint, hardware,
+settings, and both videos with any comparison; the command alone is not quality
+evidence. A matching seed does not imply matching noise over differently sized
+full and windowed latents.
 
 ## Request-scoped quality
 
@@ -870,6 +1016,84 @@ balanced switch order.
 > resulting latency/quality trade-off may vary by hardware, topology, and
 > workload. The values above apply to this deployment and are not universal
 > guarantees. `lossless` remains the exact reference path.
+
+## Exact AdaLN reuse
+
+H3 enables exact AdaLN projection reuse by default, independently of the task,
+hardware, sampling schedule, quantization setting, and request `quality`.
+This applies to both original H3 (including its default 50-point schedule) and
+FastH3; no distilled adapter or explicit few-step ladder is required.
+The first occurrence of an input runs the existing projection; later identical
+time embeddings reuse its output only while the projection weights and numerical
+settings remain unchanged. This does not approximate neighboring timesteps or
+change attention, precision, sampling, or the generated audio/video contract.
+
+Each DiT keeps at most 256 MiB of runtime projection outputs. If a long schedule
+exceeds that budget, it retains a reusable subset and computes other entries
+normally, avoiding cyclic eviction on repeated original-H3 requests. All original weights
+remain loaded so new schedules and adapters can compute normally. Adapter changes,
+weight reloads, and model device moves invalidate the cache; parameter versions
+also guard individual entries. TP ranks coordinate hits before skipping a
+projection collective. Gradient-enabled execution, compilation, custom linear
+hooks, and tensors without weight version counters use the original computation.
+Offload paths that replace weight storage can therefore reduce the hit rate.
+
+The runtime cache uses the shared `ExactProjectionCache` implementation; H3 keeps
+only its optional sidecar adaptation. Other models can integrate the same
+[projection cache interface](../../docs/design/module/diffusion/diffusion_model_integration.md#exact-conditioning-projection-reuse).
+This cache retains projection outputs, not offloaded weights, and does not skip
+block weight prefetch.
+
+For an A/B comparison, disable only this reuse at server startup:
+
+```bash
+--cache-config '{"minimax_h3_adaln_cache": false}'
+```
+
+### Optional offline sidecar
+
+An offline sidecar can seed the first projection results; it is not required to
+enable the default cache. Sidecars require `--enforce-eager`, native BF16 TP1
+math, and the same numerical environment as the builder. With the default
+compiled execution, sidecars are rejected before reading their payloads: compiled
+H3 blocks bypass cached projections, so retaining those payloads would waste GPU
+memory. This applies to both the main and Ref2VA sidecars. Other serving
+configurations retain the default runtime-cache behavior described above.
+From the repository root, for a fixed FastH3 adapter and its own four-step schedule:
+
+```bash
+PYTHONPATH=. python tools/minimax_h3/build_adaln_cache.py \
+  --transformer-path "${MODEL_ROOT}/FL2VA/transformer" \
+  --model-variant fl2va --mode t2va \
+  --fasth3-adapter "${FASTH3_ADAPTER}" \
+  --num-inference-steps 4 --flow-shift 12 --audio-flow-shift 3 \
+  --device cuda --output /path/to/h3-adaln.safetensors
+```
+
+Omit `--fasth3-adapter` for base weights and use the serving step count and shifts.
+The builder accepts a native transformer directory with `config.json` and indexed
+or single-file safetensors. It streams the required inputs and refuses to overwrite
+an existing output. It does not instantiate the full DiT.
+
+Pass the resulting local artifact at eager server startup:
+
+```bash
+--enforce-eager \
+--cache-config '{"minimax_h3_adaln_cache_path": "/path/to/h3-adaln.safetensors"}'
+```
+
+Combined servers can also use `minimax_h3_ref_adaln_cache_path` for their Ref2VA
+transformer. Each artifact binds the model architecture, task, schedule, shifts,
+fixed adapter file, effective time-embedding/AdaLN weights, payload checksums, and
+numerical environment. A missing, corrupt, incompatible, or outdated sidecar is
+rejected with a warning; the model still loads every weight and computes through
+the runtime path. A request with different settings similarly falls back.
+Build sidecars from trusted local inputs: checksums verify identity and integrity,
+not the correctness of an untrusted generator.
+
+This implementation saves repeated projection work. It does not remove AdaLN
+weights or claim a GPU memory reduction. End-to-end gains depend on the workload,
+offload behavior, embedding fingerprint cost, and TP coordination overhead.
 
 ## LoRA
 

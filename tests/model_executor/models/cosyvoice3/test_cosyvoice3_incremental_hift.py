@@ -31,6 +31,7 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     _wrapped_slice,
 )
 from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -38,7 +39,10 @@ CHUNK_LEN = 24
 TOTAL_MEL = 96
 SPM = 480  # samples per mel frame for the small test HiFT (8*5*3*4), matching the real model
 
-LONG_TOTAL_MEL = 400  # long enough that the 64-frame window actually truncates
+WINDOW_LEN = 64
+# Six chunks exercise three updates after history exceeds the bounded window,
+# without spending minutes recomputing an unnecessarily long synthetic signal.
+LONG_TOTAL_MEL = 144
 PCM16_LSB = 1.0 / 32767.0  # smallest representable PCM16 difference
 
 # Worst observed deviation is 1.97e-7 (~2x float32 eps); atol=1e-6 keeps 5x headroom.
@@ -188,16 +192,19 @@ def test_incremental_hift_bounded_window_is_close(config):
 def test_incremental_hift_matches_streaming_reference_within_tolerance(config):
     """Windowed output matches the full-cumulative reference within float32 rounding.
 
-    The load-bearing correctness test: 400 mel frames far exceeds the 64-frame
-    window, so truncation genuinely exercises the phase/noise carry. Float64
-    agrees to ~1e-16, confirming the residual here is rounding, not truncation.
+    The load-bearing correctness test crosses the 64-frame window repeatedly,
+    so truncation genuinely exercises the phase/noise carry. Float64 agrees to
+    ~1e-16, confirming the residual here is rounding, not truncation.
     """
     hift = _make_hift(config)
-    model = _make_model(hift, window_len=64)  # the real _hift_window_len
+    model = _make_model(hift, window_len=WINDOW_LEN)  # the real _hift_window_len
     chunks = _chunks(total_mel=LONG_TOTAL_MEL)
 
     trim = int(hift.f0_predictor.condnet[0].causal_padding)
-    assert LONG_TOTAL_MEL > 64 + trim + CHUNK_LEN  # window must actually truncate
+    truncating_steps = sum(
+        history_len > WINDOW_LEN + trim for history_len in range(CHUNK_LEN, LONG_TOTAL_MEL, CHUNK_LEN)
+    )
+    assert truncating_steps >= 3  # exercise repeated truncation, not only the boundary
 
     full = _full_reference(model, chunks)
     incr = _incremental(model, chunks)
@@ -334,6 +341,10 @@ def test_incremental_hift_matches_reference_for_voiced_f0(config):
 
 @pytest.mark.parametrize("config", CONFIGS)
 @pytest.mark.parametrize("first_len,step_len", [(10, 6), (10, 3), (20, 3), (10, 1)])
+@pytest.mark.skipif(
+    current_omni_platform.is_rocm(),
+    reason="exhaustive CPU reference matrix exceeds the AMD CI time budget",
+)
 def test_incremental_hift_matches_reference_for_voiced_f0_small_chunks(config, first_len, step_len):
     """Same as test_incremental_hift_matches_reference_for_voiced_f0, but with small,
     sub-receptive-field chunk sizes (down to 1 mel frame) instead of the uniform

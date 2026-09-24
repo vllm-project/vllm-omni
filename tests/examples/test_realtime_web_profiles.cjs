@@ -5,7 +5,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const root = path.resolve(__dirname, '../../examples/online_serving/realtime_web/app/static');
 const context = vm.createContext({ URL });
-for (const name of ['common', 'minicpm_native', 'qwen3_turn']) {
+for (const name of ['common', 'minicpm_native', 'qwen3_turn', 'aura_ptt']) {
   vm.runInContext(fs.readFileSync(path.join(root, `profiles/${name}.js`), 'utf8'), context);
 }
 const profiles = context.OmniRealtimeProfiles;
@@ -83,6 +83,7 @@ function shell(profileName, adapter = 'stt', options = {}) {
   class Element {
     constructor() { this.style = {}; this.listeners = {}; this.children = []; this.value = ''; this.textContent = ''; this.classList = { add() {}, remove() {}, toggle() {} }; }
     addEventListener(name, callback) { this.listeners[name] = callback; }
+    closest() { return null; }
     append(...children) { this.children.push(...children); }
     appendChild(child) { this.children.push(child); }
     replaceChildren() { this.children = []; }
@@ -112,11 +113,28 @@ function shell(profileName, adapter = 'stt', options = {}) {
     constructor(options) { this.sampleRate = options.sampleRate; this.audioWorklet = { addModule: async () => {} }; this.destination = {}; }
     createMediaStreamSource() { return { connect() {} }; }
     createGain() { return { gain: {}, connect() {} }; }
+    decodeAudioData(bytes) { return options.decodeAudioData(bytes); }
     async resume() {}
     async close() {}
   }
   class AudioWorkletNode {
-    constructor(_context, name) { this.name = name; this.sent = []; nodes.push(this); this.port = { postMessage: (message) => this.sent.push(message) }; }
+    constructor(_context, name) {
+      this.name = name; this.sent = []; nodes.push(this);
+      this.port = { postMessage: (message) => { this.sent.push(message); this.player?.handleMessage(message); } };
+      if (options.realPlayback && name === 'fullduplex-pcm-playback') {
+        let Playback;
+        const node = this;
+        const worker = vm.createContext({
+          sampleRate: 24000,
+          AudioWorkletProcessor: class {
+            constructor() { this.port = { postMessage: message => queueMicrotask(() => node.port.onmessage?.({ data: message })) }; }
+          },
+          registerProcessor: (_name, cls) => { Playback = cls; },
+        });
+        vm.runInContext(fs.readFileSync(path.join(root, 'playback_worklet.js'), 'utf8'), worker);
+        this.player = new Playback();
+      }
+    }
     connect(target) { return target; }
   }
   const ctx = vm.createContext({
@@ -132,15 +150,16 @@ function shell(profileName, adapter = 'stt', options = {}) {
     atob: (value) => Buffer.from(value, 'base64').toString('binary'),
   });
   ctx.window = ctx;
-  for (const name of ['common', 'minicpm_native', 'qwen3_turn']) {
+  for (const name of ['common', 'minicpm_native', 'qwen3_turn', 'aura_ptt']) {
     vm.runInContext(fs.readFileSync(path.join(root, `profiles/${name}.js`), 'utf8'), ctx);
   }
   // Expose closure controls only in the test VM; production has no test API.
   const source = fs.readFileSync(path.join(root, 'app.js'), 'utf8').replace(/\}\)\(\);\s*$/, `
     globalThis.testUI = { startSession, stopSession, handleEvent, playbackDrained,
-      microphoneUploadEnabled, flushCapture,
+      microphoneUploadEnabled, flushCapture, setPttHeld, awaitQueue: () => audioChain,
       capture() { pendingCapture.push(new Int16Array([100, 200])); },
-      state() { return { running, connectionReady, assistantActive }; }
+      setPendingFrame(frame) { cameraPendingFrame = frame; if (profile.stickyCamera) cameraLastFrame = frame; },
+      state() { return { running, connectionReady, assistantActive, pttHeld }; }
     };
   })();`);
   vm.runInContext(source, ctx);
@@ -174,6 +193,7 @@ test('shared shell STT sends final commit and starts a fresh second turn only af
   assert.equal(app.ui.microphoneUploadEnabled(), true);
   assert.equal(app.elements.get('cameraButton').hidden, true);
   assert.equal(app.sockets.flatMap(s => s.sent).some(e => e.type === 'playback.ack'), false);
+  assert.equal(app.elements.get('pttButton').hidden, true);
   await app.ui.stopSession({ terminal: false });
 });
 
@@ -230,6 +250,8 @@ test('an interrupted response disarms the turn watchdog it left armed', async ()
 test('MiniCPM retains microphone upload while speaking and acknowledges speaker drain', async () => {
   const app = shell('minicpm-native');
   await app.ui.startSession();
+  assert.equal(app.elements.get('pttButton').hidden, true);
+  assert.equal(app.elements.get('sendTurnButton').hidden, true);
   await app.ui.handleEvent({ type: 'response.speak', response_id: 'native-r1' });
   assert.equal(app.ui.microphoneUploadEnabled(), true);
   await app.ui.handleEvent({ type: 'response.output_audio.delta', delta: 'AAAAAA==', response_id: 'native-r1' });
@@ -409,4 +431,319 @@ test('the camera retires its oldest image instead of exhausting the session budg
   // A new call reopens the budget; stale ids from the old one must not linger.
   assert.equal(plain(p.initialMessages(config, 'x')).length > 0, true);
   assert.equal(plain(p.imageMessages('JPEG')).length, 1);
+});
+
+test('AURA PTT profile sets duplex, is_speech append, commit on release, and shell flags', () => {
+  const aura = profiles['aura-ptt']();
+  const url = new URL(aura.url({ ...config, model: 'aurateam/AURA' }, 'http://localhost/'));
+  assert.equal(url.searchParams.get('duplex'), '1');
+  assert.equal(url.searchParams.get('model'), 'aurateam/AURA');
+  assert.equal(aura.pushToTalk, true);
+  assert.equal(aura.clientCommit, false);
+  assert.equal(aura.camera, true);
+  assert.equal(aura.stickyCamera, true);
+  assert.equal(aura.cameraIntervalMs, 500);
+  assert.equal(aura.visionFollowWhileSpeaking, true);
+  assert.equal(aura.halfDuplex, false);
+  assert.equal(aura.playbackAck, true);
+  assert.equal(aura.append('PCM', 'JPEG', { isSpeech: true }).is_speech, true);
+  assert.equal(aura.append('PCM', 'JPEG', { isSpeech: false }).is_speech, false);
+  assert.equal(aura.append('PCM', 'JPEG', { isSpeech: false }).video_frames[0], 'JPEG');
+  assert.deepEqual(plain(aura.commitMessages()), [
+    { type: 'input_audio_buffer.commit', create_response: true },
+  ]);
+  assert.equal(aura.ack('r1', 50).type, 'playback.ack');
+  const [update] = aura.initialMessages({}, 'Be brief');
+  assert.equal(update.session.instructions, 'Be brief');
+  assert.equal(update.session.extra_body.auto_response, true);
+});
+
+test('AURA does not open a second bubble for the same sentence after response.done', async () => {
+  const app = shell('aura-ptt');
+  await app.ui.startSession();
+  const sentence = '你好，我看到一个戴眼镜、穿黑T恤的男生正对着镜头说话呢。';
+  await app.ui.handleEvent({
+    type: 'response.output_audio_transcript.delta', response_id: 'r1', delta: sentence,
+  });
+  await app.ui.handleEvent({ type: 'response.done', response_id: 'r1' });
+  await app.ui.handleEvent({
+    type: 'response.output_audio_transcript.done', response_id: 'r2', transcript: sentence,
+  });
+  const turns = [...app.elements.get('conversation').children].filter((row) => row.children.length);
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].children[1].textContent, sentence);
+  await app.ui.stopSession({ terminal: false });
+});
+
+function visionAppends(app) {
+  return app.sockets[0].sent.filter(e => e.type === 'input_audio_buffer.append' && e.is_speech === false);
+}
+
+test('AURA shell holds speech until PTT and opens one vision turn per two frames', async () => {
+  const app = shell('aura-ptt');
+  await app.ui.startSession();
+  assert.equal(app.elements.get('pttButton').hidden, false);
+  assert.equal(app.elements.get('sendTurnButton').hidden, true);
+  assert.equal(app.elements.get('cameraButton').hidden, false);
+  assert.equal(app.ui.microphoneUploadEnabled(), false);
+
+  app.ui.capture();
+  app.ui.flushCapture();
+  assert.equal(app.sockets[0].sent.some(e => e.type === 'input_audio_buffer.append'), false);
+
+  app.ui.setPendingFrame('IDLE1');
+  app.ui.flushCapture();
+  assert.equal(visionAppends(app).length, 0, 'one frame must not open a turn');
+  app.ui.setPendingFrame('IDLE2');
+  app.ui.flushCapture();
+  const idle = visionAppends(app).at(-1);
+  assert.equal(idle.is_speech, false);
+  assert.deepEqual(idle.video_frames, ['IDLE1', 'IDLE2'], 'two frames gate the turn and both go out as one clip');
+  assert.equal(app.sockets[0].sent.at(-1).type, 'input_audio_buffer.commit');
+  assert.equal(app.ui.state().assistantActive, false);
+
+  app.ui.setPttHeld(true);
+  assert.equal(app.ui.microphoneUploadEnabled(), true);
+  app.ui.setPendingFrame('FRAME1');
+  app.ui.capture();
+  app.ui.flushCapture();
+  const speech = app.sockets[0].sent.find(e => e.type === 'input_audio_buffer.append' && e.is_speech === true);
+  assert.equal(speech.video_frames[0], 'FRAME1');
+  assert.equal(visionAppends(app).length, 1, 'speech must not wait for a second frame');
+
+  app.ui.setPttHeld(false);
+  assert.equal(app.sockets[0].sent.at(-1).type, 'input_audio_buffer.commit');
+  assert.equal(app.ui.state().pttHeld, false);
+
+  await app.ui.handleEvent({ type: 'response.created', response: { id: 'aura-r1' } });
+  app.ui.setPendingFrame('LOCKED1');
+  app.ui.flushCapture();
+  app.ui.setPendingFrame('LOCKED2');
+  app.ui.flushCapture();
+  assert.equal(visionAppends(app).length, 1, 'open text turn blocks the next vision commit');
+
+  await app.ui.handleEvent({
+    type: 'response.output_audio_transcript.done', response_id: 'aura-r1', transcript: '看到了。',
+  });
+  assert.equal(app.ui.state().assistantActive, true, 'text end must not wait for playback');
+  app.ui.flushCapture();
+  assert.deepEqual(visionAppends(app).at(-1).video_frames, ['LOCKED1', 'LOCKED2']);
+  assert.equal(app.sockets[0].sent.at(-1).type, 'input_audio_buffer.commit');
+
+  await app.ui.handleEvent({ type: 'response.created', response: { id: 'aura-r2' } });
+  app.ui.setPendingFrame('SILENT1');
+  app.ui.flushCapture();
+  app.ui.setPendingFrame('SILENT2');
+  app.ui.flushCapture();
+  assert.equal(visionAppends(app).length, 2);
+  await app.ui.handleEvent({ type: 'response.listen', response_id: 'aura-r2' });
+  app.ui.flushCapture();
+  assert.deepEqual(visionAppends(app).at(-1).video_frames, ['SILENT1', 'SILENT2']);
+  await app.ui.stopSession({ terminal: false });
+});
+
+test('AURA hold-to-talk stops local playback and does not cancel the response', async () => {
+  const app = shell('aura-ptt', 'stt', { realPlayback: true });
+  await app.ui.startSession();
+  receive(app, { type: 'response.created', response: { id: 'old' } });
+  receive(app, audioChunk('old'));
+  await app.ui.awaitQueue();
+  const player = app.nodes.find(node => node.name === 'fullduplex-pcm-playback').player;
+  for (let index = 0; index < 75; index++) renderPlayback(player);
+  assert.ok(renderPlayback(player).some(sample => sample !== 0));
+  const sentBefore = app.sockets[0].sent.length;
+  app.ui.setPttHeld(true);
+  assertSilent(player);
+  const extra = app.sockets[0].sent.slice(sentBefore);
+  assert.ok(extra.every(event => event.type === 'playback.ack'), 'hold must not abort the server response');
+  receive(app, audioChunk('old'));
+  await app.ui.awaitQueue();
+  assertSilent(player);
+  await app.ui.stopSession({ terminal: false });
+});
+
+test('AURA sticky camera reuses the last frame on speech without a fresh pending', async () => {
+  const app = shell('aura-ptt');
+  await app.ui.startSession();
+  app.ui.setPendingFrame('STICKY');
+  app.ui.setPttHeld(true);
+  app.ui.capture();
+  app.ui.flushCapture();
+  assert.equal(app.sockets[0].sent.at(-1).video_frames[0], 'STICKY');
+  // Pending cleared; sticky last frame still available for the next speech flush.
+  app.ui.capture();
+  app.ui.flushCapture();
+  assert.equal(app.sockets[0].sent.at(-1).video_frames[0], 'STICKY');
+  await app.ui.stopSession({ terminal: false });
+});
+
+// Exercise the real WebSocket dispatch queue together with the actual playback
+// processor: sending a clear message alone does not prove the speaker is silent.
+function receive(app, event) {
+  app.sockets[0].onmessage({ data: JSON.stringify(event) });
+}
+
+function audioChunk(responseId, extra = {}) {
+  const pcm = new Int16Array(24000).fill(12000);
+  return { type: 'response.output_audio.delta', response_id: responseId,
+    delta: Buffer.from(pcm.buffer).toString('base64'), format: 'pcm16', sample_rate_hz: 24000, ...extra };
+}
+
+function renderPlayback(player) {
+  const output = new Float32Array(128);
+  player.process([], [[output]]);
+  return output;
+}
+
+async function playingQwen(options = {}) {
+  const app = shell('qwen3-turn', 'vad', { realPlayback: true, ...options });
+  await app.ui.startSession();
+  receive(app, { type: 'response.created', response: { id: 'old' } });
+  receive(app, audioChunk('old'));
+  await app.ui.awaitQueue();
+  app.player = app.nodes.find(node => node.name === 'fullduplex-pcm-playback').player;
+  // Advance through the initial 400 ms playback buffer.
+  for (let index = 0; index < 75; index++) renderPlayback(app.player);
+  assert.ok(renderPlayback(app.player).some(sample => sample !== 0));
+  return app;
+}
+
+function assertSilent(player) {
+  assert.equal(player.bufferedFrames(), 0, 'interrupted audio must leave the playback queue');
+  assert.ok(renderPlayback(player).every(sample => sample === 0), 'speaker must output silence');
+}
+
+for (const terminal of [false, true]) {
+  test(`Qwen speech interrupts actual playback after generation completed=${terminal}`, async () => {
+    const app = await playingQwen();
+    if (terminal) {
+      receive(app, { type: 'response.output_audio.done', response_id: 'old' });
+      receive(app, { type: 'response.done', response: { id: 'old', status: 'completed' } });
+      await app.ui.awaitQueue();
+    }
+    receive(app, { type: 'input_audio_buffer.speech_started', item_id: 'next', audio_start_ms: 1000 });
+    await app.ui.awaitQueue();
+    assertSilent(app.player);
+    assert.equal(app.ui.microphoneUploadEnabled(), true);
+    const ack = app.sockets[0].sent.find(event => event.type === 'playback.ack');
+    assert.equal(ack.response_id, 'old');
+    assert.equal(ack.played_ms, 5, 'ack only the 128 frames actually played, not all queued audio');
+    await app.ui.stopSession({ terminal: false });
+  });
+}
+
+test('Qwen cancellation preempts pending decode and does not delay the next response', async () => {
+  let releaseDecode;
+  const app = await playingQwen({ decodeAudioData: () => new Promise(resolve => { releaseDecode = resolve; }) });
+  receive(app, audioChunk('old', { format: 'wav' }));
+  await flushTasks();
+  assert.equal(typeof releaseDecode, 'function');
+  receive(app, { type: 'response.done', response: { id: 'old', status: 'cancelled' } });
+  await flushTasks();
+  assertSilent(app.player);
+  receive(app, { type: 'response.created', response: { id: 'new' } });
+  receive(app, audioChunk('new'));
+  await flushTasks();
+  assert.equal(app.player.activeResponseId, 'new');
+  assert.equal(app.player.bufferedFrames(), 24000);
+  releaseDecode({ sampleRate: 24000, getChannelData: () => new Float32Array(24000).fill(0.4) });
+  await flushTasks();
+  assert.equal(app.player.bufferedFrames(), 24000, 'old decoded audio must not enter the new response');
+  await app.ui.stopSession({ terminal: false });
+});
+
+test('Qwen interruption rejects queued and late audio for the cancelled response', async () => {
+  const app = await playingQwen();
+  receive(app, audioChunk('old'));
+  receive(app, { type: 'response.done', response: { id: 'old', status: 'cancelled' } });
+  receive(app, audioChunk('old'));
+  await app.ui.awaitQueue();
+  assertSilent(app.player);
+  await app.ui.stopSession({ terminal: false });
+});
+
+test('late cancellation of an old Qwen response does not clear a newer response', async () => {
+  const app = await playingQwen();
+  receive(app, { type: 'response.done', response: { id: 'old', status: 'cancelled' } });
+  await app.ui.awaitQueue();
+  receive(app, { type: 'response.created', response: { id: 'new' } });
+  receive(app, audioChunk('new'));
+  await app.ui.awaitQueue();
+  receive(app, { type: 'output_audio_buffer.cleared', response_id: 'old' });
+  receive(app, { type: 'response.done', response: { id: 'old', status: 'cancelled' } });
+  await app.ui.awaitQueue();
+  assert.equal(app.player.activeResponseId, 'new');
+  assert.equal(app.player.bufferedFrames(), 24000);
+  assert.equal(app.ui.state().assistantActive, true);
+  await app.ui.stopSession({ terminal: false });
+});
+
+test('Qwen speech interruption follows accepted turn detection; MiniCPM mapping stays unchanged', () => {
+  const qwen = profiles['qwen3-turn']({ adapter: 'vad' });
+  const speech = { type: 'input_audio_buffer.speech_started', item_id: 'next' };
+  assert.equal(qwen.mapEvent(speech).kind, 'interrupt');
+  qwen.mapEvent({ type: 'session.updated', session: { audio: { input: { turn_detection: {
+    type: 'server_vad', interrupt_response: false,
+  } } } } });
+  assert.equal(qwen.mapEvent(speech).kind, 'ignore');
+  qwen.mapEvent({ type: 'session.updated', session: { audio: { input: { turn_detection: null } } } });
+  assert.equal(qwen.mapEvent(speech).kind, 'ignore');
+  qwen.mapEvent({ type: 'session.updated', session: { audio: { input: { turn_detection: {
+    type: 'server_vad', interrupt_response: true,
+  } } } } });
+  assert.equal(qwen.mapEvent(speech).kind, 'interrupt');
+  assert.equal(profiles['qwen3-turn']({ adapter: 'stt' }).mapEvent(speech).kind, 'ignore');
+  assert.equal(profiles['minicpm-native']().mapEvent(speech).kind, 'ignore');
+});
+
+test('late old-response controls cannot invalidate a newer pending decode', async () => {
+  let releaseDecode;
+  const app = await playingQwen({ decodeAudioData: () => new Promise(resolve => { releaseDecode = resolve; }) });
+  receive(app, { type: 'input_audio_buffer.speech_started', item_id: 'next', audio_start_ms: 1000 });
+  await app.ui.awaitQueue();
+  receive(app, { type: 'response.created', response: { id: 'new' } });
+  receive(app, audioChunk('new', { format: 'wav' }));
+  await flushTasks();
+  assert.equal(typeof releaseDecode, 'function');
+  receive(app, { type: 'output_audio_buffer.cleared', response_id: 'old' });
+  receive(app, { type: 'response.done', response: { id: 'old', status: 'cancelled' } });
+  releaseDecode({ sampleRate: 24000, getChannelData: () => new Float32Array(24000).fill(0.4) });
+  await app.ui.awaitQueue();
+  assert.equal(app.player.activeResponseId, 'new');
+  assert.equal(app.player.bufferedFrames(), 24000);
+  assert.equal(app.ui.state().assistantActive, true);
+  await app.ui.stopSession({ terminal: false });
+});
+
+test('normal completion still waits for decoding before draining playback', async () => {
+  let releaseDecode;
+  const app = await playingQwen({ decodeAudioData: () => new Promise(resolve => { releaseDecode = resolve; }) });
+  receive(app, audioChunk('old', { format: 'wav' }));
+  await flushTasks();
+  receive(app, { type: 'response.output_audio.done', response_id: 'old' });
+  receive(app, { type: 'response.done', response: { id: 'old', status: 'completed' } });
+  await flushTasks();
+  assert.equal(app.player.drain, null);
+  releaseDecode({ sampleRate: 24000, getChannelData: () => new Float32Array(24000).fill(0.4) });
+  await app.ui.awaitQueue();
+  assert.equal(app.player.bufferedFrames(), 47872);
+  assert.equal(app.player.drain.responseId, 'old');
+  await app.ui.stopSession({ terminal: false });
+});
+
+test('interrupting an old decode preserves a newer response already waiting in the event queue', async () => {
+  let releaseDecode;
+  const app = await playingQwen({ decodeAudioData: () => new Promise(resolve => { releaseDecode = resolve; }) });
+  receive(app, audioChunk('old', { format: 'wav' }));
+  await flushTasks();
+  receive(app, { type: 'response.created', response: { id: 'new' } });
+  receive(app, audioChunk('new'));
+  receive(app, { type: 'output_audio_buffer.cleared', response_id: 'old' });
+  await flushTasks();
+  assert.equal(app.player.activeResponseId, 'new');
+  assert.equal(app.player.bufferedFrames(), 24000);
+  releaseDecode({ sampleRate: 24000, getChannelData: () => new Float32Array(24000).fill(0.4) });
+  await flushTasks();
+  assert.equal(app.player.bufferedFrames(), 24000);
+  await app.ui.stopSession({ terminal: false });
 });

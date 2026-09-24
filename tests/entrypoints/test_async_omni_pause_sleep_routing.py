@@ -14,7 +14,7 @@ from vllm.renderers import BaseRenderer
 from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.diffusion.data import CuMemTag, OmniACK
-from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.async_omni import CACHE_RESET_TIMEOUT_S, AsyncOmni
 
 pytestmark = [pytest.mark.core_model]
 
@@ -25,16 +25,17 @@ def _make_omni(*, stage_types: list[str]) -> AsyncOmni:
     omni._paused = False
     omni._admitting = 0
     omni._hold_admission_until_resume = False
+    omni._paused_stage_ids = set()
     omni._sleeping_tags = set()
     omni._stage_sleeping_tags = {}
     omni._level2_sleeping = False
     omni.event_resolver = SimpleNamespace(watch_task=lambda *a, **k: None, resolve=AsyncMock())
     omni._final_output_handler = lambda: None
-    omni.reset_mm_cache = AsyncMock()
+    omni._clear_frontend_mm_cache = AsyncMock()
 
-    stage_clients = [SimpleNamespace(stage_type=stage_type) for stage_type in stage_types]
+    stage_configs = [SimpleNamespace(stage_type=stage_type) for stage_type in stage_types]
     omni.engine = SimpleNamespace(
-        stage_clients=stage_clients,
+        stage_configs=stage_configs,
         stage_vllm_configs=[None] * len(stage_types),
         collective_rpc_async=AsyncMock(return_value=[True]),
     )
@@ -45,7 +46,8 @@ def _make_omni(*, stage_types: list[str]) -> AsyncOmni:
 @pytest.mark.cpu
 def test_reset_mm_cache_routes_through_renderer(mocker):
     async def run() -> None:
-        omni = object.__new__(AsyncOmni)
+        omni = _make_omni(stage_types=["llm"])
+        del omni._clear_frontend_mm_cache
         renderer = mocker.create_autospec(BaseRenderer, instance=True)
         input_processor = mocker.create_autospec(InputProcessor, instance=True)
         input_processor.renderer = renderer
@@ -114,9 +116,10 @@ def test_pause_generation_still_rpcs_when_already_paused():
             kwargs={"mode": "abort", "clear_cache": True},
             stage_ids=[0],
         )
-        omni.reset_prefix_cache.assert_awaited_once()
-        omni.reset_mm_cache.assert_awaited_once()
-        omni.reset_encoder_cache.assert_awaited_once()
+        omni.reset_prefix_cache.assert_not_awaited()
+        omni.reset_mm_cache.assert_not_awaited()
+        omni.reset_encoder_cache.assert_not_awaited()
+        omni._clear_frontend_mm_cache.assert_awaited_once_with()
 
     asyncio.run(run())
 
@@ -137,6 +140,84 @@ def test_resume_generation_resumes_ar_then_clears_frontend_pause():
         )
         assert omni._paused is False
         assert omni._hold_admission_until_resume is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_reset_prefix_cache_forwards_to_ar_stages():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "diffusion"])
+
+        result = await omni.reset_prefix_cache(reset_running_requests=True, reset_connector=True)
+
+        assert result is True
+        omni.collective_rpc.assert_awaited_once_with(
+            method="reset_prefix_cache",
+            args=(True, True),
+            kwargs=None,
+            stage_ids=[0],
+            timeout=CACHE_RESET_TIMEOUT_S,
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_reset_prefix_cache_diffusion_only_skips_rpc():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion"])
+
+        result = await omni.reset_prefix_cache()
+
+        assert result is True
+        omni.collective_rpc.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_reset_encoder_cache_forwards_to_ar_stages():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "diffusion"])
+
+        await omni.reset_encoder_cache()
+
+        omni.collective_rpc.assert_awaited_once_with(
+            method="reset_encoder_cache",
+            args=(),
+            kwargs=None,
+            stage_ids=[0],
+            timeout=CACHE_RESET_TIMEOUT_S,
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_reset_mm_cache_clears_frontend_then_forwards_to_ar_stages():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "diffusion"])
+        calls = []
+        renderer = SimpleNamespace(clear_mm_cache_async=AsyncMock(side_effect=lambda: calls.append("frontend")))
+        omni.input_processor = SimpleNamespace(renderer=renderer)
+        del omni._clear_frontend_mm_cache
+
+        async def rpc(**kwargs):
+            calls.append("engine")
+            return [None]
+
+        omni.collective_rpc.side_effect = rpc
+        await omni.reset_mm_cache()
+
+        assert calls == ["frontend", "engine"]
+        omni.collective_rpc.assert_awaited_once_with(
+            method="reset_mm_cache",
+            args=(),
+            kwargs=None,
+            stage_ids=[0],
+            timeout=CACHE_RESET_TIMEOUT_S,
+        )
 
     asyncio.run(run())
 
@@ -458,5 +539,290 @@ def test_partial_wake_does_not_skip_remaining_sleeping_stage():
         assert wake_kwargs["stage_ids"] == [1]
         assert not omni._sleeping_tags
         assert not omni._stage_sleeping_tags
+
+    asyncio.run(run())
+
+
+# ───────────────────── diffusion pause_generation(mode="keep") ─────────────────────
+
+
+def _rpc_methods(omni: AsyncOmni) -> list[tuple[str, list[int] | None]]:
+    return [(call.kwargs["method"], call.kwargs.get("stage_ids")) for call in omni.collective_rpc.await_args_list]
+
+
+@pytest.mark.cpu
+def test_diffusion_keep_routes_to_backend():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion"])
+
+        await omni.pause_generation(mode="keep", clear_cache=False)
+
+        omni.collective_rpc.assert_awaited_once_with(
+            method="pause_scheduler",
+            args=(),
+            kwargs={"mode": "keep"},
+            stage_ids=[0],
+        )
+        assert await omni.is_paused() is True
+        assert omni._hold_admission_until_resume is True
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "pause_kwargs",
+    [
+        {},
+        {"mode": "abort"},
+        {"mode": "wait"},
+        {"mode": "keep", "wait_for_inflight_requests": True},
+    ],
+)
+def test_diffusion_non_keep_modes_pause_frontend_only(pause_kwargs):
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion"])
+        omni.reset_prefix_cache = AsyncMock(return_value=True)
+        omni.reset_mm_cache = AsyncMock()
+        omni.reset_encoder_cache = AsyncMock()
+
+        await omni.pause_generation(**pause_kwargs)
+        assert await omni.is_paused() is True
+        omni.collective_rpc.assert_not_awaited()
+
+        await omni.resume_generation()
+        omni.collective_rpc.assert_not_awaited()
+        assert await omni.is_paused() is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_mixed_engine_keep_sends_engine_core_and_diffusion_pauses():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "diffusion"])
+        omni.reset_prefix_cache = AsyncMock(return_value=True)
+        omni.reset_mm_cache = AsyncMock()
+        omni.reset_encoder_cache = AsyncMock()
+
+        await omni.pause_generation(mode="keep", clear_cache=True)
+
+        assert omni.collective_rpc.await_args_list[0].kwargs == {
+            "method": "pause_scheduler",
+            "args": (),
+            "kwargs": {"mode": "keep", "clear_cache": True},
+            "stage_ids": [0],
+        }
+        assert omni.collective_rpc.await_args_list[1].kwargs == {
+            "method": "pause_scheduler",
+            "args": (),
+            "kwargs": {"mode": "keep"},
+            "stage_ids": [1],
+        }
+        # Only P0 needs clearing here: pause_scheduler already resets P1.
+        omni.reset_prefix_cache.assert_not_awaited()
+        omni._clear_frontend_mm_cache.assert_awaited_once_with()
+
+        await omni.resume_generation()
+        assert _rpc_methods(omni)[2:] == [("resume_scheduler", [0]), ("resume_scheduler", [1])]
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_keep_targets_only_requested_diffusion_stages():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion", "diffusion"])
+
+        await omni.pause_generation(mode="keep", clear_cache=False, stage_ids=[1])
+        assert _rpc_methods(omni) == [("pause_scheduler", [1])]
+
+        await omni.resume_generation(stage_ids=[0])
+        assert _rpc_methods(omni) == [("pause_scheduler", [1])]
+        # Stage 1's scheduler is still closed: admission must stay closed too,
+        # otherwise new requests queue on a stage that will not schedule them.
+        assert await omni.is_paused() is True
+
+        await omni.resume_generation(stage_ids=[1])
+        assert _rpc_methods(omni) == [("pause_scheduler", [1]), ("resume_scheduler", [1])]
+        assert await omni.is_paused() is False
+
+        await omni.resume_generation()
+        assert len(_rpc_methods(omni)) == 2
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_keep_then_sleep_wake_resume_keeps_admission_paused_until_resume():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion"])
+        omni.reset_prefix_cache = AsyncMock(return_value=True)
+        omni.reset_encoder_cache = AsyncMock()
+        omni.collective_rpc = AsyncMock(
+            side_effect=lambda **kw: (
+                [OmniACK(task_id="t", status="SUCCESS", stage_id=0, rank=0)]
+                if kw["method"] in {"handle_sleep_task", "handle_wake_task"}
+                else [None]
+            )
+        )
+
+        await omni.pause_generation(mode="keep", clear_cache=False)
+        await omni.sleep(level=1)
+        await omni.wake_up()
+        assert await omni.is_paused() is True
+
+        await omni.resume_generation()
+        assert await omni.is_paused() is False
+        assert [m for m, _ in _rpc_methods(omni)] == [
+            "pause_scheduler",
+            "handle_sleep_task",
+            "handle_wake_task",
+            "resume_scheduler",
+        ]
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "failure",
+    [
+        AsyncMock(side_effect=NotImplementedError("request-level execution only")),
+        AsyncMock(return_value=[{"supported": False, "error": "TimeoutError: outputs did not drain"}]),
+    ],
+)
+def test_keep_failure_surfaces_and_leaves_explicit_resume_possible(failure):
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion"])
+        omni.collective_rpc = failure
+
+        with pytest.raises((NotImplementedError, RuntimeError)):
+            await omni.pause_generation(mode="keep", clear_cache=False)
+
+        assert await omni.is_paused() is True
+        assert omni._paused_stage_ids == {0}
+
+        omni.collective_rpc = AsyncMock(return_value=[None])
+        await omni.resume_generation()
+        omni.collective_rpc.assert_awaited_once_with(
+            method="resume_scheduler",
+            args=(),
+            kwargs=None,
+            stage_ids=[0],
+        )
+        assert await omni.is_paused() is False
+        assert omni._paused_stage_ids == set()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_resume_failure_keeps_admission_paused_and_target_recorded():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion"])
+        await omni.pause_generation(mode="keep", clear_cache=False)
+
+        omni.collective_rpc = AsyncMock(return_value=[{"error": "replica gone"}])
+        with pytest.raises(RuntimeError, match="resume_scheduler failed"):
+            await omni.resume_generation()
+
+        assert await omni.is_paused() is True
+        assert omni._paused_stage_ids == {0}
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("first, second", [([1], [0]), ([0], [1])])
+def test_mixed_engine_partial_resume_keeps_admission_paused(first, second):
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "diffusion"])
+        await omni.pause_generation(mode="keep", clear_cache=False)
+
+        await omni.resume_generation(stage_ids=first)
+        assert await omni.is_paused() is True
+
+        await omni.resume_generation(stage_ids=second)
+        assert await omni.is_paused() is False
+        assert _rpc_methods(omni)[2:] == [("resume_scheduler", first), ("resume_scheduler", second)]
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_two_ar_stages_partial_resume_keeps_admission_paused():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "llm"])
+        omni.reset_prefix_cache = AsyncMock(return_value=True)
+        omni.reset_mm_cache = AsyncMock()
+        omni.reset_encoder_cache = AsyncMock()
+        await omni.pause_generation(mode="abort")
+
+        await omni.resume_generation(stage_ids=[0])
+        assert await omni.is_paused() is True
+
+        await omni.resume_generation(stage_ids=[1])
+        assert await omni.is_paused() is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("method", ["reset_prefix_cache", "reset_encoder_cache", "reset_mm_cache"])
+@pytest.mark.parametrize("stage_ids, targets", [(None, [0, 2]), ([2], [2]), ([1], []), ([], [])])
+def test_cache_resets_respect_stage_selection(method, stage_ids, targets):
+    async def run():
+        omni = _make_omni(stage_types=["llm", "diffusion", "llm"])
+        await getattr(omni, method)(stage_ids=stage_ids, timeout=2.0)
+        if targets:
+            assert omni.collective_rpc.await_args.kwargs["stage_ids"] == targets
+            assert omni.collective_rpc.await_args.kwargs["timeout"] == 2.0
+        else:
+            omni.collective_rpc.assert_not_awaited()
+        assert omni._clear_frontend_mm_cache.await_count == int(method == "reset_mm_cache" and 0 in targets)
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("method", ["reset_prefix_cache", "reset_encoder_cache", "reset_mm_cache"])
+@pytest.mark.parametrize("failure", [{"todo": "unsupported"}, {"supported": False}, {"error": "reset failed"}])
+def test_cache_resets_reject_failure_from_any_replica(method, failure):
+    async def run():
+        omni = _make_omni(stage_types=["llm"])
+        # Exercise the actual collective_rpc too: a single stage can have
+        # multiple replicas, so result indexes are not stage IDs.
+        del omni.collective_rpc
+        omni.engine.collective_rpc_async.return_value = [True, failure]
+        with pytest.raises(RuntimeError, match=method):
+            await getattr(omni, method)()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_prefix_reset_returns_false_if_any_replica_refuses():
+    async def run():
+        omni = _make_omni(stage_types=["llm"])
+        omni.collective_rpc.return_value = [True, [True, False]]
+        assert await omni.reset_prefix_cache() is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("operation", ["pause_generation", "sleep"])
+@pytest.mark.parametrize("stage_ids", [[0], [2]])
+def test_pause_and_sleep_do_not_reset_unselected_stages_or_reset_twice(operation, stage_ids):
+    async def run():
+        omni = _make_omni(stage_types=["llm", "diffusion", "llm"])
+        kwargs = {"clear_cache": True} if operation == "pause_generation" else {}
+        await getattr(omni, operation)(stage_ids=stage_ids, **kwargs)
+        assert omni.collective_rpc.await_count == 1
+        rpc = omni.collective_rpc.await_args.kwargs
+        assert rpc["method"] == ("pause_scheduler" if operation == "pause_generation" else "sleep")
+        assert rpc["stage_ids"] == stage_ids
+        assert omni._clear_frontend_mm_cache.await_count == int(0 in stage_ids)
 
     asyncio.run(run())

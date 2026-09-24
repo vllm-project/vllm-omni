@@ -32,6 +32,13 @@ def _positive_finite_float(value: str) -> float:
     return parsed
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
+    return parsed
+
+
 def _existing_file(value: str) -> str:
     path = Path(value).expanduser()
     if not path.is_file():
@@ -42,12 +49,42 @@ def _existing_file(value: str) -> str:
 def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
     from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
         DEFAULT_MAX_VIDEO_DURATION_S,
+        OMNIINTERACT_SCENARIO_TAGS,
         OMNIINTERACT_SUBSETS,
     )
 
     group = parser.add_argument_group("OmniInteract Benchmark Options")
     group.add_argument(
         "--omniinteract-subsets", nargs="+", choices=OMNIINTERACT_SUBSETS, default=list(OMNIINTERACT_SUBSETS)
+    )
+    group.add_argument(
+        "--omniinteract-scenario-tags",
+        nargs="+",
+        choices=OMNIINTERACT_SCENARIO_TAGS,
+        default=None,
+        help=(
+            "Scenario tags used when sampling cases: realtime, proactive, nested, interrupted, 1qna. "
+            "Default behavior covers each requested tag with at least one case (when available), "
+            "then fills remaining --num-prompts from the rest of the selected subsets."
+        ),
+    )
+    group.add_argument(
+        "--omniinteract-scenario-focus",
+        action="store_true",
+        help=(
+            "Only run cases matching --omniinteract-scenario-tags. "
+            "Without this flag, tags are used for coverage-first sampling."
+        ),
+    )
+    group.add_argument(
+        "--omniinteract-video-list",
+        type=_existing_file,
+        help=(
+            "JSONL of sampled OmniInteract cases (video_path, output_name, subset), "
+            "typically sampled_cases.jsonl from a prior run. Preserves list order. "
+            "Cannot be combined with --seed, --dataset-path, or --omniinteract-scenario-tags. "
+            "With this flag, --num-prompts caps the prefix of the list (0 or oversized = all)."
+        ),
     )
     group.add_argument(
         "--omniinteract-timeout-s", type=_positive_finite_float, default=900.0, help="Complete session timeout."
@@ -75,6 +112,50 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         type=Path,
         default=Path("omniinteract-output"),
         help="Directory for case and evaluator artifacts.",
+    )
+    group.add_argument(
+        "--omniinteract-evaluate",
+        action="store_true",
+        help="Run the text-only OmniInteract judge after generation and print an accuracy report.",
+    )
+    group.add_argument(
+        "--omniinteract-judge-base-url",
+        default="http://127.0.0.1:8000",
+        help="Base URL of an already-running OpenAI-compatible judge server.",
+    )
+    group.add_argument("--omniinteract-judge-model", help="Model name exposed by the judge server.")
+    group.add_argument(
+        "--omniinteract-judge-api-key",
+        default="EMPTY",
+        help="Bearer token for the judge server.",
+    )
+    group.add_argument(
+        "--omniinteract-judge-timeout-s",
+        type=_positive_finite_float,
+        default=60.0,
+        help="Timeout for each judge request.",
+    )
+    group.add_argument(
+        "--omniinteract-judge-max-tokens",
+        type=_positive_int,
+        default=512,
+        help="Maximum completion tokens for each judge request.",
+    )
+    group.add_argument(
+        "--omniinteract-eval-workers",
+        type=_positive_int,
+        default=8,
+        help="Maximum number of concurrent judge requests.",
+    )
+    group.add_argument(
+        "--omniinteract-eval-output-dir",
+        type=Path,
+        help="Accuracy artifact directory; defaults to OUTPUT_DIR/evaluation.",
+    )
+    group.add_argument(
+        "--omniinteract-eval-skip-existing",
+        action="store_true",
+        help="Reuse successful per-case evaluation artifacts.",
     )
 
 
@@ -192,6 +273,78 @@ def add_daily_omni_cli_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_videomme_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Add CLI arguments specific to the Video-MME dataset."""
+    group = parser.add_argument_group("Video-MME Dataset Options")
+    group.add_argument(
+        "--videomme-parquet",
+        type=str,
+        default=None,
+        help="Path to local Video-MME parquet "
+        "(e.g. videomme/test-00000-of-00001.parquet). When set, Hub QA loading is skipped.",
+    )
+    group.add_argument(
+        "--videomme-video-dir",
+        type=str,
+        default=None,
+        help="Directory containing extracted Video-MME videos (videoID.mp4). "
+        "Typical layout after unzipping videos_chunked_*.zip: <root>/video/. "
+        "When using file:// URLs, start the server with --allowed-local-media-path "
+        "covering this directory.",
+    )
+    group.add_argument(
+        "--videomme-subtitle-dir",
+        type=str,
+        default=None,
+        help="Directory containing Video-MME .srt subtitles (videoID.srt). Used only with --videomme-use-subtitle.",
+    )
+    group.add_argument(
+        "--videomme-pack-mode",
+        type=str,
+        choices=["minicpm-frames", "minicpm-interleave", "video_url"],
+        default="minicpm-frames",
+        help="Multimodal packing. "
+        "'minicpm-frames' (default): OmniEvalKit MiniCPM videomme recipe — sampled frames "
+        "as image_url only (max_frames=96). "
+        "'minicpm-interleave': OmniEvalKit videomme_short recipe — 1fps frame/audio pairs "
+        "(max_frames=64). "
+        "'video_url': single video_url part (models with native video input).",
+    )
+    group.add_argument(
+        "--videomme-max-frames",
+        type=int,
+        default=None,
+        help="Override max sampled frames (OmniEvalKit defaults: 96 for minicpm-frames, 64 for minicpm-interleave).",
+    )
+    group.add_argument(
+        "--videomme-duration",
+        type=str,
+        choices=["all", "short", "medium", "long"],
+        default="all",
+        help="Filter by Video-MME duration bucket (default: all).",
+    )
+    group.add_argument(
+        "--videomme-use-subtitle",
+        action="store_true",
+        default=False,
+        help="Prepend subtitle text to the user prompt (Video-MME w/ subs setting).",
+    )
+    group.add_argument(
+        "--videomme-inline-local-video",
+        action="store_true",
+        default=False,
+        help="Embed local frames/audio as base64 data URLs so the server does not need "
+        "--allowed-local-media-path. Increases request size; use for small --num-prompts.",
+    )
+    group.add_argument(
+        "--videomme-save-eval-items",
+        action="store_true",
+        default=False,
+        help="Include per-request Video-MME accuracy rows in the saved JSON under "
+        "videomme_eval_items. Or set env VIDEOMME_SAVE_EVAL_ITEMS=1.",
+    )
+
+
 def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
     """Add CLI arguments for Seed-TTS benchmarks."""
     group = parser.add_argument_group("Seed-TTS Dataset Options")
@@ -266,6 +419,7 @@ _OMNI_BENCH_DATASET_CHOICES = (
     "seed-tts-design",
     "ttsd",
     "sound-effect",
+    "videomme",
 )
 
 
@@ -332,6 +486,7 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
 def add_omni_args(parser: argparse.ArgumentParser) -> None:
     """Register all vLLM-Omni serving benchmark arguments."""
     add_daily_omni_cli_args(parser)
+    add_videomme_cli_args(parser)
     add_omniinteract_cli_args(parser)
     add_seed_tts_cli_args(parser)
     add_multi_stage_cli_args(parser)
@@ -347,6 +502,22 @@ def preprocess_serve_args(args: argparse.Namespace) -> None:
             raise ValueError("OmniInteract requires --endpoint /v1/realtime")
         if not getattr(args, "omniinteract_ref_audio", None):
             raise ValueError("OmniInteract requires --omniinteract-ref-audio")
+        if getattr(args, "omniinteract_evaluate", False) and not getattr(args, "omniinteract_judge_model", None):
+            raise ValueError("OmniInteract evaluation requires --omniinteract-judge-model")
+        if getattr(args, "omniinteract_video_list", None):
+            explicit = getattr(args, "explicit_keys", ())
+            if "seed" in explicit:
+                raise ValueError("--omniinteract-video-list cannot be combined with --seed")
+            if "dataset_path" in explicit:
+                raise ValueError("--omniinteract-video-list cannot be combined with --dataset-path")
+            if getattr(args, "omniinteract_scenario_tags", None):
+                raise ValueError("--omniinteract-video-list cannot be combined with --omniinteract-scenario-tags")
+            if getattr(args, "omniinteract_scenario_focus", False):
+                raise ValueError("--omniinteract-video-list cannot be combined with --omniinteract-scenario-focus")
+        if getattr(args, "omniinteract_scenario_focus", False) and not getattr(
+            args, "omniinteract_scenario_tags", None
+        ):
+            raise ValueError("--omniinteract-scenario-focus requires --omniinteract-scenario-tags")
         if getattr(args, "ignore_eos", False):
             raise ValueError("OmniInteract does not support --ignore-eos")
         if getattr(args, "profile", False):

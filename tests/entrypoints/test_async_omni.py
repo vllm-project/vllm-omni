@@ -5,6 +5,7 @@ import asyncio
 import re
 from types import SimpleNamespace
 
+import anyio
 import pytest
 from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -14,6 +15,8 @@ from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints import async_omni as async_omni_mod
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.utils import coerce_param_message_types
+from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model]
@@ -544,6 +547,87 @@ def test_generate_cancellation_converges_after_engine_shutdown_starts(mocker):
 
 
 @pytest.mark.cpu
+def test_generate_waits_for_abort_inside_cancelled_asgi_scope():
+    async def run_test():
+        submitted = anyio.Event()
+        acknowledged = []
+
+        async def add_request(**kwargs):
+            submitted.set()
+
+        async def abort(request_ids, timeout=None):
+            assert timeout == async_omni_mod.ABORT_TIMEOUT_S
+            await anyio.sleep(0)
+            acknowledged.extend(request_ids)
+
+        omni = get_async_omni_instance(fake_add_request=add_request, fake_abort_request=abort)
+
+        async def collect():
+            async for _ in omni.generate(
+                prompt={"prompt": "prompt"},
+                request_id="cancel-asgi",
+                sampling_params_list=[SamplingParams()],
+                output_modalities=["image"],
+            ):
+                pass
+
+        async with anyio.create_task_group() as group:
+            group.start_soon(collect)
+            await submitted.wait()
+            group.cancel_scope.cancel()
+        assert len(acknowledged) == 1 and acknowledged[0].startswith("cancel-asgi-")
+        assert omni.request_states == {}
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.cpu
+def test_generate_bounds_abort_inside_cancelled_asgi_scope(monkeypatch):
+    monkeypatch.setattr(async_omni_mod, "ABORT_TIMEOUT_S", 0.05)
+
+    async def run_test():
+        submitted = anyio.Event()
+        abort_started = anyio.Event()
+        abort_finished = anyio.Event()
+
+        async def add_request(**kwargs):
+            submitted.set()
+
+        async def abort(request_ids, timeout=None):
+            assert len(request_ids) == 1
+            assert timeout == 0.05
+            abort_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                abort_finished.set()
+
+        omni = get_async_omni_instance(fake_add_request=add_request, fake_abort_request=abort)
+
+        async def collect():
+            async for _ in omni.generate(
+                prompt={"prompt": "prompt"},
+                request_id="cancel-asgi-hanging-abort",
+                sampling_params_list=[SamplingParams()],
+                output_modalities=["image"],
+            ):
+                pass
+
+        async def cancel_request():
+            async with anyio.create_task_group() as group:
+                group.start_soon(collect)
+                await submitted.wait()
+                group.cancel_scope.cancel()
+
+        await asyncio.wait_for(cancel_request(), timeout=1.0)
+        assert abort_started.is_set()
+        assert abort_finished.is_set()
+        assert omni.request_states == {}
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.cpu
 def test_generate_yields_streaming_diffusion_chunks_before_final():
     """AsyncOmni.generate yields every intermediate diffusion chunk before the final one."""
 
@@ -611,6 +695,46 @@ def test_output_kind_is_preserved_with_explicit_sampling_params(output_kind):
 
     asyncio.run(run())
     assert captured_params[0].output_kind == output_kind
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "input_kind", [None, RequestOutputKind.CUMULATIVE, RequestOutputKind.DELTA, RequestOutputKind.FINAL_ONLY]
+)
+def test_qwen_video_sampling_keeps_all_three_stages_delta(input_kind):
+    """Real generate/resolution preserves the video handler's DELTA contract."""
+    captured = []
+
+    async def submit(*, sampling_params_list, **kwargs):
+        captured.extend(sampling_params_list)
+
+    async def run():
+        omni = get_async_omni_instance(fake_add_request=submit)
+        # The common fixture bypasses resolution; this test must execute it.
+        del omni.resolve_sampling_params_list
+        omni.engine.num_stages = 3
+        omni.default_sampling_params_list = [SamplingParams(output_kind=RequestOutputKind.CUMULATIVE) for _ in range(3)]
+        omni.sampling_constraints_list = omni._get_sampling_constraints_list(QWEN3_OMNI_PIPELINE.stages)
+        params = None
+        if input_kind is not None:
+            # The video handler applies this coercion to explicit overrides.
+            params = coerce_param_message_types(
+                [SamplingParams(output_kind=input_kind) for _ in range(3)], is_streaming=True
+            )
+        async for _ in omni.generate(
+            prompt={"prompt": "video"},
+            request_id="video-sampling",
+            sampling_params_list=params,
+            output_modalities=["text", "audio"],
+        ):
+            pass
+        assert len(captured) == 3
+        assert all(param.output_kind == RequestOutputKind.DELTA for param in captured)
+        assert captured[1].stop_token_ids == [2150]
+        assert [param.detokenize for param in captured] == [True, False, True]
+        assert all(param.output_kind == RequestOutputKind.CUMULATIVE for param in omni.default_sampling_params_list)
+
+    asyncio.run(run())
 
 
 # End to end tests for ensuring internal manipulation of request ID

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 This example shows how to use vLLM-Omni for running offline inference
 with the correct prompt format on Qwen2.5-Omni
@@ -137,7 +137,9 @@ def get_use_audio_in_video_query(
     question = "Describe the content of the video, then convert what the baby say into text."
     prompt = (
         f"<|im_start|>system\n{default_system}<|im_end|>\n"
-        "<|im_start|>user\n<|vision_bos|><|VIDEO|><|vision_eos|><|audio_bos|><|AUDIO|><|audio_eos|>"
+        # With use_audio_in_video=True the processor interleaves the audio into
+        # the video placeholder, so no separate <|AUDIO|> placeholder is used.
+        "<|im_start|>user\n<|vision_bos|><|VIDEO|><|vision_eos|>"
         f"{question}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )

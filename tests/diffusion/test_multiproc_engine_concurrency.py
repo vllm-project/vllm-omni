@@ -8,6 +8,7 @@ import signal
 import threading
 import time
 import weakref
+from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -77,6 +78,8 @@ def _make_executor(num_gpus: int = 1):
     executor._processes = []
     executor._is_failed = False
     executor._failure_callbacks = []
+    executor._completed_outputs = {}
+    executor._dropped_output_ids = OrderedDict()
     return executor, req_q, res_q
 
 
@@ -935,11 +938,18 @@ class TestWorkerProcRpcRankStatus:
 
     def test_execute_rpc_returns_rank_status_envelope(self, monkeypatch):
         proc = self._make_worker_proc()
+        cpu_group = object()
 
         monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
         monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+        monkeypatch.setattr(
+            diffusion_worker_module,
+            "get_world_group",
+            lambda: SimpleNamespace(cpu_group=cpu_group),
+        )
 
-        def _all_gather_object(out, local):
+        def _all_gather_object(out, local, *, group):
+            assert group is cpu_group
             out[0] = local
             out[1] = {
                 "rank": 1,
@@ -1644,6 +1654,8 @@ class TestMultiprocExecutorWorkerMonitor:
         executor._rpc_futures = {}
         executor._output_futures = {}
         executor._batch_split_map = {}
+        executor._completed_outputs = {}
+        executor._dropped_output_ids = OrderedDict()
 
         proc = _make_short_lived_process()
         executor._processes = [proc]

@@ -25,6 +25,7 @@ from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed
 from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.registry import resolve_native_single_file
 from vllm_omni.entrypoints.cli.logo import log_logo
 from vllm_omni.entrypoints.openai.api_server import (
     omni_run_server,
@@ -148,7 +149,8 @@ class OmniServeCommand(CLISubcommand):
             args.model_config = model_config
             explicit_keys = getattr(args, "explicit_keys", None)
             if explicit_keys is not None:
-                args.explicit_keys = explicit_keys | {"model_config"}
+                # --no-guardrails is a CLI-only alias, not a diffusion engine arg.
+                args.explicit_keys = (explicit_keys - {"no_guardrails"}) | {"model_config"}
 
         if args.headless:
             run_headless(args)
@@ -305,7 +307,8 @@ class OmniServeCommand(CLISubcommand):
         from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
 
         model = getattr(args, "model_tag", None) or getattr(args, "model", None)
-        if model and is_diffusion_model(model):
+        native_single_file = resolve_native_single_file(getattr(args, "model_class_name", None))
+        if model and ((native_single_file is not None and os.path.isfile(model)) or is_diffusion_model(model)):
             if api_server_count is not None and api_server_count > 1:
                 raise ValueError("--api-server-count > 1 is not supported for diffusion models")
             logger.info("Detected diffusion model: %s", model)
@@ -637,6 +640,16 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--custom-pipeline-args",
+            dest="custom_pipeline_args",
+            type=json.loads,
+            default=None,
+            help=(
+                "JSON object passed to native/custom diffusion pipelines. "
+                'Only args containing "pipeline_class" trigger custom pipeline re-initialization.'
+            ),
+        )
+        omni_config_group.add_argument(
             "--usp",
             "--ulysses-degree",
             dest="ulysses_degree",
@@ -811,6 +824,17 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable VAE tiling for memory optimization (useful for mitigating OOM issues).",
         )
+        omni_config_group.add_argument(
+            "--vae-fast-path",
+            choices=("off", "lossless", "channels_last"),
+            default="lossless",
+            help=(
+                "Wan VAE decoder fast path. 'lossless' (default) installs bit-exact fused kernels; "
+                "'channels_last' additionally switches decoder convolutions to channels-last memory "
+                "format and fuses RMSNorm+SiLU (faster, not bit-exact); 'off' keeps the reference "
+                "diffusers implementation."
+            ),
+        )
 
         # Parallel weight loading (faster diffusion startup)
         omni_config_group.add_argument(
@@ -941,7 +965,8 @@ class OmniServeCommand(CLISubcommand):
             "--diffusion-kv-cache-dtype",
             type=str,
             default=None,
-            help="Diffusion attention KV cache dtype (e.g. fp8). Separate from vLLM --kv-cache-dtype.",
+            help="Diffusion Q/K/V precision: fp8, mxfp8, mxfp4, or float (NPU). "
+            "Separate from vLLM --kv-cache-dtype. Use --diffusion-attention-config for per-role fallback.",
         )
         omni_config_group.add_argument(
             "--diffusion-kv-cache-skip-steps",

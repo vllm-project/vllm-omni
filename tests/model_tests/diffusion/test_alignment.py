@@ -28,6 +28,9 @@ EXCLUDED_MODELS = [
     "GlmImagePipeline",
     "ZImagePipeline",
     "OvisImagePipeline",
+    # Requires upstream AR hidden states and token boundaries; covered by
+    # dedicated MammothModa2 bridge/pipeline tests and real-checkpoint E2E.
+    "MammothModa2DiTPipeline",
     "WanPipeline",
     "WanDMDPipeline",
     "WanVACEPipeline",
@@ -50,6 +53,8 @@ EXCLUDED_MODELS = [
     "BooguImageTurboPipeline",
     "LancePipeline",
     "MingImagePipeline",
+    "MingImageDiffusionPipeline",
+    "MingImageLayeredDiffusionPipeline",
     "InternVLAA1Pipeline",
     "StableDiffusion3Pipeline",
     "HunyuanImage3ForCausalMM",

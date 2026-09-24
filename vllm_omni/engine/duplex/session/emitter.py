@@ -125,7 +125,7 @@ class SessionEmitter:
         extra = getattr(self._ctx.session.config, "extra_body", None)
         if not isinstance(extra, dict):
             return False
-        return extra.get("auto_response") is True or extra.get("full_duplex") is True
+        return extra.get("auto_response") is True
 
     def is_stale_model_output(self, payload: dict[str, object]) -> bool:
         """Whether ``payload`` belongs to a turn the session has already moved past."""

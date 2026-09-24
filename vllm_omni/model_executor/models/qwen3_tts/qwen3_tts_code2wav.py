@@ -46,9 +46,9 @@ def _codec_ids_from_payload_or_input(
         if isinstance(codes, dict):
             audio = codes.get("audio")
             if isinstance(audio, torch.Tensor) and audio.numel() > 0:
-                return audio.reshape(-1).to(device=input_ids.device, dtype=torch.long)
+                return audio.reshape(-1).to(dtype=torch.long)
             if isinstance(audio, (list, tuple)) and audio:
-                return torch.as_tensor(audio, device=input_ids.device, dtype=torch.long).reshape(-1)
+                return torch.as_tensor(audio, dtype=torch.long).reshape(-1)
     return input_ids.reshape(-1).to(dtype=torch.long)
 
 
@@ -58,11 +58,17 @@ class Qwen3TTSCode2Wav(nn.Module):
     via the SpeechTokenizer decoder directly (bypassing HF wrapper overhead)."""
 
     input_modalities = "audio"
+    tokenizer_subfolder = "speech_tokenizer"
+    decoder_cudagraph_modes: tuple[str, ...] = ("icl", "xvec")
 
     # Ask the model runner for the scheduler-side request IDs. Stateful
     # decoder caches must use the same IDs delivered by on_requests_finished;
     # payload metadata carries an external ID which may differ.
     requires_request_ids = True
+    # A nonempty native codes.audio payload is authoritative; token IDs may
+    # serve only as per-request control slots for the generation scheduler.
+    supports_native_payload_input = True
+    batched_gpu_staging_keys = {("codes", "audio")}
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -101,7 +107,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         # load_weights().
         tok_config = Qwen3TTSTokenizerV2Config.from_pretrained(
             self.model_path,
-            subfolder="speech_tokenizer",
+            subfolder=self.tokenizer_subfolder,
         )
         dec_config = tok_config.decoder_config
         self.decoder = Qwen3TTSTokenizerV2Decoder._from_config(dec_config)
@@ -190,6 +196,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             )
 
         self.decoder.enable_cudagraph(
+            capture_modes=self.decoder_cudagraph_modes,
             capture_batch_sizes=decode_cudagraph_batch_sizes,
             stateless_capture_sizes=decode_cudagraph_capture_sizes,
             device=device,
@@ -427,12 +434,9 @@ class Qwen3TTSCode2Wav(nn.Module):
             try:
                 _, c = valid_codes_qf[0]
                 logger.info(
-                    "Code2Wav codec: frames=%d q=%d uniq=%d range=[%d,%d] batch=%d",
+                    "Code2Wav codec: frames=%d q=%d batch=%d",
                     c.shape[1],
                     q,
-                    int(torch.unique(c).numel()),
-                    int(c.min().item()),
-                    int(c.max().item()),
                     len(valid_codes_qf),
                 )
             except Exception:
@@ -454,9 +458,22 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         request_lengths = [int(codes_qf.shape[-1]) for _, codes_qf in valid_codes_qf]
         max_request_length = max(request_lengths)
-        request_codes = valid_codes_qf[0][1].new_zeros((len(valid_codes_qf), q, max_request_length))
-        for row, (_, codes_qf) in enumerate(valid_codes_qf):
-            request_codes[row, :, : codes_qf.shape[-1]].copy_(codes_qf)
+        request_codes_shape = (len(valid_codes_qf), q, max_request_length)
+        target_device = ids.device
+        if target_device.type == "cuda" and all(codes_qf.device.type == "cpu" for _, codes_qf in valid_codes_qf):
+            staged_codes = torch.zeros(
+                request_codes_shape,
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=True,
+            )
+            for row, (_, codes_qf) in enumerate(valid_codes_qf):
+                staged_codes[row, :, : codes_qf.shape[-1]].copy_(codes_qf)
+            request_codes = staged_codes.to(device=target_device, non_blocking=True)
+        else:
+            request_codes = torch.zeros(request_codes_shape, dtype=torch.long, device=target_device)
+            for row, (_, codes_qf) in enumerate(valid_codes_qf):
+                request_codes[row, :, : codes_qf.shape[-1]].copy_(codes_qf)
 
         self._record_decode_batch_stats(
             group_size=len(valid_codes_qf),
@@ -552,7 +569,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         source = DefaultModelLoader.Source(
             model_or_path=self.model_path,
             revision=self.vllm_config.model_config.revision,
-            subfolder="speech_tokenizer",
+            subfolder=self.tokenizer_subfolder,
         )
         subfolder_weights = model_loader._get_weights_iterator(source)
         loaded = AutoWeightsLoader(self).load_weights(

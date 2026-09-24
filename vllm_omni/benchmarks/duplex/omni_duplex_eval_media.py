@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Small ffmpeg-backed media helpers used by the duplex runner and judge."""
+"""Small media helpers used by the duplex runner and judge.
+
+Video and audio decoding is delegated to PyAV (``av``), which bundles a pinned
+FFmpeg version, so results do not depend on whatever ffmpeg binary the host
+provides (see #7364: host ffmpeg 4.4.2 could hang forever on some HEVC clips).
+"""
 
 from __future__ import annotations
 
+import io
+import logging
 import os
-import subprocess
 import tempfile
 import wave
 from collections.abc import Iterator
@@ -15,10 +21,7 @@ from typing import Any
 
 from vllm_omni.experimental.fullduplex.client import PCM16_BYTES_PER_SAMPLE, PCM16_SAMPLE_RATE
 
-
-def _run_ffmpeg(args: list[str]) -> bytes:
-    result = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", *args], capture_output=True, check=True)
-    return result.stdout
+logger = logging.getLogger(__name__)
 
 
 def materialize_media(value: Any, output_dir: str | Path, stem: str, suffix: str) -> Path:
@@ -77,31 +80,73 @@ def _write_media_bytes(payload: bytes | bytearray, output_dir: str | Path, stem:
 
 
 def video_duration(path: str | Path) -> float:
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return max(0.0, float(result.stdout.strip()))
+    """Return the video duration in seconds using PyAV (no ffprobe subprocess).
+
+    Raises:
+        OSError: If the file cannot be opened (missing file, permission denied, etc.).
+        ValueError: If the file is corrupt or cannot be parsed (e.g.
+            :class:`av.error.InvalidDataError`).
+    """
+    import av
+
+    try:
+        with av.open(str(path)) as container:
+            # Container-level duration is the same source ffprobe's format=duration reads.
+            if container.duration and container.duration > 0:
+                return max(0.0, container.duration / av.time_base)
+            if container.streams.video:
+                stream = container.streams.video[0]
+                if stream.duration is not None and stream.time_base is not None:
+                    return max(0.0, float(stream.duration * stream.time_base))
+            # Last resort: count decodable frames.
+            if container.streams.video:
+                stream = container.streams.video[0]
+                stream.thread_type = "AUTO"
+                frame_count = sum(1 for _ in container.decode(stream))
+                if stream.average_rate and frame_count > 0:
+                    return frame_count / float(stream.average_rate)
+            return 0.0
+    except (OSError, ValueError) as exc:
+        logger.warning("Failed to read video duration from %s: %s", path, exc)
+        raise
 
 
 def extract_jpeg(path: str | Path, *, timestamp: float, quality: int = 3) -> bytes:
-    return _run_ffmpeg(
-        [
-            "-ss",
-            f"{max(0.0, timestamp):.3f}",
-            "-i",
-            str(path),
-            "-frames:v",
-            "1",
-            "-q:v",
-            str(quality),
-            "-f",
-            "image2",
-            "pipe:1",
-        ]
-    )
+    """Extract a single JPEG frame at ``timestamp`` using PyAV.
+
+    ``quality`` follows the ffmpeg ``-q:v`` convention (lower = better, 1..31)
+    and is mapped to the PIL JPEG quality scale (higher = better).
+
+    After ``seek`` the function continues decoding until a frame with PTS >=
+    target_pts is found, matching the ``ffmpeg -ss`` semantic of returning the
+    first decodable frame *at or after* the requested timestamp.
+
+    Raises:
+        ValueError: If the file contains no video stream or no frame could be decoded.
+    """
+    import av
+
+    with av.open(str(path)) as container:
+        if not container.streams.video:
+            raise ValueError(f"no video stream in {path}")
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        time_base = stream.time_base
+        if time_base is None:
+            time_base = 1 / 90000
+        target_pts = int(max(0.0, timestamp) / time_base)
+        container.seek(target_pts, any_frame=False, backward=True, stream=stream)
+        closest_frame = None
+        for frame in container.decode(stream):
+            closest_frame = frame
+            if frame.pts is not None and frame.pts >= target_pts:
+                break
+        if closest_frame is not None:
+            image = closest_frame.to_image()
+            buf = io.BytesIO()
+            image.save(buf, format="JPEG", quality=_ffmpeg_q_to_pil_quality(quality))
+            return buf.getvalue()
+    raise ValueError(f"no decodable video frames in {path} at timestamp {timestamp}")
 
 
 def iter_jpegs(
@@ -113,7 +158,8 @@ def iter_jpegs(
     while timestamp < end:
         try:
             frame = extract_jpeg(path, timestamp=timestamp, quality=quality)
-        except (OSError, subprocess.CalledProcessError):
+        except (OSError, ValueError) as exc:
+            logger.warning("Frame extraction failed at %.3fs for %s: %s", timestamp, path, exc)
             break
         if frame:
             yield timestamp, frame
@@ -132,9 +178,28 @@ def read_audio_pcm16(path: str | Path) -> bytes:
                     and wav_file.getcomptype() == "NONE"
                 ):
                     return wav_file.readframes(wav_file.getnframes())
-        except wave.Error:
+        except (wave.Error, OSError):
             pass
-    return _run_ffmpeg(["-i", str(source), "-f", "s16le", "-ac", "1", "-ar", str(PCM16_SAMPLE_RATE), "pipe:1"])
+    # Non-WAV audio: decode and resample to mono s16 PCM via PyAV.
+    import av
+    import numpy as np
+
+    try:
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=PCM16_SAMPLE_RATE)
+        chunks: list[Any] = []
+        with av.open(str(source)) as container:
+            for frame in container.decode(audio=0):
+                for resampled in resampler.resample(frame):
+                    chunks.append(resampled.to_ndarray())
+            # Flush the resampler to drain buffered tail samples (P3).
+            for resampled in resampler.resample(None):
+                chunks.append(resampled.to_ndarray())
+        if not chunks:
+            return b""
+        return np.concatenate([chunk.reshape(-1) for chunk in chunks]).astype(np.int16).tobytes()
+    except (OSError, ValueError) as exc:
+        logger.warning("Failed to decode audio in %s: %s", source, exc)
+        raise
 
 
 def iter_av_units(
@@ -150,3 +215,9 @@ def iter_av_units(
             frame = next_frame[1]
             next_frame = next(frame_iter, None)
         yield audio_pcm16[offset : offset + unit_bytes], frame
+
+
+def _ffmpeg_q_to_pil_quality(quality: int) -> int:
+    """Map ffmpeg ``-q:v`` (1..31, lower = better) to PIL JPEG quality (1..100, higher = better)."""
+    ffmpeg_q = max(1, min(31, int(quality)))
+    return max(1, min(100, round(95 - (ffmpeg_q - 1) * (93 / 30))))
