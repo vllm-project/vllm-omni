@@ -674,6 +674,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         return False
 
     def _send_single_request(self, task: dict):
+        cleanup_req_id = task.get("connector_cleanup")
+        if cleanup_req_id is not None:
+            self._run_connector_cleanup(cleanup_req_id)
+            return
         request = task["request"]
         external_req_id = request.external_req_id
         sender_token = task.get("sender_token")
@@ -1025,6 +1029,30 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         self.cleanup_receiver(request_id)
         self.cleanup_sender(external_req_id)
+
+    def _run_connector_cleanup(self, external_req_id: str) -> None:
+        """Unlink an aborted request's connector-side segments.
+
+        Enqueued on the save queue by ``finish_requests`` rather than called
+        inline: that serializes it behind every ``put()`` already queued for
+        the request, so no chunk is written after its own sweep.
+
+        Never on the natural-finish path -- a finished request's terminal
+        chunk may still be unconsumed downstream. Only FINISHED_ABORTED /
+        FINISHED_ERROR have no consumer left, hence the ``finished_status``
+        gate in ``finish_requests``.
+
+        Sender-side state is not reclaimed here: ``finish_requests`` already
+        retired the generation via ``cleanup_sender``. Calling it again from
+        the save thread would retire a successor generation that reused the
+        external id after the abort.
+        """
+        # Best-effort: a connector-specific failure must not propagate into
+        # the save loop.
+        try:
+            self.connector.cleanup(external_req_id)
+        except Exception as e:
+            logger.warning(f"Connector cleanup failed for aborted request {external_req_id}: {e}")
 
     ########################################################################
     # Schedule Helper
@@ -1559,8 +1587,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             for request in queue
         }
 
+        # Only abort/error leaves no downstream consumer; any other terminal
+        # status may still have an unconsumed terminal chunk in flight.
+        sweeps_connector = finished_status in (RequestStatus.FINISHED_ABORTED, RequestStatus.FINISHED_ERROR)
+
         # First pass: collect requests to remove from queues
         request_ids = set(request_ids)
+        aborted_external_ids: set[str] = set()
         for req_id in request_ids:
             request = requests.get(req_id) if requests else None
             if request is None:
@@ -1575,6 +1608,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # must not overwrite statuses such as WAITING_FOR_STREAMING_REQ.
             if req_id in self.requests_origin_status and req_id in connector_owned_ids:
                 request.status = self.requests_origin_status.pop(req_id)
+            # Must be the id _send_single_request built the put keys from.
+            if sweeps_connector and request.external_req_id:
+                aborted_external_ids.add(request.external_req_id)
 
         # An abort can terminate a long-lived native codec stream before it
         # emits a terminal payload. Reclaim both sides of the adapter so a
@@ -1601,5 +1637,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         for req_id in request_ids:
             self.cleanup_receiver(req_id)
+
+        # Enqueued, not inline, so the sweep lands after any already-queued
+        # put() for the same request -- see _run_connector_cleanup.
+        if aborted_external_ids:
+            for external_req_id in aborted_external_ids:
+                self._pending_save_reqs.append({"connector_cleanup": external_req_id})
+            with self._save_cond:
+                self._save_cond.notify()
 
         return []
