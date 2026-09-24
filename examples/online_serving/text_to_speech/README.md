@@ -1115,18 +1115,21 @@ curl -N -X POST http://localhost:8091/v1/audio/speech \
 [Vevo2](https://github.com/open-mmlab/Amphion/tree/main/models/svc/vevo2) is a unified controllable AR + flow-matching model from CUHK-Shenzhen / Amphion. Online serving exposes the **MVP zero-shot TTS path**; SVS / voice conversion / editing / streaming are deferred to follow-up PRs (see [#3391](https://github.com/vllm-project/vllm-omni/issues/3391)).
 
 > **License**: the `RMSnow/Vevo2` checkpoint is **CC BY-NC-ND 4.0** (non-commercial, no-derivatives). See the [offline README's Vevo2 section](../../offline_inference/text_to_speech/README.md#vevo2) for the full prerequisites (Amphion clone + checkpoint download + one-time `init_vevo2_checkpoint.py` setup).
-
+>
 > **`ref_audio` is required.** Vevo2 has no built-in speakers; every request must include a reference clip.
 
 ### Launch
+
 ```bash
 ./vevo2/run_server.sh
 # or:
 vllm serve ./ckpts/Vevo2 --omni --port 8092
 ```
+
 Deploy config at `vllm_omni/deploy/vevo2.yaml` auto-loads.
 
 ### Client example
+
 ```bash
 python vevo2/openai_speech_client.py \
     --text "Hello, this is Vevo2." \
@@ -1137,6 +1140,7 @@ python vevo2/openai_speech_client.py \
 The `voice` field in the OpenAI schema is required for compatibility but ignored by Vevo2 unless it matches an uploaded speaker.
 
 ### Notes
+
 - `--response-format` supports `wav` (default), `mp3`, `flac`, `pcm`.
 - No streaming yet; the full waveform is returned in one response (single-shot batch mode).
 - For a Gradio UI, see the offline example as a starting point — a Vevo2-specific demo is a follow-up.

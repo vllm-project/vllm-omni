@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """One-time setup helper for Vevo2 checkpoints.
 
 The published ``RMSnow/Vevo2`` checkpoint ships its real configs in

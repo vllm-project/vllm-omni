@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Vevo2 serving adapter.
 
 Vevo2 (Amphion's unified AR + flow-matching TTS) runs as a single AR stage and

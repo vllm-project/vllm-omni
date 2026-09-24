@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU-runnable unit tests for the Vevo2 single-stage model wrapper.
 
 These tests exercise the parts of ``Vevo2ForCausalLM`` that don't need

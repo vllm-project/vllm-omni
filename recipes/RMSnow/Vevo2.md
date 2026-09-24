@@ -173,7 +173,7 @@ python examples/offline_inference/text_to_speech/vevo2/end2end.py \
 ```
 
 | metric | value |
-|--------|-------|
+| -------- | ------- |
 | audio duration | 7.26 s (174,240 samples @ 24 kHz) |
 | Whisper WER | **0.000** (transcript exact) |
 | RMS | 0.180 |
@@ -190,8 +190,8 @@ python examples/offline_inference/text_to_speech/vevo2/end2end.py \
 ```
 
 | timbre reference | reference median F0 | output median F0 |
-|------------------|--------------------:|-----------------:|
-| `arabic_male`     | 120.7 Hz | 121.4 Hz |
+| ---------------- | ------------------: | ---------------: |
+| `arabic_male` | 120.7 Hz | 121.4 Hz |
 | `mandarin_female` | 231.8 Hz | 240.7 Hz |
 
 The output tracks the reference, confirming the cloning path conditions on the
@@ -227,7 +227,7 @@ pinned by `test_vevo2_seed_is_reproducible` (offline) and
 
 **Test suites** (`--run-level full_model`, `-m "tts and cuda"`):
 
-```
+```text
 tests/e2e/offline_inference/test_vevo2.py    4 passed in 132.96s
 tests/e2e/online_serving/test_vevo2.py      5 passed in 163.35s
 tests/model_executor/models/vevo2/  +

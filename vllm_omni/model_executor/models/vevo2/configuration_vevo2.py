@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Configuration for Vevo2 in vLLM-Omni single-stage pipeline.
 
 The published checkpoint at https://huggingface.co/RMSnow/Vevo2 ships a

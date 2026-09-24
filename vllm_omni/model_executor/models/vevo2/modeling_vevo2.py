@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Vevo2 single-stage model for vLLM-Omni.
 
 Vevo2 (https://github.com/open-mmlab/Amphion/tree/main/models/svc/vevo2) is

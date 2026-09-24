@@ -752,10 +752,11 @@ python examples/offline_inference/text_to_speech/breeze_tts_2/end2end.py \
 [Vevo2](https://github.com/open-mmlab/Amphion/tree/main/models/svc/vevo2) is a unified controllable AR + flow-matching framework for speech and singing voice generation from CUHK-Shenzhen / Amphion. The published checkpoint is at [`RMSnow/Vevo2`](https://huggingface.co/RMSnow/Vevo2).
 
 > **License**: the `RMSnow/Vevo2` checkpoint is **CC BY-NC-ND 4.0** (non-commercial, no-derivatives). The Amphion framework itself is MIT. Commercial deployment of the weights requires contacting the upstream authors. The `RMSnow/Vevo2` weights ship with a notice that explicitly forbids derivative redistribution.
-
+>
 > **MVP scope**: zero-shot text-to-speech with optional voice cloning via a timbre reference. Singing voice synthesis, voice / singing style conversion, editing, and melody control are deferred to follow-up PRs (see [#3391](https://github.com/vllm-project/vllm-omni/issues/3391)). Streaming (`async_chunk: true`) is also a follow-up.
 
 ### Prerequisites
+
 Vevo2 is not on PyPI; clone Amphion and put it on `PYTHONPATH`:
 
 ```bash
@@ -789,6 +790,7 @@ python examples/offline_inference/text_to_speech/vevo2/init_vevo2_checkpoint.py 
 > **Note**: `init_vevo2_checkpoint.py` imports `vllm_omni.model_executor.models.vevo2` to reuse the config class, so it is not standalone — run it from a checkout where vLLM-Omni is installed/importable, not as a copied-out script.
 
 ### Quick start
+
 Vevo2 has **no built-in speaker presets**, so `--ref-audio` is **required** on every call — `end2end.py` enforces it (`required=True`), overriding the "optional" note in the shared quick-start above. `--ref-text` (the transcript of the reference clip) is optional but recommended for prosody quality:
 
 ```bash
@@ -800,6 +802,7 @@ python examples/offline_inference/text_to_speech/vevo2/end2end.py \
 ```
 
 ### Voice cloning with separate timbre reference
+
 Pass a different timbre source while keeping the prosodic style of the reference:
 
 ```bash
@@ -812,6 +815,7 @@ python examples/offline_inference/text_to_speech/vevo2/end2end.py \
 ```
 
 ### Notes
+
 - Default deploy config: `vllm_omni/deploy/vevo2.yaml` (auto-loaded; override with `--deploy-config`).
 - Output sample rate: 24 kHz mono.
 - The first call loads the full Vevo2 pipeline (Qwen2.5-0.5B AR LM + 350M flow-matching transformer + Vocos vocoder) plus a Whisper-medium encoder used internally for reference-audio feature extraction. Measured peak on CUDA is ~7.5 GiB allocated / ~8.8 GiB reserved (includes the fp32 cast; see `vllm_omni/deploy/vevo2.yaml`), so leave real headroom on a 24 GB card.

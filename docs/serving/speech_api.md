@@ -894,7 +894,7 @@ parity should be checked against the upstream adapter on your deployment.
 ### Vevo2
 
 | Model | Description |
-|-------|-------------|
+| ------- | ------------- |
 | `RMSnow/Vevo2` | Unified AR + flow-matching TTS / SVS (24 kHz). Voice cloning via `ref_audio` is required; `ref_text` (transcript of the reference clip) is recommended for prosody. Checkpoint license is **CC BY-NC-ND 4.0** (non-commercial, no-derivatives); the Amphion framework itself is MIT. SVS / voice conversion / editing / streaming are deferred to follow-up PRs (see [#3391](https://github.com/vllm-project/vllm-omni/issues/3391)). See [License Considerations](#license-considerations) before deploying. |
 
 ## License Considerations
@@ -908,7 +908,7 @@ The `RMSnow/Vevo2` **checkpoint** is published under **[CC BY-NC-ND 4.0](https:/
 What CC BY-NC-ND 4.0 means in practice:
 
 | Clause | Restriction | Impact on deployment |
-|--------|-------------|----------------------|
+| -------- | ------------- | ---------------------- |
 | **NonCommercial (NC)** | The weights may not be used for commercial purposes. | Research, evaluation, and personal/non-commercial use are fine. **Commercial deployment (any revenue-generating or business use) requires explicit permission from the upstream authors** — contact the [Amphion / Vevo2 maintainers](https://github.com/open-mmlab/Amphion) to negotiate separate licensing. |
 | **NoDerivatives (ND)** | You may not distribute modified versions of the weights. | **The model weights cannot be modified or redistributed.** Fine-tuning the checkpoint and then sharing the result, or re-hosting altered weights, is not permitted. Running inference (which does not create a redistributed derivative) is allowed within the NC limits. |
 | **Attribution (BY)** | Credit must be given. | Retain the upstream attribution and license notice anywhere the model or its outputs are distributed. |
