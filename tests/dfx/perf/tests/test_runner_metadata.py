@@ -235,6 +235,55 @@ def test_is_diffusion_perf_config():
     assert is_diffusion_perf_config(custom_edits_cfg)
 
 
+def test_buildkite_perf_steps_use_matching_runner_schema():
+    """Every Buildkite step must run a perf JSON with the runner matching its schema.
+
+    Regression for #8074: the NPU nightly HunyuanVideo-1.5 step kept invoking
+    ``run_diffusion_benchmark.py`` after the JSON was migrated to the omni-bench
+    schema (#7737). The runner skipped every case as omni-bench, pytest selected
+    0 tests and the step failed with exit 5.
+    """
+    import json
+    import re
+    from pathlib import Path
+
+    from tests.dfx.conftest import is_diffusion_perf_config
+
+    repo_root = Path(__file__).resolve().parents[4]
+    step_re = re.compile(
+        r"tests/dfx/perf/scripts/(?P<runner>run_diffusion_benchmark|run_benchmark)\.py"
+        r".*?--test-config-file(?:=|\s+)(?P<file>\S+\.json)"
+    )
+    pipelines = sorted(repo_root.glob(".buildkite/**/*.yml")) + sorted(repo_root.glob(".buildkite/**/*.yaml"))
+    assert pipelines, "no Buildkite pipelines found"
+
+    invocations = 0
+    for pipeline in pipelines:
+        for match in step_re.finditer(pipeline.read_text(encoding="utf-8")):
+            invocations += 1
+            config_rel = match.group("file")
+            config_path = repo_root / config_rel
+            assert config_path.exists(), f"{pipeline}: perf config not found: {config_rel}"
+            runner_is_diffusion = match.group("runner") == "run_diffusion_benchmark"
+            cases = json.loads(config_path.read_text(encoding="utf-8"))
+            mismatched = [
+                cfg["test_name"] for cfg in cases if is_diffusion_perf_config(cfg) != runner_is_diffusion
+            ]
+            assert not mismatched, (
+                f"{pipeline}: {match.group('runner')} runs {config_rel}, but case(s) {mismatched} "
+                f"are not {'diffusion' if runner_is_diffusion else 'omni-bench'}-schema; the runner "
+                "would skip them and pytest may select 0 tests (exit 5), see issue #8074"
+            )
+
+    assert invocations, "no perf runner invocations found; the scan regex or pipeline layout changed"
+
+    # Pin the issue #8074 scenario itself: the migrated HunyuanVideo-1.5 t2v JSON
+    # is omni-bench schema and must never go back to run_diffusion_benchmark.py.
+    t2v_json = repo_root / "tests" / "dfx" / "perf" / "tests" / "test_hunyuanvideo15_t2v_vllm_omni.json"
+    t2v_cases = json.loads(t2v_json.read_text(encoding="utf-8"))
+    assert t2v_cases and all(not is_diffusion_perf_config(cfg) for cfg in t2v_cases)
+
+
 def test_merge_omni_default_server_args_respects_json():
     from tests.dfx.perf.scripts.run_benchmark import _merge_omni_default_server_args
 
