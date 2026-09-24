@@ -34,6 +34,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
+from vllm_omni.diffusion.models.qwen_image_21.ops.prefix_kv import concat_prefix_kv
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -535,6 +536,7 @@ class QwenImage21Attention(nn.Module):
         key = self._apply_rotary_emb(key, freqs)
 
         cached_key = cached_value = None
+        key_scale = value_scale = None
         if kv_cache is not None:
             branch_cache = kv_cache.setdefault(cache_branch, {})
             if cache_write_len is not None:
@@ -559,12 +561,18 @@ class QwenImage21Attention(nn.Module):
             else:
                 cached_key = branch_cache["key"]
                 cached_value = branch_cache["value"]
-                if self.prefix_kv_cache_dtype is not None:
-                    # Dequantize only entries that were actually quantized (scale present).
-                    if "key_scale" in branch_cache:
-                        cached_key = _dequantize_prefix_kv_fp8(cached_key, branch_cache["key_scale"], key.dtype)
-                    if "value_scale" in branch_cache:
-                        cached_value = _dequantize_prefix_kv_fp8(cached_value, branch_cache["value_scale"], value.dtype)
+                # A scale entry is what marks that half as FP8; its absence means the cached
+                # half is already in the native dtype.
+                key_scale = branch_cache["key_scale"] if "key_scale" in branch_cache else None
+                value_scale = branch_cache["value_scale"] if "value_scale" in branch_cache else None
+                if sp_decode and (key_scale is not None or value_scale is not None):
+                    # The Ulysses joint path hands the cached prefix straight to the
+                    # all-to-all entry instead of to `torch.cat`, so it keeps the eager
+                    # dequantization.
+                    if key_scale is not None:
+                        cached_key = _dequantize_prefix_kv_fp8(cached_key, key_scale, key.dtype)
+                    if value_scale is not None:
+                        cached_value = _dequantize_prefix_kv_fp8(cached_value, value_scale, value.dtype)
 
         metadata = copy.copy(attn_metadata) if attn_metadata is not None else None
         if sp_prefix_len > 0:
@@ -592,8 +600,10 @@ class QwenImage21Attention(nn.Module):
                 attn_output = self.attn(query, key, value, metadata)
             else:
                 # Decode: the block-causal mask degenerates to full attention for target rows.
-                key = torch.cat([cached_key, key], dim=1)
-                value = torch.cat([cached_value, value], dim=1)
+                # Both tensors are packed in one launch each: an FP8 prefix is dequantized
+                # straight into its destination region and the fresh target is copied in.
+                key = concat_prefix_kv(cached_key, key_scale, key)
+                value = concat_prefix_kv(cached_value, value_scale, value)
                 attn_output = self.attn(query, key, value, metadata)
         else:
             attn_output = self.attn(query, key, value, metadata)
