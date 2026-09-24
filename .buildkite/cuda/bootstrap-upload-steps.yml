@@ -1,0 +1,66 @@
+# Uploaded by upload_pipeline.py --upload (not the Buildkite hook).
+# ``if`` is injected by step ``key`` from skip-ci at upload time.
+steps:
+  - label: ":docker: Build image"
+    key: image-build
+    commands:
+      - "bash .buildkite/cuda/scripts/build-ci-image.sh"
+    agents:
+      queue: "cpu_queue_premerge"
+
+  # L2 Test — PR ready label (diff-aware) or main+WEEKLY=1 (--e2e, full E2E group)
+  - label: "Upload Ready Pipeline"
+    depends_on: image-build
+    key: upload-ready-pipeline
+    commands:
+      - |
+        EXTRA=""
+        if [ "${WEEKLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
+          EXTRA="--e2e"
+        fi
+        python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-ready.yml
+    agents:
+      queue: "cpu_queue_premerge"
+
+  # L3 Test — PR merge-test label or post-merge on main (both diff-aware);
+  # main+WEEKLY=1 uploads the E2E group only (--e2e).
+  - label: "Upload Merge Pipeline"
+    depends_on: image-build
+    key: upload-merge-pipeline
+    commands:
+      - |
+        EXTRA=""
+        if [ "${WEEKLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
+          EXTRA="--e2e"
+        fi
+        python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-merge.yml
+    agents:
+      queue: "cpu_queue_premerge"
+
+  # L4 Test — main+NIGHTLY=1 (full pipeline), or PR nightly-test label (diff-aware)
+  - label: "Upload Nightly Pipeline"
+    depends_on: image-build
+    key: upload-nightly-pipeline
+    commands:
+      - |
+        EXTRA=""
+        if [ "${NIGHTLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
+          EXTRA="--all"
+        fi
+        python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-nightly.yml
+    agents:
+      queue: "cpu_queue_premerge"
+
+  # L5 Test — main+WEEKLY=1 / NON_CRITICAL=1 (full pipeline), or PR weekly-test label (diff-aware)
+  - label: "Upload Weekly Pipeline"
+    depends_on: image-build
+    key: upload-weekly-pipeline
+    commands:
+      - |
+        EXTRA=""
+        if [ "${BUILDKITE_BRANCH}" = "main" ]; then
+          EXTRA="--all"
+        fi
+        python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-weekly.yml
+    agents:
+      queue: "cpu_queue_premerge"

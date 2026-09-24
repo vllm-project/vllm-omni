@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for cross-request ``codes.ref`` leakage (#4370).
 
 ``make_omni_output`` used to collapse every request's reference codec
@@ -11,16 +11,31 @@ vocoder chunks then decoded with another request's reference voice as
 context (audible onset timbre deformation at any concurrency > 1).
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
     Qwen3TTSTalkerForConditionalGeneration,
+    _qwen3_tts_gpu_resident_buffer_keys,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _NUM_CODE_GROUPS = 16
+
+
+def test_large_tts_prefill_artifacts_stay_gpu_resident_only_on_mrv2() -> None:
+    v1_keys = _qwen3_tts_gpu_resident_buffer_keys(False)
+    v2_keys = _qwen3_tts_gpu_resident_buffer_keys(True)
+
+    assert ("embed", "prefill") not in v1_keys
+    assert ("codes", "ref") not in v1_keys
+    assert ("meta", "codec_frame_valid") not in v1_keys
+    assert ("embed", "prefill") in v2_keys
+    assert ("codes", "ref") in v2_keys
+    assert ("meta", "codec_frame_valid") in v2_keys
 
 
 def _make_talker() -> Qwen3TTSTalkerForConditionalGeneration:
@@ -74,3 +89,57 @@ def test_make_omni_output_omits_ref_key_when_no_request_has_one() -> None:
     )
 
     assert "ref" not in out.multimodal_outputs["codes"]
+
+
+def test_make_omni_output_keeps_hidden_states_for_replay_spans_without_audio_codes() -> None:
+    hidden = torch.arange(6 * 8, dtype=torch.float32).reshape(6, 8)
+
+    out = _make_talker().make_omni_output(
+        hidden,
+        model_intermediate_buffer=[
+            {"meta": {"codec_streaming": True}},
+            _info(1, None),
+        ],
+    )
+
+    assert torch.equal(out.text_hidden_states, hidden)
+    assert out.multimodal_outputs["codes"]["audio"].shape == (1, _NUM_CODE_GROUPS)
+
+
+def test_make_omni_output_preserves_per_request_codec_frame_validity() -> None:
+    talker = _make_talker()
+    talker.vllm_config = SimpleNamespace(model_config=SimpleNamespace(async_chunk=True))
+    valid = _info(1, None)
+    invalid = _info(1, None)
+    valid["meta"]["codec_frame_valid"] = True
+    invalid["meta"]["codec_frame_valid"] = False
+
+    out = talker.make_omni_output(
+        torch.zeros((2, 8)),
+        model_intermediate_buffer=[valid, invalid],
+    )
+
+    assert out.multimodal_outputs["meta"]["codec_frame_valid"].tolist() == [1, 0]
+
+
+def test_make_omni_output_publishes_ref_once_for_kv_resumed_first_decode() -> None:
+    talker = _make_talker()
+    talker.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(async_chunk=True),
+    )
+    ref_code = torch.ones((5, _NUM_CODE_GROUPS), dtype=torch.long)
+    info = _info(1, ref_code)
+    info["_omni_num_computed_tokens"] = 9
+    info["_omni_prompt_len"] = 5
+
+    first = talker.make_omni_output(
+        torch.zeros((1, 8)),
+        model_intermediate_buffer=[info],
+    )
+    second = talker.make_omni_output(
+        torch.zeros((1, 8)),
+        model_intermediate_buffer=[info],
+    )
+
+    assert first.multimodal_outputs["codes"]["ref"][0] is ref_code
+    assert "ref" not in second.multimodal_outputs["codes"]

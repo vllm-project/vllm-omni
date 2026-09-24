@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from importlib import import_module
 from importlib.util import find_spec
 
 import torch
@@ -46,6 +50,8 @@ def apply_rotary_emb_mindiesd(
 ) -> torch.Tensor:
     from mindiesd import rotary_position_embedding
 
+    x, squeezed = _ensure_batch_dim(x)
+
     if cos.dim() == 3:
         # (B, S, D/2) -> (S, D/2)
         cos = cos[0]
@@ -57,13 +63,14 @@ def apply_rotary_emb_mindiesd(
             seqlen = cos.shape[0]
             sin = sin.unsqueeze(0).unsqueeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, 2).reshape(1, seqlen, 1, -1)
             cos = cos.unsqueeze(0).unsqueeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, 2).reshape(1, seqlen, 1, -1)
-        return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", head_first=False, fused=True)
+        out = rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", head_first=False, fused=True)
     else:
         if half_head_dim:
             seqlen = cos.shape[0]
             sin = sin.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
             cos = cos.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
-        return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_half", head_first=False, fused=True)
+        out = rotary_position_embedding(x, cos, sin, rotated_mode="rotated_half", head_first=False, fused=True)
+    return _restore_batch_dim(out, squeezed)
 
 
 def _ensure_batch_dim(x: torch.Tensor) -> tuple[torch.Tensor, bool]:
@@ -89,11 +96,13 @@ class RotaryEmbedding(CustomOp):
            of 1st half and 2nd half (GPT-NeoX style).
     """
 
-    def __init__(self, is_neox_style: bool = False) -> None:
+    def __init__(self, is_neox_style: bool = False, half_head_dim: bool = True) -> None:
         super().__init__()
         self.is_neox_style = is_neox_style
         self.interleaved = not is_neox_style
+        self.half_head_dim = half_head_dim
         self.apply_rotary_emb_flash_attn = None
+        self.apply_rotary_emb_vllm_flash_attn = None
         self.has_mindie = False
         # ``find_spec("flash_attn")`` is True as long as *any* package publishes
         # the ``flash_attn`` namespace — including ``flash-attn-4``, which ships
@@ -107,8 +116,34 @@ class RotaryEmbedding(CustomOp):
                 self.apply_rotary_emb_flash_attn = apply_rotary
             except ImportError:
                 pass
+        # CUDA wheels vendor this kernel under vllm_flash_attn, while source
+        # and CPU-only installations may not contain the generated package.
+        # Resolve it lazily and retain the native implementation as a portable
+        # fallback for those environments.
+        if current_omni_platform.is_cuda():
+            try:
+                self.apply_rotary_emb_vllm_flash_attn = import_module(
+                    "vllm.vllm_flash_attn.layers.rotary"
+                ).apply_rotary_emb
+            except ImportError:
+                pass
         if find_spec("mindiesd") is not None:
             self.has_mindie = True
+
+    def _prepare_half_head_dim_cos_sin(
+        self,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize shared cos/sin to the half-dim layout used by CUDA/native kernels."""
+        if cos.dim() == 3:
+            # All batch elements share the same rotary position encoding.
+            cos = cos[0]
+            sin = sin[0]
+        if not self.half_head_dim:
+            cos = cos[..., ::2] if self.interleaved else cos[..., : cos.shape[-1] // 2]
+            sin = sin[..., ::2] if self.interleaved else sin[..., : sin.shape[-1] // 2]
+        return cos, sin
 
     def forward_cuda(
         self,
@@ -116,15 +151,18 @@ class RotaryEmbedding(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+        cos, sin = self._prepare_half_head_dim_cos_sin(cos, sin)
 
-        if cos.dim() == 3:
-            # (B, S, D/2) -> (S, D/2)
-            cos = cos[0]
-            sin = sin[0]
+        if self.apply_rotary_emb_vllm_flash_attn is None:
+            return apply_rotary_emb_torch(
+                x,
+                cos,
+                sin,
+                interleaved=self.interleaved,
+            )
 
         x, squeezed = _ensure_batch_dim(x)
-        output = apply_rotary_emb(
+        output = self.apply_rotary_emb_vllm_flash_attn(
             x,
             cos,
             sin,
@@ -141,10 +179,7 @@ class RotaryEmbedding(CustomOp):
         if self.apply_rotary_emb_flash_attn is None:
             return self.forward_cuda(x, cos, sin)
 
-        if cos.dim() == 3:
-            # (B, S, D/2) -> (S, D/2)
-            cos = cos[0]
-            sin = sin[0]
+        cos, sin = self._prepare_half_head_dim_cos_sin(cos, sin)
 
         x, squeezed = _ensure_batch_dim(x)
         output = self.apply_rotary_emb_flash_attn(
@@ -162,17 +197,9 @@ class RotaryEmbedding(CustomOp):
         sin: torch.Tensor,
     ) -> torch.Tensor:
         if self.has_mindie:
-            return apply_rotary_emb_mindiesd(x, cos, sin, self.interleaved)
+            return apply_rotary_emb_mindiesd(x, cos, sin, self.interleaved, self.half_head_dim)
         else:
             return self.forward_native(x, cos, sin)
-
-    def forward_xpu(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.forward_native(x, cos, sin)
 
     def forward_musa(
         self,
@@ -180,7 +207,16 @@ class RotaryEmbedding(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        return self.forward_native(x, cos, sin)
+        # Keep the full-dimension NeoX form inline for MUSA compilation.
+        # Other layouts use the shared native implementation.
+        if self.half_head_dim or self.interleaved:
+            return self.forward_native(x, cos, sin)
+        if cos.dim() == 3:
+            cos, sin = cos[0], sin[0]
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)
+        x1, x2 = x.chunk(2, dim=-1)
+        return x * cos + torch.cat((-x2, x1), dim=-1) * sin
 
     def forward_native(
         self,
@@ -188,6 +224,10 @@ class RotaryEmbedding(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
+        # All batch elements share the same rotary position encoding.
+        # Strip the batch dim so the underlying op broadcasts over the batch,
+        # consistent with forward_cuda / forward_hip / apply_rotary_emb_mindiesd.
+        cos, sin = self._prepare_half_head_dim_cos_sin(cos, sin)
         return apply_rotary_emb_torch(
             x,
             cos,
@@ -213,13 +253,14 @@ class RotaryEmbeddingWan(RotaryEmbedding):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+        if self.apply_rotary_emb_vllm_flash_attn is None:
+            return self.forward_native(x, cos, sin)
 
         if cos.dim() > 2:
             cos = cos.reshape(-1, cos.shape[-1])
             sin = sin.reshape(-1, sin.shape[-1])
 
-        return apply_rotary_emb(
+        return self.apply_rotary_emb_vllm_flash_attn(
             x,
             cos,
             sin,
@@ -303,140 +344,6 @@ def apply_rope_to_qk(
     return query, key
 
 
-class WanS2VRotaryPosEmbed(torch.nn.Module):
-    """Precompute complex-valued RoPE embeddings for S2V multi-grid positions.
-
-    Owns the base frequency buffer and provides forward() to compute position
-    embeddings given hidden_states (for shape) and grid_sizes.
-    """
-
-    def __init__(self, num_heads: int, head_dim: int, max_seq_len: int = 1024):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        d = head_dim
-        freqs = torch.cat(
-            [
-                self._rope_params(max_seq_len, d - 4 * (d // 6)),
-                self._rope_params(max_seq_len, 2 * (d // 6)),
-                self._rope_params(max_seq_len, 2 * (d // 6)),
-            ],
-            dim=1,
-        )
-        self.register_buffer("freqs", freqs.to(torch.complex64), persistent=False)
-
-    @staticmethod
-    @torch.amp.autocast(current_omni_platform.device_type, enabled=False)
-    def _rope_params(max_seq_len, dim, theta=10000):
-        if dim % 2 != 0:
-            raise ValueError(f"dim ({dim}) must be even")
-        freqs = torch.outer(
-            torch.arange(max_seq_len), 1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float64).div(dim))
-        )
-        return torch.polar(torch.ones_like(freqs), freqs)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        grid_sizes: list,
-        trainable_freqs: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Precompute RoPE embeddings for the given grid layout.
-
-        Args:
-            hidden_states: Tensor [B, S, ...] (used for batch/seq shape and device)
-            grid_sizes: Grid specification (list of [offsets, sizes, totals])
-            trainable_freqs: Optional trainable frequency overrides for t_f < 0
-
-        Returns:
-            Complex tensor [B, S, 1, head_dim//2] of precomputed position embeddings
-        """
-        b, s = hidden_states.shape[0], hidden_states.shape[1]
-        c = self.head_dim // 2
-        device = hidden_states.device
-
-        freqs = self.freqs.to(device)
-        if trainable_freqs is not None:
-            freqs_input = [freqs, trainable_freqs]
-        else:
-            freqs_input = freqs
-
-        if isinstance(freqs_input, list):
-            trainable_f = freqs_input[1]
-            freqs_split = freqs_input[0]
-        else:
-            trainable_f = None
-            freqs_split = freqs_input
-        freqs_split = freqs_split.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
-
-        output = torch.empty((b, s, 1, c), device=device, dtype=torch.complex64)
-        seq_bucket = [0]
-        if not isinstance(grid_sizes, list):
-            grid_sizes = [grid_sizes]
-        for g in grid_sizes:
-            if not isinstance(g, list):
-                g = [torch.zeros_like(g), g]
-            batch_size = g[0].shape[0]
-            for i in range(batch_size):
-                f_o, h_o, w_o = g[0][i]
-                f, h, w = g[1][i]
-                t_f, t_h, t_w = g[2][i]
-                seq_f, seq_h, seq_w = f - f_o, h - h_o, w - w_o
-                seq_len = int(seq_f * seq_h * seq_w)
-                if seq_len > 0:
-                    if t_f > 0:
-                        assert f_o * f >= 0 and h_o * h >= 0 and w_o * w >= 0
-                        seq_f_int = int(seq_f)
-                        seq_h_int = int(seq_h)
-                        seq_w_int = int(seq_w)
-
-                        if f_o >= 0:
-                            f_sam = torch.linspace(int(f_o), int(t_f + f_o) - 1, seq_f_int, device=device).long()
-                        else:
-                            f_sam = torch.linspace(int(-f_o), int(-t_f - f_o) + 1, seq_f_int, device=device).long()
-                        h_sam = torch.linspace(int(h_o), int(t_h + h_o) - 1, seq_h_int, device=device).long()
-                        w_sam = torch.linspace(int(w_o), int(t_w + w_o) - 1, seq_w_int, device=device).long()
-
-                        freqs_0 = freqs_split[0][f_sam] if f_o >= 0 else freqs_split[0][f_sam].conj()
-                        freqs_0 = freqs_0.view(seq_f_int, 1, 1, -1)
-
-                        freqs_i = torch.cat(
-                            [
-                                freqs_0.expand(seq_f_int, seq_h_int, seq_w_int, -1),
-                                freqs_split[1][h_sam]
-                                .view(1, seq_h_int, 1, -1)
-                                .expand(seq_f_int, seq_h_int, seq_w_int, -1),
-                                freqs_split[2][w_sam]
-                                .view(1, 1, seq_w_int, -1)
-                                .expand(seq_f_int, seq_h_int, seq_w_int, -1),
-                            ],
-                            dim=-1,
-                        ).reshape(seq_len, 1, -1)
-                    elif t_f < 0:
-                        freqs_i = trainable_f.unsqueeze(1)
-                    output[i, seq_bucket[-1] : seq_bucket[-1] + seq_len] = freqs_i
-            seq_bucket.append(seq_bucket[-1] + seq_len)
-        return output
-
-
-class RotaryEmbeddingWanS2V(RotaryEmbeddingWan):
-    """Apply RoPE using precomputed complex freqs for Wan S2V main transformer.
-
-    Converts complex freqs (from WanS2VRotaryPosEmbed) to cos/sin and delegates
-    to RotaryEmbeddingWan for platform-optimized application (float32 kernel).
-    Under TP, freqs has 1 head — broadcasts automatically via cos/sin.
-    """
-
-    def __init__(self) -> None:
-        super().__init__(is_neox_style=False, half_head_dim=True)
-
-    def forward(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-        freqs_sliced = freqs[:, : x.size(1)]
-        cos = freqs_sliced.real.to(x.dtype)
-        sin = freqs_sliced.imag.to(x.dtype)
-        return super().forward(x, cos, sin)
-
-
 class RotaryEmbeddingS2VGrid(torch.nn.Module):
     """Grid-based RoPE for S2V motioner/init attention.
 
@@ -497,14 +404,18 @@ class RotaryEmbeddingS2VGrid(torch.nn.Module):
                         h_sam = torch.linspace(int(h_o), int(t_h + h_o) - 1, seq_h_int, device=device).long()
                         w_sam = torch.linspace(int(w_o), int(t_w + w_o) - 1, seq_w_int, device=device).long()
 
-                        freqs_0 = freqs[0][f_sam] if f_o >= 0 else freqs[0][f_sam].conj()
+                        freqs_0 = torch.index_select(freqs[0] if f_o >= 0 else freqs[0].conj(), 0, f_sam)
                         freqs_0 = freqs_0.view(seq_f_int, 1, 1, -1)
 
                         freqs_i = torch.cat(
                             [
                                 freqs_0.expand(seq_f_int, seq_h_int, seq_w_int, -1),
-                                freqs[1][h_sam].view(1, seq_h_int, 1, -1).expand(seq_f_int, seq_h_int, seq_w_int, -1),
-                                freqs[2][w_sam].view(1, 1, seq_w_int, -1).expand(seq_f_int, seq_h_int, seq_w_int, -1),
+                                torch.index_select(freqs[1], 0, h_sam)
+                                .view(1, seq_h_int, 1, -1)
+                                .expand(seq_f_int, seq_h_int, seq_w_int, -1),
+                                torch.index_select(freqs[2], 0, w_sam)
+                                .view(1, 1, seq_w_int, -1)
+                                .expand(seq_f_int, seq_h_int, seq_w_int, -1),
                             ],
                             dim=-1,
                         ).reshape(seg_len, 1, -1)

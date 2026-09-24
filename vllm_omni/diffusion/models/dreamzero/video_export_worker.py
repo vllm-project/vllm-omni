@@ -9,6 +9,35 @@ import torch
 class DreamZeroVideoExportWorkerExtension:
     """DreamZero worker RPCs used by offline example video export."""
 
+    def gpu_mem_stats(self) -> dict:
+        """Peak GPU memory (GiB) for this worker's device, for profiling.
+
+        ``max_memory_reserved`` is the caching-allocator high-water mark (the best
+        in-process proxy for "peak VRAM"); ``max_memory_allocated`` is the live
+        tensor high-water mark. Both are monotonic from process start, so the
+        end-of-run values capture the whole rollout's peak.
+        """
+        dev = torch.accelerator.current_device_index()
+        return {
+            "device": int(dev),
+            "peak_reserved_gib": torch.accelerator.max_memory_reserved(dev) / (1024**3),
+            "peak_allocated_gib": torch.accelerator.max_memory_allocated(dev) / (1024**3),
+        }
+
+    def ar_diffusion_perf_stats(self, reset: bool = True) -> dict:
+        """Per-request server-side forward E2E times (s) recorded by the AR-Diffusion runner.
+
+        The worker-side compute time per ``execute_model`` — the analog of the
+        upstream server's per-request E2E — which excludes the engine<->worker IPC
+        that the client's ``omni.generate`` wall time includes. Returns ``[]`` when
+        the runner is the base (KV-disabled) runner that does not record timings.
+        """
+        runner = self.model_runner
+        times = list(getattr(runner, "_perf_e2e_times", []) or [])
+        if reset and hasattr(runner, "_perf_e2e_times"):
+            runner._perf_e2e_times = []
+        return {"server_e2e_s": times}
+
     @staticmethod
     def _latents_to_uint8_frames(decoded: torch.Tensor) -> torch.Tensor:
         decoded = decoded.squeeze(0).permute(1, 2, 3, 0).contiguous()

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Base WebSocket handler for streaming video input understanding.
 
 Shared session loop, frame/audio buffering, EVS pre-filter, prewarm,
@@ -10,17 +10,19 @@ via :class:`VideoStreamPipelineHooks`.
 Protocol:
     Client -> Server:
         {"type": "session.config", ...}         # Session config (sent once)
-        {"type": "video.frame", "data": "..."}  # base64 JPEG/PNG frame
+        {"type": "video.frame", "data": "...", "frame_id": "...", "pts_ms": 0}
         {"type": "audio.chunk", "data": "..."}  # base64 PCM16 16kHz mono
         {"type": "video.query", "text": "..."}  # Submit query about buffered frames
         {"type": "video.done"}                  # End of session
 
     Server -> Client:
+        {"type": "video.frame.ack", ...}          # when frame_id is provided
+        {"type": "video.frames.consumed", ...}    # after first engine output
         {"type": "response.start"}
         {"type": "response.text.delta", "delta": "..."}
         {"type": "response.text.done", "text": "..."}
-        {"type": "response.audio.delta", "data": "...", "format": "wav"}
-        {"type": "response.audio.done"}
+        {"type": "response.output_audio.delta", "data": "...", "format": "wav"}
+        {"type": "response.output_audio.done"}
         {"type": "session.done"}
         {"type": "error", "message": "..."}
 """
@@ -35,7 +37,8 @@ import uuid
 import wave
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from enum import Enum
+from typing import Any, Final, Protocol, TypeAlias, runtime_checkable
 
 import torch
 from fastapi import WebSocket, WebSocketDisconnect
@@ -48,6 +51,7 @@ from vllm_omni.entrypoints.openai.video_frame_filter import FrameSimilarityFilte
 from vllm_omni.entrypoints.openai.video_stream_context import (
     text_only_message,
 )
+from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -59,7 +63,14 @@ _MAX_BUFFER_FRAMES = 64
 _MAX_AUDIO_BUFFER_BYTES = 4 * 1024 * 1024
 _MAX_MSG_QUEUE = 200
 _CODEC_FRAME_SAMPLES = 1920  # CausalConv leading-edge artifact length
-_BAD_FRAME = object()
+
+
+class _FrameStatus(Enum):
+    BAD = "bad"
+
+
+_BAD_FRAME: Final = _FrameStatus.BAD
+PrewarmedFrame: TypeAlias = tuple[Any, str] | _FrameStatus
 
 
 def _decode_frame_bytes(raw_bytes: bytes) -> Any:
@@ -81,9 +92,11 @@ class VideoStreamPipelineHooks(Protocol):
         audio_buffer: bytearray,
         message_history: list[dict[str, Any]],
         query_text: str,
-        prewarmed_frames: dict[str, tuple[Any, str]],
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
+        *,
+        frame_indices: list[int] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """Build OpenAI-style messages and the current user message."""
+        """Build messages using the supplied frame selection, or sample if omitted."""
         ...
 
     def on_turn_complete(
@@ -167,7 +180,9 @@ class OmniStreamingVideoHandler:
         audio_buffer: bytearray,
         message_history: list[dict[str, Any]],
         query_text: str,
-        prewarmed_frames: dict[str, tuple[Any, str]],
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
+        *,
+        frame_indices: list[int] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         raise NotImplementedError
 
@@ -215,8 +230,9 @@ class OmniStreamingVideoHandler:
                 return
 
             frame_buffer: list[str] = []  # base64-encoded JPEG frames
+            frame_metadata: list[dict[str, Any]] = []
             # Per-frame PIL cache + uuid for mm_hash reuse. Aligned with frame_buffer by index.
-            frame_pil_cache: dict[str, tuple[Any, str] | object] = {}  # b64 -> (PIL.Image, uuid) or _BAD_FRAME
+            frame_pil_cache: dict[str, PrewarmedFrame] = {}  # b64 -> (PIL.Image, uuid) or _BAD_FRAME
             frame_filter = (
                 FrameSimilarityFilter(threshold=config.frame_filter_threshold) if config.enable_frame_filter else None
             )
@@ -259,6 +275,8 @@ class OmniStreamingVideoHandler:
                         if msg_type.startswith("_internal."):
                             await self._send_error(websocket, f"Unknown type: {msg_type}")
                             continue
+                        if msg_type == "video.frame":
+                            msg["_receiver_received_ts_ms"] = _time.monotonic() * 1000
 
                         await msg_queue.put(msg)
                         if msg.get("type") == "video.done":
@@ -301,13 +319,13 @@ class OmniStreamingVideoHandler:
                         await self._engine_client.abort(prev_request_id)
                     except Exception:
                         pass
-                    await asyncio.sleep(0.1)
                 prev_was_interrupted = False
 
                 request_id = f"video-{uuid.uuid4().hex[:12]}"
                 active_request_id = request_id
                 interrupt_event.clear()
                 query_frames = list(frame_buffer)
+                query_frame_metadata = list(frame_metadata)
                 query_audio_buffer = bytearray(audio_buffer)
                 audio_buffer.clear()
                 query_prewarmed_frames = dict(frame_pil_cache)
@@ -315,6 +333,9 @@ class OmniStreamingVideoHandler:
                 async def _run_query() -> None:
                     nonlocal active_request_id, prev_request_id
                     try:
+                        process_kwargs: dict[str, Any] = {}
+                        if any(metadata.get("frame_id") for metadata in query_frame_metadata):
+                            process_kwargs["frame_metadata"] = query_frame_metadata
                         await self._process_query(
                             websocket,
                             config,
@@ -325,6 +346,7 @@ class OmniStreamingVideoHandler:
                             request_id,
                             interrupt_event,
                             query_prewarmed_frames,
+                            **process_kwargs,
                         )
                     finally:
                         if active_request_id == request_id:
@@ -349,7 +371,11 @@ class OmniStreamingVideoHandler:
                         frame_data = msg.get("b64", "")
                         removed = frame_data in frame_buffer
                         if removed:
-                            frame_buffer[:] = [f for f in frame_buffer if f != frame_data]
+                            retained_indices = [
+                                index for index, frame in enumerate(frame_buffer) if frame != frame_data
+                            ]
+                            frame_buffer[:] = [frame_buffer[index] for index in retained_indices]
+                            frame_metadata[:] = [frame_metadata[index] for index in retained_indices]
                         if frame_pil_cache.get(frame_data) is _BAD_FRAME:
                             frame_pil_cache.pop(frame_data, None)
                         if removed:
@@ -370,16 +396,43 @@ class OmniStreamingVideoHandler:
                         if frame_filter is not None:
                             try:
                                 if not frame_filter.should_retain(raw_bytes):
+                                    await self._send_frame_ack(
+                                        websocket,
+                                        msg,
+                                        accepted=False,
+                                        buffered_frames=len(frame_buffer),
+                                        reason="filtered",
+                                    )
                                     continue
                             except Exception:
                                 await self._send_error(websocket, "Invalid image data")
                                 continue
                         max_buf = config.max_frames
+                        dropped_frame_id: str | None = None
                         if len(frame_buffer) >= max_buf:
                             dropped = frame_buffer.pop(0)
+                            dropped_metadata = frame_metadata.pop(0)
+                            dropped_frame_id = dropped_metadata.get("frame_id")
                             frame_pil_cache.pop(dropped, None)
                         frame_buffer.append(frame_data)
+                        frame_metadata.append(
+                            {
+                                "frame_id": msg.get("frame_id"),
+                                "pts_ms": msg.get("pts_ms"),
+                                "source_pts_ms": msg.get("source_pts_ms"),
+                                "quality_profile": msg.get("quality_profile"),
+                                "capture_ts_ms": msg.get("capture_ts_ms"),
+                                "receiver_received_ts_ms": msg.get("_receiver_received_ts_ms"),
+                            }
+                        )
                         self.on_frame_buffered(raw_bytes, frame_data, message_history, config)
+                        await self._send_frame_ack(
+                            websocket,
+                            msg,
+                            accepted=True,
+                            buffered_frames=len(frame_buffer),
+                            dropped_frame_id=dropped_frame_id,
+                        )
                         # Prewarm: decode PIL off the event loop so query-time chat_template
                         # can skip base64+Image.open. uuid=md5 lets mm_cache dedupe identical frames.
                         if frame_data not in frame_pil_cache:
@@ -388,8 +441,12 @@ class OmniStreamingVideoHandler:
                             async def _prewarm(b64: str, b: bytes, u: str) -> None:
                                 try:
                                     pil = await asyncio.to_thread(_decode_frame_bytes, b)
-                                    frame_pil_cache[b64] = (pil, u)
+                                    # The frame may have been evicted while decoding.
+                                    if b64 in frame_buffer:
+                                        frame_pil_cache[b64] = (pil, u)
                                 except Exception:
+                                    if b64 not in frame_buffer:
+                                        return
                                     frame_pil_cache[b64] = _BAD_FRAME
                                     logger.warning("prewarm decode failed for frame (len=%d)", len(b))
                                     try:
@@ -536,7 +593,8 @@ class OmniStreamingVideoHandler:
         query_text: str,
         request_id: str,
         interrupt_event: asyncio.Event,
-        prewarmed_frames: dict[str, tuple[Any, str]],
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
+        frame_metadata: list[dict[str, Any]] | None = None,
     ) -> None:
         """Build prompt, run inference, stream text + audio response."""
 
@@ -544,6 +602,9 @@ class OmniStreamingVideoHandler:
             await self._send_error(websocket, "Streaming video requires an engine client")
             return
 
+        engine_kwargs: dict[str, Any] = {}
+        if frame_metadata:
+            engine_kwargs["frame_metadata"] = frame_metadata
         await self._process_query_engine(
             websocket,
             config,
@@ -554,6 +615,7 @@ class OmniStreamingVideoHandler:
             request_id,
             interrupt_event,
             prewarmed_frames,
+            **engine_kwargs,
         )
 
     # ------------------------------------------------------------------
@@ -570,13 +632,20 @@ class OmniStreamingVideoHandler:
         query_text: str,
         request_id: str,
         interrupt_event: asyncio.Event,
-        prewarmed_frames: dict[str, tuple[Any, str]],
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
+        frame_metadata: list[dict[str, Any]] | None = None,
     ) -> None:
         """Direct engine_client.generate() path for async_chunk audio."""
+        engine_client = self._engine_client
+        assert engine_client is not None, "_process_query must validate the engine client"
+
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
         )
 
+        # Select once from this turn's snapshot so prompt images and the
+        # consumed event refer to exactly the same frames, including decode failures.
+        frame_indices = self._sample_frame_indices(frame_buffer, config.num_frames, prewarmed_frames)
         messages, user_message = self.build_engine_prompt(
             config,
             frame_buffer,
@@ -584,6 +653,7 @@ class OmniStreamingVideoHandler:
             message_history,
             query_text,
             prewarmed_frames,
+            frame_indices=frame_indices,
         )
 
         request_kwargs: dict[str, Any] = {
@@ -599,11 +669,13 @@ class OmniStreamingVideoHandler:
             request_kwargs["mm_processor_kwargs"] = {
                 "use_audio_in_video": True,
             }
-        if config.sampling_params_list:
-            request_kwargs["sampling_params_list"] = config.sampling_params_list
-
+        sampling_kwargs: dict[str, Any] = {}
         try:
             chat_request = ChatCompletionRequest(**request_kwargs)
+            if config.sampling_params_list:
+                params = self._chat_service._to_sampling_params_list(config.sampling_params_list)
+                # Explicit params must retain the engine's streaming output mode.
+                sampling_kwargs["sampling_params_list"] = coerce_param_message_types(params, is_streaming=True)
         except Exception as e:
             await self._send_error(websocket, f"Failed to build request: {e}")
             return
@@ -613,16 +685,20 @@ class OmniStreamingVideoHandler:
         except Exception as e:
             await self._send_error(websocket, f"Preprocess failed: {e}")
             return
+        decoded_ready_ts_ms = _time.monotonic() * 1000
+        selected_metadata = [frame_metadata[index] for index in frame_indices] if frame_metadata else []
+        model_selected_ts_ms = _time.monotonic() * 1000
 
         await websocket.send_json({"type": "response.start"})
         text_parts: list[str] = []
         text_done_sent = False
         audio_chunk_count = 0
-        # Number of per-step tensors in OmniRequestOutput.audio_data already
-        # drained. Used by the fast path to skip already-emitted history.
+        # Count emitted tensors only to identify the first audio emission.
+        # Default and explicit sampling parameters use DELTA audio outputs.
         audio_chunks_drained = 0
         previous_text = ""
         interrupted = False
+        frames_consumed_sent = False
         t_start = _time.monotonic()
         t_first_text = None
         t_first_audio = None
@@ -635,10 +711,11 @@ class OmniStreamingVideoHandler:
         audio_tail_tensors: list[Any] = []
 
         try:
-            result_gen = self._engine_client.generate(
+            result_gen = engine_client.generate(
                 prompt=engine_prompt,
                 request_id=request_id,
                 output_modalities=config.modalities,
+                **sampling_kwargs,
             )
 
             async for output in result_gen:
@@ -651,6 +728,33 @@ class OmniStreamingVideoHandler:
 
                 if not isinstance(output, OmniRequestOutput):
                     continue
+
+                if not frames_consumed_sent and frame_metadata:
+                    await websocket.send_json(
+                        {
+                            "type": "video.frames.consumed",
+                            "request_id": request_id,
+                            "model_selected_ts_ms": model_selected_ts_ms,
+                            "frame_ids": [
+                                metadata["frame_id"]
+                                for metadata in selected_metadata
+                                if isinstance(metadata.get("frame_id"), str)
+                            ],
+                            "frames": [
+                                {
+                                    "frame_id": metadata.get("frame_id"),
+                                    "pts_ms": metadata.get("pts_ms"),
+                                    "source_pts_ms": metadata.get("source_pts_ms"),
+                                    "quality_profile": metadata.get("quality_profile"),
+                                    "receiver_received_ts_ms": metadata.get("receiver_received_ts_ms"),
+                                    "decoded_ready_ts_ms": decoded_ready_ts_ms,
+                                }
+                                for metadata in selected_metadata
+                            ],
+                            "latest_pts_ms": selected_metadata[-1].get("pts_ms") if selected_metadata else None,
+                        }
+                    )
+                    frames_consumed_sent = True
 
                 out_type = getattr(output, "final_output_type", "text")
 
@@ -671,7 +775,7 @@ class OmniStreamingVideoHandler:
                         if b64:
                             await websocket.send_json(
                                 {
-                                    "type": "response.audio.delta",
+                                    "type": "response.output_audio.delta",
                                     "data": b64,
                                     "format": "wav",
                                 }
@@ -680,9 +784,9 @@ class OmniStreamingVideoHandler:
                         audio_data = self._get_audio_data(output)
                         if audio_data is not None:
                             if isinstance(audio_data, list):
-                                audio_tail_tensors = list(audio_data)
+                                audio_tail_tensors.extend(audio_data)
                             else:
-                                audio_tail_tensors = [audio_data]
+                                audio_tail_tensors.append(audio_data)
                 else:
                     delta_text, previous_text = self._extract_text_delta(
                         output,
@@ -715,7 +819,7 @@ class OmniStreamingVideoHandler:
                     if b64:
                         await websocket.send_json(
                             {
-                                "type": "response.audio.delta",
+                                "type": "response.output_audio.delta",
                                 "data": b64,
                                 "format": "wav",
                             }
@@ -724,7 +828,7 @@ class OmniStreamingVideoHandler:
                     logger.exception("Failed to coalesce off-path audio")
 
             if audio_chunk_count > 0:
-                await websocket.send_json({"type": "response.audio.done"})
+                await websocket.send_json({"type": "response.output_audio.done"})
 
             response_text = "".join(text_parts)
             self.on_turn_complete(message_history, user_message, response_text)
@@ -770,16 +874,12 @@ class OmniStreamingVideoHandler:
     ) -> tuple[str | None, int]:
         """Return (base64 WAV of new samples, updated chunks_drained).
 
-        `chunks_drained` is the number of per-step tensors in
-        ``audio_data`` that have already been emitted. Each engine step appends
-        one tensor, so new samples are ``audio_data[chunks_drained:]`` — no
-        matter how many steps accumulated between reads (handles backpressure
-        cleanly, unlike a simple ``audio_data[-1]``).
-
-        Two paths, selected at runtime by ``VLLM_VIDEO_AUDIO_DELTA_MODE``:
-          * fast — only D2H the new tail. Per-call cost ∝ new chunks.
-          * slow — full cat + D2H each call. Per-call cost ∝ total history.
-                   Retained for A/B; remove once downstream callers confirm.
+        Explicit sampling parameters are coerced to DELTA above, and AsyncOmni
+        applies the same coercion to defaults. The output processor drains audio
+        after each result, so every tensor in the current payload is new.
+        `chunks_drained` only identifies the first emission for the existing
+        leading-artifact trim.
+        The legacy slow setting remains accepted as an equivalent alias.
         """
         audio_data = cls._get_audio_data(result)
         if audio_data is None:
@@ -792,7 +892,7 @@ class OmniStreamingVideoHandler:
     @staticmethod
     def _get_audio_data(result: OmniRequestOutput):
         """Navigate OmniRequestOutput → multimodal_output['audio']. None on miss."""
-        request_output = getattr(result, "request_output", None)
+        request_output = result
         if request_output is None:
             return None
         outputs = getattr(request_output, "outputs", None)
@@ -809,23 +909,20 @@ class OmniStreamingVideoHandler:
         audio_data,
         chunks_drained: int,
     ) -> tuple[str | None, int]:
-        """Emit only tensors appended since the last call."""
-        # Single tensor: output_processor hands us one tensor before it becomes a
-        # list (see output_processor.py:89). Treat it as chunk #0.
-        if not isinstance(audio_data, list):
-            if chunks_drained >= 1:
-                return None, chunks_drained
-            tail_np = cls._tensor_to_1d_np(audio_data)
-            return cls._encode_tail(tail_np, chunks_drained, new_drained=1, is_first=True)
-
-        n = len(audio_data)
-        if n <= chunks_drained:
+        """Encode every fresh tensor in this DELTA payload."""
+        new_chunks = audio_data if isinstance(audio_data, list) else [audio_data]
+        if not new_chunks:
             return None, chunks_drained
-
-        new_chunks = audio_data[chunks_drained:]
         tail = new_chunks[0] if len(new_chunks) == 1 else torch.cat(new_chunks, dim=-1)
         tail_np = cls._tensor_to_1d_np(tail)
-        return cls._encode_tail(tail_np, chunks_drained, new_drained=n, is_first=(chunks_drained == 0))
+        if tail_np is None or len(tail_np) == 0:
+            return None, chunks_drained
+        return cls._encode_tail(
+            tail_np,
+            chunks_drained,
+            new_drained=chunks_drained + len(new_chunks),
+            is_first=(chunks_drained == 0),
+        )
 
     @classmethod
     def _delta_slow(
@@ -833,36 +930,8 @@ class OmniStreamingVideoHandler:
         audio_data,
         chunks_drained: int,
     ) -> tuple[str | None, int]:
-        """Pre-fix behaviour: concat everything each call and slice on CPU."""
-        if isinstance(audio_data, list):
-            if not audio_data:
-                return None, chunks_drained
-            audio_tensor = torch.cat(audio_data, dim=-1)
-            new_drained = len(audio_data)
-        else:
-            audio_tensor = audio_data
-            new_drained = 1
-
-        full_np = cls._tensor_to_1d_np(audio_tensor)
-        if full_np is None:
-            return None, chunks_drained
-        # chunks_drained doesn't map directly to sample offset without tracking
-        # per-chunk lengths, so we re-derive: replay the tail that corresponds
-        # to chunks appended since last call by slicing off the part produced
-        # by the already-drained prefix. For slow path this is intentionally
-        # wasteful — the point is to reproduce the pre-fix hot loop.
-        if chunks_drained == 0:
-            tail_np = full_np
-        else:
-            # Recover prefix length by re-concatenating the already-drained
-            # prefix tensors (cost intentionally identical to the baseline
-            # implementation this was lifted from).
-            if isinstance(audio_data, list) and chunks_drained < len(audio_data):
-                prefix_len = sum(int(t.shape[-1]) for t in audio_data[:chunks_drained])
-                tail_np = full_np[prefix_len:]
-            else:
-                tail_np = full_np[0:0]
-        return cls._encode_tail(tail_np, chunks_drained, new_drained=new_drained, is_first=(chunks_drained == 0))
+        """Compatibility alias for the DELTA payload contract."""
+        return cls._delta_fast(audio_data, chunks_drained)
 
     @classmethod
     def _encode_tail(
@@ -911,6 +980,8 @@ class OmniStreamingVideoHandler:
         )
         mixin = AudioMixin()
         resp = mixin.create_audio(audio_obj)
+        # base64_encode=True selects the string result of create_audio().
+        assert isinstance(resp.audio_data, str)
         return resp.audio_data
 
     @staticmethod
@@ -922,7 +993,7 @@ class OmniStreamingVideoHandler:
         if result.final_output_type != "text":
             return "", previous_text
 
-        request_output = getattr(result, "request_output", None)
+        request_output = result
         if request_output is None:
             return "", previous_text
 
@@ -971,3 +1042,46 @@ class OmniStreamingVideoHandler:
             await websocket.send_json({"type": "error", "message": message})
         except Exception:
             pass
+
+    @staticmethod
+    def _sample_frame_indices(
+        frame_buffer: list[str],
+        num_frames: int,
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
+    ) -> list[int]:
+        """Stride-sample with the last frame, then drop known bad frames without refilling."""
+        n_buf = len(frame_buffer)
+        if n_buf <= num_frames:
+            indices = list(range(n_buf))
+        else:
+            stride = max(1, n_buf // num_frames)
+            indices = [index * stride for index in range(num_frames - 1)] + [n_buf - 1]
+        return [index for index in indices if prewarmed_frames.get(frame_buffer[index]) is not _BAD_FRAME]
+
+    @staticmethod
+    async def _send_frame_ack(
+        websocket: WebSocket,
+        message: Mapping[str, Any],
+        *,
+        accepted: bool,
+        buffered_frames: int,
+        reason: str | None = None,
+        dropped_frame_id: str | None = None,
+    ) -> None:
+        frame_id = message.get("frame_id")
+        if not isinstance(frame_id, str) or not frame_id:
+            return
+        ack: dict[str, Any] = {
+            "type": "video.frame.ack",
+            "frame_id": frame_id,
+            "pts_ms": message.get("pts_ms"),
+            "capture_ts_ms": message.get("capture_ts_ms"),
+            "accepted": accepted,
+            "buffered_frames": buffered_frames,
+            "server_receive_ts_ms": message.get("_receiver_received_ts_ms", _time.monotonic() * 1000),
+        }
+        if reason is not None:
+            ack["reason"] = reason
+        if dropped_frame_id is not None:
+            ack["dropped_frame_id"] = dropped_frame_id
+        await websocket.send_json(ack)

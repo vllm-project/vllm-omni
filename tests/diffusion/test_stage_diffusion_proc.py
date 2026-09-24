@@ -1,81 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
-from types import SimpleNamespace
 
 import pytest
 
+import vllm_omni.diffusion.stage_diffusion_proc as stage_diffusion_proc
+import vllm_omni.plugins as omni_plugins
+from vllm_omni.diffusion.data import DIFFUSION_REQUEST_LIFECYCLE_KEY, DIFFUSION_REQUEST_STARTED
 from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
-
-
-def test_process_batch_request_preserves_parent_request_id_and_kv_sender_info():
-    async def run_test():
-        captured = {}
-
-        async def step(request):
-            captured["request"] = request
-            return [
-                SimpleNamespace(
-                    images=["img-1"],
-                    _multimodal_output={},
-                    _custom_output={},
-                    metrics={},
-                    stage_durations={},
-                    peak_memory_mb=0.0,
-                    latents=None,
-                    trajectory_latents=None,
-                    trajectory_timesteps=None,
-                    trajectory_log_probs=None,
-                    trajectory_decoded=None,
-                    final_output_type="image",
-                ),
-                SimpleNamespace(
-                    images=["img-2"],
-                    _multimodal_output={},
-                    _custom_output={},
-                    metrics={},
-                    stage_durations={},
-                    peak_memory_mb=0.0,
-                    latents=None,
-                    trajectory_latents=None,
-                    trajectory_timesteps=None,
-                    trajectory_log_probs=None,
-                    trajectory_decoded=None,
-                    final_output_type="image",
-                ),
-            ]
-
-        proc = object.__new__(StageDiffusionProc)
-        proc._engine = SimpleNamespace(step=step)
-        proc._od_config = SimpleNamespace(streaming_output=False)
-        proc._executor = ThreadPoolExecutor(max_workers=1)
-
-        try:
-            result = await proc._process_batch_request(
-                request_id="req-parent",
-                prompts=["hello", "world"],
-                sampling_params_dict=asdict(OmniDiffusionSamplingParams()),
-                kv_sender_info={0: {"host": "10.0.0.2", "zmq_port": 50151}},
-            )
-        finally:
-            proc._executor.shutdown(wait=True)
-
-        request = captured["request"]
-        assert request.request_id == "req-parent"
-        assert not hasattr(request, "request_ids")
-        assert request.kv_sender_info == {0: {"host": "10.0.0.2", "zmq_port": 50151}}
-        assert result.request_id == "req-parent"
-        assert result.images == ["img-1", "img-2"]
-
-    asyncio.run(run_test())
 
 
 @dataclass
@@ -90,8 +29,35 @@ BASE_INFER_STEPS = 10
 DELAY_BASE = 0.01
 
 
+def test_run_diffusion_proc_sets_lifecycle_before_loading_plugins(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+
+    class StopProcessError(Exception):
+        pass
+
+    class TestStageDiffusionProc(StageDiffusionProc):
+        def __init__(self, model, od_config):
+            events.append("proc")
+            raise StopProcessError
+
+    monkeypatch.setattr(omni_plugins, "load_omni_general_plugins", lambda: events.append("plugins"))
+    monkeypatch.setattr(stage_diffusion_proc, "set_death_signal", lambda _: events.append("death_signal"))
+    monkeypatch.setattr(stage_diffusion_proc.signal, "signal", lambda *_: events.append("signal_handler"))
+
+    with pytest.raises(StopProcessError):
+        TestStageDiffusionProc.run_diffusion_proc(
+            model="test-model",
+            od_config=None,
+            handshake_address="test-address",
+            local_client=True,
+            headless=False,
+        )
+
+    assert events == ["death_signal", "signal_handler", "signal_handler", "plugins", "proc"]
+
+
 class MockDiffusionEngine:
-    async def step(self, request):
+    async def step_streaming(self, request):
         def simulate_step_delay(height, width, num_inference_steps) -> float:
             return (height / BASE_HEIGHT) * (width / BASE_WIDTH) * (num_inference_steps / BASE_INFER_STEPS)
 
@@ -101,7 +67,7 @@ class MockDiffusionEngine:
         )
         delay = DELAY_BASE + delay_scale * DELAY_BASE
         await asyncio.sleep(delay)
-        return [MockOmniRequestOutput(request_id=request.request_id)]
+        yield [MockOmniRequestOutput(request_id=request.request_id)]
 
 
 @pytest.mark.asyncio
@@ -136,6 +102,49 @@ async def test_proc_streaming_request_yields_each_engine_chunk():
     assert [output.request_id for output in outputs] == ["req-stream", "req-stream"]
     assert [output.finished for output in outputs] == [False, True]
     assert captured["request"].kv_sender_info == {0: {"host": "127.0.0.1"}}
+
+
+@pytest.mark.asyncio
+async def test_proc_non_streaming_forwards_lifecycle_before_final_output():
+    lifecycle = OmniRequestOutput.from_diffusion(
+        request_id="",
+        images=[],
+        custom_output={DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED},
+        finished=False,
+    )
+    intermediate = OmniRequestOutput.from_diffusion(
+        request_id="",
+        images=[],
+        custom_output={"chunk": 0},
+        finished=False,
+    )
+    final = OmniRequestOutput.from_diffusion(request_id="", images=[], finished=True)
+
+    class _LifecycleEngine:
+        async def step_streaming(self, request):
+            del request
+            yield [lifecycle]
+            yield [intermediate]
+            yield [final]
+
+    stage_proc = object.__new__(StageDiffusionProc)
+    stage_proc._engine = _LifecycleEngine()
+    intermediate_outputs = []
+
+    async def _capture(output):
+        intermediate_outputs.append(output)
+
+    result = await stage_proc._process_request(
+        request_id="req-lifecycle",
+        prompt="prompt",
+        sampling_params_dict=asdict(OmniDiffusionSamplingParams()),
+        on_request_started=_capture,
+    )
+
+    assert intermediate_outputs == [lifecycle]
+    assert lifecycle.request_id == "req-lifecycle"
+    assert result is final
+    assert result.request_id == "req-lifecycle"
 
 
 @pytest.mark.asyncio

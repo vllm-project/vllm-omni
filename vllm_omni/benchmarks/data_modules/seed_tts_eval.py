@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Seed-TTS WER aligned with Bytedance ``seed-tts-eval`` / ``run_wer.py``.
 
 Matches the published protocol (see Hugging Face dataset card and
@@ -36,7 +39,11 @@ Enable with ``SEED_TTS_WER_EVAL=1`` or ``--seed-tts-wer-eval``. Install optional
     pip install 'vllm-omni[dev]'
 
 Env: ``SEED_TTS_EVAL_DEVICE`` (e.g. ``cuda:0``, ``cpu``); ``SEED_TTS_HF_WHISPER_MODEL``
-defaults to ``openai/whisper-large-v3`` (override for debugging only).
+defaults to ``openai/whisper-large-v3`` (override for debugging only). Set
+``SEED_TTS_WER_SAVE_AUDIO_DIR`` to save the captured 24 kHz mono WAV used by
+WER evaluation for each synthesized utterance.
+Streaming PCM is decoded using ``VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE`` /
+``VLLM_OMNI_BENCH_AUDIO_CHANNELS`` (default: 24 kHz mono).
 """
 
 from __future__ import annotations
@@ -50,12 +57,16 @@ import string
 import tempfile
 import threading
 import wave
+from copy import copy
+from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 from vllm.benchmarks.datasets import SampleRequest
 
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import SeedTTSSampleRequest
+from vllm_omni.metrics.definitions import stream_pcm_format_from_env
 
 logger = logging.getLogger(__name__)
 
@@ -87,16 +98,54 @@ def pcm_s16le_mono_to_wav_bytes(pcm: bytes, *, sample_rate: int = 24000) -> byte
     return buf.getvalue()
 
 
+def _safe_filename_part(value: Any, *, default: str = "item", max_len: int = 96) -> str:
+    text = str(value or "").strip() or default
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in text)
+    safe = safe.strip("._") or default
+    return safe[:max_len]
+
+
+def _save_seed_tts_eval_audio(
+    pcm: bytes,
+    *,
+    output_dir: Path | None,
+    index: int,
+    utterance_id: Any,
+    locale: str,
+) -> str | None:
+    if output_dir is None:
+        return None
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"{index:05d}_{_safe_filename_part(utterance_id)}_{_safe_filename_part(locale)}"
+    path = output_dir / f"{stem}.wav"
+    path.write_bytes(pcm_s16le_mono_to_wav_bytes(pcm, sample_rate=24000))
+    return str(path)
+
+
 def _get_eval_device() -> str:
     explicit = os.environ.get("SEED_TTS_EVAL_DEVICE", "").strip()
     if explicit:
         return explicit
     try:
         import torch
-
-        return "cuda:0" if torch.cuda.is_available() else "cpu"
     except ImportError:
         return "cpu"
+
+    if torch.cuda.is_available():
+        return "cuda:0"
+
+    # Ascend: ``torch.npu`` only exists once ``torch_npu`` has been imported, which does
+    # not necessarily happen in the benchmark client process. Without this branch the
+    # eval silently lands on CPU, where Whisper-large-v3 needs hours for a full Seed-TTS
+    # run and the CI job is killed by its timeout instead of reporting a WER.
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        pass
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return "npu:0"
+
+    return "cpu"
 
 
 def _punctuation_all() -> str:
@@ -146,12 +195,27 @@ def process_one_official(hypo: str, truth: str, lang: str) -> tuple[float, str, 
     return wer, raw_truth, raw_hypo
 
 
-def _pcm_s16le_to_f32_16k(pcm: bytes, pcm_sample_rate: int = 24000) -> np.ndarray:
+def _pcm_s16le_to_f32_16k(
+    pcm: bytes,
+    pcm_sample_rate: int | None = None,
+    channels: int | None = None,
+) -> np.ndarray:
     import scipy.signal
 
     if not pcm:
         return np.zeros(0, dtype=np.float32)
+    if pcm_sample_rate is None or channels is None:
+        env_sample_rate, env_channels = stream_pcm_format_from_env()
+        if pcm_sample_rate is None:
+            pcm_sample_rate = env_sample_rate
+        if channels is None:
+            channels = env_channels
     raw = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+    if channels > 1:
+        usable = (len(raw) // channels) * channels
+        if usable <= 0:
+            return np.zeros(0, dtype=np.float32)
+        raw = raw[:usable].reshape(-1, channels).mean(axis=1)
     target_len = int(len(raw) * 16000 / pcm_sample_rate)
     if target_len <= 0:
         return np.zeros(0, dtype=np.float32)
@@ -268,7 +332,8 @@ def _ensure_utmos_jit_model() -> Any | None:
             return _utmos_jit_model
         try:
             import torch
-            from huggingface_hub import hf_hub_download
+
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
             repo = os.environ.get("SEED_TTS_UTMOS_HF_REPO", "balacoon/utmos").strip() or "balacoon/utmos"
             fname = os.environ.get("SEED_TTS_UTMOS_JIT_FILE", "utmos.jit").strip() or "utmos.jit"
@@ -277,7 +342,7 @@ def _ensure_utmos_jit_model() -> Any | None:
                 repo,
                 fname,
             )
-            path = hf_hub_download(repo_id=repo, filename=fname, repo_type="model")
+            path = hf_api().hf_hub_download(repo_id=repo, filename=fname, repo_type="model")
 
             # TODO The model weights in UTMOS must be loaded in cuda:0; otherwise, the model execution will fail.
             want = "cuda:0"
@@ -399,25 +464,33 @@ def _transcribe_en_f32_16k(wav_f32: np.ndarray) -> str:
         return ""
     with _lock:
         assert _en_processor is not None and _en_model is not None and _device is not None
+        # Whisper's default feature extraction truncates at 30 seconds. Keep
+        # abnormal tails so WER evaluates the complete generated response.
+        long_audio = len(wav_f32) > 30 * 16000
+        processor_kwargs = {"truncation": False, "padding": "longest"} if long_audio else {}
         try:
             inputs = _en_processor(
                 wav_f32,
                 sampling_rate=16000,
                 return_tensors="pt",
                 return_attention_mask=True,
+                **processor_kwargs,
             )
         except TypeError:
-            inputs = _en_processor(wav_f32, sampling_rate=16000, return_tensors="pt")
+            inputs = _en_processor(wav_f32, sampling_rate=16000, return_tensors="pt", **processor_kwargs)
         input_features = inputs.input_features.to(_device)
         attention_mask = getattr(inputs, "attention_mask", None)
         if attention_mask is None and isinstance(inputs, dict):
             attention_mask = inputs.get("attention_mask")
         generate_kwargs: dict[str, Any] = {}
+        if long_audio:
+            generate_kwargs["return_timestamps"] = True
         if attention_mask is not None:
             generate_kwargs["attention_mask"] = attention_mask.to(_device)
         with torch.no_grad():
             try:
-                forced = _en_processor.get_decoder_prompt_ids(language="english", task="transcribe")
+                prompt_kwargs = {"no_timestamps": False} if long_audio else {}
+                forced = _en_processor.get_decoder_prompt_ids(language="english", task="transcribe", **prompt_kwargs)
                 predicted_ids = _en_model.generate(input_features, forced_decoder_ids=forced, **generate_kwargs)
             except Exception:
                 predicted_ids = _en_model.generate(
@@ -467,6 +540,41 @@ def _missing_deps_message(lang: str) -> str | None:
     return None
 
 
+def _expand_seed_tts_turn_outputs(
+    input_requests: list[SeedTTSSampleRequest],
+    outputs: list[Any],
+) -> tuple[list[SeedTTSSampleRequest], list[Any]]:
+    """Expand grouped Realtime sessions into one request/output pair per turn."""
+    expanded_requests: list[SeedTTSSampleRequest] = []
+    expanded_outputs: list[Any] = []
+    for request, output in zip(input_requests, outputs, strict=True):
+        turns = request.seed_tts_turns
+        if not turns:
+            expanded_requests.append(request)
+            expanded_outputs.append(output)
+            continue
+        turn_pcm = getattr(output, "tts_turn_pcm_bytes", None)
+        session_pcm = getattr(output, "tts_output_pcm_bytes", None)
+        for turn_index, turn in enumerate(turns):
+            turn_request = replace(
+                request,
+                seed_tts_utterance_id=turn.utterance_id,
+                seed_tts_turns=(),
+            )
+            turn_request.prompt = turn.target_text
+            expanded_requests.append(turn_request)
+            turn_output = copy(output)
+            if isinstance(turn_pcm, list) and turn_index < len(turn_pcm):
+                turn_output.tts_output_pcm_bytes = turn_pcm[turn_index]
+            elif len(turns) == 1:
+                # openai-chat-omni Seed-TTS only fills the session-level PCM field.
+                turn_output.tts_output_pcm_bytes = session_pcm
+            else:
+                turn_output.tts_output_pcm_bytes = None
+            expanded_outputs.append(turn_output)
+    return expanded_requests, expanded_outputs
+
+
 def compute_seed_tts_wer_metrics(
     input_requests: list[SampleRequest],
     outputs: list[Any],
@@ -479,6 +587,8 @@ def compute_seed_tts_wer_metrics(
         return None
     if not all(isinstance(r, SeedTTSSampleRequest) for r in input_requests):
         return None
+    session_count = len(input_requests)
+    input_requests, outputs = _expand_seed_tts_turn_outputs(input_requests, outputs)
 
     first = input_requests[0]
     assert isinstance(first, SeedTTSSampleRequest)
@@ -512,13 +622,18 @@ def compute_seed_tts_wer_metrics(
     sim_skipped_no_ref = 0
     utmos_failed = 0
     utmos_on = _eval_submetric_enabled("SEED_TTS_UTMOS_EVAL", default=False)
+    save_audio_raw = os.environ.get("SEED_TTS_WER_SAVE_AUDIO_DIR", "").strip()
+    save_audio_dir = Path(save_audio_raw).expanduser() if save_audio_raw else None
+    saved_audio = 0
+    save_audio_failed = 0
 
-    for req, out in zip(input_requests, outputs, strict=True):
+    for index, (req, out) in enumerate(zip(input_requests, outputs, strict=True)):
         assert isinstance(req, SeedTTSSampleRequest)
         ref = req.prompt
         locale = req.seed_tts_locale or "en"
         row_lang = "zh" if locale.lower().startswith("zh") else "en"
         utmos_v: float | None = None
+        audio_path: str | None = None
 
         if not out.success:
             request_failed += 1
@@ -545,8 +660,30 @@ def compute_seed_tts_wer_metrics(
                     }
                 )
             continue
+        try:
+            audio_path = _save_seed_tts_eval_audio(
+                pcm,
+                output_dir=save_audio_dir,
+                index=index,
+                utterance_id=req.seed_tts_utterance_id,
+                locale=locale,
+            )
+            if audio_path:
+                saved_audio += 1
+        except OSError as e:
+            save_audio_failed += 1
+            logger.warning(
+                "Seed-TTS WER audio save failed for utterance=%s: %s",
+                req.seed_tts_utterance_id,
+                e,
+            )
 
-        wav_16k = _pcm_s16le_to_f32_16k(pcm)
+        # Request functions normalize ``tts_output_pcm_bytes`` to Seed-TTS WER
+        # format before it reaches this evaluator: 24 kHz mono int16 PCM.
+        # Do not apply the streamed-response env format here again; for MOSS
+        # local that would reinterpret already-normalized 24 kHz mono audio as
+        # 48 kHz stereo and corrupt ASR/WER.
+        wav_16k = _pcm_s16le_to_f32_16k(pcm, pcm_sample_rate=24000, channels=1)
         if len(wav_16k) == 0:
             asr_failed += 1
             if include_per_item:
@@ -555,6 +692,7 @@ def compute_seed_tts_wer_metrics(
                         "utterance_id": req.seed_tts_utterance_id,
                         "locale": locale,
                         "error": "empty_audio",
+                        "audio_path": audio_path,
                     }
                 )
             continue
@@ -609,6 +747,7 @@ def compute_seed_tts_wer_metrics(
                         "locale": locale,
                         "error": "asr_exception",
                         "detail": str(e)[:500],
+                        "audio_path": audio_path,
                     }
                 )
             continue
@@ -621,6 +760,7 @@ def compute_seed_tts_wer_metrics(
                         "utterance_id": req.seed_tts_utterance_id,
                         "locale": locale,
                         "error": "empty_asr",
+                        "audio_path": audio_path,
                     }
                 )
             continue
@@ -637,6 +777,7 @@ def compute_seed_tts_wer_metrics(
                         "locale": locale,
                         "error": "wer_compute_failed",
                         "detail": str(e)[:500],
+                        "audio_path": audio_path,
                     }
                 )
             continue
@@ -673,6 +814,8 @@ def compute_seed_tts_wer_metrics(
                 "reference_raw": raw_truth,
                 "asr_raw": raw_hypo,
             }
+            if audio_path:
+                row["audio_path"] = audio_path
             if sim_v is not None:
                 row["sim"] = sim_v
             if utmos_v is not None:
@@ -681,6 +824,8 @@ def compute_seed_tts_wer_metrics(
 
     result: dict[str, Any] = {
         "seed_tts_eval_protocol": "seed-tts-eval",
+        "seed_tts_session_count": session_count,
+        "seed_tts_turn_count": len(input_requests),
         "seed_tts_content_evaluated": len(errs),
         "seed_tts_content_error_mean": statistics.fmean(errs) if errs else None,
         "seed_tts_content_error_median": statistics.median(errs) if errs else None,
@@ -697,7 +842,11 @@ def compute_seed_tts_wer_metrics(
         "seed_tts_utmos_mean": statistics.fmean(utmos_values) if utmos_values else None,
         "seed_tts_utmos_median": statistics.median(utmos_values) if utmos_values else None,
         "seed_tts_utmos_failed": utmos_failed,
+        "seed_tts_saved_audio": saved_audio,
+        "seed_tts_save_audio_failed": save_audio_failed,
     }
+    if save_audio_dir is not None:
+        result["seed_tts_save_audio_dir"] = str(save_audio_dir)
     if include_per_item:
         result["seed_tts_wer_eval_items"] = items
     return result
@@ -729,6 +878,13 @@ def print_seed_tts_wer_summary(metrics: dict[str, Any]) -> None:
     print("{:<40} {:<10}".format("Request failed:", metrics.get("seed_tts_request_failed", 0)))
     print("{:<40} {:<10}".format("No PCM captured:", metrics.get("seed_tts_no_pcm", 0)))
     print("{:<40} {:<10}".format("ASR / WER failed:", metrics.get("seed_tts_asr_failed", 0)))
+    save_dir = metrics.get("seed_tts_save_audio_dir")
+    if save_dir:
+        print("{:<40} {:<10}".format("Saved eval WAVs:", metrics.get("seed_tts_saved_audio", 0)))
+        print("{:<40} {}".format("Saved eval WAV dir:", save_dir))
+        failed = int(metrics.get("seed_tts_save_audio_failed", 0) or 0)
+        if failed:
+            print("{:<40} {:<10}".format("Save eval WAV errors:", failed))
     if sim_ev or metrics.get("seed_tts_sim_skipped_no_ref") or metrics.get("seed_tts_sim_failed"):
         print("{:<40} {:<10}".format("SIM evaluated (higher ~ closer):", sim_ev))
         sm = metrics.get("seed_tts_sim_mean")

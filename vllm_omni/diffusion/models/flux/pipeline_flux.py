@@ -31,8 +31,8 @@ from vllm_omni.diffusion.models.flux.flux_pipeline_mixin import FluxPipelineMixi
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = logging.getLogger(__name__)
@@ -70,6 +70,8 @@ def get_flux_post_process_func(
 class FluxPipeline(
     nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
 ):
+    supports_request_batch = True
+
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "text_encoder_2"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -500,55 +502,54 @@ class FluxPipeline(
             return False
         return True
 
-    def forward(
-        self,
-        req: OmniDiffusionRequest,
-        prompt: str | list[str] | None = None,
-        prompt_2: str | list[str] | None = None,
-        negative_prompt: str | list[str] | None = None,
-        negative_prompt_2: str | list[str] | None = None,
-        true_cfg_scale: float = 1.0,
-        height: int | None = None,
-        width: int | None = None,
-        num_inference_steps: int = 28,
-        sigmas: list[float] | None = None,
-        guidance_scale: float = 3.5,
-        num_images_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        latents: torch.FloatTensor | None = None,
-        prompt_embeds: torch.FloatTensor | None = None,
-        pooled_prompt_embeds: torch.FloatTensor | None = None,
-        negative_prompt_embeds: torch.FloatTensor | None = None,
-        negative_pooled_prompt_embeds: torch.FloatTensor | None = None,
-        output_type: str | None = "pil",
-        return_dict: bool = True,
-        joint_attention_kwargs: dict[str, Any] | None = None,
-        callback_on_step_end_tensor_inputs: list[str] = ["latents"],
-        max_sequence_length: int = 512,
-    ):
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         """Forward pass for flux."""
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
-        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
+        sampling_params_list = req.sampling_params_list
+        common_sampling_params = sampling_params_list[0]
+        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts]
+
         if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
             negative_prompt = None
         elif req.prompts:
             negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
 
-        height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
-        width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
-        sigmas = req.sampling_params.sigmas or sigmas
-        guidance_scale = (
-            req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
-        )
-        generator = req.sampling_params.generator or generator
-        true_cfg_scale = req.sampling_params.true_cfg_scale or true_cfg_scale
+        height = common_sampling_params.height or self.default_sample_size * self.vae_scale_factor
+        width = common_sampling_params.width or self.default_sample_size * self.vae_scale_factor
+        num_inference_steps = common_sampling_params.num_inference_steps or 28
+        sigmas = common_sampling_params.sigmas
+        guidance_scale = common_sampling_params.guidance_scale
+        true_cfg_scale = common_sampling_params.true_cfg_scale or 1.0
         num_images_per_prompt = (
-            req.sampling_params.num_outputs_per_prompt
-            if req.sampling_params.num_outputs_per_prompt > 0
-            else num_images_per_prompt
+            common_sampling_params.num_outputs_per_prompt if common_sampling_params.num_outputs_per_prompt > 0 else 1
         )
+        max_sequence_length = common_sampling_params.max_sequence_length or 512
+        generator = req.collate_request_generators(num_images_per_prompt, None)
+        latents = req.collate_request_tensors("latents", None)
+        prompt_fields = DiffusionRequestBatch.collate_prompt_field_map(
+            req.prompts,
+            {
+                "prompt_embeds": None,
+                "negative_prompt_embeds": None,
+                "pooled_prompt_embeds": None,
+                "negative_pooled_prompt_embeds": None,
+            },
+        )
+        prompt_embeds = prompt_fields["prompt_embeds"]
+        negative_prompt_embeds = prompt_fields["negative_prompt_embeds"]
+        pooled_prompt_embeds = prompt_fields["pooled_prompt_embeds"]
+        negative_pooled_prompt_embeds = prompt_fields["negative_pooled_prompt_embeds"]
+        prompt_2 = None
+        negative_prompt_2 = None
+        if prompt_embeds is not None:
+            prompt = None
+        if negative_prompt_embeds is not None:
+            negative_prompt = None
+
+        output_type = common_sampling_params.output_type or "pil"
+        joint_attention_kwargs: dict[str, Any] | None = None
+        callback_on_step_end_tensor_inputs = ["latents"]
 
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
@@ -572,9 +573,7 @@ class FluxPipeline(
         self._interrupt = False
 
         # 2. Define call parameters
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
+        if prompt is not None:
             batch_size = len(prompt)
         else:
             batch_size = prompt_embeds.shape[0]
@@ -666,9 +665,17 @@ class FluxPipeline(
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(
-            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-        )
+        stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
+        n = num_images_per_prompt
+        if req.num_reqs == 1:
+            return [DiffusionOutput(output=image, stage_durations=stage_durations)]
+        return [
+            DiffusionOutput(
+                output=image[i * n : (i + 1) * n] if isinstance(image, list) else image[i * n : (i + 1) * n],
+                stage_durations=stage_durations,
+            )
+            for i in range(req.num_reqs)
+        ]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
@@ -681,3 +688,6 @@ class FluxDMD2Pipeline(DMD2PipelineMixin, FluxPipeline):
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
         self.__init_dmd2__()
+
+    def forward(self, req: DiffusionRequestBatch, **kwargs) -> list[DiffusionOutput]:
+        return super().forward(req, **kwargs)

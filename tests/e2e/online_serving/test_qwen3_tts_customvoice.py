@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E Online tests for Qwen3-TTS model with text input and audio output.
 
@@ -15,9 +15,19 @@ import pytest
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
-from tests.helpers.stage_config import get_deploy_config_path
+from tests.helpers.stage_config import (
+    get_deploy_config_path,
+    get_deploy_config_stage,
+    modify_stage_config,
+)
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+
+_DEFAULT_STAGE_CONFIG = get_deploy_config_path("qwen3_tts.yaml")
+_STAGE_CONFIG = modify_stage_config(
+    _DEFAULT_STAGE_CONFIG,
+    updates={"stages": {0: {"default_sampling_params.max_tokens": 500}}},
+)
 
 
 def get_prompt(prompt_type="text"):
@@ -38,7 +48,18 @@ tts_server_params = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
-            stage_config_path=get_deploy_config_path("qwen3_tts.yaml"),
+            stage_config_path=_STAGE_CONFIG,
+            server_args=["--trust-remote-code"],
+        ),
+        id="async_chunk",
+    )
+]
+
+default_tts_server_params = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=_DEFAULT_STAGE_CONFIG,
             server_args=["--trust-remote-code"],
         ),
         id="async_chunk",
@@ -50,8 +71,29 @@ tts_server_params = [
 @pytest.mark.advanced_model
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", default_tts_server_params, indirect=True)
+def test_default_cuda_graph_startup(omni_server) -> None:
+    """Verify both stages start with the shipped CUDA Graph configuration.
+
+    The fixture reaching this test is the smoke assertion: it waits for the
+    server to become ready after both stages finish model initialization and
+    CUDA Graph capture. The regression covered here exited during stage 1
+    capture, before fixture setup could complete.
+    """
+    for stage_id in (0, 1):
+        stage = get_deploy_config_stage("qwen3_tts.yaml", stage_id=stage_id)
+        assert stage.get("enforce_eager", False) is False
+
+    assert omni_server.proc is not None
+    assert omni_server.proc.poll() is None
+
+
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@pytest.mark.tts
+@hardware_test(res={"cuda": "L4", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_text_to_audio_001(omni_server, openai_client) -> None:
+def test_text_to_audio_001(omni_server, online_client) -> None:
     """
     Test text input processing and audio output via OpenAI API.
     Deploy Setting: default yaml
@@ -69,15 +111,15 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
         "voice": "vivian",
     }
 
-    openai_client.send_audio_speech_request(request_config, request_num=get_max_batch_size())
+    online_client.send_audio_speech_request(request_config, request_num=get_max_batch_size())
 
 
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_text_to_audio_002(omni_server, openai_client) -> None:
+def test_text_to_audio_002(omni_server, online_client) -> None:
     """
     Test text input processing and audio output via OpenAI API.
     Deploy Setting: default yaml
@@ -90,9 +132,10 @@ def test_text_to_audio_002(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "input": get_prompt(),
         "stream": True,
+        "stream_format": "audio",
         "response_format": "wav",
         "task_type": "CustomVoice",
         "voice": "vivian",
     }
 
-    openai_client.send_audio_speech_request(request_config)
+    online_client.send_audio_speech_request(request_config)

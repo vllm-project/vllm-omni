@@ -13,7 +13,7 @@ set -e
 MODEL="Qwen/Qwen3-Omni-30B-A3B-Instruct"
 SERVER_PORT=8091
 GRADIO_PORT=7861
-STAGE_CONFIGS_PATH=""
+DEPLOY_CONFIG=""
 SERVER_HOST="0.0.0.0"
 GRADIO_IP="127.0.0.1"
 GRADIO_SHARE=false
@@ -33,8 +33,8 @@ while [[ $# -gt 0 ]]; do
             GRADIO_PORT="$2"
             shift 2
             ;;
-        --stage-configs-path)
-            STAGE_CONFIGS_PATH="$2"
+        --deploy-config)
+            DEPLOY_CONFIG="$2"
             shift 2
             ;;
         --server-host)
@@ -56,7 +56,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --model MODEL                 Model name/path (default: Qwen/Qwen3-Omni-30B-A3B-Instruct)"
             echo "  --server-port PORT            Port for vLLM server (default: 8091)"
             echo "  --gradio-port PORT            Port for Gradio demo (default: 7861)"
-            echo "  --stage-configs-path PATH     Path to custom stage configs YAML file (optional)"
+            echo "  --deploy-config PATH          Path to custom deploy config YAML file (optional)"
             echo "  --server-host HOST            Host for vLLM server (default: 0.0.0.0)"
             echo "  --gradio-ip IP                IP for Gradio demo (default: 127.0.0.1)"
             echo "  --share                       Share Gradio demo publicly"
@@ -87,8 +87,8 @@ echo "=========================================="
 
 # Build vLLM server command
 SERVER_CMD=("vllm" "serve" "$MODEL" "--omni" "--port" "$SERVER_PORT" "--host" "$SERVER_HOST")
-if [ -n "$STAGE_CONFIGS_PATH" ]; then
-    SERVER_CMD+=("--stage-configs-path" "$STAGE_CONFIGS_PATH")
+if [ -n "$DEPLOY_CONFIG" ]; then
+    SERVER_CMD+=("--deploy-config" "$DEPLOY_CONFIG")
 fi
 
 # Function to cleanup on exit

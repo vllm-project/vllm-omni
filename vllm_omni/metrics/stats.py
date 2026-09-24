@@ -1,8 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
+import copy
 import time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -10,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import init_logger
 
 from vllm_omni.metrics import definitions as defs
-from vllm_omni.metrics.utils import _build_field_defs, _build_row, _format_table
+from vllm_omni.metrics.utils import _as_float, _as_float_list, _as_int, _build_field_defs, _build_row, _format_table
 
 if TYPE_CHECKING:
     from vllm_omni.metrics.transfer import OmniTransferMetrics
@@ -42,19 +46,21 @@ class StageRequestStats:
     stage_id: int | None = None
     replica_id: int | None = None
     final_output_type: str | None = None
+    finish_reason: str | None = None
     request_id: str | None = None
     postprocess_time_ms: float = 0.0
-    diffusion_metrics: dict[str, int] = None
+    diffusion_metrics: dict[str, float] | None = None
     audio_generated_frames: int = 0
     audio_sample_rate: int = 0
     audio_duration_s: float = 0.0
-    audio_rtf: float = 0.0
     image_pixels: int = 0
+    num_inference_steps: int = 0
     denoise_step_latency_ms: float = 0.0
     pipeline_timings: dict[str, float] | None = None
     output_unit_type: str | None = None
     output_unit_count: int = 0
     serving_time_to_first_output_ms: float = 0.0
+    image_time_to_first_output_ms: float = 0.0
     time_per_output_unit_ms: float = 0.0
     inter_output_latency_ms: float = 0.0
     inter_output_latencies_ms: list[float] | None = None
@@ -122,8 +128,14 @@ STAGE_EXCLUDE = {
     "rx_decode_time_ms",
     "rx_in_flight_time_ms",
     "final_output_type",
+    "finish_reason",
     "pipeline_timings",
 }
+# Duplex logs one StageRequestStats table per response. Chunk submits refresh
+# ``request_timestamp``, so serving_time_to_first_output_ms is often a clamped
+# 0 on the audio column and is not a useful TTFP. HTTP ``--print-stage`` keeps
+# the row.
+DUPLEX_STAGE_TABLE_EXCLUDE = frozenset({defs.SERVING_TIME_TO_FIRST_OUTPUT_MS})
 TRANSFER_EXCLUDE = {"from_stage", "to_stage", "request_id", "used_shm"}
 E2E_EXCLUDE = {"request_id"}
 
@@ -132,6 +144,86 @@ OVERALL_FIELDS: list[str] | None = None
 STAGE_FIELDS = _build_field_defs(StageRequestStats, STAGE_EXCLUDE, FIELD_TRANSFORMS)
 TRANSFER_FIELDS = _build_field_defs(TransferEdgeStats, TRANSFER_EXCLUDE, FIELD_TRANSFORMS)
 E2E_FIELDS = _build_field_defs(RequestE2EStats, E2E_EXCLUDE, FIELD_TRANSFORMS)
+
+
+def _tpot_interval_weight(token_count: object) -> int:
+    if isinstance(token_count, int | float) and not isinstance(token_count, bool):
+        return max(int(token_count) - 1, 1)
+    return 1
+
+
+def _weighted_tpot_ms(events: Sequence[StageRequestStats]) -> float | None:
+    weighted_ms = 0.0
+    weight = 0
+    for event in events:
+        tpot_ms = float(event.vllm_tpot_ms)
+        if tpot_ms <= 0:
+            continue
+        chunk_weight = _tpot_interval_weight(event.num_tokens_out)
+        weighted_ms += tpot_ms * chunk_weight
+        weight += chunk_weight
+    if weight <= 0:
+        return None
+    return weighted_ms / float(weight)
+
+
+def _apply_merged_stage_stats(template: StageRequestStats, merged: dict[str, object]) -> StageRequestStats:
+    """Write one ``_merge_stage_metric_event`` snapshot back onto a stats row."""
+    stats = copy.copy(template)
+    stats.stage_id = _as_int(merged.get("stage_id"), default=template.stage_id or 0)
+    stats.final_output_type = (
+        str(merged["final_output_type"])
+        if isinstance(merged.get("final_output_type"), str)
+        else template.final_output_type
+    )
+    stats.finish_reason = str(merged["finish_reason"]) if isinstance(merged.get("finish_reason"), str) else None
+    stats.num_tokens_in = _as_int(merged.get(defs.NUM_TOKENS_IN))
+    stats.num_tokens_out = _as_int(merged.get(defs.NUM_TOKENS_OUT))
+    stats.stage_gen_time_ms = _as_float(merged.get(defs.STAGE_GEN_TIME_MS))
+    stats.postprocess_time_ms = _as_float(merged.get(defs.POSTPROCESS_TIME_MS))
+    stats.audio_generated_frames = _as_int(merged.get(defs.AUDIO_FRAMES))
+    stats.audio_sample_rate = _as_int(merged.get(defs.AUDIO_SAMPLE_RATE))
+    stats.audio_duration_s = _as_float(merged.get(f"{defs.AUDIO_DURATION}_s"))
+    stats.image_pixels = _as_int(merged.get(defs.IMAGE_PIXELS))
+    stats.denoise_step_latency_ms = _as_float(merged.get(defs.DENOISE_STEP_LATENCY_MS))
+    stats.output_unit_type = (
+        str(merged["output_unit_type"])
+        if isinstance(merged.get("output_unit_type"), str)
+        else template.output_unit_type
+    )
+    stats.output_unit_count = _as_int(merged.get(defs.OUTPUT_UNIT_COUNT))
+    stats.serving_time_to_first_output_ms = _as_float(merged.get(defs.SERVING_TIME_TO_FIRST_OUTPUT_MS))
+    stats.image_time_to_first_output_ms = _as_float(merged.get(defs.IMAGE_TIME_TO_FIRST_OUTPUT_MS))
+    stats.time_per_output_unit_ms = _as_float(merged.get(defs.TIME_PER_OUTPUT_UNIT_MS))
+    stats.inter_output_latencies_ms = _as_float_list(merged.get(defs.INTER_OUTPUT_LATENCIES_MS))
+    stats.inter_output_latency_ms = _as_float(merged.get(defs.INTER_OUTPUT_LATENCY_MS))
+    stats.vllm_ttft_ms = _as_float(merged.get(defs.VLLM_TTFT_MS))
+    stats.vllm_tpot_ms = _as_float(merged.get(defs.VLLM_TPOT_MS))
+    stats.vllm_itls_ms = _as_float_list(merged.get(defs.VLLM_ITLS_MS))
+    stats.vllm_itl_ms = _as_float(merged.get(defs.VLLM_ITL_MS))
+    return stats
+
+
+def _one_row_per_stage(events: list[StageRequestStats]) -> list[StageRequestStats]:
+    """Fold chunk snapshots so the logger table has one column per stage."""
+    merged_by_stage: dict[int, dict[str, object]] = {}
+    templates: dict[int, StageRequestStats] = {}
+    chunks_by_stage: dict[int, list[StageRequestStats]] = {}
+    for evt in events:
+        if evt.stage_id is None:
+            continue
+        sid = int(evt.stage_id)
+        templates.setdefault(sid, evt)
+        chunks_by_stage.setdefault(sid, []).append(evt)
+        merged_by_stage[sid] = OrchestratorAggregator._merge_stage_metric_event(merged_by_stage.get(sid), evt)
+    rows: list[StageRequestStats] = []
+    for sid in sorted(merged_by_stage):
+        merged = merged_by_stage[sid]
+        tpot_ms = _weighted_tpot_ms(chunks_by_stage[sid])
+        if tpot_ms is not None:
+            merged[defs.VLLM_TPOT_MS] = tpot_ms
+        rows.append(_apply_merged_stage_stats(templates[sid], merged))
+    return rows
 
 
 class OrchestratorAggregator:
@@ -144,10 +236,12 @@ class OrchestratorAggregator:
         *,
         transfer_emitter: OmniTransferMetrics | None = None,
         replica_resolver: Callable[[int, str], int | None] | None = None,
+        stage_table_exclude: frozenset[str] = frozenset(),
     ) -> None:
         self.num_stages = int(num_stages)
         self.log_stats = bool(log_stats)
         self.final_stage_id_for_e2e = final_stage_id_for_e2e
+        self.stage_table_exclude = frozenset(stage_table_exclude)
         self.init_run_state(wall_start_ts)
         self.stage_events: dict[str, list[StageRequestStats]] = {}
         self.transfer_events: dict[
@@ -175,11 +269,11 @@ class OrchestratorAggregator:
         self.e2e_total_ms = 0.0
         self.e2e_total_tokens = 0
         self.e2e_count = 0
-        self.e2e_done = set()
+        self.e2e_done: set[str] = set()
         self.wall_start_ts = float(wall_start_ts)
         self.last_finish_ts = float(wall_start_ts)
-        self.stage_first_ts = [None for _ in range(self.num_stages)]
-        self.stage_last_ts = [None for _ in range(self.num_stages)]
+        self.stage_first_ts: list[float | None] = [None for _ in range(self.num_stages)]
+        self.stage_last_ts: list[float | None] = [None for _ in range(self.num_stages)]
         self.accumulated_gen_time_ms: defaultdict[str, defaultdict[int, float]] = defaultdict(
             lambda: defaultdict(float)
         )  # {request_id: {stage_id:accumulated_gen_time_ms}}
@@ -382,6 +476,7 @@ class OrchestratorAggregator:
         finished: bool,
         final_output_type: str | None,
         output_to_yield: Any | None,
+        event_cursor: int = 0,
     ) -> None:
         """Process and record stage metrics.
 
@@ -410,7 +505,7 @@ class OrchestratorAggregator:
                 return
 
             rid_key = str(req_id)
-            stage_snapshot = self._build_stage_metrics_snapshot(rid_key)
+            stage_snapshot = self._build_stage_metrics_snapshot(rid_key, event_cursor=event_cursor)
 
             # 3. Not finished yet — expose incremental per-stage snapshot for streaming clients.
             if not finished:
@@ -424,7 +519,11 @@ class OrchestratorAggregator:
             # token fields only for text stages (OpenAI-style completion token accounting).
             output_to_yield.metrics = {"stage_metrics": stage_snapshot}
             stage_event = next(
-                (evt for evt in reversed(self.stage_events.get(rid_key, [])) if evt.stage_id == stage_id),
+                (
+                    evt
+                    for evt in reversed(self.stage_events.get(rid_key, [])[event_cursor:])
+                    if evt.stage_id == stage_id
+                ),
                 None,
             )
             if stage_event is not None and stage_event.final_output_type == "text":
@@ -464,6 +563,7 @@ class OrchestratorAggregator:
             current = {
                 "stage_id": sid,
                 "final_output_type": evt.final_output_type,
+                "finish_reason": evt.finish_reason,
                 defs.NUM_TOKENS_IN: int(evt.num_tokens_in),
                 defs.NUM_TOKENS_OUT: int(evt.num_tokens_out),
                 defs.STAGE_GEN_TIME_MS: float(evt.stage_gen_time_ms),
@@ -471,12 +571,12 @@ class OrchestratorAggregator:
                 defs.AUDIO_FRAMES: int(evt.audio_generated_frames),
                 defs.AUDIO_SAMPLE_RATE: int(evt.audio_sample_rate),
                 f"{defs.AUDIO_DURATION}_s": float(evt.audio_duration_s),
-                defs.AUDIO_RTF: float(evt.audio_rtf),
                 defs.IMAGE_PIXELS: int(evt.image_pixels),
                 defs.DENOISE_STEP_LATENCY_MS: float(evt.denoise_step_latency_ms),
                 "output_unit_type": evt.output_unit_type,
                 defs.OUTPUT_UNIT_COUNT: int(evt.output_unit_count),
                 defs.SERVING_TIME_TO_FIRST_OUTPUT_MS: float(evt.serving_time_to_first_output_ms),
+                defs.IMAGE_TIME_TO_FIRST_OUTPUT_MS: float(evt.image_time_to_first_output_ms),
                 defs.TIME_PER_OUTPUT_UNIT_MS: float(evt.time_per_output_unit_ms),
                 defs.INTER_OUTPUT_LATENCY_MS: float(evt.inter_output_latency_ms),
                 defs.INTER_OUTPUT_LATENCIES_MS: list(evt.inter_output_latencies_ms or []),
@@ -489,6 +589,8 @@ class OrchestratorAggregator:
 
         current[defs.NUM_TOKENS_IN] = int(current.get(defs.NUM_TOKENS_IN, 0)) + int(evt.num_tokens_in)
         current[defs.NUM_TOKENS_OUT] = int(current.get(defs.NUM_TOKENS_OUT, 0)) + int(evt.num_tokens_out)
+        if evt.finish_reason is not None:
+            current["finish_reason"] = evt.finish_reason
         current[defs.STAGE_GEN_TIME_MS] = float(current.get(defs.STAGE_GEN_TIME_MS, 0.0)) + float(evt.stage_gen_time_ms)
         current[defs.POSTPROCESS_TIME_MS] = float(current.get(defs.POSTPROCESS_TIME_MS, 0.0)) + float(
             evt.postprocess_time_ms
@@ -509,6 +611,11 @@ class OrchestratorAggregator:
         current_first_output_ms = float(current.get(defs.SERVING_TIME_TO_FIRST_OUTPUT_MS, 0.0))
         if current_first_output_ms <= 0 < first_output_ms:
             current[defs.SERVING_TIME_TO_FIRST_OUTPUT_MS] = first_output_ms
+
+        image_first_output_ms = float(evt.image_time_to_first_output_ms)
+        current_image_first_output_ms = float(current.get(defs.IMAGE_TIME_TO_FIRST_OUTPUT_MS, 0.0))
+        if current_image_first_output_ms <= 0 < image_first_output_ms:
+            current[defs.IMAGE_TIME_TO_FIRST_OUTPUT_MS] = image_first_output_ms
 
         if evt.output_unit_type:
             current["output_unit_type"] = evt.output_unit_type
@@ -541,16 +648,20 @@ class OrchestratorAggregator:
             0.0,
         )
         current[defs.TIME_PER_OUTPUT_UNIT_MS] = remaining_ms / float(output_count - 1) if output_count > 1 else 0.0
-        duration_s = float(current.get(f"{defs.AUDIO_DURATION}_s", 0.0))
-        current[defs.AUDIO_RTF] = defs.compute_audio_rtf(
-            float(current.get(defs.STAGE_GEN_TIME_MS, 0.0)) / 1000.0, duration_s
-        )
         return current
 
-    def _build_stage_metrics_snapshot(self, req_id: str) -> dict[str, dict[str, Any]]:
+    def stage_event_cursor(self, req_id: str) -> int:
+        return len(self.stage_events.get(str(req_id), ()))
+
+    def _build_stage_metrics_snapshot(
+        self,
+        req_id: str,
+        *,
+        event_cursor: int = 0,
+    ) -> dict[str, dict[str, Any]]:
         """Aggregate per-stage metrics for ``req_id`` (string key), for streaming/benchmark clients."""
         snapshot: dict[str, dict[str, Any]] = {}
-        for evt in self.stage_events.get(req_id, []):
+        for evt in self.stage_events.get(req_id, [])[event_cursor:]:
             sid = int(evt.stage_id) if evt.stage_id is not None else -1
             if sid < 0:
                 continue
@@ -571,11 +682,20 @@ class OrchestratorAggregator:
         stats.request_id = req_id
         if final_output_type is not None:
             stats.final_output_type = final_output_type
+        diffusion_metrics_by_request = getattr(self, "diffusion_metrics", None)
         stats.diffusion_metrics = (
-            {k: int(v) for k, v in self.diffusion_metrics.pop(req_id, {}).items()}
-            if req_id in self.diffusion_metrics
+            {k: float(v) for k, v in diffusion_metrics_by_request.pop(req_id, {}).items()}
+            if diffusion_metrics_by_request is not None and req_id in diffusion_metrics_by_request
             else None
         )
+        forward_time_s = (stats.diffusion_metrics or {}).get("forward_time_s")
+        num_inference_steps = int(getattr(stats, "num_inference_steps", 0) or 0)
+        if num_inference_steps > 0 and getattr(stats, "output_unit_type", None) == "image":
+            if forward_time_s is not None:
+                denoise_time_ms = float(forward_time_s) * 1000.0
+            else:
+                denoise_time_ms = float(getattr(stats, "stage_gen_time_ms", 0.0) or 0.0)
+            stats.denoise_step_latency_ms = denoise_time_ms / num_inference_steps
         return stats
 
     def on_stage_metrics(
@@ -586,6 +706,7 @@ class OrchestratorAggregator:
         final_output_type: str | None = None,
     ) -> None:
         stats = self._as_stage_request_stats(stage_id, req_id, metrics, final_output_type)
+        assert stats.stage_id is not None
         self.stage_total_tokens[stats.stage_id] += int(stats.num_tokens_out)
         if stats.stage_id == 0:
             self.stage_total_tokens[stats.stage_id] += int(stats.num_tokens_in)
@@ -621,10 +742,25 @@ class OrchestratorAggregator:
             _postproc_ms = (time.perf_counter() - _t0) * 1000.0
             self.record_stage_postprocess_time(stage_id, req_id, _postproc_ms)
 
+    _MS_TO_S: dict[str, str] = {
+        "preprocess_time_ms": "preprocess_time_s",
+        "diffusion_engine_exec_time_ms": "diffusion_engine_exec_time_s",
+        "output_ready_wait_time_ms": "output_ready_wait_time_s",
+        "postprocess_time_ms": "postprocess_time_s",
+        "vae_decode_time_ms": "vae_decode_time_s",
+        "forward_time_ms": "forward_time_s",
+        "scheduler_queue_wait_ms": "scheduler_queue_wait_s",
+        "kv_recv_time_ms": "kv_recv_time_s",
+    }
+
     def accumulate_diffusion_metrics(self, stage_type: str, req_id: Any, engine_outputs: Any) -> None:
         """Accumulate diffusion metrics for a request.
 
-        Handles extraction and accumulation of diffusion stage metrics.
+        Engine emits ``*_ms`` timings; the accumulator converts them to ``_s``
+        keys via ``_MS_TO_S`` so downstream observers read a uniform
+        seconds-bearing dict. Per-chunk timing keys are summed; non-timing
+        keys (e.g. ``image_num`` / ``resolution`` from ``format_diffusion_outputs``)
+        preserve the existing ``+=`` semantics.
 
         Args:
             req_id: Request ID
@@ -636,9 +772,16 @@ class OrchestratorAggregator:
         diffusion_metrics: dict = getattr(engine_output, "metrics", {})
         if isinstance(diffusion_metrics, list):
             diffusion_metrics = diffusion_metrics[0]
-        if diffusion_metrics:
-            for key, value in diffusion_metrics.items():
-                self.diffusion_metrics[req_id][key] += value
+        if not diffusion_metrics:
+            return
+        bucket = self.diffusion_metrics[req_id]
+        for key, value in diffusion_metrics.items():
+            if value is None:
+                continue
+            if key in self._MS_TO_S:
+                bucket[self._MS_TO_S[key]] += float(value) / 1000.0
+            else:
+                bucket[key] += float(value)
 
     def on_forward(
         self,
@@ -721,10 +864,8 @@ class OrchestratorAggregator:
             final_stage_id_map = self.final_stage_id_for_e2e
 
         stage_wall_time_ms = [
-            ((self.stage_last_ts[i] - self.stage_first_ts[i]) * 1000.0)
-            if (self.stage_first_ts[i] is not None and self.stage_last_ts[i] is not None)
-            else 0.0
-            for i in range(self.num_stages)
+            ((last - first) * 1000.0) if first is not None and last is not None else 0.0
+            for first, last in zip(self.stage_first_ts, self.stage_last_ts, strict=True)
         ]
 
         overall_summary = {
@@ -827,7 +968,8 @@ class OrchestratorAggregator:
             # === Stage table (columns = stage_id) ===
             # if any stage has diffusion_metrics, remove postprocess_time_ms field
             # because it is already included in diffusion_metrics
-            local_exclude = STAGE_EXCLUDE.copy()
+            local_exclude: set[str] = set(STAGE_EXCLUDE)
+            local_exclude.update(self.stage_table_exclude)
             has_diffusion_metrics = any(getattr(evt, "diffusion_metrics", None) for evt in stage_evts)
             if has_diffusion_metrics:
                 local_exclude.add("postprocess_time_ms")

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 An high-level API client adapter that forwards ComfyUI inputs to vLLM-Omni's REST API,
 and transforms the API responses back to ComfyUI formats.
@@ -17,6 +20,7 @@ from comfy_api.input import AudioInput, VideoInput
 
 from .format import (
     audio_to_base64,
+    audio_to_bytes,
     base64_to_audio,
     base64_to_image_tensor,
     bytes_to_audio,
@@ -24,10 +28,18 @@ from .format import (
     image_tensor_to_base64,
     image_tensor_to_png_bytes,
     video_to_base64,
+    video_to_bytes,
 )
+from .latent_mask import scalar_mask_to_json, video_mask_to_grid_json
 from .logger import get_logger, pretty_printer
 from .models import lookup_model_spec
-from .types import AudioFormat
+from .types import (
+    MAX_REFERENCE_AUDIOS,
+    MAX_REFERENCE_IMAGES,
+    MAX_REFERENCE_VIDEOS,
+    MAX_TOTAL_REFERENCES,
+    AudioFormat,
+)
 
 logger = get_logger(__name__)
 
@@ -63,7 +75,11 @@ async def url_bytes(session: aiohttp.ClientSession, url: str, verb: str = "get",
 
 class VLLMOmniClient:
     def __init__(
-        self, base_url: str, timeout: float | None = None, poll_interval: float = 5.0, max_poll_duration: float = 60 * 5
+        self,
+        base_url: str,
+        timeout: float | None = None,
+        poll_interval: float = 5.0,
+        max_poll_duration: float = 60 * 30,
     ):
         self.base_url = base_url
         self.timeout = aiohttp.ClientTimeout(total=timeout)
@@ -261,12 +277,37 @@ class VLLMOmniClient:
         num_frames: int,
         fps: int,
         negative_prompt: str | None = None,
-        image: torch.Tensor | None = None,
+        frame: torch.Tensor | None = None,
+        first_frame: torch.Tensor | None = None,
+        last_frame: torch.Tensor | None = None,
+        references: dict | None = None,
         sampling_params: dict | None = None,
         model_params: dict | None = None,
         lora: dict | None = None,
-        **extra_body,
+        latent_edit: dict | None = None,
+        spec_model: str | None = None,
+        **extra_params,
     ) -> VideoInput:
+        """Post a video job and return the decoded result.
+
+        ``spec_model`` names the model whose payload spec builds the request, for
+        deployments that serve a known model under a different ``model`` alias. It
+        never reaches the wire; defaults to ``model``.
+        """
+        if frame is not None and references is not None:
+            raise ValueError("Provide only one of frame or references, not both.")
+        if frame is not None and (first_frame is not None or last_frame is not None):
+            raise ValueError("Provide either frame or first_frame/last_frame, not both.")
+        if references is not None and (first_frame is not None or last_frame is not None):
+            raise ValueError("Provide either first_frame/last_frame or references, not both.")
+
+        spec, matched_pattern = lookup_model_spec(spec_model or model)
+        if (first_frame is not None or last_frame is not None) and (
+            matched_pattern is None or "MiniMax-H3" not in matched_pattern
+        ):
+            raise ValueError("first_frame and last_frame are supported only for MiniMax-H3; use frame for this model.")
+
+        # === regular payload fields ===
         form = aiohttp.FormData()
         form.add_field("model", model)
         form.add_field("prompt", prompt)
@@ -279,22 +320,151 @@ class VLLMOmniClient:
         if sampling_params is not None:
             for k, v in sampling_params.items():
                 form.add_field(k, str(v))
-        if model_params is not None:
-            for k, v in model_params.items():
-                form.add_field(k, str(v))
         if lora is not None:
             form.add_field("lora", json.dumps(lora, ensure_ascii=False))
-        if extra_body:
-            form.add_field("extra_body", json.dumps(extra_body, ensure_ascii=False))
 
-        if image is not None:
-            image_filename = "image.png"  # Required for multipart form
+        # === multimodal inputs (first-last-frames, references, etc.) ===
+        input_reference_image: torch.Tensor | None = None
+        keyframe_images: list[tuple[str, torch.Tensor]] = []
+        video_task: str | None = None
+
+        if frame is not None:
+            input_reference_image = frame
+            video_task = "fl2va"
+        elif first_frame is not None or last_frame is not None:
+            frame_indices: list[int] = []
+            if first_frame is not None:
+                keyframe_images.append(("first_frame.png", first_frame))
+                frame_indices.append(0)
+            if last_frame is not None:
+                keyframe_images.append(("last_frame.png", last_frame))
+                frame_indices.append(-1)
+            if len(keyframe_images) == 1:
+                input_reference_image = keyframe_images[0][1]
+            extra_params["frame_indices"] = frame_indices
+            video_task = "fl2va"
+        elif references is not None:
+            reference_formats = (
+                ("image", MAX_REFERENCE_IMAGES, "png", "image/png", image_tensor_to_png_bytes),
+                ("video", MAX_REFERENCE_VIDEOS, "mp4", "video/mp4", video_to_bytes),
+                ("audio", MAX_REFERENCE_AUDIOS, "mp3", "audio/mpeg", audio_to_bytes),
+            )
+            supported_inputs = {f"{kind}_{i}" for kind, limit, *_ in reference_formats for i in range(1, limit + 1)}
+            connected = {name: value for name, value in references.items() if value is not None}
+            unsupported = connected.keys() - supported_inputs
+            if unsupported:
+                raise ValueError(f"Unsupported reference input(s): {', '.join(sorted(unsupported))}.")
+            if not any(name.startswith(("image_", "video_")) for name in connected):
+                raise ValueError(
+                    "references requires at least one image or video; audio-only inputs are not supported."
+                )
+            if len(connected) > MAX_TOTAL_REFERENCES:
+                raise ValueError(
+                    f"references supports at most {MAX_TOTAL_REFERENCES} inputs in total "
+                    f"(up to {MAX_REFERENCE_IMAGES} images, {MAX_REFERENCE_VIDEOS} videos, "
+                    f"and {MAX_REFERENCE_AUDIOS} audios)."
+                )
+            for kind, limit, extension, content_type, encode in reference_formats:
+                for index in range(1, limit + 1):
+                    name = f"{kind}_{index}"
+                    if name in connected:
+                        filename = f"{name}.{extension}"
+                        form.add_field(
+                            "input_references",
+                            encode(connected[name], filename),
+                            filename=filename,
+                            content_type=content_type,
+                        )
+            video_task = "ref2va"
+        else:
+            video_task = "t2va"
+
+        if input_reference_image is not None:
+            image_filename = keyframe_images[0][0] if keyframe_images else "image.png"
             form.add_field(
                 "input_reference",
-                image_tensor_to_png_bytes(image, image_filename),
+                image_tensor_to_png_bytes(input_reference_image, image_filename),
                 filename=image_filename,
                 content_type="image/png",
             )
+
+        # === latent-mask editing (MiniMax H3) ===
+        if latent_edit is not None:
+            source_video = latent_edit.get("source_video")
+            source_audio = latent_edit.get("source_audio")
+            video_mask = latent_edit.get("video_mask")
+            audio_mask = latent_edit.get("audio_mask")
+
+            if video_mask is None and audio_mask is None:
+                raise ValueError("Latent-mask editing requires at least one mask.")
+
+            video_mask_trivial = video_mask is None or bool((video_mask == 1.0).all().item())
+            audio_mask_trivial = audio_mask is None or audio_mask == 1.0
+            if not video_mask_trivial and source_video is None:
+                raise ValueError("A non-trivial video mask requires a source video.")
+            if not audio_mask_trivial and source_audio is None and source_video is None:
+                raise ValueError("A non-trivial audio mask requires a source audio or a source video with audio.")
+
+            if source_video is not None:
+                form.add_field(
+                    "source_video",
+                    video_to_bytes(source_video, "source.mp4"),
+                    filename="source.mp4",
+                    content_type="video/mp4",
+                )
+            if source_audio is not None:
+                form.add_field(
+                    "source_audio",
+                    audio_to_bytes(source_audio, "source_audio.mp3"),
+                    filename="source_audio.mp3",
+                    content_type="audio/mpeg",
+                )
+            if video_mask is not None:
+                mask_json = video_mask_to_grid_json(video_mask, width=width, height=height, num_frames=num_frames)
+                form.add_field(
+                    "video_noise_mask",
+                    mask_json.encode("utf-8"),
+                    filename="video-mask.json",
+                    content_type="application/json",
+                )
+            if audio_mask is not None:
+                form.add_field(
+                    "audio_noise_mask",
+                    scalar_mask_to_json(audio_mask).encode("utf-8"),
+                    filename="audio-mask.json",
+                    content_type="application/json",
+                )
+
+        if len(keyframe_images) == 2:
+            for image_filename, image in keyframe_images:
+                form.add_field(
+                    "input_references",
+                    image_tensor_to_png_bytes(image, image_filename),
+                    filename=image_filename,
+                    content_type="image/png",
+                )
+
+        # === model specific params. Either use a specialized builder, or add flattened fields as-is ===
+        if model_params is not None:
+            model_params = dict(model_params)
+            model_params.pop("type", None)
+
+        params_builder = spec.get("params_builder") if spec else None
+        if params_builder is not None:
+            form_fields = params_builder(
+                model_params or {},
+                extra_params={**extra_params, "task": video_task},
+                width=width,
+                height=height,
+            )
+            for k, v in form_fields.items():
+                form.add_field(k, v if isinstance(v, str) else str(v))
+        else:
+            if model_params is not None:
+                for k, v in model_params.items():
+                    form.add_field(k, str(v))
+            if extra_params:
+                form.add_field("extra_params", json.dumps(extra_params, ensure_ascii=False))
 
         async with aiohttp.ClientSession(timeout=self.timeout) as session:
             # Start the video generation job

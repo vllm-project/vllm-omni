@@ -2,12 +2,12 @@
 # HF: OpenMOSS-Team/MOSS-TTS
 # General-purpose TTS with voice cloning. Production-recommended variant.
 async_chunk: true
+trust_remote_code: true  # OpenMOSS-Team/MOSS-TTS ships custom modeling code
 
 connectors:
   shm:
     name: SharedMemoryConnector
     extra:
-      shm_threshold_bytes: 65536
       codec_streaming: true
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
@@ -57,3 +57,11 @@ stages:
       max_tokens: 65536
       seed: 42
       repetition_penalty: 1.0
+
+platforms:
+  rocm:
+    stages:
+      - stage_id: 1
+        # MIOPEN_FIND_MODE=FAST changes solver selection, not HIP graph safety.
+        # Keep the Conv1d codec outside the outer vLLM graph on ROCm.
+        enforce_eager: true

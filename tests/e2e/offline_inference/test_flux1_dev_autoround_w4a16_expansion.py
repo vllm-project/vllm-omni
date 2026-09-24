@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E tests for FLUX AutoRound W4A16 quantized inference.
 
 These tests require:
@@ -19,8 +19,8 @@ import pytest
 import torch
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
-from tests.helpers.env import DeviceMemoryMonitor
 from tests.helpers.mark import hardware_test
+from tests.helpers.monitor import DeviceMemoryMonitor
 from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -54,7 +54,7 @@ def _sampling_params() -> OmniDiffusionSamplingParams:
 def _first_request_images(outputs) -> list:
     first_output = outputs[0]
     assert first_output.final_output_type == "image"
-    req_out = first_output.request_output
+    req_out = first_output
     assert isinstance(req_out, OmniRequestOutput) and hasattr(req_out, "images")
     return req_out.images
 
@@ -105,7 +105,7 @@ def _generate_image(model_name: str, **extra_kwargs) -> tuple[list, float]:
 
 
 @pytest.mark.skip(reason="BF16 baseline model cannot be loaded correctly yet.")
-@pytest.mark.full_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4"})
 @pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True)
@@ -124,7 +124,7 @@ def test_flux_autoround_w4a16_generates_image(omni_runner: OmniRunner):
 
 
 @pytest.mark.skip(reason="BF16 baseline model cannot be loaded correctly yet.")
-@pytest.mark.full_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4"})
 def test_flux_autoround_w4a16_memory_savings():

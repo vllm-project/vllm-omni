@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Custom model configs that cannot be expressed via HuggingFace Transformers alone,
 following the same pattern as vllm.transformers_utils.configs.
@@ -10,6 +10,9 @@ from __future__ import annotations
 import importlib
 
 _CLASS_TO_MODULE: dict[str, str] = {
+    "Audio8TTSConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
+    "Audio8TTSSlowARConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
+    "Audio8TTSFastARConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
     "HiggsAudioV3Config": "vllm_omni.transformers_utils.configs.higgs_audio_v3",
     "Mammothmoda2Config": "vllm_omni.transformers_utils.configs.mammoth_moda2",
     "Mammothmoda2Qwen2_5_VLConfig": "vllm_omni.transformers_utils.configs.mammoth_moda2",
@@ -22,6 +25,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "VoxCPM2Config": "vllm_omni.transformers_utils.configs.voxcpm2",
     "VoxtralTTSConfig": "vllm_omni.transformers_utils.configs.voxtral_tts",
     "CosyVoice3Config": "vllm_omni.transformers_utils.configs.cosyvoice3",
+    "MiniMaxMusic3Config": "vllm_omni.transformers_utils.configs.minimax_music3",
     "OmniVoiceConfig": "vllm_omni.transformers_utils.configs.omnivoice",
     "BailingMoeV2Config": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "BailingMM2Config": "vllm_omni.transformers_utils.configs.ming_flash_omni",
@@ -29,9 +33,15 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "MingFlashOmniConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "Qwen3VLMoeVisionConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "WhisperEncoderConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
+    "AuKConfig": "vllm_omni.transformers_utils.configs.auk",
+    "SenseNovaU1Config": "vllm_omni.transformers_utils.configs.sensenova_u1",
 }
 
 __all__ = [
+    "Audio8TTSConfig",
+    "AuKConfig",
+    "Audio8TTSFastARConfig",
+    "Audio8TTSSlowARConfig",
     "HiggsAudioV3Config",
     "Mammothmoda2Config",
     "Mammothmoda2Qwen2_5_VLConfig",
@@ -44,6 +54,7 @@ __all__ = [
     "VoxCPM2Config",
     "VoxtralTTSConfig",
     "CosyVoice3Config",
+    "MiniMaxMusic3Config",
     "OmniVoiceConfig",
     "BailingMoeV2Config",
     "BailingMM2Config",
@@ -51,6 +62,7 @@ __all__ = [
     "MingFlashOmniConfig",
     "Qwen3VLMoeVisionConfig",
     "WhisperEncoderConfig",
+    "SenseNovaU1Config",
 ]
 
 
@@ -69,12 +81,16 @@ def __dir__():
 
 # Eagerly import all config modules so their AutoConfig.register() side-effects
 # run as soon as `vllm_omni.transformers_utils.configs` is imported.
+from vllm_omni.transformers_utils.configs import audio8_tts as _audio8_tts  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import auk as _auk  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import cosyvoice3 as _cosyvoice3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import glm_tts as _glm_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import higgs_audio_v3 as _higgs_audio_v3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import mammoth_moda2 as _mammoth_moda2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import ming_flash_omni as _ming_flash_omni  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import minimax_music3 as _minimax_music3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import omnivoice as _omnivoice  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import sensenova_u1 as _sensenova_u1  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxcpm2 as _voxcpm2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxtral_tts as _voxtral_tts  # noqa: F401, E402

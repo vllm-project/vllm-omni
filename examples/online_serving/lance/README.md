@@ -1,4 +1,4 @@
-# Lance — online serving
+# Lance: Online serving
 
 OpenAI-compatible chat completions API for Lance, served by `vllm-omni`.
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -46,6 +46,7 @@ from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
@@ -62,10 +63,10 @@ def get_hunyuan_video_15_i2v_pre_process_func(od_config: OmniDiffusionConfig):
     divisor = 16  # Must be divisible by VAE spatial compression
 
     def pre_process_func(req: OmniDiffusionRequest) -> OmniDiffusionRequest:
-        if not req.prompts:
+        if not req.prompt:
             return req
 
-        prompt_data = req.prompts[0]
+        prompt_data = req.prompt
         if isinstance(prompt_data, str):
             return req
 
@@ -474,7 +475,7 @@ class HunyuanVideo15I2VPipeline(
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         num_inference_steps: int = 50,
         guidance_scale: float = 6.0,
         height: int = 480,
@@ -642,7 +643,10 @@ class HunyuanVideo15I2VPipeline(
             latents = latents.to(self.vae.dtype) / self.vae.config.scaling_factor
             output = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(output=output)
+        return DiffusionOutput(
+            output=output,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

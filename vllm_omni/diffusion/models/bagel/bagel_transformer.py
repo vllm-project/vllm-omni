@@ -1,6 +1,7 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates.
 # Copyright (c) 2024 The Qwen Team and The HuggingFace Inc. team.
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # This file has been modified by ByteDance Ltd. and/or its affiliates.
 #
@@ -9,6 +10,7 @@
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -37,20 +39,20 @@ from vllm.transformers_utils.configs.bagel import BagelConfig
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata as DiffusionAttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as DiffusionAttention
-from vllm_omni.diffusion.cache.cache_dit_backend import BagelCachedAdapter, CacheDiTAdapterConfig
+from vllm_omni.diffusion.cache.cachedit import BagelCachedAdapter, CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
-    get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
     get_sequence_parallel_rank,
     get_sp_group,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
-from vllm_omni.diffusion.layers.mot.mot_layernorm import MoTRMSNorm
-from vllm_omni.diffusion.layers.mot.mot_qkv_parallel_linear import MoTQKVParallelLinear
-from vllm_omni.diffusion.layers.mot.mot_row_parallel_linear import MoTRowParallelLinear
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.models.bagel.mot.mot_layernorm import MoTRMSNorm
+from vllm_omni.diffusion.models.bagel.mot.mot_qkv_parallel_linear import MoTQKVParallelLinear
+from vllm_omni.diffusion.models.bagel.mot.mot_row_parallel_linear import MoTRowParallelLinear
 from vllm_omni.diffusion.utils.kv_utils import left_pad_stack
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 
@@ -364,15 +366,19 @@ class NaiveCache:
 
     @staticmethod
     def merge(caches: Sequence["NaiveCache"]) -> "NaiveCache":
-        """Merge per-branch NaiveCaches into one for batched attention;
-        this lets us do the forward passes for CFG in one batched pass,
-        although it's worth noting that this is currently only used
-        for single request. We need this so that gen mode knows the
-        respective kv lengths, and can split things back out as needed.
+        """Merge NaiveCaches into one for packed request/CFG attention.
+
+        Already-merged inputs keep their per-sequence lengths so nested
+        request-by-CFG packing can split cache rows back out correctly.
         """
         num_layers = caches[0].num_layers
         merged = NaiveCache(num_layers)
-        lens = [c.seq_lens for c in caches]
+        lens = []
+        for cache in caches:
+            if cache.key_values_lens is None:
+                lens.append(cache.seq_lens)
+            else:
+                lens.extend(cache.key_values_lens)
         merged.key_values_lens = lens
 
         nonempty = [c for c in caches if c.key_cache[0] is not None]
@@ -1247,7 +1253,7 @@ def get_flattened_position_ids_extrapolate(img_h, img_w, patch_size, max_num_pat
     return pos_ids
 
 
-class Bagel(nn.Module):
+class Bagel(CFGParallelMixin, nn.Module):
     config_class = BagelConfig
     base_model_prefix = "bagel"
 
@@ -1257,6 +1263,20 @@ class Bagel(nn.Module):
     # (``num_timesteps + 1``) for ``num_timesteps`` steps; ``LanceBagel`` flips
     # this on. See https://github.com/vllm-project/vllm-omni/issues/4470.
     _denoise_schedule_extra_step: bool = False
+
+    def prepare_denoise_schedule(
+        self,
+        x_t: torch.Tensor,
+        num_timesteps: int,
+        timestep_shift: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build BAGEL's flow-matching timesteps and per-step deltas."""
+        if num_timesteps < 2 and not self._denoise_schedule_extra_step:
+            raise ValueError("BAGEL image generation requires num_inference_steps >= 2.")
+        num_sample_points = num_timesteps + 1 if self._denoise_schedule_extra_step else num_timesteps
+        schedule = torch.linspace(1, 0, num_sample_points, device=x_t.device)
+        schedule = timestep_shift * schedule / (1 + (timestep_shift - 1) * schedule)
+        return schedule[:-1], schedule[:-1] - schedule[1:]
 
     def __init__(
         self,
@@ -1822,11 +1842,7 @@ class Bagel(nn.Module):
         # Build the flow-matching schedule. BAGEL drops the terminal t=0 for
         # ``num_timesteps - 1`` Euler steps; Lance keeps it for ``num_timesteps``.
         # ``_denoise_schedule_extra_step`` (overridden by ``LanceBagel``) selects which.
-        num_sample_points = num_timesteps + 1 if self._denoise_schedule_extra_step else num_timesteps
-        timesteps = torch.linspace(1, 0, num_sample_points, device=x_t.device)
-        timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
-        dts = timesteps[:-1] - timesteps[1:]
-        timesteps = timesteps[:-1]
+        timesteps, dts = Bagel.prepare_denoise_schedule(self, x_t, num_timesteps, timestep_shift)
 
         # Optional trajectory recording for RL rollout data collection
         trajectory_latents: list[torch.Tensor] | None = [] if return_trajectory_latents else None
@@ -2078,7 +2094,6 @@ class Bagel(nn.Module):
         Rank 2: img_cfg branch (no image condition), only when cfg_img_scale > 1.0
         """
         cfg_group = get_cfg_group()
-        cfg_rank = get_classifier_free_guidance_rank()
         cfg_world_size = get_classifier_free_guidance_world_size()
         use_cfg_img = cfg_img_scale > 1.0
 
@@ -2101,22 +2116,6 @@ class Bagel(nn.Module):
         x_t = x_t.contiguous()
         cfg_group.broadcast(x_t, src=0)
 
-        # Select this rank's branch inputs
-        if cfg_rank == 0:
-            # Gen branch: use main inputs directly
-            branch_position_ids = packed_position_ids
-            branch_past_key_values = past_key_values
-        elif cfg_rank == 1:
-            # Text CFG branch
-            branch_position_ids = cfg_text_packed_position_ids
-            branch_past_key_values = cfg_text_past_key_values
-        elif cfg_rank == 2:
-            # Image CFG branch
-            branch_position_ids = cfg_img_packed_position_ids
-            branch_past_key_values = cfg_img_past_key_values
-        else:
-            raise RuntimeError(f"Unexpected cfg_rank={cfg_rank} for Bagel 3-branch CFG parallel")
-
         trajectory_latents: list[torch.Tensor] | None = [] if return_trajectory_latents else None
         trajectory_timesteps: list[torch.Tensor] | None = [] if return_trajectory_latents else None
         trajectory_log_probs: list[torch.Tensor] | None = (
@@ -2137,43 +2136,46 @@ class Bagel(nn.Module):
                 timestep[frame_condition_token_indexes] = 0.0
             use_cfg_this_step = t > cfg_interval[0] and t <= cfg_interval[1] and cfg_text_scale > 1.0
 
-            if use_cfg_this_step:
-                # CFG interval: each rank computes its own branch
-                local_v_t = self.forward_single_branch(
-                    x_t=x_t,
-                    timestep=timestep,
-                    packed_vae_token_indexes=packed_vae_token_indexes,
-                    packed_vae_position_ids=packed_vae_position_ids,
-                    packed_text_ids=packed_text_ids,
-                    packed_text_indexes=packed_text_indexes,
-                    packed_position_ids=branch_position_ids,
-                    packed_seqlens=packed_seqlens,
-                    past_key_values=branch_past_key_values,
+            # Per-branch kwargs. Branch 0 (gen, full conditioning) is also the
+            # branch used by all ranks when do_true_cfg is False (outside the
+            # CFG interval) — CFGParallelMixin only runs branches_kwargs[0] then,
+            # mirroring the previous "all ranks compute gen inputs, no comm" path.
+            common = dict(
+                x_t=x_t,
+                timestep=timestep,
+                packed_vae_token_indexes=packed_vae_token_indexes,
+                packed_vae_position_ids=packed_vae_position_ids,
+                packed_text_ids=packed_text_ids,
+                packed_text_indexes=packed_text_indexes,
+                packed_seqlens=packed_seqlens,
+            )
+            branches_kwargs = [
+                dict(**common, packed_position_ids=packed_position_ids, past_key_values=past_key_values),
+                dict(
+                    **common, packed_position_ids=cfg_text_packed_position_ids, past_key_values=cfg_text_past_key_values
+                ),
+            ]
+            if use_cfg_img:
+                branches_kwargs.append(
+                    dict(
+                        **common,
+                        packed_position_ids=cfg_img_packed_position_ids,
+                        past_key_values=cfg_img_past_key_values,
+                    )
                 )
 
-                gathered = cfg_group.all_gather(local_v_t, separate_tensors=True)
-                v_t = self._combine_cfg(
-                    gathered[0],
-                    gathered[1],
-                    gathered[2] if (use_cfg_img and len(gathered) > 2) else None,
-                    cfg_text_scale,
-                    cfg_img_scale,
-                    cfg_renorm_type,
-                    cfg_renorm_min,
-                )
-            else:
-                # Outside CFG interval: all ranks compute with gen inputs, no comm
-                v_t = self.forward_single_branch(
-                    x_t=x_t,
-                    timestep=timestep,
-                    packed_vae_token_indexes=packed_vae_token_indexes,
-                    packed_vae_position_ids=packed_vae_position_ids,
-                    packed_text_ids=packed_text_ids,
-                    packed_text_indexes=packed_text_indexes,
-                    packed_position_ids=packed_position_ids,
-                    packed_seqlens=packed_seqlens,
-                    past_key_values=past_key_values,
-                )
+            # Each rank computes its assigned branch, then all_gather + combine
+            # happen inside the mixin (identical result on every rank).
+            v_t = self.predict_noise_with_multi_branch_cfg(
+                do_true_cfg=use_cfg_this_step,
+                true_cfg_scale={
+                    "cfg_text_scale": cfg_text_scale,
+                    "cfg_img_scale": cfg_img_scale,
+                    "cfg_renorm_type": cfg_renorm_type,
+                    "cfg_renorm_min": cfg_renorm_min,
+                },
+                branches_kwargs=branches_kwargs,
+            )
 
             if scheduler is not None:
                 out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
@@ -2242,10 +2244,107 @@ class Bagel(nn.Module):
 
         return v_t
 
+    def _combine_cfg_per_request(
+        self,
+        v_t: torch.Tensor,
+        cfg_text_v_t: torch.Tensor,
+        cfg_img_v_t: torch.Tensor | None,
+        cfg_vae_lengths: Sequence[int],
+        cfg_text_scales: Sequence[float],
+        cfg_img_scales: Sequence[float],
+        cfg_renorm_type: str,
+        cfg_renorm_min: float,
+    ) -> torch.Tensor:
+        """Apply BAGEL CFG independently to each packed request."""
+        if len(cfg_text_scales) != len(cfg_vae_lengths):
+            raise ValueError("cfg_text_scales must match cfg_vae_lengths.")
+        if len(cfg_img_scales) != len(cfg_vae_lengths):
+            raise ValueError("cfg_img_scales must match cfg_vae_lengths.")
+
+        gen_parts = v_t.split(list(cfg_vae_lengths))
+        text_parts = cfg_text_v_t.split(list(cfg_vae_lengths))
+        img_parts = (
+            cfg_img_v_t.split(list(cfg_vae_lengths)) if cfg_img_v_t is not None else [None] * len(cfg_vae_lengths)
+        )
+        return torch.cat(
+            [
+                gen_part
+                if text_scale <= 1.0
+                else self._combine_cfg(
+                    gen_part,
+                    text_part,
+                    img_part,
+                    text_scale,
+                    img_scale,
+                    cfg_renorm_type,
+                    cfg_renorm_min,
+                )
+                for gen_part, text_part, img_part, text_scale, img_scale in zip(
+                    gen_parts,
+                    text_parts,
+                    img_parts,
+                    cfg_text_scales,
+                    cfg_img_scales,
+                    strict=True,
+                )
+            ]
+        )
+
+    # ── CFGParallelMixin hooks ──
+    # Bagel mounts CFGParallelMixin (see class declaration) to reuse the shared
+    # N-branch CFG dispatch/all_gather logic in predict_noise_with_multi_branch_cfg.
+    # Only two hooks need model-specific behaviour:
+    #   * predict_noise: one branch == one Bagel forward (per-branch KV cache).
+    #   * combine_multi_branch_cfg_noise: Bagel's renorm-aware 3-branch combine.
+
+    def predict_noise(self, **kwargs) -> torch.Tensor:
+        """Single-branch velocity prediction for CFGParallelMixin.
+
+        Each CFG branch differs only by ``packed_position_ids`` and
+        ``past_key_values`` (carried in ``kwargs``); the heavy lifting is the
+        per-branch ``forward_single_branch`` pass.
+        """
+        return self.forward_single_branch(**kwargs)
+
+    def combine_multi_branch_cfg_noise(
+        self,
+        predictions: list[torch.Tensor],
+        true_cfg_scale: dict[str, Any],
+        cfg_normalize: bool = False,
+    ) -> torch.Tensor:
+        """Combine gen/text/img branch velocities via Bagel's renorm CFG.
+
+        ``predictions[0]`` is the gen branch, ``[1]`` the text-CFG branch, and
+        ``[2]`` (when present) the image-CFG branch. ``cfg_normalize`` is unused
+        because renormalization is folded into ``_combine_cfg`` itself.
+        """
+        cfg_img_v_t = predictions[2] if len(predictions) > 2 else None
+        cfg_vae_lengths = true_cfg_scale.get("cfg_vae_lengths")
+        if cfg_vae_lengths is not None:
+            return self._combine_cfg_per_request(
+                predictions[0],
+                predictions[1],
+                cfg_img_v_t,
+                cfg_vae_lengths,
+                true_cfg_scale["cfg_text_scales"],
+                true_cfg_scale["cfg_img_scales"],
+                true_cfg_scale["cfg_renorm_type"],
+                true_cfg_scale["cfg_renorm_min"],
+            )
+        return self._combine_cfg(
+            predictions[0],
+            predictions[1],
+            cfg_img_v_t,
+            true_cfg_scale["cfg_text_scale"],
+            true_cfg_scale["cfg_img_scale"],
+            true_cfg_scale["cfg_renorm_type"],
+            true_cfg_scale["cfg_renorm_min"],
+        )
+
     def forward_single_branch(
         self,
         x_t: torch.Tensor,
-        timestep: torch.LongTensor,
+        timestep: torch.Tensor,
         packed_vae_token_indexes: torch.LongTensor,
         packed_vae_position_ids: torch.LongTensor,
         packed_text_ids: torch.LongTensor,
@@ -2354,7 +2453,7 @@ class Bagel(nn.Module):
     def forward(
         self,
         x_t: torch.Tensor,
-        timestep: torch.LongTensor,
+        timestep: torch.Tensor,
         packed_vae_token_indexes: torch.LongTensor,
         packed_vae_position_ids: torch.LongTensor,
         packed_text_ids: torch.LongTensor,
@@ -2368,6 +2467,9 @@ class Bagel(nn.Module):
         cfg_img_scale: float = 1.0,
         cfg_branch_pids: list[torch.Tensor] | None = None,
         cfg_branch_caches: list[NaiveCache] | None = None,
+        cfg_vae_lengths: list[int] | None = None,
+        cfg_text_scales: list[float] | None = None,
+        cfg_img_scales: list[float] | None = None,
     ):
         # Build query sequence (identical for all CFG branches)
         packed_text_embedding = self.language_model.forward(
@@ -2391,17 +2493,22 @@ class Bagel(nn.Module):
             extra_inputs["packed_vae_token_indexes"] = packed_vae_token_indexes
             extra_inputs["packed_text_indexes"] = packed_text_indexes
 
-        use_cfg = cfg_text_scale > 1.0
+        has_cfg_branches = cfg_branch_pids is not None and cfg_branch_caches is not None
+        use_cfg = has_cfg_branches and (
+            cfg_text_scale > 1.0 or (cfg_text_scales is not None and any(scale > 1.0 for scale in cfg_text_scales))
+        )
         cfg_text_v_t = None
         cfg_img_v_t = None
 
-        if use_cfg and cfg_branch_pids is not None and cfg_branch_caches is not None:
+        if use_cfg:
+            assert cfg_branch_pids is not None
+            assert cfg_branch_caches is not None
             num_branches = len(cfg_branch_pids)
             seq_len = int(packed_seqlens.sum())
 
             batched_sequence = packed_sequence.repeat(num_branches, 1)
             batched_vae_indexes = torch.cat([packed_vae_token_indexes + i * seq_len for i in range(num_branches)])
-            batched_position_ids = torch.cat(cfg_branch_pids)
+            batched_position_ids = torch.cat(cfg_branch_pids, dim=1 if cfg_branch_pids[0].ndim == 2 else 0)
             batched_seqlens = packed_seqlens.repeat(num_branches)
             merged_cache = NaiveCache.merge(cfg_branch_caches)
 
@@ -2441,14 +2548,30 @@ class Bagel(nn.Module):
 
         # ── CFG combination ──
         if use_cfg:
-            v_t = self._combine_cfg(
-                v_t,
-                cfg_text_v_t,
-                cfg_img_v_t,
-                cfg_text_scale,
-                cfg_img_scale,
-                cfg_renorm_type,
-                cfg_renorm_min,
-            )
+            if cfg_vae_lengths is None:
+                v_t = self._combine_cfg(
+                    v_t,
+                    cfg_text_v_t,
+                    cfg_img_v_t,
+                    cfg_text_scale,
+                    cfg_img_scale,
+                    cfg_renorm_type,
+                    cfg_renorm_min,
+                )
+            else:
+                if cfg_text_scales is None:
+                    raise ValueError("cfg_text_scales must be provided with cfg_vae_lengths.")
+                if cfg_img_scales is None:
+                    cfg_img_scales = [cfg_img_scale] * len(cfg_vae_lengths)
+                v_t = self._combine_cfg_per_request(
+                    v_t,
+                    cfg_text_v_t,
+                    cfg_img_v_t,
+                    cfg_vae_lengths,
+                    cfg_text_scales,
+                    cfg_img_scales,
+                    cfg_renorm_type,
+                    cfg_renorm_min,
+                )
 
         return v_t

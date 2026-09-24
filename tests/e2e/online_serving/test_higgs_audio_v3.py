@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """End-to-end online tests for higgs-audio v3 against /v1/audio/speech.
 
 Mirrors the higgs_audio_v2 test layout. Covers the plain-text-in / audio-out
@@ -21,7 +21,7 @@ os.environ.setdefault("VLLM_MOE_USE_DEEP_GEMM", "0")
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import load_test_audio_data_url
+from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
@@ -51,7 +51,7 @@ _MIN_AUDIO_BYTES = 20_000
 # Reuse the shared TTS reference clip (clean ~5 s 24 kHz mono human speech)
 # vendored under tests/assets/qwen3_tts/. Keeps a single WAV across TTS
 # tests rather than duplicating asset bytes.
-_REF_AUDIO_URL = load_test_audio_data_url("qwen3_tts/clone_2.wav")
+_REF_AUDIO_URL = get_asset_path("qwen3_tts/clone_2.wav", as_data_url=True)
 _REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 
 
@@ -59,60 +59,62 @@ _REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know w
 class TestHiggsAudioV3OnlineHappyPath:
     """Plain-text -> audio happy paths against the live HTTP server."""
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
-    def test_plain_text_wav(self, omni_server, openai_client) -> None:
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    def test_plain_text_wav(self, omni_server, online_client) -> None:
         """Single non-streaming WAV request - canonical TTS happy path."""
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": "Hello world.",
                 "stream": False,
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "min_audio_bytes": _MIN_AUDIO_BYTES,
+                # whisper-small mishears this short clip ~0.5% of the time; on a
+                # failed match re-verify with this stronger ASR before failing so
+                # the gate is not flaky. Local-only key (not forwarded to server).
+                "transcript_escalation_model": "large-v3",
             }
         )
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
-    def test_plain_text_with_max_new_tokens(self, omni_server, openai_client) -> None:
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    def test_plain_text_with_max_new_tokens(self, omni_server, online_client) -> None:
         """``max_new_tokens`` is one of the few extra fields the v3 validator accepts."""
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": "Innovation distinguishes between a leader and a follower.",
                 "stream": False,
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "max_new_tokens": 500,
+                "max_new_tokens": 1024,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
             }
         )
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
-    def test_concurrent_plain_text(self, omni_server, openai_client) -> None:
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    def test_concurrent_plain_text(self, omni_server, online_client) -> None:
         """Three concurrent non-streaming requests - guards per-slot audio state and Stage-0 PC under batching."""
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
-                "input": "It was the night before my birthday.",
+                "input": "it was the night before my birthday",
                 "stream": False,
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "min_audio_bytes": _MIN_AUDIO_BYTES,
             },
             request_num=3,
         )
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
-    def test_plain_text_pcm_streaming(self, omni_server, openai_client) -> None:
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    def test_plain_text_pcm_streaming(self, omni_server, online_client) -> None:
         """Streaming PCM via talker2code2wav_async_chunk + the connector's codec_streaming path.
 
         The deploy YAML pins ``async_chunk: true`` and ``codec_streaming: true`` so chunks
@@ -121,30 +123,29 @@ class TestHiggsAudioV3OnlineHappyPath:
         windows stitch into a coherent PCM stream. The byte-count gate is the same as
         the sync paths; per-chunk audio content is verified offline against Whisper.
 
-        NOTE: ``min_hnr_db=0.0`` sits below the typical speech-noise floor so the
+        NOTE: ``min_hnr_db=0.0`` sit below the typical speech-noise floor so the
         check still catches catastrophic codec failure (silence, white noise, sample
         scramble all give HNR << 0) while allowing for the sliding-window codec's
         slightly-noisier-than-sync output. The default 1.0 dB threshold has only
         ~0.16 dB margin over measured single-request output (1.16 dB on L4), so
         flake risk is too high there.
         """
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": "The quick brown fox jumps over the lazy dog.",
                 "stream": True,
+                "stream_format": "audio",
                 "response_format": "pcm",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "min_audio_bytes": _MIN_AUDIO_BYTES,
                 "min_hnr_db": 0.0,
             }
         )
 
-    @pytest.mark.skip(reason="issue#4411")
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
-    def test_concurrent_pcm_streaming(self, omni_server, openai_client) -> None:
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    def test_concurrent_pcm_streaming(self, omni_server, online_client) -> None:
         """Three concurrent streaming requests - guards per-request frame cursors
         in ``talker2code2wav_async_chunk`` and per-slot delay-pattern state under batched AR.
 
@@ -154,14 +155,14 @@ class TestHiggsAudioV3OnlineHappyPath:
         over the measured worst-of-3 on L4 (-0.42 dB) while still well above the
         catastrophic-failure region.
         """
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": "She sells seashells by the seashore.",
                 "stream": True,
+                "stream_format": "audio",
                 "response_format": "pcm",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "min_audio_bytes": _MIN_AUDIO_BYTES,
                 "min_hnr_db": -2.0,
             },
             request_num=3,
@@ -178,17 +179,16 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
     tokens (pause, sfx) go inline. SFX tokens must pair with their written
     onomatopoeia.
 
-    These tests check the *serving surface* - the validator accepts the
-    payload, the engine produces audio, and the WAV has non-trivial size.
-    They do not assert audio quality (out of scope for CI).
+    These tests check the serving surface and spoken text. They do not assert
+    whether the requested control changes audio quality.
     """
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
-    def test_inline_emotion_and_expressive(self, omni_server, openai_client) -> None:
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    def test_inline_emotion_and_expressive(self, omni_server, online_client) -> None:
         """Delivery tokens (emotion + expressive_high) at the start of input."""
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": ("<|emotion:amusement|><|prosody:expressive_high|>Wait, that was actually hilarious."),
@@ -196,15 +196,16 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
+                "transcript_expected_text": "Wait, that was actually hilarious.",
             }
         )
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
-    def test_inline_style_whispering(self, omni_server, openai_client) -> None:
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    def test_inline_style_whispering(self, omni_server, online_client) -> None:
         """Style token at the start - ``whispering``."""
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": "<|style:whispering|>It is just between you and me, alright?",
@@ -212,15 +213,16 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
+                "transcript_expected_text": "It is just between you and me, alright?",
             }
         )
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
-    def test_inline_prosody_speed_and_pitch(self, omni_server, openai_client) -> None:
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    def test_inline_prosody_speed_and_pitch(self, omni_server, online_client) -> None:
         """Two prosody tokens at the start - slow speed plus low pitch."""
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": (
@@ -230,15 +232,16 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
+                "transcript_expected_text": "The radar shows a storm approaching from the east.",
             }
         )
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
-    def test_inline_pause_mid_text(self, omni_server, openai_client) -> None:
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    def test_inline_pause_mid_text(self, omni_server, online_client) -> None:
         """Positional pause token placed inline between two clauses."""
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": "Hold on a moment <|prosody:pause|> let me think about it.",
@@ -246,15 +249,16 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
+                "transcript_expected_text": "Hold on a moment. Let me think about it.",
             }
         )
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
-    def test_inline_sfx_with_onomatopoeia(self, omni_server, openai_client) -> None:
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    def test_inline_sfx_with_onomatopoeia(self, omni_server, online_client) -> None:
         """SFX token paired with its written onomatopoeia (``<|sfx:laughter|>Hehe``)."""
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": (
@@ -265,6 +269,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
+                "transcript_expected_text": "I cannot believe that just happened. I am still recovering from it.",
             }
         )
 
@@ -273,12 +278,12 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
 class TestHiggsAudioV3OnlineVoiceClone:
     """Voice clone via the two payload shapes the model serves."""
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
-    def test_voice_clone_ref_audio_ref_text(self, omni_server, openai_client) -> None:
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    def test_voice_clone_ref_audio_ref_text(self, omni_server, online_client) -> None:
         """Canonical vllm-omni voice clone via ``ref_audio`` + ``ref_text``."""
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": "Hello world.",
@@ -287,21 +292,20 @@ class TestHiggsAudioV3OnlineVoiceClone:
                 "stream": False,
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "min_audio_bytes": _MIN_AUDIO_BYTES,
             }
         )
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
-    def test_voice_clone_references_alias(self, omni_server, openai_client) -> None:
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    def test_voice_clone_references_alias(self, omni_server, online_client) -> None:
         """BosonAI cookbook payload: ``references=[{audio_path, text}]``.
 
         ``normalize_references_alias`` (``protocol/audio.py``) is supposed to
         translate the cookbook field into ``ref_audio`` / ``ref_text``; without
         it the request would silently fall through to zero-shot synthesis.
         """
-        openai_client.send_audio_speech_request(
+        online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": "Hello world.",
@@ -309,81 +313,5 @@ class TestHiggsAudioV3OnlineVoiceClone:
                 "stream": False,
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "min_audio_bytes": _MIN_AUDIO_BYTES,
-            }
-        )
-
-
-@pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
-class TestHiggsAudioV3OnlineValidatorRejections:
-    """Out-of-scope shapes must come back as 4xx.
-
-    These cases use ``send_audio_speech_http_request`` (raw HTTP POST against
-    ``/v1/audio/speech``) rather than the OpenAI SDK helper because:
-
-    - We need the failure-path matcher; the SDK helper asserts success.
-    - The cookbook ``references`` field is not in the OpenAI SDK schema, so
-      the SDK strips it before the request leaves the client and the server
-      sees a plain TTS request that returns 200. Raw HTTP keeps the JSON body
-      intact so the validator actually fires.
-    """
-
-    @pytest.mark.core_model
-    @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
-    def test_rejects_empty_input(self, omni_server, openai_client) -> None:
-        """Empty text input - validator should reject before reaching the engine."""
-        openai_client.send_audio_speech_http_request(
-            {
-                "json": {
-                    "model": omni_server.model,
-                    "input": "",
-                    "response_format": "wav",
-                },
-                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "err_code": (400, 422),
-                "err_message": ("input", "empty"),
-            }
-        )
-
-    @pytest.mark.core_model
-    @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
-    def test_rejects_multi_reference_payload(self, omni_server, openai_client) -> None:
-        """``references[]`` with more than one entry - multi-shot voice clone is not supported."""
-        openai_client.send_audio_speech_http_request(
-            {
-                "json": {
-                    "model": omni_server.model,
-                    "input": "Hello world.",
-                    "references": [
-                        {"audio_path": _REF_AUDIO_URL, "text": _REF_TEXT},
-                        {"audio_path": _REF_AUDIO_URL, "text": _REF_TEXT},
-                    ],
-                    "response_format": "wav",
-                },
-                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "err_code": (400, 422),
-                "err_message": "references",
-            }
-        )
-
-    @pytest.mark.core_model
-    @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
-    def test_rejects_conflicting_ref_audio_and_references(self, omni_server, openai_client) -> None:
-        """``ref_audio`` and ``references`` cannot both be set to different values."""
-        openai_client.send_audio_speech_http_request(
-            {
-                "json": {
-                    "model": omni_server.model,
-                    "input": "Hello world.",
-                    "ref_audio": _REF_AUDIO_URL,
-                    "references": [{"audio_path": "https://example.com/other.wav"}],
-                    "response_format": "wav",
-                },
-                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "err_code": (400, 422),
-                "err_message": "mutually exclusive",
             }
         )

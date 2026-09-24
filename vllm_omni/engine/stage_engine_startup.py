@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Helpers for launching and handshaking omni engine cores."""
 
 from __future__ import annotations
@@ -10,10 +13,12 @@ import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from multiprocessing import connection
+from multiprocessing.process import BaseProcess
 from types import SimpleNamespace
 from typing import Any
 
 import msgspec
+import torch
 import zmq
 from omegaconf import OmegaConf
 from vllm.config import VllmConfig
@@ -22,6 +27,7 @@ from vllm.utils.network_utils import get_open_ports_list, zmq_socket_ctx
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.utils import (
     CoreEngine,
+    CoreEngineLaunch,
     CoreEngineProcManager,
     EngineZmqAddresses,
     get_engine_zmq_addresses,
@@ -29,6 +35,7 @@ from vllm.v1.engine.utils import (
 )
 from vllm.v1.executor import Executor
 
+from vllm_omni.config.omni_config import BaseVllmOmniStageConfig
 from vllm_omni.distributed.omni_connectors.utils import initialization
 from vllm_omni.engine import stage_init_utils
 from vllm_omni.engine.stage_init_utils import (
@@ -63,11 +70,13 @@ def _serialize_stage_config(stage_config: Any) -> Any:
     """Convert a stage config to msgpack-friendly builtins."""
     if stage_config is None or isinstance(stage_config, (str, bytes, int, float, bool)):
         return stage_config
+    if isinstance(stage_config, torch.dtype):
+        return str(stage_config).removeprefix("torch.")
 
     if OmegaConf.is_config(stage_config):
         return _serialize_stage_config(OmegaConf.to_container(stage_config, resolve=True))
 
-    if dataclasses.is_dataclass(stage_config):
+    if dataclasses.is_dataclass(stage_config) and not isinstance(stage_config, type):
         return _serialize_stage_config(dataclasses.asdict(stage_config))
 
     if isinstance(stage_config, dict):
@@ -138,6 +147,21 @@ class StageReplicaResources:
 # ---------------------------------------------------------------------------
 
 
+def _port_from_zmq_address(address: str | None) -> int | None:
+    """Extract the TCP port from a ``tcp://host:port`` ZMQ address, else ``None``.
+
+    Non-TCP transports (``ipc://``, ``inproc://``) and unparsable values return
+    ``None`` so callers can skip seeding them into the port-dedup set.
+    """
+    if not address:
+        return None
+    tail = address.rsplit(":", 1)[-1]
+    try:
+        return int(tail)
+    except ValueError:
+        return None
+
+
 class OmniMasterServer:
     """Registration server for single-stage engine startup."""
 
@@ -158,10 +182,29 @@ class OmniMasterServer:
         self._stage_configs: dict[StageRoute, Any] = {}
         self._stage_coordinator_addresses: dict[StageRoute, StageCoordinatorAddresses] = {}
         self._stage_config_events: dict[StageRoute, threading.Event] = {}
+        # Ports already handed out by *this* server. ``get_open_ports_list`` only
+        # guarantees uniqueness *within* a single call; a per-route call cannot
+        # see ports drawn for other routes, so two stages/replicas can draw the
+        # same ephemeral port and the second engine to ``bind()`` it dies with
+        # ``zmq.error.ZMQError: Address already in use``. Multi-stage models
+        # (e.g. Qwen3-Omni: thinker/talker/code2wav) allocate many routes and hit
+        # this intermittently. We dedup every allocated port against this set,
+        # seeded with the registration port (and coordinator ROUTER port) that
+        # are already bound on the same host.
+        self._allocated_ports: set[int] = set()
+        # Keep route ports bound until their ZMQ owners are ready to bind them.
+        # Recording only the integer leaves a race with unrelated startup
+        # consumers (notably NCCL's own ephemeral-port selection).
+        self._port_reservations: dict[int, socket.socket] = {}
+        if master_port:
+            self._allocated_ports.add(int(master_port))
         # Coordinator ROUTER address echoed back in every registration reply
         # so OmniCoordClientForStage knows where to connect from inside the
         # engine subprocess.
         self._coordinator_router_address = coordinator_router_address
+        coord_port = _port_from_zmq_address(coordinator_router_address)
+        if coord_port is not None:
+            self._allocated_ports.add(coord_port)
         # Fires only for *newly assigned* (auto-assigned) replicas, not for
         # head-side pre-allocated slots that already have head-side clients.
         self._on_register = on_register
@@ -235,7 +278,7 @@ class OmniMasterServer:
 
         self._stage_config_events[route] = threading.Event()
         self._stage_coordinator_addresses[route] = StageCoordinatorAddresses()
-        hs_port, inp_port, out_port = get_open_ports_list(count=3)
+        hs_port, inp_port, out_port = self._alloc_unique_ports(3)
         alloc = StageAllocation(
             handshake_bind_address=f"tcp://{self._address}:{hs_port}",
             handshake_connect_address=f"tcp://{self._address}:{hs_port}",
@@ -246,6 +289,71 @@ class OmniMasterServer:
         )
         self._stage_routes[route] = alloc
         return alloc
+
+    def _alloc_unique_ports(self, count: int) -> list[int]:
+        """Return ``count`` open ports unique across every route this server owns.
+
+        ``get_open_ports_list`` dedups only within its own call, so we redraw any
+        port that collides with one already recorded in ``self._allocated_ports``
+        (registration/coordinator ports plus every previously-allocated route
+        port). Each winner remains OS-bound until its ZMQ owner is ready, so
+        another startup subsystem cannot claim it in the allocation-to-bind
+        window. Callers already hold the relevant allocation context
+        (``__init__`` is single-threaded; registration holds
+        ``self._alloc_lock``).
+        """
+        picked: list[int] = []
+        # Bounded retry budget so a pathological host (near port exhaustion)
+        # fails loudly instead of spinning forever.
+        for _ in range(64):
+            for port in get_open_ports_list(count=count - len(picked)):
+                if port in self._allocated_ports:
+                    continue
+                reservation = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    # Reserve on every local interface. The advertised address
+                    # can be a routable interface IP, but wildcard binding also
+                    # protects the route from local NCCL/socket allocations.
+                    reservation.bind(("", port))
+                except OSError:
+                    reservation.close()
+                    continue
+                self._allocated_ports.add(port)
+                self._port_reservations[port] = reservation
+                picked.append(port)
+                if len(picked) == count:
+                    return picked
+        raise RuntimeError(
+            f"[OmniMasterServer] Could not allocate {count} unique open ports "
+            f"(host={self._address}); {len(self._allocated_ports)} already in use."
+        )
+
+    def release_route_port_reservations(
+        self,
+        stage_id: int,
+        replica_id: int = 0,
+        *,
+        handshake: bool = True,
+        data: bool = True,
+    ) -> None:
+        """Release reserved route ports immediately before their ZMQ binds."""
+        alloc = self.get_allocation(stage_id, replica_id)
+        ports: list[int] = []
+        if handshake:
+            handshake_port = _port_from_zmq_address(alloc.handshake_bind_address)
+            if handshake_port is not None:
+                ports.append(handshake_port)
+        if data:
+            for address in (alloc.input_bind_address, alloc.output_bind_address):
+                port = _port_from_zmq_address(address)
+                if port is not None:
+                    ports.append(port)
+
+        with self._alloc_lock:
+            for port in ports:
+                reservation = self._port_reservations.pop(port, None)
+                if reservation is not None:
+                    reservation.close()
 
     def _next_free_replica_id(self, stage_id: int) -> int:
         """Return the next replica id to assign for an auto-assign registration.
@@ -381,6 +489,11 @@ class OmniMasterServer:
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=10)
+        with self._alloc_lock:
+            reservations = list(self._port_reservations.values())
+            self._port_reservations.clear()
+        for reservation in reservations:
+            reservation.close()
 
     # ------------------------------------------------------------------
     # Internal server logic
@@ -715,20 +828,37 @@ def connect_remote_engine_cores(
 
     handshake_bind_address = omni_master_server.get_allocation(stage_id, replica_id=replica_id).handshake_bind_address
 
-    with zmq_socket_ctx(handshake_bind_address, zmq.ROUTER, bind=True) as handshake_socket:
-        yield StageReplicaResources(
-            coordinator=coordinator,
-            addresses=addresses,
-        )
-        wait_for_engine_startup(
-            handshake_socket,
-            addresses,
-            engines_to_handshake,
-            vllm_config.parallel_config,
-            False,  # coordinated_dp
-            vllm_config.cache_config,
-            None,  # proc_manager (remote — no local procs)
-            None,  # coord_process
+    omni_master_server.release_route_port_reservations(
+        stage_id,
+        replica_id,
+        handshake=True,
+        data=False,
+    )
+    try:
+        with zmq_socket_ctx(handshake_bind_address, zmq.ROUTER, bind=True) as handshake_socket:
+            yield StageReplicaResources(
+                coordinator=coordinator,
+                addresses=addresses,
+            )
+            wait_for_engine_startup(
+                handshake_socket,
+                engines_to_handshake,
+                vllm_config.parallel_config,
+                False,  # coordinated_dp
+                vllm_config.cache_config,
+                CoreEngineLaunch(
+                    engine_manager=None,  # remote — no local procs
+                    coordinator=None,
+                    addresses=addresses,
+                    tensor_queue=None,
+                ),
+            )
+    finally:
+        omni_master_server.release_route_port_reservations(
+            stage_id,
+            replica_id,
+            handshake=False,
+            data=True,
         )
 
 
@@ -746,17 +876,34 @@ def connect_remote_diffusion_proc(
     ).handshake_bind_address
 
     logger.info("Waiting for remote diffusion proc for stage %d replica %d", stage_id, replica_id)
-    with zmq_socket_ctx(handshake_bind_address, zmq.ROUTER, bind=True) as handshake_socket:
-        yield StageReplicaResources(addresses=addresses)
-        wait_for_engine_startup(
-            handshake_socket,
-            addresses,
-            [CoreEngine(index=0, local=False)],
-            _single_diffusion_parallel_config(local_client=False),
-            False,
-            None,
-            None,
-            None,
+    omni_master_server.release_route_port_reservations(
+        stage_id,
+        replica_id,
+        handshake=True,
+        data=False,
+    )
+    try:
+        with zmq_socket_ctx(handshake_bind_address, zmq.ROUTER, bind=True) as handshake_socket:
+            yield StageReplicaResources(addresses=addresses)
+            wait_for_engine_startup(
+                handshake_socket,
+                [CoreEngine(index=0, local=False)],
+                _single_diffusion_parallel_config(local_client=False),
+                False,
+                None,
+                CoreEngineLaunch(
+                    engine_manager=None,  # remote — no local procs
+                    coordinator=None,
+                    addresses=addresses,
+                    tensor_queue=None,
+                ),
+            )
+    finally:
+        omni_master_server.release_route_port_reservations(
+            stage_id,
+            replica_id,
+            handshake=False,
+            data=True,
         )
 
 
@@ -764,23 +911,59 @@ def connect_remote_diffusion_proc(
 def scoped_spawn_device_env(
     stage_visible_devices: str | None,
     spawn_device_lock: threading.Lock | None,
+    *,
+    stage_id: int | None = None,
+    replica_id: int | None = None,
 ) -> Iterator[None]:
     """Briefly scope device visibility while spawning a stage subprocess."""
-    if stage_visible_devices is None or spawn_device_lock is None:
+    with _scoped_replica_compile_cache_env(stage_id, replica_id):
+        if stage_visible_devices is None or spawn_device_lock is None:
+            yield
+            return
+
+        device_control_env = current_omni_platform.device_control_env_var
+        with spawn_device_lock:
+            previous_visible_devices = os.environ.get(device_control_env)
+            try:
+                current_omni_platform.set_device_control_env_var(stage_visible_devices)
+                yield
+            finally:
+                if previous_visible_devices is None:
+                    current_omni_platform.unset_device_control_env_var()
+                else:
+                    current_omni_platform.set_device_control_env_var(previous_visible_devices)
+
+
+_COMPILE_CACHE_ENV_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _scoped_replica_compile_cache_env(stage_id: int | None, replica_id: int | None) -> Iterator[None]:
+    """Give additional replicas an isolated VLLM_CACHE_ROOT at spawn time.
+
+    Replicas of the same stage compile the same model concurrently; vLLM
+    0.27's AOT compile (TritonBundler) races on the shared cache dir and a
+    replica can then die with 'Cubin file saved by TritonBundler not found'
+    (build 2954, Multi-Replica perf). Replica 0 keeps the default shared
+    cache so single-replica deployments stay warm; every further replica
+    compiles into its own subdirectory.
+    """
+    if not replica_id or replica_id <= 0:
         yield
         return
 
-    device_control_env = current_omni_platform.device_control_env_var
-    with spawn_device_lock:
-        previous_visible_devices = os.environ.get(device_control_env)
+    base = os.environ.get("VLLM_CACHE_ROOT") or os.path.expanduser("~/.cache/vllm")
+    isolated = os.path.join(base, f"omni_stage{stage_id if stage_id is not None else 'x'}_replica{replica_id}")
+    with _COMPILE_CACHE_ENV_LOCK:
+        previous = os.environ.get("VLLM_CACHE_ROOT")
+        os.environ["VLLM_CACHE_ROOT"] = isolated
         try:
-            current_omni_platform.set_device_control_env_var(stage_visible_devices)
             yield
         finally:
-            if previous_visible_devices is None:
-                current_omni_platform.unset_device_control_env_var()
+            if previous is None:
+                os.environ.pop("VLLM_CACHE_ROOT", None)
             else:
-                current_omni_platform.set_device_control_env_var(previous_visible_devices)
+                os.environ["VLLM_CACHE_ROOT"] = previous
 
 
 @contextlib.contextmanager
@@ -796,6 +979,7 @@ def _launch_omni_core_engines(
     omni_coordinator_address: str | None = None,
     stage_visible_devices: str | None = None,
     spawn_device_lock: threading.Lock | None = None,
+    omni_parallel_stage_init: bool = False,
 ) -> Iterator[tuple[CoreEngineProcManager, DPCoordinator | None, EngineZmqAddresses]]:
     """Launch local engine cores using the omni registration flow.
 
@@ -862,49 +1046,82 @@ def _launch_omni_core_engines(
     # Bind the pre-allocated handshake socket for this stage.
     handshake_bind_address = omni_master_server.get_allocation(stage_id, replica_id=replica_id).handshake_bind_address
 
-    with zmq_socket_ctx(handshake_bind_address, zmq.ROUTER, bind=True) as handshake_socket:
-        if omni_coordinator_address is not None:
-            # Use the omni subclass so each spawned subprocess instantiates
-            # an OmniCoordClientForStage and heartbeats to the coordinator.
-            from vllm_omni.engine.stage_engine_core_proc_manager import StageEngineCoreProcManager
+    omni_master_server.release_route_port_reservations(
+        stage_id,
+        replica_id,
+        handshake=True,
+        data=False,
+    )
+    try:
+        with zmq_socket_ctx(handshake_bind_address, zmq.ROUTER, bind=True) as handshake_socket:
+            if omni_coordinator_address is not None:
+                # Use the omni subclass so each spawned subprocess instantiates
+                # an OmniCoordClientForStage and heartbeats to the coordinator.
+                from vllm_omni.engine.stage_engine_core_proc_manager import StageEngineCoreProcManager
 
-            with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
-                local_engine_manager: CoreEngineProcManager = StageEngineCoreProcManager(
-                    local_engine_count=local_engine_count,
-                    start_index=start_index,
-                    local_start_index=local_start_index,
-                    vllm_config=vllm_config,
-                    local_client=True,
-                    handshake_address=handshake_address,
-                    executor_class=executor_class,
-                    log_stats=log_stats,
-                    omni_stage_id=stage_id,
-                    omni_coordinator_address=omni_coordinator_address,
-                    omni_replica_base_id=replica_id,
-                )
-        else:
-            with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
-                local_engine_manager = CoreEngineProcManager(
-                    local_engine_count=local_engine_count,
-                    start_index=start_index,
-                    local_start_index=local_start_index,
-                    vllm_config=vllm_config,
-                    local_client=True,
-                    handshake_address=handshake_address,
-                    executor_class=executor_class,
-                    log_stats=log_stats,
-                )
+                with scoped_spawn_device_env(
+                    stage_visible_devices, spawn_device_lock, stage_id=stage_id, replica_id=replica_id
+                ):
+                    local_engine_manager: CoreEngineProcManager = StageEngineCoreProcManager(
+                        local_engine_count=local_engine_count,
+                        start_index=start_index,
+                        local_start_index=local_start_index,
+                        vllm_config=vllm_config,
+                        local_client=True,
+                        handshake_address=handshake_address,
+                        executor_class=executor_class,
+                        log_stats=log_stats,
+                        omni_stage_id=stage_id,
+                        omni_coordinator_address=omni_coordinator_address,
+                        omni_replica_base_id=replica_id,
+                        omni_parallel_stage_init=omni_parallel_stage_init,
+                    )
+            else:
+                if omni_parallel_stage_init:
+                    # The upstream CoreEngineProcManager targets EngineCoreProc.run_engine_core,
+                    # which does NOT install the SH/EX phase-lock executor wrapper. Since the
+                    # orchestrator skips its own device lock when parallel_stage_init is on,
+                    # running here would leave same-device init unguarded. Fail closed.
+                    raise RuntimeError(
+                        f"parallel_stage_init is enabled but stage {stage_id} would launch via the "
+                        "upstream CoreEngineProcManager (no omni coordinator), which cannot install "
+                        "the phase-lock guard. Disable parallel_stage_init for this deployment or "
+                        "run with the omni coordinator."
+                    )
+                with scoped_spawn_device_env(
+                    stage_visible_devices, spawn_device_lock, stage_id=stage_id, replica_id=replica_id
+                ):
+                    local_engine_manager = CoreEngineProcManager(
+                        local_engine_count=local_engine_count,
+                        start_index=start_index,
+                        local_start_index=local_start_index,
+                        vllm_config=vllm_config,
+                        local_client=True,
+                        handshake_address=handshake_address,
+                        executor_class=executor_class,
+                        log_stats=log_stats,
+                    )
 
-        yield local_engine_manager, coordinator, addresses
-        wait_for_engine_startup(
-            handshake_socket,
-            addresses,
-            engines_to_handshake,
-            parallel_config,
-            parallel_config.data_parallel_size > 1 and vllm_config.model_config.is_moe,
-            vllm_config.cache_config,
-            local_engine_manager,
-            coordinator.proc if coordinator else None,
+            yield local_engine_manager, coordinator, addresses
+            wait_for_engine_startup(
+                handshake_socket,
+                engines_to_handshake,
+                parallel_config,
+                parallel_config.data_parallel_size > 1 and vllm_config.model_config.is_moe,
+                vllm_config.cache_config,
+                CoreEngineLaunch(
+                    engine_manager=local_engine_manager,
+                    coordinator=coordinator,
+                    addresses=addresses,
+                    tensor_queue=None,
+                ),
+            )
+    finally:
+        omni_master_server.release_route_port_reservations(
+            stage_id,
+            replica_id,
+            handshake=False,
+            data=True,
         )
 
 
@@ -921,6 +1138,9 @@ def launch_stage_replica(
     omni_coordinator_address: str | None = None,
     stage_visible_devices: str | None = None,
     spawn_device_lock: threading.Lock | None = None,
+    omni_parallel_stage_init: bool = False,
+    num_api_servers: int = 1,
+    watched_frontend_processes: list[BaseProcess] | None = None,
 ) -> Iterator[StageReplicaResources]:
     """Launch a local LLM stage replica.
 
@@ -931,6 +1151,8 @@ def launch_stage_replica(
     keep the same returned resource bundle.
     """
     if omni_master_server is not None:
+        if num_api_servers != 1:
+            raise ValueError("Multiple API servers are not supported with distributed stage launch")
         with _launch_omni_core_engines(
             vllm_config=vllm_config,
             executor_class=executor_class,
@@ -942,6 +1164,7 @@ def launch_stage_replica(
             omni_coordinator_address=omni_coordinator_address,
             stage_visible_devices=stage_visible_devices,
             spawn_device_lock=spawn_device_lock,
+            omni_parallel_stage_init=omni_parallel_stage_init,
         ) as resources:
             engine_manager, coordinator, addresses = resources
             yield StageReplicaResources(
@@ -955,10 +1178,19 @@ def launch_stage_replica(
 
     from vllm_omni.engine.stage_engine_core_proc_manager import StageEngineCoreProcManager
 
-    addresses = get_engine_zmq_addresses(vllm_config)
+    if num_api_servers > 1:
+        # Multi-API Omni is intentionally local-only. IPC paths avoid the
+        # bind-after-allocation race of tcp://host:0 and are stable for every
+        # stage, including stages that are not used by APIServerProcessManager.
+        addresses = EngineZmqAddresses(
+            inputs=[get_open_zmq_ipc_path() for _ in range(num_api_servers)],
+            outputs=[get_open_zmq_ipc_path() for _ in range(num_api_servers)],
+        )
+    else:
+        addresses = get_engine_zmq_addresses(vllm_config)
     handshake_address = get_open_zmq_ipc_path()
     engines_to_handshake = [CoreEngine(index=0, local=True)]
-    with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
+    with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock, stage_id=stage_id, replica_id=replica_id):
         engine_manager = StageEngineCoreProcManager(
             local_engine_count=1,
             start_index=0,
@@ -971,6 +1203,7 @@ def launch_stage_replica(
             omni_stage_id=stage_id,
             omni_coordinator_address=omni_coordinator_address,
             omni_replica_base_id=replica_id,
+            omni_parallel_stage_init=omni_parallel_stage_init,
         )
 
     with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
@@ -978,15 +1211,21 @@ def launch_stage_replica(
             manager=engine_manager,
             addresses=addresses,
         )
+        engine_launch = CoreEngineLaunch(
+            engine_manager=engine_manager,
+            coordinator=None,
+            addresses=addresses,
+            tensor_queue=None,
+        )
+        if watched_frontend_processes is not None:
+            engine_launch.watched_frontend_processes = watched_frontend_processes
         wait_for_engine_startup(
             handshake_socket,
-            addresses,
             engines_to_handshake,
             vllm_config.parallel_config,
             False,  # coordinated_dp
             vllm_config.cache_config,
-            engine_manager,
-            None,  # coordinator_proc
+            engine_launch,
         )
 
 
@@ -1185,7 +1424,7 @@ def get_headless_replica_devices(
     omni_dp_size_local: int,
 ) -> list[str | None]:
     """Return per-replica device slices for a headless stage."""
-    runtime_cfg = getattr(stage_cfg, "runtime", None)
+    runtime_cfg = getattr(stage_cfg, "runtime_config", getattr(stage_cfg, "runtime", None))
     devices_str: str | None = None
     if runtime_cfg is not None:
         devices_str = (
@@ -1291,7 +1530,11 @@ def launch_headless_diffusion_replicas(
         stage_id,
     )
 
-    metadata = stage_init_utils.extract_stage_metadata(stage_cfg)
+    metadata = (
+        stage_init_utils.extract_stage_metadata_from_omni_stage_config(stage_cfg)
+        if isinstance(stage_cfg, BaseVllmOmniStageConfig)
+        else stage_init_utils.extract_legacy_stage_metadata(stage_cfg)
+    )
     if omni_conn_cfg:
         inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
     # Headless single-stage launch must still infer cross-stage TP topology
@@ -1341,11 +1584,12 @@ def launch_diffusion_stage_replica(
     stage_config: Any,
     metadata: Any,
     stage_init_timeout: int,
-    batch_size: int,
     use_inline: bool,
     replica_id: int = 0,
     omni_master_server: OmniMasterServer | None = None,
     omni_coordinator_address: str | None = None,
+    stage_visible_devices: str | None = None,
+    spawn_device_lock: threading.Lock | None = None,
 ) -> tuple[Any, StageReplicaResources]:
     """Launch a local diffusion stage replica.
 
@@ -1354,21 +1598,22 @@ def launch_diffusion_stage_replica(
     ``StageDiffusionProc`` that heartbeats to ``OmniCoordinator``.
     """
     if omni_master_server is None:
-        client = initialize_diffusion_stage(
-            metadata.stage_id,
-            model,
-            stage_config,
-            metadata,
-            stage_init_timeout=stage_init_timeout,
-            batch_size=batch_size,
-            use_inline=use_inline,
-        )
+        with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
+            client = initialize_diffusion_stage(
+                metadata.stage_id,
+                model,
+                stage_config,
+                metadata,
+                stage_init_timeout=stage_init_timeout,
+                use_inline=use_inline,
+            )
         return client, StageReplicaResources()
 
     from vllm_omni.diffusion import stage_diffusion_proc
     from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 
-    od_config = build_diffusion_config(model, stage_config, metadata)
+    with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
+        od_config = build_diffusion_config(model, stage_config, metadata)
     parallel_config = getattr(od_config, "parallel_config", None)
     world_size = getattr(parallel_config, "world_size", 1)
     try:
@@ -1379,6 +1624,7 @@ def launch_diffusion_stage_replica(
         metadata.stage_id,
         {"tensor_parallel_size": world_size},
         stage_init_timeout,
+        visible_devices=stage_visible_devices,
     )
     proc_manager = None
     try:
@@ -1389,25 +1635,37 @@ def launch_diffusion_stage_replica(
             omni_stage_config=stage_config,
             replica_id=replica_id,
         )
-        proc_manager = stage_diffusion_proc.StageDiffusionProcManager(
-            model=model,
-            od_config=od_config,
-            stage_init_timeout=stage_init_timeout,
-            handshake_address=registration.handshake_address,
-            addresses=EngineZmqAddresses(
-                inputs=[registration.input_address],
-                outputs=[registration.output_address],
-            ),
-            omni_coordinator_address=omni_coordinator_address,
-            omni_stage_id=metadata.stage_id,
-            omni_replica_id=replica_id,
+        omni_master_server.release_route_port_reservations(
+            metadata.stage_id,
+            replica_id,
+            handshake=True,
+            data=False,
+        )
+        with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
+            proc_manager = stage_diffusion_proc.StageDiffusionProcManager(
+                model=model,
+                od_config=od_config,
+                stage_init_timeout=stage_init_timeout,
+                handshake_address=registration.handshake_address,
+                addresses=EngineZmqAddresses(
+                    inputs=[registration.input_address],
+                    outputs=[registration.output_address],
+                ),
+                omni_coordinator_address=omni_coordinator_address,
+                omni_stage_id=metadata.stage_id,
+                omni_replica_id=replica_id,
+            )
+        omni_master_server.release_route_port_reservations(
+            metadata.stage_id,
+            replica_id,
+            handshake=False,
+            data=True,
         )
         client = StageDiffusionClient.from_addresses(
             metadata,
             request_address=proc_manager.addresses.inputs[0],
             response_address=proc_manager.addresses.outputs[0],
             proc_manager=proc_manager,
-            batch_size=batch_size,
         )
         return client, StageReplicaResources(
             manager=proc_manager,
@@ -1415,6 +1673,10 @@ def launch_diffusion_stage_replica(
             lock_fds=lock_fds,
         )
     except Exception:
+        omni_master_server.release_route_port_reservations(
+            metadata.stage_id,
+            replica_id,
+        )
         if proc_manager is not None:
             proc_manager.shutdown()
         if lock_fds:

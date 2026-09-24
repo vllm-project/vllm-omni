@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import contextlib
 import io
@@ -9,15 +12,19 @@ import ssl
 import sys
 import time
 import traceback
+import uuid
 import wave
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Any, Literal
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlparse
 
 import aiohttp
 import numpy as np
 import pybase64 as base64
+from PIL import Image
 from tqdm.asyncio import tqdm
 from vllm.benchmarks import datasets
 from vllm.benchmarks.datasets import SampleRequest
@@ -28,6 +35,7 @@ from vllm.benchmarks.lib.endpoint_request_func import (
     RequestFuncOutput,
     StreamedResponseHandler,
     _get_chat_content,
+    _get_headers,
     _update_headers_common,
     _update_payload_common,
     _validate_api_url,
@@ -35,10 +43,22 @@ from vllm.benchmarks.lib.endpoint_request_func import (
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 
-logger = init_logger(__name__)
-
 from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
-from vllm_omni.benchmarks.data_modules.daily_omni_dataset import DailyOmniDataset, DailyOmniSampleRequest
+from vllm_omni.benchmarks.data_modules.daily_omni_dataset import (
+    DailyOmniDataset,
+    DailyOmniSampleRequest,
+    daily_omni_local_qa_json,
+    daily_omni_local_videos_dir,
+    resolve_daily_omni_local_root,
+)
+from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
+    DEFAULT_OMNIINTERACT_REPO,
+    OmniInteractDataset,
+    OmniInteractEvaluationOptions,
+    OmniInteractPreparedInput,
+    OmniInteractSampleRequest,
+    OmniInteractSessionOptions,
+)
 from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import OmniRandomMultiModalDataset
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
@@ -49,11 +69,54 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
 )
 from vllm_omni.benchmarks.data_modules.sound_effect_dataset import SoundEffectDataset
 from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
+from vllm_omni.benchmarks.data_modules.videomme_dataset import (
+    VIDEOMME_DEFAULT_HF_REPO,
+    VideoMMEDataset,
+    VideoMMESampleRequest,
+    resolve_videomme_local_root,
+)
+from vllm_omni.benchmarks.omniinteract import (
+    VIDEO_FPS,
+    OmniInteractBenchmarkConfig,
+    OmniInteractCaseResult,
+    _audio_rtf_from_raw_metric,
+    clear_batch_artifacts,
+    clear_case_artifacts,
+    prepare_media,
+    publish_deferred_case_artifacts,
+    run_omniinteract_case,
+    write_failure_artifacts,
+)
+from vllm_omni.benchmarks.omniinteract import (
+    benchmark_summary as omniinteract_benchmark_summary,
+)
+from vllm_omni.benchmarks.omniinteract import (
+    write_batch_artifacts as write_omniinteract_batch_artifacts,
+)
+from vllm_omni.benchmarks.omniinteract_eval import evaluate_batch as evaluate_omniinteract_batch
 from vllm_omni.metrics import definitions as defs
+from vllm_omni.metrics.utils import coerce_bool, coerce_positive_float_scalar, coerce_positive_int_scalar
+
+if TYPE_CHECKING:
+    from vllm_omni.clients.duplex import DuplexClient
+
+# The duplex client library (vllm_omni.clients) is imported lazily inside the
+# functions that drive Realtime sessions: this module is imported for its
+# patching side effects by the CLI package (`vllm-omni serve` included), and
+# the client package must stay out of that import graph
+# (tests/engine/test_duplex_import_boundary.py enforces the boundary).
+
+logger = init_logger(__name__)
 
 _AUDIO_CONTINUITY_THRESHOLD_ENV = "VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S"
 RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
-_IMAGE_STAGE_METRICS_BACKENDS = frozenset({"openai-image-edits-omni"})
+_IMAGE_STAGE_METRICS_BACKENDS = frozenset(
+    {
+        "/v1/images/generations",
+        "/v1/images/edits",
+        "openai-image-edits-omni",
+    }
+)
 _PRINT_STAGE = False
 
 
@@ -73,6 +136,17 @@ def should_request_stage_metrics(args: Any) -> bool:
 
     backend = getattr(args, "backend", None)
     if backend in _IMAGE_STAGE_METRICS_BACKENDS:
+        return True
+
+    percentile_metrics = getattr(args, "percentile_metrics", ()) or ()
+    if isinstance(percentile_metrics, str):
+        percentile_metrics = percentile_metrics.split(",")
+    selected_metrics = {str(metric).strip().lower() for metric in percentile_metrics}
+    if backend == "openai-chat-omni" and selected_metrics.intersection({"tpot", "itl"}):
+        # Client receive timestamps normally provide these metrics. Under
+        # enough load, however, every text token can be coalesced into one
+        # event-loop read, leaving no positive interval. Request the engine's
+        # Stage 0 timings so that path still has an authoritative measurement.
         return True
 
     extra_body = getattr(args, "extra_body", None) or {}
@@ -109,6 +183,30 @@ def _audio_continuity_threshold_s() -> float:
     return max(value, 0.0)
 
 
+def _pcm_s16le_to_seed_tts_wer_bytes(
+    pcm_bytes: bytes,
+    *,
+    sample_rate: int,
+    channels: int,
+) -> bytes:
+    """Normalize streamed raw PCM to the 24 kHz mono PCM used by Seed-TTS WER."""
+    if not pcm_bytes:
+        return b""
+    channels = max(1, int(channels))
+    pcm = np.frombuffer(pcm_bytes, dtype=np.int16)
+    if channels > 1:
+        usable = (pcm.size // channels) * channels
+        pcm = pcm[:usable].reshape(-1, channels).mean(axis=1)
+    pcm_f32 = pcm.astype(np.float32) / 32767.0
+    if int(sample_rate) != 24000 and pcm_f32.size:
+        from vllm.multimodal.audio import AudioResampler
+
+        resampler = AudioResampler(target_sr=24000)
+        pcm_f32 = resampler.resample(pcm_f32, orig_sr=int(sample_rate))
+    pcm_f32 = np.clip(pcm_f32, -1.0, 1.0)
+    return (pcm_f32 * 32767).astype(np.int16).tobytes()
+
+
 get_samples_old = datasets.get_samples
 
 _DEFAULT_DAILY_OMNI_REPO = "liarliar/Daily-Omni"
@@ -119,6 +217,61 @@ def _seed_tts_capture_pcm_for_wer() -> bool:
         "1",
         "true",
         "yes",
+    )
+
+
+_DEFAULT_REQUEST_TIMEOUT_S = 900.0
+_LEGACY_REQUEST_TIMEOUT_S = 6 * 60 * 60.0
+
+# Set from the ``--omni-request-timeout-s`` CLI flag by ``vllm bench serve``
+# before the benchmark session is built (``None`` = use the default above).
+_REQUEST_TIMEOUT_OVERRIDE_S: float | None = None
+
+
+def set_request_timeout_s(value: float) -> None:
+    """Record the explicitly requested per-request timeout (from the CLI)."""
+    global _REQUEST_TIMEOUT_OVERRIDE_S
+    _REQUEST_TIMEOUT_OVERRIDE_S = float(value)
+
+
+def _omni_request_timeout_s() -> float:
+    """Per-request total timeout for the shared benchmark ``aiohttp`` session.
+
+    An explicit ``--omni-request-timeout-s`` value wins over the 900 s default;
+    ``<= 0`` restores the legacy 6 h cap. A bounded per-request timeout makes a
+    hung server surface as ``failed`` requests once the deadline fires instead
+    of pinning the benchmark slot indefinitely.
+    """
+    value = _REQUEST_TIMEOUT_OVERRIDE_S
+    if value is None:
+        return _DEFAULT_REQUEST_TIMEOUT_S
+    if value <= 0:
+        return _LEGACY_REQUEST_TIMEOUT_S
+    return value
+
+
+def _build_benchmark_session(
+    max_concurrency: int | None,
+    ssl_setting: ssl.SSLContext | bool,
+) -> aiohttp.ClientSession:
+    """Build the session shared by every benchmark request.
+
+    Connections are reused across requests to reduce TLS handshake overhead;
+    the per-request total timeout comes from ``_omni_request_timeout_s()``.
+    """
+    connector = aiohttp.TCPConnector(
+        limit=max_concurrency or 0,
+        limit_per_host=max_concurrency or 0,
+        ttl_dns_cache=300,
+        use_dns_cache=True,
+        enable_cleanup_closed=True,
+        force_close=True,
+        ssl=ssl_setting,
+    )
+    return aiohttp.ClientSession(
+        connector=connector,
+        trust_env=True,
+        timeout=aiohttp.ClientTimeout(total=_omni_request_timeout_s()),
     )
 
 
@@ -139,14 +292,14 @@ def _merge_extra_body_mm_kwargs(base: dict | None, overlay: dict | None) -> dict
     return out
 
 
-def _attach_daily_omni_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
-    """Apply per-request OpenAI fields (``mm_processor_kwargs``, messages) for Daily-Omni."""
-    if not isinstance(sample, DailyOmniSampleRequest):
+def _attach_omni_chat_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
+    """Apply per-request OpenAI fields (``mm_processor_kwargs``, messages) for Daily-Omni / Video-MME."""
+    if not isinstance(sample, (DailyOmniSampleRequest, VideoMMESampleRequest)):
         return
     rfi.extra_body = _merge_extra_body_mm_kwargs(rfi.extra_body, sample.omni_extra_body)
     if sample.omni_chat_messages is not None:
         setattr(rfi, "omni_chat_messages", sample.omni_chat_messages)
-    else:
+    elif isinstance(sample, DailyOmniSampleRequest):
         setattr(rfi, "mm_position", sample.omni_chat_mm_position)
 
 
@@ -163,6 +316,9 @@ def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFu
     # Mark for PCM capture (WER / UTMOS eval) regardless of extra body presence.
     setattr(rfi, "seed_tts_row", True)
     sys_prompt = (sample.seed_tts_system_prompt or "").strip() or SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT
+    setattr(rfi, "seed_tts_system_prompt", sys_prompt)
+    setattr(rfi, "seed_tts_speech_extra", sample.seed_tts_speech_extra)
+    setattr(rfi, "seed_tts_turns", sample.seed_tts_turns)
     setattr(
         rfi,
         "omni_chat_messages",
@@ -177,6 +333,151 @@ def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFu
     base = dict(rfi.extra_body) if rfi.extra_body else {}
     base.update(ex)
     rfi.extra_body = base
+
+
+def _attach_omniinteract_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
+    if not isinstance(sample, OmniInteractSampleRequest):
+        return
+    setattr(rfi, "omniinteract_case", sample.omniinteract_case)
+    setattr(rfi, "omniinteract_options", sample.omniinteract_options)
+    setattr(rfi, "omniinteract_prepared_input", sample.omniinteract_prepared_input)
+
+
+def _async_limiter(max_concurrency: int | None) -> contextlib.AbstractAsyncContextManager[object]:
+    if max_concurrency:
+        return asyncio.Semaphore(max_concurrency)
+    return contextlib.nullcontext()
+
+
+def _as_float(value: object, default: float = 0.0) -> float:
+    """Coerce loosely-typed metric dict values to ``float`` for mypy.
+
+    Strings are parsed rather than dropped: JSON-sourced session metrics such as
+    ``audio_duration_ms`` may arrive quoted, and silently reporting ``0.0`` would
+    corrupt the derived TTFT / RTF numbers.
+    """
+    if isinstance(value, bool) or value is None:
+        return default
+    if isinstance(value, (int, float, str)):
+        try:
+            return float(value)
+        except ValueError:
+            return default
+    return default
+
+
+def _append_error(existing: str, message: str) -> str:
+    return f"{existing}\n{message}" if existing else message
+
+
+def _finalize_omniinteract_batch(
+    input_requests: list[SampleRequest],
+    outputs: list[RequestFuncOutput],
+) -> dict[str, object] | None:
+    rows = [
+        (sample, output)
+        for sample, output in zip(input_requests, outputs, strict=True)
+        if isinstance(sample, OmniInteractSampleRequest)
+    ]
+    if not rows:
+        return None
+    options = rows[0][0].omniinteract_options
+    if not isinstance(options, OmniInteractSessionOptions):
+        raise RuntimeError("OmniInteract benchmark output lost its artifact options")
+    cases, results = [], []
+    artifact_errors: list[str] = []
+    for sample, output in rows:
+        case = sample.omniinteract_case
+        result = getattr(output, "omniinteract_case_result", None)
+        if case is None or not isinstance(result, OmniInteractCaseResult):
+            raise RuntimeError("OmniInteract benchmark output lost its dataset identity")
+        cases.append(case)
+        results.append(result)
+        try:
+            publish_deferred_case_artifacts(options.output_root, case, result)
+        except Exception as exc:  # noqa: BLE001 - artifact backends raise heterogeneous errors
+            result.success = result.eligible_for_official_eval = False
+            if "artifact_write_failed" not in result.official_eval_ineligible_reasons:
+                result.official_eval_ineligible_reasons.append("artifact_write_failed")
+            artifact_error = f"Artifact publication failed: {exc}"
+            result.error = _append_error(result.error, artifact_error)
+            output.error = _append_error(output.error, artifact_error)
+            message = f"{case.subset}/{case.video_rel}: {artifact_error}"
+            artifact_errors.append(message)
+            logger.exception(message)
+            try:
+                write_failure_artifacts(options.output_root, case, result)
+            except Exception as recovery_exc:  # noqa: BLE001 - preserve benchmark metrics after I/O failure
+                message = f"{case.subset}/{case.video_rel}: failure artifact publication failed: {recovery_exc}"
+                artifact_errors.append(message)
+                logger.exception(message)
+    try:
+        write_omniinteract_batch_artifacts(options.output_root, cases, results)
+    except Exception as exc:  # noqa: BLE001 - preserve benchmark metrics after I/O failure
+        message = f"Batch artifact publication failed: {exc}"
+        artifact_errors.append(message)
+        logger.exception(message)
+        try:
+            clear_batch_artifacts(options.output_root)
+        except Exception as cleanup_exc:  # noqa: BLE001 - best-effort removal of partial batch artifacts
+            message = f"Partial batch artifact cleanup failed: {cleanup_exc}"
+            artifact_errors.append(message)
+            logger.exception(message)
+    summary = omniinteract_benchmark_summary(results)
+    compact_summary = {key: value for key, value in summary.items() if key != "results"}
+    compact_summary["artifacts_complete"] = not artifact_errors
+    if artifact_errors:
+        compact_summary["artifact_errors"] = artifact_errors
+    return compact_summary
+
+
+async def _evaluate_omniinteract_batch(
+    input_requests: list[SampleRequest],
+    outputs: list[RequestFuncOutput],
+) -> dict[str, object] | None:
+    rows = [
+        (sample, output)
+        for sample, output in zip(input_requests, outputs, strict=True)
+        if isinstance(sample, OmniInteractSampleRequest)
+    ]
+    if not rows:
+        return None
+    options = rows[0][0].omniinteract_options
+    if not isinstance(options, OmniInteractSessionOptions) or options.evaluation is None:
+        return None
+    cases, results = [], []
+    for sample, output in rows:
+        result = getattr(output, "omniinteract_case_result", None)
+        if sample.omniinteract_case is None or not isinstance(result, OmniInteractCaseResult):
+            raise RuntimeError("OmniInteract benchmark output lost its dataset identity")
+        cases.append(sample.omniinteract_case)
+        results.append(result)
+    try:
+        return await asyncio.to_thread(
+            evaluate_omniinteract_batch,
+            cases,
+            results,
+            options.evaluation,
+        )
+    except Exception as exc:  # noqa: BLE001 - post-hoc accuracy must not fail a finished benchmark
+        logger.exception("OmniInteract evaluation failed")
+        return {"status": "failed", "error": str(exc)}
+
+
+def _prepare_omniinteract_batch(input_requests: list[SampleRequest]) -> None:
+    roots: set[Path] = set()
+    for sample in input_requests:
+        if not isinstance(sample, OmniInteractSampleRequest):
+            continue
+        options = sample.omniinteract_options
+        case = sample.omniinteract_case
+        if options is None or case is None:
+            raise RuntimeError("OmniInteract benchmark input lost its dataset identity")
+        root = options.output_root.resolve()
+        roots.add(root)
+        clear_case_artifacts(options.output_root, case)
+    for root in roots:
+        clear_batch_artifacts(root)
 
 
 def _daily_omni_repo_from_args(args) -> str | None:
@@ -196,10 +497,61 @@ def _daily_omni_repo_from_args(args) -> str | None:
     return None
 
 
-def get_samples(args, tokenizer):
+def _looks_like_hf_dataset_id(value: str) -> bool:
+    """True for Hub ids such as ``org/name``; false for local paths."""
+    raw = value.strip()
+    if not raw or raw.startswith((".", "~", "/")) or "\\" in raw:
+        return False
+    parts = raw.split("/")
+    return len(parts) == 2 and all(part.strip() and part.strip() not in (".", "..") for part in parts)
+
+
+def _videomme_repo_from_args(args, *, explicit: bool = False) -> str | None:
+    """Resolve a Hugging Face repo id for Video-MME from CLI args.
+
+    ``--dataset-name hf`` auto-detect only recognizes the official
+    ``lmms-eval/Video-MME`` id so a custom Hub dataset is not silently treated
+    as Video-MME. Explicit ``--dataset-name videomme`` accepts any ``org/name``
+    Hub id (for ``--videomme-repo`` / ``VLLM_VIDEOMME_REPO`` overrides) and
+    raises when ``--dataset-path`` is neither a local directory nor a Hub id.
+    """
+    official = {p.lower() for p in VideoMMEDataset.SUPPORTED_DATASET_PATHS}
+    official.add(VIDEOMME_DEFAULT_HF_REPO.lower())
+    candidates: list[str] = []
+    for attr in ("dataset_path", "hf_name"):
+        val = getattr(args, attr, None)
+        if isinstance(val, str) and val.strip():
+            candidates.append(val.strip())
+    for raw in candidates:
+        if resolve_videomme_local_root(raw) is not None:
+            continue
+        if raw.lower() in official:
+            return raw
+        if explicit and _looks_like_hf_dataset_id(raw):
+            return raw
+        if explicit:
+            raise ValueError(
+                f"Unsupported Video-MME --dataset-path={raw!r}. Pass an existing local "
+                "directory, a Hugging Face dataset id (org/name), or omit --dataset-path "
+                f"to use {VIDEOMME_DEFAULT_HF_REPO}."
+            )
+    return None
+
+
+def get_samples(args, tokenizer, **kwargs):
+    """Omni override of ``vllm.benchmarks.datasets.get_samples``.
+
+    ``**kwargs`` mirrors upstream's keyword-only arguments (today
+    ``multimodal_backends``, passed by ``vllm/benchmarks/throughput.py``) so that
+    any upstream caller reaching this patched replacement keeps working; they are
+    forwarded to the original implementation on every delegate path.
+    """
     # Daily-Omni: explicit dataset name, or hf + matching path/hf-name
     is_daily_omni = args.dataset_name == "daily-omni" or (
         args.dataset_name == "hf" and _daily_omni_repo_from_args(args) is not None
+    )
+    is_videomme = args.dataset_name == "videomme" or (
+        args.dataset_name == "hf" and _videomme_repo_from_args(args) is not None
     )
     is_seed_tts = args.dataset_name in (
         "seed-tts",
@@ -208,14 +560,96 @@ def get_samples(args, tokenizer):
         "ttsd",
         "sound-effect",
     )
+    is_omniinteract = args.dataset_name == "omniinteract"
 
     # Check if we need to handle omni-related backends/datasets
-    is_omni_backend = args.backend in ["openai-chat-omni", "openai-audio-speech", "daily-omni"]
-    is_omni_dataset = is_daily_omni or is_seed_tts or args.dataset_name == "random-mm"
+    is_omni_backend = args.backend in [
+        "openai-chat-omni",
+        "openai-audio-speech",
+        "openai-realtime-duplex",
+        "daily-omni",
+    ]
+    is_omni_dataset = is_daily_omni or is_videomme or is_seed_tts or is_omniinteract or args.dataset_name == "random-mm"
 
     if not is_omni_backend and not is_omni_dataset:
         # Not an omni-related request, delegate to original implementation
-        return get_samples_old(args, tokenizer)
+        return get_samples_old(args, tokenizer, **kwargs)
+
+    if is_omniinteract:
+        dataset_path = getattr(args, "dataset_path", None)
+        data_root = None
+        dataset_repo = DEFAULT_OMNIINTERACT_REPO
+        if dataset_path:
+            candidate = Path(dataset_path).expanduser()
+            if candidate.exists() or candidate.is_absolute():
+                data_root = str(candidate)
+            else:
+                dataset_repo = str(dataset_path)
+        dataset = OmniInteractDataset(
+            data_root=data_root,
+            dataset_repo=dataset_repo,
+            subsets=tuple(getattr(args, "omniinteract_subsets")),
+            random_seed=args.seed,
+            disable_shuffle=getattr(args, "disable_shuffle", False),
+            scenario_tags=tuple(getattr(args, "omniinteract_scenario_tags", None) or ()),
+            scenario_focus=bool(getattr(args, "omniinteract_scenario_focus", False)),
+            video_list=getattr(args, "omniinteract_video_list", None),
+        )
+        output_root = Path(getattr(args, "omniinteract_output_dir"))
+        evaluation = None
+        if bool(getattr(args, "omniinteract_evaluate", False)):
+            evaluation_output = getattr(args, "omniinteract_eval_output_dir", None)
+            evaluation = OmniInteractEvaluationOptions(
+                judge_base_url=str(getattr(args, "omniinteract_judge_base_url", "http://127.0.0.1:8000")),
+                judge_model=str(getattr(args, "omniinteract_judge_model", "")),
+                judge_api_key=str(getattr(args, "omniinteract_judge_api_key", "EMPTY")),
+                judge_timeout_s=float(getattr(args, "omniinteract_judge_timeout_s", 60.0)),
+                judge_max_tokens=int(getattr(args, "omniinteract_judge_max_tokens", 512)),
+                workers=int(getattr(args, "omniinteract_eval_workers", 8)),
+                output_dir=Path(evaluation_output) if evaluation_output else output_root / "evaluation",
+                skip_existing=bool(getattr(args, "omniinteract_eval_skip_existing", False)),
+            )
+        options = OmniInteractSessionOptions(
+            output_root=output_root,
+            timeout_s=float(getattr(args, "omniinteract_timeout_s")),
+            media_timeout_s=float(getattr(args, "omniinteract_media_timeout_s")),
+            ref_audio=str(getattr(args, "omniinteract_ref_audio")),
+            require_response=bool(getattr(args, "omniinteract_require_response")),
+            max_video_duration_s=float(getattr(args, "omniinteract_max_video_duration_s")),
+            evaluation=evaluation,
+        )
+        requests = dataset.sample(
+            tokenizer,
+            args.num_prompts,
+            request_id_prefix=args.request_id_prefix,
+            options=options,
+        )
+        if not requests:
+            raise ValueError("No OmniInteract sessions were selected")
+        from vllm_omni.clients.duplex import reference_audio_data_url
+
+        encoded_ref_audio = reference_audio_data_url(options.ref_audio)
+        assert encoded_ref_audio is not None
+        for request in requests:
+            case = request.omniinteract_case
+            assert isinstance(request, OmniInteractSampleRequest) and case is not None
+            duration, pcm, frames = prepare_media(
+                case.video_path,
+                VIDEO_FPS,
+                timeout_s=options.media_timeout_s,
+                max_duration_s=options.max_video_duration_s,
+            )
+            if not any(frames):
+                raise ValueError(f"No video frames were decoded from {case.video_path}")
+            request.omniinteract_prepared_input = OmniInteractPreparedInput(
+                duration_s=duration,
+                pcm16=pcm,
+                video_frames=tuple(frames),
+                ref_audio_data_url=encoded_ref_audio,
+            )
+        # Replace OmniInteract's ``0`` (all) with the measured request count.
+        args.num_prompts = len(requests)
+        return requests
 
     # Handle Daily-Omni dataset
     if is_daily_omni:
@@ -242,6 +676,26 @@ def get_samples(args, tokenizer):
         if isinstance(qa_json, str):
             qa_json = qa_json.strip() or None
 
+        # A local mirror of the dataset repo (plain directory or HF hub cache dir) is used
+        # directly: no Hub round-trip, so offline / air-gapped runs work without extra flags.
+        local_root: Path | None = None
+        if qa_json is None:
+            local_root = resolve_daily_omni_local_root(getattr(args, "dataset_path", None)) or (
+                resolve_daily_omni_local_root(getattr(args, "hf_name", None))
+            )
+            if local_root is not None:
+                local_qa = daily_omni_local_qa_json(local_root)
+                if local_qa is not None:
+                    qa_json = str(local_qa)
+                    if video_dir is None:
+                        video_dir = daily_omni_local_videos_dir(local_root)
+                    logger.info("Using local Daily-Omni mirror: root=%s", local_root)
+                else:
+                    logger.info(
+                        "Local Daily-Omni path %s has no qa.json; loading it with `datasets` instead",
+                        local_root,
+                    )
+
         if qa_json is not None:
             logger.info(
                 "Loading Daily-Omni dataset: qa_json=%s, video_dir=%s (Hub not used for QA)",
@@ -255,6 +709,7 @@ def get_samples(args, tokenizer):
                 random_seed=args.seed,
                 video_dir=video_dir,
                 input_mode=getattr(args, "daily_omni_input_mode", "all"),
+                pack_mode=getattr(args, "daily_omni_pack_mode", "qwen"),
                 inline_local_video=getattr(args, "daily_omni_inline_local_video", False),
                 trust_remote_code=getattr(args, "trust_remote_code", False),
                 disable_shuffle=getattr(args, "disable_shuffle", False),
@@ -263,7 +718,8 @@ def get_samples(args, tokenizer):
             repo_id = _daily_omni_repo_from_args(args)
             if args.dataset_name == "daily-omni":
                 if repo_id is None:
-                    repo_id = _DEFAULT_DAILY_OMNI_REPO
+                    # Prefer an on-disk copy over the Hub id so offline runs keep working.
+                    repo_id = str(local_root) if local_root is not None else _DEFAULT_DAILY_OMNI_REPO
             elif repo_id is None:
                 raise ValueError(
                     "Daily-Omni with --dataset-name hf requires "
@@ -285,6 +741,7 @@ def get_samples(args, tokenizer):
                 random_seed=args.seed,
                 video_dir=video_dir,
                 input_mode=getattr(args, "daily_omni_input_mode", "all"),
+                pack_mode=getattr(args, "daily_omni_pack_mode", "qwen"),
                 inline_local_video=getattr(args, "daily_omni_inline_local_video", False),
                 trust_remote_code=getattr(args, "trust_remote_code", False),
                 no_stream=getattr(args, "no_stream", False),
@@ -306,11 +763,66 @@ def get_samples(args, tokenizer):
         )
         return input_requests
 
+    if is_videomme:
+        if args.backend not in ["openai-chat-omni", "daily-omni"]:
+            raise ValueError(
+                f"Video-MME dataset requires a multimodal backend that supports video. "
+                f"Got backend='{args.backend}'. Please use '--backend openai-chat-omni'"
+            )
+
+        # Resolve the source identity here; the dataset owns loading and extraction.
+        local_root = resolve_videomme_local_root(getattr(args, "dataset_path", None)) or (
+            resolve_videomme_local_root(getattr(args, "hf_name", None))
+        )
+        source = (
+            str(local_root)
+            if local_root is not None
+            else (_videomme_repo_from_args(args, explicit=args.dataset_name == "videomme") or VIDEOMME_DEFAULT_HF_REPO)
+        )
+        dataset = VideoMMEDataset(
+            parquet_path=getattr(args, "videomme_parquet", None),
+            dataset_path=source,
+            dataset_split=getattr(args, "hf_split", None) or "test",
+            dataset_subset=getattr(args, "hf_subset", None),
+            random_seed=args.seed,
+            video_dir=getattr(args, "videomme_video_dir", None),
+            subtitle_dir=getattr(args, "videomme_subtitle_dir", None),
+            pack_mode=getattr(args, "videomme_pack_mode", "minicpm-frames"),
+            max_frames=getattr(args, "videomme_max_frames", None),
+            duration_filter=getattr(args, "videomme_duration", "all"),
+            use_subtitle=getattr(args, "videomme_use_subtitle", False),
+            inline_local_video=getattr(args, "videomme_inline_local_video", False),
+            trust_remote_code=getattr(args, "trust_remote_code", False),
+            no_stream=getattr(args, "no_stream", False),
+            disable_shuffle=getattr(args, "disable_shuffle", False),
+        )
+
+        out_len = getattr(args, "output_len", None)
+        if out_len is None:
+            out_len = getattr(args, "hf_output_len", None)
+        if out_len is None:
+            out_len = VideoMMEDataset.DEFAULT_OUTPUT_LEN
+
+        return dataset.sample(
+            tokenizer=tokenizer,
+            num_requests=args.num_prompts,
+            output_len=out_len,
+            request_id_prefix=args.request_id_prefix,
+            no_oversample=args.no_oversample,
+        )
+
     if is_seed_tts:
-        if args.backend not in ("openai-audio-speech", "openai-chat-omni"):
+        if args.backend not in (
+            "openai-audio-speech",
+            "openai-chat-omni",
+            "openai-realtime-duplex",
+            "openai-realtime-tts",
+        ):
             raise ValueError(
                 "Seed-TTS requires --backend openai-audio-speech (POST /v1/audio/speech) or "
-                "--backend openai-chat-omni (POST /v1/chat/completions with ref_audio/ref_text). "
+                "--backend openai-chat-omni (POST /v1/chat/completions with ref_audio/ref_text), or "
+                "--backend openai-realtime-duplex or openai-realtime-tts "
+                "(WebSocket /v1/realtime). "
                 f"Got backend={args.backend!r}."
             )
         repo_id = getattr(args, "dataset_path", None) or getattr(args, "hf_name", None)
@@ -318,6 +830,14 @@ def get_samples(args, tokenizer):
             raise ValueError(
                 "Seed-TTS requires --dataset-path (HF dataset repo id or local directory) or "
                 "--hf-name for the Hub dataset id."
+            )
+        turns_per_session = int(getattr(args, "seed_tts_turns_per_session", 1))
+        if turns_per_session > 1 and args.backend not in {
+            "openai-realtime-duplex",
+            "openai-realtime-tts",
+        }:
+            raise ValueError(
+                f"--seed-tts-turns-per-session > 1 requires a Realtime Seed-TTS backend. Got backend={args.backend!r}."
             )
 
         _cls_map = {
@@ -348,6 +868,7 @@ def get_samples(args, tokenizer):
             output_len=out_len,
             request_id_prefix=args.request_id_prefix,
             no_oversample=args.no_oversample,
+            turns_per_session=turns_per_session,
         )
 
     # Handle random-mm dataset (Omni's synthetic multimodal dataset)
@@ -369,14 +890,14 @@ def get_samples(args, tokenizer):
         )
         return input_requests
     else:
-        return get_samples_old(args, tokenizer)
+        return get_samples_old(args, tokenizer, **kwargs)
 
 
 datasets.get_samples = get_samples
 
 _serve_mod = sys.modules.get("vllm.benchmarks.serve")
 if _serve_mod is not None:
-    _serve_mod.get_samples = get_samples
+    setattr(_serve_mod, "get_samples", get_samples)
 
 
 @dataclass
@@ -389,7 +910,13 @@ class MixRequestFuncOutput(RequestFuncOutput):
     image_generation_time_ms: float = 0.0
     image_pixels: int = 0
     denoise_step_latency_ms: float = 0.0
+    video_duration: float = 0.0
+    video_rtf: float = 0.0
+    video_frames: int = 0
+    video_generation_time_ms: float = 0.0
+    peak_memory_mb: float = 0.0
     text_latency: float = 0.0
+    tpot_measured: bool = True
     #: Worst-case streaming-audio underrun (wall-clock seconds the player
     #: would have been starved). Populated by the audio-speech backend; ``0.0``
     #: for backends that do not run continuity analysis.
@@ -403,16 +930,24 @@ class MixRequestFuncOutput(RequestFuncOutput):
     #: Raw PCM s16le mono at 24 kHz for Seed-TTS WER: from ``/v1/audio/speech`` stream or
     #: resampled export after ``openai-chat-omni`` audio deltas.
     tts_output_pcm_bytes: bytes | None = None
+    #: Per-turn 24 kHz mono PCM for grouped Realtime Seed-TTS WER.
+    tts_turn_pcm_bytes: list[bytes] | None = None
     #: Per-stage snapshot from orchestrator ``metrics["stage_metrics"]`` (merged across SSE chunks).
     stage_metrics: dict[str, dict] | None = None
+    #: Diffusion pipeline profiler timings from response ``stage_durations``
+    #: (e.g. diffuse / text_encoder.forward / vae.decode), when present.
+    stage_durations: dict[str, float] | None = None
     stage_id: int | None = None
     final_output_type: str | None = None
+    duplex_request_metrics: list[dict[str, object]] | None = None
+    duplex_session_metrics: dict[str, object] | None = None
 
 
 _IMAGE_EDITS_EXTRA_BODY_FORM_FIELDS = (
     "negative_prompt",
     "num_inference_steps",
     "guidance_scale",
+    "guidance_scale_2",
     "strength",
     "true_cfg_scale",
     "seed",
@@ -432,15 +967,51 @@ def _guess_mime_type(path: str) -> str:
     return mime or "application/octet-stream"
 
 
-def _iter_image_edit_inputs(value: Any) -> Iterable[Any]:
-    """Yield image references from benchmark multimodal content."""
+_IMAGE_REFERENCE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".heic", ".heif"})
+_VIDEO_REFERENCE_SUFFIXES = frozenset({".mp4", ".mov", ".webm", ".mkv", ".m4v"})
+
+
+def _string_reference_kind(reference: str) -> str | None:
+    """Classify a bare reference string as image, video, or file.
+
+    ``data:image`` / ``data:video`` carry their type in the URL. Bare http(s)
+    URLs use the path extension. An existing local path is a file upload, not
+    an image or a video URL.
+    """
+    if reference.startswith("data:image"):
+        return "image"
+    if reference.startswith("data:video"):
+        return "video"
+    if reference.startswith(("http://", "https://")):
+        suffix = Path(urlparse(reference).path).suffix.lower()
+        if suffix in _VIDEO_REFERENCE_SUFFIXES:
+            return "video"
+        if suffix in _IMAGE_REFERENCE_SUFFIXES:
+            return "image"
+        return None
+    local_path = reference.removeprefix("file://")
+    if local_path and os.path.exists(local_path):
+        return "file"
+    return None
+
+
+def _iter_image_reference_inputs(value: Any) -> Iterable[Any]:
+    """Yield image references from benchmark multimodal content.
+
+    ``random-mm`` image buckets arrive as OpenAI chat parts
+    ``{"type": "image_url", "image_url": {"url": ...}}``. Yield
+    ``{"image_url": url}`` so the form helper keeps an explicit image type.
+    Bare video strings are left for ``_iter_video_reference_inputs``.
+    """
     if value is None:
         return
     if isinstance(value, list):
         for item in value:
-            yield from _iter_image_edit_inputs(item)
+            yield from _iter_image_reference_inputs(item)
         return
     if not isinstance(value, dict):
+        if isinstance(value, str) and _string_reference_kind(value) == "video":
+            return
         yield value
         return
 
@@ -449,15 +1020,49 @@ def _iter_image_edit_inputs(value: Any) -> Iterable[Any]:
         image_url = value.get("image_url")
         if isinstance(image_url, dict):
             url = image_url.get("url")
-            if url:
-                yield url
-        elif image_url:
-            yield image_url
+            if isinstance(url, str) and url:
+                yield {"image_url": url}
+        elif isinstance(image_url, str) and image_url:
+            yield {"image_url": image_url}
         return
 
     for key in ("image", "images"):
         if key in value:
-            yield from _iter_image_edit_inputs(value[key])
+            yield from _iter_image_reference_inputs(value[key])
+
+
+def _iter_video_reference_inputs(value: Any) -> Iterable[dict[str, str]]:
+    """Yield structured video references from benchmark multimodal content.
+
+    ``random-mm`` video buckets arrive as OpenAI chat parts
+    ``{"type": "video_url", "video_url": {"url": ...}}``, or as a bare
+    ``data:video`` / video http(s) string. Yield ``{"video_url": url}`` so the
+    form helper keeps the video branch.
+    """
+    if value is None:
+        return
+    if isinstance(value, list):
+        for item in value:
+            yield from _iter_video_reference_inputs(item)
+        return
+    if not isinstance(value, dict):
+        if isinstance(value, str) and _string_reference_kind(value) == "video":
+            yield {"video_url": value}
+        return
+
+    if value.get("type") == "video_url":
+        video_url = value.get("video_url")
+        if isinstance(video_url, dict):
+            url = video_url.get("url")
+            if isinstance(url, str) and url:
+                yield {"video_url": url}
+        elif isinstance(video_url, str) and video_url:
+            yield {"video_url": video_url}
+        return
+
+    for key in ("video", "videos"):
+        if key in value:
+            yield from _iter_video_reference_inputs(value[key])
 
 
 def _add_image_edit_input_to_form(form: aiohttp.FormData, image_input: Any) -> None:
@@ -469,6 +1074,12 @@ def _add_image_edit_input_to_form(form: aiohttp.FormData, image_input: Any) -> N
             content_type="image/png",
         )
         return
+
+    if isinstance(image_input, Mapping) and _is_structured_image_reference(image_input):
+        image_url = image_input.get("image_url")
+        if isinstance(image_url, str) and image_url:
+            _add_image_edit_input_to_form(form, image_url)
+            return
 
     if isinstance(image_input, str):
         if image_input.startswith(("data:image", "http://", "https://")):
@@ -500,16 +1111,8 @@ def _add_image_edit_extra_body_to_form(form: aiohttp.FormData, extra_body: dict[
             form.add_field(key, str(value))
 
 
-def _coerce_positive_int(value: Any) -> int | None:
-    try:
-        coerced = int(value)
-    except (TypeError, ValueError):
-        return None
-    return coerced if coerced > 0 else None
-
-
 def _extract_output_tokens_from_metrics(metrics: dict[str, Any]) -> int | None:
-    top_level_tokens = _coerce_positive_int(metrics.get(defs.NUM_TOKENS_OUT))
+    top_level_tokens = coerce_positive_int_scalar(metrics.get(defs.NUM_TOKENS_OUT))
     if top_level_tokens is not None:
         return top_level_tokens
 
@@ -521,7 +1124,7 @@ def _extract_output_tokens_from_metrics(metrics: dict[str, Any]) -> int | None:
     for info in stage_snapshot.values():
         if not isinstance(info, dict):
             continue
-        num_tokens_out = _coerce_positive_int(info.get(defs.NUM_TOKENS_OUT))
+        num_tokens_out = coerce_positive_int_scalar(info.get(defs.NUM_TOKENS_OUT))
         if num_tokens_out is None:
             continue
         if info.get("final_output_type") == "text" or info.get("output_unit_type") == "token":
@@ -532,9 +1135,9 @@ def _extract_output_tokens_from_metrics(metrics: dict[str, Any]) -> int | None:
 
 def _apply_usage_to_output(output: MixRequestFuncOutput, usage: dict[str, Any]) -> int | None:
     """Apply OpenAI ``usage`` fields to the benchmark output."""
-    if (pt := _coerce_positive_int(usage.get("prompt_tokens"))) is not None:
+    if (pt := coerce_positive_int_scalar(usage.get("prompt_tokens"))) is not None:
         output.prompt_len = pt
-    completion_tokens = _coerce_positive_int(usage.get("completion_tokens"))
+    completion_tokens = coerce_positive_int_scalar(usage.get("completion_tokens"))
     if completion_tokens is not None:
         output.output_tokens = max(int(output.output_tokens or 0), completion_tokens)
     return completion_tokens
@@ -579,7 +1182,7 @@ def _record_text_token_stream_intervals(
 
 def _update_output_stage_metrics_from_payload(
     output: MixRequestFuncOutput,
-    data: dict[str, Any],
+    data: Mapping[str, object],
     *,
     update_output_tokens: bool = True,
 ) -> None:
@@ -600,7 +1203,165 @@ def _update_output_stage_metrics_from_payload(
         output.stage_metrics.update(stage_snapshot)
 
 
-def _image_metrics_from_stage_metrics(metrics: dict[str, Any] | None) -> tuple[int, float, int, float]:
+# Per-request stage fields persisted in benchmark results. Full snapshots carry
+# per-token latency lists, which would inflate every chat-omni result file.
+_REQUEST_STAGE_METRIC_FIELDS = (
+    defs.NUM_TOKENS_OUT,
+    "finish_reason",
+    defs.AUDIO_FRAMES,
+    f"{defs.AUDIO_DURATION}_s",
+)
+
+
+def _compact_request_stage_metrics(snapshot: object) -> dict[str, dict] | None:
+    """Keep the stage fields used for workload checks; empty snapshots become None."""
+    if not isinstance(snapshot, dict) or not snapshot:
+        return None
+    return {
+        stage: {field: metrics[field] for field in _REQUEST_STAGE_METRIC_FIELDS if field in metrics}
+        for stage, metrics in snapshot.items()
+        if isinstance(metrics, dict)
+    }
+
+
+def _apply_chat_stage0_token_timings(output: MixRequestFuncOutput) -> bool:
+    """Apply native Stage 0 timings from a chat response snapshot."""
+    stage_metrics = output.stage_metrics
+    if not isinstance(stage_metrics, dict):
+        return False
+    stage0 = stage_metrics.get("0")
+    if not isinstance(stage0, dict):
+        return False
+
+    output_tokens = coerce_positive_int_scalar(stage0.get(defs.NUM_TOKENS_OUT))
+    expected_output_tokens = coerce_positive_int_scalar(output.output_tokens)
+    if output_tokens is None or expected_output_tokens is None or output_tokens != expected_output_tokens:
+        return False
+
+    return _apply_stage0_token_timings(
+        output,
+        [
+            {
+                "output_token_count": output_tokens,
+                "itls_ms": stage0.get(defs.VLLM_ITLS_MS),
+                "tpot_ms": stage0.get(defs.VLLM_TPOT_MS),
+            }
+        ],
+        expected_output_tokens=expected_output_tokens,
+    )
+
+
+def _peak_memory_mb_from_payload(data: Mapping[str, object]) -> float:
+    peak_memory_mb = coerce_positive_float_scalar(data.get(defs.PEAK_MEMORY_MB))
+    if peak_memory_mb is not None:
+        return peak_memory_mb
+
+    for key in ("metrics", "usage"):
+        nested = data.get(key)
+        if isinstance(nested, dict):
+            peak_memory_mb = coerce_positive_float_scalar(nested.get(defs.PEAK_MEMORY_MB))
+            if peak_memory_mb is not None:
+                return peak_memory_mb
+
+    response_data = data.get("data")
+    if isinstance(response_data, list):
+        for item in response_data:
+            if isinstance(item, dict):
+                peak_memory_mb = coerce_positive_float_scalar(item.get(defs.PEAK_MEMORY_MB))
+                if peak_memory_mb is not None:
+                    return peak_memory_mb
+
+    choices = data.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            contents = []
+            message = choice.get("message")
+            if isinstance(message, dict):
+                contents.append(message.get("content"))
+            delta = choice.get("delta")
+            if isinstance(delta, dict):
+                contents.append(delta.get("content"))
+            for content in contents:
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict):
+                            peak_memory_mb = coerce_positive_float_scalar(item.get(defs.PEAK_MEMORY_MB))
+                            if peak_memory_mb is not None:
+                                return peak_memory_mb
+    return 0.0
+
+
+def _update_output_peak_memory_from_payload(output: MixRequestFuncOutput, data: Mapping[str, object]) -> None:
+    peak_memory_mb = _peak_memory_mb_from_payload(data)
+    if peak_memory_mb > output.peak_memory_mb:
+        output.peak_memory_mb = peak_memory_mb
+
+
+def _coerce_stage_durations_dict(raw: object) -> dict[str, float] | None:
+    """Normalize a stage_durations mapping to ``dict[str, float]``."""
+    if not isinstance(raw, dict) or not raw:
+        return None
+    coerced: dict[str, float] = {}
+    for key, value in raw.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value):
+            continue
+        coerced[str(key)] = float(value)
+    return coerced or None
+
+
+def _extract_stage_durations_from_payload(data: Mapping[str, object]) -> dict[str, float] | None:
+    """Pull pipeline profiler timings from video/image/chat response shapes."""
+    found = _coerce_stage_durations_dict(data.get("stage_durations"))
+    if found:
+        return found
+
+    metrics = data.get("metrics")
+    if isinstance(metrics, dict):
+        found = _coerce_stage_durations_dict(metrics.get("stage_durations"))
+        if found:
+            return found
+
+    response_data = data.get("data")
+    if isinstance(response_data, list):
+        for item in response_data:
+            if isinstance(item, dict):
+                found = _coerce_stage_durations_dict(item.get("stage_durations"))
+                if found:
+                    return found
+
+    choices = data.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            for message_key in ("message", "delta"):
+                message = choice.get(message_key)
+                if not isinstance(message, dict):
+                    continue
+                content = message.get("content")
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict):
+                            found = _coerce_stage_durations_dict(item.get("stage_durations"))
+                            if found:
+                                return found
+                elif isinstance(content, dict):
+                    found = _coerce_stage_durations_dict(content.get("stage_durations"))
+                    if found:
+                        return found
+    return None
+
+
+def _update_output_stage_durations_from_payload(output: MixRequestFuncOutput, data: Mapping[str, object]) -> None:
+    """Persist the full profiler ``stage_durations`` map when the response has one."""
+    found = _extract_stage_durations_from_payload(data)
+    if found:
+        output.stage_durations = found
+
+
+def _image_metrics_from_stage_metrics(metrics: object) -> tuple[int, float, int, float]:
     if not isinstance(metrics, dict):
         return 0, 0.0, 0, 0.0
     stage_snapshot = metrics.get("stage_metrics")
@@ -627,7 +1388,7 @@ def _image_metrics_from_stage_metrics(metrics: dict[str, Any] | None) -> tuple[i
     return image_count, image_generation_ms, image_pixels, denoise_step_latency_ms
 
 
-def _image_generation_ms_from_content(content: Any) -> float:
+def _image_generation_ms_from_content(content: object) -> float:
     if not isinstance(content, list):
         return 0.0
     for item in content:
@@ -644,6 +1405,446 @@ def _image_generation_ms_from_content(content: Any) -> float:
         if gen_values:
             return max(gen_values)
     return 0.0
+
+
+def _image_info_from_response_data(content: object) -> tuple[int, int]:
+    if not isinstance(content, list):
+        return 0, 0
+    image_count = 0
+    total_pixels = 0
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        b64_json = item.get("b64_json")
+        if not isinstance(b64_json, str) or not b64_json:
+            continue
+        try:
+            with Image.open(io.BytesIO(base64.b64decode(b64_json, validate=True))) as img:
+                width, height = img.size
+                img.verify()
+                image_count += 1
+                total_pixels += int(width) * int(height)
+        except Exception:
+            logger.debug("Failed to decode generated image payload", exc_info=True)
+    return image_count, total_pixels
+
+
+def _apply_image_metrics_from_payload(output: MixRequestFuncOutput, data: Mapping[str, object]) -> int:
+    """Populate image benchmark fields from an OpenAI-compatible image payload."""
+    _update_output_stage_metrics_from_payload(output, data, update_output_tokens=False)
+    _update_output_peak_memory_from_payload(output, data)
+    _update_output_stage_durations_from_payload(output, data)
+
+    payload_image_count = 0
+    response_data = data.get("data")
+    if isinstance(response_data, list):
+        payload_image_count, content_image_pixels = _image_info_from_response_data(response_data)
+        output.image_count = max(output.image_count, payload_image_count)
+        content_image_ms = _image_generation_ms_from_content(response_data)
+        if content_image_ms > 0:
+            output.image_generation_time_ms = max(output.image_generation_time_ms, content_image_ms)
+        if content_image_pixels > 0:
+            output.image_pixels = max(output.image_pixels, content_image_pixels)
+
+    (
+        metrics_image_count,
+        metrics_image_ms,
+        metrics_image_pixels,
+        metrics_denoise_step_ms,
+    ) = _image_metrics_from_stage_metrics(data.get("metrics"))
+    if metrics_image_count > output.image_count:
+        output.image_count = metrics_image_count
+    if metrics_image_ms > output.image_generation_time_ms:
+        output.image_generation_time_ms = metrics_image_ms
+    if metrics_image_pixels > output.image_pixels:
+        output.image_pixels = metrics_image_pixels
+    if metrics_denoise_step_ms > output.denoise_step_latency_ms:
+        output.denoise_step_latency_ms = metrics_denoise_step_ms
+    return payload_image_count
+
+
+_VIDEO_FORM_FIELDS = (
+    "seconds",
+    "num_frames",
+    "fps",
+    "num_inference_steps",
+    "seed",
+    "negative_prompt",
+    "guidance_scale",
+    "guidance_scale_2",
+    "boundary_ratio",
+    "flow_shift",
+    "true_cfg_scale",
+    "generate_sound",
+    "sound_duration",
+    "enable_frame_interpolation",
+    "frame_interpolation_exp",
+    "frame_interpolation_scale",
+    "frame_interpolation_model_path",
+    "lora",
+    "extra_params",
+)
+
+
+def _video_generation_ms_from_stage_durations(stage_durations: object) -> float:
+    if not isinstance(stage_durations, dict):
+        return 0.0
+    gen_values = [
+        float(value)
+        for key, value in stage_durations.items()
+        if str(key).endswith("_gen_ms") and isinstance(value, (int, float))
+    ]
+    return max(gen_values) if gen_values else 0.0
+
+
+def _video_duration_from_payload(data: Mapping[str, object], request_body: Mapping[str, object]) -> float:
+    duration_s = coerce_positive_float_scalar(data.get("duration_s"))
+    if duration_s is not None and duration_s > 0:
+        return duration_s
+
+    num_frames = coerce_positive_float_scalar(data.get("num_frames"))
+    fps = coerce_positive_float_scalar(data.get("fps"))
+    if num_frames is not None and fps is not None and num_frames > 0 and fps > 0:
+        return num_frames / fps
+
+    seconds = coerce_positive_float_scalar(request_body.get("seconds"))
+    if seconds is not None and seconds > 0:
+        return seconds
+
+    num_frames = coerce_positive_float_scalar(request_body.get("num_frames"))
+    fps = coerce_positive_float_scalar(request_body.get("fps"))
+    if num_frames is not None and fps is not None and num_frames > 0 and fps > 0:
+        return num_frames / fps
+
+    return 0.0
+
+
+def _video_frames_from_payload(data: Mapping[str, object], request_body: Mapping[str, object]) -> int:
+    for key in ("num_frames", "video_frames", "frames"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return len(value)
+        num_frames = coerce_positive_int_scalar(value)
+        if num_frames is not None:
+            return num_frames
+
+    duration_s = coerce_positive_float_scalar(data.get("duration_s"))
+    fps = coerce_positive_float_scalar(data.get("fps"))
+    if duration_s is not None and fps is not None and duration_s > 0 and fps > 0:
+        return int(round(duration_s * fps))
+
+    num_frames = coerce_positive_int_scalar(request_body.get("num_frames"))
+    if num_frames is not None:
+        return num_frames
+
+    seconds = coerce_positive_float_scalar(request_body.get("seconds"))
+    fps = coerce_positive_float_scalar(request_body.get("fps"))
+    if seconds is not None and fps is not None and seconds > 0 and fps > 0:
+        return int(round(seconds * fps))
+
+    return 0
+
+
+def _is_structured_image_reference(reference: Mapping[str, object]) -> bool:
+    """True for API image_reference objects ({"image_url": "..."})."""
+    image_url = reference.get("image_url")
+    return isinstance(image_url, str) and bool(image_url)
+
+
+def _is_structured_video_reference(reference: Mapping[str, object]) -> bool:
+    """True for API video_reference objects ({"video_url": "..."})."""
+    video_url = reference.get("video_url")
+    return isinstance(video_url, str) and bool(video_url)
+
+
+_VIDEO_REFERENCE_JSON_MAX_BYTES = 1024 * 1024
+
+
+def _data_video_json_exceeds_text_limit(video_url: str) -> bool:
+    """True when a data:video URL would exceed the ~1MB multipart text-part limit."""
+    if not video_url.startswith("data:video"):
+        return False
+    encoded = json.dumps({"video_url": video_url}).encode("utf-8")
+    return len(encoded) > _VIDEO_REFERENCE_JSON_MAX_BYTES
+
+
+def _add_data_video_upload(form: aiohttp.FormData, video_url: str) -> bool:
+    """Upload one inline video as ``input_references`` instead of a JSON text part."""
+    header, _, payload = video_url.partition(",")
+    if not payload:
+        raise ValueError(f"Unsupported video data URL: {video_url[:64]!r}")
+    try:
+        video_bytes = base64.b64decode(payload)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("video data URL is not valid base64") from exc
+    mime = header[len("data:") :].split(";", 1)[0] or "video/mp4"
+    suffix = ".mp4" if mime.endswith("mp4") else ".bin"
+    form.add_field(
+        "input_references",
+        video_bytes,
+        filename=f"benchmark-reference{suffix}",
+        content_type=mime,
+    )
+    return True
+
+
+def _file_bytes_as_data_url(raw: bytes, mime: str) -> str:
+    encoded = base64.b64encode(raw).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def _image_reference_json_value(reference: object) -> object:
+    """Turn an image file into a JSON ``image_reference`` when it must share a form.
+
+    ``input_reference`` cannot be combined with ``video_reference``. Image URLs
+    stay URLs. Upload bytes and local image files become ``data:image`` URLs.
+    """
+    if isinstance(reference, Mapping) and "bytes" in reference and not _is_structured_image_reference(reference):
+        raw = reference["bytes"]
+        if not isinstance(raw, (bytes, bytearray)):
+            raise ValueError(f"image reference bytes must be bytes (got {type(raw).__name__}).")
+        content_type = reference.get("content_type", "image/png")
+        if not isinstance(content_type, str) or not content_type.startswith("image/"):
+            content_type = "image/png"
+        return {"image_url": _file_bytes_as_data_url(bytes(raw), content_type.split(";", 1)[0])}
+    if isinstance(reference, str):
+        kind = _string_reference_kind(reference)
+        if kind == "image":
+            return {"image_url": reference}
+        if kind == "file":
+            local_path = reference.removeprefix("file://")
+            mime = _guess_mime_type(local_path)
+            if not mime.startswith("image/"):
+                mime = "image/png"
+            with open(local_path, "rb") as handle:
+                return {"image_url": _file_bytes_as_data_url(handle.read(), mime)}
+    return reference
+
+
+def _video_reference_json_value(reference: object) -> object:
+    """Turn a video file into a JSON ``video_reference`` when it must share a form.
+
+    ``input_reference`` cannot be combined with ``image_reference``. Video URLs
+    stay URLs. Local video files become ``data:video`` URLs.
+    """
+    if isinstance(reference, Mapping) and "bytes" in reference and not _is_structured_video_reference(reference):
+        raw = reference["bytes"]
+        if not isinstance(raw, (bytes, bytearray)):
+            raise ValueError(f"video reference bytes must be bytes (got {type(raw).__name__}).")
+        content_type = reference.get("content_type", "video/mp4")
+        if not isinstance(content_type, str) or not content_type.startswith("video/"):
+            content_type = "video/mp4"
+        return {"video_url": _file_bytes_as_data_url(bytes(raw), content_type.split(";", 1)[0])}
+    if isinstance(reference, str):
+        kind = _string_reference_kind(reference)
+        if kind == "video":
+            return {"video_url": reference}
+        if kind == "file":
+            local_path = reference.removeprefix("file://")
+            mime = _guess_mime_type(local_path)
+            if not mime.startswith("video/"):
+                mime = "video/mp4"
+            with open(local_path, "rb") as handle:
+                return {"video_url": _file_bytes_as_data_url(handle.read(), mime)}
+    return reference
+
+
+def _add_video_reference_to_form(
+    form: aiohttp.FormData,
+    reference: object,
+    *,
+    upload_inline_video: bool = True,
+) -> bool:
+    """Encode one reference: image URL, video URL, or file upload.
+
+    Image URLs use ``image_reference``. Video URLs use ``video_reference``.
+    A lone ``data:video`` whose JSON text exceeds 1MB is uploaded as
+    ``input_references``. Local paths and raw bytes use ``input_reference``.
+    ``upload_inline_video`` must be false when an image is on the same form:
+    ``input_references`` cannot be combined with ``image_reference``.
+    """
+    candidates = reference if isinstance(reference, list) else [reference]
+    for item in candidates:
+        if isinstance(item, Mapping):
+            file_id = item.get("file_id")
+            if isinstance(file_id, str) and file_id:
+                raise ValueError("file_id is not supported yet")
+    if isinstance(reference, dict) and "bytes" in reference:
+        form.add_field(
+            "input_reference",
+            reference["bytes"],
+            filename="benchmark-reference",
+            content_type=reference.get("content_type", "application/octet-stream"),
+        )
+        return True
+
+    if isinstance(reference, Mapping) and _is_structured_image_reference(reference):
+        form.add_field("image_reference", json.dumps(dict(reference)))
+        return True
+
+    if isinstance(reference, Mapping) and _is_structured_video_reference(reference):
+        video_url = reference.get("video_url")
+        if upload_inline_video and isinstance(video_url, str) and _data_video_json_exceeds_text_limit(video_url):
+            return _add_data_video_upload(form, video_url)
+        form.add_field("video_reference", json.dumps(dict(reference)))
+        return True
+
+    if isinstance(reference, list):
+        if reference and all(isinstance(item, Mapping) and _is_structured_image_reference(item) for item in reference):
+            form.add_field("image_reference", json.dumps([dict(item) for item in reference]))
+            return True
+        if reference and all(isinstance(item, Mapping) and _is_structured_video_reference(item) for item in reference):
+            form.add_field("video_reference", json.dumps([dict(item) for item in reference]))
+            return True
+        raise ValueError(
+            "Unsupported reference list; expected non-empty list of "
+            '{"image_url": "..."} or {"video_url": "..."} objects.'
+        )
+
+    if isinstance(reference, str):
+        kind = _string_reference_kind(reference)
+        if kind == "image":
+            form.add_field("image_reference", json.dumps({"image_url": reference}))
+            return True
+        if kind == "video":
+            if upload_inline_video and _data_video_json_exceeds_text_limit(reference):
+                return _add_data_video_upload(form, reference)
+            form.add_field("video_reference", json.dumps({"video_url": reference}))
+            return True
+        if kind == "file":
+            local_path = reference.removeprefix("file://")
+            with open(local_path, "rb") as handle:
+                reference_bytes = handle.read()
+            form.add_field(
+                "input_reference",
+                reference_bytes,
+                filename=os.path.basename(local_path),
+                content_type=_guess_mime_type(local_path),
+            )
+            return True
+        if reference.startswith(("http://", "https://")):
+            raise ValueError(
+                "Bare http(s) reference needs an image or video extension "
+                f"({', '.join(sorted(_IMAGE_REFERENCE_SUFFIXES | _VIDEO_REFERENCE_SUFFIXES))}); "
+                f"got {reference!r}."
+            )
+        raise ValueError(f"Unsupported reference path or URL: {reference!r}")
+
+    raise ValueError(
+        "Unsupported reference; expected image URL, video URL, upload bytes, or a local file "
+        f"(got {type(reference).__name__})."
+    )
+
+
+def _add_combined_video_form_references(
+    form: aiohttp.FormData,
+    multi_modal_content: Any,
+    extra_body: Mapping[str, Any] | None = None,
+) -> None:
+    """Serialize image and video refs using a server-accepted field pair.
+
+    Alone, each reference uses its own field: image URL → ``image_reference``,
+    video URL → ``video_reference``, file → ``input_reference``. A lone inline
+    video whose JSON text exceeds 1MB is uploaded as ``input_references``.
+    Together, that upload cannot be combined with ``image_reference``, so both
+    sides stay on the JSON fields. A file paired with the other media is rewritten
+    as a data URL of the matching type.
+    """
+    extra_body = extra_body or {}
+    image_refs = list(_iter_image_reference_inputs(multi_modal_content))
+    video_refs = list(_iter_video_reference_inputs(multi_modal_content))
+    if not image_refs and extra_body.get("image_reference") is not None:
+        image_refs = [extra_body["image_reference"]]
+    if not video_refs and extra_body.get("video_reference") is not None:
+        video_refs = [extra_body["video_reference"]]
+
+    if image_refs and video_refs:
+        for raw in (image_refs[0], video_refs[0]):
+            candidates = raw if isinstance(raw, list) else [raw]
+            for item in candidates:
+                if isinstance(item, Mapping):
+                    file_id = item.get("file_id")
+                    if isinstance(file_id, str) and file_id:
+                        raise ValueError("file_id is not supported yet")
+        _add_video_reference_to_form(form, _image_reference_json_value(image_refs[0]))
+        _add_video_reference_to_form(
+            form,
+            _video_reference_json_value(video_refs[0]),
+            upload_inline_video=False,
+        )
+        return
+
+    if image_refs:
+        _add_video_reference_to_form(form, image_refs[0])
+    if video_refs:
+        _add_video_reference_to_form(form, video_refs[0])
+
+
+def _add_video_extra_body_to_form(
+    form: aiohttp.FormData,
+    extra_body: Mapping[str, object],
+    request_body: Mapping[str, object],
+) -> None:
+    for key in _VIDEO_FORM_FIELDS:
+        value = request_body.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (dict, list)):
+            form.add_field(key, json.dumps(value))
+        else:
+            form.add_field(key, str(value))
+
+    reserved = {
+        "model",
+        "prompt",
+        "size",
+        "width",
+        "height",
+        "poll_interval_s",
+        "poll_timeout_s",
+        # Handled only by _add_video_reference_to_form (upload / JSON image_url / video_url).
+        "image_reference",
+        "video_reference",
+        "input_reference",
+        "input_references",
+        *_VIDEO_FORM_FIELDS,
+    }
+    for key, value in extra_body.items():
+        if key in reserved or value is None:
+            continue
+        if isinstance(value, (dict, list)):
+            form.add_field(key, json.dumps(value))
+        else:
+            form.add_field(key, str(value))
+
+
+def _apply_video_metrics_from_payload(
+    output: MixRequestFuncOutput,
+    data: Mapping[str, object],
+    request_body: Mapping[str, object],
+) -> None:
+    output.video_duration = _video_duration_from_payload(data, request_body)
+    output.video_frames = _video_frames_from_payload(data, request_body)
+    _update_output_stage_metrics_from_payload(output, data, update_output_tokens=False)
+    _update_output_peak_memory_from_payload(output, data)
+    _update_output_stage_durations_from_payload(output, data)
+
+    stage_durations = output.stage_durations if output.stage_durations is not None else data.get("stage_durations")
+    stage_gen_ms = _video_generation_ms_from_stage_durations(stage_durations)
+    if stage_gen_ms <= 0:
+        inference_time_s = coerce_positive_float_scalar(data.get("inference_time_s"))
+        if inference_time_s is not None and inference_time_s > 0:
+            stage_gen_ms = inference_time_s * 1000.0
+    output.video_generation_time_ms = max(output.video_generation_time_ms, stage_gen_ms)
+    if output.video_duration <= 0:
+        return
+    # Prefer server-reported generation time so RTF is independent of client
+    # poll_interval_s sleep/overshoot baked into output.latency.
+    generation_s = output.video_generation_time_ms / 1000.0
+    if generation_s > 0:
+        output.video_rtf = generation_s / output.video_duration
+    elif output.latency > 0:
+        output.video_rtf = output.latency / output.video_duration
 
 
 async def async_request_openai_chat_omni_completions(
@@ -739,7 +1940,10 @@ async def async_request_openai_chat_omni_completions(
         output.image_generation_time_ms = 0.0
         output.image_pixels = 0
         output.denoise_step_latency_ms = 0.0
+        output.peak_memory_mb = 0.0
+        output.stage_durations = None
         completion_tokens_seen = 0
+        streaming_error_received = False
         try:
             async with session.post(url=api_url, json=payload, headers=headers) as response:
                 if response.status == 200:
@@ -767,7 +1971,16 @@ async def async_request_openai_chat_omni_completions(
                             if chunk != "[DONE]":
                                 timestamp = time.perf_counter()
                                 data = json.loads(chunk)
+                                if (streaming_error := data.get("error")) is not None:
+                                    streaming_error_received = True
+                                    if isinstance(streaming_error, dict):
+                                        output.error = str(streaming_error.get("message") or streaming_error)
+                                    else:
+                                        output.error = str(streaming_error)
+                                    continue
                                 _update_output_stage_metrics_from_payload(output, data)
+                                _update_output_peak_memory_from_payload(output, data)
+                                _update_output_stage_durations_from_payload(output, data)
                                 usage = data.get("usage")
                                 completion_tokens = None
                                 if isinstance(usage, dict):
@@ -867,6 +2080,14 @@ async def async_request_openai_chat_omni_completions(
 
                     output.latency = timestamp - st
                     output.generated_text = generated_text
+                    if output.output_tokens > 1 and not any(
+                        isinstance(value, int | float)
+                        and not isinstance(value, bool)
+                        and np.isfinite(value)
+                        and value > 0
+                        for value in output.itl
+                    ):
+                        _apply_chat_stage0_token_timings(output)
                     if output.itl:
                         # Align text_latency with ITL so TPOT formula and
                         # mean(ITL) are consistent.  Do NOT infer output_tokens
@@ -877,12 +2098,22 @@ async def async_request_openai_chat_omni_completions(
                     audio_frames = 0
                     if response_format == "wav" and wav_pcm_buffer and wav_audio_params is not None:
                         channels, sample_width, frame_rate = wav_audio_params
-                        frame_width = sample_width * channels
-                        if frame_width > 0:
-                            audio_frames = len(wav_pcm_buffer) // frame_width
-                            audio_duration_sec = audio_frames / frame_rate
+                        audio_frames = defs.compute_audio_frames(
+                            len(wav_pcm_buffer),
+                            sample_width=sample_width,
+                            channels=channels,
+                        )
+                        if audio_frames > 0 and frame_rate > 0:
+                            audio_duration_sec = audio_frames / float(frame_rate)
                         else:
-                            logger.warning("Audio frame width is zero")
+                            logger.warning(
+                                "Unable to derive audio frames/duration from wav pcm "
+                                "(pcm_nbytes=%d, sample_width=%d, channels=%d, sample_rate=%d)",
+                                len(wav_pcm_buffer),
+                                sample_width,
+                                channels,
+                                frame_rate,
+                            )
                     elif audio_bytes_buffer:
                         try:
                             from vllm.multimodal.audio import get_audio_duration
@@ -901,10 +2132,8 @@ async def async_request_openai_chat_omni_completions(
                         output.audio_duration = audio_duration_sec
                         output.audio_frames = audio_frames
                         audio_duration = output.audio_duration
-                        if audio_duration > 0:
-                            output.audio_rtf = audio_generate_time / output.audio_duration
-                        else:
-                            output.audio_rtf = 0
+                        output.audio_rtf = defs.compute_audio_rtf(audio_generate_time, audio_duration)
+                        if audio_duration <= 0:
                             logger.warning("Audio duration is zero")
                         if _seed_tts_capture_pcm_for_wer() and getattr(request_func_input, "seed_tts_row", False):
                             try:
@@ -933,7 +2162,7 @@ async def async_request_openai_chat_omni_completions(
                                     output.tts_output_pcm_bytes = (waveform * 32767).astype(np.int16).tobytes()
                             except Exception as ex:
                                 logger.warning("seed_tts WER PCM export failed: %s", ex)
-                    output.success = True
+                    output.success = not streaming_error_received
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -968,16 +2197,235 @@ async def async_request_openai_chat_omni_completions(
     return output
 
 
+def _finalize_image_json_http_response(
+    output: MixRequestFuncOutput,
+    *,
+    start_time: float,
+    status: int,
+    data: Mapping[str, object] | None,
+    error_text: str | None,
+) -> None:
+    """Set e2el after the image JSON body has been fully read and validated."""
+    output.latency = time.perf_counter() - start_time
+    if status != 200:
+        output.error = f"HTTP {status}: {error_text or ''}"
+        output.success = False
+        return
+    if not isinstance(data, Mapping):
+        output.error = "HTTP 200 response did not contain a JSON object"
+        output.success = False
+        return
+    payload_image_count = _apply_image_metrics_from_payload(output, data)
+    if payload_image_count <= 0:
+        output.error = "HTTP 200 response did not contain a valid image payload"
+        output.success = False
+        return
+    output.success = True
+
+
+async def async_request_openai_image_generations_omni(
+    request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> MixRequestFuncOutput:
+    """JSON request to /v1/images/generations for image generation benchmarks."""
+    api_url = request_func_input.api_url
+    _validate_api_url(api_url, "OpenAI Image Generations API", "images/generations")
+
+    extra_body = dict(request_func_input.extra_body or {})
+    model = request_func_input.model_name if request_func_input.model_name else request_func_input.model
+    output = MixRequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+    output.itl = []
+    output.stage_metrics = {}
+    output.output_tokens = 0
+    output.image_count = 0
+    output.image_generation_time_ms = 0.0
+    output.image_pixels = 0
+    output.denoise_step_latency_ms = 0.0
+
+    size = extra_body.get("size")
+    if size is None:
+        width, height = extra_body.get("width"), extra_body.get("height")
+        if width is not None and height is not None:
+            size = f"{width}x{height}"
+
+    payload: dict[str, object] = {
+        "model": model,
+        "prompt": request_func_input.prompt,
+        "n": int(extra_body.pop("n", extra_body.pop("num_outputs_per_prompt", 1)) or 1),
+        "response_format": "b64_json",
+    }
+    if size is not None:
+        payload["size"] = str(size)
+
+    for key, value in extra_body.items():
+        if key in {"height", "width"}:
+            continue
+        payload.setdefault(key, value)
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+    }
+    _update_headers_common(headers, request_func_input)
+
+    st = time.perf_counter()
+    output.start_time = st
+    try:
+        async with session.post(url=api_url, json=payload, headers=headers) as response:
+            if response.status == 200:
+                data = await response.json()
+                _finalize_image_json_http_response(
+                    output,
+                    start_time=st,
+                    status=response.status,
+                    data=data if isinstance(data, Mapping) else None,
+                    error_text=None,
+                )
+            else:
+                error_text = await response.text()
+                _finalize_image_json_http_response(
+                    output,
+                    start_time=st,
+                    status=response.status,
+                    data=None,
+                    error_text=error_text,
+                )
+    except Exception:
+        output.latency = time.perf_counter() - st
+        output.success = False
+        output.error = traceback.format_exc()
+        logger.error(f"ERROR: send image generation request failed, reason is: {output.error}")
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+async def async_request_openai_videos_omni(
+    request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> MixRequestFuncOutput:
+    """Multipart request to async /v1/videos, polling metadata until completion."""
+    api_url = request_func_input.api_url
+    _validate_api_url(api_url, "OpenAI Videos API", "videos")
+
+    extra_body = dict(request_func_input.extra_body or {})
+    model = request_func_input.model_name if request_func_input.model_name else request_func_input.model
+    output = MixRequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+    output.itl = []
+    output.stage_metrics = {}
+    output.output_tokens = 0
+    output.video_duration = 0.0
+    output.video_generation_time_ms = 0.0
+
+    request_body: dict[str, object] = {
+        "model": model,
+        "prompt": request_func_input.prompt,
+    }
+    request_body.update(extra_body)
+
+    size = request_body.get("size")
+    if size is None:
+        width, height = request_body.get("width"), request_body.get("height")
+        if width is not None and height is not None:
+            size = f"{width}x{height}"
+    if size is not None:
+        request_body["size"] = str(size)
+
+    form = aiohttp.FormData()
+    form.add_field("model", str(model))
+    form.add_field("prompt", str(request_func_input.prompt))
+    if request_body.get("size") is not None:
+        form.add_field("size", str(request_body["size"]))
+    _add_video_extra_body_to_form(form, extra_body, request_body)
+
+    _add_combined_video_form_references(form, request_func_input.multi_modal_content, extra_body)
+
+    headers = {
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+    }
+    _update_headers_common(headers, request_func_input)
+
+    poll_interval_s = float(extra_body.get("poll_interval_s", 2.0) or 2.0)
+    timeout_s = float(extra_body.get("poll_timeout_s", 6 * 60 * 60) or (6 * 60 * 60))
+    st = time.perf_counter()
+    output.start_time = st
+    try:
+        async with session.post(url=api_url, data=form, headers=headers) as response:
+            if response.status != 200:
+                output.latency = time.perf_counter() - st
+                output.error = f"HTTP {response.status}: {await response.text()}"
+                output.success = False
+                return output
+            create_payload = await response.json()
+
+        job_id = create_payload.get("id")
+        job_status = create_payload.get("status")
+        if not isinstance(job_id, str) or not job_id:
+            output.latency = time.perf_counter() - st
+            output.error = "Video creation response missing job id."
+            output.success = False
+            return output
+
+        job_url = f"{api_url.rstrip('/')}/{job_id}"
+        poll_payload = create_payload
+        deadline = time.perf_counter() + timeout_s
+        while job_status not in {"completed", "failed"}:
+            if time.perf_counter() >= deadline:
+                output.latency = time.perf_counter() - st
+                output.error = f"Timed out waiting for video job {job_id} to complete."
+                output.success = False
+                return output
+            await asyncio.sleep(poll_interval_s)
+            async with session.get(job_url, headers=headers) as poll_response:
+                if poll_response.status != 200:
+                    output.latency = time.perf_counter() - st
+                    output.error = f"Polling failed HTTP {poll_response.status}: {await poll_response.text()}"
+                    output.success = False
+                    return output
+                poll_payload = await poll_response.json()
+                job_status = poll_payload.get("status")
+
+        output.latency = time.perf_counter() - st
+        if job_status == "failed":
+            output.error = f"Video job failed: {poll_payload}"
+            output.success = False
+            return output
+
+        _apply_video_metrics_from_payload(output, poll_payload, request_body)
+        output.success = True
+    except Exception:
+        output.latency = time.perf_counter() - st
+        output.success = False
+        output.error = traceback.format_exc()
+        logger.error(f"ERROR: send video request failed, reason is: {output.error}")
+    finally:
+        if pbar:
+            pbar.update(1)
+    return output
+
+
 async def async_request_openai_image_edits_omni(
     request_func_input: RequestFuncInput,
     session: aiohttp.ClientSession,
     pbar: tqdm | None = None,
 ) -> MixRequestFuncOutput:
-    """Streaming request to /v1/images/edits for multi-stage image-edit benchmarks."""
+    """Multipart request to /v1/images/edits.
+
+    Defaults to non-streaming JSON so single-stage edit models work. The server
+    rejects ``stream=true`` when ``len(stage_configs) <= 1``. Pass
+    ``stream: true`` in ``--extra-body`` for multi-stage SSE (AR TTFT / image
+    chunks).
+    """
     api_url = request_func_input.api_url
     _validate_api_url(api_url, "OpenAI Image Edits API", "images/edits")
 
     extra_body = dict(request_func_input.extra_body or {})
+    want_stream = coerce_bool(extra_body.pop("stream", None), default=False)
     model = request_func_input.model_name if request_func_input.model_name else request_func_input.model
     output = MixRequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
@@ -994,7 +2442,7 @@ async def async_request_openai_image_edits_omni(
     form.add_field("prompt", request_func_input.prompt)
     form.add_field("response_format", "b64_json")
     form.add_field("output_format", str(extra_body.get("output_format", "png")))
-    form.add_field("stream", "true")
+    form.add_field("stream", "true" if want_stream else "false")
 
     size = extra_body.get("size")
     if size is None:
@@ -1005,7 +2453,7 @@ async def async_request_openai_image_edits_omni(
     _add_image_edit_extra_body_to_form(form, extra_body)
 
     try:
-        image_inputs = list(_iter_image_edit_inputs(request_func_input.multi_modal_content))
+        image_inputs = list(_iter_image_reference_inputs(request_func_input.multi_modal_content))
         if not image_inputs:
             raise ValueError(
                 "openai-image-edits-omni requires image multimodal content. "
@@ -1027,12 +2475,22 @@ async def async_request_openai_image_edits_omni(
 
     st = time.perf_counter()
     output.start_time = st
-    timestamp = st
-    most_recent_text_timestamp = st
-    generated_text = ""
     try:
         async with session.post(url=api_url, data=form, headers=headers) as response:
-            if response.status == 200:
+            if response.status != 200:
+                error_text = await response.text()
+                _finalize_image_json_http_response(
+                    output,
+                    start_time=st,
+                    status=response.status,
+                    data=None,
+                    error_text=error_text,
+                )
+            elif want_stream:
+                timestamp = st
+                most_recent_text_timestamp = st
+                generated_text = ""
+                streaming_error_received = False
                 handler = StreamedResponseHandler()
                 async for chunk_bytes in response.content.iter_any():
                     if not chunk_bytes:
@@ -1048,11 +2506,20 @@ async def async_request_openai_image_edits_omni(
 
                         timestamp = time.perf_counter()
                         data = json.loads(chunk)
+                        if (streaming_error := data.get("error")) is not None:
+                            streaming_error_received = True
+                            if isinstance(streaming_error, dict):
+                                output.error = str(streaming_error.get("message") or streaming_error)
+                            else:
+                                output.error = str(streaming_error)
+                            continue
                         _update_output_stage_metrics_from_payload(
                             output,
                             data,
                             update_output_tokens=(data.get("type") == "ar_delta"),
                         )
+                        _update_output_peak_memory_from_payload(output, data)
+                        _update_output_stage_durations_from_payload(output, data)
 
                         chunk_type = data.get("type")
                         if chunk_type == "ar_delta":
@@ -1086,11 +2553,18 @@ async def async_request_openai_image_edits_omni(
                             output.denoise_step_latency_ms = metrics_denoise_step_ms
                 output.latency = timestamp - st
                 output.generated_text = generated_text
-                output.success = True
+                output.success = not streaming_error_received
             else:
-                output.error = f"HTTP {response.status}: {await response.text()}"
-                output.success = False
+                data = await response.json()
+                _finalize_image_json_http_response(
+                    output,
+                    start_time=st,
+                    status=response.status,
+                    data=data if isinstance(data, Mapping) else None,
+                    error_text=None,
+                )
     except Exception:
+        output.latency = time.perf_counter() - st
         output.success = False
         output.error = traceback.format_exc()
         logger.error(f"ERROR: send image edit request failed, reason is: {output.error}")
@@ -1105,9 +2579,9 @@ async def async_request_openai_audio_speech(
 ) -> MixRequestFuncOutput:
     """Streaming request to /v1/audio/speech endpoint.
 
-    Sends ``stream=true`` with ``response_format=pcm`` so the server returns
-    raw PCM chunks as they are decoded. This allows measuring TTFP (time to
-    first audio packet) separately from E2EL.
+    Sends ``stream=true`` with ``stream_format=audio`` and ``response_format=pcm``
+    so the server returns raw PCM chunks as they are decoded. This allows measuring
+    TTFP (time to first audio packet) separately from E2EL.
     """
     api_url = request_func_input.api_url
     _validate_api_url(api_url, "OpenAI Audio Speech API", "audio/speech")
@@ -1116,12 +2590,14 @@ async def async_request_openai_audio_speech(
         "model": request_func_input.model_name if request_func_input.model_name else request_func_input.model,
         "input": request_func_input.prompt,
         "stream": True,
+        "stream_format": "audio",
         "response_format": "pcm",
     }
     _update_payload_common(payload, request_func_input)
     # Seed-TTS + WER: ``--extra-body`` may set stream=false / other formats; speech must stream PCM.
     if getattr(request_func_input, "seed_tts_row", False) and _seed_tts_capture_pcm_for_wer():
         payload["stream"] = True
+        payload["stream_format"] = "audio"
         payload["response_format"] = "pcm"
 
     headers = {
@@ -1133,10 +2609,9 @@ async def async_request_openai_audio_speech(
     output = MixRequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
 
-    # PCM format: 16-bit signed, 24 kHz, mono
-    sample_rate = 24000
-    sample_width = 2  # 16-bit = 2 bytes
-    channels = 1
+    # PCM format: 16-bit signed; sample_rate/channels are model-dependent.
+    sample_rate, channels = defs.stream_pcm_format_from_env()
+    sample_width = defs.DEFAULT_AUDIO_SAMPLE_WIDTH
 
     st = time.perf_counter()
     output.start_time = st
@@ -1165,13 +2640,17 @@ async def async_request_openai_audio_speech(
                 end_time = time.perf_counter()
                 output.latency = end_time - st
 
-                total_samples = total_pcm_bytes // (sample_width * channels)
-                output.audio_duration = total_samples / sample_rate
+                total_samples = defs.compute_audio_frames(
+                    total_pcm_bytes,
+                    sample_width=sample_width,
+                    channels=channels,
+                )
                 output.audio_frames = total_samples
-                if output.audio_duration > 0:
-                    output.audio_rtf = output.latency / output.audio_duration
-                else:
-                    output.audio_rtf = 0
+                output.audio_duration = (
+                    float(total_samples) / float(sample_rate) if total_samples > 0 and sample_rate > 0 else 0.0
+                )
+                output.audio_rtf = defs.compute_audio_rtf(output.latency, output.audio_duration)
+                if output.audio_duration <= 0:
                     logger.warning("Audio duration is zero")
 
                 continuity = compute_continuity_stats(
@@ -1186,12 +2665,20 @@ async def async_request_openai_audio_speech(
                 output.audio_continuity_ok = continuity.is_continuous
                 output.audio_underrun_event_count = continuity.underrun_event_count
                 if pcm_capture is not None and pcm_capture:
-                    output.tts_output_pcm_bytes = bytes(pcm_capture)
+                    try:
+                        output.tts_output_pcm_bytes = _pcm_s16le_to_seed_tts_wer_bytes(
+                            bytes(pcm_capture),
+                            sample_rate=sample_rate,
+                            channels=channels,
+                        )
+                    except Exception as ex:
+                        logger.warning("Seed-TTS WER PCM normalization failed: %s", ex)
+                        output.tts_output_pcm_bytes = bytes(pcm_capture)
                 elif capture_wer_pcm:
                     ct = response.headers.get("Content-Type", "")
                     logger.warning(
                         "Seed-TTS WER: HTTP 200 but no PCM bytes (Content-Type=%r, url=%s). "
-                        "Check stream=true and response_format=pcm on the server.",
+                        "Check stream=true, stream_format=audio, and response_format=pcm on the server.",
                         ct,
                         api_url,
                     )
@@ -1209,13 +2696,554 @@ async def async_request_openai_audio_speech(
     return output
 
 
+#: Silence budget per Seed-TTS turn: a model-native duplex session generates
+#: per audio unit, and the target text rides the session context, so the
+#: silence only advances the clock. It stops at the turn's response.done --
+#: a native model that keeps hearing silence after its turn may decide to
+#: speak again, and the benchmark measures one response per utterance -- so
+#: the budget is only spent on a turn the model is slow to take: it may
+#: choose to listen on a few units first, and a turn that has not settled
+#: when the budget runs out is reported with what the model did.
+_SEED_TTS_SILENCE_SECONDS = 30.0
+#: A native model normally answers the seeded text within this much silence;
+#: a turn that needs more is logged so a slow-to-speak model shows in the run.
+_SEED_TTS_PROMPT_RESPONSE_S = 12.0
+#: MiniCPM-o emits 24 kHz mono; used to report audio_frames after the session closed.
+_SEED_TTS_OUTPUT_SAMPLE_RATE_HZ = 24_000
+
+
+def _seed_tts_turn_stall_report(events: object, response_offset: int, request_index: int, silence_s: float) -> str:
+    """Explain a Seed-TTS turn that never settled: what the model did with the silence."""
+    response_ids = list(getattr(events, "response_ids")[response_offset:])
+    if not response_ids:
+        return (
+            f"Seed-TTS Realtime TTS turn {request_index} never started a response: the model listened "
+            f"through {silence_s:.1f}s of silence and the wait that followed"
+        )
+    audio_bytes = getattr(events, "audio_bytes")
+    response_text = getattr(events, "response_text")
+    started = ", ".join(
+        f"{response_id} ({len(audio_bytes(response_id))} audio bytes, text {response_text(response_id)!r})"
+        for response_id in response_ids
+    )
+    return (
+        f"Seed-TTS Realtime TTS turn {request_index} started {len(response_ids)} response(s) after "
+        f"{silence_s:.1f}s of silence but none reached response.done: {started}"
+    )
+
+
+def _seed_tts_turn_response_id(events: object, response_offset: int, request_index: int) -> str:
+    """The response id the Seed-TTS turn is measured on: the first one with audio.
+
+    A model-native session answers the seeded text once, but nothing in the
+    protocol stops it from speaking again on silence it hears afterwards, so
+    a later audio response is the model's own and not a failed turn.
+    """
+    response_ids = getattr(events, "response_ids")
+    audio_bytes = getattr(events, "audio_bytes")
+    audio_response_ids = [response_id for response_id in response_ids[response_offset:] if audio_bytes(response_id)]
+    if not audio_response_ids:
+        raise RuntimeError(f"Seed-TTS Realtime TTS turn {request_index} produced no audio response")
+    if len(audio_response_ids) > 1:
+        logger.warning(
+            "Seed-TTS Realtime TTS turn %d: model spoke again after its response (%d audio responses); "
+            "measuring the first",
+            request_index,
+            len(audio_response_ids),
+        )
+    return audio_response_ids[0]
+
+
+def _realtime_websocket_url(api_url: str) -> str:
+    from vllm_omni.clients.duplex import build_realtime_url
+
+    return build_realtime_url(api_url, None)
+
+
+def _nonnegative_number(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and np.isfinite(value) and value >= 0
+
+
+def _apply_stage0_token_timings(
+    output: MixRequestFuncOutput,
+    raw_stages: list[object],
+    *,
+    expected_output_tokens: int,
+) -> bool:
+    """Populate aggregate token timing from complete per-response Stage 0 metrics."""
+    output.itl = []
+    output.text_latency = output.ttft
+    output.tpot_measured = False
+
+    stages: list[tuple[int, dict[str, object]]] = []
+    for stage in raw_stages:
+        if not isinstance(stage, dict):
+            return False
+        token_count = stage.get("output_token_count")
+        if not isinstance(token_count, int) or isinstance(token_count, bool) or token_count < 0:
+            return False
+        stages.append((token_count, stage))
+
+    if not stages or sum(count for count, _ in stages) != expected_output_tokens:
+        return False
+
+    timed = [(count - 1, stage) for count, stage in stages if count > 1]
+    if not timed:
+        return False
+
+    measured_itls: list[float] = []
+    exact_itls = True
+    for intervals, stage in timed:
+        values = stage.get("itls_ms")
+        if (
+            not isinstance(values, list)
+            or len(values) != intervals
+            or not all(_nonnegative_number(value) for value in values)
+        ):
+            exact_itls = False
+            break
+        measured_itls.extend(float(value) / 1000.0 for value in values if isinstance(value, int | float))
+    if exact_itls:
+        if sum(measured_itls) > 0:
+            output.itl = measured_itls
+            output.text_latency = output.ttft + sum(output.itl)
+            output.tpot_measured = True
+            return True
+
+    weighted_tpot_ms = 0.0
+    for intervals, stage in timed:
+        tpot_ms = stage.get("tpot_ms")
+        if not _nonnegative_number(tpot_ms) or not isinstance(tpot_ms, int | float) or tpot_ms <= 0:
+            break
+        weighted_tpot_ms += float(tpot_ms) * intervals
+    else:
+        decode_intervals = sum(intervals for intervals, _ in timed)
+        weighted_tpot = weighted_tpot_ms / decode_intervals / 1000.0
+        # ``calculate_metrics`` consumes a request-shaped latency. Preserve
+        # the weighted per-response TPOT when projecting it onto the combined
+        # output token count; gaps and TTFTs between turns are intentionally
+        # excluded.
+        output.text_latency = output.ttft + weighted_tpot * (expected_output_tokens - 1)
+        output.tpot_measured = True
+        return True
+
+    return False
+
+
+async def _async_request_omniinteract(
+    request_func_input: RequestFuncInput,
+    *,
+    pbar: tqdm | None,
+) -> MixRequestFuncOutput:
+    case = getattr(request_func_input, "omniinteract_case", None)
+    options = getattr(request_func_input, "omniinteract_options", None)
+    output = MixRequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+    output.start_time = time.perf_counter()
+    try:
+        if case is None or not isinstance(options, OmniInteractSessionOptions):
+            raise ValueError("OmniInteract RequestFuncInput is missing its dataset session layout")
+        prepared_input = getattr(request_func_input, "omniinteract_prepared_input", None)
+        if not isinstance(prepared_input, OmniInteractPreparedInput):
+            raise ValueError("OmniInteract media must be prepared before benchmark request timing")
+        headers = _get_headers()
+        _update_headers_common(headers, request_func_input)
+        config = OmniInteractBenchmarkConfig(
+            endpoint=request_func_input.api_url,
+            model=request_func_input.model_name or request_func_input.model,
+            output_root=options.output_root,
+            timeout_s=options.timeout_s,
+            media_timeout_s=options.media_timeout_s,
+            max_video_duration_s=options.max_video_duration_s,
+            ref_audio=options.ref_audio,
+            require_response=options.require_response,
+            extra_headers=headers or None,
+            extra_body=dict(request_func_input.extra_body or {}) or None,
+        )
+        case_result = await run_omniinteract_case(
+            case,
+            config,
+            request_index=request_func_input.request_id or uuid.uuid4().hex,
+            capture_artifacts=request_func_input.request_id is not None,
+            prepared_input=prepared_input,
+        )
+        output.latency = case_result.latency_s
+        output.generated_text = case_result.transcript
+        output.output_tokens = case_result.output_tokens
+        output.audio_duration = case_result.audio_bytes / (24_000 * 2)
+        output.audio_frames = case_result.audio_bytes // 2
+        session_metrics = case_result.duplex_session_metrics
+        from vllm_omni.clients.duplex import metric_mean
+
+        output.ttft = (metric_mean(session_metrics.get("ttft_ms")) or 0.0) / 1000.0
+        output.audio_ttfp = (metric_mean(session_metrics.get("ttfp_ms")) or 0.0) / 1000.0
+        output.audio_rtf = metric_mean(session_metrics.get("rtf")) or 0.0
+        token_timing_measured = _apply_stage0_token_timings(
+            output,
+            [request_metric.get("stage0_tokens") for request_metric in case_result.duplex_request_metrics],
+            expected_output_tokens=output.output_tokens,
+        )
+        if not token_timing_measured:
+            if output.output_tokens > 1 or (output.output_tokens == 0 and output.generated_text):
+                logger.warning(
+                    "OmniInteract session %s omitted complete engine token timing; standard TPOT/ITL are unavailable",
+                    case_result.session_id,
+                )
+        output.duplex_request_metrics = case_result.duplex_request_metrics
+        output.duplex_session_metrics = session_metrics
+        output.success = case_result.success
+        output.error = case_result.error
+        setattr(output, "omniinteract_case", case)
+        setattr(output, "omniinteract_case_result", case_result)
+    except Exception:
+        output.success = False
+        output.error = traceback.format_exc()
+        logger.error("OmniInteract Realtime request failed: %s", output.error)
+        if case is not None:
+            case_result = OmniInteractCaseResult(
+                subset=case.subset,
+                video=str(case.video_path),
+                output_dir="",
+                error=output.error,
+            )
+            setattr(output, "omniinteract_case", case)
+            setattr(output, "omniinteract_case_result", case_result)
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+class _RealtimeTTSProbe:
+    """Explicit-session Realtime TTS driver over the public duplex client.
+
+    Owns an :class:`EventCollector` (``.events``) so turn metrics can be read
+    with controlled timestamps; the session handshake happens in
+    :meth:`configure` because the benchmark decides the session shape at
+    request time.
+    """
+
+    #: How long ``configure`` waits for a free duplex session. Every Seed-TTS
+    #: utterance is one session and the deploy config admits ``max_sessions``
+    #: of them, so a benchmark run above that concurrency queues for a slot
+    #: rather than counting the server's (retryable) refusal as a failed
+    #: request.
+    _SESSION_SLOT_WAIT_S = 120.0
+
+    def __init__(self, url: str) -> None:
+        from vllm_omni.clients.duplex import EventCollector
+
+        self._url = url
+        self.events: EventCollector = EventCollector()
+        self._client: DuplexClient | None = None
+        self._consume_task: asyncio.Task[None] | None = None
+
+    async def __aenter__(self) -> "_RealtimeTTSProbe":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._client is not None:
+            await self._client.__aexit__(exc_type, exc, tb)
+        if self._consume_task is not None:
+            try:
+                await asyncio.wait_for(self._consume_task, timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._consume_task.cancel()
+
+    async def configure(
+        self,
+        model: str,
+        *,
+        output_audio_format: str = "pcm16",
+        instructions: str | None = None,
+        auto_response: bool = False,
+        extra_body: dict[str, object] | None = None,
+        timeout_s: float = 120.0,
+    ) -> None:
+        from vllm_omni.clients.duplex import AudioFormat, DuplexClient, DuplexProtocolError, SessionConfig
+
+        session_extra_body: dict[str, object] = dict(extra_body or {})
+        config = SessionConfig(
+            output_audio=AudioFormat(output_audio_format, 24_000),
+            instructions=instructions,
+            auto_response=auto_response,
+            overlap_policy="listen_only",
+            playback_commit_policy="ack_only",
+            extra_body=session_extra_body,
+        )
+        deadline = time.monotonic() + self._SESSION_SLOT_WAIT_S
+        delay_s = 0.25
+        waited = False
+        while True:
+            # A failed handshake closes the socket on the client's side, so
+            # a refused attempt leaves nothing behind to clean up.
+            client = DuplexClient(
+                self._url,
+                model=model,
+                config=config,
+                reconnect=None,
+                heartbeat_interval_s=None,
+                handshake_timeout_s=timeout_s,
+            )
+            try:
+                await client.__aenter__()
+            except DuplexProtocolError as exc:
+                if exc.code != "resource_exhausted" or time.monotonic() >= deadline:
+                    raise
+                if not waited:
+                    logger.info("Seed-TTS Realtime TTS: no free duplex session (%s); waiting for a slot", exc)
+                    waited = True
+                await asyncio.sleep(delay_s)
+                delay_s = min(delay_s * 2.0, 2.0)
+                continue
+            self._client = client
+            break
+        self._consume_task = asyncio.create_task(self.events.consume(self._client))
+
+    async def send(self, event: dict[str, object]) -> None:
+        assert self._client is not None
+        await self._client.send(event)
+
+    async def acknowledge_playback(self) -> None:
+        from vllm_omni.clients.duplex import acknowledge_collected_playback
+
+        assert self._client is not None
+        await acknowledge_collected_playback(self._client, self.events)
+
+    async def stream_silence(
+        self,
+        *,
+        seconds: float,
+        chunk_ms: int = 200,
+        until: Callable[[], bool] | None = None,
+    ) -> float:
+        """Append silent PCM16 units so a model-native session has units to speak on.
+
+        A duplex model generates per audio unit. The target text rides the
+        session context (``duplex_initial_user_text``), so the audio only has
+        to advance the clock; silence keeps it from adding content of its own.
+        Streams in real time for at most ``seconds``, stopping as soon as
+        ``until`` holds, and returns the seconds actually appended.
+        """
+        assert self._client is not None
+        input_format = self._client.config.input_audio
+        chunk = bytes(max(input_format.byte_count(chunk_ms), input_format.bytes_per_sample))
+        chunk_s = input_format.duration_ms(len(chunk)) / 1000.0
+        streamed_s = 0.0
+        while streamed_s < seconds and not (until is not None and until()):
+            await self._client.append_audio(chunk, is_speech=False)
+            streamed_s += chunk_s
+            await asyncio.sleep(chunk_s)
+        return streamed_s
+
+    async def close_session(self, *, timeout_s: float = 20.0) -> None:
+        assert self._client is not None
+        await self._client.close(timeout_s=timeout_s)
+
+
+async def async_request_openai_realtime_duplex(
+    request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> MixRequestFuncOutput:
+    from vllm_omni.clients.duplex import summarize_session_request_metrics, wait_for_condition
+
+    del session
+    if getattr(request_func_input, "omniinteract_case", None) is not None:
+        return await _async_request_omniinteract(request_func_input, pbar=pbar)
+    output = MixRequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+    output.start_time = time.perf_counter()
+    speech_extra = getattr(request_func_input, "seed_tts_speech_extra", None)
+    if not isinstance(speech_extra, dict):
+        speech_extra = {}
+    else:
+        speech_extra = dict(speech_extra)
+    speech_extra["return_stage_metrics"] = True
+    configured_turns = getattr(request_func_input, "seed_tts_turns", ())
+    turn_prompts = [
+        (
+            str(getattr(turn, "utterance_id", "") or ""),
+            str(getattr(turn, "target_text", "") or ""),
+        )
+        for turn in configured_turns
+        if str(getattr(turn, "target_text", "") or "").strip()
+    ]
+    if not turn_prompts:
+        turn_prompts = [("", request_func_input.prompt)]
+    session_id = f"seed-tts-{request_func_input.request_id or uuid.uuid4().hex}"
+    silence_seconds = float(getattr(request_func_input, "seed_tts_silence_seconds", 0.0) or _SEED_TTS_SILENCE_SECONDS)
+    turn_metrics: list[dict[str, object]] = []
+    turn_timings: list[dict[str, object]] = []
+    turn_pcm_bytes: list[bytes] = []
+    turn_transcripts: list[str] = []
+    measurement_origin = {
+        "ttft": "first silence append client send to first non-empty text delta",
+        "ttfp": "first silence append client send to first audio packet",
+        "rtf": "request-start-to-last-audio receive time divided by emitted audio duration",
+    }
+    try:
+        # One session per utterance. A model-native duplex session takes its
+        # text once, in the session context (``duplex_initial_user_text``), so
+        # a session cannot be re-seeded for a second target text.
+        for request_index, (utterance_id, target_text) in enumerate(turn_prompts):
+            async with _RealtimeTTSProbe(_realtime_websocket_url(request_func_input.api_url)) as client:
+                await client.configure(
+                    request_func_input.model_name or request_func_input.model,
+                    output_audio_format="pcm16",
+                    instructions=getattr(
+                        request_func_input,
+                        "seed_tts_system_prompt",
+                        SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
+                    ),
+                    auto_response=True,
+                    extra_body={
+                        **speech_extra,
+                        "duplex_initial_user_text": target_text,
+                        "force_listen_count": 0,
+                    },
+                    timeout_s=120.0,
+                )
+                response_offset = len(client.events.response_ids)
+                done_before = client.events.count("response.done")
+                errors_before = len(client.events.errors())
+
+                def turn_settled() -> bool:
+                    return (
+                        client.events.count("response.done") > done_before
+                        or len(client.events.errors()) > errors_before
+                    )
+
+                turn_started_at_s = time.monotonic()
+                silence_s = await client.stream_silence(seconds=silence_seconds, until=turn_settled)
+                if silence_s > _SEED_TTS_PROMPT_RESPONSE_S:
+                    logger.warning(
+                        "Seed-TTS Realtime TTS turn %d: the model took %.1fs of silence to settle its response",
+                        request_index,
+                        silence_s,
+                    )
+                try:
+                    await wait_for_condition(
+                        turn_settled,
+                        timeout_s=180.0,
+                        label=f"Seed-TTS Realtime TTS turn {request_index} response.done",
+                    )
+                except TimeoutError as exc:
+                    raise RuntimeError(
+                        _seed_tts_turn_stall_report(client.events, response_offset, request_index, silence_s)
+                    ) from exc
+                errors = client.events.errors()
+                if len(errors) > errors_before:
+                    raise RuntimeError(f"Seed-TTS Realtime TTS server error: {errors[-1]}")
+                response_id = _seed_tts_turn_response_id(client.events, response_offset, request_index)
+                timing = client.events.timing_summary(
+                    after_s=turn_started_at_s,
+                    input_committed_at_s=turn_started_at_s,
+                    response_id=response_id,
+                    measurement_origin=measurement_origin,
+                )
+                request_metrics = timing.get("request_metrics")
+                if not isinstance(request_metrics, dict):
+                    raise RuntimeError(f"Seed-TTS duplex audio turn {response_id} omitted per-request metrics")
+                turn_timings.append(timing)
+                turn_metrics.append(
+                    {
+                        "session_id": session_id,
+                        "request_index": request_index,
+                        "utterance_id": utterance_id or None,
+                        "response_id": response_id,
+                        **request_metrics,
+                        # The client reports raw data only; the RTF is derived
+                        # here with the canonical server-side definition.
+                        "rtf": _audio_rtf_from_raw_metric(request_metrics),
+                    }
+                )
+                response_audio = client.events.audio_bytes(response_id)
+                turn_pcm_bytes.append(
+                    _pcm_s16le_to_seed_tts_wer_bytes(
+                        response_audio,
+                        sample_rate=client.events.output_sample_rate_hz,
+                        channels=1,
+                    )
+                )
+                turn_transcripts.append(client.events.response_text(response_id))
+                await client.acknowledge_playback()
+                await client.close_session(timeout_s=30.0)
+        request_finished_at = time.perf_counter()
+        session_metrics = summarize_session_request_metrics(
+            turn_metrics,
+            session_id=session_id,
+        )
+
+        output.generated_text = " ".join(filter(None, turn_transcripts))
+        from vllm_omni.clients.duplex import metric_mean
+
+        output.ttft = (metric_mean(session_metrics.get("ttft_ms")) or 0.0) / 1000.0
+        output.audio_ttfp = (metric_mean(session_metrics.get("ttfp_ms")) or 0.0) / 1000.0
+        output.audio_rtf = metric_mean(session_metrics.get("rtf")) or 0.0
+        output.audio_duration = (
+            sum((_as_float(metric.get("audio_duration_ms")) for metric in turn_metrics), start=0.0) / 1000.0
+        )
+        output.audio_frames = int(output.audio_duration * _SEED_TTS_OUTPUT_SAMPLE_RATE_HZ)
+        output.latency = request_finished_at - output.start_time
+        output.tts_turn_pcm_bytes = turn_pcm_bytes
+        output.tts_output_pcm_bytes = b"".join(turn_pcm_bytes)
+        if bool((request_func_input.extra_body or {}).get("save_duplex_request_metrics")):
+            output.duplex_request_metrics = turn_metrics
+            output.duplex_session_metrics = session_metrics
+        output.output_tokens = sum(
+            int(stage0.get("output_token_count") or 0)
+            for timing in turn_timings
+            if isinstance((stage0 := timing.get("stage0_tokens")), dict)
+        )
+        token_timing_measured = _apply_stage0_token_timings(
+            output,
+            [timing.get("stage0_tokens") for timing in turn_timings],
+            expected_output_tokens=output.output_tokens,
+        )
+        if not token_timing_measured and output.output_tokens > 1:
+            logger.warning(
+                "Realtime TTS session %s omitted complete engine token timing; standard TPOT/ITL are unavailable",
+                session_id,
+            )
+        output.success = True
+    except Exception:
+        output.success = False
+        output.error = traceback.format_exc()
+        logger.error(
+            "Seed-TTS Realtime TTS request failed: %s",
+            output.error,
+        )
+    if pbar:
+        pbar.update(1)
+    return output
+
+
 ASYNC_REQUEST_FUNCS["openai-chat-omni"] = async_request_openai_chat_omni_completions
 if "openai-chat-omni" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-chat-omni")
 
+ASYNC_REQUEST_FUNCS["/v1/images/edits"] = async_request_openai_image_edits_omni
+if "/v1/images/edits" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("/v1/images/edits")
+
+ASYNC_REQUEST_FUNCS["/v1/images/generations"] = async_request_openai_image_generations_omni
+if "/v1/images/generations" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("/v1/images/generations")
+
+ASYNC_REQUEST_FUNCS["/v1/videos"] = async_request_openai_videos_omni
+if "/v1/videos" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("/v1/videos")
+
 ASYNC_REQUEST_FUNCS["openai-audio-speech"] = async_request_openai_audio_speech
 if "openai-audio-speech" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-audio-speech")
+
+ASYNC_REQUEST_FUNCS["openai-realtime-duplex"] = async_request_openai_realtime_duplex
+if "openai-realtime-duplex" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("openai-realtime-duplex")
+ASYNC_REQUEST_FUNCS["openai-realtime-tts"] = async_request_openai_realtime_duplex
+if "openai-realtime-tts" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("openai-realtime-tts")
 
 ASYNC_REQUEST_FUNCS["openai-image-edits-omni"] = async_request_openai_image_edits_omni
 if "openai-image-edits-omni" not in OPENAI_COMPATIBLE_BACKENDS:
@@ -1236,11 +3264,25 @@ from vllm.benchmarks.serve import TaskType, calculate_metrics_for_embeddings, ge
 from vllm_omni.benchmarks.metrics.metrics import (
     MultiModalsBenchmarkMetrics,
     calculate_metrics,
+    has_metric_samples,
 )
 
 # ruff: noqa: E402
 
 benchmark_old = serve.benchmark
+
+
+def _merge_overrides(base: dict | None, overrides: dict | None) -> dict | None:
+    """Merge benchmark extra_body with per-request overrides.
+
+    vLLM 0.24 removed the private helper from ``vllm.benchmarks.serve``.
+    Keep the same shallow-merge behavior here, with request overrides winning.
+    """
+    if not base and not overrides:
+        return None
+    merged = dict(base or {})
+    merged.update(overrides or {})
+    return merged
 
 
 async def benchmark(
@@ -1273,6 +3315,7 @@ async def benchmark(
     ready_check_timeout_sec: int = 600,
     ssl_context: ssl.SSLContext | bool | None = None,
     self_timed: bool = False,
+    probe_request_rate: float = 0.0,
 ):
     try:
         request_func = ASYNC_REQUEST_FUNCS[endpoint_type]
@@ -1281,21 +3324,8 @@ async def benchmark(
 
     # Reuses connections across requests to reduce TLS handshake overhead.
     ssl_setting = ssl_context if ssl_context is not None else ("https://" in api_url)
-    connector = aiohttp.TCPConnector(
-        limit=max_concurrency or 0,
-        limit_per_host=max_concurrency or 0,
-        ttl_dns_cache=300,
-        use_dns_cache=True,
-        enable_cleanup_closed=True,
-        force_close=True,
-        ssl=ssl_setting,
-    )
-
-    session = aiohttp.ClientSession(
-        connector=connector,
-        trust_env=True,
-        timeout=aiohttp.ClientTimeout(total=6 * 60 * 60),
-    )
+    session = _build_benchmark_session(max_concurrency, ssl_setting)
+    print(f"Per-request timeout: {_omni_request_timeout_s():g}s")
 
     print("Starting initial single prompt test run...")
     test_prompt, test_prompt_len, test_output_len, test_mm_content = (
@@ -1304,6 +3334,8 @@ async def benchmark(
         input_requests[0].expected_output_len,
         input_requests[0].multi_modal_data,
     )
+    test_extra_body = _merge_overrides(extra_body, input_requests[0].request_overrides)
+    test_chat_messages = input_requests[0].chat_messages
 
     assert (
         test_mm_content is None
@@ -1321,10 +3353,12 @@ async def benchmark(
         multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
         extra_headers=extra_headers,
-        extra_body=extra_body,
+        extra_body=test_extra_body,
+        chat_messages=test_chat_messages,
     )
-    _attach_daily_omni_to_request_func_input(input_requests[0], test_input)
+    _attach_omni_chat_to_request_func_input(input_requests[0], test_input)
     _attach_seed_tts_to_request_func_input(input_requests[0], test_input)
+    _attach_omniinteract_to_request_func_input(input_requests[0], test_input)
 
     if ready_check_timeout_sec > 0:
         test_output = await wait_for_endpoint(
@@ -1347,7 +3381,7 @@ async def benchmark(
     if num_warmups > 0:
         print(f"Warming up with {num_warmups} requests...")
         warmup_pbar = None if disable_tqdm else tqdm(total=num_warmups)
-        warmup_semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
+        warmup_semaphore = _async_limiter(max_concurrency)
         warmup_tasks = []
 
         async def warmup_limited_request_func():
@@ -1365,12 +3399,13 @@ async def benchmark(
 
     print("Starting main benchmark run...")
 
+    lora_iter: Iterator[str] | None = None
     if lora_modules:
         lora_modules_list = list(lora_modules)
         if lora_assignment == "round-robin":
-            lora_modules = iter([lora_modules_list[i % len(lora_modules_list)] for i in range(len(input_requests))])
+            lora_iter = iter([lora_modules_list[i % len(lora_modules_list)] for i in range(len(input_requests))])
         else:
-            lora_modules = iter([random.choice(lora_modules_list) for _ in range(len(input_requests))])
+            lora_iter = iter([random.choice(lora_modules_list) for _ in range(len(input_requests))])
 
     if profile:
         print("Starting profiler...")
@@ -1385,9 +3420,10 @@ async def benchmark(
             multi_modal_content=test_mm_content,
             ignore_eos=ignore_eos,
             extra_headers=extra_headers,
-            extra_body=extra_body,
+            extra_body=test_extra_body,
+            chat_messages=test_chat_messages,
         )
-        _attach_daily_omni_to_request_func_input(input_requests[0], profile_input)
+        _attach_omni_chat_to_request_func_input(input_requests[0], profile_input)
         _attach_seed_tts_to_request_func_input(input_requests[0], profile_input)
         profile_output = await request_func(request_func_input=profile_input, session=session)
         if profile_output.success:
@@ -1408,12 +3444,38 @@ async def benchmark(
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
-    semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
+    semaphore = _async_limiter(max_concurrency)
 
     async def limited_request_func(request_func_input, session, pbar):
         async with semaphore:
             return await request_func(request_func_input=request_func_input, session=session, pbar=pbar)
 
+    # Ported from upstream vLLM v0.27.0 (vllm/benchmarks/serve.py), which added
+    # the probe_request_rate background probe; this file is the patched copy of
+    # that module and tracks its upstream base.
+    probe_outputs: list[MixRequestFuncOutput] = []
+    probe_stop = asyncio.Event()
+
+    async def probe_loop():
+        probe_input = replace(
+            test_input,
+            prompt="Hi",
+            prompt_len=1,
+            output_len=1,
+            multi_modal_content=None,
+            chat_messages=None,
+        )
+        interval = 1 / probe_request_rate
+        while not probe_stop.is_set():
+            probe_outputs.append(await request_func(request_func_input=probe_input, session=session))
+            await asyncio.sleep(interval)
+
+    probe_task: asyncio.Task | None = None
+    if probe_request_rate > 0:
+        print(f"Probe request rate: {probe_request_rate} req/s")
+        probe_task = asyncio.create_task(probe_loop())
+
+    _prepare_omniinteract_batch(input_requests)
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
 
@@ -1451,9 +3513,10 @@ async def benchmark(
             request.multi_modal_data,
             request.request_id,
         )
+        per_request_extra_body = _merge_overrides(extra_body, request.request_overrides)
         req_model_id, req_model_name = model_id, model_name
-        if lora_modules:
-            req_lora_module = next(lora_modules)
+        if lora_iter is not None:
+            req_lora_module = next(lora_iter)
             req_model_id, req_model_name = req_lora_module, req_lora_module
 
         request_func_input = RequestFuncInput(
@@ -1467,21 +3530,34 @@ async def benchmark(
             multi_modal_content=mm_content,
             ignore_eos=ignore_eos,
             extra_headers=extra_headers,
-            extra_body=extra_body,
+            extra_body=per_request_extra_body,
             request_id=request_id,
+            chat_messages=request.chat_messages,
         )
-        _attach_daily_omni_to_request_func_input(request, request_func_input)
+        _attach_omni_chat_to_request_func_input(request, request_func_input)
         _attach_seed_tts_to_request_func_input(request, request_func_input)
+        _attach_omniinteract_to_request_func_input(request, request_func_input)
         tasks.append(
             asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
         )
     outputs: list[MixRequestFuncOutput] = await asyncio.gather(*tasks)
+
+    if probe_task is not None:
+        probe_stop.set()
+        await probe_task
 
     if pbar is not None:
         pbar.close()
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
+    omniinteract_summary = _finalize_omniinteract_batch(input_requests, outputs)
+    omniinteract_evaluation = await _evaluate_omniinteract_batch(input_requests, outputs)
+    if omniinteract_summary is not None and omniinteract_evaluation is not None:
+        omniinteract_summary["accuracy"] = omniinteract_evaluation
+
+    metrics: Any
+    actual_output_lens: list[int] | int
     if task_type == TaskType.GENERATION:
         metrics, actual_output_lens = calculate_metrics(
             input_requests=input_requests,
@@ -1506,44 +3582,124 @@ async def benchmark(
         actual_output_lens = 0
 
     if isinstance(metrics, MultiModalsBenchmarkMetrics):
+        # ``make_dataclass`` types this class as ``type``, so isinstance()
+        # narrows to ``object`` and attribute access fails. Keep the runtime
+        # check and read fields through ``Any``.
+        mm_metrics: Any = metrics
+
+        def measured_ttft(output: RequestFuncOutput) -> float | None:
+            session_metrics = getattr(output, "duplex_session_metrics", None)
+            if isinstance(session_metrics, dict) and session_metrics.get("ttft_ms") is None:
+                return None
+            return output.ttft
+
         result = {
             "duration": benchmark_duration,
-            "completed": metrics.completed,
-            "failed": metrics.failed,
-            "total_input_tokens": metrics.total_input,
-            "total_output_tokens": metrics.total_output,
-            "request_throughput": metrics.request_throughput,
-            "request_goodput": metrics.request_goodput if goodput_config_dict else None,
-            "output_throughput": metrics.output_throughput,
-            "total_token_throughput": metrics.total_token_throughput,
-            defs.TOTAL_AUDIO_DURATION_S: getattr(metrics, defs.TOTAL_AUDIO_DURATION_S),
-            defs.TOTAL_AUDIO_FRAMES: getattr(metrics, defs.TOTAL_AUDIO_FRAMES),
-            defs.AUDIO_THROUGHPUT: getattr(metrics, defs.AUDIO_THROUGHPUT),
-            defs.TOTAL_IMAGES: getattr(metrics, defs.TOTAL_IMAGES),
-            defs.IMAGE_THROUGHPUT: getattr(metrics, defs.IMAGE_THROUGHPUT),
-            defs.AVERAGE_PIXELS_PER_IMAGE: getattr(metrics, defs.AVERAGE_PIXELS_PER_IMAGE),
-            defs.MEAN_DENOISE_STEP_LATENCY_MS: getattr(metrics, defs.MEAN_DENOISE_STEP_LATENCY_MS),
+            "completed": mm_metrics.completed,
+            "failed": mm_metrics.failed,
+            "total_input_tokens": mm_metrics.total_input,
+            "total_output_tokens": mm_metrics.total_output,
+            "request_throughput": mm_metrics.request_throughput,
+            "request_goodput": mm_metrics.request_goodput if goodput_config_dict else None,
+            "output_throughput": mm_metrics.output_throughput,
+            "total_token_throughput": mm_metrics.total_token_throughput,
+            defs.TOTAL_AUDIO_DURATION_S: getattr(mm_metrics, defs.TOTAL_AUDIO_DURATION_S),
+            defs.TOTAL_AUDIO_FRAMES: getattr(mm_metrics, defs.TOTAL_AUDIO_FRAMES),
+            defs.AUDIO_THROUGHPUT: getattr(mm_metrics, defs.AUDIO_THROUGHPUT),
+            defs.TOTAL_IMAGES: getattr(mm_metrics, defs.TOTAL_IMAGES),
+            defs.IMAGE_THROUGHPUT: getattr(mm_metrics, defs.IMAGE_THROUGHPUT),
+            defs.AVERAGE_PIXELS_PER_IMAGE: getattr(mm_metrics, defs.AVERAGE_PIXELS_PER_IMAGE),
+            defs.MEAN_DENOISE_STEP_LATENCY_MS: getattr(mm_metrics, defs.MEAN_DENOISE_STEP_LATENCY_MS),
+            defs.TOTAL_VIDEO_DURATION_S: getattr(mm_metrics, defs.TOTAL_VIDEO_DURATION_S),
+            defs.TOTAL_VIDEO_FRAMES: getattr(mm_metrics, defs.TOTAL_VIDEO_FRAMES),
+            defs.VIDEO_THROUGHPUT: getattr(mm_metrics, defs.VIDEO_THROUGHPUT),
+            defs.MEAN_VIDEO_RTF: getattr(mm_metrics, defs.MEAN_VIDEO_RTF),
+            defs.MEDIAN_VIDEO_RTF: getattr(mm_metrics, defs.MEDIAN_VIDEO_RTF),
+            defs.PERCENTILES_VIDEO_RTF: getattr(mm_metrics, defs.PERCENTILES_VIDEO_RTF),
+            defs.MEAN_VIDEO_GENERATION_MS: getattr(mm_metrics, defs.MEAN_VIDEO_GENERATION_MS),
+            defs.MEDIAN_VIDEO_GENERATION_MS: getattr(mm_metrics, defs.MEDIAN_VIDEO_GENERATION_MS),
+            defs.PERCENTILES_VIDEO_GENERATION_MS: getattr(mm_metrics, defs.PERCENTILES_VIDEO_GENERATION_MS),
+            defs.MEAN_PEAK_MEMORY_MB: getattr(mm_metrics, defs.MEAN_PEAK_MEMORY_MB),
+            defs.MEDIAN_PEAK_MEMORY_MB: getattr(mm_metrics, defs.MEDIAN_PEAK_MEMORY_MB),
+            defs.PERCENTILES_PEAK_MEMORY_MB: getattr(mm_metrics, defs.PERCENTILES_PEAK_MEMORY_MB),
+            defs.STAGE_DURATIONS_MEAN: getattr(mm_metrics, defs.STAGE_DURATIONS_MEAN) or {},
+            defs.STAGE_DURATIONS_P50: getattr(mm_metrics, defs.STAGE_DURATIONS_P50) or {},
+            defs.STAGE_DURATIONS_P99: getattr(mm_metrics, defs.STAGE_DURATIONS_P99) or {},
             "input_lens": [output.prompt_len for output in outputs],
             "start_times": [output.start_time for output in outputs],
             "output_lens": actual_output_lens,
-            "ttfts": [output.ttft for output in outputs],
+            "ttfts": [measured_ttft(output) for output in outputs],
             "itls": [output.itl for output in outputs],
             "generated_texts": [output.generated_text for output in outputs],
             "errors": [output.error for output in outputs],
-            "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
-            "max_concurrent_requests": metrics.max_concurrent_requests,
-            "rtfx": metrics.rtfx,
+            "max_output_tokens_per_s": mm_metrics.max_output_tokens_per_s,
+            "max_concurrent_requests": mm_metrics.max_concurrent_requests,
+            "rtfx": mm_metrics.rtfx,
         }
+        for sample_count in (
+            "num_ttft_samples",
+            "num_tpot_samples",
+            "num_itl_samples",
+            "num_audio_ttfp_samples",
+            "num_audio_rtf_samples",
+        ):
+            result[sample_count] = getattr(metrics, sample_count)
     else:
         result = {
             "duration": benchmark_duration,
             "completed": metrics.completed,
             "total_input_tokens": metrics.total_input,
+            "total_input_sequences": metrics.total_input_sequences,
             "request_throughput": metrics.request_throughput,
+            "input_sequence_throughput": metrics.input_sequence_throughput,
             "total_token_throughput": metrics.total_token_throughput,
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
         }
+    # Preserve request order, including missing snapshots, so CI can verify
+    # fixed stage workloads without parsing logs or storing audio payloads.
+    request_stage_metrics = [
+        _compact_request_stage_metrics(getattr(output, "stage_metrics", None)) for output in outputs
+    ]
+    if any(request_stage_metrics):
+        result["request_stage_metrics"] = request_stage_metrics
+
+    # Plain-vLLM backends (e.g. the vLLM-text perf config) return upstream
+    # RequestFuncOutput objects without the Mix duplex fields; read them
+    # tolerantly or the whole benchmark result is discarded ("fallback to
+    # template", completed=0) after every request already succeeded.
+    duplex_request_metrics = [
+        metric for output in outputs for metric in (getattr(output, "duplex_request_metrics", None) or [])
+    ]
+    if duplex_request_metrics:
+        result["duplex_request_metrics"] = duplex_request_metrics
+    duplex_session_metrics = [
+        session_metrics
+        for output in outputs
+        if (session_metrics := getattr(output, "duplex_session_metrics", None)) is not None
+    ]
+    if duplex_session_metrics:
+        result["duplex_session_metrics"] = duplex_session_metrics
+        from vllm_omni.clients.duplex import distribution_summary
+
+        for session_key, result_key, digits in (
+            ("stream_ttft_ms", "duplex_stream_ttft_ms", 3),
+            ("stream_ttfp_ms", "duplex_stream_ttfp_ms", 3),
+            ("stream_rtf", "duplex_stream_rtf", 6),
+        ):
+            values = [
+                float(value)
+                for metric in duplex_session_metrics
+                if isinstance((value := metric.get(session_key)), int | float)
+                and not isinstance(value, bool)
+                and np.isfinite(value)
+                and value >= 0
+            ]
+            summary = distribution_summary(values, digits=digits)
+            if summary is not None:
+                result[result_key] = summary
+    if omniinteract_summary is not None:
+        result["omniinteract"] = omniinteract_summary
 
     from vllm_omni.benchmarks.data_modules.daily_omni_eval import (
         compute_daily_omni_accuracy_metrics,
@@ -1559,6 +3715,21 @@ async def benchmark(
     if _daily_acc is not None:
         result.update(_daily_acc)
         print_daily_omni_accuracy_summary(_daily_acc)
+
+    from vllm_omni.benchmarks.data_modules.videomme_eval import (
+        compute_videomme_accuracy_metrics,
+        print_videomme_accuracy_summary,
+    )
+
+    _save_vm = os.environ.get("VIDEOMME_SAVE_EVAL_ITEMS", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    _vm_acc = compute_videomme_accuracy_metrics(input_requests, outputs, include_per_item=_save_vm)
+    if _vm_acc is not None:
+        result.update(_vm_acc)
+        print_videomme_accuracy_summary(_vm_acc)
 
     if _seed_tts_capture_pcm_for_wer():
         from vllm_omni.benchmarks.data_modules.seed_tts_eval import (
@@ -1600,6 +3771,8 @@ async def benchmark(
         # metric.
         if metric_attribute_name not in result_percentile_metrics:
             return
+        if not has_metric_samples(metrics, metric_attribute_name):
+            return
         # No text tokens generated (e.g. pure TTS speech endpoint): per-token
         # latency metrics (ttft/tpot/itl) are undefined, so skip them.
         is_text_token_metric = not (metric_attribute_name == "e2el" or metric_attribute_name.startswith("audio"))
@@ -1640,6 +3813,8 @@ async def benchmark(
             prompt_len=test_prompt_len,
             output_len=test_output_len,
             logprobs=logprobs,
+            extra_body=test_extra_body,
+            chat_messages=test_chat_messages,
         )
         profile_output = await request_func(request_func_input=profile_input, session=session)
         if profile_output.success:

@@ -13,6 +13,7 @@ from vllm_omni.model_executor.models.common.qwen3_code_predictor import (
     CodePredictorWrapper,
     CodePredictorWrapperConfig,
 )
+from vllm_omni.platforms import current_omni_platform
 
 from .configuration_qwen3_tts import Qwen3TTSTalkerCodePredictorConfig, Qwen3TTSTalkerConfig
 
@@ -21,7 +22,7 @@ Qwen3TTSTalkerCodePredictorModelVLLM = CodePredictorBaseModel
 
 
 class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapper):
-    """Qwen3-TTS code predictor (CUDA graphs, per-call sampling, projection)."""
+    """Qwen3-TTS code predictor (per-call sampling, projection)."""
 
     def __init__(
         self,
@@ -35,7 +36,7 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
             vllm_config=vllm_config,
             cp_config=config,
             wrapper_config=CodePredictorWrapperConfig(
-                use_cuda_graphs=True,
+                use_cuda_graphs=current_omni_platform.is_npu(),
                 use_parallel_embedding=False,
                 use_projection=(config.hidden_size != talker_config.hidden_size),
                 return_proj_buf=False,

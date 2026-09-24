@@ -1,4 +1,3 @@
-import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +16,7 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit_plus import 
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_layered import (
     QwenImageLayeredPipeline,
 )
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -160,7 +160,7 @@ def test_prepare_encode_defaults_to_tokenizer_max_length():
 
     pipeline._prepare_generation_context = _fake_prepare_generation_context
     state = SimpleNamespace(
-        prompts=["prompt"],
+        prompt="prompt",
         sampling=SimpleNamespace(
             height=None,
             width=None,
@@ -177,6 +177,105 @@ def test_prepare_encode_defaults_to_tokenizer_max_length():
     pipeline.prepare_encode(state)
 
     assert captured["max_sequence_length"] == 1024
+
+
+def _make_request_batch_prompt_sampling(**overrides):
+    values = {
+        "height": 32,
+        "width": 32,
+        "num_inference_steps": 2,
+        "sigmas": None,
+        "max_sequence_length": None,
+        "num_outputs_per_prompt": 0,
+        "generator": None,
+        "latents": None,
+        "true_cfg_scale": None,
+        "guidance_scale_provided": False,
+        "guidance_scale": 1.0,
+        "output_type": None,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_forward_collates_request_prompt_tensors_for_qwen_image():
+    pipeline = object.__new__(QwenImagePipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.vae_scale_factor = 8
+    pipeline.default_sample_size = 128
+
+    class StopAfterPrepareContextError(Exception):
+        pass
+
+    captured = {}
+
+    def _fake_prepare_generation_context(**kwargs):
+        captured.update(kwargs)
+        raise StopAfterPrepareContextError
+
+    pipeline._prepare_generation_context = _fake_prepare_generation_context
+
+    prompt_embeds_a = torch.zeros(2, 3)
+    prompt_embeds_b = torch.ones(2, 3)
+    prompt_embeds_mask_a = torch.tensor([True, True])
+    prompt_embeds_mask_b = torch.tensor([True, False])
+    negative_prompt_embeds_a = torch.full((2, 3), 2.0)
+    negative_prompt_embeds_b = torch.full((2, 3), 3.0)
+    negative_prompt_embeds_mask_a = torch.tensor([False, True])
+    negative_prompt_embeds_mask_b = torch.tensor([False, False])
+
+    batch = DiffusionRequestBatch(
+        requests=[
+            SimpleNamespace(
+                request_id="qwen-prompt-a",
+                prompt={
+                    "prompt": "prompt-a",
+                    "negative_prompt": "negative-a",
+                    "prompt_embeds": prompt_embeds_a,
+                    "prompt_embeds_mask": prompt_embeds_mask_a,
+                    "negative_prompt_embeds": negative_prompt_embeds_a,
+                    "negative_prompt_embeds_mask": negative_prompt_embeds_mask_a,
+                },
+                sampling_params=_make_request_batch_prompt_sampling(),
+            ),
+            SimpleNamespace(
+                request_id="qwen-prompt-b",
+                prompt={
+                    "prompt": "prompt-b",
+                    "negative_prompt": "negative-b",
+                    "additional_information": {
+                        "prompt_embeds": [prompt_embeds_b],
+                        "prompt_embeds_mask": [prompt_embeds_mask_b],
+                        "negative_prompt_embeds": [negative_prompt_embeds_b],
+                        "negative_prompt_embeds_mask": [negative_prompt_embeds_mask_b],
+                    },
+                },
+                sampling_params=_make_request_batch_prompt_sampling(),
+            ),
+        ]
+    )
+
+    with pytest.raises(StopAfterPrepareContextError):
+        pipeline.forward(batch)
+
+    assert captured["prompt"] is None
+    assert captured["negative_prompt"] is None
+    torch.testing.assert_close(
+        captured["prompt_embeds"],
+        torch.stack([prompt_embeds_a, prompt_embeds_b], dim=0),
+    )
+    torch.testing.assert_close(
+        captured["prompt_embeds_mask"],
+        torch.stack([prompt_embeds_mask_a, prompt_embeds_mask_b], dim=0),
+    )
+    torch.testing.assert_close(
+        captured["negative_prompt_embeds"],
+        torch.stack([negative_prompt_embeds_a, negative_prompt_embeds_b], dim=0),
+    )
+    torch.testing.assert_close(
+        captured["negative_prompt_embeds_mask"],
+        torch.stack([negative_prompt_embeds_mask_a, negative_prompt_embeds_mask_b], dim=0),
+    )
 
 
 @pytest.mark.parametrize(
@@ -245,16 +344,3 @@ def test_qwen_edit_validator_excludes_image_placeholders_from_budget(pipeline_cl
 
     with pytest.raises(AssertionError, match="text encoder should not run"):
         pipeline.encode_prompt(prompt="short prompt")
-
-
-@pytest.mark.parametrize(
-    "pipeline_class",
-    [
-        QwenImagePipeline,
-        QwenImageLayeredPipeline,
-        QwenImageEditPipeline,
-        QwenImageEditPlusPipeline,
-    ],
-)
-def test_forward_max_sequence_length_default_is_1024(pipeline_class: type):
-    assert inspect.signature(pipeline_class.forward).parameters["max_sequence_length"].default == 1024

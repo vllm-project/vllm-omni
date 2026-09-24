@@ -15,6 +15,7 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 from diffusers.utils import is_torch_npu_available
 from torch import nn
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -26,7 +27,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
@@ -37,6 +38,8 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+logger = init_logger(__name__)
 
 
 def _join_prefix(prefix: str, name: str) -> str:
@@ -765,6 +768,7 @@ class Flux2Transformer2DModel(nn.Module):
     )
 
     _repeated_blocks = ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
+    _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
     _sp_plan = {
         "": {
             "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),
@@ -945,7 +949,13 @@ class Flux2Transformer2DModel(nn.Module):
             ctx = get_forward_context()
         else:
             ctx = None
-        if ctx is not None and ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+        if (
+            ctx is not None
+            and self.parallel_config.sequence_parallel_size > 1
+            and self.parallel_config.mask_sp_padding
+            and ctx.sp_original_seq_len is not None
+            and ctx.sp_padding_size > 0
+        ):
             batch_size = hidden_states.shape[0]
             img_padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
             hidden_states_mask = torch.ones(
@@ -957,6 +967,22 @@ class Flux2Transformer2DModel(nn.Module):
             hidden_states_mask[:, ctx.sp_original_seq_len :] = False
             if hidden_states_mask.all():
                 hidden_states_mask = None
+        elif (
+            ctx is not None
+            and self.parallel_config.sequence_parallel_size > 1
+            and not self.parallel_config.mask_sp_padding
+            and ctx.sp_original_seq_len is not None
+            and ctx.sp_padding_size > 0
+        ):
+            logger.warning_once(
+                "SP auto-padding applied %d token(s) (seq_len=%d, ulysses_degree=%d). "
+                "Padding tokens are not masked from attention (mask_sp_padding=False), "
+                "which avoids the varlen attention path but may produce minor numerical differences. "
+                "Set parallel_config.mask_sp_padding=True to restore strict masking.",
+                ctx.sp_padding_size,
+                ctx.sp_original_seq_len,
+                self.parallel_config.sequence_parallel_size,
+            )
 
         if hidden_states_mask is not None:
             joint_attention_kwargs["hidden_states_mask"] = hidden_states_mask
@@ -1034,7 +1060,7 @@ class Flux2Transformer2DModel(nn.Module):
             name = original_name
             if name not in params_dict and ".to_out.0." in name:
                 name = name.replace(".to_out.0.", ".to_out.")
-            # Some GGUF checkpoints include quantized tensors for modules that
+            # Some quantized checkpoints include tensors for modules that
             # are intentionally left unquantized in this model.
             param = params_dict.get(name)
             if param is None:

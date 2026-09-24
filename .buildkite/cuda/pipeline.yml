@@ -1,0 +1,9 @@
+# Hook uploads this entry YAML; upload_pipeline.py --upload reads bootstrap-upload-steps.yml
+# and injects ``if`` by step ``key`` from skip-ci.
+steps:
+  - label: ":github: Resolve skip-ci & upload pipeline"
+    key: upload-ci-pipeline
+    commands:
+      - "python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/cuda/bootstrap-upload-steps.yml"
+    agents:
+      queue: "cpu_queue_premerge"

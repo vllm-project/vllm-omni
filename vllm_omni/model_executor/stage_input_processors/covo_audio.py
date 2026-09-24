@@ -23,33 +23,6 @@ def _filter_audio_codes(token_ids: list[int]) -> list[int]:
     return audio_codes
 
 
-def llm2code2wav(
-    source_outputs: list[Any],
-    prompt: Any = None,
-    requires_multimodal_data: bool = False,
-) -> list[OmniTokensPrompt]:
-    """Legacy orchestrator-path builder (retained for async_chunk + back-compat).
-
-    The non-async-chunk path now goes through ``llm2code2wav_token_only`` +
-    worker connector + ``llm2code2wav_full_payload``.
-    """
-    talker_outputs = source_outputs
-    code2wav_inputs = []
-
-    for talker_output in talker_outputs:
-        output = talker_output.outputs[0]
-        audio_codes = _filter_audio_codes(list(output.token_ids))
-        code2wav_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=audio_codes,
-                multi_modal_data=None,
-                mm_processor_kwargs=None,
-            )
-        )
-
-    return code2wav_inputs
-
-
 def llm2code2wav_token_only(
     source_outputs: list[Any],
     prompt: Any = None,

@@ -149,6 +149,40 @@ class MultiVaePipeline(nn.Module, SupportsComponentDiscovery):
         self.audio_vae = nn.Linear(10, 10)
 
 
+class SiblingDiTsPipeline(nn.Module, SupportsComponentDiscovery):
+    """Two independent DiTs (e.g. a MoE transformer pair)."""
+
+    _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
+    _encoder_modules: ClassVar[list[str]] = []
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+
+    def __init__(self):
+        super().__init__()
+        self.transformer = nn.Linear(10, 10)
+        self.transformer_2 = nn.Linear(10, 10)
+        self.vae = nn.Linear(10, 10)
+
+
+class NestedDiTPipeline(nn.Module, SupportsComponentDiscovery):
+    """Cosmos3-like: a DiT plus one of its own submodules listed as a DiT.
+
+    The nested entry exists so offloading can treat the inner stack as an
+    independent ring; the outer DiT's _hsdp_shard_conditions still own all
+    nested blocks for sharding. Order is nested-first, matching Cosmos3.
+    """
+
+    _dit_modules: ClassVar[list[str]] = ["transformer.language_model", "transformer"]
+    _encoder_modules: ClassVar[list[str]] = []
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+
+    def __init__(self):
+        super().__init__()
+        self.transformer = nn.Module()
+        self.transformer.language_model = nn.Linear(10, 10)
+        self.transformer.gen_layers = nn.Linear(10, 10)
+        self.vae = nn.Linear(10, 10)
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -238,3 +272,35 @@ class TestProtocolDiscovery:
         assert len(result.vaes) == 2
         assert result.vaes[0] is pipeline.vae
         assert result.vaes[1] is pipeline.audio_vae
+
+
+class TestOutermostDits:
+    """PipelineModules.outermost_dits() drops DiTs nested inside another DiT.
+
+    HSDP shards each returned DiT via its own _hsdp_shard_conditions, so a DiT
+    nested inside another discovered DiT must be excluded: it is already covered
+    by its ancestor's conditions and may not declare conditions of its own.
+    """
+
+    def test_keeps_independent_sibling_dits(self):
+        result = ModuleDiscovery.discover(SiblingDiTsPipeline())
+
+        names, modules = result.outermost_dits()
+
+        assert names == ["transformer", "transformer_2"]
+        assert [id(m) for m in modules] == [id(m) for m in result.dits]
+
+    def test_drops_nested_dit_keeping_only_ancestor(self):
+        pipeline = NestedDiTPipeline()
+        result = ModuleDiscovery.discover(pipeline)
+
+        # Discovery sees both, nested-first (matches Cosmos3's _dit_modules order).
+        assert result.dit_names == ["transformer.language_model", "transformer"]
+
+        names, modules = result.outermost_dits()
+
+        # Only the ancestor survives; sharding the nested condition-less stack
+        # again would double-wrap its blocks and raise in apply_hsdp_to_model.
+        assert names == ["transformer"]
+        assert len(modules) == 1
+        assert modules[0] is pipeline.transformer

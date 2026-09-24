@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """W4A4 MXFP4 (Microscaling FP4) online/offline quantization for diffusion transformers.
 
 Architecture mirrors mxfp8_config.py:
@@ -7,6 +7,8 @@ Architecture mirrors mxfp8_config.py:
   MXFPLinearMethodBase                    – platform-agnostic skeleton (imported from mxfp8_config)
     NPUMxfp4LinearMethod                  – NPU single-scale offline (W4A4 MXFP4)
       NPUMxfp4OnlineLinearMethod          – NPU single-scale online (BF16 → FP4)
+    ROCmMxfp4LinearMethod                 – ROCm base class (AITER quant + shuffle; online-only)
+      ROCmMxfp4OnlineLinearMethod         – ROCm online (BF16 → FP4 via AITER)
     NPUMxfp4DualScaleLinearMethod         – NPU dual-scale offline (W4A4 MXFP4 DualScale)
       NPUMxfp4DualScaleOnlineLinearMethod – NPU dual-scale online (BF16 → FP4)
 
@@ -39,7 +41,7 @@ Dual-scale (W4A4_MXFP4_DUALSCALE):
   and npu_dual_level_quant_matmul. Weight stored in NZ hardware format via npu_format_cast.
 
   Checkpoint tensor shapes for dual-scale:
-    weight            : (N, K)          float8_e4m3fn     – FP4 packed
+    weight            : (N, K)         float8_e4m3fn     – numeric FP4 values (packed after loading)
     weight_scale      : (N, K//32)      uint8    – fine scale (float8_e8m0fnu bits)
     weight_dual_scale : (N, K//512, 1)  float32  – coarse scale (extra dim avoids shape assert)
     mul_scale         : (K,)            float32  – per-input-channel activation pre-scale
@@ -49,9 +51,9 @@ Reference: MindIE-SD W4A4MXFP4QuantLinear / W4A4MXFP4DualQuantLinear (mindiesd/q
 
 from __future__ import annotations
 
-import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
+import regex as re
 import torch
 from torch.nn import Module
 from vllm.logger import init_logger
@@ -64,13 +66,15 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from vllm.model_executor.layers.quantization.fp8 import _copy_missing_attrs
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.model_loader.weight_utils import initialize_single_dummy_weight
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import replace_parameter
 
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization._copy_missing_attrs import (
+    copy_missing_attrs as _copy_missing_attrs,
+)
 from vllm_omni.quantization.mxfp8_config import (
     MXFPLinearMethodBase,
     _LazyWeightMixin,
@@ -79,7 +83,52 @@ from vllm_omni.quantization.mxfp8_config import (
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
+
 logger = init_logger(__name__)
+
+
+def _validate_w4a8_fallback_steps(steps: list[int] | None) -> list[int]:
+    if steps is None:
+        return []
+    if not isinstance(steps, list) or any(type(step) is not int or step < 0 for step in steps):
+        raise ValueError("w4a8_fallback_steps must be a list of non-negative integer denoise step indices.")
+    return sorted(set(steps))
+
+
+def _validate_w4a8_fallback_layers(layers: list[str] | None) -> list[str]:
+    """Names are exact runtime Linear paths, not checkpoint aliases or patterns."""
+    if layers is None:
+        return []
+    if not isinstance(layers, list) or any(
+        not isinstance(name, str) or re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*(?:\.[A-Za-z_0-9]+)*", name) is None
+        for name in layers
+    ):
+        raise ValueError("w4a8_fallback_layers must be a list of non-empty exact runtime Linear paths.")
+    return sorted(set(layers))
+
+
+def _is_w4a8_fallback_step(steps: list[int]) -> bool:
+    """Read the request's zero-based denoise index; never keep state on a Linear."""
+    if not steps:
+        return False
+
+    from vllm_omni.diffusion.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+
+    step = get_forward_context().denoise_step_idx if is_forward_context_available() else None
+    if step is None:
+        raise RuntimeError("W4A8 step fallback requires a pipeline that publishes its denoise step in ForwardContext.")
+    return step in steps
+
+
+def _validate_smooth_scale(scale: torch.Tensor) -> None:
+    """Reject malformed calibration before loading or activation dtype conversion."""
+    if scale.ndim != 1 or not scale.is_floating_point():
+        raise ValueError("MXFP4 mul_scale must be a one-dimensional floating-point Smooth tensor.")
+    if not bool(torch.isfinite(scale).all()) or not bool((scale > 0).all()):
+        raise ValueError("MXFP4 mul_scale must contain finite, strictly positive Smooth values.")
 
 
 # ---------------------------------------------------------------------------
@@ -101,10 +150,24 @@ class DiffusionMXFP4Config(QuantizationConfig):
         self,
         is_checkpoint_mxfp4_serialized: bool = False,
         ignored_layers: list[str] | None = None,
+        w4a8_fallback_steps: list[int] | None = None,
+        require_smooth_scale: bool = False,
+        w4a8_fallback_layers: list[str] | None = None,
+        mxfp4_scale_alg: int = 0,
     ) -> None:
         super().__init__()
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.ignored_layers = ignored_layers or []
+        self.w4a8_fallback_steps = _validate_w4a8_fallback_steps(w4a8_fallback_steps)
+        self.w4a8_fallback_layers = _validate_w4a8_fallback_layers(w4a8_fallback_layers)
+        if not isinstance(require_smooth_scale, bool):
+            raise ValueError("require_smooth_scale must be a boolean")
+        if require_smooth_scale and not self.is_checkpoint_mxfp4_serialized:
+            raise ValueError("require_smooth_scale requires an offline MXFP4 checkpoint")
+        self.require_smooth_scale = require_smooth_scale
+        if type(mxfp4_scale_alg) is not int or mxfp4_scale_alg not in (0, 2):
+            raise ValueError("mxfp4_scale_alg must be 0 (OCP MX) or 2 (UOS with dst_type_max=7.25).")
+        self.mxfp4_scale_alg = mxfp4_scale_alg
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -135,6 +198,10 @@ class DiffusionMXFP4Config(QuantizationConfig):
         return cls(
             is_checkpoint_mxfp4_serialized=is_serialized,
             ignored_layers=ignored_layers,
+            w4a8_fallback_steps=config.get("w4a8_fallback_steps"),
+            w4a8_fallback_layers=config.get("w4a8_fallback_layers"),
+            require_smooth_scale=config.get("require_smooth_scale", False),
+            mxfp4_scale_alg=config.get("mxfp4_scale_alg", 0),
         )
 
     def get_quant_method(
@@ -151,11 +218,24 @@ class DiffusionMXFP4Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             if current_omni_platform.is_npu():
                 if self.is_checkpoint_mxfp4_serialized:
-                    return NPUMxfp4LinearMethod(self)
-                return NPUMxfp4OnlineLinearMethod(self)
+                    return NPUMxfp4LinearMethod(self, prefix=prefix)
+                return NPUMxfp4OnlineLinearMethod(self, prefix=prefix)
+            if current_omni_platform.is_rocm():
+                if self.mxfp4_scale_alg != 0:
+                    raise NotImplementedError("MXFP4 UOS quantization is currently only supported on NPU (Ascend).")
+                if self.w4a8_fallback_steps or self.w4a8_fallback_layers:
+                    raise NotImplementedError(
+                        "MXFP4 W4A8 step/layer fallback is currently only supported on NPU (Ascend)."
+                    )
+                gcn_arch = torch.cuda.get_device_properties(torch.accelerator.current_device_index()).gcnArchName
+                if "gfx950" not in gcn_arch:
+                    raise NotImplementedError(f"MXFP4 on ROCm requires gfx950 (MI355X). Detected: {gcn_arch}")
+                if self.is_checkpoint_mxfp4_serialized:
+                    raise NotImplementedError("Pre-quantized MXFP4 checkpoints are not yet supported on ROCm.")
+                return ROCmMxfp4OnlineLinearMethod(self)
             raise NotImplementedError(
                 "DiffusionMXFP4Config (W4A4 MXFP4) is currently only supported "
-                "on NPU (Ascend) platforms. CUDA support is not yet implemented."
+                "on NPU (Ascend) and ROCm (AMD, gfx950) platforms."
             )
         return None
 
@@ -163,6 +243,56 @@ class DiffusionMXFP4Config(QuantizationConfig):
 # ---------------------------------------------------------------------------
 # NPU MXFP4 single-scale offline method (pre-quantized checkpoint)
 # ---------------------------------------------------------------------------
+
+
+def _npu_quantize_mxfp4(x: torch.Tensor, scale_alg: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize weight or activation using the same explicit FP4 algorithm."""
+    import torch_npu
+
+    # Universal Optimal Scaling (Qmax=7.25), MXAttention Section 4.1:
+    # https://arxiv.org/abs/2607.24377
+    scale_kwargs = {"dst_type_max": 7.25} if scale_alg == 2 else {}
+    return torch_npu.npu_dynamic_mx_quant(
+        x,
+        dst_type=torch_npu.float4_e2m1fn_x2,
+        axis=-1,
+        block_size=32,
+        round_mode="rint",
+        scale_alg=scale_alg,
+        **scale_kwargs,
+    )
+
+
+def _npu_w4a8_matmul(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """MXFP8 activations with prepared single-scale MXFP4 weights (N, K)."""
+    import torch_npu
+
+    x_q, x_scale = torch_npu.npu_dynamic_mx_quant(
+        x, dst_type=torch_npu.float8_e4m3fn, axis=-1, block_size=32, round_mode="rint", scale_alg=0
+    )
+    # Use the BF16 output/bias pair supported by the mixed FP8/FP4 kernel
+    # in the target A5 runtime. Restore the caller's dtype afterwards.
+    if bias is not None:
+        bias = bias.to(torch.bfloat16).reshape(1, -1)
+    output = torch_npu.npu_quant_matmul(
+        x_q,
+        weight.transpose(0, 1),
+        weight_scale.transpose(0, 1),
+        scale_dtype=torch_npu.float8_e8m0fnu,
+        x2_dtype=torch_npu.float4_e2m1fn_x2,
+        pertoken_scale=x_scale,
+        pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+        bias=bias,
+        output_dtype=torch.bfloat16,
+        group_sizes=[0, 0, 32],
+    )
+    return output.to(output_dtype)
 
 
 class NPUMxfp4LinearMethod(MXFPLinearMethodBase):
@@ -176,7 +306,8 @@ class NPUMxfp4LinearMethod(MXFPLinearMethodBase):
     NPUMxfp4OnlineLinearMethod normalizes to the same layout so apply() is shared.
     """
 
-    def __init__(self, quant_config: DiffusionMXFP4Config) -> None:
+    def __init__(self, quant_config: DiffusionMXFP4Config, *, prefix: str = "") -> None:
+        self.is_w4a8_fallback_layer = prefix in quant_config.w4a8_fallback_layers
         self.quant_config = quant_config
         self.out_dtype = torch.get_default_dtype()
 
@@ -199,11 +330,14 @@ class NPUMxfp4LinearMethod(MXFPLinearMethodBase):
         layer.orig_dtype = params_dtype
         layer.weight_block_size = None
 
-        # BF16 placeholder; cast to float4_e2m1fn_x2 in process_weights.
         layer.register_parameter(
             "weight",
             ModelWeightParameter(
-                data=torch.empty(output_size_per_partition, input_size_per_partition, dtype=params_dtype),
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition,
+                    dtype=params_dtype,
+                ),
                 input_dim=1,
                 output_dim=0,
                 weight_loader=weight_loader,
@@ -223,11 +357,41 @@ class NPUMxfp4LinearMethod(MXFPLinearMethodBase):
             ),
         )
 
+        # Older single-scale checkpoints have no Smooth tensor. Keep their
+        # identity transform while allowing calibrated checkpoints to load it.
+        def smooth_weight_loader(
+            param: ModelWeightParameter, loaded_weight: torch.Tensor, *args: Any, **kwargs: Any
+        ) -> None:
+            _validate_smooth_scale(loaded_weight)
+            if not callable(weight_loader):
+                raise ValueError("Loading MXFP4 Smooth requires a callable weight_loader")
+            weight_loader(param, loaded_weight, *args, **kwargs)
+
+        layer.register_parameter(
+            "mul_scale",
+            ModelWeightParameter(
+                data=torch.ones(input_size_per_partition, dtype=torch.float32),
+                input_dim=0,
+                output_dim=None,
+                weight_loader=smooth_weight_loader,
+            ),
+        )
+        setattr(layer.mul_scale, "ignore_warning", True)
+        setattr(layer.mul_scale, "is_checkpoint_optional", not self.quant_config.require_smooth_scale)
+        if self.quant_config.is_checkpoint_mxfp4_serialized:
+            setattr(layer.weight_scale, "is_checkpoint_required", True)
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
         import torch_npu
+
+        smooth_param = cast(torch.Tensor, layer.mul_scale)
+        _validate_smooth_scale(smooth_param)
+        smooth = smooth_param.data.to(dtype=cast(torch.dtype, layer.orig_dtype)).contiguous()
+        # Finite FP32 values can overflow or underflow in the activation dtype.
+        _validate_smooth_scale(smooth)
 
         # NPU: cast to float4_e2m1fn_x2. Weight stays (N, K) — no pre-transpose.
         w = layer.weight
@@ -247,15 +411,31 @@ class NPUMxfp4LinearMethod(MXFPLinearMethodBase):
 
         replace_parameter(layer, "weight", w)
         replace_parameter(layer, "weight_scale", s)
+        # Keep loader metadata while converting the calibration tensor once.
+        layer.mul_scale.data = smooth.to(device=cast(torch.Tensor, w).device)
         layer._already_called_process_weights_after_loading = True
 
     # --- NPU MXFP4 ops — shared with online path via inheritance ---
 
-    def _quantize_activation(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        import torch_npu
+    def _apply_inner(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None,
+        ori_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        # Online quantization has no calibrated Smooth tensor. For offline
+        # weights the same pre-scale must precede both A4 and A8 quantization.
+        if (mul_scale := getattr(layer, "mul_scale", None)) is not None:
+            x = x * mul_scale.to(x.dtype)
+        if self.is_w4a8_fallback_layer or _is_w4a8_fallback_step(self.quant_config.w4a8_fallback_steps):
+            return _npu_w4a8_matmul(
+                x, cast(torch.Tensor, layer.weight), cast(torch.Tensor, layer.weight_scale), bias, ori_dtype
+            )
+        return super()._apply_inner(layer, x, bias, ori_dtype)
 
-        # No dst_type: npu_dynamic_mx_quant defaults to float4_e2m1fn_x2.
-        return torch_npu.npu_dynamic_mx_quant(x)
+    def _quantize_activation(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return _npu_quantize_mxfp4(x, self.quant_config.mxfp4_scale_alg)
 
     def _quant_matmul(
         self,
@@ -307,8 +487,6 @@ class NPUMxfp4OnlineLinearMethod(_LazyWeightMixin, NPUMxfp4LinearMethod):
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
-        import torch_npu
-
         if layer.weight.device == torch.device("meta"):
             weight = ModelWeightParameter(
                 data=torch.empty_like(layer.weight, device=layer._load_device),
@@ -320,8 +498,10 @@ class NPUMxfp4OnlineLinearMethod(_LazyWeightMixin, NPUMxfp4LinearMethod):
             layer.register_parameter("weight", weight)
             initialize_single_dummy_weight(layer.weight)
 
-        # NPU: quantize BF16/FP16 (N, K) → FP4. No dst_type → float4_e2m1fn_x2.
-        weight_fp4, weight_scale_raw = torch_npu.npu_dynamic_mx_quant(layer.weight)
+        # Prepare once; offline checkpoints keep their existing weight algorithm.
+        weight_fp4, weight_scale_raw = _npu_quantize_mxfp4(
+            cast(torch.Tensor, layer.weight), self.quant_config.mxfp4_scale_alg
+        )
 
         # Weight stays (N, K) — no pre-transpose for FP4 packed format.
         # Scale: (N, S) → (N, S/2, 2). Not pre-transposed; done inline in _quant_matmul.
@@ -333,6 +513,151 @@ class NPUMxfp4OnlineLinearMethod(_LazyWeightMixin, NPUMxfp4LinearMethod):
 
 
 # ---------------------------------------------------------------------------
+# ROCm MXFP4 base method (AITER) — used as base class for the online subclass.
+# Online-only for now; offline (pre-quantized checkpoint) not yet supported.
+# ---------------------------------------------------------------------------
+
+
+def _register_rocm_mxfp4_op() -> None:
+    """Register the vllm_omni::rocm_mxfp4_gemm custom op for torch.compile.
+
+    Wraps activation quantization + GEMM in a single opaque op so that
+    torch.compile/inductor doesn't try to trace through AITER internals.
+    """
+    import aiter
+
+    @torch.library.custom_op("vllm_omni::rocm_mxfp4_gemm", mutates_args=())
+    def _rocm_mxfp4_gemm(
+        a: torch.Tensor,
+        w_quant: torch.Tensor,
+        w_scale: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        quant_func = aiter.get_hip_quant(aiter.QuantType.per_1x32)
+        a_quant, a_scale = quant_func(a, shuffle=True)
+        return aiter.gemm_a4w4(
+            a_quant,
+            w_quant,
+            a_scale,
+            w_scale,
+            bpreshuffle=True,
+            bias=bias,
+        )
+
+    @_rocm_mxfp4_gemm.register_fake
+    def _rocm_mxfp4_gemm_fake(
+        a: torch.Tensor,
+        w_quant: torch.Tensor,
+        w_scale: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        M, _ = a.shape
+        N, _ = w_quant.shape
+        return torch.empty(M, N, dtype=a.dtype, device=a.device)
+
+
+class ROCmMxfp4LinearMethod(MXFPLinearMethodBase):
+    """ROCm W4A4 MXFP4 linear method using AITER (gemm_a4w4).
+
+    Weight buffers after process_weights_after_loading:
+      weight_shuffle : FP4 quantized + shuffled via shuffle_weight(layout=(16,16))
+      weight_scale   : per-group-of-32 scales from AITER per_1x32
+
+    Forward path:
+      _quantize_activation: pass-through (activation quant is inside the custom op)
+      _quant_matmul: torch.ops.vllm_omni.rocm_mxfp4_gemm wraps activation quant
+                     then gemm_a4w4 in one custom op
+    """
+
+    def __init__(self, quant_config: DiffusionMXFP4Config) -> None:
+        self.quant_config = quant_config
+        self.out_dtype = torch.get_default_dtype()
+        if not hasattr(torch.ops.vllm_omni, "rocm_mxfp4_gemm"):
+            _register_rocm_mxfp4_op()
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+
+        import aiter
+        from aiter.ops.shuffle import shuffle_weight
+
+        quant_func = aiter.get_hip_quant(aiter.QuantType.per_1x32)
+        weight_quant, weight_scale = quant_func(layer.weight.data, shuffle=True)
+        weight_shuffled = shuffle_weight(weight_quant, layout=(16, 16))
+
+        # Store quantized tensors as non-parameter buffers; delete original weight.
+        layer.register_buffer("weight_shuffle", weight_shuffled, persistent=True)
+        layer.register_buffer("weight_scale", weight_scale, persistent=True)
+
+        # Remove the original weight parameter to free memory.
+        if hasattr(layer, "weight") and isinstance(layer.weight, torch.nn.Parameter):
+            delattr(layer, "weight")
+            layer.register_parameter("weight", None)
+
+        layer._already_called_process_weights_after_loading = True
+
+    def _quantize_activation(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # Activation quantization is inside the custom op called by _quant_matmul,
+        # so pass through the raw activation here.
+        return x, None
+
+    def _quant_matmul(
+        self,
+        x_q: torch.Tensor,
+        x_scale: torch.Tensor,
+        layer: torch.nn.Module,
+        bias: torch.Tensor | None,
+        ori_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        output = torch.ops.vllm_omni.rocm_mxfp4_gemm(
+            x_q,
+            layer.weight_shuffle,
+            layer.weight_scale,
+            bias,
+        )
+        if output.dtype != ori_dtype:
+            output = output.to(ori_dtype)
+        return output
+
+
+# ---------------------------------------------------------------------------
+# ROCm MXFP4 online method (BF16 checkpoint → quantize at load time)
+# ---------------------------------------------------------------------------
+
+
+class ROCmMxfp4OnlineLinearMethod(_LazyWeightMixin, ROCmMxfp4LinearMethod):
+    """ROCm W4A4 MXFP4 online linear method using AITER.
+
+    MRO: ROCmMxfp4OnlineLinearMethod → _LazyWeightMixin → ROCmMxfp4LinearMethod
+         → MXFPLinearMethodBase → LinearMethodBase
+
+      create_weights  : _LazyWeightMixin          (meta device + patched loader)
+      process_weights : ROCmMxfp4OnlineLinearMethod  (meta → materialize, then AITER quant + shuffle)
+      apply / ops     : ROCmMxfp4LinearMethod / MXFPLinearMethodBase (shared)
+    """
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+
+        # Materialise from meta device if needed (same pattern as NPU online).
+        if layer.weight is not None and layer.weight.device == torch.device("meta"):
+            weight = ModelWeightParameter(
+                data=torch.empty_like(layer.weight, device=layer._load_device),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=layer.weight.weight_loader,
+            )
+            _copy_missing_attrs(layer.weight, weight)
+            layer.register_parameter("weight", weight)
+            initialize_single_dummy_weight(layer.weight)
+
+        # Delegate to the base class which does AITER quant + shuffle.
+        ROCmMxfp4LinearMethod.process_weights_after_loading(self, layer)
+
+
+# ---------------------------------------------------------------------------
 # NPU MXFP4 dual-scale offline method (W4A4_MXFP4_DUALSCALE checkpoint)
 # ---------------------------------------------------------------------------
 
@@ -341,7 +666,7 @@ class NPUMxfp4DualScaleLinearMethod(MXFPLinearMethodBase):
     """NPU W4A4 MXFP4 dual-scale offline method for pre-quantized checkpoints.
 
     Checkpoint tensors and their canonical post-load shapes:
-      weight            : (N, K) float8_e4m3fn       – FP4 packed (2 values per byte)
+      weight            : (N, K) float8_e4m3fn – numeric FP4 values; packed into NZ after loading
       weight_scale      : (N, K//32) uint8  – fine scale (float8_e8m0fnu bits); reshaped to (N, K//64, 2)
       weight_dual_scale : (N, K//512, 1) float32 – coarse scale; transposed to (K//512, N)
       mul_scale         : (K,) float32      – per-input-channel activation pre-scale (from calibration)
@@ -353,7 +678,7 @@ class NPUMxfp4DualScaleLinearMethod(MXFPLinearMethodBase):
     Reference: MindIE-SD W4A4MXFP4DualQuantLinear.
     """
 
-    def __init__(self, quant_config: Any) -> None:
+    def __init__(self, quant_config: DiffusionMXFP4DualScaleMixedConfig) -> None:
         self.quant_config = quant_config
         self.out_dtype = torch.get_default_dtype()
 
@@ -376,7 +701,7 @@ class NPUMxfp4DualScaleLinearMethod(MXFPLinearMethodBase):
         layer.orig_dtype = params_dtype
         layer.weight_block_size = None
 
-        # FP4 packed: 2 values per float8_e4m3fn byte → checkpoint stores as float8_e4m3fn; register as BF16
+        # Checkpoint FP4 values are stored numerically in FP8; BF16 preserves them exactly.
         layer.register_parameter(
             "weight",
             ModelWeightParameter(
@@ -431,6 +756,7 @@ class NPUMxfp4DualScaleLinearMethod(MXFPLinearMethodBase):
             ),
         )
         setattr(layer.mul_scale, "ignore_warning", True)
+        setattr(layer.weight_scale, "is_checkpoint_required", True)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
@@ -438,7 +764,7 @@ class NPUMxfp4DualScaleLinearMethod(MXFPLinearMethodBase):
 
         import torch_npu
 
-        # float8_e4m3fn (FP4 packed) → float4_e2m1fn_x2 → NZ hardware format (format ID 29).
+        # Numeric FP4 values → packed float4_e2m1fn_x2 → NZ hardware format (format ID 29).
         # NZ layout is required by npu_dual_level_quant_matmul for FP4 weight matrices.
         w = torch_npu.npu_dtype_cast(layer.weight.data.npu(), torch_npu.float4_e2m1fn_x2)
         w = torch_npu.npu_format_cast(w.view(torch.int8), 29, customize_dtype=torch.int8)
@@ -475,7 +801,10 @@ class NPUMxfp4DualScaleLinearMethod(MXFPLinearMethodBase):
         """
         if ori_dtype not in (torch.bfloat16, torch.float16):
             x = x.to(torch.bfloat16)
-        x_q, l0_scale, l1_scale = self._quantize_activation(x, layer.mul_scale)
+        # The dual-level activation kernel requires x and Smooth to have the
+        # same dtype. Prepared calibration scales are BF16, including online.
+        smooth_scale = cast(torch.Tensor, layer.mul_scale).to(x.dtype)
+        x_q, l0_scale, l1_scale = self._quantize_activation(x, smooth_scale)
         return self._quant_matmul(x_q, l0_scale, l1_scale, layer, bias, ori_dtype)
 
     def _quantize_activation(  # type: ignore[override]
@@ -629,11 +958,20 @@ class DiffusionMXFP4DualScaleMixedConfig(QuantizationConfig):
         is_checkpoint_serialized: bool = False,
         ignored_layers: list[str] | None = None,
         num_bf16_fallback_layers: int = 5,
+        w4a8_fallback_steps: list[int] | None = None,
+        w4a8_fallback_layers: list[str] | None = None,
     ) -> None:
         super().__init__()
         self.is_checkpoint_serialized = is_checkpoint_serialized
         self.ignored_layers = ignored_layers or []
         self.num_bf16_fallback_layers = num_bf16_fallback_layers
+        self.w4a8_fallback_steps = _validate_w4a8_fallback_steps(w4a8_fallback_steps)
+        self.w4a8_fallback_layers = _validate_w4a8_fallback_layers(w4a8_fallback_layers)
+        if self.w4a8_fallback_steps or self.w4a8_fallback_layers:
+            raise ValueError(
+                "mxfp4_dualscale does not support W4A8 fallback. Use mxfp4 with single-scale weights; "
+                "changing a DualScale checkpoint's method name does not convert its storage format."
+            )
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -666,6 +1004,8 @@ class DiffusionMXFP4DualScaleMixedConfig(QuantizationConfig):
             is_checkpoint_serialized=is_serialized,
             ignored_layers=ignored_layers,
             num_bf16_fallback_layers=num_bf16_fallback_layers,
+            w4a8_fallback_steps=config.get("w4a8_fallback_steps"),
+            w4a8_fallback_layers=config.get("w4a8_fallback_layers"),
         )
 
     def get_quant_method(

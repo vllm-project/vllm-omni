@@ -123,6 +123,7 @@ def run_tts(args) -> None:
         payload["max_new_tokens"] = args.max_new_tokens
     if args.stream:
         payload["stream"] = True
+        payload["stream_format"] = "audio"
         payload["response_format"] = "pcm"
 
     api_url = f"{args.api_base}/v1/audio/speech"

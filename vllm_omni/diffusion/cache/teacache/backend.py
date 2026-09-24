@@ -57,6 +57,50 @@ def enable_bagel_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
     )
 
 
+def enable_sensenova_u1_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
+    """Enable TeaCache for SenseNova-U1 denoising forwards."""
+    teacache_config = TeaCacheConfig(
+        transformer_type="SenseNovaU1ForCausalLM",
+        rel_l1_thresh=config.rel_l1_thresh,
+        coefficients=config.coefficients,
+    )
+    transformer = pipeline.denoising_transformer
+    apply_teacache_hook(transformer, teacache_config)
+
+    logger.info(
+        f"TeaCache applied with rel_l1_thresh={teacache_config.rel_l1_thresh}, "
+        f"transformer_class={teacache_config.transformer_type}"
+    )
+
+
+def enable_minimax_h3_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
+    """Enable TeaCache for the calibrated MiniMax-H3 FL2VA partition."""
+    partition = getattr(pipeline, "partition", None)
+    if partition == "ref2va":
+        raise ValueError(
+            "TeaCache only supports the MiniMax-H3 FL2VA partition; Ref2VA TeaCache has not been calibrated"
+        )
+    if partition not in {"fl2va", "combined"}:
+        raise ValueError(f"Unsupported MiniMax-H3 partition for TeaCache: {partition!r}")
+
+    teacache_config = TeaCacheConfig(
+        transformer_type="MiniMaxH3DiTModel",
+        rel_l1_thresh=config.rel_l1_thresh,
+        coefficients=config.coefficients,
+    )
+    apply_teacache_hook(pipeline.transformer, teacache_config)
+
+    if partition == "combined":
+        logger.warning(
+            "TeaCache is enabled only for MiniMax-H3 FL2VA; "
+            "Ref2VA requests on this combined pipeline will run without TeaCache"
+        )
+    logger.info(
+        f"TeaCache applied with rel_l1_thresh={teacache_config.rel_l1_thresh}, "
+        "transformer_class=MiniMaxH3DiTModel, partition=FL2VA"
+    )
+
+
 def enable_flux2_klein_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
     """
     Enable TeaCache for Flux2 Klein model.
@@ -80,6 +124,8 @@ CUSTOM_TEACACHE_ENABLERS = {
     "BagelPipeline": enable_bagel_teacache,
     "Flux2KleinPipeline": enable_flux2_klein_teacache,
     "HunyuanImage3Pipeline": enable_hunyuan_image3_teacache,
+    "MiniMaxH3Pipeline": enable_minimax_h3_teacache,
+    "SenseNovaU1Pipeline": enable_sensenova_u1_teacache,
 }
 
 
@@ -128,7 +174,6 @@ class TeaCacheBackend(CacheBackend):
 
             # Create TeaCacheConfig from DiffusionCacheConfig with transformer_type
             # Access parameters via attribute access: config.rel_l1_thresh
-            # rel_l1_thresh already has a default value of 0.2 in DiffusionCacheConfig
             try:
                 teacache_config = TeaCacheConfig(
                     transformer_type=transformer_type,
@@ -180,6 +225,8 @@ class TeaCacheBackend(CacheBackend):
 
         # Extract transformer from pipeline
         transformer = pipeline.transformer
+        if not hasattr(transformer, "_hook_registry") and hasattr(pipeline, "denoising_transformer"):
+            transformer = pipeline.denoising_transformer
 
         if hasattr(transformer, "_hook_registry"):
             hook = transformer._hook_registry.get_hook(TeaCacheHook._HOOK_NAME)

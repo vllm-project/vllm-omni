@@ -16,9 +16,24 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
+    is_cfg_group_initialized,
 )
 
 logger = init_logger(__name__)
+
+
+def _get_cfg_world_size_or_one() -> int:
+    """Return the CFG world size, defaulting only when no group exists.
+
+    Diffusion workers initialize the CFG process group even when its world
+    size is one.  Pipelines are also invoked directly by unit tests and some
+    offline integrations, though, where no distributed groups exist. Treat
+    that explicit case like a one-rank CFG group. Errors from an existing CFG
+    coordinator must propagate instead of silently selecting sequential CFG.
+    """
+    if not is_cfg_group_initialized():
+        return 1
+    return get_classifier_free_guidance_world_size()
 
 
 def _wrap(pred: torch.Tensor | tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
@@ -81,6 +96,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         negative_kwargs: dict[str, Any] | None,
         cfg_normalize: bool = True,
         output_slice: int | None = None,
+        kwargs: dict[str, Any] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """
         Predict noise with optional classifier-free guidance.
@@ -92,6 +108,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
             negative_kwargs: Kwargs for negative/unconditional prediction
             cfg_normalize: Whether to normalize CFG output (default: True)
             output_slice: If set, slice each output to [:, :output_slice] for image editing
+            kwargs: Optional extra context for custom combine implementations.
 
         Returns:
             Predicted noise tensor or tuple of tensors.
@@ -104,15 +121,19 @@ class CFGParallelMixin(metaclass=ABCMeta):
         """
         if do_true_cfg:
             # Automatically detect CFG parallel configuration
-            cfg_parallel_ready = get_classifier_free_guidance_world_size() > 1
+            cfg_parallel_ready = _get_cfg_world_size_or_one() > 1
 
             if cfg_parallel_ready:
                 cfg_group = get_cfg_group()
                 cfg_rank = get_classifier_free_guidance_rank()
 
                 # Each rank computes one branch
-                kwargs = positive_kwargs if cfg_rank == 0 else negative_kwargs
-                local_pred = _wrap(self.predict_noise(**kwargs))
+                if cfg_rank == 0:
+                    logger.debug("CFG Parallel: Rank 0 computing positive branch")
+                    local_pred = _wrap(self.predict_noise(**positive_kwargs))
+                else:
+                    logger.debug("CFG Parallel: Rank %d computing negative branch", cfg_rank)
+                    local_pred = _wrap(self.predict_noise(**negative_kwargs))
 
                 if output_slice is not None:
                     local_pred = _slice_pred(local_pred, output_slice)
@@ -128,6 +149,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
                     negative_noise_pred,
                     true_cfg_scale,
                     cfg_normalize,
+                    **({} if kwargs is None else {"kwargs": kwargs}),
                 )
             else:
                 # Sequential CFG: compute both positive and negative
@@ -143,6 +165,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
                     negative_noise_pred,
                     true_cfg_scale,
                     cfg_normalize,
+                    **({} if kwargs is None else {"kwargs": kwargs}),
                 )
         else:
             # No CFG: only compute positive/conditional prediction
@@ -173,6 +196,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         negative_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
         true_cfg_scale: float,
         cfg_normalize: bool = False,
+        kwargs: dict[str, Any] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """
         Combine conditional and unconditional noise predictions with CFG.
@@ -196,6 +220,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
             negative_noise_pred: Negative/unconditional prediction(s) — Tensor or tuple
             true_cfg_scale: CFG scale factor
             cfg_normalize: Whether to normalize the combined prediction (default: False)
+            kwargs: Optional extra context for custom combine implementations.
 
         Returns:
             Combined noise prediction(s) — same type as inputs
@@ -225,8 +250,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
         Predict noise with N-branch CFG dispatch across M GPUs.
 
         This is the multi-branch counterpart of predict_noise_maybe_with_cfg().
-        Use this for models with 3 or more CFG branches (e.g., OmniGen2, Bagel,
-        DreamID). Existing 2-branch models should continue using
+        Use this for models with 3 or more CFG branches (e.g., OmniGen2, Bagel).
+        Existing 2-branch models should continue using
         predict_noise_maybe_with_cfg().
 
         Args:
@@ -243,7 +268,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         """
         if do_true_cfg:
             n_branches = len(branches_kwargs)
-            cfg_world_size = get_classifier_free_guidance_world_size()
+            cfg_world_size = _get_cfg_world_size_or_one()
             cfg_parallel_ready = cfg_world_size > 1
 
             if cfg_parallel_ready:
@@ -276,7 +301,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         branches_kwargs: list[dict[str, Any]],
         n_branches: int,
         cfg_world_size: int,
-        true_cfg_scale: float,
+        true_cfg_scale: float | dict[str, float],
         cfg_normalize: bool,
         output_slice: int | None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
@@ -452,6 +477,31 @@ class CFGParallelMixin(metaclass=ABCMeta):
         ```
         """
         raise NotImplementedError("Subclasses must implement diffuse")
+
+    def check_cfg_parallel_validity(self, true_cfg_scale: float, has_neg_prompt: bool) -> bool:
+        """
+        Check if CFG parallel configuration is valid.
+
+        Args:
+            true_cfg_scale: The classifier-free guidance scale value
+            has_neg_prompt: Whether a negative prompt is provided
+
+        Returns:
+            True if CFG parallel configuration is valid, False otherwise
+        """
+        if _get_cfg_world_size_or_one() == 1:
+            return True
+
+        if true_cfg_scale <= 1:
+            logger.warning("CFG parallel is NOT working correctly when true_cfg_scale <= 1.")
+            return False
+
+        if not has_neg_prompt:
+            logger.warning(
+                "CFG parallel is NOT working correctly when there is no negative prompt or negative prompt embeddings."
+            )
+            return False
+        return True
 
     def scheduler_step(
         self,

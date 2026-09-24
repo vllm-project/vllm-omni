@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+import importlib
 import logging
 import os
 import sys
@@ -94,20 +98,35 @@ assert _installed is _patched_cp, (
 # inference bug. Newly calibrated, clean checkpoints pay no runtime cost
 # (the clamp is a no-op when no NaN bytes are present).
 #
-# SCOPE: ModelOptNvFp4LinearMethod (W4A4 NVFP4 Linear) only. NvFp4FusedMoE /
-# NvFp4W4A16 / CompressedTensors / Quark NVFP4 paths are not covered.
+# SCOPE: the W4A4 NVFP4 linear PWAL only. NvFp4FusedMoE / NvFp4W4A16 /
+# CompressedTensors / Quark NVFP4 paths are not covered.
 #
-# SELF-EXTINGUISH: `_already_patched_upstream` heuristically detects when
-# vLLM's own PWAL contains an in-place `masked_fill_` against `weight_scale`
-# / `isnan` — the structure the upstream fix is expected to take when it is
-# filed (planned as a follow-up PR after this one merges). Once vllm-omni's
-# vllm pin moves to a release with that upstream fix, the override is
-# skipped at import and this block can be deleted. NOTE: the heuristic only
-# matches "vLLM PWAL clamps NaN in-place with `masked_fill_`"; if the
-# upstream fix lands as `nan_to_num_` or as a clamp before the FP32→FP8
-# cast, the check won't fire and this override stays active. The override
-# is idempotent so the overlap is a warning log, not a correctness issue —
-# but the heuristic should be revisited when the upstream PR is filed.
+# SELF-EXTINGUISH (structural): vLLM #49381 redesigned the ModelOpt linear
+# methods around one generic `ModelOptLinearMethod` built by
+# `build_linear_method()`, and removed the per-format classes
+# (`ModelOptNvFp4LinearMethod`, `ModelOptFp8LinearMethod`, ...) together with
+# the `LinearMethodCls` attributes they were reached through. This block
+# therefore resolves its target dynamically and self-extinguishes when only
+# the generic class exists, because that PWAL now REJECTS any NaN
+# weight_scale (#52501: `KNvfp4Static` creates `weight_scale` as
+# `torch.full(shape, nan)` and raises "... was never loaded (still NaN)" on
+# any surviving NaN). A NaN byte in weight_scale can come from that
+# unloaded-scale sentinel or from ModelOpt 0.44's FP32→FP8 E4M3 cast
+# overflow, and the two are byte-identical; a fused projection's
+# weight_scale is also written slice-by-slice by the weight loader, so
+# "some values are finite" does not prove the tensor was fully loaded.
+# Clamping would silently serve a partially loaded model, so the override is
+# retired there instead — a corrupt checkpoint gets a loud load-time
+# RuntimeError instead of the `!!!!` decode-time collapse.
+#
+# SELF-EXTINGUISH (heuristic, legacy pins only): `_already_patched_upstream`
+# heuristically detects when vLLM's own PWAL contains an in-place
+# `masked_fill_` against `weight_scale` / `isnan` — the structure the
+# upstream fix was expected to take. NOTE: the heuristic only matches
+# "vLLM PWAL clamps NaN in-place with `masked_fill_`"; if an upstream fix
+# lands as `nan_to_num_` or as a clamp before the FP32→FP8 cast, the check
+# won't fire and this override stays active. The override is idempotent so
+# the overlap is a warning log, not a correctness issue.
 #
 # ORDERING: the clamp must run BEFORE the original PWAL. The non-Blackwell
 # Marlin fallback (sm_<100) casts weight_scale FP8 -> bf16/fp16 and permutes
@@ -179,34 +198,77 @@ def _clamp_nvfp4_weight_scale_nans(layer) -> int:
 
 # Module-level defaults so downstream code (and tests) can import these names
 # without guarding for the import-failure / escape-hatch branches below.
-# `_already_patched_upstream` = upstream PWAL contains its own NaN clamp.
+# `_already_patched_upstream` = upstream's own PWAL already handles NaN
+#                               weight_scale by itself (its own clamp, or — on
+#                               the redesigned ModelOpt path — a hard
+#                               rejection), so we deliberately install nothing.
 # `_clamp_installed`         = our wrapper was installed on the upstream class.
 # These are independent: the env-var escape hatch and the import-failure path
-# both leave the wrapper uninstalled WITHOUT upstream being patched, so the
+# both leave the wrapper uninstalled WITHOUT upstream handling the case, so the
 # right check for "we own NaN-clamp behavior" is `_clamp_installed`.
 _already_patched_upstream = False
 _clamp_installed = False
+
+# Resolve the clamp target dynamically. A literal
+# `from ...modelopt import ModelOptNvFp4LinearMethod` is not an option any more:
+# the class was removed upstream (#49381), so the import is both a hard
+# ImportError and a static-check failure, and dynamic resolution is also what
+# lets us tell "no target" apart from "target replaced by the generic method".
+_MODELOPT_MODULE = "vllm.model_executor.layers.quantization.modelopt"
+_LEGACY_NVFP4_LINEAR_METHOD = "ModelOptNvFp4LinearMethod"
+_GENERIC_LINEAR_METHOD = "ModelOptLinearMethod"
 
 try:
     # Escape hatch — set VLLM_OMNI_SKIP_NVFP4_NAN_CLAMP=1 to skip installing
     # the patch (e.g. to confirm a `!!!!` failure is the NaN-byte case).
     # The escape-hatch deliberately raises ImportError so the not-installed
-    # warning below logs through the same path a real ImportError would.
+    # warning below logs through the same path a real ImportError would, and it
+    # short-circuits BEFORE any upstream probing so both module flags stay
+    # False on this path.
     # Use the repo-wide bool-env idiom so values like `0`, `false`, `no`,
     # `off` correctly mean "do not skip" rather than tripping naive
     # truthiness on the non-empty string.
     if os.environ.get("VLLM_OMNI_SKIP_NVFP4_NAN_CLAMP", "").lower() in ("1", "true", "yes", "on"):
         raise ImportError("VLLM_OMNI_SKIP_NVFP4_NAN_CLAMP is set; skipping NaN-clamp install")
-    from vllm.model_executor.layers.quantization.modelopt import (
-        ModelOptNvFp4LinearMethod as _OriginalModelOptNvFp4LinearMethod,
-    )
+    _modelopt = importlib.import_module(_MODELOPT_MODULE)
+    _legacy_nvfp4_linear_method = getattr(_modelopt, _LEGACY_NVFP4_LINEAR_METHOD, None)
+    _generic_linear_method = getattr(_modelopt, _GENERIC_LINEAR_METHOD, None)
 except ImportError as _nan_clamp_import_err:
     _PATCH_LOGGER.warning(
         "NVFP4 weight_scale NaN-clamp patch could NOT install: %s. NVFP4 W4A4 "
         "checkpoints with NaN bytes in per-block weight_scale will serve `!!!!`.",
         _nan_clamp_import_err,
     )
+    _legacy_nvfp4_linear_method = None
+    _generic_linear_method = None
 else:
+    if _legacy_nvfp4_linear_method is None and _generic_linear_method is not None:
+        # Redesigned upstream (#49381): only the generic ModelOptLinearMethod
+        # exists, and its PWAL rejects any NaN weight_scale (#52501). Retire the
+        # override rather than mask that check — see the SELF-EXTINGUISH
+        # (structural) note above for why the two NaN origins cannot be told
+        # apart. `_already_patched_upstream` records that upstream handles the
+        # case itself, so an absent `_clamp_installed` is the expected state.
+        _already_patched_upstream = True
+        _PATCH_LOGGER.info(
+            "NVFP4 W4A4 weight_scale NaN-clamp: skipped — upstream serves ModelOpt "
+            "linears through the generic %s and rejects any NaN weight_scale "
+            "(unloaded-scale sentinel), so a load-time error replaces the "
+            "`!!!!` decode-time collapse.",
+            _GENERIC_LINEAR_METHOD,
+        )
+    elif _legacy_nvfp4_linear_method is None:
+        # Unrecognised pin: neither the legacy per-format class nor the generic
+        # replacement is present. Nothing to install and nothing to assume.
+        _PATCH_LOGGER.warning(
+            "NVFP4 weight_scale NaN-clamp patch could NOT install: neither %s nor %s is present in %s.",
+            _LEGACY_NVFP4_LINEAR_METHOD,
+            _GENERIC_LINEAR_METHOD,
+            _MODELOPT_MODULE,
+        )
+
+if _legacy_nvfp4_linear_method is not None:
+    _OriginalModelOptNvFp4LinearMethod = _legacy_nvfp4_linear_method
     _current_nvfp4_pwal = _OriginalModelOptNvFp4LinearMethod.process_weights_after_loading
     # Reload idempotency: on a module reload (importlib.reload in a test, or a
     # second import path) the class attribute already holds OUR wrapper, so
@@ -324,11 +386,13 @@ def _patch_chat_template_registry():
     try:
         from vllm.transformers_utils.chat_templates.registry import (
             _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK,
-            _get_qwen_chat_template_fallback,
+            CHAT_TEMPLATES_DIR,
         )
 
         if "qwen3_omni_moe" not in _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK:
-            _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK["qwen3_omni_moe"] = _get_qwen_chat_template_fallback
+            _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK["qwen3_omni_moe"] = (
+                lambda _: CHAT_TEMPLATES_DIR / "template_chatml.jinja"
+            )
     except ImportError:
         pass
 
@@ -415,3 +479,157 @@ def _patch_fp8_use_quack_fused_bias():
 
 
 _patch_fp8_use_quack_fused_bias()
+
+
+# =============================================================================
+# Patch torch inductor: prove factorable symbolic divisibility (CantSplit)
+# =============================================================================
+# WHY: torch 2.13's SizeVarAllocator.statically_known_multiple_of proves
+# symbolic divisibility via torch's own Mod (torch.utils._sympy.functions),
+# which deliberately stays unevaluated to bound compile time on wide
+# expressions. torch <= 2.11 used python `%` (sympy.Mod), whose eval factors
+# common terms. As a result an expression like
+#   15360*s31 + 15360*s87  vs  s31 + s87
+# — FLUX's fp8 graph with two dynamic sequence dims — is no longer provably
+# divisible, and inductor raises CantSplit on the first compiled forward,
+# killing the engine core during the warmup dummy run (nightly builds
+# 2953/2954, Diffusion Quantization Test).
+#
+# SCOPE: wraps statically_known_multiple_of. The wrapper can only ADD True
+# results, and only when sympy.cancel(numerator/denominator) yields a
+# polynomial with integer coefficients — then numerator == denominator * q
+# identically, so divisibility holds for every symbol assignment; this is
+# unconditionally sound. Everything else defers to the original result.
+# Guards: polynomial inputs only (inductor's FloorDiv/ModularIndexing atoms
+# never reach sympy.cancel) and <= 20 free symbols (mirrors upstream's own
+# cost cap).
+#
+# FRAGILITY / REMOVE WHEN: self-extinguishes at install time by probing
+# whether the unpatched method already proves the canonical factorable case
+# (as torch <= 2.11 does). When upstream restores factor-aware proving, the
+# probe passes and nothing is patched.
+def _provably_factorable_multiple(numerator, denominator) -> bool:
+    """True only when numerator/denominator cancels to an integer polynomial."""
+    try:
+        import sympy
+
+        num = sympy.sympify(numerator)
+        den = sympy.sympify(denominator)
+        if den.is_zero:
+            return False
+        symbols = num.free_symbols | den.free_symbols
+        if len(symbols) > 20:
+            return False
+        if not (num.is_polynomial(*symbols) and den.is_polynomial(*symbols)):
+            return False
+        quotient = sympy.cancel(num / den)
+        _, q_den = sympy.fraction(sympy.together(quotient))
+        if q_den != 1:
+            return False
+        if quotient.is_Integer:
+            return True
+        poly = sympy.Poly(quotient, *sorted(quotient.free_symbols, key=str))
+        return all(coeff.is_integer for coeff in poly.coeffs())
+    except Exception:  # noqa: BLE001 - a proof failure must never break compile
+        return False
+
+
+def _patch_inductor_factorable_divisibility():
+    try:
+        import sympy
+        from torch._inductor.sizevars import SizeVarAllocator
+    except ImportError:
+        return
+
+    original = SizeVarAllocator.statically_known_multiple_of
+    if getattr(original, "_vllm_omni_factorable_divisibility", False):
+        return
+
+    try:
+        _a, _b = sympy.symbols("_omni_probe_a _omni_probe_b", positive=True, integer=True)
+        if original(SizeVarAllocator(), 7 * _a + 7 * _b, _a + _b):
+            _PATCH_LOGGER.info("inductor factorable-divisibility patch: skipped (upstream already proves it).")
+            return
+    except Exception:  # noqa: BLE001
+        # Probe broke (constructor drift etc.) — install anyway; the wrapper
+        # never subtracts results from the original.
+        pass
+
+    def statically_known_multiple_of(self, numerator, denominator):
+        if original(self, numerator, denominator):
+            return True
+        return _provably_factorable_multiple(numerator, denominator)
+
+    statically_known_multiple_of._vllm_omni_factorable_divisibility = True
+    SizeVarAllocator.statically_known_multiple_of = statically_known_multiple_of
+    _PATCH_LOGGER.info("inductor factorable-divisibility patch: installed.")
+
+
+_patch_inductor_factorable_divisibility()
+
+
+# =============================================================================
+# Patch CuMemAllocator._python_free_callback to fix CUDA double-free on shutdown
+# =============================================================================
+# WHY: CuMemAllocator._python_free_callback guards the asleep-entry double-free
+# skip with ``if data.is_asleep and current_platform.is_rocm():`` — only ROCm
+# gets the safe empty-handle return.  On CUDA, the callback falls through and
+# returns the original handle, causing cuMemRelease on already-freed memory
+# (CUDA_ERROR_INVALID_VALUE) during EngineCore subprocess atexit cleanup.
+#
+# This happens because ``sleep()`` calls ``unmap_and_release()`` on ALL
+# platforms, then sets ``is_asleep = True``.  When the atexit handler
+# (``_shutdown_singleton`` -> ``release_pools()`` -> GC) triggers the free
+# callback, the asleep entries must return an empty chunk list so the C
+# extension skips ``cuMemRelease`` — exactly the same logic already used by
+# the ROCm guard.
+#
+# The fix removes the ``current_platform.is_rocm()`` condition so the guard
+# applies to CUDA (and any future platform that implements cumem).
+#
+# FRAGILITY: Relies on ``_python_free_callback`` being a regular method
+# (not a slot or C extension).  If CuMemAllocator is rewritten in C/Cython,
+# this monkey-patch will silently become a no-op.
+def _patch_cumem_free_callback_cuda() -> None:
+    try:
+        from vllm.device_allocator.cumem import CuMemAllocator
+    except ImportError:
+        _PATCH_LOGGER.debug("[cumem-cuda] CuMemAllocator not available; skipping patch")
+        return
+
+    _original_free_callback = CuMemAllocator._python_free_callback
+
+    if getattr(_original_free_callback, "_omni_cumem_cuda_patched", False):
+        return
+
+    # The upstream bug: `_python_free_callback` only skips the double-free
+    # for ROCm (line ~206).  We wrap the method to extend the guard to all
+    # platforms.
+    def _patched_free_callback(self, ptr: int) -> tuple:
+        data = self.pointer_to_data.pop(ptr)
+        if data.cpu_backup_tensor is not None:
+            data.cpu_backup_tensor = None
+        if data.is_asleep:
+            # sleep() already called unmap_and_release() on this allocation.
+            # Return an empty chunk list so the C extension skips
+            # cuMemRelease, avoiding a double-free.  Same logic as the
+            # existing ROCm guard, but applied to all platforms.
+            device, size, d_mem, _ = data.handle
+            result = (device, size, d_mem, [])
+            _PATCH_LOGGER.debug(
+                "[cumem-cuda] Free callback: asleep entry %s -> empty handle",
+                ptr,
+            )
+            return result
+        # Drain pending kernels before the C extension's cuMemUnmap.
+        torch.accelerator.synchronize(data.handle[0])
+        return data.handle
+
+    _patched_free_callback._omni_cumem_cuda_patched = True
+    CuMemAllocator._python_free_callback = _patched_free_callback
+    _PATCH_LOGGER.info(
+        "[cumem-cuda] CuMemAllocator._python_free_callback patched: asleep guard extended to all platforms."
+    )
+
+
+_patch_cumem_free_callback_cuda()

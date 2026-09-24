@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections import namedtuple
 from types import SimpleNamespace
@@ -9,15 +9,19 @@ import torch
 from diffusers import DiffusionPipeline  # pyright: ignore[reportPrivateImportUsage]
 from PIL import Image
 
+import vllm_omni.diffusion.data as diffusion_data
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient, dummy_messages_from_mix_data
 from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionSpec,
     DiffusionOutput,
     DiffusionParallelConfig,
     OmniDiffusionConfig,
 )
 from vllm_omni.diffusion.models.diffusers_adapter import DiffusersAdapterPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.diffusion]
@@ -48,7 +52,7 @@ def _make_request(**overrides) -> OmniDiffusionRequest:
         prompt_obj["negative_prompt"] = negative_prompt
 
     defaults = {
-        "prompts": [prompt_obj],
+        "prompt": prompt_obj,
         "sampling_params": OmniDiffusionSamplingParams(
             num_inference_steps=20,
             guidance_scale=7.5,
@@ -64,6 +68,55 @@ def _make_request(**overrides) -> OmniDiffusionRequest:
     }
     defaults.update(overrides)
     return OmniDiffusionRequest(**defaults)
+
+
+def _patch_fake_diffusers_quantization_backends(mocker):
+    class FakePipelineQuantizationConfig:
+        def __init__(self, *, quant_mapping=None, quant_backend=None, quant_kwargs=None, components_to_quantize=None):
+            self.quant_mapping = quant_mapping
+            self.quant_backend = quant_backend
+            self.quant_kwargs = quant_kwargs
+            self.components_to_quantize = components_to_quantize
+
+    class FakeTorchAoConfig:
+        def __init__(self, quant_type, modules_to_not_convert=None):
+            self.quant_type = quant_type
+            self.modules_to_not_convert = modules_to_not_convert
+
+        @classmethod
+        def from_dict(cls, config):
+            return cls(quant_type=config["quant_type"])
+
+    class FakeInt8DynamicActivationInt8WeightConfig:
+        pass
+
+    mocker.patch(
+        "vllm_omni.diffusion.models.diffusers_adapter.quantization_utils.PipelineQuantizationConfig",
+        FakePipelineQuantizationConfig,
+    )
+    mocker.patch(
+        "vllm_omni.diffusion.models.diffusers_adapter.quantization_utils.TorchAoConfig",
+        FakeTorchAoConfig,
+    )
+    mocker.patch(
+        "vllm_omni.diffusion.models.diffusers_adapter.quantization_utils._get_torchao_quant_type_cls",
+        return_value=FakeInt8DynamicActivationInt8WeightConfig,
+    )
+    mocker.patch(
+        "vllm_omni.diffusion.models.diffusers_adapter.quantization_utils._get_diffusers_quantization_config_cls",
+        return_value=FakeTorchAoConfig,
+    )
+    return FakePipelineQuantizationConfig, FakeTorchAoConfig, FakeInt8DynamicActivationInt8WeightConfig
+
+
+class _TransformerBackedPipeline(DiffusionPipeline):
+    def __init__(self, transformer):
+        pass
+
+
+def _make_batch(**overrides) -> DiffusionRequestBatch:
+    """Wrap a single request in a DiffusionRequestBatch, matching the forward contract."""
+    return DiffusionRequestBatch(requests=[_make_request(**overrides)])
 
 
 @pytest.mark.core_model
@@ -84,20 +137,117 @@ class TestPipelineArgumentsHandling:
             "__call__",
             return_value=MockPipelineOutput(image=stub_image),
         )
-        output = adapter.forward(request)
+        output = adapter.forward(DiffusionRequestBatch(requests=[request]))
 
         assert isinstance(output, DiffusionOutput)
         assert isinstance(output.output, MockPipelineOutput)
         assert output.output.image is stub_image
 
+    @staticmethod
+    def _make_adapter(backend: str, set_attention_backend):
+        adapter = DiffusersAdapterPipeline(
+            od_config=_make_od_config(
+                diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend=backend)),
+            )
+        )
+        adapter._pipeline = SimpleNamespace(
+            transformer=SimpleNamespace(set_attention_backend=set_attention_backend),
+        )
+        return adapter
+
+    def test_explicit_unbound_backend_is_rejected(self):
+        calls: list[str] = []
+        adapter = self._make_adapter("CUDNN_ATTN", calls.append)
+
+        with pytest.raises(ValueError, match="do not provide a binding"):
+            adapter._set_attention_backend()
+
+        assert calls == []
+
+    def test_failed_explicit_backend_does_not_fallback_to_native(self):
+        calls: list[str] = []
+
+        def reject_backend(backend):
+            calls.append(backend)
+            raise RuntimeError(f"{backend} unavailable")
+
+        adapter = self._make_adapter("SAGE_ATTN", reject_backend)
+
+        with pytest.raises(RuntimeError, match="explicitly selected attention backend 'SAGE_ATTN'"):
+            adapter._set_attention_backend()
+
+        assert calls == ["sage_hub", "sage", "sage_varlen"]
+        assert "native" not in calls
+
+    def test_explicit_flash_attn_3_hub_does_not_fallback_to_fa2_or_local(self, monkeypatch):
+        monkeypatch.setattr(DiffusersAdapterPipeline, "_is_blackwell_gpu", lambda self: False)
+        calls: list[str] = []
+
+        def accept_later_backends(backend):
+            calls.append(backend)
+            if backend in ("flash_hub", "flash_varlen_hub", "flash", "flash_varlen", "_native_flash"):
+                return
+            raise RuntimeError(f"{backend} unavailable")
+
+        adapter = self._make_adapter("FLASH_ATTN_3_HUB", accept_later_backends)
+
+        with pytest.raises(RuntimeError, match="explicitly selected attention backend 'FLASH_ATTN_3_HUB'"):
+            adapter._set_attention_backend()
+
+        assert calls == ["_flash_3_hub", "_flash_3_varlen_hub"]
+
+    def test_explicit_flash_attn_hub_does_not_fallback_to_local(self, monkeypatch):
+        monkeypatch.setattr(DiffusersAdapterPipeline, "_is_blackwell_gpu", lambda self: False)
+        calls: list[str] = []
+
+        def accept_local_flash(backend):
+            calls.append(backend)
+            if backend in ("flash", "flash_varlen", "_native_flash"):
+                return
+            raise RuntimeError(f"{backend} unavailable")
+
+        adapter = self._make_adapter("FLASH_ATTN_HUB", accept_local_flash)
+
+        with pytest.raises(RuntimeError, match="explicitly selected attention backend 'FLASH_ATTN_HUB'"):
+            adapter._set_attention_backend()
+
+        assert calls == ["flash_hub", "flash_varlen_hub"]
+
+    def test_explicit_torch_sdpa_maps_to_diffusers_native(self):
+        calls: list[str] = []
+        adapter = self._make_adapter("TORCH_SDPA", calls.append)
+
+        adapter._set_attention_backend()
+
+        assert calls == ["native"]
+
     @pytest.mark.parametrize(
         "feature_id",
-        ["cfg_parallel", "ulysses", "ring", "teacache", "cache_dit", "enforce_eager", "quantization"],
+        [
+            "compact_offload",
+            "cfg_parallel",
+            "tensor_parallel",
+            "ulysses",
+            "ring",
+            "teacache",
+            "cache_dit",
+            "enforce_eager",
+            "unsupported_quantization",
+        ],
     )
     def test_adapter_guard_unsupported_feature(self, feature_id):
-        if feature_id == "cfg_parallel":
+        if feature_id == "compact_offload":
+            od_config = _make_od_config(
+                diffusion_offload_config={"mode": "module", "components": ["dit"]},
+            )
+        elif feature_id == "cfg_parallel":
             od_config = _make_od_config(
                 parallel_config=DiffusionParallelConfig(cfg_parallel_size=2, sequence_parallel_size=1),
+                cache_backend="none",
+            )
+        elif feature_id == "tensor_parallel":
+            od_config = _make_od_config(
+                parallel_config=DiffusionParallelConfig(tensor_parallel_size=2, sequence_parallel_size=1),
                 cache_backend="none",
             )
         elif feature_id == "ulysses":
@@ -122,13 +272,187 @@ class TestPipelineArgumentsHandling:
             )
         elif feature_id == "enforce_eager":
             od_config = _make_od_config(enforce_eager=True)
-        elif feature_id == "quantization":
-            od_config = _make_od_config(quantization_config=SimpleNamespace(quant_method="fp8"))
+        elif feature_id == "unsupported_quantization":
+            od_config = _make_od_config(quantization_config=SimpleNamespace(quant_method="gguf"))
         else:
             raise ValueError(f"Unknown feature ID: {feature_id}")
 
         with pytest.raises(NotImplementedError):
             DiffusersAdapterPipeline(od_config=od_config)
+
+    def test_adapter_load_weights_injects_supported_quantization_config(self, mocker):
+        (
+            FakePipelineQuantizationConfig,
+            FakeTorchAoConfig,
+            FakeInt8DynamicActivationInt8WeightConfig,
+        ) = _patch_fake_diffusers_quantization_backends(mocker)
+
+        class MockPipeline:
+            def __call__(self, prompt=None):
+                return None
+
+            def to(self, device):
+                return self
+
+        mock_from_pretrained = mocker.patch(
+            "vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter.DiffusionPipeline.from_pretrained",
+            return_value=MockPipeline(),
+        )
+        mocker.patch(
+            "vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter.DiffusionPipeline.load_config",
+            return_value={
+                "_class_name": "TransformerBackedPipeline",
+                "scheduler": ["diffusers", "SchedulerMixin"],
+                "transformer": ["diffusers", "Transformer2DModel"],
+                "transformer_2": ["diffusers", "Transformer2DModel"],
+                "vae": ["diffusers", "AutoencoderKL"],
+            },
+        )
+
+        adapter = DiffusersAdapterPipeline(
+            od_config=_make_od_config(
+                quantization_config=SimpleNamespace(quant_method="int8"),
+                diffusers_pipeline_cls=_TransformerBackedPipeline,
+            )
+        )
+        adapter.load_weights()
+
+        pipeline_quant_config = mock_from_pretrained.call_args.kwargs["quantization_config"]
+        torchao_config = pipeline_quant_config.quant_mapping["transformer"]
+        assert isinstance(pipeline_quant_config, FakePipelineQuantizationConfig)
+        assert isinstance(torchao_config, FakeTorchAoConfig)
+        assert isinstance(torchao_config.quant_type, FakeInt8DynamicActivationInt8WeightConfig)
+        assert isinstance(
+            pipeline_quant_config.quant_mapping["transformer_2"].quant_type,
+            FakeInt8DynamicActivationInt8WeightConfig,
+        )
+
+    @pytest.mark.parametrize(
+        ("pipeline_config", "diffusers_load_kwargs", "diffusers_pipeline_cls"),
+        [
+            (
+                {
+                    "_class_name": "NoTransformerPipeline",
+                    "scheduler": ["diffusers", "SchedulerMixin"],
+                    "unet": ["diffusers", "UNet2DConditionModel"],
+                    "vae": ["diffusers", "AutoencoderKL"],
+                },
+                {},
+                _TransformerBackedPipeline,
+            ),
+            (
+                {
+                    "_class_name": "TransformerPipeline",
+                    "scheduler": ["diffusers", "SchedulerMixin"],
+                    "transformer": ["diffusers", "Transformer2DModel"],
+                    "vae": ["diffusers", "AutoencoderKL"],
+                },
+                {"transformer": None},
+                None,
+            ),
+        ],
+    )
+    def test_adapter_load_weights_rejects_converted_quantization_without_transformer_component(
+        self,
+        pipeline_config,
+        diffusers_load_kwargs,
+        diffusers_pipeline_cls,
+        mocker,
+    ):
+        _patch_fake_diffusers_quantization_backends(mocker)
+        mocker.patch(
+            "vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter.DiffusionPipeline.load_config",
+            return_value=pipeline_config,
+        )
+        mock_from_pretrained = mocker.patch(
+            "vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter.DiffusionPipeline.from_pretrained"
+        )
+
+        adapter = DiffusersAdapterPipeline(
+            od_config=_make_od_config(
+                quantization_config=SimpleNamespace(quant_method="int8"),
+                diffusers_load_kwargs=diffusers_load_kwargs,
+                diffusers_pipeline_cls=diffusers_pipeline_cls,
+            )
+        )
+
+        with pytest.raises(NotImplementedError, match="transformer"):
+            adapter.load_weights()
+        mock_from_pretrained.assert_not_called()
+
+    def test_adapter_rejects_dduf_file_with_converted_quantization(self):
+        with pytest.raises(NotImplementedError, match="dduf_file"):
+            DiffusersAdapterPipeline(
+                od_config=_make_od_config(
+                    quantization_config=SimpleNamespace(quant_method="int8"),
+                    diffusers_load_kwargs={"dduf_file": "model.dduf"},
+                )
+            )
+
+    def test_adapter_load_weights_preserves_diffusers_native_quantization_config(self, mocker):
+        class MockPipeline:
+            def __call__(self, prompt=None):
+                return None
+
+            def to(self, device):
+                return self
+
+        diffusers_native_quantization_config = object()
+        mock_from_pretrained = mocker.patch(
+            "vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter.DiffusionPipeline.from_pretrained",
+            return_value=MockPipeline(),
+        )
+
+        adapter = DiffusersAdapterPipeline(
+            od_config=_make_od_config(
+                quantization_config=SimpleNamespace(quant_method="gguf"),
+                diffusers_load_kwargs={
+                    "dduf_file": "model.dduf",
+                    "quantization_config": diffusers_native_quantization_config,
+                },
+            )
+        )
+        adapter.load_weights()
+
+        kwargs = mock_from_pretrained.call_args.kwargs
+        assert kwargs["quantization_config"] is diffusers_native_quantization_config
+        assert kwargs["dduf_file"] == "model.dduf"
+
+    def test_adapter_load_weights_builds_diffusers_native_quantization_config_from_dict(self, mocker):
+        FakePipelineQuantizationConfig, FakeTorchAoConfig, _ = _patch_fake_diffusers_quantization_backends(mocker)
+
+        class MockPipeline:
+            def __call__(self, prompt=None):
+                return None
+
+            def to(self, device):
+                return self
+
+        mock_from_pretrained = mocker.patch(
+            "vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter.DiffusionPipeline.from_pretrained",
+            return_value=MockPipeline(),
+        )
+
+        adapter = DiffusersAdapterPipeline(
+            od_config=_make_od_config(
+                diffusers_load_kwargs={
+                    "quantization_config": {
+                        "quant_mapping": {
+                            "transformer": {
+                                "quant_method": "torchao",
+                                "quant_type": "fake-int8-config",
+                            },
+                        },
+                    },
+                },
+            )
+        )
+        adapter.load_weights()
+
+        quant_config = mock_from_pretrained.call_args.kwargs["quantization_config"]
+        assert isinstance(quant_config, FakePipelineQuantizationConfig)
+        assert isinstance(quant_config.quant_mapping["transformer"], FakeTorchAoConfig)
+        assert quant_config.quant_mapping["transformer"].quant_type == "fake-int8-config"
 
     def test_adapter_guard_unknown_output_type(self, mocker):
         """Test that the adapter wraps an unknown output type as-is.
@@ -145,7 +469,7 @@ class TestPipelineArgumentsHandling:
             "__call__",
             return_value=raw_output,
         )
-        output = adapter.forward(_make_request())
+        output = adapter.forward(_make_batch())
 
         assert isinstance(output, DiffusionOutput)
         assert output.output == raw_output
@@ -205,7 +529,7 @@ class TestPipelineArgumentsHandling:
             ),
         )
 
-        kwargs = adapter._build_call_kwargs(req)
+        kwargs = adapter._build_call_kwargs(DiffusionRequestBatch(requests=[req]))
 
         assert kwargs["prompt"] == "a cat on mars"
         assert kwargs["negative_prompt"] == "low quality"
@@ -403,7 +727,47 @@ class TestPipelineArgumentsHandling:
             ),
         )
         with pytest.raises(ValueError):
-            pipeline.forward(problematic_request)
+            pipeline.forward(DiffusionRequestBatch(requests=[problematic_request]))
+
+        interpolation_request = _make_request(
+            sampling_params=OmniDiffusionSamplingParams(
+                enable_frame_interpolation=True,
+            ),
+        )
+        with pytest.raises(ValueError, match="Frame interpolation is not supported with the Diffusers backend"):
+            pipeline.forward(DiffusionRequestBatch(requests=[interpolation_request]))
+
+    def test_diffusers_config_preserves_checkpoint_class_for_metadata(self, mocker):
+        class MockWanImageToVideoPipeline:
+            pass
+
+        od_config = _make_od_config(model_class_name=None)
+        mocker.patch(
+            "vllm_omni.diffusion.utils.hf_utils.get_diffusion_model_index",
+            return_value={"_class_name": "WanImageToVideoPipeline"},
+        )
+        mocker.patch.object(
+            diffusion_data,
+            "diffusers",
+            SimpleNamespace(WanImageToVideoPipeline=MockWanImageToVideoPipeline),
+        )
+        mocker.patch.object(OmniDiffusionConfig, "update_multimodal_support")
+
+        od_config.enrich_config()
+
+        assert od_config.model_class_name == "WanImageToVideoPipeline"
+        assert od_config.diffusers_pipeline_cls is MockWanImageToVideoPipeline
+
+    def test_diffusers_config_falls_back_to_adapter_without_pipeline_index(self, mocker):
+        od_config = _make_od_config(model_class_name=None)
+        mocker.patch(
+            "vllm_omni.diffusion.utils.hf_utils.get_diffusion_model_index",
+            return_value=None,
+        )
+
+        od_config.enrich_config()
+
+        assert od_config.model_class_name == "DiffusersAdapterPipeline"
 
 
 @pytest.mark.advanced_model
@@ -427,7 +791,7 @@ class TestDiffusersBackendEndToEndExecution:
     def test_t2i_random_weights(
         self,
         omni_server: OmniServer,
-        openai_client: OpenAIClientHandler,
+        online_client: OnlineOmniClient,
     ):
         messages = dummy_messages_from_mix_data(content_text="a photo of an astronaut riding a horse on mars")
 
@@ -443,8 +807,10 @@ class TestDiffusersBackendEndToEndExecution:
             },
         }
 
-        response = openai_client.send_diffusion_request(request_config)
-        image: Image.Image = response[0].images[0]  # pyright: ignore[reportOptionalSubscript]
+        response = online_client.send_diffusion_request(request_config)
+        images = response[0].images
+        assert images is not None
+        image: Image.Image = images[0]
 
         # Request config has incomplete width/height, so internal assertion in `send_diffusion_request` is incomplete.
         assert image.size == (512, 512)

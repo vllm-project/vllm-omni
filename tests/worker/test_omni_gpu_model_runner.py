@@ -1,13 +1,135 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
+from vllm.utils.torch_utils import weak_ref_tensors
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner, _filter_mrope_kwargs_for_model
+from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+from vllm_omni.worker.gpu_model_runner import (
+    OmniGPUModelRunner,
+    _filter_mrope_kwargs_for_model,
+)
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_model_forward_preserves_omni_payload_after_graph_weak_ref(monkeypatch):
+    hidden = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    payload = {
+        "latent": hidden,
+        "latent_input_ids": torch.tensor([[21], [22]]),
+        "latent_positions": torch.tensor([[10], [11]]),
+    }
+    original = OmniOutput(text_hidden_states=hidden, multimodal_outputs=payload)
+    # CUDAGraphWrapper weak-references its outputs both at capture and replay.
+    # vLLM converts NamedTuple outputs into plain tuples along this path.
+    # Only the CUDA storage-alias primitive is replaced for this CPU test;
+    # the upstream container conversion is exercised unchanged.
+    monkeypatch.setattr("vllm.utils.torch_utils.weak_ref_tensor", lambda value: value)
+    replay = weak_ref_tensors(original)
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(have_multimodal_outputs=True)
+    runner._build_model_kwargs_extra = lambda: {}
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: replay)
+
+    output = runner._model_forward()
+    output_hidden, output_payload = runner.extract_multimodal_outputs(output)
+
+    assert isinstance(output, OmniOutput)
+    torch.testing.assert_close(output_hidden, hidden)
+    assert output_payload is payload
+
+
+def test_model_forward_keeps_auxiliary_hidden_tuple(monkeypatch):
+    hidden = torch.ones(2, 4)
+    auxiliary = (hidden, hidden.clone(), None, None)
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(have_multimodal_outputs=True)
+    runner._build_model_kwargs_extra = lambda: {}
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: auxiliary)
+
+    assert runner._model_forward() is auxiliary
+
+
+def _runner_for_talker_graph_init(
+    *,
+    talker_mtp_graph_safe: bool | None,
+    has_separate_talker: bool = True,
+    model_stage: str = "talker",
+) -> OmniGPUModelRunner:
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(
+        talker=object() if has_separate_talker else None,
+        talker_mtp=object(),
+        model_stage=model_stage,
+    )
+    if talker_mtp_graph_safe is not None:
+        runner.model.talker_mtp_graph_safe = talker_mtp_graph_safe
+    runner.model_config = SimpleNamespace(hf_text_config=SimpleNamespace(hidden_size=4))
+    runner.compilation_config = SimpleNamespace(
+        cudagraph_mode=CUDAGraphMode.FULL,
+        max_cudagraph_capture_size=1,
+    )
+    runner.vllm_config = object()
+    runner.max_num_reqs = 1
+    runner.dtype = torch.float32
+    runner._make_buffer = lambda *args, **kwargs: SimpleNamespace(args=args, kwargs=kwargs)
+    return runner
+
+
+def test_talker_mtp_skips_graph_when_model_declares_unsafe(monkeypatch):
+    runner = _runner_for_talker_graph_init(talker_mtp_graph_safe=False)
+    talker_mtp = runner.model.talker_mtp
+    monkeypatch.setattr(
+        "vllm_omni.worker.gpu_model_runner.current_omni_platform.get_graph_wrapper_cls",
+        lambda: pytest.fail("graph wrapper must not be selected"),
+    )
+
+    OmniGPUModelRunner._init_talker_mtp(runner)
+
+    assert runner.talker_mtp is talker_mtp
+
+
+@pytest.mark.parametrize("model_stage", ["thinker", "code2wav"])
+def test_non_talker_stage_does_not_use_talker_mtp_graph(monkeypatch, model_stage: str):
+    runner = _runner_for_talker_graph_init(
+        talker_mtp_graph_safe=None,
+        has_separate_talker=False,
+        model_stage=model_stage,
+    )
+    talker_mtp = runner.model.talker_mtp
+    monkeypatch.setattr(
+        "vllm_omni.worker.gpu_model_runner.current_omni_platform.get_graph_wrapper_cls",
+        lambda: pytest.fail("graph wrapper must not be selected"),
+    )
+
+    OmniGPUModelRunner._init_talker_mtp(runner)
+
+    assert runner.talker_mtp is talker_mtp
+
+
+@pytest.mark.parametrize("talker_mtp_graph_safe", [None, True])
+def test_talker_mtp_uses_graph_for_legacy_or_explicit_safe_model(monkeypatch, talker_mtp_graph_safe):
+    runner = _runner_for_talker_graph_init(talker_mtp_graph_safe=talker_mtp_graph_safe)
+    wrapped = object()
+    monkeypatch.setattr(
+        "vllm_omni.worker.gpu_model_runner.current_omni_platform.get_graph_wrapper_cls",
+        lambda: lambda *args, **kwargs: wrapped,
+    )
+
+    OmniGPUModelRunner._init_talker_mtp(runner)
+
+    assert runner.talker_mtp is wrapped
 
 
 class DummyBuffer:
@@ -28,7 +150,25 @@ class DummyInputBatch:
 class DummyReqState:
     """A minimal request state container."""
 
-    pass
+    mm_features: list[str]
+    additional_information_cpu: dict
+
+
+def test_model_forward_passes_request_ids_to_decode_metadata(monkeypatch):
+    received = {}
+    model = SimpleNamespace(
+        supports_omni_decode_step_metadata=True,
+        update_decode_step_metadata=lambda **kwargs: received.update(kwargs),
+    )
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = model
+    runner.input_batch = DummyInputBatch(["request-a", "request-b"])
+    runner._build_model_kwargs_extra = lambda: {}
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: torch.zeros(1))
+
+    OmniGPUModelRunner._model_forward(runner, input_ids=torch.ones(2, dtype=torch.long))
+
+    assert received["req_ids"] == ["request-a", "request-b"]
 
 
 class MiMoAudioForConditionalGeneration(torch.nn.Module):
@@ -81,6 +221,7 @@ class CaptureTalkerMTP(torch.nn.Module):
         top_k=None,
         top_p=None,
         generator=None,
+        generators=None,
     ):
         self.calls.append(
             {
@@ -90,6 +231,7 @@ class CaptureTalkerMTP(torch.nn.Module):
                 "top_k": top_k,
                 "top_p": top_p,
                 "generator": generator,
+                "generators": generators,
             }
         )
         codes = torch.zeros((req_embeds.shape[0], 1), dtype=torch.int64)
@@ -194,8 +336,7 @@ def _make_runner_for_mimo(req_id="r_mimo"):
 
 
 def test_talker_mtp_forward_cpu_updates_inputs_and_info(monkeypatch):
-    # `_talker_mtp_forward` calls `current_omni_platform.set_forward_context`,
-    # which would otherwise dispatch to the real device implementation.
+    # `_talker_mtp_forward` dispatches through the active platform.
     import vllm_omni.worker.gpu_model_runner as mod  # Must be the same module that defines OmniGPUModelRunner
 
     monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
@@ -275,7 +416,7 @@ def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
     runner.requests["r1"].sampling_params = SimpleNamespace(
         seed=42,
-        extra_args={"qwen3_tts_request_seed": 42},
+        extra_args={"tts_local_seed": 42},
     )
     runner.talker_mtp = CaptureTalkerMTP()
     runner.vllm_config = SimpleNamespace(
@@ -306,6 +447,7 @@ def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker
             "top_k": 9,
             "top_p": 0.55,
             "generator": runner.talker_mtp.calls[0]["generator"],
+            "generators": None,
         }
     ]
     assert runner.talker_mtp.calls[0]["generator"] is not None
@@ -319,11 +461,11 @@ def test_talker_mtp_forward_keeps_explicit_seeded_requests_scalar(monkeypatch):
     runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
     runner.requests["r1"].sampling_params = SimpleNamespace(
         seed=11,
-        extra_args={"qwen3_tts_request_seed": 11},
+        extra_args={"tts_local_seed": 11},
     )
     runner.requests["r2"].sampling_params = SimpleNamespace(
         seed=22,
-        extra_args={"qwen3_tts_request_seed": 22},
+        extra_args={"tts_local_seed": 22},
     )
     runner.talker_mtp = CaptureTalkerMTP()
     runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))
@@ -348,6 +490,57 @@ def test_talker_mtp_forward_keeps_explicit_seeded_requests_scalar(monkeypatch):
     assert runner.talker_mtp.calls[0]["generator"] is not runner.talker_mtp.calls[1]["generator"]
     assert torch.equal(runner.talker_mtp_input_ids.gpu, saved_input_ids)
     assert torch.equal(runner.talker_mtp_inputs_embeds.gpu, saved_embeds)
+
+
+def test_talker_mtp_forward_batches_seeded_requests_for_opted_in_models(monkeypatch):
+    """Models with talker_mtp_accepts_per_row_generators get one batched call (#4883)."""
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
+
+    runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+    runner.requests["r1"].sampling_params = SimpleNamespace(
+        seed=11,
+        extra_args={"tts_local_seed": 11},
+    )
+    runner.requests["r2"].sampling_params = SimpleNamespace(
+        seed=22,
+        extra_args={"tts_local_seed": 22},
+    )
+    runner.talker_mtp = CaptureTalkerMTP()
+    runner.model = SimpleNamespace(
+        talker_mtp_output_key=("codes", "audio"),
+        talker_mtp_accepts_per_row_generators=True,
+    )
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))
+
+    def fake_determine(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, use_cascade_attn):
+        batch_desc = SimpleNamespace(num_tokens=int(num_tokens))
+        return (False, batch_desc, None, None, None)
+
+    monkeypatch.setattr(runner, "_determine_batch_execution_and_padding", fake_determine.__get__(runner, type(runner)))
+
+    inputs_embeds = torch.zeros((6, 4), dtype=torch.float32)
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1", "r2"], inputs_embeds)
+
+    # One batched call with distinct per-row generators, not two scalar calls.
+    assert [call["batch_size"] for call in runner.talker_mtp.calls] == [2]
+    row_generators = runner.talker_mtp.calls[0]["generators"]
+    assert runner.talker_mtp.calls[0]["generator"] is None
+    assert len(row_generators) == 2
+    assert all(generator is not None for generator in row_generators)
+    assert row_generators[0] is not row_generators[1]
+
+    # The per-request generator stream persists across steps...
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1", "r2"], inputs_embeds)
+    assert runner.talker_mtp.calls[1]["generators"][0] is row_generators[0]
+    assert runner.talker_mtp.calls[1]["generators"][1] is row_generators[1]
+
+    # ...and is evicted once its request finishes.
+    del runner.requests["r2"]
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1"], inputs_embeds)
+    assert set(runner._talker_mtp_generators) == {"r1"}
+    assert runner.talker_mtp.calls[2]["generator"] is row_generators[0]
 
 
 def test_update_intermediate_buffer_writes_to_buffer_and_setattr(monkeypatch):
@@ -387,6 +580,107 @@ def test_update_intermediate_buffer_accumulates():
     assert torch.allclose(buf["b"], torch.tensor([2.0]))
 
 
+def test_update_additional_information_deserializes_new_request_payload():
+    from vllm_omni.engine.serialization import serialize_additional_information
+
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    conditioning = {
+        "tts_token_ids": torch.tensor([1, 2]),
+        "tts_hidden_states": torch.ones(2, 4),
+    }
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                req_id="r1",
+                additional_information=serialize_additional_information(conditioning),
+            )
+        ],
+        scheduled_cached_reqs=SimpleNamespace(),
+    )
+
+    OmniGPUModelRunner._update_additional_information(runner, scheduler_output)
+
+    assert torch.equal(runner.model_intermediate_buffer["r1"]["tts_token_ids"], conditioning["tts_token_ids"])
+    assert torch.equal(
+        runner.model_intermediate_buffer["r1"]["tts_hidden_states"],
+        conditioning["tts_hidden_states"],
+    )
+
+
+def test_streaming_new_request_marker_replaces_terminal_chunk_snapshot():
+    from vllm_omni.engine.serialization import serialize_additional_information
+
+    runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+    runner.model.replace_runtime_additional_information = True
+    terminal = {
+        "codes": {"audio": torch.tensor([1, 2])},
+        "meta": {"cache_epoch": 0, "chunk_seq": 2, "last_chunk": True},
+    }
+    peer = {
+        "codes": {"audio": torch.tensor([9])},
+        "meta": {"cache_epoch": 3, "chunk_seq": 1, "last_chunk": False},
+    }
+    runner.model_intermediate_buffer.update(r1=terminal, r2=peer)
+    marker = {
+        "meta": {
+            "finished": False,
+            "is_segment_finished": True,
+            "request_finished": False,
+            "replace_runtime_additional_information": True,
+        }
+    }
+    new_req = SimpleNamespace(
+        req_id="r1",
+        model_intermediate_buffer=marker,
+        additional_information=serialize_additional_information(terminal),
+    )
+
+    OmniGPUModelRunner._update_streaming_input_additional_info(runner, new_req, "r1")
+    OmniGPUModelRunner._update_additional_information(
+        runner,
+        SimpleNamespace(
+            scheduled_new_reqs=[new_req],
+            scheduled_cached_reqs=SimpleNamespace(),
+        ),
+    )
+
+    info = runner.model_intermediate_buffer["r1"]
+    assert "codes" not in info
+    assert info["meta"] == {
+        **marker["meta"],
+        "num_processed_tokens": 0,
+        "resumable": True,
+    }
+    assert runner.requests["r1"].additional_information_cpu == info
+    assert runner.model_intermediate_buffer["r2"] == peer
+
+
+def test_cached_empty_marker_replaces_terminal_chunk_snapshot():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.model.replace_runtime_additional_information = True
+    runner.model_intermediate_buffer["r1"] = {
+        "codes": {"audio": torch.tensor([1, 2])},
+        "meta": {"cache_epoch": 0, "chunk_seq": 2, "last_chunk": True},
+    }
+    marker = {
+        "meta": {
+            "is_segment_finished": torch.tensor(True, dtype=torch.bool),
+            "replace_runtime_additional_information": True,
+        }
+    }
+
+    OmniGPUModelRunner._update_additional_information(
+        runner,
+        SimpleNamespace(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=SimpleNamespace(additional_information={"r1": marker}),
+        ),
+    )
+
+    assert runner.model_intermediate_buffer["r1"] == marker
+    assert runner.requests["r1"].additional_information_cpu == marker
+
+
 def test_update_intermediate_buffer_skips_empty_update():
     """Validate that an empty update dict is a no-op."""
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
@@ -405,28 +699,33 @@ def test_update_intermediate_buffer_skips_unknown_req_id():
     assert "unknown_req" not in runner.model_intermediate_buffer
 
 
-def test_maybe_run_batch_preprocess_calls_model_hook():
-    runner = object.__new__(OmniGPUModelRunner)
-    runner.model_intermediate_buffer = {"r1": {"text": ["hello"]}}
-    calls = []
+def test_streaming_input_update_merges_model_intermediate_buffer():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.model_intermediate_buffer["r1"] = {
+        "duplex": {
+            "session_id": "sid",
+            "seq": 1,
+        }
+    }
+    runner.requests["r1"].additional_information_cpu = runner.model_intermediate_buffer["r1"]
+    new_req_data = SimpleNamespace(
+        model_intermediate_buffer={
+            "duplex": {
+                "session_id": "sid",
+                "seq": 2,
+                "payload": {"type": "audio"},
+            }
+        },
+        additional_information=None,
+    )
 
-    class DummyModel:
-        def preprocess_batch(self, *, req_ids, model_intermediate_buffer, device):
-            calls.append((req_ids, model_intermediate_buffer, device))
+    OmniGPUModelRunner._update_streaming_input_additional_info(runner, new_req_data, "r1")
 
-    runner.model = DummyModel()
-
-    OmniGPUModelRunner._maybe_run_batch_preprocess(runner, ["r1"], torch.device("cpu"))
-
-    assert calls == [(["r1"], runner.model_intermediate_buffer, torch.device("cpu"))]
-
-
-def test_maybe_run_batch_preprocess_skips_missing_hook():
-    runner = object.__new__(OmniGPUModelRunner)
-    runner.model_intermediate_buffer = {}
-    runner.model = object()
-
-    OmniGPUModelRunner._maybe_run_batch_preprocess(runner, ["r1"], torch.device("cpu"))
+    info = runner.model_intermediate_buffer["r1"]
+    assert info["duplex"]["session_id"] == "sid"
+    assert info["duplex"]["seq"] == 2
+    assert info["duplex"]["payload"] == {"type": "audio"}
+    assert runner.requests["r1"].additional_information_cpu is info
 
 
 def _make_full_payload_accumulation_runner(
@@ -447,8 +746,6 @@ def _make_full_payload_accumulation_runner(
     runner._custom_process_func = object()
     runner._pending_full_payload_send = {}
     runner._stage_id = 1
-    # Non-None sentinel: the gate short-circuits to False when no connector
-    # is configured at all (terminal stages in pipelines with no connector).
     runner._omni_connector = object()
     return runner
 
@@ -465,7 +762,7 @@ def test_accumulate_full_payload_output_preserves_aligned_all_zero_qwen3_omni_co
 
 
 def test_accumulate_full_payload_output_keeps_misaligned_all_zero_qwen3_omni_codec_rows():
-    # After removing the sender-side zero filter, the full-payload accumulator keeps every
+    # After removing the sender-side zero filter, the accumulator keeps every
     # codec row including misaligned all-zero rows. The downstream consumer
     # (_extract_qwen3_full_payload_codec_rows) is the authoritative crop and
     # filters by output_token_ids.
@@ -512,45 +809,70 @@ def test_accumulate_full_payload_output_keeps_all_zero_qwen3_omni_prefill_placeh
 
 
 def test_full_payload_output_accumulation_hook_matrix():
-    """Producer-side gate: fires iff an explicit next-stage payload hook is loaded.
-
-    A derived `*_full_payload` helper from `custom_process_input_func` is not
-    enough: terminal/input-only consumer stages must not enqueue orphan
-    downstream payloads.
-    """
-    # Thinker / talker producer stages: explicit next-stage payload hook -> gate fires.
     assert _make_full_payload_accumulation_runner(model_stage="thinker")._should_accumulate_full_payload_output()
     assert _make_full_payload_accumulation_runner(model_stage="talker")._should_accumulate_full_payload_output()
-
-    # Terminal stage: even if _load_custom_func derived a builder from
-    # custom_process_input_func, final output stages are not producers.
-    runner = _make_full_payload_accumulation_runner(model_stage="code2wav", final_output=True)
-    assert not runner._should_accumulate_full_payload_output()
-
-    # Input-only consumer stage without an explicit producer hook must not
-    # accumulate/send just because a same-module *_full_payload helper exists.
-    runner = _make_full_payload_accumulation_runner(
+    # A stage may publish a user-visible output and still feed another stage
+    # (Qwen3-Omni thinker publishes text while sending audio state to talker).
+    assert _make_full_payload_accumulation_runner(
+        model_stage="thinker", final_output=True
+    )._should_accumulate_full_payload_output()
+    assert not _make_full_payload_accumulation_runner(
         model_stage="token2audio",
         custom_process_next_stage_input_func=None,
-    )
-    assert not runner._should_accumulate_full_payload_output()
-
-    # async_chunk mode -> gate off.
+    )._should_accumulate_full_payload_output()
     assert not _make_full_payload_accumulation_runner(
         model_stage="talker", async_chunk=True
     )._should_accumulate_full_payload_output()
+    for model_arch in (
+        "Qwen3TTSForConditionalGeneration",
+        "Qwen2_5OmniForConditionalGeneration",
+    ):
+        runner = _make_full_payload_accumulation_runner(model_arch=model_arch)
+        runner._custom_process_func = None
+        assert not runner._should_accumulate_full_payload_output()
 
-    # Non-qwen3 arches: gate is arch-agnostic, but if the fixture's arch
-    # does not configure a connector payload builder, its runtime
-    # `_custom_process_func` is None.  Emulate that.
-    runner = _make_full_payload_accumulation_runner(model_arch="Qwen3TTSForConditionalGeneration")
-    runner._custom_process_func = None
-    runner._should_accumulate_full_payload_output_cached = None
-    assert not runner._should_accumulate_full_payload_output()
-    runner = _make_full_payload_accumulation_runner(model_arch="Qwen2_5OmniForConditionalGeneration")
-    runner._custom_process_func = None
-    runner._should_accumulate_full_payload_output_cached = None
-    assert not runner._should_accumulate_full_payload_output()
+
+def _make_request_end_payload_runner(*, enabled=True, prefix_cache=None):
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace(omni_payload_at_request_end=enabled)
+    runner.omni_prefix_cache = prefix_cache
+    runner.model_config = SimpleNamespace(
+        model_arch="IndexTTS25TalkerForConditionalGeneration",
+        model_stage="indextts2_5_talker",
+        async_chunk=False,
+        final_output=False,
+        custom_process_next_stage_input_func="module.full_payload",
+    )
+    runner._custom_process_func = object()
+    runner._pending_full_payload_send = {}
+    runner._stage_id = 0
+    runner._omni_connector = object()
+    return runner
+
+
+def test_request_end_payload_d2h_gate_requires_opt_in_and_no_prefix_cache():
+    assert _make_request_end_payload_runner()._should_defer_full_payload_d2h()
+    assert not _make_request_end_payload_runner(enabled=False)._should_defer_full_payload_d2h()
+    assert not _make_request_end_payload_runner(prefix_cache=object())._should_defer_full_payload_d2h()
+
+
+def test_request_end_payload_suppresses_per_step_multimodal_outputs():
+    runner = _make_request_end_payload_runner()
+
+    def unexpected_build(_payload):
+        raise AssertionError("request-end payloads must stay inside the GPU accumulator")
+
+    runner._build_multimodal_outputs = unexpected_build
+    pooler_inter = [{"codes.mel": torch.tensor([[7]])}]
+
+    inter_stage, client = runner._build_omni_step_outputs(
+        pooler_inter,
+        pooler_inter,
+        defer_full_payload_d2h=True,
+    )
+
+    assert inter_stage is None
+    assert client is None
 
 
 def test_sync_local_stage_payloads_retains_payload_until_request_is_active():
@@ -601,3 +923,302 @@ def test_maybe_attach_mimo_audio_req_infos_no_req_state_returns_input():
 
     # When no req_state, helper should be a no-op.
     assert result is req_infos
+
+
+def _make_phase_runner(monkeypatch, rows, *, batched_decode):
+    """Exercise real preprocessing and MTP routing with CPU model buffers.
+
+    Each row is (request id, prompt length, computed tokens, scheduled tokens).
+    Only model computation and the device forward context are replaced.
+    """
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    monkeypatch.setattr(mod, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
+    runner = _make_runner(req_ids=tuple(row[0] for row in rows))
+    total = sum(row[3] for row in rows)
+    runner.supports_mm_inputs = False
+    runner.enable_prompt_embeds = False
+    runner.uses_mrope = False
+    runner.uses_xdrope_dim = 0
+    runner.has_talker_mtp = True
+    runner.model_config = SimpleNamespace(is_encoder_decoder=False)
+    runner.vllm_config.model_config.async_chunk = True
+    runner._init_model_kwargs = dict
+    runner.input_ids = DummyBuffer(torch.arange(total, dtype=torch.int64))
+    runner.inputs_embeds = DummyBuffer(torch.zeros(total, 4))
+    runner.positions = torch.arange(total)
+    runner.input_batch.num_computed_tokens_cpu = [row[2] for row in rows]
+    offsets = [0]
+    for rid, prompt_len, _, scheduled in rows:
+        runner.requests[rid].prompt_token_ids = list(range(prompt_len))
+        offsets.append(offsets[-1] + scheduled)
+        # Runner-owned metadata must override stale model/intermediate state.
+        runner.model_intermediate_buffer[rid] = {
+            "_omni_is_prefill": "stale",
+            "_omni_prompt_len": -1,
+            "_omni_num_computed_tokens": -1,
+        }
+    runner.query_start_loc.cpu = torch.tensor(offsets, dtype=torch.int32)
+    calls = []
+    batch_calls = []
+
+    def preprocess(input_ids, input_embeds, **info):
+        calls.append(("normal", dict(info)))
+        embeds = input_ids.float().view(-1, 1).expand(-1, 4).clone()
+        updates = {}
+        if not info["_omni_is_prefill"]:
+            updates["mtp_inputs"] = (torch.zeros_like(embeds), torch.zeros_like(embeds))
+        return input_ids, embeds, updates
+
+    def preprocess_decode_batch(input_ids, req_infos):
+        batch_calls.append([info["request_id"] for info in req_infos])
+        calls.extend(("batch", dict(info)) for info in req_infos)
+        embeds = input_ids.float().view(-1, 1).expand(-1, 4).clone()
+        return input_ids, embeds, torch.zeros_like(embeds), torch.zeros_like(embeds), [{} for _ in req_infos]
+
+    runner.model = SimpleNamespace(
+        has_preprocess=True,
+        preprocess=preprocess,
+        talker_mtp_output_key=("codes", "audio"),
+    )
+    if batched_decode:
+        runner.model.preprocess_decode_batch = preprocess_decode_batch
+    output = SchedulerOutput(
+        total_num_scheduled_tokens=total,
+        num_scheduled_tokens={row[0]: row[3] for row in rows},
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    return runner, output, calls, batch_calls
+
+
+@pytest.mark.parametrize("batched_decode", [False, True], ids=["normal", "batch"])
+@pytest.mark.parametrize("order", ["interleaved", "reversed", "adjacent"])
+def test_preprocess_phase_contract_mixed_batch(monkeypatch, batched_decode, order):
+    rows = [
+        ("decode-before", 5, 5, 1),
+        ("tail", 5, 4, 1),
+        ("decode-after", 5, 6, 1),
+        ("single-prompt", 1, 0, 1),
+        ("cached-prefill", 8, 4, 3),
+        ("multi-token-decode", 5, 5, 2),
+    ]
+    if order == "reversed":
+        rows.reverse()
+    elif order == "adjacent":
+        rows = [rows[1], rows[0], rows[2], *rows[3:]]
+    runner, scheduled, calls, batch_calls = _make_phase_runner(monkeypatch, rows, batched_decode=batched_decode)
+    _, embeds, *_ = runner._preprocess(scheduled, scheduled.total_num_scheduled_tokens)
+
+    if batched_decode:
+        decode_order = [rid for rid, _, _, _ in rows if rid.startswith("decode-")]
+        expected_batches = [decode_order] if order == "adjacent" else [[rid] for rid in decode_order]
+        assert batch_calls == expected_batches
+    else:
+        assert batch_calls == []
+    assert len(calls) == len(rows)
+    offset = 0
+    code_index = 0
+    for (route, info), (rid, prompt_len, computed, span) in zip(calls, rows, strict=True):
+        assert info["request_id"] == rid
+        assert type(info["_omni_prompt_len"]) is int
+        assert type(info["_omni_num_computed_tokens"]) is int
+        assert type(info["_omni_is_prefill"]) is bool
+        assert info["_omni_prompt_len"] == prompt_len
+        assert info["_omni_num_computed_tokens"] == computed
+        assert info["_omni_is_prefill"] == (computed < prompt_len)
+        mtp_eligible = rid in {"decode-before", "decode-after"}
+        assert route == ("batch" if batched_decode and mtp_eligible else "normal")
+        expected = torch.arange(offset, offset + span).float().view(-1, 1).expand(-1, 4)
+        torch.testing.assert_close(embeds[offset : offset + span], expected + int(mtp_eligible))
+        assert ("codes" in runner.model_intermediate_buffer[rid]) == mtp_eligible
+        if mtp_eligible:
+            torch.testing.assert_close(
+                runner.model_intermediate_buffer[rid]["codes"]["audio"],
+                torch.tensor([[code_index]], dtype=torch.int64),
+                rtol=0,
+                atol=0,
+            )
+            code_index += 1
+        offset += span
+
+
+@pytest.mark.parametrize("batched_decode", [False, True], ids=["normal", "batch"])
+def test_preprocess_one_token_chunked_prefill_tail_then_decode(monkeypatch, batched_decode):
+    # Replay a five-token prompt split at a four-token scheduling budget.
+    runner, scheduled, calls, _ = _make_phase_runner(monkeypatch, [("r", 5, 0, 4)], batched_decode=batched_decode)
+    runner._preprocess(scheduled, 4)
+    assert calls[-1][1]["_omni_is_prefill"] is True
+    assert "codes" not in runner.model_intermediate_buffer["r"]
+
+    for computed, is_prefill in [(4, True), (5, False)]:
+        runner.input_batch.num_computed_tokens_cpu = [computed]
+        scheduled.total_num_scheduled_tokens = 1
+        scheduled.num_scheduled_tokens = {"r": 1}
+        runner.query_start_loc.cpu = torch.tensor([0, 1], dtype=torch.int32)
+        runner.input_ids.gpu[0] = 42
+        _, embeds, *_ = runner._preprocess(scheduled, 1)
+        route, info = calls[-1]
+        assert info["_omni_is_prefill"] is is_prefill
+        assert info["_omni_num_computed_tokens"] == computed
+        assert info["_omni_prompt_len"] == 5
+        assert route == ("batch" if batched_decode and not is_prefill else "normal")
+        torch.testing.assert_close(embeds, torch.full((1, 4), 42.0 if is_prefill else 43.0))
+        assert ("codes" in runner.model_intermediate_buffer["r"]) == (not is_prefill)
+
+
+class DecodeOnlyPreprocessModel:
+    has_preprocess = True
+
+    def __init__(self, *, rewrite_ids=False, invalid_output=None):
+        self.rewrite_ids = rewrite_ids
+        self.invalid_output = invalid_output
+        self.calls = []
+
+    @staticmethod
+    def embed_input_ids(input_ids, **kwargs):
+        return input_ids.float().view(-1, 1).expand(-1, 4).clone()
+
+    def preprocess(self, input_ids, input_embeds, **info):
+        self.calls.append(("scalar", [info["request_id"]], [info["_omni_is_prefill"]]))
+        return input_ids, self.embed_input_ids(input_ids), {}
+
+    def preprocess_decode_batch(self, *, input_ids, req_infos):
+        self.calls.append(
+            ("batch", [info["request_id"] for info in req_infos], [info["_omni_is_prefill"] for info in req_infos])
+        )
+        ids = input_ids + 100 if self.rewrite_ids else input_ids
+        embeds = self.embed_input_ids(ids) + 10
+        updates = [{"decode_marker": info["request_id"]} for info in req_infos]
+        if self.invalid_output == "embeddings":
+            embeds = embeds[:-1]
+        elif self.invalid_output == "ids":
+            ids = ids[:-1]
+        elif self.invalid_output == "updates":
+            updates = updates[:-1]
+        return ids, embeds, updates
+
+
+def _without_mtp_buffers(runner):
+    runner.has_talker_mtp = False
+    for name in ("talker_mtp", "talker_mtp_input_ids", "talker_mtp_inputs_embeds", "last_talker_hidden", "text_step"):
+        delattr(runner, name)
+
+
+@pytest.mark.parametrize("rewrite_ids", [False, True], ids=["original-ids", "replaced-ids"])
+@pytest.mark.parametrize("order", ["interleaved", "reversed", "adjacent"])
+def test_decode_batch_without_mtp_preserves_mixed_rows_and_buffers(monkeypatch, rewrite_ids, order):
+    rows = [
+        ("cfg-uncond", 5, 5, 1),
+        ("prefill-tail", 5, 4, 1),
+        ("cfg-cond", 5, 6, 1),
+        ("single-prompt", 1, 0, 1),
+        ("multi-token-decode", 5, 5, 2),
+    ]
+    if order == "reversed":
+        rows.reverse()
+    elif order == "adjacent":
+        rows = [rows[1], rows[0], rows[2], *rows[3:]]
+    runner, scheduled, _, _ = _make_phase_runner(monkeypatch, rows, batched_decode=False)
+    _without_mtp_buffers(runner)
+    model = DecodeOnlyPreprocessModel(rewrite_ids=rewrite_ids)
+    runner.model = model
+    total = scheduled.total_num_scheduled_tokens
+    runner.inputs_embeds = DummyBuffer(torch.full((total + 2, 4), -99.0))
+    ids_buffer = runner.input_ids.gpu
+    embeds_buffer = runner.inputs_embeds.gpu
+    output_ids, output_embeds, *_ = runner._preprocess(scheduled, total)
+    assert output_ids.data_ptr() == ids_buffer.data_ptr()
+    assert output_embeds.data_ptr() == embeds_buffer.data_ptr()
+    assert torch.equal(embeds_buffer[total:], torch.full((2, 4), -99.0))
+    seen = [
+        (route, rid, prefill) for route, ids, phases in model.calls for rid, prefill in zip(ids, phases, strict=True)
+    ]
+    offset = 0
+    for (route, rid, prefill), (expected_id, prompt, computed, span) in zip(seen, rows, strict=True):
+        eligible = span == 1 and computed >= prompt
+        assert rid == expected_id
+        assert prefill == (computed < prompt)
+        assert route == ("batch" if eligible else "scalar")
+        expected_ids = torch.arange(offset, offset + span) + (100 if eligible and rewrite_ids else 0)
+        assert torch.equal(output_ids[offset : offset + span], expected_ids)
+        expected_embeds = expected_ids.float().view(-1, 1).expand(-1, 4) + (10 if eligible else 0)
+        torch.testing.assert_close(output_embeds[offset : offset + span], expected_embeds)
+        info = runner.model_intermediate_buffer[rid]
+        assert info.get("decode_marker") == (rid if eligible else None)
+        offset += span
+
+
+def test_decode_batch_without_mtp_accepts_wrapper_input_ids_none(monkeypatch):
+    rows = [("first", 5, 5, 1), ("second", 5, 6, 1)]
+    runner, scheduled, _, _ = _make_phase_runner(monkeypatch, rows, batched_decode=False)
+    _without_mtp_buffers(runner)
+    model = DecodeOnlyPreprocessModel()
+    runner.model = model
+    runner.supports_mm_inputs = True
+    runner.maybe_get_ec_connector_output = _noop_forward_context
+    runner.encoder_cache = {}
+    runner._execute_mm_encoder = lambda output: None
+    runner._gather_mm_embeddings = lambda output: ([], None)
+    runner._extract_mm_kwargs = lambda output: {}
+    runner._prepare_mm_inputs = lambda size: (None, runner.inputs_embeds.gpu[:size])
+    ids, embeds, *_ = runner._preprocess(scheduled, 2)
+    assert ids.data_ptr() == runner.input_ids.gpu.data_ptr()
+    assert model.calls == [("batch", ["first", "second"], [False, False])]
+    torch.testing.assert_close(embeds, torch.tensor([[10.0] * 4, [11.0] * 4]))
+
+
+@pytest.mark.parametrize(
+    "offsets",
+    [
+        pytest.param([0, 2, 3], id="gap"),
+        pytest.param([1, 0, 2], id="reversed"),
+        pytest.param([0, 0, 1], id="duplicate"),
+        pytest.param([-1, 0, 1], id="negative-contiguous-start"),
+        pytest.param([1, 2, 3], id="contiguous-out-of-bounds"),
+    ],
+)
+def test_decode_batch_without_mtp_rejects_invalid_offsets_before_model_hook(monkeypatch, offsets):
+    rows = [("first", 5, 5, 1), ("second", 5, 6, 1)]
+    runner, scheduled, _, _ = _make_phase_runner(monkeypatch, rows, batched_decode=False)
+    _without_mtp_buffers(runner)
+    model = DecodeOnlyPreprocessModel(rewrite_ids=True)
+    runner.model = model
+    scalar_hook = Mock(wraps=model.preprocess)
+    batch_hook = Mock(wraps=model.preprocess_decode_batch)
+    monkeypatch.setattr(model, "preprocess", scalar_hook)
+    monkeypatch.setattr(model, "preprocess_decode_batch", batch_hook)
+    runner.query_start_loc.cpu = torch.tensor(offsets, dtype=torch.int32)
+    runner.inputs_embeds = DummyBuffer(torch.full((4, 4), -99.0))
+    ids_before = runner.input_ids.gpu.clone()
+    embeds_before = runner.inputs_embeds.gpu.clone()
+
+    with pytest.raises(
+        RuntimeError,
+        match="Non-MTP batched decode preprocessing requires contiguous in-bounds token offsets",
+    ):
+        runner._preprocess(scheduled, scheduled.total_num_scheduled_tokens)
+
+    # These checks remain active when the runner is imported under python -O.
+    scalar_hook.assert_not_called()
+    batch_hook.assert_not_called()
+    torch.testing.assert_close(runner.input_ids.gpu, ids_before, rtol=0, atol=0)
+    torch.testing.assert_close(runner.inputs_embeds.gpu, embeds_before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("invalid", ["embeddings", "ids", "updates"])
+def test_decode_batch_without_mtp_rejects_incomplete_outputs(monkeypatch, invalid):
+    rows = [("first", 5, 5, 1), ("second", 5, 6, 1)]
+    runner, scheduled, _, _ = _make_phase_runner(monkeypatch, rows, batched_decode=False)
+    _without_mtp_buffers(runner)
+    runner.model = DecodeOnlyPreprocessModel(invalid_output=invalid)
+    before = runner.inputs_embeds.gpu.clone()
+    with pytest.raises(ValueError, match="decode preprocessing"):
+        runner._preprocess(scheduled, 2)
+    assert torch.equal(runner.inputs_embeds.gpu, before)

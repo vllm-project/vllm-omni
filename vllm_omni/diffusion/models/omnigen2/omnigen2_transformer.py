@@ -22,6 +22,10 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.distributed.sp_plan import (
+    SequenceParallelInput,
+    SequenceParallelOutput,
+)
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
@@ -808,6 +812,36 @@ class OmniGen2TransformerBlock(nn.Module):
         return hidden_states
 
 
+class _OmniGen2SPInputBoundary(nn.Module):
+    """SP input-sharding boundary marker for ``OmniGen2Transformer2DModel._sp_plan``.
+
+    Resets ``sp_original_seq_len`` on every call: OmniGen2 runs the transformer
+    once per CFG branch and the unconditional / conditional branches have
+    different joint sequence lengths (text prefix differs). The SP framework's
+    auto-pad records the length only on the first call, so without this reset
+    a stale length from an earlier branch truncates the gather of later ones.
+    """
+
+    def forward(self, hidden_states: torch.Tensor, rotary_emb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        from vllm_omni.diffusion.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        if is_forward_context_available():
+            ctx = get_forward_context()
+            ctx.sp_original_seq_len = None
+            ctx.sp_padding_size = 0
+        return hidden_states, rotary_emb
+
+
+class _OmniGen2SPOutputBoundary(nn.Module):
+    """SP output-gathering boundary marker for ``OmniGen2Transformer2DModel._sp_plan``."""
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states
+
+
 class OmniGen2Transformer2DModel(nn.Module):
     """
     OmniGen2 Transformer 2D Model.
@@ -835,6 +869,17 @@ class OmniGen2Transformer2DModel(nn.Module):
         text_feat_dim: Dimension of text features
         timestep_scale: Scale factor for timestep embeddings
     """
+
+    # ``attention_mask`` is intentionally omitted from the plan: OmniGen2Attention
+    # accepts but never reads it. ``auto_pad=True`` requires Ulysses SP — Ring SP
+    # cannot use attention masks.
+    _sp_plan = {
+        "sp_input_boundary": {
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+        },
+        "sp_output_boundary": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
 
     def __init__(
         self,
@@ -982,6 +1027,9 @@ class OmniGen2Transformer2DModel(nn.Module):
 
         # Add learnable embeddings to distinguish different images
         self.image_index_embedding = nn.Parameter(torch.randn(5, hidden_size))  # support max 5 ref images
+
+        self.sp_input_boundary = _OmniGen2SPInputBoundary()
+        self.sp_output_boundary = _OmniGen2SPOutputBoundary()
 
     def img_patch_embed_and_refine(
         self,
@@ -1251,8 +1299,12 @@ class OmniGen2Transformer2DModel(nn.Module):
 
         hidden_states = joint_hidden_states
 
+        hidden_states, rotary_emb = self.sp_input_boundary(hidden_states, rotary_emb)
+
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_mask, rotary_emb, temb)
+
+        hidden_states = self.sp_output_boundary(hidden_states)
 
         # 4. Output norm & projection
         hidden_states = self.norm_out(hidden_states, temb)

@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Cosmos3 sound tokenizer integration."""
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Cosmos3 sound tokenizer integration.
+
+The tokenizer decodes model-generated sound latents for video+audio output. It
+does not encode or condition on ``multi_modal_data["audio"]``; request-side
+sound generation is enabled by ``generate_sound`` or ``sound_gen``.
+"""
 
 from __future__ import annotations
 
@@ -333,9 +338,9 @@ class Cosmos3SoundTokenizer:
 
         model_root = str(model_path) if model_path and os.path.isdir(model_path) else None
         if model_root is None and model_path and not explicit_avae_path:
-            from huggingface_hub import snapshot_download
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
-            model_root = snapshot_download(
+            model_root = hf_api().snapshot_download(
                 repo_id=str(model_path),
                 revision=getattr(od_config, "revision", None),
                 allow_patterns=[

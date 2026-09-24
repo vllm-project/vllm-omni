@@ -29,7 +29,7 @@ class TestOpenAIAudioListEndpoints:
 
     @pytest.mark.advanced_model
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_list_voices_endpoint(self, omni_server) -> None:
         """``GET /v1/audio/voices`` returns a non-empty ``voices`` list."""
         url = f"http://{omni_server.host}:{omni_server.port}/v1/audio/voices"
@@ -45,7 +45,7 @@ class TestOpenAIAudioListEndpoints:
 
     @pytest.mark.advanced_model
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_models_endpoint(self, omni_server) -> None:
         """``GET /v1/models`` returns at least one model."""
         url = f"http://{omni_server.host}:{omni_server.port}/v1/models"

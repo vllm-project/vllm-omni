@@ -217,192 +217,192 @@ def ar2diffusion(
     prompt: OmniTokensPrompt | TextPrompt | list | None = None,
     requires_multimodal_data: bool = False,
     streaming_context: Any | None = None,
-) -> list[dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Process AR stage outputs to create Diffusion stage inputs.
 
-    This processor accepts the stage-pool transition interface:
-    ``ar2diffusion(source_outputs, prompt, requires_multimodal_data)``.
+    GLM-Image only produces one downstream diffusion request per AR request.
+    ``source_outputs`` may still include CFG companion outputs, but only the
+    first AR output is used to build the diffusion payload.
     """
     del streaming_context
 
     _t_total = time.perf_counter()
-    ar_outputs = source_outputs
-    diffusion_inputs = []
+    if not source_outputs:
+        return None
 
-    # Normalize prompt to list
-    if not isinstance(prompt, list):
-        prompt = [prompt] if prompt is not None else [{}]
+    ar_output = source_outputs[0]
+    _t_req = time.perf_counter()
+    output = ar_output.outputs[0]
+    generated_token_ids = output.cumulative_token_ids
 
-    for i, ar_output in enumerate(ar_outputs):
-        _t_req = time.perf_counter()
-        output = ar_output.outputs[0]
-        generated_token_ids = output.cumulative_token_ids
+    if isinstance(prompt, list):
+        original_prompt = prompt[0] if prompt else {}
+    elif prompt is not None:
+        original_prompt = prompt
+    else:
+        original_prompt = {}
 
-        # Get original prompt info
-        original_prompt = prompt[i] if i < len(prompt) else {}
-        if isinstance(original_prompt, dict):
-            pass
-        elif hasattr(original_prompt, "_asdict"):
-            original_prompt = original_prompt._asdict()
-        elif hasattr(original_prompt, "__dict__"):
-            original_prompt = vars(original_prompt)
-        else:
-            original_prompt = {}
+    if isinstance(original_prompt, dict):
+        pass
+    elif hasattr(original_prompt, "_asdict"):
+        original_prompt = original_prompt._asdict()
+    elif hasattr(original_prompt, "__dict__"):
+        original_prompt = vars(original_prompt)
+    else:
+        original_prompt = {}
 
-        mm_processor_kwargs = original_prompt.get("mm_processor_kwargs")
+    mm_processor_kwargs = original_prompt.get("mm_processor_kwargs")
 
-        def _coerce_dim(v: Any, default: int) -> int:
-            try:
-                iv = int(v)
-                return iv if iv > 0 else default
-            except (TypeError, ValueError):
-                return default
-
-        # Prefer GLM-Image target size from mm_processor_kwargs (set by serving layer),
-        # then fall back to top-level fields for backward compatibility.
-        height = _coerce_dim(
-            mm_processor_kwargs.get("target_h") if isinstance(mm_processor_kwargs, dict) else None,
-            _coerce_dim(original_prompt.get("height"), 1024),
-        )
-        width = _coerce_dim(
-            mm_processor_kwargs.get("target_w") if isinstance(mm_processor_kwargs, dict) else None,
-            _coerce_dim(original_prompt.get("width"), 1024),
-        )
-        text_prompt = original_prompt.get("prompt", "")
-
-        # Detect i2i mode.
-        # Prefer normalized prompt multi_modal_data source-image presence, with
-        # multimodal output as secondary signal.
-        _t_mode = time.perf_counter()
-        is_i2i = False
-
-        prompt_modalities = original_prompt.get("modalities")
-        if isinstance(prompt_modalities, list) and "img2img" in prompt_modalities:
-            is_i2i = True
-
-        prompt_mm_data = original_prompt.get("multi_modal_data")
-        if _has_source_image(prompt_mm_data):
-            is_i2i = True
-
-        if hasattr(ar_output, "multimodal_output") and ar_output.multimodal_output:
-            mm_output = ar_output.multimodal_output
-            if isinstance(mm_output, Mapping) and mm_output.get("ids", {}).get("prior_image") is not None:
-                is_i2i = True
-        _dt_mode = (time.perf_counter() - _t_mode) * 1000
-
-        # Parse and upsample prior tokens
-        _t_parse = time.perf_counter()
+    def _coerce_dim(v: Any, default: int) -> int:
         try:
-            prior_token_ids, pixel_h, pixel_w = _parse_generated_tokens(
-                generated_token_ids,
-                height,
-                width,
-                is_i2i=is_i2i,
-            )
-        except ValueError as e:
-            logger.warning(
-                "[ar2diffusion] Request %s: skip due to token parse failure: %s "
-                "(target=%sx%s, mode=%s, raw_tokens=%s, tail=%s)",
-                i,
-                e,
-                height,
-                width,
-                "i2i" if is_i2i else "t2i",
-                len(generated_token_ids),
-                generated_token_ids[-8:] if len(generated_token_ids) >= 8 else generated_token_ids,
-            )
-            continue
-        _dt_parse = (time.perf_counter() - _t_parse) * 1000
+            iv = int(v)
+            return iv if iv > 0 else default
+        except (TypeError, ValueError):
+            return default
 
-        # Get prior_token_image_ids from AR model output (for i2i mode)
-        # This contains VQ-VAE tokens from input image, used for KV cache conditioning
-        # NOTE: multimodal_output is attached to ar_output (RequestOutput), NOT output (CompletionOutput)
-        _t_prior_img = time.perf_counter()
-        prior_token_image_ids = None
+    # Prefer GLM-Image target size from mm_processor_kwargs (set by serving layer),
+    # then fall back to top-level fields for backward compatibility.
+    height = _coerce_dim(
+        mm_processor_kwargs.get("target_h") if isinstance(mm_processor_kwargs, dict) else None,
+        _coerce_dim(original_prompt.get("height"), 1024),
+    )
+    width = _coerce_dim(
+        mm_processor_kwargs.get("target_w") if isinstance(mm_processor_kwargs, dict) else None,
+        _coerce_dim(original_prompt.get("width"), 1024),
+    )
+    text_prompt = original_prompt.get("prompt", "")
 
-        # Check ar_output (RequestOutput) for multimodal_output - this is the correct location
-        if hasattr(ar_output, "multimodal_output") and ar_output.multimodal_output:
-            mm_output = ar_output.multimodal_output
+    # Detect i2i mode.
+    # Prefer normalized prompt multi_modal_data source-image presence, with
+    # multimodal output as secondary signal.
+    _t_mode = time.perf_counter()
+    is_i2i = False
+
+    prompt_modalities = original_prompt.get("modalities")
+    if isinstance(prompt_modalities, list) and "img2img" in prompt_modalities:
+        is_i2i = True
+
+    prompt_mm_data = original_prompt.get("multi_modal_data")
+    if _has_source_image(prompt_mm_data):
+        is_i2i = True
+
+    if hasattr(ar_output, "multimodal_output") and ar_output.multimodal_output:
+        mm_output = ar_output.multimodal_output
+        if isinstance(mm_output, Mapping) and mm_output.get("ids", {}).get("prior_image") is not None:
+            is_i2i = True
+    _dt_mode = (time.perf_counter() - _t_mode) * 1000
+
+    # Parse and upsample prior tokens
+    _t_parse = time.perf_counter()
+    try:
+        prior_token_ids, pixel_h, pixel_w = _parse_generated_tokens(
+            generated_token_ids,
+            height,
+            width,
+            is_i2i=is_i2i,
+        )
+    except ValueError as e:
+        logger.warning(
+            "[ar2diffusion] Request %s: skip due to token parse failure: %s "
+            "(target=%sx%s, mode=%s, raw_tokens=%s, tail=%s)",
+            0,
+            e,
+            height,
+            width,
+            "i2i" if is_i2i else "t2i",
+            len(generated_token_ids),
+            generated_token_ids[-8:] if len(generated_token_ids) >= 8 else generated_token_ids,
+        )
+        return None
+    _dt_parse = (time.perf_counter() - _t_parse) * 1000
+
+    # Get prior_token_image_ids from AR model output (for i2i mode)
+    # This contains VQ-VAE tokens from input image, used for KV cache conditioning
+    # NOTE: multimodal_output is attached to ar_output (RequestOutput), NOT output (CompletionOutput)
+    _t_prior_img = time.perf_counter()
+    prior_token_image_ids = None
+
+    # Check ar_output (RequestOutput) for multimodal_output - this is the correct location
+    if hasattr(ar_output, "multimodal_output") and ar_output.multimodal_output:
+        mm_output = ar_output.multimodal_output
+        if isinstance(mm_output, Mapping):
+            raw_prior_image_ids = mm_output.get("ids", {}).get("prior_image")
+            if raw_prior_image_ids is not None:
+                # Handle different formats:
+                # 1. Single tensor -> wrap in list
+                # 2. List of tensors -> use as-is
+                # 3. List of Python lists (from serialization) -> convert to tensors
+                if isinstance(raw_prior_image_ids, torch.Tensor):
+                    prior_token_image_ids = [raw_prior_image_ids]
+                elif isinstance(raw_prior_image_ids, list):
+                    # Check if elements are tensors or Python lists
+                    if raw_prior_image_ids and isinstance(raw_prior_image_ids[0], torch.Tensor):
+                        prior_token_image_ids = raw_prior_image_ids
+                    elif raw_prior_image_ids and isinstance(raw_prior_image_ids[0], list):
+                        # Convert Python lists back to tensors
+                        prior_token_image_ids = [torch.tensor(ids, dtype=torch.long) for ids in raw_prior_image_ids]
+                    else:
+                        logger.warning(
+                            f"[ar2diffusion] Request 0: unexpected prior_token_image_ids format: "
+                            f"{type(raw_prior_image_ids[0]) if raw_prior_image_ids else 'empty'}"
+                        )
+    else:
+        # Fallback: also check output (CompletionOutput) in case of different vLLM versions
+        if hasattr(output, "multimodal_output") and output.multimodal_output:
+            mm_output = output.multimodal_output
+            logger.debug("[ar2diffusion] Request 0: found multimodal_output on CompletionOutput (fallback)")
             if isinstance(mm_output, Mapping):
                 raw_prior_image_ids = mm_output.get("ids", {}).get("prior_image")
                 if raw_prior_image_ids is not None:
-                    # Handle different formats:
-                    # 1. Single tensor -> wrap in list
-                    # 2. List of tensors -> use as-is
-                    # 3. List of Python lists (from serialization) -> convert to tensors
                     if isinstance(raw_prior_image_ids, torch.Tensor):
                         prior_token_image_ids = [raw_prior_image_ids]
                     elif isinstance(raw_prior_image_ids, list):
-                        # Check if elements are tensors or Python lists
-                        if raw_prior_image_ids and isinstance(raw_prior_image_ids[0], torch.Tensor):
-                            prior_token_image_ids = raw_prior_image_ids
-                        elif raw_prior_image_ids and isinstance(raw_prior_image_ids[0], list):
-                            # Convert Python lists back to tensors
-                            prior_token_image_ids = [torch.tensor(ids, dtype=torch.long) for ids in raw_prior_image_ids]
-                        else:
-                            logger.warning(
-                                f"[ar2diffusion] Request {i}: unexpected prior_token_image_ids format: "
-                                f"{type(raw_prior_image_ids[0]) if raw_prior_image_ids else 'empty'}"
-                            )
-        else:
-            # Fallback: also check output (CompletionOutput) in case of different vLLM versions
-            if hasattr(output, "multimodal_output") and output.multimodal_output:
-                mm_output = output.multimodal_output
-                logger.debug(f"[ar2diffusion] Request {i}: found multimodal_output on CompletionOutput (fallback)")
-                if isinstance(mm_output, Mapping):
-                    raw_prior_image_ids = mm_output.get("ids", {}).get("prior_image")
-                    if raw_prior_image_ids is not None:
-                        if isinstance(raw_prior_image_ids, torch.Tensor):
-                            prior_token_image_ids = [raw_prior_image_ids]
-                        elif isinstance(raw_prior_image_ids, list):
-                            prior_token_image_ids = raw_prior_image_ids
-        _dt_prior_img = (time.perf_counter() - _t_prior_img) * 1000
+                        prior_token_image_ids = raw_prior_image_ids
+    _dt_prior_img = (time.perf_counter() - _t_prior_img) * 1000
 
-        diffusion_input = {
-            "prompt": text_prompt,
-            "height": pixel_h,
-            "width": pixel_w,
-            "extra": {
-                "prior_token_ids": prior_token_ids,
-                "prior_token_image_ids": prior_token_image_ids,
-            },
-        }
+    diffusion_input = {
+        "prompt": text_prompt,
+        "height": pixel_h,
+        "width": pixel_w,
+        "extra": {
+            "prior_token_ids": prior_token_ids,
+            "prior_token_image_ids": prior_token_image_ids,
+        },
+    }
 
-        if requires_multimodal_data:
-            mm_data = original_prompt.get("multi_modal_data")
-            if mm_data:
-                pil_image = _first_source_image(mm_data)
-                diffusion_input["pil_image"] = pil_image
+    if requires_multimodal_data:
+        mm_data = original_prompt.get("multi_modal_data")
+        if mm_data:
+            pil_image = _first_source_image(mm_data)
+            diffusion_input["pil_image"] = pil_image
 
-        for key in ["seed", "num_inference_steps", "guidance_scale", "negative_prompt"]:
-            if key in original_prompt:
-                diffusion_input[key] = original_prompt[key]
+    for key in ["seed", "num_inference_steps", "guidance_scale", "negative_prompt"]:
+        if key in original_prompt:
+            diffusion_input[key] = original_prompt[key]
 
-        _dt_req = (time.perf_counter() - _t_req) * 1000
-        logger.info(
-            "[ar2diffusion] req=%d mode=%s target=%dx%d "
-            "raw_tokens=%d prior_tokens=%d prior_image_ids=%s "
-            "timing: mode_detect=%.3fms parse+upsample=%.3fms "
-            "prior_image_ids_extract=%.3fms req_total=%.3fms",
-            i,
-            "i2i" if is_i2i else "t2i",
-            pixel_h,
-            pixel_w,
-            len(generated_token_ids),
-            len(prior_token_ids),
-            "yes" if prior_token_image_ids is not None else "no",
-            _dt_mode,
-            _dt_parse,
-            _dt_prior_img,
-            _dt_req,
-        )
-        diffusion_inputs.append(diffusion_input)
+    _dt_req = (time.perf_counter() - _t_req) * 1000
+    logger.info(
+        "[ar2diffusion] req=%d mode=%s target=%dx%d "
+        "raw_tokens=%d prior_tokens=%d prior_image_ids=%s "
+        "timing: mode_detect=%.3fms parse+upsample=%.3fms "
+        "prior_image_ids_extract=%.3fms req_total=%.3fms",
+        0,
+        "i2i" if is_i2i else "t2i",
+        pixel_h,
+        pixel_w,
+        len(generated_token_ids),
+        len(prior_token_ids),
+        "yes" if prior_token_image_ids is not None else "no",
+        _dt_mode,
+        _dt_parse,
+        _dt_prior_img,
+        _dt_req,
+    )
 
     _dt_total = (time.perf_counter() - _t_total) * 1000
     logger.info(
-        "[ar2diffusion] batch done: %d reqs, total=%.3fms",
-        len(diffusion_inputs),
+        "[ar2diffusion] request done: 1 req, total=%.3fms",
         _dt_total,
     )
 
-    return diffusion_inputs
+    return diffusion_input

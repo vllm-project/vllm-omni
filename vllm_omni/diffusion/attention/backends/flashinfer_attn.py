@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
+from packaging.version import InvalidVersion, Version
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -10,10 +16,14 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+
 logger = init_logger(__name__)
 
 try:
-    from flashinfer.prefill import single_prefill_with_kv_cache
+    import flashinfer
+    from flashinfer.prefill import BatchPrefillWithRaggedKVCacheWrapper
 
     HAS_FLASHINFER = True
 except Exception as e:
@@ -28,11 +38,18 @@ class FlashInferAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
 
     @classmethod
-    def supports_attention_mask(cls) -> bool:
-        # FlashInfer single_prefill_with_kv_cache accepts a ``custom_mask`` kwarg
-        # (2D boolean, ``True`` = keep) for non-causal attention. See reviewer
-        # comment on #3079 and the flashinfer docs:
-        #   https://docs.flashinfer.ai/generated/flashinfer.prefill.single_prefill_with_kv_cache.html
+    def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
+        # fa2/fa3 batch-prefill accept boolean custom masks. cute-dsl does not:
+        # automatic platform selection may fall back to SDPA, but an explicit
+        # FLASHINFER_ATTN config must not be advertised as mask-capable.
+        requested = "auto"
+        quant = getattr(attention_spec, "quant", None) if attention_spec is not None else None
+        requested_backend = getattr(quant, "flashinfer_backend", None)
+        if requested_backend:
+            requested = requested_backend
+        backend = FlashInferAttentionImpl._select_backend(requested)
+        if backend == "cute-dsl":
+            return attention_spec is None
         return True
 
     @staticmethod
@@ -47,11 +64,32 @@ class FlashInferAttentionBackend(AttentionBackend):
         return "FLASHINFER_ATTN"
 
     @staticmethod
-    def get_impl_cls() -> type["FlashInferAttentionImpl"]:
+    def get_impl_cls() -> type[FlashInferAttentionImpl]:
         return FlashInferAttentionImpl
 
 
 class FlashInferAttentionImpl(AttentionImpl):
+    _QK_DTYPES = {torch.float16, torch.bfloat16}
+    _VO_DTYPES = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
+
+    @dataclass(frozen=True)
+    class _WrapperPlanKey:
+        batch_size: int
+        qo_len: int
+        kv_len: int
+        num_q_heads: int
+        num_kv_heads: int
+        head_dim_qk: int
+        head_dim_k: int
+        head_dim_vo: int
+        q_dtype: torch.dtype
+        k_dtype: torch.dtype
+        v_dtype: torch.dtype
+        o_dtype: torch.dtype
+        causal: bool
+        softmax_scale: float
+        has_custom_mask: bool
+
     def __init__(
         self,
         num_heads: int,
@@ -60,10 +98,101 @@ class FlashInferAttentionImpl(AttentionImpl):
         causal: bool = False,
         num_kv_heads: int | None = None,
         prefix: str = "",
+        backend_kwargs: dict | None = None,
         **extra_impl_args,
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
+        self.device = torch.device("cuda", torch.accelerator.current_device_index())
+        backend_kwargs = backend_kwargs or {}
+        quant = backend_kwargs.get("quant") or {}
+        self.dtype_qk = self._check_dtype(quant.get("dtype_qk"), "dtype_qk", self._QK_DTYPES)
+        self.dtype_vo = self._check_dtype(quant.get("dtype_vo"), "dtype_vo", self._VO_DTYPES)
+        requested_backend = quant.get("flashinfer_backend", "auto")
+        # Set when AttentionConfig (or --diffusion-attention-backend) selected
+        # FLASHINFER_ATTN. Cute-dsl custom-mask SDPA is automatic-only.
+        self.backend_explicit = bool(extra_impl_args.get("backend_explicit", False))
+        self._sdpa_fallback: SDPAImpl | None = None
+
+        if not HAS_FLASHINFER:
+            raise ImportError("FLASHINFER_ATTN backend requires flashinfer")
+
+        self._check_flashinfer_version()
+
+        self.flashinfer_backend = self._select_backend(requested_backend, device=self.device)
+        workspace_size = 0 if self.flashinfer_backend == "cute-dsl" else 128 * 1024 * 1024
+        self._workspace = torch.empty(
+            workspace_size,
+            device=self.device,
+            dtype=torch.uint8,
+        )
+        self._wrapper = BatchPrefillWithRaggedKVCacheWrapper(
+            self._workspace,
+            kv_layout="NHD",
+            backend=self.flashinfer_backend,
+        )
+        self._qo_indptr: torch.Tensor | None = None
+        self._kv_indptr: torch.Tensor | None = None
+        self._plan_key: FlashInferAttentionImpl._WrapperPlanKey | None = None
+
+        if self.dtype_qk is not None or self.dtype_vo is not None:
+            logger.info_once(
+                "FLASHINFER_ATTN dtype override: Q/K=%s, V=%s.",
+                self.dtype_qk,
+                self.dtype_vo,
+            )
+
+        logger.info_once(
+            "FLASHINFER_ATTN initialized backend=%s on %s.",
+            self.flashinfer_backend,
+            self.device,
+        )
+
+    def _check_flashinfer_version(self) -> None:
+        if self.dtype_qk == self.dtype_vo:
+            return
+        try:
+            flashinfer_version = Version(flashinfer.__version__)
+        except (AttributeError, InvalidVersion):
+            return
+        if flashinfer_version <= Version("0.6.15"):
+            raise RuntimeError(
+                f"FlashInfer {flashinfer_version} is too old for reliable mixed "
+                f"QK/V dtype attention (Q/K={self.dtype_qk}, V={self.dtype_vo}); "
+                "install flashinfer >= 0.6.16rc1."
+            )
+
+    @staticmethod
+    def _select_backend(requested_backend: str, device: torch.device | None = None) -> str:
+        if requested_backend != "auto":
+            return requested_backend
+        try:
+            major, _minor = (
+                torch.cuda.get_device_capability(device) if device is not None else torch.cuda.get_device_capability()
+            )
+        except Exception:
+            return "fa2"
+        if major >= 10:
+            return "cute-dsl"
+        if major >= 9:
+            return "fa3"
+        return "fa2"
+
+    @classmethod
+    def _check_dtype(
+        cls,
+        dtype: torch.dtype | str | None,
+        option_name: str,
+        allowed: set[torch.dtype],
+    ) -> torch.dtype | None:
+        if dtype is None:
+            return None
+        if isinstance(dtype, str):
+            dtype = torch.float8_e4m3fn if dtype == "fp8_e4m3" else getattr(torch, dtype)
+        if dtype not in allowed:
+            choices = ", ".join(sorted(str(item) for item in allowed))
+            raise ValueError(f"Unsupported {option_name}={dtype}; expected one of: {choices}")
+        return dtype
 
     @staticmethod
     def _pack_mask_for_flashinfer(
@@ -75,18 +204,14 @@ class FlashInferAttentionImpl(AttentionImpl):
         Returns either ``(qo_len, kv_len)`` (shared across the batch) or
         ``(batch_size, qo_len, kv_len)`` (per-sample), or ``None`` when the
         mask is all-keep (elide). Only boolean masks are handled here;
-        additive/float masks raise ``ValueError`` so the caller falls back to
-        SDPA, which applies them with the correct softmax semantics. Shape
-        mismatches also raise ``ValueError``.
+        additive/float masks and shape mismatches raise ``ValueError`` because
+        an explicitly selected backend must not silently switch to SDPA.
         """
         mask = attn_mask
         if mask.dtype != torch.bool:
             # Additive masks (0 / -inf / -1e4 / finfo.min) cannot be faithfully
             # reduced to a boolean keep-mask here; SDPA handles them correctly.
-            raise ValueError(
-                f"non-boolean attn_mask (dtype={mask.dtype}); FlashInfer custom_mask "
-                "is boolean-only — deferring to SDPA"
-            )
+            raise ValueError(f"non-boolean attn_mask (dtype={mask.dtype}); FlashInfer custom_mask is boolean-only")
         # Diffusion masks arrive as (qo,kv), (1,1,kv), (B,1,1,kv), (B,1,qo,kv)
         # or (B,H,qo,kv). The mask is identical across heads, so collapse the
         # head dim, but keep a real batch dim — indexing mask[0] would reuse
@@ -111,22 +236,147 @@ class FlashInferAttentionImpl(AttentionImpl):
         # kernel, which reads from GPU memory directly.
         return mask.contiguous()
 
-    def _sdpa_fallback(
+    @torch.compiler.disable
+    def _plan_wrapper(
+        self,
+        key: _WrapperPlanKey,
+        flat_mask: torch.Tensor | None,
+    ) -> None:
+        self._wrapper.plan(
+            self._qo_indptr,
+            self._kv_indptr,
+            key.num_q_heads,
+            key.num_kv_heads,
+            key.head_dim_qk,
+            head_dim_vo=key.head_dim_vo,
+            custom_mask=flat_mask,
+            causal=key.causal,
+            sm_scale=key.softmax_scale,
+            q_data_type=key.q_dtype,
+            # FlashInfer versions newer than 0.6.15 can dispatch K and V with
+            # independent runtime dtypes even though plan() names this K/V.
+            kv_data_type=key.k_dtype,
+            o_data_type=key.o_dtype,
+        )
+
+    @torch.compiler.disable
+    def _make_indptr(self, batch_size: int, sequence_length: int) -> torch.Tensor:
+        return (
+            torch.arange(
+                batch_size + 1,
+                device=self.device,
+                dtype=torch.int32,
+            )
+            * sequence_length
+        )
+
+    def _ensure_plan(
+        self,
+        key: _WrapperPlanKey,
+        flat_mask: torch.Tensor | None,
+    ) -> None:
+        key_changed = key != self._plan_key
+        if not key_changed and flat_mask is None:
+            return
+
+        if key_changed:
+            self._qo_indptr = self._make_indptr(key.batch_size, key.qo_len)
+            self._kv_indptr = self._make_indptr(key.batch_size, key.kv_len)
+
+        # A custom mask's contents may change without its shape changing, so
+        # copy/re-plan it for every masked invocation.
+        self._plan_wrapper(key, flat_mask)
+        self._plan_key = key
+
+    def _run_batch_prefill(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        custom_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if query.device != self.device or key.device != self.device or value.device != self.device:
+            raise ValueError(
+                "FLASHINFER_ATTN inputs must remain on the layer initialization "
+                f"device {self.device}; got Q={query.device}, K={key.device}, "
+                f"V={value.device}"
+            )
+
+        batch_size, qo_len, num_q_heads, head_dim_qk = query.shape
+        kv_len = key.shape[1]
+        num_kv_heads = key.shape[2]
+        head_dim_k = key.shape[3]
+        head_dim_vo = value.shape[3]
+
+        q = query.reshape(batch_size * qo_len, num_q_heads, head_dim_qk)
+        k = key.reshape(batch_size * kv_len, num_kv_heads, head_dim_k)
+        v = value.reshape(batch_size * kv_len, num_kv_heads, head_dim_vo)
+        if self.dtype_qk is not None:
+            q = q.to(self.dtype_qk)
+            k = k.to(self.dtype_qk)
+        if self.dtype_vo is not None:
+            v = v.to(self.dtype_vo)
+
+        flat_mask = None
+        if custom_mask is not None:
+            if custom_mask.dim() == 2:
+                custom_mask = custom_mask.unsqueeze(0).expand(batch_size, -1, -1)
+            flat_mask = custom_mask.contiguous().view(-1)
+
+        self._ensure_plan(
+            FlashInferAttentionImpl._WrapperPlanKey(
+                batch_size=batch_size,
+                qo_len=qo_len,
+                kv_len=kv_len,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim_qk,
+                head_dim_k=head_dim_k,
+                head_dim_vo=head_dim_vo,
+                q_dtype=q.dtype,
+                k_dtype=k.dtype,
+                v_dtype=v.dtype,
+                o_dtype=query.dtype,
+                causal=self.causal,
+                softmax_scale=self.softmax_scale,
+                has_custom_mask=flat_mask is not None,
+            ),
+            flat_mask,
+        )
+        out = self._run_wrapper(q, k, v)
+        out = out.reshape(batch_size, qo_len, num_q_heads, head_dim_vo)
+        return out.to(query.dtype) if out.dtype != query.dtype else out
+
+    @torch.compiler.disable
+    def _run_wrapper(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._wrapper.run(query, key, value)
+
+    def _sdpa_for_unsupported_mask(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
+        reason: str,
     ) -> torch.Tensor:
         from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 
-        impl = SDPAImpl(
-            num_heads=query.shape[2],
-            head_size=query.shape[3],
-            softmax_scale=self.softmax_scale,
-            causal=self.causal,
-        )
-        return impl.forward_cuda(query, key, value, attn_metadata)
+        logger.warning_once("FLASHINFER_ATTN falling back to SDPA: %s", reason)
+        fallback = self._sdpa_fallback
+        if fallback is None:
+            fallback = SDPAImpl(
+                num_heads=query.shape[2],
+                head_size=query.shape[3],
+                softmax_scale=self.softmax_scale,
+                causal=self.causal,
+            )
+            self._sdpa_fallback = fallback
+        return fallback.forward_cuda(query, key, value, attn_metadata)
 
     def forward_cuda(
         self,
@@ -141,12 +391,10 @@ class FlashInferAttentionImpl(AttentionImpl):
                 "Install it or set DIFFUSION_ATTENTION_BACKEND to another backend."
             )
 
-        # Try the custom_mask path; if the mask can't be packed into the
-        # (qo_len, kv_len) layout FlashInfer expects, fall back to SDPA
-        # instead of risking an illegal-memory-access crash in the kernel.
-        # Input layout is (B, S, H, D); FlashInfer dense prefill takes (S, H, D).
+        # Explicit FLASHINFER_ATTN must not silently switch away from the
+        # requested kernel. Automatic platform selection (Blackwell cute-dsl)
+        # may use SDPA for masks that this FlashInfer variant cannot run.
         batch_size = query.shape[0]
-
         custom_mask = None
         if attn_metadata is not None and attn_metadata.attn_mask is not None:
             try:
@@ -156,28 +404,44 @@ class FlashInferAttentionImpl(AttentionImpl):
                     qo_len=query.shape[1],
                     kv_len=key.shape[1],
                 )
-            except ValueError as e:
-                logger.debug("Falling back to SDPA for mask path: %s", e)
-                return self._sdpa_fallback(query, key, value, attn_metadata)
+            except ValueError:
+                if self.backend_explicit:
+                    raise
+                return self._sdpa_for_unsupported_mask(
+                    query,
+                    key,
+                    value,
+                    attn_metadata,
+                    "attn_mask is not a FlashInfer boolean custom_mask",
+                )
             # FlashInfer cannot combine causal masking with a custom_mask; rather
-            # than silently dropping the explicit mask (diverging from SDPA), let
-            # SDPA handle the causal+mask case correctly.
+            # than silently dropping the explicit mask (diverging from SDPA),
+            # require an explicit caller to select a compatible backend.
             if custom_mask is not None and self.causal:
-                logger.debug("causal=True with explicit attn_mask; deferring to SDPA")
-                return self._sdpa_fallback(query, key, value, attn_metadata)
+                if self.backend_explicit:
+                    raise ValueError(
+                        "FLASHINFER_ATTN does not support causal=True together with an explicit custom mask."
+                    )
+                return self._sdpa_for_unsupported_mask(
+                    query,
+                    key,
+                    value,
+                    attn_metadata,
+                    "causal=True with a custom mask",
+                )
 
-        outputs = []
-        for b in range(batch_size):
-            kwargs: dict = {
-                "sm_scale": self.softmax_scale,
-                "causal": self.causal,
-                "return_lse": False,
-            }
-            if custom_mask is not None:
-                kwargs["custom_mask"] = custom_mask if custom_mask.dim() == 2 else custom_mask[b]
-            out = single_prefill_with_kv_cache(query[b], key[b], value[b], **kwargs)
-            outputs.append(out)
+        if custom_mask is not None and self.flashinfer_backend == "cute-dsl":
+            if self.backend_explicit:
+                raise ValueError(
+                    "FLASHINFER_ATTN cute-dsl backend does not support custom masks. "
+                    "Select TORCH_SDPA or a FlashInfer backend that accepts custom_mask."
+                )
+            return self._sdpa_for_unsupported_mask(
+                query,
+                key,
+                value,
+                attn_metadata,
+                "cute-dsl does not support custom masks",
+            )
 
-        if batch_size == 1:
-            return outputs[0].unsqueeze(0)
-        return torch.stack(outputs, dim=0)
+        return self._run_batch_prefill(query, key, value, custom_mask)

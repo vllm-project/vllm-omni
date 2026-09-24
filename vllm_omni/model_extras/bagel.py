@@ -50,6 +50,23 @@ def build_image_to_image_prompt(
     return img_prompt
 
 
+def build_x_to_text_prompt(
+    model: str,
+    prompt: str,
+    has_image: bool,
+) -> tuple[dict[str, Any], list[int] | None]:
+    """Build BAGEL's chat prompt for text-output tasks."""
+    del model
+    image_token = "<|image_pad|>\n" if has_image else ""
+    return (
+        {
+            "prompt": f"<|im_start|>user\n{image_token}{prompt}<|im_end|>\n<|im_start|>assistant\n",
+            "modalities": ["text"],
+        },
+        None,
+    )
+
+
 BAGEL_EXTRA_BODY_PARAMS = frozenset(
     {
         "cfg_text_scale",

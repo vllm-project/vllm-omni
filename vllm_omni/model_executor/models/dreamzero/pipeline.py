@@ -10,6 +10,7 @@ from vllm_omni.config.stage_config import (
 
 DREAMZERO_PIPELINE = PipelineConfig(
     model_type="dreamzero",
+    default_deploy_config_name="dreamzero.yaml",
     model_arch="DreamZeroPipeline",
     stages=(
         StagePipelineConfig(

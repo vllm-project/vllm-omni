@@ -79,7 +79,7 @@ def audio_chunk_pcm_bytes(omni_res: OmniRequestOutput) -> int:
     sample rather than recording a wrong byte count.
     """
     try:
-        final_res = omni_res.request_output
+        final_res = omni_res
         mm_output = final_res.outputs[0].multimodal_output
         audio_data = mm_output.get("audio")
         if isinstance(audio_data, list):
@@ -101,7 +101,7 @@ def audio_chunk_pcm_bytes(omni_res: OmniRequestOutput) -> int:
 def audio_chunk_sample_rate(omni_res: OmniRequestOutput) -> int:
     """Resolve audio sample rate for the request's audio stream."""
     try:
-        mm_output = omni_res.request_output.outputs[0].multimodal_output
+        mm_output = omni_res.outputs[0].multimodal_output
     except Exception:
         return _metric_defs.DEFAULT_AUDIO_SAMPLE_RATE
     return _metric_defs.resolve_audio_sample_rate(mm_output)

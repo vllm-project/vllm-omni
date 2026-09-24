@@ -55,7 +55,7 @@ if __name__ == "__main__":
     omni = Omni(model="Qwen/Qwen-Image")
     prompt = "a cup of coffee on the table"
     outputs = omni.generate(prompt)
-    images = outputs[0].request_output.images
+    images = outputs[0].images
     images[0].save("coffee.png")
 ```
 
@@ -88,8 +88,9 @@ python text_to_image.py \
 | `--vae-use-tiling` | flag | off | Enable VAE tiling for memory optimization |
 | `--cfg-parallel-size` | int | `1` | Set to `2` to enable CFG Parallel |
 | `--enable-cpu-offload` | flag | off | Enable CPU offloading for diffusion models |
-| `--lora-path` | str | — | Path to PEFT LoRA adapter folder |
+| `--lora-path` | str | — | Path to PEFT LoRA adapter folder or checkpoint file |
 | `--lora-scale` | float | `1.0` | Scale factor for LoRA weights |
+| `--lora-backend` | str |`"peft"`| LoRA backend for loading LoRA adapters. Default: peft. Available options: peft, distill |
 
 **NextStep-1.1 specific arguments:**
 
@@ -160,9 +161,11 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --output flux2-dev.png
 ```
 
-### Batch Requests (Multiple Prompts)
+### Multiple Prompts
 
-You can pass multiple prompts in a single `generate` call.
+You can pass multiple prompts in a single `generate` call. For diffusion
+pipelines, each prompt is submitted as a separate logical request; compatible
+requests may be automatically batched by the scheduler and runner.
 
 ```python
 from vllm_omni.entrypoints.omni import Omni
@@ -176,22 +179,13 @@ if __name__ == "__main__":
     ]
     outputs = omni.generate(prompts)
     for i, output in enumerate(outputs):
-        output.request_output.images[0].save(f"{i}.jpg")
+        output.images[0].save(f"{i}.jpg")
 ```
 
 !!! info
 
-    Not all models support batch inference, and batch requesting mostly does not provide significant
-    performance improvement. This feature is primarily for interface compatibility with vLLM and to
-    allow for future improvements.
-
-!!! info
-
-    For diffusion pipelines, the stage config field `stage_args.[].runtime.max_batch_size` is 1 by
-    default, and the input list is sliced into single-item requests before feeding into the diffusion
-    pipeline. For models that do internally support batched inputs, you can
-    [modify this configuration](https://github.com/vllm-project/vllm-omni/tree/main/configuration/stage_configs.md) to let the model accept a
-    longer batch of prompts.
+    For diffusion request-level batching controls such as `max_num_seqs`, see
+    [Diffusion Execution Modes](../../diffusion/execution_modes.md).
 
 ### Negative Prompts
 
@@ -213,7 +207,7 @@ if __name__ == "__main__":
         }
     ])
     for i, output in enumerate(outputs):
-        output.request_output.images[0].save(f"{i}.jpg")
+        output.images[0].save(f"{i}.jpg")
 ```
 
 You can also pass a negative prompt via the CLI argument `--negative-prompt`:

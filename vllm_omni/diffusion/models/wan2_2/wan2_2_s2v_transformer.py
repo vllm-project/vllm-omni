@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Wan2.2 Speech-to-Video (S2V) Transformer using vllm-omni ops.
 
@@ -32,7 +32,8 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
-from vllm_omni.diffusion.layers.rope import RotaryEmbeddingS2VGrid, RotaryEmbeddingWanS2V, WanS2VRotaryPosEmbed
+from vllm_omni.diffusion.layers.rope import RotaryEmbeddingS2VGrid
+from vllm_omni.diffusion.models.wan2_2.rope import RotaryEmbeddingWanS2V, WanS2VRotaryPosEmbed
 from vllm_omni.platforms import current_omni_platform
 
 from .wan2_2_transformer import DistributedRMSNorm, WanFeedForward
@@ -1359,11 +1360,9 @@ class WanS2VTransformer3DModel(nn.Module):
         return flatten_mot, mot_remb
 
     def process_motion_frame_pack(self, motion_latents, drop_motion_frames=False, add_last_motion=2):
-        flatten_mot, mot_remb = self.frame_packer(motion_latents, add_last_motion)
         if drop_motion_frames:
-            return [m[:, :0] for m in flatten_mot], [m[:, :0] for m in mot_remb]
-        else:
-            return flatten_mot, mot_remb
+            return [], []
+        return self.frame_packer(motion_latents, add_last_motion)
 
     def process_motion_transformer_motioner(self, motion_latents, drop_motion_frames=False, add_last_motion=True):
         batch_size = motion_latents.shape[0]
@@ -1499,18 +1498,27 @@ class WanS2VTransformer3DModel(nn.Module):
             dict with 'audio_emb' (and optionally 'audio_emb_global' when
             enable_adain is True).
         """
-        audio_input = torch.cat(
-            [audio_input[..., 0:1].repeat(1, 1, 1, motion_frames[0]), audio_input],
-            dim=-1,
-        )
-        audio_emb_res = self.casual_audio_encoder(audio_input)
-        result = {}
-        if self.enable_adain:
-            audio_emb_global, audio_emb = audio_emb_res
-            result["audio_emb_global"] = audio_emb_global[:, motion_frames[1] :]
-        else:
-            audio_emb = audio_emb_res
-        result["audio_emb"] = audio_emb[:, motion_frames[1] :, :]
+        # Under HSDP, this method is called outside the FSDP forward hook.
+        # Unshard root-managed params so casual_audio_encoder can run.
+        is_fsdp = hasattr(self, "unshard") and hasattr(self, "reshard")
+        if is_fsdp:
+            self.unshard()
+        try:
+            audio_input = torch.cat(
+                [audio_input[..., 0:1].repeat(1, 1, 1, motion_frames[0]), audio_input],
+                dim=-1,
+            )
+            audio_emb_res = self.casual_audio_encoder(audio_input)
+            result = {}
+            if self.enable_adain:
+                audio_emb_global, audio_emb = audio_emb_res
+                result["audio_emb_global"] = audio_emb_global[:, motion_frames[1] :]
+            else:
+                audio_emb = audio_emb_res
+            result["audio_emb"] = audio_emb[:, motion_frames[1] :, :]
+        finally:
+            if is_fsdp:
+                self.reshard()
         return result
 
     def forward(

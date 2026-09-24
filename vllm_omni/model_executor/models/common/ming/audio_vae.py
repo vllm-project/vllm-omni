@@ -138,8 +138,8 @@ class Encoder(nn.Module):
         self.norm = nn.LayerNorm(config.hidden_size)
         self.patch_size = patch_size
         if patch_size != -1:
-            aggregator_config = _qwen2_config({**encoder_args, "num_hidden_layers": 4})
-            self.aggregator = Qwen2Model(aggregator_config)
+            config.num_hidden_layers = 4
+            self.aggregator = Qwen2Model(config)
             self.cls_embed = nn.Parameter(torch.rand(1, 1, config.hidden_size))
             self.cls_embed.data.normal_(0, 0.02)
 
@@ -346,11 +346,9 @@ class AudioVAE(PreTrainedModel):
         h, _ = self.encoder(waveform)
         h = h.transpose(1, 2)
 
-        mean, logvar = torch.chunk(h, 2, dim=1)
-        logvar = torch.clamp(logvar, -30.0, 20.0)
-        std = torch.exp(0.5 * logvar)
-        latent = mean + std * torch.randn_like(mean)
-        latent = latent.transpose(1, 2)
+        mean, scale = torch.chunk(h, 2, dim=1)
+        std = F.softplus(scale) + 1e-4
+        latent = (mean + std * torch.randn_like(mean)).transpose(1, 2)
         return latent, frame_num
 
     @torch.inference_mode()

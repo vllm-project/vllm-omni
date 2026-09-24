@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import argparse
 from typing import Any
@@ -7,6 +7,29 @@ from typing import Any
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 UNSET = object()
+
+
+def build_shadow_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Build kwargs for the shadow argument with an ``UNSET`` default.
+
+    Actions that mutate their default in place (append/extend/append_const/
+    count) would crash on the bare ``UNSET`` sentinel, so they are remapped to
+    an equivalent store-style action; the shadow value only needs to flip away
+    from ``UNSET`` when the arg is passed explicitly.
+    """
+    shadow_kwargs = {**kwargs, "default": UNSET}
+    action = kwargs.get("action")
+
+    if action in ("append", "extend"):
+        shadow_kwargs["action"] = "store"
+
+    elif action in ("append_const", "count"):
+        shadow_kwargs["action"] = "store_const"
+
+        if action == "count":
+            shadow_kwargs["const"] = True
+
+    return shadow_kwargs
 
 
 class TrackingNamespace(argparse.Namespace):
@@ -29,12 +52,28 @@ class TrackingNamespace(argparse.Namespace):
         else:
             setattr(self.unfiltered_ns, name, value)
 
+    def __getstate__(self) -> dict[str, Any]:
+        """Preserve wrapper state when API workers use ``spawn``.
+
+        Our __dict__ property exposes the inner namespace, so default state
+        serialization would lose unfiltered_ns and explicit_keys.
+        """
+        return {
+            "unfiltered_ns": self.unfiltered_ns,
+            "explicit_keys": self.explicit_keys,
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        object.__setattr__(self, "unfiltered_ns", state["unfiltered_ns"])
+        object.__setattr__(self, "explicit_keys", state["explicit_keys"])
+
     def get_explicit_kwargs_dict(self):
         """Return a dict containing only the explicitly passed key-value pairs."""
         return {k: v for k, v in vars(self.unfiltered_ns).items() if k in self.explicit_keys}
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self.unfiltered_ns, name)
+        namespace = object.__getattribute__(self, "unfiltered_ns")
+        return getattr(namespace, name)
 
     @property
     def __dict__(self):
@@ -58,7 +97,7 @@ class TrackingGroup:
     def add_argument(self, *args: Any, **kwargs: Any) -> argparse.Action:
         """Add an argument to the real group and to the shadow group."""
         action = self._real.add_argument(*args, **kwargs)
-        default_kwargs = {**kwargs, "default": UNSET}
+        default_kwargs = build_shadow_kwargs(kwargs)
         self._shadow.add_argument(*args, **default_kwargs)
         return action
 
@@ -115,7 +154,7 @@ class TrackingArgumentParser(FlexibleArgumentParser):
     def add_argument(self, *args: Any, **kwargs: Any) -> argparse.Action:
         """Add an arg to the parser & the shadow, where the latter has UNSET for the default."""
         action = super().add_argument(*args, **kwargs)
-        shadow_kwargs = {**kwargs, "default": UNSET}
+        shadow_kwargs = build_shadow_kwargs(kwargs)
         self._shadow.add_argument(*args, **shadow_kwargs)
         return action
 

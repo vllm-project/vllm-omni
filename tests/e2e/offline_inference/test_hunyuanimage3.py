@@ -1,5 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # ruff: noqa: E501
+import copy
+import importlib.util
+import os
+import sys
 from collections.abc import Generator
+from pathlib import Path
 
 import pytest
 import torch
@@ -7,18 +15,37 @@ import torch.nn.functional as F
 from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
 
+from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
-from tests.helpers.stage_config import get_deploy_config_path
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni import Omni
+from vllm_omni.config.omni_config import (
+    VllmOmniARStageConfig,
+    VllmOmniDiffusionStageConfig,
+)
+from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt_tokens, resolve_stop_token_ids
+from vllm_omni.entrypoints.openai.stage_params import clone_sampling_params
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_extras import get_ar_input_builder, get_ar_tokenizer_validator, get_model_class_name
 from vllm_omni.platforms import current_omni_platform
 
 PROMPT = "A brown and white dog is running on the grass"
-MODEL_NAME = "tencent/HunyuanImage-3.0"
+MODEL_NAME = os.environ.get("HUNYUAN_IMAGE3_MODEL", "tencent/HunyuanImage-3.0-Instruct")
 LOCAL_CLIP_PATH = "openai/clip-vit-base-patch32"
-DEPLOY_CONFIG_PATH = get_deploy_config_path("hunyuan_image3.yaml")
+_PRODUCTION_DEPLOY_CONFIG_PATH = get_deploy_config_path("hunyuan_image_3_moe.yaml")
+# Keep the production Mooncake connector, but use its TCP transport for this
+# single-host test.  The shared server's RDMA device is not usable reliably;
+# TCP still exercises the Mooncake AR→DiT data plane without changing deploy
+# semantics in production.
+DEPLOY_CONFIG_PATH = modify_stage_config(
+    _PRODUCTION_DEPLOY_CONFIG_PATH,
+    updates={"connectors.rdma_connector.extra.protocol": "tcp"},
+)
 
-pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
+pytestmark = [
+    pytest.mark.advanced_model,
+    pytest.mark.diffusion,
+]
 
 # System prompt type. Options: None, dynamic, en_vanilla, en_recaption, en_think_recaption, en_unified
 # Below are the CLIP embedding tensors from the official HunyuanImage model (seed=1234, prompt: "A brown and white dog is running on the grass").
@@ -275,29 +302,102 @@ def omni() -> Generator[Omni, None, None]:
         MODEL_NAME,
         deploy_config=str(DEPLOY_CONFIG_PATH),
         mode="text-to-image",
+        trust_remote_code=True,
     ) as runner:
         yield runner.omni
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 4, reason="Need at least 4 CUDA GPUs for this test.")
+@hardware_test(res={"cuda": "H100"}, num_cards=4)
+def test_structured_mixed_pipeline_config_reaches_runtime(omni: Omni) -> None:
+    """Mixed-pipeline deploy settings reach both terminal engine configs."""
+    engine = omni.engine
+
+    # Topology, connector selection, and placement remain Omni-owned.
+    resolved_stages = engine.stage_configs
+    assert len(resolved_stages) == 2
+    ar_stage, diffusion_stage = resolved_stages
+    assert isinstance(ar_stage, VllmOmniARStageConfig)
+    assert ar_stage.stage_id == 0
+    assert ar_stage.model_stage == "AR"
+    assert ar_stage.final_output_type == "text"
+    assert ar_stage.runtime_config.devices == "0,1"
+    assert ar_stage.connector_config.output_connectors == {"to_stage_1": "rdma_connector"}
+    assert isinstance(diffusion_stage, VllmOmniDiffusionStageConfig)
+    assert diffusion_stage.stage_id == 1
+    assert diffusion_stage.model_stage == "dit"
+    assert diffusion_stage.final_output_type == "image"
+    assert diffusion_stage.input_sources == [0]
+    assert diffusion_stage.runtime_config.devices == "2,3"
+    assert diffusion_stage.connector_config.input_connectors == {"from_stage_0": "rdma_connector"}
+
+    # Stage 0 is materialized as the VllmConfig actually passed to its engine.
+    ar_vllm_config, diffusion_vllm_config = engine.stage_vllm_configs
+    assert ar_vllm_config is not None
+    assert diffusion_vllm_config is None
+    assert ar_vllm_config.model_config.enforce_eager is True
+    assert ar_vllm_config.model_config.trust_remote_code is True
+    assert ar_vllm_config.parallel_config.tensor_parallel_size == 2
+    assert ar_vllm_config.scheduler_config.max_num_seqs == 1
+    assert ar_vllm_config.scheduler_config.max_num_batched_tokens == 32768
+    assert ar_vllm_config.cache_config.gpu_memory_utilization == 0.95
+    ar_omni_config = ar_vllm_config.model_config.omni_config
+    assert ar_omni_config.omni_kv_config["need_send_cache"] is True
+
+    expected_ar_sampling = {
+        "temperature": 0.0,
+        "top_p": 1,
+        "top_k": -1,
+        "max_tokens": 8192,
+        "detokenize": True,
+        "skip_special_tokens": False,
+        "include_stop_str_in_output": True,
+    }
+    ar_sampling, diffusion_sampling = engine.default_sampling_params_list
+    assert all(getattr(ar_sampling, name) == value for name, value in expected_ar_sampling.items())
+    assert diffusion_sampling.num_inference_steps == 50
+    assert diffusion_sampling.guidance_scale == 0
+
+    # Stage 1 is a diffusion engine, so its terminal owner is the launched
+    # OmniDiffusionConfig rather than a VllmConfig.
+    od_config = omni.get_diffusion_od_config()
+    assert od_config is not None
+    assert od_config.model == MODEL_NAME
+    assert od_config.enforce_eager is True
+    assert od_config.distributed_executor_backend == "mp"
+    assert od_config.parallel_config.tensor_parallel_size == 2
+    assert od_config.parallel_config.enable_expert_parallel is True
+    assert od_config.max_num_seqs == 1
+    diffusion_kv = od_config.omni_kv_config
+    assert diffusion_kv["need_recv_cache"] is True
+    assert diffusion_kv["enable_kv_async_prefetch"] is True
+    assert diffusion_kv["kv_prefetch_min_free_mem_ratio"] == 0.2
 
 
 def _extract_generated_image(outputs: list[object]) -> Image.Image:
     if not outputs:
         raise AssertionError("No outputs were returned from Omni.generate()")
 
-    first_output = outputs[0]
-    if images := getattr(first_output, "images", None):
-        return images[0]
-
-    request_output = getattr(first_output, "request_output", None)
-    if request_output is not None and (images := getattr(request_output, "images", None)):
-        return images[0]
+    for output in outputs:
+        if images := getattr(output, "images", None):
+            return images[0]
+        multimodal_output = getattr(output, "multimodal_output", None)
+        if isinstance(multimodal_output, dict) and (images := multimodal_output.get("images")):
+            return images[0]
 
     raise AssertionError("No generated image found in Omni output")
 
 
 def extract_embedding(image: Image.Image, clip_model: CLIPModel, clip_processor: CLIPProcessor) -> torch.Tensor:
-    inputs = clip_processor(images=image.convert("RGB"), return_tensors="pt")
+    # The full CLIP forward API is stable across supported Transformers
+    # versions, but it expects text inputs as well as pixels.  An empty text
+    # prompt is sufficient when only the projected image embedding is needed.
+    inputs = clip_processor(text=[""], images=[image.convert("RGB")], return_tensors="pt", padding=True)
     with torch.inference_mode():
-        features = clip_model.get_image_features(**inputs)
+        # Use the public CLIP forward output, matching the shared CLIPScorer
+        # helper.  ``get_image_features`` changed from Tensor to
+        # BaseModelOutputWithPooling in Transformers 5.x.
+        features = clip_model(**inputs).image_embeds
         features = F.normalize(features, p=2, dim=-1)
     return features.squeeze(0)
 
@@ -314,20 +414,49 @@ def compare_semantic(
 
 
 def _generate_image(omni: Omni, use_system_prompt: str | None) -> Image.Image:
-    generator_device = current_omni_platform.device_type or "cuda"
-    sampling_params = OmniDiffusionSamplingParams(
-        seed=1234,
-        generator=torch.Generator(device=generator_device).manual_seed(1234),
-        num_outputs_per_prompt=1,
-    )
-    if use_system_prompt is not None:
-        sampling_params.extra_args = {"use_system_prompt": use_system_prompt}
+    from transformers import AutoTokenizer
 
-    outputs = omni.generate({"prompt": PROMPT}, sampling_params)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    prompt_tokens = build_prompt_tokens(
+        PROMPT,
+        tokenizer,
+        task="t2i",
+        bot_task="think",
+        sys_type=use_system_prompt or "None",
+    )
+    stop_token_ids = resolve_stop_token_ids(task="t2i", bot_task="think", tokenizer=tokenizer, image_size="1024x1024")
+    params_list = copy.deepcopy(omni.default_sampling_params_list)
+    generator_device = current_omni_platform.device_type or "cuda"
+    for params in params_list:
+        if isinstance(params, OmniDiffusionSamplingParams):
+            params.seed = 1234
+            params.generator = torch.Generator(device=generator_device).manual_seed(1234)
+            params.num_outputs_per_prompt = 1
+        elif hasattr(params, "stop_token_ids"):
+            params.stop_token_ids = stop_token_ids
+
+    prompt = {
+        "prompt": PROMPT,
+        "prompt_token_ids": prompt_tokens.token_ids,
+        "use_system_prompt": prompt_tokens.system_prompt_type,
+        "modalities": ["image"],
+        "height": 1024,
+        "width": 1024,
+    }
+    outputs = omni.generate(prompt, params_list)
     return _extract_generated_image(outputs)
 
 
-@pytest.mark.skipif(torch.accelerator.device_count() < 8, reason="Need at least 8 CUDA GPUs for this test.")
+# A floor for "this is recognizably the same generation" against each
+# case's precomputed reference embedding, not a quality bar -- catches a
+# gross migration regression (wrong/blank/garbage image, or the wrong
+# system prompt applied) without being flaky on run-to-run sampling noise.
+# Matches the threshold test_shared_script_ar_path_reaches_generation uses
+# for its own (seed=1234, en_recaption) comparison below.
+MIN_SEMANTIC_SIMILARITY = 0.5
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 4, reason="Need at least 4 CUDA GPUs for this test.")
 @pytest.mark.parametrize("system_prompt_name,use_system_prompt,expected_embedding", SYSTEM_PROMPT_CASES)
 def test_system_prompt_scores(
     omni: Omni,
@@ -341,3 +470,109 @@ def test_system_prompt_scores(
     score = compare_semantic(expected_embedding, generated_image, clip_model, clip_processor)
 
     print(f"{system_prompt_name}: CLIP cosine similarity = {score:.6f}")
+    assert score >= MIN_SEMANTIC_SIMILARITY, (
+        f"{system_prompt_name}: CLIP similarity {score:.4f} is below "
+        f"{MIN_SEMANTIC_SIMILARITY} against the reference (seed=1234) embedding -- "
+        "the migrated path may have diverged from the reference HunyuanImage-3.0 "
+        f"output for use_system_prompt={use_system_prompt!r}."
+    )
+
+
+def _load_text_to_image_module():
+    """Dynamically load the shared example script by file path (``examples/``
+    is not an installed package) so this test can call its real
+    ``_apply_ar_stage_inputs`` instead of re-implementing its logic."""
+    repo_root = Path(__file__).resolve().parents[3]
+    path = repo_root / "examples/offline_inference/text_to_image/text_to_image.py"
+    spec = importlib.util.spec_from_file_location("_e2e_shared_text_to_image", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 4, reason="Need at least 4 CUDA GPUs for this test.")
+def test_shared_script_ar_path_reaches_generation(
+    omni: Omni,
+    clip_bundle: tuple[CLIPModel, CLIPProcessor],
+) -> None:
+    """Exercise the path this PR actually migrates HunyuanImage-3.0 onto:
+
+        get_model_class_name -> get_ar_input_builder -> _apply_ar_stage_inputs
+        -> Omni.generate()
+
+    using the *real* model_extras registry lookup (keyed on the engine's
+    live ``model_class_name``) and the shared ``text_to_image.py``'s own
+    helper -- not the hand-constructed ``sampling_params.extra_args`` that
+    ``_generate_image``/``test_system_prompt_scores`` above use, which never
+    touch the registry or the AR-tokenizer-loading path at all. This is the
+    one gap those tests leave: a regression in the registry key (the bug
+    this PR fixes), in ``_apply_ar_stage_inputs``, or in the
+    ``ar_tokenizer_validator`` wiring would not fail any of them.
+
+    Reuses the ``en_recaption`` reference embedding from
+    ``test_system_prompt_scores`` so this also asserts the migrated path
+    produces the *same* output as the hand-constructed one, not just "didn't
+    crash."
+    """
+    text_to_image = _load_text_to_image_module()
+    clip_model, clip_processor = clip_bundle
+
+    model_class_name = get_model_class_name(omni)
+    ar_input_builder = get_ar_input_builder(model_class_name)
+    assert ar_input_builder is not None, (
+        f"get_ar_input_builder({model_class_name!r}) returned None for the running "
+        "engine -- this is exactly the registry-key regression this PR fixes "
+        "(spec registered under the wrong model_class_name), and it would "
+        "silently skip AR-stage input building entirely."
+    )
+
+    generator_device = current_omni_platform.device_type or "cuda"
+    diffusion_params = OmniDiffusionSamplingParams(
+        seed=1234,
+        generator=torch.Generator(device=generator_device).manual_seed(1234),
+        num_outputs_per_prompt=1,
+    )
+    defaults = list(omni.default_sampling_params_list or [])
+    sampling_params_list = [clone_sampling_params(p) for p in defaults]
+    for idx, params in enumerate(sampling_params_list):
+        if isinstance(params, OmniDiffusionSamplingParams):
+            sampling_params_list[idx] = diffusion_params
+
+    prompt_dict: dict[str, object] = {"prompt": PROMPT, "modalities": ["image"]}
+    text_to_image._apply_ar_stage_inputs(
+        ar_input_builder,
+        model=MODEL_NAME,
+        prompt_text=PROMPT,
+        extra_body={"use_system_prompt": "en_recaption"},
+        num_images=0,
+        height=None,
+        width=None,
+        prompt_dict=prompt_dict,
+        sampling_params_list=sampling_params_list,
+        trust_remote_code=True,
+        # validate_special_token_ids now tolerates tokens the loaded tokenizer
+        # doesn't recognize at all (unk_token_id) instead of requiring every
+        # entry in HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS to be present, so this is
+        # safe against MODEL_NAME's base checkpoint missing the Instruct-only
+        # <img_ratio_33>/<img_ratio_36> tokens. Wiring it here exercises the
+        # real production path (get_ar_tokenizer_validator via the registry),
+        # not just the isolated fake-tokenizer coverage in test_hunyuan_image3_prompt_utils.py
+        # / test_shared_script_ar_integration.py.
+        validate_tokenizer=get_ar_tokenizer_validator(model_class_name),
+    )
+
+    outputs = omni.generate(prompt_dict, sampling_params_list=sampling_params_list)
+    generated_image = _extract_generated_image(outputs)
+    score = compare_semantic(SYSTEM_EN_RECAPTION, generated_image, clip_model, clip_processor)
+    print(f"shared-script AR path (en_recaption): CLIP cosine similarity = {score:.6f}")
+    # test_system_prompt_scores now asserts this same (seed=1234, en_recaption)
+    # case through the hand-constructed extra_args path against the same
+    # module-level MIN_SEMANTIC_SIMILARITY floor, so this reuses it too rather
+    # than picking an independent threshold for the same comparison.
+    assert score >= MIN_SEMANTIC_SIMILARITY, (
+        f"shared-script AR path (en_recaption) CLIP similarity {score:.4f} is below "
+        f"{MIN_SEMANTIC_SIMILARITY} -- the migrated get_ar_input_builder path may have "
+        "diverged from the reference HunyuanImage-3.0 output for this prompt/system-prompt."
+    )

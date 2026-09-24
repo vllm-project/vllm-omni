@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from functools import cached_property
@@ -6,7 +9,6 @@ from pathlib import Path
 import regex as re
 import torch
 import torch.nn as nn
-from huggingface_hub import hf_hub_download
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal
@@ -28,6 +30,7 @@ from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_generation im
     VoxtralTTSMultiModalProcessor,
     VoxtralTTSProcessingInfo,
 )
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 logger = init_logger(__name__)
 
@@ -45,10 +48,12 @@ def parse_batched_audio_input(input_ids: torch.Tensor, num_codebooks: int) -> tu
     """
     all_audio_tokens: list[torch.Tensor] = []
     all_ctx_frames: list[int] = []
+    # One D2H copy up-front avoids 2 syncs per request inside the loop.
+    header_view = input_ids.cpu() if input_ids.is_cuda else input_ids
     offset = 0
     while offset < input_ids.numel():
-        ctx_frames = int(input_ids[offset].item())
-        context_length = int(input_ids[offset + 1].item())
+        ctx_frames = int(header_view[offset])
+        context_length = int(header_view[offset + 1])
         offset += 2
 
         req_input_ids_length = (ctx_frames + context_length) * num_codebooks
@@ -131,7 +136,7 @@ class VoxtralTTSForConditionalGeneration(
                 self.voice_to_embedding = {}
                 for sid in speaker_id:
                     if self.is_hf_model:
-                        path = hf_hub_download(repo_id=self.repo_id, filename=f"voice_embedding/{sid}.pt")
+                        path = hf_api().hf_hub_download(repo_id=self.repo_id, filename=f"voice_embedding/{sid}.pt")
                     else:
                         path = Path(self.repo_id) / "voice_embedding" / f"{sid}.pt"
                     if Path(path).exists():
@@ -155,6 +160,9 @@ class VoxtralTTSForConditionalGeneration(
                 architectures=["VoxtralTTSAudioTokenizer"],
             )
             self.model = self.audio_tokenizer
+            # forward() returns a runtime-length per-request list; FULL CUDAGraphWrapper
+            # would freeze that length at capture.
+            self.supports_cudagraph_full = False
         else:
             raise ValueError("Invalid model stage")
 
@@ -165,6 +173,11 @@ class VoxtralTTSForConditionalGeneration(
         if hasattr(self.model, "get_language_model"):
             return self.model.get_language_model()
         return self.model
+
+    def encoder_loaded(self):
+        if self.audio_tokenizer is not None:
+            return self.audio_tokenizer.encoder_loaded
+        return False
 
     def _enable_acoustic_transformer_cudagraph(self):
         """Initialize and capture CUDA graphs for compute_mm_logits."""
@@ -197,17 +210,33 @@ class VoxtralTTSForConditionalGeneration(
             return self.model.sampler
         return Sampler()
 
+    @staticmethod
+    def _is_prefill_step(info_dict: Mapping[str, object], input_ids: torch.Tensor) -> bool:
+        is_prefill_raw = info_dict.get("_omni_is_prefill")
+        if isinstance(is_prefill_raw, bool):
+            return is_prefill_raw
+        try:
+            return int(info_dict["_omni_num_computed_tokens"]) < int(info_dict["_omni_prompt_len"])
+        except (KeyError, TypeError, ValueError):
+            return input_ids.shape[0] > 1
+
     def tts_preprocess(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict | None):
         self.post_process_idx = 0
-        audio_tokens = info_dict.pop("audio", None)
+        codes = info_dict.get("codes")
+        audio_tokens = codes.get("audio") if isinstance(codes, Mapping) else None
+        if audio_tokens is None:
+            # Backward compatible with request state written before #4527 moved
+            # Voxtral TTS feedback frames under ``codes.audio``.
+            audio_tokens = info_dict.pop("audio", None)
         if audio_tokens is not None:
             kwargs = {"audio_tokens": audio_tokens.to(input_ids.device)}
             multimodal_embeddings = self.model.embed_multimodal(**kwargs)
             if input_ids[0] == self._audio_token_id:
                 input_embeds = multimodal_embeddings[0]
             return input_ids, input_embeds, info_dict
-        voice = info_dict.pop("voice", None)
-        if voice is not None:
+        voice = info_dict.get("voice")
+        if voice is not None and self._is_prefill_step(info_dict, input_ids):
+            voice = info_dict.pop("voice")
             if isinstance(voice, list):
                 voice = voice[0]
             multimodal_embeddings = self.voice_to_embedding[voice].to(input_ids.device).clone().detach()
@@ -220,12 +249,15 @@ class VoxtralTTSForConditionalGeneration(
 
     def tts_postprocess(self, hidden_states: torch.Tensor, multimodal_outputs: object, **info_dict: object | None):
         update_dict = {}
-        if isinstance(multimodal_outputs, Mapping) and "audio" in multimodal_outputs:
-            assert self.post_process_idx < len(multimodal_outputs["audio"]), (
-                f"Expect {self.post_process_idx=} < {len(multimodal_outputs['audio'])=}"
-            )
-            update_dict["audio"] = multimodal_outputs["audio"][self.post_process_idx]
-            self.post_process_idx += 1
+        if isinstance(multimodal_outputs, Mapping):
+            codes = multimodal_outputs.get("codes")
+            if isinstance(codes, Mapping) and "audio" in codes:
+                audio_frames = codes["audio"]
+                assert self.post_process_idx < len(audio_frames), (
+                    f"Expect {self.post_process_idx=} < {len(audio_frames)=}"
+                )
+                update_dict["codes"] = {"audio": audio_frames[self.post_process_idx]}
+                self.post_process_idx += 1
         return update_dict
 
     def embed_input_ids(

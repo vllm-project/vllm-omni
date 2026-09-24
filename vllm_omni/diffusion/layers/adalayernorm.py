@@ -70,14 +70,6 @@ class AdaLayerNorm(CustomOp):
 
         return output
 
-    def forward_xpu(
-        self,
-        x: torch.Tensor,
-        scale: torch.Tensor,
-        shift: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.forward_native(x, scale, shift)
-
     def forward_native(
         self,
         x: torch.Tensor,

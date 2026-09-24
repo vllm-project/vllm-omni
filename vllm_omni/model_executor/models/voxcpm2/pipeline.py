@@ -15,6 +15,7 @@ from vllm_omni.config.stage_config import (
 
 VOXCPM2_PIPELINE = PipelineConfig(
     model_type="voxcpm2",
+    default_deploy_config_name="voxcpm2.yaml",
     model_arch="VoxCPM2TalkerForConditionalGeneration",
     stages=(
         StagePipelineConfig(
@@ -26,6 +27,7 @@ VOXCPM2_PIPELINE = PipelineConfig(
             final_output_type="audio",
             owns_tokenizer=True,
             engine_output_type="audio",
+            scheduler_cls="vllm_omni.model_executor.models.voxcpm2.scheduler.VoxCPM2OmniARAsyncScheduler",
             sampling_constraints={
                 "detokenize": False,
                 "stop_token_ids": [1],

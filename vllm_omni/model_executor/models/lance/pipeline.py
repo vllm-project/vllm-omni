@@ -15,6 +15,7 @@ from vllm_omni.config.stage_config import (
 
 LANCE_PIPELINE = PipelineConfig(
     model_type="lance",
+    default_deploy_config_name="lance.yaml",
     model_arch="LancePipeline",
     hf_architectures=(),
     stages=(

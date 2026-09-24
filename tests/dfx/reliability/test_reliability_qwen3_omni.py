@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Qwen3-Omni reliability integration tests.
 """
@@ -63,7 +66,7 @@ DEPLOY_CONFIGS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "vll
 
 def _default_oom_device_spec() -> str:
     """Use currently visible CUDA ordinals to avoid invalid device index in sidecar."""
-    count = torch.accelerator.device_count()
+    count = torch.accelerator.device_count() or 0
     if count <= 0:
         return "0"
     return ",".join(str(i) for i in range(count))
@@ -71,7 +74,7 @@ def _default_oom_device_spec() -> str:
 
 OOM_INJECTION_CONFIG = {
     "device": _default_oom_device_spec(),
-    "target_mem_ratio": 0.92,
+    "target_mem_ratio": 0.95,
     "hold_seconds": 0,
     "startup_timeout_sec": 20,
     "strict": False,
@@ -241,12 +244,12 @@ def _fault_keywords_match_response(*, status: int, body: bytes) -> bool:
     return any(key in text for key in body_fault_hints)
 
 
-def _stage_config_path_from_omni_server(omni_server: _HasServeArgs) -> str | None:
+def _deploy_config_path_from_omni_server(omni_server: _HasServeArgs) -> str | None:
     args: list[str] = omni_server.serve_args
     for i, arg in enumerate(args):
-        if arg == "--stage-configs-path" and i + 1 < len(args):
+        if arg == "--deploy-config" and i + 1 < len(args):
             return args[i + 1]
-        if arg.startswith("--stage-configs-path="):
+        if arg.startswith("--deploy-config="):
             return arg.split("=", 1)[1]
     return None
 
@@ -315,11 +318,32 @@ def _assert_post_fault_health_terminal(host: str, port: int, *, scenario: str) -
     pytest.fail(f"[{scenario} health] no terminal post-fault health observed: {last_observation}")
 
 
+def _assert_server_alive_after_fault(host: str, port: int, *, scenario: str) -> None:
+    """#4285: a single-stage engine death must NOT take down the API server.
+
+    The process must stay up and keep answering /health (503 is acceptable —
+    errored but listening). A connection-refused means the server process
+    exited, which is the bug this fix closes.
+    """
+    deadline = time.monotonic() + 15.0
+    responded = False
+    while time.monotonic() < deadline:
+        try:
+            status, _ = get_health_raw(host, port, timeout_sec=5)
+            responded = True
+            assert status in (200, 503), f"[{scenario} alive] unexpected /health status={status}"
+        except Exception as exc:  # noqa: BLE001
+            if _looks_like_server_unreachable(exc):
+                pytest.fail(f"[{scenario} alive] server exited after single-stage OOM (#4285): {exc!r}")
+            raise
+        time.sleep(0.5)
+    assert responded, f"[{scenario} alive] /health never responded after fault"
+
+
 QWEN_PARAMS = create_reliability_omni_server_params(RELIABILITY_SCENARIOS, DEPLOY_CONFIGS_DIR)
 
 
 @pytest.mark.slow
-@pytest.mark.skip(reason="issue#4285")
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
@@ -331,7 +355,7 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
     """
     device_spec = resolve_oom_device_spec(
         OOM_INJECTION_CONFIG,
-        _stage_config_path_from_omni_server(omni_server_function),
+        _deploy_config_path_from_omni_server(omni_server_function),
     )
     handle = inject_gpu_oom(
         device=device_spec,
@@ -386,15 +410,17 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
     assert "code" in chat_error, f"chat error lacks code field: {chat_error!r}"
     assert "code" in speech_error, f"speech error lacks code field: {speech_error!r}"
 
+    # #4285: a single dead stage must not take the whole API server down.
+    _assert_server_alive_after_fault(host, port, scenario="oom_contract")
+
 
 @pytest.mark.slow
-@pytest.mark.skip(reason="issue#4285")
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
-def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_function, openai_client_function) -> None:
+def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_function, online_client_function) -> None:
     device_spec = resolve_oom_device_spec(
         OOM_INJECTION_CONFIG,
-        _stage_config_path_from_omni_server(omni_server_function),
+        _deploy_config_path_from_omni_server(omni_server_function),
     )
     handle = inject_gpu_oom(
         device=device_spec,
@@ -421,7 +447,7 @@ def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_functi
             "key_words": {"audio": ["test"]},
         }
         try:
-            openai_client_function.send_omni_request(request_config, request_num=1)
+            online_client_function.send_omni_request(request_config, request_num=1)
         except Exception as exc:
             assert_fault_exception(exc, FAULT_ERROR_KEYWORDS)
         else:
@@ -431,13 +457,12 @@ def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_functi
 
 
 @pytest.mark.slow
-@pytest.mark.skip(reason="issue#4285")
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
-def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_function, openai_client_function) -> None:
+def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_function, online_client_function) -> None:
     device_spec = resolve_oom_device_spec(
         OOM_INJECTION_CONFIG,
-        _stage_config_path_from_omni_server(omni_server_function),
+        _deploy_config_path_from_omni_server(omni_server_function),
     )
     handle = inject_gpu_oom(
         device=device_spec,
@@ -465,7 +490,7 @@ def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_funct
             "key_words": {"audio": ["test"]},
         }
         try:
-            openai_client_function.send_omni_request(request_config, request_num=4)
+            online_client_function.send_omni_request(request_config, request_num=4)
         except Exception as exc:
             assert_fault_exception(exc, FAULT_ERROR_KEYWORDS)
         else:
@@ -483,7 +508,7 @@ def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_funct
 )
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_request_failure(
-    omni_server_after_fault_function, openai_client_function
+    omni_server_after_fault_function, online_client_function
 ) -> None:
     messages = dummy_messages_from_mix_data(
         system_prompt=_get_system_prompt(),
@@ -497,7 +522,7 @@ def test_reliability_fault_process_kill_request_failure(
         "key_words": {"text": ["beijing"]},
     }
     try:
-        openai_client_function.send_omni_request(request_config, request_num=1)
+        online_client_function.send_omni_request(request_config, request_num=1)
     except Exception as exc:
         assert_fault_exception(exc, PROCESS_KILL_ERROR_KEYWORDS)
     else:
@@ -545,7 +570,7 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
         assert elapsed <= _PROCESS_KILL_WORKER_CHAT_FF_MAX_ELAPSED_SEC + 1.0, (
             f"[process_kill fast_fail] request did not fail fast after fault: {elapsed:.2f}s"
         )
-        assert ff_status >= 500, (
+        assert ff_status is not None and ff_status >= 500, (
             f"[process_kill fast_fail] expected server-side failure after fault, "
             f"got status={ff_status}, body={ff_body[:200]!r}"
         )
@@ -630,13 +655,13 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_worker_with_load_request_failure(
     omni_server_function,
-    openai_client_function,
+    online_client_function,
     fault_injector: FaultInjector,
 ) -> None:
     request_config = _chat_request_config(omni_server_function)
     scenario = "kill_worker_with_load"
     load_result = run_fault_injection_with_rate_load(
-        submit_request=lambda: openai_client_function.send_omni_request(request_config, request_num=1),
+        submit_request=lambda: online_client_function.send_omni_request(request_config, request_num=1),
         inject_fault=lambda: fault_injector(omni_server_function),
         num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
         request_rate=INFLIGHT_INJECTION_REQUEST_RATE,
@@ -682,14 +707,14 @@ def test_reliability_fault_process_kill_serve_root_no_load_fast_fail_and_cleanup
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_serve_root_with_load_fast_fail_and_cleanup(
     omni_server_function,
-    openai_client_function,
+    online_client_function,
     signal_name: str,
 ) -> None:
     request_config = _chat_request_config(omni_server_function)
     scenario = f"kill_serve_root_with_load_{signal_name.lower()}"
     injector = make_server_root_kill_fault_injector(signal_name=signal_name, post_kill_wait_seconds=2.0)
     load_result = run_fault_injection_with_rate_load(
-        submit_request=lambda: openai_client_function.send_omni_request(request_config, request_num=1),
+        submit_request=lambda: online_client_function.send_omni_request(request_config, request_num=1),
         inject_fault=lambda: injector(omni_server_function),
         num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
         request_rate=INFLIGHT_INJECTION_REQUEST_RATE,
@@ -742,7 +767,7 @@ def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
     omni_server_function,
-    openai_client_function,
+    online_client_function,
     signal_name: str,
 ) -> None:
     request_config = _chat_request_config(omni_server_function)
@@ -753,7 +778,7 @@ def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
         inter_kill_wait_seconds=0.1,
     )
     load_result = run_fault_injection_with_rate_load(
-        submit_request=lambda: openai_client_function.send_omni_request(request_config, request_num=1),
+        submit_request=lambda: online_client_function.send_omni_request(request_config, request_num=1),
         inject_fault=lambda: injector(omni_server_function),
         num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
         request_rate=INFLIGHT_INJECTION_REQUEST_RATE,
@@ -774,7 +799,11 @@ def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
 
 
 @pytest.mark.slow
-@pytest.mark.skip(reason="issue#4285")
+@pytest.mark.skip(
+    reason="needs request-scoped OOM recovery: under transient pressure the stage "
+    "EngineCore still dies and is evicted (not respawned), so the engine does not "
+    "recover after the hog stops. Out of scope for the #4285 fault-isolation fix."
+)
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
@@ -791,7 +820,7 @@ def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
     """
     device_spec = resolve_oom_device_spec(
         OOM_RECOVER_INJECTION_CONFIG,
-        _stage_config_path_from_omni_server(omni_server_function),
+        _deploy_config_path_from_omni_server(omni_server_function),
     )
     handle = inject_gpu_oom(
         device=device_spec,

@@ -27,8 +27,6 @@ connectors:
       memory_pool_device: "npu"
   shared_memory_connector:
     name: SharedMemoryConnector
-    extra:
-      shm_threshold_bytes: 65536
 
 stages:
   - stage_id: 0
@@ -62,7 +60,7 @@ stages:
       max_tokens: 8192
       detokenize: true
       skip_special_tokens: false
-      include_stop_str_in_output: true,
+      include_stop_str_in_output: true
 
   - stage_id: 1
     max_num_seqs: 1
@@ -71,6 +69,8 @@ stages:
     distributed_executor_backend: "mp"
     omni_kv_config:
       need_recv_cache: true
+      enable_kv_async_prefetch: true
+      kv_prefetch_min_free_mem_ratio: 0.2
     parallel_config:
       tensor_parallel_size: 2
       enable_expert_parallel: true
@@ -106,11 +106,14 @@ platforms:
 
   xpu:
     stages:
+      # Both stages stay resident, so they cannot share cards.
       - stage_id: 0
         gpu_memory_utilization: 0.95
-        devices: "0,1,2,3,4,5,6,7"
-        tensor_parallel_size: 8
-        max_num_batched_tokens: 32784
+        devices: "0,1,2,3"
+        tensor_parallel_size: 4
+        # fp8 AR weights leave under 1 GiB for KV; 22800 tokens will not fit.
+        max_num_batched_tokens: 8192
+        max_model_len: 8192
         quantization: fp8
         enable_expert_parallel: true
         worker_cls: vllm_omni.platforms.xpu.worker.xpu_ar_worker.XPUARWorker
@@ -120,12 +123,12 @@ platforms:
           repetition_penalty: 1.1
       - stage_id: 1
         gpu_memory_utilization: 0.9
-        devices: "0,1,2,3,4,5,6,7"
+        devices: "4,5,6,7"
         quantization: fp8
         parallel_config:
           pipeline_parallel_size: 1
           data_parallel_size: 1
-          tensor_parallel_size: 8
+          tensor_parallel_size: 4
           enable_expert_parallel: true
           sequence_parallel_size: 1
           ulysses_degree: 1

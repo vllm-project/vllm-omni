@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -36,6 +36,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +121,7 @@ class MistralEncoderAttention(nn.Module):
         num_kv_heads: int,
         head_dim: int,
         prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -140,6 +144,7 @@ class MistralEncoderAttention(nn.Module):
             total_num_heads=num_heads,
             total_num_kv_heads=num_kv_heads,
             bias=False,
+            quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
 
@@ -147,6 +152,7 @@ class MistralEncoderAttention(nn.Module):
             input_size=num_heads * head_dim,
             output_size=hidden_size,
             bias=False,
+            quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -194,18 +200,21 @@ class MistralEncoderMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=hidden_size,
             output_sizes=[intermediate_size, intermediate_size],
             bias=False,
+            quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
             input_size=intermediate_size,
             output_size=hidden_size,
             bias=False,
+            quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
         )
         self.act_fn = SiluAndMul()
@@ -227,6 +236,7 @@ class MistralEncoderLayer(nn.Module):
         intermediate_size: int,
         rms_norm_eps: float,
         prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         self.self_attn = MistralEncoderAttention(
@@ -235,11 +245,13 @@ class MistralEncoderLayer(nn.Module):
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             prefix=f"{prefix}.self_attn",
+            quant_config=quant_config,
         )
         self.mlp = MistralEncoderMLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             prefix=f"{prefix}.mlp",
+            quant_config=quant_config,
         )
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
@@ -295,7 +307,12 @@ class MistralEncoderModel(nn.Module):
     parallel layers for TP but simple SDPA for attention (no PagedAttention).
     """
 
-    def __init__(self, config: PretrainedConfig, prefix: str = ""):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
+    ):
         super().__init__()
         self._processor = None
         self._system_message_t2i: str | None = None
@@ -339,6 +356,7 @@ class MistralEncoderModel(nn.Module):
         m = self.language_model.model
 
         m.embed_tokens = VocabParallelEmbedding(self.vocab_size, self.hidden_size)
+        layer_prefix_root = f"{prefix}.language_model.model.layers" if prefix else "language_model.model.layers"
 
         m.layers = nn.ModuleList(
             [
@@ -349,7 +367,8 @@ class MistralEncoderModel(nn.Module):
                     head_dim=self.head_dim,
                     intermediate_size=self.intermediate_size,
                     rms_norm_eps=self.rms_norm_eps,
-                    prefix=f"language_model.model.layers.{i}",
+                    prefix=f"{layer_prefix_root}.{i}",
+                    quant_config=quant_config,
                 )
                 for i in range(self.num_layers)
             ]

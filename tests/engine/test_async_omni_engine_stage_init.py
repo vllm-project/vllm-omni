@@ -1,22 +1,97 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+import concurrent.futures
 import contextlib
 import importlib
+import json
 import os
+import threading
 import time
 import types
+from dataclasses import dataclass, field
 
 import pytest
+from omegaconf import OmegaConf
+from vllm.v1.engine.utils import EngineZmqAddresses
 
-from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+from tests.helpers.mock import patch_hf_snapshot_download
+from vllm_omni.config.omni_config import OmniStageRuntimeConfig
+from vllm_omni.diffusion.data import AttentionConfig
+from vllm_omni.engine import omni_engine_base as async_omni_engine_module
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.engine.stage_engine_startup import StageReplicaResources
 from vllm_omni.engine.stage_init_utils import (
     LogicalStageInitPlan,
     ReplicaInitPlan,
     build_stage0_input_processor,
     compute_replica_layout,
+    split_devices_for_replicas,
+    stage_runtime_env,
 )
 from vllm_omni.engine.stage_runtime import StageRuntime
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@dataclass
+class _FakeParallelConfig:
+    enable_fault_tolerance: bool = False
+    enable_elastic_ep: bool = False
+    data_parallel_size: int = 1
+    use_ray: bool = False
+
+
+@dataclass
+class _FakeVllmConfig:
+    parallel_config: _FakeParallelConfig = field(default_factory=_FakeParallelConfig)
+
+
+@dataclass
+class _FakeRuntimeConfig:
+    devices: str
+
+
+@dataclass
+class _FakeStageConfig:
+    stage_id: int
+    stage_type: str
+    engine_args: dict[str, object]
+    runtime: _FakeRuntimeConfig
+
+
+def test_stage_runtime_env_accepts_typed_runtime_config(monkeypatch):
+    env_key = "VLLM_OMNI_TEST_TYPED_STAGE_ENV"
+    monkeypatch.delenv(env_key, raising=False)
+
+    with stage_runtime_env(0, OmniStageRuntimeConfig(env={env_key: "typed-value"})):
+        assert os.environ[env_key] == "typed-value"
+
+    assert env_key not in os.environ
+
+
+def test_orchestrator_startup_timeout_warns_how_to_raise_limits(monkeypatch):
+    engine = object.__new__(AsyncOmniEngine)
+    engine.orchestrator_thread = types.SimpleNamespace(is_alive=lambda: True)
+    monkeypatch.setattr(engine, "_try_shutdown", lambda _message: None)
+
+    ticks = iter((0.0, 1.0))
+    monkeypatch.setattr(async_omni_engine_module.time, "monotonic", lambda: next(ticks))
+
+    warnings: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        async_omni_engine_module.logger,
+        "warning",
+        lambda *args: warnings.append(args),
+    )
+
+    with pytest.raises(TimeoutError, match="did not become ready within 1s"):
+        engine._wait_for_orchestrator_init(concurrent.futures.Future(), startup_timeout=1)
+
+    assert len(warnings) == 1
+    message = str(warnings[0][0])
+    assert "--init-timeout" in message
+    assert "--stage-init-timeout" in message
 
 
 def _make_llm_metadata(
@@ -135,6 +210,16 @@ def _make_diffusion_plan(
     )
 
 
+def _make_stage_runtime() -> StageRuntime:
+    return StageRuntime(
+        stage_configs=[],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        async_chunk=False,
+    )
+
+
 def test_stage_engine_core_client_module_reload_keeps_forward_refs_deferred():
     """Regression test for forward references in make_async_mp_client."""
     import vllm_omni.engine.stage_engine_core_client as client_mod
@@ -144,6 +229,87 @@ def test_stage_engine_core_client_module_reload_keeps_forward_refs_deferred():
     assert client_mod.StageEngineCoreClientBase.make_async_mp_client.__annotations__["return"] == (
         "StageEngineCoreClient | DPLBStageEngineCoreClient"
     )
+
+
+def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_to_runtime(monkeypatch):
+    import vllm_omni.engine.omni_engine_base as engine_mod
+
+    engine = object.__new__(AsyncOmniEngine)
+    engine.stage_configs = [types.SimpleNamespace()]
+    engine.model = "dummy-model"
+    engine.config_path = "dummy-config"
+    engine.single_stage_mode = False
+    engine.async_chunk = False
+    engine.tokenizer = None
+    engine._single_stage_id_filter = None
+    engine._omni_master_address = None
+    engine._omni_master_port = None
+    engine._omni_dp_size_local = 1
+    engine._omni_heartbeat_timeout = 30.0
+    engine._omni_lb_policy = "random"
+    engine.request_queue = types.SimpleNamespace()
+    engine._log_stats = True
+    engine._client_config = engine_mod.OmniClientConfig(client_count=2, client_index=1, stage_addresses={})
+    engine._parallel_stage_init = False
+
+    captured: dict[str, object] = {}
+    runtime = types.SimpleNamespace(stage_pools=[], initialize=lambda: None)
+
+    def _capture_create_stage_runtime(**kwargs):
+        captured.update(kwargs)
+        return runtime
+
+    monkeypatch.setattr(engine_mod, "create_stage_runtime", _capture_create_stage_runtime)
+
+    engine._initialize_stages(stage_init_timeout=7)
+
+    assert captured["stage_init_timeout"] == 7
+    assert captured["log_stats"] is True
+    assert captured["client_config"] is engine._client_config
+
+
+def test_async_omni_engine_initialize_stages_retains_stage0_prompt_transform(monkeypatch):
+    import vllm_omni.engine.omni_engine_base as engine_mod
+
+    engine = object.__new__(AsyncOmniEngine)
+    engine.stage_configs = [types.SimpleNamespace()]
+    engine.model = "dummy-model"
+    engine.config_path = "dummy-config"
+    engine.single_stage_mode = False
+    engine.async_chunk = False
+    engine.tokenizer = None
+    engine._single_stage_id_filter = None
+    engine._omni_master_address = None
+    engine._omni_master_port = None
+    engine._omni_dp_size_local = 1
+    engine._omni_heartbeat_timeout = 30.0
+    engine._omni_lb_policy = "random"
+    engine.request_queue = types.SimpleNamespace()
+    engine._log_stats = False
+    engine._parallel_stage_init = False
+
+    prompt_transform = object()
+    client = types.SimpleNamespace(
+        prompt_transform_func=prompt_transform,
+        prompt_expand_func=None,
+        default_sampling_params=types.SimpleNamespace(),
+        final_output=True,
+        final_output_type="text",
+        stage_type="llm",
+        model_stage="text_encoder",
+        is_comprehension=True,
+    )
+    pool = types.SimpleNamespace(
+        stage_client=client,
+        stage_vllm_config=None,
+        output_processor=None,
+    )
+    runtime = types.SimpleNamespace(stage_pools=[pool], initialize=lambda: None)
+    monkeypatch.setattr(engine_mod, "create_stage_runtime", lambda **_kwargs: runtime)
+
+    engine._initialize_stages(stage_init_timeout=7)
+
+    assert engine.prompt_transform_func is prompt_transform
 
 
 def test_compute_replica_layout_splits_diffusion_devices_by_world_size():
@@ -160,6 +326,75 @@ def test_compute_replica_layout_splits_diffusion_devices_by_world_size():
     assert replica_devices_map == {0: ["0,1", "2,3"]}
 
 
+@pytest.mark.parametrize("num_replicas", [1, 2, 4])
+def test_split_devices_for_replicas_returns_one_slot_per_replica_when_devices_unset(num_replicas):
+    """``devices`` is optional, and the result is indexed by replica id.
+
+    A stage that declares ``num_replicas`` without ``devices`` lets every
+    replica inherit the launcher's CUDA_VISIBLE_DEVICES, so each one still
+    needs its own (empty) slot.
+    """
+    assert split_devices_for_replicas(None, num_replicas, 1, 0) == [None] * num_replicas
+
+
+def test_compute_replica_layout_covers_every_replica_when_devices_unset():
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={},
+        runtime=types.SimpleNamespace(num_replicas=3),
+    )
+
+    replicas_per_stage, replica_devices_map = compute_replica_layout([stage_cfg])
+
+    assert replicas_per_stage == [3]
+    assert replica_devices_map == {0: [None, None, None]}
+
+
+def test_build_logical_stage_init_plans_handles_stage_without_devices(monkeypatch):
+    """Regression: a multi-replica stage with no ``devices`` must still plan.
+
+    ``_build_logical_stage_init_plans`` indexes ``replica_devices_map`` by
+    replica id, so a short list raised ``IndexError`` for every replica after
+    the first.
+    """
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={},
+        runtime=types.SimpleNamespace(num_replicas=3),
+    )
+    runtime = StageRuntime(
+        stage_configs=[stage_cfg],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        async_chunk=False,
+    )
+
+    monkeypatch.setattr(
+        runtime_mod,
+        "extract_legacy_stage_metadata",
+        lambda cfg: _make_llm_metadata(cfg.stage_id),
+    )
+    monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
+    monkeypatch.setattr(runtime_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
+    monkeypatch.setattr(runtime_mod, "build_engine_args_dict", lambda *_, **__: {})
+    monkeypatch.setattr(runtime_mod, "build_vllm_config", lambda *_args, **_kwargs: (types.SimpleNamespace(), object))
+
+    replicas_per_stage, replica_devices_map = compute_replica_layout([stage_cfg])
+    stage_plans = runtime._build_logical_stage_init_plans(
+        omni_transfer_config=None,
+        replicas_per_stage=replicas_per_stage,
+        replica_devices_map=replica_devices_map,
+    )
+
+    assert [replica.replica_id for replica in stage_plans[0].replicas] == [0, 1, 2]
+    assert [replica.stage_cfg.runtime.devices for replica in stage_plans[0].replicas] == [None, None, None]
+
+
 def test_collect_initialized_clients_for_cleanup_deduplicates_clients():
     shared = types.SimpleNamespace(name="shared")
     extra = types.SimpleNamespace(name="extra")
@@ -172,6 +407,52 @@ def test_collect_initialized_clients_for_cleanup_deduplicates_clients():
     assert cleanup_clients == [shared, extra]
 
 
+def test_initialize_local_diffusion_replica_scopes_runtime_env(monkeypatch):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+    from vllm_omni.platforms import current_omni_platform
+
+    runtime = _make_stage_runtime()
+    plan = _make_diffusion_plan(0, stage_id=0).replicas[0]
+
+    runtime_env_var = "VLLM_OMNI_TEST_STAGE_RUNTIME_ENV"
+    device_env_var = current_omni_platform.device_control_env_var
+    runtime._init_visible_devices_baseline = "0,1"
+    plan.metadata.runtime_cfg = {
+        "devices": "0",
+        "env": {runtime_env_var: "stage-value"},
+    }
+    monkeypatch.delenv(runtime_env_var, raising=False)
+    monkeypatch.setenv(device_env_var, "0,1")
+
+    captured: dict[str, str | None] = {}
+    monkeypatch.setattr(runtime_mod, "inject_kv_stage_info", lambda *_: None)
+
+    def _capture_launch_diffusion_stage_replica(**_kwargs):
+        captured["runtime_env"] = os.environ.get(runtime_env_var)
+        captured["device_env"] = os.environ.get(device_env_var)
+        captured["visible_devices"] = _kwargs["stage_visible_devices"]
+        assert _kwargs["spawn_device_lock"] is runtime._spawn_device_lock
+        assert not runtime._spawn_device_lock.locked()
+        raise RuntimeError("stop after capturing launch environment")
+
+    monkeypatch.setattr(
+        runtime_mod,
+        "launch_diffusion_stage_replica",
+        _capture_launch_diffusion_stage_replica,
+    )
+
+    with pytest.raises(RuntimeError, match="stop after capturing launch environment"):
+        runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=1)
+
+    assert captured == {
+        "runtime_env": "stage-value",
+        "device_env": "0,1",
+        "visible_devices": "0",
+    }
+    assert runtime_env_var not in os.environ
+    assert os.environ[device_env_var] == "0,1"
+
+
 def test_initialize_local_diffusion_replica_restores_device_visibility_after_local_init(monkeypatch):
     import vllm_omni.engine.stage_runtime as runtime_mod
     from vllm_omni.engine.stage_engine_startup import StageReplicaResources
@@ -182,7 +463,6 @@ def test_initialize_local_diffusion_replica_restores_device_visibility_after_loc
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -210,16 +490,23 @@ def test_initialize_local_diffusion_replica_restores_device_visibility_after_loc
             os.environ[env_var] = old_env
 
 
-def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline_flag(monkeypatch):
+@pytest.mark.parametrize(
+    ("num_stages", "expected_inline"),
+    [(1, True), (2, False)],
+)
+def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline_flag(
+    monkeypatch,
+    num_stages,
+    expected_inline,
+):
     import vllm_omni.engine.stage_runtime as runtime_mod
     from vllm_omni.engine.stage_engine_startup import StageReplicaResources
 
     runtime = StageRuntime(
-        stage_configs=[types.SimpleNamespace()],
+        stage_configs=[types.SimpleNamespace()] * num_stages,
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=4,
         async_chunk=False,
     )
 
@@ -232,7 +519,6 @@ def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline
     def _capture_launch_diffusion_stage_replica(**kwargs):
         captured["stage_id"] = kwargs["metadata"].stage_id
         captured["stage_init_timeout"] = kwargs["stage_init_timeout"]
-        captured["batch_size"] = kwargs["batch_size"]
         captured["use_inline"] = kwargs["use_inline"]
         captured["omni_master_server"] = kwargs["omni_master_server"]
         return types.SimpleNamespace(), StageReplicaResources()
@@ -244,10 +530,269 @@ def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline
     assert captured == {
         "stage_id": 0,
         "stage_init_timeout": 302,
-        "batch_size": 4,
-        "use_inline": True,
+        "use_inline": expected_inline,
         "omni_master_server": None,
     }
+
+
+def test_initialize_local_diffusion_replica_uses_explicit_inline_opt_in(monkeypatch):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+    from vllm_omni.engine.stage_engine_startup import StageReplicaResources
+
+    runtime = _make_stage_runtime()
+    plan = _make_diffusion_plan(0, stage_id=1).replicas[0]
+    plan.stage_cfg.engine_args["inline_diffusion"] = True
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(runtime_mod, "inject_kv_stage_info", lambda *_: None)
+    monkeypatch.setattr(
+        runtime_mod,
+        "launch_diffusion_stage_replica",
+        lambda **kwargs: (
+            captured.update(use_inline=kwargs["use_inline"]),
+            (types.SimpleNamespace(), StageReplicaResources()),
+        )[1],
+    )
+
+    runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=1)
+
+    assert captured["use_inline"] is True
+
+
+def test_initialize_local_llm_replica_scopes_runtime_env(monkeypatch):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = _make_stage_runtime()
+    plan = _make_llm_plan(0, stage_id=0, vllm_config=object()).replicas[0]
+    plan.engine_args_dict = {}
+
+    runtime_env_var = "VLLM_OMNI_TEST_STAGE_RUNTIME_ENV"
+    runtime._init_visible_devices_baseline = "0"
+    plan.metadata.runtime_cfg = {
+        "devices": "0",
+        "env": {runtime_env_var: "stage-value"},
+    }
+    monkeypatch.setenv(runtime_env_var, "parent-value")
+    # Pin the logical->physical device mapping so the assertion below is
+    # deterministic regardless of the ambient CUDA_VISIBLE_DEVICES (which on a
+    # rebase host can be e.g. "3,4", mapping logical device 0 -> physical 3).
+    runtime._init_visible_devices_baseline = "0"
+
+    captured: dict[str, str | None] = {}
+
+    @contextlib.contextmanager
+    def _capture_launch_stage_replica(*, stage_visible_devices, **_kwargs):
+        captured["runtime_env"] = os.environ.get(runtime_env_var)
+        captured["stage_visible_devices"] = stage_visible_devices
+        yield None
+
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", _capture_launch_stage_replica)
+
+    with pytest.raises(RuntimeError, match="launcher returned no resources"):
+        runtime._initialize_local_llm_replica(plan, stage_init_timeout=1)
+
+    assert captured == {
+        "runtime_env": "stage-value",
+        "stage_visible_devices": "0",
+    }
+    assert os.environ[runtime_env_var] == "parent-value"
+
+
+def test_initialize_diffusion_stage_preserves_configured_max_num_seqs(monkeypatch):
+    import vllm_omni.diffusion.stage_diffusion_client as client_mod
+    import vllm_omni.engine.stage_init_utils as init_mod
+
+    od_config = types.SimpleNamespace(max_num_seqs=4)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(init_mod, "build_diffusion_config", lambda *args: od_config)
+
+    def _capture_client(model, config, metadata, stage_init_timeout, use_inline):
+        captured.update(
+            model=model,
+            config=config,
+            metadata=metadata,
+            stage_init_timeout=stage_init_timeout,
+            use_inline=use_inline,
+        )
+        return object()
+
+    monkeypatch.setattr(client_mod, "create_diffusion_client", _capture_client)
+    metadata = _make_diffusion_metadata(0)
+
+    init_mod.initialize_diffusion_stage(
+        0,
+        "dummy-model",
+        types.SimpleNamespace(),
+        metadata,
+        stage_init_timeout=12,
+        use_inline=True,
+    )
+
+    assert od_config.max_num_seqs == 4
+    assert captured == {
+        "model": "dummy-model",
+        "config": od_config,
+        "metadata": metadata,
+        "stage_init_timeout": 12,
+        "use_inline": True,
+    }
+
+
+@pytest.mark.parametrize("spawn_failure", [False, True])
+def test_launch_diffusion_stage_replica_preserves_configured_max_num_seqs(monkeypatch, spawn_failure):
+    import vllm_omni.diffusion.stage_diffusion_client as client_mod
+    import vllm_omni.diffusion.stage_diffusion_proc as proc_mod
+    import vllm_omni.engine.stage_engine_startup as startup_mod
+    from vllm_omni.platforms import current_omni_platform
+
+    spawn_lock = threading.Lock()
+    device_env = current_omni_platform.device_control_env_var
+    monkeypatch.setenv(device_env, "0,1")
+    released = []
+    monkeypatch.setattr(startup_mod, "release_device_locks", lambda fds: released.extend(fds))
+
+    def acquire(*args, **kwargs):
+        assert not spawn_lock.locked()
+        assert os.environ[device_env] == "0,1"
+        assert kwargs["visible_devices"] == "1"
+        return [42]
+
+    od_config = types.SimpleNamespace(max_num_seqs=4, parallel_config=types.SimpleNamespace(world_size=1))
+    monkeypatch.setattr(startup_mod, "build_diffusion_config", lambda *args: od_config)
+    monkeypatch.setattr(startup_mod, "acquire_device_locks", acquire)
+    monkeypatch.setattr(
+        startup_mod,
+        "register_stage_with_omni_master",
+        lambda **kwargs: types.SimpleNamespace(
+            handshake_address="tcp://127.0.0.1:26001",
+            input_address="tcp://127.0.0.1:26002",
+            output_address="tcp://127.0.0.1:26003",
+        ),
+    )
+
+    omni_master_server = types.SimpleNamespace(
+        address="127.0.0.1",
+        port=25000,
+        release_route_port_reservations=lambda *args, **kwargs: None,
+    )
+    proc_manager = types.SimpleNamespace(
+        addresses=types.SimpleNamespace(
+            inputs=["tcp://127.0.0.1:26002"],
+            outputs=["tcp://127.0.0.1:26003"],
+        )
+    )
+
+    def spawn(**kwargs):
+        assert spawn_lock.locked()
+        assert os.environ[device_env] == "1"
+        if spawn_failure:
+            raise RuntimeError("spawn failed")
+        return proc_manager
+
+    monkeypatch.setattr(proc_mod, "StageDiffusionProcManager", spawn)
+    sentinel_client = object()
+    monkeypatch.setattr(
+        client_mod.StageDiffusionClient,
+        "from_addresses",
+        lambda metadata, **kwargs: sentinel_client,
+    )
+
+    expectation = pytest.raises(RuntimeError, match="spawn failed") if spawn_failure else contextlib.nullcontext()
+    with expectation:
+        result, resources = startup_mod.launch_diffusion_stage_replica(
+            model="dummy-model",
+            stage_config=types.SimpleNamespace(),
+            metadata=types.SimpleNamespace(stage_id=0),
+            stage_init_timeout=12,
+            use_inline=False,
+            omni_master_server=omni_master_server,
+            stage_visible_devices="1",
+            spawn_device_lock=spawn_lock,
+        )
+
+    assert not spawn_lock.locked()
+    assert os.environ[device_env] == "0,1"
+    if spawn_failure:
+        assert released == [42]
+        return
+    assert resources.lock_fds == [42]
+    assert released == []
+    assert result is sentinel_client
+    assert od_config.max_num_seqs == 4
+    assert resources.manager is proc_manager
+
+
+def test_initialize_diffusion_stage_does_not_write_max_num_seqs(monkeypatch):
+    import vllm_omni.diffusion.stage_diffusion_client as client_mod
+    import vllm_omni.engine.stage_init_utils as init_mod
+
+    od_config = types.SimpleNamespace(max_num_seqs=8, step_execution=True)
+    monkeypatch.setattr(init_mod, "build_diffusion_config", lambda *args: od_config)
+    monkeypatch.setattr(client_mod, "create_diffusion_client", lambda *args: object())
+    metadata = _make_diffusion_metadata(0)
+
+    init_mod.initialize_diffusion_stage(
+        0,
+        "dummy-model",
+        types.SimpleNamespace(),
+        metadata,
+        stage_init_timeout=12,
+        use_inline=True,
+    )
+
+    assert od_config.max_num_seqs == 8
+
+
+def test_launch_diffusion_stage_replica_preserves_step_execution_max_num_seqs(monkeypatch):
+    import vllm_omni.diffusion.stage_diffusion_client as client_mod
+    import vllm_omni.diffusion.stage_diffusion_proc as proc_mod
+    import vllm_omni.engine.stage_engine_startup as startup_mod
+
+    od_config = types.SimpleNamespace(
+        max_num_seqs=8,
+        step_execution=True,
+        parallel_config=types.SimpleNamespace(world_size=1),
+    )
+    monkeypatch.setattr(startup_mod, "build_diffusion_config", lambda *args: od_config)
+    monkeypatch.setattr(startup_mod, "acquire_device_locks", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        startup_mod,
+        "register_stage_with_omni_master",
+        lambda **kwargs: types.SimpleNamespace(
+            handshake_address="tcp://127.0.0.1:26001",
+            input_address="tcp://127.0.0.1:26002",
+            output_address="tcp://127.0.0.1:26003",
+        ),
+    )
+    omni_master_server = types.SimpleNamespace(
+        address="127.0.0.1",
+        port=25000,
+        release_route_port_reservations=lambda *args, **kwargs: None,
+    )
+    proc_manager = types.SimpleNamespace(
+        addresses=types.SimpleNamespace(
+            inputs=["tcp://127.0.0.1:26002"],
+            outputs=["tcp://127.0.0.1:26003"],
+        )
+    )
+    monkeypatch.setattr(proc_mod, "StageDiffusionProcManager", lambda **kwargs: proc_manager)
+    monkeypatch.setattr(
+        client_mod.StageDiffusionClient,
+        "from_addresses",
+        lambda metadata, **kwargs: object(),
+    )
+
+    startup_mod.launch_diffusion_stage_replica(
+        model="dummy-model",
+        stage_config=types.SimpleNamespace(),
+        metadata=types.SimpleNamespace(stage_id=0),
+        stage_init_timeout=12,
+        use_inline=False,
+        omni_master_server=omni_master_server,
+    )
+
+    assert od_config.max_num_seqs == 8
 
 
 def test_stage_runtime_initializes_stage_pools(monkeypatch):
@@ -258,7 +803,6 @@ def test_stage_runtime_initializes_stage_pools(monkeypatch):
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -316,6 +860,377 @@ def test_stage_runtime_initializes_stage_pools(monkeypatch):
     assert runtime.stage_pools[1].output_processor is stage1_output_processor
 
 
+def test_stage_runtime_passes_log_stats_to_llm_replica_launch(monkeypatch):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = StageRuntime(
+        stage_configs=[types.SimpleNamespace()],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        async_chunk=False,
+        log_stats=True,
+    )
+    cfg = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+    plan = _make_llm_plan(0, stage_id=0, vllm_config=cfg).replicas[0]
+    plan.engine_args_dict = {}
+
+    captured: dict[str, object] = {}
+    addresses = types.SimpleNamespace(
+        inputs=["tcp://127.0.0.1:1"],
+        outputs=["tcp://127.0.0.1:2"],
+        frontend_stats_publish_address=None,
+    )
+    resources = types.SimpleNamespace(manager=object(), coordinator=None, addresses=addresses)
+    stage_client = types.SimpleNamespace()
+
+    @contextlib.contextmanager
+    def _capture_launch_stage_replica(**kwargs):
+        captured["log_stats"] = kwargs["log_stats"]
+        yield resources
+
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", _capture_launch_stage_replica)
+
+    def _make_async_mp_client(**kwargs):
+        captured["client_log_stats"] = kwargs["log_stats"]
+        return stage_client
+
+    monkeypatch.setattr(runtime_mod.StageEngineCoreClientBase, "make_async_mp_client", _make_async_mp_client)
+
+    assert runtime._initialize_local_llm_replica(plan, stage_init_timeout=1) is stage_client
+    assert captured["log_stats"] is True
+    assert captured["client_log_stats"] is True
+
+
+def test_stage_runtime_attaches_external_llm_client_without_launching_engine(monkeypatch):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    client_addresses = {
+        "input_address": "ipc://stage0-input-1",
+        "output_address": "ipc://stage0-output-1",
+    }
+    client_config = {
+        "client_count": 2,
+        "client_index": 1,
+        "stage_addresses": {0: {0: client_addresses}},
+    }
+    runtime = StageRuntime(
+        stage_configs=[],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        async_chunk=False,
+        client_config=client_config,
+    )
+    parallel_config = _FakeParallelConfig()
+    vllm_config = _FakeVllmConfig(parallel_config=parallel_config)
+    plan = _make_llm_plan(0, stage_id=0, vllm_config=vllm_config).replicas[0]
+    captured: dict[str, object] = {}
+    stage_client = object()
+
+    def _capture_client(**kwargs):
+        captured.update(kwargs)
+        return stage_client
+
+    monkeypatch.setattr(runtime_mod.StageEngineCoreClientBase, "make_async_mp_client", _capture_client)
+    monkeypatch.setattr(
+        runtime_mod,
+        "launch_stage_replica",
+        lambda **_kwargs: pytest.fail("external client must not launch a stage engine"),
+    )
+
+    assert runtime._initialize_local_llm_replica(plan, stage_init_timeout=1) is stage_client
+    assert captured["client_addresses"] == client_addresses
+    assert captured["client_count"] == 2
+    assert captured["client_index"] == 1
+    assert not hasattr(parallel_config, "_api_process_count")
+    assert not hasattr(parallel_config, "_api_process_rank")
+
+
+@pytest.mark.parametrize("stage_ids", [(0,), (0, 1)], ids=["single-stage", "multi-stage"])
+@pytest.mark.parametrize("client_count", [1, 2])
+def test_stage_runtime_launches_shared_engines_with_per_client_addresses(monkeypatch, stage_ids, client_count):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = _make_stage_runtime()
+    stage_plans = []
+    for stage_id in stage_ids:
+        parallel_config = _FakeParallelConfig()
+        plan = _make_llm_plan(
+            stage_id,
+            stage_id=stage_id,
+            vllm_config=_FakeVllmConfig(parallel_config=parallel_config),
+        )
+        plan.replicas[0].engine_args_dict = {}
+        stage_plans.append(plan)
+    stage_plans[0].replicas[0].metadata.runtime_cfg = {"env": {"VLLM_OMNI_TEST_STAGE_RUNTIME_ENV": "enabled"}}
+
+    monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: stage_plans)
+    monkeypatch.setattr(runtime, "_resolve_replica_physical_devices", lambda stage_id, _cfg: str(stage_id))
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", lambda *_args, **_kwargs: [])
+
+    events: list[tuple[str, int]] = []
+    captured_launch_kwargs: list[dict[str, object]] = []
+    captured_launch_env: list[str | None] = []
+
+    @contextlib.contextmanager
+    def _fake_launch_stage_replica(**kwargs):
+        stage_id = kwargs["stage_id"]
+        events.append(("enter", stage_id))
+        captured_launch_kwargs.append(kwargs)
+        captured_launch_env.append(os.environ.get("VLLM_OMNI_TEST_STAGE_RUNTIME_ENV"))
+        yield StageReplicaResources(
+            addresses=EngineZmqAddresses(
+                inputs=[f"ipc://stage{stage_id}-input-{idx}" for idx in range(client_count)],
+                outputs=[f"ipc://stage{stage_id}-output-{idx}" for idx in range(client_count)],
+            ),
+        )
+        events.append(("exit", stage_id))
+
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", _fake_launch_stage_replica)
+
+    with runtime.launch_stage_engines(client_count) as launch:
+        expected = (
+            [("enter", stage_id) for stage_id in stage_ids]
+            if client_count > 1
+            else [(event, stage_id) for stage_id in stage_ids for event in ("enter", "exit")]
+        )
+        assert events == expected
+        for client_index, config in enumerate(launch.client_configs):
+            assert config["client_count"] == client_count
+            assert config["client_index"] == client_index
+            for stage_id in stage_ids:
+                assert config["stage_addresses"][stage_id][0] == {
+                    "input_address": f"ipc://stage{stage_id}-input-{client_index}",
+                    "output_address": f"ipc://stage{stage_id}-output-{client_index}",
+                }
+
+    assert events == (
+        [(event, stage_id) for event in ("enter", "exit") for stage_id in stage_ids] if client_count > 1 else expected
+    )
+    assert not hasattr(stage_plans[0].replicas[0].stage_vllm_config.parallel_config, "_api_process_count")
+    assert not hasattr(stage_plans[0].replicas[0].stage_vllm_config.parallel_config, "_api_process_rank")
+    assert all(
+        kwargs["watched_frontend_processes"] is (launch.watched_frontend_processes if client_count > 1 else None)
+        for kwargs in captured_launch_kwargs
+    )
+    assert captured_launch_env == ["enabled" if stage_id == 0 else None for stage_id in stage_ids]
+    assert os.environ.get("VLLM_OMNI_TEST_STAGE_RUNTIME_ENV") is None
+
+
+@pytest.mark.parametrize("client_count", [1, 2])
+def test_stage_runtime_overlapping_devices_acquire_real_locks_once(monkeypatch, tmp_path, client_count):
+    import fcntl
+
+    import vllm_omni.engine.stage_init_utils as init_utils
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = _make_stage_runtime()
+    plans = [_make_llm_plan(stage_id, stage_id=stage_id, vllm_config=_FakeVllmConfig()) for stage_id in (0, 1)]
+    for stage_id, plan in enumerate(plans):
+        plan.replicas[0].engine_args_dict = {"tensor_parallel_size": stage_id + 1}
+    monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: plans)
+    monkeypatch.setattr(runtime, "_resolve_replica_physical_devices", lambda sid, _cfg: "0" if sid == 0 else "0,1")
+    monkeypatch.setattr(
+        init_utils, "device_init_lock_path", lambda device_id: str(tmp_path / f"device-{device_id}.lock")
+    )
+    monkeypatch.setattr(
+        init_utils.time, "sleep", lambda _: pytest.fail("Overlapping stages must not wait on their own lock")
+    )
+
+    @contextlib.contextmanager
+    def launch(**kwargs):
+        # Real flock on a separate descriptor proves the runtime holds each lock.
+        for device_id in range(kwargs["stage_id"] + 1):
+            with open(tmp_path / f"device-{device_id}.lock", "a") as probe:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield StageReplicaResources(
+            addresses=EngineZmqAddresses(
+                inputs=[f"ipc://input-{i}" for i in range(client_count)],
+                outputs=[f"ipc://output-{i}" for i in range(client_count)],
+            )
+        )
+
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", launch)
+    with runtime.launch_stage_engines(client_count):
+        pass
+    for device_id in (0, 1):
+        with open(tmp_path / f"device-{device_id}.lock", "a") as probe:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(probe, fcntl.LOCK_UN)
+
+
+@pytest.mark.parametrize("diffusion_stage_id", [0, 1], ids=["diffusion-only", "enginecore-to-diffusion"])
+def test_stage_runtime_multi_api_rejects_diffusion_before_launch(monkeypatch, diffusion_stage_id):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = _make_stage_runtime()
+    stage_plans = [
+        _make_llm_plan(stage_id, stage_id=stage_id, vllm_config=_FakeVllmConfig())
+        for stage_id in range(diffusion_stage_id)
+    ]
+    stage_plans.append(_make_diffusion_plan(diffusion_stage_id, stage_id=diffusion_stage_id))
+    monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: stage_plans)
+    monkeypatch.setattr(
+        runtime_mod,
+        "acquire_device_locks",
+        lambda *_args: pytest.fail("unsupported topology must fail before acquiring devices"),
+    )
+    monkeypatch.setattr(
+        runtime_mod,
+        "launch_stage_replica",
+        lambda **_kwargs: pytest.fail("unsupported topology must not partially launch EngineCore stages"),
+    )
+
+    with pytest.raises(ValueError, match="diffusion stage\\(s\\) are not supported"):
+        with runtime.launch_stage_engines(2):
+            pytest.fail("unsupported topology must not yield a launch handle")
+
+
+def test_stage_runtime_multi_api_maps_stage_devices_from_launcher_visibility(monkeypatch):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = _make_stage_runtime()
+    stage_plan = _make_llm_plan(
+        0,
+        stage_id=0,
+        vllm_config=_FakeVllmConfig(),
+    )
+    replica = stage_plan.replicas[0]
+    replica.engine_args_dict = {}
+    replica.metadata.runtime_cfg = {"devices": "0"}
+
+    device_env = runtime_mod.current_omni_platform.device_control_env_var
+    monkeypatch.setenv(device_env, "5")
+    monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: [stage_plan])
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", lambda *_args, **_kwargs: [])
+    captured_devices: list[str | None] = []
+
+    @contextlib.contextmanager
+    def _fake_launch_stage_replica(**kwargs):
+        captured_devices.append(kwargs["stage_visible_devices"])
+        yield StageReplicaResources(
+            addresses=EngineZmqAddresses(
+                inputs=["ipc://input-0", "ipc://input-1"],
+                outputs=["ipc://output-0", "ipc://output-1"],
+            ),
+        )
+
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", _fake_launch_stage_replica)
+
+    with runtime.launch_stage_engines(2):
+        pass
+
+    assert captured_devices == ["5"]
+    assert os.environ[device_env] == "5"
+
+
+def test_stage_runtime_multi_api_rejects_elastic_ep(monkeypatch):
+    runtime = _make_stage_runtime()
+    stage_plan = _make_llm_plan(
+        0,
+        stage_id=0,
+        vllm_config=_FakeVllmConfig(parallel_config=_FakeParallelConfig(enable_elastic_ep=True)),
+    )
+    stage_plan.replicas[0].engine_args_dict = {}
+    monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: [stage_plan])
+
+    with pytest.raises(ValueError, match="enable-elastic-ep"):
+        with runtime.launch_stage_engines(2):
+            pass
+
+
+def test_stage_runtime_multi_api_failure_shuts_down_before_exceptional_context_exit(monkeypatch):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = _make_stage_runtime()
+    stage_plan = _make_llm_plan(0, stage_id=0, vllm_config=_FakeVllmConfig())
+    stage_plan.replicas[0].engine_args_dict = {}
+    monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: [stage_plan])
+    monkeypatch.setattr(runtime, "_resolve_replica_physical_devices", lambda *_args: None)
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", lambda *_args, **_kwargs: [])
+
+    events: list[str] = []
+
+    class _Manager:
+        def shutdown(self) -> None:
+            events.append("shutdown")
+
+    @contextlib.contextmanager
+    def _fake_launch_stage_replica(**_kwargs):
+        try:
+            yield StageReplicaResources(
+                manager=_Manager(),
+                addresses=EngineZmqAddresses(
+                    inputs=["tcp://127.0.0.1:0", "tcp://127.0.0.1:1"],
+                    outputs=["tcp://127.0.0.1:2", "tcp://127.0.0.1:3"],
+                ),
+            )
+        except RuntimeError as exc:
+            events.append(f"exceptional-exit:{exc}")
+            raise
+        else:
+            events.append("normal-exit")
+
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", _fake_launch_stage_replica)
+
+    with pytest.raises(RuntimeError, match="deferred TCP addresses"):
+        with runtime.launch_stage_engines(2):
+            pass
+
+    assert events == [
+        "shutdown",
+        "exceptional-exit:Stage 0 returned deferred TCP addresses; multi-API launch requires fixed ports or IPC addresses",
+    ]
+
+
+def test_stage_runtime_passes_log_stats_to_output_processor(monkeypatch):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = StageRuntime(
+        stage_configs=[types.SimpleNamespace()],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        async_chunk=False,
+        log_stats=True,
+    )
+    cfg = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+    stage_plan = _make_llm_plan(0, stage_id=0, vllm_config=cfg)
+    stage_client = types.SimpleNamespace(
+        stage_type="llm",
+        is_comprehension=False,
+        final_output=True,
+        final_output_type=None,
+        default_sampling_params=types.SimpleNamespace(),
+    )
+    captured: dict[str, object] = {}
+    output_processor = object()
+
+    def _capture_build_llm_stage_output_processor(plan, stage_vllm_config, *, log_stats=False):
+        captured["plan"] = plan
+        captured["stage_vllm_config"] = stage_vllm_config
+        captured["log_stats"] = log_stats
+        return output_processor
+
+    monkeypatch.setattr(
+        runtime_mod,
+        "build_llm_stage_output_processor",
+        _capture_build_llm_stage_output_processor,
+    )
+
+    pools = runtime._assemble_stage_pools([stage_plan], {0: [stage_client]})
+
+    assert pools[0].output_processor is output_processor
+    assert captured == {
+        "plan": stage_plan,
+        "stage_vllm_config": cfg,
+        "log_stats": True,
+    }
+
+
 def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatch):
     import vllm_omni.engine.stage_runtime as runtime_mod
 
@@ -331,7 +1246,6 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -342,7 +1256,7 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
 
     monkeypatch.setattr(
         runtime_mod,
-        "extract_stage_metadata",
+        "extract_legacy_stage_metadata",
         lambda cfg: types.SimpleNamespace(**metadata_by_stage[cfg.stage_id].__dict__),
     )
     monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
@@ -372,7 +1286,6 @@ def test_initialize_stage_replicas_collects_results_by_stage_and_replica_id(monk
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=123,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -410,7 +1323,6 @@ def test_remote_replicas_use_distinct_init_group_keys():
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=123,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
     plan = _make_llm_plan(
@@ -424,10 +1336,7 @@ def test_remote_replicas_use_distinct_init_group_keys():
         replica.launch_mode = "remote"
         replica.metadata.runtime_cfg = None
 
-    assert [runtime._replica_init_group_key(replica) for replica in plan.replicas] == [
-        "remote:1:0",
-        "remote:1:1",
-    ]
+    assert runtime._init_group_keys(plan.replicas) == ["remote:1:0", "remote:1:1"]
 
 
 def test_initialize_stages_cleans_up_successful_replicas_after_partial_multi_replica_failure(monkeypatch):
@@ -436,7 +1345,6 @@ def test_initialize_stages_cleans_up_successful_replicas_after_partial_multi_rep
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -473,7 +1381,6 @@ def test_initialize_stages_cleans_up_late_successful_replicas_after_early_multi_
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -485,7 +1392,7 @@ def test_initialize_stages_cleans_up_late_successful_replicas_after_early_multi_
 
     def _initialize_stage_replicas(_stage_plans, _stage_init_timeout):
         exc = RuntimeError("replica launch failed")
-        exc._initialized_clients_by_stage = {0: [None, initialized_client]}
+        setattr(exc, "_initialized_clients_by_stage", {0: [None, initialized_client]})
         raise exc
 
     monkeypatch.setattr(runtime, "_initialize_stage_replicas", _initialize_stage_replicas)
@@ -511,10 +1418,10 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
         stage_configs=[],
         model="dummy-model",
         config_path="dummy-config",
-        stage_init_timeout=302,
-        diffusion_batch_size=1,
+        stage_init_timeout=1,
         async_chunk=False,
     )
+    stage_init_timeout = 302
 
     fake_vllm_config = types.SimpleNamespace()
     fake_addresses = types.SimpleNamespace(inputs=["in"], outputs=["out"], frontend_stats_publish_address=None)
@@ -525,7 +1432,7 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
         num_replicas=1,
         launch_mode="local",
         stage_cfg=types.SimpleNamespace(engine_args={}, runtime=types.SimpleNamespace(devices="0")),
-        metadata=types.SimpleNamespace(stage_id=0, runtime_cfg={"devices": "0"}),
+        metadata=types.SimpleNamespace(stage_id=0, stage_type="llm", runtime_cfg={"devices": "0"}),
         stage_connector_spec={},
         omni_kv_connector=(None, None, None),
         stage_vllm_config=fake_vllm_config,
@@ -537,7 +1444,7 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
     prev_device_env = os.environ.get(device_env_var)
     os.environ[device_env_var] = "0"
 
-    def _capture_acquire_device_locks(*_args):
+    def _capture_acquire_device_locks(*_args, **_kwargs):
         nonlocal captured_timeout
         captured_timeout = _args[2]
         return []
@@ -561,14 +1468,14 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
     )
 
     try:
-        runtime._initialize_local_llm_replica(plan, 302)
+        runtime._initialize_local_llm_replica(plan, stage_init_timeout)
     finally:
         if prev_device_env is None:
             os.environ.pop(device_env_var, None)
         else:
             os.environ[device_env_var] = prev_device_env
 
-    assert captured_timeout == 302
+    assert captured_timeout == stage_init_timeout
 
 
 def test_build_engine_args_cli_tokenizer_overrides_inferred_base_tokenizer(tmp_path):
@@ -580,6 +1487,8 @@ def test_build_engine_args_cli_tokenizer_overrides_inferred_base_tokenizer(tmp_p
         engine_args={"model_subdir": "llm"},
         default_sampling_params={},
     )
+
+    (tmp_path / "llm").mkdir()
 
     engine_args = build_engine_args_dict(
         stage_cfg,
@@ -609,6 +1518,29 @@ def test_build_engine_args_stage_model_overrides_parent_model():
     assert engine_args["model"] == "/stage/model"
 
 
+def test_build_engine_args_keeps_full_payload_connector_spec():
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=1,
+        stage_type="llm",
+        engine_args={"async_chunk": False},
+        default_sampling_params={},
+    )
+    connector_spec = {
+        "name": "SharedMemoryConnector",
+        "extra": {"role": "sender"},
+    }
+
+    engine_args = build_engine_args_dict(
+        stage_cfg,
+        "/parent/model",
+        stage_connector_spec=connector_spec,
+    )
+
+    assert engine_args["stage_connector_spec"] == connector_spec
+
+
 def test_build_engine_args_keeps_stage_owned_tokenizer_subdir(tmp_path):
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
@@ -618,6 +1550,9 @@ def test_build_engine_args_keeps_stage_owned_tokenizer_subdir(tmp_path):
         engine_args={"model_subdir": "llm", "tokenizer_subdir": "tokenizer"},
         default_sampling_params={},
     )
+
+    (tmp_path / "llm").mkdir()
+    (tmp_path / "tokenizer").mkdir()
 
     engine_args = build_engine_args_dict(
         stage_cfg,
@@ -629,29 +1564,475 @@ def test_build_engine_args_keeps_stage_owned_tokenizer_subdir(tmp_path):
     assert engine_args["tokenizer"] == os.path.join(str(tmp_path), "tokenizer")
 
 
-def test_build_stage0_input_processor_uses_omni_input_preprocessor(monkeypatch):
+def test_build_engine_args_rejects_missing_subdir_in_local_model_dir(tmp_path):
+    """A local model directory without the stage subfolder must fail closed.
+
+    Forwarding the joined path as ``EngineArgs.model`` sends a non-directory
+    string to HuggingFace, which reports it as a malformed repo id.
+    """
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model_subdir": "language_model", "tokenizer_subdir": "tokenizer"},
+        default_sampling_params={},
+    )
+    (tmp_path / "tokenizer").mkdir()
+
+    with pytest.raises(RuntimeError, match="language_model"):
+        build_engine_args_dict(stage_cfg, str(tmp_path))
+
+
+# A real snapshot subfolder always carries artifacts; empty directories would
+# assert the broken exists-means-complete predicate this suite regresses.
+_SUBDIR_ARTIFACT = {"language_model": "model.safetensors", "tokenizer": "tokenizer.json"}
+
+
+def _make_snapshot(root, subdirs):
+    for subdir in subdirs:
+        folder = root / subdir
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / _SUBDIR_ARTIFACT.get(subdir, "data.bin")).write_text("x")
+    return str(root)
+
+
+def test_build_engine_args_pulls_stage_subdirs_missing_from_cached_snapshot(monkeypatch, tmp_path):
+    """Regression for issue #6638.
+
+    ``snapshot_download(local_files_only=True)`` hands back a snapshot root as
+    soon as the repo is partly cached, even when this stage's subfolders were
+    never materialized. Stage init must fetch exactly those subfolders instead
+    of joining onto a path that exists nowhere.
+    """
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    snapshot = tmp_path / "snapshots" / "deadbeef"
+    _make_snapshot(snapshot, ["tokenizer"])
+    calls = []
+
+    def fake_snapshot_download(repo_id, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("local_files_only"):
+            return str(snapshot)
+        _make_snapshot(snapshot, ["language_model"])
+        return str(snapshot)
+
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model_subdir": "language_model", "tokenizer_subdir": "tokenizer"},
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+    assert engine_args["model"] == os.path.join(str(snapshot), "language_model")
+    assert engine_args["tokenizer"] == os.path.join(str(snapshot), "tokenizer")
+    assert os.path.isdir(engine_args["model"])
+    # Only the stage's own subfolders are pulled, not the whole repo.
+    assert calls[-1]["allow_patterns"] == ["language_model/*", "tokenizer/*"]
+
+
+def test_build_engine_args_skips_hub_call_when_cached_snapshot_is_complete(monkeypatch, tmp_path):
+    """A warm cache stays offline-friendly: no outgoing Hub request."""
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    snapshot = tmp_path / "snapshots" / "deadbeef"
+    _make_snapshot(snapshot, ["language_model", "tokenizer"])
+
+    def fake_snapshot_download(repo_id, **kwargs):
+        assert kwargs.get("local_files_only"), "warm cache must not reach the Hub"
+        return str(snapshot)
+
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model_subdir": "language_model", "tokenizer_subdir": "tokenizer"},
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+    assert engine_args["model"] == os.path.join(str(snapshot), "language_model")
+
+
+def test_build_engine_args_redownloads_a_partial_subdir(monkeypatch, tmp_path):
+    """A subfolder holding only config.json is an interrupted download.
+
+    The warm-cache early return must not accept it: converting the Hub ID into
+    that local path leaves vLLM's loader without any fallback for the missing
+    weights.
+    """
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    snapshot = tmp_path / "snapshots" / "deadbeef"
+    partial = snapshot / "language_model"
+    partial.mkdir(parents=True)
+    (partial / "config.json").write_text("{}")
+    _make_snapshot(snapshot, ["tokenizer"])
+    calls = []
+
+    def fake_snapshot_download(repo_id, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("local_files_only"):
+            return str(snapshot)
+        _make_snapshot(snapshot, ["language_model"])
+        return str(snapshot)
+
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model_subdir": "language_model", "tokenizer_subdir": "tokenizer"},
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+    assert any(not call.get("local_files_only") for call in calls), "a partial subdir must fall through to the Hub"
+    assert engine_args["model"] == os.path.join(str(snapshot), "language_model")
+
+
+def test_build_engine_args_redownloads_when_index_lists_missing_shards(monkeypatch, tmp_path):
+    """An index plus a subset of its shards is an interrupted download.
+
+    The index downloads early; accepting it as proof of weights converts the
+    Hub ID into a local path vLLM cannot fetch the remaining shards for.
+    """
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    snapshot = tmp_path / "snapshots" / "deadbeef"
+    partial = snapshot / "language_model"
+    partial.mkdir(parents=True)
+    (partial / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "a.weight": "model-00001-of-00002.safetensors",
+                    "b.weight": "model-00002-of-00002.safetensors",
+                }
+            }
+        )
+    )
+    (partial / "model-00001-of-00002.safetensors").write_text("x")
+    _make_snapshot(snapshot, ["tokenizer"])
+    calls = []
+
+    def fake_snapshot_download(repo_id, **kwargs):
+        calls.append(kwargs)
+        if not kwargs.get("local_files_only"):
+            (partial / "model-00002-of-00002.safetensors").write_text("x")
+        return str(snapshot)
+
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model_subdir": "language_model", "tokenizer_subdir": "tokenizer"},
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+    assert any(not call.get("local_files_only") for call in calls), "missing shards must fall through to the Hub"
+    assert engine_args["model"] == os.path.join(str(snapshot), "language_model")
+
+
+def test_build_engine_args_redownloads_shards_without_their_index(monkeypatch, tmp_path):
+    """Shard-named weights always ship an index; one without it is partial."""
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    snapshot = tmp_path / "snapshots" / "deadbeef"
+    partial = snapshot / "language_model"
+    partial.mkdir(parents=True)
+    (partial / "model-00001-of-00004.safetensors").write_text("x")
+    _make_snapshot(snapshot, ["tokenizer"])
+    calls = []
+
+    def fake_snapshot_download(repo_id, **kwargs):
+        calls.append(kwargs)
+        if not kwargs.get("local_files_only"):
+            shards = {f"w{i}.weight": f"model-0000{i}-of-00004.safetensors" for i in range(1, 5)}
+            (partial / "model.safetensors.index.json").write_text(json.dumps({"weight_map": shards}))
+            for shard in shards.values():
+                (partial / shard).write_text("x")
+        return str(snapshot)
+
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model_subdir": "language_model", "tokenizer_subdir": "tokenizer"},
+        default_sampling_params={},
+    )
+
+    build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+    assert any(not call.get("local_files_only") for call in calls)
+
+
+def test_build_engine_args_redownloads_a_tokenizer_folder_without_vocabulary(monkeypatch, tmp_path):
+    """Templates and configs download first; alone they are not a tokenizer."""
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    snapshot = tmp_path / "snapshots" / "deadbeef"
+    _make_snapshot(snapshot, ["language_model"])
+    partial = snapshot / "tokenizer"
+    partial.mkdir(parents=True)
+    (partial / "chat_template.jinja").write_text("{{ messages }}")
+    calls = []
+
+    def fake_snapshot_download(repo_id, **kwargs):
+        calls.append(kwargs)
+        if not kwargs.get("local_files_only"):
+            _make_snapshot(snapshot, ["tokenizer"])
+        return str(snapshot)
+
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model_subdir": "language_model", "tokenizer_subdir": "tokenizer"},
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+    assert any(not call.get("local_files_only") for call in calls)
+    assert engine_args["tokenizer"] == os.path.join(str(snapshot), "tokenizer")
+
+
+def test_build_engine_args_forwards_revision_and_download_dir(monkeypatch, tmp_path):
+    """revision/download_dir must shape snapshot selection (they cannot be
+    corrected downstream once the repo ID is a local path)."""
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    snapshot = tmp_path / "snapshots" / "pinned"
+    _make_snapshot(snapshot, ["language_model", "tokenizer"])
+    seen = []
+
+    def fake_snapshot_download(repo_id, **kwargs):
+        seen.append(kwargs)
+        return str(snapshot)
+
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={
+            "model_subdir": "language_model",
+            "tokenizer_subdir": "tokenizer",
+            "revision": "v2.0",
+            "download_dir": str(tmp_path / "cache"),
+        },
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+    assert engine_args["model"] == os.path.join(str(snapshot), "language_model")
+    assert seen, "snapshot resolution must have been consulted"
+    for call in seen:
+        assert call.get("revision") == "v2.0"
+        assert call.get("cache_dir") == str(tmp_path / "cache")
+
+
+def test_build_engine_args_resolves_tokenizer_revision_separately(monkeypatch, tmp_path):
+    """A tokenizer pinned to a different revision resolves against its own snapshot."""
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    model_snapshot = tmp_path / "snapshots" / "model-rev"
+    _make_snapshot(model_snapshot, ["language_model"])
+    tokenizer_snapshot = tmp_path / "snapshots" / "tok-rev"
+    _make_snapshot(tokenizer_snapshot, ["tokenizer"])
+
+    def fake_snapshot_download(repo_id, **kwargs):
+        if kwargs.get("revision") == "tok-rev":
+            return str(tokenizer_snapshot)
+        return str(model_snapshot)
+
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={
+            "model_subdir": "language_model",
+            "tokenizer_subdir": "tokenizer",
+            "revision": "model-rev",
+            "tokenizer_revision": "tok-rev",
+        },
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+    assert engine_args["model"] == os.path.join(str(model_snapshot), "language_model")
+    assert engine_args["tokenizer"] == os.path.join(str(tokenizer_snapshot), "tokenizer")
+
+
+def test_build_engine_args_resolves_root_tokenizer_revision_separately(monkeypatch, tmp_path):
+    """An empty tokenizer_subdir targets the snapshot root and still honors
+    its own revision."""
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    model_snapshot = tmp_path / "snapshots" / "model-rev"
+    _make_snapshot(model_snapshot, ["language_model"])
+    # An empty tokenizer_subdir means the tokenizer IS the snapshot root, so
+    # the vocabulary artifact must sit at the root. Building it under
+    # ``tokenizer/`` returned a root that holds no loadable tokenizer, which
+    # the root-tokenizer validation now correctly rejects.
+    tokenizer_snapshot = tmp_path / "snapshots" / "tok-rev"
+    tokenizer_snapshot.mkdir(parents=True, exist_ok=True)
+    (tokenizer_snapshot / _SUBDIR_ARTIFACT["tokenizer"]).write_text("x")
+
+    def fake_snapshot_download(repo_id, **kwargs):
+        if kwargs.get("revision") == "tok-rev":
+            return str(tokenizer_snapshot)
+        return str(model_snapshot)
+
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={
+            "model_subdir": "language_model",
+            "tokenizer_subdir": "",
+            "revision": "model-rev",
+            "tokenizer_revision": "tok-rev",
+        },
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+    assert engine_args["model"] == os.path.join(str(model_snapshot), "language_model")
+    assert engine_args["tokenizer"] == str(tokenizer_snapshot)
+
+
+def test_build_engine_args_fails_closed_when_subdir_cannot_be_downloaded(monkeypatch, tmp_path):
+    """An undownloadable subfolder raises here instead of reaching HuggingFace."""
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    snapshot = tmp_path / "snapshots" / "deadbeef"
+    _make_snapshot(snapshot, ["tokenizer"])
+
+    def fake_snapshot_download(repo_id, **kwargs):
+        if kwargs.get("local_files_only"):
+            return str(snapshot)
+        raise OSError("offline")
+
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model_subdir": "language_model", "tokenizer_subdir": "tokenizer"},
+        default_sampling_params={},
+    )
+
+    with pytest.raises(RuntimeError, match="language_model"):
+        build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+
+def test_build_engine_args_fails_closed_on_cold_cache_instead_of_joining_repo_id(monkeypatch, tmp_path):
+    """With nothing cached, the stage must not join a subdir onto the repo id."""
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    def fake_snapshot_download(repo_id, **kwargs):
+        raise OSError("offline")
+
+    patch_hf_snapshot_download(monkeypatch, fake_snapshot_download, hf_home=tmp_path)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model_subdir": "language_model", "tokenizer_subdir": "tokenizer"},
+        default_sampling_params={},
+    )
+
+    with pytest.raises(RuntimeError, match="nothing is cached locally"):
+        build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+
+def test_model_path_resolver_is_generic_and_model_owned(tmp_path):
+    from vllm_omni.engine.stage_init_utils import _resolve_model_path
+
+    engine_args = {
+        "model_path_resolver": ("vllm_omni.model_executor.models.minimax_h3.checkpoint.resolve_minimax_h3_model_root"),
+        "revision": None,
+        "task_type": "ref2va",
+    }
+
+    resolved = _resolve_model_path(str(tmp_path), engine_args)
+
+    assert resolved == str(tmp_path / "Ref2VA" / "text_encoder")
+    assert "model_path_resolver" not in engine_args
+
+
+def test_build_stage0_input_processor_uses_omni_renderer_subclass(monkeypatch):
+    from vllm.renderers import BaseRenderer
+
     import vllm_omni.engine.stage_init_utils as init_mod
+    from vllm_omni.inputs.preprocess import OmniRenderer, omni_renderer_cls
+
+    class _Base(BaseRenderer):
+        def __init__(self, config, tokenizer):
+            self.config, self.tokenizer = config, tokenizer
+
+        def render_messages(self, messages, params):  # pragma: no cover - abstract stub
+            raise NotImplementedError
+
+    config = types.SimpleNamespace(model_config=types.SimpleNamespace(try_get_generation_config=lambda: {}))
+    built = omni_renderer_cls(_Base)(config, "tok")
+    seen = {}
 
     class DummyInputProcessor:
-        def __init__(self, vllm_config):
-            self.vllm_config = vllm_config
-            self.renderer = object()
-            self.input_preprocessor = None
-
-    class DummyOmniInputPreprocessor:
         def __init__(self, vllm_config, renderer=None):
-            self.vllm_config = vllm_config
+            seen["renderer"] = renderer
             self.renderer = renderer
 
     monkeypatch.setattr(init_mod, "InputProcessor", DummyInputProcessor)
-    monkeypatch.setattr(init_mod, "OmniInputPreprocessor", DummyOmniInputPreprocessor)
+    monkeypatch.setattr(init_mod, "build_omni_renderer", lambda cfg: built if cfg is config else None)
+    processor = build_stage0_input_processor(config)
+    assert seen["renderer"] is built
+    assert isinstance(processor.renderer, OmniRenderer)
+    assert isinstance(processor.renderer, _Base)
+    assert not hasattr(processor, "input_preprocessor")
 
-    input_processor = build_stage0_input_processor(
-        types.SimpleNamespace(model_config=types.SimpleNamespace(try_get_generation_config=lambda: {}))
+
+def test_build_stage0_input_processor_does_not_resolve_tokenizer_when_skipped(monkeypatch):
+    import vllm_omni.engine.stage_init_utils as init_mod
+
+    original = object()
+
+    class DummyInputProcessor:
+        def __init__(self, vllm_config, renderer=None):
+            assert renderer is original
+            self.renderer = renderer
+
+    def _must_not_resolve(_cfg):
+        raise AssertionError("tokenizer must not be resolved when skip_tokenizer_init=True")
+
+    monkeypatch.setattr(init_mod, "InputProcessor", DummyInputProcessor)
+    monkeypatch.setattr(init_mod, "_build_token_only_renderer", lambda _: original)
+    monkeypatch.setattr(init_mod, "build_omni_renderer", _must_not_resolve)
+    config = types.SimpleNamespace(
+        model_config=types.SimpleNamespace(skip_tokenizer_init=True, try_get_generation_config=lambda: {})
     )
-
-    assert isinstance(input_processor.input_preprocessor, DummyOmniInputPreprocessor)
-    assert input_processor.input_preprocessor.renderer is input_processor.renderer
+    processor = build_stage0_input_processor(config)
+    assert processor.renderer is original
 
 
 def test_inject_kv_stage_info_infers_sender_tp_topology():
@@ -721,98 +2102,54 @@ def test_inject_kv_stage_info_infers_receiver_tp_topology():
     assert stage1.engine_args["omni_kv_config"]["rank_mapping"] == {"from_tp": 4, "to_tp": 2}
 
 
-def test_resolve_stage_configs_injects_global_diffusion_attention_when_missing(monkeypatch):
-    import vllm_omni.engine.async_omni_engine as engine_mod
+def test_inject_kv_stage_info_updates_typed_connector_config():
+    from vllm_omni.config.omni_config import (
+        OmniStageConnectorConfig,
+        OmniStageDiffusionParallelConfig,
+        VllmOmniDiffusionStageConfig,
+    )
+    from vllm_omni.config.stage_config import StageExecutionType, StagePipelineConfig
+    from vllm_omni.engine.stage_init_utils import inject_kv_stage_info
+    from vllm_omni.entrypoints.utils import inject_omni_kv_config
 
-    engine = object.__new__(AsyncOmniEngine)
-    stage_cfg = types.SimpleNamespace(
-        stage_type="diffusion",
-        engine_args=types.SimpleNamespace(
-            diffusion_attention_config=None,
-            lora_path=None,
-            lora_scale=None,
-            enable_sleep_mode=None,
-            quantization_config=None,
+    stage0 = VllmOmniDiffusionStageConfig(
+        stage_pipeline_config=StagePipelineConfig(
+            stage_id=0,
+            model_stage="diffusion",
+            execution_type=StageExecutionType.DIFFUSION,
         ),
-    )
-
-    monkeypatch.setattr(
-        engine_mod,
-        "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg]),
-    )
-
-    _config_path, stage_configs = engine._resolve_stage_configs(
-        model="dummy-model",
-        kwargs={"diffusion_attention_backend": "FLASH_ATTN"},
-    )
-
-    diffusion_attention_config = stage_configs[0].engine_args.diffusion_attention_config
-    assert isinstance(diffusion_attention_config, AttentionConfig)
-    assert diffusion_attention_config.default is not None
-    assert diffusion_attention_config.default.backend == "FLASH_ATTN"
-
-
-def test_resolve_stage_configs_preserves_stage_diffusion_attention(monkeypatch):
-    import vllm_omni.engine.async_omni_engine as engine_mod
-
-    engine = object.__new__(AsyncOmniEngine)
-    existing_attention = AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA"))
-    stage_cfg = types.SimpleNamespace(
-        stage_type="diffusion",
-        engine_args=types.SimpleNamespace(
-            diffusion_attention_config=existing_attention,
-            lora_path=None,
-            lora_scale=None,
-            enable_sleep_mode=None,
-            quantization_config=None,
+        connector_config=OmniStageConnectorConfig(
+            omni_kv_config={
+                "need_send_cache": True,
+                "omni_from_stage": "0",
+                "omni_to_stage": "1",
+            }
         ),
+        parallel_config=OmniStageDiffusionParallelConfig(tensor_parallel_size=4),
     )
-
-    monkeypatch.setattr(
-        engine_mod,
-        "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg]),
-    )
-
-    _config_path, stage_configs = engine._resolve_stage_configs(
-        model="dummy-model",
-        kwargs={"diffusion_attention_backend": "FLASH_ATTN"},
-    )
-
-    assert stage_configs[0].engine_args.diffusion_attention_config is existing_attention
-
-
-def test_resolve_stage_configs_does_not_inject_diffusion_attention_into_llm_stage(monkeypatch):
-    import vllm_omni.engine.async_omni_engine as engine_mod
-
-    engine = object.__new__(AsyncOmniEngine)
-    stage_cfg = types.SimpleNamespace(
-        stage_type="llm",
-        engine_args=types.SimpleNamespace(
-            attention_config={"backend": "FLASH_ATTN"},
-            enable_sleep_mode=None,
+    stage1 = VllmOmniDiffusionStageConfig(
+        stage_pipeline_config=StagePipelineConfig(
+            stage_id=1,
+            model_stage="diffusion",
+            execution_type=StageExecutionType.DIFFUSION,
+            input_sources=(0,),
         ),
+        connector_config=OmniStageConnectorConfig(omni_kv_config={"need_recv_cache": True}),
+        parallel_config=OmniStageDiffusionParallelConfig(tensor_parallel_size=2),
     )
 
-    monkeypatch.setattr(
-        engine_mod,
-        "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg]),
-    )
+    inject_omni_kv_config(stage0, {"kv_connector": "P2pNcclConnector"}, "0", "1")
+    inject_kv_stage_info(stage0, 0, [stage0, stage1])
 
-    _config_path, stage_configs = engine._resolve_stage_configs(
-        model="dummy-model",
-        kwargs={"diffusion_attention_backend": "TORCH_SDPA"},
-    )
-
-    assert stage_configs[0].engine_args.attention_config == {"backend": "FLASH_ATTN"}
-    assert not hasattr(stage_configs[0].engine_args, "diffusion_attention_config")
+    assert stage0.connector_config.omni_kv_config["stage_id"] == 0
+    assert stage0.connector_config.omni_kv_config["connector_config"] == {"kv_connector": "P2pNcclConnector"}
+    assert stage0.connector_config.omni_kv_config["engine_input_source"] == []
+    assert stage0.connector_config.omni_kv_config["rank_mapping"] == {"from_tp": 4, "to_tp": 2}
 
 
-def test_extract_stage_metadata_rocm_does_not_inject_diffusion_attention(monkeypatch):
+def test_extract_legacy_stage_metadata_rocm_does_not_inject_diffusion_attention(monkeypatch):
     """ROCm default attention logic only applies to LLM stages, not diffusion."""
-    from vllm_omni.engine.stage_init_utils import extract_stage_metadata
+    from vllm_omni.engine.stage_init_utils import extract_legacy_stage_metadata
 
     monkeypatch.setattr("vllm_omni.engine.stage_init_utils.current_omni_platform.is_rocm", lambda: True)
 
@@ -826,7 +2163,7 @@ def test_extract_stage_metadata_rocm_does_not_inject_diffusion_attention(monkeyp
         final_output_type=None,
     )
 
-    metadata = extract_stage_metadata(stage_cfg)
+    metadata = extract_legacy_stage_metadata(stage_cfg)
 
     assert metadata.stage_type == "diffusion"
     assert "diffusion_attention_config" not in stage_cfg.engine_args
@@ -874,3 +2211,470 @@ def test_build_engine_args_dict_uses_diffusion_attention_config_key():
 
     assert "attention_config" not in engine_args_dict
     assert engine_args_dict["diffusion_attention_config"].default.backend == "FLASH_ATTN"
+
+
+def test_omni_master_server_allocates_globally_unique_route_ports(monkeypatch):
+    """Regression: two stages must never draw the same ZMQ port.
+
+    ``get_open_ports_list`` only dedups within a single call, so per-route
+    allocation used to let a later stage reuse an earlier stage's port. The
+    second engine to ``bind()`` then died with ``zmq.error.ZMQError: Address
+    already in use`` (flaky multi-stage startup, e.g. Qwen3-Omni thinker/talker/
+    code2wav). ``OmniMasterServer`` now dedups every port it hands out.
+    """
+    import itertools
+
+    from vllm_omni.engine import stage_engine_startup as ses
+
+    # A colliding prefix (repeats + the master port 9000) followed by an endless
+    # fresh stream, so the only way to succeed is to redraw the collisions.
+    supply = itertools.chain([9000, 9000, 9001, 9001, 9000], itertools.count(9002))
+
+    def fake_get_open_ports_list(count):
+        return [next(supply) for _ in range(count)]
+
+    monkeypatch.setattr(ses, "get_open_ports_list", fake_get_open_ports_list)
+
+    server = ses.OmniMasterServer(
+        master_address="127.0.0.1",
+        master_port=9000,  # seed: a route must not reuse the registration port
+        stage_ids=[0, 1, 2],
+    )
+
+    ports = []
+    for sid in (0, 1, 2):
+        alloc = server.get_allocation(sid)
+        for addr in (
+            alloc.handshake_bind_address,
+            alloc.input_bind_address,
+            alloc.output_bind_address,
+        ):
+            ports.append(ses._port_from_zmq_address(addr))
+
+    assert len(ports) == len(set(ports)), f"duplicate route ports allocated: {ports}"
+    assert 9000 not in ports, "route reused the master registration port"
+
+
+def test_port_from_zmq_address_parsing():
+    from vllm_omni.engine.stage_engine_startup import _port_from_zmq_address
+
+    assert _port_from_zmq_address("tcp://127.0.0.1:34277") == 34277
+    assert _port_from_zmq_address(None) is None
+    assert _port_from_zmq_address("ipc:///tmp/sock") is None
+    assert _port_from_zmq_address("tcp://host:not-a-port") is None
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("failure", ["ready", "attach", None])
+def test_single_api_common_launch_ownership_and_rollback(monkeypatch, parallel, failure):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = _make_stage_runtime()
+    runtime._parallel_stage_init = parallel
+    plan = _make_llm_plan(0, stage_id=0, vllm_config=_FakeVllmConfig()).replicas[0]
+    plan.engine_args_dict = {}
+    events = []
+
+    class Manager:
+        def shutdown(self):
+            events.append("shutdown")
+
+    manager = Manager()
+    addresses = EngineZmqAddresses(inputs=["ipc://input"], outputs=["ipc://output"])
+    monkeypatch.setattr(runtime, "_resolve_replica_physical_devices", lambda *_: "0")
+
+    def acquire(*_, **kwargs):
+        assert kwargs["visible_devices"] == "0"
+        assert not runtime._spawn_device_lock.locked()
+        events.append("lock")
+        return [42]
+
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", acquire)
+    monkeypatch.setattr(runtime_mod, "release_device_locks", lambda _: events.append("unlock"))
+
+    @contextlib.contextmanager
+    def launch(**kwargs):
+        assert kwargs["num_api_servers"] == 1
+        assert kwargs["omni_parallel_stage_init"] is parallel
+        events.append("spawn")
+        yield StageReplicaResources(manager=manager, addresses=addresses)
+        assert runtime._replica_launch_lock.locked() is False
+        events.append("ready")
+        if failure == "ready":
+            raise RuntimeError("ready")
+
+    def attach(**kwargs):
+        assert "ready" in events
+        assert kwargs["engine_manager"] is manager
+        events.append("attach")
+        if failure == "attach":
+            raise RuntimeError("attach")
+        return manager
+
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", launch)
+    monkeypatch.setattr(runtime_mod.StageEngineCoreClientBase, "make_async_mp_client", attach)
+    if failure:
+        with pytest.raises(RuntimeError, match=failure):
+            runtime._initialize_local_llm_replica(plan, 1)
+        assert events.count("shutdown") == 1
+    else:
+        assert runtime._initialize_local_llm_replica(plan, 1) is manager
+        assert "shutdown" not in events
+    assert events.count("lock") == events.count("unlock") == (0 if parallel else 1)
+
+
+@pytest.mark.parametrize("client_count", [1, 2])
+def test_common_launch_parallel_admission_before_spawn(monkeypatch, client_count):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = _make_stage_runtime()
+    runtime._parallel_stage_init = True
+    plan = _make_llm_plan(0, stage_id=0, vllm_config=_FakeVllmConfig())
+    plan.replicas[0].engine_args_dict = {}
+    events = []
+    monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: [plan])
+    monkeypatch.setattr(runtime, "_reject_unguardable_executors", lambda _: events.append("guard"))
+    monkeypatch.setattr(runtime, "_run_stage_admission", lambda _: events.append("admit"))
+    monkeypatch.setattr(runtime, "_resolve_replica_physical_devices", lambda *_: "0")
+
+    def forbidden_lock(*_):
+        pytest.fail("parallel initialization must use child phase locks")
+
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", forbidden_lock)
+
+    @contextlib.contextmanager
+    def launch(**kwargs):
+        assert events == ["guard", "admit"]
+        assert kwargs["omni_parallel_stage_init"] is True
+        events.append("spawn")
+        yield StageReplicaResources(
+            addresses=EngineZmqAddresses(
+                inputs=[f"ipc://in{i}" for i in range(client_count)],
+                outputs=[f"ipc://out{i}" for i in range(client_count)],
+            )
+        )
+        assert not runtime._replica_launch_lock.locked()
+        events.append("ready")
+
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", launch)
+    with runtime.launch_stage_engines(client_count):
+        pass
+    assert events == ["guard", "admit", "spawn", "ready"]
+
+
+@pytest.mark.parametrize(
+    "stage_modes,expected", [([False, True, True], True), ([False, False], False), ([True, False], True)]
+)
+def test_engine_async_chunk_includes_downstream_stages(monkeypatch, stage_modes, expected):
+    engine = object.__new__(AsyncOmniEngine)
+    stages = [OmegaConf.create({"engine_args": {"async_chunk": mode}}) for mode in stage_modes]
+    monkeypatch.setattr(async_omni_engine_module.StageConfigFactory, "get_pipeline_config", lambda *a, **k: None)
+    monkeypatch.setattr(engine, "_resolve_stage_configs", lambda *a, **k: (None, stages))
+    monkeypatch.setattr(engine, "_set_pipeline_runtime_config", lambda *a: None)
+
+    class ConfigResolvedError(Exception):
+        pass
+
+    def stop_before_queues(*args, **kwargs):
+        raise ConfigResolvedError
+
+    monkeypatch.setattr(async_omni_engine_module.janus, "Queue", stop_before_queues)
+    with pytest.raises(ConfigResolvedError):
+        engine.__init__("test-model")
+    assert engine.async_chunk is expected
+
+
+@pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
+def test_dist_stage_runtime_applies_local_dp_to_stage_config(typed):
+    from vllm_omni.config.omni_config import VllmOmniARStageConfig
+    from vllm_omni.config.stage_config import StagePipelineConfig
+    from vllm_omni.engine.stage_runtime import DistStageRuntime
+
+    if typed:
+        stage = VllmOmniARStageConfig(stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="ar"))
+        runtime_cfg = stage.runtime_config
+    else:
+        runtime_cfg = types.SimpleNamespace(num_replicas=1)
+        stage = types.SimpleNamespace(stage_id=0, runtime=runtime_cfg)
+    runtime = DistStageRuntime(
+        stage_configs=[stage],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        async_chunk=False,
+        single_stage_id_filter=0,
+        omni_master_address="127.0.0.1",
+        omni_master_port=12345,
+        omni_dp_size_local=2,
+    )
+
+    runtime._validate_single_stage_mode_replica_constraints()
+
+    assert runtime_cfg.num_replicas == 2
+
+
+@pytest.mark.parametrize("num_replicas", [1, 2, 3])
+@pytest.mark.parametrize("kv_owner", [None, "connector_config", "diffusion_config"])
+def test_typed_diffusion_replicas_share_one_config_between_planning_and_launch(mocker, num_replicas, kv_owner):
+    from vllm_omni.config.config_factory import StageConfigFactory
+    from vllm_omni.engine import stage_runtime as runtime_module
+
+    stage = StageConfigFactory.create_typed_default_diffusion(
+        "generic-diffusion", {"model_class_name": "QwenImagePipeline"}
+    ).stage_configs[0]
+    if kv_owner is not None:
+        from vllm.config import KVTransferConfig
+
+        getattr(stage, kv_owner).kv_transfer_config = KVTransferConfig(
+            kv_connector="MooncakeConnector", kv_role="kv_consumer", engine_id="dit"
+        )
+    devices = ",".join(str(i) for i in range(num_replicas))
+    stage.runtime_config.devices = devices
+    stage.runtime_config.num_replicas = num_replicas
+    runtime = StageRuntime(
+        stage_configs=[stage],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        async_chunk=False,
+    )
+    mocker.patch.object(runtime_module, "get_stage_connector_spec", return_value={})
+    mocker.patch.object(runtime_module, "resolve_omni_kv_config_for_stage", return_value=(None, None, None))
+    client = mocker.Mock()
+    launch = mocker.patch.object(runtime_module, "launch_diffusion_stage_replica", return_value=(client, None))
+
+    # Replanning must not inherit the first replica's narrowed device slice.
+    for _ in range(2):
+        counts, device_map = compute_replica_layout([stage])
+        plans = runtime._build_logical_stage_init_plans(
+            omni_transfer_config=None,
+            replicas_per_stage=counts,
+            replica_devices_map=device_map,
+        )
+        replicas = plans[0].replicas
+        assert stage.runtime_config.devices == devices
+        assert len({id(plan.stage_cfg) for plan in replicas}) == num_replicas
+        for i, plan in enumerate(replicas):
+            assert plan.metadata.runtime_cfg is plan.stage_cfg.runtime_config
+            assert plan.stage_cfg.runtime_config.devices == str(i)
+            if num_replicas > 1 or kv_owner is not None:
+                assert plan.stage_cfg is not stage
+            if kv_owner is not None:
+                from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+                assert getattr(stage, kv_owner).kv_transfer_config.engine_id == "dit"
+                engine_args = build_engine_args_dict_from_omni_stage_config(plan.stage_cfg, "dummy-model")
+                assert engine_args["kv_transfer_config"].engine_id == f"dit-s0-r{i}"
+            assert runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=1) is client
+            assert launch.call_args.kwargs["stage_config"] is plan.stage_cfg
+            assert launch.call_args.kwargs["metadata"] is plan.metadata
+            assert launch.call_args.kwargs["use_inline"] is (num_replicas == 1)
+
+    assert launch.call_count == 2 * num_replicas
+
+
+@pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
+@pytest.mark.parametrize("num_replicas", [1, 2])
+def test_native_kv_producer_replica_identity_and_bootstrap_are_isolated(mocker, typed, num_replicas):
+    from vllm.config import KVTransferConfig
+
+    from vllm_omni.config.omni_config import VllmOmniARStageConfig
+    from vllm_omni.config.stage_config import StagePipelineConfig
+    from vllm_omni.engine import stage_runtime as runtime_module
+
+    kv_config = KVTransferConfig(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        engine_id="ar",
+        kv_ip="127.0.0.1",
+        kv_connector_extra_config={"bootstrap_port": 9100},
+    )
+    if typed:
+        stage = VllmOmniARStageConfig(stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="ar"))
+        stage.connector_config.kv_transfer_config = kv_config
+        runtime_cfg = stage.runtime_config
+    else:
+        runtime_cfg = OmegaConf.create({"devices": "0,1", "env": {"KEEP": "value"}})
+        stage = types.SimpleNamespace(stage_id=0, engine_args={"kv_transfer_config": kv_config}, runtime=runtime_cfg)
+        metadata = _make_llm_metadata(0)
+        mocker.patch.object(
+            runtime_module,
+            "extract_legacy_stage_metadata",
+            side_effect=lambda cfg: types.SimpleNamespace(**{**metadata.__dict__, "runtime_cfg": cfg.runtime}),
+        )
+    runtime_cfg.devices = "0,1"
+    runtime_cfg.env = {"KEEP": "value"}
+    runtime = StageRuntime(
+        stage_configs=[stage],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        async_chunk=False,
+    )
+    mocker.patch.object(runtime_module, "get_stage_connector_spec", return_value={})
+    mocker.patch.object(runtime_module, "resolve_omni_kv_config_for_stage", return_value=(None, None, None))
+    for builder in ("build_engine_args_dict", "build_engine_args_dict_from_omni_stage_config"):
+        mocker.patch.object(runtime_module, builder, return_value={})
+    mocker.patch.object(
+        runtime_module,
+        "build_vllm_config",
+        return_value=(types.SimpleNamespace(kv_transfer_config=kv_config), object),
+    )
+
+    for _ in range(2):
+        plans = runtime._build_logical_stage_init_plans(None, [num_replicas], {})
+        for i, replica in enumerate(plans[0].replicas):
+            config = replica.stage_vllm_config.kv_transfer_config
+            assert config.engine_id == f"ar-s0-r{i}"
+            assert config.kv_connector_extra_config["bootstrap_addr"] == f"http://127.0.0.1:{9100 + i}"
+            assert dict(replica.metadata.runtime_cfg.env) == {
+                "KEEP": "value",
+                "VLLM_MOONCAKE_BOOTSTRAP_PORT": str(9100 + i),
+            }
+            if typed:
+                assert replica.metadata.runtime_cfg is replica.stage_cfg.runtime_config
+        assert kv_config.engine_id == "ar"
+        assert kv_config.kv_connector_extra_config == {"bootstrap_port": 9100}
+        assert dict(runtime_cfg.env) == {"KEEP": "value"}
+
+
+@pytest.mark.parametrize(
+    "roles, sources, async_chunk, valid",
+    [
+        (["kv_producer", "kv_consumer"], [0], False, True),
+        (["kv_producer", "kv_consumer"], [0], True, False),
+        ([None, "kv_consumer"], [0], False, False),
+        (["kv_producer", None], [0], False, False),
+        ([None, "kv_producer", "kv_consumer"], [1], False, False),
+        (["kv_producer", "kv_consumer"], [1], False, False),
+        ([None, None], [0], False, True),
+    ],
+)
+def test_native_kv_topology_rejects_silent_legacy_fallback(roles, sources, async_chunk, valid):
+    plans = []
+    for stage_id, role in enumerate(roles):
+        diffusion = stage_id == len(roles) - 1
+        config = types.SimpleNamespace(kv_role=role) if role else None
+        replica = types.SimpleNamespace(
+            metadata=types.SimpleNamespace(stage_type="diffusion" if diffusion else "llm", engine_input_source=sources),
+            stage_vllm_config=None if diffusion else types.SimpleNamespace(kv_transfer_config=config),
+            stage_cfg=types.SimpleNamespace(engine_args={"kv_transfer_config": config}),
+        )
+        plans.append(types.SimpleNamespace(stage_id=stage_id, replicas=[replica]))
+    runtime = object.__new__(StageRuntime)
+    runtime._async_chunk = async_chunk
+    if valid:
+        runtime._validate_native_kv_topology(plans)
+    else:
+        with pytest.raises(ValueError, match="two-stage"):
+            runtime._validate_native_kv_topology(plans)
+
+
+@pytest.mark.parametrize("explicit", [None, "1"])
+def test_acquire_device_locks_visible_devices_precedence(monkeypatch, tmp_path, explicit):
+    import vllm_omni.engine.stage_init_utils as init_mod
+    from vllm_omni.platforms import current_omni_platform
+
+    env_var = current_omni_platform.device_control_env_var
+    monkeypatch.setenv(env_var, "0")
+    monkeypatch.setattr(init_mod, "device_init_lock_path", lambda device: str(tmp_path / f"gpu-{device}"))
+    locked: set[int] = set()
+    fds = init_mod.acquire_device_locks(0, {}, 1, locked, visible_devices=explicit)
+    try:
+        assert len(fds) == 1
+        assert locked == {int(explicit or "0")}
+        assert os.environ[env_var] == "0"
+    finally:
+        init_mod.release_device_locks(fds)
+
+
+def test_llm_device_lock_wait_allows_holder_to_spawn(monkeypatch, tmp_path):
+    """A peer holding the GPU flock must be able to spawn to finish init."""
+    import vllm_omni.engine.stage_init_utils as init_mod
+    import vllm_omni.engine.stage_runtime as runtime_mod
+    from vllm_omni.platforms import current_omni_platform
+
+    runtime = _make_stage_runtime()
+    plan = _make_llm_plan(0, stage_id=0, vllm_config=_FakeVllmConfig()).replicas[0]
+    plan.engine_args_dict = {}
+    monkeypatch.setenv(current_omni_platform.device_control_env_var, "0")
+    monkeypatch.setattr(runtime, "_resolve_replica_physical_devices", lambda *_: "0")
+    monkeypatch.setattr(init_mod, "device_init_lock_path", lambda device: str(tmp_path / f"gpu-{device}"))
+    holder_fds = init_mod.acquire_device_locks(1, {}, 1)
+    assert len(holder_fds) == 1
+    waiting = threading.Event()
+    spawned = threading.Event()
+
+    def holder():
+        try:
+            if waiting.wait(5):
+                acquired = runtime._spawn_device_lock.acquire(timeout=2)
+                if acquired:
+                    runtime._spawn_device_lock.release()
+                    spawned.set()
+        finally:
+            init_mod.release_device_locks(holder_fds)
+
+    def acquire(*args, **kwargs):
+        waiting.set()
+        # Ensure the peer has an opportunity to request the spawn lock before
+        # flock acquisition can return (including via its timeout escape).
+        assert spawned.wait(3), "GPU-lock holder blocked by the waiting stage's spawn lock"
+        return init_mod.acquire_device_locks(*args, **kwargs)
+
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", acquire)
+
+    @contextlib.contextmanager
+    def launch(**kwargs):
+        yield StageReplicaResources(addresses=EngineZmqAddresses(inputs=["ipc://in"], outputs=["ipc://out"]))
+
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", launch)
+    monkeypatch.setattr(runtime_mod.StageEngineCoreClientBase, "make_async_mp_client", lambda **_: object())
+    thread = threading.Thread(target=holder, daemon=True)
+    thread.start()
+    try:
+        runtime._initialize_local_llm_replica(plan, 5)
+        assert spawned.is_set()
+    finally:
+        waiting.set()
+        thread.join(6)
+    assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_colocated_diffusion_scopes_devices(monkeypatch, fail):
+    import vllm_omni.engine.stage_engine_startup as startup_mod
+    from vllm_omni.platforms import current_omni_platform
+
+    env_var = current_omni_platform.device_control_env_var
+    monkeypatch.setenv(env_var, "0,1")
+    lock = threading.Lock()
+    client = object()
+    plan = _make_diffusion_plan(0, stage_id=0).replicas[0]
+
+    def initialize(*args, **kwargs):
+        assert lock.locked()
+        assert os.environ[env_var] == "1"
+        if fail:
+            raise RuntimeError("init failed")
+        return client
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("colocated diffusion must not acquire distributed device locks")
+
+    monkeypatch.setattr(startup_mod, "initialize_diffusion_stage", initialize)
+    monkeypatch.setattr(startup_mod, "acquire_device_locks", forbidden)
+    expectation = pytest.raises(RuntimeError, match="init failed") if fail else contextlib.nullcontext()
+    with expectation:
+        result, _ = startup_mod.launch_diffusion_stage_replica(
+            model="dummy",
+            stage_config=plan.stage_cfg,
+            metadata=plan.metadata,
+            stage_init_timeout=1,
+            use_inline=True,
+            stage_visible_devices="1",
+            spawn_device_lock=lock,
+        )
+        assert result is client
+    assert os.environ[env_var] == "0,1"
+    assert not lock.locked()

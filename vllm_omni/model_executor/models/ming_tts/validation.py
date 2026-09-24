@@ -14,6 +14,9 @@ from .constants import (
     LATENT_DIM,
     LLM_HIDDEN_SIZE,
     LLM_VOCAB_SIZE,
+    MOE_AUDIO_DUMMY_TOKEN_ID,
+    MOE_AUDIO_EOS_TOKEN_ID,
+    MOE_TEXT_EOS_TOKEN_ID,
     PATCH_SIZE,
     SAMPLE_RATE,
 )
@@ -70,19 +73,23 @@ def _nested_get(obj: Any, *keys: str, default: Any = None) -> Any:
 
 def validate_ming_tts_config(cfg: Any) -> None:
     """Run before GPU allocation/weight loading. Raises ValueError on mismatches."""
-    if cfg.audio_dummy_token_id != 151705:
+    is_moe = getattr(cfg, "model_variant", "dense") == "moe"
+    exp_audio_dummy = MOE_AUDIO_DUMMY_TOKEN_ID if is_moe else 151705
+    exp_audio_eos = MOE_AUDIO_EOS_TOKEN_ID if is_moe else 151704
+    exp_text_eos = MOE_TEXT_EOS_TOKEN_ID if is_moe else 151669
+    if cfg.audio_dummy_token_id != exp_audio_dummy:
         raise ValueError(
-            f"audio_dummy_token_id={cfg.audio_dummy_token_id}, expected 151705 (<audioPatch>). "
+            f"audio_dummy_token_id={cfg.audio_dummy_token_id}, expected {exp_audio_dummy} (<audioPatch>). "
             "Wrong tokenizer/checkpoint?"
         )
-    if cfg.audio_eos_token_id != 151704:
+    if cfg.audio_eos_token_id != exp_audio_eos:
         raise ValueError(
-            f"audio_eos_token_id={cfg.audio_eos_token_id}, expected 151704 (<end_of_audio>). "
+            f"audio_eos_token_id={cfg.audio_eos_token_id}, expected {exp_audio_eos} (<end_of_audio>). "
             "Wrong tokenizer/checkpoint?"
         )
-    if cfg.text_eos_token_id != 151669:
+    if cfg.text_eos_token_id != exp_text_eos:
         raise ValueError(
-            f"text_eos_token_id={cfg.text_eos_token_id}, expected 151669 (<text_eos>). Wrong tokenizer/checkpoint?"
+            f"text_eos_token_id={cfg.text_eos_token_id}, expected {exp_text_eos}. Wrong tokenizer/checkpoint?"
         )
 
     if cfg.audio_tokenizer_config is None:
@@ -102,13 +109,16 @@ def validate_ming_tts_config(cfg: Any) -> None:
             f"history_patch_size mismatch: got {cfg.history_patch_size}, expected {HISTORY_PATCH_SIZE}. "
             "Check ditar_config.history_patch_size."
         )
-    if cfg.llm_hidden_size != LLM_HIDDEN_SIZE:
-        raise ValueError(
-            f"llm_hidden_size mismatch: got {cfg.llm_hidden_size}, expected {LLM_HIDDEN_SIZE}. "
-            "Check llm_config.hidden_size."
-        )
-    if cfg.llm_vocab_size != LLM_VOCAB_SIZE:
-        raise ValueError(f"llm_vocab_size mismatch: got {cfg.llm_vocab_size}, expected {LLM_VOCAB_SIZE}.")
+    # Absolute hidden/vocab pins are dense-only; the MoE backbone carries its
+    # own (larger) dims, cross-checked against llm_config.hidden_size below.
+    if not is_moe:
+        if cfg.llm_hidden_size != LLM_HIDDEN_SIZE:
+            raise ValueError(
+                f"llm_hidden_size mismatch: got {cfg.llm_hidden_size}, expected {LLM_HIDDEN_SIZE}. "
+                "Check llm_config.hidden_size."
+            )
+        if cfg.llm_vocab_size != LLM_VOCAB_SIZE:
+            raise ValueError(f"llm_vocab_size mismatch: got {cfg.llm_vocab_size}, expected {LLM_VOCAB_SIZE}.")
     if cfg.sample_rate != SAMPLE_RATE:
         raise ValueError(f"sample_rate mismatch: got {cfg.sample_rate}, expected {SAMPLE_RATE}.")
 
@@ -162,6 +172,9 @@ def validate_ming_tts_config(cfg: Any) -> None:
 
     if cfg.latent_chunk_size <= 0:
         raise ValueError(f"latent_chunk_size must be > 0, got {cfg.latent_chunk_size}.")
+    initial_latent_chunk_size = getattr(cfg, "initial_latent_chunk_size", 0)
+    if initial_latent_chunk_size < 0:
+        raise ValueError(f"initial_latent_chunk_size must be >= 0, got {initial_latent_chunk_size}.")
     if cfg.latent_left_context < 0:
         raise ValueError(f"latent_left_context must be >= 0, got {cfg.latent_left_context}.")
     if cfg.max_decode_steps <= 0:

@@ -857,6 +857,40 @@ class GLMTTSDiTForGeneration(nn.Module):
         if self.t_scheduler == "cosine":
             t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
 
+        # Hoist loop-invariant DiT inputs (text embedding, RoPE table,
+        # block-causal mask, CFG double-batch conditioning) out of the Euler
+        # loop; they depend only on the conditioning and seq_len, not on the
+        # per-step state x or the timestep.
+        seq_len = int(mel_cond.shape[1])
+        # Must match the dtype forward() casts with internally (both are
+        # proj_out.weight.dtype); keep them in sync if that derivation changes.
+        dit_dtype = self.dit.proj_out.weight.dtype
+        # `device` is speech_tokens.device; in this call path the sampled state x
+        # lives on the same device, so the hoisted mask matches the old in-forward one.
+        attn_mask = (
+            self.dit._create_block_causal_mask(block_pattern, seq_len, device, dit_dtype)
+            if block_pattern is not None
+            else None
+        )
+        rope = self.dit.rotary_embed.forward_from_seq_len(seq_len)
+
+        if self.inference_cfg_rate > 0:
+            condition_b = torch.cat([condition_dit, torch.zeros_like(condition_dit)], dim=0)
+            if self.speech_token_cfg:
+                text_b = torch.cat([speech_tokens, torch.zeros_like(speech_tokens)], dim=0)
+            else:
+                text_b = speech_tokens.expand(2, -1)
+            padding_b = padding_mask.expand(2, -1)
+            if spkr_embedding_dit is not None and self.spkr_emb_adaln:
+                spkr_b = torch.cat([spkr_embedding_dit, torch.zeros_like(spkr_embedding_dit)], dim=0)
+            else:
+                spkr_b = None
+            text_lens_b = text_lens.expand(2) if text_lens is not None else None
+            text_embed_b = self.dit.text_emb_layer(text_b, seq_len, text_lens=text_lens_b).to(dit_dtype)
+        else:
+            spkr_uncond = spkr_embedding_dit if (spkr_embedding_dit is not None and self.spkr_emb_adaln) else None
+            text_embed_u = self.dit.text_emb_layer(speech_tokens, seq_len, text_lens=text_lens).to(dit_dtype)
+
         for step in range(n_timesteps):
             cache_step = step + 1
             if last_step_cache is not None and cache_step in last_step_cache:
@@ -872,24 +906,12 @@ class GLMTTSDiTForGeneration(nn.Module):
             t_current = t_span[step]
             dt = t_span[step + 1] - t_current
 
-            use_causal = block_pattern is not None
             x_dit = x.to(mel_cond.dtype)
 
             if self.inference_cfg_rate > 0:
                 # Batch conditional + unconditional into a single forward
                 middle_b = x_dit.expand(2, -1, -1)
-                condition_b = torch.cat([condition_dit, torch.zeros_like(condition_dit)], dim=0)
-                if self.speech_token_cfg:
-                    text_b = torch.cat([speech_tokens, torch.zeros_like(speech_tokens)], dim=0)
-                else:
-                    text_b = speech_tokens.expand(2, -1)
                 time_b = t_current.unsqueeze(0).expand(2)
-                padding_b = padding_mask.expand(2, -1)
-                if spkr_embedding_dit is not None and self.spkr_emb_adaln:
-                    spkr_b = torch.cat([spkr_embedding_dit, torch.zeros_like(spkr_embedding_dit)], dim=0)
-                else:
-                    spkr_b = None
-                text_lens_b = text_lens.expand(2) if text_lens is not None else None
                 pred_b = self.dit(
                     middle_point=middle_b,
                     condition=condition_b,
@@ -897,9 +919,10 @@ class GLMTTSDiTForGeneration(nn.Module):
                     time_step=time_b,
                     padding_mask=padding_b,
                     spkr_emb=spkr_b,
-                    is_causal=use_causal,
-                    block_pattern=block_pattern,
+                    attn_mask=attn_mask,
                     text_lens=text_lens_b,
+                    text_embed=text_embed_b,
+                    rope=rope,
                 ).to(torch.float32)
                 dphi_dt, cfg_dphi_dt = pred_b.chunk(2, dim=0)
                 dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
@@ -910,10 +933,11 @@ class GLMTTSDiTForGeneration(nn.Module):
                     text=speech_tokens,
                     time_step=t_current.unsqueeze(0),
                     padding_mask=padding_mask,
-                    spkr_emb=spkr_embedding_dit if spkr_embedding_dit is not None and self.spkr_emb_adaln else None,
-                    is_causal=use_causal,
-                    block_pattern=block_pattern,
+                    spkr_emb=spkr_uncond,
+                    attn_mask=attn_mask,
                     text_lens=text_lens,
+                    text_embed=text_embed_u,
+                    rope=rope,
                 ).to(torch.float32)
 
             x = x + dt * dphi_dt

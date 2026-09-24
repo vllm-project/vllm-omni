@@ -6,9 +6,8 @@ OmniVoice Generator (Stage 0) - Iterative unmasking with Qwen3 backbone.
 Generates 8-codebook audio tokens from text via 32-step non-autoregressive
 iterative masked prediction with classifier-free guidance.
 
-Uses full bidirectional attention computed directly with PyTorch SDPA
-(torch.nn.functional.scaled_dot_product_attention); no auto-selected
-FlashAttention/SageAttention/DiffusionAttention backend is used.
+Uses backend-dispatched variable-length full bidirectional attention over
+packed conditional and unconditional sequences, with an SDPA mask fallback.
 """
 
 from __future__ import annotations
@@ -22,7 +21,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
+from vllm.utils.math_utils import round_up
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.model_executor.models.omnivoice.fused_qkv_rope import fused_qkv_norm_rope
 from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 
 logger = init_logger(__name__)
@@ -100,44 +104,46 @@ try:
 
     @triton.jit
     def _swiglu_fwd_kernel(
-        gate_ptr,
-        up_ptr,
+        inp_ptr,
         out_ptr,
-        stride,
+        in_stride,
+        out_stride,
         n_cols: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,  # noqa: N803
     ):
         pid = tl.program_id(0).to(tl.int64)
-        gate_ptr += pid * stride
-        up_ptr += pid * stride
-        out_ptr += pid * stride
+        inp_ptr += pid * in_stride
+        out_ptr += pid * out_stride
         cols = tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
-        gate = tl.load(gate_ptr + cols, mask=mask, other=0).to(tl.float32)
-        up = tl.load(up_ptr + cols, mask=mask, other=0)
+        gate = tl.load(inp_ptr + cols, mask=mask, other=0).to(tl.float32)
+        up = tl.load(inp_ptr + n_cols + cols, mask=mask, other=0)
         silu_gate = gate * tl.sigmoid(gate)
         out = silu_gate.cast(up.dtype) * up
         tl.store(out_ptr + cols, out, mask=mask)
 
-    def triton_swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-        gate = gate.contiguous()
-        up = up.contiguous()
-        shape = gate.shape
-        n_cols = shape[-1]
-        g2d = gate.view(-1, n_cols)
-        u2d = up.view(-1, n_cols)
-        out = torch.empty_like(g2d)
+    def triton_swiglu(gate_up: torch.Tensor) -> torch.Tensor:
+        """SwiGLU over a packed ``[..., 2 * intermediate]`` activation.
+
+        Reading both halves straight out of the fused projection's output keeps
+        the packing free: splitting it first would hand this kernel two strided
+        views and cost a full copy of each half per layer per step.
+        """
+        n_cols = gate_up.shape[-1] // 2
+        gate_up = gate_up.contiguous()
+        x2d = gate_up.view(-1, 2 * n_cols)
+        out = torch.empty(x2d.shape[0], n_cols, dtype=gate_up.dtype, device=gate_up.device)
         BLOCK_SIZE, num_warps = _calculate_settings(n_cols)
-        _swiglu_fwd_kernel[(g2d.shape[0],)](
-            g2d,
-            u2d,
+        _swiglu_fwd_kernel[(x2d.shape[0],)](
+            x2d,
             out,
+            x2d.stride(0),
             out.stride(0),
             n_cols=n_cols,
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=num_warps,
         )
-        return out.view(*shape)
+        return out.view(*gate_up.shape[:-1], n_cols)
 
     @triton.jit
     def _fused_add_rms_norm_fwd_kernel(
@@ -238,10 +244,11 @@ def _gumbel_sample(logits: torch.Tensor, temperature: float, generator: torch.Ge
 
 
 # ---------------------------------------------------------------------------
-# Qwen3-style transformer blocks using PyTorch SDPA
+# Qwen3-style transformer blocks using PyTorch variable-length attention
 # ---------------------------------------------------------------------------
 
 
+# Subclass keeps .weight name + ctor shape so the state_dict loader stays unchanged.
 class OmniVoiceRMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -257,18 +264,20 @@ class OmniVoiceRMSNorm(nn.Module):
 
 
 class OmniVoiceAttention(nn.Module):
-    """Qwen3-style GQA attention using PyTorch SDPA (full bidirectional)."""
+    """Qwen3-style GQA using packed, full-bidirectional varlen attention."""
 
-    def __init__(self, config: OmniVoiceConfig):
+    def __init__(self, config: OmniVoiceConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.llm_hidden_size
         self.num_heads = config.llm_num_attention_heads
         self.num_kv_heads = config.llm_num_key_value_heads
         self.head_dim = config.llm_head_dim
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        # q/k/v are packed into one projection: the three are sibling GEMMs over
+        # the same activation, and at this model's shapes (2 x 44 rows) three
+        # small GEMMs cost noticeably more than one wide one.
+        self.num_qkv_heads = self.num_heads + 2 * self.num_kv_heads
+        self.qkv_proj = nn.Linear(self.hidden_size, self.num_qkv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
         # Qwen3 uses per-head QK norm
@@ -276,62 +285,51 @@ class OmniVoiceAttention(nn.Module):
         self.k_norm = OmniVoiceRMSNorm(self.head_dim)
 
         self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.attention_op = Attention(
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_heads,
+            head_size=self.head_dim,
+            causal=False,
+            softmax_scale=self.scale,
+            prefix=f"layers.{layer_idx}.self_attn.attention_op",
+            qkv_layout="BSND",
+            skip_sequence_parallel=True,
+        )
+        self.use_packed_varlen = self.attention_op.attn_backend.supports_multi_doc_packed_varlen()
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        cos: torch.Tensor | None = None,
-        sin: torch.Tensor | None = None,
+        rope_table: torch.Tensor,
+        attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        batch_size, seq_len, _ = hidden_states.shape
+        seq_len, _ = hidden_states.shape
 
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states).view(1, seq_len, self.num_qkv_heads, self.head_dim)
 
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-
-        # Per-head QK norm (Qwen3)
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-
-        # Apply RoPE
-        if cos is not None and sin is not None:
-            q = _apply_rotary_pos_emb(q, cos, sin)
-            k = _apply_rotary_pos_emb(k, cos, sin)
-
-        # Expand KV heads for GQA (8 KV heads → 16 Q heads)
-        if self.num_kv_heads != self.num_heads:
-            repeat_factor = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(repeat_factor, dim=2)
-            v = v.repeat_interleave(repeat_factor, dim=2)
-
-        # Full bidirectional attention via SDPA with proper mask support
-        # Permute to (batch, heads, seq, head_dim) for SDPA
-        q = q.permute(0, 2, 1, 3)
-        k = k.permute(0, 2, 1, 3)
-        v = v.permute(0, 2, 1, 3)
-
-        # Convert [B, 1, S, S] bool mask to float mask for SDPA
-        # (0.0 where attend, -inf where masked)
-        sdpa_mask = None
-        if attention_mask is not None:
-            sdpa_mask = torch.zeros_like(attention_mask, dtype=q.dtype).masked_fill_(~attention_mask, float("-inf"))
-
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=sdpa_mask,
-            scale=self.scale,
+        # One kernel for the whole prologue: split the packed projection, RMSNorm
+        # Q and K per head, rotate both, broadcast K and V across their query
+        # groups, and emit SDPA's [batch, heads, positions, head_dim] layout.
+        q, k, v = fused_qkv_norm_rope(
+            qkv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            rope_table,
+            self.q_norm.eps,
+            self.num_heads,
+            self.num_kv_heads,
         )
 
-        # Back to (batch, seq, heads * head_dim)
-        out = out.permute(0, 2, 1, 3).contiguous()
-        out = out.view(batch_size, seq_len, self.num_heads * self.head_dim)
+        # The fused prologue emits [B, N, S, D]; Omni attention backends use
+        # [B, S, N, D]. Keep the conversion outside the backend.
+        q, k, v = (tensor.permute(0, 2, 1, 3).contiguous().to(torch.bfloat16) for tensor in (q, k, v))
+        if self.use_packed_varlen:
+            out = self.attention_op(q, k, v, attn_metadata)
+        else:
+            out = self.attention_op.sdpa_fallback.forward(q, k, v, attn_metadata)
+
+        out = out.squeeze(0).to(hidden_states.dtype)
+        out = out.reshape(seq_len, self.num_heads * self.head_dim)
         return self.o_proj(out)
 
 
@@ -340,36 +338,68 @@ class OmniVoiceMLP(nn.Module):
 
     def __init__(self, config: OmniVoiceConfig):
         super().__init__()
-        self.gate_proj = nn.Linear(config.llm_hidden_size, config.llm_intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.llm_hidden_size, config.llm_intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.llm_intermediate_size, config.llm_hidden_size, bias=False)
+        self.intermediate_size = config.llm_intermediate_size
+        self.gate_up_proj = nn.Linear(config.llm_hidden_size, 2 * self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, config.llm_hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up = self.gate_up_proj(x)
         if _TRITON_AVAILABLE:
-            return self.down_proj(triton_swiglu(self.gate_proj(x), self.up_proj(x)))
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+            return self.down_proj(triton_swiglu(gate_up))
+        gate, up = gate_up.chunk(2, dim=-1)
+        return self.down_proj(F.silu(gate) * up)
+
+
+# Fused parameter -> the HF checkpoint shards it absorbs, in packing order.
+# The checkpoint keeps q/k/v and gate/up separate; load_weights packs them.
+_FUSED_PROJECTIONS: dict[str, tuple[str, ...]] = {
+    "self_attn.qkv_proj": ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"),
+    "mlp.gate_up_proj": ("mlp.gate_proj", "mlp.up_proj"),
+}
 
 
 class OmniVoiceTransformerBlock(nn.Module):
-    """Single Qwen3 transformer block with PyTorch SDPA attention."""
+    """Single Qwen3 transformer block with variable-length attention."""
 
-    def __init__(self, config: OmniVoiceConfig):
+    def __init__(self, config: OmniVoiceConfig, layer_idx: int):
         super().__init__()
         self.input_layernorm = OmniVoiceRMSNorm(config.llm_hidden_size, eps=config.llm_rms_norm_eps)
-        self.self_attn = OmniVoiceAttention(config)
+        self.self_attn = OmniVoiceAttention(config, layer_idx)
         self.post_attention_layernorm = OmniVoiceRMSNorm(config.llm_hidden_size, eps=config.llm_rms_norm_eps)
         self.mlp = OmniVoiceMLP(config)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        cos: torch.Tensor | None = None,
-        sin: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, attention_mask=attention_mask, cos=cos, sin=sin)
+        attn_metadata: AttentionMetadata,
+        rope_table: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns ``(normed_hidden_states, residual)``.
+
+        The residual is threaded across the block boundary rather than being
+        added at the end. The MLP's residual add and the next block's input
+        RMSNorm are the same read of the same tensor, so handing the pending
+        residual on lets both happen in one fused kernel instead of a bare add
+        followed by a separate norm. Only the first block, which has no pending
+        residual, still pays for a standalone norm.
+        """
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        elif _TRITON_AVAILABLE:
+            hidden_states, residual = triton_fused_add_rms_norm(
+                hidden_states,
+                residual,
+                self.input_layernorm.weight,
+                self.input_layernorm.eps,
+            )
+        else:
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+
+        hidden_states = self.self_attn(hidden_states, rope_table, attn_metadata)
 
         if _TRITON_AVAILABLE:
             # Fused: (attn_out + residual) + RMSNorm in one kernel
@@ -384,9 +414,7 @@ class OmniVoiceTransformerBlock(nn.Module):
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
+        return self.mlp(hidden_states), residual
 
 
 # ---------------------------------------------------------------------------
@@ -394,30 +422,103 @@ class OmniVoiceTransformerBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _precompute_rope(
+def _precompute_rope_table(
     head_dim: int,
     max_seq_len: int,
     theta: float = 1000000.0,
     device: torch.device | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Precompute RoPE cos/sin tensors."""
+) -> torch.Tensor:
+    """Precompute the packed ``[max_seq_len, head_dim]`` RoPE table.
+
+    Layout is what ``fused_qkv_norm_rope`` expects: the first half of each row
+    holds ``cos(theta)`` and the second half ``sin(theta)``, each of width
+    ``head_dim // 2``. Precomputing it keeps the hot path free of any cat.
+    """
     inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
     t = torch.arange(max_seq_len, device=device, dtype=torch.float32)
     freqs = torch.outer(t, inv_freq)
-    cos = freqs.cos()
-    sin = freqs.sin()
-    return cos, sin
+    return torch.cat([freqs.cos(), freqs.sin()], dim=-1)
 
 
-def _apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Apply rotary position embedding. x shape: (B, S, H, D)."""
-    seq_len = x.shape[1]
-    cos = cos[:seq_len].unsqueeze(0).unsqueeze(2)  # (1, S, 1, D/2)
-    sin = sin[:seq_len].unsqueeze(0).unsqueeze(2)
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    rotated = torch.cat([-x2, x1], dim=-1)
-    return x * torch.cat([cos, cos], dim=-1) + rotated * torch.cat([sin, sin], dim=-1)
+def _position_ids_from_cu_seqs(cu_seqs: torch.Tensor, seq_len: int) -> torch.Tensor:
+    """Return each packed token's zero-based position within its sequence."""
+    token_ids = torch.arange(seq_len, device=cu_seqs.device, dtype=cu_seqs.dtype)
+    sequence_ids = torch.searchsorted(cu_seqs[1:], token_ids, right=True)
+    sequence_starts = cu_seqs.index_select(0, sequence_ids.to(torch.long))
+    return (token_ids - sequence_starts).to(torch.long)
+
+
+def _attention_metadata_from_cu_seqs(
+    cu_seqs: torch.Tensor,
+    seq_len: int,
+    *,
+    needs_sdpa_mask: bool,
+    max_seqlen: int | None = None,
+) -> AttentionMetadata:
+    """Build packed-varlen metadata and, when needed, an SDPA block mask."""
+    # Local benchmarks found no measurable performance difference between the
+    # exact longest segment and the packed total. Eager uses the exact bound;
+    # CUDA Graph uses the fixed token-bucket maximum.
+    kernel_max_seqlen = seq_len if max_seqlen is None else max_seqlen
+    extra = {
+        "cu_seqlens_q": cu_seqs,
+        "cu_seqlens_k": cu_seqs,
+        "max_seqlen_q": kernel_max_seqlen,
+        "max_seqlen_k": kernel_max_seqlen,
+    }
+    if not needs_sdpa_mask:
+        return AttentionMetadata(extra=extra)
+
+    token_ids = torch.arange(seq_len, device=cu_seqs.device, dtype=cu_seqs.dtype)
+    sequence_ids = torch.searchsorted(cu_seqs[1:], token_ids, right=True)
+    attn_mask = sequence_ids.view(1, 1, seq_len, 1) == sequence_ids.view(1, 1, 1, seq_len)
+    return AttentionMetadata(attn_mask=attn_mask, extra=extra)
+
+
+def _build_cu_seqs(
+    cond_lens: list[int],
+    uncond_lens: list[int],
+    device: torch.device,
+    *,
+    tail_end: int | None = None,
+) -> torch.Tensor:
+    """Build request-major [cond0, uncond0, ...] cumulative offsets."""
+    if len(cond_lens) != len(uncond_lens):
+        raise ValueError(f"Mismatched cond/uncond lengths: {len(cond_lens)} != {len(uncond_lens)}.")
+    offsets = [0]
+    for cond_len, uncond_len in zip(cond_lens, uncond_lens):
+        offsets.append(offsets[-1] + cond_len)
+        offsets.append(offsets[-1] + uncond_len)
+    if tail_end is None:
+        tail_end = offsets[-1]
+    if offsets[-1] > tail_end:
+        raise ValueError(f"Packed length {offsets[-1]} exceeds tail end {tail_end}.")
+    offsets.append(tail_end)
+    return torch.tensor(offsets, device=device, dtype=torch.int32)
+
+
+# ---------------------------------------------------------------------------
+# TF32 opt-in (process-wide; default off)
+# ---------------------------------------------------------------------------
+
+_TF32_ENABLED = False
+
+
+def _maybe_enable_tf32() -> None:
+    """Enable TF32 matmuls process-wide (idempotent). Not bit-identical; opt-in via config.enable_tf32."""
+    global _TF32_ENABLED
+    if _TF32_ENABLED or not torch.cuda.is_available():
+        return
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+    _TF32_ENABLED = True
+    logger.info(
+        "OmniVoice TF32 enabled process-wide: matmul.allow_tf32=%s cudnn.allow_tf32=%s float32_matmul_precision=%s",
+        torch.backends.cuda.matmul.allow_tf32,
+        torch.backends.cudnn.allow_tf32,
+        torch.get_float32_matmul_precision(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -433,24 +534,47 @@ class _OmniVoiceCUDAGraphForward:
     (one step at a time) means pool sharing is safe.
     """
 
-    # Default bucket count is 10; 16 gives modest headroom for edge cases
-    # (seq_len > max bucket or non-CFG batch) without unbounded GPU growth.
-    _MAX_LAZY_GRAPHS: int = 16
+    _MAX_LAZY_GRAPHS = 16
+    _STATIC_CAPTURE_TOKEN_LIMIT = 1024
+    _LAZY_CAPTURE_ALIGNMENT = 128
 
     def __init__(self, generator: OmniVoiceGenerator, capture_sizes: list[int]) -> None:
         self._gen = generator
-        self._capture_sizes = sorted(capture_sizes)
-        # Pre-warmed graphs keyed by (two_b, bucket); fixed set, never evicted.
+        self.capture_batch_sizes = self._derive_capture_batch_size()
+        self.capture_bucket_sizes_by_batch = self._derive_capture_bucket_sizes(capture_sizes)
         self._graphs: dict[tuple[int, int], dict] = {}
-        # Lazy-captured graphs for oversized / non-CFG shapes; capped via LRU.
         self._lazy_graphs: OrderedDict[tuple[int, int], dict] = OrderedDict()
         self._lock = threading.Lock()
         # Per-instance pool handle: isolates OmniVoice CUDA memory from other
         # vllm modules while still allowing safe re-use across sequential replays.
         self._pool_handle: int | None = None
 
-    def _find_bucket(self, seq_len: int) -> int | None:
-        for bucket in self._capture_sizes:
+    def _derive_capture_batch_size(self) -> list[int]:
+        return list(range(1, self._gen.od_config.max_num_seqs + 1))
+
+    def _derive_capture_bucket_sizes(self, capture_sizes: list[int]) -> dict[int, list[int]]:
+        """Build a triangular, batch-aware token-bucket capture plan."""
+        base_sizes = sorted(set(capture_sizes))
+        if not base_sizes:
+            return {batch_size: [] for batch_size in self.capture_batch_sizes}
+        alignment = base_sizes[0]
+        single_request_cap = min(base_sizes[-1], 512)
+        max_graph_tokens = min(base_sizes[-1], self._STATIC_CAPTURE_TOKEN_LIMIT)
+        growth_per_batch = max(alignment, single_request_cap // 2)
+        candidates = sorted(set(base_sizes) | set(range(alignment, max_graph_tokens + alignment, alignment)))
+        return {
+            batch_size: [
+                bucket
+                for bucket in candidates
+                if alignment * batch_size
+                <= bucket
+                <= min(single_request_cap + (batch_size - 1) * growth_per_batch, max_graph_tokens)
+            ]
+            for batch_size in self.capture_batch_sizes
+        }
+
+    def _find_bucket(self, batch_size: int, seq_len: int) -> int | None:
+        for bucket in self.capture_bucket_sizes_by_batch.get(batch_size, ()):
             if bucket >= seq_len:
                 return bucket
         return None
@@ -459,63 +583,37 @@ class _OmniVoiceCUDAGraphForward:
         self,
         input_ids: torch.Tensor,
         audio_mask: torch.Tensor,
-        attention_mask: torch.Tensor | None,
         bucket: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        S = input_ids.shape[-1]
-        if S == bucket:
-            return input_ids, audio_mask, attention_mask
-
-        two_b = input_ids.shape[0]
-        num_cb = input_ids.shape[1]
-
-        ids_padded = torch.zeros(two_b, num_cb, bucket, dtype=input_ids.dtype, device=input_ids.device)
-        ids_padded[:, :, :S] = input_ids
-
-        mask_padded = torch.zeros(two_b, bucket, dtype=torch.bool, device=audio_mask.device)
-        mask_padded[:, :S] = audio_mask
-
-        if attention_mask is not None:
-            attn_padded = torch.zeros(
-                two_b,
-                1,
-                bucket,
-                bucket,
-                dtype=attention_mask.dtype,
-                device=attention_mask.device,
-            )
-            attn_padded[:, :, :S, :S] = attention_mask
-        else:
-            attn_padded = None
-
-        return ids_padded, mask_padded, attn_padded
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        seq_len = input_ids.shape[0]
+        if seq_len == bucket:
+            return input_ids, audio_mask
+        return (
+            F.pad(input_ids, (0, 0, 0, bucket - seq_len), value=0),
+            F.pad(audio_mask, (0, bucket - seq_len), value=False),
+        )
 
     def _capture_for_key(
         self,
         key: tuple[int, int],
         input_ids: torch.Tensor,
         audio_mask: torch.Tensor,
-        attention_mask: torch.Tensor | None,
+        cu_seqs: torch.Tensor,
     ) -> dict:
         _, bucket = key
         device = input_ids.device
 
-        self._gen._ensure_rope(bucket, device)
-        model_dtype = self._gen.text_embedding.weight.dtype
-        static_cos = self._gen._rope_cos[:bucket].to(device=device, dtype=model_dtype).contiguous()
-        static_sin = self._gen._rope_sin[:bucket].to(device=device, dtype=model_dtype).contiguous()
-
         static_input_ids = input_ids.clone()
         static_audio_mask = audio_mask.clone()
-        static_attn_mask = attention_mask.clone() if attention_mask is not None else None
+        static_cu_seqs = cu_seqs.clone()
+        static_rope_table = self._gen._rope_table_for(bucket, device, self._gen.model_dtype)
 
         with torch.no_grad():
             _ = self._gen._step_forward(
                 static_input_ids,
                 static_audio_mask,
-                static_attn_mask,
-                static_cos,
-                static_sin,
+                static_cu_seqs,
+                static_rope_table,
             )
         torch.accelerator.synchronize(device)
 
@@ -532,94 +630,91 @@ class _OmniVoiceCUDAGraphForward:
                 static_output = self._gen._step_forward(
                     static_input_ids,
                     static_audio_mask,
-                    static_attn_mask,
-                    static_cos,
-                    static_sin,
+                    static_cu_seqs,
+                    static_rope_table,
                 )
 
         entry = {
             "graph": graph,
             "static_input_ids": static_input_ids,
             "static_audio_mask": static_audio_mask,
-            "static_attn_mask": static_attn_mask,
-            "static_cos": static_cos,
-            "static_sin": static_sin,
+            "static_cu_seqs": static_cu_seqs,
+            "static_rope_table": static_rope_table,
             "static_output": static_output,
         }
         logger.info("OmniVoice CUDA Graph captured for key %s", key)
         return entry
 
+    def make_capture_cu_seq(self, batch_size: int, bucket_size: int, device: torch.device) -> torch.Tensor:
+        num_real_sequences = 2 * batch_size
+        base, rem = divmod(bucket_size, num_real_sequences)
+        lengths = torch.full((num_real_sequences,), base, dtype=torch.int32, device=device)
+        lengths[:rem] += 1
+        cu_seq = torch.empty(num_real_sequences + 2, dtype=torch.int32, device=device)
+        cu_seq[0] = 0
+        cu_seq[1:-1] = lengths.cumsum(0)
+        cu_seq[-1] = bucket_size
+        return cu_seq
+
     def warmup(self, device: torch.device) -> None:
-        """Pre-capture graphs for all bucket sizes with B=1 (two_b=2 for CFG)."""
+        """Pre-capture common request batch sizes for every token bucket."""
         if not torch.cuda.is_available():
             return
         logger.info(
-            "OmniVoice CUDA Graph warmup: capturing %d bucket sizes %s",
-            len(self._capture_sizes),
-            self._capture_sizes,
+            "OmniVoice CUDA Graph warmup: batch-aware capture plan %s",
+            self.capture_bucket_sizes_by_batch,
         )
-        two_b = 2
         num_cb = self._gen.config.num_audio_codebook
-        for bucket in self._capture_sizes:
-            key = (two_b, bucket)
-            dummy_ids = torch.zeros(two_b, num_cb, bucket, dtype=torch.long, device=device)
-            dummy_mask = torch.zeros(two_b, bucket, dtype=torch.bool, device=device)
-            dummy_attn = torch.ones(two_b, 1, bucket, bucket, dtype=torch.bool, device=device)
-            self._graphs[key] = self._capture_for_key(key, dummy_ids, dummy_mask, dummy_attn)
+        for batch_size in self.capture_batch_sizes:
+            for bucket in self.capture_bucket_sizes_by_batch[batch_size]:
+                key = (batch_size, bucket)
+                dummy_ids = torch.zeros(bucket, num_cb, dtype=torch.long, device=device)
+                dummy_mask = torch.zeros(bucket, dtype=torch.bool, device=device)
+                dummy_cu_seqs = self.make_capture_cu_seq(batch_size, bucket, device)
+                self._graphs[key] = self._capture_for_key(key, dummy_ids, dummy_mask, dummy_cu_seqs)
         logger.info("OmniVoice CUDA Graph warmup complete (%d graphs)", len(self._graphs))
 
     def __call__(
         self,
         input_ids: torch.Tensor,
         audio_mask: torch.Tensor,
-        attention_mask: torch.Tensor | None,
+        cu_seqs: torch.Tensor,
+        batch_size: int,
     ) -> torch.Tensor:
         if torch.cuda.is_current_stream_capturing():
-            seq_len = input_ids.shape[-1]
-            self._gen._ensure_rope(seq_len, input_ids.device)
-            dtype = self._gen.text_embedding.weight.dtype
-            cos = self._gen._rope_cos[:seq_len].to(device=input_ids.device, dtype=dtype)
-            sin = self._gen._rope_sin[:seq_len].to(device=input_ids.device, dtype=dtype)
-            return self._gen._step_forward(input_ids, audio_mask, attention_mask, cos, sin)
+            rope_table = self._gen._rope_table_for(input_ids.shape[0], input_ids.device, self._gen.model_dtype)
+            return self._gen._step_forward(input_ids, audio_mask, cu_seqs, rope_table)
 
-        seq_len = input_ids.shape[-1]
-        two_b = input_ids.shape[0]
-        bucket = self._find_bucket(seq_len) if two_b == 2 else None
-
+        seq_len = input_ids.shape[0]
+        bucket = self._find_bucket(batch_size, seq_len)
+        is_lazy = bucket is None
         if bucket is None:
-            # Lazy capture: oversized sequence or non-unit batch (no pre-warmed bucket).
-            # Lock prevents concurrent threads from double-capturing the same key.
-            # _lazy_graphs is capped at _MAX_LAZY_GRAPHS with LRU eviction to
-            # prevent unbounded GPU memory growth when seq_len varies widely.
-            key = (two_b, seq_len)
-            ids_in, mask_in, attn_in = input_ids, audio_mask, attention_mask
-            with self._lock:
-                entry = self._lazy_graphs.get(key)
-                if entry is None:
-                    entry = self._capture_for_key(key, ids_in, mask_in, attn_in)
-                    if len(self._lazy_graphs) >= self._MAX_LAZY_GRAPHS:
-                        evicted_key, _ = self._lazy_graphs.popitem(last=False)
-                        logger.warning("OmniVoice CUDA Graph lazy cache full; evicted key %s", evicted_key)
-                    self._lazy_graphs[key] = entry
-        else:
-            key = (two_b, bucket)
-            ids_in, mask_in, attn_in = self._pad_inputs(input_ids, audio_mask, attention_mask, bucket)
-            with self._lock:
-                entry = self._graphs.get(key)
-                if entry is None:
-                    entry = self._capture_for_key(key, ids_in, mask_in, attn_in)
-                    self._graphs[key] = entry
+            bucket = round_up(seq_len, self._LAZY_CAPTURE_ALIGNMENT)
+        ids_in, mask_in = self._pad_inputs(input_ids, audio_mask, bucket)
+        runtime_cu_seqs = cu_seqs.clone()
+        runtime_cu_seqs[-1] = bucket
+        key = (batch_size, bucket)
+        cache = self._lazy_graphs if is_lazy else self._graphs
+        with self._lock:
+            entry = cache.get(key)
+            if entry is None:
+                if is_lazy and len(self._lazy_graphs) >= self._MAX_LAZY_GRAPHS:
+                    evicted_key, _ = self._lazy_graphs.popitem(last=False)
+                    logger.info("Evicted OmniVoice lazy CUDA Graph key %s", evicted_key)
+                entry = self._capture_for_key(key, ids_in, mask_in, runtime_cu_seqs)
+                cache[key] = entry
+            elif is_lazy:
+                self._lazy_graphs.move_to_end(key)
 
         entry["static_input_ids"].copy_(ids_in)
         entry["static_audio_mask"].copy_(mask_in)
-        if attn_in is not None and entry["static_attn_mask"] is not None:
-            entry["static_attn_mask"].copy_(attn_in)
+        entry["static_cu_seqs"].copy_(runtime_cu_seqs)
 
         entry["graph"].replay()
 
         output = entry["static_output"]
-        if bucket is not None and bucket != seq_len:
-            output = output[:, :, :seq_len, :]
+        if bucket != seq_len:
+            output = output[:, :seq_len, :]
         return output
 
     def clear(self) -> None:
@@ -643,17 +738,21 @@ class OmniVoiceGenerator(nn.Module):
     - 32-step iterative unmasking with classifier-free guidance
 
     Optimizations:
-    - Full bidirectional attention via PyTorch SDPA (no auto-selected
-      FlashAttn/SageAttn/DiffusionAttention backend)
+    - Packed full-bidirectional varlen attention with SDPA fallback
     - regionally_compile() compatible for torch.compile on repeated blocks
     """
 
     # For regionally_compile() support
     _repeated_blocks = ["layers"]
 
-    def __init__(self, config: OmniVoiceConfig):
+    def __init__(self, config: OmniVoiceConfig, od_config: OmniDiffusionConfig):
         super().__init__()
         self.config = config
+        self.od_config = od_config
+
+        # Opt-in TF32; must run before any CUDA-graph capture so captured kernels honour it.
+        if getattr(config, "enable_tf32", False):
+            _maybe_enable_tf32()
 
         # Text embedding (shared with LLM)
         self.text_embedding = nn.Embedding(config.llm_vocab_size, config.llm_hidden_size)
@@ -669,7 +768,10 @@ class OmniVoiceGenerator(nn.Module):
         )
 
         # Transformer layers
-        self.layers = nn.ModuleList([OmniVoiceTransformerBlock(config) for _ in range(config.llm_num_hidden_layers)])
+        self.layers = nn.ModuleList(
+            [OmniVoiceTransformerBlock(config, layer_idx) for layer_idx in range(config.llm_num_hidden_layers)]
+        )
+        self._needs_sdpa_mask = any(not layer.self_attn.use_packed_varlen for layer in self.layers)
         self.norm = OmniVoiceRMSNorm(config.llm_hidden_size, eps=config.llm_rms_norm_eps)
 
         # Prediction head: hidden → 8 * 1025
@@ -680,122 +782,186 @@ class OmniVoiceGenerator(nn.Module):
         )
 
         # Precompute RoPE
-        self._rope_cos = None
-        self._rope_sin = None
+        self._rope_table = None
 
         # CUDA Graph (bucket-size pre-capture; lazy fallback for oversized shapes)
         self._cuda_graph_fwd: _OmniVoiceCUDAGraphForward | None = (
             _OmniVoiceCUDAGraphForward(self, config.cuda_graph_capture_sizes) if config.enable_cuda_graph else None
         )
 
+    @property
+    def model_dtype(self) -> torch.dtype:
+        """The dtype every activation and mask in the generator has to match."""
+        return self.text_embedding.weight.dtype
+
     def _ensure_rope(self, seq_len: int, device: torch.device) -> None:
-        """Lazily compute RoPE cos/sin if needed."""
-        if self._rope_cos is None or self._rope_cos.shape[0] < seq_len:
+        """Lazily compute the packed RoPE table if needed."""
+        if self._rope_table is None or self._rope_table.shape[0] < seq_len:
             max_len = max(seq_len, 4096)
-            self._rope_cos, self._rope_sin = _precompute_rope(
+            self._rope_table = _precompute_rope_table(
                 self.config.llm_head_dim,
                 max_len,
                 theta=self.config.llm_rope_theta,
                 device=device,
             )
 
+    def _rope_table_for(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """The packed [seq_len, head_dim] table the fused prologue indexes.
+
+        It depends only on the bucket and dtype, so callers build it once per
+        request or per captured graph, never per layer.
+        """
+        self._ensure_rope(seq_len, device)
+        return self._rope_table[:seq_len].to(device=device, dtype=dtype).contiguous()
+
     def _prepare_embeddings(
         self,
         input_ids: torch.Tensor,
         audio_mask: torch.Tensor,
+        text_embeds: torch.Tensor | None = None,
+        audio_mask_3d: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Prepare mixed text+audio embeddings.
 
         Args:
-            input_ids: [B, 8, S] - text tokens replicated across codebooks,
+            input_ids: [T, 8] - text tokens replicated across codebooks,
                        audio positions have per-codebook token IDs
-            audio_mask: [B, S] - True for audio positions, False for text
+            audio_mask: [T] - True for audio positions, False for text
+            text_embeds: optional cached [T, H] text-position embeddings
+            audio_mask_3d: optional cached [T, 1] audio_mask.unsqueeze(-1)
 
         Returns:
-            embeddings: [B, S, hidden_size]
+            embeddings: [T, hidden_size]
         """
-        # Text embeddings from first codebook row (all rows identical for text)
-        text_embeds = self.text_embedding(input_ids[:, 0, :])
+        # Cached across the denoising loop since text ids don't change.
+        if text_embeds is None:
+            text_embeds = self.text_embedding(input_ids[:, 0])
+        if audio_mask_3d is None:
+            audio_mask_3d = audio_mask.unsqueeze(-1)
 
         # Audio embeddings: offset per codebook, then sum across codebooks
-        shifted_ids = (input_ids * audio_mask.unsqueeze(1)) + self.codebook_layer_offsets.view(1, -1, 1)
+        shifted_ids = (input_ids * audio_mask.unsqueeze(1)) + self.codebook_layer_offsets.view(1, -1)
         audio_embeds = self.audio_embeddings(shifted_ids).sum(dim=1)
 
         # Merge: audio where audio_mask=True, text elsewhere
-        return torch.where(audio_mask.unsqueeze(-1), audio_embeds, text_embeds)
+        return torch.where(audio_mask_3d, audio_embeds, text_embeds)
 
     def _transformer_forward(
         self,
         inputs_embeds: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        cu_seqs: torch.Tensor,
+        max_seqlen: int | None = None,
+        rope_table: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run through transformer layers.
 
         Args:
-            inputs_embeds: [B, S, hidden_size]
-            attention_mask: [B, 1, S, S] or None
+            inputs_embeds: [T, hidden_size]
+            cu_seqs: cumulative boundaries for packed sequences
+            rope_table: optional base [T, head_dim] RoPE table
 
         Returns:
-            hidden_states: [B, S, hidden_size]
+            hidden_states: [T, hidden_size]
         """
-        device = inputs_embeds.device
-        seq_len = inputs_embeds.shape[1]
-        self._ensure_rope(seq_len, device)
-
         hidden_states = inputs_embeds
-        cos = self._rope_cos.to(device=device, dtype=hidden_states.dtype)
-        sin = self._rope_sin.to(device=device, dtype=hidden_states.dtype)
+        if rope_table is None:
+            rope_table = self._rope_table_for(inputs_embeds.shape[0], inputs_embeds.device, hidden_states.dtype)
+        seq_len = inputs_embeds.shape[0]
+        position_ids = _position_ids_from_cu_seqs(cu_seqs, seq_len)
+        packed_rope_table = rope_table.index_select(0, position_ids).contiguous()
+        attn_metadata = _attention_metadata_from_cu_seqs(
+            cu_seqs,
+            seq_len,
+            needs_sdpa_mask=self._needs_sdpa_mask,
+            max_seqlen=max_seqlen,
+        )
 
+        residual = None
         for layer in self.layers:
-            hidden_states = layer(
+            hidden_states, residual = layer(
                 hidden_states,
-                attention_mask=attention_mask,
-                cos=cos,
-                sin=sin,
+                attn_metadata=attn_metadata,
+                rope_table=packed_rope_table,
+                residual=residual,
             )
 
-        return self.norm(hidden_states)
+        return self.norm(hidden_states + residual)
 
     def _get_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project hidden states to per-codebook logits.
 
         Args:
-            hidden_states: [B, S, hidden_size]
+            hidden_states: [T, hidden_size]
 
         Returns:
-            logits: [B, 8, S, 1025]
+            logits: [8, T, 1025]
         """
-        batch_size, seq_len, _ = hidden_states.shape
-        logits_flat = self.audio_heads(hidden_states)  # [B, S, 8*1025]
+        seq_len, _ = hidden_states.shape
+        logits_flat = self.audio_heads(hidden_states)  # [T, 8*1025]
         return logits_flat.view(
-            batch_size,
             seq_len,
             self.config.num_audio_codebook,
             self.config.audio_vocab_size,
-        ).permute(0, 2, 1, 3)  # [B, 8, S, 1025]
+        ).permute(1, 0, 2)  # [8, T, 1025]
 
     def _step_forward(
         self,
         input_ids: torch.Tensor,
         audio_mask: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
+        cu_seqs: torch.Tensor,
+        rope_table: torch.Tensor,
     ) -> torch.Tensor:
-        """Single unmasking-step forward using pre-cast RoPE tensors (CUDA graph safe)."""
+        """Single unmasking-step forward using a pre-cast RoPE table (CUDA graph safe)."""
         hidden_states = self._prepare_embeddings(input_ids, audio_mask)
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask=attention_mask, cos=cos, sin=sin)
-        return self._get_logits(self.norm(hidden_states))
+        hidden_states = self._transformer_forward(hidden_states, cu_seqs, rope_table=rope_table)
+        return self._get_logits(hidden_states)
+
+    def _unmask_one_request(
+        self,
+        c_logits: torch.Tensor,
+        u_logits: torch.Tensor,
+        sample_tokens: torch.Tensor,
+        *,
+        num_to_unmask: int | torch.Tensor,
+        guidance_scale: float,
+        generator: torch.Generator,
+        class_temperature: float,
+        position_temperature: float,
+        layer_penalty_factor: float,
+        layer_ids: torch.Tensor,
+    ) -> None:
+        """Sample and unmask one request in place from FP32 target logits."""
+        mask_id = self.config.audio_mask_id
+        if guidance_scale != 0:
+            log_probs = F.log_softmax(
+                (1.0 + guidance_scale) * c_logits - guidance_scale * u_logits,
+                dim=-1,
+            )
+        else:
+            log_probs = F.log_softmax(c_logits, dim=-1)
+        log_probs[..., mask_id] = -float("inf")
+        if class_temperature > 0.0:
+            pred_tokens = _gumbel_sample(log_probs, class_temperature, generator).argmax(dim=-1)
+        else:
+            pred_tokens = log_probs.argmax(dim=-1)
+        scores = log_probs.max(dim=-1)[0]
+        scores = scores - (layer_ids * layer_penalty_factor)
+        if position_temperature > 0.0:
+            scores = _gumbel_sample(scores, position_temperature, generator)
+        scores.masked_fill_(sample_tokens != mask_id, -float("inf"))
+        _, topk_idx = torch.topk(scores.flatten(), num_to_unmask)
+        flat_tokens = sample_tokens.flatten()
+        flat_tokens[topk_idx] = pred_tokens.flatten()[topk_idx]
+        sample_tokens.copy_(flat_tokens.view_as(sample_tokens))
 
     @torch.inference_mode()
     def forward(
         self,
         input_ids: torch.Tensor,
         audio_mask: torch.Tensor,
-        attention_mask: torch.Tensor,
+        cond_lens: list[int],
         target_lens: list[int],
-        seed: int | None = None,
+        seed: int | list[int | None] | None = None,
         num_step: int = 32,
         guidance_scale: float = 2.0,
         t_shift: float = 0.1,
@@ -806,36 +972,51 @@ class OmniVoiceGenerator(nn.Module):
         """Run the full 32-step iterative unmasking generation.
 
         Args:
-            input_ids: [2*B, 8, S] - conditional (0:B) + unconditional (B:2B)
-            audio_mask: [2*B, S] - True for audio positions
-            attention_mask: [2*B, 1, S, S] - attention mask
-            target_lens: List of target audio lengths per batch item
-            num_step: Number of unmasking steps
-            guidance_scale: CFG scale
-            t_shift: Time shift for schedule
-            layer_penalty_factor: Penalty for later codebooks
-            position_temperature: Gumbel temperature for position selection
-            class_temperature: Temperature for token prediction (0=greedy)
+            input_ids: Packed token IDs with shape ``[total_seq_len, 8]`` in
+                request-major ``[cond0, uncond0, ...]`` order.
+            audio_mask: Boolean audio-position mask with shape
+                ``[total_seq_len]``.
+            cond_lens: Conditional sequence length for each request.
+            target_lens: Target length for each request; also the corresponding
+                unconditional sequence length.
+            seed: One seed per request, a shared scalar seed, or ``None``.
+            num_step: Number of iterative unmasking steps.
+            guidance_scale: Classifier-free guidance scale.
+            t_shift: Time shift used to construct the unmasking schedule.
+            layer_penalty_factor: Penalty applied to later codebooks.
+            position_temperature: Gumbel temperature for position selection.
+            class_temperature: Token sampling temperature; zero selects greedy
+                decoding.
 
         Returns:
-            tokens: [B, 8, max_target_len] - generated audio tokens
+            Packed generated audio tokens with shape
+            ``[1, 8, sum(target_lens)]``.
         """
         B = len(target_lens)
         device = input_ids.device
-        max_target_len = max(target_lens)
+        total_target_lens = sum(target_lens)
         mask_id = self.config.audio_mask_id
         num_codebooks = self.config.num_audio_codebook
-        if seed is None:
-            seed = random.randint(0, 2**63 - 1)
-        generator = torch.Generator(device=device).manual_seed(seed)
+        seeds = seed if isinstance(seed, list) else [seed] * B
+        generators = [
+            torch.Generator(device=device).manual_seed(
+                request_seed if request_seed is not None else random.randint(0, 2**63 - 1)
+            )
+            for request_seed in seeds
+        ]
 
         # Initialize all target tokens as [MASK]
-        tokens = torch.full(
-            (B, num_codebooks, max_target_len),
-            mask_id,
-            dtype=torch.long,
-            device=device,
-        )
+        tokens = torch.full((1, num_codebooks, total_target_lens), mask_id, dtype=torch.long, device=device)
+        target_offsets: list[int] = []
+        target_offset = 0
+        sequence_offsets: list[int] = []
+        sequence_offset = 0
+        for cond_len, target_len in zip(cond_lens, target_lens):
+            target_offsets.append(target_offset)
+            target_offset += target_len
+            sequence_offsets.append(sequence_offset)
+            sequence_offset += cond_len + target_len
+        cu_seqs = _build_cu_seqs(cond_lens, target_lens, device)
 
         # Compute unmasking schedule
         timesteps = _get_time_steps(0.0, 1.0, num_step + 1, t_shift).tolist()
@@ -859,41 +1040,54 @@ class OmniVoiceGenerator(nn.Module):
 
         layer_ids = torch.arange(num_codebooks, device=device).view(1, -1, 1)
 
-        # Compute c_lens for extracting target region from full sequence
-        c_lens = []
-        for i in range(B):
-            # Conditional sequence length = number of non-padding positions
-            c_len = attention_mask[i, 0, 0].sum().item()
-            c_lens.append(int(c_len))
+        use_cuda_graph = self._cuda_graph_fwd is not None and input_ids.is_cuda
+        if not use_cuda_graph:
+            # Eager-path-only constants (the cuda-graph captures its own).
+            text_embeds_cached = self.text_embedding(input_ids[:, 0])
+            audio_mask_3d = audio_mask.unsqueeze(-1)
+            rope_table = self._rope_table_for(input_ids.shape[0], device, text_embeds_cached.dtype)
 
         # Main iterative loop
         for step in range(num_step):
-            if self._cuda_graph_fwd is not None and input_ids.is_cuda:
-                batch_logits = self._cuda_graph_fwd(input_ids, audio_mask, attention_mask).to(torch.float32)
+            if use_cuda_graph:
+                # Float mask skips per-layer conversion; fp32 cast deferred to the per-item slices below.
+                batch_logits = self._cuda_graph_fwd(input_ids, audio_mask, cu_seqs, B)
             else:
-                inputs_embeds = self._prepare_embeddings(input_ids, audio_mask)
-                hidden_states = self._transformer_forward(inputs_embeds, attention_mask)
-                batch_logits = self._get_logits(hidden_states).to(torch.float32)
-            # batch_logits: [2*B, 8, S, 1025]
+                # Eager fallback reuses hoisted constants (text embeds, sdpa mask, rope table).
+                inputs_embeds = self._prepare_embeddings(
+                    input_ids, audio_mask, text_embeds=text_embeds_cached, audio_mask_3d=audio_mask_3d
+                )
+                hidden_states = self._transformer_forward(
+                    inputs_embeds,
+                    cu_seqs,
+                    max_seqlen=max(cond_lens),
+                    rope_table=rope_table,
+                )
+                # fp32 cast deferred to the per-item slices below.
+                batch_logits = self._get_logits(hidden_states)
+            # batch_logits: [8, T, 1025]
 
             for i in range(B):
                 k = schedules[i][step]
                 if k <= 0:
                     continue
 
-                c_len = c_lens[i]
+                c_len = cond_lens[i]
                 t_len = target_lens[i]
+                request_start = sequence_offsets[i]
+                cond_end = request_start + c_len
 
-                # Extract logits for target region
-                c_logits = batch_logits[i : i + 1, :, c_len - t_len : c_len, :]  # [1, 8, T, 1025]
-                u_logits = batch_logits[B + i : B + i + 1, :, :t_len, :]  # [1, 8, T, 1025]
+                # Extract logits for target region; upcast only the slices we actually consume.
+                c_logits = batch_logits[:, cond_end - t_len : cond_end, :].unsqueeze(0).to(torch.float32)
+                u_logits = batch_logits[:, cond_end : cond_end + t_len, :].unsqueeze(0).to(torch.float32)
 
-                # Classifier-free guidance
+                # Classifier-free guidance. Fuse the chain: the two inner
+                # log_softmax normalizers are per-position scalars that the final
+                # shift-invariant log_softmax cancels, so guide on the raw logits
+                # with a single softmax: log_softmax((1+s)*c - s*u). Exact.
                 if guidance_scale != 0:
-                    c_log_probs = F.log_softmax(c_logits, dim=-1)
-                    u_log_probs = F.log_softmax(u_logits, dim=-1)
-                    log_probs = torch.log_softmax(
-                        c_log_probs + guidance_scale * (c_log_probs - u_log_probs),
+                    log_probs = F.log_softmax(
+                        (1.0 + guidance_scale) * c_logits - guidance_scale * u_logits,
                         dim=-1,
                     )
                 else:
@@ -904,7 +1098,7 @@ class OmniVoiceGenerator(nn.Module):
 
                 # Token prediction
                 if class_temperature > 0.0:
-                    pred_tokens = _gumbel_sample(log_probs, class_temperature, generator).argmax(dim=-1)
+                    pred_tokens = _gumbel_sample(log_probs, class_temperature, generators[i]).argmax(dim=-1)
                 else:
                     pred_tokens = log_probs.argmax(dim=-1)  # [1, 8, T]
 
@@ -916,25 +1110,71 @@ class OmniVoiceGenerator(nn.Module):
 
                 # Gumbel noise for position selection
                 if position_temperature > 0.0:
-                    scores = _gumbel_sample(scores, position_temperature, generator)
+                    scores = _gumbel_sample(scores, position_temperature, generators[i])
 
                 # Mask out already unmasked positions
-                sample_tokens = tokens[i : i + 1, :, :t_len]
+                target_start = target_offsets[i]
+                sample_tokens = tokens[:, :, target_start : target_start + t_len]
                 scores.masked_fill_(sample_tokens != mask_id, -float("inf"))
 
-                # Select top-k positions to unmask
+                # Select top-k positions to unmask. .flatten() on this non-contiguous view already copies.
                 _, topk_idx = torch.topk(scores.flatten(), k)
-                flat_tokens = sample_tokens.flatten().clone()
+                flat_tokens = sample_tokens.flatten()
                 flat_tokens[topk_idx] = pred_tokens.flatten()[topk_idx]
                 sample_tokens.copy_(flat_tokens.view_as(sample_tokens))
 
-                # Update tokens and batch inputs for next iteration
-                tokens[i : i + 1, :, :t_len] = sample_tokens
-                input_ids = input_ids.clone()
-                input_ids[i, :, c_len - t_len : c_len] = sample_tokens.squeeze(0)
-                input_ids[B + i, :, :t_len] = sample_tokens.squeeze(0)
+                # Mirror update into both cond and uncond input_ids halves for the next step.
+                packed_sample_tokens = sample_tokens.squeeze(0).transpose(0, 1)
+                input_ids[cond_end - t_len : cond_end] = packed_sample_tokens
+                input_ids[cond_end : cond_end + t_len] = packed_sample_tokens
 
         return tokens
+
+    def _load_fused_projections(self, state_dict: dict[str, torch.Tensor]) -> set[str]:
+        """Pack the checkpoint's separate q/k/v and gate/up shards into the fused params.
+
+        This has to happen explicitly. The generic per-tensor path below looks
+        the destination up by name, and ``q_proj``/``gate_proj`` no longer exist
+        as modules -- so it would find nothing, log a warning nobody reads, and
+        leave the fused parameters at their random initialization. A corrupted
+        model that still answers requests is worse than a failed load, so a
+        missing or wrong-shaped shard raises here.
+        """
+        loaded: set[str] = set()
+        packed_params = 0
+        for idx, layer in enumerate(self.layers):
+            for fused_path, shard_paths in _FUSED_PROJECTIONS.items():
+                keys = [f"llm.layers.{idx}.{path}.weight" for path in shard_paths]
+                missing = [k for k in keys if k not in state_dict]
+                if len(missing) == len(keys):
+                    continue
+                if missing:
+                    raise ValueError(
+                        f"OmniVoice checkpoint is missing {missing} needed to build "
+                        f"layers.{idx}.{fused_path}; refusing to load a partially "
+                        f"initialized fused projection."
+                    )
+                module = layer
+                for part in fused_path.split("."):
+                    module = getattr(module, part)
+                packed = torch.cat([state_dict[k] for k in keys], dim=0)
+                if packed.shape != module.weight.shape:
+                    raise ValueError(
+                        f"OmniVoice checkpoint shards {keys} pack to {tuple(packed.shape)} "
+                        f"but layers.{idx}.{fused_path}.weight is {tuple(module.weight.shape)}."
+                    )
+                module.weight.data.copy_(packed)
+                loaded.update(keys)
+                packed_params += 1
+
+        expected = len(self.layers) * len(_FUSED_PROJECTIONS)
+        if loaded and packed_params != expected:
+            raise ValueError(
+                f"OmniVoice checkpoint filled {packed_params}/{expected} fused projections; "
+                f"the remaining ones would stay randomly initialized."
+            )
+        logger.info("Generator: packed %d/%d fused projections", packed_params, expected)
+        return loaded
 
     def load_weights(self, model_dir: str, device: torch.device) -> None:
         """Load weights from HuggingFace OmniVoice model.safetensors.
@@ -975,8 +1215,13 @@ class OmniVoiceGenerator(nn.Module):
                 self.audio_heads.weight.data.copy_(state_dict[key])
                 loaded_keys.add(key)
 
-        # 4. Transformer layers: llm.layers.N.* -> layers.N.*
+        # 4a. Fused projections, packed from their separate checkpoint shards.
+        loaded_keys |= self._load_fused_projections(state_dict)
+
+        # 4b. Remaining transformer weights: llm.layers.N.* -> layers.N.*
         for key, value in state_dict.items():
+            if key in loaded_keys:
+                continue
             if key.startswith("llm.layers."):
                 # llm.layers.0.self_attn.q_proj.weight -> layers.0.self_attn.q_proj.weight
                 our_key = key.replace("llm.layers.", "layers.")

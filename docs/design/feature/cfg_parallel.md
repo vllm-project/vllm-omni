@@ -63,7 +63,7 @@ vLLM-omni provides `CFGParallelMixin` that encapsulates all CFG parallel logic. 
 
 ### N-Branch CFG (3+ branches)
 
-Some models require more than 2 CFG branches. For example, Bagel and OmniGen2 use 3 branches, DreamID Omni uses 4 branches.
+Some models require more than 2 CFG branches. For example, Bagel and OmniGen2 use 3 branches.
 
 `predict_noise_with_multi_branch_cfg()` handles these by automatically dispatching N branches across M GPUs using round-robin (rule: branch `i` → rank `i % M`):
 
@@ -126,16 +126,16 @@ Call `self.diffuse` in your pipeline's forward function:
 
 ```python
 import torch.nn as nn
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+
 class YourModelPipeline(nn.Module, CFGParallelMixin):
     def forward(
         self,
-        prompt: str,
-        negative_prompt: str | None = None,
-        guidance_scale: float = 3.5,
-        num_inference_steps: int = 50,
-        **kwargs,
-    ):
-        # Encode prompts, Initialize latents, Get timesteps
+        req: DiffusionRequestBatch,
+    ) -> list[DiffusionOutput]:
+        # Read prompts and sampling params from the request
+        ...
+        # Encode prompts, initialize latents, get timesteps
         ...
         # Run diffusion loop (calls the mixin's diffuse method)
         latents = self.diffuse(

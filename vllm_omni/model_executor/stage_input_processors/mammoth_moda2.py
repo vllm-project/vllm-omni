@@ -1,97 +1,90 @@
-"""Stage input processor for MammothModa2 (AR -> DiT)."""
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Stage input processor for MammothModa2 (AR -> diffusion)."""
 
 from collections.abc import Mapping
 from typing import Any
 
-import torch
-from vllm.inputs import TextPrompt
 
-from vllm_omni.inputs.data import OmniTokensPrompt
+def _as_dict(prompt: Any) -> dict[str, Any]:
+    if isinstance(prompt, dict):
+        return prompt
+    if hasattr(prompt, "_asdict"):
+        return prompt._asdict()
+    if hasattr(prompt, "__dict__"):
+        return vars(prompt)
+    return {}
 
 
-def ar2dit(
+def _coerce_dim(value: Any, default: int) -> int:
+    try:
+        resolved = int(value)
+    except (TypeError, ValueError):
+        return default
+    return resolved if resolved > 0 else default
+
+
+def ar2diffusion(
     source_outputs: list[Any],
-    prompts: OmniTokensPrompt | TextPrompt | None = None,
-    _requires_multimodal_data: bool = False,
-) -> list[OmniTokensPrompt]:
-    """Convert AR stage outputs to DiT stage inputs."""
-    ar_outputs = source_outputs
-
-    dit_inputs: list[OmniTokensPrompt] = []
-    for ar_output, prompt in zip(ar_outputs, prompts):
-        addi_info = prompt["additional_information"]
-        image_height = addi_info["image_height"][0]
-        image_width = addi_info["image_width"][0]
-        text_guidance_scale = addi_info["text_guidance_scale"][0]
-        cfg_range = addi_info["cfg_range"]
-        num_inference_steps = addi_info["num_inference_steps"][0]
-        gen_vocab_start_index = addi_info["visual_token_start_id"][0]
-        # ["<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>"]
-        visual_ids = addi_info["visual_ids"]
-
-        prompt_token_ids = ar_output.prompt_token_ids
-        # exclude the last token because it has no corresponding hidden state
-        completion_output = ar_output.outputs[0]
-        gen_token_ids = completion_output.cumulative_token_ids[:-1]
-        full_token_ids = prompt_token_ids + gen_token_ids
-
-        mm_output = getattr(completion_output, "multimodal_output", None)
-        if not isinstance(mm_output, Mapping) or "latent" not in mm_output:
-            raise ValueError(
-                "AR stage output missing latent multimodal output. "
-                f"request_id={getattr(ar_output, 'request_id', None)}, "
-                f"completion_has_mm={hasattr(completion_output, 'multimodal_output')}"
-            )
-        full_hidden_states = mm_output["latent"]
-        hidden_total = int(full_hidden_states.shape[0])
-        assert hidden_total == len(prompt_token_ids) + len(gen_token_ids), (
-            f"Hidden states length mismatch: expected {len(prompt_token_ids) + len(gen_token_ids)}, got {hidden_total}"
+    prompt: Any | None = None,
+    requires_multimodal_data: bool = False,
+) -> dict[str, Any]:
+    del requires_multimodal_data
+    if len(source_outputs) != 1:
+        raise ValueError(
+            f"MammothModa2 request-mode diffusion expects exactly one AR output, got {len(source_outputs)}"
         )
 
-        mask_device = full_hidden_states.device
-        full_token_ids_t = torch.tensor(full_token_ids, dtype=torch.long, device=mask_device)
-        attention_mask = torch.ones_like(full_token_ids_t, dtype=torch.bool)
+    ar_output = source_outputs[0]
+    if isinstance(prompt, list):
+        prompt = prompt[0] if prompt else {}
+    prompt_dict = _as_dict(prompt)
+    additional = prompt_dict.get("additional_information") or {}
+    mm_kwargs = prompt_dict.get("mm_processor_kwargs") or {}
+    height = _coerce_dim(
+        mm_kwargs.get("target_h"),
+        _coerce_dim((additional.get("image_height") or [None])[0], 1024),
+    )
+    width = _coerce_dim(
+        mm_kwargs.get("target_w"),
+        _coerce_dim((additional.get("image_width") or [None])[0], 1024),
+    )
 
-        pos = torch.arange(full_token_ids_t.shape[0], device=mask_device)
-        answer_start_index = len(prompt_token_ids)
-        questions_mask = pos < answer_start_index
-        answers_mask = ~questions_mask
-
-        gen_token_mask = full_token_ids_t >= gen_vocab_start_index
-
-        visual_token_mask = torch.isin(
-            full_token_ids_t,
-            torch.tensor(visual_ids, dtype=torch.long, device=mask_device),
+    completion = ar_output.outputs[0]
+    generated_token_ids = list(completion.cumulative_token_ids[:-1])
+    prompt_token_ids = list(ar_output.prompt_token_ids)
+    full_token_ids = prompt_token_ids + generated_token_ids
+    multimodal_output = getattr(completion, "multimodal_output", None)
+    if not isinstance(multimodal_output, Mapping) or "latent" not in multimodal_output:
+        raise ValueError(
+            "MammothModa2 AR stage output is missing latent multimodal output; "
+            f"request_id={getattr(ar_output, 'request_id', None)}"
         )
 
-        text_condition_token_mask = questions_mask & ~(visual_token_mask | gen_token_mask) & attention_mask
-        image_condition_token_mask = answers_mask & gen_token_mask & attention_mask
-
-        text_condition = full_hidden_states[text_condition_token_mask]
-        image_condition = full_hidden_states[image_condition_token_mask]
-
-        text_prompt_embeds = text_condition.to(dtype=torch.float32).contiguous()
-        image_prompt_embeds = image_condition.to(dtype=torch.float32).contiguous()
-
-        additional_information = {
-            "text_prompt_embeds": text_prompt_embeds,
-            "text_prompt_embeds_shape": list(text_prompt_embeds.shape),
-            "image_prompt_embeds": image_prompt_embeds,
-            "image_prompt_embeds_shape": list(image_prompt_embeds.shape),
-            "image_height": [int(image_height)],
-            "image_width": [int(image_width)],
-            "text_guidance_scale": [float(text_guidance_scale)],
-            "cfg_range": [float(cfg_range[0]), float(cfg_range[1])],
-            "num_inference_steps": [int(num_inference_steps)],
-        }
-
-        dit_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=[0],
-                additional_information=additional_information,
-                multi_modal_data=None,
-                mm_processor_kwargs=None,
-            )
+    full_hidden_states = multimodal_output["latent"]
+    hidden_total = int(full_hidden_states.shape[0])
+    if hidden_total != len(full_token_ids):
+        raise ValueError(
+            "Hidden states length mismatch: "
+            f"expected {len(full_token_ids)}, got {hidden_total}; "
+            f"request_id={getattr(ar_output, 'request_id', None)}"
         )
 
-    return dit_inputs
+    return {
+        "prompt": "",
+        "height": height,
+        "width": width,
+        "additional_information": {
+            # Keep #7102's compact BF16/FP16 payload across the EngineCore
+            # boundary. The diffusion pipeline casts only after selecting the
+            # text/image condition rows.
+            "full_hidden_states": full_hidden_states.contiguous(),
+            "full_token_ids": full_token_ids,
+            "answer_start_index": len(prompt_token_ids),
+            **{
+                key: additional[key]
+                for key in ("text_guidance_scale", "num_inference_steps", "cfg_range")
+                if key in additional
+            },
+        },
+    }

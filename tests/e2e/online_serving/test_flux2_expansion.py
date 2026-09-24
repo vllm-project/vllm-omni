@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Tests for Flux2 Klein; currently Dev is implemented separately,
 but ideally these models will fold together in the future.
@@ -15,11 +18,11 @@ from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import (
     OmniServer,
     OmniServerParams,
-    OpenAIClientHandler,
+    OnlineOmniClient,
     dummy_messages_from_mix_data,
 )
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 FOUR_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"}, num_cards=4)
 POSITIVE_PROMPT = "A cat sitting on a windowsill"
@@ -113,7 +116,7 @@ def _get_diffusion_feature_cases(model: str):
     ),
     indirect=True,
 )
-def test_flux2_klein(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_flux2_klein(omni_server: OmniServer, online_client: OnlineOmniClient):
     messages = dummy_messages_from_mix_data(content_text=POSITIVE_PROMPT)
     request_config = {
         "model": omni_server.model,
@@ -128,4 +131,4 @@ def test_flux2_klein(omni_server: OmniServer, openai_client: OpenAIClientHandler
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)

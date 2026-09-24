@@ -40,6 +40,7 @@ from vllm_omni.diffusion.models.omnigen2.omnigen2_transformer import (
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -258,44 +259,42 @@ def get_omnigen2_pre_process_func(
         request: OmniDiffusionRequest,
     ) -> OmniDiffusionRequest:
         """Pre-process requests for OmniGen2Pipeline."""
-        for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+        prompt = request.prompt
+        multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+        raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
 
-            if isinstance(prompt, str):
-                prompt = OmniTextPrompt(prompt=prompt)
-            if "additional_information" not in prompt:
-                prompt["additional_information"] = {}
+        if isinstance(prompt, str):
+            prompt = OmniTextPrompt(prompt=prompt)
+        if "additional_information" not in prompt:
+            prompt["additional_information"] = {}
 
-            if raw_image is not None:
-                if isinstance(raw_image, list):
-                    images = [PIL.Image.open(img) if isinstance(img, str) else img for img in raw_image]
-                elif isinstance(raw_image, str):
-                    images = [PIL.Image.open(raw_image)]
-                else:
-                    images = [raw_image]
+        if raw_image is not None:
+            if isinstance(raw_image, list):
+                images = [PIL.Image.open(img) if isinstance(img, str) else img for img in raw_image]
+            elif isinstance(raw_image, str):
+                images = [PIL.Image.open(raw_image)]
+            else:
+                images = [raw_image]
 
-                first_raw = images[0]
-                if isinstance(first_raw, PIL.Image.Image):
-                    new_h, new_w = image_processor.get_new_height_width(
-                        first_raw, max_pixels=1024 * 1024, max_side_length=1024
-                    )
-                    if request.sampling_params.height is None:
-                        request.sampling_params.height = new_h
-                    if request.sampling_params.width is None:
-                        request.sampling_params.width = new_w
+            first_raw = images[0]
+            if isinstance(first_raw, PIL.Image.Image):
+                new_h, new_w = image_processor.get_new_height_width(
+                    first_raw, max_pixels=1024 * 1024, max_side_length=1024
+                )
+                if request.sampling_params.height is None:
+                    request.sampling_params.height = new_h
+                if request.sampling_params.width is None:
+                    request.sampling_params.width = new_w
 
-                preprocessed_images = []
-                for image in images:
-                    if not (
-                        isinstance(image, torch.Tensor) and len(image.shape) > 1 and image.shape[1] == latent_channels
-                    ):
-                        image = image_processor.preprocess(image, max_pixels=1024 * 1024, max_side_length=1024)
-                    preprocessed_images.append(image)
+            preprocessed_images = []
+            for image in images:
+                if not (isinstance(image, torch.Tensor) and len(image.shape) > 1 and image.shape[1] == latent_channels):
+                    image = image_processor.preprocess(image, max_pixels=1024 * 1024, max_side_length=1024)
+                preprocessed_images.append(image)
 
-                prompt["additional_information"]["preprocessed_images"] = preprocessed_images
+            prompt["additional_information"]["preprocessed_images"] = preprocessed_images
 
-            request.prompts[i] = prompt
+        request.prompt = prompt
         return request
 
     return pre_process_func
@@ -1005,7 +1004,7 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
     @torch.no_grad()
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
         prompt_embeds: torch.FloatTensor | None = None,

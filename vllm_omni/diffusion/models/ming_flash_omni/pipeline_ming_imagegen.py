@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -50,40 +49,14 @@ from vllm_omni.diffusion.models.ming_flash_omni.ming_zimage_transformer import (
 )
 from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
 from vllm_omni.transformers_utils.configs.ming_flash_omni import MingImageGenConfig
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class _ZPipelineSamplingParams:
-    """Typed shim satisfying the attributes ZImagePipeline.forward reads
-    from ``req.sampling_params``.  Unlike SimpleNamespace this fails loudly
-    at construction if a required field is missing."""
-
-    height: int
-    width: int
-    num_inference_steps: int
-    guidance_scale: float
-    generator: torch.Generator | None = None
-    strength: float | None = None
-    sigmas: list[float] | None = None
-    max_sequence_length: int = 512
-    guidance_rescale: float | None = None
-    num_outputs_per_prompt: int = 1
-
-
-@dataclass
-class _ZPipelineRequest:
-    """Typed shim satisfying the attributes ZImagePipeline.forward reads
-    from ``req``."""
-
-    request_id: str
-    sampling_params: _ZPipelineSamplingParams
-    prompts: list[dict[str, Any]] = field(default_factory=lambda: [{"prompt": "", "negative_prompt": ""}])
 
 
 class MingImagePipeline(ZImagePipeline):
@@ -94,6 +67,8 @@ class MingImagePipeline(ZImagePipeline):
       * ``byte5``             — Optional ByT5 glyph encoder (loaded if checkpoint
                                 ships ``byt5/``)
     """
+
+    supports_request_batch = False
 
     def __init__(
         self,
@@ -116,6 +91,10 @@ class MingImagePipeline(ZImagePipeline):
         self._execution_device = get_local_device()
         self.device = self._execution_device  # Ming convention alias
         self._dtype = dtype
+
+        # Request-scoped conditioning handed to the inherited encode_prompt override
+        self._pending_prompt_embeds: list[torch.Tensor] | None = None
+        self._pending_negative_prompt_embeds: list[torch.Tensor] | None = None
 
         # Ming's per-checkpoint image-gen configuration. We cannot rely on
         # ``od_config.hf_config.image_gen_config`` because the diffusion
@@ -267,23 +246,38 @@ class MingImagePipeline(ZImagePipeline):
         latent = self.vae.encode(ref).latent_dist.mode()
         return (latent - self.vae.config.shift_factor) * self.vae.config.scaling_factor
 
+    def encode_prompt(self, *args, **kwargs):  # noqa: ARG002
+        """Return Ming's precomputed conditioning instead of encoding text.
+
+        NOTE: Ming has no Z-Image text_encoder; its conditioning (cap_feats, optionally ByT5-augmented)
+        is computed in forward and stashed on `self._pending_*` immediately before
+        the `super().forward` call, so we simply hand it back here.
+        """
+        if self._pending_prompt_embeds is None:
+            raise RuntimeError(
+                "MingImagePipeline.encode_prompt called without pending "
+                "conditioning; it must run within MingImagePipeline.forward."
+            )
+
+        return self._pending_prompt_embeds, self._pending_negative_prompt_embeds
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
     @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         """Run one text-to-image generation request.
 
         Args:
-            req: Diffusion request. The cross-stage thinker hidden states
+            req: Single-request batch. The cross-stage thinker hidden states
                 must be present at
                 ``req.prompts[0]["extra"]["thinker_hidden_states"]`` as a
                 ``[N, H]`` (or ``[1, N, H]``) tensor, placed there by
                 ``thinker2imagegen``.
 
         Returns:
-            DiffusionOutput with ``.output`` set to a ``[B, 3, H, W]``
+            One DiffusionOutput with ``.output`` set to a ``[B, 3, H, W]``
             image tensor in ``[-1, 1]``. The vllm-omni diffusion engine's
             output adapter converts this to PIL/base64 downstream.
         """
@@ -410,17 +404,27 @@ class MingImagePipeline(ZImagePipeline):
             negative_prompt_embeds = [negative_cap_feats[i] for i in range(negative_cap_feats.shape[0])]
         else:
             negative_prompt_embeds = [self.condition_encoder.zero_negative(e) for e in prompt_embeds]
+        self._pending_prompt_embeds = prompt_embeds
+        self._pending_negative_prompt_embeds = negative_prompt_embeds
 
-        z_sp = _ZPipelineSamplingParams(
+        # Build a real single-request DiffusionRequestBatch;
+        # the prompt text itself is a neutral placeholder here.
+        z_sp = OmniDiffusionSamplingParams(
             height=height,
             width=width,
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
             generator=generator,
+            output_type="pt",
         )
-        z_req = _ZPipelineRequest(
-            request_id=req.request_id or "ming-imagegen",
-            sampling_params=z_sp,
+        z_req = DiffusionRequestBatch(
+            requests=[
+                OmniDiffusionRequest(
+                    prompt={"prompt": ""},
+                    sampling_params=z_sp,
+                    request_id=req.request_id or "ming-imagegen",
+                )
+            ]
         )
 
         # Reference image (img2img) → VAE-encoded latent published on the
@@ -440,28 +444,14 @@ class MingImagePipeline(ZImagePipeline):
             None if ref_latent is None else tuple(ref_latent.shape),
         )
         try:
-            output = super().forward(
-                z_req,
-                prompt=None,
-                height=height,
-                width=width,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                prompt_embeds=prompt_embeds,
-                negative_prompt_embeds=negative_prompt_embeds,
-                generator=generator,
-                output_type="pt",
-                return_dict=True,
-            )
+            outputs: DiffusionOutput = super().forward(z_req)
         finally:
             set_forward_context_ref_latent(None)
+            # Drop request-scoped conditioning so we don't retain GPU tensors.
+            self._pending_prompt_embeds = None
+            self._pending_negative_prompt_embeds = None
 
-        if hasattr(output, "output") and output.output is not None:
-            raw = output.output
-        elif hasattr(output, "images"):
-            raw = output.images
-        else:
-            raw = output
+        raw = outputs.output
         if not isinstance(raw, torch.Tensor):
             raise RuntimeError(f"ZImagePipeline returned non-tensor output: {type(raw).__name__}")
         if logger.isEnabledFor(logging.DEBUG):
@@ -471,7 +461,7 @@ class MingImagePipeline(ZImagePipeline):
                 raw.float().min().item(),
                 raw.float().max().item(),
             )
-        return DiffusionOutput(output=raw)
+        return outputs
 
 
 # ----------------------------------------------------------------------

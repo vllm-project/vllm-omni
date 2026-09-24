@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import logging
 import traceback
@@ -7,7 +7,6 @@ from itertools import chain
 from typing import TYPE_CHECKING
 
 from vllm.utils.import_utils import resolve_obj_by_qualname
-from vllm.utils.torch_utils import supports_xccl
 
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 from vllm_omni.plugins import (
@@ -86,7 +85,7 @@ def xpu_omni_platform_plugin() -> str | None:
     try:
         import torch
 
-        if supports_xccl():
+        if torch.distributed.is_xccl_available():
             dist_backend = "xccl"
         else:
             dist_backend = "ccl"
@@ -143,7 +142,11 @@ def resolve_current_omni_platform_cls_qualname() -> str:
             if platform_cls_qualname is not None:
                 activated_plugins.append(name)
         except Exception:
-            pass
+            logger.debug(
+                "OmniPlatform plugin %s failed during detection.",
+                name,
+                exc_info=True,
+            )
 
     activated_builtin_plugins = list(set(activated_plugins) & set(builtin_omni_platform_plugins.keys()))
     activated_oot_plugins = list(set(activated_plugins) & set(platform_plugins.keys()))

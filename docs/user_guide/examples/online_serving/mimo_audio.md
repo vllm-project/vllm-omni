@@ -1,4 +1,4 @@
-# Online serving Example of vLLM-Omni for MiMo-Audio
+# MiMo-Audio: Online serving
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/mimo_audio>.
 

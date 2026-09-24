@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The Qwen team.
 """Inference-only Qwen3-Omni-Moe Code2Wav model."""
 
@@ -28,11 +28,14 @@ from vllm.model_executor.models.utils import (  # type: ignore
 )
 
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
+from vllm_omni.model_executor.models.qwen3_omni.quantization import (
+    Qwen3OmniNestedSupportsQuant,
+)
 
 logger = init_logger(__name__)
 
 
-class Qwen3OmniMoeCode2Wav(nn.Module):
+class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
     """
     Qwen3 Omni MoE Code2Wav - Converts num_quantizers-layer RVQ codec codes to audio waveform.
 
@@ -313,21 +316,26 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         else:
             # Fallback: assume all batch elements share the same sequence length.
             code_seq_lens = [codes.shape[-1]] * codes.shape[0]
+        # The decoder trims the same right-edge tail from every batch row.
+        # Infer it from the decoded window, not a shorter request's length:
+        # padding that request with codec zeros does not provide valid context.
+        tail = max(0, int(codes.shape[-1] * self.total_upsample) - batch_wav.shape[-1])
         for idx, code_seq_len in enumerate(code_seq_lens):
-            # Remove context from output (left_context_size * total_upsample samples)
-            wav_chunk = batch_wav[
-                idx, :, left_context_size[idx] * self.total_upsample : code_seq_len * self.total_upsample
-            ]
+            # Refill the previous chunk's tail using the re-decoded left context,
+            # and exclude the current row's padded tail just as singleton decode does.
+            start = max(0, left_context_size[idx] * self.total_upsample - tail)
+            end = max(0, code_seq_len * self.total_upsample - tail)
+            wav_chunk = batch_wav[idx, :, start:end]
             wavs.append(wav_chunk)
         return wavs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights from HuggingFace checkpoint."""
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=["thinker.", "talker."],  # Already loaded above
+        loader = AutoWeightsLoader(self)
+        loaded = loader.load_weights(
+            weights,
+            mapper=(self.hf_to_vllm_mapper) | WeightsMapper(orig_to_new_prefix={"thinker.": None, "talker.": None}),
         )
-        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
         # Log load summary
         try:

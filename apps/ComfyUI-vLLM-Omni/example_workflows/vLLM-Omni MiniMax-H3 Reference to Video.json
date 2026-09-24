@@ -1,0 +1,786 @@
+{
+  "id": "e7a4e606-6510-4c4e-b127-9a8b6bf3ea71",
+  "revision": 0,
+  "last_node_id": 11,
+  "last_link_id": 5,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadImage",
+      "pos": [
+        40,
+        100
+      ],
+      "size": [
+        320,
+        300
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "image",
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "choose file to upload",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "IMAGE",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            1
+          ]
+        },
+        {
+          "localized_name": "MASK",
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "h3_reference.png",
+        "image"
+      ],
+      "title": "Reference image \u2014 select a local file"
+    },
+    {
+      "type": "LoadVideo",
+      "size": [
+        320,
+        200
+      ],
+      "flags": {},
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadVideo"
+      },
+      "widgets_values": [
+        "h3_reference.mp4"
+      ],
+      "id": 2,
+      "pos": [
+        40,
+        470
+      ],
+      "order": 1,
+      "mode": 0,
+      "title": "Optional reference video"
+    },
+    {
+      "id": 3,
+      "type": "LoadAudio",
+      "pos": [
+        40,
+        1100
+      ],
+      "size": [
+        320,
+        160
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "audio",
+          "name": "audio",
+          "type": "COMBO",
+          "widget": {
+            "name": "audio"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "audioUI",
+          "name": "audioUI",
+          "type": "AUDIO_UI",
+          "widget": {
+            "name": "audioUI"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "choose file to upload",
+          "name": "upload",
+          "type": "AUDIOUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "AUDIO",
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadAudio"
+      },
+      "widgets_values": [
+        "h3_reference.wav",
+        null,
+        ""
+      ],
+      "title": "Optional reference audio"
+    },
+    {
+      "id": 4,
+      "type": "VLLMOmniVideoReferences",
+      "pos": [
+        420,
+        100
+      ],
+      "size": [
+        300,
+        365
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image_1",
+          "type": "IMAGE",
+          "shape": 7,
+          "link": 1
+        },
+        {
+          "name": "image_2",
+          "type": "IMAGE",
+          "shape": 7,
+          "link": null
+        },
+        {
+          "name": "audio_1",
+          "type": "AUDIO",
+          "shape": 7,
+          "link": null
+        },
+        {
+          "name": "audio_2",
+          "type": "AUDIO",
+          "shape": 7,
+          "link": null
+        },
+        {
+          "name": "video_1",
+          "type": "VIDEO",
+          "shape": 7,
+          "link": null
+        },
+        {
+          "name": "video_2",
+          "type": "VIDEO",
+          "shape": 7,
+          "link": null
+        },
+        {
+          "name": "image_3",
+          "type": "IMAGE",
+          "shape": 7,
+          "link": null
+        },
+        {
+          "name": "image_4",
+          "type": "IMAGE",
+          "shape": 7,
+          "link": null
+        },
+        {
+          "name": "image_5",
+          "type": "IMAGE",
+          "shape": 7,
+          "link": null
+        },
+        {
+          "name": "image_6",
+          "type": "IMAGE",
+          "shape": 7,
+          "link": null
+        },
+        {
+          "name": "image_7",
+          "type": "IMAGE",
+          "shape": 7,
+          "link": null
+        },
+        {
+          "name": "image_8",
+          "type": "IMAGE",
+          "shape": 7,
+          "link": null
+        },
+        {
+          "name": "image_9",
+          "type": "IMAGE",
+          "shape": 7,
+          "link": null
+        },
+        {
+          "name": "audio_3",
+          "type": "AUDIO",
+          "shape": 7,
+          "link": null
+        },
+        {
+          "name": "video_3",
+          "type": "VIDEO",
+          "shape": 7,
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "references",
+          "name": "references",
+          "type": "VIDEO_REFERENCES",
+          "links": [
+            2
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniVideoReferences"
+      },
+      "widgets_values": [],
+      "title": "References \u2014 up to 12 total"
+    },
+    {
+      "id": 5,
+      "type": "VLLMOmniDiffusionSampling",
+      "pos": [
+        420,
+        530
+      ],
+      "size": [
+        310,
+        275
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "n",
+          "name": "n",
+          "type": "INT",
+          "widget": {
+            "name": "n"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "num_inference_steps",
+          "name": "num_inference_steps",
+          "type": "INT",
+          "widget": {
+            "name": "num_inference_steps"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "guidance_scale",
+          "name": "guidance_scale",
+          "type": "FLOAT",
+          "widget": {
+            "name": "guidance_scale"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "true_cfg_scale",
+          "name": "true_cfg_scale",
+          "type": "FLOAT",
+          "widget": {
+            "name": "true_cfg_scale"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "vae_use_slicing",
+          "name": "vae_use_slicing",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "vae_use_slicing"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "vae_use_tiling",
+          "name": "vae_use_tiling",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "vae_use_tiling"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "seed",
+          "name": "seed",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "diffusion sampling params",
+          "name": "diffusion sampling params",
+          "type": "SAMPLING_PARAMS",
+          "links": [
+            3
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniDiffusionSampling"
+      },
+      "widgets_values": [
+        1,
+        50,
+        1.0,
+        1.0,
+        false,
+        false,
+        42,
+        "fixed"
+      ],
+      "title": "Sampling \u2014 base 50 / Turbo 5"
+    },
+    {
+      "id": 6,
+      "type": "VLLMOmniMiniMaxH3Params",
+      "pos": [
+        790,
+        750
+      ],
+      "size": [
+        310,
+        105
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "audio_flow_shift",
+          "name": "audio_flow_shift",
+          "type": "FLOAT",
+          "widget": {
+            "name": "audio_flow_shift"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "flow_shift",
+          "name": "flow_shift",
+          "type": "FLOAT",
+          "widget": {
+            "name": "flow_shift"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "MiniMax-H3 video params",
+          "name": "MiniMax-H3 video params",
+          "type": "VIDEO_PARAMS",
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniMiniMaxH3Params"
+      },
+      "widgets_values": [
+        3.0,
+        12.0
+      ],
+      "title": "H3 video/audio flow shifts"
+    },
+    {
+      "type": "VLLMOmniRemoteLoRA",
+      "size": [
+        310,
+        180
+      ],
+      "flags": {},
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "lora",
+          "type": "REMOTE_LORA",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniRemoteLoRA"
+      },
+      "widgets_values": [
+        "",
+        "h3-ref2va-turbo",
+        1.0,
+        0
+      ],
+      "id": 7,
+      "pos": [
+        420,
+        940
+      ],
+      "order": 6,
+      "mode": 0,
+      "title": "Optional Turbo LoRA \u2014 connect to enable"
+    },
+    {
+      "id": 8,
+      "type": "VLLMOmniGenerateVideo",
+      "pos": [
+        800,
+        100
+      ],
+      "size": [
+        470,
+        560
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "frame",
+          "name": "frame",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "references",
+          "name": "references",
+          "shape": 7,
+          "type": "VIDEO_REFERENCES",
+          "link": 2
+        },
+        {
+          "localized_name": "sampling_params",
+          "name": "sampling_params",
+          "shape": 7,
+          "type": "SAMPLING_PARAMS",
+          "link": 3
+        },
+        {
+          "localized_name": "lora",
+          "name": "lora",
+          "shape": 7,
+          "type": "REMOTE_LORA",
+          "link": null
+        },
+        {
+          "localized_name": "model_params",
+          "name": "model_params",
+          "shape": 7,
+          "type": "VIDEO_PARAMS",
+          "link": 4
+        },
+        {
+          "localized_name": "url",
+          "name": "url",
+          "type": "STRING",
+          "widget": {
+            "name": "url"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "model",
+          "name": "model",
+          "type": "STRING",
+          "widget": {
+            "name": "model"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "prompt",
+          "name": "prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "prompt"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "negative_prompt",
+          "name": "negative_prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "negative_prompt"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "width",
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "height",
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "fps",
+          "name": "fps",
+          "type": "INT",
+          "widget": {
+            "name": "fps"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "duration",
+          "name": "duration",
+          "type": "FLOAT",
+          "widget": {
+            "name": "duration"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "video",
+          "name": "video",
+          "type": "VIDEO",
+          "links": [
+            5
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniGenerateVideo"
+      },
+      "widgets_values": [
+        "http://localhost:8000/v1",
+        "MiniMaxAI/MiniMax-H3",
+        "Use the subject and visual style from <Picture 1>. Create a cinematic shot with a gentle camera move and natural ambient sound.",
+        "",
+        1344,
+        768,
+        24,
+        5.167
+      ],
+      "title": "MiniMax-H3 Reference to Video"
+    },
+    {
+      "id": 9,
+      "type": "SaveVideo",
+      "pos": [
+        1360,
+        100
+      ],
+      "size": [
+        410,
+        420
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "video",
+          "name": "video",
+          "type": "VIDEO",
+          "link": 5
+        },
+        {
+          "localized_name": "filename_prefix",
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "format",
+          "name": "format",
+          "type": "COMBO",
+          "widget": {
+            "name": "format"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "codec",
+          "name": "codec",
+          "type": "COMFY_DYNAMICCOMBO_V3",
+          "widget": {
+            "name": "codec"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "video",
+          "name": "video",
+          "type": "VIDEO",
+          "links": null
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        "video/MiniMax-H3-Ref2VA",
+        "mp4",
+        "h264"
+      ],
+      "title": "Save generated video with audio"
+    },
+    {
+      "id": 10,
+      "type": "MarkdownNote",
+      "pos": [
+        1360,
+        590
+      ],
+      "size": [
+        440,
+        595
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Reference inputs and output settings",
+      "properties": {},
+      "widgets_values": [
+        "## Reference to Video\nSelect an image, set the server URL and served model name, then run.\n\nConnect the optional video/audio loaders to Video References, or duplicate loaders for more inputs: up to 9 images, 3 videos, 3 audio clips, 12 total. At least one image or video is required.\n\nSlots are numbered separately per media type. Empty slots are skipped. Update prompt tags such as <Picture 1>, <Video 1>, <Audio 1> to match the connected references. Videos keep their own soundtrack in the reference upload.\n\n**Output:** 24 FPS; 124 frames (~5.17 s). Valid frame counts are 107, 124, 141, 158, 175, 192, 209, 226, 243, 260, 277, 294, 311, 328, 345.\n\n**Width x height:** 1344x768 (16:9), 1024x768 (4:3), 768x768 (1:1), 768x1024 (3:4), 768x1344 (9:16).\n\nEach reference video/audio clip must be 2\u201315 s. Total reference-video duration <=15 s; total standalone-audio duration <=15 s.\n\nRequires the expanded Video References node and the audio-preserving video output fix. See the extension README for setup and validation status."
+      ],
+      "color": "#432",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 11,
+      "type": "MarkdownNote",
+      "pos": [
+        790,
+        940
+      ],
+      "size": [
+        480,
+        455
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Optional Turbo \u2014 same workflow",
+      "properties": {},
+      "widgets_values": [
+        "## Turbo Ref2VA\nBase mode: leave LoRA disconnected; use 50 steps, video flow shift 12, audio flow shift 3.\n\nFor the 4-step v0.1 Ref2VA Turbo adapter:\n1. Start a Ref2VA-only server with the Diffusers adapter loaded (see README).\n2. Set LoRA local_path to its path on the server, then connect LoRA to Generate Video.\n3. Set Sampling num_inference_steps to **5**; keep shifts at **12 / 3**, scale **1**.\n\nvLLM-Omni counts sigma points: 5 points give 4 denoiser evaluations. Use minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors, not the _comfyui_ export.\n\nDisconnect LoRA and restore 50 steps to return to base mode. FastH3 is a separate T2VA deployment, not this option.\n\nAdapted from the official ComfyUI MiniMax-H3 R2V workflow: https://github.com/Comfy-Org/workflow_templates/blob/main/templates/video_minimax_h3_r2v.json"
+      ],
+      "color": "#432",
+      "bgcolor": "#000"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      4,
+      0,
+      "IMAGE"
+    ],
+    [
+      2,
+      4,
+      0,
+      8,
+      1,
+      "VIDEO_REFERENCES"
+    ],
+    [
+      3,
+      5,
+      0,
+      8,
+      2,
+      "SAMPLING_PARAMS"
+    ],
+    [
+      4,
+      6,
+      0,
+      8,
+      4,
+      "VIDEO_PARAMS"
+    ],
+    [
+      5,
+      8,
+      0,
+      9,
+      0,
+      "VIDEO"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "workflowRendererVersion": "LG",
+    "ds": {
+      "scale": 0.85,
+      "offset": [
+        100,
+        100
+      ]
+    }
+  },
+  "version": 0.4
+}

@@ -3,7 +3,7 @@
 ## Overview
 
 [AutoRound](https://github.com/intel/auto-round) produces pre-quantized
-checkpoints for LLMs, VLMs, and diffusion models. vLLM-Omni reads the
+checkpoints for LLMs, VLMs, diffusion models, and world models. vLLM-Omni reads the
 checkpoint's `config.json` and auto-detects
 `quantization_config.quant_method = "auto-round"`.
 
@@ -35,6 +35,13 @@ guide. AutoRound is Intel-supported.
 | Wan2.2-I2V | `Intel/Wan2.2-I2V-A14B-Diffusers-int4-AutoRound` | Diffusion transformer | W4A16 | GPTQ-Marlin or Intel-supported AutoRound backend |
 | Wan2.2-T2V | `Intel/Wan2.2-T2V-A14B-Diffusers-int4-AutoRound` | Diffusion transformer | W4A16 | GPTQ-Marlin or Intel-supported AutoRound backend |
 | Wan2.2-TI2V | `Intel/Wan2.2-TI2V-5B-Diffusers-int4-AutoRound` | Diffusion transformer | W4A16 | GPTQ-Marlin or Intel-supported AutoRound backend |
+
+### World Model (Cosmos3)
+
+| Model | Checkpoint | Scope | Scheme | Backend |
+|-------|------------|-------|--------|---------|
+| Cosmos3-Nano | `Intel/Cosmos3-Nano-int4-AutoRound` | World-model transformer | W4A16 | GPTQ-Marlin or Intel-supported AutoRound backend |
+| Cosmos3-Super | `Intel/Cosmos3-Super-int4-AutoRound` | World-model transformer | W4A16 | GPTQ-Marlin or Intel-supported AutoRound backend |
 
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 

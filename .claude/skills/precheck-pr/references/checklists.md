@@ -35,6 +35,44 @@ PR title must follow the project convention documented in `docs/contributing/REA
 
 ---
 
+## All PRs: Code Quality (run on every PR, quick & full)
+
+Diff-scoped sweep for five fragility patterns that are pervasive in the existing codebase — **only lines the PR adds count**, not the pre-existing backlog. Detection commands, codebase examples, and full severity rules live in [code-quality.md](code-quality.md).
+
+- [ ] **No new `**kwargs` string-lookup plumbing:** the diff adds no `**kwargs` + `kwargs["..."]` / `kwargs.get("...")` / `"..." in kwargs`. ⚠ any new instance; ✗ if a new string key is duplicated across ≥2 files without a shared constant, or unknown keys are silently dropped on a fail-fast path.
+- [ ] **No new broad exception swallow:** the diff adds no `except Exception:` / bare `except:`. ⚠ any new instance; ✗ for `except: pass` / `except Exception: return None` / `continue` on a fail-fast path (init, config validation, weight loading, request handling).
+- [ ] **No new `Any` / wrong type hints:** the diff adds no `: Any` / `-> Any` / untyped production signature, and no new `SimpleNamespace` in tests faking an object that already has a real typed stub. ⚠ any new instance; ✗ for a *wrong* (actively misleading) annotation or a `SimpleNamespace` test fake of a typed object.
+- [ ] **No new hot-path copy:** the diff adds no `.clone()` / `.copy_()` / `copy.deepcopy(...)` inside a per-step loop or per-request path. ⚠ any new instance; ✗ for `.clone()` of a full latent/activations tensor inside an AR or diffusion step loop without a comment, or `deepcopy` of a scheduler / sampling-config on the request path.
+- [ ] **No new event-loop blocking:** the diff adds no `time.sleep` / blocking HTTP (`requests`, `urllib`) / `await` inside a held lock in `async def` code. ⚠ any new instance; ✗ for blocking sleep or HTTP on the serving path (`engine/`, `entrypoints/`, async `connectors/`), or a lock held across an `await`. Blocking inside a dedicated worker thread is fine.
+
+Roll the ⚠/✗ counts into the report as a single **Code quality** dimension row.
+
+---
+
+## All PRs: Examples Policy (run on every PR, quick & full)
+
+Inspect Python files introduced under `examples/` using
+[examples-policy.md](examples-policy.md). This is a diff-scoped ratchet: existing
+model-specific examples may be edited or removed without triggering the check.
+
+- [ ] **No new model-specific Python examples:** the diff adds, copies, or renames no Python file whose path or behavior is specific to one model, checkpoint, vendor, or model family. ✗ for any violation. Route inference through a shared task/protocol entrypoint, model request behavior through `vllm_omni/model_extras`, and commands through task docs or `recipes/`.
+- [ ] **New generic example code is justified:** any new task-neutral Python file under `examples/` is an actual user-facing entrypoint rather than reusable production logic, a benchmark, an app, a setup tool, or a reproducer. ⚠ when the placement is questionable.
+
+Roll the result into the report as a separate **Examples policy** dimension.
+
+### Conventions (eyeball — no grep)
+
+Judgment calls that don't grep cleanly — apply them while reading the diff, not as a mechanical check:
+
+- **Right log level** — `info` is for end-user-visible events; routine internal events are `debug`; hot paths are `trace` or removed. Logging is not free.
+- **Structured fields over f-strings** — pass dynamic values as structured fields (`logger.info("msg", extra={...})`), not interpolated strings, so they stay greppable and parseable.
+- **No reflexive synchronization** — don't add `threading.Lock` / `asyncio.Lock` / `deepcopy` / re-wrap shared state unless there is real concurrent mutation; the GIL covers most Python code. Owners decide their own synchronization — don't pre-lock in a constructor.
+- **Context managers for cleanup** — use `with` / `contextlib` for files, locks, CUDA streams, and profilers; not raw `open()` + manual `.close()` or ad-hoc `finally`.
+- **No new dependencies without justification** — prefer the stdlib and existing vllm-omni deps; a new top-level dep needs a reason (check `pyproject.toml` / `requirements*.txt`).
+- **Naming / interface discipline** — don't rename or change interfaces just for taste in this PR, but do fix names that actively mislead (e.g. `serve` implying a long-running server, `Instance` where multiple instance kinds coexist).
+
+---
+
 ## Bug Fix PRs
 
 ### Quick
@@ -49,7 +87,7 @@ PR title must follow the project convention documented in `docs/contributing/REA
 - [ ] **Regression test exists:** `git diff --name-only` includes at least one `tests/` file
 - [ ] **Regression test reproduces the original error:** the test would fail on main, pass on this branch
 - [ ] **Fix matches root cause exactly:** no "fix the symptom + something else" — if the root cause is dtype, the fix is dtype, not dtype + reformatting
-- [ ] **No silent failure risk:** no bare `except: pass`, no `try: ... except: return None`, no empty fallback added
+- [ ] **No silent failure risk:** no bare `except: pass`, no `try: ... except: return None`, no empty fallback added. See the broad-except pattern in [code-quality.md](code-quality.md#2-broad-exception-swallow) for the full severity rule (⚠ any new broad catch; ✗ for a swallow on a fail-fast path).
 - [ ] **Upstream pattern match:** the fix follows the same pattern as existing code for similar cases (grep for analogous `from_pretrained` calls, etc.)
 - [ ] **Environment documented:** torch/transformers/vllm versions listed if the bug is version-dependent
 
@@ -126,6 +164,7 @@ Diffusion models live under `vllm_omni/diffusion/`. In addition to the New Model
 - [ ] **PR body matches diff:** description doesn't claim changes not in the diff
 - [ ] **Branch is rebased:** `git merge-base HEAD origin/main` is recent, no merge conflicts
 - [ ] **CI gates passing:** DCO, pre-commit, build — check `gh pr view --json statusCheckRollup` if a PR already exists
+- [ ] **Local pre-commit gates:** full list in [Linting](../../../../docs/contributing/README.md#linting). Blocking when the diff introduces: stale `vLLM project` SPDX; stdlib `re`/`base64` or pickle in library code; new `torch.cuda` call sites; `tests/**/test_*.py` without level+hardware marks; new `_tts_model_type` branches in `serving_speech.py`; invalid `.buildkite` YAML. macOS/Windows need a native `shellcheck`. ✗ for growing `CHECK_IMPORTS[*].allowed_files`, `ALLOWED_FILES`, or `MAX_MODEL_TYPE_BRANCHES` without review.
 
 ### Full (adds)
 

@@ -1,4 +1,4 @@
-# AURA Omni
+# AURA Omni: Offline inference
 
 This example runs the native AURA Omni pipeline offline:
 

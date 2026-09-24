@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Process manager for omni stage engine subprocesses.
 
@@ -38,13 +38,11 @@ from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 
 logger = init_logger(__name__)
 
-try:
-    # ``set_device_control_env_var`` lives next to CoreEngineProcManager and
-    # is only required for non-CUDA DP, so we tolerate its absence on
-    # older / future vLLM revisions.
-    from vllm.v1.engine.utils import set_device_control_env_var  # type: ignore
-except ImportError:  # pragma: no cover - depends on vLLM build
-    set_device_control_env_var = None  # type: ignore[assignment]
+# ``set_device_control_env_var`` was removed from upstream vllm.
+# It was only required for non-CUDA DP; set to None so the existing
+# guard at the call-site (vllm_config is not None and ... is not None)
+# skips the call transparently.
+set_device_control_env_var = None
 
 
 class StageEngineCoreProcManager(CoreEngineProcManager):
@@ -77,12 +75,19 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
         omni_replica_base_id: int = 0,
         client_handshake_address: str | None = None,
         tensor_queue: Queue | None = None,
+        omni_parallel_stage_init: bool = False,
     ) -> None:
         # NOTE: we intentionally do not call ``super().__init__`` — the
         # parent's body hardcodes the wrong target. We re-implement it here
         # while reusing the parent's instance methods (shutdown, monitor).
         if local_engine_count <= 0:
             raise ValueError(f"local_engine_count must be > 0, got {local_engine_count}")
+
+        # Mirrors the vLLM 0.29 parent __init__: the inherited shutdown() reads
+        # this to bound how long in-flight requests may drain. Omitting it makes
+        # shutdown raise AttributeError, which leaves the engine core
+        # subprocesses alive and hangs interpreter exit until the job timeout.
+        self._request_shutdown_timeout = vllm_config.shutdown_timeout
 
         context = get_mp_context()
         common_kwargs: dict[str, object] = {
@@ -94,6 +99,7 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
             "tensor_queue": tensor_queue,
             "omni_stage_id": int(omni_stage_id),
             "omni_coordinator_address": omni_coordinator_address,
+            "omni_parallel_stage_init": bool(omni_parallel_stage_init),
         }
 
         if client_handshake_address:

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Shared stage-client typing for vLLM-Omni runtime surfaces."""
 
 from __future__ import annotations
@@ -8,11 +11,16 @@ from typing import TYPE_CHECKING, Any, Protocol
 if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest
 
-    from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniTokensPrompt
+    from vllm_omni.inputs.data import (
+        OmniDiffusionSamplingParams,
+        OmniInteractionPrompt,
+        OmniPromptType,
+        OmniTokensPrompt,
+    )
     from vllm_omni.outputs import OmniRequestOutput
 
-from vllm_omni.engine.output_modality import FinalOutputModalityType
 from vllm_omni.inputs.data import OmniSamplingParams
+from vllm_omni.outputs.output_metadata import FinalOutputModalityType
 
 
 class StageClient(Protocol):
@@ -30,6 +38,7 @@ class StageClient(Protocol):
     final_output: bool
     final_output_type: FinalOutputModalityType | None
     default_sampling_params: OmniSamplingParams
+    prompt_transform_func: Any | None
     prompt_expand_func: Any | None
     requires_multimodal_data: bool
     custom_process_input_func: Any | None
@@ -88,6 +97,8 @@ class StagePoolLLMClient(StagePoolClient, Protocol):
         kv_transfer_port_offset: int = ...,
     ) -> dict[str, Any] | None: ...
 
+    def get_payload_sender_info(self) -> dict[str, Any] | None: ...
+
 
 class StagePoolDiffusionClient(StagePoolClient, Protocol):
     """Pool-facing API for diffusion stages."""
@@ -98,14 +109,14 @@ class StagePoolDiffusionClient(StagePoolClient, Protocol):
         prompt: OmniPromptType,
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
-    ) -> None: ...
-
-    async def add_batch_request_async(
-        self,
-        request_id: str,
-        prompts: list[OmniPromptType],
-        sampling_params: OmniDiffusionSamplingParams,
-        kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        kv_transfer_params: dict[str, Any] | None = None,
     ) -> None: ...
 
     def get_diffusion_output_nowait(self) -> OmniRequestOutput | None: ...
+
+    async def submit_interaction_async(
+        self,
+        request_id: str,
+        interaction: OmniInteractionPrompt,
+        timeout: float | None = None,
+    ) -> Any: ...

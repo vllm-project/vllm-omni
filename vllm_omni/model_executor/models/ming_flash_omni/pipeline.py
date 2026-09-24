@@ -6,8 +6,8 @@ Stage 0: Thinker — multimodal understanding + text generation.
 Stage 1: Talker  — text -> audio waveform via CFM + AudioVAE.
 
 The thinker -> talker bridge passes the detokenized text rather than
-hidden states through `ming_flash_omni.thinker2talker`; the talker has a
-self-contained Qwen2 LLM that retokenizes the string itself.
+hidden states; the talker has a self-contained Qwen2 LLM that retokenizes
+the string itself.
 """
 
 from vllm_omni.config.stage_config import (
@@ -21,6 +21,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.ming_flash_omni"
 
 MING_FLASH_OMNI_PIPELINE = PipelineConfig(
     model_type="ming_flash_omni",
+    default_deploy_config_name="ming_flash_omni.yaml",
     model_arch="MingFlashOmniForConditionalGeneration",
     # Upstream HF config applies model_type="bailingmm_moe_v2_lite"
     # (the thinker sub-config name) rather than "ming_flash_omni".
@@ -57,7 +58,6 @@ MING_FLASH_OMNI_PIPELINE = PipelineConfig(
             hf_config_name="talker_config",
             engine_output_type="audio",
             tokenizer_subdir="talker/llm",
-            custom_process_input_func=f"{_PROC}.thinker2talker",
             sync_process_input_func=f"{_PROC}.thinker2talker_token_only",
         ),
     ),
@@ -67,6 +67,7 @@ MING_FLASH_OMNI_PIPELINE = PipelineConfig(
 # Standalone TTS variant: talker only.
 MING_FLASH_OMNI_TTS_PIPELINE = PipelineConfig(
     model_type="ming_flash_omni_tts",
+    default_deploy_config_name="ming_flash_omni_tts.yaml",
     model_arch="MingFlashOmniTalkerForConditionalGeneration",
     stages=(
         StagePipelineConfig(
@@ -88,6 +89,7 @@ MING_FLASH_OMNI_TTS_PIPELINE = PipelineConfig(
 # Thinker-only variant: multimodal understanding with text output
 MING_FLASH_OMNI_THINKER_ONLY_PIPELINE = PipelineConfig(
     model_type="ming_flash_omni_thinker_only",
+    default_deploy_config_name="ming_flash_omni_thinker_only.yaml",
     model_arch="MingFlashOmniForConditionalGeneration",
     stages=(
         StagePipelineConfig(
@@ -110,6 +112,7 @@ MING_FLASH_OMNI_THINKER_ONLY_PIPELINE = PipelineConfig(
 # Thinker + image-generation (diffusion) variant: text-to-image / img2img.
 MING_FLASH_OMNI_IMAGE_PIPELINE = PipelineConfig(
     model_type="ming_flash_omni_image",
+    default_deploy_config_name="ming_flash_omni_image.yaml",
     model_arch="MingFlashOmniForConditionalGeneration",
     stages=(
         StagePipelineConfig(

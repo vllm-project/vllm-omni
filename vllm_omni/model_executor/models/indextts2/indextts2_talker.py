@@ -12,6 +12,7 @@ import json
 import math
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -38,7 +39,11 @@ from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
-from .configuration_indextts2 import IndexTTS2Config
+from .configuration_indextts2 import (
+    INDEXTTS25_MAX_DURATION_FACTOR,
+    INDEXTTS25_MIN_DURATION_FACTOR,
+    IndexTTS2Config,
+)
 from .gpt.conformer_encoder import ConformerEncoder
 from .gpt.embeddings import LearnedPositionEmbeddings
 from .gpt.perceiver import PerceiverResampler
@@ -54,6 +59,57 @@ from .preprocess_utils import (
 )
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class IndexTTSConditioningPolicy:
+    prefix_tokens: int
+    uses_conformer_perceiver: bool
+    uses_campplus_projection: bool
+    uses_language_embedding: bool
+
+
+def resolve_indextts_conditioning_policy(model_type: str) -> IndexTTSConditioningPolicy:
+    if model_type == "indextts2_5":
+        return IndexTTSConditioningPolicy(
+            prefix_tokens=3,
+            uses_conformer_perceiver=False,
+            uses_campplus_projection=True,
+            uses_language_embedding=True,
+        )
+    return IndexTTSConditioningPolicy(
+        prefix_tokens=34,
+        uses_conformer_perceiver=True,
+        uses_campplus_projection=False,
+        uses_language_embedding=False,
+    )
+
+
+def _normalize_indextts_checkpoint_key(name: str) -> str:
+    """Remove FSDP wrapper path components from native checkpoint keys."""
+    return name.replace("_fsdp_wrapped_module.", "")
+
+
+def _require_exact_indextts_prefill_span(
+    *,
+    actual_span_len: int,
+    scheduled_span_len: int,
+    model_type: str,
+    lang: str,
+    text_token_count: int,
+) -> None:
+    """Reject prompt-sizing drift before it can move/remove ``start_mel``."""
+    if actual_span_len == scheduled_span_len:
+        return
+    raise ValueError(
+        "IndexTTS prefill embedding span mismatch: "
+        f"scheduled_span_len={scheduled_span_len}, "
+        f"actual_span_len={actual_span_len}, "
+        f"model_type={model_type}, lang={lang}, "
+        f"text_token_count={text_token_count}. "
+        "IndexTTS requires exact placeholder sizing and does not support "
+        "chunked prefill; keep enable_chunked_prefill=false."
+    )
 
 
 def _find_most_similar_cosine(query: torch.Tensor, matrix: torch.Tensor) -> int:
@@ -82,6 +138,8 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         self.model_path = vllm_config.model_config.model
         self.config: IndexTTS2Config = vllm_config.model_config.hf_config  # type: ignore[assignment]
         gpt_cfg = self.config.gpt
+        self.conditioning_policy = resolve_indextts_conditioning_policy(self.config.model_type)
+        self.use_gpt_latent = bool(getattr(self.config, "use_gpt_latent", True))
 
         self.model_dim = gpt_cfg["model_dim"]
         self.num_layers = gpt_cfg["layers"]
@@ -100,26 +158,37 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         self.has_postprocess = True
         self.requires_raw_input_tokens = True
         self.enable_update_additional_information = True
-        # S2Mel consumes the complete code sequence only at request end, but
-        # the connector accumulator needs to observe each appendable AR delta.
-        # Keep runner request-end gating disabled and emit per-step rows from
-        # make_omni_output; the full-payload builder reconstructs the sequence.
-        self.omni_payload_at_request_end = False
+        # Stage 1 consumes the hidden-state stream only in the legacy
+        # ``use_gpt_latent`` mode.  IndexTTS 2.5 transports mel codes plus
+        # reference conditioning, so asking the generic runner to include
+        # hidden states would add a synchronous [num_tokens, model_dim] D2H
+        # copy on every decode step without adding anything to the payload.
+        self.omni_pooler_payload_include_hidden = self.use_gpt_latent
+        # S2Mel consumes the complete sequence only at request end. In latent
+        # mode the runner retains aligned code/latent deltas on GPU; no-latent
+        # mode reuses the CPU output-token history and retains only conditioning
+        # metadata here.
+        self.omni_payload_at_request_end = self.config.model_type == "indextts2_5"
         self.omni_request_end_token_ids = ()
         self._speaker_cache = get_speaker_cache()
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("codes", "mel"),
-            ("hidden_states", "latent"),
             ("meta", "mel_start_offset"),
-            ("meta", "latent_acc"),
             ("meta", "mel_code_count"),
         }
+        if self.use_gpt_latent:
+            self.gpu_resident_buffer_keys.update(
+                {
+                    ("hidden_states", "latent"),
+                    ("meta", "latent_acc"),
+                }
+            )
 
         # --- GPT-2 transformer (vLLM-native with PagedAttention) ---
         # Build a GPT2Config-like object for GPT2Block
         from transformers import GPT2Config as HFGpt2Config
 
-        max_seq_len = self.max_mel_tokens + self.max_text_tokens + self.condition_num_latent + 4
+        max_seq_len = self.max_mel_tokens + self.max_text_tokens + self.conditioning_policy.prefix_tokens + 3
         gpt2_config = HFGpt2Config(
             vocab_size=self.number_mel_codes,
             n_positions=max_seq_len,
@@ -149,7 +218,13 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         self.mel_embedding = nn.Embedding(self.number_mel_codes, self.model_dim)
         self.text_pos_embedding = LearnedPositionEmbeddings(self.max_text_tokens + 2, self.model_dim)
         self.mel_pos_embedding = LearnedPositionEmbeddings(self.max_mel_tokens + 2 + 1, self.model_dim)
-        self.speed_emb = nn.Embedding(2, self.model_dim)
+        if self.conditioning_policy.uses_campplus_projection:
+            from .tokenizer_v2_5 import LANGUAGE_DICT
+
+            self.spk_emb_proj = nn.Linear(192, self.model_dim)
+            self.lang_embedding = nn.Embedding(len(LANGUAGE_DICT) + 1, self.model_dim)
+        else:
+            self.speed_emb = nn.Embedding(2, self.model_dim)
         self.emo_layer = nn.Linear(self.model_dim, self.model_dim)
         self.emovec_layer = nn.Linear(1024, self.model_dim)
 
@@ -158,6 +233,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             self.mel_head = ParallelLMHead(
                 self.number_mel_codes,
                 self.model_dim,
+                bias=True,
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "mel_head"),
             )
@@ -169,21 +245,22 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         cond_cfg = gpt_cfg.get("condition_module", {})
         emo_cond_cfg = gpt_cfg.get("emo_condition_module", {})
 
-        self.conditioning_encoder = ConformerEncoder(
-            input_size=1024,
-            output_size=cond_cfg.get("output_size", 512),
-            linear_units=cond_cfg.get("linear_units", 2048),
-            attention_heads=cond_cfg.get("attention_heads", 8),
-            num_blocks=cond_cfg.get("num_blocks", 6),
-            input_layer=cond_cfg.get("input_layer", "conv2d2"),
-        )
-        self.perceiver_encoder = PerceiverResampler(
-            self.model_dim,
-            dim_context=cond_cfg.get("output_size", 512),
-            ff_mult=cond_cfg.get("perceiver_mult", 2),
-            heads=cond_cfg.get("attention_heads", 8),
-            num_latents=self.condition_num_latent,
-        )
+        if self.conditioning_policy.uses_conformer_perceiver:
+            self.conditioning_encoder = ConformerEncoder(
+                input_size=1024,
+                output_size=cond_cfg.get("output_size", 512),
+                linear_units=cond_cfg.get("linear_units", 2048),
+                attention_heads=cond_cfg.get("attention_heads", 8),
+                num_blocks=cond_cfg.get("num_blocks", 6),
+                input_layer=cond_cfg.get("input_layer", "conv2d2"),
+            )
+            self.perceiver_encoder = PerceiverResampler(
+                self.model_dim,
+                dim_context=cond_cfg.get("output_size", 512),
+                ff_mult=cond_cfg.get("perceiver_mult", 2),
+                heads=cond_cfg.get("attention_heads", 8),
+                num_latents=self.condition_num_latent,
+            )
 
         self.emo_conditioning_encoder = ConformerEncoder(
             input_size=1024,
@@ -202,7 +279,8 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         )
 
         # Padding masks for perceiver cross-attention
-        self.cond_mask_pad = nn.ConstantPad1d((self.condition_num_latent, 0), True)
+        if self.conditioning_policy.uses_conformer_perceiver:
+            self.cond_mask_pad = nn.ConstantPad1d((self.condition_num_latent, 0), True)
         self.emo_cond_mask_pad = nn.ConstantPad1d((1, 0), True)
 
         # --- Lazy-loaded external models ---
@@ -214,7 +292,8 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         # Initialize embeddings per GPT-2 convention
         for emb in [self.text_embedding, self.mel_embedding]:
             emb.weight.data.normal_(mean=0.0, std=0.02)
-        self.speed_emb.weight.data.normal_(mean=0.0, std=0.0)
+        if hasattr(self, "speed_emb"):
+            self.speed_emb.weight.data.normal_(mean=0.0, std=0.0)
 
     # ------------------------------------------------------------------
     # vLLM required hooks
@@ -283,14 +362,23 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             hidden_states = hidden_states.text_hidden_states
         if hidden_states is None or self.mel_head is None:
             return None
-        return self.logits_processor(self.mel_head, hidden_states)
+        # `LogitsProcessor` never reads `lm_head.bias`: the unquantized apply()
+        # path is `F.linear(x, layer.weight, bias)` where `bias` comes from the
+        # `embedding_bias` argument.  IndexTTS's mel head is `Linear(..., bias=True)`
+        # upstream, so the bias has to be passed explicitly or logits silently
+        # drop it.
+        return self.logits_processor(
+            self.mel_head,
+            hidden_states,
+            embedding_bias=getattr(self.mel_head, "bias", None),
+        )
 
     # ------------------------------------------------------------------
     # Omni multimodal output plumbing
     # ------------------------------------------------------------------
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
-        """Collect mel_codes and hidden_states from intermediate buffer."""
+        """Build the per-step Stage 1 payload from the intermediate buffer."""
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
 
@@ -303,58 +391,71 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
 
         device = hidden.device
         latent_dim = hidden.shape[-1]
-        _zero_codes = torch.zeros(0, 1, dtype=torch.long, device=device)
-        _zero_latent = torch.zeros(0, latent_dim, dtype=hidden.dtype, device=device)
+        _zero_codes = torch.zeros(0, 1, dtype=torch.long, device=device) if self.use_gpt_latent else None
+        _zero_latent = torch.zeros(0, latent_dim, dtype=hidden.dtype, device=device) if self.use_gpt_latent else None
 
         # Per-request lists: to_payload_element dispatches lists via
         # element[idx], giving correct per-request mapping even during
         # mixed prefill+decode steps. Zero-length placeholders for prefill
         # requests are harmless — torch.cat ignores them in accumulation.
         #
-        # Export semantics are appendable deltas for the existing full-payload
-        # accumulator: codes.mel is a 2-D row [1, 1], hidden_states.latent is
-        # the aligned one-row [1, D] slice from meta.latent_acc.
+        # Latent-mode exports are appendable deltas for the existing
+        # full-payload accumulator: codes.mel is a 2-D row [1, 1], while
+        # hidden_states.latent is the aligned one-row [1, D] slice from
+        # meta.latent_acc. No-latent mode only uses meta_list.
         mel_codes_list: list[torch.Tensor] = []
         latent_list: list[torch.Tensor] = []
         meta_list: list[dict[str, Any]] = []
 
         for info in info_dicts:
             if not isinstance(info, dict):
-                mel_codes_list.append(_zero_codes)
-                latent_list.append(_zero_latent)
+                if self.use_gpt_latent:
+                    assert _zero_codes is not None
+                    mel_codes_list.append(_zero_codes)
+                    assert _zero_latent is not None
+                    latent_list.append(_zero_latent)
                 meta_list.append({})
                 continue
-            codes = info.get("codes", {})
-            mc = codes.get("mel")
             info_meta = info.get("meta", {})
             # mel_len now comes from the int counter in meta, not from
             # code_seq.shape[0] (codes.mel is a single-token delta).
             mel_len = int(info_meta.get("mel_code_count", 0))
-            if isinstance(mc, torch.Tensor) and mc.numel() > 0 and mel_len > 0:
-                code_seq = mc.reshape(-1)
-                mel_codes_list.append(code_seq[-1:].reshape(1, 1).contiguous())
-            else:
-                mel_codes_list.append(_zero_codes)
 
-            lat_acc = info_meta.get("latent_acc")
-            if isinstance(lat_acc, torch.Tensor) and lat_acc.numel() > 0 and mel_len > 0:
-                lat_seq = lat_acc.reshape(-1, lat_acc.shape[-1]) if lat_acc.ndim != 2 else lat_acc
-                idx = min(max(mel_len - 1, 0), int(lat_seq.shape[0]) - 1)
-                latent_list.append(lat_seq[idx : idx + 1].contiguous())
-            else:
-                hs = info.get("hidden_states", {})
-                lat = hs.get("latent")
-                if isinstance(lat, torch.Tensor) and lat.numel() > 0:
-                    lat_seq = lat.reshape(-1, lat.shape[-1]) if lat.ndim != 2 else lat
-                    latent_list.append(lat_seq[-1:].contiguous())
+            if self.use_gpt_latent:
+                codes = info.get("codes", {})
+                mc = codes.get("mel")
+                if isinstance(mc, torch.Tensor) and mc.numel() > 0 and mel_len > 0:
+                    code_seq = mc.reshape(-1)
+                    mel_codes_list.append(code_seq[-1:].reshape(1, 1).contiguous())
                 else:
-                    latent_list.append(_zero_latent)
+                    assert _zero_codes is not None
+                    mel_codes_list.append(_zero_codes)
 
-            req_meta: dict[str, Any] = {}
+                lat_acc = info_meta.get("latent_acc")
+                if isinstance(lat_acc, torch.Tensor) and lat_acc.numel() > 0 and mel_len > 0:
+                    lat_seq = lat_acc.reshape(-1, lat_acc.shape[-1]) if lat_acc.ndim != 2 else lat_acc
+                    idx = min(max(mel_len - 1, 0), int(lat_seq.shape[0]) - 1)
+                    latent_list.append(lat_seq[idx : idx + 1].contiguous())
+                else:
+                    hs = info.get("hidden_states", {})
+                    lat = hs.get("latent")
+                    if isinstance(lat, torch.Tensor) and lat.numel() > 0:
+                        lat_seq = lat.reshape(-1, lat.shape[-1]) if lat.ndim != 2 else lat
+                        latent_list.append(lat_seq[-1:].contiguous())
+                    else:
+                        assert _zero_latent is not None
+                        latent_list.append(_zero_latent)
+
+            # Scalar metadata is kept with REPLACE semantics by the generic
+            # full-payload accumulator. Emit the policy on every step so the
+            # final payload contract never depends on which decode row carried
+            # the one-time conditioning tensors.
+            req_meta: dict[str, Any] = {"use_gpt_latent": self.use_gpt_latent}
             if mel_len == 1:
                 s_ref = info_meta.get("S_ref")
                 ref_mel = info_meta.get("ref_mel")
                 style = info_meta.get("style")
+                req_meta["duration_factor"] = info_meta.get("duration_factor", 1.0)
                 if isinstance(s_ref, torch.Tensor):
                     req_meta["S_ref"] = s_ref
                 if isinstance(ref_mel, torch.Tensor):
@@ -363,13 +464,22 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                     req_meta["style"] = style
             meta_list.append(req_meta)
 
-        if not any(t.numel() > 0 for t in mel_codes_list):
-            return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
-
-        mm: OmniPayload = {
-            "codes": {"mel": mel_codes_list},
-            "hidden_states": {"latent": latent_list},
-        }
+        if self.use_gpt_latent:
+            if not any(t.numel() > 0 for t in mel_codes_list):
+                return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+            mm: OmniPayload = {
+                "codes": {"mel": mel_codes_list},
+            }
+            mm["hidden_states"] = {"latent": latent_list}
+        else:
+            # vLLM already materializes sampled token IDs on CPU for scheduler
+            # bookkeeping and stop-token handling. Stage 1 consumes the complete
+            # sequence only after request completion, so retain the conditioning
+            # metadata once and read the finished request.output_token_ids there
+            # instead of snapshotting a duplicate GPU code row every step.
+            if not any(meta_list):
+                return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+            mm = {}
         if any(meta_list):
             mm["meta"] = meta_list
 
@@ -387,9 +497,8 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Build prompt embeddings for prefill; compute mel embeddings for decode.
 
-        Prefill layout::
-
-            [conds(32) + emo_vec(1) + duration(2)] [text_emb + text_pos] [start_mel + mel_pos(0)]
+        IndexTTS 2 prefill uses 32 speaker latents plus two duration tokens.
+        IndexTTS 2.5 uses one CAMPPlus speaker token plus two zero tokens.
 
         Decode: ``mel_embedding(token) + mel_pos_embedding(step)``.
         """
@@ -453,6 +562,12 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             v = info_dict.get(key)
             return v[0] if isinstance(v, list) and v else default
 
+        duration_factor = float(_first("duration_factor", 1.0))
+        # Direct Omni callers bypass the serving adapter, so retain the
+        # model-side guard as the final fail-fast validation layer.
+        if not (INDEXTTS25_MIN_DURATION_FACTOR <= duration_factor <= INDEXTTS25_MAX_DURATION_FACTOR):
+            raise ValueError("IndexTTS 2.5 duration_factor must be between 0.5 and 2.0")
+
         text = _first("text")
         if not text:
             raise ValueError("Missing additional_information.text for IndexTTS2 talker.")
@@ -467,6 +582,8 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         emo_vector = _first("emo_vector")
         emo_alpha = float(_first("emo_alpha", 1.0))
         use_random = bool(_first("use_random", False))
+        lang = str(_first("lang", "zh"))
+        text_normalization = bool(_first("text_normalization", True))
         _raw_emo_voice = _first("emo_voice_name")
         emo_voice_name = str(_raw_emo_voice).strip().lower() if _raw_emo_voice else None
 
@@ -499,9 +616,19 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             self._ensure_w2v_stat_loaded(device)
             spk_cond_emb = wav2vec_extract(wav_16k, w2v_model, w2v_proc, device, self._w2v_stat)
 
-            semantic_codec = load_semantic_codec(self.model_path, self.config.semantic_codec, device)
-            with torch.no_grad():
-                _, s_ref = semantic_codec.quantize(spk_cond_emb)  # [B, T, 1024] quantized embeddings
+            if self.conditioning_policy.uses_campplus_projection:
+                # Official 2.5 keeps W2V-BERT features as the reference
+                # semantic sequence; EnhancedCodec is only used for generated
+                # semantic codes in Stage 1.
+                s_ref = spk_cond_emb
+            else:
+                semantic_codec = load_semantic_codec(
+                    self.model_path,
+                    self.config.semantic_codec,
+                    device,
+                )
+                with torch.no_grad():
+                    _, s_ref = semantic_codec.quantize(spk_cond_emb)
 
             campplus = load_campplus(self.model_path, device)
             fbank = compute_fbank(wav_16k, device)
@@ -521,12 +648,16 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                     },
                 )
 
-        model_dtype = next(self.conditioning_encoder.parameters()).dtype
+        if self.conditioning_policy.uses_campplus_projection:
+            model_dtype = self.spk_emb_proj.weight.dtype
+        else:
+            model_dtype = next(self.conditioning_encoder.parameters()).dtype
         spk_cond_emb = spk_cond_emb.to(device=device, dtype=model_dtype)
-        spk_lens = torch.tensor([spk_cond_emb.shape[1]], device=device, dtype=torch.long)
-        speech_cond, mask = self.conditioning_encoder(spk_cond_emb, spk_lens)
-        conds_mask = self.cond_mask_pad(mask.squeeze(1))
-        conds = self.perceiver_encoder(speech_cond, conds_mask)  # [1, 32, D]
+        if self.conditioning_policy.uses_conformer_perceiver:
+            spk_lens = torch.tensor([spk_cond_emb.shape[1]], device=device, dtype=torch.long)
+            speech_cond, mask = self.conditioning_encoder(spk_cond_emb, spk_lens)
+            conds_mask = self.cond_mask_pad(mask.squeeze(1))
+            conds = self.perceiver_encoder(speech_cond, conds_mask)
 
         emo_vec = self._compute_emotion_vector(
             wav_16k=wav_16k,
@@ -546,19 +677,39 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             device=device,
         )
 
-        speed_zero = torch.zeros(1, device=device, dtype=torch.long)
-        speed_one = torch.ones(1, device=device, dtype=torch.long)
-        duration_emb = self.speed_emb(speed_zero)
-        duration_emb_half = self.speed_emb(speed_one)
+        if self.conditioning_policy.uses_campplus_projection:
+            speaker_token = self.spk_emb_proj(style.to(dtype=model_dtype)).unsqueeze(1)
+            zero_tokens = torch.zeros(
+                speaker_token.shape[0],
+                2,
+                self.model_dim,
+                device=device,
+                dtype=speaker_token.dtype,
+            )
+            conds_prefix = torch.cat(
+                [speaker_token + emo_vec.unsqueeze(1), zero_tokens],
+                dim=1,
+            )
+        else:
+            speed_zero = torch.zeros(1, device=device, dtype=torch.long)
+            speed_one = torch.ones(1, device=device, dtype=torch.long)
+            duration_emb = self.speed_emb(speed_zero)
+            duration_emb_half = self.speed_emb(speed_one)
+            conds_with_emo = conds + emo_vec.unsqueeze(1)
+            conds_prefix = torch.cat(
+                [conds_with_emo, duration_emb_half.unsqueeze(1), duration_emb.unsqueeze(1)],
+                dim=1,
+            )
 
-        conds_with_emo = conds + emo_vec.unsqueeze(1)  # [1, 32, D]
-        conds_prefix = torch.cat(
-            [conds_with_emo, duration_emb_half.unsqueeze(1), duration_emb.unsqueeze(1)],
-            dim=1,
-        )  # [1, 34, D]
-
-        text_tokens = self._tokenize_text(text, device)  # [1, L]
+        text_tokens, lang_id = self._tokenize_text(
+            text,
+            device,
+            lang=lang,
+            text_normalization=text_normalization,
+        )
         text_emb = self.text_embedding(text_tokens) + self.text_pos_embedding(text_tokens)
+        if lang_id is not None:
+            text_emb = text_emb + self.lang_embedding(lang_id).unsqueeze(1)
 
         start_mel = self.mel_embedding(torch.tensor([[self.start_mel_token]], device=device, dtype=torch.long))
         start_mel_pos = self.mel_pos_embedding.get_fixed_embedding(0, device)
@@ -567,13 +718,13 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         inputs_embeds = torch.cat([conds_prefix, text_emb, start_mel], dim=1).squeeze(0)
         mel_start_offset = int(conds_prefix.shape[1]) + int(text_emb.shape[1])
         prefill_mel_index = int(inputs_embeds.shape[0]) - 1
-
-        if int(inputs_embeds.shape[0]) < span_len:
-            pad_n = span_len - int(inputs_embeds.shape[0])
-            pad_emb = torch.zeros(pad_n, self.model_dim, device=device, dtype=inputs_embeds.dtype)
-            inputs_embeds = torch.cat([inputs_embeds, pad_emb], dim=0)
-        elif int(inputs_embeds.shape[0]) > span_len:
-            inputs_embeds = inputs_embeds[:span_len]
+        _require_exact_indextts_prefill_span(
+            actual_span_len=int(inputs_embeds.shape[0]),
+            scheduled_span_len=span_len,
+            model_type=str(getattr(self.config, "model_type", "indextts2")),
+            lang=lang,
+            text_token_count=int(text_tokens.shape[1]),
+        )
 
         input_ids_out = torch.full_like(input_ids, self.start_mel_token)
 
@@ -585,11 +736,26 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                 "S_ref": s_ref.cpu().contiguous(),
                 "ref_mel": ref_mel.cpu().contiguous(),
                 "style": style.cpu().contiguous(),
-                "latent_acc": torch.zeros(0, self.model_dim, dtype=inputs_embeds.dtype, device=device),
+                "use_gpt_latent": self.use_gpt_latent,
+                "duration_factor": duration_factor,
             },
             "codes": {"mel": torch.zeros(0, dtype=torch.long, device=device)},
-            "hidden_states": {"latent": torch.zeros(0, self.model_dim, dtype=inputs_embeds.dtype, device=device)},
         }
+        if self.use_gpt_latent:
+            info_update["meta"]["latent_acc"] = torch.zeros(
+                0,
+                self.model_dim,
+                dtype=inputs_embeds.dtype,
+                device=device,
+            )
+            info_update["hidden_states"] = {
+                "latent": torch.zeros(
+                    0,
+                    self.model_dim,
+                    dtype=inputs_embeds.dtype,
+                    device=device,
+                )
+            }
 
         return input_ids_out, inputs_embeds, info_update
 
@@ -605,6 +771,8 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         reconstructs the complete latent sequence from per-step deltas emitted
         by make_omni_output.
         """
+        if not self.use_gpt_latent:
+            return {}
         if hidden_states.shape[0] != 1:
             meta = kwargs.get("meta", {})
             prefill_mel_index = int(meta.get("prefill_mel_index", hidden_states.shape[0] - 1))
@@ -665,6 +833,8 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             if emo_text is None:
                 emo_text = main_text
             emo_vector = self._predict_emotion_from_text(emo_text, device)
+            if emo_vector is None:
+                raise RuntimeError("IndexTTS use_emo_text requested but QwenEmotion could not be loaded")
         if use_emo_text or emo_vector is not None:
             emo_audio_path = None
 
@@ -840,7 +1010,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         self._ensure_matrix_loaded("_emo_matrix", "emo_matrix", "Emotion matrix")
         self._ensure_matrix_loaded("_spk_matrix", "spk_matrix", "Speaker matrix")
         if self._emo_matrix is None or self._spk_matrix is None:
-            return torch.zeros(1, self.model_dim, device=device)
+            raise RuntimeError("IndexTTS emotion control requires both emotion and speaker matrices")
 
         weight_vector = emo_dist.to(device=device, dtype=torch.float32)
         if weight_vector.ndim == 2:
@@ -886,23 +1056,47 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
     # Text tokenizer
     # ------------------------------------------------------------------
 
-    def _tokenize_text(self, text: str, device: torch.device) -> torch.Tensor:
-        """Tokenize text using the BPE tokenizer, add start/stop tokens."""
-        if self._text_tokenizer is None:
-            from .tokenizer import IndexTTS2Tokenizer
-
-            bpe_path = resolve_model_file(self.model_path, "bpe.model")
-            if bpe_path is None:
-                raise FileNotFoundError(f"BPE model not found in {self.model_path}")
-            self._text_tokenizer = IndexTTS2Tokenizer(bpe_path, model_dir=self.model_path)
-
-        token_ids = self._text_tokenizer.encode(text, add_special_tokens=False)
-
-        # Wrap with start/stop text tokens
+    def _tokenize_text(
+        self,
+        text: str,
+        device: torch.device,
+        *,
+        lang: str = "zh",
+        text_normalization: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Tokenize text and add the checkpoint start/stop text tokens."""
         start_text = 0
         stop_text = 1
+        lang_id: int | None = None
+        if self.conditioning_policy.uses_language_embedding:
+            from .text_processing_v2_5 import prepare_indextts25_text
+
+            token_ids, lang_id = prepare_indextts25_text(
+                text,
+                lang=lang,
+                model_dir=self.model_path,
+                tokenizer_file=self.config.tokenizer_file,
+                text_normalization=text_normalization,
+            )
+            token_ids = [token_id for token_id in token_ids if token_id not in {start_text, stop_text}]
+        else:
+            if self._text_tokenizer is None:
+                from .tokenizer import IndexTTS2Tokenizer
+
+                bpe_path = resolve_model_file(self.model_path, "bpe.model")
+                if bpe_path is None:
+                    raise FileNotFoundError(f"BPE model not found in {self.model_path}")
+                self._text_tokenizer = IndexTTS2Tokenizer(bpe_path, model_dir=self.model_path)
+
+            token_ids = self._text_tokenizer.encode(text, add_special_tokens=False)
+
+        # The 2.5 tokenizer begins with the explicit ``<|lang|>`` token.
+        # Official prepare_gpt_inputs filters any existing wrapper tokens,
+        # then adds start_text=0 and stop_text=1 around that tokenizer output.
         token_ids = [start_text] + token_ids + [stop_text]
-        return torch.tensor([token_ids], device=device, dtype=torch.long)
+        token_tensor = torch.tensor([token_ids], device=device, dtype=torch.long)
+        lang_tensor = torch.tensor([lang_id], device=device, dtype=torch.long) if lang_id is not None else None
+        return token_tensor, lang_tensor
 
     # ------------------------------------------------------------------
     # Lazy loading helpers
@@ -919,7 +1113,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             else:
                 self._w2v_stat = raw
         else:
-            logger.warning("Wav2Vec2-BERT stat file not found in %s", self.model_path)
+            raise FileNotFoundError(f"Wav2Vec2-BERT stat file not found in {self.model_path!r}")
 
     def _ensure_matrix_loaded(self, attr: str, cfg_key: str, label: str) -> None:
         if getattr(self, attr) is not None:
@@ -929,7 +1123,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             raw = torch.load(path, map_location="cpu", weights_only=True)
             setattr(self, attr, torch.split(raw, list(self.config.emo_num)))
         else:
-            logger.warning("%s not found in %s", label, self.model_path)
+            raise FileNotFoundError(f"{label} not found in {self.model_path!r}")
 
     # ------------------------------------------------------------------
     # Weight loading
@@ -966,7 +1160,8 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: set[str] = set()
 
-        for name, loaded_weight in state.items():
+        for checkpoint_name, loaded_weight in state.items():
+            name = _normalize_indextts_checkpoint_key(checkpoint_name)
             # Skip attention masks
             if ".attn.bias" in name or ".attn.masked_bias" in name:
                 continue
@@ -989,7 +1184,11 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                 continue
 
             if mapped_name not in params_dict:
-                logger.debug("Skipping unrecognized weight: %s → %s", name, mapped_name)
+                logger.debug(
+                    "Skipping unrecognized weight: %s → %s",
+                    checkpoint_name,
+                    mapped_name,
+                )
                 continue
 
             param = params_dict[mapped_name]
@@ -1015,17 +1214,29 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             "mel_embedding.",
             "text_pos_embedding.",
             "mel_pos_embedding.",
-            "speed_emb.",
             "emo_layer.",
             "emovec_layer.",
-            "conditioning_encoder.",
-            "perceiver_encoder.",
             "emo_conditioning_encoder.",
             "emo_perceiver_encoder.",
             "h.",
             "ln_f.",
             "final_norm.",
         ]
+        if self.conditioning_policy.uses_campplus_projection:
+            required_prefixes.extend(
+                [
+                    "spk_emb_proj.",
+                    "lang_embedding.",
+                ]
+            )
+        else:
+            required_prefixes.extend(
+                [
+                    "speed_emb.",
+                    "conditioning_encoder.",
+                    "perceiver_encoder.",
+                ]
+            )
         if self.mel_head is not None:
             required_prefixes.append("mel_head.")
         missing_prefixes = [
@@ -1033,18 +1244,22 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         ]
         if missing_prefixes:
             raise RuntimeError(
-                "IndexTTS2 GPT checkpoint did not load required parameter groups: " + ", ".join(missing_prefixes)
+                f"{self.config.model_type} GPT checkpoint did not load required parameter groups: "
+                + ", ".join(missing_prefixes)
             )
 
         # Ensure all sub-modules on correct device (some nn.Parameter created
         # with torch.Tensor() end up on CPU even when model is on CUDA).
         target_device = next((p.device for p in self.h.parameters()), torch.device("cpu"))
-        for mod in [
-            self.conditioning_encoder,
+        modules = [
             self.emo_conditioning_encoder,
-            self.perceiver_encoder,
             self.emo_perceiver_encoder,
-        ]:
+        ]
+        if self.conditioning_policy.uses_campplus_projection:
+            modules.extend([self.spk_emb_proj, self.lang_embedding])
+        else:
+            modules.extend([self.conditioning_encoder, self.perceiver_encoder])
+        for mod in modules:
             mod.to(target_device)
 
         self._warmup_external_models(target_device)
@@ -1054,9 +1269,17 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         """Preload external models to eliminate first-request latency."""
         try:
             load_wav2vec2(self.model_path, device)
-            load_semantic_codec(self.model_path, self.config.semantic_codec, device)
+            if not self.conditioning_policy.uses_campplus_projection:
+                load_semantic_codec(
+                    self.model_path,
+                    self.config.semantic_codec,
+                    device,
+                )
             load_campplus(self.model_path, device)
             self._ensure_w2v_stat_loaded(device)
-            logger.info("External models preloaded: Wav2Vec2, RepCodec, CAMPPlus")
+            logger.info(
+                "External models preloaded: Wav2Vec2, %sCAMPPlus",
+                "RepCodec, " if not self.conditioning_policy.uses_campplus_projection else "",
+            )
         except Exception as e:
-            logger.warning("Failed to preload external models: %s", e)
+            raise RuntimeError("Failed to preload required IndexTTS Stage 0 models") from e

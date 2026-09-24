@@ -66,6 +66,8 @@ def build_payload(
         "response_format": "pcm" if stream else response_format,
         "stream": stream,
     }
+    if stream:
+        payload["stream_format"] = "audio"
 
     # Voice cloning: ref_audio takes priority over URL.
     ref_url_stripped = ref_audio_url.strip() if ref_audio_url else ""

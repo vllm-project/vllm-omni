@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from collections.abc import Iterable
 
 import torch
@@ -20,6 +23,7 @@ from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    WeightsMapper,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -339,14 +343,6 @@ class Qwen2Model(nn.Module):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            if self.quant_config is not None and (scale_name := self.quant_config.get_cache_scale(name)):
-                # Loading kv cache quantization scales
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
-                weight_loader(param, loaded_weight)
-                loaded_params.add(scale_name)
-                continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -449,8 +445,8 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         return next_tokens
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(
+            weights,
+            mapper=WeightsMapper(orig_to_new_prefix={"lm_head.": None} if self.config.tie_word_embeddings else {}),
         )
-        return loader.load_weights(weights)
