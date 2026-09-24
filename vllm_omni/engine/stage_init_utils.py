@@ -1755,9 +1755,13 @@ def acquire_device_locks(
     engine_args_dict: dict[str, Any],
     stage_init_timeout: int,
     locked_devices: set[int] | None = None,
+    *,
+    visible_devices: str | None = None,
 ) -> list[int]:
     """Acquire exclusive file locks on devices needed by this stage.
 
+    Pass resolved physical ``visible_devices`` to avoid changing the process
+    environment while waiting. When omitted, use the device-control environment.
     Returns list of lock file descriptors that must be released after init.
     """
     lock_fds: list[int] = []
@@ -1790,7 +1794,7 @@ def acquire_device_locks(
 
         # Get physical device IDs
         device_control_env = current_omni_platform.device_control_env_var
-        visible_devices_str = os.environ.get(device_control_env)
+        visible_devices_str = visible_devices if visible_devices is not None else os.environ.get(device_control_env)
         physical_devices: list[int] = []
 
         if visible_devices_str:

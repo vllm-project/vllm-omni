@@ -188,6 +188,10 @@ source_file_dependencies:
 
   # --- models ---
   # --- omni / tts jobs ---
+  entrypoints_function:
+    - tests/entrypoints/
+    - vllm_omni/entrypoints/
+
   omni_qwen3_omni_function:
     - *qwen3_omni
     - tests/e2e/offline_inference/test_qwen3_omni.py
@@ -235,6 +239,14 @@ source_file_dependencies:
   omni_minicpmo_4_5_accuracy:
     - *minicpmo_4_5
     - tests/e2e/accuracy/minicpmo_4_5/
+
+  omni_duplex_eval_ci:
+    - *minicpmo_4_5
+    - *minicpmo_4_5_duplex
+    - tests/e2e/accuracy/omni_duplex_eval/**
+    - tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py
+    - vllm_omni/benchmarks/duplex/**
+    - vllm_omni/entrypoints/cli/benchmark/omni_duplex_eval.py
 
   omni_minicpmo_4_5_perf:
     - *minicpmo_4_5
@@ -390,6 +402,8 @@ source_file_dependencies:
   diffusion_hunyuan_image3_accuracy:
     - *hunyuan_image3
     - tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py
+    - tests/e2e/accuracy/test_hunyuan_image3_lora.py
+    - vllm_omni/diffusion/lora/
 
   diffusion_hunyuan_image3_perf:
     - *hunyuan_image3

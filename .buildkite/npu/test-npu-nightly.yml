@@ -85,6 +85,25 @@ steps:
             EXIT=$$?
             buildkite-agent artifact upload "tests/e2e/accuracy/minicpmo_4_5/results/*.json"
             exit $$EXIT
+      - label: ":full_moon: Omni · Omni-DuplexEval CI Guard"
+        source_file_dependencies: omni_duplex_eval_ci
+        timeout_in_minutes: 240
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          HF_TOKEN: "${HF_TOKEN}"
+          VLLM_DUPLEX_EVAL_JUDGE_URL: "http://127.0.0.1:8001"
+        commands:
+          - |
+            set +e
+            pytest -s -v tests/e2e/accuracy/omni_duplex_eval/test_omni_duplex_eval_ci.py \
+              -m "full_model and npu and A3 and cards_2" \
+              --run-level full_model \
+              --basetemp /tmp/omni_duplex_ci
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/e2e/accuracy/omni_duplex_eval/results/*.json"
+            exit $$EXIT
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test"
         source_file_dependencies: omni_minicpmo_4_5_perf
         key: nightly-omni-performance-minicpmo-4-5-npu
@@ -224,6 +243,42 @@ steps:
           - |
             set +e
             pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m A3 --test-config-file tests/dfx/perf/tests/test_hunyuan_image_tp4.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
+            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+            exit $$EXIT
+      - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image · Single-NPU"
+        source_file_dependencies: diffusion_qwen_image_perf
+        key: nightly-diffusion-x2iat-performance-qwen-image-single-npu
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_TOKEN: "${HF_TOKEN}"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        commands:
+          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "npu and A3 and cards_1" --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
+            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+            exit $$EXIT
+      - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image · 4-NPU"
+        source_file_dependencies: diffusion_qwen_image_perf
+        key: nightly-diffusion-x2iat-performance-qwen-image-4npu
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_4
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_TOKEN: "${HF_TOKEN}"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        commands:
+          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "npu and A3 and cards_4" --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"

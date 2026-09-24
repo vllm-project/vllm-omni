@@ -781,17 +781,16 @@ class MiniMaxH3Pipeline(
     def _validate_turbo_sampling(self, sampling: Any, spec: TurboSpec) -> None:
         """Hold a request to the contract of the artifact that is loaded.
 
-        Sigma-point count and both flow shifts vary across the Turbo family, so
+        Denoiser count and both flow shifts vary across the Turbo family, so
         each is checked against the adapter's own spec rather than a single
         published configuration.
         """
 
         extra = sampling.extra_args or {}
-        sigma_points = sampling.num_inference_steps
-        if sigma_points != spec.sigma_points:
+        if sampling.num_inference_steps != spec.denoise_steps:
             raise OmniClientError(
                 f"{spec.filename} is a {spec.denoise_steps}-step artifact and requires "
-                f"num_inference_steps={spec.sigma_points} "
+                f"num_inference_steps={spec.denoise_steps} "
                 f"({spec.sigma_points} sigma points produce {spec.denoise_steps} denoiser evaluations)"
             )
         try:
@@ -2012,6 +2011,10 @@ class MiniMaxH3Pipeline(
         additional_information = raw_prompt.get("additional_information") or {}
         encoder_output = additional_information.get("encoder_output")
         if encoder_output is None:
+            # Preserve main's text-only handoff for deployments that still
+            # encode media locally; a supplied unified payload takes priority.
+            encoder_output = additional_information.get("text_encoder_output")
+        if encoder_output is None:
             return None
         if not isinstance(encoder_output, Mapping):
             raise OmniClientError("MiniMax H3 encoder output must be a mapping")
@@ -2210,6 +2213,12 @@ class MiniMaxH3Pipeline(
                     self._validate_turbo_sampling(sampling, turbo_spec)
                 if has_native_lora:
                     self._validate_native_sampling(sampling, task=task)
+                if self._fasth3 is not None:
+                    self._fasth3.check_request(
+                        sampling,
+                        video_shift=self.default_video_shift,
+                        audio_shift=self.default_audio_shift,
+                    )
                 text_conditioning = self._extract_text_conditioning(raw_prompt)
                 if require_external_text and text_conditioning is None:
                     raise OmniClientError(
