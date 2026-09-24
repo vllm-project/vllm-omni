@@ -977,6 +977,9 @@ class OmniDiffusionConfig:
     enable_broadcast_weight_load: bool = False
     num_weight_load_threads: int = 4
 
+    # Shard meta parameters before reading rank-local HF safetensors slices.
+    hsdp_weight_load_strategy: str = "full"
+
     # Enable sleep mode
     enable_sleep_mode: bool = False
 
@@ -1190,6 +1193,10 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        if self.hsdp_weight_load_strategy not in {"full", "pre_sharded"}:
+            raise ValueError(
+                f"hsdp_weight_load_strategy must be 'full' or 'pre_sharded', got {self.hsdp_weight_load_strategy!r}"
+            )
         from vllm_omni.diffusion.offloader.config import (
             OffloadStrategy,
             materialize_legacy_offload_flags,

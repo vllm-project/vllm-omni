@@ -488,6 +488,7 @@ class StageDeployConfig:
     auxiliary_text_encoder: str | None = None
 
     # Runtime optimizations used by diffusion loading/execution.
+    hsdp_weight_load_strategy: str | None = None
     enable_multithread_weight_load: bool | None = None
     enable_broadcast_weight_load: bool | None = None
     num_weight_load_threads: int | None = None

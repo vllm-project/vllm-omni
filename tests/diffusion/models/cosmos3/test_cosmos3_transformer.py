@@ -626,6 +626,93 @@ def test_qwen_gen_mlp_remains_gated() -> None:
     assert hasattr(model.gen_layers[0].mlp, "gate_proj")
 
 
+@pytest.mark.parametrize("edge", [False, True])
+@pytest.mark.parametrize(
+    "use_hsdp,strategy", [(False, "full"), (False, "pre_sharded"), (True, "full"), (True, "pre_sharded")]
+)
+def test_cosmos3_releases_blocks_only_for_pre_sharded_hsdp(edge, use_hsdp, strategy, monkeypatch):
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3, transformer_cosmos3_edge
+    from vllm_omni.diffusion.models.utils import release_module_parameters_to_meta
+
+    released = []
+
+    def release_and_check(block):
+        parameters = dict(block.named_parameters())
+        metadata = {name: dict(parameter.__dict__) for name, parameter in parameters.items()}
+        release_module_parameters_to_meta(block)
+        for name, parameter in block.named_parameters():
+            assert parameter is parameters[name]
+            assert parameter.device.type == "meta"
+            assert parameter.__dict__ == metadata[name]
+        released.append(block)
+
+    monkeypatch.setattr(transformer_cosmos3, "release_module_parameters_to_meta", release_and_check)
+    monkeypatch.setattr(transformer_cosmos3_edge, "release_module_parameters_to_meta", release_and_check)
+    model_cls = (
+        transformer_cosmos3_edge.Cosmos3EdgeVFMTransformer if edge else transformer_cosmos3.Cosmos3VFMTransformer
+    )
+    config = _tiny_cosmos3_edge_config if edge else _tiny_cosmos3_config
+    model = model_cls(
+        SimpleNamespace(
+            tf_model_config=config(num_hidden_layers=1),
+            dtype=torch.float32,
+            parallel_config=SimpleNamespace(use_hsdp=use_hsdp),
+            hsdp_weight_load_strategy=strategy,
+        )
+    )
+    blocks = [*model.language_model.layers, *model.gen_layers]
+    expected_meta = use_hsdp and strategy == "pre_sharded"
+    assert len(released) == (len(blocks) if expected_meta else 0)
+    assert all((p.device.type == "meta") == expected_meta for block in blocks for p in block.parameters())
+    assert model.time_embedder.linear_1.weight.device.type != "meta"
+    assert all(buffer.device.type != "meta" for buffer in model.buffers())
+
+
+@pytest.mark.parametrize("edge", [False, True])
+def test_cosmos3_pre_sharded_meta_processing_accepts_real_unquantized_blocks(edge, monkeypatch):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+    from vllm_omni.diffusion.models.cosmos3 import Cosmos3EdgeVFMTransformer, Cosmos3VFMTransformer
+
+    model_cls = Cosmos3EdgeVFMTransformer if edge else Cosmos3VFMTransformer
+    config = _tiny_cosmos3_edge_config if edge else _tiny_cosmos3_config
+    model = model_cls(
+        SimpleNamespace(
+            tf_model_config=config(num_hidden_layers=1),
+            dtype=torch.float32,
+            parallel_config=SimpleNamespace(use_hsdp=True),
+            hsdp_weight_load_strategy="pre_sharded",
+        )
+    )
+    groups = [SimpleNamespace(module=block) for block in (*model.language_model.layers, *model.gen_layers)]
+    plan = SimpleNamespace(roots=[SimpleNamespace(module=model)], groups=groups)
+    processed = []
+    # Exercise model selection with real vLLM linears, without invoking the
+    # CPU-specific weight packing hook on meta tensors in CPU-only CI.
+    monkeypatch.setattr(
+        UnquantizedLinearMethod, "process_weights_after_loading", lambda self, layer: processed.append(layer)
+    )
+    DiffusersPipelineLoader._process_pre_sharded_hsdp_groups_on_meta(plan)
+    expected = [module for group in groups for module in group.module.modules() if hasattr(module, "quant_method")]
+    assert expected
+    assert processed == expected
+
+    model._hsdp_pre_sharded_meta_post_load = False
+    with pytest.raises(ValueError, match="has not declared"):
+        DiffusersPipelineLoader._process_pre_sharded_hsdp_groups_on_meta(plan)
+    model._hsdp_pre_sharded_meta_post_load = True
+
+    class UnsupportedMethod(UnquantizedLinearMethod):
+        pass
+
+    expected[-1].quant_method = UnsupportedMethod()
+    processed.clear()
+    with pytest.raises(ValueError, match="UnsupportedMethod"):
+        DiffusersPipelineLoader._process_pre_sharded_hsdp_groups_on_meta(plan)
+    assert not processed
+
+
 def test_model_cpu_offload_swaps_back_to_generator(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
 

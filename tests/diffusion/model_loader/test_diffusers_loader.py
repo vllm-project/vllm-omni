@@ -27,6 +27,7 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
     HostWeightPlanResult,
     TensorBinding,
+    build_checkpoint_binding_plan,
 )
 from vllm_omni.diffusion.model_loader.host_weights import source_identity as source_identity_module
 from vllm_omni.diffusion.models.helios import HeliosPipeline
@@ -2089,3 +2090,206 @@ def test_hsdp_broadcast_weight_load_online_quant_multiprocess():
             )
         assert os.path.exists(os.path.join(temp_dir, "rank_0_success.flag"))
         assert os.path.exists(os.path.join(temp_dir, "rank_1_success.flag"))
+
+
+def test_pre_sharded_hsdp_rejects_quantization_before_loading():
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        hsdp_weight_load_strategy="pre_sharded",
+        lora_path=None,
+        quantization_config=object(),
+        parallel_config=SimpleNamespace(
+            use_hsdp=True,
+            hsdp_replicate_size=1,
+            hsdp_shard_size=2,
+        ),
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    with pytest.raises(ValueError, match="does not support quantization"):
+        loader._load_model_with_hsdp(torch.device("cpu"))
+
+
+def test_pre_sharded_hsdp_strategy_dispatches_without_using_full_loader(mocker):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+    from vllm_omni.diffusion.offloader.module_collector import PipelineModules
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        hsdp_weight_load_strategy="pre_sharded",
+        lora_path=None,
+        quantization_config=None,
+        parallel_config=SimpleNamespace(
+            use_hsdp=True,
+            hsdp_replicate_size=1,
+            hsdp_shard_size=2,
+        ),
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    discovered = PipelineModules(
+        dits=[model.transformer],
+        dit_names=["transformer"],
+        vaes=[],
+        encoders=[],
+        encoder_names=[],
+        resident_modules=[],
+        resident_names=[],
+    )
+    loader._init_from_load_format = mocker.Mock(return_value=model)  # type: ignore[method-assign]
+    loader.load_weights = mocker.Mock(side_effect=AssertionError("full loader must not run"))  # type: ignore[method-assign]
+    mocker.patch.object(loader_mod.ModuleDiscovery, "discover", return_value=discovered)
+    pre_sharded_load = mocker.patch.object(
+        loader,
+        "_load_model_with_pre_sharded_hsdp",
+        return_value=model,
+    )
+
+    assert loader._load_model_with_hsdp(torch.device("cpu")) is model
+    pre_sharded_load.assert_called_once()
+
+
+def test_pre_sharded_hsdp_rejects_tensor_transform():
+    def transform(tensor):
+        return tensor.transpose(-2, -1)
+
+    load_plan = SimpleNamespace(
+        bindings={
+            "transformer.weight": TensorBinding(
+                checkpoint_key="weight",
+                file_path="model.safetensors",
+                transform=transform,
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="tensor transforms are unsupported"):
+        DiffusersPipelineLoader._validate_pre_sharded_hsdp_bindings(load_plan)
+
+
+def test_pre_sharded_hsdp_accepts_direct_safetensors_binding():
+    load_plan = SimpleNamespace(
+        bindings={
+            "transformer.weight": TensorBinding(
+                checkpoint_key="weight",
+                file_path="model.safetensors",
+            )
+        }
+    )
+
+    DiffusersPipelineLoader._validate_pre_sharded_hsdp_bindings(load_plan)
+
+
+def test_pre_sharded_hsdp_uses_fsdp_destination_directly():
+    target = torch.empty(8, 4, 3)
+    load_plan = SimpleNamespace(
+        bindings={
+            "transformer.weight": TensorBinding(
+                checkpoint_key="source_weight",
+                file_path="transformer/model.safetensors",
+            )
+        }
+    )
+
+    checkpoint_states, local_bytes = DiffusersPipelineLoader._prepare_pre_sharded_checkpoint_states(
+        load_plan,
+        {"transformer.weight": target},
+    )
+    checkpoint_target = checkpoint_states[Path("transformer")]["source_weight"]
+
+    assert checkpoint_target is target
+    assert checkpoint_target.shape == (8, 4, 3)
+    assert checkpoint_target.device.type == "cpu"
+    assert checkpoint_target.untyped_storage().data_ptr() == target.untyped_storage().data_ptr()
+    assert local_bytes == target.numel() * target.element_size()
+
+
+def test_pre_sharded_hsdp_checkpoint_writes_runtime_storage_directly():
+    runtime_target = torch.empty(2, 3)
+    load_plan = SimpleNamespace(
+        bindings={
+            "transformer.weight": TensorBinding(
+                checkpoint_key="source_weight",
+                file_path="transformer/model.safetensors",
+            )
+        }
+    )
+    checkpoint_tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    checkpoint_states, _ = DiffusersPipelineLoader._prepare_pre_sharded_checkpoint_states(
+        load_plan,
+        {"transformer.weight": runtime_target},
+    )
+    checkpoint_states[Path("transformer")]["source_weight"].copy_(checkpoint_tensor)
+
+    assert torch.equal(runtime_target, checkpoint_tensor)
+
+
+def test_pre_sharded_hsdp_rejects_duplicate_checkpoint_destinations():
+    binding = TensorBinding(checkpoint_key="weight", file_path="transformer/model.safetensors")
+    load_plan = SimpleNamespace(
+        bindings={
+            "transformer.first": binding,
+            "transformer.second": binding,
+        }
+    )
+
+    with pytest.raises(ValueError, match="multiple runtime tensors"):
+        DiffusersPipelineLoader._prepare_pre_sharded_checkpoint_states(
+            load_plan,
+            {"transformer.first": torch.empty(2, 3), "transformer.second": torch.empty(2, 3)},
+        )
+
+
+def test_pre_sharded_hsdp_managed_module_traversal_is_child_first_and_skips_nested_roots():
+    root = nn.Module()
+    root.left = nn.Sequential(nn.Linear(2, 2), nn.ReLU())
+    root.right = nn.Sequential(nn.Linear(2, 2), nn.ReLU())
+
+    names = {module: name or "root" for name, module in root.named_modules()}
+    modules = DiffusersPipelineLoader._hsdp_managed_modules_post_order(
+        root,
+        nested_hsdp_roots={root.left},
+    )
+
+    assert [names[module] for module in modules] == ["right.0", "right.1", "right", "root"]
+
+
+@pytest.mark.parametrize("checkpoint_key", ["renamed", "unexpected"])
+def test_hsdp_checkpoint_plan_honors_remap_and_rejects_missing(tmp_path, checkpoint_key, monkeypatch):
+    import vllm_omni.diffusion.model_loader.host_weight_plan as plan_mod
+
+    monkeypatch.setattr(plan_mod, "get_direct_mmap_adapter", lambda _model: None)
+
+    class Pipeline(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.transformer = nn.Linear(2, 2, bias=False)
+
+        @staticmethod
+        def remap_checkpoint_key(name):
+            return "transformer.weight" if name == "transformer.renamed" else name
+
+    checkpoint = tmp_path / "model.safetensors"
+    save_file({checkpoint_key: torch.ones(2, 2)}, str(checkpoint))
+    source = SimpleNamespace(
+        model_or_path=str(tmp_path),
+        subfolder=None,
+        revision=None,
+        prefix="transformer.",
+    )
+    model = Pipeline()
+    result = build_checkpoint_binding_plan(
+        model,
+        dit_modules=(("transformer", model.transformer),),
+        sources=(source,),
+        model_path=None,
+        tensor_parallel_size=1,
+        online_quantization=False,
+    )
+
+    if checkpoint_key == "renamed":
+        assert result.plan is not None
+        assert result.plan.bindings["transformer.weight"].checkpoint_key == "renamed"
+    else:
+        assert result.plan is None
+        assert "no checkpoint binding" in result.fallback_reason

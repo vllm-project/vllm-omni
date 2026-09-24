@@ -38,6 +38,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.norm import RMSNorm as _VllmRMSNorm
+from vllm_omni.diffusion.models.utils import release_module_parameters_to_meta
 from vllm_omni.platforms import current_omni_platform
 
 from .mixed_precision import (
@@ -1029,6 +1030,7 @@ class Cosmos3LanguageModel(nn.Module):
         rope_theta: float,
         mrope_section: list[int],
         quant_config: QuantizationConfig | None = None,
+        release_completed_blocks_to_meta: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -1038,21 +1040,21 @@ class Cosmos3LanguageModel(nn.Module):
             rope_theta=rope_theta,
             mrope_section=mrope_section,
         )
-        self.layers = nn.ModuleList(
-            [
-                Cosmos3UndDecoderLayer(
-                    hidden_size=hidden_size,
-                    intermediate_size=intermediate_size,
-                    num_attention_heads=num_attention_heads,
-                    num_key_value_heads=num_key_value_heads,
-                    head_dim=head_dim,
-                    rms_norm_eps=rms_norm_eps,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.layers.{i}",
-                )
-                for i in range(num_hidden_layers)
-            ]
-        )
+        self.layers = nn.ModuleList()
+        for i in range(num_hidden_layers):
+            layer = Cosmos3UndDecoderLayer(
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_attention_heads=num_attention_heads,
+                num_key_value_heads=num_key_value_heads,
+                head_dim=head_dim,
+                rms_norm_eps=rms_norm_eps,
+                quant_config=quant_config,
+                prefix=f"{prefix}.layers.{i}",
+            )
+            if release_completed_blocks_to_meta:
+                release_module_parameters_to_meta(layer)
+            self.layers.append(layer)
         # TODO: Not used right now, will be used in the future for prompt upsampler.
         self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
@@ -1173,6 +1175,10 @@ class Cosmos3VFMTransformer(nn.Module):
 
     _hsdp_shard_conditions = [_is_transformer_block]
 
+    # Standard unquantized vLLM linears need no value-dependent post-load
+    # processing on accelerators. Edge inherits the same loading contract.
+    _hsdp_pre_sharded_meta_post_load = True
+
     # Modules whose parameters must NOT be FSDP-sharded at the root level.
     # time_embedder is cast to fp32 by post_load_weights for precision; if it
     # were swept into the root flat-parameter under MixedPrecisionPolicy(param_dtype=bf16),
@@ -1289,6 +1295,10 @@ class Cosmos3VFMTransformer(nn.Module):
 
         dtype = od_config.dtype
         quant_config = getattr(od_config, "quantization_config", None) if od_config else None
+        release_completed_blocks_to_meta = bool(
+            getattr(getattr(od_config, "parallel_config", None), "use_hsdp", False)
+            and getattr(od_config, "hsdp_weight_load_strategy", "full") == "pre_sharded"
+        )
         mixed_precision_config, mixed_precision_source = resolve_mixed_precision_config(od_config)
         if mixed_precision_config is None:
             if mixed_precision_source == "additional_config_disabled":
@@ -1315,6 +1325,7 @@ class Cosmos3VFMTransformer(nn.Module):
             rope_theta=self.rope_theta,
             mrope_section=self.mrope_section,
             quant_config=quant_config,
+            release_completed_blocks_to_meta=release_completed_blocks_to_meta,
             prefix="language_model",
             **self._language_model_kwargs(),
         )
@@ -1342,24 +1353,24 @@ class Cosmos3VFMTransformer(nn.Module):
             self.audio_proj_out = nn.Linear(self.hidden_size, self.sound_dim)
             self.audio_modality_embed = nn.Parameter(torch.zeros(self.hidden_size))
 
-        self.gen_layers = nn.ModuleList(
-            [
-                Cosmos3GenDecoderLayer(
-                    layer_idx=i,
-                    hidden_size=self.hidden_size,
-                    intermediate_size=self.intermediate_size,
-                    num_attention_heads=self.num_attention_heads,
-                    num_key_value_heads=self.num_key_value_heads,
-                    head_dim=self.head_dim,
-                    rms_norm_eps=self.rms_norm_eps,
-                    quant_config=quant_config,
-                    mlp_cls=self._gen_mlp_cls,
-                    qk_norm=self.qk_norm_for_diffusion,
-                    prefix=f"gen_layers.{i}",
-                )
-                for i in range(self.num_hidden_layers)
-            ]
-        )
+        self.gen_layers = nn.ModuleList()
+        for i in range(self.num_hidden_layers):
+            layer = Cosmos3GenDecoderLayer(
+                layer_idx=i,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                num_attention_heads=self.num_attention_heads,
+                num_key_value_heads=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                rms_norm_eps=self.rms_norm_eps,
+                quant_config=quant_config,
+                mlp_cls=self._gen_mlp_cls,
+                qk_norm=self.qk_norm_for_diffusion,
+                prefix=f"gen_layers.{i}",
+            )
+            if release_completed_blocks_to_meta:
+                release_module_parameters_to_meta(layer)
+            self.gen_layers.append(layer)
 
         self.mixed_precision_runtime: Cosmos3MixedPrecisionRuntime | None = None
         if mixed_precision_config is not None:

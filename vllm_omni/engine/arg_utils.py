@@ -558,6 +558,7 @@ class OrchestratorArgs:
     # === Diffusion model config ===
     num_gpus: int | None = None
     model_class_name: str | None = None
+    hsdp_weight_load_strategy: str | None = None
     diffusion_load_format: str | None = None
     lora_path: list[str] | None = None
     lora_backend: str | None = None
