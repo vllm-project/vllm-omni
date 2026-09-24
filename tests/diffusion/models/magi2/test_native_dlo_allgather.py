@@ -18,7 +18,6 @@ import torch.nn as nn
 from safetensors.torch import load_file, save_file
 
 import vllm_omni.diffusion.models.magi2.layers as layers_module
-import vllm_omni.diffusion.models.magi2.mh_moe as mh_moe_module
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     build_checkpoint_mmap_plan,
 )
@@ -83,7 +82,7 @@ def _patched_weight_groups(ep_group: Magi2ParallelGroup):
     singleton = Magi2ParallelGroup(None, world_size=1, rank=0)
     with ExitStack() as stack:
         stack.enter_context(patch.object(layers_module, "get_magi2_tp_group", return_value=singleton))
-        stack.enter_context(patch.object(mh_moe_module, "get_magi2_ep_group", return_value=ep_group))
+        stack.enter_context(patch.object(layers_module, "get_magi2_ep_group", return_value=ep_group))
         yield
 
 

@@ -15,7 +15,6 @@ import torch.multiprocessing as mp
 
 import vllm_omni.diffusion.models.magi2.attention as attention_module
 import vllm_omni.diffusion.models.magi2.layers as layers_module
-import vllm_omni.diffusion.models.magi2.mh_moe as mh_moe_module
 import vllm_omni.diffusion.models.magi2.parallel as parallel_module
 from vllm_omni.diffusion.models.magi2.attention import VarlenHandler
 from vllm_omni.diffusion.models.magi2.configuration_magi2 import (
@@ -123,7 +122,7 @@ def _patched_groups(
     ep_group = tp_group if tp_group.world_size > 1 else sp_group
     with ExitStack() as stack:
         stack.enter_context(patch.object(layers_module, "get_magi2_tp_group", return_value=tp_group))
-        stack.enter_context(patch.object(mh_moe_module, "get_magi2_ep_group", return_value=ep_group))
+        stack.enter_context(patch.object(layers_module, "get_magi2_ep_group", return_value=ep_group))
         stack.enter_context(patch.object(parallel_module, "get_magi2_ulysses_group", return_value=sp_group))
         stack.enter_context(patch.object(attention_module, "get_magi2_ulysses_group", return_value=sp_group))
         yield
