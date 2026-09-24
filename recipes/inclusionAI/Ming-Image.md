@@ -52,7 +52,7 @@ curl -s http://127.0.0.1:8091/v1/chat/completions \
     "modalities": ["image"],
     "extra_body": {
       "height": 1024, "width": 1024,
-      "steps": 12, "cfg": 1.0, "seed": 42
+      "num_inference_steps": 12, "guidance_scale": 1.0, "seed": 42
     }
   }' \
   | jq -r '.choices[0].message.content[0].image_url.url | split(",")[1]' \
@@ -79,7 +79,7 @@ jq -n \
     modalities: ["image"],
     extra_body: {
       height: 1024, width: 1024,
-      steps: 12, cfg: 1.0, seed: 42
+      num_inference_steps: 12, guidance_scale: 1.0, seed: 42
     }
   }' |
 curl -sS http://127.0.0.1:8091/v1/chat/completions \
@@ -113,7 +113,7 @@ jq -n \
     extra_body: {
       num_layers: 6,
       height: 1024, width: 1024,
-      steps: 12, cfg: 2.0, seed: 42
+      num_inference_steps: 12, guidance_scale: 2.0, seed: 42
     }
   }' |
 curl -sS http://127.0.0.1:8091/v1/chat/completions \
