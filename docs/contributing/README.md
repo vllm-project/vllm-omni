@@ -295,6 +295,10 @@ If you encounter a bug or have a feature request, please search existing issues 
 
 Thank you for your contribution to vLLM-Omni! Before submitting the pull request, please ensure the PR meets the following criteria. This helps vLLM-Omni maintain the code quality and improve the efficiency of the review process.
 
+### Pull Request Limit
+
+To avoid agent spam, vLLM-Omni uses GitHub's [pull request limit](https://github.blog/open-source/maintainers/how-pull-request-limits-are-cutting-down-the-noise/) for contributors without write access. The current cap is 5 open PRs. If this blocks well-intentioned critical work, contact a committer to request bypass list access.
+
 ### DCO and Signed-off-by
 
 When contributing changes to this project, you must agree to the [DCO](https://developercertificate.org/). Commits must include a `Signed-off-by:` header which certifies agreement with the terms of the DCO.
