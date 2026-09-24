@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for StagePool.collective_rpc EngineCore control dispatch."""
 
 from __future__ import annotations
@@ -120,5 +123,27 @@ def test_abort_requests_does_not_commit_op_state_when_engine_abort_fails():
         assert output_processor.collected is True
         assert output_processor.committed is False
         abort.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("async_chunk", [False, True])
+def test_release_request_resources_broadcasts_only_with_async_chunk(async_chunk):
+    async def run() -> None:
+        call = AsyncMock()
+        client = SimpleNamespace(call_utility_async=call)
+        pool = StagePool(
+            0,
+            [client],  # type: ignore[arg-type]
+            stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(async_chunk=async_chunk)),
+        )
+
+        await pool.release_request_resources(["req-1"])
+
+        if async_chunk:
+            call.assert_awaited_once_with("omni_release_request_resources", ["req-1"])
+        else:
+            call.assert_not_awaited()
 
     asyncio.run(run())

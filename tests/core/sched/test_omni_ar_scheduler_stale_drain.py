@@ -40,6 +40,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
 
 # isort: on
 
@@ -103,6 +104,7 @@ def _make_drain_sched(session: Request) -> MagicMock:
     sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
     sched.finished_req_ids_dict = {}
     sched.make_stats.return_value = None
+    bind_omits_transfer_helpers(sched)
     return sched
 
 

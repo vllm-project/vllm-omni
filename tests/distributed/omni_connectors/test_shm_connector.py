@@ -213,7 +213,7 @@ class TestCleanup:
         connector.put("s0", "s1", "cleanup_req_42", data)
         assert "cleanup_req_42" in connector._pending_keys
 
-        connector.cleanup("cleanup_req_42")
+        assert connector.cleanup("cleanup_req_42") is True
         assert "cleanup_req_42" not in connector._pending_keys
 
         result = connector.get("s0", "s1", "cleanup_req_42", metadata=None)
@@ -224,7 +224,7 @@ class TestCleanup:
         connector.put("s0", "s1", "consumed_req_99", data)
         connector.get("s0", "s1", "consumed_req_99", metadata=None)
 
-        connector.cleanup("consumed_req_99")
+        assert connector.cleanup("consumed_req_99") is False
         assert "consumed_req_99" not in connector._pending_keys
 
     def test_close_cleans_all_pending(self, connector):
@@ -294,3 +294,21 @@ def test_consumed_bad_payload_removes_lock_file(connector, monkeypatch):
     assert not os.path.exists(f"/dev/shm/shm_{key}_lockfile.lock")
     connector.reap_consumed()
     assert key not in connector._pending_keys
+
+
+@pytest.mark.parametrize("suffix", ["_1_2", "_1", "_0", "_suffix"])
+def test_cleanup_prefix_only_matches_own_chunk_keys(connector, suffix):
+    request_id = f"prefix_{uuid.uuid4().hex}"
+    own_keys = [f"{request_id}_0_{i}" for i in range(3)]
+    sibling_key = f"{request_id}{suffix}_0_0"
+    for key in own_keys:
+        assert connector.put("0", "1", key, key)[0]
+    assert connector.put("0", "1", sibling_key, "sibling")[0]
+    # A consumed chunk is no longer counted as reclaimed.
+    assert connector.get("0", "1", own_keys[0])[0] == own_keys[0]
+
+    assert connector.cleanup_prefix(f"{request_id}_0_") == 2
+    for key in own_keys:
+        assert key not in connector._pending_keys
+        assert connector.get("0", "1", key) is None
+    assert connector.get("0", "1", sibling_key)[0] == "sibling"

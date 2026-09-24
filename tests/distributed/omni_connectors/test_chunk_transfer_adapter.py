@@ -15,6 +15,7 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.metrics.stats import PrefillStats, PromptTokenStats
 from vllm.v1.request import Request, RequestStatus
 
+from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
@@ -93,6 +94,30 @@ def test_shm_abort_reclaims_inflight_put_without_blocking(shm_sender, monkeypatc
     assert connector.get("0", "1", f"{request.external_req_id}_0_0") is None
     assert not adapter._sender_tokens
     assert not adapter.code_prompt_token_ids
+
+
+def test_shm_release_reclaims_undrained_chunks_after_finish(shm_sender):
+    adapter, connector = shm_sender
+    ext_id = f"release_{uuid.uuid4().hex}"
+    request = _req("done", RequestStatus.RUNNING, external_req_id=ext_id)
+    sibling_key = f"{ext_id}_1_0_0"
+    assert connector.put("0", "1", sibling_key, "sibling")[0]
+    for _ in range(3):
+        adapter.save_async(None, request)
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    # The consumer read only the first chunk before its own request ended.
+    assert connector.get("0", "1", f"{ext_id}_0_0") is not None
+
+    adapter.release_shm_resources(ext_id)
+    # The release is queued behind sends; nothing is unlinked on the caller.
+    assert f"{ext_id}_0_1" in connector._pending_keys
+    while adapter._pending_save_reqs:
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    assert adapter._reclaimed_shm_total == 2
+    assert not any(k.startswith(f"{ext_id}_0_") for k in connector._pending_keys)
+    assert connector.get("0", "1", f"{ext_id}_0_1") is None
+    assert connector.get("0", "1", sibling_key)[0] == "sibling"
 
 
 @pytest.mark.parametrize("fail_terminal", [False, True])
@@ -2618,10 +2643,9 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
     adapter_mock.cleanup = lambda *a, **kw: cleanup_calls.append((a, kw))
     adapter_mock.save_async = lambda *a, **kw: save_calls.append((a, kw))
 
-    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
-
     scheduler = mocker.MagicMock()
     scheduler.chunk_transfer_adapter = adapter_mock
+    bind_omits_transfer_helpers(scheduler)
     scheduler.connector = None
     scheduler.perf_metrics = None
     scheduler.log_stats = False

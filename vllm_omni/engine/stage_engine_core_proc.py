@@ -110,6 +110,21 @@ class StageEngineCoreProc(EngineCoreProc):
         if _bind_native_data_plane_ready_sink(self.model_executor, self.scheduler):
             logger.info("Bound native MRv2 connector readiness directly to the scheduler inbox.")
 
+    def omni_release_request_resources(self, request_ids: list[str]) -> None:
+        """Release this stage's inter-stage transfer resources for *request_ids*.
+
+        Invoked over the UTILITY channel by the orchestrator once every stage
+        has finished with the request. Idempotent and safe for unknown ids.
+        """
+        adapter = getattr(getattr(self, "scheduler", None), "chunk_transfer_adapter", None)
+        if adapter is None:
+            return
+        for request_id in request_ids or ():
+            try:
+                adapter.release_shm_resources(request_id)
+            except Exception as e:
+                logger.debug("omni_release_request_resources(%s) failed: %s", request_id, e)
+
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""
         scheduler_request, current_wave = super().preprocess_add_request(request)

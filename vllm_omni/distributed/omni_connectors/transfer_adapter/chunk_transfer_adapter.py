@@ -28,6 +28,8 @@ from .base import OmniTransferAdapterBase
 
 logger = get_connector_logger(__name__)
 
+_RECLAIM_WARN_INTERVAL = 1000
+
 
 class _SenderGeneration:
     """Fence one external request generation without blocking cleanup."""
@@ -196,6 +198,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.request_payload = {}
         self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
+        # Save-thread only: running count of segments reclaimed after finish.
+        self._reclaimed_shm_total = 0
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
@@ -688,6 +692,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             for chunk_id in range(num_puts):
                 self.connector.cleanup(f"{key_prefix}_{chunk_id}")
             return
+        if "release_shm" in task:
+            self._release_shm_prefix(task["release_shm"])
+            return
         request = task["request"]
         external_req_id = request.external_req_id
         sender_token = task.get("sender_token")
@@ -979,8 +986,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         Called after a terminal chunk is sent or when the scheduler aborts the
         request before a terminal chunk can be produced. In-flight sends are
-        cancelled here and reclaim their own state in ``finally``; cleanup
-        never waits for connector I/O on the scheduler thread.
+        cancelled here and reclaim adapter state plus leftover SHM in
+        ``finally`` after ``put()`` returns; cleanup never waits for connector
+        I/O on the scheduler thread.
 
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
@@ -1041,6 +1049,42 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
             cached_ic.pop(external_req_id, None)
+
+    def release_shm_resources(self, request_id: str) -> None:
+        """Queue reclaim of inter-stage segments this request left unconsumed.
+
+        Safe only once every stage has finished with the request: the producer
+        keeps writing until its own request ends, and a consumer that stopped
+        early never drains the remainder. Successful terminal chunks are kept
+        by ``_queue_shm_cleanup_locked`` for exactly that consumer, so the
+        orchestrator -- the only party that knows all stages are done -- drives
+        this (see ``Orchestrator._cleanup_request_ids``).
+
+        Like abort cleanup, the unlink runs on the save thread: the scheduler
+        never performs SHM I/O, and it is ordered before any reuse of the id.
+        """
+        if not isinstance(self.connector, SharedMemoryConnector):
+            return
+        external_req_id = self.request_ids_mapping.get(request_id, request_id)
+        self._pending_save_reqs.append({"release_shm": f"{external_req_id}_{self.connector.stage_id}_"})
+        with self._save_cond:
+            self._save_cond.notify()
+
+    def _release_shm_prefix(self, key_prefix: str) -> None:
+        reclaimed = self.connector.cleanup_prefix(key_prefix)
+        if not reclaimed:
+            return
+        # Non-zero means a consumer stopped before draining the producer.
+        # Common on audio requests, so warn only when the running total
+        # crosses another _RECLAIM_WARN_INTERVAL boundary.
+        prev = self._reclaimed_shm_total
+        self._reclaimed_shm_total = prev + reclaimed
+        if prev // _RECLAIM_WARN_INTERVAL != self._reclaimed_shm_total // _RECLAIM_WARN_INTERVAL:
+            logger.warning(
+                "Reclaimed %d unconsumed inter-stage segments so far; "
+                "a downstream stage finished before draining its producer",
+                self._reclaimed_shm_total,
+            )
 
     def cleanup(
         self,

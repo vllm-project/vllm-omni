@@ -131,6 +131,11 @@ class StagePool:
         self.clients: list[StagePoolClient | None] = list(normalized_clients)
         self._output_processor = output_processor
         self._stage_vllm_config = stage_vllm_config
+        model_config = getattr(stage_vllm_config, "model_config", None) if stage_vllm_config is not None else None
+        # Unknown config: keep broadcasting so reclaim cannot be skipped by accident.
+        self._has_chunk_transfer_adapter = (
+            True if model_config is None else bool(getattr(model_config, "async_chunk", False))
+        )
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
         self._unavailable_replicas: set[int] = set()
@@ -1299,6 +1304,26 @@ class StagePool:
                     commit(replica_request_ids, internal=False)
 
         return abort_outputs
+
+    async def release_request_resources(self, request_ids: list[str]) -> None:
+        """Ask every live replica to drop transfer resources for *request_ids*.
+
+        Broadcast rather than binding-routed: the orchestrator releases route
+        bindings as part of the same teardown, so a binding lookup here would
+        race it. The engine-core handler is idempotent for unknown ids.
+        """
+        if not request_ids or not self._has_chunk_transfer_adapter:
+            return
+        for client in self.clients:
+            if client is None:
+                continue
+            call = getattr(client, "call_utility_async", None)
+            if call is None:
+                continue
+            try:
+                await call("omni_release_request_resources", list(request_ids))
+            except Exception as e:
+                logger.debug("[StagePool-%s] release_request_resources failed: %s", self.stage_id, e)
 
     async def collective_rpc(
         self,
