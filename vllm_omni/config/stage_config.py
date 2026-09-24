@@ -458,6 +458,8 @@ class StageDeployConfig:
     # Diffusion model loading and adapter construction.
     model_class_name: str | None = None
     diffusion_load_format: str | None = None
+    controlnet_model_path: str | None = None
+    """Local original H3 Fun ControlNet Union safetensors checkpoint."""
     lora_path: str | list[str] | None = None
     lora_backend: str | None = None
     lora_scale: float | None = None

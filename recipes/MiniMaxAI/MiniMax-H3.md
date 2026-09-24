@@ -817,6 +817,159 @@ Reference images accept JPG/JPEG, PNG, WEBP, HEIC, or HEIF up to 30 MiB. Standal
 audio references accept WAV or MP3 up to 15 MiB, with 2–15 seconds per file and
 at most 15 seconds combined.
 
+## Fun ControlNet Union (CTRL-01)
+
+The original [Alibaba PAI Fun ControlNet Union checkpoint](https://huggingface.co/alibaba-pai/MiniMax-H3-Fun-Controlnet-Union)
+adds one control branch to the existing FL2VA transformer. It accepts prepared
+Canny, Depth, HED, MLSD or Pose videos and mask-based video inpainting. The
+control checkpoint contains only branch weights; keep the base FL2VA components
+available. ComfyUI-repacked, pruned and quantized control checkpoints are not
+supported by this loading path.
+
+Set local checkpoint paths and start the control-enabled server:
+
+```bash
+export MODEL=/path/to/MiniMax-H3/FL2VA
+export CONTROL_MODEL=/path/to/MiniMax-H3-Fun-Controlnet-Union.safetensors
+CUDA_VISIBLE_DEVICES=0,1 VLLM_WORKER_MULTIPROC_METHOD=spawn \
+vllm serve "$MODEL" --omni --task-type fl2va --trust-remote-code \
+  --served-model-name MiniMaxAI/MiniMax-H3 --host 127.0.0.1 --port 8092 \
+  --controlnet-model-path "$CONTROL_MODEL" \
+  --num-gpus 2 --tensor-parallel-size 2 --text-encoder-tp-size 2 \
+  --usp 1 --ring 1 --enforce-eager --diffusion-attention-backend TORCH_SDPA \
+  --vae-patch-parallel-size 2 --vae-parallel-mode tile --vae-use-tiling
+```
+
+The initial control path uses resident BF16 weights and tensor parallelism.
+Reference/keyframe conditioning, sequence parallelism, cache acceleration and
+quantized control execution require separate support; do not combine them with
+this configuration. Control/Turbo combinations need their own validation and
+are not established by ordinary H3 Turbo results.
+
+Upload a prepared Canny video through the existing control API:
+
+```bash
+curl --fail-with-body http://localhost:8092/v1/videos/sync \
+  -F 'model=MiniMaxAI/MiniMax-H3' \
+  -F 'prompt=A forest stream with flowing water and birdsong.' \
+  -F 'control_type=canny' \
+  -F 'control_reference=@canny.mkv;type=video/x-matroska' \
+  -F 'extra_params={"task":"t2va","canny":{"control_context_scale":1.0},"audio_flow_shift":3.0}' \
+  -F 'width=1344' -F 'height=768' -F 'aspect_ratio=16:9' \
+  -F 'num_frames=124' -F 'fps=24' -F 'num_inference_steps=40' \
+  -F 'guidance_scale=1.0' -F 'flow_shift=12.0' -F 'seed=43' \
+  -o control-output.mp4
+```
+
+Use `depth`, `hed`, `mlsd` or `pose` for the corresponding prepared hint, and
+use that same key in `extra_params`. Selecting a type does not run a
+preprocessor. Strength is the model's `control_context_scale`: default 1.0,
+finite and nonnegative; 0 disables the control branch.
+
+For inpainting, source and mask have explicit roles:
+
+```bash
+curl --fail-with-body http://localhost:8092/v1/videos/sync \
+  -F 'model=MiniMaxAI/MiniMax-H3' \
+  -F 'prompt=A small wooden bridge crosses the forest stream.' \
+  -F 'control_type=inpaint' \
+  -F 'source_reference=@source.mp4;type=video/mp4' \
+  -F 'mask_reference=@mask.png;type=image/png' \
+  -F 'extra_params={"task":"t2va","inpaint":{"control_context_scale":1.0},"audio_flow_shift":3.0}' \
+  -F 'width=1344' -F 'height=768' -F 'aspect_ratio=16:9' \
+  -F 'num_frames=124' -F 'fps=24' -F 'num_inference_steps=40' \
+  -F 'guidance_scale=1.0' -F 'flow_shift=12.0' -F 'seed=43' \
+  -o inpaint-output.mp4
+```
+
+White/1 in the mask means regenerate; black/0 supplies preserved source
+conditioning. This is learned conditioning, not a promise of pixel-exact
+compositing outside the mask. A static image mask repeats over the target
+frames; a temporal mask uses a video. Prefer lossless mask encodings. Keep the
+source, control and mask aligned to the same canvas and timeline. The model
+fits conditioning to the requested frame count by truncating longer inputs or
+holding the final frame of shorter inputs.
+
+A source requires a mask. A mask without a source is supported, using zeroed
+source pixels; it does not preserve an unavailable original video. A mask can
+also accompany a prepared control video. Do not send the inpainting source as
+`video_reference`: that field has Ref2VA semantics.
+
+Both `/v1/videos` and `/v1/videos/sync` share these inputs. Async requests retain
+the existing job polling/content interface. Unsupported controls and invalid
+combinations fail instead of silently falling back to ordinary generation.
+See the [video API](../../docs/serving/videos_api.md) for upload rules and errors.
+
+### Validation status
+
+Local integration checks used two H20-3e GPUs, driver 550.127.08, PyTorch
+2.13.0+cu129, vLLM 0.29.0+cu129, Diffusers 0.40.0 and Transformers 5.14.1.
+The configuration above used resident weights and TORCH_SDPA. Canny and
+inpainting also completed with the native
+`minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors` adapter: 5 sigma
+positions / 4 denoiser forwards, video/audio shifts 6/3, guidance 1, adapter
+scale 1, seed 1101, 1344x768, 124 frames and 24 FPS.
+
+To reproduce that Turbo comparison, add `--lora-backend peft --lora-path "$TURBO_LORA"`
+at startup and activate the same artifact in the request, following the
+[LoRA contract](#lora). Change the request to `num_inference_steps=5`,
+`flow_shift=6`, and add:
+
+```bash
+-F "lora={\"name\":\"h3-turbo-v1.0\",\"path\":\"${TURBO_LORA}\",\"scale\":1.0}"
+```
+
+The Canny check used an FFV1 edge video derived from a generated forest clip;
+the inpainting check used that source clip and a static PNG mask. Canny
+followed the source layout; inpainting introduced a bridge in the masked
+region while retaining the surrounding scene. Both output audio and video
+fully decoded, but the Turbo control samples had much quieter audio than
+the same-seed control-disabled sample. This remained after matching the
+reference timestep precision and correcting container timestamp rounding.
+A Base 40-step Canny comparison restored the audio signal level, but a
+final-code Base 40-step inpainting sample was also nearly silent. Base
+inpainting therefore is not established as a workaround. Audio quality
+validation remains incomplete for these combinations; an independent
+reference-runtime comparison is needed before attributing the limitation
+to the model or the integration. These checks establish those two request paths,
+not an exhaustive quality evaluation of all hint types or Turbo variants. The
+40-step examples above follow the original control recipe. This does not
+claim exhaustive coverage of all Base or Turbo conditioning combinations.
+
+Four additional real-model API smokes used synthetic analytic Depth, HED,
+MLSD and Pose hints with the same Turbo configuration above (4 forwards).
+All returned HTTP 200 with 1344x768 H264 video, 124 frames at 24 FPS, and
+32 kHz stereo AAC; full decoding passed. Their audio RMS values were:
+
+| Hint | Audio RMS |
+| --- | ---: |
+| Depth | 0.02181784 |
+| HED | 0.00042317 |
+| MLSD | 0.00017059 |
+| Pose | 0.00990357 |
+
+These hints were analytic geometry, edges, segments and skeletons, without
+learned preprocessing. They establish API/inference smoke coverage, not
+real-video fidelity. Prompts and inputs differed from the forest checks;
+stronger Depth/Pose signal levels do not isolate an effect of the mode name.
+HED/MLSD audio remained weak. Listening and dialogue quality were not verified,
+and these results do not resolve the earlier audio findings.
+
+### ComfyUI client boundary
+
+CTRL-01 provides serving; the remote conditioning node and full workflow belong
+to CTRL-02 and WF-06. The client integration should extend the existing
+Generate Video node with the explicit multipart roles above. Pose preprocessing belongs in the client workflow:
+
+```text
+Load Video -> Get Video Components -> SDPose Keypoint Extractor
+           -> SDPose Draw Keypoints -> Create Video (24 FPS) -> control video
+```
+
+Use the detector and model loader required by the pose extractor. Already
+prepared pose videos can skip preprocessing. The server does not load SDPose
+or a person detector merely because `control_type=pose` was selected.
+
 ## Official input matrix and limits
 
 | Task | Supported references | Limits |
