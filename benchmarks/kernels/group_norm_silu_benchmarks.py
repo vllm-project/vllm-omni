@@ -85,7 +85,13 @@ _RELEASED_CONFIGS = [triton.Config({"BLOCK_SIZE": 4096}, num_warps=16, num_stage
 
 @contextlib.contextmanager
 def _released_kernels():
-    """Re-decorate both operators' kernels with the pre-split autotune space."""
+    """Re-decorate both operators' kernels with the pre-split autotune space.
+
+    With the split disabled the kernels take their ``SPLIT == 1`` branch, which
+    computes what the released kernel did (one Welford pass over the whole group,
+    then the same epilogue), so this times the operator as it shipped without
+    keeping a second copy of it here.
+    """
     import vllm_omni.model_executor.models.common.ops._group_norm_reduction as reduction
 
     plain = sys.modules["vllm_omni.model_executor.models.common.ops.fused_group_norm_silu"]
@@ -184,7 +190,11 @@ def run_compare(op, batch, dtype, device, sms, released=False):
 
         split, _ = pick_split(x[0, 0].numel(), batch, NUM_GROUPS, device)
         ms_eager = _bench(eager)
-        ms_off = _with_waves(0, lambda: _bench(fused))
+        if released:
+            with _released_kernels():
+                ms_off = _bench(fused)
+        else:
+            ms_off = _with_waves(0, lambda: _bench(fused))
         ms_split = _bench(fused)
 
         gbs = traffic / (ms_split * 1e-3) / 1e9
