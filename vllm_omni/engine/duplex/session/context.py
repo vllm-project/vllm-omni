@@ -116,7 +116,20 @@ class DuplexSessionTasks:
 
     append_tasks: dict[asyncio.Task[bool], DuplexAppendTaskMeta] = field(default_factory=dict)
     append_tail: asyncio.Task[bool] | None = None
+    #: Whether ``append_tail`` concluded a turn. Read after the task is done,
+    #: when its ``append_tasks`` metadata has already been popped.
+    append_tail_final: bool = False
     active_response_task: asyncio.Task[None] | None = None
+
+    def set_append_tail(self, task: asyncio.Task[bool], *, final: bool) -> None:
+        self.append_tail = task
+        self.append_tail_final = final
+
+    def clear_append_tail(self, task: asyncio.Task[bool] | None = None) -> None:
+        if task is not None and self.append_tail is not task:
+            return
+        self.append_tail = None
+        self.append_tail_final = False
 
     def track_append_task(
         self,
@@ -144,8 +157,8 @@ class DuplexSessionTasks:
         # asyncio.TimeoutError is not the builtin TimeoutError before Python 3.11.
         except (TimeoutError, asyncio.TimeoutError):
             pass
-        if cancelled_tail is not None and self.append_tail is cancelled_tail:
-            self.append_tail = None
+        if cancelled_tail is not None:
+            self.clear_append_tail(cancelled_tail)
         return True
 
 

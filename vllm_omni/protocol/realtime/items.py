@@ -24,17 +24,26 @@ from __future__ import annotations
 
 import base64
 import binascii
+import io
 from collections.abc import Mapping
 from uuid import uuid4
 
 __all__ = [
+    "IMAGE_DATA_URL_PREFIXES",
     "input_transcript_from_item",
     "normalize_conversation_item",
     "text_chars_for_audio_ms_from_marks",
     "truncate_realtime_item_content",
+    "validate_realtime_image_data_url",
     "validate_realtime_item_truncate",
     "validate_realtime_video_frames",
 ]
+
+IMAGE_DATA_URL_PREFIXES = ("data:image/jpeg;base64,", "data:image/png;base64,")
+
+#: Generous for a real photo, small enough that a declared-huge image cannot
+#: turn one admission into minutes of decoding.
+MAX_IMAGE_PIXELS = 16_000_000
 
 
 def validate_realtime_video_frames(video_frames: object, max_slice_nums: object) -> str | None:
@@ -67,6 +76,44 @@ def validate_realtime_video_frames(video_frames: object, max_slice_nums: object)
             return "video_frames entries must be valid base64"
         if not (header.startswith(b"\xff\xd8") or header.startswith(b"\x89PNG")):
             return "video_frames entries must be JPEG or PNG images"
+    return None
+
+
+def validate_realtime_image_data_url(url: object) -> str | None:
+    """Admit an ``input_image`` data URL only if it really decodes.
+
+    The header check ``validate_realtime_video_frames`` performs is enough for
+    a camera frame, which is used once and thrown away. An ``input_image``
+    item is different: it is kept in conversation history and decoded again on
+    every later turn, so a payload that merely starts like a PNG fails the
+    prompt build for the rest of the session rather than for one append. That
+    is worth a full decode here, once, so the failure lands on the request
+    that sent it.
+
+    Caller's note: this decodes, so run it off the event loop.
+    """
+    if not isinstance(url, str) or not url.startswith(IMAGE_DATA_URL_PREFIXES):
+        return "input_image requires a JPEG or PNG base64 data URL"
+    encoded = url.split(",", 1)[1]
+    if len(encoded) > 4_000_000:
+        return "input_image exceeds 4MB base64; reduce capture resolution or JPEG quality"
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return "input_image must be valid base64"
+    from PIL import Image
+
+    try:
+        with Image.open(io.BytesIO(raw)) as image:
+            if image.format not in {"JPEG", "PNG"}:
+                return "input_image must be a JPEG or PNG image"
+            width, height = image.size
+            if width * height > MAX_IMAGE_PIXELS:
+                return f"input_image exceeds {MAX_IMAGE_PIXELS // 1_000_000} megapixels"
+            # Structure alone does not survive the prompt build; the pixels do.
+            image.load()
+    except Exception:
+        return "input_image is not a decodable JPEG or PNG image"
     return None
 
 

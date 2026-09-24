@@ -1123,7 +1123,7 @@ class DuplexSessionRunner:
                 predecessor = None
         task = asyncio.create_task(attempt.run_in_wire_order(predecessor))
         task.add_done_callback(attempt.release_on_failure)
-        self.tasks.append_tail = task
+        self.tasks.set_append_tail(task, final=final)
         self.tasks.track_append_task(
             task,
             epoch=append_epoch,
@@ -1145,6 +1145,22 @@ class DuplexSessionRunner:
     async def _wait_for_append_tail(self) -> bool:
         predecessor = self.tasks.append_tail
         if predecessor is None:
+            return True
+        if predecessor.done() and self.tasks.append_tail_final:
+            # A turn that already concluded is not this command's predecessor:
+            # nothing of this command was queued behind it, so its result says
+            # nothing about whether this command can be applied.
+            # ``_start_append`` already treats a later append as an explicit
+            # retry that starts a new chain; commands that wait on the tail
+            # follow the same rule, or one failed turn would abort every
+            # command after it for the rest of the session -- which is how a
+            # plugin that only appends on commit loses the session entirely.
+            #
+            # A mid-utterance append is different: the command waiting on it
+            # owns the same input, which is incomplete without that append, so
+            # its failure still aborts the command below.
+            if self.tasks.append_tail is predecessor:
+                self.tasks.clear_append_tail(predecessor)
             return True
         try:
             return await predecessor
