@@ -175,7 +175,10 @@ def decode_audio_append(
     defaults: RealtimeInputDefaults,
     hints_source: Mapping[str, object] | None = None,
 ) -> RealtimeAudioAppend:
-    """Validate, convert (to 16 kHz ``pcm_f32le``) and pack one audio append.
+    """Validate and pack one input append (audio and/or video frames).
+
+    Capability checks (required/optional modalities) run later on the session.
+    Audio path converts to 16 kHz ``pcm_f32le``.
 
     ``hints_source`` is the enclosing payload when the audio arrives inside
     something larger than a bare append --- a ``conversation.item.create``
@@ -186,6 +189,39 @@ def decode_audio_append(
     """
     event_id = cast("str", event.get("event_id")) if isinstance(event.get("event_id"), str) else None
     audio = event.get("audio") or event.get("delta")
+    video_frames: tuple[str, ...] = ()
+    raw_frames = event.get("video_frames")
+    if raw_frames is not None:
+        frames_error = validate_realtime_video_frames(raw_frames, event.get("max_slice_nums"))
+        if frames_error is not None:
+            raise RealtimeProtocolError(frames_error, code="invalid_video_frames", event_id=event_id)
+        if isinstance(raw_frames, list):
+            video_frames = tuple(frame for frame in raw_frames if isinstance(frame, str) and frame)
+    has_audio_field = isinstance(audio, str) and bool(audio)
+    if not has_audio_field:
+        if not video_frames:
+            raise RealtimeProtocolError(
+                "input_audio_buffer.append requires audio and/or video_frames",
+                code="bad_event",
+                event_id=event_id,
+            )
+        hints: dict[str, object] = {}
+        if hints_source is not None:
+            copy_realtime_input_hints(hints_source, hints)
+        copy_realtime_input_hints(event, hints)
+        duration_ms = hints.get("duration_ms", hints.get("audio_duration_ms"))
+        audio_end_ms = hints.get("audio_end_ms")
+        return RealtimeAudioAppend(
+            event_id=event_id,
+            audio=b"",
+            format="pcm_f32le",
+            sample_rate_hz=defaults.input_sample_rate_hz,
+            is_speech=False,
+            video_frames=video_frames,
+            duration_ms=int(duration_ms) if isinstance(duration_ms, int | float) else None,
+            audio_end_ms=int(audio_end_ms) if isinstance(audio_end_ms, int | float) else None,
+            hints=hints,
+        )
     fmt, format_rate = parse_realtime_audio_format(
         event.get("format") or event.get("input_audio_format") or defaults.input_audio_format
     )
@@ -216,14 +252,6 @@ def decode_audio_append(
         fmt=fmt,
         overlap_silence_rms=defaults.overlap_silence_rms,
     )
-    video_frames: tuple[str, ...] = ()
-    raw_frames = event.get("video_frames")
-    if raw_frames is not None:
-        frames_error = validate_realtime_video_frames(raw_frames, event.get("max_slice_nums"))
-        if frames_error is not None:
-            raise RealtimeProtocolError(frames_error, code="invalid_video_frames", event_id=event_id)
-        if isinstance(raw_frames, list):
-            video_frames = tuple(frame for frame in raw_frames if isinstance(frame, str) and frame)
     duration_ms = hints.get("duration_ms", hints.get("audio_duration_ms"))
     audio_end_ms = hints.get("audio_end_ms")
     try:

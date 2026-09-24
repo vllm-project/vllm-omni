@@ -28,7 +28,10 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.engine.duplex.intermediate import get_tts_handoff
-from vllm_omni.model_executor.models.minicpmo_4_5 import MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
+from vllm_omni.model_executor.models.minicpmo_4_5 import (
+    MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
+    MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -48,13 +51,38 @@ _OFFLINE_CODEC_MAX_NEW_TOKENS = 2048
 # Without this, the single-vocab Sampler keeps the stage-1 request alive
 # until codec EOS / 4096 and Thinker never starts the next model turn.
 _DUPLEX_CODEC_TOKENS_PER_CHUNK = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
+_DUPLEX_TURN_END_CODEC_TOKENS = MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS
+#: Frames the Talker forwards per generate_chunk before its cadence EOS.
+_DUPLEX_CODEC_FRAMES_PER_CHUNK = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK - 1
+#: On a turn-end chunk the Talker's EOS is masked for this many steps after
+#: each 25-frame boundary: the model emits a cadence EOS there whether or not
+#: its text is spoken, while a genuine end of text shows up as an EOS anywhere
+#: else in the window.
+_DUPLEX_TURN_END_BOUNDARY_MASK_STEPS = 5
 
 
 def _native_duplex_chunk_budget(meta: Mapping[str, Any] | None) -> tuple[int, int]:
     """Return ``(max_tokens, min_tokens)`` for one native-duplex Talker request."""
-    boundary = isinstance(meta, Mapping) and (bool(meta.get("turn_start")) or bool(meta.get("turn_end")))
+    turn_start = isinstance(meta, Mapping) and bool(meta.get("turn_start"))
+    turn_end = isinstance(meta, Mapping) and bool(meta.get("turn_end"))
+    if turn_end:
+        # The turn-end chunk drains the text the Talker still owes: no floor
+        # (an early EOS means the text is spoken) and a multi-unit ceiling.
+        return _DUPLEX_TURN_END_CODEC_TOKENS, 0
     ceiling = _DUPLEX_CODEC_TOKENS_PER_CHUNK
-    return ceiling, 0 if boundary else ceiling
+    return ceiling, 0 if turn_start else ceiling
+
+
+def _turn_end_boundary_eos_masked(step: int) -> bool:
+    """Whether a turn-end chunk masks codec EOS at ``step`` forwarded frames.
+
+    The Talker emits a cadence EOS after every 25 frames regardless of the text
+    left, so a turn-end chunk ignores EOS in a short window after each boundary
+    and lets the model continue; EOS elsewhere ends the chunk as usual.
+    """
+    if step < _DUPLEX_CODEC_FRAMES_PER_CHUNK:
+        return False
+    return step % _DUPLEX_CODEC_FRAMES_PER_CHUNK < _DUPLEX_TURN_END_BOUNDARY_MASK_STEPS
 
 
 def blank_scheduler_prompt_for_penalties(
@@ -102,27 +130,29 @@ def _apply_batched_repetition_penalty(
         penalties = penalties.expand(batch_size)
     elif penalties.numel() != batch_size:
         raise ValueError(f"expected 1 or {batch_size} codec repetition penalties, got {penalties.numel()}")
-    if not bool((penalties != 1.0).any()):
-        return logits
-
     penalized = logits.clone()
     for start in range(0, batch_size, _REPETITION_PENALTY_CHUNK_SIZE):
         end = min(start + _REPETITION_PENALTY_CHUNK_SIZE, batch_size)
         chunk_logits = logits[start:end]
+        chunk_histories = histories[start:end]
+        # The runner keeps codec history on the CPU. Pack it before uploading
+        # instead of transferring one small tensor per request on every step.
+        history_device = "cpu" if all(history.device.type == "cpu" for history in chunk_histories) else logits.device
         encoded_rows: list[torch.Tensor] = []
-        for local_row, history in enumerate(histories[start:end]):
-            recent = history.reshape(-1)[-window_size:].to(device=logits.device, dtype=torch.long)
+        for local_row, history in enumerate(chunk_histories):
+            recent = history.reshape(-1)[-window_size:].to(device=history_device, dtype=torch.long)
             if recent.numel() > 0:
                 encoded_rows.append(recent + local_row * vocab_size)
         if not encoded_rows:
             continue
 
-        # Bound the int64 bincount workspace independently of request concurrency.
+        # The vocabulary fixes the output size. CUDA bincount still reads the
+        # maximum id back to the host even when minlength is provided.
         encoded = encoded_rows[0] if len(encoded_rows) == 1 else torch.cat(encoded_rows)
-        frequencies = torch.bincount(
-            encoded,
-            minlength=(end - start) * vocab_size,
-        ).reshape(end - start, vocab_size)
+        encoded = encoded.to(device=logits.device)
+        frequencies = torch.zeros((end - start) * vocab_size, dtype=torch.long, device=logits.device)
+        frequencies.scatter_add_(0, encoded, torch.ones_like(encoded))
+        frequencies = frequencies.reshape(end - start, vocab_size)
         alpha = torch.pow(penalties[start:end].unsqueeze(1), frequencies.to(dtype=logits.dtype))
         penalized[start:end] = torch.where(chunk_logits < 0, chunk_logits * alpha, chunk_logits / alpha)
 
@@ -367,7 +397,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             code_ids = torch.as_tensor(previous_codes, device=self.emb_code[0].weight.device, dtype=torch.long)
         else:
             raise ValueError("streaming prompt recompute is missing confirmed codec ids")
-        if code_ids.numel() > _DUPLEX_CODEC_TOKENS_PER_CHUNK - 1:
+        if code_ids.numel() > _DUPLEX_TURN_END_CODEC_TOKENS - 1:
             raise ValueError(f"streaming prompt recompute has too many codec ids: {code_ids.numel()}")
         if code_ids.numel() and bool(((code_ids < 0) | (code_ids >= self._codec_eos_id)).any()):
             raise ValueError("streaming prompt recompute codec ids include an invalid or terminal token")
@@ -500,6 +530,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 "step": 0,
                 "max_tokens": max_tokens,
                 "min_tokens": min_tokens,
+                "turn_end_drain": bool(native_duplex and isinstance(meta, Mapping) and bool(meta.get("turn_end"))),
             }
             if retained_codes:
                 state["recent_codes"] = retained_codes
@@ -508,7 +539,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 request_states = {}
                 self._request_audio_states = request_states
             request_states[request_id] = state
-            empty_codes = torch.empty(0, dtype=torch.long, device=embeds.device)
+            empty_codes = torch.empty(0, dtype=torch.long, device="cpu")
             return (
                 input_ids,
                 embeds,
@@ -528,7 +559,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # eligible. The sampler is forced to EOS; any shape-correct
             # embedding is enough for these leftover decode rows.
             weight = self.emb_code[0].weight
-            empty_codes = torch.empty(0, dtype=torch.long, device=weight.device)
+            empty_codes = torch.empty(0, dtype=torch.long, device="cpu")
             return input_ids, weight.new_zeros((span_len, weight.shape[1])), {"codes": {"audio": empty_codes}}
 
         # Decode: vLLM's previous sampled codec id is this step's input.
@@ -542,9 +573,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 state["finished"] = True
             elif stored is None:
                 self._request_audio_states[request_id] = {"finished": True, "step": 0}
-            delta = torch.empty(0, dtype=torch.long, device=code.device)
+            delta = torch.empty(0, dtype=torch.long, device="cpu")
         else:
-            delta = code.reshape(1, 1)
+            # The runner and connector consume CPU IDs; reuse the scalar
+            # already read for EOS instead of copying the same token again.
+            delta = torch.tensor([[code_id]], dtype=torch.long, device="cpu")
         return input_ids, embeds, {"codes": {"audio": delta}}
 
     def make_omni_output(
@@ -566,12 +599,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         duplex_turn_ids: list[torch.Tensor] = []
         segment_texts_utf8: list[torch.Tensor] = []
         turn_end_flags: list[torch.Tensor] = []
-        empty_delta = hidden.new_empty((0, 1), dtype=torch.long)
+        empty_delta = torch.empty((0, 1), dtype=torch.long, device="cpu")
         codec_deltas = [empty_delta for _ in infos]
         terminal_flags = [torch.tensor(False, dtype=torch.bool) for _ in infos]
         force_eos_rows = [False] * len(infos)
         mask_eos_rows = [False] * len(infos)
-        empty_history = hidden.new_empty((0,), dtype=torch.long)
+        empty_history = torch.empty(0, dtype=torch.long, device="cpu")
         penalty_histories = [empty_history for _ in infos]
         for index, info in enumerate(infos):
             info_dict = info if isinstance(info, dict) else {}
@@ -628,16 +661,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             codes = info.get("codes", {})
             audio = codes.get("audio") if isinstance(codes, Mapping) else None
             if isinstance(audio, torch.Tensor) and audio.numel() > 0:
-                codec_deltas[index] = audio.to(device=hidden.device, dtype=torch.long).reshape(-1, 1)
+                audio = audio.to(device="cpu", dtype=torch.long)
+                codec_deltas[index] = audio.reshape(-1, 1)
                 state["step"] = int(state.get("step", 0)) + 1
                 # ``audio`` is the id sampled last step, i.e. exactly upstream's
                 # ``new_tokens[:, 0:t]`` history for the logits computed below.
                 recent = state.get("recent_codes")
-                recent = (recent if isinstance(recent, list) else []) + codec_deltas[index].reshape(-1).tolist()
+                recent = (recent if isinstance(recent, list) else []) + audio.reshape(-1).tolist()
                 state["recent_codes"] = recent[-_CODEC_PENALTY_WINDOW:]
             recent_codes = state.get("recent_codes")
             if recent_codes:
-                penalty_histories[index] = torch.tensor(recent_codes, dtype=torch.long, device=hidden.device)
+                penalty_histories[index] = torch.tensor(recent_codes, dtype=torch.long, device="cpu")
             max_tokens = state.get("max_tokens")
             min_tokens = state.get("min_tokens")
             step = int(state.get("step", 0))
@@ -653,7 +687,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 # plane does not wait for a follow-up empty decode.
                 state["finished"] = True
             force_eos_rows[index] = chunk_done
-            mask_eos_rows[index] = not force_eos_rows[index] and min_tokens is not None and step < int(min_tokens)
+            mask_eos_rows[index] = not force_eos_rows[index] and (
+                (min_tokens is not None and step < int(min_tokens))
+                or (bool(state.get("turn_end_drain")) and _turn_end_boundary_eos_masked(step))
+            )
             terminal_flags[index] = torch.tensor(chunk_done, dtype=torch.bool)
 
         # Empty-speech rows, finished duplex chunks, and offline requests that

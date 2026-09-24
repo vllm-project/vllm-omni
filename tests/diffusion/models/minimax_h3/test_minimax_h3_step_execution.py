@@ -27,6 +27,9 @@ class _SegmentMeanModel:
     assignment shows up as a numeric difference instead of passing silently.
     """
 
+    def __init__(self):
+        self.calls: list[dict[str, torch.Tensor]] = []
+
     def __call__(self, **kwargs):
         x = kwargs["x"][0]
         audio_x = kwargs["audio_x"][0]
@@ -45,6 +48,14 @@ class _SegmentMeanModel:
             pooled_audio[start:stop] = audio_x[start:stop].mean(dim=0, keepdim=True)
 
         row_timesteps = kwargs["unique_timesteps"][kwargs["inverse_indices"]].unsqueeze(-1)
+        self.calls.append(
+            {
+                "video_rows": x[img_pos].clone(),
+                "audio_rows": audio_x[audio_pos].clone(),
+                "video_timesteps": row_timesteps[img_pos, 0].clone(),
+                "audio_timesteps": row_timesteps[audio_pos, 0].clone(),
+            }
+        )
         video = (pooled_video + 0.5 * x + row_timesteps)[img_pos]
         audio = (pooled_audio + 0.5 * audio_x + row_timesteps)[audio_pos]
         if not kwargs.get("skip_mask_out_condition", False):
@@ -77,10 +88,10 @@ def _make_branch(*, text_len: int, latent_t: int, latent_h: int, latent_w: int, 
     return branch, video_rows, audio_rows
 
 
-def _sigmas(num_points: int, shift: float) -> list[float]:
+def _sigmas(num_steps: int, shift: float) -> list[float]:
     from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
 
-    return minimax_h3_time_shift_sigmas(num_steps=num_points, shift_scale=shift)
+    return minimax_h3_time_shift_sigmas(num_steps=num_steps, shift_scale=shift)
 
 
 def _make_state(request_id: str, model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio):
@@ -119,15 +130,16 @@ def _step_pipeline(model, *, packed_batch_supported: bool = True):
     return pipeline
 
 
-def test_step_execution_matches_request_mode_denoise_loop():
+@pytest.mark.parametrize("num_steps", [1, 8, 50])
+def test_step_execution_matches_request_mode_denoise_loop(num_steps, mocker):
     """Stepping through the contract must reproduce the request-mode loop."""
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
     from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
 
-    model = _SegmentMeanModel()
+    model = mocker.Mock(wraps=_SegmentMeanModel())
     branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=5)
-    sigmas_video = _sigmas(6, 12.0)
-    sigmas_audio = _sigmas(6, 3.0)
+    sigmas_video = _sigmas(num_steps, 12.0)
+    sigmas_audio = _sigmas(num_steps, 3.0)
 
     reference_video, reference_audio = minimax_h3_denoise_loop(
         model=model,
@@ -140,6 +152,8 @@ def test_step_execution_matches_request_mode_denoise_loop():
         device=torch.device("cpu"),
     )
 
+    assert model.call_count == num_steps
+    model.reset_mock()
     pipeline = _step_pipeline(model)
     state = _make_state("req-0", model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio)
     input_batch = SimpleNamespace(states=(state,))
@@ -150,15 +164,84 @@ def test_step_execution_matches_request_mode_denoise_loop():
         pipeline.step_scheduler(state, noise_pred)
         steps += 1
 
-    assert steps == len(sigmas_video) - 1
+    assert steps == num_steps
+    assert model.call_count == num_steps
     assert state.total_steps == steps
     torch.testing.assert_close(state.latents, reference_video)
     torch.testing.assert_close(state.extra[mod._STEP_AUDIO_ROWS], reference_audio)
 
 
-def test_batched_step_execution_matches_independent_requests():
+def test_step_execution_matches_request_mode_with_latent_edits():
+    """Masked model rows, row timesteps, and scheduler math match both paths."""
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
+    from vllm_omni.diffusion.models.minimax_h3.latent_mask import MiniMaxH3LatentEdit
+
+    model = _SegmentMeanModel()
+    branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=51)
+    sigmas_video = _sigmas(5, 12.0)
+    sigmas_audio = _sigmas(5, 3.0)
+    video_clean = torch.linspace(-1.0, 1.0, video_rows.numel()).reshape_as(video_rows)
+    audio_clean = torch.linspace(1.0, -1.0, audio_rows.numel()).reshape_as(audio_rows)
+    video_mask = torch.linspace(0.0, 1.0, video_rows.shape[0])
+    video_edit = MiniMaxH3LatentEdit.from_rows(
+        video_clean,
+        0.999 * video_clean + 0.001 * video_rows,
+        video_mask,
+        video_mask,
+    )
+    audio_mask = torch.tensor([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    audio_edit = MiniMaxH3LatentEdit.from_rows(
+        audio_clean,
+        audio_clean,
+        audio_mask,
+        audio_mask,
+    )
+
+    reference_video, reference_audio = minimax_h3_denoise_loop(
+        model=model,
+        positive=branch,
+        initial_video_rows=video_rows,
+        initial_audio_rows=audio_rows,
+        keyframe_cond_rows=None,
+        video_edit=video_edit,
+        audio_edit=audio_edit,
+        sigmas_video=sigmas_video,
+        sigmas_audio=sigmas_audio,
+        device=torch.device("cpu"),
+    )
+    request_first_call = model.calls[0]
+    torch.testing.assert_close(request_first_call["video_rows"], video_edit.model_rows(video_rows))
+    torch.testing.assert_close(request_first_call["audio_rows"], audio_edit.model_rows(audio_rows))
+    torch.testing.assert_close(
+        request_first_call["video_timesteps"],
+        video_edit.target_timesteps(1.0 - sigmas_video[0], 0.999, sigma=sigmas_video[0]),
+    )
+    torch.testing.assert_close(
+        request_first_call["audio_timesteps"],
+        audio_edit.target_timesteps(1.0 - sigmas_audio[0], 1.0, sigma=sigmas_audio[0]),
+    )
+    model.calls.clear()
+
+    state = _make_state("req-edit", model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio)
+    state.extra[mod._STEP_VIDEO_EDIT] = video_edit
+    state.extra[mod._STEP_AUDIO_EDIT] = audio_edit
+    pipeline = _step_pipeline(model)
+    while not state.denoise_completed:
+        velocity = pipeline.denoise_step(SimpleNamespace(states=(state,)), states=[state])
+        pipeline.step_scheduler(state, velocity)
+
+    for name, expected in request_first_call.items():
+        torch.testing.assert_close(model.calls[0][name], expected)
+    torch.testing.assert_close(state.latents, reference_video)
+    torch.testing.assert_close(state.extra[mod._STEP_AUDIO_ROWS], reference_audio)
+
+
+@pytest.mark.parametrize("lock_audio", [False, True])
+def test_batched_step_execution_matches_independent_requests(lock_audio):
     """Two co-batched requests must land where they would have landed alone."""
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.models.minimax_h3.latent_mask import MiniMaxH3LatentEdit
 
     model = _SegmentMeanModel()
     specs = [
@@ -171,20 +254,40 @@ def test_batched_step_execution_matches_independent_requests():
 
     pipeline = _step_pipeline(model)
 
+    def make_state(request_id: str, index: int):
+        branch, video_rows, audio_rows = _make_branch(**specs[index])
+        sigmas_video, sigmas_audio = schedules[index]
+        state = _make_state(request_id, model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio)
+        video_mask = torch.linspace(0.1 * index, 0.8 + 0.1 * index, video_rows.shape[0])
+        video_edit = MiniMaxH3LatentEdit.from_rows(
+            torch.full_like(video_rows, 10.0 + index),
+            torch.full_like(video_rows, 20.0 + index),
+            video_mask,
+            video_mask,
+        )
+        audio_mask = torch.linspace(0.2 - 0.1 * index, 1.0 - 0.1 * index, audio_rows.shape[0])
+        audio_edit = MiniMaxH3LatentEdit.from_rows(
+            torch.full_like(audio_rows, 30.0 + index),
+            torch.full_like(audio_rows, 40.0 + index),
+            audio_mask,
+            audio_mask,
+        )
+        state.extra[mod._STEP_VIDEO_EDIT] = video_edit
+        if lock_audio and index == 0:
+            branch.locked_audio_rows = audio_rows.clone()
+        else:
+            state.extra[mod._STEP_AUDIO_EDIT] = audio_edit
+        return state
+
     alone: list[tuple[torch.Tensor, torch.Tensor]] = []
-    for spec, (sigmas_video, sigmas_audio) in zip(specs, schedules):
-        branch, video_rows, audio_rows = _make_branch(**spec)
-        state = _make_state("solo", model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio)
+    for index in range(len(specs)):
+        state = make_state("solo", index)
         while not state.denoise_completed:
             pipeline.step_scheduler(state, pipeline.denoise_step(SimpleNamespace(states=(state,)), states=[state]))
         alone.append((state.latents, state.extra[mod._STEP_AUDIO_ROWS]))
 
-    states = []
-    for index, (spec, (sigmas_video, sigmas_audio)) in enumerate(zip(specs, schedules)):
-        branch, video_rows, audio_rows = _make_branch(**spec)
-        if index == 0:
-            assert branch.used_len == branch.seq_len
-        states.append(_make_state(f"req-{index}", model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio))
+    states = [make_state(f"req-{index}", index) for index in range(len(specs))]
+    assert states[0].extra[mod._STEP_BRANCH].used_len == states[0].extra[mod._STEP_BRANCH].seq_len
 
     active = list(states)
     while active:
@@ -291,6 +394,8 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
 
     branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=8)
+    video_edit = object()
+    audio_edit = object()
     sigmas_video = _sigmas(6, 12.0)
     sigmas_audio = _sigmas(6, 3.0)
     context = {
@@ -315,7 +420,7 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
     monkeypatch.setattr(
         mod.MiniMaxH3Pipeline,
         "_prepare_encoder_conditioning_inputs",
-        lambda self, value, sampling: context,
+        lambda self, value, sampling: context if value is conditioning else pytest.fail("wrong encoder handoff"),
     )
     monkeypatch.setattr(
         mod.MiniMaxH3Pipeline,
@@ -326,6 +431,8 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
             "audio_rows": audio_rows,
             "cond_anchor": None,
             "audio_anchor": None,
+            "video_edit": video_edit,
+            "audio_edit": audio_edit,
             "sigmas_video": sigmas_video,
             "sigmas_audio": sigmas_audio,
         },
@@ -347,6 +454,8 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
     assert state.do_true_cfg is False
     torch.testing.assert_close(state.current_timestep, torch.tensor(1.0 - sigmas_video[0]))
     assert state.extra[mod._STEP_BRANCH] is branch
+    assert state.extra[mod._STEP_VIDEO_EDIT] is video_edit
+    assert state.extra[mod._STEP_AUDIO_EDIT] is audio_edit
     assert state.extra[mod._STEP_SHAPE]["height"] == 96
 
     pipeline.od_config = SimpleNamespace()
@@ -450,3 +559,33 @@ def test_packed_batch_rejects_backends_that_cannot_isolate_requests(attention):
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 
     assert MiniMaxH3Pipeline._packed_batch_supported(_FakeTransformer([attention])) is False
+
+
+def test_locked_driving_audio_is_clean_and_unchanged_during_denoising():
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
+
+    branch, video, audio = _make_branch(text_len=3, latent_t=2, latent_h=2, latent_w=2, audio_t=3, seed=7)
+    branch.locked_audio_rows = audio.clone()
+    seen = []
+
+    def model(**kwargs):
+        positions = kwargs["audio_pos_info"]["position_ids"]
+        times = kwargs["unique_timesteps"][kwargs["inverse_indices"]]
+        torch.testing.assert_close(times[positions], torch.ones_like(times[positions]))
+        torch.testing.assert_close(kwargs["audio_x"][0, positions], audio)
+        seen.append(True)
+        return torch.ones_like(video), torch.ones_like(audio)
+
+    result_video, result_audio = minimax_h3_denoise_loop(
+        model=model,
+        positive=branch,
+        initial_video_rows=video,
+        initial_audio_rows=audio,
+        keyframe_cond_rows=None,
+        sigmas_video=[1.0, 0.5, 0.0],
+        sigmas_audio=[1.0, 0.25, 0.0],
+        device=torch.device("cpu"),
+    )
+    assert len(seen) == 2
+    torch.testing.assert_close(result_audio, audio)
+    assert not torch.equal(result_video, video)

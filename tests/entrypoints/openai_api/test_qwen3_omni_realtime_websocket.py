@@ -18,20 +18,26 @@ import io
 import json
 import os
 import wave
+from contextlib import asynccontextmanager, suppress
+from pathlib import Path
+from typing import Any, NamedTuple
 
+import numpy as np
 import pytest
 import websockets
+import yaml
 
-from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import validated_input_wav
+from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import validated_input_wav, validated_soft_interrupt_wav
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import (
     convert_audio_bytes_to_text,
     cosine_similarity_text,
     generate_synthetic_audio,
 )
-from tests.helpers.runtime import OmniServerParams
+from tests.helpers.runtime import OmniServer, OmniServerParams, get_model_prefix
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.config.stage_config import load_deploy_config
+from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to_session
 from vllm_omni.engine.duplex.vad import (
     SILERO_VAD_FILENAME,
     SILERO_VAD_REPO_ID,
@@ -361,6 +367,15 @@ def _assert_realtime_accuracy(
 
 
 class TestQwen3OmniRealtimeWebSocket:
+    @pytest.fixture(scope="class")
+    def omni_server(self, request, run_level):
+        # Release the legacy turn deployment before the duplex class below
+        # starts another model server on the same pair of GPUs.
+        from tests.helpers.fixtures.runtime import omni_fixture_lock
+        from tests.helpers.runtime import iter_omni_server
+
+        yield from iter_omni_server(request, run_level, omni_fixture_lock)
+
     @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -518,3 +533,411 @@ class TestQwen3OmniRealtimeWebSocket:
 
         _assert_realtime_smoke(result)
         _assert_realtime_accuracy(result)
+
+
+# These regressions use the engine-owned Qwen duplex plugin. The older class
+# above intentionally exercises the separate turn/STT deployment.
+# ``advanced_model`` (merge) uses 5 interruptions; ``full_model`` (nightly)
+# keeps the 20-repeat race hunt. Marks select the case, not ``--run-level``.
+_DUPLEX_REPEATS_ADVANCED = 5
+_DUPLEX_REPEATS_FULL = 20
+_DUPLEX_LONG_INSTRUCTIONS = "Answer the user's question in English using at least eight complete sentences."
+_DUPLEX_SHORT_INSTRUCTIONS = "Answer the user's question in one short English sentence."
+
+
+class _DuplexTestRuntime(NamedTuple):
+    server: OmniServer
+    processor: Any
+    artifacts: Path
+
+
+@pytest.fixture(scope="class")
+def qwen_duplex_server(tmp_path_factory, cached_silero_vad_artifact, run_level):
+    """Load real weights once for all interruption repetitions and history checks."""
+    from transformers import AutoProcessor
+
+    assert run_level in {"advanced_model", "full_model"}, "Duplex playback acceptance requires real weights"
+    artifacts = tmp_path_factory.mktemp("qwen_duplex_playback")
+    deploy = artifacts / "deploy.yaml"
+    # An absolute base keeps the production YAML's relative inheritance intact
+    # when the test's Silero override lives in a temporary directory.
+    deploy.write_text(
+        yaml.safe_dump(
+            {
+                "base_config": get_deploy_config_path("qwen3_omni_duplex.yaml"),
+                "duplex_session": {"server_vad_model_path": cached_silero_vad_artifact},
+            }
+        )
+    )
+    assert load_deploy_config(deploy).session_mode == "duplex"
+    model = get_model_prefix() + MODEL
+    processor = AutoProcessor.from_pretrained(model, trust_remote_code=True)
+    with OmniServer(
+        model,
+        ["--deploy-config", str(deploy), "--init-timeout", "900", "--stage-init-timeout", "600"],
+        env_dict={"VLLM_OMNI_QWEN_VISUAL_DEBUG_DIR": str(artifacts)},
+    ) as server:
+        yield _DuplexTestRuntime(server=server, processor=processor, artifacts=artifacts)
+
+
+def _duplex_fixture_pcm(path: Path, *, duration_s: float | None = None) -> bytes:
+    """Replay checked-in speech at the web client's negotiated 24 kHz PCM16 rate."""
+    pcm = np.frombuffer(_pcm16_mono_16k_from_wav_bytes(path.read_bytes()), dtype="<i2")
+    if duration_s is not None:
+        pcm = pcm[: int(duration_s * 16000)]
+    positions = np.arange(len(pcm) * 3 // 2) * (2.0 / 3.0)
+    return np.interp(positions, np.arange(len(pcm)), pcm).astype("<i2").tobytes()
+
+
+def _duplex_response_id(event: dict) -> str | None:
+    return event.get("response_id") or event.get("response", {}).get("id")
+
+
+def _duplex_response_events(events: list[dict], response_id: str, event_type: str) -> list[dict]:
+    return [event for event in events if event["type"] == event_type and _duplex_response_id(event) == response_id]
+
+
+async def _duplex_receive_until(ws, events: list[dict], predicate, *, timeout_s: float = 180) -> None:
+    # One deadline covers the whole operation, including an endless stream that
+    # would otherwise reset a per-recv timeout forever.
+    async def receive() -> None:
+        while not predicate():
+            raw = await ws.recv()
+            assert isinstance(raw, str), "Expected JSON Realtime events"
+            event = json.loads(raw)
+            events.append(event)
+            assert event.get("type") != "error", event
+
+    await asyncio.wait_for(receive(), timeout=timeout_s)
+
+
+async def _duplex_send_pcm(ws, pcm: bytes, *, paced: bool = False, trailing_silence: bool = True) -> None:
+    if trailing_silence:
+        pcm += bytes(24000 * 2)  # One second exceeds the configured 500 ms endpoint.
+    chunk_bytes = 24000 * 2 // 5
+    for offset in range(0, len(pcm), chunk_bytes):
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(pcm[offset : offset + chunk_bytes]).decode(),
+                }
+            )
+        )
+        if paced:
+            await asyncio.sleep(0.2)
+
+
+async def _duplex_add_image(ws) -> None:
+    from PIL import Image
+
+    image = io.BytesIO()
+    Image.new("RGB", (448, 336), (32, 96, 160)).save(image, format="JPEG")
+    await ws.send(
+        json.dumps(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "id": "camera_1",
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/jpeg;base64," + base64.b64encode(image.getvalue()).decode(),
+                        }
+                    ],
+                },
+            }
+        )
+    )
+
+
+@asynccontextmanager
+async def _duplex_recorded_session(runtime, log_path: Path, *, instructions: str, vad: bool = True):
+    events: list[dict] = []
+    server = runtime.server
+    async with websockets.connect(
+        f"ws://{server.host}:{server.port}/v1/realtime?duplex=1", max_size=64 * 1024 * 1024
+    ) as ws:
+        failed = True
+        try:
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "model": server.model,
+                            "instructions": instructions,
+                            "temperature": 0,
+                            "max_output_tokens": 384 if vad else 64,
+                            "audio": {
+                                "input": {
+                                    "format": {"type": "audio/pcm", "rate": 24000},
+                                    "turn_detection": {
+                                        "type": "server_vad",
+                                        "threshold": 0.5,
+                                        "prefix_padding_ms": 300,
+                                        "silence_duration_ms": 500,
+                                        "create_response": True,
+                                        "interrupt_response": True,
+                                    }
+                                    if vad
+                                    else None,
+                                },
+                                "output": {"format": {"type": "audio/pcm", "rate": 24000}},
+                            },
+                        },
+                    }
+                )
+            )
+            await _duplex_receive_until(ws, events, lambda: any(e["type"] == "session.updated" for e in events))
+            session = next(e["session"] for e in events if e["type"] == "session.updated")
+            if vad:
+                accepted = session["audio"]["input"]["turn_detection"]
+                assert accepted["interrupt_response"] is True
+                assert accepted["create_response"] is True
+            await _duplex_add_image(ws)
+            yield ws, events, session["id"]
+            failed = False
+        finally:
+            # Closing the transport alone leaves a resumable session occupying
+            # the deployment's single session slot. Always release the session.
+            try:
+                await ws.send(json.dumps({"type": "session.close"}))
+                await _duplex_receive_until(
+                    ws, events, lambda: any(e["type"] == "session.closed" for e in events), timeout_s=15
+                )
+            except Exception:
+                if not failed:
+                    raise
+            finally:
+                log_path.write_text(json.dumps(events, ensure_ascii=False, indent=2))
+
+
+def _duplex_assert_prompt(
+    runtime,
+    session_id: str,
+    *,
+    audio_count: int,
+    instructions: str,
+    request_count: int,
+    assistant_texts: list[str] | None = None,
+):
+    captures = []
+    for path in runtime.artifacts.glob("*/input.json"):
+        capture = json.loads(path.read_text())
+        if duplex_resource_request_belongs_to_session(capture["request_id"], session_id):
+            captures.append((path.stat().st_mtime_ns, capture))
+    assert len(captures) == request_count, captures
+    capture = max(captures, key=lambda item: item[0])[1]
+    assert capture["audio_count"] == audio_count
+    # The camera belongs to the first user turn and leaves with its audio.
+    image_retained = request_count <= 4
+    assert len(capture["images"]) == int(image_retained)
+    messages: list[dict[str, Any]] = [{"role": "system", "content": instructions}]
+    if assistant_texts is None:
+        assistant_texts = [""] * (audio_count - 1)
+    assert len(assistant_texts) == audio_count - 1
+    for index in range(audio_count):
+        if index:
+            messages.append({"role": "assistant", "content": assistant_texts[index - 1]})
+        parts = [{"type": "image"}] if index == 0 and image_retained else []
+        parts.append({"type": "audio"})
+        messages.append({"role": "user", "content": parts})
+    expected = runtime.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    assert capture["prompt"] == expected
+    # Use the checkpoint tokenizer too: a repr(messages) processor stub cannot
+    # establish that an empty assistant survives as a real turn separator.
+    tokenizer = runtime.processor.tokenizer
+    actual_ids = tokenizer.encode(capture["prompt"], add_special_tokens=False)
+    separator_ids = tokenizer.encode("<|im_start|>assistant\n<|im_end|>\n", add_special_tokens=False)
+    assert sum(
+        actual_ids[index : index + len(separator_ids)] == separator_ids for index in range(len(actual_ids))
+    ) == assistant_texts.count("")
+
+
+def _duplex_assert_completed_audio(events: list[dict], response_id: str) -> None:
+    terminal = _duplex_response_events(events, response_id, "response.done")
+    assert len(terminal) == 1, terminal
+    assert terminal[0]["response"]["status"] == "completed", terminal
+    audio = _duplex_response_events(events, response_id, "response.output_audio.delta")
+    assert sum(len(base64.b64decode(event["delta"])) for event in audio) > 4800
+    assert any(
+        event.get("delta")
+        for event in events
+        if _duplex_response_id(event) == response_id
+        and event["type"] in {"response.output_text.delta", "response.output_audio_transcript.delta"}
+    ), "The follow-up must produce text as well as audio"
+
+
+async def _run_duplex_playback_interruption(runtime, log_path: Path, *, generation_finished: bool) -> None:
+    async with _duplex_recorded_session(runtime, log_path, instructions=_DUPLEX_LONG_INSTRUCTIONS) as (
+        ws,
+        events,
+        session_id,
+    ):
+        await _duplex_send_pcm(ws, _duplex_fixture_pcm(validated_input_wav()))
+        await _duplex_receive_until(ws, events, lambda: any(e["type"] == "response.created" for e in events))
+        old_id = next(_duplex_response_id(e) for e in events if e["type"] == "response.created")
+        assert old_id
+        await _duplex_receive_until(
+            ws,
+            events,
+            lambda: (
+                sum(
+                    len(base64.b64decode(e["delta"]))
+                    for e in _duplex_response_events(events, old_id, "response.output_audio.delta")
+                )
+                > 4800
+            ),
+        )
+        if generation_finished:
+            await _duplex_receive_until(ws, events, lambda: _duplex_response_events(events, old_id, "response.done"))
+        await ws.send(
+            json.dumps({"type": "playback.ack", "response_id": old_id, "played_ms": 100, "committed_ms": 100})
+        )
+        await _duplex_receive_until(ws, events, lambda: any(e["type"] == "playback.acknowledged" for e in events))
+        ack = next(e["event"] for e in events if e["type"] == "playback.acknowledged")
+        assert ack["item_id"] == f"item_{old_id}"
+        assert ack["committed_ms"] == 100
+        assert ack["playback"]["sent_ms"] > 100
+        cursor = len(events)
+        sender = asyncio.create_task(
+            _duplex_send_pcm(ws, _duplex_fixture_pcm(validated_soft_interrupt_wav(), duration_s=4.7), paced=True)
+        )
+        try:
+            await _duplex_receive_until(
+                ws, events, lambda: any(e["type"] == "input_audio_buffer.speech_started" for e in events[cursor:])
+            )
+            speech_index = next(
+                i for i in range(cursor, len(events)) if events[i]["type"] == "input_audio_buffer.speech_started"
+            )
+            if not generation_finished:
+                assert not _duplex_response_events(events[:speech_index], old_id, "response.done"), (
+                    "Generation completed before speech interruption; the in-progress scenario was not exercised"
+                )
+            await _duplex_receive_until(
+                ws,
+                events,
+                lambda: any(e["type"] == "response.done" and _duplex_response_id(e) != old_id for e in events[cursor:]),
+            )
+            await sender
+        finally:
+            sender.cancel()
+            with suppress(asyncio.CancelledError):
+                await sender
+        new_id = next(
+            _duplex_response_id(e)
+            for e in events[cursor:]
+            if e["type"] == "response.created" and _duplex_response_id(e) != old_id
+        )
+    # Include everything observed through session.closed when checking duplicates.
+    terminals = _duplex_response_events(events, old_id, "response.done")
+    assert len(terminals) == 1, terminals
+    assert terminals[0]["response"]["status"] == ("completed" if generation_finished else "cancelled")
+    if generation_finished:
+        cleared = _duplex_response_events(events, old_id, "output_audio_buffer.cleared")
+        assert len(cleared) == 1, cleared
+        boundary = events.index(cleared[0])
+    else:
+        boundary = events.index(terminals[0])
+    assert not _duplex_response_events(events[boundary + 1 :], old_id, "response.output_audio.delta")
+    assert new_id and new_id != old_id
+    _duplex_assert_completed_audio(events, new_id)
+    _duplex_assert_prompt(runtime, session_id, audio_count=2, instructions=_DUPLEX_LONG_INSTRUCTIONS, request_count=2)
+
+
+async def _run_duplex_history_pruning(runtime, log_path: Path) -> None:
+    async with _duplex_recorded_session(runtime, log_path, instructions=_DUPLEX_SHORT_INSTRUCTIONS, vad=False) as (
+        ws,
+        events,
+        session_id,
+    ):
+        response_ids = []
+        heard_texts: list[str] = []
+        pcm = _duplex_fixture_pcm(validated_input_wav())
+        for turn in range(6):
+            cursor = len(events)
+            await _duplex_send_pcm(ws, pcm, trailing_silence=False)
+            await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+            await ws.send(json.dumps({"type": "response.create"}))
+            await _duplex_receive_until(ws, events, lambda: any(e["type"] == "response.done" for e in events[cursor:]))
+            response_id = next(_duplex_response_id(e) for e in events[cursor:] if e["type"] == "response.done")
+            assert response_id and response_id not in response_ids
+            response_ids.append(response_id)
+            _duplex_assert_completed_audio(events, response_id)
+            _duplex_assert_prompt(
+                runtime,
+                session_id,
+                audio_count=min(turn + 1, 4),
+                instructions=_DUPLEX_SHORT_INSTRUCTIONS,
+                request_count=turn + 1,
+                assistant_texts=heard_texts[-3:],
+            )
+            # Complete playback so pruning is checked against real assistant
+            # answers paired with retained user audio. Repeated empty assistant
+            # turns can make Qwen emit EOS; interruption tests cover those slots.
+            done = _duplex_response_events(events, response_id, "response.done")[0]["response"]
+            played_ms = done["metadata"]["playback"]["sent_ms"]
+            heard_texts.append(
+                "".join(
+                    e["delta"]
+                    for e in _duplex_response_events(events, response_id, "response.output_audio_transcript.delta")
+                ).strip()
+            )
+            assert heard_texts[-1]
+            cursor = len(events)
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "playback.ack",
+                        "response_id": response_id,
+                        "played_ms": played_ms,
+                        "committed_ms": played_ms,
+                    }
+                )
+            )
+            await _duplex_receive_until(
+                ws, events, lambda: any(e["type"] == "playback.acknowledged" for e in events[cursor:])
+            )
+            ack = next(e["event"] for e in events[cursor:] if e["type"] == "playback.acknowledged")
+            assert ack["item_id"] == f"item_{response_id}"
+            assert ack["committed_ms"] == ack["playback"]["sent_ms"] == played_ms
+            assert ack["history_committed"] is True
+    for response_id in response_ids:
+        _duplex_assert_completed_audio(events, response_id)
+
+
+@pytest.mark.omni
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
+class TestQwen3OmniDuplexPlayback:
+    @pytest.mark.advanced_model
+    @pytest.mark.parametrize("generation_finished", [False, True], ids=["generating", "queued-playback"])
+    @pytest.mark.parametrize("repetition", range(_DUPLEX_REPEATS_ADVANCED))
+    def test_speech_interrupts_playback(
+        self, qwen_duplex_server, tmp_path: Path, generation_finished: bool, repetition: int
+    ):
+        """Reuse one live deployment; every repetition opens an independent call."""
+        asyncio.run(
+            _run_duplex_playback_interruption(
+                qwen_duplex_server, tmp_path / f"events-{repetition}.json", generation_finished=generation_finished
+            )
+        )
+
+    @pytest.mark.full_model
+    @pytest.mark.parametrize("generation_finished", [False, True], ids=["generating", "queued-playback"])
+    @pytest.mark.parametrize("repetition", range(_DUPLEX_REPEATS_FULL))
+    def test_speech_interrupts_playback_full(
+        self, qwen_duplex_server, tmp_path: Path, generation_finished: bool, repetition: int
+    ):
+        """Same contract as ``test_speech_interrupts_playback``, 20 nightly repeats."""
+        asyncio.run(
+            _run_duplex_playback_interruption(
+                qwen_duplex_server, tmp_path / f"events-{repetition}.json", generation_finished=generation_finished
+            )
+        )
+
+    @pytest.mark.advanced_model
+    def test_mixed_image_audio_history_pruning(self, qwen_duplex_server, tmp_path: Path):
+        asyncio.run(_run_duplex_history_pruning(qwen_duplex_server, tmp_path / "events.json"))

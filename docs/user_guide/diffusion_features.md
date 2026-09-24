@@ -32,6 +32,30 @@ Cache methods trade minimal quality for significant speedup. Quality loss is typ
 | **[TeaCache](diffusion/cache_acceleration/teacache.md)** | Adaptive caching using modulated inputs | Quick setup, balanced quality/speed on single GPU |
 | **[Cache-DiT](diffusion/cache_acceleration/cache_dit.md)** | Multiple caching techniques: DBCache, TaylorSeer, SCM | Fine-grained control, tunable quality-speed tradeoff |
 
+#### Diffusion KV Prefix Caching
+
+[KV prefix caching](../design/feature/prefix_caching.md#diffusion-kv-prefix-caching)
+reuses stable context KV across requests, rather than approximating denoise
+steps. Enable `diffusion_kv_mode: paged_scheduler` and `enable_prefix_caching: true`
+on the HunyuanImage3 standalone DiT stage. This is separate from the AR stage-output
+cache, TeaCache and Cache-DiT.
+
+| Model / combination | Scope |
+|---------------------|-------|
+| HunyuanImage3 standalone DiT | Stable text/reference-image prefix reuse; dynamic image tokens are excluded |
+| TP4/SP1 + EP, CFGP1 | Validated reference-image prefix hits |
+| TP2/SP2 (Ulysses) + EP, CFGP1 | Validated reference-image prefix hits; CFG guidance does not require CFG parallelism |
+| Other SP/TP combinations, CFGP>1 | Prefix-hit E2E accuracy not yet validated |
+| AR-imported KV / cross-stage missing-page transfer | Not covered by local prefix caching |
+| Sleep mode | Rejected with prefix caching; discarded KV pages would leave stale cache hits |
+| TeaCache / Cache-DiT, offload, quantization | Not validated with prefix hits |
+| Step execution | Not supported with HunyuanImage3 paged KV; use request-level execution |
+| Other diffusion models | No prefix-cache model adapter yet |
+
+This table describes prefix-cache scope; the general parallelism tables below do
+not establish prefix-hit compatibility. Floating-point kernel differences still
+require accuracy validation. `dense_legacy` remains the default.
+
 #### Lossless Acceleration
 
 Parallelism methods distribute computation across GPUs without quality loss (mathematically equivalent to single-GPU).
@@ -130,7 +154,7 @@ The following tables show which models support each feature:
 | **Krea 2**               |     ❌     |     ✅      |           ❌           |       ❌        |         ❌         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **LongCat-Image**        |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **LongCat-Image-Edit**   |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
-| **MammothModa2(T2I)**    |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |          ❌          |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
+| **MammothModa2(T2I)**    |     ❌     |     ✅      |           ❌           |       ❌        |         ❌         |          ❌          |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **Nextstep_1(T2I)**      |     ❓     |     ❓      |           ❌           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **OmniGen2**             |     ❌     |     ✅      |           ✅           |       ❌        |         ✅         |          ❌          |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **Ovis-Image**           |     ❌     |     ✅      |           ❌           |       ✅        |         ❌         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
@@ -154,6 +178,7 @@ The following tables show which models support each feature:
 > 4. Krea 2 currently supports single-GPU inference plus LoRA, Cache-DiT, HSDP, CPU/layerwise offload, and VAE-patch-parallel (decode). TP/SP/CFG-Parallel are not yet wired. The few-step distilled (Turbo) checkpoint uses `is_distilled=true` (fixed timestep shift `mu=1.15`); generate at 2048x2048 by default with `num_inference_steps≈8` and `guidance_scale=0`. The Raw checkpoint uses 1024x1024, `num_inference_steps=28`, and `guidance_scale=4.5`.
 > 5. HunyuanImage3 supports step execution. Multi-request step execution requires `TORCH_SDPA`; see [Diffusion Execution Modes](diffusion/execution_modes.md#step-execution).
 > 6. BAGEL step execution supports image generation with `bagel.yaml`, `bagel_think.yaml`, and `bagel_single_stage.yaml`; two-stage Thinker execution and explicit single-stage text output remain on their existing complete-request paths. Image requests require `num_inference_steps >= 2`. BAGEL step execution cannot currently be combined with sequence parallelism or a diffusion cache backend; see [Diffusion Execution Modes](diffusion/execution_modes.md#step-execution).
+> 7. MammothModa2 runs its DiT stage on the diffusion runner (`StageExecutionType.DIFFUSION`); Cache-DiT is enabled through the standard diffusion-stage knobs on the stage entry of the deploy YAML (`cache_backend: cache_dit`, plus optional `cache_config` / `enable_cache_dit_summary`). The runner installs the backend at startup and the pipeline adopts it per request. Only the repeated main-layer stack is cached; requests with `text_guidance_scale = 1.0` bypass the cache hooks.
 
 ### VideoGen
 
@@ -247,9 +272,11 @@ The Diffusion Acceleration navigation groups the remaining guides as follows:
 | Compatibility | [Feature Compatibility](feature_compatibility.md) |
 | CPU offloading | [CPU Offloading](diffusion/cpu_offload.md) |
 | Cache acceleration | [TeaCache](diffusion/cache_acceleration/teacache.md), [Cache-DiT](diffusion/cache_acceleration/cache_dit.md) |
+| KV cache paging | [Scheduler-Managed Paged KV Cache](diffusion/paged_kv_cache.md) |
 | Parallelism | [Parallelism Overview](diffusion/parallelism/overview.md) |
 | Attention | [Attention Backends](diffusion/attention_backends.md) |
 | Compilation | [Regional Compilation](diffusion/regional_compilation.md) |
+| VAE decode | [Wan VAE Decoder Fast Path](diffusion/vae_fast_path.md) |
 | Video extension | [Frame Interpolation](diffusion/frame_interpolation.md) |
 | Startup | [Startup and Loading](diffusion/startup_and_loading.md) |
 | Adapters | [LoRA](diffusion/lora.md) |

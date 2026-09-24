@@ -23,6 +23,7 @@ from vllm_omni.diffusion.forward_context import (
 )
 from vllm_omni.platforms import current_omni_platform
 
+from .latent_mask import MiniMaxH3LatentEdit, minimax_h3_prepare_edit_rows
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_euler_eta0_step,
     minimax_h3_rf_v_to_x0,
@@ -86,6 +87,7 @@ class MiniMaxH3DenoiseBranch:
             raise ValueError(f"token_tags length {int(token_tags.view(-1).shape[0])} != seq_len {seq_len}")
         cu = packed["cu_seqlens"].to(torch.int32)
         self.device = device
+        self.locked_audio_rows: torch.Tensor | None = None
         # ``used_len`` is the real (non-padding) document length; step-mode
         # batching concatenates layouts and needs both bounds as Python ints so
         # it can rebuild ``cu_seqlens`` without a device sync per step.
@@ -185,25 +187,23 @@ class MiniMaxH3DenoiseBranch:
         t_audio: float,
         imgvid_cond_timestep: float,
         audio_ref_cond_timestep: float,
+        video_target_timesteps: torch.Tensor | None = None,
+        audio_target_timesteps: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         x = self.x_base.clone()
         x[0].index_copy_(0, self.img_pos_dev, video_rows)
         audio_x = self.audio_x_base.clone()
         audio_x[0].index_copy_(0, self.audio_pos_dev, audio_rows)
-        # Packed-sequence timestep semantics: non-media rows (text and
-        # padding) inherit the current video timestep. Later steps must reuse
-        # the previous step's updated rows; re-initializing from zeros is only
-        # valid at step 0.
-        timesteps = torch.full(
-            (self.seq_len,),
-            float(t_video),
-            dtype=torch.float32,
-            device=x.device,
+        timesteps = torch.empty(self.seq_len, dtype=torch.float32, device=self.device)
+        self.fill_timesteps(
+            timesteps,
+            t_video=t_video,
+            t_audio=t_audio,
+            imgvid_cond_timestep=imgvid_cond_timestep,
+            audio_ref_cond_timestep=audio_ref_cond_timestep,
+            video_target_timesteps=video_target_timesteps,
+            audio_target_timesteps=audio_target_timesteps,
         )
-        timesteps[self.img_pos_dev[self.update_mask_dev]] = t_video
-        timesteps[self.img_pos_dev[~self.update_mask_dev]] = imgvid_cond_timestep
-        timesteps[self.audio_pos_dev[self.audio_update_mask_dev]] = t_audio
-        timesteps[self.audio_pos_dev[~self.audio_update_mask_dev]] = audio_ref_cond_timestep
         unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
         return {
             **self.static_kwargs,
@@ -212,6 +212,56 @@ class MiniMaxH3DenoiseBranch:
             "unique_timesteps": unique_timesteps,
             "inverse_indices": inverse_indices,
         }
+
+    def fill_timesteps(
+        self,
+        timesteps: torch.Tensor,
+        *,
+        t_video: float,
+        t_audio: float,
+        imgvid_cond_timestep: float,
+        audio_ref_cond_timestep: float,
+        video_target_timesteps: torch.Tensor | None = None,
+        audio_target_timesteps: torch.Tensor | None = None,
+    ) -> None:
+        """Fill one request's packed row timesteps in an existing tensor."""
+        if timesteps.shape != (self.seq_len,):
+            raise ValueError(f"timesteps must have shape ({self.seq_len},)")
+        # Packed-sequence timestep semantics: non-media rows (text and
+        # padding) inherit the current video timestep. Later steps must reuse
+        # the previous step's updated rows; re-initializing from zeros is only
+        # valid at step 0.
+        timesteps.fill_(float(t_video))
+        timestep_groups = (
+            (
+                "video_target_timesteps",
+                self.img_pos_dev,
+                self.update_mask_dev,
+                video_target_timesteps,
+                t_video,
+                imgvid_cond_timestep,
+            ),
+            (
+                "audio_target_timesteps",
+                self.audio_pos_dev,
+                self.audio_update_mask_dev,
+                audio_target_timesteps,
+                t_audio if self.locked_audio_rows is None else 1.0,
+                audio_ref_cond_timestep,
+            ),
+        )
+        for name, positions, update_mask, target_timesteps, current_timestep, condition_timestep in timestep_groups:
+            target_positions = positions[update_mask]
+            if target_timesteps is None:
+                timesteps[target_positions] = current_timestep
+            else:
+                target_timesteps = target_timesteps.to(device=self.device, dtype=torch.float32).reshape(-1)
+                if target_timesteps.shape[0] != target_positions.shape[0]:
+                    raise ValueError(
+                        f"{name} rows {target_timesteps.shape[0]} != target rows {target_positions.shape[0]}"
+                    )
+                timesteps[target_positions] = target_timesteps
+            timesteps[positions[~update_mask]] = condition_timestep
 
 
 def minimax_h3_prepare_denoise_rows(
@@ -273,6 +323,8 @@ def minimax_h3_denoise_loop(
     initial_audio_rows: torch.Tensor,
     keyframe_cond_rows: torch.Tensor | None,
     audio_ref_rows: torch.Tensor | None = None,
+    video_edit: MiniMaxH3LatentEdit | None = None,
+    audio_edit: MiniMaxH3LatentEdit | None = None,
     sigmas_video: list[float],
     sigmas_audio: list[float],
     device: torch.device,
@@ -307,6 +359,10 @@ def minimax_h3_denoise_loop(
     )
     update = positive.update_mask_dev
     audio_update = positive.audio_update_mask_dev
+    if video_edit is not None:
+        video_edit = video_edit.to(device=device, dtype=torch.float32)
+    if audio_edit is not None:
+        audio_edit = audio_edit.to(device=device, dtype=torch.float32)
 
     num_steps = len(sigmas_video) - 1
     for step in range(num_steps):
@@ -323,40 +379,73 @@ def minimax_h3_denoise_loop(
             imgvid_cond_t = max(t_v, float(imgvid_cond_noise_aug_for_inference))
             audio_ref_cond_t = max(t_a, float(audio_cond_noise_aug_for_inference))
 
+            model_video_rows, video_target_timesteps = minimax_h3_prepare_edit_rows(
+                video_rows,
+                update,
+                video_edit,
+                t_v,
+                imgvid_cond_t,
+                sigma=s_v,
+            )
+            model_audio_rows, audio_target_timesteps = minimax_h3_prepare_edit_rows(
+                audio_rows,
+                audio_update,
+                audio_edit,
+                t_a,
+                audio_ref_cond_t,
+                sigma=s_a,
+            )
+
             fk = positive.forward_kwargs(
-                video_rows=video_rows,
-                audio_rows=audio_rows,
+                video_rows=model_video_rows,
+                audio_rows=model_audio_rows,
                 t_video=t_v,
                 t_audio=t_a,
                 imgvid_cond_timestep=imgvid_cond_t,
                 audio_ref_cond_timestep=audio_ref_cond_t,
+                video_target_timesteps=video_target_timesteps,
+                audio_target_timesteps=audio_target_timesteps,
             )
             with torch.inference_mode():
                 v_video, v_audio = model(**fk)
             mv_video_t = v_video.float()[update]
             mv_audio_t = v_audio.float()[audio_update]
 
-            x0_video = minimax_h3_rf_v_to_x0(
-                video_rows[update],
-                mv_video_t,
-                torch.tensor(t_v, dtype=torch.float32, device=device),
-            )
+            if video_edit is None:
+                x0_video = minimax_h3_rf_v_to_x0(
+                    video_rows[update],
+                    mv_video_t,
+                    torch.tensor(t_v, dtype=torch.float32, device=device),
+                )
+            else:
+                x0_video = video_edit.x0(
+                    model_video_rows[update],
+                    mv_video_t,
+                    t_v,
+                )
             new_target = minimax_h3_euler_eta0_step(video_rows[update], x0_video, sigma_curr=s_v, sigma_next=s_v_next)
             video_rows = video_rows.clone()
             video_rows[update] = new_target
             if cond_anchor is not None:
                 video_rows[~update] = cond_anchor  # per-step imgvid cond reset
 
-            x0_audio = minimax_h3_rf_v_to_x0(
-                audio_rows[audio_update],
-                mv_audio_t,
-                torch.tensor(t_a, dtype=torch.float32, device=device),
-            )
+            if audio_edit is None:
+                x0_audio = minimax_h3_rf_v_to_x0(
+                    audio_rows[audio_update],
+                    mv_audio_t,
+                    torch.tensor(t_a, dtype=torch.float32, device=device),
+                )
+            else:
+                x0_audio = audio_edit.x0(
+                    model_audio_rows[audio_update],
+                    mv_audio_t,
+                    t_a,
+                )
             new_audio = minimax_h3_euler_eta0_step(
                 audio_rows[audio_update], x0_audio, sigma_curr=s_a, sigma_next=s_a_next
             )
             audio_rows = audio_rows.clone()
-            audio_rows[audio_update] = new_audio
+            audio_rows[audio_update] = new_audio if positive.locked_audio_rows is None else positive.locked_audio_rows
             if audio_anchor is not None:
                 audio_rows[~audio_update] = audio_anchor  # per-step audio ref reset
             if on_step is not None:

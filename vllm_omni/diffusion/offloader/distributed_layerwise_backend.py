@@ -53,8 +53,7 @@ from .host_registration import (
     HostRegistrationError,
     register_host_mappings,
 )
-from .offload_plan import OffloadPlan
-from .plan_resolver import ResolvedComponent, resolve_offload_plan
+from .plan_resolver import BlockStack, ResolvedComponent, resolve_offload_plan
 from .tensor_utils import (
     clear_block_storage,
     clear_tensor_storage,
@@ -111,7 +110,6 @@ def _forget_active_hwr_registration(
 # use layerwise offload (streaming hooks) or be moved to GPU as a resident
 # module.  Submodules larger than this are offloaded to save HBM; smaller
 # ones stay resident for lower latency.
-_ON_DEMAND_THRESHOLD_MB = 1024
 
 
 class DistributedLayerwiseOffloadHook(ModelHook):
@@ -1182,7 +1180,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
     def _load_weights_via_mmap(
         self,
         pipeline: nn.Module,
-        modules,
+        dits: tuple[ResolvedComponent, ...],
         plan: HostWeightPlan,
     ) -> None:
         """Load DiT checkpoint tensors as file-backed safetensors views.
@@ -1226,7 +1224,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # converts the child's buffers too.  So we must save ALL buffers
         # from ALL DiT modules BEFORE any to_empty call.
         saved_buffers: dict[int, dict[str, torch.Tensor]] = {}
-        for dit_module in modules.dits:
+        for dit_module in (component.module for component in dits):
             bufs: dict[str, torch.Tensor] = {}
             for name, buf in dit_module.named_buffers():
                 # Check if this buffer is non-persistent on its OWNING module
@@ -1246,7 +1244,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # Skip modules that are already meta (happens when a parent DiT
         # module contains a child DiT module — to_empty on the parent
         # already converted the child).
-        for dit_module in modules.dits:
+        for dit_module in (component.module for component in dits):
             if any(p.is_meta for p in dit_module.parameters()):
                 logger.info(
                     "%s already on meta device (skipping to_empty, %d buffers saved)",
@@ -1307,7 +1305,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # assigning checkpoint tensors. The mmap path bypasses that loader, so
         # preserve the same lifecycle for transforms such as Cosmos3's fp32
         # timestep embedder.
-        for dit_name, dit_module in zip(modules.dit_names, modules.dits):
+        for dit_name, dit_module in ((component.path, component.module) for component in dits):
             # Restore non-persistent buffers before post-load hooks and strict
             # validation. They are constructor-derived and intentionally have
             # no checkpoint binding.
@@ -1352,7 +1350,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             self._mmap_transforms_by_tensor_id[id(target)] = binding.transform
 
         remaining_meta: list[str] = []
-        for dit_name, dit_module in zip(modules.dit_names, modules.dits):
+        for dit_name, dit_module in ((component.path, component.module) for component in dits):
             remaining_meta.extend(
                 f"{dit_name}.{name}" for name, tensor in dit_module.named_parameters() if tensor.is_meta
             )
@@ -1517,73 +1515,26 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         )
         return True
 
-    def _try_layerwise_offload_submodule(self, module: nn.Module, name: str, plan: OffloadPlan | None = None) -> bool:
-        """Try to apply layerwise offload to a large submodule's blocks.
-        Resolution order:
-        1. OffloadPlan.offload_submodules (declarative, if plan is provided)
-        2. Heuristic search for common block-list attributes
-
-        Returns True if layerwise offload was applied, False otherwise.
-        """
-        from operator import attrgetter
-
-        blocks = None
-        blocks_attr = None
-
-        # 1. Check OffloadPlan first (declarative — no guessing)
-        if plan is not None and name in plan.offload_submodules:
-            attr_name = plan.offload_submodules[name]
-            try:
-                candidate = attrgetter(attr_name)(module)
-                if isinstance(candidate, nn.ModuleList) and len(candidate) > 1:
-                    blocks = candidate
-                    blocks_attr = attr_name
-            except AttributeError:
-                logger.warning(
-                    "OffloadPlan declared block attr '%s' for submodule '%s' "
-                    "but attribute not found — falling back to heuristic",
-                    attr_name,
-                    name,
-                )
-
-        # 2. Fallback: heuristic search
-        if blocks is None:
-            for attr_name in ("layers", "blocks", "h", "model.layers"):
-                try:
-                    candidate = attrgetter(attr_name)(module)
-                except AttributeError:
-                    continue
-                if isinstance(candidate, nn.ModuleList) and len(candidate) > 1:
-                    blocks = candidate
-                    blocks_attr = attr_name
-                    break
-
-        if blocks is None:
-            return False
-
+    def _offload_nested_submodule(self, component: ResolvedComponent) -> None:
+        """Stream one resolved DiT submodule through its own hook ring."""
+        stack = component.stacks[0]
         logger.info(
             "Distributed layerwise offload for submodule '%s.%s' (%d blocks, %.0f MB total, group_size=%d)",
-            name,
-            blocks_attr,
-            len(blocks),
-            sum(p.nelement() * p.element_size() for p in module.parameters()) / 1048576,
+            component.path,
+            stack.attrs[0],
+            len(stack.blocks),
+            sum(p.nelement() * p.element_size() for p in component.module.parameters()) / 1048576,
             self._component_transport(DIT_COMPONENT)[1],
         )
-
-        # Move non-block parts of the submodule to GPU (small: embeddings, norms)
-        for child_name, child in module.named_children():
-            if child_name != blocks_attr:
-                child.to(self.device)
-
-        self._install_hook_group(blocks, DIT_COMPONENT, use_dit_mmap=True)
-        return True
+        # Keep the submodule's own non-block state resident by block identity,
+        # so an attribute aliasing a streamed block is not placed with it.
+        move_non_block_state_to_device(component.module, (stack.blocks,), self.device)
+        self._install_hook_group(stack.blocks, DIT_COMPONENT, use_dit_mmap=True)
 
     def _prepare_dit_non_block_modules(
         self,
-        dit_module: nn.Module,
-        blocks_attr_names: list[str],
-        all_dit_modules: set[int],
-        plan: OffloadPlan | None,
+        component: ResolvedComponent,
+        stack: BlockStack,
     ) -> None:
         """Place or hook the DiT parts that are outside its repeated blocks.
 
@@ -1591,28 +1542,23 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         an all-resident stage skips placement for modules such as H3's token
         refiner and enters the forward pass with CPU or meta tensors.
         """
+        dit_module = component.module
+        nested = {child.path.rsplit(".", 1)[-1]: child for child in component.children}
         for name, module in dit_module.named_children():
-            if name in blocks_attr_names:
+            if name in stack.attrs:
                 logger.debug("Skipped blocks module %s", name)
                 continue
 
-            module_mb = (
-                sum(
-                    param.nelement() * param.element_size() if not getattr(param, "is_meta", False) else 0
-                    for param in module.parameters()
-                )
-                / 1048576
-            )
-            explicitly_planned = plan is not None and name in plan.offload_submodules
-            if explicitly_planned or module_mb > _ON_DEMAND_THRESHOLD_MB:
-                if id(module) in all_dit_modules:
+            child = nested.get(name)
+            if child is not None:
+                if not child.selected:
                     logger.info("Submodule '%s' is already a DiT module, skipping layerwise offload", name)
-                elif self._try_layerwise_offload_submodule(module, name, plan):
-                    pass
+                elif child.stacks:
+                    self._offload_nested_submodule(child)
                 else:
                     prepare_component(
-                        module,
-                        name,
+                        child.module,
+                        child.path,
                         device=self.device,
                         stage_on_demand=True,
                         blockwise=False,
@@ -1715,7 +1661,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             elif host_weight_plan.backing_kind == "checkpoint_mmap":
                 self._load_weights_via_mmap(
                     pipeline,
-                    resolved.modules,
+                    resolved.dits,
                     host_weight_plan,
                 )
             else:
@@ -1750,15 +1696,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             enable_encoder_blocks=self._try_layerwise_offload_encoder,
         )
 
-        if self.config.offloads(DIT_COMPONENT):
+        if any(component.selected for component in resolved.dits):
             logger.info(
                 "Applying distributed layer-wise offloading on %s",
                 [component.path for component in resolved.dits],
             )
-
-        # Collect all DiT module objects to detect submodules that are
-        # already handled as a separate DiT module (avoids duplicate hooks).
-        all_dit_modules = set(id(component.module) for component in resolved.dits)
 
         # Apply hooks for each DiT module
         for component, stack in iter_streamable_dits(resolved, self.device):
@@ -1772,12 +1714,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     len(streaming),
                 )
 
-            self._prepare_dit_non_block_modules(
-                component.module,
-                list(stack.attrs),
-                all_dit_modules,
-                resolved.declaration,
-            )
+            self._prepare_dit_non_block_modules(component, stack)
 
             if not streaming:
                 logger.info("All blocks for %s are resident; no streaming hooks required", component.path)
@@ -1804,11 +1741,6 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             self.enabled = bool(self._resident_blocks or self._encoder_modules or self._staged_components)
             if self._using_mmap and not self.enabled:
                 self._release_mmap_handles()
-            if not self.enabled and not self.config.offloads(DIT_COMPONENT):
-                raise ValueError(
-                    "None of the selected distributed layerwise offload components have "
-                    "a model-declared streamable or on-demand plan"
-                )
             return
 
         # Unified allocation: 2 shared output buffers + 2 shared shard buffers

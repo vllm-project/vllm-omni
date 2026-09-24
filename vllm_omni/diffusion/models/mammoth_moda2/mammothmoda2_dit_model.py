@@ -695,8 +695,16 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         return text_hidden_states, img_tokens
 
     def _apply_transformer_layers(self, hidden_states, attention_mask, rotary_emb, temb):
+        # Call blocks with keyword arguments: Cache-DiT's Pattern_3 wrapper
+        # re-invokes blocks as block(hidden_states, **kwargs), so the cached
+        # and uncached paths share this exact calling convention.
         for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask, rotary_emb, temb)
+            hidden_states = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                image_rotary_emb=rotary_emb,
+                temb=temb,
+            )
         return hidden_states
 
     def forward(

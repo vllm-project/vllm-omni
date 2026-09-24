@@ -108,7 +108,7 @@ CHECK_IMPORTS = {
             "setup.py",
             "vllm_omni/benchmarks/data_modules/daily_omni_eval.py",
             "vllm_omni/config/stage_config.py",
-            "vllm_omni/diffusion/layers/mot/ops/mot_gemm.py",
+            "vllm_omni/diffusion/models/bagel/mot/ops/mot_gemm.py",
             "vllm_omni/diffusion/model_loader/diffusers_loader.py",
             "vllm_omni/diffusion/models/diffusers_adapter/pipeline_diffusers_adapter.py",
             "vllm_omni/diffusion/models/dreamid_omni/fusion.py",

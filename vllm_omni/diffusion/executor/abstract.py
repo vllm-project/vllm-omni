@@ -1,13 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from concurrent.futures import Future
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.outputs import KVConnectorOutput
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.sched.interface import CachedRequestData
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -126,6 +133,20 @@ class DiffusionExecutor(ABC):
         """
         return None
 
+    def wait_output_ready(self, async_output_id: str) -> Future[DiffusionOutput]:
+        """Resolve deferred output; only asynchronous executors implement this."""
+        raise NotImplementedError(f"{type(self).__name__} does not support asynchronous output")
+
+    def drop_output(self, async_output_id: str) -> None:
+        """Reclaim an async output that will never be waited on (e.g. an
+        aborted request).
+
+        Only executors with an async output path (result pump) cache outputs
+        that a consumer must later claim; executors without one have nothing to
+        reclaim and can keep the default no-op implementation.
+        """
+        return None
+
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         """Collect rank-local native specs after every Worker loads its model."""
 
@@ -159,7 +180,7 @@ class DiffusionExecutor(ABC):
         # ranks are not silently dropped.
         self.collective_rpc("set_kv_cache_configs", args=(kv_cache_configs, resolved_max_model_len))
 
-    def remove_diffusion_kv_requests(self, request_ids: list[str]) -> None:
+    def remove_diffusion_kv_requests(self, request_ids: list[str | tuple[str, int]]) -> None:
         """Clear request rows on every Worker after Scheduler retirement."""
 
         unique_request_ids = list(dict.fromkeys(request_ids))
@@ -169,6 +190,67 @@ class DiffusionExecutor(ABC):
             "remove_diffusion_kv_requests",
             args=(unique_request_ids,),
         )
+
+    def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput) -> KVConnectorOutput | None:
+        if scheduler_output.kv_prefetch_connector_metadata is not None:
+            current = replace(
+                scheduler_output,
+                kv_transfer_request_ids=scheduler_output.kv_transfer_request_ids
+                - scheduler_output.kv_prefetch_request_ids,
+                kv_prefetch_connector_metadata=None,
+                kv_prefetch_request_ids=set(),
+            )
+            # First complete the current request on every rank. Only then
+            # submit B, preventing Mooncake from coalescing its bytes with A.
+            self.prepare_kv_for_forward(current)
+            return self.prepare_kv_for_forward(
+                replace(
+                    current,
+                    kv_connector_metadata=scheduler_output.kv_prefetch_connector_metadata,
+                    kv_transfer_request_ids=scheduler_output.kv_prefetch_request_ids,
+                    kv_required_request_ids=set(),
+                    kv_finished_request_ids=set(),
+                )
+            )
+        if (
+            scheduler_output.kv_connector_metadata is None
+            and not scheduler_output.kv_required_request_ids
+            and not scheduler_output.kv_poll_only
+        ):
+            return None
+        transfer_output = replace(
+            scheduler_output,
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            kv_prefetch_job=None,
+        )
+        outputs: list[KVConnectorOutput] = self.collective_rpc(
+            "prepare_kv_for_forward",
+            args=(transfer_output,),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+        if len(outputs) != self.od_config.num_gpus or any(output.invalid_block_ids for output in outputs):
+            # Missing ranks / invalid pages cannot establish safe ownership.
+            raise RuntimeError("Diffusion KV receive failed on one or more ranks")
+        if scheduler_output.kv_required_request_ids is not None:
+            # Prefetch workers retain completion events until retirement.
+            # Their cumulative snapshots can be intersected directly.
+            finished = set.intersection(*(set(output.finished_recving or ()) for output in outputs))
+            if not scheduler_output.kv_required_request_ids.issubset(finished):
+                raise RuntimeError("Required diffusion KV receive did not complete on every rank")
+            outputs[0].finished_recving = finished
+            return outputs[0]
+        completed = getattr(self, "_kv_receive_completed_ranks", {})
+        for rank, output in enumerate(outputs):
+            for request_id in output.finished_recving or ():
+                completed.setdefault(request_id, set()).add(rank)
+        finished = {request_id for request_id, ranks in completed.items() if len(ranks) == len(outputs)}
+        for request_id in finished:
+            del completed[request_id]
+        self._kv_receive_completed_ranks = completed
+        outputs[0].finished_recving = finished
+        return outputs[0]
 
     @abstractmethod
     def shutdown(self) -> None:

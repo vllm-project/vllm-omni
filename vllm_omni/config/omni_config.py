@@ -18,6 +18,7 @@ from inspect import Parameter, signature
 from pathlib import Path
 from typing import Any, Literal, TypeAlias, TypedDict, cast
 
+import regex as re
 from pydantic import ConfigDict, Field, field_validator, model_validator
 from typing_extensions import Self
 from vllm.config import CacheConfig as VllmCacheConfig
@@ -43,6 +44,7 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
     StageType,
+    _apply_diffusion_parallel_runtime_overrides,
     _apply_platform_overrides,
     _get_recursively_merged_dict,
     _resolve_scheduler,
@@ -73,10 +75,14 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
     {
         "async_chunk",
         "disable_log_stats",
+        "command",
+        "headless",
         "model",
+        "model_tag",
         "omni",
         "output_modalities",
         "stage_id",
+        "subparser",
         "tokenizer",
     }
 )
@@ -93,6 +99,8 @@ _LEGACY_STAGE_METADATA_EXTRA_FIELDS = frozenset(
 )
 
 _QuantizationConfigType: TypeAlias = QuantizationConfig | str | Mapping[str, Any] | None
+
+_DIFFUSION_SHARED_ONLY_ENGINE_FIELDS = frozenset({"kv_cache_dtype", "seed"})
 
 
 class _QuantizationEngineOverrides(TypedDict, total=False):
@@ -162,7 +170,10 @@ class _ModelEngineOverrides(TypedDict, total=False):
     limit_mm_per_prompt: dict[str, Any]
     interleave_mm_strings: bool
     media_io_kwargs: dict[str, Any]
+    final_output: bool
     active_stream_window: int
+    use_v2_model_runner: bool
+    supports_native_mrv2_data_plane: bool
     enable_sleep_mode: bool
     subtalker_sampling_params: dict[str, Any]
     silence_ban_frames: int
@@ -263,6 +274,7 @@ class _ParallelEngineOverrides(_ParallelConfigEngineOverrides, total=False):
 
 class _ConnectorEngineOverrides(TypedDict, total=False):
     omni_kv_config: dict[str, Any]
+    kv_transfer_config: KVTransferConfig | dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -288,10 +300,6 @@ class _DiffusionEngineOverrides:
     """Validated diffusion projection of legacy flat per-stage engine args."""
 
     _values: dict[str, Any]
-
-    @classmethod
-    def from_engine(cls, engine: Mapping[str, Any]) -> _DiffusionEngineOverrides:
-        return cls(_select_engine_overrides(engine, _DIFFUSION_STAGE_ENGINE_FIELDS))
 
     def to_kwargs(self) -> dict[str, Any]:
         return {name: _copy_value(value) for name, value in self._values.items()}
@@ -328,6 +336,8 @@ def _first_defined(*values: Any) -> Any:
 
 def _validate_async_chunk_support(pipeline: PipelineConfig, deploy: DeployConfig) -> None:
     has_inter_stage_edges = any(stage.input_sources for stage in pipeline.stages)
+    if deploy.async_chunk and any(stage.engine_extras.get("kv_transfer_config") for stage in deploy.stages):
+        raise ValueError("Native AR-to-DiT KV transfer requires async_chunk=False.")
     if (
         deploy.async_chunk
         and has_inter_stage_edges
@@ -358,12 +368,32 @@ def _stage_cli_overrides(
     *,
     execution_type: StageExecutionType | None = None,
 ) -> dict[str, Any]:
+    if execution_type == StageExecutionType.DIFFUSION:
+        stage_override_pattern = re.compile(r"^stage_\d+_")
+        stage_scoped = {
+            name: _copy_value(value) for name, value in cli_overrides.items() if stage_override_pattern.match(name)
+        }
+        global_inputs = {name: _copy_value(value) for name, value in cli_overrides.items() if name not in stage_scoped}
+        cli_overrides = {
+            **normalize_and_validate_diffusion_engine_ingress_kwargs(
+                global_inputs,
+                stage_id=stage_id,
+            ),
+            **stage_scoped,
+        }
     runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
     global_stage_fields = _global_stage_cli_fields()
     owned_fields = None if execution_type is None else _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
     result: dict[str, Any] = {}
     for key, value in runtime_overrides.items():
-        stage_specific = f"stage_{stage_id}_{key}" in cli_overrides
+        stage_key = f"stage_{stage_id}_{key}"
+        stage_specific = stage_key in cli_overrides
+        if (
+            execution_type == StageExecutionType.DIFFUSION
+            and key in _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
+            and not stage_specific
+        ):
+            continue
         if stage_specific or (key in global_stage_fields and (owned_fields is None or key in owned_fields)):
             result[key] = _copy_value(value)
 
@@ -371,6 +401,19 @@ def _stage_cli_overrides(
     # argument. Keep global and stage-scoped CLI values off AR/generation stages.
     if execution_type is not None and execution_type is not StageExecutionType.DIFFUSION:
         result.pop("step_execution", None)
+    if execution_type == StageExecutionType.DIFFUSION:
+        prefix = f"stage_{stage_id}_"
+        for key, value in cli_overrides.items():
+            if key.startswith(prefix):
+                field_name = key.removeprefix(prefix)
+                if field_name in {"model", "model_arch", "stage_id"}:
+                    raise ValueError(f"Diffusion stage {stage_id} cannot override identity field {field_name!r}.")
+                if field_name in _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS:
+                    raise ValueError(
+                        f"Diffusion stage {stage_id} cannot override shared engine field {field_name!r}; "
+                        "it has no diffusion stage-config consumer."
+                    )
+                result.setdefault(field_name, _copy_value(value))
     return result
 
 
@@ -386,6 +429,10 @@ def _validate_global_stage_cli_ownership(
         field for stage in pipeline.stages for field in _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[stage.execution_type]
     }
     unowned_fields = explicit_global_fields - owned_fields
+    if any(stage.execution_type == StageExecutionType.DIFFUSION for stage in pipeline.stages):
+        # Mixed engine ingress accepts these shared globals, but diffusion
+        # stages deliberately leave them outside their terminal config.
+        unowned_fields -= _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
     if unowned_fields:
         names = ", ".join(sorted(unowned_fields))
         raise ValueError(
@@ -449,9 +496,12 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     # MiniCPM interleaved AV packing and media decode knobs (Daily-Omni).
     interleave_mm_strings: bool | None = None
     media_io_kwargs: dict[str, Any] | None = None
+    final_output: bool = False
     active_stream_window: int = Field(default=0, ge=0)
     session_mode: str = "turn"
     duplex_max_sessions: int = Field(default=1, ge=1)
+    use_v2_model_runner: bool = False
+    supports_native_mrv2_data_plane: bool = False
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
@@ -564,6 +614,7 @@ class OmniStageConnectorConfig:
 
     async_chunk: bool = False
     omni_kv_config: dict[str, Any] | None = None
+    kv_transfer_config: KVTransferConfig | None = None
     stage_connector: dict[str, Any] = field(
         default_factory=lambda: {
             "name": "SharedMemoryConnector",
@@ -735,7 +786,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
             self.world_size = other_parallel_world_size
 
 
-@config(config=ConfigDict(arbitrary_types_allowed=True))
+@config(config=ConfigDict(arbitrary_types_allowed=True, extra="forbid"))
 class _DiffusionConfigProjection:
     """Diffusion-specific per-stage settings.
 
@@ -773,6 +824,7 @@ class _DiffusionConfigProjection:
     video_output_transport: object = field(default_factory=dict)
     enable_cache_dit_summary: bool = False
     diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
+    enable_prefix_caching: bool = False
     diffusion_kv_max_rows_per_request: int | None = Field(default=None, ge=1, strict=True)
     enable_prompt_embed_cache: bool = False
     prompt_embed_cache_size: int = Field(default=32, ge=1)
@@ -803,6 +855,7 @@ class _DiffusionConfigProjection:
     fa_deterministic: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    vae_fast_path: Literal["off", "lossless", "channels_last"] = "lossless"
     mask_strategy_file_path: str | None = None
     skip_time_steps: int = 15
     VSA_sparsity: float = 0.0
@@ -835,6 +888,9 @@ class _DiffusionConfigProjection:
     custom_pipeline_args: dict[str, Any] | None = None
     additional_config: dict[str, Any] = field(default_factory=dict)
     kv_transfer_config: KVTransferConfig | None = None
+    # Full stage-payload transport, independent of native paged KV transfer.
+    stage_input_payload_keys: tuple[str, ...] = ()
+    stage_output_payload_keys: tuple[str, ...] = ()
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
     quantization_config: _QuantizationConfigType = None
@@ -851,15 +907,19 @@ class _DiffusionConfigProjection:
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> _DiffusionConfigProjection:
-        from vllm_omni.diffusion.data import normalize_omni_diffusion_kwargs
+        from vllm_omni.diffusion.data import (
+            normalize_omni_diffusion_kwargs,
+            validate_omni_diffusion_kwargs,
+        )
         from vllm_omni.diffusion.offloader.config import parse_diffusion_offload_config
 
-        config_kwargs = normalize_omni_diffusion_kwargs(kwargs)
+        valid_fields = frozenset(f.name for f in fields(cast(Any, cls)))
+        normalized = normalize_omni_diffusion_kwargs(kwargs)
+        validate_omni_diffusion_kwargs(normalized, valid_fields)
         # Validate before stage construction while retaining the raw mapping
         # needed by dataclass/config serialization across process boundaries.
-        parse_diffusion_offload_config(config_kwargs.get("diffusion_offload_config"))
-        valid_fields = {f.name for f in fields(cast(Any, cls))}
-        return cls(**{k: v for k, v in config_kwargs.items() if k in valid_fields})
+        parse_diffusion_offload_config(normalized.get("diffusion_offload_config"))
+        return cls(**{name: value for name, value in normalized.items() if value is not None})
 
     def __post_init__(self) -> None:
         # Keep diffusion imports lazy so importing vllm_omni.config does not
@@ -944,6 +1004,11 @@ class _DiffusionConfigProjection:
             )
 
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
+        if self.enable_prefix_caching and self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+            raise ValueError(
+                "enable_prefix_caching=True requires diffusion_kv_mode='paged_scheduler'; "
+                "set diffusion_kv_mode='paged_scheduler' or disable enable_prefix_caching"
+            )
         if (
             self.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
             and self.diffusion_kv_max_rows_per_request is None
@@ -1052,6 +1117,7 @@ _DIFFUSION_SHARED_CONFIG_FIELDS = frozenset(
         "dist_timeout",
         "model_config",
         "quantization_config",
+        "enable_prefix_caching",
     }
 )
 _DIFFUSION_RUNTIME_CONFIG_FIELDS = frozenset(
@@ -1094,20 +1160,7 @@ _DIFFUSION_MOVED_SHARED_FIELDS = frozenset(
 
 _STAGE_DEPLOY_ENGINE_FIELDS: tuple[str, ...] = tuple(_STAGE_DEPLOY_FIELDS)
 
-_DIFFUSION_BACKCOMPAT_ENGINE_FIELDS = frozenset(
-    {
-        "diffusion_attention_backend",
-        "fastvideo_vsa_topk",
-        "kv_cache_dtype",
-        "kv_cache_skip_layers",
-        "kv_cache_skip_steps",
-        "static_lora_scale",
-    }
-)
-_DIFFUSION_STAGE_ENGINE_FIELDS = (_DIFFUSION_CONFIG_FIELDS | _DIFFUSION_BACKCOMPAT_ENGINE_FIELDS) - {
-    "model",
-    "stage_id",
-}
+_DIFFUSION_STAGE_ENGINE_FIELDS = _DIFFUSION_CONFIG_FIELDS - {"model", "stage_id"}
 
 
 def _upstream_engine_field_map(
@@ -1247,6 +1300,8 @@ def _validate_stage_engine_override_ownership(
     stage_id: int,
     execution_type: StageExecutionType,
     overrides: Mapping[str, Any],
+    *,
+    validate_top_level: bool = True,
 ) -> None:
     try:
         owner_fields = _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
@@ -1255,7 +1310,7 @@ def _validate_stage_engine_override_ownership(
     except KeyError as exc:
         raise ValueError(f"Unsupported stage execution type: {execution_type!r}") from exc
 
-    unowned_fields = set(overrides) - owner_fields
+    unowned_fields = set(overrides) - owner_fields if validate_top_level else set()
     parallel_config = overrides.get("parallel_config")
     if isinstance(parallel_config, Mapping):
         # Nested values traditionally use upstream config names, while flat
@@ -1272,6 +1327,144 @@ def _validate_stage_engine_override_ownership(
         )
 
 
+_DIFFUSION_STAGE_METADATA_FIELDS = frozenset(
+    {
+        "async_chunk",
+        "custom_process_next_stage_input_func",
+        "engine_output_type",
+        "has_sampling_extra_args",
+        "hf_config_name",
+        "model_arch",
+        "model_stage",
+        "retains_state_across_chunks",
+        "scheduler_cls",
+        "stage_connector_spec",
+        "worker_type",
+    }
+)
+
+_DIFFUSION_ENGINE_ADAPTER_METADATA_FIELDS = frozenset(
+    {
+        # Serialized shared model settings are consumed outside the terminal
+        # diffusion config; accepting them here does not widen raw ingress.
+        "duplex_max_sessions",
+        "has_sampling_extra_args",
+        "inline_diffusion",
+        "requires_full_payload_input",
+        "sampling_extra_args_keys",
+        "session_mode",
+    }
+)
+_DIFFUSION_DEFAULT_FACTORY_FIELDS = frozenset(
+    {"default_llama_model_id", "default_sampling_params", "devices", "stage_0_devices"}
+)
+
+
+def _frontend_cli_fields() -> frozenset[str]:
+    """Return vLLM server fields that are consumed before stage startup."""
+    from vllm.entrypoints.launchers.cli_args import FrontendArgs
+
+    return frozenset(config_field.name for config_field in fields(FrontendArgs))
+
+
+def normalize_and_validate_diffusion_engine_ingress_kwargs(
+    kwargs: Mapping[str, Any],
+    *,
+    stage_id: int | str,
+) -> dict[str, Any]:
+    """Normalize and validate raw diffusion input without inserting defaults."""
+    from vllm_omni.diffusion.data import (
+        OmniDiffusionConfig,
+        normalize_omni_diffusion_kwargs,
+        validate_omni_diffusion_kwargs,
+    )
+    from vllm_omni.engine.arg_utils import orchestrator_field_names
+
+    mixed_kwargs = {name: _copy_value(value) for name, value in kwargs.items()}
+    engine_owned = {
+        name: mixed_kwargs.pop(name)
+        for name in _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS | {"quantization"}
+        if name in mixed_kwargs
+    }
+    normalized = normalize_omni_diffusion_kwargs(mixed_kwargs, apply_defaults=False)
+    if engine_owned.get("quantization") is not None and normalized.get("quantization_config") is not None:
+        raise ValueError("Diffusion config fields 'quantization' and 'quantization_config' cannot both be provided.")
+    normalized.update(engine_owned)
+
+    diffusion_fields = frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
+    stage_consumed_fields = (
+        diffusion_fields
+        | _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS
+        | frozenset(_STAGE_DEPLOY_ENGINE_FIELDS)
+        | frozenset(_PIPELINE_DEPLOY_CLI_FIELDS)
+        | _DIFFUSION_STAGE_METADATA_FIELDS
+        | _DIFFUSION_DEFAULT_FACTORY_FIELDS
+    ) - _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
+    externally_consumed_fields = (
+        _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
+        | _NON_STAGE_ENGINE_CLI_FIELDS
+        | _frontend_cli_fields()
+        | orchestrator_field_names()
+        # Coordination fields also live on the typed orchestrator config, not
+        # all of them are present on the CLI-only OrchestratorArgs dataclass.
+        | frozenset(config_field.name for config_field in fields(cast(Any, VllmOmniOrchestratorConfig)))
+    )
+    allowed_fields = stage_consumed_fields | externally_consumed_fields
+    validate_omni_diffusion_kwargs(normalized, allowed_fields, stage_id=stage_id)
+    return {name: value for name, value in normalized.items() if name in stage_consumed_fields}
+
+
+def extract_diffusion_stage_config_kwargs(
+    kwargs: Mapping[str, Any],
+    *,
+    stage_id: int | str,
+    include_engine_adapter_metadata: bool = False,
+) -> dict[str, Any]:
+    """Take the diffusion-owned payload from resolved mixed stage arguments."""
+    from vllm_omni.diffusion.data import (
+        OmniDiffusionConfig,
+        normalize_omni_diffusion_kwargs,
+        validate_omni_diffusion_kwargs,
+    )
+
+    shared_only_fields = sorted(_DIFFUSION_SHARED_ONLY_ENGINE_FIELDS.intersection(kwargs))
+    if shared_only_fields:
+        field_names = ", ".join(repr(name) for name in shared_only_fields)
+        raise ValueError(
+            f"Diffusion stage {stage_id} cannot consume shared engine field(s) {field_names}; "
+            "use diffusion-owned fields or request sampling parameters instead."
+        )
+
+    diffusion_fields = frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
+    fields_owned_elsewhere = (
+        frozenset(_STAGE_DEPLOY_ENGINE_FIELDS)
+        | frozenset(_PIPELINE_DEPLOY_CLI_FIELDS)
+        | _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS
+        | _DIFFUSION_STAGE_METADATA_FIELDS
+    )
+    if include_engine_adapter_metadata:
+        fields_owned_elsewhere |= _DIFFUSION_ENGINE_ADAPTER_METADATA_FIELDS
+
+    # ``quantization`` is canonical in the mixed engine namespace. Hand it to
+    # the compatibility adapter without treating it as a deprecated alias.
+    mixed_kwargs = {name: _copy_value(value) for name, value in kwargs.items()}
+    engine_quantization = mixed_kwargs.pop("quantization", None)
+    normalized = normalize_omni_diffusion_kwargs(mixed_kwargs)
+    if engine_quantization is not None:
+        if normalized.get("quantization_config") is not None:
+            raise ValueError(
+                "Diffusion config fields 'quantization' and 'quantization_config' cannot both be provided."
+            )
+        normalized["quantization_config"] = engine_quantization
+
+    validate_omni_diffusion_kwargs(
+        normalized,
+        diffusion_fields | fields_owned_elsewhere,
+        stage_id=stage_id,
+    )
+    return {name: _copy_value(value) for name, value in normalized.items() if name in diffusion_fields}
+
+
 def _global_stage_cli_fields() -> frozenset[str]:
     # Lazy import avoids vllm_omni.config -> omni_config -> engine.arg_utils ->
     # vllm_omni.config during package-level config imports.
@@ -1284,6 +1477,7 @@ def _global_stage_cli_fields() -> frozenset[str]:
     )
     externally_consumed = (
         _NON_STAGE_ENGINE_CLI_FIELDS
+        | _frontend_cli_fields()
         | frozenset(f.name for f in fields(cast(Any, VllmOmniOrchestratorConfig)))
         | (orchestrator_field_names() - _STAGE_ENGINE_FIELDS)
     )
@@ -1328,8 +1522,13 @@ def _stage_engine_values(
     if topology.omni_kv_config:
         engine["omni_kv_config"] = _copy_value(topology.omni_kv_config)
     if stage_cli_overrides:
+        stage_cli_overrides = dict(stage_cli_overrides)
         if topology.execution_type == StageExecutionType.DIFFUSION:
             # Mirror StageConfig.to_omegaconf so both projections resolve alike.
+            # CLI parallel fields move into the nested ``parallel_config`` dict,
+            # otherwise the deploy YAML's nested values would win over flat CLI
+            # flags when ``_build_parallel_config`` merges nested over flat.
+            _apply_diffusion_parallel_runtime_overrides(engine, stage_cli_overrides)
             reconcile_diffusion_attention_overrides(engine, stage_cli_overrides)
         for key, value in stage_cli_overrides.items():
             existing = engine.get(key)
@@ -1337,10 +1536,15 @@ def _stage_engine_values(
                 engine[key] = _get_recursively_merged_dict(existing, dict(value))
             else:
                 engine[key] = _copy_value(value)
+    if topology.execution_type == StageExecutionType.DIFFUSION:
+        diffusion_kwargs = extract_diffusion_stage_config_kwargs(engine, stage_id=topology.stage_id)
+    else:
+        diffusion_kwargs = {}
     _validate_stage_engine_override_ownership(
         topology.stage_id,
         topology.execution_type,
         engine,
+        validate_top_level=topology.execution_type != StageExecutionType.DIFFUSION,
     )
     if topology.execution_type in {
         StageExecutionType.LLM_AR,
@@ -1377,7 +1581,7 @@ def _stage_engine_values(
         ),
         runtime=cast(_RuntimeEngineOverrides, _select_engine_overrides(engine, runtime_engine_fields)),
         parallel=cast(_ParallelEngineOverrides, _select_engine_overrides(engine, _PARALLEL_ENGINE_FIELDS)),
-        diffusion=_DiffusionEngineOverrides.from_engine(engine),
+        diffusion=_DiffusionEngineOverrides(_select_engine_overrides(diffusion_kwargs, _DIFFUSION_STAGE_ENGINE_FIELDS)),
         compilation_config=_copy_value(engine.get("compilation_config")),
         profiler_config=_copy_value(engine.get("profiler_config")),
     )
@@ -1701,6 +1905,7 @@ def _build_diffusion_stage_config(
         engine.diffusion,
         model=common_kwargs["model_config"].model,
         quantization_config=common_kwargs["quantization_config"],
+        enable_prefix_caching=bool(common_kwargs["cache_config"].enable_prefix_caching),
     )
     return cast(
         VllmOmniDiffusionStageConfig,
@@ -1778,8 +1983,14 @@ def _build_model_config(
         kwargs["dtype"] = _copy_value(deploy.dtype)
     if "active_stream_window" not in kwargs:
         kwargs["active_stream_window"] = _copy_value(deploy.active_stream_window)
+    kwargs["final_output"] = topology.final_output
     if "custom_voice_dir" not in kwargs and deploy.custom_voice_dir is not None:
         kwargs["custom_voice_dir"] = _copy_value(deploy.custom_voice_dir)
+    kwargs.setdefault("use_v2_model_runner", deploy.model_runner == "v2")
+    kwargs.setdefault(
+        "supports_native_mrv2_data_plane",
+        topology.supports_native_mrv2_data_plane,
+    )
     if "has_sampling_extra_args" not in kwargs:
         kwargs["has_sampling_extra_args"] = bool((default_sampling_params or {}).get("extra_args"))
     if "model_subdir" not in kwargs and topology.model_subdir is not None:
@@ -1895,6 +2106,7 @@ def _build_connector_config(
     return cast(Any, OmniStageConnectorConfig)(
         async_chunk=resolve_stage_async_chunk(deploy, stage_deploy),
         omni_kv_config=_copy_value(engine.get("omni_kv_config")),
+        kv_transfer_config=_copy_value(engine.get("kv_transfer_config")),
         output_connectors=_copy_value(output_connectors) if output_connectors else None,
         input_connectors=_copy_value(input_connectors) if input_connectors else None,
     )
@@ -1955,8 +2167,15 @@ def _build_diffusion_config_projection(
     *,
     model: str | None,
     quantization_config: _QuantizationConfigType,
+    enable_prefix_caching: bool,
 ) -> _DiffusionConfigProjection:
     diffusion_kwargs = engine.to_kwargs()
+    # Mirror the resolved cache setting, including deploy/CLI precedence.
+    diffusion_kwargs["enable_prefix_caching"] = enable_prefix_caching
+    # Match the legacy builder: topology supplies defaults, while explicit
+    # deploy/CLI values (including empty tuples) retain precedence.
+    diffusion_kwargs.setdefault("stage_input_payload_keys", tuple(topology.stage_input_payload_keys))
+    diffusion_kwargs.setdefault("stage_output_payload_keys", tuple(topology.stage_output_payload_keys))
     diffusion_kwargs["stage_id"] = topology.stage_id
     diffusion_kwargs["model_arch"] = _first_defined(
         diffusion_kwargs.get("model_arch"),

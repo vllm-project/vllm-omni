@@ -21,8 +21,13 @@ from benchmarks.qwen3_omni.embedding_harness import (
     expected_outputs,
     make_thinker,
 )
+from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+pytestmark = [
+    pytest.mark.core_model,
+    pytest.mark.cuda,
+    pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="requires NVIDIA CUDA"),
+]
 
 _SHAPE = ModelShape(
     vocab_size=64,
