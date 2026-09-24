@@ -97,7 +97,7 @@ Note that the prompt should better depict each layer to be decomposed, we will r
 ```bash
 MODEL=inclusionAI/Ming-Image-0.1-Design-Layer
 INPUT_IMAGE=/path/to/input.png
-PROMPT="Decompose this design into editable visual layers"
+PROMPT="Decompose this image into 6 layers with the following specifications: Number of layers: 6 \nLayer 1: Central text ... Layer 2: ... Layer 6: ..."
 
 jq -n \
   --arg model "$MODEL" \

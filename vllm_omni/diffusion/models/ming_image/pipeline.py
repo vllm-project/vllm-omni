@@ -190,6 +190,7 @@ class MingImageDiffusionPipeline(ZImagePipeline):
         self.image_processor = VaeImageProcessor(
             vae_scale_factor=self.vae_scale_factor * 2,
             do_convert_rgb=False,
+            resample="bilinear",
         )
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler
