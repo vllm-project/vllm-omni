@@ -60,10 +60,16 @@ def test_config_package_lazy_exports_still_resolve() -> None:
 
 def test_npu_platform_defers_minimax_h3_encoder_patch() -> None:
     src = (REPO_ROOT / "vllm_omni" / "platforms" / "npu" / "platform.py").read_text(encoding="utf-8")
-    init_start = src.index("def __init__(self) -> None:")
     runtime_start = src.index("def init_diffusion_model_runner_runtime")
-    init_src = src[init_start:runtime_start]
     runtime_src = src[runtime_start:]
+    # The shared NPU interface carries no ``__init__`` (construction lives on
+    # the DiT/AR subclasses), but keep guarding any future init block: the
+    # MiniMax encoder patches must never run during platform construction.
+    init_start = src.find("def __init__(self) -> None:")
+    if init_start == -1:
+        init_src = src[:runtime_start]
+    else:
+        init_src = src[init_start:runtime_start]
     assert "apply_minimax_h3_qwen3vl_patch" not in init_src
     assert "apply_minimax_h3_qwen3vl_patch" in runtime_src
     assert "apply_minimax_h3_qwen3vl_sdpa_patch" not in init_src

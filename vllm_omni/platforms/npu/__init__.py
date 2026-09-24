@@ -8,9 +8,11 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
+    from vllm_omni.platforms.npu.ar_platform import ARNPUOmniPlatform
+    from vllm_omni.platforms.npu.dit_platform import DiTNPUOmniPlatform
     from vllm_omni.platforms.npu.platform import NPUOmniPlatform
 
-__all__ = ["NPUOmniPlatform"]
+__all__ = ["NPUOmniPlatform", "DiTNPUOmniPlatform", "ARNPUOmniPlatform"]
 
 
 def is_a5(device: torch.device | None = None) -> bool:
@@ -26,10 +28,20 @@ def is_a5(device: torch.device | None = None) -> bool:
 
 
 def __getattr__(name: str):
-    if name != "NPUOmniPlatform":
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    if name == "NPUOmniPlatform":
+        from vllm_omni.platforms.npu.platform import NPUOmniPlatform
 
-    from vllm_omni.platforms.npu.platform import NPUOmniPlatform
+        globals()[name] = NPUOmniPlatform
+        return NPUOmniPlatform
+    if name == "DiTNPUOmniPlatform":
+        from vllm_omni.platforms.npu.dit_platform import DiTNPUOmniPlatform
 
-    globals()[name] = NPUOmniPlatform
-    return NPUOmniPlatform
+        globals()[name] = DiTNPUOmniPlatform
+        return DiTNPUOmniPlatform
+    if name == "ARNPUOmniPlatform":
+        from vllm_omni.platforms.npu.ar_platform import ARNPUOmniPlatform
+
+        globals()[name] = ARNPUOmniPlatform
+        return ARNPUOmniPlatform
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
