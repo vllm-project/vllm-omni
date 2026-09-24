@@ -168,6 +168,8 @@ def test_two_stage_topology_and_request_metadata():
     assert MING_IMAGE_PIPELINE.hf_architectures == ("MingImageForConditionalGeneration",)
     for class_name in MING_IMAGE_PIPELINE.diffusers_class_aliases + (MING_IMAGE_PIPELINE.diffusers_class_name,):
         assert "num_layers" in get_extra_body_params(class_name)
+        assert "steps" not in get_extra_body_params(class_name)
+        assert "cfg" not in get_extra_body_params(class_name)
         assert should_init_extra_args_for_non_diffusion_stages(class_name)
 
 

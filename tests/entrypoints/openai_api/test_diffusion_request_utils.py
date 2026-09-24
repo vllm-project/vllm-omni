@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -46,6 +46,24 @@ def test_normalizer_routes_values_without_erasing_defaults(
     apply_normalized_diffusion_request_extra_args(sampling_params, normalized)
 
     assert sampling_params.extra_args == {"solver": expected, "stage_default": True}
+
+
+def test_ming_compatibility_aliases_route_to_standard_sampling_fields() -> None:
+    normalized, request_args = normalize_diffusion_request_args(
+        nested={"steps": 12, "cfg": 1.0},
+        serving_root_fields={"num_inference_steps", "guidance_scale"},
+        registered_extra_fields={"height", "width"},
+        root_field_aliases={
+            "steps": "num_inference_steps",
+            "cfg": "guidance_scale",
+        },
+    )
+
+    assert normalized == {}
+    assert request_args == {
+        "num_inference_steps": 12,
+        "guidance_scale": 1.0,
+    }
 
 
 def test_non_overlapping_legacy_and_canonical_values_are_merged(mocker) -> None:

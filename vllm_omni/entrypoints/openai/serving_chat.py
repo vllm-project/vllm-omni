@@ -203,7 +203,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             "modalities",
         }
     )
-    _diffusion_root_field_aliases = {"cfg_scale": "true_cfg_scale"}
+    _diffusion_root_field_aliases = {
+        "cfg_scale": "true_cfg_scale",
+        "steps": "num_inference_steps",
+        "cfg": "guidance_scale",
+    }
     _diffusion_serving_root_fields = _diffusion_common_root_fields | _diffusion_existing_control_fields
 
     # Harmony flag (always False for vllm-omni models)
