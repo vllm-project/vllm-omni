@@ -26,6 +26,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
+from vllm_omni.diffusion.distributed.autoencoders.wan_decoder_fast_path import install_wan_decoder_fast_path
 from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import install_wan_spatial_shard_decode
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
@@ -61,6 +62,7 @@ from vllm_omni.diffusion.models.lingbot_world.transformer import (
     LingBotAttentionCache,
     LingBotTransformerCache,
 )
+from vllm_omni.diffusion.models.lingbot_world.utils import _vae_decode_fast_path
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.utils import _load_json
@@ -338,7 +340,22 @@ def _uint8_frames(video: torch.Tensor) -> np.ndarray:
     # the decoder dtype, then widen, scale and round.
     frames = (video[0] / 2 + 0.5).clamp(0, 1).permute(1, 2, 3, 0)
     frames = frames.float().mul_(255).round_().to(torch.uint8)
-    return np.ascontiguousarray(frames.cpu().numpy())
+    pixels = frames.cpu().numpy()
+    frame_count, height, width, channels = pixels.shape
+    # A planar GPU result stays planar after the host copy. NumPy's generic
+    # contiguous conversion is slow for this three-channel interleave; copying
+    # each plane into its output channel preserves every byte and vectorizes it.
+    if channels == 3 and pixels.strides == (
+        height * width,
+        width,
+        1,
+        frame_count * height * width,
+    ):
+        contiguous = np.empty(pixels.shape, dtype=np.uint8)
+        for channel in range(3):
+            contiguous[..., channel] = pixels[..., channel]
+        return contiguous
+    return np.ascontiguousarray(pixels)
 
 
 @functools.lru_cache(maxsize=1)
@@ -695,6 +712,12 @@ class LingBotWorldCausalDMDPipeline(
         sequence_parallel_size = int(getattr(parallel_config, "sequence_parallel_size", 1) or 1)
         if sequence_parallel_size > 1 and vae_sharding:
             self._install_sharded_vae_decode(sequence_parallel_size)
+        fast_path_level = _vae_decode_fast_path(model_config)
+        if fast_path_level is not None:
+            # Install after sharding so its conv wrappers get persistent buffers. The VAE parameters
+            # already use the stage dtype, so no autocast parameter cast is needed.
+            counts = install_wan_decoder_fast_path(self.vae, conv_dtype=None, level=fast_path_level)
+            logger.info("LingBot World VAE decode fast path installed: %s", counts)
         self.setup_diffusion_pipeline_profiler(
             profiler_targets=[
                 "vae.encode",

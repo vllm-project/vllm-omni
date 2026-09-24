@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from abc import ABC, abstractmethod
 from typing import Any
@@ -74,6 +74,9 @@ class OmniConnectorBase(ABC):
 
     def abandon_get(self, get_key: str) -> None:
         """Retire unresolved discovery attempts; never cancel an active DMA READ."""
+
+    def reap_consumed(self) -> None:
+        """Release producer bookkeeping for payloads consumed by another process."""
 
     @abstractmethod
     def health(self) -> dict[str, Any]:

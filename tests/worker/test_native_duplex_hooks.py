@@ -2916,3 +2916,112 @@ def test_ar_runner_applies_duplex_sampling_before_the_model_sampler(class_name: 
         f"{_MODEL_SAMPLER_CALL}() at line {sampler_lineno}.  The hook masks the logits and publishes the "
         f"row -> session map the sampler reads, so running it afterwards is a silent no-op."
     )
+
+
+class _NativeDuplexTokenizer:
+    eos_token_id = 151705
+    unk_token_id = -1
+    bad_token_ids: list[int] = []
+    all_special_ids: list[int] = []
+
+    def convert_tokens_to_ids(self, token):
+        return {
+            "<unit>": 151683,
+            "</unit>": 151684,
+            "<|listen|>": 151705,
+            "<|speak|>": 151706,
+            "<|tts_bos|>": 151703,
+            "<|tts_eos|>": 151704,
+            "<|tts_pad|>": 151722,
+            "<|chunk_eos|>": 151718,
+            "<|chunk_tts_eos|>": 151721,
+            "<|turn_eos|>": 151717,
+        }.get(token, -1)
+
+
+def _native_duplex_model_with_state():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    session_key = "sid-lookahead"
+    state = _MiniCPMO45Stage0SessionState(session_id=session_key, current_turn_ended=False)
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model.model_stage = "llm"
+    model.thinker = SimpleNamespace(get_tokenizer=lambda: _NativeDuplexTokenizer())
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={session_key: state})
+    model._minicpmo45_duplex_row_sessions = {0: session_key}
+    model._minicpmo45_duplex_row_payloads = {0: {"is_speech": True}}
+    model._minicpmo45_active_duplex_rows = [0]
+    return model, state
+
+
+def _native_duplex_sampling_metadata(output_token_ids: list[int]):
+    return SimpleNamespace(
+        all_greedy=True,
+        all_random=False,
+        temperature=torch.tensor([0.0]),
+        top_k=torch.tensor([1]),
+        top_p=torch.tensor([1.0]),
+        generators={},
+        prompt_token_ids=torch.tensor([[151683] * 16]),
+        output_token_ids=[output_token_ids],
+    )
+
+
+@pytest.mark.parametrize("terminator", [151718, 151721, 151705])
+def test_minicpmo_stage0_async_lookahead_frame_after_chunk_terminator_is_frozen(terminator):
+    """The frame async scheduling runs after a sampled chunk terminator is
+    discarded by the scheduler; it must neither decide anything nor touch the
+    session state that the next append re-injects."""
+    model, state = _native_duplex_model_with_state()
+    state.pending_terminator_token = terminator
+    state.last_terminator_token = terminator
+    state.generated_tokens = [200, 201]
+    logits = torch.full((1, 151723), -100.0)
+    logits[0, 1234] = 30.0  # what the stale frame would otherwise pick
+
+    sampled = model.sample(logits, _native_duplex_sampling_metadata([151706, 200, 201, terminator, -1]))
+
+    assert sampled is not None
+    assert sampled.sampled_token_ids.tolist() == [[terminator]]
+    assert state.pending_terminator_token == terminator
+    assert state.last_terminator_token == terminator
+    assert state.generated_tokens == [200, 201]
+    assert state.current_turn_ended is False
+
+
+def test_minicpmo_stage0_turn_eos_is_forwarded_not_pending():
+    """<|turn_eos|> is fed like text in the official unit loop; only the
+    chunk terminator sampled afterwards is re-injected on the next append."""
+    model, state = _native_duplex_model_with_state()
+    logits = torch.full((1, 151723), -100.0)
+    logits[0, 151717] = 30.0
+
+    sampled = model.sample(logits, _native_duplex_sampling_metadata([151706, 200, 201]))
+
+    assert sampled.sampled_token_ids.tolist() == [[151717]]
+    assert state.pending_terminator_token is None
+    assert state.last_terminator_token == 151717
+    assert state.current_turn_ended is True
+
+    # The frame that consumes <|turn_eos|> keeps sampling; the chunk
+    # terminator it picks becomes the pending token for the next append.
+    logits = torch.full((1, 151723), -100.0)
+    logits[0, 151718] = 30.0
+    sampled = model.sample(logits, _native_duplex_sampling_metadata([151706, 200, 201, 151717]))
+
+    assert sampled.sampled_token_ids.tolist() == [[151718]]
+    assert state.pending_terminator_token == 151718
+    assert state.current_turn_ended is True
+
+
+def test_minicpmo_stage0_stop_tokens_exclude_turn_eos():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import _stage0_stop_token_ids
+
+    stop_ids = _stage0_stop_token_ids(_NativeDuplexTokenizer())
+
+    assert stop_ids == [151718, 151721, 151705]

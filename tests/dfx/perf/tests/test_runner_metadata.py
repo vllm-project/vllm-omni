@@ -694,6 +694,204 @@ def test_omniinteract_result_rejects_incomplete_artifacts():
         )
 
 
+def test_omniinteract_result_accepts_accuracy_at_floor():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result(
+        {
+            "completed": 4,
+            "omniinteract": {
+                "total": 4,
+                "success": 4,
+                "failed": 0,
+                "artifacts_complete": True,
+                "accuracy": {
+                    "status": "ok",
+                    "failed": 0,
+                    "evaluated": 4,
+                    "summary": {"IA_QTF1": 0.25},
+                },
+            },
+        },
+        {"dataset_name": "omniinteract", "omniinteract_evaluate": True, "omniinteract_min_ia_qtf1": 0.2},
+        4,
+    )
+
+
+def test_omniinteract_result_rejects_missing_accuracy():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="accuracy is missing"):
+        assert_result(
+            {
+                "completed": 4,
+                "omniinteract": {"total": 4, "success": 4, "failed": 0, "artifacts_complete": True},
+            },
+            {"dataset_name": "omniinteract", "omniinteract_evaluate": True},
+            4,
+        )
+
+
+def test_omniinteract_result_rejects_failed_accuracy():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="accuracy did not complete"):
+        assert_result(
+            {
+                "completed": 4,
+                "omniinteract": {
+                    "total": 4,
+                    "success": 4,
+                    "failed": 0,
+                    "artifacts_complete": True,
+                    "accuracy": {"status": "failed", "failed": 1, "summary": {"IA_QTF1": 0.9}},
+                },
+            },
+            {"dataset_name": "omniinteract", "omniinteract_evaluate": True, "omniinteract_min_ia_qtf1": 0.0},
+            4,
+        )
+
+
+def test_omniinteract_result_rejects_ia_qtf1_below_floor():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="IA-QTF1"):
+        assert_result(
+            {
+                "completed": 4,
+                "omniinteract": {
+                    "total": 4,
+                    "success": 4,
+                    "failed": 0,
+                    "artifacts_complete": True,
+                    "accuracy": {
+                        "status": "ok",
+                        "failed": 0,
+                        "evaluated": 4,
+                        "summary": {"IA_QTF1": 0.1},
+                    },
+                },
+            },
+            {"dataset_name": "omniinteract", "omniinteract_evaluate": True, "omniinteract_min_ia_qtf1": 0.2},
+            4,
+        )
+
+
+def _omniinteract_accuracy_result(
+    *,
+    tp: float,
+    fp: float,
+    fn: float,
+    ia_qtf1: float = 0.5,
+    evaluated: int = 4,
+    skipped: int = 0,
+) -> dict[str, object]:
+    return {
+        "completed": 4,
+        "omniinteract": {
+            "total": 4,
+            "success": 4,
+            "failed": 0,
+            "artifacts_complete": True,
+            "accuracy": {
+                "status": "ok",
+                "failed": 0,
+                "evaluated": evaluated,
+                "skipped": skipped,
+                "total": 4,
+                "summary": {"IA_QTF1": ia_qtf1, "Global_TP": tp, "Global_FP": fp, "Global_FN": fn},
+            },
+        },
+    }
+
+
+def _omniinteract_aggregate_params(subset: str, *, group: str) -> dict[str, object]:
+    return {
+        "dataset_name": "omniinteract",
+        "omniinteract_evaluate": True,
+        "omniinteract_subsets": subset,
+        "omniinteract_aggregate_min_ia_qtf1": 0.2,
+        "omniinteract_aggregate_subsets": ["1q1a", "1q1a_math", "1qna"],
+        "omniinteract_aggregate_group": group,
+    }
+
+
+def test_omniinteract_aggregate_waits_until_all_subsets():
+    from tests.dfx.perf.scripts.run_benchmark import _reset_omniinteract_aggregate_counts, assert_result
+
+    _reset_omniinteract_aggregate_counts()
+    assert_result(
+        _omniinteract_accuracy_result(tp=6.157502, fp=9, fn=8),
+        _omniinteract_aggregate_params("1q1a", group="wait"),
+        4,
+    )
+    assert_result(
+        _omniinteract_accuracy_result(tp=1.133541, fp=2, fn=2),
+        _omniinteract_aggregate_params("1q1a_math", group="wait"),
+        4,
+    )
+
+
+def test_omniinteract_aggregate_accepts_pooled_ia_qtf1_at_floor():
+    from tests.dfx.perf.scripts.run_benchmark import _reset_omniinteract_aggregate_counts, assert_result
+
+    _reset_omniinteract_aggregate_counts()
+    assert_result(
+        _omniinteract_accuracy_result(tp=6.157502, fp=9, fn=8),
+        _omniinteract_aggregate_params("1q1a", group="pass"),
+        4,
+    )
+    assert_result(
+        _omniinteract_accuracy_result(tp=1.133541, fp=2, fn=2),
+        _omniinteract_aggregate_params("1q1a_math", group="pass"),
+        4,
+    )
+    assert_result(
+        _omniinteract_accuracy_result(tp=0.0, fp=11, fn=18, ia_qtf1=0.0),
+        _omniinteract_aggregate_params("1qna", group="pass"),
+        4,
+    )
+
+
+def test_omniinteract_aggregate_rejects_pooled_ia_qtf1_below_floor():
+    from tests.dfx.perf.scripts.run_benchmark import _reset_omniinteract_aggregate_counts, assert_result
+
+    _reset_omniinteract_aggregate_counts()
+    assert_result(
+        _omniinteract_accuracy_result(tp=0.0, fp=1, fn=1, ia_qtf1=0.0),
+        _omniinteract_aggregate_params("1q1a", group="fail"),
+        4,
+    )
+    assert_result(
+        _omniinteract_accuracy_result(tp=0.0, fp=1, fn=1, ia_qtf1=0.0),
+        _omniinteract_aggregate_params("1q1a_math", group="fail"),
+        4,
+    )
+    with pytest.raises(AssertionError, match="aggregate All Global IA-QTF1"):
+        assert_result(
+            _omniinteract_accuracy_result(tp=0.0, fp=1, fn=1, ia_qtf1=0.0),
+            _omniinteract_aggregate_params("1qna", group="fail"),
+            4,
+        )
+
+
+def test_omniinteract_aggregate_rejects_entirely_skipped_subset():
+    from tests.dfx.perf.scripts.run_benchmark import _reset_omniinteract_aggregate_counts, assert_result
+
+    _reset_omniinteract_aggregate_counts()
+    assert_result(
+        _omniinteract_accuracy_result(tp=4.0, fp=0.0, fn=0.0, ia_qtf1=1.0),
+        _omniinteract_aggregate_params("1q1a", group="skipped-subset"),
+        4,
+    )
+    with pytest.raises(AssertionError, match="evaluated 0 cases"):
+        assert_result(
+            _omniinteract_accuracy_result(tp=0.0, fp=0.0, fn=0.0, ia_qtf1=1.0, evaluated=0, skipped=4),
+            _omniinteract_aggregate_params("1q1a_math", group="skipped-subset"),
+            4,
+        )
+
+
 def test_omni_tpot_baseline_accepts_measured_finite_sample():
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
