@@ -473,7 +473,7 @@ async def test_multistage_ar_diffusion_sleep_wake():
 
 
 # ---------------------------------------------------------------------------
-# 4) BAGEL — H100 ``full_model`` (nightly Entrypoints Test)
+# 4) BAGEL — H100/B200 ``full_model`` (nightly Entrypoints Test)
 # ---------------------------------------------------------------------------
 
 
@@ -527,7 +527,7 @@ async def bagel_diffusion_engine():
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 class TestBagelDiffusionSleepMode:
     """BAGEL diffusion sleep/wake on a class-scoped TP=2 BagelPipeline."""
 
@@ -632,7 +632,7 @@ def _build_bagel_llm_stages() -> tuple[list[dict], list[dict]]:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 class TestBagelCoordinatedSleepMode:
     """Dual-engine coordination (kept skipped; do not delete)."""
 

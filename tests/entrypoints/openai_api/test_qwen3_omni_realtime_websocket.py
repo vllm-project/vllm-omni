@@ -910,7 +910,7 @@ async def _run_duplex_history_pruning(runtime, log_path: Path) -> None:
 
 
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
 class TestQwen3OmniDuplexPlayback:
     @pytest.mark.advanced_model
     @pytest.mark.parametrize("generation_finished", [False, True], ids=["generating", "queued-playback"])
