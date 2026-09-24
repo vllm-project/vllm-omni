@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import threading
+import uuid
 from collections import deque
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -18,6 +19,7 @@ from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
 from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_streaming_input_prompt
+from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -25,6 +27,129 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture
+def shm_sender(build_adapter):
+    adapter, _ = build_adapter(stage_id=0)
+    connector = SharedMemoryConnector({"stage_id": 0})
+    adapter.connector = connector
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.tensor([1], dtype=torch.long))
+    )
+    yield adapter, connector
+    connector.close()
+
+
+def test_shm_abort_cleans_only_owned_chunks_before_id_reuse(shm_sender):
+    adapter, connector = shm_sender
+    ext_id = f"abort_{uuid.uuid4().hex}"
+    request = _req("old", RequestStatus.RUNNING, external_req_id=ext_id)
+    sibling_key = f"{ext_id}_1_2_0_0"
+    assert connector.put("0", "1", sibling_key, "sibling")[0]
+    adapter.save_async(None, request)
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    adapter.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED, {request.request_id: request})
+    # Queue a replacement before cleanup runs. The same save loop must reclaim
+    # the old generation before its key can be written by the new generation.
+    replacement = _req("new", RequestStatus.RUNNING, external_req_id=ext_id)
+    adapter.save_async(None, replacement)
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    assert connector.get("0", "1", f"{ext_id}_0_0") is None
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    assert connector.get("0", "1", f"{ext_id}_0_0") is not None
+    assert connector.get("0", "1", sibling_key)[0] == "sibling"
+
+
+def test_shm_abort_reclaims_inflight_put_without_blocking(shm_sender, monkeypatch):
+    adapter, connector = shm_sender
+    request = _req("inflight", RequestStatus.RUNNING, external_req_id=f"inflight_{uuid.uuid4().hex}")
+    put_started = threading.Event()
+    release_put = threading.Event()
+    real_put = connector.put
+
+    def blocking_put(**kwargs):
+        put_started.set()
+        assert release_put.wait(timeout=5)
+        return real_put(**kwargs)
+
+    monkeypatch.setattr(connector, "put", blocking_put)
+    adapter.save_async(None, request)
+    task = adapter._pending_save_reqs.popleft()
+    sender = threading.Thread(target=adapter._send_single_request, args=(task,))
+    sender.start()
+    try:
+        assert put_started.wait(timeout=5)
+        adapter.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED, {request.request_id: request})
+        assert sender.is_alive()
+    finally:
+        release_put.set()
+        sender.join(timeout=5)
+    assert not sender.is_alive()
+    while adapter._pending_save_reqs:
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    assert not connector._pending_keys
+    assert connector.get("0", "1", f"{request.external_req_id}_0_0") is None
+    assert not adapter._sender_tokens
+    assert not adapter.code_prompt_token_ids
+
+
+@pytest.mark.parametrize("fail_terminal", [False, True])
+def test_shm_terminal_keeps_payload_only_after_success(shm_sender, monkeypatch, fail_terminal):
+    adapter, connector = shm_sender
+    request = _req("terminal", RequestStatus.FINISHED_STOPPED, external_req_id=f"terminal_{uuid.uuid4().hex}")
+    if fail_terminal:
+        real_put = connector.put
+
+        def failed_put(**kwargs):
+            real_put(**kwargs)
+            return False, 0, None
+
+        monkeypatch.setattr(connector, "put", failed_put)
+    adapter.save_async(None, request)
+    adapter.cleanup_sender(request.external_req_id)
+    while adapter._pending_save_reqs:
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    result = connector.get("0", "1", f"{request.external_req_id}_0_0")
+    assert (result is None) == fail_terminal
+    assert not adapter._sender_tokens
+
+
+@pytest.mark.parametrize("stage_id", [0, 1])
+def test_receiver_cleanup_does_not_accumulate_tombstones(build_adapter, stage_id):
+    adapter, _ = build_adapter(stage_id=stage_id)
+    for index in range(256):
+        adapter.cleanup_receiver(f"completed-{index}")
+    assert not getattr(adapter, "_cancelled_load_reqs", ())
+    assert not adapter._registered_load_entries
+
+
+def test_recv_loop_does_not_recreate_mapping_for_cancelled_entry(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("cancelled", RequestStatus.RUNNING, external_req_id="external")
+    adapter.load_async(request)
+    adapter.cleanup_receiver(request.request_id)
+    # Stop after the loop has drained the stale queue entry.
+    adapter._recv_cond.wait = lambda **kwargs: adapter.stop_event.set()
+    adapter.recv_loop()
+    connector.get.assert_not_called()
+    assert not adapter.request_ids_mapping
+    assert not adapter._pending_load_reqs
+
+
+def test_idle_save_loop_reaps_consumed_shm(shm_sender):
+    adapter, connector = shm_sender
+    key = f"idle_{uuid.uuid4().hex}"
+    assert connector.put("0", "1", key, "payload")[0]
+    receiver = SharedMemoryConnector({})
+    try:
+        assert receiver.get("0", "1", key)[0] == "payload"
+        adapter._save_cond.wait = lambda **kwargs: adapter.stop_event.set()
+        adapter.save_loop()
+        assert not connector._pending_keys
+    finally:
+        receiver.close()
 
 
 class DummyWaitingQueue(list):
@@ -583,7 +708,7 @@ def test_load_poll_uses_request_scoped_payload_sender_endpoint(build_adapter):
     connector.get.assert_called_once_with(
         "1",
         "2",
-        "req-1_1_0",
+        "external-1_1_0",
         {"source_host": "10.0.0.1", "source_port": 50051},
     )
 
@@ -1910,7 +2035,7 @@ def test_cleanup_clears_all_state(build_adapter):
     assert req_id not in adapter.get_req_chunk
     assert req_id not in adapter.requests_with_ready_chunks
     assert req_id not in adapter.request_ids_mapping
-    assert req_id in adapter._cancelled_load_reqs
+    assert req_id not in adapter._registered_load_entries
     assert req_id not in adapter._finished_load_reqs
     assert req_id not in adapter._pending_ar_prompt_updates
     assert req_id not in adapter._streaming_condition_lengths
@@ -3229,12 +3354,11 @@ def test_process_pending_chunks_purges_zombies_in_running_deque(
     # 2. Live request is still in the deque.
     assert live_req in adapter.waiting_for_chunk_running_requests
     # 3. ``cleanup_receiver`` ran for the zombie (drops origin-status mapping
-    #    and registers the id as cancelled so a late load/poll is dropped too).
+    #    and unregisters it so a late load/poll is dropped too).
     assert zombie_req.request_id not in adapter.requests_origin_status
-    assert zombie_req.request_id in adapter._cancelled_load_reqs
+    assert zombie_req.request_id not in adapter._registered_load_entries
     # 4. Live request's bookkeeping is untouched.
     assert adapter.requests_origin_status[live_req.request_id] == RequestStatus.RUNNING
-    assert live_req.request_id not in adapter._cancelled_load_reqs
 
     # 5. ``restore_queues`` (which the scheduler runs in its ``finally``
     #    clause) now only re-injects the live request -- the zombie is
@@ -3267,7 +3391,7 @@ def test_process_pending_chunks_purges_zombies_in_waiting_deque(build_adapter):
 
     assert live_req in adapter.waiting_for_chunk_waiting_requests
     assert zombie_req not in adapter.waiting_for_chunk_waiting_requests
-    assert zombie_req.request_id in adapter._cancelled_load_reqs
+    assert zombie_req.request_id not in adapter._registered_load_entries
 
     adapter.restore_queues(waiting_queue, running_queue, scheduler_requests=scheduler_requests)
     assert waiting_queue == [live_req]
@@ -3295,8 +3419,8 @@ def test_purge_preserves_live_order_with_interleaved_zombies(build_adapter):
     adapter.process_pending_chunks(waiting_queue, running_queue, scheduler_requests=scheduler_requests)
 
     assert list(adapter.waiting_for_chunk_running_requests) == [live1, live2]
-    assert zombie1.request_id in adapter._cancelled_load_reqs
-    assert zombie2.request_id in adapter._cancelled_load_reqs
+    assert zombie1.request_id not in adapter._registered_load_entries
+    assert zombie2.request_id not in adapter._registered_load_entries
 
 
 def test_restore_queues_purges_late_aborts_after_process_pending_chunks(
@@ -3327,7 +3451,7 @@ def test_restore_queues_purges_late_aborts_after_process_pending_chunks(
     # instead of blindly extending it onto running_queue.
     adapter.restore_queues(waiting_queue, running_queue, scheduler_requests=scheduler_requests)
     assert running_queue == []
-    assert req.request_id in adapter._cancelled_load_reqs
+    assert req.request_id not in adapter._registered_load_entries
 
 
 def test_purge_is_noop_on_empty_deques(build_adapter):
