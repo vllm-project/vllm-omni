@@ -193,8 +193,11 @@ def _apply_batched_repetition_penalty(
 def resolve_codec_sampling_params(
     yaml_params: Mapping[str, Any] | None,
     tts_config: Any | None = None,
+    *,
+    deploy_defaults: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Resolve Talker codec knobs: deploy YAML, then checkpoint, then defaults.
+    """Resolve Talker codec knobs: deploy YAML, then stage defaults, then
+    checkpoint, then defaults.
 
     A deploy YAML is not required to carry a ``codec_sampling_params`` block --
     the stock MiniCPM-o configs do not -- so requiring one would turn a
@@ -204,6 +207,10 @@ def resolve_codec_sampling_params(
     unchanged.
 
     A YAML block still wins key by key, so a deployment can override any knob.
+    ``deploy_defaults`` is the stage's ``default_sampling_params`` -- the same
+    source the single-frame path's SamplingParams are built from -- so a
+    deployment tuning stage 1 through it keeps controlling the K-step codec
+    sampler instead of silently drifting to checkpoint/module values.
     """
     provided = yaml_params if isinstance(yaml_params, Mapping) else {}
     resolved: dict[str, Any] = {}
@@ -211,6 +218,9 @@ def resolve_codec_sampling_params(
     for key, attribute, fallback, cast in _CODEC_SAMPLING_SOURCES:
         value = provided.get(key)
         source = "yaml"
+        if value is None and isinstance(deploy_defaults, Mapping):
+            value = deploy_defaults.get(key)
+            source = "default_sampling_params"
         if value is None:
             value = getattr(tts_config, attribute, None) if tts_config is not None else None
             source = "tts_config"
@@ -224,6 +234,12 @@ def resolve_codec_sampling_params(
         raise ValueError("codec_sampling_params.max_tokens must be > 0")
     logger.info("MiniCPM-o Talker codec sampling %s (from %s)", resolved, sources)
     return resolved
+
+
+def _codec_float_param(state: Any, key: str, fallback: float) -> float:
+    """Float counterpart of _codec_int_param; same None-means-unset rule."""
+    value = state.get(key) if isinstance(state, Mapping) else None
+    return float(fallback if value is None else value)
 
 
 def _codec_int_param(state: Any, key: str, fallback: int) -> int:
@@ -295,7 +311,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # module fallbacks. The multi-frame path reads the resolved values
             # straight off the model.
             yaml_codec = getattr(getattr(vllm_config, "model_config", None), "codec_sampling_params", None)
-            resolved = resolve_codec_sampling_params(yaml_codec, tts_config)
+            # The stage's default_sampling_params sits between the YAML block
+            # and the checkpoint: it is the source the single-frame path's
+            # SamplingParams are built from, so tuning stage 1 through it must
+            # control the K-step codec sampler too.
+            deploy_defaults = getattr(getattr(vllm_config, "model_config", None), "default_sampling_params", None)
+            resolved = resolve_codec_sampling_params(yaml_codec, tts_config, deploy_defaults=deploy_defaults)
             self._codec_seed = resolved["seed"]
             self._codec_temperature = resolved["temperature"]
             self._codec_top_k = resolved["top_k"]
@@ -856,6 +877,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             raise RuntimeError(
                 f"MiniCPM-o continuous Talker received {len(sample_eligible)} sampling flags for {len(infos)} requests"
             )
+        request_sampling_params = kwargs.get("request_sampling_params")
+        if request_sampling_params is not None and len(request_sampling_params) != len(infos):
+            raise RuntimeError(
+                f"MiniCPM-o continuous Talker received {len(request_sampling_params)} "
+                f"sampling params for {len(infos)} requests"
+            )
         emit_duplex_metadata = any(isinstance(info, dict) and info.get("native_duplex") is True for info in infos)
 
         stop_rows: list[torch.Tensor] = []
@@ -932,6 +959,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             if not isinstance(state, dict):
                 state = dict(info.get("audio_state", {}) or {})
                 request_states[request_id] = state
+            self._merge_request_codec_params(
+                state,
+                request_sampling_params[index] if request_sampling_params is not None else None,
+            )
             if state.get("finished"):
                 stop_rows.append(row_stop)
                 codec_deltas.append(empty_delta)
@@ -965,7 +996,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             min_tokens = _codec_int_param(state, "min_tokens", self._codec_min_tokens)
             max_tokens = _codec_int_param(state, "max_tokens", self._codec_max_tokens)
             eos_window_masked = bool(state.get("turn_end_drain")) and _turn_end_boundary_eos_masked(step)
-            if self._codec_temperature == 0.0:
+            # A request pinning temperature to 0 (override or stage default)
+            # takes the deterministic boundary sampler, same as single-frame.
+            if _codec_float_param(state, "codec_temperature", self._codec_temperature) == 0.0:
                 sampled = self._sample_audio_code_greedy(
                     hidden[end - 1 : end],
                     codes,
@@ -1113,11 +1146,38 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             multimodal_outputs={"codes": {"audio": codec_deltas}, "meta": meta_outputs},
         )
 
+    def _merge_request_codec_params(self, state: dict[str, Any], sampling_params: Any) -> None:
+        """Pin one request's effective codec sampling knobs into its state.
+
+        The request's SamplingParams -- the engine merges the stage's
+        default_sampling_params with per-request overrides into it -- wins
+        field by field, so K-step in-model sampling keeps the single-frame
+        configuration contract: a request that overrides temperature or seed
+        steers the codec stream the same way it would under single-frame
+        decoding. Values already pinned (offline duplex states) and missing
+        sampling params (CPU tests, dummy runs without the runner hook) fall
+        back to the statically resolved deployment values.
+        """
+        if sampling_params is None or not isinstance(state, dict):
+            return
+        for key, attr in (
+            ("codec_temperature", "temperature"),
+            ("codec_top_k", "top_k"),
+            ("codec_top_p", "top_p"),
+            ("codec_repetition_penalty", "repetition_penalty"),
+            ("codec_seed", "seed"),
+        ):
+            if state.get(key) is None:
+                value = getattr(sampling_params, attr, None)
+                if value is not None:
+                    state[key] = value
+
     def _request_generator(self, request_id: str, device: torch.device) -> torch.Generator:
         generator = self._request_generators.get(request_id)
         if generator is None:
+            request_state = getattr(self, "_request_audio_states", {}).get(request_id, {})
             generator = torch.Generator(device=device)
-            generator.manual_seed(self._codec_seed)
+            generator.manual_seed(_codec_int_param(request_state, "codec_seed", self._codec_seed))
             self._request_generators[request_id] = generator
         return generator
 
@@ -1149,18 +1209,22 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             device_inputs_by_request = {}
             self._request_codec_device_inputs = device_inputs_by_request
         device_inputs = device_inputs_by_request.get(request_id)
+        request_states = getattr(self, "_request_audio_states", {})
+        request_state = request_states.get(request_id, {})
         if device_inputs is None:
-            request_states = getattr(self, "_request_audio_states", {})
-            request_state = request_states.get(request_id, {})
             device_inputs = (
                 torch.tensor(
                     [_codec_int_param(request_state, "min_tokens", self._codec_min_tokens)],
                     dtype=torch.int32,
                     device=hidden_state.device,
                 ),
-                torch.tensor([self._codec_temperature], dtype=torch.float32, device=hidden_state.device),
                 torch.tensor(
-                    [self._codec_repetition_penalty],
+                    [_codec_float_param(request_state, "codec_temperature", self._codec_temperature)],
+                    dtype=torch.float32,
+                    device=hidden_state.device,
+                ),
+                torch.tensor(
+                    [_codec_float_param(request_state, "codec_repetition_penalty", self._codec_repetition_penalty)],
                     dtype=torch.float32,
                     device=hidden_state.device,
                 ),
@@ -1175,8 +1239,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             temperature_tensor,
             penalty_tensor,
             eos_token_id=eos_id,
-            top_k=self._codec_top_k,
-            top_p=self._codec_top_p,
+            # top-k/top-p stay host-side constants: they branch the sampler at
+            # capture time, and the per-request sampling graph bakes in this
+            # request's pinned values from its own state.
+            top_k=_codec_int_param(request_state, "codec_top_k", self._codec_top_k),
+            top_p=_codec_float_param(request_state, "codec_top_p", self._codec_top_p),
             min_tokens_to_keep=3,
             eos_window_masked=eos_window_masked,
         )
@@ -1228,12 +1295,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             device_inputs_by_request = {}
             self._request_codec_device_inputs = device_inputs_by_request
         device_inputs = device_inputs_by_request.get(request_id)
+        request_state = getattr(self, "_request_audio_states", {}).get(request_id, {})
         if device_inputs is None:
             device_inputs = (
                 torch.tensor([min_tokens], dtype=torch.int32, device=hidden_state.device),
                 torch.tensor([1.0], dtype=torch.float32, device=hidden_state.device),
                 torch.tensor(
-                    [self._codec_repetition_penalty],
+                    [_codec_float_param(request_state, "codec_repetition_penalty", self._codec_repetition_penalty)],
                     dtype=torch.float32,
                     device=hidden_state.device,
                 ),
@@ -1245,7 +1313,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             device_state,
             min_tokens_tensor,
             penalty_tensor,
-            top_k=self._codec_top_k,
+            top_k=_codec_int_param(request_state, "codec_top_k", self._codec_top_k),
             eos_token_id=self._codec_eos_id,
             eos_window_masked=eos_window_masked,
         )

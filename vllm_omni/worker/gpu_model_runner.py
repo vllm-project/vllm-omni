@@ -1432,6 +1432,15 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                         )
                         for req_index, req_id in enumerate(self.input_batch.req_ids)
                     ]
+                    # Effective per-request sampling params (stage defaults
+                    # merged with request overrides) for in-model sampling
+                    # paths, so the K-step codec sampler keeps the
+                    # single-frame configuration contract. Same order as
+                    # request_sample_eligible / request_token_spans.
+                    model_kwargs_extra["request_sampling_params"] = [
+                        req.sampling_params if (req := self.requests.get(req_id)) is not None else None
+                        for req_id in self.input_batch.req_ids
+                    ]
             except Exception as e:
                 # Visible on purpose: the fallback is the equal rows-per-request
                 # split, which can re-introduce the cross-request corruption this
