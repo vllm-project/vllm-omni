@@ -20,6 +20,7 @@ import pytest
 
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
+from vllm_omni.platforms import current_omni_platform
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -27,16 +28,44 @@ MODEL = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
 PROMPT = "Two anthropomorphic cats in boxing gear on a spotlighted stage."
 NEGATIVE_PROMPT = "low quality, blurry, watermark, text"
 
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
+# CUDA / ROCm: single card, no extra server_args — behavior unchanged.
+# Skip on NPU, where a single A3 (64 GB HBM) cannot hold Wan2.2-T2V-A14B.
+CUDA_SINGLE_CARD_FEATURE_MARKS = [
+    *hardware_marks(res={"cuda": "H100"}, num_cards=1),
+    pytest.mark.skipif(
+        current_omni_platform.is_npu(),
+        reason="CUDA/ROCm single-card path; skip on NPU",
+    ),
+]
+
+# NPU: TP=2 across two A3 cards.
+# Skip on any non-NPU platform.
+NPU_TP2_FEATURE_MARKS = [
+    *hardware_marks(res={"npu": "A3"}, num_cards=2),
+    pytest.mark.skipif(
+        not current_omni_platform.is_npu(),
+        reason="Requires Ascend NPU platform",
+    ),
+]
 
 
 def _get_diffusion_feature_cases(model: str):
-    """Return a single default ``OmniServerParams`` row (no extra ``server_args``)."""
+    """Return one param per platform with explicit platform skip conditions."""
     return [
+        # CUDA: single card, no extra server_args
         pytest.param(
             OmniServerParams(model=model, init_timeout=1800, stage_init_timeout=1800, startup_timeout=2100),
             id="default",
-            marks=SINGLE_CARD_FEATURE_MARKS,
+            marks=CUDA_SINGLE_CARD_FEATURE_MARKS,
+        ),
+        # NPU: TP=2 across two cards
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=["--tensor-parallel-size", "2"],
+            ),
+            id="default",
+            marks=NPU_TP2_FEATURE_MARKS,
         ),
     ]
 
