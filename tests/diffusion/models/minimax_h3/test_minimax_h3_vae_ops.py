@@ -213,6 +213,7 @@ def test_video_vae_installs_exact_optimizations(monkeypatch):
     install.assert_called_once_with(
         video_vae.model.decoder,
         device=torch.device("cuda"),
+        persist_fp16_weights=True,
     )
 
 

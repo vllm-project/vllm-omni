@@ -312,6 +312,29 @@ class Attention(nn.Module):
                 return self._no_parallel_strategy
         return self.parallel_strategy
 
+    @property
+    def supports_qk_input_landing(self) -> bool:
+        """Expose the static producer-direct capability to model layers."""
+        if self.skip_sequence_parallel:
+            return False
+        return bool(getattr(self.parallel_strategy, "supports_qk_input_landing", False))
+
+    @torch.compiler.disable
+    def prepare_qk_input_landings(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Acquire Q/K landing buffers only from the existing eager island."""
+        strategy = self._get_active_parallel_strategy()
+        prepare = getattr(strategy, "prepare_qk_input_landings", None)
+        if prepare is None:
+            return None
+        return prepare(
+            query,
+            key,
+        )
+
     def _init_kv_cache_quantization(self, config) -> None:
         if config is None or self._has_custom_attention:
             return

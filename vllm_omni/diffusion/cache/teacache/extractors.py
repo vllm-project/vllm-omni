@@ -972,6 +972,7 @@ def extract_flux2_context(
     # ============================================================================
     # PREPROCESSING (Flux2-specific)
     # ============================================================================
+    assert encoder_hidden_states is not None
     num_txt_tokens = encoder_hidden_states.shape[1]
 
     timestep = timestep.to(hidden_states.dtype) * 1000

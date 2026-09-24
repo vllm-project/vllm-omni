@@ -28,7 +28,9 @@ def test_h3_full_pipeline_profiler_includes_local_encoding():
     assert targets == [
         "encode_prompt",
         "_encode_local_media",
+        "_build_denoise_inputs",
         "diffuse",
+        "_unpack_denoised_rows",
         "decode",
         "video_vae.decode_latent",
         "audio_vae.decode_latent",
@@ -98,6 +100,7 @@ def test_decode_releases_only_audio_before_return(monkeypatch):
         _component_on_device=lambda component: nullcontext(),
         _offload_model_cpu_stage_output=Mock(side_effect=lambda value: value),
         _release_stage_cache=Mock(),
+        _full_vae_audio_overlap_enabled=False,
     )
     monkeypatch.setattr(
         module.current_omni_platform,
@@ -105,7 +108,7 @@ def test_decode_releases_only_audio_before_return(monkeypatch):
         lambda **kwargs: nullcontext(),
     )
 
-    actual_video, actual_audio = MiniMaxH3Pipeline.decode(
+    actual_video, actual_audio = MiniMaxH3Pipeline._decode_impl(
         pipeline,
         torch.zeros(1),
         torch.zeros(1),
@@ -144,7 +147,7 @@ def test_forward_releases_video_after_quantization_and_before_next_seed(monkeypa
         events.append(f"diffuse:{kwargs['seed']}")
         return torch.zeros(1), torch.zeros(1)
 
-    def decode(video_latent, audio_latent, *, height, width):
+    def decode(video_latent, audio_latent, *, height, width, **_kwargs):
         events.append("decode")
         return (
             torch.zeros((1, 3, 2, height, width), dtype=decoded_dtype),
@@ -153,7 +156,7 @@ def test_forward_releases_video_after_quantization_and_before_next_seed(monkeypa
 
     # ``forward`` indexes ``preencode_mp4`` (#7018): this test drives the
     # tensor-decode branch, which is the one the release hook wraps.
-    context = {"num_outputs": 2, "seed": 41, "height": 4, "width": 4, "preencode_mp4": False}
+    context = {"num_outputs": 2, "seed": 41, "height": 4, "width": 4, "fps": 24, "preencode_mp4": False}
     pipeline = SimpleNamespace(
         od_config=SimpleNamespace(),
         _extract_prompt=lambda raw: ("a prompt", {}),
@@ -166,7 +169,7 @@ def test_forward_releases_video_after_quantization_and_before_next_seed(monkeypa
         _offload_model_cpu_stage_output=_recording_release(events, releases),
         _release_stage_cache=lambda: None,
     )
-    request = SimpleNamespace(prompts=["a prompt"], sampling_params=SimpleNamespace())
+    request = SimpleNamespace(prompts=["a prompt"], sampling_params=SimpleNamespace(output_type=None))
 
     output = MiniMaxH3Pipeline.forward(pipeline, request)
 
@@ -196,14 +199,14 @@ def test_forward_drops_the_decoded_video_before_the_next_seed_diffuses(monkeypat
         alive_at_diffuse.append(sum(1 for ref in decoded_refs if ref() is not None))
         return torch.zeros(1), torch.zeros(1)
 
-    def decode(video_latent, audio_latent, *, height, width):
+    def decode(video_latent, audio_latent, *, height, width, **_kwargs):
         video = torch.zeros((1, 3, 2, height, width), dtype=torch.float32)
         decoded_refs.append(weakref.ref(video))
         return video, torch.zeros((1, 8))
 
     # ``forward`` indexes ``preencode_mp4`` (#7018): this test drives the
     # tensor-decode branch, which is the one the release hook wraps.
-    context = {"num_outputs": 2, "seed": 41, "height": 4, "width": 4, "preencode_mp4": False}
+    context = {"num_outputs": 2, "seed": 41, "height": 4, "width": 4, "fps": 24, "preencode_mp4": False}
     pipeline = SimpleNamespace(
         od_config=SimpleNamespace(),
         _extract_prompt=lambda raw: ("a prompt", {}),
@@ -216,7 +219,7 @@ def test_forward_drops_the_decoded_video_before_the_next_seed_diffuses(monkeypat
         _offload_model_cpu_stage_output=lambda value: value.clone(),
         _release_stage_cache=lambda: None,
     )
-    request = SimpleNamespace(prompts=["a prompt"], sampling_params=SimpleNamespace())
+    request = SimpleNamespace(prompts=["a prompt"], sampling_params=SimpleNamespace(output_type=None))
 
     MiniMaxH3Pipeline.forward(pipeline, request)
 
@@ -233,7 +236,7 @@ def test_post_decode_releases_video_after_quantization(monkeypatch):
     events: list[str] = []
     releases: list[torch.Tensor] = []
 
-    def decode(video_latent, audio_latent, *, height, width):
+    def decode(video_latent, audio_latent, *, height, width, **_kwargs):
         events.append("decode")
         return (
             torch.zeros((1, 3, 2, height, width), dtype=torch.float16),
@@ -248,6 +251,7 @@ def test_post_decode_releases_video_after_quantization(monkeypatch):
         _release_stage_cache=lambda: None,
     )
     state = SimpleNamespace(
+        sampling=SimpleNamespace(output_type=None),
         latents=torch.zeros(1),
         extra={
             module._STEP_BRANCH: object(),

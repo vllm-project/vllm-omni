@@ -527,6 +527,7 @@ def _load_fixture(
         rope_inv_freq_len=2,
     )
     model._diffusers_weights = diffusers_weights
+    model.adaln_cache = None
     model._rope_theta = 10000.0
     qkv_calls: list[tuple[str | None, torch.Tensor]] = []
     fc1_calls: list[tuple[int, torch.Tensor]] = []

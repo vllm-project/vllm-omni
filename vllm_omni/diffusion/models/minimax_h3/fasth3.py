@@ -345,6 +345,8 @@ class FastH3WeightFusion:
         self._injections = dict(injections or {})
         self._injected: set[str] = set()
         self._applied: set[str] = set()
+        self._sidecar_satisfied: set[str] = set()
+        self._stream_started = False
         self._device: torch.device | None = None
 
     @property
@@ -509,6 +511,8 @@ class FastH3WeightFusion:
         patch = self._patches.get(name)
         if patch is None:
             return weight
+        if name in self._sidecar_satisfied:
+            return weight
         self._applied.add(name)
 
         device = self._compute_device(weight)
@@ -548,11 +552,12 @@ class FastH3WeightFusion:
 
     def apply(self, weights: Iterable[tuple[str, torch.Tensor]]) -> Iterator[tuple[str, torch.Tensor]]:
         """Fuse every streamed checkpoint tensor on its way into the model."""
-        if self._applied:
+        if self._stream_started or (self._applied - self._sidecar_satisfied):
             # ``validate_fully_applied`` released the deltas, so a second stream
             # would fuse nothing and then pass its own completeness check: the
             # server would serve base H3 weights on the student's ladder.
             raise FastH3AdapterError(f"{self._source} has already been fused into this checkpoint")
+        self._stream_started = True
         for name, weight in weights:
             if name in self._injections:
                 raise FastH3AdapterError(
@@ -565,6 +570,26 @@ class FastH3WeightFusion:
         for name, weight in self._injections.items():
             self._injected.add(name)
             yield name, weight
+
+    def mark_sidecar_satisfied(self, names: Iterable[str]) -> None:
+        """Mark adapter edits supplied by a verified AdaLN sidecar.
+
+        The cache owns only block/final AdaLN projections. Its runtime binding
+        verifies that it was built from this adapter and exact four-step
+        schedule before exposing the names. Keep this method strict as the last
+        boundary: a sidecar may satisfy only edits this adapter really carries,
+        and it must be bound before checkpoint streaming starts.
+        """
+        if self._stream_started:
+            raise FastH3AdapterError("FastH3 AdaLN sidecar must be bound before checkpoint weights start streaming")
+        satisfied = frozenset(str(name) for name in names)
+        unknown = sorted(satisfied - set(self._patches))
+        if unknown:
+            raise FastH3AdapterError(
+                f"FastH3 AdaLN sidecar claims parameters this adapter does not edit: {unknown[:5]}"
+            )
+        self._sidecar_satisfied.update(satisfied)
+        self._applied.update(satisfied)
 
     def validate_fully_applied(self, loaded: Iterable[str] | None = None) -> None:
         """Close the fusion: every edit must have met its parameter.
