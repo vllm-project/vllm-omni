@@ -522,7 +522,7 @@ class Vevo2ForCausalLM(nn.Module):
             # Fail loudly rather than emit a silent WAV: a blank request is a
             # caller error, and returning exit-0 silence hides it. The online
             # serving path already rejects this with a 400 (see
-            # ``_validate_vevo2_request``); this guards the offline path, which
+            # ``Vevo2Adapter.validate``); this guards the offline path, which
             # has no validation layer in front of the model.
             raise ValueError("Vevo2 received empty text; provide non-empty input.")
 

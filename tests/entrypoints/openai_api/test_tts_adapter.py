@@ -13,6 +13,7 @@ import pytest
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters import (
     TTS_ADAPTER_REGISTRY,
     ARTTSAdapter,
@@ -731,3 +732,40 @@ def test_vevo2_leaves_unset_knobs_to_model_defaults():
     assert tts_params["top_k"] == [7]
     for absent in ("top_p", "temperature", "flow_matching_steps"):
         assert absent not in tts_params
+
+
+# spec= pins the adapter to helpers the real serving class still has, so a
+# call into a removed server method fails here rather than at request time.
+def _vevo2_adapter(mocker):
+    server = mocker.Mock(spec=OmniOpenAIServingSpeech)
+    server.uploaded_speakers = {}
+    server._apply_uploaded_speaker.return_value = None
+    server._validate_ref_audio_format.return_value = None
+    server._resolve_ref_audio = mocker.AsyncMock(return_value=([0.0, 0.5], 16000, "ref-cache-key"))
+    return Vevo2Adapter(SpeechServingContext(server=server))
+
+
+def test_vevo2_validate_requires_text_and_ref_audio(mocker):
+    adapter = _vevo2_adapter(mocker)
+    ref = "https://example.com/ref.wav"
+
+    assert adapter.validate(OpenAICreateSpeechRequest(input="  ", ref_audio=ref)) == "Input text cannot be empty"
+    assert "requires 'ref_audio'" in adapter.validate(OpenAICreateSpeechRequest(input="hello"))
+    assert adapter.validate(OpenAICreateSpeechRequest(input="hello", ref_audio=ref)) is None
+
+
+def test_vevo2_build_accumulates_nonstreaming_delta_chunks(mocker):
+    # Vevo2 yields its waveform as delta chunks with async_chunk=false; without
+    # accumulation the non-streaming response keeps only the last (empty) one.
+    adapter = _vevo2_adapter(mocker)
+    request = OpenAICreateSpeechRequest(input="hello", ref_audio="https://example.com/ref.wav", ref_text="transcript")
+
+    prepared = asyncio.run(adapter.build(request, [SamplingParams(seed=42)], has_inline_ref_audio=True))
+
+    assert prepared.output_policy.accumulate_nonstreaming is True
+    assert prepared.model_type == "vevo2"
+    info = prepared.prompt["additional_information"]
+    assert info["text"] == ["hello"]
+    assert info["ref_text"] == ["transcript"]
+    assert info["prompt_audio_array"] == [[[0.0, 0.5], 16000]]
+    assert info["seed"] == [42]
