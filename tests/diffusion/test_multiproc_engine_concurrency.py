@@ -220,6 +220,51 @@ def _make_sched_output(*request_ids: str) -> DiffusionSchedulerOutput:
     )
 
 
+class TestStepModeTimeout:
+    def test_missing_reply_closes_executor_and_prevents_dispatch(self, monkeypatch):
+        from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+        executor, req_q, res_q = _make_executor(num_gpus=2)
+
+        def dequeue(timeout=None):
+            try:
+                return res_q.get(timeout=timeout)
+            except queue.Empty as exc:
+                # Match MessageQueue's timeout contract in step mode.
+                raise TimeoutError from exc
+
+        executor._result_mq = SimpleNamespace(dequeue=dequeue)
+        executor._shutdown_cleaner = None
+        executor._finalizer = weakref.finalize(executor, lambda: None)
+        executor._pump_stop = threading.Event()
+        executor._futures_lock = threading.RLock()
+        executor._rpc_futures = {}
+        executor._output_futures = {}
+        executor._batch_split_map = {}
+        failure_callback = Mock()
+        executor.register_failure_callback(failure_callback)
+        monkeypatch.setattr(executor_module, "_DLO_DP_WAVE_TIMEOUT_S", 0.05)
+
+        # No worker replies: exercise the real RPC deadline and shutdown path.
+        with pytest.raises(TimeoutError, match="timed out"):
+            executor.execute_step(_make_sched_output("A"))
+
+        assert req_q.get_nowait()["method"] == "execute_stepwise"
+        assert executor._is_failed
+        assert executor._closed
+        assert executor._pump_stop.is_set()
+        assert executor._broadcast_mq is None
+        assert executor._result_mq is None
+        failure_callback.assert_called_once_with()
+        with pytest.raises(EngineDeadError):
+            executor.check_health()
+
+        for dispatch in (executor.execute_step, executor.execute_request, executor.execute_batch):
+            with pytest.raises(RuntimeError, match="DiffusionExecutor is closed"):
+                dispatch(_make_sched_output("B", "C"))
+        assert req_q.empty()
+
+
 class TestRequestModeDispatch:
     """Request-batch-capable dispatch uses ``execute_batch`` for request-mode cycles."""
 
