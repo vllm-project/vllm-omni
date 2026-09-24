@@ -75,6 +75,90 @@ def _tiny_cosmos3_edge_config(**overrides):
     return config
 
 
+@pytest.mark.parametrize(
+    ("config_kind", "expected_language", "expected_gen"),
+    [
+        ("flat", "transformer", "transformer"),
+        ("transformer", "transformer", "transformer"),
+        ("other_component", None, None),
+        ("language_model", "language", None),
+        ("gen_layers", None, "gen"),
+        ("transformer_language_override", "language", "transformer"),
+        ("transformer_gen_disabled", "transformer", None),
+        ("independent_subcomponents", "language", "gen"),
+    ],
+)
+def test_transformer_resolves_global_and_subcomponent_quant_configs(
+    monkeypatch: pytest.MonkeyPatch,
+    config_kind: str,
+    expected_language: str | None,
+    expected_gen: str | None,
+) -> None:
+    """Resolve pipeline-level defaults and Cosmos3 subcomponent overrides."""
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+    from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+
+    received: list[tuple[str, object]] = []
+    configs = {
+        "transformer": object(),
+        "language": object(),
+        "gen": object(),
+    }
+
+    class _StubLanguageModel(nn.Module):
+        def __init__(self, *, quant_config, **kwargs) -> None:
+            del kwargs
+            super().__init__()
+            received.append(("language_model", quant_config))
+            self.layers = nn.ModuleList()
+
+    class _StubGenDecoderLayer(nn.Module):
+        def __init__(self, *, quant_config, **kwargs) -> None:
+            del kwargs
+            super().__init__()
+            received.append(("gen_layers", quant_config))
+
+    monkeypatch.setattr(Cosmos3VFMTransformer, "_language_model_cls", _StubLanguageModel)
+    monkeypatch.setattr(transformer_cosmos3, "Cosmos3GenDecoderLayer", _StubGenDecoderLayer)
+
+    if config_kind == "flat":
+        top_level_config = configs["transformer"]
+    elif config_kind == "transformer":
+        top_level_config = ComponentQuantizationConfig({"transformer": configs["transformer"]})
+    elif config_kind == "other_component":
+        top_level_config = ComponentQuantizationConfig({"vae": configs["transformer"]})
+    elif config_kind == "language_model":
+        top_level_config = ComponentQuantizationConfig({"language_model": configs["language"]})
+    elif config_kind == "gen_layers":
+        top_level_config = ComponentQuantizationConfig({"gen_layers": configs["gen"]})
+    elif config_kind == "transformer_language_override":
+        top_level_config = ComponentQuantizationConfig(
+            {"transformer": configs["transformer"], "language_model": configs["language"]}
+        )
+    elif config_kind == "transformer_gen_disabled":
+        top_level_config = ComponentQuantizationConfig({"transformer": configs["transformer"], "gen_layers": None})
+    else:
+        top_level_config = ComponentQuantizationConfig(
+            {"language_model": configs["language"], "gen_layers": configs["gen"]}
+        )
+
+    Cosmos3VFMTransformer(
+        SimpleNamespace(
+            tf_model_config=_tiny_cosmos3_config(num_hidden_layers=1),
+            dtype=torch.float32,
+            quantization_config=top_level_config,
+            custom_pipeline_args={},
+            model_config={},
+        )
+    )
+
+    assert received == [
+        ("language_model", configs.get(expected_language)),
+        ("gen_layers", configs.get(expected_gen)),
+    ]
+
+
 def test_mrope_position_ids_cover_text_video_sound_and_action() -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
         compute_mrope_position_ids_action,
