@@ -394,14 +394,31 @@ def test_duplex_seeded_text_to_audio(omni_server, locale: str, text: str) -> Non
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
-def test_duplex_seeded_text_to_text_needs_no_reference_voice(omni_server) -> None:
-    """text -> text, the one duplex session that opens without a reference voice.
+def test_duplex_seeded_text_to_audio_uses_model_default_reference_audio(omni_server) -> None:
+    """Audio-output sessions can use the prompt bundled with the model."""
+    result = asyncio.run(
+        _run_seeded_text_to_audio(
+            url=realtime_url(omni_server),
+            model=omni_server.model,
+            ref_audio=None,
+            text="Please say: the quick brown fox jumps over the lazy dog.",
+        )
+    )
 
-    ``ref_audio`` is required only when the session asks for audio output, so a
-    ``modalities: ["text"]`` session is the duplex equivalent of the deleted
-    turn-based ``text -> text`` case. The model is model-native and still
-    speaks its answer, so this asserts the text side and the absence of the
-    ``ref_audio_required`` rejection, not the absence of audio.
+    assert "response.done" in result["event_types"], result["event_types"]
+    assert int(result["audio_bytes"]) > 0, "seeded text with the model default produced no audio"
+    assert str(result["transcript"]).strip(), "seeded text with the model default produced no transcript"
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+def test_duplex_seeded_text_to_text_needs_no_reference_voice(omni_server) -> None:
+    """Text-only sessions do not need to load or send a reference voice.
+
+    The model is model-native and may still speak its answer, so this checks the
+    text side and verifies that the text-only configuration skips reference
+    audio loading; it does not assert the absence of audio.
     """
     result = asyncio.run(
         _run_seeded_text_to_audio(

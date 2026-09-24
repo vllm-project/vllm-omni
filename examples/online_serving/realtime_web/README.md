@@ -82,7 +82,6 @@ accepts only model selection, so system-prompt controls are hidden in this mode.
 The adapter follows the shipped `qwen3_omni/openai_realtime_client.py` and
 `vllm_omni/entrypoints/openai/realtime_connection.py`:
 
-
 1. Explicit `duplex=0` selects the legacy STT handler on a turn deployment.
    It does not enable STT on a duplex deployment.
 2. Send `{type: "session.update", model: ...}` and `commit(final=false)`.
@@ -227,7 +226,9 @@ python -m examples.online_serving.realtime_web --profile qwen3-turn \
 - `--public-realtime-url`: optional browser-visible WebSocket URL; otherwise the
   static host proxies `/v1/realtime` on the same origin.
 - `--host`, `--port`: UI bind address and port (default port 7862).
-- `--ref-audio`: required for MiniCPM; rejected for Qwen3 and AURA.
+- `--ref-audio`: optional MiniCPM assistant voice override; the server uses the
+  model-bundled `assets/HT_ref_audio.wav` when it is omitted. Rejected for
+  Qwen3 and AURA.
 
 Microphone and camera access require `localhost` or HTTPS. For a remote backend,
 use an SSH tunnel to the UI host or an HTTPS reverse proxy with WebSocket support.

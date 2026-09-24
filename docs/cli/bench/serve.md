@@ -299,8 +299,9 @@ vllm bench serve --omni \
 
 `--dataset-path` accepts an extracted directory, `data.tar[.gz]`, or a Hugging Face dataset ID; omitting it uses
 `lucky-lance/OmniInteract`. `--num-prompts` is the total across subsets and defaults to 3 for OmniInteract; explicit `0`
-selects all and oversize values use all available cases. Reference audio is required, and OmniInteract uses the
-`/v1/realtime` endpoint.
+selects all and oversize values use all available cases. OmniInteract requires a reference WAV to pin the assistant voice
+for comparable scores; this is a benchmark constraint, since ordinary MiniCPM-o duplex sessions can use the model-bundled
+default when `ref_audio` is omitted. OmniInteract uses the `/v1/realtime` endpoint.
 
 Audio is replayed as 16 kHz PCM16 in 200 ms chunks and video at 1 FPS with real-time pacing. All selected media is decoded
 before timing and remains in client memory for the run, so `--max-concurrency` does not limit media preparation memory; use

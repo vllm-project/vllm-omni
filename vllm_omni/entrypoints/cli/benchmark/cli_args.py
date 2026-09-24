@@ -65,7 +65,9 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         help="Reject media longer than this safety limit before decoding.",
     )
     group.add_argument(
-        "--omniinteract-ref-audio", type=_existing_file, help="Reference WAV for native-duplex audio output."
+        "--omniinteract-ref-audio",
+        type=_existing_file,
+        help="Required reference WAV to pin the assistant voice for reproducible native-duplex scoring.",
     )
     group.add_argument(
         "--omniinteract-require-response", action="store_true", help="Fail LISTEN-only functional E2E cases."
@@ -420,7 +422,7 @@ def preprocess_serve_args(args: argparse.Namespace) -> None:
         if getattr(args, "endpoint", None) != "/v1/realtime":
             raise ValueError("OmniInteract requires --endpoint /v1/realtime")
         if not getattr(args, "omniinteract_ref_audio", None):
-            raise ValueError("OmniInteract requires --omniinteract-ref-audio")
+            raise ValueError("OmniInteract requires --omniinteract-ref-audio to pin the voice for reproducible scoring")
         if getattr(args, "ignore_eos", False):
             raise ValueError("OmniInteract does not support --ignore-eos")
         if getattr(args, "profile", False):

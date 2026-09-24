@@ -62,7 +62,14 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     _common(generate)
     generate.add_argument("--url", default="ws://localhost:8099/v1/realtime?duplex=1")
     generate.add_argument("--model", required=True)
-    generate.add_argument("--ref-audio", required=True)
+    generate.add_argument(
+        "--ref-audio",
+        required=True,
+        help=(
+            "Reference WAV used for every sample to pin the assistant voice for comparable scores; "
+            "pass the model-bundled assets/HT_ref_audio.wav to evaluate that voice."
+        ),
+    )
     generate.add_argument("--response-root", required=True)
     generate.add_argument("--fps", type=float, default=1.0)
     generate.add_argument("--mix", choices=("question",), default="question")

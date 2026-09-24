@@ -90,10 +90,10 @@ python examples/online_serving/barge_in_client.py \
     --output-dir ./duplex_out
 ```
 
-Input WAVs must be mono 16 kHz PCM16. `--ref-audio` is required by the
-MiniCPM-o preset (the session is otherwise rejected with
-`ref_audio_required`). `--preset personaplex` switches the session shape to
-the PersonaPlex preset. The flow is diagrammed in
+Input WAVs must be mono 16 kHz PCM16. MiniCPM-o uses the model-bundled
+`assets/HT_ref_audio.wav` when `--ref-audio` is omitted; an explicit reference
+clip overrides that default. `--preset personaplex` switches the session shape
+to the PersonaPlex preset. The flow is diagrammed in
 `examples/online_serving/barge_in_client_flow.md`.
 
 ## Using DuplexClient
@@ -124,7 +124,7 @@ ships a preset:
 
 | Preset | Input / output audio | What it sets |
 | --- | --- | --- |
-| `vllm_omni.clients.minicpmo_4_5.create_duplex_session_config(ref_audio=...)` | 16 kHz `pcm16` / 24 kHz `pcm16` | `force_listen_count=0`, `overlap_policy="listen_only"`, `playback_commit_policy="ack_only"`; `ref_audio` is the assistant voice clip |
+| `vllm_omni.clients.minicpmo_4_5.create_duplex_session_config(ref_audio=...)` | 16 kHz `pcm16` / 24 kHz `pcm16` | `force_listen_count=0`, `overlap_policy="listen_only"`, `playback_commit_policy="ack_only"`; optional `ref_audio` overrides the assistant voice, otherwise the server uses `assets/HT_ref_audio.wav` from the model |
 | `vllm_omni.clients.personaplex.create_duplex_session_config(voice="NATF2.pt", persona="")` | 24 kHz `pcm_f32le` / 24 kHz `pcm16` | bundled `.pt` voice prompt and the persona as `instructions` |
 | `SessionConfig(...)` | 16 kHz `pcm16` / 24 kHz `pcm16` | model-neutral defaults; pass `extra_body`, `turn_detection`, `overlap_policy`, `playback_commit_policy`, `instructions`, `voice`, `temperature` yourself |
 

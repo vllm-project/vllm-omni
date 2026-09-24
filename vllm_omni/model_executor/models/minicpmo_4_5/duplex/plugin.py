@@ -18,6 +18,7 @@ from base64 import b64decode
 from binascii import Error as BinasciiError
 from collections.abc import Mapping
 from copy import deepcopy
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -51,6 +52,9 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.session import (
     MiniCPMO45ServingSessionState,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
+    load_default_prompt_audio,
 )
 
 if TYPE_CHECKING:
@@ -478,6 +482,37 @@ async def resolve_ref_audio(ref_audio: str, *, model_config: ModelConfig | None)
     return np.asarray(wav_np, dtype=np.float32), int(sr)
 
 
+@lru_cache(maxsize=8)
+def _load_default_ref_audio(model_ref: str, revision: str | None = None) -> tuple[NDArray[np.float32], int] | None:
+    """Load the prompt WAV shipped in the MiniCPM-o model snapshot.
+
+    Code2Wav already resolves the model reference and uses the same bundled
+    ``assets/HT_ref_audio.wav`` as its fallback prompt. Reuse those helpers so
+    native duplex and Code2Wav condition on the same model-owned asset. Cache
+    the result for each model revision so sessions reuse the same prompt audio.
+    """
+    loaded = load_default_prompt_audio(model_ref, revision=revision)
+    if loaded is None:
+        return None
+    waveform, sample_rate = loaded
+    wav_np = np.asarray(waveform, dtype=np.float32)
+    if wav_np.ndim > 1:
+        # Code2Wav's WAV reader returns (channels, samples); native duplex
+        # normalizes request references as samples-first audio.
+        wav_np = wav_np.mean(axis=0)
+    return wav_np, int(sample_rate)
+
+
+async def resolve_default_ref_audio(model_config: ModelConfig | None) -> tuple[NDArray[np.float32], int] | None:
+    """Resolve the model-bundled prompt without blocking the session loop."""
+    model_ref = getattr(model_config, "model", None)
+    if not isinstance(model_ref, str) or not model_ref:
+        return None
+    raw_revision = getattr(model_config, "revision", None)
+    revision = raw_revision if isinstance(raw_revision, str) else None
+    return await asyncio.to_thread(_load_default_ref_audio, model_ref, revision)
+
+
 def normalize_ref_audio(wav_np: NDArray[np.float32], sample_rate: int, *, target_sr: int) -> NDArray[np.float32]:
     wav_np = np.asarray(wav_np, dtype=np.float32)
     if wav_np.ndim > 1:
@@ -762,10 +797,15 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             extra_body.pop("tts_ref_audio")
             ref_audio = extra_tts_ref_audio
 
-        if ref_audio is None:
-            if any(str(modality).lower() == "audio" for modality in config.modalities):
+        requests_audio = any(str(modality).lower() == "audio" for modality in config.modalities)
+        default_ref_audio = None
+        if ref_audio is None and requests_audio:
+            default_ref_audio = await resolve_default_ref_audio(model_config)
+
+        if ref_audio is None and default_ref_audio is None:
+            if requests_audio:
                 raise MiniCPMO45ClientRuntimeConfigError(
-                    "MiniCPM-o duplex audio output requires ref_audio",
+                    "MiniCPM-o duplex audio output requires ref_audio or the model-bundled assets/HT_ref_audio.wav",
                     code="ref_audio_required",
                 )
             _apply_first_append_context_tokens(
@@ -778,7 +818,10 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             config.extra_body = extra_body
             return runtime_config
 
-        wav_np, sr = await resolve_ref_audio(ref_audio, model_config=model_config)
+        if default_ref_audio is None:
+            wav_np, sr = await resolve_ref_audio(ref_audio, model_config=model_config)
+        else:
+            wav_np, sr = default_ref_audio
         # torchaudio resampling is CPU work: keep it off the orchestrator loop.
         wav_np = await asyncio.to_thread(normalize_ref_audio, wav_np, int(sr), target_sr=16000)
         # Trim to a whole number of pooled audio embeddings (100 ms frames) so

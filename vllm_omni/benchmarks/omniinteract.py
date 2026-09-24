@@ -1013,7 +1013,10 @@ async def run_omniinteract_case(
     prepared_input: OmniInteractPreparedInput | None = None,
 ) -> OmniInteractCaseResult:
     if not config.ref_audio:
-        raise ValueError("ref_audio is required for MiniCPM-o native-duplex audio output")
+        raise ValueError(
+            "OmniInteract requires an explicit ref_audio to pin the assistant voice for reproducible scoring; "
+            "the server can use the model-bundled default when a normal client omits ref_audio"
+        )
     for name, value in (
         ("timeout_s", config.timeout_s),
         ("media_timeout_s", config.media_timeout_s),
