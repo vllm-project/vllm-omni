@@ -213,7 +213,7 @@ def test_batched_repetition_penalty_matches_rows_across_chunks(mocker) -> None:
         ],
         dim=0,
     )
-    bincount = mocker.spy(torch, "bincount")
+    zeros = mocker.spy(torch, "zeros")
     actual = _apply_batched_repetition_penalty(
         logits,
         histories,
@@ -222,11 +222,34 @@ def test_batched_repetition_penalty_matches_rows_across_chunks(mocker) -> None:
     )
 
     assert torch.equal(actual, expected)
-    assert [call.kwargs["minlength"] for call in bincount.call_args_list] == [
+    assert [call.args[0] for call in zeros.call_args_list] == [
         _REPETITION_PENALTY_CHUNK_SIZE * vocab_size,
         _REPETITION_PENALTY_CHUNK_SIZE * vocab_size,
         vocab_size,
     ]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_batched_repetition_penalty_preserves_per_row_values_without_bincount(dtype: torch.dtype, mocker) -> None:
+    logits = torch.tensor([[-2, -1, 0, 1, 2]] * 4, dtype=dtype)
+    histories = [
+        torch.tensor([0, 0, 4, 4]),
+        torch.tensor([1, 1]),
+        torch.tensor([3, 3]),
+        torch.empty(0, dtype=torch.long),
+    ]
+    penalties = torch.tensor([1.2, 1.0, 0.8, 1.05], dtype=dtype)
+    expected = torch.cat(
+        [
+            _reference_repetition_penalty(logits[i : i + 1], history, penalty=penalties[i], window_size=3)
+            for i, history in enumerate(histories)
+        ]
+    )
+    mocker.patch.object(torch, "bincount", side_effect=AssertionError("codec penalty must use fixed-size counts"))
+
+    actual = _apply_batched_repetition_penalty(logits, histories, penalty=penalties, window_size=3)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_scheduler_prompt_is_fully_blanked_for_penalties() -> None:

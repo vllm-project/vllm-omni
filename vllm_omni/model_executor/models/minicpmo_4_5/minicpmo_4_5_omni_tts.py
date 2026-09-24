@@ -145,12 +145,11 @@ def _apply_batched_repetition_penalty(
         if not encoded_rows:
             continue
 
-        # Bound the int64 bincount workspace independently of request concurrency.
+        # Fixed-size counts avoid bincount's data-dependent output sizing.
         encoded = encoded_rows[0] if len(encoded_rows) == 1 else torch.cat(encoded_rows)
-        frequencies = torch.bincount(
-            encoded,
-            minlength=(end - start) * vocab_size,
-        ).reshape(end - start, vocab_size)
+        frequencies = torch.zeros((end - start) * vocab_size, dtype=torch.long, device=logits.device)
+        frequencies.scatter_add_(0, encoded, torch.ones_like(encoded))
+        frequencies = frequencies.reshape(end - start, vocab_size)
         alpha = torch.pow(penalties[start:end].unsqueeze(1), frequencies.to(dtype=logits.dtype))
         penalized[start:end] = torch.where(chunk_logits < 0, chunk_logits * alpha, chunk_logits / alpha)
 
