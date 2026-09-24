@@ -266,9 +266,7 @@ def test_buildkite_perf_steps_use_matching_runner_schema():
             assert config_path.exists(), f"{pipeline}: perf config not found: {config_rel}"
             runner_is_diffusion = match.group("runner") == "run_diffusion_benchmark"
             cases = json.loads(config_path.read_text(encoding="utf-8"))
-            mismatched = [
-                cfg["test_name"] for cfg in cases if is_diffusion_perf_config(cfg) != runner_is_diffusion
-            ]
+            mismatched = [cfg["test_name"] for cfg in cases if is_diffusion_perf_config(cfg) != runner_is_diffusion]
             assert not mismatched, (
                 f"{pipeline}: {match.group('runner')} runs {config_rel}, but case(s) {mismatched} "
                 f"are not {'diffusion' if runner_is_diffusion else 'omni-bench'}-schema; the runner "
