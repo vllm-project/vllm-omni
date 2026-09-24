@@ -24,6 +24,7 @@ from vllm_omni.diffusion.data import DiffusionCacheConfig, DiffusionOutput, Omni
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
 
@@ -90,7 +91,7 @@ class _MammothRequest:
     generator: torch.Generator | list[torch.Generator] | None
 
 
-class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
+class MammothModa2DiTPipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
     """
     MammothModa2 DiT + VAE generation stage (non-autoregressive).
 
@@ -177,12 +178,6 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
 
         self._llm_hidden_size = llm_hidden_size
 
-        # Cache-DiT lifecycle: the diffusion runner enables the configured
-        # backend (``cache_backend`` on the deploy YAML stage entry) at startup
-        # and transfers ownership here via the request-scoped protocol;
-        # forward() then reconciles per-request state (step count, CFG parity).
-        # The runner also emits the cache summary when
-        # ``enable_cache_dit_summary`` is set.
         self._cache_dit_runtime = RequestScopedCacheDiTRuntime(self)
         self._cache_dit_config: DiffusionCacheConfig | None = None
         if str(getattr(od_config, "cache_backend", "") or "").lower() == "cache_dit":
@@ -192,6 +187,14 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
                 if isinstance(cache_config, DiffusionCacheConfig)
                 else DiffusionCacheConfig.from_dict(cache_config or {})
             )
+
+        profiler_targets = ["gen_transformer.forward", "gen_vae.decode"]
+        if self.gen_image_condition_refiner is not None:
+            profiler_targets.append("gen_image_condition_refiner.forward")
+        self.setup_diffusion_pipeline_profiler(
+            profiler_targets=profiler_targets,
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler,
+        )
 
     def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
         """Adopt a runner-installed Cache-DiT backend (request-scoped protocol)."""

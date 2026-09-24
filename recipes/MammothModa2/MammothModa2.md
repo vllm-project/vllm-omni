@@ -264,6 +264,44 @@ python3 examples/offline_inference/text_to_image/text_to_image.py \
 
 The first request took 85.224 seconds. The AR stage generated 4,161 visual tokens in 72.996 seconds, and the DiT stage took 12.163 seconds. AR weight loading used 21.4 GiB and took 8.250 seconds. DiT weight loading used 5.49 GiB and took 1.824 seconds. The largest one second whole device memory sample was 106.57 GiB, including the AR KV cache reserved by the 0.5 memory setting.
 
+### 1x A800 80GB, MammothModa2 Preview (serving)
+
+#### Environment
+
+- OS: Linux, x86_64
+- CPU: 18 cores
+- GPU: one NVIDIA A800-SXM4-80GB
+- Deploy config: `vllm_omni/deploy/mammoth_moda2.yaml` (default split: AR `gpu_memory_utilization` 0.5, DiT 0.3)
+- vLLM-Omni version or commit: use the commit you are deploying from
+
+#### Serving Commands
+
+```bash
+vllm-omni serve bytedance-research/MammothModa2-Preview --omni \
+    --port 8091 \
+    --trust-remote-code
+
+python benchmarks/diffusion/diffusion_benchmark_serving.py \
+    --model bytedance-research/MammothModa2-Preview \
+    --endpoint /v1/images/generations \
+    --host 127.0.0.1 --port 8091 \
+    --height 1024 --width 1024 --num-inference-steps 50 \
+    --extra-body '{"text_guidance_scale": 9.0, "cfg_range": [0.0, 1.0]}' \
+    --num-prompts 8 --seed 142 --warmup-requests 0 \
+    --output-file mm2_1024_s50_c1.json
+```
+
+#### Verification
+
+On 1024x1024 / 50 steps, single-concurrency end-to-end mean latency is ~96 s
+(P99 ~101 s) per image and concurrency-4 mean is ~151 s (~0.024 img/s);
+steady-state combined GPU memory is ~50.4 GiB (AR ~39.2 GiB, DiT ~11.1 GiB).
+The AR stage dominates (~77 s of a ~96 s request) because it decodes a fixed
+4,161-token visual grid per image, so latency is insensitive to prompt length
+and scales only partially with DiT step count. See the
+[serving performance dashboard](../../benchmarks/diffusion/performance_dashboard/mammoth_moda2_serving_performance.md)
+for the full sweep, peak-memory, and component-attribution data.
+
 The output was a valid 1024 by 1024 RGB PNG.
 
 ## MammothModa2-Dev unified inference
