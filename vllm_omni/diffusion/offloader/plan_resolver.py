@@ -27,7 +27,7 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 
 from .block_discovery import get_blocks_from_dit
 from .component_utils import get_encoder_block_groups, validate_on_demand_component
-from .config import DIT_COMPONENT, TEXT_ENCODER_COMPONENT, OffloadStrategy
+from .config import DIT_COMPONENT, TEXT_ENCODER_COMPONENT, VAE_COMPONENT, OffloadStrategy
 from .module_collector import ModuleDiscovery
 from .offload_plan import OffloadPlan, get_offload_plan
 
@@ -309,6 +309,11 @@ def resolve_offload_plan(pipeline: nn.Module, config: OffloadConfig) -> Resolved
     dit_selected = config.offloads(DIT_COMPONENT)
 
     if explicit:
+        if config.offloads(VAE_COMPONENT):
+            raise ValueError(
+                "vae offload requires a pipeline that owns its VAE lifecycle "
+                "(SupportsModelCpuOffload); this pipeline does not support the 'vae' component"
+            )
         if config.strategy is OffloadStrategy.MODEL_LEVEL:
             # Model-level offload swaps the DiT against an encoder stage, so
             # both sides must exist regardless of which side was selected.

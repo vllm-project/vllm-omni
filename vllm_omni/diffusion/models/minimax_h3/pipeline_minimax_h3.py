@@ -51,6 +51,7 @@ from vllm_omni.diffusion.offloader import (
 from vllm_omni.diffusion.offloader.config import (
     DIT_COMPONENT,
     TEXT_ENCODER_COMPONENT,
+    VAE_COMPONENT,
     OffloadStrategy,
     resolve_offload,
     should_offload_component,
@@ -360,9 +361,9 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
     if not isinstance(output, tuple) or len(output) != 2:
         return output
     video, audio = output
-    if isinstance(video, (bytes, bytearray, memoryview)):
+    if isinstance(video, bytes | bytearray | memoryview):
         video = [video]
-    if isinstance(video, list) and all(isinstance(item, (bytes, bytearray, memoryview)) for item in video):
+    if isinstance(video, list) and all(isinstance(item, bytes | bytearray | memoryview) for item in video):
         encoded_videos = [bytes(item) for item in video]
     else:
         encoded_videos = None
@@ -448,7 +449,7 @@ def _expose_padded_audio_tail(
 def _resolve_minimax_h3_num_outputs(value: Any) -> int:
     if value is None:
         return 1
-    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+    if isinstance(value, bool) or not isinstance(value, int | np.integer):
         raise OmniClientError("MiniMax H3 num_outputs_per_prompt must be an integer in [1, 10]")
     value = int(value)
     if not 1 <= value <= 10:
@@ -466,7 +467,7 @@ def _resolve_pad_seq_len(value: object) -> int | None:
     """
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+    if isinstance(value, bool) or not isinstance(value, int | np.integer):
         raise OmniClientError("MiniMax H3 pad_seq_len must be an integer")
     pinned = int(value)
     if pinned <= 0:
@@ -1356,6 +1357,11 @@ class MiniMaxH3Pipeline(
         modules = [*dits, *stages]
         selection_options: dict[str, Any] = {}
         if offload_components is not None:
+            if VAE_COMPONENT in offload_components:
+                raise ValueError(
+                    "MiniMax-H3 module offload stages its VAEs through the compatibility "
+                    "topology; the compact selector does not support the 'vae' component"
+                )
             if DIT_COMPONENT in offload_components and not dits:
                 raise ValueError("MiniMax-H3 has no loaded DiT for selected module offload")
             if TEXT_ENCODER_COMPONENT in offload_components and not components.encoders:

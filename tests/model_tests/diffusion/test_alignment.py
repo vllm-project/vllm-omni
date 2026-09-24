@@ -76,6 +76,11 @@ EXCLUDED_MODELS = [
     # The 270+ GiB multimodal checkpoint needs 4/8-way native sequence/head
     # parallel execution; covered by focused native contract and GPU tests.
     "Magi2Pipeline",
+    # Requires AR-stage hidden states (full_hidden_states / full_token_ids) that
+    # only the upstream AR stage produces; covered by dedicated contract tests in
+    # tests/diffusion/models/mammoth_moda2 (CPU pipeline + GPU lifecycle) instead
+    # of a tiny-model builder.
+    "MammothModa2DiTPipeline",
     "OmniVoicePipeline",
     "OmniVoice",
     "Cosmos3OmniDiffusersPipeline",

@@ -11,7 +11,8 @@ from typing import Any, TypeVar
 
 DIT_COMPONENT = "dit"
 TEXT_ENCODER_COMPONENT = "text_encoder"
-OFFLOAD_COMPONENTS = frozenset({DIT_COMPONENT, TEXT_ENCODER_COMPONENT})
+VAE_COMPONENT = "vae"
+OFFLOAD_COMPONENTS = frozenset({DIT_COMPONENT, TEXT_ENCODER_COMPONENT, VAE_COMPONENT})
 DEFAULT_OFFLOAD_COMPONENTS = frozenset({DIT_COMPONENT})
 
 _KeyT = TypeVar("_KeyT")
@@ -195,6 +196,8 @@ def parse_diffusion_offload_config(value: Any) -> ParsedDiffusionOffloadConfig |
 
     mode = _parse_enum(value["mode"], OffloadMode, "diffusion offload mode")
     components = parse_offload_components(value["components"])
+    if VAE_COMPONENT in components and mode is not OffloadMode.MODULE:
+        raise ValueError("diffusion_offload_config 'vae' component requires mode='module'")
 
     raw_layer_options = value.get("layer_options", {})
     if not isinstance(raw_layer_options, Mapping):
@@ -291,6 +294,7 @@ def resolve_offload(config: Any) -> ResolvedOffload:
                 DLOTransfer.ALLGATHER if bool(getattr(config, "dlo_use_allgather", True)) else DLOTransfer.RANK_LOCAL
             ),
             TEXT_ENCODER_COMPONENT: DLOTransfer.RANK_LOCAL,
+            VAE_COMPONENT: DLOTransfer.RANK_LOCAL,
         }
         resolved = ResolvedOffload(
             strategy=legacy,
@@ -367,7 +371,7 @@ def materialize_legacy_offload_flags(config: Any) -> OffloadStrategy:
 
 def parse_offload_components(value: Collection[str]) -> frozenset[str]:
     """Validate an internal component collection."""
-    if isinstance(value, (str, Mapping)) or not isinstance(value, Collection):
+    if isinstance(value, str | Mapping) or not isinstance(value, Collection):
         raise TypeError("diffusion_offload_config.components must be a non-empty list of component names")
     if any(not isinstance(item, str) for item in value):
         raise TypeError("offload component entries must be strings")

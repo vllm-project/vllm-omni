@@ -174,7 +174,7 @@ def test_parse_request_uses_standard_sampling_fields() -> None:
     assert parsed.answer_start_index == 2
 
 
-def test_parse_request_prefers_legacy_sampling_overrides() -> None:
+def test_parse_request_standard_fields_override_legacy_aliases() -> None:
     sampling = OmniDiffusionSamplingParams(
         guidance_scale=3.0,
         num_inference_steps=5,
@@ -182,8 +182,8 @@ def test_parse_request_prefers_legacy_sampling_overrides() -> None:
         extra_args={"text_guidance_scale": 6.0, "num_inference_steps": 11, "cfg_range": [0.0, 0.5]},
     )
     parsed = _pipeline_shell()._parse_request(_batch(sampling=sampling))
-    assert parsed.text_guidance_scale == 6.0
-    assert parsed.num_inference_steps == 11
+    assert parsed.text_guidance_scale == 3.0
+    assert parsed.num_inference_steps == 5
     assert parsed.cfg_range == (0.0, 0.5)
 
 
