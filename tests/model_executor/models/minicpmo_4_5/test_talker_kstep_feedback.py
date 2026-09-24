@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """No-device regression tests for the MiniCPM-o Talker K-step feedback chain.
 
 Layers pinned down here:
@@ -379,3 +382,155 @@ def test_kstep_min_tokens_neutralization_clears_the_censor_list():
     # An empty list and odd inputs must not raise either.
     talker_multiframe.neutralize_kstep_min_tokens(SimpleNamespace(non_argmax_invariant=[]))
     talker_multiframe.neutralize_kstep_min_tokens(None)
+
+
+def test_incomplete_prefill_chunk_skips_sampling():
+    """The runner's eligibility flag must gate the K-step sampling branch.
+
+    A request whose prompt spans several prefill chunks reports
+    ``request_sample_eligible=False`` for the incomplete chunks; sampling
+    there would advance codec history and RNG state, making the generated
+    audio depend on how the prompt happened to be chunked (review on PR
+    #7929). The flag only reaches the Talker while the outer wrapper
+    forwards ``requires_request_sample_eligibility`` -- without that forward
+    the runner never sends the flag and this branch degrades to the
+    ``[True] * len(infos)`` fallback.
+    """
+    model = _make_talker(k_step_frames=8, scripted_samples=[42])
+    state = {"step": 0, "codes": torch.tensor([10, 11])}
+    model._request_audio_states["r1"] = state
+
+    out = model.make_omni_output(
+        torch.randn(1, 8),
+        model_intermediate_buffer=[{"request_id": "r1"}],
+        request_token_spans=[(0, 1)],
+        request_sample_eligible=[False],
+    )
+    # No codec frame, no state advance, no history touch.
+    assert out.multimodal_outputs["codes"]["audio"][0].numel() == 0
+    assert state["step"] == 0
+    assert "last_code" not in state
+    assert model._request_codec_history.get("r1", []) == []
+
+    # Eligible again (the chunking completed): sampling resumes.
+    out2 = _frame_call(model, torch.randn(1, 8))
+    assert state["last_code"] == 42
+    assert out2.multimodal_outputs["codes"]["audio"][0].reshape(-1).tolist() == [42]
+
+
+def test_outer_wrapper_forwards_sampling_eligibility_flag():
+    """The runner only sees the wrapper, so the flag must resolve through it.
+
+    gpu/npu runners arm the ``request_sample_eligible`` transmission with
+    ``getattr(self.model, "requires_request_sample_eligibility", False)``,
+    and ``self.model`` is the stage's registered architecture -- the outer
+    ``MiniCPMO45OmniForConditionalGeneration`` wrapper, never the inner
+    Talker that declares the flag.
+    """
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    wrapper = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    nn.Module.__init__(wrapper)
+    # A wrapper without a Talker (stage 0 LLM) must not arm the transmission.
+    assert wrapper.requires_request_sample_eligibility is False
+
+    wrapper.talker = _make_talker(k_step_frames=8, scripted_samples=[])
+    assert wrapper.requires_request_sample_eligibility is True
+
+
+def test_request_sampling_params_pin_codec_knobs():
+    """Per-request SamplingParams override the statically resolved knobs.
+
+    Single-frame contract: temperature/seed/top-k/top-p/penalty overrides
+    steer the codec stream exactly like they steer the vLLM sampler in the
+    single-frame path. A request pinning temperature to 0 must also take
+    the deterministic boundary sampler.
+    """
+    model = _make_talker(k_step_frames=8, scripted_samples=[42])
+    # Deployment resolved a warm stochastic profile; the request pins its own.
+    model._codec_temperature = 0.8
+    model._codec_top_k = 100
+    model._codec_top_p = 0.8
+    model._codec_repetition_penalty = 1.05
+    model._codec_seed = 42
+    state = {"step": 0, "codes": torch.tensor([10, 11])}
+    model._request_audio_states["r1"] = state
+
+    model.make_omni_output(
+        torch.randn(1, 8),
+        model_intermediate_buffer=[{"request_id": "r1"}],
+        request_token_spans=[(0, 1)],
+        request_sample_eligible=[True],
+        request_sampling_params=[
+            SimpleNamespace(temperature=0.0, top_k=25, top_p=0.85, repetition_penalty=1.0, seed=7)
+        ],
+    )
+    # temperature 0 -> the deterministic boundary sampler was taken.
+    assert state["last_code"] == 42
+    # The knobs are pinned for this request's samplers.
+    assert state["codec_temperature"] == 0.0
+    assert state["codec_top_k"] == 25
+    assert state["codec_top_p"] == 0.85
+    assert state["codec_repetition_penalty"] == 1.0
+    gen = model._request_generator("r1", torch.device("cpu"))
+    assert gen.initial_seed() == 7
+
+    # A request without SamplingParams (dummy runs, CPU tests) keeps the
+    # statically resolved deployment profile.
+    model2 = _make_talker(k_step_frames=8, scripted_samples=[43])
+    model2._codec_seed = 42
+    model2._request_audio_states["r2"] = {"step": 0, "codes": torch.tensor([10, 11])}
+    model2.make_omni_output(
+        torch.randn(1, 8),
+        model_intermediate_buffer=[{"request_id": "r2"}],
+        request_token_spans=[(0, 1)],
+        request_sample_eligible=[True],
+    )
+    gen2 = model2._request_generator("r2", torch.device("cpu"))
+    assert gen2.initial_seed() == 42
+
+
+def test_default_sampling_params_feed_codec_resolution():
+    """``default_sampling_params`` sits between the YAML block and tts_config.
+
+    It is the source the single-frame path's SamplingParams are built from,
+    so a deployment tuning stage 1 through it must control the K-step codec
+    sampler too (review on PR #7929). The explicit YAML block still wins key
+    by key, and untouched keys fall through to the checkpoint config.
+    """
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        resolve_codec_sampling_params,
+    )
+
+    tts_config = SimpleNamespace(
+        seed=42,
+        temperature=0.8,
+        top_k=100,
+        top_p=0.8,
+        repetition_penalty=1.05,
+        min_new_tokens=50,
+        max_new_tokens=2048,
+    )
+
+    # No YAML block: the stage defaults drive the knobs the deployment set,
+    # untouched keys keep the checkpoint values.
+    resolved = resolve_codec_sampling_params(
+        None, tts_config, deploy_defaults={"top_k": 25, "top_p": 0.85, "max_tokens": 4096}
+    )
+    assert resolved["top_k"] == 25
+    assert resolved["top_p"] == 0.85
+    assert resolved["max_tokens"] == 4096
+    assert resolved["temperature"] == 0.8
+    assert resolved["min_tokens"] == 50
+
+    # The explicit YAML block still wins key by key.
+    resolved2 = resolve_codec_sampling_params({"top_k": 9}, tts_config, deploy_defaults={"top_k": 25})
+    assert resolved2["top_k"] == 9
+
+    # No stage defaults either: back to the old chain (tts_config, then
+    # module fallbacks).
+    resolved3 = resolve_codec_sampling_params(None, tts_config)
+    assert resolved3["top_k"] == 100
+    assert resolved3["seed"] == 42

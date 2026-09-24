@@ -634,6 +634,21 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             return model_outputs
         return self.talker.make_omni_output(model_outputs, **kwargs)
 
+    @property
+    def requires_request_sample_eligibility(self) -> bool:
+        """Forward the Talker's sampling-eligibility contract to the runner.
+
+        The runner only supplies ``request_sample_eligible`` when the model it
+        sees declares the flag, and it always sees this wrapper -- never the
+        inner Talker (the same resolution rule as talker_multiframe.applies
+        below). Without the forward, the Talker's K-step branch falls back to
+        treating every request as eligible, so an incomplete prefill chunk
+        advances codec history and RNG state and the generated audio starts
+        depending on prefill chunking.
+        """
+        talker = getattr(self, "talker", None)
+        return talker is not None and bool(getattr(talker, "requires_request_sample_eligibility", False))
+
     # Runner-side forwards for multi-frame decode. The baseline declares these
     # four methods on this outer wrapper class; the runner only ever sees the
     # wrapper (talker_multiframe.applies / is_multi_token_decode /
