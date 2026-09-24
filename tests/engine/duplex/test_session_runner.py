@@ -1606,7 +1606,10 @@ async def test_first_audio_delta_carries_server_request_start_metrics() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("old_text", ["first", "first later"])
-async def test_draining_audio_does_not_own_new_response_first_output_metrics(old_text: str) -> None:
+@pytest.mark.parametrize("initial_samples", [0, 24000])
+async def test_draining_audio_does_not_own_new_response_first_output_metrics(
+    old_text: str, initial_samples: int
+) -> None:
     """AURA R1's late audio must not consume R2's accepted request-start clock."""
     from dataclasses import replace
 
@@ -1627,7 +1630,11 @@ async def test_draining_audio_does_not_own_new_response_first_output_metrics(old
         h.session.mark_model_turn_request_started(0, clock["now"])
         h.session.bind_request(r1_request)
         clock["now"] = 1000.2
-        await h.deliver_and_settle(tts_output(r1_request, samples=24000, text="first"), stage_id=3)
+        first_events = await h.deliver_and_settle(
+            tts_output(r1_request, samples=initial_samples, text="first"), stage_id=3
+        )
+        if initial_samples == 0:
+            assert "response.output_audio.delta" not in types(first_events)
         r1 = h.session.active_response_id
         assert r1 is not None
         h.session.snapshot_active_response_for_drain()
@@ -1645,6 +1652,10 @@ async def test_draining_audio_does_not_own_new_response_first_output_metrics(old
         old_events = await h.deliver_and_settle(tts_output(r1_request, samples=48000, text=old_text), stage_id=3)
         old_audio = find(old_events, "response.output_audio.delta")
         assert old_audio.response_id == r1
+        if initial_samples == 0:
+            old_metrics = _response_request_metrics_of(old_audio)
+            assert old_metrics["ttft_ms"] == pytest.approx(200.0)
+            assert old_metrics["ttfp_ms"] == pytest.approx(1200.0)
 
         clock["now"] = 1001.8
         new_events = await h.deliver_and_settle(
@@ -1657,7 +1668,8 @@ async def test_draining_audio_does_not_own_new_response_first_output_metrics(old
         assert metrics["ttfp_ms"] == pytest.approx(800.0)
         old_metadata = old_audio.to_realtime().get("metadata", {})
         old_extensions = old_metadata.get("vllm_omni", {})
-        assert "response_request_metrics" not in old_extensions
+        if initial_samples:
+            assert "response_request_metrics" not in old_extensions
     finally:
         await close_harness(h)
 

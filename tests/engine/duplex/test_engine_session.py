@@ -898,6 +898,53 @@ def test_complete_model_turn_drops_request_starts_for_finished_turns():
     )
 
 
+@pytest.mark.parametrize("terminal", ["drain_done", "drain_failed", "cancel_drains", "barge_in", "close"])
+def test_response_timing_survives_overlap_until_its_own_terminal(terminal):
+    session = _session()
+    session.mark_model_turn_request_started(0, 10.0)
+    first = session.begin_response(turn_id=0)
+    session.bind_draining_request("tts-1", first)
+    session.bind_draining_request("tts-2", first)
+    session.mark_model_turn_request_started(1, 11.0)
+    second = session.begin_response(turn_id=1)
+    session.end_response()
+    assert (
+        session.mark_response_first_outputs(response_id=second, observed_at_s=11.1, has_text=True, has_audio=True) == {}
+    )
+
+    # One finished producer and a newer completed response cannot retire R1.
+    assert session.pop_draining_request("tts-1") == first
+    metrics = session.mark_response_first_outputs(response_id=first, observed_at_s=11.2, has_text=True, has_audio=False)
+    assert metrics["ttft_ms"] == pytest.approx(1200.0)
+    if terminal == "drain_done":
+        assert session.pop_draining_request("tts-2") == first
+    elif terminal == "drain_failed":
+        session.clear_draining_for_response(first)
+    elif terminal == "cancel_drains":
+        session.clear_draining_requests()
+    elif terminal == "barge_in":
+        session.barge_in()
+    else:
+        session.close()
+    assert (
+        session.mark_response_first_outputs(response_id=first, observed_at_s=11.3, has_text=False, has_audio=True) == {}
+    )
+    assert not session._response.request_timing_by_response
+
+
+def test_response_timing_does_not_retain_replaced_responses_without_draining_requests():
+    session = _session()
+    session.mark_model_turn_request_started(0, 10.0)
+    first = session.begin_response(turn_id=0)
+    second = session.begin_response(turn_id=1)
+    assert (
+        session.mark_response_first_outputs(response_id=first, observed_at_s=11.0, has_text=True, has_audio=True) == {}
+    )
+    assert set(session._response.request_timing_by_response) == {second}
+    session.end_response()
+    assert not session._response.request_timing_by_response
+
+
 def test_log_stats_off_does_not_open_a_response_aggregator():
     session = _session()
     session.begin_response()

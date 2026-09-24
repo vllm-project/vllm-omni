@@ -86,6 +86,13 @@ class InputBufferState:
 
 
 @dataclass
+class ResponseRequestTiming:
+    started_at_s: float | None = None
+    ttft_ms: float | None = None
+    ttfp_ms: float | None = None
+
+
+@dataclass
 class ResponseState:
     active_request_id: str | None = None
     active_response_id: str | None = None
@@ -105,9 +112,7 @@ class ResponseState:
     stage_metric_tpot_weighted_ms: dict[str, float] = field(default_factory=dict)
     stage_metric_tpot_weight: dict[str, int] = field(default_factory=dict)
     request_started_at_s_by_turn: dict[int, float] = field(default_factory=dict)
-    active_response_request_started_at_s: float | None = None
-    active_response_ttft_ms: float | None = None
-    active_response_ttfp_ms: float | None = None
+    request_timing_by_response: dict[str, ResponseRequestTiming] = field(default_factory=dict)
 
 
 RESPONSE_REQUEST_MEASUREMENT_ORIGIN: dict[str, str] = {
@@ -645,7 +650,14 @@ class DuplexEngineSession:
     def pop_draining_request(self, request_id: str | None) -> str | None:
         if not isinstance(request_id, str):
             return None
-        return self._response.draining_response_by_request.pop(request_id, None)
+        response_id = self._response.draining_response_by_request.pop(request_id, None)
+        if (
+            response_id is not None
+            and response_id != self.active_response_id
+            and not self.response_has_draining_request(response_id)
+        ):
+            self._response.request_timing_by_response.pop(response_id, None)
+        return response_id
 
     def is_draining_request(self, request_id: str | None) -> bool:
         return isinstance(request_id, str) and request_id in self._response.draining_response_by_request
@@ -660,12 +672,16 @@ class DuplexEngineSession:
         return list(self._response.draining_response_by_request)
 
     def clear_draining_requests(self) -> None:
+        for response_id in self._response.draining_response_by_request.values():
+            if response_id != self.active_response_id:
+                self._response.request_timing_by_response.pop(response_id, None)
         self._response.draining_response_by_request.clear()
 
     def clear_draining_for_response(self, response_id: str | None) -> None:
         """Drop draining bindings owned by ``response_id``; leave other responses intact."""
         if response_id is None:
             return
+        self._response.request_timing_by_response.pop(response_id, None)
         self._response.draining_response_by_request = {
             rid: resp for rid, resp in self._response.draining_response_by_request.items() if resp != response_id
         }
@@ -847,13 +863,14 @@ class DuplexEngineSession:
         if self._response_aggregator is not None:
             self._log_response_aggregator()
         self._activate_response_options()
+        prior_response_id = self.active_response_id
+        if prior_response_id is not None and not self.response_has_draining_request(prior_response_id):
+            self._response.request_timing_by_response.pop(prior_response_id, None)
         response_id = f"resp-{self.session_id}-{self.epoch}-{uuid4().hex[:8]}"
         self._response.active_response_id = response_id
         self._response.active_response_turn_id = self.turn_id if turn_id is None else int(turn_id)
-        self._clear_response_request_timing()
-        self._response.active_response_request_started_at_s = self._response.request_started_at_s_by_turn.pop(
-            self._response.active_response_turn_id,
-            None,
+        self._response.request_timing_by_response[response_id] = ResponseRequestTiming(
+            started_at_s=self._response.request_started_at_s_by_turn.pop(self._response.active_response_turn_id, None)
         )
         self._response.active_response_input_commit_seq = self.input_commit_seq
         self._response.active_response_awaits_input_commit = self.turn_state == DuplexTurnState.USER_SPEAKING
@@ -876,7 +893,9 @@ class DuplexEngineSession:
 
     def _response_aggregator_wall_start_ts(self) -> float:
         now_wall_s = time.time()
-        started_at_s = self._response.active_response_request_started_at_s
+        response_id = self.active_response_id
+        timing = self._response.request_timing_by_response.get(response_id) if response_id is not None else None
+        started_at_s = timing.started_at_s if timing is not None else None
         if started_at_s is None:
             return now_wall_s
         elapsed_s = max(0.0, self._clock() - started_at_s)
@@ -938,11 +957,6 @@ class DuplexEngineSession:
             aggregator.stage_events[rid] = _one_row_per_stage(events)
         aggregator.build_and_log_summary()
 
-    def _clear_response_request_timing(self) -> None:
-        self._response.active_response_request_started_at_s = None
-        self._response.active_response_ttft_ms = None
-        self._response.active_response_ttfp_ms = None
-
     def mark_model_turn_request_started(self, turn_id: int, started_at_s: float) -> None:
         """Record the native request start that can own one model turn.
 
@@ -951,9 +965,11 @@ class DuplexEngineSession:
         """
         turn_id = int(turn_id)
         started_at_s = float(started_at_s)
-        if self.active_response_turn_id == turn_id:
-            if self._response.active_response_request_started_at_s is None:
-                self._response.active_response_request_started_at_s = started_at_s
+        response_id = self.active_response_id
+        if response_id is not None and self.active_response_turn_id == turn_id:
+            timing = self._response.request_timing_by_response.get(response_id)
+            if timing is not None and timing.started_at_s is None:
+                timing.started_at_s = started_at_s
             return
         self._response.request_started_at_s_by_turn[turn_id] = started_at_s
 
@@ -965,19 +981,22 @@ class DuplexEngineSession:
         has_text: bool,
         has_audio: bool,
     ) -> dict[str, object]:
-        """Observe first outputs only when their owner is the active response."""
-        if response_id is None or response_id != self.active_response_id:
+        """Observe first outputs using their active or draining response's clock."""
+        if response_id is None:
             return {}
-        started_at_s = self._response.active_response_request_started_at_s
+        timing = self._response.request_timing_by_response.get(response_id)
+        if timing is None:
+            return {}
+        started_at_s = timing.started_at_s
         if started_at_s is None:
             return {}
         elapsed_ms = max(0.0, (float(observed_at_s) - started_at_s) * 1000.0)
         newly_observed = False
-        if has_text and self._response.active_response_ttft_ms is None:
-            self._response.active_response_ttft_ms = elapsed_ms
+        if has_text and timing.ttft_ms is None:
+            timing.ttft_ms = elapsed_ms
             newly_observed = True
-        if has_audio and self._response.active_response_ttfp_ms is None:
-            self._response.active_response_ttfp_ms = elapsed_ms
+        if has_audio and timing.ttfp_ms is None:
+            timing.ttfp_ms = elapsed_ms
             newly_observed = True
         if not newly_observed:
             return {}
@@ -985,10 +1004,10 @@ class DuplexEngineSession:
             "source": "server_monotonic_request_start",
             "measurement_origin": dict(RESPONSE_REQUEST_MEASUREMENT_ORIGIN),
         }
-        if self._response.active_response_ttft_ms is not None:
-            metrics["ttft_ms"] = self._response.active_response_ttft_ms
-        if self._response.active_response_ttfp_ms is not None:
-            metrics["ttfp_ms"] = self._response.active_response_ttfp_ms
+        if timing.ttft_ms is not None:
+            metrics["ttft_ms"] = timing.ttft_ms
+        if timing.ttfp_ms is not None:
+            metrics["ttfp_ms"] = timing.ttfp_ms
         return metrics
 
     def stash_stage_metrics(self, stage_metrics: Mapping[Any, Any] | None) -> None:
@@ -1348,7 +1367,6 @@ class DuplexEngineSession:
             self._response.active_request_id = None
         self._response.active_response_id = None
         self._response.active_response_turn_id = None
-        self._clear_response_request_timing()
         self._response.active_response_input_commit_seq = None
         self._response.active_response_awaits_input_commit = False
         # Keep draining bindings for other responses (older TTS may still play).
@@ -1687,7 +1705,7 @@ class DuplexEngineSession:
         self._response.active_response_id = None
         self._response.active_response_turn_id = None
         self._response.request_started_at_s_by_turn.clear()
-        self._clear_response_request_timing()
+        self._response.request_timing_by_response.clear()
         self._response.active_response_input_commit_seq = None
         self._response.active_response_awaits_input_commit = False
         self._response.draining_response_by_request.clear()
@@ -1706,7 +1724,7 @@ class DuplexEngineSession:
         self.turn_state = DuplexTurnState.IDLE
         self._response.active_response_turn_id = None
         self._response.request_started_at_s_by_turn.clear()
-        self._clear_response_request_timing()
+        self._response.request_timing_by_response.clear()
         self._response.active_response_input_commit_seq = None
         self._response.active_response_awaits_input_commit = False
         self._clear_response_metrics()
