@@ -223,7 +223,7 @@ def test_release_captured_graphs_tolerates_a_pipeline_without_captures():
     assert not hasattr(runner, "graph_runners")
 
 
-def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summary: bool = True):
+def _make_runner(cache_backend, cache_backend_name: str | None, enable_cache_dit_summary: bool = True):
     runner = object.__new__(DiffusionModelRunner)
     runner.vllm_config = object()
     runner.device = torch.device("cpu")
@@ -251,6 +251,55 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
     )
     runner._kv_prefetch_enabled = False
     return runner
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("imported_tokens", [None, (4, 4), (4, 2)])
+def test_request_forward_separates_imported_kv_and_local_hits(monkeypatch, imported_tokens):
+    from contextlib import nullcontext
+
+    from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata, DiffusionKVSequenceMetadata
+
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.od_config.kv_transfer_config = object() if imported_tokens else None
+    request = _make_request()
+    metadata = DiffusionKVMetadata(
+        request_id=request.request_id,
+        allocation_generation=1,
+        sequences=tuple(
+            DiffusionKVSequenceMetadata(
+                sequence_id=i,
+                prefix_len=8,
+                target_len=4,
+                seq_len=12,
+                block_ids=([1, 2, 3],),
+                cached_prefix_len=0 if imported_tokens else 4,
+                num_computed_tokens=imported_tokens[i] if imported_tokens else 4,
+            )
+            for i in range(2)
+        ),
+    )
+    captured = {}
+
+    @contextmanager
+    def capture_context(**kwargs):
+        captured.update(kwargs)
+        yield
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", capture_context)
+    runner.diffusion_kv_backend.activate_paged_attention_metadata = Mock(return_value=(object(), nullcontext()))
+    runner._execute_request_list(
+        [request],
+        od_config=runner.od_config,
+        allow_single_output=True,
+        require_request_batch_support=False,
+        record_name="test",
+        record_output_peak_memory=False,
+        diffusion_kv_metadata=[metadata],
+    )
+    assert captured["paged_kv_cached_prefix_len"] == (0 if imported_tokens else 4)
+    assert getattr(request, "kv_computed_tokens", ()) == (imported_tokens or ())
 
 
 def _make_compile_runner(
@@ -310,7 +359,8 @@ def test_refresh_cache_prefers_request_steps_then_schedule_then_pipeline_default
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_refresh_cache_without_request_or_pipeline_default_warns(caplog):
+def test_refresh_cache_without_request_or_pipeline_default_warns(caplog, monkeypatch):
+    monkeypatch.setattr(model_runner_module.logger, "handlers", [*model_runner_module.logger.handlers, caplog.handler])
     cache_backend = _EnabledCacheBackend()
     runner = _make_runner(cache_backend=cache_backend, cache_backend_name="cache_dit")
     req = _make_request()
@@ -828,7 +878,7 @@ def test_profile_run_executes_maximum_step_batch_without_resetting_peak(monkeypa
         observed_batch_rows.append((len(states), int(input_batch.latents.shape[0])))
         return original_denoise_step(input_batch, states)
 
-    runner.pipeline.denoise_step = denoise_step
+    monkeypatch.setattr(runner.pipeline, "denoise_step", denoise_step)
     runner._validate_diffusion_kv_metadata = Mock(side_effect=AssertionError("profile must bypass admission"))
     forward_context_calls = []
 
@@ -1313,7 +1363,7 @@ def test_vllm_set_forward_context_implementation(monkeypatch):
         device_config=DeviceConfig(device="cpu"),
         compilation_config=CompilationConfig(),
     )
-    calls = []
+    calls: list[tuple[str, object]] = []
 
     @contextmanager
     def _set_priority():

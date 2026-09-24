@@ -846,7 +846,7 @@ class OmniDiffusionConfig:
     parallel_config: DiffusionParallelConfig = field(default_factory=DiffusionParallelConfig)
 
     # Cache backend configuration (NEW)
-    cache_backend: str = "none"  # "tea_cache", "deep_cache", etc.
+    cache_backend: str | None = "none"  # "tea_cache", "deep_cache", etc.
     cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
     video_output_transport: VideoOutputTransportConfig = field(default_factory=VideoOutputTransportConfig)
     enable_cache_dit_summary: bool = False
@@ -883,6 +883,9 @@ class OmniDiffusionConfig:
 
     # Local Diffusion KV ownership and cache-layout mode.
     diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
+    # Reuse block-aligned, immutable diffusion prefixes across requests when
+    # Scheduler-owned paged KV is active.
+    enable_prefix_caching: bool = False
     # Maximum number of native BlockTable rows one public request can own
     # (sequences plus independent contexts). The model adapter defines it.
     diffusion_kv_max_rows_per_request: int | None = None
@@ -1204,6 +1207,19 @@ class OmniDiffusionConfig:
         if not isinstance(self.diffusion_compile_dynamic, bool):
             raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
+        if not isinstance(self.enable_prefix_caching, bool):
+            raise TypeError("enable_prefix_caching must be a bool")
+        if self.enable_prefix_caching and self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+            raise ValueError(
+                "enable_prefix_caching=True requires diffusion_kv_mode='paged_scheduler'; "
+                "set diffusion_kv_mode='paged_scheduler' or disable enable_prefix_caching"
+            )
+        if self.enable_prefix_caching and self.enable_sleep_mode:
+            raise ValueError(
+                "Diffusion prefix caching cannot be combined with sleep mode: "
+                "sleep discards KV pages without invalidating cached prefixes; "
+                "disable enable_prefix_caching or enable_sleep_mode"
+            )
         if self.diffusion_kv_max_rows_per_request is not None and (
             type(self.diffusion_kv_max_rows_per_request) is not int or self.diffusion_kv_max_rows_per_request <= 0
         ):
@@ -1247,6 +1263,11 @@ class OmniDiffusionConfig:
             if self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
                 raise ValueError("native kv_transfer_config requires diffusion_kv_mode='paged_scheduler'")
             self.kv_transfer_config = parse_kv_transfer_config(self.kv_transfer_config)
+            if self.enable_prefix_caching and self.kv_transfer_config is not None:
+                raise ValueError(
+                    "Diffusion prefix caching cannot be combined with native kv_transfer_config; "
+                    "disable enable_prefix_caching for AR KV import or remove kv_transfer_config for local DiT reuse"
+                )
             if self.enable_sleep_mode:
                 raise ValueError("Native KV transfer does not support sleep mode: registered pages must remain mapped")
 
@@ -1722,6 +1743,7 @@ class OmniDiffusionConfig:
                         or DiffusionModelRegistry._try_load_model_cls(architecture) is not None
                     ):
                         self.model_class_name = architecture
+                    self.update_multimodal_support()
                 else:
                     raise
 

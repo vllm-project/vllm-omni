@@ -19,6 +19,8 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 if TYPE_CHECKING:
     import torch
 
+    from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import DiffusionPagedAttentionRuntime
+
 
 @dataclass
 class ForwardContext:
@@ -32,7 +34,10 @@ class ForwardContext:
     # Runner-owned paged execution metadata/runtime. Attention resolves the
     # active Worker adapter from it; model code must not construct BlockTable
     # rows or activate the runtime directly.
-    paged_kv_runtime: object | None = None
+    paged_kv_runtime: DiffusionPagedAttentionRuntime | None = None
+    # Block-aligned prefix already resident in Scheduler-owned pages for the
+    # active request-level prefill. Zero keeps the cold/full-prefill path.
+    paged_kv_cached_prefix_len: int = 0
     # Active Worker-side paged KV adapter.  The adapter is installed only for
     # the duration of a paged forward; dense forwards leave this as ``None``.
     # Keep the field opaque here to avoid coupling the common context module to
@@ -177,7 +182,8 @@ def create_forward_context(
     vllm_config: VllmConfig | None = None,
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
-    paged_kv_runtime: object | None = None,
+    paged_kv_runtime: DiffusionPagedAttentionRuntime | None = None,
+    paged_kv_cached_prefix_len: int = 0,
     in_diffusion_kv_memory_profile: bool = False,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
@@ -187,6 +193,7 @@ def create_forward_context(
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
         paged_kv_runtime=paged_kv_runtime,
+        paged_kv_cached_prefix_len=paged_kv_cached_prefix_len,
         in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
@@ -213,7 +220,8 @@ def set_forward_context(
     vllm_config: VllmConfig | None = None,
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
-    paged_kv_runtime: object | None = None,
+    paged_kv_runtime: DiffusionPagedAttentionRuntime | None = None,
+    paged_kv_cached_prefix_len: int = 0,
     in_diffusion_kv_memory_profile: bool = False,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
@@ -227,6 +235,7 @@ def set_forward_context(
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
         paged_kv_runtime=paged_kv_runtime,
+        paged_kv_cached_prefix_len=paged_kv_cached_prefix_len,
         in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,

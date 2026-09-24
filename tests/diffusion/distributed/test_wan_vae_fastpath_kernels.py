@@ -18,6 +18,10 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
 )
 from torch import nn
 
+from tests.diffusion.distributed.wan_vae_fastpath_helpers import (  # noqa: F401
+    original_wan_rms_norm,
+    unpatched_wan_rms_norm,
+)
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import forwards as fp
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
     install_wan_vae_fastpath,
@@ -28,6 +32,7 @@ from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_upsample as up
 
 pytestmark = [
+    pytest.mark.usefixtures("unpatched_wan_rms_norm"),
     pytest.mark.core_model,
     pytest.mark.cuda,
     pytest.mark.diffusion,

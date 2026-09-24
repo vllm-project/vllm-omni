@@ -135,5 +135,6 @@ platforms:
         devices: "4"
       - stage_id: 2
         gpu_memory_utilization: 0.3
+        enforce_eager: true
         max_cudagraph_capture_size: 0
         devices: "4"

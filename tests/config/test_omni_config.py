@@ -1578,6 +1578,68 @@ def test_diffusion_config_preserves_existing_coercion_hooks():
     assert cfg.max_cpu_loras == 1
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_diffusion_projection_retains_prefix_caching(enabled):
+    projection = omni_config_module._DiffusionConfigProjection
+    assert projection.from_kwargs().enable_prefix_caching is False
+    config = projection.from_kwargs(
+        diffusion_kv_mode="paged_scheduler",
+        diffusion_kv_max_rows_per_request=2,
+        enable_prefix_caching=enabled,
+    )
+    assert config.enable_prefix_caching is enabled
+
+
+@pytest.mark.parametrize(
+    "pipeline_value,stage_value,cli_value,expected",
+    [
+        (None, None, None, False),
+        (True, None, None, True),
+        (False, True, None, True),
+        (True, False, None, False),
+        (None, None, True, True),
+        (True, True, False, False),
+        (False, False, True, True),
+    ],
+)
+def test_diffusion_prefix_caching_precedence_and_transport(
+    tmp_path,
+    pipeline_value,
+    stage_value,
+    cli_value,
+    expected,
+):
+    import yaml
+
+    from vllm_omni.engine.stage_init_utils import _project_omni_stage_engine_args
+
+    stage_deploy = {
+        "stage_id": 0,
+        "diffusion_kv_mode": "paged_scheduler",
+        "diffusion_kv_max_rows_per_request": 2,
+    }
+    deploy = {"pipeline": "hunyuan_image3_dit", "async_chunk": False, "stages": [stage_deploy]}
+    if pipeline_value is not None:
+        deploy["enable_prefix_caching"] = pipeline_value
+    if stage_value is not None:
+        stage_deploy["enable_prefix_caching"] = stage_value
+    deploy_path = tmp_path / "prefix.yaml"
+    deploy_path.write_text(yaml.safe_dump(deploy))
+    cli = {} if cli_value is None else {"stage_0_enable_prefix_caching": cli_value}
+    stage = _from_pipeline_key(
+        "hunyuan_image3_dit",
+        deploy_config_path=str(deploy_path),
+        cli_overrides=cli,
+    ).stage_by_id(0)
+
+    assert bool(stage.cache_config.enable_prefix_caching) is expected
+    assert stage.diffusion_config.enable_prefix_caching is expected
+    assert _project_omni_stage_engine_args(stage)["enable_prefix_caching"] is expected
+    serialized = _serialize_stage_config(stage)
+    restored = omni_config_module._DiffusionConfigProjection.from_kwargs(**serialized["diffusion_config"])
+    assert restored.enable_prefix_caching is expected
+
+
 def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
     from vllm_omni.platforms import current_omni_platform
 
