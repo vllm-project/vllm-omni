@@ -55,6 +55,7 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
 from vllm_omni.platforms import current_omni_platform
 
+from .adaln_lookup import canonical_lookup_timesteps, lookup_timestep_indices
 from .fasth3 import _resolve_native_target
 
 if TYPE_CHECKING:
@@ -117,6 +118,7 @@ class MiniMaxH3DiTArchConfig:
     norm_eps: float = 1e-5
     qk_norm_eps: float = 1e-5
     final_norm_eps: float = 1e-5
+    adaln_lookup_timesteps: list[float] | None = None
 
     @classmethod
     def from_mapping(cls, config: Mapping[str, Any]) -> MiniMaxH3DiTArchConfig:
@@ -137,6 +139,8 @@ class MiniMaxH3DiTArchConfig:
         if "patch_size" in values:
             values["patch_size"] = tuple(values["patch_size"])
         arch = cls(**values)
+        if arch.adaln_lookup_timesteps is not None:
+            arch.adaln_lookup_timesteps = canonical_lookup_timesteps(arch.adaln_lookup_timesteps)
         if len(arch.patch_size) != 3:
             raise ValueError(f"patch_size must contain three values, got {arch.patch_size!r}")
         return arch
@@ -768,6 +772,12 @@ class MiniMaxH3AdalnProj(nn.Module):
         self.expand_ratio = expand_ratio
         self.modality_num = modality_num
         self.hidden_size = arch.hidden_size
+        if arch.adaln_lookup_timesteps is not None:
+            self.lookup_values = nn.Parameter(
+                torch.empty(len(arch.adaln_lookup_timesteps), out_features, dtype=_BF16_DTYPE),
+                requires_grad=False,
+            )
+            return
         self.linear = ColumnParallelLinear(
             arch.time_embed_dim,
             out_features,
@@ -780,8 +790,13 @@ class MiniMaxH3AdalnProj(nn.Module):
 
     def forward(self, t_emb: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """t_emb: [M, t_dim] -> expand_ratio tensors of [M*modality_num, H]."""
-        x = nn.functional.silu(t_emb)
-        x, _ = self.linear(x.to(_BF16_DTYPE))
+        if hasattr(self, "lookup_values"):
+            if t_emb.ndim != 1 or t_emb.dtype != torch.int64:
+                raise ValueError("AdaLN table requires resolved int64 timestep indices")
+            x = self.lookup_values.index_select(0, t_emb)
+        else:
+            x = nn.functional.silu(t_emb)
+            x, _ = self.linear(x.to(_BF16_DTYPE))
         m = x.shape[0]
         x = x.view(m * self.modality_num, self.expand_ratio * self.hidden_size)
         return tuple(x.chunk(self.expand_ratio, dim=-1))
@@ -1164,6 +1179,14 @@ class MiniMaxH3DiTModel(nn.Module):
         self._rope_theta = float(config_mapping.get("rope_theta", 10000.0))
         arch = MiniMaxH3DiTArchConfig.from_mapping(config_mapping)
         self.arch = arch
+        if arch.adaln_lookup_timesteps is not None:
+            if not od_config.enforce_eager:
+                raise ValueError("MiniMax-H3 AdaLN lookup currently requires enforce_eager=True")
+            self.register_buffer(
+                "adaln_timesteps",
+                torch.tensor(arch.adaln_lookup_timesteps, dtype=torch.float32),
+                persistent=False,
+            )
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
         self.hidden_size = arch.hidden_size
@@ -1312,6 +1335,10 @@ class MiniMaxH3DiTModel(nn.Module):
             raise ValueError(f"rope_table must be {_BF16_DTYPE}, got {rope_table.dtype}.")
 
     def post_load_weights(self) -> None:
+        if self.arch.adaln_lookup_timesteps is not None:
+            for name, param in self.named_parameters():
+                if name.endswith(".lookup_values") and param.dtype != _BF16_DTYPE:
+                    raise ValueError(f"{name} must remain BF16")
         for name, param in self.named_parameters():
             if name in MINIMAX_H3_FP32_PARAM_NAMES and param.dtype != _FP32_DTYPE:
                 raise ValueError(f"{name} must stay fp32 after load, got {param.dtype}.")
@@ -1393,6 +1420,11 @@ class MiniMaxH3DiTModel(nn.Module):
             )
             default_weight_loader(params["rope.inv_freq"], rope)
             loaded.add("rope.inv_freq")
+        if self.arch.adaln_lookup_timesteps is not None:
+            expected_tables = {name for name in params if name.endswith(".lookup_values")}
+            missing_tables = sorted(expected_tables - loaded)
+            if missing_tables:
+                raise ValueError(f"MiniMax-H3 AdaLN lookup tables not loaded: {missing_tables}")
         return loaded
 
     @staticmethod
@@ -1507,7 +1539,10 @@ class MiniMaxH3DiTModel(nn.Module):
             audio_embed.to(_BF16_DTYPE)[: audio_local_pos.shape[0]],
         )
 
-        t_emb = self.time_embedder(unique_timesteps)
+        if self.arch.adaln_lookup_timesteps is not None:
+            t_emb = lookup_timestep_indices(unique_timesteps, self.adaln_timesteps)
+        else:
+            t_emb = self.time_embedder(unique_timesteps)
         return embeddings, t_emb
 
     def forward(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:

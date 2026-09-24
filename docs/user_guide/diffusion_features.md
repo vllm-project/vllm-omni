@@ -117,6 +117,7 @@ current support.
 | **[FP8](quantization/fp8.md)** | `quantization="fp8"` | FP8 W8A8 on validated transformer stages | Memory reduction, inference speedup |
 | **[INT8](quantization/int8.md)** | `quantization="int8"` | INT8 W8A8 on validated transformer stages | Memory reduction, broad GPU compatibility |
 | **[GGUF](quantization/gguf.md)** | `quantization="gguf"` | Native GGUF transformer-only weights (Q4, Q8, etc.) | Memory reduction on consumer GPUs |
+| **[SVDQuant](quantization/svdquant.md)** | Offline `svdquant` metadata | Rank-32 NVFP4 W4A4 DiT; MiniMax-H3 candidate adds encoder-local W4A16 and exact BF16 AdaLN tables | Packed checkpoints on supported Blackwell GPUs; quality validation required |
 
 ## Supported Models
 
