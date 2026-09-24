@@ -227,6 +227,19 @@ class OmniEngineArgs(EngineArgs):
     # for library callers (#7564); registered pipelines may consume it through
     # their own stage_cli_aliases or deploy YAML.
     text_encoder_tp_size: int | None = None
+    # Same filter (#8037): these are parsed on the CLI namespace, but
+    # ``from_cli_args`` keeps only fields declared on this dataclass.
+    ulysses_degree: int | None = None
+    ulysses_mode: str = "strict"
+    ulysses_a2a_permute: bool | None = None
+    ring_degree: int | None = None
+    allgather_degree: int | None = None
+    use_hsdp: bool = False
+    hsdp_shard_size: int = -1
+    hsdp_replicate_size: int = 1
+    cfg_parallel_size: int = 1
+    vae_patch_parallel_size: int = 1
+    vae_parallel_mode: str = "tile"
 
     @classmethod
     def _add_omni_specific_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -634,6 +647,19 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "log_stats",  # both want the flag
         "async_chunk",  # orch: read from CLI, redistribute; engine: per-stage flag
         "tokenizer",  # orch: detect model type; engine: tokenization
+        # Diffusion parallel knobs are parsed by the orchestrator and must
+        # survive OmniEngineArgs.from_cli_args (#8037).
+        "ulysses_degree",
+        "ulysses_mode",
+        "ulysses_a2a_permute",
+        "ring_degree",
+        "allgather_degree",
+        "use_hsdp",
+        "hsdp_shard_size",
+        "hsdp_replicate_size",
+        "cfg_parallel_size",
+        "vae_patch_parallel_size",
+        "vae_parallel_mode",
     }
 )
 

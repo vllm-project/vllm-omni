@@ -581,3 +581,58 @@ def test_text_encoder_tp_size_reaches_default_diffusion_parallel_config():
 
     parallel_config = stage_cfg["engine_args"]["parallel_config"]
     assert parallel_config["text_encoder_tp_size"] == 2
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/8037
+# use_hsdp=True is omitted: standalone HSDP rejects a missing shard size.
+_DIFFUSION_PARALLEL_KNOBS = [
+    ("ulysses_degree", 4),
+    ("ulysses_mode", "advanced_uaa"),
+    ("ulysses_a2a_permute", True),
+    ("ring_degree", 2),
+    ("allgather_degree", 8),
+    ("hsdp_shard_size", 2048),
+    ("hsdp_replicate_size", 2),
+    ("cfg_parallel_size", 2),
+    ("vae_patch_parallel_size", 2),
+    ("vae_parallel_mode", "spatial_shard_height"),
+]
+
+
+@pytest.mark.parametrize(("knob", "value"), _DIFFUSION_PARALLEL_KNOBS)
+def test_from_cli_args_preserves_diffusion_parallel_knobs(knob: str, value: object):
+    """``from_cli_args`` drops namespace attrs the dataclass does not declare.
+
+    Degrees are checked one at a time because AllGather-KV rejects a combined
+    Ulysses or Ring degree.
+    """
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**{knob: value}))
+    assert getattr(engine_args, knob) == value
+
+    stage_cfg = StageConfigFactory.create_default_diffusion({knob: getattr(engine_args, knob)})[0]
+    assert stage_cfg["engine_args"]["parallel_config"][knob] == value
+
+
+def test_use_hsdp_reaches_parallel_config_with_explicit_shard_size():
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(use_hsdp=True, hsdp_shard_size=2048))
+    stage_cfg = StageConfigFactory.create_default_diffusion(
+        {"use_hsdp": engine_args.use_hsdp, "hsdp_shard_size": engine_args.hsdp_shard_size}
+    )[0]
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel_config["use_hsdp"] is True
+    assert parallel_config["hsdp_shard_size"] == 2048
+
+
+def test_from_cli_args_unset_diffusion_degree_keeps_parallel_default():
+    """A CLI degree left unset (None) must not replace the diffusion default."""
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(ulysses_degree=None))
+    assert engine_args.ulysses_degree is None
+
+    stage_cfg = StageConfigFactory.create_default_diffusion({"ulysses_degree": engine_args.ulysses_degree})[0]
+    assert stage_cfg["engine_args"]["parallel_config"]["ulysses_degree"] == 1
