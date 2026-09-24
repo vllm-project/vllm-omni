@@ -27,7 +27,7 @@ For Design-Layer, the first returned image is the reconstructed composite and th
 - Python: 3.10+
 - CUDA: 13.0
 - vLLM version: 0.29.0
-- vLLM-Omni version or commit: 59db6a428
+- vLLM-Omni version or commit: 6daf5b30f
 - 2x H100 80GB (1xH100 to be validated)
 
 ### Commands
