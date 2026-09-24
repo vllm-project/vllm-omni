@@ -224,7 +224,7 @@ def test_batched_repetition_penalty_matches_rows_across_chunks(mocker) -> None:
         ],
         dim=0,
     )
-    bincount = mocker.spy(torch, "bincount")
+    zeros = mocker.spy(torch, "zeros")
     actual = _apply_batched_repetition_penalty(
         logits,
         histories,
@@ -233,11 +233,33 @@ def test_batched_repetition_penalty_matches_rows_across_chunks(mocker) -> None:
     )
 
     assert torch.equal(actual, expected)
-    assert [call.kwargs["minlength"] for call in bincount.call_args_list] == [
+    assert [call.args[0] for call in zeros.call_args_list] == [
         _REPETITION_PENALTY_CHUNK_SIZE * vocab_size,
         _REPETITION_PENALTY_CHUNK_SIZE * vocab_size,
         vocab_size,
     ]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_codec_penalty_keeps_per_row_values_without_host_scalar_reads(dtype, monkeypatch):
+    logits = torch.tensor([[-2, -1, 0, 1, 2]] * 4, dtype=dtype)
+    histories = [torch.tensor([1, 1, 4, 4]), torch.tensor([1, 1]), torch.tensor([3, 3]), torch.tensor([])]
+    penalties = torch.tensor([1.2, 1.0, 0.8, 1.05], dtype=dtype)
+    expected = torch.cat(
+        [
+            _reference_repetition_penalty(logits[i : i + 1], history, penalty=penalties[i], window_size=3)
+            for i, history in enumerate(histories)
+        ]
+    )
+
+    def disallow_host_scalar(*args, **kwargs):
+        raise AssertionError("codec penalty must not read a GPU-dependent scalar on the host")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "__bool__", disallow_host_scalar)
+        patch.setattr(torch, "bincount", disallow_host_scalar)
+        actual = _apply_batched_repetition_penalty(logits, histories, penalty=penalties, window_size=3)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_scheduler_prompt_is_fully_blanked_for_penalties() -> None:
@@ -672,6 +694,75 @@ def test_make_omni_output_packs_the_previous_codec_id() -> None:
     assert _routed(output, 0)["meta"]["finished"].item() is False
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_make_omni_output_reads_history_from_runner_cpu_buffer(monkeypatch, device) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA codec output")
+    from types import SimpleNamespace
+
+    from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+
+    talker = _make_talker()
+    talker.emb_code = nn.ModuleList([nn.Embedding(8, 2, device=device)])
+    talker.gpu_resident_buffer_keys = {("codes", "audio")}
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.model_stage = "tts"
+    model.model = model.talker = talker
+    state = {"finished": False, "step": 16, "recent_codes": [0] + [1] * 14 + [2]}
+    talker._request_audio_states["req"] = state
+
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = model
+    runner.requests = {"req": SimpleNamespace(output_token_ids=[])}
+    runner.input_batch = SimpleNamespace(req_ids=["req"])
+    runner.model_intermediate_buffer = {"req": {"request_id": "req", "audio_state": state}}
+    _, _, updates = model.preprocess(
+        torch.tensor([3], dtype=torch.int32, device=device),
+        **runner.model_intermediate_buffer["req"],
+    )
+    assert updates["codes"]["audio"].device.type == "cpu"
+    assert updates["codes"]["audio"].dtype == torch.long
+    # The real outer model does not expose its Talker's GPU-resident keys.
+    runner._update_intermediate_buffer("req", updates)
+    infos = runner._gather_runtime_additional_information()
+    source = infos[0]["codes"]["audio"]
+    assert source.device.type == "cpu"
+    torch.testing.assert_close(source, torch.tensor([[3]], dtype=torch.long))
+
+    original_tolist = torch.Tensor.tolist
+    readback_devices = []
+
+    def cpu_only_tolist(tensor):
+        readback_devices.append(tensor.device.type)
+        assert tensor.device.type == "cpu", "codec history must use the CPU transport delta"
+        return original_tolist(tensor)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "tolist", cpu_only_tolist)
+        output = model.make_omni_output(
+            torch.ones(1, 2, device=device),
+            model_intermediate_buffer=infos,
+            request_token_spans=[(0, 1)],
+        )
+
+    assert readback_devices == ["cpu"]
+    emitted = output.multimodal_outputs["codes"]["audio"][0]
+    assert emitted.device.type == "cpu"
+    torch.testing.assert_close(emitted, source)
+    expected_codes = [1] * 14 + [2, 3]
+    assert state["step"] == 17
+    assert state["recent_codes"] == expected_codes
+    expected_history = torch.tensor(expected_codes, dtype=torch.long, device=device)
+    torch.testing.assert_close(talker._penalty_histories[0], expected_history.cpu())
+    logits = torch.arange(-4, 4, dtype=torch.float32, device=device).reshape(1, 8)
+    actual, _ = talker._apply_codec_repetition_penalty(
+        logits.clone(), _CodecSamplingMetadata(repetition_penalties=torch.tensor([1.05], device=device))
+    )
+    expected = _reference_repetition_penalty(logits, expected_history, penalty=1.05, window_size=_CODEC_PENALTY_WINDOW)
+    torch.testing.assert_close(actual, expected)
+
+
 def test_talker_projects_request_aligned_duplex_metadata() -> None:
     talker = _make_talker()
     infos = [
@@ -753,6 +844,135 @@ def test_decode_preprocess_drops_codec_eos() -> None:
     assert updates["codes"]["audio"].numel() == 0
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("code_id", [0, 3, 7])
+def test_cpu_codec_transport_preserves_embedding_and_owns_delta(device, dtype, code_id) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA embedding")
+    talker = _make_talker()
+    talker.emb_code = nn.ModuleList([nn.Embedding(8, 2, device=device, dtype=dtype)])
+    ids = torch.tensor([code_id], device=device, dtype=torch.int32)
+    expected_embeds = talker.emb_code[0](ids.to(dtype=torch.long))
+    state = {"finished": False, "step": 0}
+    # Factories must explicitly choose CPU even inside a non-CPU default device.
+    with torch.device("meta"):
+        returned_ids, embeds, updates = talker.preprocess(ids, None, request_id="req", audio_state=state)
+    delta = updates["codes"]["audio"]
+    assert returned_ids is ids
+    assert embeds.device == ids.device
+    torch.testing.assert_close(embeds, expected_embeds, rtol=0, atol=0)
+    assert delta.device.type == "cpu" and delta.dtype == torch.long
+    assert delta.shape == ((0,) if code_id == 7 else (1, 1))
+    assert delta.tolist() == ([] if code_id == 7 else [[code_id]])
+    assert state == {"finished": code_id == 7, "step": 0}
+    ids.fill_(5)
+    assert delta.tolist() == ([] if code_id == 7 else [[code_id]])
+
+
+@pytest.mark.parametrize("use_snapshot", [False, True])
+def test_cpu_codec_transport_routes_owned_payloads_with_hidden(monkeypatch, use_snapshot) -> None:
+    from types import SimpleNamespace
+
+    from tests.worker.test_gpu_ar_model_runner import _make_async_output_runner
+    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import _extract_codec_delta
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner, _snapshot_tensor_payload_to_cpu_async
+
+    talker = _make_talker()
+    req_ids = ["r2", "r1", "r3"]
+    codes = [torch.tensor([[0]]), torch.empty(0, dtype=torch.long), torch.tensor([[3]])]
+    talker._request_audio_states = {
+        "r2": {"finished": False, "step": 0},
+        "r1": {"finished": True, "step": 0},
+        "r3": {"finished": False, "step": 0},
+    }
+    hidden = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    model_output = talker.make_omni_output(
+        hidden,
+        model_intermediate_buffer=[
+            {"request_id": rid, "codes": {"audio": code}} for rid, code in zip(req_ids, codes, strict=True)
+        ],
+        request_token_spans=[(0, 1), (1, 2), (2, 3)],
+    )
+    assert model_output.text_hidden_states is hidden
+    mm = model_output.multimodal_outputs
+    assert [value.device.type for value in mm["codes"]["audio"]] == ["cpu"] * 3
+    assert [value.shape for value in mm["codes"]["audio"]] == [(1, 1), (0, 1), (1, 1)]
+    if use_snapshot:
+        snapshot = _snapshot_tensor_payload_to_cpu_async(
+            {"hidden_states": hidden, "multimodal_outputs": mm}, copy_stream=None, pin_memory=False
+        )
+        assert snapshot._ready_event is None
+        snapshot.wait()
+        mm = snapshot.payload["multimodal_outputs"]
+        codes[0].fill_(6)
+        assert mm["codes"]["audio"][0].tolist() == [[0]]
+
+    runner = _make_async_output_runner(engine_output_type="latent")
+    assert runner._pooler_payload_include_hidden_flag is True
+    runner.requests = {rid: object() for rid in req_ids}
+    monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, ids: ("latent", ids))
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+    output = runner._build_omni_model_runner_output_from_snapshot(
+        scheduler_output=SimpleNamespace(total_num_scheduled_tokens=3, num_scheduled_tokens=dict.fromkeys(req_ids, 1)),
+        hidden_states=hidden,
+        staged_hidden_states_cpu=None,
+        multimodal_outputs=mm,
+        req_ids_output_copy=req_ids,
+        req_id_to_index_output_copy={rid: index for index, rid in enumerate(req_ids)},
+        valid_sampled_token_ids=[[1], [7], [1]],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=torch.ones(3, dtype=torch.int32).numpy(),
+        query_start_loc_cpu=torch.arange(3),
+    )
+    for code in codes:
+        code.fill_(6)
+    for code in mm["codes"]["audio"]:
+        code.fill_(5)
+    talker.on_requests_finished(set(req_ids))
+    talker._flush_deferred_cleanup()
+    talker._request_audio_states["r2"] = {"finished": False, "step": 0}
+    extracted = [
+        _extract_codec_delta(payload, rid) for rid, payload in zip(req_ids, output.inter_stage_outputs, strict=True)
+    ]
+    assert extracted == [[0], [], [3]]
+    assert [payload["meta.finished"].item() for payload in output.inter_stage_outputs] == [False, True, False]
+    assert all(payload["codes.audio"].device.type == "cpu" for payload in output.inter_stage_outputs)
+    for index, payload in enumerate(output.inter_stage_outputs):
+        torch.testing.assert_close(payload["hidden"], hidden[index : index + 1])
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_cpu_codec_transport_accepts_direct_device_source(device) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA codec source")
+    talker = _make_talker()
+    hidden = torch.ones(1, 2, device=device)
+    output = talker.make_omni_output(
+        hidden,
+        model_intermediate_buffer=[
+            {"request_id": "req", "codes": {"audio": torch.tensor([[0]], device=device, dtype=torch.int32)}}
+        ],
+        request_token_spans=[(0, 1)],
+    )
+    assert output.text_hidden_states is hidden
+    delta = output.multimodal_outputs["codes"]["audio"][0]
+    assert delta.device.type == "cpu" and delta.dtype == torch.long
+    assert delta.tolist() == [[0]]
+    assert talker._request_audio_states["req"]["recent_codes"] == [0]
+    assert talker._request_audio_states["req"]["step"] == 1
+    assert talker._penalty_histories[0].tolist() == [0]
+    assert not output.multimodal_outputs["meta"]["finished"][0].item()
+
+
 def test_missing_conditioning_fails_clearly() -> None:
     talker = _make_talker()
 
@@ -784,6 +1004,8 @@ def test_empty_speech_segment_finishes_without_sampling_codes() -> None:
     assert torch.equal(embeds, talker.emb_text(torch.tensor([5, 6])))
     assert updates["audio_state"]["finished"] is True
     assert updates["codes"]["audio"].numel() == 0
+    assert updates["codes"]["audio"].device.type == "cpu"
+    assert updates["codes"]["audio"].shape == (0,)
 
     # min_tokens can keep scheduling leftover decode rows after an empty
     # speech segment. Those rows have no previous codec id to embed.
@@ -796,6 +1018,8 @@ def test_empty_speech_segment_finishes_without_sampling_codes() -> None:
 
     assert decode_embeds.shape == (1, 4)
     assert decode_updates["codes"]["audio"].numel() == 0
+    assert decode_updates["codes"]["audio"].device.type == "cpu"
+    assert decode_updates["codes"]["audio"].shape == (0,)
 
 
 def test_chunked_prefill_tail_aligns_condition_with_prompt_length(mocker) -> None:
