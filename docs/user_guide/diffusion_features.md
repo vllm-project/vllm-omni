@@ -32,6 +32,30 @@ Cache methods trade minimal quality for significant speedup. Quality loss is typ
 | **[TeaCache](diffusion/cache_acceleration/teacache.md)** | Adaptive caching using modulated inputs | Quick setup, balanced quality/speed on single GPU |
 | **[Cache-DiT](diffusion/cache_acceleration/cache_dit.md)** | Multiple caching techniques: DBCache, TaylorSeer, SCM | Fine-grained control, tunable quality-speed tradeoff |
 
+#### Diffusion KV Prefix Caching
+
+[KV prefix caching](../design/feature/prefix_caching.md#diffusion-kv-prefix-caching)
+reuses stable context KV across requests, rather than approximating denoise
+steps. Enable `diffusion_kv_mode: paged_scheduler` and `enable_prefix_caching: true`
+on the HunyuanImage3 standalone DiT stage. This is separate from the AR stage-output
+cache, TeaCache and Cache-DiT.
+
+| Model / combination | Scope |
+|---------------------|-------|
+| HunyuanImage3 standalone DiT | Stable text/reference-image prefix reuse; dynamic image tokens are excluded |
+| TP4/SP1 + EP, CFGP1 | Validated reference-image prefix hits |
+| TP2/SP2 (Ulysses) + EP, CFGP1 | Validated reference-image prefix hits; CFG guidance does not require CFG parallelism |
+| Other SP/TP combinations, CFGP>1 | Prefix-hit E2E accuracy not yet validated |
+| AR-imported KV / cross-stage missing-page transfer | Not covered by local prefix caching |
+| Sleep mode | Rejected with prefix caching; discarded KV pages would leave stale cache hits |
+| TeaCache / Cache-DiT, offload, quantization | Not validated with prefix hits |
+| Step execution | Not supported with HunyuanImage3 paged KV; use request-level execution |
+| Other diffusion models | No prefix-cache model adapter yet |
+
+This table describes prefix-cache scope; the general parallelism tables below do
+not establish prefix-hit compatibility. Floating-point kernel differences still
+require accuracy validation. `dense_legacy` remains the default.
+
 #### Lossless Acceleration
 
 Parallelism methods distribute computation across GPUs without quality loss (mathematically equivalent to single-GPU).

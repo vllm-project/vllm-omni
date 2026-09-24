@@ -39,6 +39,7 @@ def resolve_diffusion_kv_cache_layout(
     vllm_config: VllmConfig,
     *,
     indexes_kv_by_block_stride: bool = False,
+    required_layout: KVCacheLayout | str | None = None,
 ) -> KVCacheLayout:
     """Pin the physical KV layout for the Diffusion cache and return it.
 
@@ -48,29 +49,65 @@ def resolve_diffusion_kv_cache_layout(
     from the wrong offsets instead of raising.
     """
 
+    if required_layout is not None:
+        required_layout = KVCacheLayout[required_layout] if isinstance(required_layout, str) else required_layout
+        if not isinstance(required_layout, KVCacheLayout):
+            raise TypeError(f"required_layout must be a KVCacheLayout or name, got {type(required_layout)!r}")
     required_block_outermost = bool(indexes_kv_by_block_stride)
+    if required_layout is not None and required_layout.is_block_outermost != required_block_outermost:
+        raise ValueError(
+            f"Connector KV cache layout {required_layout.name} contradicts the attention "
+            f"backend, which requires is_block_outermost={required_block_outermost}."
+        )
     cache_config = getattr(vllm_config, "cache_config", None)
     if cache_config is None:
         # A config double with nowhere to record the choice; report what the
         # requirement implies without pretending it was pinned.
-        return BLOCK_STRIDE_DIFFUSION_KV_CACHE_LAYOUT if required_block_outermost else DEFAULT_DIFFUSION_KV_CACHE_LAYOUT
+        return required_layout or (
+            BLOCK_STRIDE_DIFFUSION_KV_CACHE_LAYOUT if required_block_outermost else DEFAULT_DIFFUSION_KV_CACHE_LAYOUT
+        )
 
     current = getattr(cache_config, "kv_cache_layout", None)
     if current is not None:
         layout = KVCacheLayout[current]
-        if layout.is_block_outermost != required_block_outermost:
+        if (required_layout is not None and layout is not required_layout) or (
+            required_layout is None and layout.is_block_outermost != required_block_outermost
+        ):
             raise ValueError(
                 "Diffusion KV cache layout "
                 f"{layout.name} (is_block_outermost="
                 f"{layout.is_block_outermost}) contradicts the attention "
-                "backend, which requires is_block_outermost="
-                f"{required_block_outermost}."
+                "backend/connector requirement: "
+                f"layout {required_layout.name if required_layout is not None else required_block_outermost}."
             )
         return layout
 
-    layout = BLOCK_STRIDE_DIFFUSION_KV_CACHE_LAYOUT if required_block_outermost else DEFAULT_DIFFUSION_KV_CACHE_LAYOUT
+    layout = required_layout or (
+        BLOCK_STRIDE_DIFFUSION_KV_CACHE_LAYOUT if required_block_outermost else DEFAULT_DIFFUSION_KV_CACHE_LAYOUT
+    )
     cache_config.kv_cache_layout = layout.name
     return layout
+
+
+def get_connector_required_kv_cache_layout(vllm_config: VllmConfig) -> KVCacheLayout | None:
+    """Resolve the physical layout declared by the configured native connector."""
+
+    transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    if transfer_config is None:
+        return None
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+    connector_cls = KVConnectorFactory.get_connector_class(transfer_config)
+    getter = getattr(connector_cls, "get_required_kvcache_layout", None)
+    if getter is None:
+        return None
+    layout = getter(vllm_config)
+    if layout is None:
+        return None
+    try:
+        return layout if isinstance(layout, KVCacheLayout) else KVCacheLayout[layout]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"Connector {connector_cls.__name__} returned unsupported KV layout {layout!r}") from exc
 
 
 def adopt_kv_cache_layout(vllm_config: VllmConfig, kv_cache_config) -> KVCacheLayout:

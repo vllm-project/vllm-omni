@@ -91,6 +91,8 @@ class NixlConnector(OmniConnectorBase):
         self._pending: dict[str, _PendingPayload] = {}
         self._published: dict[str, dict[str, Any]] = {}
         self._state_lock = threading.RLock()
+        self._close_lock = threading.Lock()
+        self._close_thread: threading.Thread | None = None
         self._remote_agents: list[str] = []
         self._metrics: dict[str, int] = {
             "puts": 0,
@@ -159,6 +161,7 @@ class NixlConnector(OmniConnectorBase):
             self._lease_thread.start()
         self._transfer_wakeup = threading.Event()
         self._deferred_transfers: list[_DeferredTransfer] = []
+        self._abandoned_queries: list[tuple[str, str, str | None, str]] = []
         self._transfer_thread: threading.Thread | None = None
         if self._role != "sender":
             self._transfer_thread = threading.Thread(
@@ -325,6 +328,25 @@ class NixlConnector(OmniConnectorBase):
             logger.error("NixlConnector put failed for %s", put_key, exc_info=True)
             return False, 0, None
 
+    def get_with_deadline(self, from_stage, to_stage, get_key, metadata=None, *, deadline):
+        """Bound control-plane and DMA waits without freeing active READ buffers."""
+        self._req_local.deadline = deadline
+        try:
+            if time.monotonic() >= deadline:
+                return None
+            return self.get(from_stage, to_stage, get_key, metadata)
+        finally:
+            self._req_local.deadline = None
+
+    def abandon_get(self, get_key: str) -> None:
+        claims = getattr(self._req_local, "claims", {})
+        with self._state_lock:
+            for query_key, claim_id in list(claims.items()):
+                if query_key[1] == get_key:
+                    self._abandoned_queries.append((*query_key, claim_id))
+                    del claims[query_key]
+        self._transfer_wakeup.set()
+
     def get(
         self,
         from_stage: str,
@@ -347,6 +369,9 @@ class NixlConnector(OmniConnectorBase):
                 return None
 
             source_metadata = metadata
+            deadline = getattr(self._req_local, "deadline", None)
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
 
             tensor_specs = metadata.get("tensor_specs")
             if not isinstance(tensor_specs, list):
@@ -448,7 +473,14 @@ class NixlConnector(OmniConnectorBase):
             for local_reg_descs in local_reg_descs_list:
                 self._safe_call(self._agent.deregister_memory, local_reg_descs)
             if source_metadata is not None:
-                self._notify_transfer_done(get_key, source_metadata)
+                if not self._notify_transfer_done(get_key, source_metadata):
+                    self._defer_transfer(
+                        _DeferredTransfer(
+                            tensors=[],
+                            source_key=get_key,
+                            source_metadata=source_metadata,
+                        )
+                    )
 
     def cleanup(self, request_id: str) -> None:
         pending = self._take_pending(request_id)
@@ -474,11 +506,27 @@ class NixlConnector(OmniConnectorBase):
             return self._pending.pop(request_id)
 
     def close(self) -> None:
+        with self._close_lock:
+            self._close_once()
+            if not self._closed and self._close_thread is None:
+                self._close_thread = threading.Thread(
+                    target=self._finish_close_in_background, name="nixl-close", daemon=True
+                )
+                self._close_thread.start()
+
+    def _finish_close_in_background(self) -> None:
+        retry = threading.Event()
+        while not retry.wait(max(self._poll_interval_s, 0.1)):
+            with self._close_lock:
+                self._close_once()
+                if self._closed:
+                    return
+
+    def _close_once(self) -> None:
         if self._closed:
             return
         self._closed = True
-        # Stop accepting puts/gets, but keep serving completion ACKs for outstanding
-        # remote READs. A later close() call can finish teardown once drained.
+        # Keep completion ACKs available until the automatic closer drains ownership.
         for request_id in list(self._pending):
             self.cleanup(request_id)
         with self._state_lock:
@@ -486,25 +534,33 @@ class NixlConnector(OmniConnectorBase):
                 _RETAINED_PRODUCERS.add(self)
                 self._closed = False
                 self._closing = True
-                logger.warning("NIXL close deferred: remote READ claims still own source allocations")
+                if self._close_thread is None:
+                    logger.warning("NIXL close deferred: remote READ claims still own source allocations")
                 return
         _RETAINED_PRODUCERS.discard(self)
         self._stop_event.set()
         self._lease_wakeup.set()
         self._transfer_wakeup.set()
-        if self._listener_thread is not None:
-            self._listener_thread.join(timeout=5.0)
-            self._listener_thread = None
-        if self._lease_thread is not None:
-            self._lease_thread.join(timeout=5.0)
-            self._lease_thread = None
-        if self._transfer_thread is not None:
-            self._transfer_thread.join(timeout=5.0)
-            self._transfer_thread = None
-        while self._deferred_transfers:
-            self._reap_deferred_transfers()
-            if self._deferred_transfers:
-                time.sleep(max(self._poll_interval_s, 0.01))
+        for thread_name in ("_listener_thread", "_lease_thread", "_transfer_thread"):
+            thread = getattr(self, thread_name)
+            if thread is None:
+                continue
+            if thread is not threading.current_thread():
+                thread.join(timeout=5.0)
+            if thread.is_alive():
+                _RETAINED_PRODUCERS.add(self)
+                self._closed = False
+                self._closing = True
+                return
+            setattr(self, thread_name, None)
+        self._reap_deferred_transfers()
+        if self._deferred_transfers or self._abandoned_queries:
+            _RETAINED_PRODUCERS.add(self)
+            self._closed = False
+            self._closing = True
+            if self._close_thread is None:
+                logger.warning("NIXL close deferred: local DMA resources retained for automatic cleanup")
+            return
         if self._zmq_ctx is not None:
             # destroy() rather than term(): REQ sockets live in thread-local
             # caches this thread cannot reach, and term() blocks until every
@@ -525,7 +581,7 @@ class NixlConnector(OmniConnectorBase):
 
     def health(self) -> dict[str, Any]:
         return {
-            "status": "unhealthy" if self._closed else "healthy",
+            "status": "unhealthy" if self._closed or getattr(self, "_closing", False) else "healthy",
             "pending_requests": len(self._pending),
             **self._metrics,
         }
@@ -593,19 +649,26 @@ class NixlConnector(OmniConnectorBase):
         return self._query_metadata_at(get_key, *endpoint)
 
     def _query_metadata_at(
-        self, get_key: str, host: str, port: int, *, generation: str | None = None
+        self, get_key: str, host: str, port: int, *, generation: str | None = None, claim_id: str | None = None
     ) -> dict[str, Any] | None:
         """Fetch transfer metadata for ``get_key`` from a producer's ROUTER socket.
 
         Each call performs one bounded query so a missing key cannot starve
         other requests in the shared receive loop. The caller retries later.
+        Retries after a lost reply reuse ownership until metadata is received.
         """
         zmq_addr = f"tcp://{host}:{port}"
+        claims = getattr(self._req_local, "claims", None)
+        if claims is None:
+            claims = {}
+            self._req_local.claims = claims
+        query_key = (zmq_addr, get_key, generation)
+        claim_id = claims.setdefault(query_key, claim_id or uuid.uuid4().hex)
         request = _GET_META_MSG + msgspec.msgpack.encode(
-            {"key": get_key, "generation": generation, "claim_id": uuid.uuid4().hex}
+            {"key": get_key, "generation": generation, "claim_id": claim_id}
         )
-        sock = self._get_req_socket(zmq_addr, self._metadata_query_timeout_ms)
         try:
+            sock = self._get_req_socket(zmq_addr, self._metadata_query_timeout_ms)
             sock.send(request)
             reply = sock.recv()
         except Exception:
@@ -613,10 +676,13 @@ class NixlConnector(OmniConnectorBase):
             logger.debug("NixlConnector handshake query to %s failed for %s", zmq_addr, get_key, exc_info=True)
             return None
         if reply == _META_NOT_FOUND:
+            claims.pop(query_key, None)
             return None
-        return msgspec.msgpack.decode(reply)
+        metadata = msgspec.msgpack.decode(reply)
+        claims.pop(query_key, None)
+        return metadata
 
-    def _notify_transfer_done(self, get_key: str, metadata: dict[str, Any]) -> None:
+    def _notify_transfer_done(self, get_key: str, metadata: dict[str, Any]) -> bool:
         """Tell the producer its buffer is drained so it can deregister now.
 
         Without this the producer would hold the registration until the lease
@@ -624,11 +690,11 @@ class NixlConnector(OmniConnectorBase):
         """
         endpoint = self._metadata_endpoint(metadata)
         if endpoint is None or self._zmq_ctx is None:
-            return
+            return True
         host, port = endpoint
         zmq_addr = f"tcp://{host}:{port}"
-        sock = self._get_req_socket(zmq_addr)
         try:
+            sock = self._get_req_socket(zmq_addr)
             sock.send(
                 _XFER_DONE_MSG
                 + msgspec.msgpack.encode(
@@ -636,9 +702,11 @@ class NixlConnector(OmniConnectorBase):
                 )
             )
             sock.recv()
+            return True
         except Exception:
             self._invalidate_req_socket(zmq_addr)
             logger.debug("NixlConnector failed to notify completion for %s", get_key, exc_info=True)
+            return False
 
     def _handshake_listener_loop(self) -> None:
         router = self._zmq_ctx.socket(zmq.ROUTER)
@@ -686,8 +754,7 @@ class NixlConnector(OmniConnectorBase):
                     or not claim
                     or request.get("generation") not in (None, pending.generation)
                     or (not pending.claims and time.monotonic() >= pending.deadline)
-                    or self._closed
-                    or getattr(self, "_closing", False)
+                    or ((self._closed or getattr(self, "_closing", False)) and claim not in pending.claims)
                 ):
                     return _META_NOT_FOUND
                 # Publish ownership before descriptors can leave this lock.
@@ -723,6 +790,12 @@ class NixlConnector(OmniConnectorBase):
             sock.connect(zmq_addr)
             cache[zmq_addr] = sock
         timeout_ms = self._handshake_timeout_ms if timeout_ms is None else timeout_ms
+        deadline = getattr(self._req_local, "deadline", None)
+        if deadline is not None:
+            remaining_ms = int((deadline - time.monotonic()) * 1000 / 2)
+            if remaining_ms <= 0:
+                raise TimeoutError("NIXL receive deadline expired")
+            timeout_ms = min(timeout_ms, remaining_ms)
         sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
         sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
         return sock
@@ -751,6 +824,9 @@ class NixlConnector(OmniConnectorBase):
 
     def _wait_for_transfer(self, handle: int, request_id: str) -> None:
         deadline = time.monotonic() + self._transfer_timeout_s
+        receive_deadline = getattr(self._req_local, "deadline", None)
+        if receive_deadline is not None:
+            deadline = min(deadline, receive_deadline)
         while True:
             state = self._agent.check_xfer_state(handle)
             if state == "DONE":
@@ -759,7 +835,7 @@ class NixlConnector(OmniConnectorBase):
                 raise RuntimeError(f"NIXL transfer for {request_id} failed with state={state}")
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"NIXL transfer for {request_id} timed out")
-            time.sleep(self._poll_interval_s)
+            time.sleep(min(self._poll_interval_s, max(0.0, deadline - time.monotonic())))
 
     def _transfers_may_be_active(self, handles: list[Any]) -> bool:
         try:
@@ -816,6 +892,22 @@ class NixlConnector(OmniConnectorBase):
 
     def _reap_deferred_transfers(self) -> None:
         with self._state_lock:
+            queries = list(self._abandoned_queries)
+        for query in queries:
+            address, key, generation, claim_id = query
+            endpoint = address.removeprefix("tcp://").rsplit(":", 1)
+            metadata = self._query_metadata_at(
+                key, endpoint[0], int(endpoint[1]), generation=generation, claim_id=claim_id
+            )
+            query_key = (address, key, generation)
+            unresolved = query_key in getattr(self._req_local, "claims", {})
+            if metadata is None and unresolved:
+                continue
+            if metadata is not None and not self._notify_transfer_done(key, metadata):
+                self._defer_transfer(_DeferredTransfer(tensors=[], source_key=key, source_metadata=metadata))
+            with self._state_lock:
+                self._abandoned_queries.remove(query)
+        with self._state_lock:
             transfers = list(self._deferred_transfers)
         for transfer in transfers:
             try:
@@ -834,7 +926,8 @@ class NixlConnector(OmniConnectorBase):
             ):
                 transfer.tensors.clear()
                 if transfer.source_metadata is not None:
-                    self._notify_transfer_done(transfer.source_key, transfer.source_metadata)
+                    if not self._notify_transfer_done(transfer.source_key, transfer.source_metadata):
+                        continue
                     transfer.source_metadata = None
                 with self._state_lock:
                     if transfer in self._deferred_transfers:

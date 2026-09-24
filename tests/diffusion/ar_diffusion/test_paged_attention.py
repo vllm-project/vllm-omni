@@ -244,7 +244,8 @@ def test_paged_attention_matches_dense_reference_cpu(history_chunks, action_len,
 
 
 @pytest.mark.parametrize("history_chunks", [0, 1, 2, 3])
-def test_staged_reuse_refreshes_the_current_blocks_at_their_live_offset(monkeypatch, history_chunks):
+@pytest.mark.parametrize("window_chunks", [2, 4])
+def test_staged_reuse_refreshes_the_current_blocks_at_their_live_offset(monkeypatch, history_chunks, window_chunks):
     """A second probe of the same AR block restages its current K/V where the table actually holds it.
 
     The padded table always ends in at least one action-capacity block, and while the window is still
@@ -254,11 +255,14 @@ def test_staged_reuse_refreshes_the_current_blocks_at_their_live_offset(monkeypa
     monkeypatch.setenv(KV_GATHER_ENV, "1")
     device = torch.device("cpu")
     dtype = torch.float32
-    kv, st = make_state(dtype=dtype, device=device, window_chunks=2, reuse_history_staging=True)
+    kv, st = make_state(dtype=dtype, device=device, window_chunks=window_chunks, reuse_history_staging=True)
+    for buffer in kv.history_staging[0]:
+        buffer.fill_(-7)
     if history_chunks:
         _commit_video_span(kv, st, kv_branch=POS, n_chunks=history_chunks, dtype=dtype, device=device)
 
     ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)[0].forward_ctx
+    ctx.max_video_tokens = 2 * BLOCK
     ctx.ensure_video_slots(device)
     key_cache, value_cache = kv.key_cache(0), kv.value_cache(0)
 
@@ -275,6 +279,8 @@ def test_staged_reuse_refreshes_the_current_blocks_at_their_live_offset(monkeypa
         n_blocks = max_seq_len // BLOCK
         block_ids = block_table[0, :n_blocks].to(torch.long)
         stage_k, stage_v = ctx.history_staging(0)
+        # The custom op narrows the manager-owned buffers before calling this helper.
+        stage_k, stage_v = stage_k[:max_seq_len], stage_v[:max_seq_len]
         paged_attention_module._stage_window(
             stage_k,
             stage_v,
@@ -287,6 +293,8 @@ def test_staged_reuse_refreshes_the_current_blocks_at_their_live_offset(monkeypa
         )
         full_k = key_cache.index_select(0, block_ids).reshape(n_blocks * BLOCK, N_HEADS, HEAD_DIM)
         full_v = value_cache.index_select(0, block_ids).reshape(n_blocks * BLOCK, N_HEADS, HEAD_DIM)
+        for buffer in kv.history_staging[0]:
+            assert (buffer[max_seq_len:] == -7).all()
         return stage_k, stage_v, full_k, full_v, n_blocks
 
     stage_k, stage_v, full_k, full_v, n_blocks = probe(1)
@@ -321,6 +329,24 @@ def test_staging_is_only_allocated_for_the_gather_path(monkeypatch, gather_enabl
     assert ctx.staging_enabled is gather_enabled
     stage_k, _ = ctx.history_staging(0)
     assert (stage_k is not None) is gather_enabled
+
+
+@pytest.mark.parametrize("window_chunks", [2, 4])
+def test_layer_inputs_preserve_static_staging_tensors(monkeypatch, window_chunks):
+    """Compiled inputs must retain the manager's static-address annotations, including with spare capacity."""
+    monkeypatch.setenv(KV_GATHER_ENV, "1")
+    device = torch.device("cpu")
+    kv, st = make_state(device=device, window_chunks=window_chunks, reuse_history_staging=True)
+    stage_key, stage_value = kv.history_staging[0]
+    for _ in range(2):
+        ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)[0].forward_ctx
+        ctx.max_video_tokens = 2 * BLOCK
+        ctx.prepare(device, action_len=0, query_len=BLOCK)
+        inputs = ctx.layer_inputs(0)
+        assert inputs.stage_key is stage_key
+        assert inputs.stage_value is stage_value
+        assert inputs.max_seq_len == 3 * BLOCK
+        assert stage_key.shape[0] == (window_chunks + 1) * BLOCK
 
 
 @pytest.mark.skipif(not _gpu_flash_attn_usable(), reason="usable GPU FlashAttention is required")
@@ -363,8 +389,8 @@ def test_paged_attention_matches_dense_reference_gpu(history_chunks, action_len,
         query[0],
         current_k[0],
         current_v[0],
-        action_k[0] if action_len else None,
-        action_v[0] if action_len else None,
+        action_k[0] if action_k is not None else None,
+        action_v[0] if action_v is not None else None,
         HEAD_DIM**-0.5,
     ).unsqueeze(0)
 
@@ -556,8 +582,8 @@ def test_contiguous_kv_gather_path_matches_paged_path_gpu(monkeypatch, history_c
             query[0],
             current_k[0],
             current_v[0],
-            action_k[0] if action_len else None,
-            action_v[0] if action_len else None,
+            action_k[0] if action_k is not None else None,
+            action_v[0] if action_v is not None else None,
             HEAD_DIM**-0.5,
         ).unsqueeze(0)
 

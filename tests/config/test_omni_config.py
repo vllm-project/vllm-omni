@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import warnings
-from dataclasses import fields
+from dataclasses import fields, replace
 from inspect import Parameter, signature
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
@@ -246,6 +246,12 @@ def test_vllm_omni_config_from_pipeline_config_matches_merge_pipeline_deploy(mod
             assert omni_stage.diffusion_config is not None
             assert omni_stage.diffusion_config.stage_id == legacy_stage.stage_id
             assert omni_stage.diffusion_config.model_arch == engine_args.get("model_arch")
+            assert omni_stage.diffusion_config.stage_input_payload_keys == engine_args.get(
+                "stage_input_payload_keys", ()
+            )
+            assert omni_stage.diffusion_config.stage_output_payload_keys == engine_args.get(
+                "stage_output_payload_keys", ()
+            )
         elif omni_stage.stage_pipeline_config.execution_type == StageExecutionType.LLM_AR:
             assert isinstance(omni_stage, VllmOmniARStageConfig)
             assert not hasattr(omni_stage, "diffusion_config")
@@ -1572,6 +1578,68 @@ def test_diffusion_config_preserves_existing_coercion_hooks():
     assert cfg.max_cpu_loras == 1
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_diffusion_projection_retains_prefix_caching(enabled):
+    projection = omni_config_module._DiffusionConfigProjection
+    assert projection.from_kwargs().enable_prefix_caching is False
+    config = projection.from_kwargs(
+        diffusion_kv_mode="paged_scheduler",
+        diffusion_kv_max_rows_per_request=2,
+        enable_prefix_caching=enabled,
+    )
+    assert config.enable_prefix_caching is enabled
+
+
+@pytest.mark.parametrize(
+    "pipeline_value,stage_value,cli_value,expected",
+    [
+        (None, None, None, False),
+        (True, None, None, True),
+        (False, True, None, True),
+        (True, False, None, False),
+        (None, None, True, True),
+        (True, True, False, False),
+        (False, False, True, True),
+    ],
+)
+def test_diffusion_prefix_caching_precedence_and_transport(
+    tmp_path,
+    pipeline_value,
+    stage_value,
+    cli_value,
+    expected,
+):
+    import yaml
+
+    from vllm_omni.engine.stage_init_utils import _project_omni_stage_engine_args
+
+    stage_deploy = {
+        "stage_id": 0,
+        "diffusion_kv_mode": "paged_scheduler",
+        "diffusion_kv_max_rows_per_request": 2,
+    }
+    deploy = {"pipeline": "hunyuan_image3_dit", "async_chunk": False, "stages": [stage_deploy]}
+    if pipeline_value is not None:
+        deploy["enable_prefix_caching"] = pipeline_value
+    if stage_value is not None:
+        stage_deploy["enable_prefix_caching"] = stage_value
+    deploy_path = tmp_path / "prefix.yaml"
+    deploy_path.write_text(yaml.safe_dump(deploy))
+    cli = {} if cli_value is None else {"stage_0_enable_prefix_caching": cli_value}
+    stage = _from_pipeline_key(
+        "hunyuan_image3_dit",
+        deploy_config_path=str(deploy_path),
+        cli_overrides=cli,
+    ).stage_by_id(0)
+
+    assert bool(stage.cache_config.enable_prefix_caching) is expected
+    assert stage.diffusion_config.enable_prefix_caching is expected
+    assert _project_omni_stage_engine_args(stage)["enable_prefix_caching"] is expected
+    serialized = _serialize_stage_config(stage)
+    restored = omni_config_module._DiffusionConfigProjection.from_kwargs(**serialized["diffusion_config"])
+    assert restored.enable_prefix_caching is expected
+
+
 def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
     from vllm_omni.platforms import current_omni_platform
 
@@ -1725,6 +1793,58 @@ def test_from_pipeline_config_rejects_reserved_diffusion_kv_mode(tmp_path):
         )
 
 
+@pytest.mark.parametrize("source", ["default", "topology", "deploy", "stage-cli"])
+@pytest.mark.parametrize("key_container", [list, tuple])
+def test_diffusion_stage_payload_keys_roundtrip(source, key_container):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    topology_keys = {
+        "stage_input_payload_keys": ("conditioning", "metadata"),
+        "stage_output_payload_keys": ("latents",),
+    }
+    override_keys = {
+        "stage_input_payload_keys": (),
+        "stage_output_payload_keys": ("audio", "video"),
+    }
+    pipeline = _resolve_pipeline_or_skip("dreamzero")
+    topology = pipeline.get_stage(0)
+    if source != "default":
+        topology = replace(topology, **topology_keys)
+    pipeline = replace(pipeline, stages=(topology,))
+    deploy = _load_default_deploy(pipeline)
+    cli_overrides = {}
+    if source == "deploy":
+        deploy = replace(deploy, stages=[StageDeployConfig(stage_id=0, engine_extras=override_keys)])
+    elif source == "stage-cli":
+        cli_overrides = {f"stage_0_{name}": value for name, value in override_keys.items()}
+
+    stage = VllmOmniConfig.from_pipeline_config(
+        pipeline, user_deploy_config=deploy, cli_overrides=cli_overrides
+    ).stage_by_id(0)
+    expected = topology_keys if source == "topology" else override_keys
+    if source == "default":
+        expected = dict.fromkeys(topology_keys, ())
+    legacy_stage = merge_pipeline_deploy(pipeline, deploy)[0]
+    legacy_args = {**legacy_stage.yaml_engine_args, **(override_keys if source == "stage-cli" else {})}
+    restored_stage = ForkingPickler.loads(ForkingPickler.dumps(stage))
+    engine_args = build_engine_args_dict_from_omni_stage_config(restored_stage, model="test-model")
+    diffusion_kwargs = omni_config_module.extract_diffusion_stage_config_kwargs(
+        engine_args, stage_id=restored_stage.stage_id, include_engine_adapter_metadata=True
+    )
+    for name in topology_keys:
+        diffusion_kwargs[name] = key_container(diffusion_kwargs[name])
+    od_config = OmniDiffusionConfig.from_kwargs(**diffusion_kwargs)
+
+    for name, keys in expected.items():
+        assert legacy_args.get(name, ()) == keys
+        assert getattr(stage.diffusion_config, name) == keys
+        assert engine_args[name] == keys
+        assert getattr(od_config, name) == keys
+    for name in topology_keys:
+        assert getattr(topology, name) == (() if source == "default" else topology_keys[name])
+
+
 def test_diffusion_config_field_classification_covers_current_fields():
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
@@ -1745,6 +1865,8 @@ def test_diffusion_config_field_classification_covers_current_fields():
         "diffusion_kv_cache_dtype",
         "diffusion_kv_mode",
         "diffusion_kv_max_rows_per_request",
+        "stage_input_payload_keys",
+        "stage_output_payload_keys",
     } <= omni_config_module._DIFFUSION_ONLY_CONFIG_FIELDS
     assert {
         "revision",

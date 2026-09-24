@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from contextlib import AbstractContextManager
 from functools import partial
 from typing import Any
 
@@ -36,9 +37,13 @@ else:
 
 
 class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
-    def initialize_kv_cache(self, kv_cache_config) -> None:
+    def initialize_kv_cache(
+        self, kv_cache_config, kv_cache_allocation_context: AbstractContextManager | None = None
+    ) -> None:
         """Stage the omni prefix-cache config (hidden / mm tensors reused on hits)."""
-        NPUModelRunner.initialize_kv_cache(self, kv_cache_config)
+        NPUModelRunner.initialize_kv_cache(
+            self, kv_cache_config, kv_cache_allocation_context=kv_cache_allocation_context
+        )
         if getattr(self, "_omni_prefix_cache_cfg", None) is None:
             # Same gate as the GPU runner (pooling stage, kv_consumer /
             # kv_both, hybrid kv groups). Read the config back off
@@ -338,8 +343,6 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
 
             if self.uses_mrope:
                 positions = self.mrope_positions.gpu[:, :num_tokens_padded]
-            elif self.uses_xdrope_dim > 0:
-                positions = self.xdrope_positions.gpu[:, :num_tokens_padded]
             else:
                 positions = self.positions[:num_tokens_padded]
 

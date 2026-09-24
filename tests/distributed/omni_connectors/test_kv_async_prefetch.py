@@ -205,6 +205,25 @@ def test_start_prefetch_sweeps_orphan():
     assert "rid-next" in receiver._prefetch_futures
 
 
+def test_manager_close_stops_prefetch_before_connector_and_is_idempotent():
+    receiver = object.__new__(OmniKVTransferManager)
+    events = []
+    receiver.shutdown_prefetch = lambda: events.append("prefetch")
+    receiver._connector = SimpleNamespace(close=lambda: events.append("connector"))
+    receiver.close()
+    receiver.close()
+    assert events == ["prefetch", "connector", "prefetch"]
+    assert receiver.connector is None
+
+
+def test_manager_close_does_not_initialize_unused_connector():
+    receiver = object.__new__(OmniKVTransferManager)
+    receiver.shutdown_prefetch = lambda: None
+    receiver._connector = None
+    receiver.close()
+    assert receiver.connector is None
+
+
 def test_shutdown_prefetch_clears_state():
     sender, receiver, _ = _make_sender_receiver()
     _seed_payload(sender, "rid-sd")

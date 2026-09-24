@@ -416,7 +416,7 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
     monkeypatch.setattr(
         mod.MiniMaxH3Pipeline,
         "_prepare_encoder_conditioning_inputs",
-        lambda self, value, sampling: context,
+        lambda self, value, sampling: context if value is conditioning else pytest.fail("wrong encoder handoff"),
     )
     monkeypatch.setattr(
         mod.MiniMaxH3Pipeline,
