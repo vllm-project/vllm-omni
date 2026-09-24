@@ -652,6 +652,9 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
         monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
 
         model = h3.MiniMaxH3DiTModel(_minimax_h3_small_od_config(), quant_config=None)
+        # Normally loaded from the checkpoint; torch.empty() can contain NaNs.
+        # With one frequency per axis, the RoPE inverse frequency is 1.
+        model.rope.inv_freq.fill_(1.0)
         for submodule in model.modules():
             if isinstance(submodule, h3.MiniMaxH3Attention):
                 submodule.rope._forward_method = submodule.rope.forward_native
