@@ -602,6 +602,9 @@ class OrchestratorArgs:
     dlo_host_registration_limit_gib: float = 0.0
     boundary_ratio: float | None = None
     flow_shift: float | None = None
+    enable_pid: bool = False
+    pid_checkpoint: str | None = None
+    pid_gemma: str | None = None
     diffusion_kv_cache_dtype: str | None = None
     diffusion_kv_cache_skip_steps: str | None = None
     diffusion_kv_cache_skip_layers: str | None = None
