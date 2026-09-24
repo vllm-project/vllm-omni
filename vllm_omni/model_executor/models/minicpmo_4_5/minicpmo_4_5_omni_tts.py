@@ -338,10 +338,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # read back from the injected stage-1 speculative_config.
         self._k_step_frames = self._parse_k_step_frames(vllm_config)
         self.supports_multi_frame_decode = self._k_step_frames > 0
-        # Per-request device RNG streams for in-model codec sampling (the
-        # multi-frame loop cannot run the vLLM host sampler per frame).
-        self._k_step_rngs: dict[str, torch.Generator] = {}
-        self._k_step_base_seed = 0x5EEDC0DE
         # Last frame's stop/continue rows and the flattened per-token stop
         # sequence the merged step presents to compute_logits.
         self._k_last_stop_rows: list[bool] | None = None
