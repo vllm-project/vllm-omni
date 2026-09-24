@@ -57,7 +57,10 @@ from vllm_omni.config.stage_config import (
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.engine.stage_engine_startup import _serialize_stage_config
-from vllm_omni.engine.stage_init_utils import build_legacy_engine_args_dict
+from vllm_omni.engine.stage_init_utils import (
+    build_engine_args_dict_from_omni_stage_config,
+    build_legacy_engine_args_dict,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -194,6 +197,35 @@ def _build_single_diffusion_config(
         user_deploy_config=DeployConfig(async_chunk=False, stages=deploy_stages),
         cli_overrides=cli_overrides,
     )
+
+
+def test_hunyuan_image3_pd_structured_config_projects_vllm_kv_transfer() -> None:
+    pipeline = _resolve_pipeline_or_skip("hunyuan_image3_pd")
+    omni_config = VllmOmniConfig.from_pipeline_config(pipeline)
+
+    prefill = omni_config.stage_by_id(0)
+    decode = omni_config.stage_by_id(1)
+    assert prefill.scheduler_config.enable_chunked_prefill is True
+    assert decode.scheduler_config.enable_chunked_prefill is True
+    assert prefill.cache_config.enable_prefix_caching is False
+    assert decode.cache_config.enable_prefix_caching is False
+    for stage, role, rank, port in [
+        (prefill, "kv_producer", 0, 25201),
+        (decode, "kv_consumer", 1, 25202),
+    ]:
+        kv_config = stage.connector_config.kv_transfer_config
+        assert kv_config is not None
+        assert kv_config.kv_connector == "MooncakeConnector"
+        assert kv_config.kv_role == role
+        assert kv_config.kv_rank == rank
+        assert kv_config.kv_parallel_size == 2
+        assert kv_config.kv_ip == "127.0.0.1"
+        assert kv_config.kv_connector_extra_config == {"mooncake_bootstrap_port": port}
+
+    prefill_args = build_engine_args_dict_from_omni_stage_config(prefill, "dummy-model")
+    decode_args = build_engine_args_dict_from_omni_stage_config(decode, "dummy-model")
+    assert prefill_args["kv_transfer_config"].kv_role == "kv_producer"
+    assert decode_args["kv_transfer_config"].kv_role == "kv_consumer"
 
 
 @pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))

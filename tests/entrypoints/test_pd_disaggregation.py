@@ -623,7 +623,24 @@ class TestGetPDConnectorInfo:
         )
         info = omni._pd_connector_info
         assert "prefill_bootstrap_addr" in info
-        assert info["prefill_bootstrap_addr"] == "127.0.0.1:25201"
+        assert info["prefill_bootstrap_addr"] == "http://127.0.0.1:25201"
+
+    def test_extracts_bootstrap_addr_from_stage_env(self, monkeypatch):
+        prefill_cfg = _prefill_stage_cfg()
+        del prefill_cfg["engine_args"]["kv_transfer_config"]["kv_connector_extra_config"]
+        del prefill_cfg["engine_args"]["kv_transfer_config"]["kv_ip"]
+        prefill_cfg["runtime"] = {
+            "env": {
+                "VLLM_HOST_IP": "10.0.0.8",
+                "VLLM_MOONCAKE_BOOTSTRAP_PORT": "26001",
+            }
+        }
+        omni = _make_pd_omni(
+            monkeypatch,
+            [prefill_cfg, _decode_stage_cfg(engine_input_source=[0])],
+        )
+
+        assert omni._pd_connector_info == {"prefill_bootstrap_addr": "http://10.0.0.8:26001"}
 
     def test_none_for_non_pd_pipeline(self, monkeypatch):
         omni = _make_pd_omni(
@@ -1003,7 +1020,7 @@ class TestPDRouting:
         assert kv_params["do_remote_prefill"] is True
         assert kv_params["do_remote_decode"] is False
         assert kv_params["transfer_id"] == f"xfer-{expected_rid}"
-        assert kv_params["remote_bootstrap_addr"] == "127.0.0.1:25201"
+        assert kv_params["remote_bootstrap_addr"] == "http://127.0.0.1:25201"
 
 
 # ===================================================================

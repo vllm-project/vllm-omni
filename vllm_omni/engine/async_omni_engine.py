@@ -30,6 +30,7 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.omni_engine_base import OmniEngineBase, StageRuntimeInfo
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorBase
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
 
 logger = init_logger(__name__)
@@ -273,7 +274,14 @@ class AsyncOmniEngine(OmniEngineBase):
             raise ValueError(
                 f"Missing sampling params for stage 0. Got {len(effective_sampling_params_list)} stage params."
             )
+        pd_pair = self._pd_pair
+        effective_sampling_params_list = PDDisaggregationMixin._resolve_pd_sampling_params(
+            effective_sampling_params_list, pd_pair
+        )
         params = effective_sampling_params_list[0]
+        if pd_pair is not None and pd_pair[0] == 0:
+            params = PDDisaggregationMixin._prepare_prefill_sampling_params(request_id, params)
+            effective_sampling_params_list[0] = params
 
         # Keep the original prompt for downstream stages (they need the raw
         # dict, e.g. for multi_modal_data).
