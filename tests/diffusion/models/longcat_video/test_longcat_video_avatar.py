@@ -231,6 +231,7 @@ def test_longcat_video_avatar_bsa_skips_cpu():
 
 
 def test_longcat_video_avatar_bsa_skips_incompatible_cuda_metadata_shapes():
+    # _bsa_latent_shapes only needs tensor metadata; avoid requiring CUDA in unit tests.
     class TensorMetadata:
         device = torch.device("cuda")
 
