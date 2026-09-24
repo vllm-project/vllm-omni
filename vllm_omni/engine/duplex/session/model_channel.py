@@ -402,11 +402,10 @@ class ModelChannel:
         try:
             next_fence = session.sync_fence()
             if next_fence.epoch > cancelled_fence.epoch:
-                stale_request_ids = session.cancel_fence(cancelled_fence, next_fence)
-            else:
-                stale_request_ids = []
-            if stale_request_ids:
-                await self._ctx.stage_port.cleanup(list(stale_request_ids), abort=True)
+                stale_request_ids = session.prepare_cancel_fence(cancelled_fence, next_fence)
+                if stale_request_ids:
+                    await self._ctx.stage_port.cleanup(list(stale_request_ids), abort=True)
+                session.release_fence(cancelled_fence)
             session.touch_lease(DuplexLeaseActivity.SIGNAL)
         except asyncio.CancelledError:
             raise

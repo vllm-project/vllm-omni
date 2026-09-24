@@ -511,7 +511,7 @@ def test_commit_append_rejects_stale_reservation():
         session.prepare_append(DuplexFence("sid-other", epoch=0, turn_id=0))
 
 
-def test_cancel_fence_releases_stage_requests_and_advances_identity():
+def test_prepare_cancel_fence_retains_stage_requests_until_release():
     session = _session("sid-cancel")
     cancelled = session.fence
     session.reserve_stage_request(0, "req-a", fence=cancelled)
@@ -520,16 +520,20 @@ def test_cancel_fence_releases_stage_requests_and_advances_identity():
     assert session.stage_request_submitted(0, "req-a") is False
     next_fence = DuplexFence("sid-cancel", epoch=1, turn_id=0)
 
-    stale = session.cancel_fence(cancelled, next_fence)
+    stale = session.prepare_cancel_fence(cancelled, next_fence)
 
     assert stale == ["req-a", "req-b"]
-    assert session.resource_request_ids() == []
+    assert session.resource_request_ids() == ["req-a", "req-b"]
     assert session.accepted_fence == next_fence
 
+    # Stage cleanup succeeds before the caller releases its resource records.
+    session.release_fence(cancelled)
+    assert session.resource_request_ids() == []
+
     with pytest.raises(DuplexFenceMismatchError):
-        session.cancel_fence(next_fence, DuplexFence("sid-cancel", epoch=1, turn_id=1))
+        session.prepare_cancel_fence(next_fence, DuplexFence("sid-cancel", epoch=1, turn_id=1))
     with pytest.raises(DuplexFenceMismatchError):
-        session.cancel_fence(DuplexFence("sid-other", epoch=1, turn_id=0), DuplexFence("sid-cancel", epoch=2))
+        session.prepare_cancel_fence(DuplexFence("sid-other", epoch=1, turn_id=0), DuplexFence("sid-cancel", epoch=2))
 
 
 def test_request_resource_keys_are_stage_id_and_request_id():
