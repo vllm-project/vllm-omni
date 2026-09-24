@@ -25,6 +25,7 @@ class OmniChatCompletionResponseChoice(ChatCompletionResponseChoice):
 class OmniChatCompletionStreamResponse(ChatCompletionStreamResponse):
     choices: list[SerializeAsAny[ChatCompletionResponseStreamChoice]]
     modality: str | None = "text"
+    sample_rate_hz: int | None = None
     metrics: dict[str, Any] | None = None
 
 
