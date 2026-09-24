@@ -36,7 +36,7 @@ python speech_to_video.py \
 | `--model` | *(required)* | Path to Wan2.2 S2V model (local path or HuggingFace ID) |
 | `--image` | *(required)* | Path to reference image (face/portrait) |
 | `--audio` | *(required)* | Path to audio file (wav/mp3) |
-| `--prompt` | `"A person speaking naturally"` | Text prompt describing the scene |
+| `--prompt` | `""` | Text prompt describing the scene; an `input_json` case can supply it when omitted |
 | `--negative-prompt` | *(S2V default)* | Negative prompt (built-in Chinese quality filter if not set) |
 | `--height` / `--width` | *auto* | Output resolution (auto-calculated from image aspect ratio if not set, must be divisible by 64) |
 | `--num-frames` | `80` | Number of frames per clip (should be divisible by 4) |

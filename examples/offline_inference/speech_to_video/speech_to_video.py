@@ -98,8 +98,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--prompt",
-        default="A person speaking naturally",
-        help="Text prompt describing the scene.",
+        default="",
+        help="Text prompt describing the scene (defaults to the input_json prompt when available).",
     )
     parser.add_argument(
         "--negative-prompt",
@@ -345,7 +345,7 @@ def main():
         # sampling extra_args, so only the load-time ones are forwarded here.
         additional_config = {
             key: extra_body.pop(key)
-            for key in ("use_int8", "build_components_on_gpu", "base_model_dir")
+            for key in ("use_int8", "use_distill", "build_components_on_gpu", "base_model_dir")
             if key in extra_body
         }
         omni_kwargs["model"] = prepare_longcat_video_avatar_model_for_omni(
