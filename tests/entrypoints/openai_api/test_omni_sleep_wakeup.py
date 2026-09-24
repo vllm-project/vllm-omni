@@ -20,6 +20,7 @@ def _make_app(engine_client):
     from vllm_omni.entrypoints.openai.api_server import router
 
     app = FastAPI()
+    app.state.api_server_count = 1
     app.include_router(router)
     app.state.engine_client = engine_client
     app.state.sleeping_stages = set()
@@ -253,6 +254,7 @@ def pure_diffusion_app(pure_diffusion_engine, mocker):
     )
 
     app = FastAPI()
+    app.state.api_server_count = 1
     app.include_router(router)
 
     mocker.patch(

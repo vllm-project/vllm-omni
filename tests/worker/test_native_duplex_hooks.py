@@ -848,6 +848,176 @@ def test_minicpmo_stage0_data_plane_prefill_matches_official_unit_format():
     assert result["prompt_suffix_len"] == 0
 
 
+@pytest.mark.parametrize("mode", [None, "off", "basic", "context"])
+def test_minicpmo_stage0_history_collection_starts_with_session_config(mode):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="history-lifecycle")
+    config = {} if mode is None else {"duplex_window_config": {"sliding_window_mode": mode}}
+    runtime._prepare_session_context(state, {}, runtime_config=config)
+    for seq in range(1, 101):
+        runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=seq)
+    enabled = mode in {"basic", "context"}
+    assert state.window_enabled is enabled
+    assert len(state.window_units) == (99 if enabled else 0)
+    assert (state.pending_window_unit is not None) is enabled
+    assert state.pending_window_generated_tokens == []
+
+
+@pytest.mark.parametrize("mode", ["basic", "context"])
+@pytest.mark.parametrize("buffered", [False, True])
+def test_minicpmo_stage0_multi_chunk_append_matches_scheduler_window(mode, buffered):
+    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="multi-chunk-window", window_enabled=True)
+    if buffered:
+        # Keep the tiny fake processor's initial chunk unpadded to model carry.
+        runtime._pad_first_audio_chunk_if_needed = lambda *args: None
+        assert runtime._stage_prefill_embeddings_only(state, np.zeros(2, dtype=np.float32), seq=0)["success"] is False
+    first = runtime._stage_prefill_embeddings_only(
+        state, np.zeros(6 if buffered else 8, dtype=np.float32), seq=1, final=buffered
+    )
+    assert first["input_token_ids"] == [1, 11, 2, 1, 11]
+    assert state.window_units == []
+    assert state.pending_window_unit.token_ids == first["input_token_ids"]
+    session = SimpleNamespace(num_prompt_tokens=5)
+    replaced = False
+    for seq in (2, 3):
+        info = {
+            "duplex": {
+                "data_plane": True,
+                "seq": seq,
+                "runtime_config": {
+                    "duplex_window_config": {
+                        "sliding_window_mode": mode,
+                        "basic_window_high_tokens": 1,
+                        "basic_window_low_tokens": 2,
+                        "context_max_units": 1,
+                        "context_previous_max_tokens": 16,
+                    },
+                    "duplex_window_previous_marker_token_ids": [201, 5],
+                },
+            }
+        }
+        update = SimpleNamespace(prompt_token_ids=[3, 2, 1, 11], model_intermediate_buffer=info)
+        planned = OmniARScheduler._prepare_minicpmo45_stage0_window(
+            session, update, segment_output_ids=[44], completed_terminator=3
+        )
+        result = runtime._stage_prefill_embeddings_only(
+            state, np.zeros(4, dtype=np.float32), seq=seq, stage0_window=info["duplex"]["stage0_window"]
+        )
+        assert result["stage0_window_replaced"] is planned
+        if planned:
+            assert result["num_input_tokens"] == len(update.prompt_token_ids)
+            replaced = True
+            break
+        session.num_prompt_tokens += 1 + len(update.prompt_token_ids)
+    assert replaced
+
+
+def test_minicpmo_stage0_basic_window_rebuilds_from_retained_units():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-stage0-basic-window", window_enabled=True)
+    first = runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=1)
+    assert first["input_token_ids"] == [1, 11]
+    state.pending_window_generated_tokens.append(5)
+    state.pending_terminator_token = 3
+
+    rebuilt = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(4, dtype=np.float32),
+        seq=2,
+        stage0_window={
+            "replace": True,
+            "mode": "basic",
+            "drop_units": 1,
+            "replacement_prompt_len": 2,
+        },
+    )
+
+    assert rebuilt["stage0_window_replaced"] is True
+    assert rebuilt["input_token_ids"] == [1, 11]
+    assert state.window_units == []
+
+
+def test_minicpmo_stage0_context_window_inserts_previous_before_suffix():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-stage0-context-window", window_enabled=True)
+    prefix = runtime._embed_token(200)
+    suffix = runtime._embed_token(202)
+    state.context_embeds = [prefix, suffix]
+    state.context_token_ids = [200, 202]
+    state.context_prefix_embeds = [prefix]
+    state.context_prefix_token_ids = [200]
+    state.context_suffix_embeds = [suffix]
+    state.context_suffix_token_ids = [202]
+    first = runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=1)
+    assert first["input_token_ids"] == [200, 202, 1, 11]
+    state.pending_window_generated_tokens.append(42)
+    state.pending_terminator_token = 3
+
+    rebuilt = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(4, dtype=np.float32),
+        seq=2,
+        stage0_window={
+            "replace": True,
+            "mode": "context",
+            "drop_units": 1,
+            "previous_token_ids": [42],
+            "previous_marker_token_ids": [201, 5],
+            "replacement_prompt_len": 7,
+        },
+    )
+
+    assert rebuilt["input_token_ids"] == [200, 201, 5, 42, 202, 1, 11]
+    assert rebuilt["num_input_tokens"] == 7
+
+
+@pytest.mark.parametrize("pending_terminator", [None, 3, 99])
+def test_minicpmo_stage0_window_uses_accepted_output_not_async_sampler_history(pending_terminator):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    runtime = _stage0_vision_runtime()
+    runtime._stage_audio_embeddings = lambda *args, **kwargs: torch.zeros((10, 2))
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-accepted-window", window_enabled=True)
+    state.context_prefix_token_ids = [200] * 7
+    state.context_suffix_token_ids = [202]
+    state.context_token_ids = [*state.context_prefix_token_ids, 202]
+    state.context_prefix_embeds = [runtime._embed_token(token_id) for token_id in state.context_prefix_token_ids]
+    state.context_suffix_embeds = [runtime._embed_token(202)]
+    state.context_embeds = [*state.context_prefix_embeds, *state.context_suffix_embeds]
+    runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=1)
+    for seq in (2, 3):
+        state.pending_window_generated_tokens = [3, 40, 41]
+        state.pending_terminator_token = pending_terminator
+        plan = {"completed_token_ids": [], "completed_terminator_token_id": 3}
+        if seq == 3:
+            plan.update(replace=True, mode="context", drop_units=1, replacement_prompt_len=32)
+        result = runtime._stage_prefill_embeddings_only(
+            state, np.zeros(4, dtype=np.float32), seq=seq, stage0_window=plan
+        )
+
+    assert result["num_input_tokens"] == 32
+    assert [len(unit.token_ids) for unit in state.window_units] == [13]
+    assert len(state.pending_window_unit.token_ids) == 11
+    assert 40 not in result["input_token_ids"]
+    assert 41 not in result["input_token_ids"]
+
+
 def _stage0_vision_runtime():
     import torch
 
@@ -2639,7 +2809,7 @@ _REQUIRED_DUPLEX_CALLS = {
     "_sample": "_apply_duplex_sampling",
 }
 
-_MODEL_SAMPLER_CALL = "model_sample"
+_MODEL_SAMPLER_CALL = "call_model_sampler"
 
 
 def _repo_root():

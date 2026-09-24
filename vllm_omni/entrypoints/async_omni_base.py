@@ -35,7 +35,7 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 _FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
 # Blocking-wait interval for the event-driven final-output drain
-# (VLLM_OMNI_EVENT_DRIVEN_ORCH=1): a message wakes the drain immediately via
+# (explicit env value or the engine pipeline default): a message wakes the drain immediately via
 # the janus queue's condition variable; this timeout only bounds how often the
 # orchestrator liveness check runs while the pipeline is idle.
 _FINAL_OUTPUT_BLOCKING_WAIT_S = 1.0
@@ -71,6 +71,9 @@ class AsyncEventResolver:
 
         if tid is None and isinstance(ack, dict):
             tid = ack.get("task_id")
+        if tid is None:
+            logger.warning("Received ACK without a task_id")
+            return
 
         async with self._lock:
             task_info = self._pending_tasks.get(tid)
@@ -155,13 +158,13 @@ class AsyncOmniBase(OmniBase):
 
     def _get_comprehension_stage_index(self) -> int | None:
         fallback_idx: int | None = None
-        for idx, stage_client in enumerate(self.engine.stage_clients):
+        for idx, stage_config in enumerate(self.engine.stage_configs):
             stage_vllm_config = self.engine.stage_vllm_configs[idx]
             if stage_vllm_config is None:
                 continue
             if fallback_idx is None:
                 fallback_idx = idx
-            if stage_client.is_comprehension:
+            if stage_config.is_comprehension:
                 return idx
         return fallback_idx
 
@@ -186,12 +189,10 @@ class AsyncOmniBase(OmniBase):
 
     def get_diffusion_od_config(self) -> Any | None:
         """Return the diffusion-stage config when the pipeline has one."""
-        saw_diffusion_stage = False
+        saw_diffusion_stage = any(stage_config.stage_type == "diffusion" for stage_config in self.engine.stage_configs)
         for stage_client in self.engine.stage_clients:
             if getattr(stage_client, "stage_type", None) != "diffusion":
                 continue
-
-            saw_diffusion_stage = True
 
             od_config = getattr(stage_client, "od_config", None)
             if od_config is not None:
@@ -313,13 +314,15 @@ class AsyncOmniBase(OmniBase):
 
         engine = self.engine
 
-        # Event-driven drain (VLLM_OMNI_EVENT_DRIVEN_ORCH=1): block on the
+        # Event-driven drain (explicit env value or the engine pipeline default): block on the
         # queue's condition variable in a dedicated thread instead of the
         # get_nowait + 1 ms sleep cadence. Same flag as the orchestrator-side
         # event-driven loop (vllm_omni/engine/orchestrator.py).
         from vllm_omni.engine.orchestrator import _event_driven_orch_enabled
 
-        event_driven_drain = _event_driven_orch_enabled() and hasattr(engine, "get_output_blocking_async")
+        event_driven_drain = _event_driven_orch_enabled(
+            default=bool(getattr(engine, "_event_driven_orch_default", False))
+        ) and hasattr(engine, "get_output_blocking_async")
 
         async def _final_output_loop():
             """Background coroutine that dispatches final outputs to request queues."""
@@ -382,6 +385,7 @@ class AsyncOmniBase(OmniBase):
                     if should_continue:
                         continue
 
+                    assert req_state is not None
                     req_state.stage_id = stage_id
 
                     # Route to the per-request queue
@@ -479,7 +483,22 @@ class AsyncOmniBase(OmniBase):
             if state is not None and rid not in delivered:
                 queue = getattr(state, "queue", None)
                 if queue is not None:
-                    await state.queue.put(self._synthetic_abort_output_message(rid))
+                    final_stage_id = getattr(state, "final_stage_id", None)
+                    if final_stage_id is None:
+                        final_stage_id = 0
+                    stage_metadata = getattr(self, "_stage_meta_list", ())
+                    final_output_type = (
+                        getattr(stage_metadata[final_stage_id], "final_output_type", None)
+                        if final_stage_id < len(stage_metadata)
+                        else None
+                    ) or "text"
+                    await state.queue.put(
+                        self._synthetic_abort_output_message(
+                            rid,
+                            stage_id=final_stage_id,
+                            final_output_type=final_output_type,
+                        )
+                    )
                     delivered.add(rid)
         for rid in request_ids:
             self._record_request_failure_once(rid, reason="client_abort")
@@ -491,13 +510,18 @@ class AsyncOmniBase(OmniBase):
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
 
     @staticmethod
-    def _synthetic_abort_output_message(request_id: str) -> OutputMessage:
+    def _synthetic_abort_output_message(
+        request_id: str,
+        *,
+        stage_id: int,
+        final_output_type: str,
+    ) -> OutputMessage:
         """Terminal abort OutputMessage used when the engine returned none."""
         engine_output = OmniRequestOutput(
             request_id=request_id,
             finished=True,
-            stage_id=0,
-            final_output_type="text",
+            stage_id=stage_id,
+            final_output_type=final_output_type,
             outputs=[
                 CompletionOutput(
                     index=0,
@@ -512,7 +536,7 @@ class AsyncOmniBase(OmniBase):
         )
         return OutputMessage(
             request_id=request_id,
-            stage_id=0,
+            stage_id=stage_id,
             replica_id=None,
             engine_outputs=engine_output,
             metrics=None,
@@ -543,7 +567,8 @@ class AsyncOmniBase(OmniBase):
 
     # ==================== EngineClient Interface ====================
 
-    async def check_health(self) -> None:
+    # The async entrypoints expose the synchronous base health check as an awaitable.
+    async def check_health(self) -> None:  # type: ignore[override]
         """Check engine health by verifying the Orchestrator process is alive."""
         OmniBase.check_health(self)
 

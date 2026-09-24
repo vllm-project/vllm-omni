@@ -59,6 +59,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_hsdp_replicate_group,
     get_pp_group,
     get_sp_group,
+    get_world_group,
     init_distributed_environment,
     initialize_model_parallel,
     model_parallel_is_initialized,
@@ -116,7 +117,11 @@ def _all_gather_rank_values(value: Any) -> list[Any]:
     if not dist.is_available() or not dist.is_initialized():
         return [value]
     values: list[Any] = [None] * dist.get_world_size()
-    dist.all_gather_object(values, value)
+    # Object collectives are control-plane traffic. Using the default NCCL
+    # group serializes them through temporary CUDA tensors, adding pointless
+    # H2D/DtoH copies to every rank-wide status check. Reuse the world
+    # coordinator's Gloo group, as vLLM does for CPU metadata collectives.
+    dist.all_gather_object(values, value, group=get_world_group().cpu_group)
     return values
 
 
@@ -181,11 +186,16 @@ def _setup_diffusion_worker_proc_title_and_log_prefix(
 def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[None]:
     import vllm.model_executor.layers.quantization.modelopt as vllm_modelopt
 
-    linear_method_cls = getattr(quant_config, "LinearMethodCls", None)
-    if linear_method_cls in {
-        vllm_modelopt.ModelOptFp8LinearMethod,
-        vllm_modelopt.ModelOptFp8PcPtLinearMethod,
-    }:
+    # vLLM #49381 replaced the per-format ModelOpt linear methods with the
+    # generic ``ModelOptLinearMethod`` and removed the ``LinearMethodCls``
+    # attributes this used to match on. The same two formats are identified by
+    # the ModelOpt quant-algo string carried on the config
+    # (``ModelOptQuantConfigBase.quant_method``): "FP8" used to select
+    # ``ModelOptFp8LinearMethod`` and "FP8_PER_CHANNEL_PER_TOKEN" used to select
+    # ``ModelOptFp8PcPtLinearMethod``. "FP8_PB_WO" / "NVFP4" / "W4A16_NVFP4"
+    # were never matched here and still are not.
+    quant_algo = getattr(quant_config, "quant_method", None)
+    if quant_algo in ("FP8", "FP8_PER_CHANNEL_PER_TOKEN"):
         from vllm.platforms import current_platform
 
         if current_platform.is_cuda() and current_platform.has_device_capability(89):
@@ -251,6 +261,7 @@ class DiffusionWorker:
         self.init_snapshot: MemorySnapshot | None = None
         self.requested_memory: int | None = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
+        self._owns_sleep_pool = False
         self.lora_manager: DiffusionLoRAManager | None = None
         # Worker-side cache of (lora_request, lora_scale) per scheduled
         # request id. Used by step mode to recover LoRA identity for cached
@@ -446,15 +457,13 @@ class DiffusionWorker:
                 raise RuntimeError("Diffusion KV memory snapshot was not captured before model loading")
             override = self.vllm_config.cache_config.kv_cache_memory_bytes
             if override:
-                # Match native vLLM: an explicit cache budget skips automatic
-                # capacity derivation, but still runs the maximum-shape model
-                # request so lazy kernels and communication buffers initialize.
-                self.model_runner.profile_run(profile_requests)
+                # Post-allocation warmup avoids retaining a second activation arena.
                 logger.info(
                     "Worker %d: Initial free memory %s GiB, reserved %s GiB memory for "
                     "Diffusion KV Cache as specified by kv_cache_memory_bytes config and "
                     "skipped automatic memory profiling. This does not respect the "
-                    "gpu_memory_utilization config. A profile warmup was still executed.",
+                    "gpu_memory_utilization config. Model kernels will be initialized by "
+                    "the post-allocation startup warmup.",
                     self.rank,
                     format_gib(self.init_snapshot.free_memory),
                     format_gib(int(override)),
@@ -466,6 +475,8 @@ class DiffusionWorker:
                 weights_memory=self.model_runner.model_memory_usage,
             ) as profile_result:
                 self.model_runner.profile_run(profile_requests)
+
+            current_omni_platform.empty_cache()
 
             available_memory = self.requested_memory - profile_result.non_kv_cache_memory
             if available_memory <= 0:
@@ -534,11 +545,17 @@ class DiffusionWorker:
         with self._maybe_get_memory_pool_context("kv_cache"):
             self.model_runner.set_kv_cache_config(kv_cache_config)
 
-    def remove_diffusion_kv_requests(self, request_ids: list[str]) -> int:
+    def remove_diffusion_kv_requests(self, request_ids: list[str | tuple[str, int]]) -> int:
         """Clear Worker-local rows without freeing Scheduler-owned blocks."""
 
         assert self.model_runner is not None, "Model runner not initialized"
         return self.model_runner.remove_diffusion_kv_requests(request_ids)
+
+    def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput):
+        return _run_and_gather_rank_values(
+            "Diffusion KV receive",
+            lambda: self.model_runner.prepare_kv_for_forward(scheduler_output),
+        )
 
     def init_lora_manager(self) -> None:
         """Initialize the LoRA manager for this worker."""
@@ -790,6 +807,18 @@ class DiffusionWorker:
         Args:
             level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
         """
+        progress = getattr(getattr(self, "model_runner", None), "_kv_receive_progress", None)
+        if progress is not None and progress.submitted:
+            raise RuntimeError("Cannot sleep with live native KV prefetch reservations; finish requests first")
+        # The config validator rejects sleep for the native paged path. Keep
+        # this worker-side guard precise as well: test doubles and legacy
+        # configs may expose arbitrary attributes through Mock/getattr.
+        if (
+            getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is DiffusionKVCacheMode.PAGED_SCHEDULER
+            and getattr(self.od_config, "kv_transfer_config", None) is not None
+        ):
+            raise ValueError("Cannot sleep while native KV connector memory is registered")
         CuMemAllocator = _get_cumem_allocator_class()
         allocator = CuMemAllocator.get_instance()
 
@@ -856,6 +885,19 @@ class DiffusionWorker:
             logger.info(f"[Worker {self.rank}] Buffers restored from CPU.")
         logger.info(f"[Worker {self.rank}] Wake-up complete.")
         return True
+
+    def synchronize_device(self, timeout: float | None = None) -> None:
+        """Wait until this rank has no device work left.
+
+        A KV prefetch still receiving on its background thread has queued no
+        device work yet, so it is joined first. ``timeout`` bounds that join
+        (and the multi-process worker's output drain before this call); the
+        device wait itself is unbounded.
+        """
+        manager = getattr(self.model_runner, "kv_transfer_manager", None)
+        if manager is not None and not manager.wait_prefetch(timeout=timeout):
+            raise TimeoutError("Diffusion KV prefetch did not finish before pause")
+        current_omni_platform.synchronize()
 
     def handle_sleep_task(self, task: OmniSleepTask | dict) -> OmniACK | None:
         from vllm_omni.platforms import current_omni_platform
@@ -969,6 +1011,7 @@ class DiffusionWorker:
             allocator = CuMemAllocator.get_instance()
             if tag == "weights":
                 assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
+                self._owns_sleep_pool = True
             logger.info(f"[Worker {self.rank}] Activating Diffusion CuMem pool for tag: {tag}")
             return allocator.use_memory_pool(tag=tag)
         return nullcontext()
@@ -978,25 +1021,36 @@ class DiffusionWorker:
         try:
             if self.model_runner is not None:
                 mgr = getattr(self.model_runner, "kv_transfer_manager", None)
+                if mgr is None:
+                    mgr = getattr(self.model_runner, "_kv_transfer_manager", None)
                 try:
                     offload_backend = getattr(self.model_runner, "offload_backend", None)
                     if offload_backend is not None:
                         offload_backend.disable()
                 finally:
                     if mgr is not None:
-                        mgr.shutdown_prefetch()
+                        mgr.close()
         finally:
+            self.model_runner = None
+            self.lora_manager = None
+            self._sleep_saved_buffers = {}
             try:
-                shutdown_kv_connector()
+                if getattr(self, "_owns_sleep_pool", False):
+                    gc.collect()
+                    _get_cumem_allocator_class().get_instance().release_pools()
+                    self._owns_sleep_pool = False
             finally:
                 try:
-                    a2a_permute = sys.modules.get("vllm_omni.diffusion.distributed.a2a_permute")
-                    if a2a_permute is not None:
-                        a2a_permute.clear_a2a_permute_workspaces()
-                except Exception:
-                    logger.exception("Failed to release fused Ulysses symmetric-memory workspaces")
+                    shutdown_kv_connector()
                 finally:
-                    destroy_distributed_env()
+                    try:
+                        a2a_permute = sys.modules.get("vllm_omni.diffusion.distributed.a2a_permute")
+                        if a2a_permute is not None:
+                            a2a_permute.clear_a2a_permute_workspaces()
+                    except Exception:
+                        logger.exception("Failed to release fused Ulysses symmetric-memory workspaces")
+                    finally:
+                        destroy_distributed_env()
 
 
 class CustomPipelineWorkerExtension:
@@ -1194,11 +1248,13 @@ class WorkerProc:
                     self._async_output_pending = max(0, self._async_output_pending - 1)
                     self._async_output_done.notify_all()
 
-    def drain_async_outputs(self, timeout: float = _ASYNC_OUTPUT_DRAIN_TIMEOUT_S) -> bool:
+    def drain_async_outputs(self, timeout: float | None = None) -> bool:
         """Block until background D2H/SHM packing has no work left.
 
         Returns False if outputs are still in flight when ``timeout`` expires.
         """
+        if timeout is None:
+            timeout = _ASYNC_OUTPUT_DRAIN_TIMEOUT_S
         with self._async_output_done:
             if self._async_output_pending == 0:
                 return True
@@ -1254,7 +1310,11 @@ class WorkerProc:
 
         world_size = torch.distributed.get_world_size()
         statuses: list[dict[str, Any] | None] = [None] * world_size
-        torch.distributed.all_gather_object(statuses, status)
+        torch.distributed.all_gather_object(
+            statuses,
+            status,
+            group=get_world_group().cpu_group,
+        )
         missing_ranks = [rank for rank, rank_status in enumerate(statuses) if rank_status is None]
         if missing_ranks:
             logger.warning("RPC rank status gather returned missing entries for ranks: %s", missing_ranks)
@@ -1310,6 +1370,8 @@ class WorkerProc:
         }
 
         try:
+            if method == "synchronize_device" and not self.drain_async_outputs(timeout=kwargs.get("timeout")):
+                raise TimeoutError("Diffusion async outputs did not drain before pause")
             if method in _MEMORY_RELEASING_METHODS:
                 self.drain_async_outputs()
             # Use execute_method from WorkerWrapperBase for consistent method resolution
@@ -1568,32 +1630,39 @@ class WorkerWrapperBase:
             gpu_id: GPU device ID
             od_config: OmniDiffusionConfig configuration
             worker_extension_cls: Optional qualified name of worker extension class
-            custom_pipeline_args: Optional arguments for custom pipeline initialization
+            custom_pipeline_args: Optional arguments passed to native pipelines.
+                A ``pipeline_class`` entry triggers custom pipeline initialization.
         """
         self.gpu_id = gpu_id
         self.od_config = od_config
         self.base_worker_class = base_worker_class
         self.worker_extension_cls = worker_extension_cls
         self.custom_pipeline_args = custom_pipeline_args
+        self.uses_custom_pipeline = bool(custom_pipeline_args and "pipeline_class" in custom_pipeline_args)
 
         # Prepare worker class with extension support
         worker_class = self._prepare_worker_class()
 
         # Create the actual worker instance
-        # When custom_pipeline_args is provided, skip initial model loading
-        # since re_init_pipeline will handle it. This avoids allocating memory
-        # through CuMemAllocator twice, which causes assertion failures in
-        # sleep mode.
+        # Only dynamic custom pipelines skip initial loading; native pipelines
+        # may also use custom_pipeline_args for model-specific component paths.
         self.worker = worker_class(
             local_rank=gpu_id,
             rank=gpu_id,
             od_config=od_config,
-            skip_load_model=(self.custom_pipeline_args is not None),
+            skip_load_model=self.uses_custom_pipeline,
         )
 
         # Re-initialize pipeline with custom pipeline if provided
-        if self.custom_pipeline_args is not None:
-            self.worker.re_init_pipeline(self.custom_pipeline_args)
+        if self.uses_custom_pipeline:
+            try:
+                self.worker.re_init_pipeline(self.custom_pipeline_args)
+            except Exception:
+                try:
+                    self.worker.shutdown()
+                except Exception:
+                    logger.exception("Failed to clean up worker after custom pipeline initialization failure")
+                raise
 
     def _prepare_worker_class(self) -> type:
         """
@@ -1605,8 +1674,8 @@ class WorkerWrapperBase:
         """
         worker_class = self.base_worker_class
 
-        # If custom_pipeline_args is provided, use CustomPipelineWorkerExtension
-        if self.custom_pipeline_args is not None:
+        # If custom pipeline initialization is requested, use CustomPipelineWorkerExtension.
+        if self.uses_custom_pipeline:
             # Set worker_extension_cls to CustomPipelineWorkerExtension if not already set
             if self.worker_extension_cls is None:
                 self.worker_extension_cls = CustomPipelineWorkerExtension

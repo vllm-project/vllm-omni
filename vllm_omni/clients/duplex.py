@@ -40,13 +40,25 @@ import random
 import time
 import wave
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
 import pybase64 as base64
+
+from vllm_omni.clients.utils import (
+    _finite_metric_values,
+    _finite_number,
+    _interval_summary,
+    _rounded_ms,
+    _stage_engine_metrics_block,
+    _stage_id_sort_key,
+    distribution_summary,
+    metric_mean,
+    summarize_stage_metrics,
+)
 
 __all__ = [
     "DUPLEX_FIRST_UNIT_MS",
@@ -72,6 +84,7 @@ __all__ = [
     "ResponseHandle",
     "SessionConfig",
     "SessionCreated",
+    "SessionUpdated",
     "SpeakDecision",
     "WebSocketTransport",
     "TextDelta",
@@ -88,6 +101,7 @@ __all__ = [
     "distribution_summary",
     "metric_mean",
     "summarize_session_request_metrics",
+    "summarize_stage_metrics",
     "wait_for_condition",
     "write_pcm16_wav",
 ]
@@ -376,6 +390,15 @@ class SessionResumed(SessionCreated):
     pass
 
 
+class SessionUpdated(DuplexEvent):
+    """An acknowledged replacement of the public session configuration."""
+
+    @property
+    def session(self) -> dict[str, object]:
+        value = self.raw.get("session")
+        return value if isinstance(value, dict) else {}
+
+
 class SessionClosed(DuplexEvent):
     pass
 
@@ -456,6 +479,7 @@ class ErrorEvent(DuplexEvent):
 _EVENT_TYPES: dict[str, type[DuplexEvent]] = {
     "session.created": SessionCreated,
     "session.resumed": SessionResumed,
+    "session.updated": SessionUpdated,
     "session.closed": SessionClosed,
     "session.expired": SessionExpired,
     "response.created": ResponseCreated,
@@ -1011,6 +1035,9 @@ class DuplexClientBase(ABC):
             self._adopt_session(event)
         elif isinstance(event, SessionCreated):
             self._adopt_session(event)
+        elif isinstance(event, SessionUpdated):
+            if event.session:
+                self.session_info = event.session
         elif isinstance(event, ResponseCreated):
             response_id = event.response_id
             if response_id and response_id not in self._responses:
@@ -1325,67 +1352,6 @@ class DuplexClient(DuplexClientBase):
 # Test/benchmark collector
 
 
-def _rounded_ms(value: float) -> float:
-    return round(float(value), 3)
-
-
-def _finite_number(value: object, *, nonnegative: bool = False) -> float | None:
-    if not isinstance(value, int | float) or isinstance(value, bool) or not math.isfinite(float(value)):
-        return None
-    number = float(value)
-    if nonnegative and number < 0:
-        return None
-    return number
-
-
-def _interval_summary(values: list[float]) -> dict[str, float | int]:
-    clean = sorted(_rounded_ms(value) for value in values if math.isfinite(value) and value >= 0)
-    if not clean:
-        return {"count": 0, "mean": 0.0, "p50": 0.0, "p95": 0.0, "max": 0.0}
-
-    def nearest_rank(percentile: float) -> float:
-        index = max(0, math.ceil(percentile * len(clean)) - 1)
-        return clean[min(index, len(clean) - 1)]
-
-    return {
-        "count": len(clean),
-        "mean": _rounded_ms(sum(clean) / len(clean)),
-        "p50": nearest_rank(0.50),
-        "p95": nearest_rank(0.95),
-        "max": clean[-1],
-    }
-
-
-def distribution_summary(values: Sequence[float], *, digits: int = 3) -> dict[str, float | int] | None:
-    """Summarize values as ``{count, mean, p50, p99}`` for duplex report fields."""
-    clean = sorted(float(value) for value in values if math.isfinite(float(value)))
-    if not clean:
-        return None
-
-    def nearest_rank(percentile: float) -> float:
-        index = max(0, math.ceil(percentile * len(clean)) - 1)
-        return clean[min(index, len(clean) - 1)]
-
-    return {
-        "count": len(clean),
-        "mean": round(sum(clean) / len(clean), digits),
-        "p50": round(nearest_rank(0.50), digits),
-        "p99": round(nearest_rank(0.99), digits),
-    }
-
-
-def metric_mean(value: object) -> float | None:
-    """Read a scalar mean, or the ``mean`` field of a distribution summary."""
-    if isinstance(value, Mapping):
-        nested = value.get("mean")
-        if isinstance(nested, int | float) and not isinstance(nested, bool) and math.isfinite(float(nested)):
-            return float(nested)
-        return None
-    if isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(float(value)):
-        return float(value)
-    return None
-
-
 def _event_stage_metrics(event: dict[str, object]) -> dict[str, object] | None:
     candidates: list[object] = [event.get("vllm_omni")]
     metadata = event.get("metadata")
@@ -1615,7 +1581,7 @@ class EventCollector:
         measurement_origin: dict[str, str] | None = None,
     ) -> dict[str, object]:
         """Summarize engine token metrics and client-observed audio cadence."""
-        stage0_metrics: dict[str, object] | None = None
+        observed_stage_metrics: dict[str, dict[str, object]] = {}
         response_request_metrics: dict[str, object] = {}
         response_created_at_s: float | None = None
         first_text_received_at_s: float | None = None
@@ -1643,9 +1609,10 @@ class EventCollector:
                 first_text_received_at_s = received_at_s
 
             stage_metrics = _event_stage_metrics(event)
-            stage0 = stage_metrics.get("0") if isinstance(stage_metrics, dict) else None
-            if isinstance(stage0, dict):
-                stage0_metrics = stage0
+            if isinstance(stage_metrics, dict):
+                for stage_id, stage_snapshot in stage_metrics.items():
+                    if isinstance(stage_snapshot, dict):
+                        observed_stage_metrics[str(stage_id)] = stage_snapshot
 
             event_request_metrics = _event_response_request_metrics(event)
             if event_request_metrics is not None:
@@ -1663,21 +1630,18 @@ class EventCollector:
                 cumulative_audio_ms.append(max(0.0, float(duration_ms)))
 
         result: dict[str, object] = {}
-        if stage0_metrics is not None:
-            raw_itls = stage0_metrics.get("vllm_itls_ms")
-            itls = (
-                [float(value) for value in raw_itls if isinstance(value, int | float)]
-                if isinstance(raw_itls, list)
-                else []
-            )
-            result["stage0_tokens"] = {
-                "source": "engine_stage_metrics",
-                "output_token_count": int(stage0_metrics.get("num_tokens_out") or 0),
-                "ttft_ms": float(stage0_metrics.get("vllm_ttft_ms") or 0.0),
-                "tpot_ms": float(stage0_metrics.get("vllm_tpot_ms") or 0.0),
-                "itls_ms": itls,
-                "inter_token_interval_ms": _interval_summary(itls),
+        stage0_metrics = observed_stage_metrics.get("0")
+        if observed_stage_metrics:
+            stages = {
+                stage_id: _stage_engine_metrics_block(stage_snapshot)
+                for stage_id, stage_snapshot in sorted(
+                    observed_stage_metrics.items(),
+                    key=lambda item: _stage_id_sort_key(item[0]),
+                )
             }
+            result["stages"] = stages
+            if "0" in stages:
+                result["stage0_tokens"] = stages["0"]
 
         if audio_received_at_s:
             intervals_ms = [
@@ -1929,26 +1893,17 @@ def summarize_session_request_metrics(
 
     Aggregatable fields are nested as ``{count, mean, p50, p99}``.
     """
-
-    def values(metric: str, *, positive: bool = False) -> list[float]:
-        return [
-            float(request[metric])
-            for request in request_metrics
-            if isinstance(request.get(metric), int | float)
-            and not isinstance(request.get(metric), bool)
-            and math.isfinite(float(request[metric]))
-            and (not positive or float(request[metric]) > 0)
-        ]
-
     summary: dict[str, object] = {
         "session_id": session_id,
         "audio_turn_count": len(request_metrics),
-        "ttft_ms": distribution_summary(values("ttft_ms")),
-        "ttfp_ms": distribution_summary(values("ttfp_ms")),
-        "rtf": distribution_summary(values("rtf"), digits=6),
+        "ttft_ms": distribution_summary(_finite_metric_values(request_metrics, "ttft_ms")),
+        "ttfp_ms": distribution_summary(_finite_metric_values(request_metrics, "ttfp_ms")),
+        "rtf": distribution_summary(_finite_metric_values(request_metrics, "rtf"), digits=6),
     }
-    if (tpot := distribution_summary(values("tpot_ms", positive=True))) is not None:
+    if (tpot := distribution_summary(_finite_metric_values(request_metrics, "tpot_ms", positive=True))) is not None:
         summary["tpot_ms"] = tpot
+    if (stages := summarize_stage_metrics(request_metrics)) is not None:
+        summary["stages"] = stages
     return summary
 
 

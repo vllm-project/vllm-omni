@@ -3,6 +3,7 @@
 
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -770,8 +771,10 @@ def test_accumulate_full_payload_output_keeps_all_zero_qwen3_omni_prefill_placeh
 def test_full_payload_output_accumulation_hook_matrix():
     assert _make_full_payload_accumulation_runner(model_stage="thinker")._should_accumulate_full_payload_output()
     assert _make_full_payload_accumulation_runner(model_stage="talker")._should_accumulate_full_payload_output()
-    assert not _make_full_payload_accumulation_runner(
-        model_stage="code2wav", final_output=True
+    # A stage may publish a user-visible output and still feed another stage
+    # (Qwen3-Omni thinker publishes text while sending audio state to talker).
+    assert _make_full_payload_accumulation_runner(
+        model_stage="thinker", final_output=True
     )._should_accumulate_full_payload_output()
     assert not _make_full_payload_accumulation_runner(
         model_stage="token2audio",
@@ -1028,3 +1031,154 @@ def test_preprocess_one_token_chunked_prefill_tail_then_decode(monkeypatch, batc
         assert route == ("batch" if batched_decode and not is_prefill else "normal")
         torch.testing.assert_close(embeds, torch.full((1, 4), 42.0 if is_prefill else 43.0))
         assert ("codes" in runner.model_intermediate_buffer["r"]) == (not is_prefill)
+
+
+class DecodeOnlyPreprocessModel:
+    has_preprocess = True
+
+    def __init__(self, *, rewrite_ids=False, invalid_output=None):
+        self.rewrite_ids = rewrite_ids
+        self.invalid_output = invalid_output
+        self.calls = []
+
+    @staticmethod
+    def embed_input_ids(input_ids, **kwargs):
+        return input_ids.float().view(-1, 1).expand(-1, 4).clone()
+
+    def preprocess(self, input_ids, input_embeds, **info):
+        self.calls.append(("scalar", [info["request_id"]], [info["_omni_is_prefill"]]))
+        return input_ids, self.embed_input_ids(input_ids), {}
+
+    def preprocess_decode_batch(self, *, input_ids, req_infos):
+        self.calls.append(
+            ("batch", [info["request_id"] for info in req_infos], [info["_omni_is_prefill"] for info in req_infos])
+        )
+        ids = input_ids + 100 if self.rewrite_ids else input_ids
+        embeds = self.embed_input_ids(ids) + 10
+        updates = [{"decode_marker": info["request_id"]} for info in req_infos]
+        if self.invalid_output == "embeddings":
+            embeds = embeds[:-1]
+        elif self.invalid_output == "ids":
+            ids = ids[:-1]
+        elif self.invalid_output == "updates":
+            updates = updates[:-1]
+        return ids, embeds, updates
+
+
+def _without_mtp_buffers(runner):
+    runner.has_talker_mtp = False
+    for name in ("talker_mtp", "talker_mtp_input_ids", "talker_mtp_inputs_embeds", "last_talker_hidden", "text_step"):
+        delattr(runner, name)
+
+
+@pytest.mark.parametrize("rewrite_ids", [False, True], ids=["original-ids", "replaced-ids"])
+@pytest.mark.parametrize("order", ["interleaved", "reversed", "adjacent"])
+def test_decode_batch_without_mtp_preserves_mixed_rows_and_buffers(monkeypatch, rewrite_ids, order):
+    rows = [
+        ("cfg-uncond", 5, 5, 1),
+        ("prefill-tail", 5, 4, 1),
+        ("cfg-cond", 5, 6, 1),
+        ("single-prompt", 1, 0, 1),
+        ("multi-token-decode", 5, 5, 2),
+    ]
+    if order == "reversed":
+        rows.reverse()
+    elif order == "adjacent":
+        rows = [rows[1], rows[0], rows[2], *rows[3:]]
+    runner, scheduled, _, _ = _make_phase_runner(monkeypatch, rows, batched_decode=False)
+    _without_mtp_buffers(runner)
+    model = DecodeOnlyPreprocessModel(rewrite_ids=rewrite_ids)
+    runner.model = model
+    total = scheduled.total_num_scheduled_tokens
+    runner.inputs_embeds = DummyBuffer(torch.full((total + 2, 4), -99.0))
+    ids_buffer = runner.input_ids.gpu
+    embeds_buffer = runner.inputs_embeds.gpu
+    output_ids, output_embeds, *_ = runner._preprocess(scheduled, total)
+    assert output_ids.data_ptr() == ids_buffer.data_ptr()
+    assert output_embeds.data_ptr() == embeds_buffer.data_ptr()
+    assert torch.equal(embeds_buffer[total:], torch.full((2, 4), -99.0))
+    seen = [
+        (route, rid, prefill) for route, ids, phases in model.calls for rid, prefill in zip(ids, phases, strict=True)
+    ]
+    offset = 0
+    for (route, rid, prefill), (expected_id, prompt, computed, span) in zip(seen, rows, strict=True):
+        eligible = span == 1 and computed >= prompt
+        assert rid == expected_id
+        assert prefill == (computed < prompt)
+        assert route == ("batch" if eligible else "scalar")
+        expected_ids = torch.arange(offset, offset + span) + (100 if eligible and rewrite_ids else 0)
+        assert torch.equal(output_ids[offset : offset + span], expected_ids)
+        expected_embeds = expected_ids.float().view(-1, 1).expand(-1, 4) + (10 if eligible else 0)
+        torch.testing.assert_close(output_embeds[offset : offset + span], expected_embeds)
+        info = runner.model_intermediate_buffer[rid]
+        assert info.get("decode_marker") == (rid if eligible else None)
+        offset += span
+
+
+def test_decode_batch_without_mtp_accepts_wrapper_input_ids_none(monkeypatch):
+    rows = [("first", 5, 5, 1), ("second", 5, 6, 1)]
+    runner, scheduled, _, _ = _make_phase_runner(monkeypatch, rows, batched_decode=False)
+    _without_mtp_buffers(runner)
+    model = DecodeOnlyPreprocessModel()
+    runner.model = model
+    runner.supports_mm_inputs = True
+    runner.maybe_get_ec_connector_output = _noop_forward_context
+    runner.encoder_cache = {}
+    runner._execute_mm_encoder = lambda output: None
+    runner._gather_mm_embeddings = lambda output: ([], None)
+    runner._extract_mm_kwargs = lambda output: {}
+    runner._prepare_mm_inputs = lambda size: (None, runner.inputs_embeds.gpu[:size])
+    ids, embeds, *_ = runner._preprocess(scheduled, 2)
+    assert ids.data_ptr() == runner.input_ids.gpu.data_ptr()
+    assert model.calls == [("batch", ["first", "second"], [False, False])]
+    torch.testing.assert_close(embeds, torch.tensor([[10.0] * 4, [11.0] * 4]))
+
+
+@pytest.mark.parametrize(
+    "offsets",
+    [
+        pytest.param([0, 2, 3], id="gap"),
+        pytest.param([1, 0, 2], id="reversed"),
+        pytest.param([0, 0, 1], id="duplicate"),
+        pytest.param([-1, 0, 1], id="negative-contiguous-start"),
+        pytest.param([1, 2, 3], id="contiguous-out-of-bounds"),
+    ],
+)
+def test_decode_batch_without_mtp_rejects_invalid_offsets_before_model_hook(monkeypatch, offsets):
+    rows = [("first", 5, 5, 1), ("second", 5, 6, 1)]
+    runner, scheduled, _, _ = _make_phase_runner(monkeypatch, rows, batched_decode=False)
+    _without_mtp_buffers(runner)
+    model = DecodeOnlyPreprocessModel(rewrite_ids=True)
+    runner.model = model
+    scalar_hook = Mock(wraps=model.preprocess)
+    batch_hook = Mock(wraps=model.preprocess_decode_batch)
+    monkeypatch.setattr(model, "preprocess", scalar_hook)
+    monkeypatch.setattr(model, "preprocess_decode_batch", batch_hook)
+    runner.query_start_loc.cpu = torch.tensor(offsets, dtype=torch.int32)
+    runner.inputs_embeds = DummyBuffer(torch.full((4, 4), -99.0))
+    ids_before = runner.input_ids.gpu.clone()
+    embeds_before = runner.inputs_embeds.gpu.clone()
+
+    with pytest.raises(
+        RuntimeError,
+        match="Non-MTP batched decode preprocessing requires contiguous in-bounds token offsets",
+    ):
+        runner._preprocess(scheduled, scheduled.total_num_scheduled_tokens)
+
+    # These checks remain active when the runner is imported under python -O.
+    scalar_hook.assert_not_called()
+    batch_hook.assert_not_called()
+    torch.testing.assert_close(runner.input_ids.gpu, ids_before, rtol=0, atol=0)
+    torch.testing.assert_close(runner.inputs_embeds.gpu, embeds_before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("invalid", ["embeddings", "ids", "updates"])
+def test_decode_batch_without_mtp_rejects_incomplete_outputs(monkeypatch, invalid):
+    rows = [("first", 5, 5, 1), ("second", 5, 6, 1)]
+    runner, scheduled, _, _ = _make_phase_runner(monkeypatch, rows, batched_decode=False)
+    _without_mtp_buffers(runner)
+    runner.model = DecodeOnlyPreprocessModel(invalid_output=invalid)
+    before = runner.inputs_embeds.gpu.clone()
+    with pytest.raises(ValueError, match="decode preprocessing"):
+        runner._preprocess(scheduled, 2)
+    assert torch.equal(runner.inputs_embeds.gpu, before)

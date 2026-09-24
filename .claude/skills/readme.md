@@ -60,6 +60,14 @@ self-check.
   `test-weekly.yml`), and copy-paste local plus CI-like `pytest` commands; see
   `references/test-routing.md` for level-to-command mapping
 
+## MiniMax H3 Creative Skills
+
+The [portable H3 collection](../../.agents/skills/README.md) contains the prompt
+writing skill and eight creative workflows for product ads, 3D shorts, paper art,
+brand promos, music videos, co-op intros, and hand-drawn/live-action fusion.
+Same-named directories here link to the canonical `.agents/skills/` copies, so
+Claude Code and Codex use the same instructions and templates.
+
 ## Maintenance Guidelines
 
 - Keep skill names short and task-oriented.

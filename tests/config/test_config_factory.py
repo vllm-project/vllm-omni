@@ -1429,6 +1429,9 @@ stages:
         assert deploy.async_chunk is True
         assert deploy.connectors is not None
         assert deploy.platforms is not None
+        connector = deploy.connectors["connector_of_shared_memory"]
+        assert "async_chunk_batch_min_size" not in connector["extra"]
+        assert "async_chunk_batch_max_wait_ms" not in connector["extra"]
 
     @pytest.mark.parametrize(
         ("hf_config", "model"),
@@ -1585,19 +1588,32 @@ stages:
         assert "text_encoder_tp_size" not in stages[1].runtime_overrides
         assert stages[1].yaml_engine_args["parallel_config"]["tensor_parallel_size"] == 1
 
-    def test_minimax_h3_disaggregated_defaults_match_validated_topology(self):
+    @pytest.mark.parametrize(
+        "deploy_name",
+        ["minimax_h3_disaggregated.yaml", "minimax_h3_disaggregated_turbo.yaml"],
+    )
+    def test_minimax_h3_disaggregated_defaults(self, deploy_name):
         pipeline = OMNI_PIPELINES["minimax_h3_disaggregated"]
-        deploy = load_deploy_config(Path(get_deploy_config_path("minimax_h3_disaggregated.yaml")))
+        deploy = load_deploy_config(Path(get_deploy_config_path(deploy_name)))
         stages = merge_pipeline_deploy(pipeline, deploy)
 
+        assert pipeline.model_arch == "MiniMaxH3Encoder"
+        assert stages[0].model_stage == "encoder"
         assert stages[0].yaml_engine_args["model_arch"] == "MiniMaxH3Encoder"
+        processor = "vllm_omni.model_executor.stage_input_processors.minimax_h3"
+        assert stages[0].yaml_extras["prompt_transform_func"] == f"{processor}.prepare_encoder_prompt"
+        assert (
+            stages[0].yaml_engine_args["custom_process_next_stage_input_func"]
+            == f"{processor}.encoder2diffusion_full_payload"
+        )
+        assert stages[1].custom_process_input_func == f"{processor}.encoder2diffusion"
+        assert tuple(stages[1].yaml_engine_args["stage_input_payload_keys"]) == ("encoder_output",)
+        assert stages[1].yaml_engine_args["omni_kv_config"]["need_recv_cache"] is False
         assert stages[1].yaml_engine_args["model_arch"] == "MiniMaxH3Pipeline"
         assert stages[0].yaml_runtime["num_replicas"] == 1
         assert stages[1].yaml_runtime["num_replicas"] == 1
-        assert stages[1].yaml_engine_args["model_loaded"] == {
-            "text_encoder": False,
-            "vae_encoder": False,
-        }
+        assert stages[1].yaml_engine_args["model_loaded"] == {"text_encoder": False, "vae_encoder": False}
+        assert stages[0].yaml_engine_args["tensor_parallel_size"] == 2
         assert stages[0].yaml_engine_args["max_num_seqs"] == 1
         assert stages[0].yaml_engine_args["hf_overrides"]["minimax_h3_encoder_components"] == {
             "text_encoder": {"parallel_mode": "tp"},
@@ -1611,7 +1627,12 @@ stages:
         assert parallel["ulysses_degree"] == 4
         assert parallel["vae_patch_parallel_size"] == 4
         assert stages[1].yaml_engine_args["inline_diffusion"] is True
-        assert stages[1].yaml_extras["default_sampling_params"]["num_inference_steps"] == 50
+        sampling = stages[1].yaml_extras["default_sampling_params"]
+        if "turbo" in deploy_name:
+            assert sampling["num_inference_steps"] == 5
+            assert sampling["extra_args"] == {"flow_shift": 6.0, "audio_flow_shift": 3.0}
+        else:
+            assert sampling["num_inference_steps"] == 50
 
         turbo = load_deploy_config(Path(get_deploy_config_path("minimax_h3_disaggregated_turbo.yaml")))
         turbo_stages = merge_pipeline_deploy(pipeline, turbo)
@@ -1621,6 +1642,73 @@ stages:
         turbo_sampling = turbo_stages[1].yaml_extras["default_sampling_params"]
         assert turbo_sampling["num_inference_steps"] == 5
         assert turbo_sampling["extra_args"] == {"flow_shift": 6.0, "audio_flow_shift": 3.0}
+
+    @pytest.mark.parametrize(
+        "deploy_name",
+        ["minimax_h3_disaggregated.yaml", "minimax_h3_disaggregated_turbo.yaml"],
+    )
+    @pytest.mark.parametrize("shared_memory", [False, True], ids=["nixl", "shared_memory"])
+    def test_minimax_h3_deploy_connector_wiring_and_roles(self, deploy_name, shared_memory):
+        from vllm_omni.config.stage_config import resolve_deploy_yaml
+        from vllm_omni.distributed.omni_connectors.utils.initialization import load_omni_transfer_config
+        from vllm_omni.engine.stage_init_utils import get_stage_connector_spec
+
+        base_config = resolve_deploy_yaml(get_deploy_config_path(deploy_name))
+        if not shared_memory:
+            deploy_name = deploy_name.replace(".yaml", "_nixl.yaml")
+        deploy_path = get_deploy_config_path(deploy_name)
+        config = resolve_deploy_yaml(deploy_path)
+        assert config["async_chunk"] is False
+        connector_name = "shared_memory_connector" if shared_memory else "nixl_connector"
+        assert connector_name in config["connectors"]
+        assert config["stages"][0]["output_connectors"] == {"to_stage_1": connector_name}
+        assert config["stages"][1]["input_connectors"] == {"from_stage_0": connector_name}
+        load_deploy_config(deploy_path)
+        for base_stage, stage in zip(base_config["stages"], config["stages"], strict=True):
+            edge_keys = {"input_connectors", "output_connectors"}
+            assert {key: value for key, value in stage.items() if key not in edge_keys} == {
+                key: value for key, value in base_stage.items() if key not in edge_keys
+            }
+        transfer = load_omni_transfer_config(config_dict=config)
+        assert transfer is not None
+        assert set(transfer.connectors) == {("0", "1")}
+        edge = transfer.connectors[("0", "1")]
+        expected_name = "SharedMemoryConnector" if shared_memory else "NixlConnector"
+        assert edge.name == expected_name
+        assert "role" not in edge.extra
+        for stage_id, role in ((0, "sender"), (1, "receiver")):
+            spec = get_stage_connector_spec(transfer, stage_id, async_chunk=False)
+            assert spec["name"] == expected_name
+            assert spec["extra"]["role"] == role
+            if shared_memory:
+                assert "from_stage" not in spec["extra"]
+                assert "to_stage" not in spec["extra"]
+            else:
+                assert spec["extra"]["from_stage"] == 0
+                assert spec["extra"]["to_stage"] == 1
+                assert spec["extra"]["host"] == "auto"
+                assert spec["extra"]["zmq_port"] == 50071
+                assert spec["extra"]["backends"] == ["UCX"]
+        assert "role" not in edge.extra
+
+    @pytest.mark.parametrize(
+        "deploy_name",
+        ["minimax_h3_disaggregated.yaml", "minimax_h3_disaggregated_turbo.yaml"],
+    )
+    def test_minimax_h3_builtin_stage_one_tp4_ulysses1_override(self, deploy_name):
+        stages, _ = StageConfigFactory._create_legacy_from_registry(
+            OMNI_PIPELINES["minimax_h3_disaggregated"],
+            {"stage_1_tensor_parallel_size": 4, "stage_1_ulysses_degree": 1},
+            deploy_config_path=get_deploy_config_path(deploy_name),
+        )
+        encoder_args = stages[0].to_omegaconf().engine_args
+        diffusion_args = stages[1].to_omegaconf().engine_args
+        assert encoder_args.tensor_parallel_size == 2
+        assert "ulysses_degree" not in stages[0].runtime_overrides
+        assert diffusion_args.parallel_config.tensor_parallel_size == 4
+        assert diffusion_args.parallel_config.ulysses_degree == 1
+        assert diffusion_args.parallel_config.vae_patch_parallel_size == 4
+        assert tuple(diffusion_args.stage_input_payload_keys) == ("encoder_output",)
 
     def test_minimax_h3_text_encoder_tp_alias_targets_stage_zero(self):
         pipeline = OMNI_PIPELINES["minimax_h3_disaggregated"]
@@ -2625,6 +2713,15 @@ class TestPlatformOverrides:
 
         assert stages[1].yaml_engine_args["dtype"] == dtype
 
+    def test_moss_tts_rocm_disables_codec_cudagraph(self):
+        deploy_path = Path(get_deploy_config_path("moss_tts.yaml"))
+
+        base = load_deploy_config(deploy_path)
+        assert base.stages[1].enforce_eager is False
+
+        rocm = _apply_platform_overrides(base, platform="rocm")
+        assert rocm.stages[1].enforce_eager is True
+
     def test_higgs_audio_v3_rocm_uses_triton_attention(self):
         deploy_path = Path(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
 
@@ -2687,6 +2784,63 @@ class TestPlatformOverrides:
             replica_stages = merge_pipeline_deploy(pipeline, replica)
             # Explicit null clears the inherited single-GPU 2 GiB CUDA cap.
             assert replica_stages[1].yaml_engine_args.get("kv_cache_memory_bytes") is None
+
+    def test_fish_speech_npu_uses_ascend_kv_block_size(self):
+        deploy_path = Path(get_deploy_config_path("fish_qwen3_omni.yaml"))
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+
+        assert deploy.stages[0].engine_extras["block_size"] == 128
+
+    @pytest.mark.parametrize("platform", ["cuda", "npu"])
+    def test_recommended_native_runner_platform_defaults(self, platform):
+        filename, pipeline_key = "qwen3_tts_mrv2.yaml", "qwen3_tts"
+        deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
+        deploy = _apply_platform_overrides(deploy, platform=platform)
+        expect_v2 = platform == "cuda"
+        assert deploy.model_runner == ("v2" if expect_v2 else "v1")
+
+        # The selection must reach the live worker-dispatch consumer, not just
+        # the transport-level DeployConfig field.
+        pipeline = resolve_pipeline_config(pipeline_key)
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [expect_v2] * len(stages)
+
+        if expect_v2 and pipeline.stages and deploy.async_chunk:
+            # v2 only engages the native plane on stages declaring support.
+            assert all(ps.supports_native_mrv2_data_plane for ps in pipeline.stages)
+
+    @pytest.mark.parametrize("runner,native", [("v1", False), ("v2", False), ("v2", True)])
+    def test_mrv2_undeclared_transport_warns(self, monkeypatch, runner, native):
+        from unittest.mock import Mock
+
+        warning = Mock()
+        monkeypatch.setattr("vllm_omni.config.stage_config.logger.warning", warning)
+        pipeline = PipelineConfig(
+            model_type="custom_pipeline",
+            stages=[
+                StagePipelineConfig(
+                    stage_id=0, model_stage="custom_ar", final_output=True, supports_native_mrv2_data_plane=native
+                )
+            ],
+        )
+        merge_pipeline_deploy(pipeline, DeployConfig(model_runner=runner))
+        assert warning.call_count == int(runner == "v2" and not native)
+        if warning.called:
+            assert "legacy transport path" in warning.call_args.args[0]
+
+    def test_runner_selection_rejects_engine_extras_override(self):
+        pipeline = PipelineConfig(
+            model_type="runner_selection_reserved",
+            stages=SINGLE_STAGE_PIPE_CFG,
+        )
+        for reserved in ("use_v2_model_runner", "supports_native_mrv2_data_plane"):
+            deploy = DeployConfig(
+                model_runner="v2",
+                stages=[StageDeployConfig(stage_id=0, engine_extras={reserved: False})],
+            )
+            with pytest.raises(ValueError, match=f"{reserved!r} must not be set"):
+                merge_pipeline_deploy(pipeline, deploy)
 
     def test_npu_overrides(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))

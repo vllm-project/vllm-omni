@@ -49,9 +49,11 @@ This extension offers the following nodes based on the output modalities (at **C
 
 - **Generate Image** for text-to-image and image-to-image tasks
 - **Generate Video** for text-to-video, first-frame/image-to-video, and reference-conditioned video
+- **Latent Mask Editing** for MiniMax-H3 latent-mask editing (source media plus video/audio noise masks)
 - **FastH3 Deployment** for routing text-to-video requests to a MiniMax-H3 server with FastH3 fused at startup
 - **Multimodality Understanding** for multimodality-to-text and multimodality-to-audio tasks
 - **TTS** and **TTS Voice Clone** for TTS tasks
+- **Generate Music** for lyrics-and-description-to-music generation
 
 This extension also offers example workflows (at **ComfyUI sidebar -> Templates -> vLLM-Omni**)
 
@@ -66,7 +68,7 @@ Every node carries the vLLM-Omni mark in its title bar and is tinted by what it 
 | Amber | AR / Diffusion / Multi-Stage Sampling Params | Sampling parameters that apply to any model |
 | Purple | Qwen TTS Params, Wan Video Params, MiniMax-H3 Video Params | Parameters that only one model family accepts |
 | Red | LoRA, FastH3 Deployment | Which weights the server is expected to have loaded |
-| Teal | Video References | Reference media |
+| Teal | Video References, Latent Mask Editing | Reference media |
 
 Recolouring a node by hand (right click -> Colors) overrides its tint, and the choice is kept.
 
@@ -133,11 +135,13 @@ You can configure per-stage sampling parameters for multi-stage models.
 </p>
 
 > [!TIP]
-> Connect a **frame** image for first-frame / image-to-video (e.g., Wan I2V, MiniMax-H3 FL2VA).
+> Connect **frame** for backward-compatible first-frame / image-to-video behavior. For MiniMax-H3 FL2VA,
+> connect **first_frame**, **last_frame**, or both to condition the start frame, end frame, or both.
 >
 > For reference-conditioned generation (MiniMax-H3 Ref2VA), connect a **Video References** node instead.
 >
-> Do not use `frame` and `references` together. Task routing is automatic from which inputs you connect.
+> Do not combine `frame` with `first_frame` or `last_frame`, and do not combine any frame input with
+> `references`. Task routing is automatic from which inputs you connect.
 
 For MiniMax-H3 Ref2VA, **Video References** accepts up to 9 images (`image_1`–`image_9`),
 3 videos (`video_1`–`video_3`), and 3 audio clips (`audio_1`–`audio_3`), with at most
@@ -260,6 +264,18 @@ Open the **vLLM-Omni FastH3 Text to Video** template, then:
 
 The node records which server the workflow targets; it does not start one, nor switch adapters or attention backends on a running server.
 
+#### Latent-mask editing (MiniMax-H3)
+
+The [WF-05 template](example_workflows/vLLM-Omni%20MiniMax-H3%20Latent%20Mask%20Editing.json) contains inpainting, object removal, continuation, and extension examples in one graph. See the [workflow guide](docs/wf05-h3-latent-editing.md) for inputs, mask settings, dependencies, and preview limitations.
+
+Connect a **Latent Mask Editing** node to **Generate Video → latent_edit** to edit a source clip instead of generating from scratch. It uploads the source media and serializes the video/audio noise masks the MiniMax H3 API accepts:
+
+- `source_video` / `source_audio` — the media to edit.
+- `video_mask` — a ComfyUI mask image; `0` preserves a region, `1` regenerates it, fractional values blend. A 2D mask `[H, W]` is applied to every frame; a 3D mask `[T, H, W]` is treated as a temporal mask (one slice per frame) for continuation or extension. It is resized to the video latent grid.
+- `audio_mask` — a scalar in `[0, 1]`; `0` keeps the source audio, `1` regenerates it, fractional values blend.
+
+A non-trivial mask requires its matching source, and a source without a mask is rejected. This node only forwards inputs to the server; the served model must declare latent-mask editing support (MiniMax-H3).
+
 ### TTS (e.g., Qwen TTS series)
 
 (Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni TTS**)
@@ -273,6 +289,17 @@ The node records which server the workflow targets; it does not start one, nor s
 
 > [!TIP]
 > There is a dedicated node for VoiceClone tasks with reference audio input. Other simple text-to-speech tasks should use the regular TTS node.
+
+### Music generation (e.g., MiniMax Music 3)
+
+(Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni Music Generation**)
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-music-generation.jpg">
+    <img alt="vLLM-Omni Music Generation" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-music-generation.jpg" width=55%>
+  </picture>
+</p>
 
 ### Chaining multiple model services
 

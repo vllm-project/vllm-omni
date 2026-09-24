@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import fcntl
 import os
+import time
 from multiprocessing import shared_memory as shm_pkg
 from typing import Any
 
@@ -23,6 +24,11 @@ class SharedMemoryConnector(OmniConnectorBase):
     (that is the RDMA connector's job).  When such metadata is passed in,
     the connector silently falls back to key-based lookup.
     """
+
+    def get_with_deadline(self, from_stage, to_stage, get_key, metadata=None, *, deadline):
+        if time.monotonic() >= deadline:
+            return None
+        return self.get(from_stage, to_stage, get_key, metadata)
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
@@ -68,13 +74,15 @@ class SharedMemoryConnector(OmniConnectorBase):
         deserialized = False
         try:
             with open(lock_file, "rb+") as lockf:
-                fcntl.flock(lockf, fcntl.LOCK_EX)
+                fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 data_bytes = shm_read_bytes(shm_handle)
                 fcntl.flock(lockf, fcntl.LOCK_UN)
             obj = self.deserialize_obj(data_bytes)
             result = (obj, int(shm_handle.get("size", 0)))
             deserialized = True
             return result
+        except BlockingIOError:
+            return None
         except Exception as e:
             logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
             return None

@@ -8,11 +8,40 @@ history stays honest, and a dropped connection can resume the same session.
 This page covers how to run a duplex deployment, how to drive it from Python
 with `vllm_omni.clients.duplex.DuplexClient`, and the complete wire contract.
 
-The endpoint is served for models that ship a duplex plugin — currently
-MiniCPM-o 4.5 only — and just for deploy configurations that declare
+The endpoint is served for models that ship a duplex plugin — including
+MiniCPM-o 4.5 and Qwen3-Omni — and just for deploy configurations that declare
 `session_mode: duplex`. PersonaPlex and Nemotron VoiceChat are ported to the
 plugin contract in follow-up PRs and are not served over this endpoint yet. The runtime architecture
 is described in [Full-Duplex Runtime (MiniCPM-o 4.5)](../design/fullduplex.md).
+
+## Qwen3-Omni conversation history
+
+Qwen3-Omni keeps incoming conversation items independently addressable by item
+ID. Before applying the model's chat template, it merges consecutive user
+items into one multimodal user message. An assistant message, including an
+empty message reserved for an interrupted or unheard answer, separates turns.
+The final user message places media before text instructions, following the
+[official Qwen3-Omni demo's `format_history()`](https://github.com/QwenLM/Qwen3-Omni/blob/e4235853125589c789f06a2dd83e9f4126df5e9d/web_demo.py#L84-L179).
+
+A camera image or text item may arrive after an audio commit and before
+`response.create`. Those items belong to the same pending user turn: the
+committed audio remains associated with its history item even when that item
+is no longer last. Prompt preparation snapshots the selected inputs; later
+items do not modify an already prepared request.
+
+The duplex adapter retains its existing budgets: at most four audio payloads
+(including the current input), an 8 MiB encoded-audio history budget (keeping
+at least the newest payload), and at most eight prompt images. The recent
+16-message window is rounded outwards to a complete turn. If any audio in an
+older turn is no longer retained, the entire turn's model context, including
+its images/text and assistant replies, is omitted. Images from that turn are
+therefore **not** permanent session-wide model context. These limits differ
+from the demo's one image-bearing turn and five audio-bearing turns; the
+shared rule is grouping before pruning, rather than copying its UI budgets.
+
+Grouping and pruning affect only the model-input view. They do not merge or
+delete the source conversation items exposed to clients, and do not change
+playback acknowledgement or interruption handling.
 
 ## Quick Start
 
@@ -32,33 +61,19 @@ vllm-omni serve openbmb/MiniCPM-o-4_5 \
 mounts `ws://<host>:8099/v1/realtime?duplex=1` (this page; `ws://<host>:8099/v1/duplex`
 is an alias of the same route), `POST /v1/chat/completions`, `/v1/models` and
 `/health`, and nothing else. The remaining turn-based HTTP routes (speech,
-batch, embeddings, video, ...) are not served by a duplex model.
+batch, embeddings, video, ...) are not served in duplex mode.
 
-`/v1/chat/completions` is not a turn-based path on a duplex server: each
-request opens a short-lived duplex session and reads the answer off it. Audio
-content becomes an ordinary committed turn; text is seeded as the session's
-opening turn, because a model-native model takes a turn only when it hears
-speech. A model that cannot be seeded that way declares so, and a text request
-to it is refused with 400. Two consequences are worth sizing for:
+`/v1/chat/completions` uses the ordinary chat service on the same engine
+when the plugin declares `supports_chat_completions`. HTTP chat requests do
+not create duplex sessions or consume session admission slots. Their options
+follow the [Chat Completions API](chat_completions_api.md) and the model's
+capabilities and endpoint restrictions.
 
-- **Every request holds an admission slot** for its lifetime, so
-  `duplex_session.max_sessions` caps HTTP concurrency as well as websocket
-  sessions. Beyond it a request is refused with HTTP 503.
-- **Latency follows the model's own clock.** A model-native session generates
-  per audio unit, so even a short answer costs what that many units cost --
-  noticeably more than the same model would take turn-based.
-
-`n > 1`, `logprobs`, `tools`, and image or video content parts have no
-representation in one duplex turn and are refused with HTTP 400 -- a Realtime
-conversation item carries text and audio only. `temperature`,
-`max_completion_tokens`, `modalities` and
-`chat_template_kwargs.use_tts_template` apply; the other
-`chat_template_kwargs` keys are logged as ignored. `extra_body` is passed to
-the session unchanged, exactly as a websocket client's session `extra_body`
-is, which is how a request asking for `modalities: ["text", "audio"]` supplies
-the `ref_audio` MiniCPM-o requires for audio output. A model that should not
-serve the route lists it in the deploy config's `endpoint_restrictions`,
-exactly as a turn-based model does.
+For a turn-based online deployment, use `minicpmo_4_5_turn.yaml` or explicitly
+set `session_mode: turn` in a deploy configuration derived from the model's
+profile. This selects `AsyncOmni` and the ordinary API initialization instead
+of the duplex handler. See [Full Duplex](full_duplex_api.md#enable-full-duplex)
+for the command and configuration requirements.
 
 ### Run the Example Client
 
@@ -782,7 +797,10 @@ events with `server_event_seq > 40` are replayed in order)
 ```
 
 with camera frames (omni video; rides the append that closes a 1 s model
-unit; each entry is a **bare** base64 JPEG/PNG — no `data:` URL prefix)
+unit; each entry is a **bare** base64 JPEG/PNG — no `data:` URL prefix).
+Only a model whose Stage 0 interleaves a frame track at unit boundaries takes
+this field; a turn model has no such boundary and rejects it, expecting
+`conversation.item.create` with `input_image` content instead.
 
 ```json
 {
@@ -958,6 +976,10 @@ deferred commit during an active response (`event.response_create_deferred`)
 ```json
 {"type": "conversation.item.truncated", "item_id": "item_resp_01", "content_index": 0, "audio_end_ms": 1850, "event": {"…": "…"}}
 ```
+
+After this acknowledgement, `conversation.item.retrieve` returns the truncated
+transcript. Without text/audio alignment marks, its prefix is estimated from
+the requested position and audio duration; this is not exact word alignment.
 
 #### Response lifecycle
 
@@ -1345,8 +1367,9 @@ them out into typed events before they reach a client.
 - Session capacity is bounded by `duplex_session.max_sessions` in the deploy
   configuration; admission beyond it fails with `resource_exhausted`
   (`rate_limit_error`, retryable).
-- A duplex deployment serves the duplex session surfaces only: the websocket
-  route and `/v1/chat/completions`, the latter on a session per request (see
-  [Start the Server](#start-the-server)). The other turn-based HTTP routes
-  report "not available" on a MiniCPM-o 4.5 server; turn-based use of the
-  model stays available offline through `Omni` / `AsyncOmni`.
+- A duplex deployment serves the websocket route and, when supported by the
+  model, ordinary `/v1/chat/completions` requests on the same engine without a
+  session per request (see [Start the Server](#start-the-server)). Other
+  turn-based HTTP routes report "not available" in duplex mode. To use the
+  ordinary online serving stack, select `session_mode: turn` as described in
+  [Full Duplex](full_duplex_api.md#enable-full-duplex).

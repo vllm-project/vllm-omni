@@ -14,8 +14,9 @@ import asyncio
 import time
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
+import anyio
 from vllm import TokensPrompt
 from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.logger import init_logger
@@ -75,6 +76,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         ...     print(output)
     """
 
+    engine: AsyncOmniEngine
+
     def _create_engine(self, **engine_kwargs: Any) -> AsyncOmniEngine:
         return AsyncOmniEngine(**engine_kwargs)
 
@@ -95,6 +98,10 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # sleep uses _paused as a temporary admission gate and clears it
         # on wake so sleep → wake → generate keeps working.
         self._hold_admission_until_resume: bool = False
+        # Stages whose scheduler pause_generation closed (AR in any mode,
+        # diffusion with mode="keep"); admission stays closed until
+        # resume_generation has reopened all of them.
+        self._paused_stage_ids: set[int] = set()
         self._sleeping_tags: set[str] = set()
         self._stage_sleeping_tags: dict[int, set[str]] = {}
         self._level2_sleeping: bool = False
@@ -115,6 +122,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
+        session_id: str | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
@@ -124,6 +132,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         Coordinates multi-stage pipeline execution. Processes the prompt
         through all stages in the pipeline and yields outputs as they become
         available.
+
+        ``session_id`` is accepted for EngineClient protocol compatibility
+        and is not duplex-session plumbing.
 
         **Diffusion batching:**
         Diffusion stages accept only a single prompt per request.  Passing a
@@ -182,7 +193,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
             # Reject diffusion list-prompt early with a clear API error.
             if isinstance(prompt, list) and any(
-                getattr(client, "stage_type", "") == "diffusion" for client in getattr(self.engine, "stage_clients", [])
+                stage_config.stage_type == "diffusion" for stage_config in self.engine.stage_configs
             ):
                 raise ValueError(
                     "Diffusion stages accept only a single prompt per request. "
@@ -236,6 +247,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             req_state = ClientRequestState(
                 request_id=request_id,
                 external_request_id=external_request_id,
+                final_stage_id=final_stage_id_for_e2e,
             )
             req_state.metrics = metrics
             req_state.request_arrival_ts = wall_start_ts
@@ -256,7 +268,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 first_chunk_submitted = asyncio.get_running_loop().create_future()
                 input_stream_task = await self._add_streaming_input_request(
                     request_id=request_id,
-                    input_stream=prompt,
+                    input_stream=cast(AsyncGenerator, prompt),
                     sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id_for_e2e,
                     final_output_stage_ids=final_output_stage_ids,
@@ -276,7 +288,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     lora_request=lora_request,
                 )
             submit_ts = time.time()
-            req_state.metrics.stage_first_ts[0] = submit_ts
+            stage_first_ts = cast(list[float | None], req_state.metrics.stage_first_ts)
+            stage_first_ts[0] = submit_ts
             req_start_ts[request_id] = submit_ts
             if admitting:
                 await self._release_generate_admission()
@@ -301,7 +314,10 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
         except (asyncio.CancelledError, GeneratorExit):
             self._record_request_failure_once(request_id, reason="client_disconnect")
-            await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
+            # ASGI cancellation also affects subsequent awaits. Shield the
+            # bounded engine abort before removing the local request state.
+            with anyio.CancelScope(shield=True):
+                await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
         except Exception as e:
@@ -350,6 +366,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # only check thinker's sampling params now
         stage0_params = sampling_params_list[0]
         self._validate_streaming_input_sampling_params(stage0_params)
+        stage0_params = cast(SamplingParams, stage0_params)
         req_state = self.request_states[request_id]
         has_submitted_first_chunk = False
 
@@ -541,10 +558,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> list[Any]:
-        """Call an AR EngineCore helper via collective_rpc (orchestrator loop).
+        """Call an engine control helper via collective_rpc (orchestrator loop).
 
         StagePool resolves ``{method}_async`` on the AR client when present
-        (vLLM AsyncMPClient convention). Raises if any replica reports failure.
+        (vLLM AsyncMPClient convention); diffusion stages answer the same
+        method names inside DiffusionEngine. Raises if any replica reports
+        failure.
         """
         results = await self.collective_rpc(
             method=method,
@@ -619,7 +638,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
     def _split_stage_ids_by_type(self, stage_ids: list[int] | None = None) -> tuple[list[int], list[int]]:
         """Split stage ids into AR/LLM (EngineCore) vs diffusion (worker RPC)."""
-        n_stages = len(self.engine.stage_clients)
+        n_stages = len(self.engine.stage_configs)
         if stage_ids is None:
             stage_ids = list(range(n_stages))
         else:
@@ -633,8 +652,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         ar_stage_ids: list[int] = []
         diffusion_stage_ids: list[int] = []
         for sid in stage_ids:
-            client = self.engine.stage_clients[sid]
-            if getattr(client, "stage_type", "llm") == "diffusion":
+            stage_config = self.engine.stage_configs[sid]
+            if stage_config.stage_type == "diffusion":
                 diffusion_stage_ids.append(sid)
             else:
                 ar_stage_ids.append(sid)
@@ -694,8 +713,13 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         1. Stop frontend admission (``_paused``).
         2. For AR/LLM stages, call EngineCore.pause_scheduler via the
            Orchestrator loop (abort/wait/keep + optional cache clear).
-        3. Diffusion stages have no EngineCore scheduler — only frontend
-           admission is paused for them.
+        3. For diffusion stages, ``mode="keep"`` pauses the DiffusionEngine
+           scheduler and returns once the batch that was running has finished
+           on every worker; that batch is delivered before any control RPC
+           issued after this call runs, so the documented pause -> sleep order
+           is safe. Queued requests stay queued until
+           :meth:`resume_generation`. Other modes pause frontend admission
+           only.
 
         Note: ``sleep()`` already pauses the AR scheduler internally (same as
         vLLM EngineCore.sleep). Call this API when you need pause *without*
@@ -710,7 +734,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             self._paused = True
             self._hold_admission_until_resume = True
 
-        ar_stage_ids, _diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+        if mode != "keep":
+            diffusion_stage_ids = []
+        # Recorded before the RPCs so a failed or cancelled pause can still
+        # be undone with an explicit resume_generation.
+        self._paused_stage_ids.update(ar_stage_ids, diffusion_stage_ids)
         if ar_stage_ids:
             logger.info(
                 "[%s] Pausing AR stage(s) %s via EngineCore.pause_scheduler(mode=%s)",
@@ -725,6 +754,17 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 stage_ids=ar_stage_ids,
                 kwargs={"mode": mode, "clear_cache": clear_cache},
             )
+        if diffusion_stage_ids:
+            logger.info(
+                "[%s] Pausing diffusion stage(s) %s via DiffusionEngine pause_scheduler(mode=keep)",
+                self._name,
+                diffusion_stage_ids,
+            )
+            await self._engine_core_rpc(
+                "pause_scheduler",
+                stage_ids=diffusion_stage_ids,
+                kwargs={"mode": "keep"},
+            )
 
         # Frontend / sender-side cache clear (P0). EngineCore.pause_scheduler
         # already clears AR-side caches when clear_cache=True.
@@ -738,10 +778,26 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
     async def resume_generation(self, stage_ids: list[int] | None = None) -> None:
         """Resume generation after :meth:`pause_generation`."""
-        ar_stage_ids, _diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
         if ar_stage_ids:
             logger.info("[%s] Resuming AR stage(s) %s via EngineCore", self._name, ar_stage_ids)
             await self._engine_core_rpc("resume_scheduler", stage_ids=ar_stage_ids)
+            self._paused_stage_ids.difference_update(ar_stage_ids)
+        diffusion_stage_ids = [sid for sid in diffusion_stage_ids if sid in self._paused_stage_ids]
+        if diffusion_stage_ids:
+            logger.info("[%s] Resuming diffusion stage(s) %s via DiffusionEngine", self._name, diffusion_stage_ids)
+            await self._engine_core_rpc("resume_scheduler", stage_ids=diffusion_stage_ids)
+            self._paused_stage_ids.difference_update(diffusion_stage_ids)
+
+        if self._paused_stage_ids:
+            # Reopening admission now would let new requests queue on a stage
+            # whose scheduler is still closed.
+            logger.info(
+                "[%s] Admission stays paused: stage(s) %s are still paused",
+                self._name,
+                sorted(self._paused_stage_ids),
+            )
+            return
 
         async with self._pause_cond:
             self._paused = False
@@ -753,7 +809,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         async with self._pause_cond:
             return self._paused
 
-    async def start_profile(
+    # EngineClient exposes async operations; OmniBase implements the sync API.
+    async def start_profile(  # type: ignore[override]
         self,
         profile_prefix: str | None = None,
         stages: list[int] | None = None,
@@ -768,7 +825,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         """
         return await self.collective_rpc(method="profile", args=(True, profile_prefix), stage_ids=stages)
 
-    async def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
+    async def stop_profile(self, stages: list[int] | None = None) -> list[Any]:  # type: ignore[override]
         """Stop profiling specified stages.
 
         Uses vLLM-compatible profile(is_start=False) interface.
@@ -815,8 +872,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         AR/LLM stages use EngineCore.sleep (pause scheduler, wait idle, then
         offload/discard memory) — matching vLLM AsyncLLM.sleep.
 
-        Diffusion stages keep the existing worker-level handle_sleep_task RPC
-        because StageDiffusionProc does not expose EngineCore.pause_scheduler.
+        Diffusion stages keep the worker-level handle_sleep_task RPC, which
+        does not stop the DiffusionEngine scheduler; quiesce a busy diffusion
+        stage first with ``pause_generation(mode="keep")`` (or abort it).
 
         Frontend admission is blocked at the start of this call (``_paused``)
         so pipelined :meth:`generate` cannot race into stages while sleep is
@@ -1054,10 +1112,14 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         """Get tokenizer for the comprehension stage."""
         stage_index = self._get_comprehension_stage_index()
         if stage_index is not None:
-            tokenizer = self.engine.output_processors[stage_index].tokenizer
+            processor = self.engine.output_processors[stage_index]
+            assert processor is not None
+            tokenizer = processor.tokenizer
             if tokenizer is not None:
                 return tokenizer
-        return self.input_processor.tokenizer  # type: ignore[return-value]
+        processor = self.input_processor
+        assert processor is not None
+        return processor.tokenizer
 
     async def is_tracing_enabled(self) -> bool:
         """Check if tracing is enabled."""
