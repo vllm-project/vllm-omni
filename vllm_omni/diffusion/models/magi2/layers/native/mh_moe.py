@@ -161,6 +161,7 @@ class Magi2MultiHeadMoE(nn.Module):
             # Resolve through the public layer API so tests and integrations
             # keep one platform-neutral EP-group patch point.
             from .. import get_magi2_ep_group
+
             ep_group = get_magi2_ep_group()
         self.ep_group = ep_group
         self.padded_num_heads = math.ceil(self.num_heads / self.ep_group.world_size) * self.ep_group.world_size

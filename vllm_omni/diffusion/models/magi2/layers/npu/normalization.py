@@ -38,9 +38,7 @@ class MultiModalityRMSNorm(NativeMultiModalityRMSNorm):
                 raise ValueError("modality_dispatcher is required for multimodal RMSNorm")
             inputs = modality_dispatcher.dispatch(compute)
             outputs = [
-                part
-                if part.shape[0] == 0
-                else torch_npu.npu_rms_norm(part, weights[index], epsilon=self.eps)[0]
+                part if part.shape[0] == 0 else torch_npu.npu_rms_norm(part, weights[index], epsilon=self.eps)[0]
                 for index, part in enumerate(inputs)
             ]
             result = modality_dispatcher.undispatch(*outputs)

@@ -14,10 +14,10 @@ from vllm_omni.platforms import current_omni_platform
 from ..parallel import get_magi2_ep_group, get_magi2_tp_group
 from .native import (
     ElementWiseFourierEmbed,
-    MHCHandler,
     Magi2GroupedLinear,
     Magi2MultiHeadMoE,
     Magi2MultiHeadMoEConfig,
+    MHCHandler,
     ModalityDispatcher,
     MultiModalityRMSNorm,
     apply_rotary_emb,
@@ -54,6 +54,8 @@ __all__ = [
     "apply_rotary_emb",
     "compute_topk_probs_and_indices",
     "correct_out_lse_with_sink",
+    "get_magi2_ep_group",
+    "get_magi2_tp_group",
     "global_sort_routes",
     "make_grouped_linear",
     "rotate_half",

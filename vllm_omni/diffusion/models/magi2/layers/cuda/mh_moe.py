@@ -16,6 +16,8 @@ from vllm_omni.platforms import current_omni_platform
 
 from ..native.mh_moe import (
     Magi2MultiHeadMoE as NativeMagi2MultiHeadMoE,
+)
+from ..native.mh_moe import (
     Magi2MultiHeadMoEConfig,
     global_sort_routes,
     torch_mh_moe_forward,
@@ -142,10 +144,7 @@ def _mh_moe_kernel(
             up_acc += tl.dot(x_block, wu)
         hidden = _swiglu7_kernel(gate_acc, up_acc, wd_ptr.dtype.element_ty)
         down = tl.load(
-            wd_ptr
-            + expert_i64 * stride_wd_e
-            + de_offsets[:, None] * stride_wd_de
-            + dh_offsets[None, :] * stride_wd_dh
+            wd_ptr + expert_i64 * stride_wd_e + de_offsets[:, None] * stride_wd_de + dh_offsets[None, :] * stride_wd_dh
         )
         output_acc += tl.dot(hidden, down)
     output_acc = output_acc * probabilities[:, None]

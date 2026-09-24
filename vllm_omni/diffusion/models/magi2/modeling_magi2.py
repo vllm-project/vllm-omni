@@ -27,10 +27,10 @@ from .attention import Magi2PackedAttentionKernel, VarlenHandler
 from .configuration_magi2 import Magi2PreviewConfig
 from .layers import (
     ElementWiseFourierEmbed,
-    MHCHandler,
-    ModalityDispatcher,
     Magi2MultiHeadMoE,
     Magi2MultiHeadMoEConfig,
+    MHCHandler,
+    ModalityDispatcher,
     MultiModalityRMSNorm,
     apply_rotary_emb,
     make_grouped_linear,

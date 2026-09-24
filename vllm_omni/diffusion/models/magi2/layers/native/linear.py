@@ -47,6 +47,7 @@ class Magi2GroupedLinear(nn.Module):
             # Keep the patch point exposed by the former ``magi2.layers``
             # module while avoiding an import cycle during package setup.
             from .. import get_magi2_tp_group
+
             tp_group = get_magi2_tp_group()
         self.tp_group = tp_group
         self.local_in_features = in_features

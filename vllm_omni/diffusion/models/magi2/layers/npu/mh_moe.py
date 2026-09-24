@@ -12,6 +12,8 @@ import torch
 
 from ..native.mh_moe import (
     Magi2MultiHeadMoE as NativeMagi2MultiHeadMoE,
+)
+from ..native.mh_moe import (
     Magi2MultiHeadMoEConfig,
     swiglu7_pair,
 )

@@ -62,8 +62,7 @@ def varlen_attention_with_sink(
     if sink is not None and sink.numel() > 0:
         if sink.ndim != 2 or sink.shape[-1] != q.shape[1]:
             raise ValueError(
-                "attention sink must be [num_sink,query_heads], got "
-                f"{tuple(sink.shape)} for {q.shape[1]} heads"
+                f"attention sink must be [num_sink,query_heads], got {tuple(sink.shape)} for {q.shape[1]} heads"
             )
         # The Ascend op accepts one zero-value sink logit per query head.
         # logsumexp exactly folds multiple MAGI sink logits into that one logit.
