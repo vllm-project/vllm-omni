@@ -152,11 +152,13 @@ class StageEngineCoreClientBase(StageClientBase):
 
         self.engine_outputs: Any = None
         self.client_addresses = dict(client_addresses or {})
+        self.vllm_config = vllm_config
         self._omni_kv_config = getattr(getattr(vllm_config, "model_config", None), "omni_kv_config", None)
         self._stage_hf_config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
         self._kv_sender_host = self._resolve_contact_host()
         self._kv_sender_info: dict[str, Any] | None = None
         self._kv_sender_initialized = False
+        self._payload_sender_info: dict[str, Any] | None = None
 
         client_name = self.__class__.__name__
         logger.info(
@@ -213,8 +215,8 @@ class StageEngineCoreClientBase(StageClientBase):
                 )
             raise
 
-        self._payload_sender_info = self._build_payload_sender_info()
         self._initialize_kv_sender_endpoint()
+        self._payload_sender_info = self._build_payload_sender_info()
 
         logger.info(
             "[%s] stage-%s [rep-%s] EngineCore running",
@@ -301,16 +303,34 @@ class StageEngineCoreClientBase(StageClientBase):
     def _build_payload_sender_info(self) -> dict[str, Any] | None:
         model_config = getattr(self.vllm_config, "model_config", None)
         connector_config = getattr(model_config, "stage_connector_config", None)
-        if not isinstance(connector_config, dict):
-            return None
-        extra = connector_config.get("extra")
-        if not isinstance(extra, dict):
-            return None
-        if isinstance(extra.get("outgoing"), dict):
-            extra = extra["outgoing"]
-        elif extra.get("role") != "sender":
-            return None
-        base_port = extra.get("zmq_port", 50051)
+        extra = connector_config.get("extra") if isinstance(connector_config, dict) else None
+        outgoing = extra.get("outgoing") if isinstance(extra, dict) else None
+
+        # An intermediate stage's outgoing listener is independent of its
+        # incoming KV endpoint. Never advertise the upstream sender here.
+        sender_info = getattr(self, "_kv_sender_info", None)
+        if not isinstance(outgoing, dict) and isinstance(sender_info, dict):
+            sender_host = sender_info.get("host")
+            sender_port = sender_info.get("zmq_port")
+            if sender_host is not None and sender_port is not None:
+                return {
+                    "host": str(sender_host),
+                    "zmq_port": int(sender_port) - KV_TRANSFER_PORT_OFFSET,
+                }
+
+        kv_connector_config = self._get_kv_connector_config()
+        if isinstance(outgoing, dict):
+            extra = outgoing
+            base_port = extra.get("zmq_port", 50051)
+        else:
+            if not isinstance(extra, dict) or extra.get("role") != "sender":
+                extra = kv_connector_config
+            if not isinstance(extra, dict) or extra.get("role") != "sender":
+                return None
+            base_port = extra.get("zmq_port", 50051)
+            kv_port = kv_connector_config.get("zmq_port") if isinstance(kv_connector_config, dict) else None
+            if kv_port is not None:
+                base_port = int(os.path.expandvars(str(kv_port))) - KV_TRANSFER_PORT_OFFSET
         if base_port is None:
             return None
         sender_host = self._resolve_sender_host_from_config(extra)

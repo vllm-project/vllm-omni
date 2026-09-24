@@ -117,9 +117,7 @@ def _render_tool_response(output: str) -> str:
 
 def _require_native_full_duplex(config: object) -> None:
     extra_body = getattr(config, "extra_body", None)
-    enabled = isinstance(extra_body, dict) and (
-        extra_body.get("auto_response") is True or extra_body.get("full_duplex") is True
-    )
+    enabled = isinstance(extra_body, dict) and extra_body.get("auto_response") is True
     if not enabled:
         raise ServingRuntimeConfigError(
             "Nemotron VoiceChat currently supports model-native full-duplex streaming only; "

@@ -13,7 +13,7 @@ from __future__ import annotations
 import copy
 import gc
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Any, cast
 
@@ -66,6 +66,7 @@ from vllm_omni.diffusion.sched.interface import (
 )
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.stage_payload import DiffusionStagePayloadMixin
 from vllm_omni.diffusion.worker.utils import (
     BatchRunnerOutput,
     RunnerOutput,
@@ -78,7 +79,6 @@ from vllm_omni.diffusion.worker.utils import (
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
-from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniInteractionPrompt
@@ -97,9 +97,10 @@ def _dit_any_rank_failed(local_failed: bool) -> bool:
     if not torch.distributed.is_initialized():
         return local_failed
     try:
-        from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
+        from vllm_omni.diffusion.distributed import parallel_state
 
-        group = get_dit_group()
+        get_dit_group = getattr(parallel_state, "get_dit_group", None)
+        group = get_dit_group() if get_dit_group is not None else None
     except (AssertionError, ImportError):
         group = None
     if group is None:
@@ -148,7 +149,7 @@ def _normalize_pipeline_outputs(
     return outputs
 
 
-class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
+class DiffusionModelRunner(DiffusionStagePayloadMixin):
     """
     Model runner that handles model loading and execution for diffusion models.
 
@@ -194,11 +195,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.state_cache: dict[str, StepRequestState] = {}
 
         # Initialize KV cache manager for connector management.
+        payload_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
         self.kv_transfer_manager = (
-            OmniKVTransferManager.from_od_config(od_config)
-            if getattr(od_config, "kv_transfer_config", None) is None
-            else None
+            payload_transfer_manager if getattr(od_config, "kv_transfer_config", None) is None else None
         )
+        self.init_omni_connectors(od_config, payload_transfer_manager, synchronous=True)
         self._kv_connector = None
         from vllm_omni.diffusion.diffusion_kv.kv_connector import KVReceiveProgress, native_prefetch_enabled
 
@@ -489,6 +490,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput):
         from vllm_omni.diffusion.diffusion_kv.kv_connector import wait_for_kv_load
 
+        assert self.od_config.kv_transfer_config is not None
         timeout = self.od_config.kv_transfer_config.kv_connector_extra_config.get("transfer_timeout", 60.0)
         if self._kv_receive_progress is not None:
             return self._kv_receive_progress.prepare(self._kv_connector, scheduler_output, timeout)
@@ -505,7 +507,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     ) -> int:
         return self.diffusion_kv_backend.get_diffusion_kv_row(request_id, sequence_id, context_id)
 
-    def remove_diffusion_kv_requests(self, request_ids: list[str | tuple[str, int]]) -> int:
+    def remove_diffusion_kv_requests(self, request_ids: Sequence[str | tuple[str, int]]) -> int:
         return self.diffusion_kv_backend.remove_diffusion_kv_requests(request_ids)
 
     def refresh_diffusion_kv_block_table_layout(self) -> None:
@@ -538,13 +540,19 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         f"request={request_metadata.request_id!r}, sequence={sequence.sequence_id}, "
                         f"active={active_seq_len}, allocated={sequence.seq_len}"
                     )
+                # Imported AR KV and local hits have separate owners.
+                kv_start_pos = (
+                    sequence.num_computed_tokens
+                    if getattr(self.od_config, "kv_transfer_config", None) is not None
+                    else sequence.cached_prefix_len
+                )
                 prefill_rows.append(
                     DiffusionPagedAttentionRow(
                         request_id=request_metadata.request_id,
                         sequence_id=sequence.sequence_id,
-                        query_len=sequence.seq_len - sequence.num_computed_tokens,
+                        kv_start_pos=kv_start_pos,
+                        query_len=sequence.seq_len - kv_start_pos,
                         seq_len=sequence.seq_len,
-                        kv_start_pos=sequence.num_computed_tokens,
                     )
                 )
                 denoise_rows.append(
@@ -629,6 +637,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         kv_prefetch_job: KVPrefetchJob | None = None,
         use_prefetch: bool = False,
     ) -> None:
+        # Fetch upstream conditioning before anything else: the pipeline reads
+        # it out of the prompt during the forward below.
+        self._maybe_recv_stage_payload(req)
+
         if self.kv_transfer_manager is None:
             self._initialize_generator(req.sampling_params)
             return
@@ -796,17 +808,48 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         "Diffusion KV metadata count must match the request batch: "
                         f"metadata={len(diffusion_kv_metadata)}, requests={len(reqs)}"
                     )
-                for req, metadata in zip(reqs, diffusion_kv_metadata, strict=True):
-                    req.kv_computed_tokens = tuple(seq.num_computed_tokens for seq in metadata.sequences)
+                native_kv_transfer = getattr(self.od_config, "kv_transfer_config", None) is not None
+                if native_kv_transfer:
+                    for req, metadata in zip(reqs, diffusion_kv_metadata, strict=True):
+                        # This field is consumed by Hunyuan only for native
+                        # AR->DiT transfer. Local prefix hits must still run
+                        # their VAE/ViT conditioning path.
+                        req.kv_computed_tokens = tuple(seq.num_computed_tokens for seq in metadata.sequences)
                 paged_metadata = self._build_paged_attention_metadata(diffusion_kv_metadata)
+                paged_kv_cached_prefix_len = 0
+                if not native_kv_transfer:
+                    cached_prefix_lens = {row.kv_start_pos for row in paged_metadata.prefill_rows}
+                    if len(cached_prefix_lens) != 1:
+                        raise ValueError(
+                            "One paged request-level forward requires a uniform cached prefix boundary; "
+                            f"got {sorted(cached_prefix_lens)}"
+                        )
+                    paged_kv_cached_prefix_len = next(iter(cached_prefix_lens))
                 paged_kv_runtime, paged_kv_context = self.diffusion_kv_backend.activate_paged_attention_metadata(
                     paged_metadata
                 )
+                if is_primary:
+                    # Trace the boundary actually passed to the model, not a
+                    # speculative lookup. Useful for warm-cache regressions.
+                    for request_metadata in diffusion_kv_metadata:
+                        for sequence in request_metadata.sequences:
+                            logger.debug(
+                                "Diffusion prefix prefill: request_id=%s sequence_id=%d "
+                                "cached_prefix_len=%d prefix_len=%d query_len=%d",
+                                request_metadata.request_id,
+                                sequence.sequence_id,
+                                sequence.cached_prefix_len,
+                                sequence.prefix_len,
+                                sequence.seq_len - sequence.cached_prefix_len,
+                            )
+            else:
+                paged_kv_cached_prefix_len = 0
             with (
                 set_forward_context(
                     vllm_config=self.vllm_config,
                     omni_diffusion_config=od_config,
                     paged_kv_runtime=paged_kv_runtime,
+                    paged_kv_cached_prefix_len=paged_kv_cached_prefix_len,
                     in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
                 ),
                 paged_kv_context,
@@ -842,6 +885,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 and (runner_cache_dit_enabled or is_request_scoped_cache_dit_enabled(self.pipeline))
             ):
                 cache_summary(self.pipeline, details=True)
+
+        self._maybe_send_stage_payload(reqs, outputs)
 
         return self._runner_output_from_outputs(reqs, outputs)
 
@@ -1039,14 +1084,19 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 new_request_ids.append(request_id)
                 if request_id in self.state_cache:
                     raise ValueError(f"Received duplicate new-request payload for cached request {request_id}.")
+                self._maybe_recv_stage_payload(sched_new_req.req)
                 new_state = StepRequestState(
                     request_id=request_id,
                     sampling=copy.deepcopy(sched_new_req.req.sampling_params),
                     prompt=sched_new_req.req.prompt,
                     kv_sender_info=sched_new_req.req.kv_sender_info,
                     prepared_layout=getattr(sched_new_req.req, "prepared_layout", None),
+                    external_req_id=getattr(sched_new_req.req, "external_req_id", None),
                 )
-                if sched_new_req.diffusion_kv_metadata is not None:
+                if (
+                    sched_new_req.diffusion_kv_metadata is not None
+                    and getattr(self.od_config, "kv_transfer_config", None) is not None
+                ):
                     new_state.extra["kv_computed_tokens"] = tuple(
                         seq.num_computed_tokens for seq in sched_new_req.diffusion_kv_metadata.sequences
                     )
@@ -1387,6 +1437,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                                 if self.od_config.streaming_output
                                 else req.denoise_completed
                             )
+                            if finished and result is not None:
+                                self._maybe_send_stage_payload([req], [result])
                             runner_output_list.append(
                                 RunnerOutput(
                                     request_id=req.request_id,

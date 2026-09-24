@@ -22,6 +22,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _DummyLoRALayer:
+    base_layer: torch.nn.Module
+
     def __init__(self, n_slices: int, output_slices: tuple[int, ...], tp_size: int = 1):
         self.n_slices = n_slices
         self.output_slices = output_slices
@@ -550,6 +552,146 @@ def test_lora_manager_warns_when_all_adapters_pinned(monkeypatch):
     assert set(manager.list_adapters()) == {1, 2}
 
 
+def _make_hunyuan_image3_pipeline(num_heads=4, num_kv_heads=2, head_dim=2, hidden_size=8):
+    """Use production hooks and the production base-weight splitter without
+    allocating the full checkpoint or initializing distributed workers.
+    """
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import HunyuanImage3Model
+    from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import HunyuanImage3Pipeline
+
+    model = HunyuanImage3Model.__new__(HunyuanImage3Model)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
+        attention_head_dim=head_dim,
+        hidden_size=hidden_size,
+    )
+    pipeline = HunyuanImage3Pipeline.__new__(HunyuanImage3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.model = model
+    pipeline.transformer = model
+    return pipeline
+
+
+def _make_hunyuan_image3_qkv_base():
+    """An un-initialized QKVParallelLinear instance for isinstance() checks.
+
+    Supply the type and checkpoint head metadata for binding-only tests.
+    The PEFT forward test below constructs the real distributed projection.
+    """
+    from vllm.model_executor.layers.linear import QKVParallelLinear
+
+    layer = object.__new__(QKVParallelLinear)
+    layer.total_num_heads = 4
+    layer.total_num_kv_heads = 2
+    layer.head_size = layer.v_head_size = 2
+    return layer
+
+
+def test_lora_manager_activates_hunyuan_image3_fused_qkv_lora():
+    """A fused HI3 ``qkv_proj`` LoRA-B (GQA-interleaved in the adapter) is
+    de-interleaved to the block [Q; K; V] layout the QKV output slices expect,
+    with the namespace alias resolving the PEFT adapter tensors."""
+    manager = DiffusionLoRAManager(
+        pipeline=_make_hunyuan_image3_pipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+
+    wrapper = "transformer.layers.0.self_attn.qkv_proj"
+    packed_layer = _DummyLoRALayer(
+        n_slices=3,
+        output_slices=(8, 4, 4),
+        tp_size=1,
+    )
+    # Use QKV type identity and checkpoint head metadata for the manager's
+    # de-interleave branch; the forward test below constructs real layers.
+    packed_layer.base_layer = _make_hunyuan_image3_qkv_base()
+    manager._lora_modules = {wrapper: packed_layer}
+
+    rank = 3
+    # GQA-interleaved fused QKV rows: [Q-group0, K0, V0, Q-group1, K1, V1].
+    interleaved = torch.arange(16, dtype=torch.bfloat16).unsqueeze(1).repeat(1, rank)
+    lora = LoRALayerWeights(
+        module_name="model.layers.0.self_attn.qkv_proj",
+        rank=rank,
+        lora_alpha=rank,
+        lora_a=torch.ones((rank, 8)),
+        lora_b=interleaved,
+    )
+    manager._registered_adapters = {
+        11: type(
+            "LM",
+            (),
+            {
+                "id": 11,
+                "loras": {"model.layers.0.self_attn.qkv_proj": lora},
+                "get_lora": lambda self, k: self.loras.get(k),
+            },
+        )()
+    }
+
+    manager._activate_adapter(11, 0.5)
+
+    assert packed_layer.reset_calls == 0
+    assert len(packed_layer.set_calls) == 1
+    lora_a_list, lora_b_list = packed_layer.set_calls[0]
+    assert len(lora_a_list) == 3 and len(lora_b_list) == 3
+    # De-interleaved full [Q; K; V] slices, scaled by the lora scale.
+    expected_q = torch.cat([interleaved[0:4], interleaved[8:12]], dim=0) * 0.5
+    expected_k = torch.cat([interleaved[4:6], interleaved[12:14]], dim=0) * 0.5
+    expected_v = torch.cat([interleaved[6:8], interleaved[14:16]], dim=0) * 0.5
+    assert torch.equal(lora_b_list[0], expected_q)
+    assert torch.equal(lora_b_list[1], expected_k)
+    assert torch.equal(lora_b_list[2], expected_v)
+
+
+def test_lora_manager_rejects_hunyuan_image3_qkv_lora_with_unexpected_rows():
+    """If the fused HI3 QKV layout cannot be established (wrong row count), the
+    manager must fail closed instead of applying the LoRA to wrong slices."""
+    manager = DiffusionLoRAManager(
+        pipeline=_make_hunyuan_image3_pipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+
+    wrapper = "transformer.layers.0.self_attn.qkv_proj"
+    packed_layer = _DummyLoRALayer(n_slices=3, output_slices=(8, 4, 4))
+    packed_layer.base_layer = _make_hunyuan_image3_qkv_base()
+    manager._lora_modules = {wrapper: packed_layer}
+
+    rank = 3
+    # Row count (12) does not match the HI3 QKV layout (16): fail closed.
+    lora = LoRALayerWeights(
+        module_name="model.layers.0.self_attn.qkv_proj",
+        rank=rank,
+        lora_alpha=rank,
+        lora_a=torch.ones((rank, 8)),
+        lora_b=torch.arange(12 * rank, dtype=torch.bfloat16).view(-1, rank),
+    )
+    manager._registered_adapters = {
+        12: type(
+            "LM",
+            (),
+            {
+                "id": 12,
+                "loras": {"model.layers.0.self_attn.qkv_proj": lora},
+                "get_lora": lambda self, k: self.loras.get(k),
+            },
+        )()
+    }
+
+    with pytest.raises(ValueError, match="applies to no layer"):
+        manager._activate_adapter(12, 0.5)
+
+    assert packed_layer.set_calls == []
+    assert packed_layer.reset_calls >= 1
+    assert manager._active_adapter_id is None
+
+
 def test_lora_manager_applies_multiple_scales_correctly(monkeypatch):
     """Ensure that the LoRA manager applies scales correctly when the
     active adapter receives a different scale, i.e., the rank is unchanged.
@@ -894,3 +1036,96 @@ def test_removing_suspended_adapter_drops_the_upload(monkeypatch):
     assert manager._suspended_adapter_id is None
     assert layer.reset_calls == 1, "the upload must be torn down"
     assert layer.suspended_slices is None
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_hunyuan_image3_peft_qkv_forward(tmp_path, monkeypatch, tp_size):
+    """Disk PEFT -> real manager/hooks -> vLLM sharding -> numerical forward.
+
+    TP4 also covers replicated KV heads. Only distributed rank discovery is
+    stubbed: projection construction, adapter loading and all LoRA operations
+    execute production code. The oracle indexes checkpoint rows explicitly.
+    """
+    import json
+
+    from safetensors.torch import save_file
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    rank = 2
+    a = torch.arange(16, dtype=torch.float32).reshape(rank, 8) / 16
+    b = torch.arange(32, dtype=torch.float32).reshape(16, rank) / 32
+    prefix = "base_model.model.model.layers.0.self_attn.qkv_proj"
+    save_file(
+        {f"{prefix}.lora_A.weight": a, f"{prefix}.lora_B.weight": b},
+        str(adapter_dir / "adapter_model.safetensors"),
+    )
+    (adapter_dir / "adapter_config.json").write_text(
+        json.dumps({"r": rank, "lora_alpha": rank, "target_modules": ["qkv_proj"]})
+    )
+    request = LoRARequest(lora_name="hi3", lora_int_id=6411, lora_path=str(adapter_dir))
+    x = torch.arange(24, dtype=torch.float32).reshape(3, 8) / 24
+    q_rows = [0, 1, 2, 3, 8, 9, 10, 11]
+    k_rows = [4, 5, 12, 13]
+    v_rows = [6, 7, 14, 15]
+    for tp_rank in range(tp_size):
+        monkeypatch.setattr(linear, "get_tensor_model_parallel_world_size", lambda: tp_size)
+        monkeypatch.setattr(linear, "get_tensor_model_parallel_rank", lambda: tp_rank)
+        monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: tp_rank)
+        monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: tp_size)
+        with set_current_vllm_config(VllmConfig()):
+            pipeline = _make_hunyuan_image3_pipeline()
+            base = linear.QKVParallelLinear(8, 2, 4, 2, bias=False, params_dtype=torch.float32)
+            base.weight.data.zero_()
+            block = torch.nn.Module()
+            block.self_attn = torch.nn.Module()
+            block.self_attn.qkv_proj = base
+            pipeline.model.layers = torch.nn.ModuleList([block])
+            manager = DiffusionLoRAManager(pipeline, torch.device("cpu"), torch.float32)
+            manager.set_active_adapter(request, lora_scale=0.5)
+            wrapped = pipeline.model.layers[0].self_attn.qkv_proj
+            assert wrapped is not base
+            q_size = 8 // tp_size
+            kv_size = 4 // min(tp_size, 2)
+            kv_rank = tp_rank // max(tp_size // 2, 1)
+            rows = (
+                q_rows[tp_rank * q_size : (tp_rank + 1) * q_size]
+                + k_rows[kv_rank * kv_size : (kv_rank + 1) * kv_size]
+                + v_rows[kv_rank * kv_size : (kv_rank + 1) * kv_size]
+            )
+            expected = (x @ a.T) @ b[rows].T * 0.5
+            with torch.inference_mode():
+                torch.testing.assert_close(wrapped.apply(x), expected)
+                manager.set_active_adapter(None)
+                torch.testing.assert_close(wrapped.apply(x), torch.zeros_like(expected))
+                manager.set_active_adapter(request, lora_scale=0.5)
+                torch.testing.assert_close(wrapped.apply(x), expected)
+
+
+@pytest.mark.parametrize("projection", ["qkv_proj", "o_proj"])
+def test_hunyuan_image3_lora_namespace_is_model_scoped(projection):
+    from vllm.lora.lora_model import LoRAModel
+
+    name = f"model.layers.0.self_attn.{projection}"
+    weights = LoRALayerWeights(name, 2, 2, torch.ones(2, 8), torch.ones(8, 2))
+    adapter = LoRAModel(6411, 2, {name: weights})
+    wrapper = f"transformer.layers.0.self_attn.{projection}"
+    hi3 = DiffusionLoRAManager(_make_hunyuan_image3_pipeline(), torch.device("cpu"), torch.float32)
+    other = DiffusionLoRAManager(_DummyPipeline(), torch.device("cpu"), torch.float32)
+    assert hi3._get_lora_weights(adapter, wrapper) is weights
+    assert other._get_lora_weights(adapter, wrapper) is None
+
+
+@pytest.mark.parametrize("head_dim_key", ["head_dim", "attention_head_dim", None])
+def test_hunyuan_image3_real_qkv_hook_head_dimension(head_dim_key):
+    pipeline = _make_hunyuan_image3_pipeline()
+    del pipeline.model.config.attention_head_dim
+    if head_dim_key is not None:
+        setattr(pipeline.model.config, head_dim_key, 2)
+    b = torch.arange(32, dtype=torch.float32).reshape(16, 2)
+    expected_rows = [0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15]
+    torch.testing.assert_close(pipeline._deinterleave_fused_qkv_lora_b(b), b[expected_rows])
+    assert pipeline._deinterleave_fused_qkv_lora_b(b[:-1]) is None

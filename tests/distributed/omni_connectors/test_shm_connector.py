@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for SharedMemoryConnector focusing on TP / CFG / metadata fallback."""
 
+import fcntl
 import os
+import time
 
 import pytest
 import torch
@@ -25,6 +27,15 @@ def connector():
 
 
 class TestKeyBasedReadWrite:
+    def test_deadline_receive_does_not_wait_for_writer_lock(self, connector):
+        key = "deadline_locked_payload"
+        connector.put("0", "1", key, {"value": 7})
+        with open(f"/dev/shm/shm_{key}_lockfile.lock", "rb+") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            assert connector.get_with_deadline("0", "1", key, deadline=time.monotonic() + 1) is None
+        assert connector.get_with_deadline("0", "1", key, deadline=time.monotonic() - 1) is None
+        assert connector.get_with_deadline("0", "1", key, deadline=time.monotonic() + 1)[0] == {"value": 7}
+
     def test_put_then_get_by_key(self, connector):
         data = {"hello": "world", "n": 42}
         ok, size, meta = connector.put("s0", "s1", "test_key_1", data)

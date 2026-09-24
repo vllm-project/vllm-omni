@@ -826,6 +826,7 @@ class _DiffusionConfigProjection:
     video_output_transport: object = field(default_factory=dict)
     enable_cache_dit_summary: bool = False
     diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
+    enable_prefix_caching: bool = False
     diffusion_kv_max_rows_per_request: int | None = Field(default=None, ge=1, strict=True)
     enable_prompt_embed_cache: bool = False
     prompt_embed_cache_size: int = Field(default=32, ge=1)
@@ -889,6 +890,9 @@ class _DiffusionConfigProjection:
     custom_pipeline_args: dict[str, Any] | None = None
     additional_config: dict[str, Any] = field(default_factory=dict)
     kv_transfer_config: KVTransferConfig | None = None
+    # Full stage-payload transport, independent of native paged KV transfer.
+    stage_input_payload_keys: tuple[str, ...] = ()
+    stage_output_payload_keys: tuple[str, ...] = ()
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
     quantization_config: _QuantizationConfigType = None
@@ -1002,6 +1006,11 @@ class _DiffusionConfigProjection:
             )
 
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
+        if self.enable_prefix_caching and self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+            raise ValueError(
+                "enable_prefix_caching=True requires diffusion_kv_mode='paged_scheduler'; "
+                "set diffusion_kv_mode='paged_scheduler' or disable enable_prefix_caching"
+            )
         if (
             self.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
             and self.diffusion_kv_max_rows_per_request is None
@@ -1110,6 +1119,7 @@ _DIFFUSION_SHARED_CONFIG_FIELDS = frozenset(
         "dist_timeout",
         "model_config",
         "quantization_config",
+        "enable_prefix_caching",
     }
 )
 _DIFFUSION_RUNTIME_CONFIG_FIELDS = frozenset(
@@ -1917,6 +1927,7 @@ def _build_diffusion_stage_config(
         engine.diffusion,
         model=common_kwargs["model_config"].model,
         quantization_config=common_kwargs["quantization_config"],
+        enable_prefix_caching=bool(common_kwargs["cache_config"].enable_prefix_caching),
     )
     return cast(
         VllmOmniDiffusionStageConfig,
@@ -2178,8 +2189,15 @@ def _build_diffusion_config_projection(
     *,
     model: str | None,
     quantization_config: _QuantizationConfigType,
+    enable_prefix_caching: bool,
 ) -> _DiffusionConfigProjection:
     diffusion_kwargs = engine.to_kwargs()
+    # Mirror the resolved cache setting, including deploy/CLI precedence.
+    diffusion_kwargs["enable_prefix_caching"] = enable_prefix_caching
+    # Match the legacy builder: topology supplies defaults, while explicit
+    # deploy/CLI values (including empty tuples) retain precedence.
+    diffusion_kwargs.setdefault("stage_input_payload_keys", tuple(topology.stage_input_payload_keys))
+    diffusion_kwargs.setdefault("stage_output_payload_keys", tuple(topology.stage_output_payload_keys))
     diffusion_kwargs["stage_id"] = topology.stage_id
     diffusion_kwargs["model_arch"] = _first_defined(
         diffusion_kwargs.get("model_arch"),

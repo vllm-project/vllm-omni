@@ -19,6 +19,8 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 if TYPE_CHECKING:
     import torch
 
+    from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import DiffusionPagedAttentionRuntime
+
 
 @dataclass
 class ForwardContext:
@@ -32,7 +34,10 @@ class ForwardContext:
     # Runner-owned paged execution metadata/runtime. Attention resolves the
     # active Worker adapter from it; model code must not construct BlockTable
     # rows or activate the runtime directly.
-    paged_kv_runtime: object | None = None
+    paged_kv_runtime: DiffusionPagedAttentionRuntime | None = None
+    # Block-aligned prefix already resident in Scheduler-owned pages for the
+    # active request-level prefill. Zero keeps the cold/full-prefill path.
+    paged_kv_cached_prefix_len: int = 0
     # Active Worker-side paged KV adapter.  The adapter is installed only for
     # the duration of a paged forward; dense forwards leave this as ``None``.
     # Keep the field opaque here to avoid coupling the common context module to
@@ -48,6 +53,8 @@ class ForwardContext:
     total_denoise_steps: int | None = None
     # Per-request reference latent for img2img DiT models (e.g. Ming)
     ref_latent: torch.Tensor | None = None
+    # Per-request projected direct-VLM condition (e.g., Ming-Image). For now for bsz 1.
+    direct_condition: torch.Tensor | None = None
     # whether to split the text embed in sequence parallel, if True, the text embed will be split in sequence parallel
 
     # Sequence Parallel padding support
@@ -175,7 +182,8 @@ def create_forward_context(
     vllm_config: VllmConfig | None = None,
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
-    paged_kv_runtime: object | None = None,
+    paged_kv_runtime: DiffusionPagedAttentionRuntime | None = None,
+    paged_kv_cached_prefix_len: int = 0,
     in_diffusion_kv_memory_profile: bool = False,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
@@ -185,6 +193,7 @@ def create_forward_context(
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
         paged_kv_runtime=paged_kv_runtime,
+        paged_kv_cached_prefix_len=paged_kv_cached_prefix_len,
         in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
@@ -211,7 +220,8 @@ def set_forward_context(
     vllm_config: VllmConfig | None = None,
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
-    paged_kv_runtime: object | None = None,
+    paged_kv_runtime: DiffusionPagedAttentionRuntime | None = None,
+    paged_kv_cached_prefix_len: int = 0,
     in_diffusion_kv_memory_profile: bool = False,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
@@ -225,6 +235,7 @@ def set_forward_context(
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
         paged_kv_runtime=paged_kv_runtime,
+        paged_kv_cached_prefix_len=paged_kv_cached_prefix_len,
         in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
@@ -377,3 +388,9 @@ def set_forward_context_ref_latent(ref_latent: torch.Tensor | None) -> None:
     """
     if _forward_context is not None:
         _forward_context.ref_latent = ref_latent
+
+
+def set_forward_context_direct_condition(direct_condition: torch.Tensor | None) -> None:
+    """Set the projected direct-VLM condition on the active context."""
+    if _forward_context is not None:
+        _forward_context.direct_condition = direct_condition

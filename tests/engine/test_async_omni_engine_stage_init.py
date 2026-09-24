@@ -6,6 +6,7 @@ import contextlib
 import importlib
 import json
 import os
+import threading
 import time
 import types
 from dataclasses import dataclass, field
@@ -429,6 +430,9 @@ def test_initialize_local_diffusion_replica_scopes_runtime_env(monkeypatch):
     def _capture_launch_diffusion_stage_replica(**_kwargs):
         captured["runtime_env"] = os.environ.get(runtime_env_var)
         captured["device_env"] = os.environ.get(device_env_var)
+        captured["visible_devices"] = _kwargs["stage_visible_devices"]
+        assert _kwargs["spawn_device_lock"] is runtime._spawn_device_lock
+        assert not runtime._spawn_device_lock.locked()
         raise RuntimeError("stop after capturing launch environment")
 
     monkeypatch.setattr(
@@ -442,7 +446,8 @@ def test_initialize_local_diffusion_replica_scopes_runtime_env(monkeypatch):
 
     assert captured == {
         "runtime_env": "stage-value",
-        "device_env": "0",
+        "device_env": "0,1",
+        "visible_devices": "0",
     }
     assert runtime_env_var not in os.environ
     assert os.environ[device_env_var] == "0,1"
@@ -634,14 +639,28 @@ def test_initialize_diffusion_stage_preserves_configured_max_num_seqs(monkeypatc
     }
 
 
-def test_launch_diffusion_stage_replica_preserves_configured_max_num_seqs(monkeypatch):
+@pytest.mark.parametrize("spawn_failure", [False, True])
+def test_launch_diffusion_stage_replica_preserves_configured_max_num_seqs(monkeypatch, spawn_failure):
     import vllm_omni.diffusion.stage_diffusion_client as client_mod
     import vllm_omni.diffusion.stage_diffusion_proc as proc_mod
     import vllm_omni.engine.stage_engine_startup as startup_mod
+    from vllm_omni.platforms import current_omni_platform
+
+    spawn_lock = threading.Lock()
+    device_env = current_omni_platform.device_control_env_var
+    monkeypatch.setenv(device_env, "0,1")
+    released = []
+    monkeypatch.setattr(startup_mod, "release_device_locks", lambda fds: released.extend(fds))
+
+    def acquire(*args, **kwargs):
+        assert not spawn_lock.locked()
+        assert os.environ[device_env] == "0,1"
+        assert kwargs["visible_devices"] == "1"
+        return [42]
 
     od_config = types.SimpleNamespace(max_num_seqs=4, parallel_config=types.SimpleNamespace(world_size=1))
     monkeypatch.setattr(startup_mod, "build_diffusion_config", lambda *args: od_config)
-    monkeypatch.setattr(startup_mod, "acquire_device_locks", lambda *args: [])
+    monkeypatch.setattr(startup_mod, "acquire_device_locks", acquire)
     monkeypatch.setattr(
         startup_mod,
         "register_stage_with_omni_master",
@@ -663,7 +682,15 @@ def test_launch_diffusion_stage_replica_preserves_configured_max_num_seqs(monkey
             outputs=["tcp://127.0.0.1:26003"],
         )
     )
-    monkeypatch.setattr(proc_mod, "StageDiffusionProcManager", lambda **kwargs: proc_manager)
+
+    def spawn(**kwargs):
+        assert spawn_lock.locked()
+        assert os.environ[device_env] == "1"
+        if spawn_failure:
+            raise RuntimeError("spawn failed")
+        return proc_manager
+
+    monkeypatch.setattr(proc_mod, "StageDiffusionProcManager", spawn)
     sentinel_client = object()
     monkeypatch.setattr(
         client_mod.StageDiffusionClient,
@@ -671,15 +698,26 @@ def test_launch_diffusion_stage_replica_preserves_configured_max_num_seqs(monkey
         lambda metadata, **kwargs: sentinel_client,
     )
 
-    result, resources = startup_mod.launch_diffusion_stage_replica(
-        model="dummy-model",
-        stage_config=types.SimpleNamespace(),
-        metadata=types.SimpleNamespace(stage_id=0),
-        stage_init_timeout=12,
-        use_inline=False,
-        omni_master_server=omni_master_server,
-    )
+    expectation = pytest.raises(RuntimeError, match="spawn failed") if spawn_failure else contextlib.nullcontext()
+    with expectation:
+        result, resources = startup_mod.launch_diffusion_stage_replica(
+            model="dummy-model",
+            stage_config=types.SimpleNamespace(),
+            metadata=types.SimpleNamespace(stage_id=0),
+            stage_init_timeout=12,
+            use_inline=False,
+            omni_master_server=omni_master_server,
+            stage_visible_devices="1",
+            spawn_device_lock=spawn_lock,
+        )
 
+    assert not spawn_lock.locked()
+    assert os.environ[device_env] == "0,1"
+    if spawn_failure:
+        assert released == [42]
+        return
+    assert resources.lock_fds == [42]
+    assert released == []
     assert result is sentinel_client
     assert od_config.max_num_seqs == 4
     assert resources.manager is proc_manager
@@ -717,7 +755,7 @@ def test_launch_diffusion_stage_replica_preserves_step_execution_max_num_seqs(mo
         parallel_config=types.SimpleNamespace(world_size=1),
     )
     monkeypatch.setattr(startup_mod, "build_diffusion_config", lambda *args: od_config)
-    monkeypatch.setattr(startup_mod, "acquire_device_locks", lambda *args: [])
+    monkeypatch.setattr(startup_mod, "acquire_device_locks", lambda *args, **kwargs: [])
     monkeypatch.setattr(
         startup_mod,
         "register_stage_with_omni_master",
@@ -930,7 +968,7 @@ def test_stage_runtime_launches_shared_engines_with_per_client_addresses(monkeyp
 
     monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: stage_plans)
     monkeypatch.setattr(runtime, "_resolve_replica_physical_devices", lambda stage_id, _cfg: str(stage_id))
-    monkeypatch.setattr(runtime_mod, "acquire_device_locks", lambda *_args: [])
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", lambda *_args, **_kwargs: [])
 
     events: list[tuple[str, int]] = []
     captured_launch_kwargs: list[dict[str, object]] = []
@@ -1067,7 +1105,7 @@ def test_stage_runtime_multi_api_maps_stage_devices_from_launcher_visibility(mon
     device_env = runtime_mod.current_omni_platform.device_control_env_var
     monkeypatch.setenv(device_env, "5")
     monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: [stage_plan])
-    monkeypatch.setattr(runtime_mod, "acquire_device_locks", lambda *_args: [])
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", lambda *_args, **_kwargs: [])
     captured_devices: list[str | None] = []
 
     @contextlib.contextmanager
@@ -1112,7 +1150,7 @@ def test_stage_runtime_multi_api_failure_shuts_down_before_exceptional_context_e
     stage_plan.replicas[0].engine_args_dict = {}
     monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: [stage_plan])
     monkeypatch.setattr(runtime, "_resolve_replica_physical_devices", lambda *_args: None)
-    monkeypatch.setattr(runtime_mod, "acquire_device_locks", lambda *_args: [])
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", lambda *_args, **_kwargs: [])
 
     events: list[str] = []
 
@@ -1406,7 +1444,7 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
     prev_device_env = os.environ.get(device_env_var)
     os.environ[device_env_var] = "0"
 
-    def _capture_acquire_device_locks(*_args):
+    def _capture_acquire_device_locks(*_args, **_kwargs):
         nonlocal captured_timeout
         captured_timeout = _args[2]
         return []
@@ -2245,7 +2283,9 @@ def test_single_api_common_launch_ownership_and_rollback(monkeypatch, parallel, 
     addresses = EngineZmqAddresses(inputs=["ipc://input"], outputs=["ipc://output"])
     monkeypatch.setattr(runtime, "_resolve_replica_physical_devices", lambda *_: "0")
 
-    def acquire(*_):
+    def acquire(*_, **kwargs):
+        assert kwargs["visible_devices"] == "0"
+        assert not runtime._spawn_device_lock.locked()
         events.append("lock")
         return [42]
 
@@ -2400,7 +2440,6 @@ def test_typed_diffusion_replicas_share_one_config_between_planning_and_launch(m
     )
     mocker.patch.object(runtime_module, "get_stage_connector_spec", return_value={})
     mocker.patch.object(runtime_module, "resolve_omni_kv_config_for_stage", return_value=(None, None, None))
-    mocker.patch.object(runtime, "_stage_device_scope", side_effect=lambda *_: contextlib.nullcontext())
     client = mocker.Mock()
     launch = mocker.patch.object(runtime_module, "launch_diffusion_stage_replica", return_value=(client, None))
 
@@ -2529,3 +2568,113 @@ def test_native_kv_topology_rejects_silent_legacy_fallback(roles, sources, async
     else:
         with pytest.raises(ValueError, match="two-stage"):
             runtime._validate_native_kv_topology(plans)
+
+
+@pytest.mark.parametrize("explicit", [None, "1"])
+def test_acquire_device_locks_visible_devices_precedence(monkeypatch, tmp_path, explicit):
+    import vllm_omni.engine.stage_init_utils as init_mod
+    from vllm_omni.platforms import current_omni_platform
+
+    env_var = current_omni_platform.device_control_env_var
+    monkeypatch.setenv(env_var, "0")
+    monkeypatch.setattr(init_mod, "device_init_lock_path", lambda device: str(tmp_path / f"gpu-{device}"))
+    locked: set[int] = set()
+    fds = init_mod.acquire_device_locks(0, {}, 1, locked, visible_devices=explicit)
+    try:
+        assert len(fds) == 1
+        assert locked == {int(explicit or "0")}
+        assert os.environ[env_var] == "0"
+    finally:
+        init_mod.release_device_locks(fds)
+
+
+def test_llm_device_lock_wait_allows_holder_to_spawn(monkeypatch, tmp_path):
+    """A peer holding the GPU flock must be able to spawn to finish init."""
+    import vllm_omni.engine.stage_init_utils as init_mod
+    import vllm_omni.engine.stage_runtime as runtime_mod
+    from vllm_omni.platforms import current_omni_platform
+
+    runtime = _make_stage_runtime()
+    plan = _make_llm_plan(0, stage_id=0, vllm_config=_FakeVllmConfig()).replicas[0]
+    plan.engine_args_dict = {}
+    monkeypatch.setenv(current_omni_platform.device_control_env_var, "0")
+    monkeypatch.setattr(runtime, "_resolve_replica_physical_devices", lambda *_: "0")
+    monkeypatch.setattr(init_mod, "device_init_lock_path", lambda device: str(tmp_path / f"gpu-{device}"))
+    holder_fds = init_mod.acquire_device_locks(1, {}, 1)
+    assert len(holder_fds) == 1
+    waiting = threading.Event()
+    spawned = threading.Event()
+
+    def holder():
+        try:
+            if waiting.wait(5):
+                acquired = runtime._spawn_device_lock.acquire(timeout=2)
+                if acquired:
+                    runtime._spawn_device_lock.release()
+                    spawned.set()
+        finally:
+            init_mod.release_device_locks(holder_fds)
+
+    def acquire(*args, **kwargs):
+        waiting.set()
+        # Ensure the peer has an opportunity to request the spawn lock before
+        # flock acquisition can return (including via its timeout escape).
+        assert spawned.wait(3), "GPU-lock holder blocked by the waiting stage's spawn lock"
+        return init_mod.acquire_device_locks(*args, **kwargs)
+
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", acquire)
+
+    @contextlib.contextmanager
+    def launch(**kwargs):
+        yield StageReplicaResources(addresses=EngineZmqAddresses(inputs=["ipc://in"], outputs=["ipc://out"]))
+
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", launch)
+    monkeypatch.setattr(runtime_mod.StageEngineCoreClientBase, "make_async_mp_client", lambda **_: object())
+    thread = threading.Thread(target=holder, daemon=True)
+    thread.start()
+    try:
+        runtime._initialize_local_llm_replica(plan, 5)
+        assert spawned.is_set()
+    finally:
+        waiting.set()
+        thread.join(6)
+    assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_colocated_diffusion_scopes_devices(monkeypatch, fail):
+    import vllm_omni.engine.stage_engine_startup as startup_mod
+    from vllm_omni.platforms import current_omni_platform
+
+    env_var = current_omni_platform.device_control_env_var
+    monkeypatch.setenv(env_var, "0,1")
+    lock = threading.Lock()
+    client = object()
+    plan = _make_diffusion_plan(0, stage_id=0).replicas[0]
+
+    def initialize(*args, **kwargs):
+        assert lock.locked()
+        assert os.environ[env_var] == "1"
+        if fail:
+            raise RuntimeError("init failed")
+        return client
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("colocated diffusion must not acquire distributed device locks")
+
+    monkeypatch.setattr(startup_mod, "initialize_diffusion_stage", initialize)
+    monkeypatch.setattr(startup_mod, "acquire_device_locks", forbidden)
+    expectation = pytest.raises(RuntimeError, match="init failed") if fail else contextlib.nullcontext()
+    with expectation:
+        result, _ = startup_mod.launch_diffusion_stage_replica(
+            model="dummy",
+            stage_config=plan.stage_cfg,
+            metadata=plan.metadata,
+            stage_init_timeout=1,
+            use_inline=True,
+            stage_visible_devices="1",
+            spawn_device_lock=lock,
+        )
+        assert result is client
+    assert os.environ[env_var] == "0,1"
+    assert not lock.locked()

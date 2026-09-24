@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU tests for the Wan VAE decoder fast path installer and its exact PyTorch fallbacks."""
 
 from __future__ import annotations
 
 import importlib
+from collections.abc import Callable
 from functools import wraps
 from types import SimpleNamespace
 
@@ -13,6 +14,10 @@ import torch
 from diffusers.models.autoencoders import AutoencoderKLWan
 from torch import nn
 
+from tests.diffusion.distributed.wan_vae_fastpath_helpers import (  # noqa: F401
+    original_wan_rms_norm,
+    unpatched_wan_rms_norm,
+)
 from vllm_omni.diffusion import registry as registry_module
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import OmniAutoencoderKLWan
@@ -25,7 +30,12 @@ from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
 )
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import forwards as fastpath_forwards
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+pytestmark = [
+    pytest.mark.core_model,
+    pytest.mark.cpu,
+    pytest.mark.diffusion,
+    pytest.mark.usefixtures("unpatched_wan_rms_norm"),
+]
 
 TINY_RESIDUAL = dict(
     base_dim=8,
@@ -201,7 +211,7 @@ def test_failed_install_restores_original_state(failure_stage: str, monkeypatch)
     with monkeypatch.context() as patch:
         if failure_stage == "binding":
             conv_type = type(vae.post_quant_conv)
-            original_setattr = conv_type.__setattr__
+            original_setattr: Callable[..., None] = conv_type.__setattr__
 
             def fail_binding(module, name, value):
                 original_setattr(module, name, value)
@@ -534,13 +544,30 @@ def test_upsample_forward_only_fuses_nearest_2x() -> None:
             assert torch.equal(actual, expected)
 
 
-def test_rms_norm_vae_substitute_is_not_matched() -> None:
-    from vllm_omni.diffusion.layers.norm import RMSNormVAE
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_rms_norm_vae_substitute_is_not_matched(dtype: torch.dtype, monkeypatch) -> None:
+    from diffusers.models.autoencoders import autoencoder_kl_wan
+
+    from vllm_omni.diffusion.models.wan2_2.norm import RMSNormVAE
 
     assert not fastpath_forwards.is_diffusers_rms_norm(RMSNormVAE(8, images=False))
-    _, vae = _build_pair(TINY_RESIDUAL, torch.float32)
-    norm = vae.decoder.norm_out
-    assert fastpath_forwards.is_diffusers_rms_norm(norm)
+    _, vae = _build_pair(TINY_RESIDUAL, dtype)
+    assert fastpath_forwards.is_diffusers_rms_norm(vae.decoder.norm_out)
+
+    # Production Wan pipelines use this substitute. The installer must leave
+    # its different epsilon/upcast behavior intact while optimizing the rest.
+    monkeypatch.setattr(autoencoder_kl_wan, "WanRMS_norm", RMSNormVAE)
+    reference, candidate = _build_pair(TINY_RESIDUAL, dtype)
+    report = install_wan_vae_fastpath(candidate)
+    assert report.installed
+    assert "WanRMS_norm" not in report.patched
+    assert "RMSNormVAE" not in report.patched
+    assert "forward" not in candidate.decoder.norm_out.__dict__
+    latents = torch.randn(1, 4, 3, 6, 8).to(dtype)
+    expected = reference.decode(latents, return_dict=False)[0]
+    actual = candidate.decode(latents, return_dict=False)[0]
+    assert torch.equal(actual, expected)
 
 
 @torch.no_grad()

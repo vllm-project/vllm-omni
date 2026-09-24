@@ -55,6 +55,7 @@ class OmniDiffusionRequest:
     sampling_params: OmniDiffusionSamplingParams
     request_id: str
     kv_sender_info: dict[str, Any] | None = None
+    payload_sender_info: dict[str, Any] | None = None
     # Optional opaque, model-owned input prepared before Scheduler admission.
     # Model code validates its concrete type when consuming it on the Worker.
     prepared_layout: Any | None = None
