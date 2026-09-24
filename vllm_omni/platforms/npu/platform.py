@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from collections.abc import Callable
 from contextlib import nullcontext
 from functools import cache
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 import torch.nn as nn
@@ -13,7 +14,16 @@ from vllm_ascend.platform import NPUPlatform
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
 logger = init_logger(__name__)
+
+
+class _MindieSDCompilationConfig(Protocol):
+    aclgraph_only: bool
+    aclgraph_with_compile: bool
+
 
 _DIFFUSION_PACKED_MODULES_MAPPING = {
     "HunyuanImage3Pipeline": {
@@ -42,6 +52,79 @@ def _get_strict_ulysses_paged_backend() -> type:
             return AscendAttentionMetadataBuilder
 
     return AscendStrictUlyssesPagedBackend
+
+
+def _configure_residual_gate_patterns(
+    fusion_patterns: object,
+    model_class_name: str | None,
+) -> tuple[bool, bool]:
+    """Enable residual-gate patterns only for their matching model family."""
+    model_class_name = model_class_name or ""
+    is_qwen_image = model_class_name.startswith("QwenImage")
+    is_wan = model_class_name.startswith("Wan")
+
+    if hasattr(fusion_patterns, "enable_wan_residual_gate"):
+        enabled = bool(getattr(fusion_patterns, "enable_wan_residual_gate")) and is_wan
+        setattr(fusion_patterns, "enable_wan_residual_gate", enabled)
+    if hasattr(fusion_patterns, "enable_qwen_residual_gate"):
+        enabled = bool(getattr(fusion_patterns, "enable_qwen_residual_gate")) and is_qwen_image
+        setattr(fusion_patterns, "enable_qwen_residual_gate", enabled)
+
+    return (
+        bool(getattr(fusion_patterns, "enable_wan_residual_gate", False)),
+        bool(getattr(fusion_patterns, "enable_qwen_residual_gate", False)),
+    )
+
+
+def _get_mindiesd_incompatibility(od_config: "OmniDiffusionConfig") -> str | None:
+    if od_config.diffusion_compile_dynamic:
+        return "MindIE-SD requires diffusion_compile_dynamic=False."
+    if od_config.dtype != torch.bfloat16 or od_config.quantization_config is not None:
+        return "MindIE-SD requires unquantized BF16 weights."
+    if od_config.parallel_config.world_size != 1:
+        return "MindIE-SD currently requires a single NPU."
+    if (
+        od_config.enable_cpu_offload
+        or od_config.enable_layerwise_offload
+        or od_config.enable_distributed_layerwise_offload
+    ):
+        return "MindIE-SD does not support CPU or layerwise offload."
+    if od_config.cache_backend not in (None, "none"):
+        return "MindIE-SD requires cache_backend='none'."
+    if od_config.lora_path or od_config.enable_sleep_mode:
+        return "MindIE-SD does not support LoRA or sleep mode."
+    if od_config.diffusion_compile_granularity == "full" and (
+        od_config.parallel_config.use_hsdp or (od_config.parallel_config.sequence_parallel_size or 1) > 1
+    ):
+        return "MindIE-SD full compilation does not support HSDP or sequence parallelism."
+    return None
+
+
+def _configure_mindiesd_compilation(
+    compilation_config: _MindieSDCompilationConfig,
+    od_config: "OmniDiffusionConfig",
+) -> tuple[bool, bool, bool]:
+    for flag in ("aclgraph_only", "aclgraph_with_compile"):
+        if not hasattr(compilation_config, flag):
+            raise RuntimeError(f"Unsupported MindIE-SD compilation API: CompilationConfig.{flag} is missing.")
+
+    use_aclgraph = od_config.diffusion_compile_aclgraph
+    compilation_config.aclgraph_only = False
+    compilation_config.aclgraph_with_compile = use_aclgraph
+    if hasattr(compilation_config, "aclgraph_lazy_capture"):
+        compilation_config.aclgraph_lazy_capture = use_aclgraph
+    if hasattr(compilation_config, "safe_output_mode"):
+        # ACLGraph outputs alias persistent replay buffers. Clone outputs so a
+        # later replay cannot overwrite results still owned by another request.
+        compilation_config.safe_output_mode = True
+
+    if not hasattr(compilation_config, "fusion_patterns"):
+        raise RuntimeError("Unsupported MindIE-SD compilation API: CompilationConfig.fusion_patterns is missing.")
+    wan_residual_gate, qwen_residual_gate = _configure_residual_gate_patterns(
+        compilation_config.fusion_patterns,
+        od_config.model_class_name,
+    )
+    return use_aclgraph, wan_residual_gate, qwen_residual_gate
 
 
 class NPUOmniPlatform(OmniPlatform, NPUPlatform):
@@ -291,6 +374,48 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     @classmethod
     def supports_torch_inductor(cls) -> bool:
         return False
+
+    @classmethod
+    def get_diffusion_compile_backend(
+        cls,
+        od_config: "OmniDiffusionConfig",
+    ) -> Callable | None:
+        requested = od_config.diffusion_compile_backend
+        if requested not in {"auto", "mindiesd"}:
+            raise ValueError("NPU diffusion compilation requires diffusion_compile_backend='mindiesd'.")
+        allow_eager_fallback = requested == "auto" and not od_config.diffusion_compile_aclgraph
+
+        try:
+            from mindiesd.compilation import CompilationConfig, MindieSDBackend
+        except (ImportError, OSError) as exc:
+            if allow_eager_fallback:
+                logger.info("MindIE-SD is unavailable; running the diffusion pipeline eagerly.")
+                return None
+            raise RuntimeError(
+                "MindIE-SD diffusion compilation was requested, but mindiesd.compilation could not be imported. "
+                "Install a MindIE-SD build compatible with PyTorch, torch_npu and CANN, "
+                "or use enforce_eager=True."
+            ) from exc
+
+        incompatibility = _get_mindiesd_incompatibility(od_config)
+        if incompatibility is not None:
+            if allow_eager_fallback:
+                logger.info("%s Running the diffusion pipeline eagerly.", incompatibility)
+                return None
+            raise ValueError(incompatibility)
+
+        use_aclgraph, wan_residual_gate, qwen_residual_gate = _configure_mindiesd_compilation(
+            CompilationConfig,
+            od_config,
+        )
+        backend = MindieSDBackend()
+        logger.info(
+            "Selected MindIE-SD diffusion backend (aclgraph=%s, wan_residual_gate=%s, qwen_residual_gate=%s).",
+            use_aclgraph,
+            wan_residual_gate,
+            qwen_residual_gate,
+        )
+        return backend
 
     @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:

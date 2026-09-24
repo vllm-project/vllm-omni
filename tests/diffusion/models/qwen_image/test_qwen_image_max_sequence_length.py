@@ -1,9 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
+    QwenImageCFGParallelMixin,
+    canonicalize_qwen_image_attention_mask,
+)
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import (
     QwenImagePipeline,
 )
@@ -16,9 +25,20 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit_plus import 
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_layered import (
     QwenImageLayeredPipeline,
 )
+from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.utils import StepRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_attention_mask_canonicalization_drops_only_all_valid_masks():
+    all_valid = torch.ones((1, 4), dtype=torch.bool)
+    padded = torch.tensor([[True, True, False, False]])
+
+    assert canonicalize_qwen_image_attention_mask(None) is None
+    assert canonicalize_qwen_image_attention_mask(all_valid) is None
+    assert canonicalize_qwen_image_attention_mask(padded) is padded
 
 
 class _RejectingTextEncoder:
@@ -75,14 +95,99 @@ PIPELINE_CASES = [
 ]
 
 
+@pytest.mark.parametrize(("pipeline_class", "_drop_idx", "_input_kind"), PIPELINE_CASES)
+def test_all_qwen_image_pipelines_share_mask_canonicalization_path(
+    pipeline_class: type[QwenImageCFGParallelMixin],
+    _drop_idx: int,
+    _input_kind: str,
+):
+    assert pipeline_class.diffuse is QwenImageCFGParallelMixin.diffuse
+
+
+@dataclass
+class _StepSampling:
+    true_cfg_scale: float = 1.0
+    cfg_normalize: bool = False
+    image_latent: torch.Tensor | None = None
+
+
+@dataclass
+class _TransformerState:
+    do_true_cfg: bool = False
+
+
+def _make_qwen_step_state(request_id: str, prompt_length: int) -> StepRequestState:
+    return StepRequestState(
+        request_id=request_id,
+        sampling=_StepSampling(),
+        prompt_embeds=torch.ones((1, prompt_length, 2)),
+        prompt_embeds_mask=torch.ones((1, prompt_length), dtype=torch.bool),
+        latents=torch.ones((1, 2, 2)),
+        timesteps=torch.tensor([1.0]),
+        img_shapes=[[(1, 1, 1)]],
+        txt_seq_lens=[prompt_length],
+    )
+
+
+def _capture_qwen_denoise_mask(input_batch: InputBatch) -> torch.Tensor | None:
+    pipeline = object.__new__(QwenImagePipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.transformer = _TransformerState()
+    pipeline._attention_kwargs = {}
+    pipeline._interrupt = False
+
+    captured = {}
+
+    def _fake_predict_noise(*args):
+        captured["mask"] = args[2]["encoder_hidden_states_mask"]
+        return input_batch.latents
+
+    pipeline.predict_noise_maybe_with_cfg = _fake_predict_noise
+    pipeline.denoise_step(input_batch)
+    return captured["mask"]
+
+
+def test_step_denoise_keeps_padding_mask_after_variable_length_batching():
+    input_batch = InputBatch.make_batch(
+        [
+            _make_qwen_step_state("short", 2),
+            _make_qwen_step_state("long", 4),
+        ]
+    )
+
+    mask = _capture_qwen_denoise_mask(input_batch)
+
+    assert torch.equal(
+        mask,
+        torch.tensor(
+            [
+                [True, True, False, False],
+                [True, True, True, True],
+            ]
+        ),
+    )
+
+
+def test_step_denoise_drops_all_valid_mask_after_batching():
+    input_batch = InputBatch.make_batch(
+        [
+            _make_qwen_step_state("first", 4),
+            _make_qwen_step_state("second", 4),
+        ]
+    )
+
+    assert _capture_qwen_denoise_mask(input_batch) is None
+    assert input_batch.prompt_embeds_mask is None
+
+
 def _make_pipeline(
-    pipeline_class: type,
+    pipeline_class: type[QwenImageCFGParallelMixin],
     *,
     total_sequence_length: int,
     drop_idx: int,
     input_kind: str,
 ):
-    pipeline = object.__new__(pipeline_class)
+    pipeline: Any = object.__new__(pipeline_class)
     nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")
     pipeline.text_encoder = _RejectingTextEncoder()
@@ -289,7 +394,7 @@ def test_edit_pipelines_validate_text_prompt_length_before_image_token_expansion
     pipeline_class: type,
     drop_idx: int,
 ):
-    pipeline = object.__new__(pipeline_class)
+    pipeline: Any = object.__new__(pipeline_class)
     nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")
     pipeline.text_encoder = _RejectingTextEncoder()
@@ -311,7 +416,7 @@ def test_edit_pipelines_validate_text_prompt_length_before_image_token_expansion
     ],
 )
 def test_qwen_generation_validator_excludes_template_suffix_from_budget(pipeline_class: type):
-    pipeline = object.__new__(pipeline_class)
+    pipeline: Any = object.__new__(pipeline_class)
     nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")
     pipeline.text_encoder = _RejectingTextEncoder()
@@ -332,7 +437,7 @@ def test_qwen_generation_validator_excludes_template_suffix_from_budget(pipeline
     ],
 )
 def test_qwen_edit_validator_excludes_image_placeholders_from_budget(pipeline_class: type):
-    pipeline = object.__new__(pipeline_class)
+    pipeline: Any = object.__new__(pipeline_class)
     nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")
     pipeline.text_encoder = _RejectingTextEncoder()

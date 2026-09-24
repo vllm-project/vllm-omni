@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CFG Parallel Mixin for Qwen Image series
 Shared by
 - QwenImagePipeline
@@ -18,6 +18,13 @@ from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_g
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 
 logger = logging.getLogger(__name__)
+
+
+def canonicalize_qwen_image_attention_mask(mask: torch.Tensor | None) -> torch.Tensor | None:
+    """Drop an all-valid prompt mask after request batching is complete."""
+    if mask is not None and bool(mask.all()):
+        return None
+    return mask
 
 
 class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
@@ -69,6 +76,8 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
         self.scheduler.set_begin_index(0)
         self.transformer.do_true_cfg = do_true_cfg
         additional_transformer_kwargs = additional_transformer_kwargs or {}
+        prompt_embeds_mask = canonicalize_qwen_image_attention_mask(prompt_embeds_mask)
+        negative_prompt_embeds_mask = canonicalize_qwen_image_attention_mask(negative_prompt_embeds_mask)
 
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):

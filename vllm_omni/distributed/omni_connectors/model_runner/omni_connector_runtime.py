@@ -10,7 +10,7 @@ import os
 import threading
 from collections import defaultdict, deque
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 from vllm.logger import init_logger
@@ -27,13 +27,25 @@ from vllm_omni.outputs import OmniConnectorOutput
 logger = init_logger("vllm_omni.worker.omni_connector_model_runner_mixin")
 
 if TYPE_CHECKING:
-    from vllm_omni.config.model import OmniModelConfig
     from vllm_omni.distributed.omni_connectors.connectors.base import (
         OmniConnectorBase,
     )
     from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
         OmniKVTransferManager,
     )
+
+
+class OmniConnectorRuntimeConfig(Protocol):
+    """Required configuration surface for connector runtime initialization.
+
+    Other connector features are optional and discovered with ``getattr``.
+    """
+
+    stage_id: int
+
+
+class _StagePayloadBroadcastGroup(Protocol):
+    rank_in_group: int
 
 
 def needs_omni_connector(model_config: Any) -> bool:
@@ -159,6 +171,7 @@ class _OmniConnectorRuntimeMixin:
     _save_loop: Any
     flush_full_payload_outputs: Any
     _custom_process_supports_is_finished_kwarg: Any
+    _stage_payload_broadcast_groups: Callable[[], tuple[_StagePayloadBroadcastGroup, ...]]
     _get_local_tp_group: Any
 
     # ------------------------------------------------------------------ #
@@ -167,7 +180,7 @@ class _OmniConnectorRuntimeMixin:
 
     def init_omni_connectors(
         self,
-        model_config: OmniModelConfig,
+        model_config: OmniConnectorRuntimeConfig,
         kv_transfer_manager: OmniKVTransferManager | None = None,
         *,
         synchronous: bool = False,
@@ -175,7 +188,7 @@ class _OmniConnectorRuntimeMixin:
         """Initialize connectors and background threads.
 
         Args:
-            model_config: Stage-level model config with connector settings.
+            model_config: Stage-level connector runtime configuration.
             kv_transfer_manager: Existing KV transfer manager to delegate to.
             synchronous: Borrow the manager's lazy connector without background
                 threads or changes to its KV callbacks. The manager retains ownership.
@@ -552,7 +565,7 @@ class _OmniConnectorRuntimeMixin:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _create_connector(model_config: Any) -> OmniConnectorBase | None:
+    def _create_connector(model_config: OmniConnectorRuntimeConfig) -> OmniConnectorBase | None:
         """Create a connector from model_config, or None if unconfigured."""
         connector_config = getattr(model_config, "stage_connector_config", None)
         if connector_config is None:
@@ -590,7 +603,7 @@ class _OmniConnectorRuntimeMixin:
             raise RuntimeError(f"Failed to create connector {name}") from exc
 
     @classmethod
-    def _load_custom_func(cls, model_config: Any) -> tuple[str | None, Any | None]:
+    def _load_custom_func(cls, model_config: OmniConnectorRuntimeConfig) -> tuple[str | None, Any | None]:
         """Load the connector payload builder for the downstream stage.
 
         Preferred source is ``custom_process_next_stage_input_func``. Some
@@ -667,7 +680,7 @@ class _OmniConnectorRuntimeMixin:
             raise ValueError("Connector request has neither an external nor an internal request ID")
         return fallback_req_id
 
-    def _resolve_next_stage_id(self, model_config: Any) -> int:
+    def _resolve_next_stage_id(self, model_config: OmniConnectorRuntimeConfig) -> int:
         """Determine the downstream stage ID from connector config.
 
         Falls back to ``stage_id + 1`` when the config does not specify
@@ -686,7 +699,7 @@ class _OmniConnectorRuntimeMixin:
         return self._stage_id + 1
 
     @staticmethod
-    def _parse_rank_mapping(model_config: Any) -> dict[str, int]:
+    def _parse_rank_mapping(model_config: OmniConnectorRuntimeConfig) -> dict[str, int]:
         """Parse rank_mapping from connector config (optional).
 
         Returns ``{"from_tp": int, "to_tp": int, "local_rank": int}``.
