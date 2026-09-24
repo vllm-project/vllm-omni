@@ -132,18 +132,19 @@ with `guidance_scale=1.0` remain valid on the same server: every rank evaluates
 only the positive branch, no negative embeddings are built, and no guidance is
 applied.
 
-### 1 x RTX 4090 48 GB (FP8)
+### 1 x RTX 4090 24 GB / 48 GB (FP8)
 
-Boogu-Image supports two ways to quantize or load the DiT transformer:
+Boogu-Image supports the following FP8 loading paths:
 
-| Path               | Base model                       | Edit model                       | Method                       | Scheme                  |
-| ------------------ | -------------------------------- | -------------------------------- | ---------------------------- | ----------------------- |
-| Serialized TorchAO | `Boogu/Boogu-Image-0.1-Base-fp8` | `Boogu/Boogu-Image-0.1-Edit-fp8` | `torchao_float8_weight_only` | FP8 weight-only (W8A16) |
-| Native online FP8  | `Boogu/Boogu-Image-0.1-Base`     | `Boogu/Boogu-Image-0.1-Edit`     | `fp8`                        | Dynamic W8A8            |
+| Path | Checkpoints | MLLM | DiT |
+| --- | --- | --- | --- |
+| Pre-quantized FP8 | `Boogu/Boogu-Image-0.1-{Base,Edit}-fp8` | HF checkpoint FP8 configuration | TorchAO FP8 weight-only (W8A16) |
+| Online FP8 | `Boogu/Boogu-Image-0.1-{Base,Edit}` | Optional 128x128 block FP8: Triton W8A8 (vLLM 0.28.0); Marlin W8A16 (vLLM 0.29.0) | Native dynamic FP8 (CUTLASS W8A8) |
 
 #### Environment
 
-The following configuration was validated:
+The following isolated environments were used for Base T2I and Edit I2I
+measurements at 512x512:
 
 - OS: Linux
 - Python: 3.12
@@ -152,7 +153,9 @@ The following configuration was validated:
 - vLLM-Omni version or commit: Use a commit that contains TorchAO FP8
   checkpoint loading for diffusion models
 - TorchAO version: 0.17.0
-- `kernels` / `kernels-data`: 0.15.2 / 0.16.1
+- `kernels` / `kernels-data`: 0.16.1 / 0.16.1
+- Transformers: 5.17.0
+- Tokenizers: 0.23.1
 
 #### Command
 
@@ -167,19 +170,61 @@ vllm serve Boogu/Boogu-Image-0.1-Base-fp8 \
   '{"transformer":{"method":"torchao_float8_weight_only"}}'
 ```
 
-Native online FP8 (currently applied only to eligible vLLM-quantizable linear
-layers in the DiT transformer):
+Native online FP8:
 
 ```bash
+# DiT only
 vllm serve Boogu/Boogu-Image-0.1-Base \
   --omni \
   --port 8091 \
   --diffusion-quantization-config \
-  '{"transformer":{"method":"fp8"}}'
+  '{"mllm":null,"transformer":"fp8","vae":null}'
+
+# MLLM + DiT
+vllm serve Boogu/Boogu-Image-0.1-Base \
+  --omni \
+  --port 8091 \
+  --quantization fp8
+
+# MLLM + DiT (using --diffusion-quantization-config)
+vllm serve Boogu/Boogu-Image-0.1-Base \
+  --omni \
+  --port 8091 \
+  --diffusion-quantization-config \
+  '{"mllm":"fp8","transformer":"fp8","vae":null}'
+
 ```
 
-For image editing, use the matching Edit model ID from the table and keep the
-corresponding quantization configuration.
+For image editing, replace `Base` with `Edit` and keep the corresponding
+quantization configuration.
+
+#### Notes
+
+- **Memory usage:**
+    - The serialized TorchAO FP8 path uses approximately 21.1 GiB at 512x512
+      and 24.2-24.6 GiB at 1024x1024.
+    - The DiT-only online FP8 path uses approximately 26.9 GiB at 512x512
+      and 29.9-30.9 GiB at 1024x1024.
+    - The MLLM + DiT online FP8 path uses approximately 20.5-20.6 GiB at
+      512x512 and 23.6-24.5 GiB at 1024x1024.
+
+- **Quantization scope:** For original Base/Edit checkpoints, `--quantization fp8`
+  quantizes the MLLM's language-model linear layers through per-block FP8
+  and the DiT's linear layers through native online FP8. The vision encoder,
+  embeddings, normalization layers and VAE remain unquantized.
+
+- **Performance:** In the 48 GB Base/Edit benchmarks at 512x512, both DiT-only
+  and MLLM + DiT online FP8 reduced E2E latency by over 10 seconds compared with
+  official FP8 and vLLM-Omni pre-quantized FP8. The main runtime difference lies in the DiT quantization implementation, which switches from TorchAO weight-only FP8 (W8A16) to native CUTLASS
+  W8A8 kernels. This reduces additional dequantization overhead and enables
+  FP8 Tensor Core acceleration.
+
+- **Known Limitation:**
+    - **Output consistency:** With MLLM + DiT online FP8, same-seed outputs may visibly differ from BF16 for some Base prompts, but these differences do not mean lower image quality.
+
+    - **Import compatibility conflict between TorchAO and Diffusers::** Loading pre-quantized checkpoints requires `torchao>=0.17.0`, which has a compatibility conflict with `diffusers==0.40.0`. This produces a warning when Diffusers is imported, but currently does not affect Boogu-Image weight loading.
+
+    - **Conflict between the default kernels and Transformers versions:** The default Transformers version range (`>=5.10.1,<5.15`) conflicts with `kernels==0.16.1` when loading pre-quantized FP8 MLLM weights through Hugging Face `FP8Linear`. When using this loading path with `kernels==0.16.1`, please upgrade Transformers to `5.17.0`.
 
 #### Verification
 
@@ -190,19 +235,6 @@ ID passed to `vllm serve`. For example, use
 corresponding Edit model.
 
 Base text-to-image:
-## Fast text-to-image (Boogu-Image-0.1-Turbo)
-
-Turbo is the distilled text-to-image checkpoint. Its `model_index.json`
-declares `BooguImageTurboPipeline`, which runs the four-step DMD path instead
-of the scheduler-driven path used by Base.
-
-### Command
-
-```bash
-vllm serve Boogu/Boogu-Image-0.1-Turbo --omni --port 8091
-```
-
-### Verification
 
 ```bash
 curl -X POST http://localhost:8091/v1/images/generations \
@@ -231,22 +263,24 @@ curl -X POST http://localhost:8091/v1/images/edits \
   | jq -r '.data[0].b64_json' | base64 -d > edited_fp8.png
 ```
 
-#### Notes
+## Fast text-to-image (Boogu-Image-0.1-Turbo)
 
-- **Memory usage:**
-    - The serialized TorchAO FP8 path uses approximately 21.1 GiB at 512x512
-      and 24.2-24.6 GiB at 1024x1024.
-    - The native online FP8 path uses approximately 31.5 GiB for Base and
-      30.7 GiB for Edit at 1024x1024. It uses more memory because only eligible
-      DiT linear layers are quantized online, while the MLLM from the regular
-      Base/Edit checkpoint remains in BF16. Most of the observed difference
-      comes from the MLLM precision, although differences in the two DiT FP8
-      representations and kernels may also contribute.
-- **Quantization scope:** The transformer-scoped configuration applies to the
-  DiT. With the serialized `-fp8` checkpoints, the MLLM follows its own
-  checkpoint-declared FP8 configuration. With the regular checkpoints used for
-  online FP8, the MLLM remains in BF16. The VAE and scheduler are outside this
-  quantization routing.
+Turbo is the distilled text-to-image checkpoint. Its `model_index.json`
+declares `BooguImageTurboPipeline`, which runs the four-step DMD path instead
+of the scheduler-driven path used by Base.
+
+### Command
+
+```bash
+vllm serve Boogu/Boogu-Image-0.1-Turbo --omni --port 8091
+```
+
+### Verification
+
+```bash
+curl -X POST http://localhost:8091/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
     "model": "Boogu/Boogu-Image-0.1-Turbo",
     "prompt": "A mountain lake at sunset, photorealistic, cinematic lighting",
     "size": "1024x1024",
@@ -451,6 +485,39 @@ curl -s http://localhost:8091/v1/chat/completions \
   the regular Edit checkpoint applies.
 - **Known limitations:** the same single-GPU limitations as Base and Edit apply;
   CPU offload, Cache-DiT, and multi-GPU parallelism are not yet validated.
+
+## Output format and compression
+
+Image requests accept `output_format` (`png`, `jpeg`, or `webp`) and
+`output_compression` (0-100). The default is `png` with the fastest,
+least-compressed PNG encode, which is lossless but produces multi-megabyte
+payloads. For latency-sensitive clients, `output_format: "jpeg"` removes
+almost the entire response-encoding overhead: on a 1024x1024 Turbo request
+the client-observed e2e latency drops from ~900 ms to ~766 ms and the
+payload shrinks from ~3.1 MB to ~0.8 MB. Use `output_compression` to trade
+encode time against payload size when PNG must stay lossless: lower values
+(e.g. 1) compress harder and produce smaller payloads at proportionally
+longer encode times.
+
+## Attention backend
+
+The diffusion attention backend defaults to `FLASH_ATTN` (FlashAttention-2).
+On Hopper-class GPUs (SM90) pass `--diffusion-attention-backend CUDNN_ATTN`
+for a measured ~12% engine-time reduction on Boogu-Image workloads:
+
+```bash
+vllm serve Boogu/Boogu-Image-0.1-Turbo \
+  --omni \
+  --diffusion-attention-backend CUDNN_ATTN \
+  --port 8091
+```
+
+Measured on a 143 GB SM90 card (1024x1024, 4 steps, 5-run mean): stage time
+673 ms with `CUDNN_ATTN` vs 763 ms with the default. Outputs are numerically
+different from FLASH_ATTN (different attention kernel) but visually
+equivalent, deterministic per seed, and decode identically. On datacenter
+Blackwell (SM100 / SM103) use `--diffusion-attention-backend TRTLLM_ATTN`
+instead; it is rejected on SM90.
 
 ## Performance validation
 

@@ -4,7 +4,7 @@
 
 import asyncio
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -16,6 +16,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     PreparedRequest,
     apply_max_new_tokens,
     conditioning_cache_salt,
+    resolve_stage_model_path,
 )
 
 _REF_CODE_CACHE_MAX_ENTRIES = 256
@@ -62,7 +63,7 @@ class HiggsAudioV3Adapter(ARTTSAdapter):
             encode_reference_audio,
         )
 
-        wav_list, sr, cache_key = await self._resolve_ref_audio(request.ref_audio)
+        wav_list, sr, cache_key = await self._resolve_ref_audio(cast(str, request.ref_audio))
         artifact_key = self._get_resolved_ref_audio_artifact_key(cache_key)
         wav = np.asarray(wav_list, dtype=np.float32)
         ref_codes_delayed, cache_hit, inflight_wait = await self._resolve_higgs_audio_v3_ref_codes(
@@ -109,7 +110,7 @@ class HiggsAudioV3Adapter(ARTTSAdapter):
 
         task = self._higgs_audio_v3_ref_code_inflight.get(artifact_key)
         if task is not None:
-            return (await task).clone(), False, True
+            return (await asyncio.shield(task)).clone(), False, True
 
         async def _encode_and_cache() -> torch.Tensor:
             ref_codes_raw = await asyncio.to_thread(encode_reference_audio, wav, sr)
@@ -120,11 +121,15 @@ class HiggsAudioV3Adapter(ARTTSAdapter):
 
         task = asyncio.create_task(_encode_and_cache())
         self._higgs_audio_v3_ref_code_inflight[artifact_key] = task
-        try:
-            return (await task).clone(), False, False
-        finally:
-            if self._higgs_audio_v3_ref_code_inflight.get(artifact_key) is task:
+
+        def _retire(t: asyncio.Task[torch.Tensor]) -> None:
+            if not t.cancelled():
+                t.exception()
+            if self._higgs_audio_v3_ref_code_inflight.get(artifact_key) is t:
                 self._higgs_audio_v3_ref_code_inflight.pop(artifact_key, None)
+
+        task.add_done_callback(_retire)
+        return (await asyncio.shield(task)).clone(), False, False
 
     def _get_higgs_audio_v3_ref_codes(self, artifact_key: str | None) -> torch.Tensor | None:
         if not artifact_key:
@@ -166,13 +171,7 @@ class HiggsAudioV3Adapter(ARTTSAdapter):
             HiggsAudioV3TokenizerAdapter,
         )
 
-        model_path = None
-        for stage in self.engine_client.stage_configs:
-            model_path = getattr(getattr(stage, "engine_args", None), "model", None)
-            if model_path:
-                break
-        if model_path is None:
-            model_path = getattr(self.engine_client, "model", None)
+        model_path = resolve_stage_model_path(self.engine_client)
         if model_path is None:
             raise RuntimeError("higgs_audio_v3 serving could not resolve model path")
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)

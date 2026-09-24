@@ -1,5 +1,6 @@
 # Copyright 2026 The Alibaba Qwen team.
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 CUDA Graph wrapper for Qwen3TTSTokenizerV2Decoder.
 
@@ -16,6 +17,13 @@ from torch.cuda import CUDAGraph
 from transformers.cache_utils import DynamicCache
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+
+from vllm_omni.model_executor.models.model_local_kv import (
+    ModelLocalKVScope,
+    ModelLocalKVSpec,
+    RowDriver,
+    spec_from_hf_config,
+)
 
 logger = init_logger(__name__)
 
@@ -38,6 +46,7 @@ class CUDAGraphDecoderWrapper:
     def __init__(
         self,
         decoder: torch.nn.Module,
+        capture_modes: tuple[str, ...] = ("icl", "xvec"),
         capture_batch_sizes: list[int] | None = None,
         stateless_capture_sizes: list[int] | None = None,
         num_quantizers: int = 8,
@@ -50,6 +59,9 @@ class CUDAGraphDecoderWrapper:
         decode_left_context: int = 25,
     ):
         self.decoder = decoder
+        if not capture_modes or set(capture_modes) - {"icl", "xvec"}:
+            raise ValueError("capture_modes must contain icl and/or xvec")
+        self.capture_modes = capture_modes
         self.capture_batch_sizes = sorted(set(capture_batch_sizes or [1]))
         self.num_quantizers = num_quantizers
         self.enabled = enabled
@@ -165,6 +177,85 @@ class CUDAGraphDecoderWrapper:
     def _maybe_log_stats(self) -> None:
         if self._stats_log_every > 0 and self._stats_total_requests % self._stats_log_every == 0:
             self.log_decode_stats()
+
+    @staticmethod
+    def _retained_kv_caches(states: dict) -> list[tuple[int, DynamicCache]]:
+        """Find the KV caches a capture kept alive, with their batch rows.
+
+        Walks the stored ``cache`` payload instead of assuming which capture
+        path populates it: ``_decode_icl_first_chunk`` fills its dict on the
+        decoder side, so the only reliable count is the one taken from the
+        objects themselves after warmup.
+        """
+        found: list[tuple[int, DynamicCache]] = []
+        for state in states.values():
+            payload = state.get("cache")
+            if not isinstance(payload, dict):
+                continue
+            for value in payload.values():
+                if not isinstance(value, DynamicCache):
+                    continue
+                layers = getattr(value, "layers", None)
+                keys = getattr(layers[0], "keys", None) if layers else None
+                if keys is None:
+                    continue
+                found.append((int(keys.shape[0]), value))
+        return found
+
+    def model_local_kv_specs(self) -> list[ModelLocalKVSpec]:
+        """Declare only the graph-resident copies this wrapper retains.
+
+        The per-decode cache is declared by the decoder itself, because it
+        exists whether or not graphs were captured. What is specific to this
+        wrapper is that every captured shape keeps its dummy ``DynamicCache``
+        alive for replay (``combined_states``, ``icl_prefix_states`` and
+        ``xvec_prefix_states`` all store ``cache``), for the process lifetime.
+
+        Rows come from the state dicts rather than the configured capture
+        lists: a capture that raised is logged and skipped, so the configured
+        shape count would over-report. The trade is that a capture whose
+        tensors transformers has not yet materialized contributes nothing, so
+        this is a floor rather than a contract.
+        """
+        config = self.decoder.config
+        try:
+            dtype = next(self.decoder.parameters()).dtype
+        except StopIteration:  # parameterless stub, only reachable in tests
+            return []
+
+        # Physical, not logical: the sliding window truncates on every write,
+        # so a stream of thousands of frames never occupies more than this.
+        physical = self.prefix_length - 1
+        retained = [
+            *self._retained_kv_caches(self.combined_states),
+            *self._retained_kv_caches(self.icl_prefix_states),
+            *self._retained_kv_caches(self.xvec_prefix_states),
+        ]
+        batched_captures = sum(rows for rows, _ in retained)
+
+        if not batched_captures:
+            return []
+        return [
+            spec_from_hf_config(
+                config,
+                name="codec_decoder_graph_pool",
+                dtype=dtype,
+                physical_capacity_positions=physical,
+                capacity_source=f"sliding_window({self.prefix_length}) - 1",
+                scope=ModelLocalKVScope.MODEL,
+                rows=RowDriver.FIXED,
+                rows_fixed=batched_captures,
+                rows_reason=(
+                    f"rows across {len(retained)} retained caches in "
+                    f"{len(self.combined_states)} suffix / {len(self.icl_prefix_states)} icl-prefix / "
+                    f"{len(self.xvec_prefix_states)} xvec-prefix captures"
+                ),
+                allocation_note=(
+                    "counted from caches transformers has materialized; captures whose tensors are still "
+                    "unallocated report nothing, so this is a floor for the xvec path"
+                ),
+            )
+        ]
 
     def log_decode_stats(self) -> None:
         if not getattr(self, "_stats_enabled", False) or self._stats_total_requests == 0:
@@ -321,16 +412,18 @@ class CUDAGraphDecoderWrapper:
         icl_capture_shapes = self._get_icl_capture_shapes()
 
         for batch_size in self.capture_batch_sizes:
-            try:
-                self._capture_icl_prefix(batch_size, device, dtype)
-                logger.info("Captured ICL prefix CUDA Graph for batch=%d", batch_size)
-            except Exception:
-                logger.warning("Failed to capture ICL prefix CUDA Graph for batch=%d", batch_size, exc_info=True)
-            try:
-                self._capture_xvec_prefix(batch_size, device, dtype)
-                logger.info("Captured xvec prefix CUDA Graph for batch=%d", batch_size)
-            except Exception:
-                logger.warning("Failed to capture xvec prefix CUDA Graph for batch=%d", batch_size, exc_info=True)
+            if "icl" in self.capture_modes:
+                try:
+                    self._capture_icl_prefix(batch_size, device, dtype)
+                    logger.info("Captured ICL prefix CUDA Graph for batch=%d", batch_size)
+                except Exception:
+                    logger.warning("Failed to capture ICL prefix CUDA Graph for batch=%d", batch_size, exc_info=True)
+            if "xvec" in self.capture_modes:
+                try:
+                    self._capture_xvec_prefix(batch_size, device, dtype)
+                    logger.info("Captured xvec prefix CUDA Graph for batch=%d", batch_size)
+                except Exception:
+                    logger.warning("Failed to capture xvec prefix CUDA Graph for batch=%d", batch_size, exc_info=True)
 
         logger.info(
             "Starting CUDA Graph warmup for %d shapes: batch_sizes=%s seq_lens=%s",
@@ -339,7 +432,7 @@ class CUDAGraphDecoderWrapper:
             self.icl_capture_sizes,
         )
 
-        for batch_size, size in icl_capture_shapes:
+        for batch_size, size in icl_capture_shapes if "icl" in self.capture_modes else ():
             try:
                 caches = self._make_dummy_icl_cache(batch_size, device, next(self.decoder.parameters()).dtype)
                 self._capture_combined_suffix("icl", batch_size, size, caches, device, dtype)
@@ -353,7 +446,7 @@ class CUDAGraphDecoderWrapper:
                 )
 
         model_dtype = next(self.decoder.parameters()).dtype
-        for batch_size in self.capture_batch_sizes:
+        for batch_size in self.capture_batch_sizes if "xvec" in self.capture_modes else ():
             for size, previous_frames in self._xvec_previous_frames_by_target.items():
                 try:
                     caches = self._make_dummy_xvec_cache(batch_size, device, model_dtype)

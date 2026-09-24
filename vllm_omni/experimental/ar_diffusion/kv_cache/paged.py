@@ -115,11 +115,27 @@ def allocate_kv_pool_with_views(
     cache_shape = (num_blocks, block_size, num_kv_heads, head_dim)
     flat_shape = (num_blocks * block_size, num_kv_heads, head_dim)
     for _ in range(num_layers):
-        k = torch.empty(cache_shape, dtype=dtype, device=device)
-        v = torch.empty(cache_shape, dtype=dtype, device=device)
-        kv_pools.append([k, v])
-        k_pools.append(k.reshape(flat_shape))
-        v_pools.append(v.reshape(flat_shape))
+        # The flat slot views are what the paged-write custom op mutates inside the
+        # compiled block graphs, so they must be the *base* allocations: dynamo only
+        # honours mark_static_address on the tensor object it sees as a graph input,
+        # and a view of a static base is still classified as a mutated input, which
+        # makes inductor skip CUDA graphs for every block ("skipping cudagraphs due
+        # to mutated inputs"). The block-table layout is therefore the view here.
+        k = torch.empty(flat_shape, dtype=dtype, device=device)
+        v = torch.empty(flat_shape, dtype=dtype, device=device)
+        for pool in (k, v):
+            # Block 0 is the manager's null block: block tables are tail-padded with
+            # it and it is never written. The contiguous-K/V gather path may read
+            # (masked) rows from it, so it must hold finite values; every other
+            # block is fully written before it is read.
+            pool[:block_size].zero_()
+            # Session-lifetime storage: tell dynamo/inductor the address is static so
+            # CUDA-graph trees (mode="reduce-overhead") mutate it in place instead of
+            # copying ~300 MB per layer per replay (or skipping the graph).
+            torch._dynamo.mark_static_address(pool)
+        kv_pools.append([k.view(cache_shape), v.view(cache_shape)])
+        k_pools.append(k)
+        v_pools.append(v)
     return kv_pools, k_pools, v_pools
 
 
@@ -196,6 +212,28 @@ class ChunkWindowManager(SlidingWindowManager):
             sink_chunks=spec.sink_chunks,
             reset_at_boundary=spec.reset_at_boundary,
         )
+
+    def compact_block_table(self, request_id: str) -> int:
+        """Remove the evicted gap after the sink; return its size in tokens.
+
+        Call only after commit/eviction, then shift the request's storage
+        position by the returned amount. Physical pages and model positions
+        are unchanged, including any allocated but not yet committed tail.
+        """
+        if self.enable_caching:
+            raise RuntimeError("AR block-table compaction requires prefix caching to be disabled")
+        blocks = self.req_to_blocks.get(request_id, [])
+        start = self.kv_cache_spec.sink_chunks
+        end = start
+        while end < len(blocks) and blocks[end] == self._null_block:
+            end += 1
+        if end == start:
+            return 0
+        del blocks[start:end]
+        if request_id in self.num_cached_block:
+            cached = self.num_cached_block[request_id]
+            self.num_cached_block[request_id] = min(cached, start) + max(0, cached - end)
+        return (end - start) * self.block_size
 
     def remove_skipped_blocks(
         self,

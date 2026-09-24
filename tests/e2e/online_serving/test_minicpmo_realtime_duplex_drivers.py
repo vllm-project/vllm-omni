@@ -152,7 +152,6 @@ def test_realtime_duplex_demo_pair_launches_demo_processes_concurrently(tmp_path
                 "parser.add_argument('--output-dir')",
                 "parser.add_argument('--chunk-ms')",
                 "parser.add_argument('--timeout-s')",
-                "parser.add_argument('--session-id')",
                 "parser.add_argument('--ref-audio')",
                 "parser.add_argument('--require-audio', action='store_true')",
                 "parser.add_argument('--no-realtime-pacing', action='store_true')",
@@ -168,9 +167,9 @@ def test_realtime_duplex_demo_pair_launches_demo_processes_concurrently(tmp_path
                 "events = [",
                 "    {'type': 'session.created'},",
                 "    {'type': 'response.created', 'response': {'id': response_id}},",
-                "    {'type': 'response.audio.delta', 'response_id': response_id, "
+                "    {'type': 'response.output_audio.delta', 'response_id': response_id, "
                 "'delta': 'AAAA', 'sample_rate_hz': 24000, '_client_received_at_s': 10.1},",
-                "    {'type': 'response.audio.delta', 'response_id': response_id, "
+                "    {'type': 'response.output_audio.delta', 'response_id': response_id, "
                 "'delta': 'AAAA', 'sample_rate_hz': 24000, '_client_received_at_s': 10.6},",
                 "    {'type': 'response.done', 'response_id': response_id},",
                 "    {'type': 'session.closed'},",
@@ -237,8 +236,8 @@ def test_realtime_duplex_demo_pair_rejects_false_green_audio_contract(tmp_path):
     response_id = "resp-a"
     events = [
         {"type": "response.created", "response": {"id": response_id}},
-        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "sample_rate_hz": 24000},
-        {"type": "response.audio.delta", "response_id": "resp-other", "delta": "AAAA", "sample_rate_hz": 24000},
+        {"type": "response.output_audio.delta", "response_id": response_id, "delta": "AAAA", "sample_rate_hz": 24000},
+        {"type": "response.output_audio.delta", "response_id": "resp-other", "delta": "AAAA", "sample_rate_hz": 24000},
         {"type": "response.done", "response_id": response_id},
     ]
     (output / "events.jsonl").write_text(
@@ -459,25 +458,25 @@ def test_realtime_duplex_soft_interrupt_accepts_multi_delta_handoff_sequence(tmp
         {"type": "response.created", "response": {"id": first_response_id}, "_client_received_at_s": 2.0},
         {"type": "response.speak", "response_id": first_response_id, "_client_received_at_s": 2.0},
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": first_response_id,
             "delta": "AAAA",
             "_client_received_at_s": 2.1,
         },
         {
-            "type": "response.audio_transcript.delta",
+            "type": "response.output_audio_transcript.delta",
             "response_id": first_response_id,
             "delta": "中国古代四大发明",
             "_client_received_at_s": 2.1,
         },
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": first_response_id,
             "delta": "AAAA",
             "_client_received_at_s": 2.6,
         },
         {
-            "type": "response.audio_transcript.delta",
+            "type": "response.output_audio_transcript.delta",
             "response_id": first_response_id,
             "delta": "是造纸术。",
             "_client_received_at_s": 2.6,
@@ -486,25 +485,25 @@ def test_realtime_duplex_soft_interrupt_accepts_multi_delta_handoff_sequence(tmp
         {"type": "response.created", "response": {"id": second_response_id}, "_client_received_at_s": 4.0},
         {"type": "response.speak", "response_id": second_response_id, "_client_received_at_s": 4.0},
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": second_response_id,
             "delta": "AAAA",
             "_client_received_at_s": 4.1,
         },
         {
-            "type": "response.audio_transcript.delta",
+            "type": "response.output_audio_transcript.delta",
             "response_id": second_response_id,
             "delta": "一加一等于",
             "_client_received_at_s": 4.1,
         },
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": second_response_id,
             "delta": "AAAA",
             "_client_received_at_s": 4.6,
         },
         {
-            "type": "response.audio_transcript.delta",
+            "type": "response.output_audio_transcript.delta",
             "response_id": second_response_id,
             "delta": "二。",
             "_client_received_at_s": 4.6,
@@ -561,25 +560,25 @@ def test_realtime_duplex_soft_interrupt_accepts_followup_done_after_commit(tmp_p
         {"type": "response.created", "response": {"id": first_response_id}, "_client_received_at_s": 2.0},
         {"type": "response.speak", "response_id": first_response_id, "_client_received_at_s": 2.0},
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": first_response_id,
             "delta": "AAAA",
             "_client_received_at_s": 2.1,
         },
         {
-            "type": "response.audio_transcript.delta",
+            "type": "response.output_audio_transcript.delta",
             "response_id": first_response_id,
             "delta": "中国古代四大发明",
             "_client_received_at_s": 2.1,
         },
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": first_response_id,
             "delta": "AAAA",
             "_client_received_at_s": 2.6,
         },
         {
-            "type": "response.audio_transcript.delta",
+            "type": "response.output_audio_transcript.delta",
             "response_id": first_response_id,
             "delta": "是造纸术。",
             "_client_received_at_s": 2.6,
@@ -589,25 +588,25 @@ def test_realtime_duplex_soft_interrupt_accepts_followup_done_after_commit(tmp_p
         {"type": "response.created", "response": {"id": second_response_id}, "_client_received_at_s": 3.5},
         {"type": "response.speak", "response_id": second_response_id, "_client_received_at_s": 3.5},
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": second_response_id,
             "delta": "AAAA",
             "_client_received_at_s": 3.6,
         },
         {
-            "type": "response.audio_transcript.delta",
+            "type": "response.output_audio_transcript.delta",
             "response_id": second_response_id,
             "delta": "一加一等于",
             "_client_received_at_s": 3.6,
         },
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": second_response_id,
             "delta": "AAAA",
             "_client_received_at_s": 3.7,
         },
         {
-            "type": "response.audio_transcript.delta",
+            "type": "response.output_audio_transcript.delta",
             "response_id": second_response_id,
             "delta": "二。",
             "_client_received_at_s": 3.7,
@@ -653,8 +652,18 @@ def test_realtime_duplex_soft_interrupt_model_policy_accepts_single_response(tmp
     events = [
         {"type": "response.listen", "_client_received_at_s": 1.0},
         {"type": "response.created", "response": {"id": response_id}, "_client_received_at_s": 2.0},
-        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 2.1},
-        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 2.15},
+        {
+            "type": "response.output_audio.delta",
+            "response_id": response_id,
+            "delta": "AAAA",
+            "_client_received_at_s": 2.1,
+        },
+        {
+            "type": "response.output_audio.delta",
+            "response_id": response_id,
+            "delta": "AAAA",
+            "_client_received_at_s": 2.15,
+        },
         {"type": "response.done", "response_id": response_id, "_client_received_at_s": 2.2},
         {"type": "response.listen", "_client_received_at_s": 2.3},
         {"type": "input_audio_buffer.committed", "_client_received_at_s": 3.0},
@@ -692,10 +701,25 @@ def test_realtime_duplex_soft_interrupt_model_policy_accepts_commit_during_speak
     events = [
         {"type": "response.listen", "_client_received_at_s": 1.0},
         {"type": "response.created", "response": {"id": response_id}, "_client_received_at_s": 2.0},
-        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 2.1},
-        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 2.2},
+        {
+            "type": "response.output_audio.delta",
+            "response_id": response_id,
+            "delta": "AAAA",
+            "_client_received_at_s": 2.1,
+        },
+        {
+            "type": "response.output_audio.delta",
+            "response_id": response_id,
+            "delta": "AAAA",
+            "_client_received_at_s": 2.2,
+        },
         {"type": "input_audio_buffer.committed", "_client_received_at_s": 3.0},
-        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 4.0},
+        {
+            "type": "response.output_audio.delta",
+            "response_id": response_id,
+            "delta": "AAAA",
+            "_client_received_at_s": 4.0,
+        },
         {"type": "response.done", "response_id": response_id, "_client_received_at_s": 5.0},
     ]
     (output / "events.jsonl").write_text(
@@ -729,8 +753,18 @@ def test_realtime_duplex_soft_interrupt_response_required_rejects_single_respons
     events = [
         {"type": "response.listen", "_client_received_at_s": 1.0},
         {"type": "response.created", "response": {"id": response_id}, "_client_received_at_s": 2.0},
-        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 2.1},
-        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 2.15},
+        {
+            "type": "response.output_audio.delta",
+            "response_id": response_id,
+            "delta": "AAAA",
+            "_client_received_at_s": 2.1,
+        },
+        {
+            "type": "response.output_audio.delta",
+            "response_id": response_id,
+            "delta": "AAAA",
+            "_client_received_at_s": 2.15,
+        },
         {"type": "response.done", "response_id": response_id, "_client_received_at_s": 2.2},
         {"type": "response.listen", "_client_received_at_s": 2.3},
         {"type": "input_audio_buffer.committed", "_client_received_at_s": 3.0},
@@ -767,19 +801,19 @@ def test_realtime_duplex_soft_interrupt_reports_text_expectation_without_gating(
         {"type": "response.listen", "_client_received_at_s": 1.0},
         {"type": "response.created", "response": {"id": first_response_id}, "_client_received_at_s": 2.0},
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": first_response_id,
             "delta": "AAAA",
             "_client_received_at_s": 2.1,
         },
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": first_response_id,
             "delta": "AAAA",
             "_client_received_at_s": 2.2,
         },
         {
-            "type": "response.audio_transcript.delta",
+            "type": "response.output_audio_transcript.delta",
             "response_id": first_response_id,
             "delta": "一加一等于二",
             "_client_received_at_s": 2.2,
@@ -788,19 +822,19 @@ def test_realtime_duplex_soft_interrupt_reports_text_expectation_without_gating(
         {"type": "response.listen", "_client_received_at_s": 2.4},
         {"type": "response.created", "response": {"id": second_response_id}, "_client_received_at_s": 3.0},
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": second_response_id,
             "delta": "AAAA",
             "_client_received_at_s": 3.1,
         },
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": second_response_id,
             "delta": "AAAA",
             "_client_received_at_s": 3.2,
         },
         {
-            "type": "response.audio_transcript.delta",
+            "type": "response.output_audio_transcript.delta",
             "response_id": second_response_id,
             "delta": "不知道",
             "_client_received_at_s": 3.2,
@@ -834,7 +868,7 @@ def test_realtime_duplex_soft_interrupt_reports_text_expectation_without_gating(
     events = [
         event
         for event in events
-        if event.get("response_id") != second_response_id or event["type"] != "response.audio_transcript.delta"
+        if event.get("response_id") != second_response_id or event["type"] != "response.output_audio_transcript.delta"
     ]
     (output / "events.jsonl").write_text(
         "".join(demo.json.dumps(event) + "\n" for event in events),
@@ -992,7 +1026,7 @@ def test_realtime_duplex_demo_resolves_distinct_turn_inputs():
         demo._turn_input_paths(primary, ["second.wav"], turns=3)
 
 
-def test_realtime_duplex_demo_explicitly_enables_native_runtime_before_connect():
+def test_realtime_duplex_demo_url_carries_no_model_opt_in_or_session_id():
     demo = _load_demo_module()
 
     url = demo._url_with_model(
@@ -1001,23 +1035,12 @@ def test_realtime_duplex_demo_explicitly_enables_native_runtime_before_connect()
     )
 
     query = parse_qs(urlsplit(url).query)
-    assert query["native_duplex"] == ["1"]
+    assert query["duplex"] == ["1"]
+    assert "native_duplex" not in query
+    assert "session_id" not in query
 
 
-def test_realtime_duplex_demo_explicit_session_id_reaches_autostart_query():
-    demo = _load_demo_module()
-
-    url = demo._url_with_model(
-        "ws://localhost:8099/v1/realtime?duplex=1",
-        "openbmb/MiniCPM-o-4_5",
-        session_id="reopen-e2e",
-    )
-
-    query = parse_qs(urlsplit(url).query)
-    assert query["session_id"] == ["reopen-e2e"]
-
-
-def test_realtime_duplex_demo_session_update_uses_explicit_session_id():
+def test_realtime_duplex_demo_session_update_leaves_session_id_to_the_server():
     demo = _load_demo_module()
 
     event = demo._session_update_event(
@@ -1031,8 +1054,8 @@ def test_realtime_duplex_demo_session_update_uses_explicit_session_id():
 
     assert event["type"] == "session.update"
     assert "session_id" not in event
-    assert event["session"]["session_id"] == "reopen-e2e"
-    assert event["session"]["extra_body"]["native_duplex"] is True
+    assert "session_id" not in event["session"]
+    assert "native_duplex" not in event["session"]["extra_body"]
 
 
 def test_realtime_duplex_demo_response_required_uses_deterministic_sampling():
@@ -1123,7 +1146,7 @@ def test_realtime_duplex_demo_partitions_timing_by_response_identity():
         )
         state.add(
             {
-                "type": "response.audio.delta",
+                "type": "response.output_audio.delta",
                 "response_id": response_id,
                 "delta": base64.b64encode(b"audio").decode("ascii"),
                 "metadata": {
@@ -1142,7 +1165,7 @@ def test_realtime_duplex_demo_partitions_timing_by_response_identity():
         )
         state.add(
             {
-                "type": "response.audio_transcript.delta",
+                "type": "response.output_audio_transcript.delta",
                 "response_id": response_id,
                 "delta": "audio",
             },
@@ -1174,7 +1197,9 @@ def test_realtime_duplex_demo_partitions_timing_by_response_identity():
                 "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
                 "ttfp": "input_audio_buffer.commit client send to first audio packet",
                 "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
+                "tpot": "Stage-0 engine mean time per output token",
             },
+            "tpot_ms": None,
         },
         {
             "session_id": "seed-tts-session",
@@ -1190,15 +1215,17 @@ def test_realtime_duplex_demo_partitions_timing_by_response_identity():
                 "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
                 "ttfp": "input_audio_buffer.commit client send to first audio packet",
                 "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
+                "tpot": "Stage-0 engine mean time per output token",
             },
+            "tpot_ms": None,
         },
     ]
     assert session_metrics == {
         "session_id": "seed-tts-session",
         "audio_turn_count": 2,
-        "mean_ttft_ms": 150.0,
-        "mean_ttfp_ms": 250.0,
-        "mean_rtf": 3.125,
+        "ttft_ms": {"count": 2, "mean": 150.0, "p50": 150.0, "p99": 150.0},
+        "ttfp_ms": {"count": 2, "mean": 250.0, "p50": 200.0, "p99": 300.0},
+        "rtf": {"count": 2, "mean": 3.125, "p50": 2.5, "p99": 3.75},
     }
 
 
@@ -1251,8 +1278,8 @@ def test_realtime_duplex_demo_distinguishes_late_and_missing_commit():
         {"type": "response.output_item.added", "response_id": response_id},
         {"type": "response.content_part.added", "response_id": response_id},
         {"type": "response.speak", "response_id": response_id},
-        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA"},
-        {"type": "response.audio.done", "response_id": response_id},
+        {"type": "response.output_audio.delta", "response_id": response_id, "delta": "AAAA"},
+        {"type": "response.output_audio.done", "response_id": response_id},
         {"type": "response.content_part.done", "response_id": response_id},
         {"type": "response.output_item.done", "response_id": response_id},
         {"type": "response.done", "response_id": response_id},
@@ -1314,7 +1341,7 @@ def test_realtime_duplex_demo_distinct_inputs_compare_audio_content():
 def _add_response_transcript(state, response_id, *, transcript, audio=True):
     state.add(
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": response_id,
             "delta": "YQ==" if audio else "",
         }
@@ -1322,14 +1349,14 @@ def _add_response_transcript(state, response_id, *, transcript, audio=True):
     if transcript:
         state.add(
             {
-                "type": "response.audio_transcript.delta",
+                "type": "response.output_audio_transcript.delta",
                 "response_id": response_id,
                 "delta": transcript,
             }
         )
         state.add(
             {
-                "type": "response.audio_transcript.done",
+                "type": "response.output_audio_transcript.done",
                 "response_id": response_id,
                 "transcript": transcript,
             }
@@ -1404,7 +1431,7 @@ def test_realtime_duplex_demo_speak_gate_rejects_text_channel():
         {
             "type": "response.speak",
             "response_id": "resp-1",
-            "text": "must be emitted through response.audio_transcript.delta",
+            "text": "must be emitted through response.output_audio_transcript.delta",
         }
     )
 
@@ -1450,7 +1477,7 @@ def test_realtime_duplex_demo_gate_rejects_delta_done_mismatch():
     demo = _load_demo_module()
     state = demo.DemoState()
     _add_response_transcript(state, "resp-1", transcript="delta文本")
-    done = next(event for event in state.events if event.get("type") == "response.audio_transcript.done")
+    done = next(event for event in state.events if event.get("type") == "response.output_audio_transcript.done")
     done["transcript"] = "另一个done文本"
 
     result = demo._evaluate_transcript_integrity(
@@ -1979,19 +2006,18 @@ def test_realtime_duplex_demo_streams_one_video_frame_per_model_unit():
     messages = _send_seconds_of_audio(demo, seconds=3, frames=["f0", "f1", "f2", "f3"])
 
     # Frame k rides the append that closes model unit k, so Stage0 can bind it
-    # to that unit's audio. 3 s of audio closes units at 1030 ms and 2030 ms and
-    # leaves a residual too short for a third, so only two frames go out.
-    assert _sent_video_frames(messages) == [["f0"], ["f1"]]
+    # to that unit's audio. 3 s of audio closes units at 1000, 2000, and 3000 ms.
+    assert _sent_video_frames(messages) == [["f0"], ["f1"], ["f2"]]
     frame_indices = [index for index, message in enumerate(messages) if "video_frames" in message]
-    assert frame_indices == [5, 10]
+    assert frame_indices == [4, 9, 14]
     # The carrying appends are exactly the ones that reach a unit boundary.
-    assert [messages[index]["audio_end_ms"] for index in frame_indices] == [1200, 2200]
+    assert [messages[index]["audio_end_ms"] for index in frame_indices] == [1000, 2000, 3000]
 
 
 def test_realtime_duplex_demo_never_sends_a_frame_before_its_unit_can_close():
     """Regression: frame 0 used to ride the very first 200 ms append.
 
-    Stage0 cannot close a unit until 1030 ms of audio has arrived, and it does
+    Stage0 cannot close a unit until 1000 ms of audio has arrived, and it does
     not carry frames across appends, so a frame sent that early was silently
     dropped and every later frame ended up one unit ahead of its audio.
     """
@@ -2008,11 +2034,19 @@ def test_realtime_duplex_demo_never_sends_a_frame_before_its_unit_can_close():
 def test_realtime_duplex_demo_holds_the_last_video_frame_when_audio_outlives_the_clip():
     demo = _load_demo_module()
 
-    # 4 s of audio closes three units (1030/2030/3030 ms); the two-frame clip
-    # holds its last frame for the third.
-    assert _sent_video_frames(_send_seconds_of_audio(demo, seconds=4, frames=["a", "b"])) == [["a"], ["b"], ["b"]]
+    # 4 s of audio closes four units; the two-frame clip holds its last frame.
+    assert _sent_video_frames(_send_seconds_of_audio(demo, seconds=4, frames=["a", "b"])) == [
+        ["a"],
+        ["b"],
+        ["b"],
+        ["b"],
+    ]
     # A still image is a one-element clip and therefore repeats every unit.
-    assert _sent_video_frames(_send_seconds_of_audio(demo, seconds=3, frames=["still"])) == [["still"], ["still"]]
+    assert _sent_video_frames(_send_seconds_of_audio(demo, seconds=3, frames=["still"])) == [
+        ["still"],
+        ["still"],
+        ["still"],
+    ]
 
 
 def test_realtime_duplex_demo_sends_each_units_stacked_composite_next_to_its_base_frame():
@@ -2028,7 +2062,7 @@ def test_realtime_duplex_demo_sends_each_units_stacked_composite_next_to_its_bas
     # Official pairing is frame_list=[base, composite of that unit's interior],
     # so the composite belongs to the same unit as the base beside it -- never
     # to the previous one. A unit without interior sub-frames sends base alone.
-    assert _sent_video_frames(messages) == [["f0", "s0"], ["f1", "s1"], ["f2"]]
+    assert _sent_video_frames(messages) == [["f0", "s0"], ["f1", "s1"], ["f2"], ["f2"]]
 
 
 def test_minicpmo_duplex_camera_fixture_returns_flat_base_frame_track(tmp_path, monkeypatch):
@@ -2180,7 +2214,7 @@ def test_realtime_duplex_demo_listen_only_overlap_accepts_silence_unit_before_fi
             state.add({"type": "response.created", "response": {"id": "resp-first"}})
             state.add(
                 {
-                    "type": "response.audio.delta",
+                    "type": "response.output_audio.delta",
                     "response_id": "resp-first",
                     "delta": "YQ==",
                 }
@@ -2290,7 +2324,7 @@ def test_realtime_duplex_demo_writes_audio_per_response(tmp_path):
         state.add({"type": "response.created", "response": {"id": response_id}})
         state.add(
             {
-                "type": "response.audio.delta",
+                "type": "response.output_audio.delta",
                 "response_id": response_id,
                 "delta": demo.base64.b64encode(payload).decode(),
                 "sample_rate_hz": 24000,

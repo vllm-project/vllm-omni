@@ -6,9 +6,15 @@ from __future__ import annotations
 import base64
 import binascii
 from dataclasses import dataclass
-from typing import Any
 
 import numpy as np
+from numpy.typing import NDArray
+
+from vllm_omni.engine.duplex.pcm_reservation import (
+    commit_ordered_reservation,
+    rollback_ordered_reservation,
+)
+from vllm_omni.engine.duplex.plugin import PcmAppendBuffer, PcmAppendReservation
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,7 +24,7 @@ class _PcmSpan:
     is_speech: bool
 
 
-class MiniCPMO45PcmAppendReservation:
+class MiniCPMO45PcmAppendReservation(PcmAppendReservation):
     __slots__ = (
         "_active",
         "_force_listen",
@@ -74,7 +80,7 @@ class MiniCPMO45PcmAppendReservation:
         self._owner._rollback_reservation(self)
 
 
-def validate_native_ref_audio_config(session_config: dict[str, Any]) -> None:
+def validate_native_ref_audio_config(session_config: dict[str, object]) -> None:
     extra_body = session_config.get("extra_body")
     if not isinstance(extra_body, dict):
         extra_body = {}
@@ -84,7 +90,7 @@ def validate_native_ref_audio_config(session_config: dict[str, Any]) -> None:
         raise ValueError("native duplex ref_audio_path is not accepted; resolve ref_audio in serving first")
 
 
-def decode_native_ref_audio_from_config(session_config: dict[str, Any]) -> np.ndarray | None:
+def decode_native_ref_audio_from_config(session_config: dict[str, object]) -> NDArray[np.float32] | None:
     validate_native_ref_audio_config(session_config)
     extra_body = session_config.get("extra_body")
     if not isinstance(extra_body, dict):
@@ -106,7 +112,7 @@ def decode_native_ref_audio_from_config(session_config: dict[str, Any]) -> np.nd
     return np.frombuffer(raw, dtype="<f4").astype(np.float32, copy=True)
 
 
-class MiniCPMO45PcmAppendBuffer:
+class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
     """Accumulates short native-duplex PCM chunks into model-sized appends."""
 
     def __init__(self) -> None:
@@ -116,9 +122,12 @@ class MiniCPMO45PcmAppendBuffer:
         self._turn_had_speech = False
         self._reservation_seq = 0
         self._reservations: list[MiniCPMO45PcmAppendReservation] = []
-        # Omni duplex: queued camera frames (base64 JPEG), consumed FIFO at
-        # one frame per emitted model unit alongside the unit's audio.
-        self._frame_queue: list[str] = []
+        # Omni duplex: queued camera frames (base64 JPEG), grouped per client
+        # append and consumed FIFO at one group per emitted model unit. A
+        # group is the base frame plus its optional stacked composite (the
+        # wire contract allows at most 2 images per append); both must ride
+        # the same unit, mirroring official ``frame_list``.
+        self._frame_queue: list[list[str]] = []
 
     def clear(self) -> None:
         for reservation in self._reservations:
@@ -251,7 +260,9 @@ class MiniCPMO45PcmAppendBuffer:
         )
         frames_in = payload.get("video_frames")
         if isinstance(frames_in, list):
-            self._frame_queue.extend(frame for frame in frames_in if isinstance(frame, str) and frame)
+            frame_group = [frame for frame in frames_in if isinstance(frame, str) and frame]
+            if frame_group:
+                self._frame_queue.append(frame_group)
         self._turn_had_speech = self._turn_had_speech or bool(payload.get("is_speech", False))
         if not allow_emit:
             return None
@@ -284,16 +295,17 @@ class MiniCPMO45PcmAppendBuffer:
         out.pop("video_frames", None)
         out["audio"] = base64.b64encode(emit_raw).decode("ascii")
         out["sample_rate_hz"] = sample_rate_hz
-        # Omni duplex: attach at most one queued camera frame per emitted
-        # model unit (official cadence: one frame per 1 s chunk). The engine
-        # budgets 66 scheduler slots per attached frame from this payload.
-        # Official omni cadence is one frame per ~1 s chunk, and the first
-        # append consumes extra samples (1035 ms first window), so per-unit
-        # attachment could outrun the units Stage0 actually builds. Attach at
-        # most ONE frame per emitted payload; the rest stay queued.
+        # Omni duplex: attach at most one queued frame *group* per emitted
+        # model unit (official cadence: one ``frame_list`` per 1 s chunk). The
+        # engine budgets scheduler slots for every frame in this payload.
+        # The first append consumes extra samples (1035 ms first window), so
+        # per-unit attachment could outrun the units Stage0 actually builds.
+        # Attach ONE group per emitted payload; later groups stay queued. A
+        # group is what one client append carried (base frame + optional
+        # stacked composite), so the composite never lags its base frame.
         attached_frames: list[str] = []
         if emit_samples + pad_samples >= min_samples and self._frame_queue:
-            attached_frames = [self._frame_queue.pop(0)]
+            attached_frames = list(self._frame_queue.pop(0))
             out["video_frames"] = attached_frames
         out["force_listen"] = any(span.force_listen for span in reserved_spans)
         out["is_speech"] = any(span.is_speech for span in reserved_spans)
@@ -381,33 +393,23 @@ class MiniCPMO45PcmAppendBuffer:
         return reservation.payload
 
     def _commit_reservation(self, reservation: MiniCPMO45PcmAppendReservation) -> None:
-        if not reservation._active:
-            return
-        if not self._reservations or self._reservations[0] is not reservation:
-            raise RuntimeError("PCM append reservations must commit in wire order")
-        self._reservations.pop(0)
-        reservation._active = False
+        commit_ordered_reservation(self._reservations, reservation, head_only=True)
 
     def _rollback_reservation(self, reservation: MiniCPMO45PcmAppendReservation) -> None:
-        if not reservation._active:
+        rolled_back = rollback_ordered_reservation(
+            self._reservations,
+            reservation,
+            self._buffer,
+            active_only=False,
+        )
+        if not rolled_back:
             return
-        try:
-            index = self._reservations.index(reservation)
-        except ValueError:
-            reservation._active = False
-            return
-        rolled_back = self._reservations[index:]
-        restored = b"".join(item._raw for item in rolled_back)
-        self._buffer[:0] = restored
         self._prepend_spans([span for item in rolled_back for span in item._spans])
-        restored_frames = [frame for item in rolled_back for frame in item._video_frames]
-        if restored_frames:
-            self._frame_queue[:0] = restored_frames
+        restored_groups = [list(item._video_frames) for item in rolled_back if item._video_frames]
+        if restored_groups:
+            self._frame_queue[:0] = restored_groups
         self._sample_rate_hz = self._sample_rate_hz or reservation._sample_rate_hz
         self._turn_had_speech = self._turn_had_speech or any(item._turn_had_speech for item in rolled_back)
-        for item in rolled_back:
-            item._active = False
-        del self._reservations[index:]
 
     def flush(self, *, chunk_period_ms: int) -> dict[str, object] | None:
         if not self._buffer:

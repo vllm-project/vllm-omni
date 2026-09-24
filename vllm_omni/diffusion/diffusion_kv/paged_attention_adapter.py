@@ -84,12 +84,18 @@ class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
         attention_config = vllm_config.attention_config
         previous_backend = attention_config.backend
         previous_backend_per_kind = attention_config.backend_per_kind
+        parallel_config = vllm_config.parallel_config
+        previous_pcp_size = parallel_config.prefill_context_parallel_size
         try:
             # This is a portable vLLM backend request. The active platform
             # resolves it to its native implementation, such as FlashAttention
             # on CUDA or AscendAttentionBackend on NPU.
             attention_config.backend = AttentionBackendEnum.FLASH_ATTN
             attention_config.backend_per_kind = {}
+            # Diffusion maps SP to PCP for MoE, not for attention. Omni's
+            # Ulysses hooks gather the sequence and shard heads before this
+            # native kernel, so backend selection must not request PCP.
+            parallel_config.prefill_context_parallel_size = 1
             with set_current_vllm_config(vllm_config):
                 attn_backend = get_attn_backend(
                     head_size=spec.head_size,
@@ -101,14 +107,17 @@ class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
         finally:
             attention_config.backend = previous_backend
             attention_config.backend_per_kind = previous_backend_per_kind
+            parallel_config.prefill_context_parallel_size = previous_pcp_size
         attn_backend = current_omni_platform.get_diffusion_paged_kv_attn_backend(
             attn_backend,
             ulysses_degree=ulysses_degree,
         )
+        # vLLM 0.29 carries the block-stride decision on the resolved physical
+        # ``CacheConfig.kv_cache_layout`` instead of the spec; the backend's
+        # requirement is enforced against that layout rather than copied here.
         canonical_spec = replace(
             spec,
             num_kv_heads=num_kv_heads,
-            indexes_kv_by_block_stride=attn_backend.indexes_kv_by_block_stride(),
         )
         self.layer_name = layer_name
         self.spec = canonical_spec
@@ -756,6 +765,19 @@ class DiffusionPagedAttentionAdapter:
                 slot_mappings=slot_mappings,
                 causal=(row_segments[0].mode == "causal"),
             )
+            # FA2's ``num_splits=0`` auto policy selects SplitKV for these
+            # already-small piecewise calls. Reuse vLLM's supported metadata
+            # control to select the single-pass kernel and avoid its extra
+            # partial-output/reduction work. Leave newer native backends and
+            # metadata without this control untouched.
+            for layer_name, native_metadata in segment_metadata.items():
+                layer = self.layers.get(layer_name)
+                if (
+                    layer is not None
+                    and getattr(layer.impl, "vllm_flash_attn_version", None) == 2
+                    and hasattr(native_metadata, "max_num_splits")
+                ):
+                    native_metadata.max_num_splits = 1
             # FA3's full-CUDA-graph metadata builder reuses one persistent
             # scheduler buffer across builds. Piecewise attention prepares all
             # segments before executing any of them, so each segment needs its
@@ -899,9 +921,17 @@ class DiffusionPagedAttentionAdapter:
                 raise KeyError(
                     f"No piecewise native attention metadata was built for diffusion layer {layer_name!r}"
                 ) from exc
+        # Identical rows are sliced and packed once per segment by the
+        # homogeneous piecewise runner.  Keeping the projection view here
+        # avoids first copying the complete Q tensor only to copy each segment
+        # again immediately afterwards.  Other native paths still require one
+        # packed query buffer.
+        query_input = query_flat
+        if piecewise_plan is None or piecewise_plan.homogeneous_batch_shape is None:
+            query_input = query_flat.contiguous()
         return DiffusionPagedAttentionContext(
             layer=layer,
-            query=query_flat.contiguous(),
+            query=query_input,
             key_write=key_flat,
             value_write=value_flat,
             slot_mapping=slot_mapping,

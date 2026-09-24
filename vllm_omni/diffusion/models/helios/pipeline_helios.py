@@ -76,9 +76,9 @@ def load_json_config(model_path: str, subfolder: str, filename: str, local_files
                 return json.load(f)
     else:
         try:
-            from huggingface_hub import hf_hub_download
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
-            config_path = hf_hub_download(
+            config_path = hf_api().hf_hub_download(
                 repo_id=model_path,
                 filename=f"{subfolder}/{filename}",
             )
@@ -535,19 +535,23 @@ class HeliosPipeline(
                 "zero_steps": int(extra.get("zero_steps", 1)),
             }
         )
-        self.prepare_next_chunk(state)
         return state
 
     def peek_chunk_media(self, state: StepRequestState) -> ChunkMediaSpec:
         """Expose this chunk's decoded media extent for interaction timelines."""
-        num_frames = int(state.extra["window_num_frames"])
+        num_media_frames = int(state.extra["window_num_frames"])
+        num_latent_frames = int(state.extra["num_latent_frames_per_chunk"])
         fps = state.sampling.fps
         if fps is None or float(fps) <= 0:
             raise ValueError(
                 "sampling.fps is required and must be > 0 for interaction modalities that use the "
                 f"chunk media timeline, got {fps!r} (request_id={state.request_id!r})"
             )
-        return ChunkMediaSpec(num_frames=num_frames, fps=float(fps))
+        return ChunkMediaSpec(
+            num_media_frames=num_media_frames,
+            fps=float(fps),
+            num_latent_frames=num_latent_frames,
+        )
 
     @override
     def prepare_next_chunk(self, state: StepRequestState) -> None:

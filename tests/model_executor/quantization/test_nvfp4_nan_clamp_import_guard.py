@@ -10,9 +10,7 @@ from ``vllm.model_executor.layers.quantization.utils.w8a8_utils``'s
 module-level ``CUTLASS_FP8_SUPPORTED = cutlass_fp8_supported()``, which
 is reached transitively while ``vllm_omni.patch`` does:
 
-    from vllm.model_executor.layers.quantization.modelopt import (
-        ModelOptNvFp4LinearMethod as _OriginalModelOptNvFp4LinearMethod,
-    )
+    importlib.import_module("vllm.model_executor.layers.quantization.modelopt")
 
 to install the NVFP4 weight_scale NaN clamp. That import is guarded by
 ``except ImportError`` so a missing/older modelopt degrades gracefully
@@ -108,6 +106,9 @@ sys.meta_path.insert(0, _RaisingFinder())
 _PATCH_LOGGER = logging.getLogger("vllm_omni.patch.test")
 _already_patched_upstream = False
 _clamp_installed = False
+_MODELOPT_MODULE = "vllm.model_executor.layers.quantization.modelopt"
+_LEGACY_NVFP4_LINEAR_METHOD = "ModelOptNvFp4LinearMethod"
+_GENERIC_LINEAR_METHOD = "ModelOptLinearMethod"
 
 __BLOCK__
 

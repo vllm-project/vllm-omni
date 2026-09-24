@@ -26,18 +26,34 @@ from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, Pipe
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
+from vllm_omni.diffusion.media import (
+    DiffusionMediaOutput,
+    VideoMediaOutput,
+    VideoTensorEncoding,
+    VideoTensorLayout,
+    VideoTensorSpec,
+    VideoValueRange,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
+    resolve_wan_output_fps,
+    resolve_wan_preencode_batch_frames,
+    resolve_wan_preencode_mp4,
+    resolve_wan_video_codec_options,
+    wan_preencoded_mp4_payload,
+)
 from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention, WanTransformer3DModel
 from vllm_omni.diffusion.offloader import OffloadPlan
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.chunked_video import decode_to_mp4
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
@@ -51,9 +67,11 @@ FASTWAN_DMD_SCHEDULER_SHIFT = 8.0
 
 def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
     if sample_solver == "unipc":
+        # Keep native Wan's unshifted training endpoints; set_timesteps applies
+        # the requested shift to the interpolated inference sigmas.
         return FlowUniPCMultistepScheduler(
             num_train_timesteps=1000,
-            shift=flow_shift,
+            shift=1.0,
             prediction_type="flow_prediction",
         )
     if sample_solver == "euler":
@@ -156,9 +174,9 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
     else:
         # Try to download config from HF Hub
         try:
-            from huggingface_hub import hf_hub_download
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
-            config_path = hf_hub_download(
+            config_path = hf_api().hf_hub_download(
                 repo_id=model_path,
                 filename=f"{subfolder}/config.json",
             )
@@ -169,8 +187,36 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
     return {}
 
 
+def resolve_wan_transformer_quant_config(
+    config: dict, quant_config: QuantizationConfig | None, component: str
+) -> QuantizationConfig | None:
+    """Resolve the expert before applying its checkpoint's storage contract."""
+    from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+    from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+
+    # Wan experts are siblings: "transformer_2" must not inherit "transformer"
+    # through the generic layer-prefix resolver. Select the whole expert name.
+    component_quant_config = (
+        quant_config.component_configs.get(component, quant_config.default_config)
+        if isinstance(quant_config, ComponentQuantizationConfig)
+        else quant_config
+    )
+    quantization_disabled = isinstance(quant_config, ComponentQuantizationConfig) and component_quant_config is None
+    resolved_quant_config = resolve_quant_config_from_disk(component_quant_config, config.get("quantization_config"))
+    if quantization_disabled and resolved_quant_config is not None:
+        raise ValueError(
+            f"Quantization is disabled for component {component!r}, but its checkpoint declares quantization. "
+            "Use a BF16 checkpoint for this component or enable its matching quantization method."
+        )
+    return resolved_quant_config
+
+
 def create_transformer_from_config(
-    config: dict, quant_config: QuantizationConfig | None = None, prefix: str = ""
+    config: dict,
+    quant_config: QuantizationConfig | None = None,
+    prefix: str = "",
+    *,
+    component: str = "transformer",
 ) -> WanTransformer3DModel:
     """Create WanTransformer3DModel from config dict."""
     kwargs: dict = {}
@@ -206,11 +252,7 @@ def create_transformer_from_config(
     if "pos_embed_seq_len" in config:
         kwargs["pos_embed_seq_len"] = config["pos_embed_seq_len"]
 
-    if "quantization_config" in config:
-        from vllm_omni.quantization.factory import resolve_quant_config_from_disk
-
-        quant_config = resolve_quant_config_from_disk(quant_config, config["quantization_config"])
-
+    quant_config = resolve_wan_transformer_quant_config(config, quant_config, component)
     if quant_config is not None:
         kwargs["quant_config"] = quant_config
     if prefix:
@@ -235,6 +277,9 @@ def get_wan22_post_process_func(
             output_type = sampling_params.output_type
         if output_type == "latent":
             return video
+        encoded = wan_preencoded_mp4_payload(video)
+        if encoded is not None:
+            return encoded
         video_metadata = {}
         if sampling_params is not None and getattr(sampling_params, "enable_frame_interpolation", False):
             video, multiplier = interpolate_video_tensor(
@@ -364,9 +409,9 @@ class Wan22Pipeline(
         else:
             # For remote models, download and read model_index.json
             try:
-                from huggingface_hub import hf_hub_download
+                from vllm_omni.transformers_utils.repo_utils import hf_api
 
-                model_index_path = hf_hub_download(repo_id=model, filename="model_index.json")
+                model_index_path = hf_api().hf_hub_download(repo_id=model, filename="model_index.json")
                 with open(model_index_path) as f:
                     model_index = json.load(f)
                     self.expand_timesteps = model_index.get("expand_timesteps", False)
@@ -450,13 +495,13 @@ class Wan22Pipeline(
         # Initialize transformers with correct config (weights loaded via load_weights)
         if load_transformer:
             transformer_config = load_transformer_config(model, "transformer", local_files_only)
-            self.transformer = self._create_transformer(transformer_config)
+            self.transformer = self._create_transformer(transformer_config, component="transformer")
         else:
             self.transformer = None
 
         if load_transformer_2:
             transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
-            self.transformer_2 = self._create_transformer(transformer_2_config)
+            self.transformer_2 = self._create_transformer(transformer_2_config, component="transformer_2")
         else:
             self.transformer_2 = None
 
@@ -494,10 +539,17 @@ class Wan22Pipeline(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
 
-    def _create_transformer(self, config: dict) -> WanTransformer3DModel:
+    def _create_transformer(self, config: dict, component: str = "transformer") -> WanTransformer3DModel:
         """Create a transformer from a config dict. Respects od_config.quantization_config."""
         quant_config = getattr(self.od_config, "quantization_config", None)
-        return create_transformer_from_config(config, quant_config=quant_config)
+        # Startup metadata describes the first expert, not a user policy for both.
+        if getattr(self.od_config, "quantization_config_is_auto_detected", False):
+            quant_config = None
+        return create_transformer_from_config(
+            config,
+            quant_config=quant_config,
+            component=component,
+        )
 
     @property
     def guidance_scale(self):
@@ -670,6 +722,8 @@ class Wan22Pipeline(
             num_steps = 40 if common.num_inference_steps is None else common.num_inference_steps
 
         output_type = common.output_type or "np"
+        preencode_mp4 = resolve_wan_preencode_mp4(common, output_type=output_type)
+        preencode_batch_frames = resolve_wan_preencode_batch_frames(common) if preencode_mp4 else 17
         num_outputs_per_prompt = common.num_outputs_per_prompt or 1
         attention_kwargs: dict | None = None
 
@@ -766,7 +820,10 @@ class Wan22Pipeline(
                 self._sample_solver = sample_solver
                 self._flow_shift = flow_shift
 
-            self.scheduler.set_timesteps(num_steps, device=device)
+            if sample_solver == "unipc":
+                self.scheduler.set_timesteps(num_steps, device=device, shift=flow_shift)
+            else:
+                self.scheduler.set_timesteps(num_steps, device=device)
             timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
         boundary_timestep = None
@@ -907,6 +964,7 @@ class Wan22Pipeline(
 
         if DEBUG_PERF:
             _t_decode_start = time.perf_counter()
+        media = None
         if output_type == "latent":
             output = latents
         else:
@@ -920,7 +978,36 @@ class Wan22Pipeline(
                 latents.device, latents.dtype
             )
             latents = latents / latents_std + latents_mean
-            output = self.vae.decode(latents, return_dict=False)[0]
+            if preencode_mp4:
+                output = decode_to_mp4(
+                    self.vae,
+                    latents,
+                    fps=resolve_wan_output_fps(common),
+                    batch_frames=preencode_batch_frames,
+                    video_codec_options=resolve_wan_video_codec_options(common),
+                )
+            else:
+                decoded = self.vae.decode(latents, return_dict=False)[0]
+                # Distributed VAE decode uses broadcast_result=False, so only the
+                # output-owning rank receives the full [B, C, T, H, W] video; other
+                # ranks get an empty placeholder. Emit typed media only from the
+                # owning rank and keep the placeholder on the legacy output field, so
+                # the media batch-dimension check in split_diffusion_output_by_request
+                # does not trip on every non-owner rank.
+                if decoded.dim() == 5:
+                    output = None
+                    media = DiffusionMediaOutput(
+                        video=VideoMediaOutput(
+                            tensor=decoded,
+                            spec=VideoTensorSpec(
+                                layout=VideoTensorLayout.BCTHW,
+                                encoding=VideoTensorEncoding.NORMALIZED_FLOAT,
+                                value_range=VideoValueRange.NEGATIVE_ONE_TO_ONE,
+                            ),
+                        )
+                    )
+                else:
+                    output = decoded
 
         if DEBUG_PERF:
             current_omni_platform.synchronize()
@@ -947,6 +1034,7 @@ class Wan22Pipeline(
         return split_diffusion_output_by_request(
             DiffusionOutput(
                 output=output,
+                media=media,
                 stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             ),
             req,

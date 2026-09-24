@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Literal
 
 import torch
 import torch.nn as nn
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    LinearBase,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -124,6 +126,28 @@ def recursive_replace_linear(model: nn.Module, od_config: OmniDiffusionConfig):
     _recursive_replace(model, prefix="")
 
 
+def recursive_replace_linear_with_quantization_config(
+    model: nn.Module,
+    quant_config: QuantizationConfig | None,
+    prefix: str = "",
+    skip_modules: Sequence[str] = (),
+) -> None:
+    for child_name, child_module in model.named_children():
+        qual_name = maybe_prefix(prefix, child_name)
+        if any(qual_name == path or qual_name.startswith(path + ".") for path in skip_modules):
+            continue
+        if isinstance(child_module, nn.Linear):
+            setattr(
+                model,
+                child_name,
+                replace_linear_class(child_module, quant_config=quant_config, prefix=qual_name),
+            )
+        else:
+            recursive_replace_linear_with_quantization_config(
+                child_module, quant_config, prefix=qual_name, skip_modules=skip_modules
+            )
+
+
 def init_parameters(
     module: nn.Module,
     dtype: torch.dtype | None,
@@ -144,6 +168,24 @@ def init_parameters(
         init_parameters(child, dtype, device)
 
 
+def init_parameters_preserving_vllm_linear(
+    module: nn.Module,
+    dtype: torch.dtype | None,
+    device: torch.device | None = None,
+) -> None:
+    if isinstance(module, LinearBase):
+        return
+    for name, param in module.named_parameters(recurse=False):
+        if param.is_meta:
+            setattr(
+                module,
+                name,
+                nn.Parameter(torch.empty_like(param, dtype=dtype, device=device), requires_grad=param.requires_grad),
+            )
+    for child in module.children():
+        init_parameters_preserving_vllm_linear(child, dtype, device)
+
+
 def create_transformers_model(
     auto_cls: _BaseAutoModelClass,
     od_config: OmniDiffusionConfig,
@@ -161,6 +203,23 @@ def create_transformers_model(
     return model
 
 
+def create_transformers_model_with_vllm_linears(
+    auto_cls: _BaseAutoModelClass,
+    hf_config: PretrainedConfig,
+    quant_config: QuantizationConfig | None,
+    dtype: torch.dtype,
+    device: torch.device,
+    prefix: str = "",
+    skip_modules: Sequence[str] = (),
+) -> PreTrainedModel:
+    """Build a Transformers model with vLLM linears."""
+    with init_on_device_without_buffers("meta"):
+        model = auto_cls.from_config(hf_config, dtype=dtype)
+    recursive_replace_linear_with_quantization_config(model, quant_config, prefix=prefix, skip_modules=skip_modules)
+    init_parameters_preserving_vllm_linear(model, dtype=dtype, device=device)
+    return model
+
+
 def _load_json(model_path: str, filename: str, local_files_only: bool = True) -> dict:
     """Load a JSON config file from a local path or HuggingFace Hub repo."""
     if local_files_only:
@@ -168,8 +227,8 @@ def _load_json(model_path: str, filename: str, local_files_only: bool = True) ->
         with open(path) as f:
             return json.load(f)
     else:
-        from huggingface_hub import hf_hub_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
-        cached = hf_hub_download(repo_id=model_path, filename=filename)
+        cached = hf_api().hf_hub_download(repo_id=model_path, filename=filename)
         with open(cached) as f:
             return json.load(f)

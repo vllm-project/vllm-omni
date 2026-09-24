@@ -171,6 +171,38 @@ def _short_transcript_contains_expected(transcript: str, expected: str) -> bool:
     return short_text and small_word_delta and expected_clean in transcript_clean
 
 
+_MAX_TAIL_WORDS_FLOOR = 2
+_TAIL_WORD_RATIO = 0.2
+
+
+def _transcript_has_bounded_tail(transcript: str, expected: str) -> bool:
+    """Pass when the expected text is spoken verbatim, only trailed by noise.
+
+    A short, unrelated tail after the complete expected sentence is the exact
+    case #6828's rationale anticipated: a different valid TTS sample can append
+    an audible tail even when the spoken text is identical, and Whisper can
+    hallucinate brief words on a non-speech tail. The length-penalized n-gram
+    cosine stays below the gate for such tails, so accept the match when the
+    expected text is a word-aligned prefix of the transcript and the trailing
+    words stay within the floor/ratio bounds.
+    """
+    transcript_clean = preprocess_text(transcript)
+    expected_clean = preprocess_text(expected)
+    if not transcript_clean or not expected_clean:
+        return False
+
+    transcript_words = transcript_clean.split()
+    expected_words = expected_clean.split()
+    if not transcript_words or not expected_words:
+        return False
+
+    if transcript_words[: len(expected_words)] != expected_words:
+        return False
+    tail_words = len(transcript_words) - len(expected_words)
+    max_tail_words = max(_MAX_TAIL_WORDS_FLOOR, math.ceil(_TAIL_WORD_RATIO * len(expected_words)))
+    return tail_words <= max_tail_words
+
+
 def assert_image_diffusion_response(
     response: "DiffusionResponse",
     request_config: dict[str, Any],
@@ -656,10 +688,16 @@ def _compute_pcm_hnr_db(pcm_samples: np.ndarray, sr: int = _PCM_SPEECH_SAMPLE_RA
         peak = float(np.max(ac[min_lag:max_lag]))
         if 0 < peak < 1:
             hnr_values.append(10 * np.log10(peak / (1 - peak + 1e-10)))
-    return float(np.mean(hnr_values)) if hnr_values else 0.0
+    # Silence and constant signals provide no usable harmonic estimate. They
+    # must not pass a model-specific floor of zero or below.
+    return float(np.mean(hnr_values)) if hnr_values else float("-inf")
 
 
-def _assert_pcm_int16_speech_hnr(audio_bytes: bytes, min_hnr_db: float = _MIN_PCM_SPEECH_HNR_DB) -> None:
+def _assert_pcm_int16_speech_hnr(
+    audio_bytes: bytes,
+    min_hnr_db: float = _MIN_PCM_SPEECH_HNR_DB,
+    sr: int = _PCM_SPEECH_SAMPLE_RATE_HZ,
+) -> None:
     """Validate harmonic-to-noise ratio on raw int16 PCM from /v1/audio/speech.
 
     min_hnr_db defaults to the global _MIN_PCM_SPEECH_HNR_DB (1.0 dB),
@@ -668,16 +706,17 @@ def _assert_pcm_int16_speech_hnr(audio_bytes: bytes, min_hnr_db: float = _MIN_PC
     intrinsically around -2 dB) can pass a lower per-test threshold via
     request_config["min_hnr_db"] to keep the catastrophic-failure check
     while not gating CI on a model-intrinsic property.
+
+    ``sr`` must be the stream's real sample rate: the autocorrelation lag window
+    is derived from it, so a wrong rate detunes the 80-400 Hz pitch search and
+    understates HNR for models that do not decode at 24 kHz.
     """
     assert audio_bytes is not None and len(audio_bytes) >= 2, "missing PCM bytes"
     assert len(audio_bytes) % 2 == 0, "PCM byte length must be aligned to int16"
     pcm_samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-    hnr = _compute_pcm_hnr_db(pcm_samples)
-    print(f"PCM speech HNR: {hnr:.2f} dB (threshold: {min_hnr_db} dB)")
-    assert hnr >= min_hnr_db, (
-        f"Audio distortion detected: HNR={hnr:.2f} dB < {min_hnr_db} dB. "
-        "Voice clone decoder may be losing ref_code speaker context on later chunks."
-    )
+    hnr = _compute_pcm_hnr_db(pcm_samples, sr=sr)
+    print(f"PCM speech HNR: {hnr:.2f} dB (threshold: {min_hnr_db} dB, sr={sr})")
+    assert hnr >= min_hnr_db, f"PCM speech HNR={hnr:.2f} dB is below the configured floor of {min_hnr_db} dB."
 
 
 def _response_has_audio_output(response: Any) -> bool:
@@ -714,9 +753,36 @@ def _omni_assertion_needs_audio_transcript(request_config: dict[str, Any], run_l
 def _speech_assertion_needs_audio_transcript(request_config: dict[str, Any], run_level: str | None) -> bool:
     if run_level not in {"advanced_model", "full_model"}:
         return False
-    if request_config.get("response_format") == "pcm":
+    if request_config.get("response_format") == "pcm" and "transcript_pcm_sample_rate" not in request_config:
         return False
     return bool(request_config.get("transcript_expected_text", request_config.get("input")))
+
+
+def _speech_pcm_sample_rate(request_config: dict[str, Any]) -> int:
+    expected = request_config.get("expected_sample_rate")
+    if "transcript_pcm_sample_rate" in request_config:
+        sample_rate = request_config["transcript_pcm_sample_rate"]
+        assert type(sample_rate) is int and sample_rate > 0, "transcript_pcm_sample_rate must be a positive integer"
+        assert expected is None or int(expected) == sample_rate, (
+            "transcript_pcm_sample_rate must match expected_sample_rate"
+        )
+        return sample_rate
+    return int(expected or _PCM_SPEECH_SAMPLE_RATE_HZ)
+
+
+def _speech_audio_for_transcription(audio_bytes: bytes | None, request_config: dict[str, Any]) -> bytes | None:
+    """Give ASR a WAV container when a speech test opts into raw PCM transcription."""
+    if not audio_bytes or request_config.get("response_format") != "pcm":
+        return audio_bytes
+    sample_rate = _speech_pcm_sample_rate(request_config)
+    assert len(audio_bytes) % 2 == 0, "PCM byte length must be aligned to int16"
+    with io.BytesIO() as buffer:
+        with wave.open(buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(audio_bytes)
+        return buffer.getvalue()
 
 
 def _resolve_audio_transcript(
@@ -737,10 +803,18 @@ def _resolve_audio_transcript(
     existing = getattr(response, "audio_content", None)
     if isinstance(existing, str) and existing.strip():
         return existing
-    audio_bytes = getattr(response, "audio_bytes", None)
+    audio_bytes = (
+        _speech_audio_for_transcription(getattr(response, "audio_bytes", None), request_config)
+        if speech_api
+        else getattr(response, "audio_bytes", None)
+    )
     if not audio_bytes:
         return None
-    return convert_audio_bytes_to_text(audio_bytes, language=request_config.get("transcript_language"))
+    return convert_audio_bytes_to_text(
+        audio_bytes,
+        model_size=request_config.get("transcript_model", "small"),
+        language=request_config.get("transcript_language"),
+    )
 
 
 def assert_omni_response(response: Any, request_config: dict[str, Any], run_level):
@@ -826,7 +900,16 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                         text_output.lower(),
                     )
                     print(f"similarity is: {similarity}")
-                    assert similarity > similarity_threshold, AUDIO_MISMATCH_MESSAGE
+                    if similarity <= similarity_threshold and _transcript_has_bounded_tail(transcript, text_output):
+                        # The full answer is spoken verbatim and only a short
+                        # noise tail follows it; see #6828's rationale.
+                        print(
+                            "bounded-tail containment check passed: "
+                            f"text={text_output!r} is a word-aligned prefix of "
+                            f"transcript={transcript!r}"
+                        )
+                    else:
+                        assert similarity > similarity_threshold, AUDIO_MISMATCH_MESSAGE
             if audio_ref_text:
                 assert transcript is not None, "No audio transcript for reference-text validation"
                 audio_similarity = cosine_similarity_text(
@@ -906,6 +989,17 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
     """
     assert response.success, "The request failed."
 
+    if request_config.get("word_timestamps"):
+        timestamps = response.word_timestamps
+        assert isinstance(timestamps, list) and timestamps, "Expected nonempty X-Word-Timestamps"
+        previous_start = 0
+        for timestamp in timestamps:
+            assert isinstance(timestamp["word"], str) and timestamp["word"]
+            start, end = timestamp["start_ms"], timestamp["end_ms"]
+            assert isinstance(start, int) and isinstance(end, int)
+            assert previous_start <= start <= end
+            previous_start = start
+
     # Optional floor on decoded audio size (models with very short clips may use a lower value).
     min_audio = request_config.get("min_audio_bytes")
     if min_audio is not None:
@@ -934,7 +1028,15 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
     if run_level in {"advanced_model", "full_model"}:
         if req_fmt == "pcm" and response.audio_bytes:
             min_hnr_db = float(request_config.get("min_hnr_db", _MIN_PCM_SPEECH_HNR_DB))
-            _assert_pcm_int16_speech_hnr(response.audio_bytes, min_hnr_db=min_hnr_db)
+            # Raw PCM carries no header, so the HNR pitch search has to be told
+            # the rate. Defaulting to 24 kHz for a 44.1 kHz model shifts the
+            # search window to 147-735 Hz and misses the fundamental entirely,
+            # scoring clean speech ~1.9 dB lower than it is.
+            _assert_pcm_int16_speech_hnr(
+                response.audio_bytes,
+                min_hnr_db=min_hnr_db,
+                sr=_speech_pcm_sample_rate(request_config),
+            )
 
         transcript = _resolve_audio_transcript(response, request_config, run_level, speech_api=True)
         if transcript is not None:
@@ -944,7 +1046,7 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
                 print(f"input text is: {expected_text}")
                 _assert_transcript_matches(
                     transcript,
-                    getattr(response, "audio_bytes", None),
+                    _speech_audio_for_transcription(getattr(response, "audio_bytes", None), request_config),
                     expected_text,
                     threshold=0.9,
                     escalation_model=request_config.get("transcript_escalation_model"),

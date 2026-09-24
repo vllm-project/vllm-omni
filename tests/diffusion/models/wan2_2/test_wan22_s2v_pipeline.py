@@ -1,4 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -7,6 +11,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v import (
     Wan22S2VPipeline,
     _make_clip_generators,
@@ -14,11 +19,32 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v import (
 from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import WanS2VTransformer3DModel
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.mark.parametrize("configured_shift", [None, 12.0])
+def test_s2v_constructor_preserves_unshifted_endpoints(configured_shift: float | None) -> None:
+    module = "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v"
+    config = SimpleNamespace(model="unused", flow_shift=configured_shift, enable_diffusion_pipeline_profiler=False)
+
+    def init_components(pipeline, *args):
+        pipeline.vae = SimpleNamespace(config=SimpleNamespace(scale_factor_temporal=4, scale_factor_spatial=8))
+
+    with (
+        patch(f"{module}.get_local_device", return_value=torch.device("cpu")),
+        patch(f"{module}._resolve_model_path", return_value="unused"),
+        patch(f"{module}._is_diffusers_format", return_value=True),
+        patch.object(Wan22S2VPipeline, "_init_diffusers_format", init_components),
+        patch.object(Wan22S2VPipeline, "setup_diffusion_pipeline_profiler"),
+    ):
+        pipeline = Wan22S2VPipeline(od_config=config)
+    assert pipeline._flow_shift == (3.0 if configured_shift is None else configured_shift)
+    assert pipeline.scheduler.config.shift == pipeline.scheduler.config["shift"] == 1.0
+    assert pipeline.scheduler.sigma_max == float(np.float32(0.999))
 
 
 def _make_s2v_sampling(**overrides):
-    values = {
+    values: dict[str, Any] = {
         "height": 16,
         "width": 16,
         "num_frames": 8,
@@ -211,7 +237,8 @@ def test_s2v_forward_rejects_different_raw_audio_shapes() -> None:
         pipeline.forward(batch)
 
 
-def test_s2v_forward_batches_request_local_inputs_and_splits_outputs() -> None:
+@pytest.mark.parametrize("shift", [3.0, 12.0])
+def test_s2v_forward_batches_request_local_inputs_and_splits_outputs(shift: float) -> None:
     pipeline = object.__new__(Wan22S2VPipeline)
     nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")
@@ -227,7 +254,8 @@ def test_s2v_forward_batches_request_local_inputs_and_splits_outputs() -> None:
         enable_cpu_offload=False,
         parallel_config=SimpleNamespace(use_hsdp=False),
     )
-    pipeline.scheduler = MagicMock(timesteps=torch.tensor([1.0]))
+    pipeline._flow_shift = shift
+    pipeline.scheduler = FlowUniPCMultistepScheduler(shift=1.0)
     pipeline.vae_scale_factor_spatial = 8
     pipeline.resolution_divisor = 16
     pipeline.motion_frames = 7
@@ -262,6 +290,7 @@ def test_s2v_forward_batches_request_local_inputs_and_splits_outputs() -> None:
                     "multi_modal_data": {"image": image, "audio": audio_a},
                 },
                 sampling_params=_make_s2v_sampling(
+                    num_inference_steps=5,
                     num_outputs_per_prompt=2,
                     generator=generators_a,
                     latents=latents_a,
@@ -275,6 +304,7 @@ def test_s2v_forward_batches_request_local_inputs_and_splits_outputs() -> None:
                     "multi_modal_data": {"image": image, "audio": audio_b},
                 },
                 sampling_params=_make_s2v_sampling(
+                    num_inference_steps=5,
                     num_outputs_per_prompt=2,
                     generator=generators_b,
                     latents=latents_b,
@@ -287,6 +317,12 @@ def test_s2v_forward_batches_request_local_inputs_and_splits_outputs() -> None:
         platform.is_available.return_value = False
         outputs = pipeline.forward(batch)
 
+    expected = np.linspace(float(np.float32(0.999)), 0.0, 6)[:-1]
+    expected = shift * expected / (1.0 + (shift - 1.0) * expected)
+    torch.testing.assert_close(
+        pipeline.scheduler.sigmas, torch.tensor(np.append(expected, 0.0), dtype=torch.float32), rtol=0, atol=0
+    )
+    assert pipeline.scheduler.config.shift == pipeline.scheduler.config["shift"] == 1.0
     assert len(outputs) == 2
     assert outputs[0].output[0].shape[0] == 2
     assert outputs[1].output[0].shape[0] == 2
@@ -519,6 +555,7 @@ def test_s2v_pipeline_hsdp_forward_complete_process():
     mock_scheduler.timesteps = torch.linspace(999, 0, 5)
     mock_scheduler.step = MagicMock(return_value=(torch.zeros(1, 16, 20, 88, 128),))
     pipeline.scheduler = mock_scheduler
+    pipeline._flow_shift = 3.0
 
     # -- Bind methods from the real class --
     pipeline.encode_prompt = Wan22S2VPipeline.encode_prompt.__get__(pipeline)
@@ -611,3 +648,245 @@ def test_s2v_pipeline_hsdp_forward_complete_process():
     assert video.shape[1] == 3  # channels
     assert audio_waveform is not None
     assert audio_sr == 16000
+
+
+def _make_s2v_preencode_pipeline() -> Wan22S2VPipeline:
+    """Build the same stub pipeline the batching test drives, for preencode runs."""
+    pipeline = object.__new__(Wan22S2VPipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.transformer = MagicMock()
+    pipeline.transformer.dtype = torch.float32
+    # A fresh iterator per call: the clip loop reads this once per clip.
+    pipeline.transformer.parameters.side_effect = lambda: iter([torch.zeros(1, dtype=torch.float32)])
+    pipeline.transformer.casual_audio_encoder = None
+    pipeline.transformer.encode_audio.side_effect = lambda audio, _motion: {"audio_emb": audio}
+    pipeline.vae = MagicMock()
+    pipeline.vae.dtype = torch.float32
+    # The shared consumer reads the published pixel range off the VAE.
+    pipeline.vae.chunk_value_range = (-1.0, 1.0)
+    # One decoded clip: [B, C, T, H, W] for a batch of four (2 requests x 2 outputs).
+    pipeline.vae.decode.return_value = (torch.zeros(4, 3, 8, 16, 16),)
+    pipeline.od_config = SimpleNamespace(
+        enable_cpu_offload=False,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+    )
+    pipeline.scheduler = MagicMock(timesteps=torch.tensor([1.0]))
+    pipeline._flow_shift = 3.0
+    pipeline.vae_scale_factor_spatial = 8
+    pipeline.resolution_divisor = 16
+    pipeline.motion_frames = 7
+    pipeline.drop_first_motion = True
+    pipeline._DEFAULT_INFER_FRAMES = 8
+    pipeline._guidance_scale = None
+    pipeline._num_timesteps = None
+    pipeline.check_inputs = lambda *args, **kwargs: None
+    pipeline.encode_prompt = MagicMock(return_value=(torch.zeros(4, 2, 3), torch.ones(4, 2, 3)))
+    pipeline.encode_audio = MagicMock(return_value=(torch.zeros(1, 1, 2, 8), 1, 8))
+    pipeline.encode_ref_image = MagicMock(return_value=torch.zeros(1, 16, 1, 2, 2))
+    pipeline.prepare_motion_latents = MagicMock(
+        side_effect=lambda pixels, **_: torch.zeros(pixels.shape[0], 16, 2, 2, 2)
+    )
+    pipeline._denormalize_latents = lambda latents: latents
+    pipeline.diffuse = MagicMock(side_effect=lambda **kwargs: kwargs["latents"])
+    return pipeline
+
+
+def _make_s2v_preencode_batch(audio_a, audio_b, **sampling_overrides) -> DiffusionRequestBatch:
+    image = PIL.Image.new("RGB", (16, 16))
+    return DiffusionRequestBatch(
+        requests=[
+            SimpleNamespace(
+                request_id="a",
+                prompt={"prompt": "first", "multi_modal_data": {"image": image, "audio": audio_a}},
+                sampling_params=_make_s2v_sampling(
+                    num_outputs_per_prompt=2,
+                    latents=torch.zeros(2, 16, 2, 2, 2),
+                    output_type="np",
+                    **sampling_overrides,
+                ),
+            ),
+            SimpleNamespace(
+                request_id="b",
+                prompt={"prompt": "second", "multi_modal_data": {"image": image, "audio": audio_b}},
+                sampling_params=_make_s2v_sampling(
+                    num_outputs_per_prompt=2,
+                    latents=torch.ones(2, 16, 2, 2, 2),
+                    output_type="np",
+                    **sampling_overrides,
+                ),
+            ),
+        ]
+    )
+
+
+def _decode_mp4(data: bytes):
+    """Return (video frame count, first audio samples) for one encoded container."""
+    import io
+
+    import av
+
+    with av.open(io.BytesIO(data)) as container:
+        frames = sum(1 for _ in container.decode(video=0))
+    with av.open(io.BytesIO(data)) as container:
+        assert container.streams.audio, "the worker must mux the waveform into the container"
+        samples = np.concatenate(
+            [frame.to_ndarray().reshape(-1) for frame in container.decode(audio=0)][:4],
+        )
+    return frames, samples
+
+
+@pytest.mark.parametrize("batch_frames", [1, 1000])
+def test_s2v_preencode_returns_playable_mp4_bytes_per_request(monkeypatch, batch_frames) -> None:
+    """The clip loop hands finished clips to the encoder instead of concatenating."""
+    pipeline = _make_s2v_preencode_pipeline()
+    # Two clips, so the autoregressive motion feedback runs between pushes.
+    pipeline.encode_audio = MagicMock(return_value=(torch.zeros(1, 1, 2, 8), 2, 16))
+    audio_a = np.zeros(16000, dtype=np.float32)
+    audio_b = np.full(16000, 0.5, dtype=np.float32)
+    batch = _make_s2v_preencode_batch(
+        audio_a, audio_b, extra_args={"preencode_mp4": True, "preencode_batch_frames": batch_frames}
+    )
+    from vllm_omni.diffusion.utils import chunked_video
+
+    transfers = []
+    quantize = chunked_video.quantize_chunk
+
+    def capture(chunk, value_range):
+        transfers.append(chunk.shape[2])
+        return quantize(chunk, value_range)
+
+    monkeypatch.setattr(chunked_video, "quantize_chunk", capture)
+
+    with patch("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v.current_omni_platform") as platform:
+        platform.is_available.return_value = False
+        outputs = pipeline.forward(batch)
+
+    assert len(outputs) == 2
+    assert pipeline.vae.decode.call_count == 2, "both clips must reach the encoder"
+    assert len(transfers) == (2 if batch_frames == 1 else 1)
+
+    decoded = []
+    for request_output in outputs:
+        # Two outputs per prompt, each already a complete container.
+        assert isinstance(request_output.output, list)
+        assert len(request_output.output) == 2
+        for data in request_output.output:
+            assert isinstance(data, bytes)
+            frames, samples = _decode_mp4(data)
+            assert frames > 0
+            decoded.append(samples)
+
+    # Four entries: request a's waveform for its two outputs, then request b's.
+    # A silent and a non-silent waveform must not land on the same request.
+    assert np.abs(decoded[0]).max() == pytest.approx(0.0, abs=1e-3)
+    assert np.abs(decoded[1]).max() == pytest.approx(0.0, abs=1e-3)
+    assert np.abs(decoded[2]).max() > 0.1
+    assert np.abs(decoded[3]).max() > 0.1
+
+
+def test_s2v_preencode_aborts_encoders_when_a_later_clip_fails(monkeypatch) -> None:
+    """A failure after the first push must not strand encoder worker threads."""
+    pipeline = _make_s2v_preencode_pipeline()
+    pipeline.encode_audio = MagicMock(return_value=(torch.zeros(1, 1, 2, 8), 2, 16))
+    batch = _make_s2v_preencode_batch(
+        np.zeros(16000, dtype=np.float32),
+        np.ones(16000, dtype=np.float32),
+        extra_args={"preencode_mp4": True, "preencode_batch_frames": 1},
+    )
+    sessions = []
+
+    from vllm_omni.diffusion.utils.chunked_video import ChunkedVideoMP4Session
+
+    def capture_session(**kwargs):
+        session = ChunkedVideoMP4Session(**kwargs)
+        sessions.append(session)
+        return session
+
+    def fail_on_second_clip(**kwargs):
+        if pipeline.vae.decode.call_count:
+            raise RuntimeError("second clip failed")
+        return kwargs["latents"]
+
+    pipeline.diffuse = fail_on_second_clip
+    monkeypatch.setattr("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v.ChunkedVideoMP4Session", capture_session)
+
+    with patch("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v.current_omni_platform") as platform:
+        platform.is_available.return_value = False
+        with pytest.raises(RuntimeError, match="second clip failed"):
+            pipeline.forward(batch)
+
+    assert len(sessions) == 1
+    assert len(sessions[0]._encoders) == 4
+    assert all(not encoder._thread.is_alive() for encoder in sessions[0]._encoders)
+
+
+def test_s2v_preencode_skips_encoding_on_a_vae_patch_parallel_peer(monkeypatch) -> None:
+    """A peer still receives every clip for the motion loop but encodes none of them."""
+    pipeline = _make_s2v_preencode_pipeline()
+    pipeline.encode_audio = MagicMock(return_value=(torch.zeros(1, 1, 2, 8), 2, 16))
+    # A peer's patch-parallel decode returns an empty placeholder.
+    pipeline.vae.decode.return_value = (torch.empty(0),)
+    pipeline.vae._vae_pp_group = object()
+    broadcasts = []
+    monkeypatch.setattr(
+        "torch.distributed.broadcast",
+        lambda tensor, src, group: broadcasts.append(tensor.zero_()),
+    )
+    batch = _make_s2v_preencode_batch(
+        np.zeros(16000, dtype=np.float32),
+        np.ones(16000, dtype=np.float32),
+        extra_args={"preencode_mp4": True, "preencode_batch_frames": 1},
+    )
+    sessions = []
+
+    from vllm_omni.diffusion.utils.chunked_video import ChunkedVideoMP4Session
+
+    def capture_session(**kwargs):
+        session = ChunkedVideoMP4Session(**kwargs)
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v.ChunkedVideoMP4Session", capture_session)
+
+    with patch("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v.current_omni_platform") as platform:
+        platform.is_available.return_value = False
+        outputs = pipeline.forward(batch)
+
+    assert len(broadcasts) == 2, "the peer must still join the broadcast for both clips"
+    # Once for the initial motion latents, once more from the peer's broadcast clip.
+    assert pipeline.prepare_motion_latents.call_count == 2, "the motion loop still consumes the peer's frames"
+    assert sessions[0]._encoders == []
+    assert [request_output.output for request_output in outputs] == [[], []]
+
+
+@pytest.mark.parametrize("output_type", ["pil", "pt", "latent"])
+def test_s2v_preencode_rejects_request_output_types_it_cannot_serve(output_type) -> None:
+    """Pre-encoding returns MP4 bytes, so a request asking for frames must fail."""
+    pipeline = _make_s2v_preencode_pipeline()
+    batch = _make_s2v_preencode_batch(
+        np.zeros(16000, dtype=np.float32),
+        np.ones(16000, dtype=np.float32),
+        extra_args={"preencode_mp4": True},
+    )
+    for request in batch.requests:
+        request.sampling_params.output_type = output_type
+
+    with pytest.raises(ValueError, match="output_type"):
+        pipeline.forward(batch)
+
+
+def test_s2v_preencode_keeps_the_full_decode_path_untouched() -> None:
+    """Without the flag the loop still returns the (video, audio, rate) tuple."""
+    pipeline = _make_s2v_preencode_pipeline()
+    audio_a = np.zeros(16000, dtype=np.float32)
+    audio_b = np.ones(16000, dtype=np.float32)
+    batch = _make_s2v_preencode_batch(audio_a, audio_b)
+
+    with patch("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v.current_omni_platform") as platform:
+        platform.is_available.return_value = False
+        outputs = pipeline.forward(batch)
+
+    assert outputs[0].output[0].shape[0] == 2
+    np.testing.assert_array_equal(outputs[0].output[1], audio_a)
+    np.testing.assert_array_equal(outputs[1].output[1], audio_b)

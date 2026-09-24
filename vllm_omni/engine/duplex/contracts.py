@@ -1,100 +1,50 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Model-neutral contracts for the experimental duplex engine plugin.
+"""Model-neutral value types shared by the duplex engine components.
 
-This module contains only immutable data transfer objects and narrow protocols.
-Duplex control algorithms, session implementations, model policy, and Realtime
-serving remain in sibling experimental modules.
+Immutable DTOs plus the ``DuplexStagePort`` base class that ``DuplexOrchestrator``
+implements for the session manager/runner.
 """
 
 from __future__ import annotations
 
 import base64
+from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Protocol
 
-from vllm_omni.engine.duplex.messages import DuplexFence
-from vllm_omni.engine.messages import EngineQueueMessage
+import regex as re
 
 
-class SessionMode(str, Enum):
-    TURN = "turn"
-    DUPLEX = "duplex"
+@dataclass(frozen=True, slots=True)
+class DuplexFence:
+    """Engine-internal session identity used for stage request ids and stale filtering."""
 
-
-class DuplexInputMode(str, Enum):
-    APPEND_TOKENS = "append_tokens"
-    APPEND_AUDIO_CHUNK = "append_audio_chunk"
-    REPLACE_LATEST_CHUNK = "replace_latest_chunk"
-    REENCODE_CONTEXT = "reencode_context"
-    ROLLBACK_TO_CHECKPOINT = "rollback_to_checkpoint"
-    TURN_COMMIT_ONLY = "turn_commit_only"
+    session_id: str
+    epoch: int = 0
+    turn_id: int = 0
 
 
 class DuplexOutputAction(str, Enum):
     DIRECT_RESPONSE = "direct_response"
 
 
-@dataclass
-class DuplexRuntimeCapabilities:
-    input_modes: set[DuplexInputMode] = field(default_factory=lambda: {DuplexInputMode.TURN_COMMIT_ONLY})
-    implementation_level: str = "serving_session_adapter"
-
-
 @dataclass(frozen=True)
 class DuplexAppendPlan:
-    prompt: dict[str, Any]
+    prompt: dict[str, object]
 
 
 @dataclass(frozen=True)
 class DuplexOutputDecision:
     action: DuplexOutputAction
-    metadata: Mapping[str, Any] = field(default_factory=dict)
+    metadata: Mapping[str, object] = field(default_factory=dict)
     final_output_type: str = "text"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
-
-
-class DuplexRuntimeExtension(Protocol):
-    """Pure model policy invoked by the experimental duplex control plane."""
-
-    def configure_sampling_params(
-        self,
-        *,
-        runtime_config: dict[str, Any],
-        defaults: tuple[object, ...],
-    ) -> tuple[object, ...]: ...
-
-    def plan_append(
-        self,
-        *,
-        request_id: str,
-        fence: DuplexFence,
-        session_config: dict[str, Any],
-        runtime_config: dict[str, Any],
-        seq: int,
-        turn_seq: int,
-        mode: DuplexInputMode,
-        payload: object,
-        final: bool,
-        sampling_params: object,
-    ) -> DuplexAppendPlan: ...
-
-    def decide_output(
-        self,
-        *,
-        stage_id: int,
-        final_stage_id: int,
-        segment_finished: bool,
-        segment_token_ids: tuple[int, ...],
-        segment_output_metadata: dict[str, Any],
-        output: object,
-    ) -> DuplexOutputDecision | None: ...
 
 
 @dataclass(frozen=True)
@@ -112,8 +62,8 @@ class DuplexStageRequestContext:
     final_stage_id: int
     config_generation: int
     sampling_params: tuple[object, ...]
-    session_config: Mapping[str, Any] = field(default_factory=dict)
-    runtime_config: Mapping[str, Any] = field(default_factory=dict)
+    session_config: Mapping[str, object] = field(default_factory=dict)
+    runtime_config: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "sampling_params", tuple(self.sampling_params))
@@ -128,8 +78,11 @@ class DuplexStageRequestContext:
 @dataclass(frozen=True)
 class DuplexStageSubmission:
     context: DuplexStageRequestContext
-    prompt: Mapping[str, Any]
+    prompt: Mapping[str, object]
     already_submitted: bool
+    # True: resume/update an existing stage0 id. False: open a new ephemeral id.
+    # Distinct from DuplexCapabilities.supports_core_resumable_request.
+    resumable: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prompt", MappingProxyType(dict(self.prompt)))
@@ -148,7 +101,7 @@ class DuplexOutputContext:
     final_stage_id: int
     segment_finished: bool
     segment_token_ids: tuple[int, ...] = ()
-    segment_output_metadata: Mapping[str, Any] = field(default_factory=dict)
+    segment_output_metadata: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "segment_token_ids", tuple(self.segment_token_ids))
@@ -159,53 +112,27 @@ class DuplexOutputContext:
         )
 
 
-class DuplexStagePort(Protocol):
+class DuplexStagePort(ABC):
+    """Narrow stage-management surface the session runner/manager use (implemented by DuplexOrchestrator)."""
+
     @property
+    @abstractmethod
     def stage_count(self) -> int: ...
 
+    @abstractmethod
     def sampling_defaults(self) -> tuple[object, ...]: ...
 
+    @abstractmethod
     def ensure_request(self, context: DuplexStageRequestContext) -> None: ...
 
+    @abstractmethod
     async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult: ...
 
+    @abstractmethod
     async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None: ...
 
-
-class DuplexControlPlanePort(Protocol):
-    @property
-    def sessions(self) -> object: ...
-
-    def accepts(self, message: object) -> bool: ...
-
-    def dispatch(self, message: object) -> None: ...
-
-    async def shutdown(self) -> None: ...
-
-    def close_sessions_for_request_ids(self, request_ids: list[str]) -> dict[str, list[str]]: ...
-
-    def finalize_closed_sessions(self, session_ids: Iterable[str]) -> None: ...
-
-    def session_for_identity(self, identity: DuplexRequestIdentity | None) -> object | None: ...
-
-    def decide_output(
-        self,
-        stage_id: int,
-        output: object,
-        context: DuplexOutputContext | None,
-    ) -> DuplexOutputDecision | None: ...
-
-
-class CorrelatedRpcTransport(Protocol):
-    def execute(
-        self,
-        key: tuple[str, str],
-        message: EngineQueueMessage,
-        *,
-        timeout: float | None,
-        timeout_message: str,
-        block_on_submit: bool = False,
-    ) -> EngineQueueMessage: ...
+    @abstractmethod
+    async def abort_requests(self, request_ids: list[str]) -> None: ...
 
 
 def duplex_data_plane_request_info(result: dict[str, object]) -> tuple[str | None, int | None]:
@@ -232,45 +159,101 @@ def duplex_resource_request_id(fence: DuplexFence, role: str) -> str:
     ):
         raise ValueError(f"invalid duplex resource role: {role!r}")
     encoded_session_id = base64.urlsafe_b64encode(fence.session_id.encode("utf-8")).decode("ascii").rstrip("=")
-    return f"duplex-s.{encoded_session_id}.i.{fence.incarnation}.e.{fence.epoch}.r.{role}"
+    return f"duplex-s.{encoded_session_id}.e.{fence.epoch}.r.{role}"
+
+
+def duplex_ephemeral_stage_request_id(fence: DuplexFence, *, stage_id: int) -> str:
+    """Turn-scoped Stage request id for non-resumable (ephemeral) duplex models."""
+    return duplex_resource_request_id(fence, f"stage{stage_id}-turn{fence.turn_id}")
+
+
+_EPHEMERAL_TURN_IN_REQUEST_ID = re.compile(r"\.r\.stage\d+-turn(\d+)$")
+
+
+def duplex_turn_id_from_request_id(request_id: str | None) -> int | None:
+    """Parse ephemeral ``…r.stage{N}-turn{T}`` ids."""
+    if not isinstance(request_id, str):
+        return None
+    match = _EPHEMERAL_TURN_IN_REQUEST_ID.search(request_id)
+    return int(match.group(1)) if match else None
+
+
+def duplex_same_turn_request_ids(request_id: str, candidate_ids: Iterable[str]) -> list[str]:
+    """Other ephemeral stage ids from the same session, epoch, and turn.
+
+    ``request_id`` itself is not included. Non-ephemeral ids are ignored.
+    """
+    turn_id = duplex_turn_id_from_request_id(request_id)
+    if turn_id is None or ".r." not in request_id:
+        return []
+    prefix = request_id.rsplit(".r.", 1)[0] + ".r."
+    return [
+        candidate
+        for candidate in candidate_ids
+        if candidate != request_id
+        and isinstance(candidate, str)
+        and candidate.startswith(prefix)
+        and duplex_turn_id_from_request_id(candidate) == turn_id
+    ]
+
+
+def _duplex_resource_request_fields(request_id: str | None) -> tuple[str, str, str] | None:
+    """Split ``duplex-s.<b64url>.e.<epoch>.r.<role>`` or return None."""
+    if not isinstance(request_id, str):
+        return None
+    parts = request_id.split(".")
+    if len(parts) != 6 or parts[0] != "duplex-s" or parts[2] != "e" or parts[4] != "r":
+        return None
+    return parts[1], parts[3], parts[5]
+
+
+def duplex_session_id_from_request_id(request_id: str | None) -> str | None:
+    """Decode the session id from ``duplex-s.<b64url>.e.<epoch>.r.<role>``."""
+    fields = _duplex_resource_request_fields(request_id)
+    if fields is None:
+        return None
+    encoded, _, _ = fields
+    pad = "=" * (-len(encoded) % 4)
+    try:
+        return base64.urlsafe_b64decode(encoded + pad).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
 
 
 def duplex_resource_request_belongs_to_session(request_id: str, session_id: str) -> bool:
     """Return whether a current-format resource request belongs to a session."""
-    parts = request_id.split(".")
-    if len(parts) != 8 or parts[0] != "duplex-s" or parts[2] != "i" or parts[4] != "e" or parts[6] != "r":
+    fields = _duplex_resource_request_fields(request_id)
+    if fields is None:
         return False
+    encoded, epoch, role = fields
     try:
-        int(parts[3])
-        int(parts[5])
+        int(epoch)
     except ValueError:
         return False
-    role = parts[7]
     if not role or any(
         character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in role
     ):
         return False
     encoded_session_id = base64.urlsafe_b64encode(session_id.encode("utf-8")).decode("ascii").rstrip("=")
-    return parts[1] == encoded_session_id
+    return encoded == encoded_session_id
 
 
 __all__ = [
-    "CorrelatedRpcTransport",
+    "DuplexFence",
     "DuplexAppendPlan",
-    "DuplexControlPlanePort",
-    "DuplexInputMode",
     "DuplexOutputAction",
     "DuplexOutputContext",
     "DuplexOutputDecision",
     "DuplexRequestIdentity",
-    "DuplexRuntimeCapabilities",
-    "DuplexRuntimeExtension",
     "DuplexStagePort",
     "DuplexStageRequestContext",
     "DuplexStageSubmission",
     "DuplexStageSubmissionResult",
-    "SessionMode",
     "duplex_data_plane_request_info",
+    "duplex_ephemeral_stage_request_id",
+    "duplex_turn_id_from_request_id",
     "duplex_resource_request_belongs_to_session",
     "duplex_resource_request_id",
+    "duplex_same_turn_request_ids",
+    "duplex_session_id_from_request_id",
 ]

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
+from collections.abc import Sequence
 from itertools import chain
 from typing import Any
 
@@ -13,22 +14,14 @@ from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig, run_cleanup_steps
-from .block_discovery import (
-    get_blocks_attr_names,
-    get_blocks_from_dit,
-    set_blocks_attr_names,
-)
 from .component_utils import (
     clear_encoder_layerwise_state,
-    get_encoder_block_groups,
     iter_streamable_dits,
     move_non_block_state_to_device,
     prepare_pipeline_components,
     set_encoder_layerwise_state,
 )
-from .config import DIT_COMPONENT
-from .module_collector import ModuleDiscovery
-from .offload_plan import OffloadPlan, get_offload_plan
+from .plan_resolver import ResolvedComponent, resolve_offload_plan
 from .tensor_utils import (
     clear_block_storage,
     clear_tensor_storage,
@@ -279,7 +272,7 @@ def remove_block_hook(module: nn.Module) -> None:
 
 
 def _install_layerwise_hook_group(
-    blocks: list[nn.Module] | nn.ModuleList,
+    blocks: Sequence[nn.Module] | nn.ModuleList,
     device: torch.device,
     stream: Any,
     pin_memory: bool,
@@ -327,36 +320,29 @@ def _install_layerwise_hook_group(
 
 
 def enable_plan_encoder_layerwise_offload(
-    module: nn.Module,
-    name: str,
-    plan: OffloadPlan | None,
+    component: ResolvedComponent,
     *,
     device: torch.device,
     stream: current_omni_platform.Stream,
     pin_memory: bool,
-    stage_on_demand: bool = False,
-    strict: bool = False,
 ) -> bool:
-    """Apply rank-local layerwise hooks to plan-declared encoder stacks."""
+    """Apply rank-local layerwise hooks to the encoder's resolved stacks."""
+    module = component.module
     if getattr(module, "_omni_layerwise_enabled", False):
         return True
 
-    hooks: list[LayerwiseOffloadHook] = []
-    hooked_blocks: list[nn.Module] = []
-    block_groups = get_encoder_block_groups(
-        module,
-        name,
-        plan,
-        strict=strict,
-    )
+    block_groups = [stack.blocks for stack in component.stacks]
     if not block_groups:
         return False
+
+    hooks: list[LayerwiseOffloadHook] = []
+    hooked_blocks: list[nn.Module] = []
     try:
         for blocks in block_groups:
             group_hooks = _install_layerwise_hook_group(blocks, device, stream, pin_memory)
             hooks.extend(group_hooks)
             hooked_blocks.extend(blocks)
-        if not stage_on_demand:
+        if not component.on_demand:
             move_non_block_state_to_device(module, block_groups, device)
     except BaseException:
         run_cleanup_steps(
@@ -376,7 +362,7 @@ def enable_plan_encoder_layerwise_offload(
     )
     logger.info(
         "Enabled rank-local layerwise offload for encoder %s (%d blocks across %d stacks)",
-        name,
+        component.path,
         sum(len(blocks) for blocks in block_groups),
         len(block_groups),
     )
@@ -440,92 +426,42 @@ class LayerWiseOffloadBackend(OffloadBackend):
             logger.warning("LayerWiseOffloadBackend already enabled")
             return
 
-        modules = ModuleDiscovery.discover(pipeline)
-        plan = get_offload_plan(pipeline)
-        if not modules.dits and self.config.offloads(DIT_COMPONENT):
-            message = "No DiT/transformer modules found for selected DiT layerwise offload"
-            if self.config.components is not None:
-                raise ValueError(message)
-            logger.warning(message)
+        resolved = resolve_offload_plan(pipeline, self.config)
+        if resolved.skip_reason is not None:
+            logger.warning("%s", resolved.skip_reason)
             return
 
-        def enable_encoder_blocks(
-            module: nn.Module,
-            name: str,
-            component_plan: OffloadPlan | None,
-            stage_on_demand: bool,
-        ) -> bool:
+        def enable_encoder_blocks(component: ResolvedComponent) -> bool:
             enabled = enable_plan_encoder_layerwise_offload(
-                module,
-                name,
-                component_plan,
+                component,
                 device=self.device,
                 stream=self.copy_stream,
                 pin_memory=self.config.pin_cpu_memory,
-                stage_on_demand=stage_on_demand,
-                strict=self.config.components is not None,
             )
             if enabled:
                 # Record each successful installation immediately so a later
                 # component failure can remove these hooks transactionally.
-                self._encoder_modules.append(module)
+                self._encoder_modules.append(component.module)
             return enabled
 
         prepare_pipeline_components(
-            modules,
-            self.config,
-            plan,
+            resolved,
             device=self.device,
             staged_components=self._staged_components,
             enable_encoder_blocks=enable_encoder_blocks,
         )
 
-        if not self.config.offloads(DIT_COMPONENT):
-            self.enabled = bool(self._encoder_modules or self._staged_components)
-            if not self.enabled:
-                raise ValueError(
-                    "None of the selected layerwise offload components have "
-                    "a model-declared streamable or on-demand plan"
-                )
-            return
-
-        logger.info("Applying layer-wise offloading on %s", modules.dit_names)
+        logger.info("Applying layer-wise offloading on %s", [component.path for component in resolved.dits])
 
         # Apply block-wise offloading hook for each of the blocks in DiT model(s)
         # Note that there might exist multiple DiT models in specific pipelines
-        for dit_name, dit_module, blocks_attr_names, blocks in iter_streamable_dits(
-            modules, self.config, self.device, plan
-        ):
-            num_blocks = len(blocks)
-            if num_blocks <= 1:
-                if self.config.components is not None:
-                    raise ValueError(
-                        f"Selected DiT {dit_name!r} requires at least two streamable layerwise-offload blocks"
-                    )
-                logger.warning(
-                    "#Target layers (blocks) <= 1. Skipping offloading on %s (%s)",
-                    dit_name,
-                    dit_module.__class__.__name__,
-                )
-                dit_module.to(self.device)
-                continue
+        for component, stack in iter_streamable_dits(resolved, self.device):
+            dit_module = component.module
+            blocks = list(stack.blocks)
 
-            # Move non-block modules to GPU (they stay resident)
-            for name, m in dit_module.named_children():
-                if name not in blocks_attr_names:
-                    m.to(self.device)
-                    logger.debug(f"Moved {name} to device {self.device}")
-                else:
-                    logger.debug(f"Skipped blocks module {name}")
-
-            # Move top-level params/buffers to GPU (dit_module's own, not sub-modules)
-            for param in dit_module._parameters.values():
-                if param is not None:
-                    param.data = param.data.to(self.device, non_blocking=True)
-
-            for buffer in dit_module._buffers.values():
-                if buffer is not None:
-                    buffer.data = buffer.data.to(self.device, non_blocking=True)
+            # Place the remainder by resolved block tensor identity, just as
+            # for encoders. Attribute aliases must not move streamed weights.
+            move_non_block_state_to_device(dit_module, (stack.blocks,), self.device)
 
             block_hooks = _install_layerwise_hook_group(
                 blocks,
@@ -540,7 +476,7 @@ class LayerWiseOffloadBackend(OffloadBackend):
             # zero once; later denoising iterations prefetch it from the ring.
             block_hooks[0].prefetch_layer(non_blocking=False)
 
-            logger.info(f"Layer-wise offloading enabled on {num_blocks} layers (blocks)")
+            logger.info(f"Layer-wise offloading enabled on {len(blocks)} layers (blocks)")
 
             # Track hooked blocks for cleanup
             self._blocks.append(blocks)
@@ -585,8 +521,3 @@ class LayerWiseOffloadBackend(OffloadBackend):
 
     def disable(self) -> None:
         self._disable(restore_weights=True)
-
-    # Compatibility aliases for existing model integrations.
-    get_blocks_attr_names = staticmethod(get_blocks_attr_names)
-    set_blocks_attr_names = staticmethod(set_blocks_attr_names)
-    get_blocks_from_dit = staticmethod(get_blocks_from_dit)

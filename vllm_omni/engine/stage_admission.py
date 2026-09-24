@@ -287,8 +287,13 @@ def check_admission(
 
 
 def _diffusion_utilization(replica: Any) -> float | None:
-    """Best-effort gpu_memory_utilization for a diffusion replica from raw args."""
+    """Resolve a diffusion replica's memory budget from typed or legacy config."""
     stage_cfg = getattr(replica, "stage_cfg", None)
+    cache_config = getattr(stage_cfg, "cache_config", None)
+    util = getattr(cache_config, "gpu_memory_utilization", None)
+    if util is not None:
+        return float(util)
+
     engine_args = getattr(stage_cfg, "engine_args", None)
     if isinstance(engine_args, dict):
         util = engine_args.get("gpu_memory_utilization")

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Declarative model capabilities for component layerwise offload.
 
 Models declare an ``_offload_plan`` class attribute on the pipeline. Both the
@@ -22,9 +22,11 @@ class OffloadPlan:
     pipeline class. When present, both layerwise backends use it instead of
     model-specific backend branches, making new integrations data-driven.
 
-    If not declared, the offloader falls back to:
-    1. ``_layerwise_offload_blocks_attrs`` on each DiT module class.
-    2. Heuristic search for ``layers`` / ``blocks`` / ``h`` attributes.
+    If not declared, the offloader falls back to
+    ``_layerwise_offload_blocks_attrs`` on each DiT module class.
+
+    :func:`~vllm_omni.diffusion.offloader.plan_resolver.resolve_offload_plan`
+    is the only consumer; backends read the resolved artifact it returns.
 
     Attributes:
         block_attrs: Maps DiT path → tuple of block-list attribute names.

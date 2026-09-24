@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import ClassVar, Self
+from typing import ClassVar
+
+from typing_extensions import Self
 
 from vllm_omni.diffusion.interaction.types import (
     InteractionChunkMetadata,
@@ -23,9 +25,14 @@ class InteractionHandler(ABC):
     """
 
     modality: ClassVar[str]
-    # When True, chunk-boundary apply needs ``ChunkMediaSpec`` (num_frames/fps)
+    # When True, chunk-boundary apply needs ``ChunkMediaSpec`` (frame count & fps)
     # Those information are useful when interaction handler needs interpolation/integration on a frame-by-frame basis
     needs_chunk_media: ClassVar[bool] = False
+    # When True, the coordinator skips ``apply_at_chunk_boundary`` until a session
+    # exists (normally created on the first enqueue). When False, every chunk
+    # boundary runs apply even with no prior enqueue so the handler can create
+    # its session and materialize default chunk data (e.g. identity camera hold).
+    lazy_initialize_session: ClassVar[bool] = True
 
     @classmethod
     def from_pipeline(cls, pipeline: object) -> Self:
@@ -36,6 +43,21 @@ class InteractionHandler(ABC):
         """
         del pipeline
         return cls()
+
+    @abstractmethod
+    def validate_payload(
+        self,
+        state: StepRequestState,
+        *,
+        event_id: str,
+        payload: InteractionPayload,
+        transition_chunks: int | None,
+    ) -> None:
+        """Validate a modality payload without mutating request state.
+
+        Used by ``InteractionCoordinator.enqueue_parts`` so composite events
+        fail before any track is queued.
+        """
 
     @abstractmethod
     def enqueue(
@@ -56,7 +78,9 @@ class InteractionHandler(ABC):
         *,
         boundary_at: float,
         chunk_index: int | None = None,  # defaults to state.chunk_index when omitted
-        num_frames: int | None = None,  # only set when at least one interaction handler needs it
-        fps: float | None = None,  # only set when at least one interaction handler needs it
+        # Optional chunk media information. Only present when at least one initialized interaction handler needs it
+        num_media_frames: int | None = None,
+        fps: float | None = None,
+        num_latent_frames: int | None = None,
     ) -> InteractionChunkMetadata | None:
         """Advance request-local state and materialize this chunk's effects."""

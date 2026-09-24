@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import importlib
 import logging
 import os
 import sys
@@ -97,20 +98,35 @@ assert _installed is _patched_cp, (
 # inference bug. Newly calibrated, clean checkpoints pay no runtime cost
 # (the clamp is a no-op when no NaN bytes are present).
 #
-# SCOPE: ModelOptNvFp4LinearMethod (W4A4 NVFP4 Linear) only. NvFp4FusedMoE /
-# NvFp4W4A16 / CompressedTensors / Quark NVFP4 paths are not covered.
+# SCOPE: the W4A4 NVFP4 linear PWAL only. NvFp4FusedMoE / NvFp4W4A16 /
+# CompressedTensors / Quark NVFP4 paths are not covered.
 #
-# SELF-EXTINGUISH: `_already_patched_upstream` heuristically detects when
-# vLLM's own PWAL contains an in-place `masked_fill_` against `weight_scale`
-# / `isnan` — the structure the upstream fix is expected to take when it is
-# filed (planned as a follow-up PR after this one merges). Once vllm-omni's
-# vllm pin moves to a release with that upstream fix, the override is
-# skipped at import and this block can be deleted. NOTE: the heuristic only
-# matches "vLLM PWAL clamps NaN in-place with `masked_fill_`"; if the
-# upstream fix lands as `nan_to_num_` or as a clamp before the FP32→FP8
-# cast, the check won't fire and this override stays active. The override
-# is idempotent so the overlap is a warning log, not a correctness issue —
-# but the heuristic should be revisited when the upstream PR is filed.
+# SELF-EXTINGUISH (structural): vLLM #49381 redesigned the ModelOpt linear
+# methods around one generic `ModelOptLinearMethod` built by
+# `build_linear_method()`, and removed the per-format classes
+# (`ModelOptNvFp4LinearMethod`, `ModelOptFp8LinearMethod`, ...) together with
+# the `LinearMethodCls` attributes they were reached through. This block
+# therefore resolves its target dynamically and self-extinguishes when only
+# the generic class exists, because that PWAL now REJECTS any NaN
+# weight_scale (#52501: `KNvfp4Static` creates `weight_scale` as
+# `torch.full(shape, nan)` and raises "... was never loaded (still NaN)" on
+# any surviving NaN). A NaN byte in weight_scale can come from that
+# unloaded-scale sentinel or from ModelOpt 0.44's FP32→FP8 E4M3 cast
+# overflow, and the two are byte-identical; a fused projection's
+# weight_scale is also written slice-by-slice by the weight loader, so
+# "some values are finite" does not prove the tensor was fully loaded.
+# Clamping would silently serve a partially loaded model, so the override is
+# retired there instead — a corrupt checkpoint gets a loud load-time
+# RuntimeError instead of the `!!!!` decode-time collapse.
+#
+# SELF-EXTINGUISH (heuristic, legacy pins only): `_already_patched_upstream`
+# heuristically detects when vLLM's own PWAL contains an in-place
+# `masked_fill_` against `weight_scale` / `isnan` — the structure the
+# upstream fix was expected to take. NOTE: the heuristic only matches
+# "vLLM PWAL clamps NaN in-place with `masked_fill_`"; if an upstream fix
+# lands as `nan_to_num_` or as a clamp before the FP32→FP8 cast, the check
+# won't fire and this override stays active. The override is idempotent so
+# the overlap is a warning log, not a correctness issue.
 #
 # ORDERING: the clamp must run BEFORE the original PWAL. The non-Blackwell
 # Marlin fallback (sm_<100) casts weight_scale FP8 -> bf16/fp16 and permutes
@@ -182,27 +198,41 @@ def _clamp_nvfp4_weight_scale_nans(layer) -> int:
 
 # Module-level defaults so downstream code (and tests) can import these names
 # without guarding for the import-failure / escape-hatch branches below.
-# `_already_patched_upstream` = upstream PWAL contains its own NaN clamp.
+# `_already_patched_upstream` = upstream's own PWAL already handles NaN
+#                               weight_scale by itself (its own clamp, or — on
+#                               the redesigned ModelOpt path — a hard
+#                               rejection), so we deliberately install nothing.
 # `_clamp_installed`         = our wrapper was installed on the upstream class.
 # These are independent: the env-var escape hatch and the import-failure path
-# both leave the wrapper uninstalled WITHOUT upstream being patched, so the
+# both leave the wrapper uninstalled WITHOUT upstream handling the case, so the
 # right check for "we own NaN-clamp behavior" is `_clamp_installed`.
 _already_patched_upstream = False
 _clamp_installed = False
+
+# Resolve the clamp target dynamically. A literal
+# `from ...modelopt import ModelOptNvFp4LinearMethod` is not an option any more:
+# the class was removed upstream (#49381), so the import is both a hard
+# ImportError and a static-check failure, and dynamic resolution is also what
+# lets us tell "no target" apart from "target replaced by the generic method".
+_MODELOPT_MODULE = "vllm.model_executor.layers.quantization.modelopt"
+_LEGACY_NVFP4_LINEAR_METHOD = "ModelOptNvFp4LinearMethod"
+_GENERIC_LINEAR_METHOD = "ModelOptLinearMethod"
 
 try:
     # Escape hatch — set VLLM_OMNI_SKIP_NVFP4_NAN_CLAMP=1 to skip installing
     # the patch (e.g. to confirm a `!!!!` failure is the NaN-byte case).
     # The escape-hatch deliberately raises ImportError so the not-installed
-    # warning below logs through the same path a real ImportError would.
+    # warning below logs through the same path a real ImportError would, and it
+    # short-circuits BEFORE any upstream probing so both module flags stay
+    # False on this path.
     # Use the repo-wide bool-env idiom so values like `0`, `false`, `no`,
     # `off` correctly mean "do not skip" rather than tripping naive
     # truthiness on the non-empty string.
     if os.environ.get("VLLM_OMNI_SKIP_NVFP4_NAN_CLAMP", "").lower() in ("1", "true", "yes", "on"):
         raise ImportError("VLLM_OMNI_SKIP_NVFP4_NAN_CLAMP is set; skipping NaN-clamp install")
-    from vllm.model_executor.layers.quantization.modelopt import (
-        ModelOptNvFp4LinearMethod as _OriginalModelOptNvFp4LinearMethod,
-    )
+    _modelopt = importlib.import_module(_MODELOPT_MODULE)
+    _legacy_nvfp4_linear_method = getattr(_modelopt, _LEGACY_NVFP4_LINEAR_METHOD, None)
+    _generic_linear_method = getattr(_modelopt, _GENERIC_LINEAR_METHOD, None)
 except Exception as _nan_clamp_import_err:  # noqa: BLE001 - this optional import
     # transitively pulls in vllm.model_executor.layers.quantization.utils.w8a8_utils,
     # whose module-level `cutlass_fp8_supported()` probes NVML and can raise
@@ -216,7 +246,36 @@ except Exception as _nan_clamp_import_err:  # noqa: BLE001 - this optional impor
         "checkpoints with NaN bytes in per-block weight_scale will serve `!!!!`.",
         _nan_clamp_import_err,
     )
+    _legacy_nvfp4_linear_method = None
+    _generic_linear_method = None
 else:
+    if _legacy_nvfp4_linear_method is None and _generic_linear_method is not None:
+        # Redesigned upstream (#49381): only the generic ModelOptLinearMethod
+        # exists, and its PWAL rejects any NaN weight_scale (#52501). Retire the
+        # override rather than mask that check — see the SELF-EXTINGUISH
+        # (structural) note above for why the two NaN origins cannot be told
+        # apart. `_already_patched_upstream` records that upstream handles the
+        # case itself, so an absent `_clamp_installed` is the expected state.
+        _already_patched_upstream = True
+        _PATCH_LOGGER.info(
+            "NVFP4 W4A4 weight_scale NaN-clamp: skipped — upstream serves ModelOpt "
+            "linears through the generic %s and rejects any NaN weight_scale "
+            "(unloaded-scale sentinel), so a load-time error replaces the "
+            "`!!!!` decode-time collapse.",
+            _GENERIC_LINEAR_METHOD,
+        )
+    elif _legacy_nvfp4_linear_method is None:
+        # Unrecognised pin: neither the legacy per-format class nor the generic
+        # replacement is present. Nothing to install and nothing to assume.
+        _PATCH_LOGGER.warning(
+            "NVFP4 weight_scale NaN-clamp patch could NOT install: neither %s nor %s is present in %s.",
+            _LEGACY_NVFP4_LINEAR_METHOD,
+            _GENERIC_LINEAR_METHOD,
+            _MODELOPT_MODULE,
+        )
+
+if _legacy_nvfp4_linear_method is not None:
+    _OriginalModelOptNvFp4LinearMethod = _legacy_nvfp4_linear_method
     _current_nvfp4_pwal = _OriginalModelOptNvFp4LinearMethod.process_weights_after_loading
     # Reload idempotency: on a module reload (importlib.reload in a test, or a
     # second import path) the class attribute already holds OUR wrapper, so

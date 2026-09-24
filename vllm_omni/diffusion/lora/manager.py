@@ -394,17 +394,20 @@ class DiffusionLoRAManager:
             fully_sharded_loras=False,
         )
 
-        # Default denoising components, declared DiT components, and any a
-        # pipeline opts into via ``_lora_components``.
+        # Components scanned for LoRA-capable layers: framework defaults,
+        # declared DiT components, and any a pipeline opts into via
+        # ``_lora_components``. The defaults only cover the generic diffusers
+        # naming convention: ``transformer`` (plus ``transformer_2`` for
+        # dual-DiT pipelines such as Wan2.2) and ``unet`` for SDXL-style
+        # pipelines. Model-specific attribute names must be declared by the
+        # pipeline itself via ``_dit_modules`` or ``_lora_components``.
         #
-        # NOTE: SDXL-style pipelines expose the denoiser as ``unet``.
-        # Without scanning this component, adapters can load/activate while
-        # effectively applying to zero layers, producing base-identical output.
+        # NOTE: if the denoiser component is not scanned here, adapters can
+        # load/activate while effectively applying to zero layers, producing
+        # base-identical output.
         default_components = (
             "transformer",
             "transformer_2",
-            "dit",
-            "bagel",
             "unet",
         )
         declared_components = tuple(getattr(self.pipeline, "_dit_modules", ()) or ())
@@ -545,7 +548,21 @@ class DiffusionLoRAManager:
             return lora_weights
 
         module_suffix = full_module_name.split(".")[-1]
-        return lora_model.get_lora(module_suffix)
+        lora_weights = lora_model.get_lora(module_suffix)
+        if lora_weights is not None:
+            return lora_weights
+
+        # Model-scoped namespace aliases. HunyuanImage-3 registers the DiT
+        # under ``transformer.layers.*`` (``self.transformer`` aliases
+        # ``self.model``) while PEFT adapters use ``model.layers.*``.
+        name_aliases = getattr(self.pipeline, "_get_diffusion_lora_name_aliases", None)
+        if callable(name_aliases):
+            for alias in name_aliases(full_module_name) or []:
+                lora_weights = lora_model.get_lora(alias)
+                if lora_weights is not None:
+                    return lora_weights
+
+        return None
 
     def _is_active_at_scale(self, adapter_id: int, scale: float) -> bool:
         """True if the adapter_id is active and the current scale matches."""
@@ -556,9 +573,8 @@ class DiffusionLoRAManager:
 
     def _bind_adapter_weights(self, lora_model: LoRAModel, scale: float) -> None:
         binding_validator = getattr(self.pipeline, "_validate_diffusion_lora_binding", None)
-        lora_names_by_id = (
-            {id(weights): name for name, weights in lora_model.loras.items()} if callable(binding_validator) else {}
-        )
+        # Track successful bindings for generic and model-specific validation.
+        lora_names_by_id = {id(weights): name for name, weights in lora_model.loras.items()}
         bound_lora_names: set[str] = set()
 
         def _record_bound(weights: LoRALayerWeights | PackedLoRALayerWeights) -> None:
@@ -643,18 +659,43 @@ class DiffusionLoRAManager:
                     lora_layer.reset_lora(0)
                     continue
 
-                total = sum(output_slices)
-                if lora_weights.lora_b.shape[0] != total:
-                    logger.warning(
-                        "Skipping LoRA for %s due to shape mismatch: lora_b[0]=%d != sum(output_slices)=%d",
-                        full_module_name,
-                        lora_weights.lora_b.shape[0],
-                        total,
+                # HunyuanImage-3 fused ``qkv_proj`` LoRA-B rows are
+                # GQA-interleaved in the checkpoint (per-KV-head
+                # [Q-group, K, V]); de-interleave them to the block layout
+                # [all Q, all K, all V] the QKV output slices expect. The
+                # checkpoint sizes exclude replicated KV heads; set_lora()
+                # selects the appropriate Q shard and shared KV shard.
+                deinterleave = getattr(self.pipeline, "_deinterleave_fused_qkv_lora_b", None)
+                if isinstance(getattr(lora_layer, "base_layer", None), QKVParallelLinear) and callable(deinterleave):
+                    deinterleaved = deinterleave(lora_weights.lora_b)
+                    base = lora_layer.base_layer
+                    output_sizes = (
+                        base.total_num_heads * base.head_size,
+                        base.total_num_kv_heads * base.head_size,
+                        base.total_num_kv_heads * base.v_head_size,
                     )
-                    lora_layer.reset_lora(0)
-                    continue
+                    if (
+                        deinterleaved is None
+                        or len(output_sizes) != n_slices
+                        or deinterleaved.shape[0] != sum(output_sizes)
+                    ):
+                        raise ValueError(
+                            f"LoRA adapter {lora_model.id} binding is incomplete for {full_module_name}: "
+                            "cannot establish HunyuanImage-3 fused-QKV layout "
+                            f"(lora_b.shape[0]={lora_weights.lora_b.shape[0]}, "
+                            f"expected output_sizes={output_sizes})"
+                        )
+                    b_splits = list(torch.split(deinterleaved, list(output_sizes), dim=0))
+                else:
+                    total = sum(output_slices)
+                    if lora_weights.lora_b.shape[0] != total:
+                        raise ValueError(
+                            f"LoRA adapter {lora_model.id} binding is incomplete for {full_module_name}: "
+                            f"lora_b.shape[0]={lora_weights.lora_b.shape[0]} != "
+                            f"sum(output_slices)={total} for output_slices={tuple(output_slices)}"
+                        )
+                    b_splits = list(torch.split(lora_weights.lora_b, list(output_slices), dim=0))
 
-                b_splits = list(torch.split(lora_weights.lora_b, list(output_slices), dim=0))
                 lora_a_list = [lora_weights.lora_a] * n_slices
                 lora_b_list = [b * scale for b in b_splits]
                 lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
@@ -675,6 +716,15 @@ class DiffusionLoRAManager:
                 lora_weights.lora_a.shape,
                 lora_weights.lora_b.shape,
                 scale,
+            )
+
+        unbound_lora_names = sorted(set(lora_model.loras) - bound_lora_names)
+        if not bound_lora_names or unbound_lora_names:
+            raise ValueError(
+                f"LoRA adapter {lora_model.id} binding is incomplete: "
+                f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, "
+                f"unbound modules={unbound_lora_names}; "
+                f"expected target modules in {sorted(self._expected_lora_modules)}"
             )
 
         if callable(binding_validator):
