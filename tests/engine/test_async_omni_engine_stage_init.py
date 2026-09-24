@@ -1845,6 +1845,8 @@ def test_typed_diffusion_replicas_share_one_config_between_planning_and_launch(m
             assert launch.call_args.kwargs["use_inline"] is (num_replicas == 1)
 
     assert launch.call_count == 2 * num_replicas
+
+
 @pytest.mark.parametrize("num_replicas", [1, 2])
 def test_native_kv_producer_replica_identity_and_bootstrap_are_isolated(mocker, num_replicas):
     from vllm.config import KVTransferConfig
@@ -1908,15 +1910,32 @@ def test_native_kv_producer_replica_identity_and_bootstrap_are_isolated(mocker, 
         ([None, None], [0], False, True),
     ],
 )
-def test_native_kv_topology_rejects_silent_legacy_fallback(roles, sources, async_chunk, valid):
+def test_native_kv_topology_validation(roles, sources, async_chunk, valid):
+    from vllm_omni.config.omni_config import VllmOmniARStageConfig, VllmOmniDiffusionStageConfig
+
     plans = []
     for stage_id, role in enumerate(roles):
         diffusion = stage_id == len(roles) - 1
         config = types.SimpleNamespace(kv_role=role) if role else None
+        if diffusion:
+            stage_cfg = VllmOmniDiffusionStageConfig(
+                stage_pipeline_config=StagePipelineConfig(
+                    stage_id=stage_id,
+                    model_stage="diffusion",
+                    execution_type=StageExecutionType.DIFFUSION,
+                )
+            )
+            stage_cfg.connector_config.kv_transfer_config = config
+            stage_vllm_config = None
+        else:
+            stage_cfg = VllmOmniARStageConfig(
+                stage_pipeline_config=StagePipelineConfig(stage_id=stage_id, model_stage="ar")
+            )
+            stage_vllm_config = types.SimpleNamespace(kv_transfer_config=config)
         replica = types.SimpleNamespace(
             metadata=types.SimpleNamespace(stage_type="diffusion" if diffusion else "llm", engine_input_source=sources),
-            stage_vllm_config=None if diffusion else types.SimpleNamespace(kv_transfer_config=config),
-            stage_cfg=types.SimpleNamespace(engine_args={"kv_transfer_config": config}),
+            stage_vllm_config=stage_vllm_config,
+            stage_cfg=stage_cfg,
         )
         plans.append(types.SimpleNamespace(stage_id=stage_id, replicas=[replica]))
     runtime = object.__new__(StageRuntime)
