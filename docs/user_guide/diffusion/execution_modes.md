@@ -8,7 +8,7 @@ are exposed.
 ## Choose a Mode
 
 | Goal | CLI configuration |
-|---|---|
+| --- | --- |
 | Serial request execution | `--max-num-seqs 1` |
 | Fused request-level batching | `--max-num-seqs N` |
 | Single-request step execution | `--step-execution --max-num-seqs 1` |
@@ -99,16 +99,21 @@ step-wise continuous batching for image generation with `bagel.yaml`,
 `bagel_think.yaml`, and `bagel_single_stage.yaml`. In the two-stage topologies,
 only the diffusion stage uses step execution; the autoregressive Thinker is
 unchanged. Explicit text-output requests in the single-stage topology retain
-the complete-request path. BAGEL schedules exactly `num_inference_steps`
-denoising updates, so one-step image requests are supported. BAGEL step
-execution does not currently support sequence parallelism or a diffusion cache
-backend. HunyuanImage3 also supports step execution, but only
+the complete-request path. Use at least two inference steps for BAGEL image
+requests because BAGEL schedules `num_inference_steps - 1` denoising updates.
+BAGEL step execution does not currently support sequence parallelism or a
+diffusion cache backend. HunyuanImage3 also supports step execution, but only
 when its resolved self-attention backend is `TORCH_SDPA`;
 set `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA` or configure
 `diffusion_attention_config.default.backend=TORCH_SDPA` before using
 `--max-num-seqs >1`. See the
 [HunyuanImage-3.0 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/HunyuanImage-3.0-Instruct.md)
-for its validated configuration. Helios supports single-request step execution only: use
+for its validated configuration. For HunyuanImage3, this step-execution
+support applies to the `dense_legacy` path; `paged_scheduler` currently
+supports request-level execution only. See the
+[Scheduler-Managed Paged KV Cache guide](paged_kv_cache.md) for its required
+backend and configuration. Helios supports single-request step
+execution only: use
 `--step-execution --max-num-seqs 1` for Helios. MiniMax H3 supports step-wise
 continuous batching by packing co-batched requests into one sequence that keeps
 a separate attention document per request; that layout needs a backend which
@@ -177,8 +182,10 @@ wait
 The scheduler may batch these requests when their sampling parameters are
 compatible. See the
 [Image Generation API](../../serving/image_generation_api.md) for response
-formats and additional client examples. Streaming models can use
-model-specific streaming endpoints documented by their serving guide.
+formats and additional client examples.
+
+Streaming models can use model-specific streaming endpoints documented at
+[Streaming Video Output API](../../serving/streaming_video_output_api.md).
 
 ## Python API
 
@@ -241,7 +248,7 @@ For step execution, set `step_execution: true` and remove
 ## CLI Reference
 
 | Flag | Default | Effect |
-|---|---:|---|
+| --- | ---: | --- |
 | `--step-execution` | disabled | Select step-wise scheduling |
 | `--max-num-seqs` | `1` for diffusion stages | Set request- or step-scheduler capacity |
 | `--request-batch-max-wait-ms` | `0` | Wait for burst coalescing in request mode |

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -16,7 +16,7 @@ from tests.diffusion.models.sana_video.test_transformer_sana_video import (  # n
     _TINY_CONFIG,
     _init_distributed,
 )
-from tests.diffusion.offloader.test_layerwise_backend import DummyEvent, DummyStream, dummy_stream
+from tests.diffusion.offloader.helpers import DummyEvent, DummyStream, dummy_stream
 from vllm_omni.diffusion.attention import selector as attention_selector
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend
@@ -155,6 +155,11 @@ def test_sana_video_rejects_unvalidated_cache_backends():
         _validate_cache_offload_parallelism(OmniDiffusionConfig(cache_backend="tea_cache"))
 
 
+def test_sana_video_accepts_none_cache_backend():
+    """An explicit ``cache_backend=None`` means "no cache", same as ``"none"``."""
+    _validate_cache_offload_parallelism(OmniDiffusionConfig(cache_backend=None))
+
+
 def test_sana_video_rejects_cache_dit_with_distributed_layerwise_offload():
     config = OmniDiffusionConfig(cache_backend="cache_dit", enable_distributed_layerwise_offload=True)
 
@@ -226,7 +231,7 @@ def test_component_loading_uses_loader_device_not_runtime_device(monkeypatch):
     monkeypatch.setattr(
         pipeline_module,
         "_load_json",
-        lambda _model, filename, _local: ({"vae": [None, "FakeVAE"]} if filename == "model_index.json" else {}),
+        lambda _model, filename, _local: {"vae": [None, "FakeVAE"]} if filename == "model_index.json" else {},
     )
     monkeypatch.setattr(
         pipeline_module,

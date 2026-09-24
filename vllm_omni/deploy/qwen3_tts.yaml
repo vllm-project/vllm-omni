@@ -1,16 +1,23 @@
 # Qwen3-TTS deploy: talker → code2wav via shared-memory chunk streaming.
 # Verified on 1x H100.
 #
+# Runner selection:
+#   Model Runner V2 (MRV2) is EXPERIMENTAL and is the default runner on CUDA
+#   for this model. Set `model_runner: v1` to opt out. The `platforms:`
+#   sections at the end of this file keep V1 on NPU, XPU, ROCm and MUSA.
+#   See docs/configuration/stage_configs.md ("Qwen3-TTS with Model Runner V2").
+#
 # Fields omitted from a stage fall back to StageDeployConfig defaults (see
 # vllm_omni/config/stage_config.py). Notable choices for this model:
 #   * Stage 0 (talker) sets max_num_batched_tokens=512 for async-chunk
 #     latency tuning (not correctness) — small per-step batches keep
-#     first-chunk latency low.
+#     first-chunk latency low, and the MRV2 profiles rely on that bound.
 #   * Stage 1 (code2wav) sets max_num_batched_tokens=65536 for correctness:
 #     codec prefill length (Q * num_frames) exceeds the 32k default.
 #   * Stage 0 does not set enforce_eager — talker runs cudagraph by default.
 #     Stage 1 defaults to false so Code2Wav can use its inner cudagraph;
 #     set true to disable that path in eager mode.
+model_runner: v2
 async_chunk: true
 
 connectors:
@@ -63,14 +70,17 @@ stages:
     max_num_seqs: 64
     gpu_memory_utilization: 0.3
     trust_remote_code: true
-    # Prefix caching on by default. The HS opt-out (talker only consumes the
-    # last token's hidden state) and deferred mm-output writes added in this
-    # PR make per-step bookkeeping negligible, and any text repetition across
-    # requests (same voice or shared ref_audio) is a net throughput win.
-    # Disable explicitly if memory headroom is tight on a single-GPU deploy.
+    # Omni prefix cache (reuse of talker codec rows on shared prefixes). Off
+    # by default; set true when text repeats across requests (same voice or
+    # shared ref_audio). The talker opts out of hidden-state caching and
+    # defers codes.audio writes, so per-step cost is small. Stage 1 (codec
+    # decoder) is not a supported prefix-cache stage: keep it false there.
+    # See docs/design/feature/prefix_caching.md for the stage matrix.
     enable_prefix_caching: false
     async_scheduling: true
-    max_num_batched_tokens: 32768
+    # Bound per-step prefill work (validated MRV2 basic profile). Small
+    # per-step batches keep first-chunk latency low.
+    max_num_batched_tokens: 512
     max_model_len: 4096
     devices: "0"
     output_connectors:
@@ -95,6 +105,8 @@ stages:
       top_p: 1.0
 
   - stage_id: 1
+    # Decoder compute dtype on GPU/NPU; 310P requires FP16 and overrides this.
+    dtype: bfloat16
     # Tuned for Base voice clone; CustomVoice / VoiceDesign are TTFA-optimal at 1.
     max_num_seqs: 64
     gpu_memory_utilization: 0.3
@@ -121,6 +133,8 @@ stages:
 
 platforms:
   rocm:
+    # MRV2 is not qualified on ROCm; keep the legacy V1 runner.
+    model_runner: v1
     stages:
       - stage_id: 1
         # MIOpen Conv1d cannot be invoked while vLLM captures the outer
@@ -128,6 +142,7 @@ platforms:
         # Stage 1 eager on ROCm so decoder convolutions execute normally.
         enforce_eager: true
   npu:
+    model_runner: v1
     stages:
       - stage_id: 0
         enforce_eager: false
@@ -136,3 +151,7 @@ platforms:
       - stage_id: 1
         compilation_config:
           cudagraph_mode: PIECEWISE
+  xpu:
+    model_runner: v1
+  musa:
+    model_runner: v1

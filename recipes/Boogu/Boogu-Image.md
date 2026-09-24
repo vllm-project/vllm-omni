@@ -1,12 +1,13 @@
 # Boogu-Image
 
 > Text-to-image and image-editing online serving
-(Boogu-Image-0.1-Base / -Edit / -Edit-Turbo)
+(Boogu-Image-0.1-Base / -Turbo / -Edit / -Edit-Turbo)
 
 ## Summary
 
 - Vendor: Boogu
 - Model: `Boogu/Boogu-Image-0.1-Base` (text-to-image),
+  `Boogu/Boogu-Image-0.1-Turbo` (four-step text-to-image),
   `Boogu/Boogu-Image-0.1-Edit` (image editing), and
   `Boogu/Boogu-Image-0.1-Edit-Turbo` (four-step image editing)
 - Task: Text-to-image generation and text-guided image editing (TI2I)
@@ -16,8 +17,9 @@
 ## When to use this recipe
 
 Use this recipe when you want a known-good starting point for serving
-`Boogu/Boogu-Image-0.1-Base`, `Boogu/Boogu-Image-0.1-Edit`, or
-`Boogu/Boogu-Image-0.1-Edit-Turbo` with vLLM-Omni's native pipeline (no
+`Boogu/Boogu-Image-0.1-Base`, `Boogu/Boogu-Image-0.1-Turbo`,
+`Boogu/Boogu-Image-0.1-Edit`, or `Boogu/Boogu-Image-0.1-Edit-Turbo` with
+vLLM-Omni's native pipeline (no
 `--diffusion-load-format diffusers`, and the upstream `boogu` package is not
 required).
 
@@ -25,12 +27,14 @@ Boogu-Image-0.1 is an Apache-2.0 unified image generation and editing model
 family. The Base text-to-image checkpoint pairs a Qwen3-VL multimodal encoder
 with a Diffusion Transformer (DiT) and a flow-match Euler scheduler with
 time-shift. It handles photorealistic generation and Chinese/English text
-rendering. The Edit and Edit-Turbo checkpoints use the same native
-`BooguImagePipeline` for image editing.
+rendering. The Edit checkpoint uses the native `BooguImagePipeline`, while the
+distilled Turbo and Edit-Turbo checkpoints run the four-step DMD path through
+`BooguImageTurboPipeline`.
 
 ## References
 
 - Upstream model card: <https://huggingface.co/Boogu/Boogu-Image-0.1-Base>
+- Turbo model card: <https://huggingface.co/Boogu/Boogu-Image-0.1-Turbo>
 - Edit model card: <https://huggingface.co/Boogu/Boogu-Image-0.1-Edit>
 - Edit-Turbo 1K hotfix: <https://huggingface.co/Boogu/Boogu-Image-0.1-Edit-Turbo/tree/hotfix-1k-20260708>
 - Project page: <https://boogu.org>
@@ -127,6 +131,173 @@ Use `guidance_scale > 1.0` to activate the parallel two-branch path. Requests
 with `guidance_scale=1.0` remain valid on the same server: every rank evaluates
 only the positive branch, no negative embeddings are built, and no guidance is
 applied.
+
+### 1 x RTX 4090 24 GB / 48 GB (FP8)
+
+Boogu-Image supports the following FP8 loading paths:
+
+| Path | Checkpoints | MLLM | DiT |
+| --- | --- | --- | --- |
+| Pre-quantized FP8 | `Boogu/Boogu-Image-0.1-{Base,Edit}-fp8` | HF checkpoint FP8 configuration | TorchAO FP8 weight-only (W8A16) |
+| Online FP8 | `Boogu/Boogu-Image-0.1-{Base,Edit}` | Optional 128x128 block FP8: Triton W8A8 (vLLM 0.28.0); Marlin W8A16 (vLLM 0.29.0) | Native dynamic FP8 (CUTLASS W8A8) |
+
+#### Environment
+
+The following isolated environments were used for Base T2I and Edit I2I
+measurements at 512x512:
+
+- OS: Linux
+- Python: 3.12
+- Driver / runtime: NVIDIA CUDA environment with one RTX 4090 48 GB GPU
+- vLLM version: Match the vLLM-Omni checkout used for deployment
+- vLLM-Omni version or commit: Use a commit that contains TorchAO FP8
+  checkpoint loading for diffusion models
+- TorchAO version: 0.17.0
+- `kernels` / `kernels-data`: 0.16.1 / 0.16.1
+- Transformers: 5.17.0
+- Tokenizers: 0.23.1
+
+#### Command
+
+Serve the official Base FP8 checkpoint using its pre-quantized TorchAO FP8
+weight-only transformer weights:
+
+```bash
+vllm serve Boogu/Boogu-Image-0.1-Base-fp8 \
+  --omni \
+  --port 8091 \
+  --diffusion-quantization-config \
+  '{"transformer":{"method":"torchao_float8_weight_only"}}'
+```
+
+Native online FP8:
+
+```bash
+# DiT only
+vllm serve Boogu/Boogu-Image-0.1-Base \
+  --omni \
+  --port 8091 \
+  --diffusion-quantization-config \
+  '{"mllm":null,"transformer":"fp8","vae":null}'
+
+# MLLM + DiT
+vllm serve Boogu/Boogu-Image-0.1-Base \
+  --omni \
+  --port 8091 \
+  --quantization fp8
+
+# MLLM + DiT (using --diffusion-quantization-config)
+vllm serve Boogu/Boogu-Image-0.1-Base \
+  --omni \
+  --port 8091 \
+  --diffusion-quantization-config \
+  '{"mllm":"fp8","transformer":"fp8","vae":null}'
+
+```
+
+For image editing, replace `Base` with `Edit` and keep the corresponding
+quantization configuration.
+
+#### Notes
+
+- **Memory usage:**
+    - The serialized TorchAO FP8 path uses approximately 21.1 GiB at 512x512
+      and 24.2-24.6 GiB at 1024x1024.
+    - The DiT-only online FP8 path uses approximately 26.9 GiB at 512x512
+      and 29.9-30.9 GiB at 1024x1024.
+    - The MLLM + DiT online FP8 path uses approximately 20.5-20.6 GiB at
+      512x512 and 23.6-24.5 GiB at 1024x1024.
+
+- **Quantization scope:** For original Base/Edit checkpoints, `--quantization fp8`
+  quantizes the MLLM's language-model linear layers through per-block FP8
+  and the DiT's linear layers through native online FP8. The vision encoder,
+  embeddings, normalization layers and VAE remain unquantized.
+
+- **Performance:** In the 48 GB Base/Edit benchmarks at 512x512, both DiT-only
+  and MLLM + DiT online FP8 reduced E2E latency by over 10 seconds compared with
+  official FP8 and vLLM-Omni pre-quantized FP8. The main runtime difference lies in the DiT quantization implementation, which switches from TorchAO weight-only FP8 (W8A16) to native CUTLASS
+  W8A8 kernels. This reduces additional dequantization overhead and enables
+  FP8 Tensor Core acceleration.
+
+- **Known Limitation:**
+    - **Output consistency:** With MLLM + DiT online FP8, same-seed outputs may visibly differ from BF16 for some Base prompts, but these differences do not mean lower image quality.
+
+    - **Import compatibility conflict between TorchAO and Diffusers::** Loading pre-quantized checkpoints requires `torchao>=0.17.0`, which has a compatibility conflict with `diffusers==0.40.0`. This produces a warning when Diffusers is imported, but currently does not affect Boogu-Image weight loading.
+
+    - **Conflict between the default kernels and Transformers versions:** The default Transformers version range (`>=5.10.1,<5.15`) conflicts with `kernels==0.16.1` when loading pre-quantized FP8 MLLM weights through Hugging Face `FP8Linear`. When using this loading path with `kernels==0.16.1`, please upgrade Transformers to `5.17.0`.
+
+#### Verification
+
+The request format is shared by both FP8 paths. Set `<MODEL_ID>` to the model
+ID passed to `vllm serve`. For example, use
+`Boogu/Boogu-Image-0.1-Base-fp8` for serialized TorchAO FP8 or
+`Boogu/Boogu-Image-0.1-Base` for native online FP8. For image editing, use the
+corresponding Edit model.
+
+Base text-to-image:
+
+```bash
+curl -X POST http://localhost:8091/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "<MODEL_ID>",
+    "prompt": "A mountain lake at sunset, photorealistic, cinematic lighting",
+    "size": "1024x1024",
+    "num_inference_steps": 28,
+    "guidance_scale": 4.0,
+    "seed": 42
+  }' | jq -r '.data[0].b64_json' | base64 -d > output_fp8.png
+```
+
+Image editing:
+
+```bash
+curl -X POST http://localhost:8091/v1/images/edits \
+  -F model="<MODEL_ID>" \
+  -F image="@input.png" \
+  -F prompt="Change the style to a colored pencil drawing." \
+  -F num_inference_steps=28 \
+  -F guidance_scale=4.0 \
+  -F guidance_scale_2=1.0 \
+  -F seed=42 \
+  | jq -r '.data[0].b64_json' | base64 -d > edited_fp8.png
+```
+
+## Fast text-to-image (Boogu-Image-0.1-Turbo)
+
+Turbo is the distilled text-to-image checkpoint. Its `model_index.json`
+declares `BooguImageTurboPipeline`, which runs the four-step DMD path instead
+of the scheduler-driven path used by Base.
+
+### Command
+
+```bash
+vllm serve Boogu/Boogu-Image-0.1-Turbo --omni --port 8091
+```
+
+### Verification
+
+```bash
+curl -X POST http://localhost:8091/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Boogu/Boogu-Image-0.1-Turbo",
+    "prompt": "A mountain lake at sunset, photorealistic, cinematic lighting",
+    "size": "1024x1024",
+    "seed": 42
+  }' | jq -r '.data[0].b64_json' | base64 -d > output-turbo.png
+```
+
+### Notes
+
+- **Required settings:** `guidance_scale=1.0` and `guidance_scale_2=1.0`; any
+  other value is rejected. `num_inference_steps` defaults to 4. All three are
+  pipeline defaults, so the request above omits them.
+- **Resolution:** upstream constrains Turbo to 1K, so `1024x1024` is the
+  supported working resolution. The shared pipeline still clamps at 2K; larger
+  sizes are not validated for this checkpoint.
+- **Known limitations:** the same single-GPU limitations as Base apply; CPU
+  offload, Cache-DiT, and multi-GPU parallelism are not yet validated.
 
 ## Image editing (Boogu-Image-0.1-Edit)
 
@@ -251,16 +422,18 @@ curl -s http://localhost:8091/v1/chat/completions \
 ## Fast image editing (Boogu-Image-0.1-Edit-Turbo)
 
 Edit-Turbo is the distilled image-editing checkpoint. Its `model_index.json`
-declares `BooguImagePipeline`, so it uses the same native TI2I path as Edit.
-The upstream 1K hotfix is recommended for stable results and is pinned below
-to avoid silently loading the older checkpoint from the repository's default
-revision.
+declares `BooguImagePipeline`, so `--model-class-name BooguImageTurboPipeline`
+is required to reach the four-step DMD path; without it the checkpoint is
+served on the dense Edit path. The upstream 1K hotfix is recommended for
+stable results and is pinned below to avoid silently loading the older
+checkpoint from the repository's default revision.
 
 ### Command
 
 ```bash
 vllm serve Boogu/Boogu-Image-0.1-Edit-Turbo \
   --omni \
+  --model-class-name BooguImageTurboPipeline \
   --revision hotfix-1k-20260708 \
   --port 8091
 ```
@@ -304,15 +477,47 @@ curl -s http://localhost:8091/v1/chat/completions \
 
 - **Pinned revision:** use `hotfix-1k-20260708`; upstream recommends the 1K
   hotfix over the 1.5K variant for more stable results.
-- **Recommended settings:** `num_inference_steps=4` and
-  `guidance_scale=1.0`. Edit-Turbo is guidance-distilled, meaning the guidance
-  behavior is already baked into the distilled checkpoint. A scale of `1.0`
-  avoids applying additional classifier-free guidance; unlike the regular Edit
-  checkpoint, it should not be increased to `5.0`.
+- **Required settings:** `guidance_scale=1.0` and `guidance_scale_2=1.0`; the
+  Turbo pipeline rejects any other value, so the `guidance_scale_2=2.0` shown
+  for the regular Edit checkpoint does not apply here. `num_inference_steps`
+  defaults to 4.
 - **Reference images:** the same single-reference and `align_res` behavior as
   the regular Edit checkpoint applies.
 - **Known limitations:** the same single-GPU limitations as Base and Edit apply;
   CPU offload, Cache-DiT, and multi-GPU parallelism are not yet validated.
+
+## Output format and compression
+
+Image requests accept `output_format` (`png`, `jpeg`, or `webp`) and
+`output_compression` (0-100). The default is `png` with the fastest,
+least-compressed PNG encode, which is lossless but produces multi-megabyte
+payloads. For latency-sensitive clients, `output_format: "jpeg"` removes
+almost the entire response-encoding overhead: on a 1024x1024 Turbo request
+the client-observed e2e latency drops from ~900 ms to ~766 ms and the
+payload shrinks from ~3.1 MB to ~0.8 MB. Use `output_compression` to trade
+encode time against payload size when PNG must stay lossless: lower values
+(e.g. 1) compress harder and produce smaller payloads at proportionally
+longer encode times.
+
+## Attention backend
+
+The diffusion attention backend defaults to `FLASH_ATTN` (FlashAttention-2).
+On Hopper-class GPUs (SM90) pass `--diffusion-attention-backend CUDNN_ATTN`
+for a measured ~12% engine-time reduction on Boogu-Image workloads:
+
+```bash
+vllm serve Boogu/Boogu-Image-0.1-Turbo \
+  --omni \
+  --diffusion-attention-backend CUDNN_ATTN \
+  --port 8091
+```
+
+Measured on a 143 GB SM90 card (1024x1024, 4 steps, 5-run mean): stage time
+673 ms with `CUDNN_ATTN` vs 763 ms with the default. Outputs are numerically
+different from FLASH_ATTN (different attention kernel) but visually
+equivalent, deterministic per seed, and decode identically. On datacenter
+Blackwell (SM100 / SM103) use `--diffusion-attention-backend TRTLLM_ATTN`
+instead; it is rejected on SM90.
 
 ## Performance validation
 

@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from transformers import PretrainedConfig
 from vllm.logger import init_logger
@@ -250,12 +250,22 @@ class StagePipelineConfig:
     # Alternates picked by ``merge_pipeline_deploy`` based on ``deploy.async_chunk``.
     async_chunk_process_next_stage_input_func: str | None = None
     sync_process_input_func: str | None = None
+    supports_native_mrv2_data_plane: bool = False
     # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
     # The callable receives ``(prompt, sampling_params_list)``; downstream
     # stages continue to receive the original prompt.
     prompt_transform_func: str | None = None
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
+    # Payload keys this stage expects to receive from its upstream stage over
+    # the omni connector instead of through the orchestrator IPC hop. Declaring
+    # them is what enables the worker-side connector receive path, so an empty
+    # tuple leaves existing deployments untouched.
+    stage_input_payload_keys: tuple[str, ...] = ()
+    # Mirror of the above on the producing side: keys this stage hands to the
+    # next stage over the connector. Only diffusion producers need this; AR
+    # stages already send through ``send_full_payload_outputs``.
+    stage_output_payload_keys: tuple[str, ...] = ()
     omni_kv_config: dict[str, Any] | None = None
     scheduler_cls: str | None = None
     # Model subdirectory indirections: for multi-component HF repos where the
@@ -309,14 +319,17 @@ class PipelineConfig:
     diffusers_class_name: str | None = None
     diffusers_class_aliases: tuple[str, ...] = ()
     endpoint_restrictions: tuple[EndpointRestriction, ...] = ()
-    # Optional model-owned duplex planner loaded by the stable engine runtime.
+    # Dotted path of the model's ``DuplexModelPlugin``. Online serving uses
+    # DuplexOmni only when the deploy configuration selects session_mode: duplex.
+    duplex_plugin: str | None = None
+    # Preserve legacy turn deployments when adding an optional duplex plugin.
+    default_session_mode: str | None = None
+    # Legacy duplex wiring of the models that are not ported to the plugin
+    # framework yet (PersonaPlex, Nemotron VoiceChat). Nothing reads them: a
+    # pipeline that only declares these is served turn-based. Each field goes
+    # away with the follow-up PR that ports its model to ``duplex_plugin``.
     duplex_runtime_extension: str | None = None
-    # Optional model-owned Serving adapter loaded only when the Realtime duplex
-    # endpoint is enabled. Generic OpenAI modules must not select a model.
     duplex_serving_adapter: str | None = None
-    # Explicitly enable the stable duplex control mechanism. This is separate
-    # from the optional model extension because turn-commit-only deployments
-    # do not require a model planner.
     duplex_control_enabled: bool = False
     # Bundled deploy defaults for this concrete pipeline topology. The file is
     # loaded from vllm_omni/deploy; None uses DeployConfig defaults.
@@ -386,6 +399,9 @@ class StageDeployConfig:
     devices: str | None = None
     num_replicas: int = 1
     env: dict[str, Any] | None = None
+
+    # False opts this stage out of pipeline-wide async chunking.
+    async_chunk: bool | None = None
 
     # Inter-stage connector wiring and request defaults.
     output_connectors: dict[str, str] | None = None
@@ -458,10 +474,12 @@ class StageDeployConfig:
     fa_deterministic: bool | None = None
     cache_backend: str | None = None
     cache_config: dict[str, Any] | None = None
+    video_output_transport: dict[str, Any] | None = None
     enable_cache_dit_summary: bool | None = None
     step_execution: bool | None = None
     vae_use_slicing: bool | None = None
     vae_use_tiling: bool | None = None
+    vae_fast_path: str | None = None
     boundary_ratio: float | None = None
     flow_shift: float | None = None
     diffusion_kv_cache_dtype: str | None = None
@@ -471,7 +489,11 @@ class StageDeployConfig:
 
     # Runtime optimizations used by diffusion loading/execution.
     enable_multithread_weight_load: bool | None = None
+    enable_broadcast_weight_load: bool | None = None
     num_weight_load_threads: int | None = None
+    diffusion_offload_config: dict[str, Any] | None = None
+    # Compatibility aliases for existing callers and model-specific stage
+    # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool | None = None
     enable_layerwise_offload: bool | None = None
 
@@ -505,11 +527,20 @@ class DuplexSessionRuntimeConfig:
     max_pending_input_bytes_per_session: int = 16 * 1024 * 1024
     max_pending_turns_per_session: int = 4
     max_sessions: int = 1
+    # Unread by the plugin framework. It used to bound the per-session
+    # completed-append table that made a retried append RPC submit once; the
+    # framework carries appends as one-way commands on the runner's ordered
+    # mailbox, so there is no client-visible retry to deduplicate. The field
+    # stays so the deploy configs of the models that are not ported yet still
+    # parse, and goes away with the PR that ports the last of them.
     completed_append_cache_size: int = 256
-    # Startup warmup: run this many silent 80 ms-style frames through a
-    # throwaway realtime session before real clients are admitted, so
-    # one-time costs (kernel JIT, first prefill/decode paths, codec caches)
-    # never land on the first user. 0 disables the warmup.
+    server_vad_model_path: str | None = None
+    # Startup warmup, before real ``/v1/realtime`` clients are admitted.
+    # Audio-primary models run this many silent frames; 0 disables that path.
+    # Video-required models (AURA) still run one short non-silent audio chunk
+    # plus one image when this is 0, so ASR, vision, Talker and Code2Wav
+    # compile their real shapes. The empty per-stage JIT registry does not.
+    # A negative value disables every startup warmup.
     warmup_frames: int = 0
 
     def __post_init__(self) -> None:
@@ -525,6 +556,10 @@ class DuplexSessionRuntimeConfig:
         }
         if self.idle_ttl_s is not None and self.idle_ttl_s <= 0:
             raise ValueError("duplex_session.idle_ttl_s must be positive or null")
+        if self.server_vad_model_path is not None and (
+            not isinstance(self.server_vad_model_path, str) or not self.server_vad_model_path.strip()
+        ):
+            raise ValueError("duplex_session.server_vad_model_path must be a non-empty string or null")
         for name, value in positive.items():
             if value <= 0:
                 raise ValueError(f"duplex_session.{name} must be positive")
@@ -544,6 +579,7 @@ class DeployConfig:
 
     async_chunk: bool = True
     session_mode: str = "turn"
+    model_runner: Literal["v1", "v2"] = "v1"
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
     active_stream_window: int = 0
     duplex_session: DuplexSessionRuntimeConfig = field(default_factory=DuplexSessionRuntimeConfig)
@@ -568,6 +604,7 @@ class DeployConfig:
 
 _STAGE_RESERVED_KEYS = frozenset(
     {
+        "async_chunk",
         "stage_id",
         "devices",
         "num_replicas",
@@ -626,6 +663,7 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
         if name in flat_args:
             kwargs[name] = flat_args.pop(name)
 
+    kwargs["async_chunk"] = stage_data.get("async_chunk")
     kwargs["output_connectors"] = stage_data.get("output_connectors")
     kwargs["input_connectors"] = stage_data.get("input_connectors")
     kwargs["default_sampling_params"] = stage_data.get("default_sampling_params")
@@ -712,6 +750,16 @@ def _merge_platforms(
     return merged
 
 
+def _merge_connectors(
+    base: dict[str, Any] | None,
+    overlay: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Deep-merge named connector definitions from a deploy overlay."""
+    if not base and not overlay:
+        return None
+    return _get_recursively_merged_dict(base or {}, overlay or {})
+
+
 def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
     """Load a deploy YAML with optional ``base_config`` inheritance."""
     raw_dict = to_dict(load_yaml_config(path))
@@ -724,12 +772,15 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
     base_path = Path(path).parent / base_path
     base_dict = resolve_deploy_yaml(base_path)
 
-    # Merge top-level scalars: overlay wins. ``stages:`` and ``platforms:``
-    # are deep-merged below so an overlay can layer on top of the base.
+    # Merge top-level scalars: overlay wins. Structured sections are merged
+    # below so a thin overlay does not discard inherited runtime contracts.
     merged = {
         **base_dict,
-        **{k: v for k, v in raw_dict.items() if k not in ("stages", "platforms")},
+        **{k: v for k, v in raw_dict.items() if k not in ("connectors", "stages", "platforms")},
     }
+    merged_connectors = _merge_connectors(base_dict.get("connectors"), raw_dict.get("connectors"))
+    if merged_connectors is not None:
+        merged["connectors"] = merged_connectors
     merged["stages"] = _merge_stage_lists(base_dict.get("stages"), raw_dict.get("stages"))
     merged_platforms = _merge_platforms(base_dict.get("platforms"), raw_dict.get("platforms"))
     if merged_platforms is not None:
@@ -749,9 +800,14 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
 
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
 
+    model_runner = raw_dict.get("model_runner", "v1")
+    if model_runner not in ("v1", "v2"):
+        raise ValueError(f"model_runner must be one of ('v1', 'v2'), got {model_runner!r}")
+
     kwargs: dict[str, Any] = {
         "async_chunk": raw_dict.get("async_chunk", True),
         "session_mode": raw_dict.get("session_mode", "turn"),
+        "model_runner": model_runner,
         "active_stream_window": int(raw_dict.get("active_stream_window", 0) or 0),
         "duplex_session": DuplexSessionRuntimeConfig(**(raw_dict.get("duplex_session") or {})),
         "connectors": raw_dict.get("connectors", None),
@@ -804,15 +860,25 @@ def _apply_platform_overrides(
     deploy: DeployConfig,
     platform: str | None = None,
 ) -> DeployConfig:
-    """Merge platform-specific stage overrides into deploy config."""
+    """Merge platform-specific runner and stage overrides into deploy config."""
     if platform is None:
         from vllm_omni.platforms import current_omni_platform
 
         device_name = current_omni_platform.device_name
         platform = device_name.lower() if device_name is not None else None
+    platform_section = (deploy.platforms or {}).get(platform) if platform is not None else None
+    if platform_section is not None and "model_runner" in platform_section:
+        model_runner = platform_section["model_runner"]
+        if model_runner not in ("v1", "v2"):
+            raise ValueError(f"platform model_runner must be one of ('v1', 'v2'), got {model_runner!r}")
+        deploy.model_runner = model_runner
+    if deploy.model_runner == "v2" and platform in {"npu", "xpu"}:
+        raise NotImplementedError(
+            f"Model Runner V2 is not supported on {platform.upper()}: "
+            "the platform worker still uses the legacy chunk-transfer data plane."
+        )
     if platform is None or deploy.platforms is None:
         return deploy
-    platform_section = deploy.platforms.get(platform)
     if platform_section is None:
         return deploy
 
@@ -867,6 +933,28 @@ def _resolve_execution_mode(
 ) -> tuple[StageType, str | None]:
     """Map ``execution_type`` → ``(stage_type, worker_type)`` legacy tuple."""
     return _EXECUTION_TYPE_TO_STAGE_WORKER.get(execution_type, (StageType.LLM, None))
+
+
+def resolve_stage_async_chunk(deploy: DeployConfig, stage: StageDeployConfig | None) -> bool:
+    return bool(deploy.async_chunk and (stage is None or stage.async_chunk is not False))
+
+
+def validate_stage_async_chunk_edges(pipeline: PipelineConfig, deploy: DeployConfig) -> None:
+    stages = {stage.stage_id: stage for stage in pipeline.stages}
+    deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
+    for consumer in pipeline.stages:
+        for source_id in consumer.input_sources:
+            producer = stages[source_id]
+            if not producer.async_chunk_process_next_stage_input_func:
+                continue
+            producer_async = resolve_stage_async_chunk(deploy, deploy_by_id.get(source_id))
+            consumer_async = resolve_stage_async_chunk(deploy, deploy_by_id.get(consumer.stage_id))
+            if producer_async != consumer_async:
+                raise ValueError(
+                    f"Pipeline {pipeline.model_type!r} has incompatible async_chunk settings on "
+                    f"connector edge {source_id} -> {consumer.stage_id}. "
+                    "Set the same async_chunk mode on both stages or disable pipeline-wide async_chunk."
+                )
 
 
 def _select_processor_funcs(
@@ -931,6 +1019,10 @@ def _build_engine_args(
     if ps.model_path_resolver:
         engine_args["model_path_resolver"] = ps.model_path_resolver
     engine_args["inline_diffusion"] = ps.inline_diffusion
+    if ps.stage_input_payload_keys:
+        engine_args["stage_input_payload_keys"] = tuple(ps.stage_input_payload_keys)
+    if ps.stage_output_payload_keys:
+        engine_args["stage_output_payload_keys"] = tuple(ps.stage_output_payload_keys)
 
     # Pipeline-wide top-level DeployConfig settings, applied to every stage.
     for name in _PIPELINE_WIDE_ENGINE_FIELDS:
@@ -945,19 +1037,52 @@ def _build_engine_args(
                 continue
             engine_args[k] = v
         engine_args.update(ds.engine_extras)
-    # Materialize the resolved pipeline-wide async_chunk value into every
-    # stage so explicit False overrides do not get lost downstream.
-    engine_args["async_chunk"] = bool(deploy.async_chunk)
+    engine_args["async_chunk"] = resolve_stage_async_chunk(deploy, ds)
     engine_args["session_mode"] = deploy.session_mode
     if deploy.session_mode == "duplex":
         # The engine admission limit is also the authoritative capacity for
         # model-owned streaming state. Propagate it to every stage instead of
         # making individual models duplicate the value in connector extras.
         engine_args["duplex_max_sessions"] = deploy.duplex_session.max_sessions
+    # The runner selection is a deploy-topology decision owned by the
+    # ``model_runner`` field; do not let an opaque ``engine_extras`` entry
+    # silently veto or force it per stage.
+    if ds is not None:
+        for reserved in ("use_v2_model_runner", "supports_native_mrv2_data_plane"):
+            if reserved in ds.engine_extras:
+                raise ValueError(
+                    f"stage {ds.stage_id}: {reserved!r} must not be set via engine_extras; "
+                    "it is derived from the deploy-level `model_runner` field and the "
+                    "pipeline's `supports_native_mrv2_data_plane` declaration."
+                )
+    engine_args["use_v2_model_runner"] = deploy.model_runner == "v2"
+    engine_args["supports_native_mrv2_data_plane"] = bool(ps.supports_native_mrv2_data_plane)
+    if deploy.model_runner == "v2" and not ps.supports_native_mrv2_data_plane:
+        logger.warning(
+            "Stage %s (%s) selects model_runner=v2 without declaring "
+            "supports_native_mrv2_data_plane. It will use the legacy transport path; "
+            "MRV2 support for this pipeline has not been validated. Use model_runner=v1 "
+            "unless you are validating a new MRV2 integration.",
+            ps.stage_id,
+            ps.model_arch or pipeline.model_arch or pipeline.model_type,
+        )
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     engine_args["requires_full_payload_input"] = ps.requires_full_payload_input
     return engine_args
+
+
+def merge_sampling_constraints(
+    sampling_params: Mapping[str, Any] | None,
+    constraints: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Apply scalar constraints and extend stop tokens without mutating inputs."""
+    resolved_constraints = dict(constraints)
+    if "stop_token_ids" in resolved_constraints:
+        caller_stop_ids = (sampling_params or {}).get("stop_token_ids") or []
+        required_stop_ids = resolved_constraints["stop_token_ids"] or []
+        resolved_constraints["stop_token_ids"] = list(dict.fromkeys([*caller_stop_ids, *required_stop_ids]))
+    return {**(sampling_params or {}), **resolved_constraints}
 
 
 def _build_extras(
@@ -966,10 +1091,10 @@ def _build_extras(
 ) -> dict[str, Any]:
     """Assemble ``yaml_extras`` (sampling + connectors + pipeline extras)."""
     extras: dict[str, Any] = {}
-    sampling: dict[str, Any] = {}
-    if ds is not None and ds.default_sampling_params:
-        sampling.update(ds.default_sampling_params)
-    sampling.update(ps.sampling_constraints)
+    sampling = merge_sampling_constraints(
+        ds.default_sampling_params if ds is not None else None,
+        ps.sampling_constraints,
+    )
     if sampling:
         extras["default_sampling_params"] = sampling
     if ds is not None and ds.default_pooling_params:
@@ -1028,11 +1153,12 @@ def merge_pipeline_deploy(
             "Either set async_chunk=False or implement an async-chunk producer on the pipeline."
         )
 
+    validate_stage_async_chunk_edges(pipeline, deploy)
     result: list[StageConfig] = []
     for ps in pipeline.stages:
         ds = deploy_by_id.get(ps.stage_id)
         stage_type, worker_type = _resolve_execution_mode(ps.execution_type)
-        input_proc, next_stage_proc = _select_processor_funcs(ps, deploy.async_chunk)
+        input_proc, next_stage_proc = _select_processor_funcs(ps, resolve_stage_async_chunk(deploy, ds))
         engine_args = _build_engine_args(ps, ds, pipeline, deploy, next_stage_proc)
         # Downstream stages may share a multimodal wrapper class without owning
         # an encoder. Do not make vLLM profile dummy multimodal inputs for them.
@@ -1121,10 +1247,25 @@ class StageConfig:
             _apply_diffusion_parallel_runtime_overrides(engine_args, runtime_overrides)
             reconcile_diffusion_attention_overrides(engine_args, runtime_overrides)
 
-        # CLI overrides take precedence over YAML defaults
+        # CLI overrides take precedence over YAML defaults. Most dict-valued
+        # overrides are deep-merged so a partial CLI dict (e.g. --no-guardrails
+        # riding on ``model_config``) layers onto the deploy YAML instead of
+        # clobbering sibling keys such as ``policy_server_config`` — the same
+        # rationale as the platform-overlay deep-merge. Legacy atomic mappings
+        # are handled explicitly below.
         for key, value in runtime_overrides.items():
             if value is not None and key not in ("devices", "max_batch_size", "num_replicas"):
-                engine_args[key] = value
+                existing = engine_args.get(key)
+                # ``omni_kv_config`` is an atomic legacy override: callers use
+                # a partial mapping to replace the topology-provided transfer
+                # role, rather than to add fields to it.
+                if key != "omni_kv_config" and isinstance(existing, dict) and isinstance(value, dict):
+                    engine_args[key] = _get_recursively_merged_dict(existing, value)
+                else:
+                    engine_args[key] = value
+
+        # Terminal-stage ownership comes from topology, not engine overrides.
+        engine_args["final_output"] = self.final_output
 
         # Build runtime config from YAML defaults + CLI overrides
         runtime: dict[str, Any] = dict(self.yaml_runtime)

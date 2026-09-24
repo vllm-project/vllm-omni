@@ -67,6 +67,11 @@
 # File-level overrides within entrypoints/
 /vllm_omni/entrypoints/openai/errors.py @alex-jw-brooks @NickCao
 /vllm_omni/entrypoints/cli/benchmark/ @alex-jw-brooks @Bounty-hunter
+# Shared wire codec: protocol/realtime (OpenAI Realtime GA) and protocol/duplex
+# (vLLM-Omni's extension of it) — RFC #6592 P0a. Layer-neutral by design — the
+# engine depends on it — so it is owned by the serving-boundary document rather
+# than by any one consumer. — docs/design/module/entrypoints.md
+/vllm_omni/protocol/ @alex-jw-brooks @linyueqian @NickCao
 
 # Error contracts — docs/design/module/error_contracts.md
 /vllm_omni/errors.py @alex-jw-brooks @NickCao

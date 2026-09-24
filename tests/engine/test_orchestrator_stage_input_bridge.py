@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -7,25 +7,20 @@ import asyncio
 import queue
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import ANY, AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import janus
 import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
     StreamingSegmentState,
-    _OrchestratorDuplexStagePort,
 )
 from vllm_omni.engine.stage_pool import StagePool
-from vllm_omni.experimental.fullduplex.engine.contracts import (
-    DuplexStageRequestContext,
-    DuplexStageSubmission,
-)
-from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -104,9 +99,13 @@ class FakeInputProcessor:
 
 
 class FakePrewarmPool:
+    """Single-replica pool double that binds requests only on submission."""
+
     stage_type = "llm"
 
     def __init__(self, role: str) -> None:
+        self.stage_client = SimpleNamespace()
+        self._bound_request_ids: set[str] = set()
         self.stage_vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(
                 max_model_len=64,
@@ -115,70 +114,16 @@ class FakePrewarmPool:
         )
         self.submitted: list[Any] = []
 
-    async def submit_initial(self, _request_id, _req_state, request, prompt_text=None):
+    async def submit_initial(self, request_id, _req_state, request, prompt_text=None):
         self.submitted.append(request)
+        self._bound_request_ids.add(request_id)
         return 0
 
-    def get_bound_replica_id(self, _request_id):
-        return 0
+    def get_bound_replica_id(self, request_id):
+        return 0 if request_id in self._bound_request_ids else None
 
-
-def _duplex_stage_port_submission():
-    stage_pools = []
-    for stage_id in range(3):
-        pool = SimpleNamespace(
-            stage_client=SimpleNamespace(default_sampling_params=SamplingParams(max_tokens=1)),
-            stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
-            submit_initial=AsyncMock(return_value=stage_id + 10),
-            submit_update=AsyncMock(return_value=stage_id + 20),
-        )
-        stage_pools.append(pool)
-    request_states: dict[str, OrchestratorRequestState] = {}
-    prewarm = AsyncMock()
-    port = _OrchestratorDuplexStagePort(
-        stage_pools=stage_pools,
-        request_states=request_states,
-        running_counter=None,
-        cleanup_request_ids=AsyncMock(),
-        async_chunk=True,
-        prewarm_async_chunk_stages=prewarm,
-    )
-    context = DuplexStageRequestContext(
-        request_id="req-duplex",
-        session_id="session-duplex",
-        fence=DuplexFence("session-duplex"),
-        stage_id=0,
-        final_stage_id=2,
-        config_generation=0,
-        sampling_params=tuple(SamplingParams(max_tokens=1) for _ in range(3)),
-    )
-    port.ensure_request(context)
-    submission = DuplexStageSubmission(
-        context=context,
-        prompt={"prompt_token_ids": [1, 2]},
-        already_submitted=False,
-    )
-    return port, stage_pools, request_states, prewarm, submission
-
-
-def test_duplex_bridge_state_catches_up_after_serving_turn_boundary() -> None:
-    port, _, request_states, _, submission = _duplex_stage_port_submission()
-    request_state = request_states[submission.context.request_id]
-    bridge_state = request_state.streaming.bridge_states["duplex"]
-    bridge_state["model_turn_id"] = 0
-
-    next_context = DuplexStageRequestContext(
-        request_id=submission.context.request_id,
-        session_id=submission.context.session_id,
-        fence=DuplexFence(submission.context.session_id, turn_id=1),
-        stage_id=submission.context.stage_id,
-        final_stage_id=submission.context.final_stage_id,
-        config_generation=submission.context.config_generation,
-        sampling_params=submission.context.sampling_params,
-    )
-    port.ensure_request(next_context)
-
-    assert bridge_state["model_turn_id"] == 1
+    def get_bound_client(self, request_id):
+        return self.stage_client if self.get_bound_replica_id(request_id) is not None else None
 
 
 def _request_output(request_id: str) -> RequestOutput:
@@ -261,20 +206,22 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
 
 
 @pytest.mark.asyncio
-async def test_async_prewarm_skips_outgoing_only_stage() -> None:
+@pytest.mark.parametrize("payload_sender_info", [None, {"host": "10.0.0.2", "zmq_port": 52099}])
+async def test_async_prewarm_skips_outgoing_only_stage(payload_sender_info) -> None:
     orchestrator = object.__new__(Orchestrator)
     stage0 = FakePrewarmPool("sender")
     stage1 = FakePrewarmPool("sender")
     stage2 = FakePrewarmPool("receiver")
+    if payload_sender_info is not None:
+        stage1.stage_client.get_payload_sender_info = MagicMock(return_value=payload_sender_info)
     orchestrator.stage_pools = [stage0, stage1, stage2]
     orchestrator._emit_tx_edge = lambda **_kwargs: None
-    orchestrator._record_duplex_stage_submission = MagicMock()
+    orchestrator._on_stage_submitted = MagicMock()
     req_state = OrchestratorRequestState(
         request_id="req-prewarm",
         prompt={"prompt_token_ids": [1, 2]},
         sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(3)],
         final_stage_id=2,
-        duplex_identity=SimpleNamespace(),
     )
 
     prewarmed = await orchestrator._prewarm_async_chunk_stages(
@@ -285,10 +232,17 @@ async def test_async_prewarm_skips_outgoing_only_stage() -> None:
 
     assert prewarmed is True
     assert stage1.submitted == []
+    assert stage1.get_bound_client("req-prewarm") is None
     assert len(stage2.submitted) == 1
+    assert stage2.get_bound_client("req-prewarm") is stage2.stage_client
+    assert stage2.submitted[0].payload_sender_info == payload_sender_info
+    if payload_sender_info is not None:
+        stage1.stage_client.get_payload_sender_info.assert_called_once_with()
+    assert stage2.submitted[0].external_req_id == "req-prewarm"
+    assert stage2.submitted[0].resumable is True
     assert 1 not in req_state.stage_submit_ts
     assert 2 in req_state.stage_submit_ts
-    orchestrator._record_duplex_stage_submission.assert_called_once_with(
+    orchestrator._on_stage_submitted.assert_called_once_with(
         2,
         "req-prewarm",
         0,
@@ -297,39 +251,38 @@ async def test_async_prewarm_skips_outgoing_only_stage() -> None:
 
 
 @pytest.mark.asyncio
-async def test_duplex_prewarm_runs_after_first_stage0_submission() -> None:
-    port, stage_pools, request_states, prewarm, submission = _duplex_stage_port_submission()
-    prewarm.return_value = True
+async def test_async_prewarm_skips_stage_with_custom_process_input_func() -> None:
+    """AURA Stage1 has asr2aura: must not be zero-prewarmed under async_chunk.
 
-    result = await port.submit(submission)
-
-    assert result.stage_id == 0
-    stage_pools[0].submit_initial.assert_awaited_once()
-    prewarm.assert_awaited_once_with("req-duplex", ANY, request_states["req-duplex"])
-
-
-@pytest.mark.asyncio
-async def test_duplex_submit_bails_out_when_prewarm_failed_the_request() -> None:
-    """A failed prewarm has already aborted the request and popped its state.
-
-    Returning a success result here would hand the control plane a replica for a
-    request that no longer exists, and the trailing bookkeeping would re-register
-    a running counter the cleanup just released -- a leak that never decrements.
+    The custom-process-input gate lives on DuplexOrchestrator (AURA path), not
+    the turn-based Orchestrator base.
     """
-    port, stage_pools, request_states, prewarm, submission = _duplex_stage_port_submission()
-    counter = MagicMock()
-    port._running_counter = counter
-    prewarm.return_value = False
-    request_state = request_states["req-duplex"]
+    orchestrator = object.__new__(DuplexOrchestrator)
+    stage0 = FakePrewarmPool("sender")
+    stage1 = FakePrewarmPool("receiver")  # would receive chunks if role alone decided
+    stage1.stage_client = SimpleNamespace(custom_process_input_func=lambda *a, **k: None)
+    stage2 = FakePrewarmPool("receiver")
+    orchestrator.stage_pools = [stage0, stage1, stage2]
+    orchestrator._emit_tx_edge = lambda **_kwargs: None
+    orchestrator._on_stage_submitted = MagicMock()
+    req_state = OrchestratorRequestState(
+        request_id="req-prewarm-custom",
+        prompt={"prompt_token_ids": [1, 2]},
+        sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(3)],
+        final_stage_id=2,
+    )
 
-    with pytest.raises(RuntimeError, match="prewarm failed"):
-        await port.submit(submission)
+    prewarmed = await orchestrator._prewarm_async_chunk_stages(
+        "req-prewarm-custom",
+        SimpleNamespace(prompt_token_ids=[1, 2], resumable=True),
+        req_state,
+    )
 
-    prewarm.assert_awaited_once()
-    assert request_state.duplex_stage_fences == {}
-    assert request_state.stage_submit_ts == {}
-    assert request_state.running_counter_registered is False
-    counter.increment.assert_not_called()
+    assert prewarmed is True
+    assert stage1.submitted == []
+    assert len(stage2.submitted) == 1
+    assert 1 not in req_state.stage_submit_ts
+    assert 2 in req_state.stage_submit_ts
 
 
 @pytest.mark.asyncio

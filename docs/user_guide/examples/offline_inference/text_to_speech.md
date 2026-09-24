@@ -2,7 +2,6 @@
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_speech>.
 
-
 vLLM-Omni supports several autoregressive TTS models. They share a common
 CLI shape (`--text`, `--ref-audio`, `--ref-text`, `--output-dir`) and live
 together in this hub. Each model has its own subdirectory containing a
@@ -15,7 +14,7 @@ list of supported architectures across all modalities, see
 ## Supported Models
 
 | Model | HuggingFace repo | Stages | Voice cloning | Streaming | Special modes | Sample rate |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | — | continuation (`--ref-audio` + `--ref-text`) | 48 kHz |
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ (`async_chunk: true` default) | — | 22.05 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ (`--streaming`) | — | 44.1 kHz |
@@ -45,13 +44,15 @@ python examples/offline_inference/text_to_speech/<model>/end2end.py \
 Single-stage native AR TTS at 48 kHz. Pipeline: `feat_encoder → MiniCPM4 → FSQ → residual_lm → LocDiT → AudioVAE`.
 
 ### Prerequisites
+
 ```bash
 pip install voxcpm
 # or, for a local source checkout:
-export VLLM_OMNI_VOXCPM_CODE_PATH=/path/to/voxcpm
+pip install -e /path/to/voxcpm
 ```
 
 ### Quick start
+
 ```bash
 python examples/offline_inference/text_to_speech/voxcpm2/end2end.py \
     --model openbmb/VoxCPM2 \
@@ -59,7 +60,9 @@ python examples/offline_inference/text_to_speech/voxcpm2/end2end.py \
 ```
 
 ### Voice cloning
+
 Pass a reference audio for isolated cloning, or both `--ref-audio` + `--ref-text` for prompt continuation:
+
 ```bash
 python examples/offline_inference/text_to_speech/voxcpm2/end2end.py \
     --text "Hello, this is a voice clone demo." \
@@ -68,6 +71,7 @@ python examples/offline_inference/text_to_speech/voxcpm2/end2end.py \
 ```
 
 ### Notes
+
 - Output: 48 kHz mono WAV.
 - Deploy config: `vllm_omni/deploy/voxcpm2.yaml` (default).
 
@@ -78,12 +82,14 @@ python examples/offline_inference/text_to_speech/voxcpm2/end2end.py \
 2-stage TTS pipeline (`talker` + `code2wav`) at 22.05 kHz.
 
 ### Prerequisites
+
 ```bash
 uv pip install -e .
 # Includes soundfile, onnxruntime, x-transformers, einops via requirements.
 ```
 
 Download the model snapshot:
+
 ```python
 from huggingface_hub import snapshot_download
 snapshot_download('FunAudioLLM/Fun-CosyVoice3-0.5B-2512',
@@ -91,15 +97,18 @@ snapshot_download('FunAudioLLM/Fun-CosyVoice3-0.5B-2512',
 ```
 
 If your downloaded checkpoint lacks `config.json`, add it:
+
 ```json
 {
     "model_type": "cosyvoice3",
     "architectures": ["CosyVoice3Model"]
 }
 ```
+
 This is required because `AutoConfig.register("cosyvoice3", CosyVoice3Config)` only registers the class mapping; the loader still reads `model_type` from `config.json` to select the class.
 
 ### Quick start
+
 ```bash
 python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
     --model pretrained_models/Fun-CosyVoice3-0.5B \
@@ -107,7 +116,9 @@ python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
 ```
 
 ### Voice cloning
+
 Pass a reference audio. Note that CosyVoice3's `--prompt-text` is a system-style prompt for the GPT stage, not a reference transcript:
+
 ```bash
 python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
     --model pretrained_models/Fun-CosyVoice3-0.5B \
@@ -117,6 +128,7 @@ python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
 ```
 
 ### Notes
+
 - Stage 0 (`talker`) emits speech tokens; stage 1 (`code2wav`) runs flow matching + HiFiGAN to synthesize waveform.
 - Deploy config auto-loads from `vllm_omni/deploy/cosyvoice3.yaml` based on HF `model_type`. Pass `--deploy-config <path>` to override.
 - `async_chunk: true` is the default; pass `--no-async-chunk` to switch to the legacy synchronous path.
@@ -126,19 +138,17 @@ python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
 ## Fish Speech S2 Pro
 
 4B dual-AR text-to-speech model from FishAudio with the DAC codec at 44.1 kHz.
-
-### Prerequisites
-```bash
-pip install fish-speech
-```
+No extra packages are required; the DAC codec is vendored in vLLM-Omni.
 
 ### Quick start
+
 ```bash
 python examples/offline_inference/text_to_speech/fish_speech/end2end.py \
     --text "Hello, this is a test of the Fish Speech text to speech system."
 ```
 
 ### Voice cloning
+
 ```bash
 python examples/offline_inference/text_to_speech/fish_speech/end2end.py \
     --text "Hello, this is a cloned voice." \
@@ -147,14 +157,17 @@ python examples/offline_inference/text_to_speech/fish_speech/end2end.py \
 ```
 
 ### Streaming
+
 ```bash
 python examples/offline_inference/text_to_speech/fish_speech/end2end.py \
     --text "Hello, this is a streaming test." \
     --streaming
 ```
+
 Streaming requires `async_chunk: true` in the deploy config.
 
 ### Notes
+
 - Output: 44.1 kHz mono WAV.
 - DAC codec weights (`codec.pth`) are loaded lazily from the model directory.
 
@@ -165,6 +178,7 @@ Streaming requires `async_chunk: true` in the deploy config.
 2-stage TTS pipeline (AR + DiT flow-matching) at 24 kHz. Every request requires reference audio and its transcript for zero-shot voice cloning.
 
 ### Quick start
+
 ```bash
 python examples/offline_inference/text_to_speech/glm_tts/end2end.py \
     --model zai-org/GLM-TTS \
@@ -175,12 +189,14 @@ python examples/offline_inference/text_to_speech/glm_tts/end2end.py \
 ```
 
 ### Architecture
-```
+
+```text
 Text → [Stage 0: AR] → Speech Tokens → [Stage 1: DiT + HiFT] → Audio (24 kHz)
         (Llama-based)    (32k vocab)      (Flow Matching)
 ```
 
 ### Notes
+
 - `--ref-audio` and `--ref-text` are **required** together; GLM-TTS does not support text-only synthesis.
 - Reference audio should be 3-10 seconds.
 - First run may be slow due to lazy loading of WhisperVQ tokenizer and CampPlus ONNX speaker embedder.
@@ -194,12 +210,15 @@ Text → [Stage 0: AR] → Speech Tokens → [Stage 1: DiT + HiFT] → Audio (24
 Zero-shot multilingual TTS supporting 600+ languages, with three modes (auto / clone / design).
 
 ### Prerequisites
+
 ```bash
 huggingface-cli download k2-fsa/OmniVoice
 ```
+
 Voice cloning requires `transformers>=5.3.0`. Auto and design modes work with `transformers>=4.57.0`.
 
 ### Quick start (auto voice)
+
 ```bash
 python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --model k2-fsa/OmniVoice \
@@ -207,6 +226,7 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
 ```
 
 ### Voice cloning
+
 ```bash
 python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --model k2-fsa/OmniVoice \
@@ -216,6 +236,7 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
 ```
 
 ### Voice design
+
 ```bash
 python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --model k2-fsa/OmniVoice \
@@ -224,6 +245,7 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
 ```
 
 ### Language hint
+
 ```bash
 python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --model k2-fsa/OmniVoice \
@@ -232,6 +254,7 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
 ```
 
 ### Notes
+
 - Stage 0 (Generator): Qwen3-0.6B with 32-step iterative unmasking.
 - Stage 1 (Decoder): HiggsAudioV2 RVQ + DAC at 24 kHz.
 
@@ -242,13 +265,16 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
 3-task-variant TTS with 24 kHz output. Has its own argparse surface (this script does not follow the common `--text` / `--ref-audio` shape).
 
 ### Prerequisites
+
 For ROCm builds, replace `onnxruntime` with `onnxruntime-rocm`:
+
 ```bash
 pip uninstall onnxruntime
 pip install onnxruntime-rocm
 ```
 
 ### Task variants
+
 - `CustomVoice`: predefined speaker (speaker ID) with optional style instruction.
 - `VoiceDesign`: text + descriptive instruction designs a new voice.
 - `Base`: voice cloning from reference audio + transcript.
@@ -268,16 +294,20 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py --query-ty
 ```
 
 ### Streaming
+
 ```bash
 python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py \
     --query-type CustomVoice \
     --streaming \
     --output-dir /tmp/out_stream
 ```
+
 Streaming requires `async_chunk: true` in the deploy config.
 
 ### Batched decoding
+
 The Code2Wav stage supports batched decoding through the SpeechTokenizer. Configure both stages with `max_num_seqs > 1` via `--stage-overrides` and pass multiple prompts via `--txt-prompts`:
+
 ```bash
 python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py \
     --query-type CustomVoice \
@@ -285,9 +315,11 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py \
     --batch-size 4 \
     --stage-overrides '{"0":{"max_num_seqs":4,"gpu_memory_utilization":0.2},"1":{"max_num_seqs":4,"gpu_memory_utilization":0.2}}'
 ```
+
 `--batch-size` must match a CUDA-graph capture size (1, 2, 4, 8, 16…).
 
 ### Notes
+
 - Run `--help` for the full argument surface.
 - See `qwen3_tts/end2end.py` for the prompt-length-estimation logic the Talker uses.
 
@@ -298,12 +330,15 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py \
 Voxtral-4B-TTS (Mistral). Has its own argparse surface; uses voice presets and the `mistral_common` `SpeechRequest` protocol.
 
 ### Prerequisites
+
 Latest `mistral_common` with `SpeechRequest` support:
+
 ```bash
 pip install -e /path/to/mistral-common  # or upgrade from PyPI when available
 ```
 
 ### Quick start (voice preset)
+
 ```bash
 python examples/offline_inference/text_to_speech/voxtral_tts/end2end.py \
     --write-audio --voice cheerful_female \
@@ -312,6 +347,7 @@ python examples/offline_inference/text_to_speech/voxtral_tts/end2end.py \
 ```
 
 ### Voice cloning (capability gated upstream)
+
 ```bash
 python examples/offline_inference/text_to_speech/voxtral_tts/end2end.py \
     --write-audio \
@@ -321,15 +357,18 @@ python examples/offline_inference/text_to_speech/voxtral_tts/end2end.py \
 ```
 
 ### Streaming + concurrency
+
 ```bash
 python examples/offline_inference/text_to_speech/voxtral_tts/end2end.py \
     --num-prompts 32 --concurrency 8 --streaming --write-audio --voice neutral_female \
     --model mistralai/Voxtral-4B-TTS-2603 \
     --text "..."
 ```
+
 Available voice presets are listed on the HF model card (`mistralai/Voxtral-4B-TTS-2603`).
 
 ### Notes
+
 - `--num-prompts N` replicates the prompt for performance measurement.
 - `--concurrency M` requires `--streaming` and must evenly divide `--num-prompts`.
 - Run `--help` for the full argument surface.

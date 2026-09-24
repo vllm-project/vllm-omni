@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -41,7 +42,7 @@ def _time_shift_sigmas(
     shift_scale: float = 6.0,
     base_schedule: Sequence[float] | None = None,
 ) -> list[float]:
-    """Build a shifted sigma schedule.
+    """Build N + 1 sigma boundaries for N denoiser evaluations.
 
     ``base_schedule`` supplies the rectified-flow positions explicitly and takes
     precedence over ``num_steps``. Distilled checkpoints need it because their
@@ -59,21 +60,16 @@ def _time_shift_sigmas(
     if num_steps <= 0:
         raise ValueError("MiniMax H3 num_steps must be > 0")
 
-    # The rectified-flow sigma range is fixed at [1.0, 0.0].
+    # Requests count denoiser evaluations, not sigma points. Include both
+    # endpoints so even a one-step request traverses the full [1.0, 0.0] range.
     base = torch.linspace(
         1.0,
         0.0,
-        int(num_steps),
+        int(num_steps) + 1,
         device="cpu",
         dtype=torch.float32,
     )
     shifted = float(shift_scale) * base / (1 + (float(shift_scale) - 1) * base)
-    shifted, _ = torch.unique_consecutive(shifted, return_counts=True)
-    # A one-point request is still exactly one point.  Normal serving uses
-    # multiple points, but preserving the requested cardinality keeps
-    # ``num_inference_steps`` the sole schedule-size control.
-    if num_steps > 1 and shifted[-1].item() > 0.0:
-        shifted = torch.cat([shifted, torch.tensor([0.0], dtype=shifted.dtype)])
     return [float(value) for value in shifted.tolist()]
 
 

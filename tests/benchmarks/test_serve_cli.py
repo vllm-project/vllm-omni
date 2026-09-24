@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,76 @@ from vllm_omni.entrypoints.cli.benchmark.cli_args import (
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
+
+
+def test_it2i_dataset_uses_upstream_warmups(monkeypatch, tmp_path):
+    """Exercise real dataset/benchmark code; replace only the HTTP backend."""
+    from vllm_omni.benchmarks import serve
+    from vllm_omni.benchmarks.patch import patch
+    from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
+
+    dataset_path = Path(__file__).parents[1] / "assets/hunyuan_image3/it2i.jsonl"
+    sample = json.loads(dataset_path.read_text(encoding="utf-8"))
+    parser = argparse.ArgumentParser()
+    OmniBenchmarkServingSubcommand.add_cli_args(parser)
+    args = parser.parse_args(
+        [
+            "--model",
+            "test-model",
+            "--endpoint",
+            "/v1/images/edits",
+            "--dataset-name",
+            "custom_image",
+            "--dataset-path",
+            str(dataset_path),
+            "--skip-tokenizer-init",
+            "--disable-shuffle",
+            "--disable-tqdm",
+            "--num-prompts",
+            "8",
+            "--num-warmups",
+            "2",
+            "--max-concurrency",
+            "1",
+            "--ready-check-timeout-sec",
+            "0",
+            "--percentile-metrics",
+            "e2el",
+            "--extra-body",
+            '{"seed":42,"guidance_scale":2.5,"bot_task":"think_recaption"}',
+            "--save-result",
+            "--result-dir",
+            str(tmp_path),
+            "--result-filename",
+            "result.json",
+        ]
+    )
+    requests = []
+
+    async def request_func(request_func_input, session, pbar=None):
+        requests.append(request_func_input)
+        if pbar is not None:
+            pbar.update(1)
+        return patch.MixRequestFuncOutput(
+            success=True,
+            prompt_len=1,
+            output_tokens=1,
+            image_count=1,
+            start_time=time.perf_counter(),
+            latency=99.0 if len(requests) <= 2 else 0.1,
+        )
+
+    monkeypatch.setitem(patch.ASYNC_REQUEST_FUNCS, "/v1/images/edits", request_func)
+    result = serve.main(args)
+    assert len(requests) == 10
+    for request in requests:
+        assert request.prompt == sample["prompt"]
+        assert [image["image_url"]["url"] for image in request.multi_modal_content] == sample["image_files"]
+        assert request.extra_body == args.extra_body
+    assert result["completed"] == 8
+    saved = json.loads((tmp_path / "result.json").read_text())
+    assert saved["completed"] == 8
+    assert saved["mean_e2el_ms"] == pytest.approx(100.0)  # Excludes both 99-second warmups.
 
 
 @pytest.mark.parametrize(
@@ -168,6 +239,26 @@ def test_preprocess_serve_args_applies_safe_omniinteract_prompt_default(
             {"backend", "print_stage", "bot_task"},
         ),
         (
+            [
+                "--endpoint",
+                "/v1/images/edits",
+                "--image-edits-bot-task",
+                "think",
+            ],
+            {"bot_task": "think"},
+            {"endpoint", "bot_task"},
+        ),
+        (
+            [
+                "--backend",
+                "/v1/images/edits",
+                "--image-edits-bot-task",
+                "recaption",
+            ],
+            {"bot_task": "recaption"},
+            {"backend", "bot_task"},
+        ),
+        (
             ["--extra-body", '{"bot_task":"vanilla"}'],
             {"bot_task": "vanilla"},
             {"extra_body"},
@@ -182,6 +273,7 @@ def test_omni_args_parse_and_preprocess(
     parser = TrackingArgumentParser()
     parser.add_argument("--extra-body", type=json.loads, default=None)
     parser.add_argument("--backend", default="openai-chat-omni")
+    parser.add_argument("--endpoint", default="/v1/chat/completions")
     add_omni_args(parser)
 
     args = parser.parse_args(argv)
@@ -358,3 +450,17 @@ def test_bench_serve_cli_mocks_http_request(tmp_path: Path):
     )
     assert bench_requests
     assert all(url == expected_url for url in bench_requests), f"Unexpected target URLs: {bench_requests}"
+
+
+def test_omni_request_timeout_s_flag_defaults_and_parses() -> None:
+    parser = TrackingArgumentParser()
+    add_omni_args(parser)
+
+    args = parser.parse_args([])
+    assert args.omni_request_timeout_s is None
+
+    args = parser.parse_args(["--omni-request-timeout-s", "0"])
+    assert args.omni_request_timeout_s == 0.0
+
+    args = parser.parse_args(["--omni-request-timeout-s", "3600"])
+    assert args.omni_request_timeout_s == 3600.0

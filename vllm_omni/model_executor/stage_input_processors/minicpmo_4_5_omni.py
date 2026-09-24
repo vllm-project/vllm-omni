@@ -10,13 +10,16 @@ import torch
 from vllm.inputs import TextPrompt
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
-from vllm_omni.experimental.fullduplex.engine.intermediate import (
+from vllm_omni.engine.duplex.intermediate import (
     build_duplex_intermediate_buffer,
     set_ref_audio,
     set_tts_handoff,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
-from vllm_omni.model_executor.models.minicpmo_4_5 import MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
+from vllm_omni.model_executor.models.minicpmo_4_5 import (
+    MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
+    MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
 
 logger = logging.getLogger(__name__)
@@ -95,7 +98,7 @@ def _extract_native_runtime_ref_audio(data_plane_metadata):
     runtime_config = data_plane_metadata.get("runtime_config")
     if not isinstance(runtime_config, dict):
         return None
-    from vllm_omni.experimental.fullduplex.minicpmo45.input import decode_native_ref_audio_from_config
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input import decode_native_ref_audio_from_config
 
     waveform = decode_native_ref_audio_from_config({"extra_body": runtime_config})
     if waveform is None:
@@ -637,6 +640,7 @@ def _native_duplex_segment_output_ids(
         state["request_id"] = request_id
         state["sent_output_len"] = 0
         state["sent_output_ids"] = []
+        state["condition_seq"] = -1
     previous_turn_id = state.get("turn_id")
     sent_len = state.get("sent_output_len", 0)
     prev_output_ids = state.get("sent_output_ids", [])
@@ -689,9 +693,6 @@ def _native_duplex_data_plane_metadata(streaming_context) -> dict[str, object] |
     session_id = duplex_state.get("session_id")
     if isinstance(session_id, str) and session_id:
         metadata["session_id"] = session_id
-    incarnation = duplex_state.get("incarnation")
-    if isinstance(incarnation, int):
-        metadata["incarnation"] = incarnation
     epoch = duplex_state.get("epoch")
     if isinstance(epoch, int):
         metadata["epoch"] = epoch
@@ -864,8 +865,25 @@ def llm2tts(
                     special_token_ids.get("chunk_eos_token_id"),
                     special_token_ids.get("chunk_tts_eos_token_id"),
                 }
-            tts_token_ids_slice = torch.tensor(full_token_ids[tts_bos_idx:end_idx], dtype=torch.long)
-            tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
+            if is_native_duplex_handoff:
+                # Earlier unforwarded decisions may already be folded into
+                # the rebuilt prompt while still appearing in this delta.
+                # Align the explicit tts_bos path by the segment's end, just
+                # like the native speak/text paths below, rather than adding
+                # those decisions to the prompt a second time.
+                out_start = tts_bos_idx - prompt_token_ids_len
+                out_end = tts_eos_idx - prompt_token_ids_len if tts_eos_idx is not None else len(llm_output_ids)
+                hidden_base = int(thinker_hidden_states.shape[0]) - len(llm_output_ids)
+                if hidden_base >= 0 and out_end > out_start:
+                    tts_token_ids_slice = torch.tensor(llm_output_ids[out_start:out_end], dtype=torch.long)
+                    tts_hidden_slice = (
+                        thinker_hidden_states[hidden_base + out_start : hidden_base + out_end]
+                        .to(torch.float32)
+                        .contiguous()
+                    )
+            else:
+                tts_token_ids_slice = torch.tensor(full_token_ids[tts_bos_idx:end_idx], dtype=torch.long)
+                tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
         elif is_native_duplex_handoff:
             # Official MiniCPM-o duplex does not prefill an assistant
             # <|tts_bos|> boundary before generation. A segment delta can
@@ -1000,6 +1018,8 @@ def llm2tts(
         if native_turn_end_handoff:
             model_intermediate_buffer.setdefault("meta", {})["turn_end"] = True
 
+        condition_sequence_state = None
+        condition_sequence_value = None
         if handoff_ids is not None and handoff_hidden is not None:
             condition_suffix_length = 1 if is_native_duplex_handoff else 2
             condition_length = max(len(handoff_ids), len(handoff_hidden)) + condition_suffix_length
@@ -1010,7 +1030,25 @@ def llm2tts(
             handoff_meta = model_intermediate_buffer.setdefault("meta", {})
             handoff_meta["next_stage_prompt_len"] = condition_length
             if is_native_duplex_handoff:
-                handoff_meta["next_stage_generation_tokens"] = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
+                handoff_meta["next_stage_generation_tokens"] = (
+                    MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS
+                    if native_turn_end_handoff
+                    else MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
+                )
+                bridge_states = getattr(_streaming_context, "bridge_states", None)
+                handoff_state = bridge_states.get("minicpmo45_tts_handoff") if isinstance(bridge_states, dict) else None
+                if not isinstance(handoff_state, dict) or handoff_state.get("request_id") != str(llm_output.request_id):
+                    raise ValueError("native duplex Talker handoff is missing request-local streaming state")
+                previous_condition_seq = handoff_state.get("condition_seq", -1)
+                if (
+                    not isinstance(previous_condition_seq, int)
+                    or isinstance(previous_condition_seq, bool)
+                    or previous_condition_seq < -1
+                ):
+                    raise ValueError("native duplex Talker condition sequence state is invalid")
+                condition_sequence_state = handoff_state
+                condition_sequence_value = previous_condition_seq + 1
+                handoff_meta["streaming_condition_seq"] = condition_sequence_value
             # Native duplex resumes one Talker request within a turn, but a new
             # assistant turn must discard the previous turn's prompt and KV.
             if not is_native_duplex_handoff or native_turn_start:
@@ -1033,6 +1071,8 @@ def llm2tts(
                 mm_processor_kwargs=None,
             )
         )
+        if condition_sequence_state is not None:
+            condition_sequence_state["condition_seq"] = condition_sequence_value
         if native_turn_end_handoff:
             bridge_states = getattr(_streaming_context, "bridge_states", None)
             duplex_state = bridge_states.get("duplex") if isinstance(bridge_states, dict) else None

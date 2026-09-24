@@ -55,6 +55,7 @@ class OmniDiffusionRequest:
     sampling_params: OmniDiffusionSamplingParams
     request_id: str
     kv_sender_info: dict[str, Any] | None = None
+    payload_sender_info: dict[str, Any] | None = None
     # Optional opaque, model-owned input prepared before Scheduler admission.
     # Model code validates its concrete type when consuming it on the Worker.
     prepared_layout: Any | None = None
@@ -67,6 +68,11 @@ class OmniDiffusionRequest:
     # This is populated by a pipeline preprocessor before the request reaches
     # the scheduler; ``None`` keeps the default behavior for other pipelines.
     batch_compatibility_key: tuple[Any, ...] | None = None
+    # Opaque native vLLM connector parameters. The Orchestrator and Scheduler
+    # transport this bag without interpreting local pages or block IDs.
+    kv_transfer_params: dict[str, Any] | None = None
+    # Worker-populated scheduler reuse boundaries, available before encoding.
+    kv_computed_tokens: tuple[int, ...] = ()
     # A model preprocessor may keep selected requests on the legacy full-forward
     # path even when the engine is globally configured for step execution.
     use_step_execution: bool = True

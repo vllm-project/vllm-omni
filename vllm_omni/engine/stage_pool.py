@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_coordinator import (
     LoadBalancer,
     OmniCoordClientForHub,
@@ -22,6 +23,7 @@ from vllm_omni.distributed.omni_coordinator import (
     ReplicaStatus,
 )
 from vllm_omni.distributed.omni_coordinator.load_balancer import Task
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_client import (
     StagePoolClient,
     StagePoolDiffusionClient,
@@ -739,10 +741,16 @@ class StagePool:
     def _infer_output_unit_type(self, request_outputs: list[Any], *, token_count: int) -> str:
         final_output_type = getattr(self.stage_client, "final_output_type", None)
 
-        if self._has_image_output(request_outputs) or final_output_type in {"image", "images"}:
-            return "image"
-        if self._has_video_output(request_outputs) or final_output_type in {"video", "videos"}:
+        # Prefer declared modality over payload heuristics: video diffusion often
+        # stores frames in ``images`` (see serving_video / output_formatter).
+        if final_output_type in {"video", "videos"}:
             return "video"
+        if final_output_type in {"image", "images"}:
+            return "image"
+        if self._has_video_output(request_outputs):
+            return "video"
+        if self._has_image_output(request_outputs):
+            return "image"
         if self._has_audio_output(request_outputs) or final_output_type == "audio":
             return "audio"
         if self._has_trajectory_latent_output(request_outputs) or self._has_latent_output(request_outputs):
@@ -778,6 +786,10 @@ class StagePool:
             total_videos = sum(self._count_videos(ro) for ro in request_outputs)
             if total_videos > 0:
                 return total_videos
+            # Video payloads are commonly carried on ``images`` for diffusion.
+            total_images = sum(self._count_images(ro) for ro in request_outputs)
+            if total_images > 0:
+                return total_images
         if unit_type == "latent":
             total_latents = sum(
                 self._count_value_units(getattr(ro, "trajectory_latents", None))
@@ -986,6 +998,9 @@ class StagePool:
                     "Diffusion list-prompt batch requests are no longer supported. "
                     "Submit multiple independent requests to use scheduler batching."
                 )
+            payload_sender_info = getattr(request, "payload_sender_info", None)
+            if payload_sender_info is not None:
+                submit_kwargs.setdefault("payload_sender_info", payload_sender_info)
             replica_id = await self._pick_or_select(
                 request_id,
                 affinity_request_id=affinity_request_id,
@@ -1038,8 +1053,10 @@ class StagePool:
         request: Any,
         *,
         prompt_text: Any = None,
+        submit_kwargs: dict[str, Any] | None = None,
     ) -> int:
         """Submit a streaming update to an already admitted request."""
+        submit_kwargs = submit_kwargs or {}
         params = req_state.sampling_params_list[self.stage_id]
         if self.stage_type == "diffusion":
             params = OmniDiffusionSamplingParams.from_params(params)
@@ -1057,7 +1074,7 @@ class StagePool:
                     "Diffusion list-prompt batch requests are no longer supported. "
                     "Submit multiple independent requests to use scheduler batching."
                 )
-            await self._diffusion_client(replica_id).add_request_async(request_id, request, params)
+            await self._diffusion_client(replica_id).add_request_async(request_id, request, params, **submit_kwargs)
         else:
             # Refresh the shared output-processor state before yielding to the
             # stage client so streaming segments are merged against the latest
@@ -1070,7 +1087,7 @@ class StagePool:
                     request_index=0,
                     queue=None,
                 )
-                await self._llm_client(replica_id).add_request_async(request)
+                await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
             except Exception:
                 rollback = getattr(self.output_processor, "remove_request", None)
                 if callable(rollback):
@@ -1126,7 +1143,29 @@ class StagePool:
         # gauges for that interval.
         if not outputs.outputs and outputs.scheduler_stats is None and not outputs.finished_requests:
             return None
+        self._rehydrate_pooling_output_payloads(outputs)
         return outputs
+
+    @staticmethod
+    def _rehydrate_pooling_output_payloads(outputs: EngineCoreOutputs) -> None:
+        """Restore dict-shaped pooling_output from its bytes carrier (MR V2).
+
+        vLLM decodes EngineCoreOutput.pooling_output as a torch.Tensor, so MR
+        V2 runners ship the per-request dict handoff via ``pooling_output_payload``
+        with ``pooling_output=None``. Decode it back here so downstream stage-input
+        processors see the same ``pooling_output`` shape as the legacy runner.
+        """
+        for eco in outputs.outputs:
+            payload = getattr(eco, "pooling_output_payload", None)
+            if payload is None:
+                continue
+            if getattr(eco, "pooling_output", None) is None:
+                # deserialize_* returns the nested OmniPayload form; the producer
+                # serialized a flat (dotted-key) pooler dict, and downstream
+                # consumers (e.g. talker2code2wav_full_payload) read flat keys like
+                # "codes.audio". Re-flatten to restore the exact on-wire shape.
+                eco.pooling_output = flatten_payload(deserialize_additional_information(payload))
+            eco.pooling_output_payload = None
 
     async def process_llm_raw_outputs(
         self,

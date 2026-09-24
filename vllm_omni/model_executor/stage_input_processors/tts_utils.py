@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The Qwen team.
 """Shared TTS utility functions for speaker and language extraction.
 
@@ -100,6 +100,37 @@ def extract_speaker_from_prompt(
     speaker = add_info.get("speaker")
     if isinstance(speaker, list) and speaker:
         return speaker
+    return None
+
+
+# =============================================================================
+# Code2Wav emit-mode helpers (independent of prompt construction)
+# =============================================================================
+
+
+def extract_full_utterance_decode_from_request(request: Any) -> bool | None:
+    """Extract ``full_utterance_decode`` from a request's additional_information.
+
+    This is a *response / Code2Wav emit* intent flag. It must not be confused
+    with ``non_streaming_mode``, which only controls Qwen3-TTS prompt
+    construction and is independent of HTTP/WebSocket streaming (#4198).
+
+    Returns:
+        True/False when explicitly set, otherwise None.
+    """
+    additional_information = getattr(request, "additional_information", None)
+    if additional_information is None:
+        return None
+    entries = getattr(additional_information, "entries", None)
+    if not isinstance(entries, dict):
+        return None
+    entry = entries.get("full_utterance_decode")
+    if entry is None:
+        return None
+    list_data = getattr(entry, "list_data", None)
+    if isinstance(list_data, list) and list_data:
+        raw = list_data[0]
+        return raw if isinstance(raw, bool) else None
     return None
 
 

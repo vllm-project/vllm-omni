@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -11,8 +12,10 @@ from vllm_omni.diffusion.models.lingbot_world.actions import (
     LINGBOT_CAMERA_ACTION_SCHEMA,
     LINGBOT_CAMERA_TRAJECTORY_SCHEMA,
     LingBotCameraControlReducer,
+    camera_trajectory_from_absolute_pose,
     integrate_lingbot_camera_actions,
     parse_lingbot_camera_action_frames,
+    parse_lingbot_camera_action_script,
 )
 from vllm_omni.experimental.ar_diffusion.session import (
     ARDiffusionSession,
@@ -210,6 +213,11 @@ def test_action_integrator_matches_lingbot_motion_and_calibration() -> None:
         torch.tensor([500.0, 500.0, 208.0, 120.0]),
     )
 
+    with pytest.raises(ValueError, match="resolution must be positive"):
+        camera_trajectory_from_absolute_pose(trajectory.poses[:1], width=0, height=480)
+    with pytest.raises(ValueError, match=r"\[frames, 4, 4\]"):
+        camera_trajectory_from_absolute_pose(torch.zeros(4, 4), width=832, height=480)
+
 
 @pytest.mark.parametrize(
     ("data", "message"),
@@ -292,3 +300,8 @@ def test_session_reducer_keeps_prompt_and_actions_atomic_and_resets() -> None:
         assert consumer.ticks[1].controls[0].data["frames"] == ((), (), ())
 
     asyncio.run(exercise())
+
+
+def test_parse_camera_action_script_rejects_wrong_chunk_width() -> None:
+    with pytest.raises(ValueError, match="exactly 3 per-latent-frame"):
+        parse_lingbot_camera_action_script([[["w"], ["w"]]], frames_per_chunk=3)

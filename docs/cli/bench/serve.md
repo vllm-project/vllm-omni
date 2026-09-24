@@ -1,11 +1,15 @@
 # vLLM-Omni Benchmark CLI Guide
+
 The vllm bench command launches the vLLM-Omni benchmark to evaluate the performance of multimodal models.
 
 ## Notes
+
 vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, and `openai-realtime-duplex` serving benchmark backends. It also adds the `omniinteract` dataset.
 
 ## Basic Parameter Description
+
 You can use `vllm bench serve --omni --help=all` to get descriptions of all parameters. The commonly used parameters are described below:
+
 - `--omni`
   Enable Omni (multimodal) mode, supporting multimodal inputs and outputs such as images, videos, and audio.
 
@@ -19,7 +23,9 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
   The API endpoint exposed externally, to which clients send their requests.
 
 - `--dataset-name`
-  The name of the dataset used; random-mm indicates generating random multimodal inputs (images, videos, audio), while `omniinteract` replays official OmniInteract videos.
+  The name of the dataset used; `random-mm` generates random multimodal inputs (images, videos, audio),
+  `omniinteract` replays official OmniInteract videos, and `videomme` loads Video-MME MCQ videos
+  (`lmms-eval/Video-MME`, MiniCPM OmniEvalKit packing).
 
 - `--num-prompts`
   The total number of requests to send, an integer.
@@ -77,8 +83,8 @@ Specify to save benchmark results to a json file
 - `--random-prefix-len`
   Number of fixed prefix tokens before the random context in a request.
   The total input length is the sum of random-prefix-len and a random
-  context length sampled from [input_len * (1 - range_ratio),
-  input_len * (1 + range_ratio)].Only the random and random-mm modes
+  context length sampled from [input_len *(1 - range_ratio),
+  input_len* (1 + range_ratio)].Only the random and random-mm modes
   support this parameter.
 
 - `--random-input-len`
@@ -91,7 +97,7 @@ Specify to save benchmark results to a json file
   Range ratio for sampling input/output length,
   used only for random sampling. Must be in the range [0, 1) to define
   a symmetric sampling range
-  [length * (1 - range_ratio), length * (1 + range_ratio)].
+  [length *(1 - range_ratio), length* (1 + range_ratio)].
   Only the random and random-mm modes support this parameter.
 
 - `--random-mm-base-items-per-request`
@@ -137,6 +143,7 @@ Specify to save benchmark results to a json file
 ## Usage Examples
 
 ### Online Benchmark
+
 <details class="admonition abstract" markdown="1">
 <summary>Show more</summary>
 
@@ -162,7 +169,9 @@ vllm bench serve \
   --dataset-path ShareGPT_V3_unfiltered_cleaned_split.json \
   --percentile-metrics ttft,tpot,itl,e2el
 ```
+
 If successful, you will see the following output:
+
 ```text
 ============ Serving Benchmark Result ============
 Successful requests:                     2
@@ -264,6 +273,7 @@ Median AUDIO_RTF:                        0.47
 P99 AUDIO_RTF:                           0.48
 ==================================================
 ```
+
 Notes:
 We use audio generation time / audio duration to calculate RTF.
 
@@ -301,11 +311,19 @@ options apply. Use `--omniinteract-require-response` only for functional E2E cas
 Each completed case writes `output.wav`, `wav_transcript.json`, `events.json`, `result.json`, and a final `.done` marker under
 `--omniinteract-output-dir`. The root also contains `batch_summary.json` and `official_eval_manifest.jsonl`; failed cases write
 `.failed.json`. Runs sharing one output root are serialized. Completion validates transport, response lifecycle, and artifacts,
-not answer accuracy. Transcript timestamps are serialized playback-queue times. Clipped or cancelled outputs are ineligible and
-omitted from the official manifest; `audio_clipped_bytes` records output beyond the rounded video horizon.
+not answer accuracy. Transcript timestamps are serialized playback-queue times. Playback ACKs report cumulative progress
+incrementally along that serialized clock, like a live listener; the first ack for a response goes out as soon as its audio
+arrives, checkpointing the response's history position so a later committed user input updates it in place. A residual
+`playback_ack_too_late` rejection is recorded as an artifact warning rather than failing the case. Clipped or cancelled
+outputs are ineligible and omitted from the official manifest; `audio_clipped_bytes` records output beyond the rounded video
+horizon.
 
-TTFT, TTFP, and RTF start at client receipt of `response.created`. TPOT/ITL use engine stage-0 timing; ITL is emitted only when
-every token interval is present.
+Per-response TTFT and TTFP start when the server begins executing the native model-turn request that owns the response. RTF
+continues to use client receipt of `response.created` through the last audio packet, divided by emitted audio duration. Global
+TTFT, TTFP, and RTF cover the complete input-stream window. TPOT/ITL use engine stage-0 timing; ITL is emitted only when every
+token interval is present within a continuous generation segment. Model-unit pacing and gaps between generation segments are
+excluded from TPOT/ITL. Raw request metrics retain `response_created_to_first_text_ms` and
+`response_created_to_first_audio_ms` as client-envelope diagnostics.
 
 The checked-in local performance configuration measures four deterministic cases from each OmniInteract subset (12 videos
 total), with no benchmark warmups and a maximum concurrency of two. Each subset also sends one readiness request before its
@@ -327,6 +345,57 @@ transcript, event, and result artifacts without errors. A valid LISTEN-only case
 chunks. Official-manifest eligibility is reported separately because clipped or cancelled output is a benchmark-quality
 signal, not a transport failure. This local performance test does not score answer accuracy.
 
+### Video-MME Benchmark
+
+Video-MME (`--dataset-name videomme`) scores multiple-choice video QA. Default packing is
+OmniEvalKit MiniCPM `minicpm-frames` (up to 96 sampled frames as `image_url`). Pass a local
+mirror with `--dataset-path` / `--videomme-parquet` + `--videomme-video-dir`, or a Hugging
+Face dataset id (`lmms-eval/Video-MME` by default; any `org/name` is accepted when
+`--dataset-name videomme` is explicit). Relative `--videomme-video-dir` values are resolved
+to absolute `file://` URLs. For those URLs, start the server with
+`--allowed-local-media-path` covering the video root; otherwise use `--videomme-inline-local-video`.
+
+For MiniCPM-o 4.5, the default deployment allows 64 images per request. To run the
+96-frame recipe, start the server with a stage 0 override (replace `/path/to/Video-MME`
+with the local video root shared by the benchmark client and server):
+
+```bash
+vllm serve openbmb/MiniCPM-o-4_5 --omni \
+  --allowed-local-media-path /path/to/Video-MME \
+  --stage-overrides '{"0":{"limit_mm_per_prompt":{"image":96,"audio":64,"video":1}}}'
+```
+
+The override applies to this server invocation only. Alternatively, use
+`--videomme-max-frames 64` in the benchmark to stay within the default image limit;
+this evaluates a different frame-sampling setting from the 96-frame recipe.
+
+Run the benchmark against that server:
+
+```bash
+vllm bench serve --omni \
+  --backend openai-chat-omni \
+  --dataset-name videomme \
+  --dataset-path /path/to/Video-MME \
+  --videomme-pack-mode minicpm-frames \
+  --videomme-max-frames 96 \
+  --model openbmb/MiniCPM-o-4_5 \
+  --endpoint /v1/chat/completions \
+  --num-prompts 8 \
+  --max-concurrency 1 \
+  --save-result
+```
+
+Accuracy keys (`videomme_accuracy`, per-duration / domain / task breakdowns) are written into
+the saved JSON. `videomme_accuracy` excludes HTTP failures; `videomme_accuracy_incl_http_fail`
+counts them as wrong. `videomme_submitted` / `videomme_unique_question_ids` show when
+oversampling made the request count differ from unique-question coverage.
+`videomme_skipped_rows` counts rows skipped during sampling because of missing or unreadable
+media or invalid question fields. The opt-in accuracy runner rejects skipped rows, HTTP
+failures, duplicate question IDs, and missing gold answers. This checks the sampled subset;
+it does not establish that a supplied local mirror contains the entire official dataset.
+Use `--videomme-save-eval-items` (or `VIDEOMME_SAVE_EVAL_ITEMS=1`) for per-request
+`videomme_eval_items` rows.
+
 ### Multi-Modal Benchmark
 
 <details class="admonition abstract" markdown="1">
@@ -339,8 +408,8 @@ Generate synthetic image、video、audio inputs alongside random text prompts to
 Notes:
 
 - Works only with online benchmark via:
-  - the OpenAI chat backend (`--backend openai-chat-omni`) and endpoint `/v1/chat/completions`.
-  - the OpenAI edit image backend (`--backend openai-image-edits-omni`) and endpoint `/v1/images/edits`.
+    - the OpenAI chat backend (`--backend openai-chat-omni`) and endpoint `/v1/chat/completions`.
+    - the OpenAI edit image backend (`--backend openai-image-edits-omni`) and endpoint `/v1/images/edits`.
 
 Start the server (example):
 
@@ -351,6 +420,7 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni
 It is recommended to use the flag `--ignore-eos` to simulate real responses. You can set the size of the output via the arg `random-output-len`.
 
 Then run the benchmarking script:
+
 ```bash
 vllm bench serve \
     --omni \
@@ -420,7 +490,78 @@ How sampling works:
 - If a modality (e.g., image) reaches its limit from `--random-mm-limit-mm-per-prompt`, all buckets of that modality are excluded and the remaining bucket probabilities are renormalized before continuing.
 This should be seen as an edge case, and if this behavior can be avoided by setting `--random-mm-limit-mm-per-prompt` to a large number. Note that this might result in errors due to engine config `--limit-mm-per-prompt`.
 - The resulting request contains synthetic image data in `multi_modal_data` (OpenAI Chat format). When `random-mm` is used with the OpenAI Chat backend, prompts remain text and MM content is attached via `multi_modal_data`.
+
 </details>
+
+### Image / video generation
+
+For `/v1/images/generations`, `/v1/images/edits`, and `/v1/videos`, set `--endpoint` to that path and omit `--backend`. The endpoint path is registered as the bench request adapter, so a separate named backend is not required.
+
+Example (`/v1/images/generations`):
+
+```bash
+vllm bench serve --omni \
+  --endpoint /v1/images/generations \
+  --dataset-name random \
+  --model ~/models/Qwen/Qwen-Image \
+  --tokenizer ~/models/Qwen/Qwen-Image/tokenizer \
+  --max-concurrency 1 \
+  --num-warmups 2 \
+  --num-prompts 10 \
+  --random-input-len 64 \
+  --random-output-len 1 \
+  --ignore-eos \
+  --percentile-metrics e2el \
+  --extra-body '{
+    "num_inference_steps": 20,
+    "seed": 42,
+    "true_cfg_scale": 4.0
+  }'
+```
+
+If successful, following output is like:
+
+```text
+============ Serving Benchmark Result ============
+Successful requests:                     3  
+Failed requests:                         0  
+Maximum request concurrency:             1  
+Benchmark duration (s):                  8.42  
+Request throughput (req/s):              0.36  
+Peak concurrent requests:                2.00  
+-------------------Peak Memory--------------------
+Mean PEAK_MEMORY_MB (MB):                58832.00  
+Median PEAK_MEMORY_MB (MB):              58832.00  
+P99 PEAK_MEMORY_MB (MB):                 58832.00  
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          2798.16  
+Median E2EL (ms):                        2799.83  
+P99 E2EL (ms):                           2800.03  
+================== Image Result ==================
+Total images generated:                  3  
+Image throughput (img/s):                0.36  
+Average pixels per image:                1048576.00
+Mean denoise step latency (ms):          136.59  
+---------------- Image Generation ----------------
+Mean IMAGE_GENERATION (ms):              2731.84  
+Median IMAGE_GENERATION (ms):            2732.02  
+P99 IMAGE_GENERATION (ms):               2734.65  
+==================================================
+```
+
+Use the same pattern with `--endpoint /v1/images/edits` or `--endpoint /v1/videos` (and model-specific `--extra-body` as needed). Pure image/video runs omit the Text Result section when there is no generated text.
+
+`/v1/images/edits` defaults to **non-streaming JSON** (`stream=false`) so single-stage edit models are not rejected by the server. For multi-stage pipelines that need SSE (AR TTFT / image chunks), pass `"stream": true` in `--extra-body`.
+
+`/v1/videos` is an async job API: the client creates a job, then polls until `completed`/`failed`. Measured **e2el** therefore includes client poll sleep and any overshoot after the job actually finishes. Tune polling via `--extra-body`:
+
+- `poll_interval_s` (default `2.0`): sleep between status polls
+- `poll_timeout_s` (default `21600`, i.e. 6 hours): give up waiting for the job
+
+**VIDEO_RTF** prefers server-reported generation time when available:
+
+- `video_rtf = video_generation_time_ms / 1000 / video_duration`, where `video_generation_time_ms` comes from response `stage_durations` (or `inference_time_s` as fallback)
+- If generation time is missing, falls back to `e2el / video_duration` (this fallback *does* include poll overhead)
 
 ### Multi-Stage Benchmark
 
@@ -434,6 +575,7 @@ vllm serve --omni --port 29999 --model ~/Qwen3-Omni-30B-A3B-Instruct
 ```
 
 Then run the benchmarking script (remember to add the flag `--print-stage`):
+
 ```bash
 vllm bench serve --omni \
   --dataset-name random \
@@ -453,6 +595,7 @@ vllm bench serve --omni \
 ```
 
 Besides the "Serving Benchmark Result", there will be "Stage Benchmark Result" below:
+
 ```text
 ============= Stage Benchmark Result =============
 =============== Stage 0 (thinker) ================
@@ -509,7 +652,9 @@ Mean AUDIO_RTF:                          0.24
 Median AUDIO_RTF:                        0.26
 P99 AUDIO_RTF:                           0.27
 ```
+
 Explanation:
+
 - stage_gen_time: Time from submitting a request to a specific stage to that stage finishing generation.
 
 - Serving TTFC (Time to First Chunk): Time from the HTTP request being accepted by the serving frontend to

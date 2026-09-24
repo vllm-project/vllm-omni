@@ -6,6 +6,7 @@ from __future__ import annotations
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -15,18 +16,36 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMSchedu
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
-from vllm_omni.core.sched.utils import omni_routed_experts_for_request
+from vllm_omni.core.sched.utils import (
+    free_kv_blocks_in_physical_order,
+    omni_routed_experts_for_request,
+)
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
 
 logger = init_logger(__name__)
+
+
+def _should_emit_engine_output(
+    model_config: Any,
+    *,
+    stopped: bool,
+    has_control: bool,
+) -> bool:
+    if stopped or has_control:
+        return True
+    return not (
+        bool(getattr(model_config, "use_v2_model_runner", False))
+        and bool(getattr(model_config, "async_chunk", False))
+        and not bool(getattr(model_config, "final_output", False))
+    )
 
 
 class SampledLogprobContractError(RuntimeError):
@@ -80,6 +99,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     core scheduling logic.
     """
 
+    max_num_running_reqs: int
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Track requests that need KV cache transfer when finished
@@ -115,11 +136,36 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._init_omni_io_scheduling_state()
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
+        # Streaming sessions finished because their next prompt extension
+        # would exceed max_model_len: request_id -> (client_index, reason).
+        # Drained into an explicit FinishReason.ERROR output on the next
+        # update_from_output so the client learns why the session ended.
+        self._streaming_context_overflow: dict[str, tuple[int, str]] = {}
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
         # Output placeholders are zero when async scheduling isn't used
         return request.num_computed_tokens - request.num_output_placeholders
+
+    def _uses_native_mooncake_connector(self) -> bool:
+        kv_config = getattr(self.vllm_config, "kv_transfer_config", None)
+        return getattr(kv_config, "kv_connector", None) == "MooncakeConnector"
+
+    def _free_request_blocks(self, request: Request) -> None:
+        """Keep native Mooncake pages coalescible without changing vLLM APIs."""
+
+        if not self._uses_native_mooncake_connector() or self.kv_cache_manager.enable_caching:
+            super()._free_request_blocks(request)
+            return
+        if not self.defer_block_free or request.last_sched_seq <= self.processed_step_seq:
+            free_kv_blocks_in_physical_order(self.kv_cache_manager, request)
+            return
+        blocks = self.kv_cache_manager.pop_blocks_for_free(request)
+        if blocks:
+            # vLLM's deferred-free drain reverses this list before returning
+            # it to BlockPool, so store the inverse of the desired order.
+            blocks.sort(key=lambda block: block.block_id, reverse=True)
+            self.deferred_frees.append((self.sched_step_seq, blocks))
 
     def _resolve_kv_connector_type(self) -> str:
         """Connector backend name for the ``kv_wait_s`` label, or ``unknown``."""
@@ -171,15 +217,20 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         finished_status: RequestStatus,
     ) -> list[Request]:
         """Finish requests and discard any incomplete KV-wait timing."""
+        # Annotated explicitly so every branch keeps the same static type
+        # (typing-only; the runtime values are unchanged).
+        cleanup_ids: tuple[str, ...]
+        finish_request_ids: str | Iterable[str] | None
         if isinstance(request_ids, str):
             cleanup_ids = (request_ids,)
-            finish_request_ids: str | tuple[str, ...] | None = request_ids
+            finish_request_ids = request_ids
         elif request_ids is None:
             cleanup_ids = ()
             finish_request_ids = None
         else:
-            finish_request_ids = list(request_ids) if isinstance(request_ids, Iterator) else request_ids
-            cleanup_ids = tuple(finish_request_ids)
+            ids = list(request_ids) if isinstance(request_ids, Iterator) else request_ids
+            finish_request_ids = ids
+            cleanup_ids = tuple(ids)
 
         finished = super().finish_requests(finish_request_ids, finished_status)
         self._clear_kv_wait_starts(cleanup_ids)
@@ -300,15 +351,22 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._process_pending_omni_inputs(model_mode="ar")
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
-
         original_waiting = None
         if self._should_defer_waiting_admission():
             original_waiting = waiting
             self.waiting = create_request_queue(self.policy)
 
+        original_max_num_running_reqs = self.max_num_running_reqs
+        async_chunk_transport = self._async_chunk_transport_enabled()
+        reserved_running_slots = (
+            self._get_async_chunk_reserved_running_slots() if async_chunk_transport and self.use_v2_model_runner else 0
+        )
+        if reserved_running_slots:
+            self.max_num_running_reqs = max(0, original_max_num_running_reqs - reserved_running_slots)
         try:
             scheduler_output = super().schedule(throttle_prefills)
         finally:
+            self.max_num_running_reqs = original_max_num_running_reqs
             if original_waiting is not None:
                 deferred_waiting = list(self.waiting)
                 if deferred_waiting:
@@ -368,14 +426,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
 
-        failed_kv_load_req_ids = None
+        failed_kv_load_req_ids: set[str] = set()
+        if kv_connector_output and getattr(kv_connector_output, "failed_recving", None):
+            # Upstream d43bb2f37f (HiSparse #53781): a receive failure is
+            # reported per request identity, so hybrid / multi-pool layouts
+            # whose numeric block ids overlap fail closed instead of recovering
+            # the wrong request. The helper returns an empty set when the
+            # failure is being recomputed, matching _handle_failed_kv_load_outputs.
+            failed_kv_load_req_ids.update(self._handle_failed_recving(kv_connector_output.failed_recving))
         if kv_connector_output and kv_connector_output.invalid_block_ids:
             # These blocks contain externally computed tokens that failed to
             # load. Identify affected requests and adjust their computed token
             # count to trigger recomputation of the invalid blocks.
-            failed_kv_load_req_ids = self._handle_invalid_blocks(
-                kv_connector_output.invalid_block_ids,
-                num_scheduled_tokens,
+            failed_kv_load_req_ids.update(
+                self._handle_invalid_blocks(
+                    kv_connector_output.invalid_block_ids,
+                    num_scheduled_tokens,
+                )
             )
 
         # Pre-process KV extraction acks so that the per-request loop below
@@ -412,7 +479,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
             if request is not None:
-                # vLLM 0.26: settle the in-flight tokens counted in schedule().
+                # Settle the in-flight tokens counted in schedule().
                 # Must happen before the skips below — failed-KV-load and
                 # already-finished requests were incremented too, and the two
                 # readers (allocate_slots, _connector_finished) clamp with
@@ -546,6 +613,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if request.status != RequestStatus.FINISHED_ERROR:
                     request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
+            elif (
+                # Upstream parity: an encoder-only instance publishes
+                # embeddings instead of sampling, so it stops as soon as the
+                # whole prompt is consumed. Encoder inputs are never scheduled
+                # past a multi-modal item the encoder cache could not admit, so
+                # a consumed prompt also means every item in it was encoded.
+                # getattr: upstream Scheduler.__init__ sets is_mm_encoder_only,
+                # but SimpleNamespace/__new__ unit-test stubs may not carry it.
+                getattr(self, "is_mm_encoder_only", False) and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
+                request.status = RequestStatus.FINISHED_STOPPED
+                stopped = True
 
             # If criteria returns True, it means we must STOP the request.
             # If criteria returns False, it might have triggered a background
@@ -553,19 +632,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if not stopped and self._process_kv_transfer_trigger(request, new_token_ids):
                 stopped = True
 
-            if new_token_ids and self.structured_output_manager.should_advance(request):
-                struct_output_request = request.structured_output_request
-                assert struct_output_request is not None
-                assert struct_output_request.grammar is not None
-                if not struct_output_request.grammar.accept_tokens(req_id, new_token_ids):
-                    logger.error(
-                        "Unexpected: grammar rejected tokens %s for request %s. Terminating request.",
-                        new_token_ids,
-                        req_id,
-                    )
-                    request.status = RequestStatus.FINISHED_ERROR
-                    request.resumable = False
-                    stopped = True
+            if OmniSchedulerMixin._reject_invalid_grammar_tokens(self, request, new_token_ids):
+                stopped = True
 
             # Finalize prefill stats BEFORE stop handling (upstream v0.28
             # order): _free_request below releases the KV blocks, after which
@@ -580,6 +648,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             confirmed_num_computed_tokens = None
             boundary_generation = None
+            # Capture before resumable stop handling can clear token history.
+            output_token_ids: Any = getattr(request, "output_token_ids", None)
+            if output_token_ids is None:
+                output_token_ids = getattr(request, "_output_token_ids", ())
+            num_generation_tokens = len(output_token_ids)
             if stopped:
                 if self.chunk_transfer_adapter is not None:
                     confirmed_num_computed_tokens = self.chunk_transfer_adapter._confirmed_num_computed_tokens(request)
@@ -598,6 +671,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 is_segment_finished = not finished
                 if finished:
                     request.resumable = False
+                    if self._native_data_plane:
+                        self._pending_data_plane_terminal_req_ids.add(req_id)
                 if not finished:
                     # for streaming input request only
                     if self.chunk_transfer_adapter:
@@ -654,7 +729,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
+            has_stage_output = (
+                bool(new_token_ids)
+                or mm_output is not None
+                or pooler_output is not None
+                or kv_transfer_params
+                or stopped
+            )
+            if has_stage_output and _should_emit_engine_output(
+                self.vllm_config.model_config,
+                stopped=stopped,
+                has_control=kv_transfer_params is not None,
+            ):
                 OmniSchedulerMixin._append_request_output(
                     self,
                     outputs,
@@ -673,6 +759,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     num_nans_in_logits=request.num_nans_in_logits,
                     is_segment_finished=is_segment_finished,
                     new_prompt_len_snapshot=self._new_prompt_len_snapshot.get(req_id),
+                    num_generation_tokens=num_generation_tokens,
                 )
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
@@ -699,10 +786,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             stopped_preempted_reqs,
         )
 
+        OmniSchedulerMixin._finish_error_requests(self, outputs)
+
         failed_requests = self._handle_failed_kv_load_outputs(
             failed_kv_load_req_ids,
             outputs,
         )
+        self._emit_streaming_context_overflow_outputs(outputs)
         if self.chunk_transfer_adapter is not None:
             for request in failed_requests:
                 self.chunk_transfer_adapter.cleanup_receiver(request.request_id)
@@ -748,9 +838,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     if req_id in self.waiting_for_transfer_free:
                         req = self.requests.get(req_id)
                         if req:
-                            self.kv_cache_manager.free(req)
-                            if req_id in self.requests:
-                                del self.requests[req_id]
+                            self._free_blocks(req)
                             if req_id in self.transfer_triggered_requests:
                                 self.transfer_triggered_requests.remove(req_id)
                             self.active_kv_transfers.discard(req_id)
@@ -763,15 +851,29 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return engine_core_outputs
 
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
-        """
-        Override: Only extend prompt at stage 0, and replace
-        the existing session with the next streaming update at other stages.
+        """Apply the next streaming update to a persistent session.
 
-        Discards the last sampled output token from the prior input chunk at stage 0.
+        Stage 0 uses upstream prompt extension. A MiniCPM Talker preserves its
+        accumulated prompt while it fits, then rebuilds a bounded window and
+        re-enters admission. Other downstream stages retain their existing
+        replacement or connector-polling behavior.
+
+        Discards the last sampled output token from the prior input chunk at
+        stage 0.
         """
         req_id = session.request_id
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
         outstanding_async_tokens = getattr(session, "num_output_placeholders", 0)
+        # Use the same confirmed span that upstream preserves when extending
+        # a session. The segment output list is cleared on a resumable stop,
+        # and, for an already queued append, can still include its terminator.
+        confirmed_end = session.num_computed_tokens - outstanding_async_tokens
+        segment_output_ids = list(session._all_token_ids[session.num_prompt_tokens : confirmed_end])
+        completed_terminator = (
+            session._all_token_ids[confirmed_end]
+            if session.num_prompt_tokens <= confirmed_end < len(session._all_token_ids)
+            else None
+        )
         # Seed the stale share in SCHEDULED-token units (see the segment-stop
         # site in update_from_output): num_in_flight_tokens matches what each
         # pre-replacement frame will drain, so the counter reaches exactly
@@ -818,6 +920,77 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if self.log_stats:
                     session.record_event(EngineCoreEventType.QUEUED)
                 return
+        if stage_id == 0 and self._prepare_minicpmo45_stage0_window(
+            session,
+            update,
+            segment_output_ids=segment_output_ids,
+            completed_terminator=completed_terminator,
+        ):
+            # The rebuilt prompt is bounded by the client's window settings,
+            # not by the model (a camera unit is hundreds of tokens), so it
+            # needs the same max_model_len check as a plain extension. The
+            # plan replaces the whole prompt, so the replacement length is the
+            # projection, not the session's current prompt plus an extension.
+            plan = update.model_intermediate_buffer["duplex"]["stage0_window"]
+            if self._streaming_update_overflows(session, update, projected_len=plan["replacement_prompt_len"]):
+                return
+            self._release_replaced_streaming_prompt_cache(session)
+            self._replace_streaming_session(session, update)
+            return
+        streaming_prompt_payload = next(
+            (
+                info
+                for info in update_infos
+                if isinstance(info, dict)
+                and isinstance(info.get("meta"), dict)
+                and "next_stage_prompt_len" in info["meta"]
+            ),
+            None,
+        )
+        chunk_transfer_adapter = self.chunk_transfer_adapter
+        update_streaming_prompt = getattr(
+            chunk_transfer_adapter,
+            "update_streaming_prompt_for_condition",
+            None,
+        )
+        if stage_id != 0 and streaming_prompt_payload is not None and callable(update_streaming_prompt):
+            mm_feature_base = session.num_computed_tokens
+            try:
+                replaced = update_streaming_prompt(
+                    streaming_prompt_payload,
+                    session,
+                    update_prompt=True,
+                )
+            except ValueError as exc:
+                # This streaming update has already been dequeued. Report the
+                # permanent contract failure so the next scheduling pass
+                # finishes only this request instead of crashing EngineCore.
+                # callable(update_streaming_prompt) above implies a live
+                # adapter; the assert narrows it for the type checker.
+                assert chunk_transfer_adapter is not None
+                chunk_transfer_adapter.record_receive_failure(req_id, str(exc))
+                return
+            if replaced is not None:
+                if replaced:
+                    # The window recipe needs the old prompt and confirmed
+                    # codec ids, so it runs before their KV/encoder state is
+                    # released. The rebuilt prompt is then admitted from zero.
+                    self._release_replaced_streaming_prompt_cache(session)
+                    self._reset_streaming_session_replacement_state(session)
+                else:
+                    session._omni_segment_generation = int(getattr(session, "_omni_segment_generation", 0) or 0) + 1
+                    if update.mm_features:
+                        # Match upstream streaming-session extension semantics.
+                        # The helper has already appended this condition, so use
+                        # the pre-append confirmed length as the MM offset base.
+                        for mm_feature in update.mm_features:
+                            mm_feature.mm_position = replace(
+                                mm_feature.mm_position,
+                                offset=mm_feature.mm_position.offset + mm_feature_base,
+                            )
+                        session.mm_features.extend(update.mm_features)
+                self._finish_streaming_session_update(session, update)
+                return
         replace_streaming_prompt = any(
             isinstance(info, dict)
             and isinstance(info.get("meta"), dict)
@@ -828,10 +1001,318 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self._release_replaced_streaming_prompt_cache(session)
             self._replace_streaming_session(session, update)
             return
+        if self._streaming_update_overflows(session, update):
+            return
         session._omni_segment_generation = int(getattr(session, "_omni_segment_generation", 0) or 0) + 1
         super()._update_request_as_session(session, update)
         if hasattr(update, "model_intermediate_buffer"):
             session.model_intermediate_buffer = update.model_intermediate_buffer
+
+    @staticmethod
+    def _prepare_minicpmo45_stage0_window(
+        session: Request,
+        update: StreamingUpdate,
+        *,
+        segment_output_ids: list[int],
+        completed_terminator: int | None = None,
+    ) -> bool:
+        """Plan an official-style MiniCPM Stage-0 window at unit boundaries.
+
+        vLLM owns a paged KV cache, so deleting a middle span and rotating the
+        retained K tensors in place is not a safe model hook.  Instead, record
+        completed unit lengths in the scheduler and request a full prompt
+        replacement when a watermark fires.  The worker rebuilds matching
+        embeddings from its unit history, which recomputes RoPE at the new
+        contiguous positions.
+        """
+        info = getattr(update, "model_intermediate_buffer", None)
+        if not isinstance(info, dict):
+            return False
+        duplex = info.get("duplex")
+        if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+            return False
+        runtime_config = duplex.get("runtime_config")
+        runtime_config = runtime_config if isinstance(runtime_config, dict) else {}
+        window = runtime_config.get("duplex_window_config")
+        if not isinstance(window, dict):
+            return False
+        mode = window.get("sliding_window_mode", "off")
+        if mode == "off":
+            return False
+        if mode not in {"basic", "context"}:
+            return False
+
+        try:
+            seq = int(duplex.get("seq", 0) or 0)
+            preserve_len = int(runtime_config.get("duplex_first_append_context_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        if seq <= 1:
+            return False
+
+        # The sampled terminator is discarded by the normal session update and
+        # re-injected at the head of this append, followed by </unit>.
+        # generated_ids contains only the confirmed output span retained by
+        # the streaming update, excluding its final uncomputed sample.
+        generated_ids = segment_output_ids
+        # Sampler-side history can contain speculative or stale async output.
+        # The worker must rebuild from the same accepted ids used for lengths.
+        duplex["stage0_window"] = {"completed_token_ids": list(generated_ids)}
+        if completed_terminator is not None:
+            duplex["stage0_window"]["completed_terminator_token_id"] = int(completed_terminator)
+        base_len = int(getattr(session, "num_prompt_tokens", 0) or 0) + len(generated_ids)
+        boundary = base_len + 2
+        # A legitimate open_start of 0 (an empty context prefix) must not fall
+        # back to preserve_len, which would double-count the suffix below.
+        recorded_open_start = getattr(session, "_minicpmo45_window_open_start", None)
+        open_start = preserve_len if recorded_open_start is None else int(recorded_open_start)
+        unit_len = boundary - open_start
+        if unit_len <= 0:
+            return False
+
+        special_ids = {
+            int(token_id)
+            for token_id in runtime_config.get("duplex_window_special_token_ids", ())
+            if isinstance(token_id, int)
+        }
+        units = list(getattr(session, "_minicpmo45_window_units", ()))
+        units.append(
+            {
+                "length": unit_len,
+                "generated_token_ids": [int(token_id) for token_id in generated_ids if token_id not in special_ids],
+            }
+        )
+        projected_len = base_len + len(update.prompt_token_ids)
+        drop_count = 0
+        dropped_len = 0
+
+        if mode == "basic":
+            try:
+                high = int(window.get("basic_window_high_tokens", 8000))
+                low = int(window.get("basic_window_low_tokens", 6000))
+            except (TypeError, ValueError):
+                return False
+            if projected_len > high:
+                while units and projected_len - dropped_len > low:
+                    dropped_len += int(units[drop_count]["length"])
+                    drop_count += 1
+                    if drop_count >= len(units):
+                        break
+        else:
+            try:
+                max_units = int(window.get("context_max_units", 24))
+                previous_max = int(window.get("context_previous_max_tokens", 500))
+            except (TypeError, ValueError):
+                return False
+            drop_count = max(0, len(units) - max_units)
+            dropped_len = sum(int(unit["length"]) for unit in units[:drop_count])
+            previous = list(getattr(session, "_minicpmo45_window_previous_token_ids", ()))
+            for unit in units[:drop_count]:
+                previous.extend(unit["generated_token_ids"])
+            if len(previous) > previous_max:
+                previous = previous[-previous_max:]
+            marker = [
+                int(token_id)
+                for token_id in runtime_config.get("duplex_window_previous_marker_token_ids", ())
+                if isinstance(token_id, int)
+            ]
+            previous_with_marker = marker + previous if previous else []
+            old_previous_len = int(getattr(session, "_minicpmo45_window_previous_len", 0) or 0)
+            session._minicpmo45_window_previous_token_ids = previous
+            session._minicpmo45_window_previous_len = len(previous_with_marker)
+            projected_len += len(previous_with_marker) - old_previous_len
+
+        retained_units = units[drop_count:]
+        session._minicpmo45_window_units = retained_units
+        if drop_count == 0:
+            session._minicpmo45_window_open_start = boundary
+            return False
+
+        replacement_len = projected_len - dropped_len
+        if replacement_len <= 0:
+            return False
+        scheduler_token_id = runtime_config.get("duplex_scheduler_token_id", 0)
+        try:
+            scheduler_token_id = max(0, int(scheduler_token_id))
+        except (TypeError, ValueError):
+            scheduler_token_id = 0
+        update.prompt_token_ids = [scheduler_token_id] * replacement_len
+        meta = info.setdefault("meta", {})
+        if isinstance(meta, dict):
+            meta["replace_streaming_prompt"] = True
+        previous_ids = list(getattr(session, "_minicpmo45_window_previous_token_ids", ()))
+        # The worker embeds the marker ids the window plan carries: it must not
+        # re-tokenize the marker with its own tokenizer, which could differ
+        # from the ids this length is computed from.
+        marker_ids = [
+            int(token_id)
+            for token_id in runtime_config.get("duplex_window_previous_marker_token_ids", ())
+            if isinstance(token_id, int)
+        ]
+        duplex["stage0_window"] = {
+            "completed_token_ids": list(generated_ids),
+            "replace": True,
+            "mode": mode,
+            "drop_units": drop_count,
+            "dropped_tokens": dropped_len,
+            "previous_token_ids": previous_ids,
+            "previous_marker_token_ids": marker_ids,
+            "replacement_prompt_len": replacement_len,
+        }
+        if completed_terminator is not None:
+            duplex["stage0_window"]["completed_terminator_token_id"] = int(completed_terminator)
+        recorded_prefix_len = runtime_config.get("duplex_window_prefix_tokens")
+        prefix_len = preserve_len if recorded_prefix_len is None else int(recorded_prefix_len)
+        suffix_len = len(runtime_config.get("duplex_window_suffix_token_ids", ()) or ())
+        previous_len = int(getattr(session, "_minicpmo45_window_previous_len", 0) or 0)
+        new_preserve_len = prefix_len + previous_len + suffix_len if mode == "context" else preserve_len
+        session._minicpmo45_window_open_start = new_preserve_len + sum(int(unit["length"]) for unit in retained_units)
+        return True
+
+    # Prefix of the stop_reason carried by the FinishReason.ERROR output, so the
+    # serving side can map it to a stable error code.
+    STREAMING_CONTEXT_OVERFLOW_STOP_REASON = "context_length_exceeded"
+
+    def _streaming_update_overflows(
+        self,
+        session: Request,
+        update: StreamingUpdate,
+        *,
+        projected_len: int | None = None,
+    ) -> bool:
+        """Finish a streaming session whose next extension cannot fit the model.
+
+        Upstream ``_update_request_as_session`` appends the update to the
+        session prompt without checking ``max_model_len``. The worker's input
+        batch then fails to copy the prompt (``could not broadcast input array
+        from shape (N,) into shape (max_model_len,)``) and the EngineCore dies,
+        taking every session on the replica with it. A native duplex session
+        grows by tens to hundreds of tokens per second of input, so long
+        sessions reach this point in normal use.
+
+        A prompt that fills the model exactly is over the line as well: the
+        session samples at least one listen/speak token after every append,
+        and upstream's running-request budget
+        ``max_model_len - num_computed_tokens - num_sampled_tokens_per_step``
+        then goes negative, which the ``num_new_tokens == 0`` guard in
+        ``schedule()`` does not catch (``allocate_slots`` dies, or the worker
+        asserts ``max_model_len + 1`` sampled positions). So the extended
+        prompt must leave room for the tokens sampled in one step.
+
+        The update is dropped and only this request is finished, right here:
+        a parked session does not make the engine schedule, so deferring the
+        finish to the next ``schedule()`` would leave the client waiting. The
+        reason is emitted with the terminal output (see
+        :meth:`_emit_streaming_context_overflow_outputs`).
+
+        ``projected_len`` overrides the extended-prompt projection for a caller
+        that replaces the prompt instead of growing it, such as the MiniCPM
+        Stage-0 window rebuild.
+        """
+        max_model_len = getattr(self, "max_model_len", None)
+        if max_model_len is None:
+            model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+            max_model_len = getattr(model_config, "max_model_len", None)
+        if not max_model_len:
+            return False
+        new_tokens = len(update.prompt_token_ids or ())
+        # The extended prompt is the current prompt plus the computed output
+        # tokens upstream keeps, then the update: num_computed_tokens covers
+        # both when the prompt was fully computed. A caller that already knows
+        # the post-update prompt length (a window rebuild) passes it instead.
+        projected = (
+            max(int(session.num_prompt_tokens), int(session.num_computed_tokens)) + new_tokens
+            if projected_len is None
+            else int(projected_len)
+        )
+        # Room for the tokens one step samples on top of the prompt (1 without
+        # speculative decoding). __new__-built test schedulers carry no
+        # num_sampled_tokens_per_step.
+        sample_room = max(1, int(getattr(self, "num_sampled_tokens_per_step", 1) or 1))
+        if projected + sample_room <= int(max_model_len):
+            return False
+        reason = (
+            f"{self.STREAMING_CONTEXT_OVERFLOW_STOP_REASON}: streaming session prompt would grow to "
+            f"{projected} tokens, leaving no room to sample within max_model_len {int(max_model_len)}"
+        )
+        logger.error(
+            "[Omni] %s: %s; finishing the request instead of extending it",
+            session.request_id,
+            reason,
+        )
+        overflow = getattr(self, "_streaming_context_overflow", None)
+        if overflow is None:
+            overflow = self._streaming_context_overflow = {}
+        overflow[session.request_id] = (int(getattr(session, "client_index", 0) or 0), reason)
+        if session.is_finished():
+            # Reached from ``_handle_stopped_request`` with a queued update.
+            # ``update_from_output`` frees every request that call reports as
+            # finished, so finishing the session here too would free it twice.
+            # ``_handle_stopped_request`` below takes it out of admission and
+            # leaves the single free to the caller.
+            return True
+        self.finish_requests((session.request_id,), RequestStatus.FINISHED_ERROR)
+        return True
+
+    def _handle_stopped_request(self, request: Request) -> bool:
+        """Do not resume a session whose queued update overflowed the model.
+
+        Upstream pops one queued ``StreamingUpdate``, applies it through
+        ``_update_request_as_session`` and then re-enqueues the request
+        unconditionally. When that update overflows, the request must not go
+        back into the waiting queue: it is terminal, and admission raises
+        ``RuntimeError: Invalid request status`` on anything that is neither
+        WAITING nor PREEMPTED, which would kill the EngineCore this guard
+        exists to keep alive. The same holds for a session whose overflow was
+        recorded before this call and that upstream still reports as resumed.
+        """
+        finished = super()._handle_stopped_request(request)
+        if finished:
+            return True
+        overflow = getattr(self, "_streaming_context_overflow", None)
+        if not overflow or request.request_id not in overflow:
+            return False
+        # Whether the overflow was recorded by this call's queued update or
+        # earlier makes no difference: a session in the overflow map is
+        # terminal, and upstream has just put it back into admission.
+        self._finish_overflowed_streaming_session(request)
+        return True
+
+    def _finish_overflowed_streaming_session(self, request: Request) -> None:
+        """Take a terminal session back out of admission.
+
+        Queues and status only. ``update_from_output`` frees every request
+        ``_handle_stopped_request`` reports as finished, so freeing here as
+        well deletes it from ``self.requests`` twice (``KeyError`` in
+        ``_free_blocks``) and skips the caller's input-coordinator cleanup.
+        """
+        self.waiting.remove_requests((request,))
+        self.skipped_waiting.remove_requests((request,))
+        if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+            self.num_waiting_for_streaming_input -= 1
+        request.status = RequestStatus.FINISHED_ERROR
+        request.resumable = False
+
+    def _emit_streaming_context_overflow_outputs(self, outputs: dict[int, list[EngineCoreOutput]]) -> None:
+        """Turn recorded context overflows into explicit error outputs.
+
+        Without this the finished session would only get the synthesized
+        ``FinishReason.ABORT`` output, which a client cannot tell apart from
+        its own cancel.
+        """
+        overflow = getattr(self, "_streaming_context_overflow", None)
+        if not overflow:
+            return
+        for request_id, (client_index, reason) in list(overflow.items()):
+            outputs.setdefault(client_index, []).append(
+                OmniEngineCoreOutput(
+                    request_id=request_id,
+                    new_token_ids=[],
+                    finish_reason=FinishReason.ERROR,
+                    stop_reason=reason,
+                )
+            )
+        overflow.clear()
 
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
@@ -848,7 +1329,36 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         getattr(self, "_inflight_prefills", set()).discard(request)
 
         # 1. Standard cleanup parts from base _free_request
-        connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+        status = getattr(request, "status", None)
+        transfer_params = getattr(request, "kv_transfer_params", None)
+        native_transfer = (
+            transfer_params
+            and transfer_params.get("do_remote_decode")
+            and getattr(getattr(self.vllm_config, "kv_transfer_config", None), "kv_connector", None)
+            == "MooncakeConnector"
+        )
+        if native_transfer and status == RequestStatus.FINISHED_STOPPED:
+            request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        num_computed_tokens = None
+        if native_transfer:
+            # vLLM clips the block table with
+            # get_block_ids_for_computed_tokens(). Exclude Omni's optimistic
+            # async output placeholders from the physical transfer boundary.
+            num_computed_tokens = request.num_computed_tokens
+            request.num_computed_tokens = self._get_confirmed_num_computed_tokens(request)
+        try:
+            connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+        finally:
+            if num_computed_tokens is not None:
+                request.num_computed_tokens = num_computed_tokens
+            if status is not None:
+                request.status = status
+        if native_transfer and connector_delay_free_blocks:
+            kv_xfer_params = {
+                **(kv_xfer_params or {}),
+                "transfer_id": transfer_params["transfer_id"],
+                "num_transfer_tokens": self._get_confirmed_num_computed_tokens(request),
+            }
 
         # EC Connector: mirror the KV hook (upstream v0.28 _free_request).
         # The contract requires firing before the encoder cache is freed so

@@ -324,10 +324,21 @@ def _transcode_reference_video(
     workdir: str,
     start_time_seconds: float = 0.0,
     duration_seconds: float | None = None,
+    pad_last_frame: bool = False,
 ) -> str:
     output = str(Path(workdir) / "prepared.mp4")
     duration_args = ["-t", f"{float(duration_seconds):.6f}"] if duration_seconds is not None else []
     frame_count_args = ["-frames:v", str(int(target_frame_count))] if target_frame_count > 0 else []
+    filters = [
+        f"fps={MINIMAX_H3_FPS:g}",
+        f"scale={target_width}:{target_height}:flags=lanczos",
+        "setsar=1",
+    ]
+    if pad_last_frame:
+        # Keep cloning the final converted frame until -frames:v reaches the
+        # requested target; longer inputs are deterministically trimmed by the
+        # same -frames:v limit without enabling this padding filter.
+        filters.append("tpad=stop_mode=clone:stop=-1")
     subprocess.run(
         [
             "ffmpeg",
@@ -342,7 +353,7 @@ def _transcode_reference_video(
             "0:v:0",
             "-an",
             "-vf",
-            (f"fps={MINIMAX_H3_FPS:g},scale={target_width}:{target_height}:flags=lanczos,setsar=1"),
+            ",".join(filters),
             *duration_args,
             *frame_count_args,
             "-metadata:s:v:0",
@@ -364,6 +375,41 @@ def _transcode_reference_video(
         check=True,
     )
     return output
+
+
+def prepare_edit_video(
+    value: Any,
+    target_width: int,
+    target_height: int,
+    target_frame_count: int,
+    workdir: str,
+) -> dict[str, Any]:
+    """Resize an edit source and clone its last frame to the target length."""
+    if not isinstance(value, str | os.PathLike):
+        raise OmniClientError("MiniMax H3 edit video input must be a single file path")
+    source = str(value)
+    source_meta = _probe_video(source)
+    if int(source_meta.get("frame_count", 0)) <= 0:
+        raise OmniClientError(f"video has no frames: {source}")
+
+    Path(workdir).mkdir(parents=True, exist_ok=True)
+    prepared_path = _transcode_reference_video(
+        source,
+        target_width=target_width,
+        target_height=target_height,
+        target_frame_count=target_frame_count,
+        workdir=workdir,
+        pad_last_frame=True,
+    )
+
+    return {
+        "original_path": source,
+        "prepared_path": prepared_path,
+        "input_has_audio": bool(source_meta.get("audio_codecs")),
+        "width": target_width,
+        "height": target_height,
+        "frame_count": target_frame_count,
+    }
 
 
 def prepare_reference_videos(
@@ -531,14 +577,27 @@ def _decode_video_frames_ffmpeg(
     )
 
 
-def sample_reference_video_frames(prepared_path: str) -> dict[str, Any]:
-    meta = _probe_video(prepared_path)
+def sample_reference_video_frames(
+    prepared_path: str,
+    *,
+    decoded_frames: np.ndarray | None = None,
+) -> dict[str, Any]:
+    if decoded_frames is None:
+        meta = _probe_video(prepared_path)
+        frame_count = int(meta["frame_count"])
+    else:
+        decoded_frames = np.asarray(decoded_frames)
+        if decoded_frames.ndim != 4 or decoded_frames.shape[-1] != 3 or len(decoded_frames) <= 0:
+            raise OmniClientError(
+                f"decoded reference video frames must have shape [T, H, W, 3], got {decoded_frames.shape}"
+            )
+        frame_count = len(decoded_frames)
     ratio = MINIMAX_H3_FPS / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS
     indices: list[int] = []
     cursor = 0.0
     while True:
         frame_index = int(round(cursor))
-        if frame_index >= meta["frame_count"]:
+        if frame_index >= frame_count:
             break
         if not indices or frame_index > indices[-1]:
             indices.append(frame_index)
@@ -546,16 +605,16 @@ def sample_reference_video_frames(prepared_path: str) -> dict[str, Any]:
     if not indices:
         raise OmniClientError(f"no frames sampled from {prepared_path}")
 
-    # The preparation step emits a lossless RGB stream. Decode only the sampled
-    # frames in one ffmpeg process so Qwen3VL sees the exact prepared pixels
-    # without decoding the entire high-bitrate stream into host memory.
-    decoded_frames = _decode_video_frames_ffmpeg(
-        prepared_path,
-        frame_count=int(meta["frame_count"]),
-        indices=indices,
-        width=meta["width"],
-        height=meta["height"],
-    )
+    if decoded_frames is None:
+        decoded_frames = _decode_video_frames_ffmpeg(
+            prepared_path,
+            frame_count=frame_count,
+            indices=indices,
+            width=meta["width"],
+            height=meta["height"],
+        )
+    else:
+        decoded_frames = decoded_frames[indices]
     frames = [np.asarray(frame) for frame in decoded_frames]
 
     timestamps = [index / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS for index in range(len(indices))]
@@ -661,6 +720,7 @@ __all__ = [
     "load_audio_file",
     "load_video_audio",
     "load_video_frames",
+    "prepare_edit_video",
     "prepare_reference_videos",
     "sample_reference_video_frames",
     "validate_reference_audio_files",

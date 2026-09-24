@@ -31,6 +31,8 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
+_MIN_FREE_VRAM = 16 * 1024**3
+
 
 _synthetic_media_fallback_dir: Path | None = None
 
@@ -600,7 +602,7 @@ def concat_audio(audio_val) -> np.ndarray:
 def preprocess_text(text):
     import opencc
 
-    word_to_num = {
+    word_normalizations = {
         "zero": "0",
         "one": "1",
         "two": "2",
@@ -612,10 +614,11 @@ def preprocess_text(text):
         "eight": "8",
         "nine": "9",
         "ten": "10",
+        "kilohertz": "khz",
     }
-    for word, num in word_to_num.items():
+    for word, replacement in word_normalizations.items():
         pattern = r"\b" + re.escape(word) + r"\b"
-        text = re.sub(pattern, num, text, flags=re.IGNORECASE)
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
 
     text = re.sub(r"[^\w\s]", "", text)
     text = re.sub(r"\s+", " ", text)
@@ -710,12 +713,16 @@ def _select_whisper_device() -> str:
 
     if current_omni_platform.is_available():
         n = current_omni_platform.get_device_count()
-        # Single-GPU runners (e.g. the L4 nightly): the model server already
-        # occupies device 0, and a Whisper model resident there competes with
-        # it for VRAM and OOMs. Only borrow an accelerator when a spare device
-        # exists; otherwise validate on CPU.
-        if n > 1:
-            device_index = n - 1
+        # Prefer the highest-index device with enough room for Whisper. The
+        # 16 GiB floor protects low-memory single-GPU runners such as the L4
+        # nightly, where the model server already occupies device 0, from the
+        # server-plus-Whisper OOM fixed in #3822. Keep the CPU fallback when no
+        # device has enough room.
+        for candidate_index in range(n - 1, -1, -1):
+            candidate_device = current_omni_platform.get_torch_device(candidate_index)
+            if current_omni_platform.get_free_memory(candidate_device) >= _MIN_FREE_VRAM:
+                device_index = candidate_index
+                break
 
     if device_index is None:
         return "cpu"
@@ -727,9 +734,13 @@ def _select_whisper_device() -> str:
 
 # Populated in the transcription worker, not in the pytest process.
 _WHISPER_MODELS: dict[str, Any] = {}
+# Pinned on the first ``whisper.load_model`` in this worker. Later sizes reuse
+# it so a CPU fallback cannot be mixed with a later GPU load in the same pool.
+_WHISPER_LOADED_DEVICE: str | None = None
 
 
 def _get_whisper_model(model_size: str) -> Any:
+    global _WHISPER_LOADED_DEVICE
     model = _WHISPER_MODELS.get(model_size)
     if model is None:
         import whisper
@@ -737,16 +748,41 @@ def _get_whisper_model(model_size: str) -> Any:
         # The device is picked on first load and the model stays on it for the
         # worker's lifetime: the current server or runner fixture instance, or
         # the test module for callers that transcribe without those fixtures.
-        device = _select_whisper_device()
+        device = _WHISPER_LOADED_DEVICE
+        if device is None:
+            device = _select_whisper_device()
+            _WHISPER_LOADED_DEVICE = device
         with _serialize_whisper_model_download(model_size):
             model = whisper.load_model(model_size, device=device)
         _WHISPER_MODELS[model_size] = model
     return model
 
 
+def _whisper_process_reserved_gib() -> float:
+    """GiB held by this worker's caching allocator, or 0 on CPU / if unreadable.
+
+    Parent-side ``nvidia-smi --query-compute-apps`` is empty on some CI
+    drivers (pmon shows ``-`` while device-wide used is tens of GiB), so the
+    pytest process cannot map the worker PID to VRAM. The allocator in *this*
+    process still knows what it reserved.
+    """
+    index = _accelerator_index_from_device(_WHISPER_LOADED_DEVICE)
+    if index is None:
+        return 0.0
+    try:
+        from vllm_omni.platforms import current_omni_platform
+
+        if not current_omni_platform.is_available():
+            return 0.0
+        device = current_omni_platform.get_torch_device(index)
+        return current_omni_platform.memory_reserved(device) / 1024**3
+    except Exception:
+        return 0.0
+
+
 def _whisper_transcribe_in_current_process(
     output_path: str, model_size: str = "small", language: str | None = None
-) -> str:
+) -> tuple[str, str, float]:
     model = _get_whisper_model(model_size)
     text = model.transcribe(
         output_path,
@@ -757,7 +793,9 @@ def _whisper_transcribe_in_current_process(
         # language: callers include non-English audio tests.
         language=language,
     )["text"]
-    return text or ""
+    device = _WHISPER_LOADED_DEVICE or "cpu"
+    reserved = _whisper_process_reserved_gib() if _accelerator_index_from_device(device) is not None else 0.0
+    return text or "", device, reserved
 
 
 # Serializes a whole submit->result->cleanup on the parent side, so at most one
@@ -768,6 +806,52 @@ _TRANSCRIBER_CALL_LOCK = threading.Lock()
 # Guards the _TRANSCRIBER pointer itself.
 _TRANSCRIBER_LOCK = threading.Lock()
 _TRANSCRIBER: concurrent.futures.ProcessPoolExecutor | None = None
+# Parent-side record of the device the child reported and its allocator
+# reserved GiB. Credit only after a GPU result (not while the model might
+# still be on CPU). Reserved is the child's caching-allocator reading, not
+# nvidia-smi PID memory (N/A on some CI drivers) and not a size table.
+_TRANSCRIBER_DEVICE: str | None = None
+_TRANSCRIBER_RESERVED_GIB: float = 0.0
+
+
+def _accelerator_index_from_device(device: str | None) -> int | None:
+    """Logical device index for ``cuda:1`` / ``npu:0``; ``None`` for CPU or unknown."""
+    if device is None:
+        return None
+    name = device.strip().lower()
+    if not name or name == "cpu":
+        return None
+    if ":" in name:
+        suffix = name.rsplit(":", 1)[1]
+        if suffix.isdigit():
+            return int(suffix)
+    return None
+
+
+def whisper_resident_device_index() -> int | None:
+    """Logical accelerator index holding Whisper, or ``None`` if it is not on GPU."""
+    with _TRANSCRIBER_LOCK:
+        if _TRANSCRIBER is None:
+            return None
+        device = _TRANSCRIBER_DEVICE
+    return _accelerator_index_from_device(device)
+
+
+def whisper_resident_vram_gib() -> float:
+    """VRAM (GiB) held by the living Whisper worker, or 0 if none / CPU.
+
+    Only the child's caching-allocator reading. Unmeasured or CPU → 0 (fail
+    closed: do not invent a size-table credit). This is not a substitute for
+    engine PID reap or a raised 5% wait threshold (RFC #6851).
+    """
+    with _TRANSCRIBER_LOCK:
+        if _TRANSCRIBER is None:
+            return 0.0
+        device = _TRANSCRIBER_DEVICE
+        measured = _TRANSCRIBER_RESERVED_GIB
+    if _accelerator_index_from_device(device) is None:
+        return 0.0
+    return measured if measured > 0.0 else 0.0
 
 
 def _get_transcriber() -> concurrent.futures.ProcessPoolExecutor:
@@ -785,11 +869,13 @@ def _discard_transcriber(executor: concurrent.futures.ProcessPoolExecutor) -> No
     Identity-checked so a stale reference can never shut down a newer worker that
     was installed after ``executor`` was replaced.
     """
-    global _TRANSCRIBER
+    global _TRANSCRIBER, _TRANSCRIBER_DEVICE, _TRANSCRIBER_RESERVED_GIB
     with _TRANSCRIBER_LOCK:
         if _TRANSCRIBER is not executor:
             return
         _TRANSCRIBER = None
+        _TRANSCRIBER_DEVICE = None
+        _TRANSCRIBER_RESERVED_GIB = 0.0
     # Joining the worker can block; do it outside the lock.
     executor.shutdown(wait=True)
 
@@ -805,12 +891,23 @@ def release_audio_transcriber() -> None:
     Takes the call lock, so it waits for any in-flight transcription to finish
     rather than shutting the worker down underneath it.
     """
-    global _TRANSCRIBER
+    global _TRANSCRIBER, _TRANSCRIBER_DEVICE, _TRANSCRIBER_RESERVED_GIB
     with _TRANSCRIBER_CALL_LOCK:
         with _TRANSCRIBER_LOCK:
             executor, _TRANSCRIBER = _TRANSCRIBER, None
+            _TRANSCRIBER_DEVICE = None
+            _TRANSCRIBER_RESERVED_GIB = 0.0
         if executor is not None:
             executor.shutdown(wait=True)
+
+
+def _unpack_transcribe_worker_result(result: object) -> tuple[str, str, float]:
+    """Accept ``(text, device)`` from tests or ``(text, device, reserved_gib)`` from the worker."""
+    if not isinstance(result, tuple) or len(result) not in (2, 3):
+        raise TypeError(f"whisper worker returned {type(result)!r}, expected a 2- or 3-tuple")
+    text, device = result[0], result[1]
+    reserved = float(result[2]) if len(result) == 3 else 0.0
+    return str(text), str(device), reserved
 
 
 def convert_audio_file_to_text(output_path: str, model_size: str = "small", language: str | None = None) -> str:
@@ -830,13 +927,21 @@ def convert_audio_file_to_text(output_path: str, model_size: str = "small", lang
     and its resident model -- is torn down, and a dead worker
     (``BrokenProcessPool``) is additionally retried once.
     """
+    global _TRANSCRIBER_DEVICE, _TRANSCRIBER_RESERVED_GIB
     with _TRANSCRIBER_CALL_LOCK:
         for attempt in range(2):
             executor = _get_transcriber()
             try:
-                return executor.submit(
-                    _whisper_transcribe_in_current_process, output_path, model_size, language
-                ).result()
+                text, device, reserved_gib = _unpack_transcribe_worker_result(
+                    executor.submit(_whisper_transcribe_in_current_process, output_path, model_size, language).result()
+                )
+                with _TRANSCRIBER_LOCK:
+                    _TRANSCRIBER_DEVICE = device
+                    if _accelerator_index_from_device(device) is None:
+                        _TRANSCRIBER_RESERVED_GIB = 0.0
+                    elif reserved_gib > 0.0:
+                        _TRANSCRIBER_RESERVED_GIB = reserved_gib
+                return text
             except BrokenProcessPool:
                 _discard_transcriber(executor)
                 if attempt == 1:
@@ -875,4 +980,6 @@ __all__ = [
     "get_asset_path",
     "preprocess_text",
     "release_audio_transcriber",
+    "whisper_resident_device_index",
+    "whisper_resident_vram_gib",
 ]

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The vLLM-Omni team.
 #
 # Adapted from Ming repository (inclusionAI/Ming) — the ``get_condition_embeds
@@ -65,12 +66,16 @@ class MingConditionEncoder(nn.Module):
         thinker_hidden_size: int = 4096,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
+        normalize_output: bool = True,
+        strict_loading: bool = False,
     ) -> None:
         super().__init__()
         self.config = image_gen_config
         self.thinker_hidden_size = thinker_hidden_size
         self._target_device = torch.device(device) if device is not None else None
         self._target_dtype = dtype
+        self.normalize_output = normalize_output
+        self.strict_loading = strict_loading
 
         # Populated lazily by ``load_from_checkpoint`` to keep this module
         # cheap to construct (useful for dummy-init paths and unit tests).
@@ -195,6 +200,8 @@ class MingConditionEncoder(nn.Module):
         condition path to be meaningful.
         """
         if not mlp_path.exists():
+            if self.strict_loading:
+                raise FileNotFoundError(f"Missing Ming MLP directory: {mlp_path}")
             logger.warning(
                 "[MingConditionEncoder] mlp/ subfolder missing at %s — proj/norm "
                 "will stay randomly initialized. EXPECT BAD IMAGES until this "
@@ -206,6 +213,8 @@ class MingConditionEncoder(nn.Module):
         try:
             from safetensors.torch import load_file  # type: ignore
         except ImportError:
+            if self.strict_loading:
+                raise
             logger.exception("[MingConditionEncoder] safetensors not installed")
             return
 
@@ -213,6 +222,8 @@ class MingConditionEncoder(nn.Module):
         if not candidates:
             candidates = sorted(mlp_path.glob("*.bin"))
         if not candidates:
+            if self.strict_loading:
+                raise FileNotFoundError(f"No Ming MLP weights under {mlp_path}")
             logger.warning("[MingConditionEncoder] no weight files under %s", mlp_path)
             return
 
@@ -258,6 +269,8 @@ class MingConditionEncoder(nn.Module):
         ok_ow = _copy(self.proj_out.weight, "proj_out.weight")
         ok_ob = _copy(self.proj_out.bias, "proj_out.bias")
         if not (ok_w and ok_b and ok_ow and ok_ob):
+            if self.strict_loading:
+                raise ValueError(f"Ming condition projection weights are incomplete or incompatible under {mlp_path}.")
             logger.error(
                 "[MingConditionEncoder] proj_in/proj_out NOT fully loaded; diffusion conditioning will be garbage."
             )
@@ -342,7 +355,8 @@ class MingConditionEncoder(nn.Module):
         # L2 normalize + ×1000 rescale.  Ming's ``get_condition_embeds_for_image_gen``
         # applies F.normalize; ``ZImageModel_withMLP`` then rescales by 1000
         # when ``text_encoder_norm=True``.  We fold both into one place.
-        cap_feats = torch.nn.functional.normalize(cap_feats, dim=-1)
+        if self.normalize_output:
+            cap_feats = torch.nn.functional.normalize(cap_feats, dim=-1)
         if self.config.text_encoder_norm:
             cap_feats = cap_feats * 1000.0
 

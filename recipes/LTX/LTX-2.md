@@ -5,7 +5,7 @@
 ## Pipelines
 
 | `--model-class-name` | Task | Required checkpoint repositories |
-|---|---|---|
+| --- | --- | --- |
 | `LTX2Pipeline` | LTX-2 one-stage T2V/I2V | `Lightricks/LTX-2` |
 | `LTX2TwoStagePipeline` | LTX-2 ordinary two-stage T2V/I2V | `Lightricks/LTX-2` |
 | `LTX2DistilledOneStagePipeline` | LTX-2 merged-distilled one-stage T2V/I2V | `rootonchair/LTX-2-19b-distilled` |
@@ -53,7 +53,7 @@ pipe(req, image=image, prompt=prompt)
 The consolidation also removes these registry names without aliases:
 
 | Removed name | Replacement |
-|---|---|
+| --- | --- |
 | `LTX23Pipeline` | `LTX2Pipeline`; checkpoint metadata selects LTX-2.3 |
 | `LTX2ImageToVideoPipeline` | `LTX2Pipeline` with `image=` |
 | `LTX23ImageToVideoPipeline` | `LTX2Pipeline` with `image=`; checkpoint metadata selects LTX-2.3 |
@@ -67,7 +67,7 @@ offline and serving entrypoints already use named fields and are unaffected.
 ## One-Stage Defaults
 
 | Parameter | LTX-2 | LTX-2.3 |
-|---|---:|---:|
+| --- | ---: | ---: |
 | Width × height | 768 × 512 | 768 × 512 |
 | Frames / frame rate | 121 / 24 | 121 / 24 |
 | Denoise steps | 40 | 30 |
@@ -85,7 +85,7 @@ default to `121`.
 ## Two-Stage Defaults
 
 | Parameter | Ordinary | Full-distilled |
-|---|---:|---:|
+| --- | ---: | ---: |
 | Final width × height | 1536 × 1024 | 1536 × 1024 |
 | Stage 1 width × height | 768 × 512 | 768 × 512 |
 | Frames / frame rate | 121 / 24 | 121 / 24 |
@@ -100,6 +100,12 @@ sigmas and input latents.
 
 Ordinary two-stage uses layer-fused LoRA for an unquantized BF16 Transformer
 and automatically switches to dynamic LoRA when quantization is enabled.
+
+## Sequence Parallelism
+
+Strict Ulysses only: `((F - 1) / 8 + 1) * (H / 32) * (W / 32)` and TP-local
+SP attention head counts must be divisible by `ulysses_degree`. Use each
+phase's `H, W` (half/full resolution for two-stage); non-divisible shapes fail.
 
 ## Serving
 
@@ -166,7 +172,7 @@ spatio-temporal guidance (STG), cross-modality guidance, and rescaling.
 Distilled stages and ordinary Stage 2 are fixed positive-only.
 
 | Parameter | Default | Effect | Alias |
-|---|---:|---|---|
+| --- | ---: | --- | --- |
 | `video_cfg_scale` | 3.0 | Video text CFG; `1.0` disables it | `video_cfg_guidance_scale` |
 | `audio_cfg_scale` | 7.0 | Audio text CFG; `1.0` disables it | `audio_cfg_guidance_scale` |
 | `video_stg_scale` | 1.0 | Video STG; `0.0` disables it | `video_stg_guidance_scale` |
@@ -204,7 +210,7 @@ per denoise step: `cond`, `uncond`, `ptb` (STG), and `mod`
 (cross-modality). The useful balanced configurations are therefore:
 
 | `--cfg-parallel-size` | Passes per rank | Guidance-slot utilization | Notes |
-|---:|---:|---:|---|
+| ---: | ---: | ---: | --- |
 | `1` | 4 | 100% | Single-rank fused guidance batch |
 | `2` | 2 | 100% | Recommended two-rank configuration |
 | `4` | 1 | 100% | One guidance pass per rank |
@@ -263,7 +269,7 @@ noted below.
 ### Complete `forward` Surface
 
 | Argument | Type/default | Meaning and constraints |
-|---|---|---|
+| --- | --- | --- |
 | `req` | `DiffusionRequestBatch`, required | Only positional argument; contains prompts and per-request sampling parameters. |
 | `image` | image or batch, `None` | Direct value wins over request images; no image selects T2V. I2V accepts one image per prompt, and a batch cannot mix T2V/I2V. |
 | `prompt` | string or list, `None` | Positive-text fallback; request prompts win. Mutually exclusive with `prompt_embeds`. |
@@ -300,7 +306,7 @@ request prompt payload; LTX guidance fields live in sampling `extra_args`.
 ### Recipe-Specific Request Capabilities
 
 | Override | One-stage | Ordinary two-stage | Distilled two-stage |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Guidance | Supported | Stage 1 only; Stage 2 is positive-only | Fixed positive-only |
 | Negative prompt/embeddings | Supported | Supported by Stage 1 | Rejected |
 | `num_inference_steps` | Supported | Controls Stage 1; Stage 2 uses 3 | Fixed at 8 for Stage 1; Stage 2 uses 3 |
@@ -335,9 +341,8 @@ bundled offline CLI do not currently expose `sigmas`.
   `--max-num-seqs 1`.
 - `--cfg-parallel-size` shards the complete LTX guidance plan, including STG,
   modality guidance, and rescale-compatible prediction gathering.
-- Sequence parallelism may pad audio latents. Pure Ulysses masks the padding;
-  Ring cannot, so audio length must be SP-divisible. Use `ring_degree=1` or a
-  divisible request shape.
+- Ulysses masks padded audio latents; video sequences must satisfy the
+  [sequence-parallel divisibility constraints](#sequence-parallelism).
 - Cache-DiT is one-stage only; multi-stage configurations are rejected.
 
 ## Operational Notes
@@ -352,7 +357,7 @@ bundled offline CLI do not currently expose `sigmas`.
 - The output audio sample rate comes from the loaded components and is not a
   request parameter.
 - For benchmarks, use `tests/dfx/perf/tests/test_ltx2_vllm_omni.json` with
-  `tests/dfx/perf/scripts/run_diffusion_benchmark.py`.
+  `tests/dfx/perf/scripts/run_benchmark.py`.
 - Ordinary and full-distilled two-stage T2V/I2V are supported; HQ execution
   remains out of scope.
 

@@ -4,10 +4,10 @@
 
 from __future__ import annotations
 
-import dataclasses
 import functools
+import json
 from collections.abc import Mapping
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -18,20 +18,26 @@ from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 from vllm.transformers_utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction
-from vllm_omni.config.omni_config import VllmOmniConfig
+from vllm_omni.config.omni_config import (
+    VllmOmniConfig,
+    normalize_and_validate_diffusion_engine_ingress_kwargs,
+)
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
     DeployConfig,
     PipelineConfig,
     StageConfig,
+    StageDeployConfig,
+    StageExecutionType,
+    StagePipelineConfig,
     StageType,
     build_stage_runtime_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
     normalize_pipeline_cli_overrides,
 )
-from vllm_omni.config.yaml_util import create_config
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.io_support import get_diffusion_output_type
 from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
@@ -46,6 +52,15 @@ logger = init_logger(__name__)
 # defaults can't drift apart. This is the light slice; the full device-layout
 # centralization is tracked as a follow-up.
 _DEFAULT_PARALLEL_DEGREE = 1
+
+
+@dataclass(frozen=True)
+class _LegacyConfigResolution:
+    """Factory-owned result for the temporary legacy runtime bridge."""
+
+    stage_configs: list[StageConfig]
+    pipeline_config: PipelineConfig
+    omni_lb_policy: str | None
 
 
 @functools.cache
@@ -103,6 +118,11 @@ def with_trust_remote_code_override(
 
 class StageConfigFactory:
     """Factory that loads pipeline YAML and merges CLI overrides.
+
+    Production startup source selection is owned by
+    :func:`vllm_omni.config.resolver.resolve_omni_config`. Factory methods are
+    lower-level construction primitives for that resolver, config internals,
+    and focused tests; entrypoints and engines must not call them directly.
 
     Handles both single-stage and multi-stage models.
 
@@ -359,6 +379,7 @@ class StageConfigFactory:
         trust_remote_code: bool | None,
         cli_overrides: dict[str, Any],
         deploy_config_path: str | None,
+        strategy_specs: Mapping[Any, Any] | None = None,
     ) -> VllmOmniConfig | None:
         """Build the structured Omni config for a model/deploy pair."""
         user_deploy_config = cls._load_user_deploy_config(deploy_config_path)
@@ -373,6 +394,20 @@ class StageConfigFactory:
         if pipeline_cfg is None:
             return None
 
+        # Keep the typed representation's topology in lockstep with the
+        # compatibility launch representation. The aligner is a real extra
+        # stage, not an engine-only setting, so it must be injected before
+        # either representation is built.
+        if user_deploy_config is None:
+            if pipeline_cfg.default_deploy_config_name is not None:
+                default_deploy_path = _DEPLOY_DIR / pipeline_cfg.default_deploy_config_name
+                user_deploy_config = load_deploy_config(default_deploy_path)
+                deploy_config_path = str(default_deploy_path)
+            else:
+                user_deploy_config = DeployConfig()
+        from vllm_omni.utils.forced_aligner import inject_forced_aligner_stage
+
+        pipeline_cfg, user_deploy_config = inject_forced_aligner_stage(pipeline_cfg, user_deploy_config, cli_overrides)
         registry_cli_overrides = with_trust_remote_code_override(
             {**cli_overrides, "model": model},
             trust_remote_code,
@@ -382,6 +417,7 @@ class StageConfigFactory:
             user_deploy_config=user_deploy_config,
             deploy_config_path=deploy_config_path,
             cli_overrides=registry_cli_overrides,
+            strategy_specs=strategy_specs,
         )
 
     @classmethod
@@ -394,11 +430,13 @@ class StageConfigFactory:
         deploy_config_path: str | None,
         strategy_specs: Mapping[Any, Any] | None = None,
     ) -> tuple[list[StageConfig] | None, str | None]:
-        """Build current runtime stage configs from the shared resolution.
+        """Build the migration-only runtime ABI from the shared resolution.
 
-        The engine still consumes the legacy StageConfig/OmegaConf shape.
-        RFC #4021 will replace this transitional path as runtime consumers move
-        to VllmOmniConfig.
+        The engine still consumes the legacy ``StageConfig``/OmegaConf shape.
+        This method is the resolver's temporary compatibility bridge, not an
+        alternative production source-selection entrypoint and not a stable
+        public contract. RFC #4021 will remove it as runtime consumers move to
+        ``VllmOmniConfig``.
         """
         user_deploy_config = cls._load_user_deploy_config(deploy_config_path)
         pipeline_cfg = cls.get_pipeline_config(
@@ -429,14 +467,29 @@ class StageConfigFactory:
         user_deploy_config: DeployConfig | None = None,
         strategy_specs: Mapping[Any, Any] | None = None,
     ) -> tuple[list[StageConfig], str | None]:
-        """Create current runtime StageConfigs from registry + deploy YAML.
+        """Return the existing two-value legacy runtime ABI."""
+        resolved = cls._resolve_legacy_from_registry(
+            pipeline_cfg,
+            cli_overrides,
+            deploy_config_path,
+            user_deploy_config,
+            strategy_specs,
+        )
+        return resolved.stage_configs, resolved.omni_lb_policy
+
+    @classmethod
+    def _resolve_legacy_from_registry(
+        cls,
+        pipeline_cfg: PipelineConfig,
+        cli_overrides: dict[str, Any],
+        deploy_config_path: str | None = None,
+        user_deploy_config: DeployConfig | None = None,
+        strategy_specs: Mapping[Any, Any] | None = None,
+    ) -> _LegacyConfigResolution:
+        """Create runtime stages and retain their effective topology.
 
         Precedence: caller-typed (non-None) value > deploy YAML >
         StageDeployConfig dataclass default.
-
-        Returns ``(stages, omni_lb_policy)`` — the strategy-derived pipeline-wide
-        load-balancer policy (``None`` when no strategy set one) travels with the
-        stages instead of through a mutable out-param.
         """
         cli_overrides = normalize_pipeline_cli_overrides(pipeline_cfg, cli_overrides)
         deploy_cfg: DeployConfig | None
@@ -475,7 +528,11 @@ class StageConfigFactory:
         cls._reconcile_strategy_with_cli(stages, applied)
 
         omni_lb_policy = applied.omni_lb_policy if applied is not None else None
-        return stages, omni_lb_policy
+        return _LegacyConfigResolution(
+            stage_configs=stages,
+            pipeline_config=pipeline_cfg,
+            omni_lb_policy=omni_lb_policy,
+        )
 
     @staticmethod
     def _apply_strategy_specs(
@@ -586,66 +643,136 @@ class StageConfigFactory:
             )
 
     @classmethod
-    def create_default_diffusion(cls, kwargs: dict[str, Any]) -> list[dict[str, Any]]:
-        """Single-stage diffusion - no YAML needed.
+    def _normalize_default_diffusion(
+        cls,
+        kwargs: dict[str, Any],
+    ) -> tuple[dict[str, Any], DiffusionParallelConfig, dict[str, Any], str]:
+        """Normalize inputs shared by typed and compatibility diffusion builders."""
+        # Preserve the default builder's explicit top-level override of model
+        # extras before the strict same-source alias validator runs.
+        if kwargs.get("auxiliary_text_encoder") is not None:
+            kwargs = dict(kwargs)
+            extras = dict(kwargs.get("extras") or {})
+            extras.pop("auxiliary_text_encoder", None)
+            kwargs["extras"] = extras
+        kwargs = normalize_and_validate_diffusion_engine_ingress_kwargs(kwargs, stage_id=0)
+        raw_sampling_params = kwargs.get("default_sampling_params")
+        if isinstance(raw_sampling_params, str):
+            try:
+                raw_sampling_params = json.loads(raw_sampling_params)
+            except json.JSONDecodeError:
+                logger.warning("Invalid default_sampling_params JSON, ignoring stage defaults.")
+                raw_sampling_params = None
+        if not isinstance(raw_sampling_params, Mapping):
+            raw_sampling_params = None
+        default_sampling_params = dict(raw_sampling_params.get("0", {})) if raw_sampling_params else {}
 
-        Creates a default diffusion stage configuration for single-stage
-        diffusion models. Returns a legacy OmegaConf-compatible dict for
-        backward compatibility with OmniStage.
+        parallel_config = DiffusionParallelConfig.from_stage_overrides(kwargs)
+        if kwargs.get("num_gpus") is not None:
+            parallel_config.resolve_data_parallel_size(int(kwargs["num_gpus"]))
+        # Ingress keeps the engine spelling; canonicalize it before filtering
+        # to terminal diffusion fields. Conflicts were validated at ingress.
+        quantization = kwargs.pop("quantization", None)
+        if quantization is not None:
+            kwargs["quantization_config"] = quantization
+        diffusion_config_fields = frozenset(config_field.name for config_field in fields(OmniDiffusionConfig))
+        engine_args = OmniDiffusionConfig.normalize_init_kwargs(
+            {name: value for name, value in kwargs.items() if name in diffusion_config_fields}
+        )
 
-        Args:
-            kwargs: Engine arguments from CLI/API.
-
-        Returns:
-            List containing a single config dict for the diffusion stage.
-        """
-        # Calculate devices based on parallel config
-        devices = "0"
-        if "parallel_config" in kwargs:
-            num_devices = kwargs["parallel_config"].world_size
-            for i in range(1, num_devices):
-                devices += f",{i}"
-
-        engine_args: dict[str, Any] = {}
-        for key, value in kwargs.items():
-            if key in ("parallel_config",):
-                continue
-            engine_args[key] = value
-
-        # Serialize parallel_config as dict for OmegaConf. Test helpers
-        # sometimes pass SimpleNamespace rather than a dataclass instance.
-        if "parallel_config" in kwargs:
-            parallel_config = kwargs["parallel_config"]
-            if dataclasses.is_dataclass(parallel_config) and not isinstance(parallel_config, type):
-                engine_args["parallel_config"] = asdict(parallel_config)
-            elif hasattr(parallel_config, "__dict__"):
-                engine_args["parallel_config"] = dict(vars(parallel_config))
+        extras = dict(engine_args.get("extras") or {})
+        for key, default in (
+            ("auxiliary_text_encoder", None),
+            ("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct"),
+        ):
+            value = kwargs.get(key)
+            if value is not None:
+                extras[key] = value
             else:
-                engine_args["parallel_config"] = parallel_config
+                extras.setdefault(key, default)
+        engine_args["extras"] = extras
 
-        engine_args.setdefault("cache_backend", "none")
+        model_class_name = engine_args.get("model_class_name")
+        final_output_type = get_diffusion_output_type(model_class_name)
+        logger.info(
+            "Resolved generic diffusion final_output_type=%r for model_class_name=%r.",
+            final_output_type,
+            model_class_name,
+        )
+        return engine_args, parallel_config, default_sampling_params, final_output_type
+
+    @classmethod
+    def create_default_diffusion(cls, kwargs: dict[str, Any]) -> list[dict[str, Any]]:
+        """Build the temporary runtime ABI for a generic diffusion stage.
+
+        The terminal diffusion config owns engine defaults and normalization;
+        this compatibility builder only adds Omni stage topology, request
+        defaults, and device placement.
+        """
+        engine_args, parallel_config, default_sampling_params, final_output_type = cls._normalize_default_diffusion(
+            kwargs
+        )
+        engine_args["parallel_config"] = asdict(parallel_config)
         engine_args["model_stage"] = "diffusion"
 
-        # Convert dtype to string for OmegaConf
-        if "dtype" in engine_args:
-            engine_args["dtype"] = str(engine_args["dtype"])
+        return [
+            {
+                "stage_id": 0,
+                "stage_type": StageType.DIFFUSION.value,
+                "runtime": {
+                    "process": True,
+                    "devices": ",".join(str(i) for i in range(parallel_config.world_size)),
+                },
+                "engine_args": engine_args,
+                "default_sampling_params": default_sampling_params,
+                "final_output": True,
+                "final_output_type": final_output_type,
+            }
+        ]
 
-        engine_args.setdefault("max_num_seqs", 1)
-        model_class_name = engine_args.get("model_class_name")
+    @classmethod
+    def create_typed_default_diffusion(
+        cls,
+        model: str,
+        kwargs: dict[str, Any],
+    ) -> VllmOmniConfig:
+        """Build generic diffusion directly into the structured runtime config."""
+        engine_overrides, parallel_config, default_sampling_params, final_output_type = (
+            cls._normalize_default_diffusion(kwargs)
+        )
+        engine_overrides.update(asdict(parallel_config))
+        model_class_name = engine_overrides.get("model_class_name")
+        pipeline = PipelineConfig(
+            model_type="generic_diffusion",
+            model_arch=str(model_class_name or ""),
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="diffusion",
+                    execution_type=StageExecutionType.DIFFUSION,
+                    final_output=True,
+                    final_output_type=final_output_type,
+                ),
+            ),
+        )
 
-        config_dict: dict[str, Any] = {
-            "stage_id": 0,
-            "stage_type": StageType.DIFFUSION.value,
-            "runtime": {
-                "process": True,
-                "devices": devices,
-            },
-            "engine_args": create_config(engine_args),
-            "final_output": True,
-            "final_output_type": get_diffusion_output_type(model_class_name),
+        # These values have already been normalized for this diffusion stage.
+        # Scope them explicitly so diffusion-only fields such as engine_backend
+        # and extras are not filtered by the global LLM CLI argument surface.
+        stage_overrides = {
+            f"stage_0_{key}": value for key, value in engine_overrides.items() if key not in {"model", "stage_id"}
         }
-
-        return [config_dict]
+        stage_overrides["stage_0_devices"] = (
+            kwargs.get("stage_0_devices")
+            or kwargs.get("devices")
+            or ",".join(str(i) for i in range(parallel_config.world_size))
+        )
+        # Caller defaults belong to deployment, not immutable pipeline constraints:
+        # explicit request sampling parameters must still be able to override them.
+        deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, default_sampling_params=default_sampling_params)])
+        return VllmOmniConfig.from_pipeline_config(
+            pipeline, user_deploy_config=deploy, cli_overrides={"model": model, **stage_overrides}
+        )
 
     @classmethod
     def _merge_cli_overrides(

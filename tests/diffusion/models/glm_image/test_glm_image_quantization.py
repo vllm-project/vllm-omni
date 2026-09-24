@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for GLM-Image quantization support (W4A16/AutoRound).
 
 These tests verify that the GLM-Image DiT transformer correctly accepts and uses
@@ -69,7 +69,7 @@ def _force_default_gemm(monkeypatch):
 
     monkeypatch.setattr(
         "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
-        lambda: default_unquantized_gemm,
+        lambda *_args, **_kwargs: default_unquantized_gemm,
     )
 
 
@@ -178,7 +178,13 @@ class TestGlmImageAdaLayerNormZeroQuantization:
 
     def test_accepts_quant_config_parameter(self, mocker: MockerFixture):
         """Verify the class accepts quant_config parameter."""
+        # vLLM 0.30 resolves online quantization in resolve_quant_method():
+        # a non-None online_quantization_config whose resolve_quant_method_cls()
+        # returns a target raises on a checkpoint-quantized layer. A bare
+        # MagicMock satisfies both, so declare no online quantization -- these
+        # tests only assert the layer accepts and stores a quant_config.
         mock_quant_config = mocker.MagicMock()
+        mock_quant_config.online_quantization_config = None
         layer = GlmImageAdaLayerNormZero(
             embedding_dim=512,
             dim=2560,
@@ -220,7 +226,13 @@ class TestGlmImageAdaLayerNormContinuousQuantization:
 
     def test_accepts_quant_config_parameter(self, mocker: MockerFixture):
         """Verify the class accepts quant_config parameter."""
+        # vLLM 0.30 resolves online quantization in resolve_quant_method():
+        # a non-None online_quantization_config whose resolve_quant_method_cls()
+        # returns a target raises on a checkpoint-quantized layer. A bare
+        # MagicMock satisfies both, so declare no online quantization -- these
+        # tests only assert the layer accepts and stores a quant_config.
         mock_quant_config = mocker.MagicMock()
+        mock_quant_config.online_quantization_config = None
         layer = GlmImageAdaLayerNormContinuous(
             embedding_dim=2560,
             conditioning_embedding_dim=512,
@@ -260,7 +272,13 @@ class TestGlmImageAttentionQuantization:
 
     def test_accepts_quant_config_parameter(self, mocker: MockerFixture):
         """Verify GlmImageAttention accepts quant_config parameter."""
+        # vLLM 0.30 resolves online quantization in resolve_quant_method():
+        # a non-None online_quantization_config whose resolve_quant_method_cls()
+        # returns a target raises on a checkpoint-quantized layer. A bare
+        # MagicMock satisfies both, so declare no online quantization -- these
+        # tests only assert the layer accepts and stores a quant_config.
         mock_quant_config = mocker.MagicMock()
+        mock_quant_config.online_quantization_config = None
         attn = GlmImageAttention(
             dim=2560,
             num_heads=64,
@@ -286,7 +304,13 @@ class TestColumnParallelModulesQuantization:
 
     def test_column_parallel_gelu_accepts_quant_config(self, mocker: MockerFixture):
         """Verify ColumnParallelGELU accepts quant_config."""
+        # vLLM 0.30 resolves online quantization in resolve_quant_method():
+        # a non-None online_quantization_config whose resolve_quant_method_cls()
+        # returns a target raises on a checkpoint-quantized layer. A bare
+        # MagicMock satisfies both, so declare no online quantization -- these
+        # tests only assert the layer accepts and stores a quant_config.
         mock_quant_config = mocker.MagicMock()
+        mock_quant_config.online_quantization_config = None
         layer = ColumnParallelGELU(
             dim_in=2560,
             dim_out=10240,
@@ -297,7 +321,13 @@ class TestColumnParallelModulesQuantization:
 
     def test_column_parallel_silu_accepts_quant_config(self, mocker: MockerFixture):
         """Verify ColumnParallelSiLU accepts quant_config."""
+        # vLLM 0.30 resolves online quantization in resolve_quant_method():
+        # a non-None online_quantization_config whose resolve_quant_method_cls()
+        # returns a target raises on a checkpoint-quantized layer. A bare
+        # MagicMock satisfies both, so declare no online quantization -- these
+        # tests only assert the layer accepts and stores a quant_config.
         mock_quant_config = mocker.MagicMock()
+        mock_quant_config.online_quantization_config = None
         layer = ColumnParallelSiLU(
             dim_in=2560,
             dim_out=10240,
@@ -312,7 +342,13 @@ class TestGlmImageFeedForwardQuantization:
 
     def test_accepts_quant_config_parameter(self, mocker: MockerFixture):
         """Verify GlmImageFeedForward accepts quant_config parameter."""
+        # vLLM 0.30 resolves online quantization in resolve_quant_method():
+        # a non-None online_quantization_config whose resolve_quant_method_cls()
+        # returns a target raises on a checkpoint-quantized layer. A bare
+        # MagicMock satisfies both, so declare no online quantization -- these
+        # tests only assert the layer accepts and stores a quant_config.
         mock_quant_config = mocker.MagicMock()
+        mock_quant_config.online_quantization_config = None
         ff = GlmImageFeedForward(
             dim=2560,
             dim_out=2560,
@@ -358,7 +394,13 @@ class TestGlmImageTransformerBlockQuantization:
 
     def test_accepts_quant_config_parameter(self, mocker: MockerFixture):
         """Verify GlmImageTransformerBlock accepts quant_config parameter."""
+        # vLLM 0.30 resolves online quantization in resolve_quant_method():
+        # a non-None online_quantization_config whose resolve_quant_method_cls()
+        # returns a target raises on a checkpoint-quantized layer. A bare
+        # MagicMock satisfies both, so declare no online quantization -- these
+        # tests only assert the layer accepts and stores a quant_config.
         mock_quant_config = mocker.MagicMock()
+        mock_quant_config.online_quantization_config = None
         parallel_config = DiffusionParallelConfig(
             tensor_parallel_size=1,
             sequence_parallel_size=1,
@@ -399,15 +441,14 @@ class TestGlmImagePrepareModule:
         prepare = GlmImagePrepare(
             image_projector=projector,
             rope=rope,
-            patch_size=2,
         )
 
         # Test forward pass
         hidden_states = torch.randn(1, 16, 64, 64)  # [B, C, H, W]
         result = prepare(hidden_states)
 
-        assert len(result) == 5
-        hidden_out, rope_cos, rope_sin, height, width = result
+        assert len(result) == 3
+        hidden_out, rope_cos, rope_sin = result
         assert hidden_out.shape[0] == 1  # batch size
         assert hidden_out.shape[1] == 1024  # seq_len (32 * 32)
         assert hidden_out.shape[2] == 2560  # hidden_dim
@@ -535,7 +576,13 @@ class TestGlmImageTransformer2DModelQuantization:
         """Verify the model accepts quant_config parameter."""
         from vllm_omni.diffusion.data import OmniDiffusionConfig
 
+        # vLLM 0.30 resolves online quantization in resolve_quant_method():
+        # a non-None online_quantization_config whose resolve_quant_method_cls()
+        # returns a target raises on a checkpoint-quantized layer. A bare
+        # MagicMock satisfies both, so declare no online quantization -- these
+        # tests only assert the layer accepts and stores a quant_config.
         mock_quant_config = mocker.MagicMock()
+        mock_quant_config.online_quantization_config = None
         parallel_config = DiffusionParallelConfig(
             tensor_parallel_size=1,
             sequence_parallel_size=1,
@@ -608,7 +655,13 @@ class TestGlmImageTransformer2DModelQuantization:
         """Verify norm_out (output layer) does NOT use quantization to preserve precision."""
         from vllm_omni.diffusion.data import OmniDiffusionConfig
 
+        # vLLM 0.30 resolves online quantization in resolve_quant_method():
+        # a non-None online_quantization_config whose resolve_quant_method_cls()
+        # returns a target raises on a checkpoint-quantized layer. A bare
+        # MagicMock satisfies both, so declare no online quantization -- these
+        # tests only assert the layer accepts and stores a quant_config.
         mock_quant_config = mocker.MagicMock()
+        mock_quant_config.online_quantization_config = None
         parallel_config = DiffusionParallelConfig(
             tensor_parallel_size=1,
             sequence_parallel_size=1,
