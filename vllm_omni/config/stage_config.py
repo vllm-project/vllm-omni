@@ -312,10 +312,10 @@ class PipelineConfig:
     # ``hf_config_predicate=lambda c: getattr(c, "version", "") == "4.5"``
     # to avoid misrouting 2.6 checkpoints.
     hf_config_predicate: Callable[[Any], bool] | None = None
-    # Diffusers pipeline class name: for models that ship a ``model_index.json``
-    # (no root ``config.json``), the ``_class_name`` field is matched against
-    # this value to auto-detect the pipeline.  Only needed for diffusers-style
-    # multi-component repos (e.g. GLM-Image).  ``None`` = not a diffusers model.
+    # Canonical diffusion runtime class for this registered pipeline.
+    # Serving uses it as a metadata fallback; model_index.json discovery
+    # also matches its _class_name against this value and its aliases.
+    # None delegates class discovery to the checkpoint metadata.
     diffusers_class_name: str | None = None
     diffusers_class_aliases: tuple[str, ...] = ()
     endpoint_restrictions: tuple[EndpointRestriction, ...] = ()
