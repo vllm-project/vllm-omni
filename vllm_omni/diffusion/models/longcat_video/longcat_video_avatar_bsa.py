@@ -9,18 +9,13 @@ import os
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
+from vllm.triton_utils import tl, triton
 
 _TRITON_AUTOTUNE_ENABLE_ENV = "TRITON_AUTOTUNE_ENABLE"
-_LEGACY_TRITON_AUTOTUNE_ENABLE_ENV = "TRITON_AUTOTUNE_ENBALE"
 
 
 def _triton_autotune_enabled() -> bool:
-    return (
-        os.environ.get(_TRITON_AUTOTUNE_ENABLE_ENV, "0") == "1"
-        or os.environ.get(_LEGACY_TRITON_AUTOTUNE_ENABLE_ENV, "0") == "1"
-    )
+    return os.environ.get(_TRITON_AUTOTUNE_ENABLE_ENV, "0") == "1"
 
 
 if _triton_autotune_enabled():
