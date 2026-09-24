@@ -8,7 +8,7 @@ import threading
 
 import torch
 from vllm.logger import init_logger
-from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
 
@@ -50,6 +50,25 @@ def sinkhorn_knopp(matrix_logits: torch.Tensor, iterations: int, epsilon: float)
 
 
 @triton.jit
+def _asm_add_rn_f32(a, b):
+    """Opaque FP32 add that blocks FMA contraction of ``a * b + c``.
+
+    The native expression runs the scaled-logits multiply and the bias add
+    as separate kernels, so they can never fuse; an inline-asm add is
+    invisible to the optimizer's contraction and keeps the kernel
+    bit-equal to that boundary.
+    """
+    return tl.inline_asm_elementwise(
+        "add.rn.f32 $0, $1, $2;",
+        "=f,f,f",
+        [a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
 def _mhc_post_residual_kernel(
     post_ptr,
     residual_ptr,
@@ -63,29 +82,124 @@ def _mhc_post_residual_kernel(
     residual_stride,
     scale,
     epsilon,
+    num_tokens,
     iterations: tl.constexpr,
+    tokens_per_program: tl.constexpr,
+    out_dtype_code: tl.constexpr,
 ):
-    token = tl.program_id(0).to(tl.int64)
-    index = tl.arange(0, 4)
-    post = tl.load(post_ptr + token * post_stride + index)
+    pid = tl.program_id(0)
+    offs_t = pid * tokens_per_program + tl.arange(0, tokens_per_program)
+    t_mask = offs_t < num_tokens
+    offs_row = offs_t.to(tl.int64)
+    post_row = offs_row * post_stride
+    residual_row = offs_row * residual_stride
+    offs_post_out = offs_row * 4
+    offs_residual_out = offs_row * 16
+
+    # Post coefficients: 2 * sigmoid((alpha_post * scale) * x + bias).
+    # sigmoid is div_rn(1, 1 + exp(-z)) — tl.sigmoid is not bit-equal to
+    # torch.sigmoid; libdevice exp with IEEE division is. The add sits
+    # behind the asm barrier so it cannot contract into an FMA.
     ap = tl.load(alpha_post_ptr)
-    bp = tl.load(bias_post_ptr + index)
-    post = 2.0 * tl.sigmoid(ap * scale * post + bp)
-    offsets = index[:, None] * 4 + index[None, :]
-    matrix = tl.load(residual_ptr + token * residual_stride + offsets)
+    post_scale = ap * scale
+    post = ()
+    for j in tl.static_range(4):
+        x = tl.load(post_ptr + post_row + j, mask=t_mask, other=0.0)
+        b = tl.load(bias_post_ptr + j)
+        z = _asm_add_rn_f32(post_scale * x, b)
+        post = post + (2.0 * tldevice.div_rn(1.0, 1.0 + tldevice.exp(-z)),)
+
+    # Bit-exact Sinkhorn (per #7545): the eager formula's numerical
+    # behaviors are reproduced structurally rather than left to the
+    # compiler —
+    #   * (alpha*scale)*x + bias keeps the eager association order behind
+    #     an inline-asm barrier (the native expression runs the multiply
+    #     and the add as separate kernels and can never fuse them);
+    #   * exp uses the accurate libdevice expf (tl.exp may lower to the
+    #     approximate ex2 path);
+    #   * amax propagates NaN like torch.amax;
+    #   * the strided sum(dim=-2) is a sequential ascending chain and the
+    #     contiguous sum(dim=-1) is eager's interleaved lane pairing
+    #     (x0 + x2) + (x1 + x3);
+    #   * divisions use IEEE div_rn (Triton's / does not guarantee
+    #     round-to-nearest).
+    # m[i][j] holds one [TPB] vector per matrix element; Triton models
+    # Python lists as immutable tuples, so updates rebuild the tuples and
+    # every index is a compile-time constant.
     ar = tl.load(alpha_residual_ptr)
-    br = tl.load(bias_residual_ptr + offsets)
-    matrix = ar * scale * matrix + br
-    # Native amax propagates any NaN to the whole token's normalization.
-    has_nan = tl.sum(tl.sum((matrix != matrix).to(tl.int32), axis=0), axis=0) != 0
-    maximum = tl.max(tl.max(matrix, axis=0), axis=0)
-    maximum = tl.where(has_nan, float("nan"), maximum)
-    matrix = tl.exp(matrix - maximum)
+    residual_scale = ar * scale
+    m = ()
+    for i in tl.static_range(4):
+        row = ()
+        for j in tl.static_range(4):
+            x = tl.load(residual_ptr + residual_row + i * 4 + j, mask=t_mask, other=0.0)
+            b = tl.load(bias_residual_ptr + i * 4 + j)
+            row = row + (_asm_add_rn_f32(residual_scale * x, b),)
+        m = m + (row,)
+
+    # NaN-propagating amax over all 16 elements, matching torch.amax.
+    any_nan = m[0][0] != m[0][0]
+    amax = m[0][0]
+    for i in tl.static_range(4):
+        for j in tl.static_range(4):
+            any_nan = any_nan | (m[i][j] != m[i][j])
+            amax = tl.maximum(amax, m[i][j])
+    amax = tl.where(any_nan, float("nan"), amax)
+
+    new_m = ()
+    for i in tl.static_range(4):
+        row = ()
+        for j in tl.static_range(4):
+            row = row + (tldevice.exp(m[i][j] - amax),)
+        new_m = new_m + (row,)
+    m = new_m
+
     for _ in tl.static_range(iterations):
-        matrix = matrix / (tl.sum(matrix, axis=0)[None, :] + epsilon)
-        matrix = matrix / (tl.sum(matrix, axis=1)[:, None] + epsilon)
-    tl.store(post_out_ptr + token * 4 + index, post)
-    tl.store(residual_out_ptr + token * 16 + offsets, matrix)
+        # matrix / (matrix.sum(dim=-2, keepdim=True) + epsilon):
+        # ascending sequential chain over i per column j.
+        col_sum = ()
+        for j in tl.static_range(4):
+            s = m[0][j]
+            for i in tl.static_range(1, 4):
+                s = s + m[i][j]
+            col_sum = col_sum + (s,)
+        new_m = ()
+        for i in tl.static_range(4):
+            row = ()
+            for j in tl.static_range(4):
+                row = row + (tldevice.div_rn(m[i][j], col_sum[j] + epsilon),)
+            new_m = new_m + (row,)
+        m = new_m
+        # matrix / (matrix.sum(dim=-1, keepdim=True) + epsilon):
+        # interleaved lane pairing (x0 + x2) + (x1 + x3).
+        row_sum = ()
+        for i in tl.static_range(4):
+            even = m[i][0] + m[i][2]
+            odd = m[i][1] + m[i][3]
+            row_sum = row_sum + (even + odd,)
+        new_m = ()
+        for i in tl.static_range(4):
+            row = ()
+            for j in tl.static_range(4):
+                row = row + (tldevice.div_rn(m[i][j], row_sum[i] + epsilon),)
+            new_m = new_m + (row,)
+        m = new_m
+
+    for j in tl.static_range(4):
+        v = post[j]
+        if out_dtype_code == 1:
+            v = v.to(tl.bfloat16)
+        elif out_dtype_code == 2:
+            v = v.to(tl.float16)
+        tl.store(post_out_ptr + offs_post_out + j, v, mask=t_mask)
+    for i in tl.static_range(4):
+        for j in tl.static_range(4):
+            v = m[i][j]
+            if out_dtype_code == 1:
+                v = v.to(tl.bfloat16)
+            elif out_dtype_code == 2:
+                v = v.to(tl.float16)
+            tl.store(residual_out_ptr + offs_residual_out + i * 4 + j, v, mask=t_mask)
 
 
 @triton.jit
@@ -195,7 +309,7 @@ class MHCPostResidual(CustomOp):
         residual_out = torch.empty((tokens, 4, 4), device=post_logits.device, dtype=out_dtype)
         if tokens:
             try:
-                _mhc_post_residual_kernel[(tokens,)](
+                _mhc_post_residual_kernel[(triton.cdiv(tokens, 32),)](
                     *tensors,
                     post_out,
                     residual_out,
@@ -203,7 +317,10 @@ class MHCPostResidual(CustomOp):
                     residual_logits.stride(0),
                     scale,
                     epsilon,
+                    tokens,
                     iterations=iterations,
+                    tokens_per_program=32,
+                    out_dtype_code={torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}[out_dtype],
                     num_warps=1,
                     enable_fp_fusion=False,
                 )
