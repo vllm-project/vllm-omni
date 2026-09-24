@@ -323,9 +323,7 @@ class MingImageDiffusionPipeline(ZImagePipeline):
             else self.default_guidance_scale
         )
         seed = extra_args.get("seed", sampling.seed)
-        generator = (
-            torch.Generator(device=self.device).manual_seed(int(seed)) if seed is not None else sampling.generator
-        )
+        generator = torch.Generator(device="cpu").manual_seed(int(seed)) if seed is not None else sampling.generator
 
         ref_latent = self._encode_reference(reference, height, width)
         positive = [item for item in cap_feats]
@@ -333,7 +331,7 @@ class MingImageDiffusionPipeline(ZImagePipeline):
         self._pending_prompt_embeds = positive
         self._pending_negative_prompt_embeds = negative
 
-        apply_cfg = cfg > 0
+        apply_cfg = cfg > 1
         context_direct = (
             torch.cat([direct_condition, torch.zeros_like(direct_condition)], dim=0) if apply_cfg else direct_condition
         )
