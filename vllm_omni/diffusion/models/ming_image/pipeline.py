@@ -314,14 +314,8 @@ class MingImageDiffusionPipeline(ZImagePipeline):
 
         height = int(extra_args.get("height") or sampling.height or 1024)
         width = int(extra_args.get("width") or sampling.width or 1024)
-        steps = int(extra_args.get("steps") or sampling.num_inference_steps or self.default_num_inference_steps)
-        cfg = float(
-            extra_args["cfg"]
-            if extra_args.get("cfg") is not None
-            else sampling.guidance_scale
-            if sampling.guidance_scale is not None
-            else self.default_guidance_scale
-        )
+        steps = int(sampling.num_inference_steps or self.default_num_inference_steps)
+        cfg = float(sampling.guidance_scale if sampling.guidance_scale is not None else self.default_guidance_scale)
         seed = extra_args.get("seed", sampling.seed)
         generator = torch.Generator(device="cpu").manual_seed(int(seed)) if seed is not None else sampling.generator
 
