@@ -231,10 +231,10 @@ class TestWorkerWrapperBaseDelegation:
         assert result is None
 
     @pytest.mark.parametrize("native_kv", [False, True])
-    def test_worker_shutdown_disables_offloader_before_distributed_teardown(self, mocker: MockerFixture, native_kv):
+    def test_worker_shutdown_releases_offloader_before_distributed_teardown(self, mocker: MockerFixture, native_kv):
         events: list[str] = []
         offload_backend = mocker.Mock()
-        offload_backend.disable.side_effect = lambda: events.append("offload")
+        offload_backend.shutdown.side_effect = lambda: events.append("offload")
         kv_manager = mocker.Mock()
         kv_manager.close.side_effect = lambda: events.append("kv")
         destroy = mocker.patch(
@@ -260,7 +260,7 @@ class TestWorkerWrapperBaseDelegation:
         mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.shutdown_kv_connector")
         offload_backend = mocker.Mock()
         if cleanup_fails:
-            offload_backend.disable.side_effect = RuntimeError("offload cleanup failed")
+            offload_backend.shutdown.side_effect = RuntimeError("offload cleanup failed")
         worker = DiffusionWorker.__new__(DiffusionWorker)
         weights = torch.ones(1)
         weights_ref = weakref.ref(weights)

@@ -244,5 +244,12 @@ class OffloadBackend(ABC):
         """
         raise NotImplementedError
 
+    def shutdown(self) -> None:
+        """Release resources when the pipeline will no longer be used.
+
+        Backends may discard weights instead of restoring a reusable model.
+        """
+        self.disable()
+
     def is_enabled(self) -> bool:
         return self.enabled
