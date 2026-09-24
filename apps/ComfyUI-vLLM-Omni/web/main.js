@@ -117,12 +117,6 @@ app.registerExtension({
             return
         }
 
-        const { color, bgcolor } = FAMILIES[familyOf(nodeData)];
-        // On the prototype, not the instance: a colour the user picks by hand is
-        // written to the instance and shadows this, so manual overrides survive.
-        nodeType.prototype.color = color;
-        nodeType.prototype.bgcolor = bgcolor;
-
         if (nodeData.name === "VLLMOmniGenerateVideo") {
             const onConfigure = nodeType.prototype.onConfigure;
             nodeType.prototype.onConfigure = function (info) {
@@ -149,6 +143,14 @@ app.registerExtension({
                 height,
             );
         };
+    },
+    nodeCreated(node) {
+        if (!node.comfyClass?.startsWith("VLLMOmni")) return;
+        // Current ComfyUI tracks colours on initialized instances. Saved
+        // workflow colours are restored after this hook and override defaults.
+        const family = familyOf({ output: (node.outputs ?? []).map(output => output.type) });
+        node.color = FAMILIES[family].color;
+        node.bgcolor = FAMILIES[family].bgcolor;
     },
     async setup() {
         console.info("vLLM-Omni Setup complete!")

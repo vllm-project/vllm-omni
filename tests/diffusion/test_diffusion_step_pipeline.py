@@ -553,6 +553,41 @@ def _distributed_step_worker(local_rank: int, world_size: int, mode: str, master
 
 
 @pytest.mark.cpu
+def test_interactions_arriving_after_a_chunk_apply_before_next_chunk(monkeypatch, mocker):
+    from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
+
+    pending: list[str] = []
+    applied: list[str] = []
+
+    class InteractivePipeline(_ChunkedStepPipeline):
+        def peek_chunk_media(self, state):
+            return ChunkMediaSpec(num_media_frames=12, fps=12.0, num_latent_frames=3)
+
+        def apply_interaction_at_chunk_boundary(self, state):
+            applied.extend(pending)
+            pending.clear()
+
+        def prepare_next_chunk(self, state):
+            state.latents = torch.tensor([float(len(applied))])
+
+    runner = _make_runner()
+    runner.od_config.streaming_output = True
+    runner.pipeline = InteractivePipeline()
+    runner._interaction_coordinator = mocker.Mock()
+    runner._interaction_coordinator.maybe_prepare_initial_session.return_value = None
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    runner.execute_stepwise(_make_scheduler_output(_make_step_request(4)))
+    output = runner.execute_stepwise(_make_cached_scheduler_output()).get_request_output("req-1")
+    assert output.result is not None and not output.finished
+
+    # The transport/RPC loop can receive a key only after execute returns.
+    pending.append("key-release")
+    runner.execute_stepwise(_make_cached_scheduler_output(step_id=2))
+    assert applied == ["key-release"]
+    assert runner.input_batch.latents.item() == 1.0
+
+
+@pytest.mark.cpu
 def test_input_batch_cached_repack_refreshes_state_references_without_prompt_embeds():
     first_state = _make_input_batch_state("req-1", 1.0)
     batch = InputBatch.make_batch([first_state])

@@ -66,7 +66,9 @@ def base64_to_image_tensor(base64_str: str, mode: str = "RGB") -> torch.Tensor:
     return image_tensor
 
 
-def image_tensor_to_png_bytes(tensor: torch.Tensor, filename: str = "image.png") -> BytesIO:
+def image_tensor_to_png_bytes(
+    tensor: torch.Tensor, filename: str = "image.png", *, size: tuple[int, int] | None = None
+) -> BytesIO:
     """
     Convert ComfyUI image tensor to PNG BytesIO for multipart upload.
 
@@ -77,6 +79,7 @@ def image_tensor_to_png_bytes(tensor: torch.Tensor, filename: str = "image.png")
     Args:
         tensor: ComfyUI IMAGE tensor with shape (B, H, W, C), dtype float32, range [0, 1]
         filename: Name attribute to set on BytesIO (default: "image.png")
+        size: Optional (width, height) for Lanczos resizing before encoding
 
     Returns:
         BytesIO object containing PNG-encoded image with .name attribute set
@@ -90,6 +93,8 @@ def image_tensor_to_png_bytes(tensor: torch.Tensor, filename: str = "image.png")
     image_tensor = tensor[0]  # Shape: (H, W, C)
     image_np = (image_tensor.cpu().numpy() * 255.0).astype(np.uint8)
     pil_image = Image.fromarray(image_np)
+    if size is not None:
+        pil_image = pil_image.resize(size, Image.Resampling.LANCZOS)
 
     # Save to BytesIO as image file
     img_bytes = BytesIO()
@@ -106,13 +111,16 @@ def image_tensor_to_png_bytes(tensor: torch.Tensor, filename: str = "image.png")
     return img_bytes
 
 
-def image_tensor_to_base64(tensor: torch.Tensor, filename: str = "image.png") -> str:
+def image_tensor_to_base64(
+    tensor: torch.Tensor, filename: str = "image.png", *, size: tuple[int, int] | None = None
+) -> str:
     """
     Convert ComfyUI image tensor to base64-encoded image string.
 
     Args:
         tensor: ComfyUI IMAGE tensor with shape (B, H, W, C), dtype float32, range [0, 1]
         filename: Name attribute to set on BytesIO (default: "image.png")
+        size: Optional (width, height) for Lanczos resizing before encoding
         format: File format of the output image file buffer (default: "PNG")
 
     Returns:
@@ -121,7 +129,7 @@ def image_tensor_to_base64(tensor: torch.Tensor, filename: str = "image.png") ->
     Raises:
         ValueError: If tensor format is invalid (not 4D, wrong dtype, etc.)
     """
-    img_bytes = image_tensor_to_png_bytes(tensor, filename)
+    img_bytes = image_tensor_to_png_bytes(tensor, filename, size=size)
     img_bytes.seek(0)
     byte_data = img_bytes.read()
     base64_str = base64.b64encode(byte_data).decode("utf-8")

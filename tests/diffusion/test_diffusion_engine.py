@@ -81,6 +81,9 @@ class MockScheduler:
     def num_running_requests(self) -> int:
         return 0
 
+    def pending_finished_request_ids(self) -> set[str]:
+        return set()
+
     def get_admission_wait_decision(
         self,
         *,
@@ -950,7 +953,7 @@ async def test_async_add_req_and_stream_response():
     await engine._check_and_start_background_loop()
 
     async def run_task(rid):
-        req = SimpleNamespace(request_id=rid)
+        req = SimpleNamespace(request_id=rid, sampling_params=OmniDiffusionSamplingParams())
         start = time.time()
         res = await _consume_final_output(engine.async_add_req_and_stream_response(req))
         return rid, res, time.time() - start

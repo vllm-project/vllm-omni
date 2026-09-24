@@ -30,6 +30,7 @@ from vllm_omni.engine.messages import (
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
     ErrorMessage,
+    InteractionMessage,
     OutputMessage,
     ShutdownRequestMessage,
     StageSubmissionMessage,
@@ -2097,3 +2098,118 @@ async def test_duplex_session_request_error_finish_is_delivered_as_request_error
         plain_state,
     )
     assert output_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_interaction_wait_does_not_block_playback_or_abort(monkeypatch: pytest.MonkeyPatch) -> None:
+    requests: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=requests,
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[],
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    feedback = asyncio.Event()
+    aborted = asyncio.Event()
+    second = asyncio.Event()
+    calls = []
+
+    async def interaction(msg):
+        calls.append(msg.interaction["event_id"])
+        entered.set()
+        if len(calls) == 1:
+            await release.wait()
+        else:
+            second.set()
+
+    async def playback(msg):
+        assert msg.method == "update_streaming_playback"
+        feedback.set()
+
+    async def abort(msg):
+        aborted.set()
+
+    monkeypatch.setattr(orchestrator, "_handle_interaction", interaction)
+    monkeypatch.setattr(orchestrator, "_handle_collective_rpc", playback)
+    monkeypatch.setattr(orchestrator, "_handle_abort", abort)
+    tasks = [asyncio.create_task(coro) for coro in orchestrator._background_tasks()]
+    tasks.append(asyncio.create_task(orchestrator._request_handler()))
+    try:
+        await requests.put(InteractionMessage(request_id="video", interaction={"event_id": "press", "event": {}}))
+        await asyncio.wait_for(entered.wait(), 1)
+        await requests.put(InteractionMessage(request_id="video", interaction={"event_id": "release", "event": {}}))
+        await requests.put(
+            CollectiveRPCRequestMessage(
+                rpc_id="feedback", method="update_streaming_playback", args=(), kwargs={}, stage_ids=[0]
+            )
+        )
+        await requests.put(AbortRequestMessage(request_ids=["video"]))
+        await asyncio.wait_for(feedback.wait(), 1)
+        await asyncio.wait_for(aborted.wait(), 1)
+        assert calls == ["press"]
+        release.set()
+        await asyncio.wait_for(second.wait(), 1)
+        assert calls == ["press", "release"]
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_interaction_worker_shutdown_cancels_inflight_rpc(monkeypatch: pytest.MonkeyPatch) -> None:
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[],
+    )
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def blocked(msg):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(orchestrator, "_handle_interaction", blocked)
+    task = asyncio.create_task(orchestrator._interaction_worker())
+    try:
+        await orchestrator._dispatch_message(InteractionMessage(request_id="video", interaction={"event": {}}))
+        await asyncio.wait_for(entered.wait(), 1)
+        orchestrator._shutdown_event.set()
+        await asyncio.wait_for(task, 1)
+        assert cancelled.is_set()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_interaction_backlog_is_bounded_without_blocking_dispatch() -> None:
+    errors: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=errors,
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[],
+    )
+    for index in range(65):
+        await orchestrator._dispatch_message(
+            InteractionMessage(request_id="video", interaction={"event_id": str(index), "event": {}})
+        )
+    error = errors.get_nowait()
+    assert error.event_id == "64"
+    assert error.fatal is False
+    assert error.error == "Too many pending interactions"
+
+    # fatal=False preserves the engine, not the overflowing video request.
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
+
+    consumer = object.__new__(AsyncOmni)
+    with pytest.raises(RuntimeError, match="Too many pending interactions"):
+        consumer._handle_output_message(error)

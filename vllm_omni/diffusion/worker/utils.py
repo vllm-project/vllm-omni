@@ -108,6 +108,7 @@ class StepRequestState:
     # ── Optional interaction information in streaming output mode ──
     interaction_sessions: dict[str, InteractionSession] = field(default_factory=dict)  # Modality -> transition progress
     interaction_chunk_metadata: InteractionChunkMetadata | None = None  # Acknowledging completion of each interaction
+    pending_chunk_boundary: bool = False
 
     # ── Per-request scheduler instance (set once by prepare_encode) ──
     scheduler: Any | None = None
@@ -196,6 +197,7 @@ class RunnerOutput(BaseRunnerOutput):
     finished: bool = False
     result: DiffusionOutput | None = None
     async_output_id: str | None = None
+    streaming_media_duration: float = 0.0
 
     def get_request_output(self, request_id: str) -> RunnerOutput | None:
         return self if self.request_id == request_id else None
