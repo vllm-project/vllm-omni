@@ -388,10 +388,7 @@ class DuplexSessionConfig:
         ``realtime_*`` keys of ``extra_body`` exactly like the old
         ``_session_create_from_realtime``.
         """
-        from vllm_omni.engine.duplex.realtime_commands import (
-            DUPLEX_REALTIME_CAPABILITIES,
-            duplex_response_format,
-        )
+        from vllm_omni.engine.duplex.mailbox import DUPLEX_REALTIME_CAPABILITIES
         from vllm_omni.engine.duplex.turn_detection import normalize_turn_detection_session_payload
         from vllm_omni.protocol.duplex import (
             RealtimeInputDefaults,
@@ -404,7 +401,7 @@ class DuplexSessionConfig:
 
         payload: dict[str, object] = dict(session_payload)
         # One session check for every consumer (ENTRY-INV-002): the same
-        # capability object ``translate_realtime_command`` uses, so a session
+        # capability object ``command_from_realtime`` uses, so a session
         # object is accepted or refused identically whichever door it came in.
         rejection = validate_session_payload(payload, capabilities=DUPLEX_REALTIME_CAPABILITIES)
         if rejection is not None:
@@ -496,7 +493,6 @@ class DuplexSessionConfig:
         when the patch changes something a live session cannot change.
         ``audio_started`` is ``playback.generated_ms > 0 or playback.sent_ms > 0``.
         """
-        from vllm_omni.engine.duplex.realtime_commands import duplex_response_format
         from vllm_omni.protocol.duplex import (
             REALTIME_OUTPUT_AUDIO_FORMATS,
             input_audio_transcription_config,
@@ -679,7 +675,6 @@ class ResponseCreateOptions:
         for options a model-native duplex session cannot apply per response.
         Private runtime keys in ``extra_body`` are dropped.
         """
-        from vllm_omni.engine.duplex.realtime_commands import duplex_response_format
         from vllm_omni.protocol.duplex import (
             REALTIME_OUTPUT_AUDIO_FORMATS,
             parse_realtime_audio_format,
@@ -830,6 +825,18 @@ def realtime_item_to_history_message(item: object) -> dict[str, object] | None:
     if text:
         return {"role": role, "content": text}
     return None
+
+
+def duplex_response_format(realtime_format: str) -> str:
+    """A Realtime output format -> the duplex ``response_format`` vocabulary."""
+    normalized = realtime_format.lower()
+    if normalized in {"pcm16", "pcm_s16le", "s16le"}:
+        return "pcm"
+    if normalized in {"g711_ulaw", "g711_alaw"}:
+        return "pcm"
+    if normalized in {"wav", "pcm"}:
+        return normalized
+    return "wav"
 
 
 def realtime_max_output_tokens(value: object) -> int | None:

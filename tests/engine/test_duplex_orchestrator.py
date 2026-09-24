@@ -21,7 +21,6 @@ from tests.engine.test_orchestrator import (
     _build_stage_pools,
 )
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexSessionConfig, DuplexSessionState
 from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_request_id
 from vllm_omni.engine.duplex.messages import (
@@ -34,6 +33,7 @@ from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator, DuplexOrche
 from vllm_omni.engine.messages import AbortRequestMessage, ShutdownRequestMessage
 from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
+from vllm_omni.protocol.duplex import commands
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

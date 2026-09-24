@@ -36,7 +36,7 @@ from vllm_omni.engine.messages import EngineQueueMessage
 from vllm_omni.engine.orchestrator import OrchestratorBase
 
 if TYPE_CHECKING:
-    from vllm_omni.engine.duplex.commands import DuplexCommand
+    from vllm_omni.protocol.duplex import DuplexCommand
 
 logger = init_logger(__name__)
 

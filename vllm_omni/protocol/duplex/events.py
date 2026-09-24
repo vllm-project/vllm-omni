@@ -343,7 +343,7 @@ class DuplexRawEvent(RealtimeEvent):
     def type(self) -> str:
         return f"duplex.{self.internal_type}"
 
-    def to_realtime(self) -> dict[str, object]:
+    def to_wire(self) -> dict[str, object]:
         return {"type": self.type, "event_id": self.event_id, "event": wire_value(self.details)}
 
 

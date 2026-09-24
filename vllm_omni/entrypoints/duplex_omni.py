@@ -34,10 +34,7 @@ from uuid import uuid4
 from vllm.logger import init_logger
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.engine.duplex import commands as duplex_commands
-from vllm_omni.engine.duplex.commands import DuplexCommand
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig, ResponseCreateOptions
-from vllm_omni.engine.duplex.events import DuplexEvent, SessionClosed
 from vllm_omni.engine.duplex.messages import (
     DuplexControlResultMessage,
     DuplexSessionError,
@@ -45,6 +42,9 @@ from vllm_omni.engine.duplex.messages import (
 )
 from vllm_omni.engine.duplex_omni_engine import DuplexOmniEngine
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.protocol.duplex import DuplexCommand, DuplexEvent
+from vllm_omni.protocol.duplex import commands as duplex_commands
+from vllm_omni.protocol.duplex.events import SessionClosed
 
 logger = init_logger(__name__)
 

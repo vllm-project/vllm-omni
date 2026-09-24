@@ -72,31 +72,34 @@ def test_a_duplex_consumer_does_not_skip_the_duplex_protocol_package(module: Pat
 
 
 def test_the_duplex_package_carries_the_whole_command_vocabulary() -> None:
-    from vllm_omni.engine.duplex import commands as engine_commands
+    from vllm_omni.engine.duplex.mailbox import mailbox_channel
     from vllm_omni.protocol.duplex import commands as duplex_wire
+    from vllm_omni.protocol.realtime import commands as realtime_commands
 
-    # Every command the engine handles is nameable through the one door.
-    engine_names = {
-        name
-        for name in engine_commands.__all__
-        if isinstance(getattr(engine_commands, name), type)
-        and issubclass(getattr(engine_commands, name), engine_commands.DuplexCommand)
-        and getattr(engine_commands, name) is not engine_commands.DuplexCommand
+    # Every Tier 1 command is nameable through the one door ...
+    assert set(realtime_commands.__all__) <= set(duplex_wire.__all__)
+    # ... and every command the door offers is one the engine knows how to run.
+    command_classes = {
+        getattr(duplex_wire, name)
+        for name in duplex_wire.__all__
+        if isinstance(getattr(duplex_wire, name), type)
+        and issubclass(getattr(duplex_wire, name), duplex_wire.DuplexCommand)
+        and getattr(duplex_wire, name) is not duplex_wire.DuplexCommand
     }
-    assert engine_names <= set(duplex_wire.__all__)
+    assert command_classes
+    for cls in command_classes:
+        assert mailbox_channel(cls)
 
 
 def test_the_duplex_package_carries_the_whole_event_vocabulary() -> None:
-    from vllm_omni.engine.duplex import events as engine_events
     from vllm_omni.protocol.duplex import events as duplex_wire
+    from vllm_omni.protocol.realtime import events as realtime_events
 
-    engine_names = {
-        name
-        for name in engine_events.__all__
-        if isinstance(getattr(engine_events, name), type)
-        and issubclass(getattr(engine_events, name), engine_events.DuplexEvent)
-    }
-    assert engine_names <= set(duplex_wire.__all__)
+    assert set(realtime_events.__all__) <= set(duplex_wire.__all__)
+    for name in duplex_wire.__all__:
+        obj = getattr(duplex_wire, name)
+        if isinstance(obj, type):
+            assert issubclass(obj, duplex_wire.DuplexEvent), name
 
 
 @pytest.mark.parametrize(
@@ -124,21 +127,24 @@ def test_a_reexported_tier1_name_is_the_tier1_object(module_pair: tuple[str, str
         )
 
 
-def test_duplex_event_is_an_alias_but_duplex_command_is_not() -> None:
-    """The asymmetry is deliberate, and a later reader should not 'fix' it.
+def test_duplex_command_and_event_are_aliases_of_the_realtime_bases() -> None:
+    """A duplex command or event carries nothing a Realtime one does not.
 
-    An event has no engine-internal half --- what the session emits is what the
-    socket sends --- so ``DuplexEvent`` is simply ``RealtimeEvent``. A command
-    does: ``payload()`` renders the session runner's mailbox dictionary, and for
-    four of the seventeen the mailbox channel is not even the client event type.
+    How the engine *represents* a command internally (the session runner's
+    mailbox dictionary, whose channel is not even the client event type for
+    four of the seventeen) is the engine's business and lives in
+    ``vllm_omni.engine.duplex.mailbox`` --- not on the protocol classes.
     """
-    from vllm_omni.engine.duplex.commands import DuplexCommand
+    from vllm_omni.protocol.duplex import commands as duplex_commands
+    from vllm_omni.protocol.duplex.commands import DuplexCommand
     from vllm_omni.protocol.duplex.events import DuplexEvent
     from vllm_omni.protocol.realtime.commands import RealtimeCommand
     from vllm_omni.protocol.realtime.events import RealtimeEvent
 
     assert DuplexEvent is RealtimeEvent
-
-    assert DuplexCommand is not RealtimeCommand
-    assert issubclass(DuplexCommand, RealtimeCommand)
-    assert hasattr(DuplexCommand, "payload") and not hasattr(RealtimeCommand, "payload")
+    assert DuplexCommand is RealtimeCommand
+    for name in duplex_commands.__all__:
+        obj = getattr(duplex_commands, name)
+        if isinstance(obj, type) and issubclass(obj, DuplexCommand):
+            assert not hasattr(obj, "payload"), name
+            assert "type" not in vars(obj), name

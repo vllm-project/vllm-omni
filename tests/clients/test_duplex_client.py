@@ -46,9 +46,9 @@ from vllm_omni.clients.duplex import (
     write_pcm16_wav,
 )
 from vllm_omni.clients.inline_duplex import InlineDuplexClient
-from vllm_omni.engine.duplex import commands as duplex_commands
-from vllm_omni.engine.duplex import events as duplex_events
 from vllm_omni.engine.duplex.messages import DuplexSessionError
+from vllm_omni.protocol.duplex import commands as duplex_commands
+from vllm_omni.protocol.duplex import events as duplex_events
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -125,7 +125,7 @@ class _WireEvent:
     def is_terminal(self) -> bool:
         return self.raw.get("type") in {"session.closed", "session.expired"}
 
-    def to_realtime(self) -> dict[str, object]:
+    def to_wire(self) -> dict[str, object]:
         return dict(self.raw)
 
 

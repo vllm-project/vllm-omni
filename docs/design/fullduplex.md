@@ -46,7 +46,7 @@ the model plugins.
                    │                          ┌──────────────────────────────────────┐
                    │                          │ OmniDuplexSessionHandler (thin)      │
                    │                          │  websocket I/O, command_from_realtime│
-                   │                          │  event.to_realtime(), attachment /   │
+                   │                          │  event.to_wire(), attachment /   │
                    │                          │  resume tokens / replay journal      │
                    │                          └──────────────────┬───────────────────┘
                    ▼                                             ▼   DuplexSessionHandle
@@ -104,9 +104,9 @@ plugin and the session runtime config to `DuplexOrchestrator` directly.
    the orchestrator loop. Nothing above the engine keeps session state beyond
    a handle (session id, event queue, capabilities, public session object).
 2. **Typed contract.** Commands into a session are `DuplexCommand`
-   dataclasses (`engine/duplex/commands.py`); outputs are `DuplexEvent`
-   dataclasses (`engine/duplex/events.py`). `command_from_realtime()` and
-   `DuplexEvent.to_realtime()` derive the OpenAI Realtime JSON, so the wire
+   dataclasses (`protocol/duplex/commands.py`); outputs are `DuplexEvent`
+   dataclasses (`protocol/duplex/events.py`). `command_from_realtime()` and
+   `DuplexEvent.to_wire()` derive the OpenAI Realtime JSON, so the wire
    format is never hand-built, and the websocket handler and the inline client
    share one conversion.
 3. **Generic bases and the turn-based classes have zero duplex vocabulary.**
@@ -143,13 +143,17 @@ plugin and the session runtime config to `DuplexOrchestrator` directly.
    `resume_token`, `input_audio_buffer.append` without `video_frames`. Our
    error **codes** are Tier 3 (`protocol/duplex/errors.py`); only the envelope
    shape and OpenAI's three `error.type` classes are Tier 1.
-   What stays engine-side is everything that is *internal representation*
-   rather than contract: `DuplexCommand.payload()` renders the session runner's
-   mailbox dictionary, whose channel genuinely differs from the client event
-   (`session.update` and the three `conversation.item.*` commands all travel on
-   `turn.signal`); `engine/duplex/realtime_commands.py` decides which command a
-   decoded event becomes; `engine/duplex/realtime_events.py` holds the
-   session's projection state. The codec may not import the engine, the
+   `protocol/duplex` is the whole duplex vocabulary: it re-exports Tier 1,
+   declares Tier 2 and Tier 3, and decodes a client event
+   (`decode_duplex_command`); `DuplexCommand` / `DuplexEvent` are aliases of
+   `RealtimeCommand` / `RealtimeEvent`. What stays engine-side is everything
+   that is *internal representation* rather than contract:
+   `engine/duplex/mailbox.py` binds the decoder to what the engine can serve
+   (`DUPLEX_REALTIME_CAPABILITIES`, `command_from_realtime`) and renders the
+   session runner's mailbox dictionary (`mailbox_payload`), whose channel
+   genuinely differs from the client event (`session.update` and the three
+   `conversation.item.*` commands all travel on `turn.signal`);
+   `engine/duplex/projection.py` holds the session's projection state. The codec may not import the engine, the
    entrypoints, `model_executor` or the clients
    (`tests/protocol/realtime/test_protocol_import_boundary.py`), and there is
    exactly one implementation of each codec behaviour
@@ -214,13 +218,11 @@ vllm_omni/
 │   ├── orchestrator.py              OrchestratorBase + Orchestrator
 │   ├── duplex_orchestrator.py       DuplexOrchestrator (+ DuplexOrchestratorRequestState; implements DuplexStagePort)
 │   └── duplex/
-│       ├── commands.py              mailbox half: DuplexCommand.payload() + the mailbox `type`,
-│       │                            paired with each protocol command; command_from_realtime
-│       ├── realtime_commands.py     duplex binding of the codec: decoded event -> DuplexCommand,
-│       │                            DUPLEX_REALTIME_CAPABILITIES, duplex_response_format
-│       ├── events.py                re-export shim (DuplexEvent = RealtimeEvent) + the runner's
-│       │                            epoch-filter sets DOMAIN_TERMINAL_EVENTS / MODEL_OUTPUT_EVENTS
-│       ├── realtime_events.py       RealtimeProjectionState: internal event -> typed events
+│       ├── mailbox.py               engine binding of the protocol: DUPLEX_REALTIME_CAPABILITIES,
+│       │                            command_from_realtime, mailbox_payload (typed command -> the
+│       │                            runner's mailbox dictionary and its channel)
+│       ├── projection.py            RealtimeProjectionState: internal event -> typed events,
+│       │                            resolve_* (typed command -> mailbox payloads + events)
 │       ├── messages.py              queue envelopes (Open/Close/Resume/Touch/Command/Result/Event), DuplexSessionError
 │       ├── config.py                DuplexSessionConfig, DuplexCapabilities, ResponseCreateOptions
 │       ├── contracts.py             DuplexFence (session_id, epoch, turn_id), stage request records, DuplexStagePort
@@ -411,12 +413,12 @@ follow-up PRs port them (RFC vllm-omni#7181, PR 2/3).
    when the model supports resume); `session.resume(session_id, resume_token,
    last_received_server_event_seq)` -> `attachment.authenticate_resume` ->
    `omni.resume_session`;
-3. reader loop: JSON -> `RealtimeEnvelope.translate` (`translate_realtime_command`
+3. reader loop: JSON -> `RealtimeEnvelope.translate` (`command_from_realtime`
    with the session's declared audio defaults) -> `handle.submit`;
    envelope-level errors (invalid JSON, oversize frame, unknown type,
    event acks) are answered locally;
 4. writer pump (session-scoped, survives reconnects): `async for ev in
-   handle.events(): attachment.send_event(ev.to_realtime())`, journaling
+   handle.events(): attachment.send_event(ev.to_wire())`, journaling
    for replay until the journal overflows (`session.resync_required`);
 5. disconnect: a resumable session is detached (`attachment.detach` +
    `omni.detach_session`, engine-owned grace); a superseded socket's

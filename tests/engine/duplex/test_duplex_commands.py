@@ -10,8 +10,10 @@ import base64
 import numpy as np
 import pytest
 
-from vllm_omni.engine.duplex.commands import (
-    REALTIME_COMMAND_TYPES,
+from vllm_omni.engine.duplex.mailbox import command_from_realtime, mailbox_channel, mailbox_payload
+from vllm_omni.protocol.duplex import RealtimeInputDefaults, RealtimeProtocolError
+from vllm_omni.protocol.duplex import commands as duplex_commands
+from vllm_omni.protocol.duplex.commands import (
     AckPlayback,
     AppendAudio,
     AppendText,
@@ -26,16 +28,10 @@ from vllm_omni.engine.duplex.commands import (
     CreateResponse,
     DeleteItem,
     DuplexCommand,
-    DuplexCommandError,
     Heartbeat,
     SignalTurn,
     TruncateItem,
     UpdateSession,
-    command_from_realtime,
-)
-from vllm_omni.engine.duplex.realtime_commands import (
-    RealtimeInputDefaults,
-    translate_realtime_command,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -65,11 +61,21 @@ _MINIMAL_PAYLOADS: dict[str, tuple[dict[str, object], type[DuplexCommand]]] = {
 }
 
 
-def test_every_realtime_command_type_has_a_mapping_case():
-    assert set(_MINIMAL_PAYLOADS) == set(REALTIME_COMMAND_TYPES)
+#: The canonical client event type of every command class in the duplex vocabulary.
+_COMMAND_WIRE_TYPES = frozenset(
+    getattr(duplex_commands, name).wire_type
+    for name in duplex_commands.__all__
+    if isinstance(getattr(duplex_commands, name), type)
+    and issubclass(getattr(duplex_commands, name), DuplexCommand)
+    and getattr(duplex_commands, name) is not DuplexCommand
+)
 
 
-@pytest.mark.parametrize("event_type", sorted(REALTIME_COMMAND_TYPES))
+def test_every_command_class_has_a_mapping_case():
+    assert set(_MINIMAL_PAYLOADS) == _COMMAND_WIRE_TYPES
+
+
+@pytest.mark.parametrize("event_type", sorted(_COMMAND_WIRE_TYPES))
 def test_command_from_realtime_maps_each_type_to_its_dataclass_and_propagates_event_id(event_type: str):
     body, expected_cls = _MINIMAL_PAYLOADS[event_type]
 
@@ -77,14 +83,14 @@ def test_command_from_realtime_maps_each_type_to_its_dataclass_and_propagates_ev
 
     assert type(command) is expected_cls
     assert command.event_id == f"evt-{event_type}"
-    payload = command.payload()
-    assert payload["type"] == expected_cls.type
+    payload = mailbox_payload(command)
+    assert payload["type"] == mailbox_channel(expected_cls)
     assert payload["realtime_event_id"] == f"evt-{event_type}"
     assert "event_id" not in payload
 
     anonymous = command_from_realtime({"type": event_type, **body})
     assert anonymous.event_id is None
-    assert "realtime_event_id" not in anonymous.payload()
+    assert "realtime_event_id" not in mailbox_payload(anonymous)
 
 
 @pytest.mark.parametrize(
@@ -127,7 +133,7 @@ def test_append_audio_defaults_come_from_the_session_payload():
     assert defaults.input_audio_format == "pcm16"
     assert defaults.input_sample_rate_hz == 8000
 
-    command = translate_realtime_command({"type": "input_audio_buffer.append", "audio": _LOUD_PCM16}, defaults=defaults)
+    command = command_from_realtime({"type": "input_audio_buffer.append", "audio": _LOUD_PCM16}, defaults=defaults)
 
     assert isinstance(command, AppendAudio)
     assert command.format == "pcm_f32le"
@@ -135,7 +141,7 @@ def test_append_audio_defaults_come_from_the_session_payload():
     assert command.sample_rate_hz == 16000
     assert len(command.audio) > 8 * 4
 
-    passthrough = translate_realtime_command(
+    passthrough = command_from_realtime(
         {"type": "input_audio_buffer.append", "audio": base64.b64encode(np.zeros(4, dtype="<f4").tobytes()).decode()},
         defaults=RealtimeInputDefaults(input_audio_format="pcm_f32le", input_sample_rate_hz=16000),
     )
@@ -178,7 +184,7 @@ def test_append_audio_carries_wire_hints_and_video_frames():
     assert command.video_frames == (_JPEG_FRAME,)
     assert dict(command.hints) == {"transcript": "hi there", "duration_ms": 1000, "audio_end_ms": 3000}
 
-    payload = command.payload()
+    payload = mailbox_payload(command)
     assert payload["type"] == "input_audio_buffer.append"
     assert payload["realtime_event_id"] == "evt-append"
     assert payload["audio"] == base64.b64encode(command.audio).decode("ascii")
@@ -196,7 +202,7 @@ def test_append_audio_carries_wire_hints_and_video_frames():
 def test_append_audio_payload_re_encodes_bytes_and_flattens_hints():
     command = AppendAudio(audio=b"\x01\x02", hints={"vad": {"is_speech": True}}, is_speech=True)
 
-    assert command.payload() == {
+    assert mailbox_payload(command) == {
         "type": "input_audio_buffer.append",
         "audio": "AQI=",
         "format": "pcm16",
@@ -216,7 +222,7 @@ def test_append_audio_payload_re_encodes_bytes_and_flattens_hints():
     ],
 )
 def test_malformed_append_raises_command_error_with_code(body: dict[str, object], code: str):
-    with pytest.raises(DuplexCommandError) as excinfo:
+    with pytest.raises(RealtimeProtocolError) as excinfo:
         command_from_realtime({"type": "input_audio_buffer.append", "event_id": "evt-bad", **body})
 
     assert excinfo.value.code == code
@@ -259,14 +265,14 @@ def test_malformed_append_raises_command_error_with_code(body: dict[str, object]
     ],
 )
 def test_malformed_payloads_raise_command_error_with_code(payload: dict[str, object], code: str):
-    with pytest.raises(DuplexCommandError) as excinfo:
+    with pytest.raises(RealtimeProtocolError) as excinfo:
         command_from_realtime({"event_id": "evt-bad", **payload})
 
     assert excinfo.value.code == code
     assert excinfo.value.event_id == "evt-bad"
 
 
-# ---- payload() rendering ----
+# ---- mailbox rendering ----
 
 
 def test_commit_maps_create_response_to_response_create():
@@ -275,14 +281,14 @@ def test_commit_maps_create_response_to_response_create():
     )
 
     assert command == Commit(event_id="evt-commit", final=False, create_response=True)
-    assert command.payload() == {
+    assert mailbox_payload(command) == {
         "type": "input_audio_buffer.commit",
         "realtime_event_id": "evt-commit",
         "final": False,
         "response_create": True,
     }
-    assert Commit().payload() == {"type": "input_audio_buffer.commit", "final": True}
-    assert Commit(is_speech=False, realtime_item_id="item_1").payload() == {
+    assert mailbox_payload(Commit()) == {"type": "input_audio_buffer.commit", "final": True}
+    assert mailbox_payload(Commit(is_speech=False, realtime_item_id="item_1")) == {
         "type": "input_audio_buffer.commit",
         "final": True,
         "is_speech": False,
@@ -298,18 +304,21 @@ def test_create_response_renders_options_as_response_object():
 
     assert isinstance(command, CreateResponse)
     assert dict(command.options) == {"modalities": ["text"]}
-    assert command.payload() == {"type": "response.create", "response": {"modalities": ["text"]}}
-    assert command_from_realtime({"type": "response.create"}).payload() == {"type": "response.create", "response": {}}
+    assert mailbox_payload(command) == {"type": "response.create", "response": {"modalities": ["text"]}}
+    assert mailbox_payload(command_from_realtime({"type": "response.create"})) == {
+        "type": "response.create",
+        "response": {},
+    }
 
 
 def test_cancel_and_clear_commands_keep_optional_response_id():
     assert command_from_realtime({"type": "response.cancel", "response_id": ""}).response_id is None
     cancel = command_from_realtime({"type": "response.cancel", "response_id": "resp_1"})
     assert cancel == CancelResponse(response_id="resp_1")
-    assert cancel.payload() == {"type": "response.cancel", "response_id": "resp_1"}
+    assert mailbox_payload(cancel) == {"type": "response.cancel", "response_id": "resp_1"}
     clear = command_from_realtime({"type": "output_audio_buffer.clear", "response_id": "resp_2"})
     assert clear == ClearOutputAudio(response_id="resp_2")
-    assert ClearInput().payload() == {"type": "input_audio_buffer.clear"}
+    assert mailbox_payload(ClearInput()) == {"type": "input_audio_buffer.clear"}
 
 
 def test_update_session_renders_as_turn_signal_payload():
@@ -318,7 +327,7 @@ def test_update_session_renders_as_turn_signal_payload():
     )
 
     assert command == UpdateSession(patch={"instructions": "be brief", "voice": "alloy"})
-    assert command.payload() == {
+    assert mailbox_payload(command) == {
         "type": "turn.signal",
         "event": "session.update",
         "payload": {"instructions": "be brief", "voice": "alloy"},
@@ -339,7 +348,7 @@ def test_create_item_normalizes_item_and_renders_as_turn_signal_payload():
     assert command.item["id"].startswith("item_")
     assert command.item["object"] == "realtime.item"
     assert command.item["status"] == "completed"
-    payload = command.payload()
+    payload = mailbox_payload(command)
     assert payload["type"] == "turn.signal"
     assert payload["event"] == "conversation.item.create"
     assert payload["payload"] == {"item": dict(command.item), "previous_item_id": "item_0"}
@@ -349,13 +358,13 @@ def test_create_item_normalizes_item_and_renders_as_turn_signal_payload():
     without_previous = command_from_realtime({"type": "conversation.item.create", "item": {"content": "x"}})
     assert without_previous.item["role"] == "user"
     assert without_previous.item["content"] == []
-    assert without_previous.payload()["payload"] == {"item": dict(without_previous.item)}
+    assert mailbox_payload(without_previous)["payload"] == {"item": dict(without_previous.item)}
 
 
 def test_delete_and_truncate_render_as_turn_signal_payloads():
     delete = command_from_realtime({"type": "conversation.item.delete", "item_id": "item_1"})
     assert delete == DeleteItem(item_id="item_1")
-    assert delete.payload() == {
+    assert mailbox_payload(delete) == {
         "type": "turn.signal",
         "event": "conversation.item.delete",
         "payload": {"item_id": "item_1"},
@@ -365,7 +374,7 @@ def test_delete_and_truncate_render_as_turn_signal_payloads():
         {"type": "conversation.item.truncate", "item_id": "item_1", "audio_end_ms": 1500.0, "content_index": 1}
     )
     assert truncate == TruncateItem(item_id="item_1", audio_end_ms=1500, content_index=1)
-    assert truncate.payload() == {
+    assert mailbox_payload(truncate) == {
         "type": "turn.signal",
         "event": "conversation.item.truncate",
         "payload": {"item_id": "item_1", "audio_end_ms": 1500, "content_index": 1},
@@ -377,7 +386,7 @@ def test_playback_ack_close_and_text_append_payloads():
         {"type": "playback.ack", "played_ms": 1200.0, "committed_ms": 1000, "response_id": "resp_1", "item_id": ""}
     )
     assert ack == AckPlayback(played_ms=1200, committed_ms=1000, response_id="resp_1")
-    assert ack.payload() == {
+    assert mailbox_payload(ack) == {
         "type": "playback.ack",
         "played_ms": 1200,
         "committed_ms": 1000,
@@ -385,22 +394,22 @@ def test_playback_ack_close_and_text_append_payloads():
     }
 
     assert command_from_realtime({"type": "session.close"}) == CloseSession(reason="client_close")
-    assert command_from_realtime({"type": "session.close", "reason": "done"}).payload() == {
+    assert mailbox_payload(command_from_realtime({"type": "session.close", "reason": "done"})) == {
         "type": "session.close",
         "reason": "done",
     }
-    assert command_from_realtime({"type": "input.text.append", "text": "hello"}).payload() == {
+    assert mailbox_payload(command_from_realtime({"type": "input.text.append", "text": "hello"})) == {
         "type": "input.text.append",
         "text": "hello",
     }
-    assert Heartbeat().payload() == {"type": "session.heartbeat"}
+    assert mailbox_payload(Heartbeat()) == {"type": "session.heartbeat"}
 
 
 def test_turn_signal_renders_payload_only_when_present_and_dispatches_known_events():
     signal = command_from_realtime({"type": "turn.signal", "event": "user_started", "payload": {"source": "client"}})
     assert signal == SignalTurn(event="user_started", signal_payload={"source": "client"})
-    assert signal.payload() == {"type": "turn.signal", "event": "user_started", "payload": {"source": "client"}}
-    assert command_from_realtime({"type": "turn.signal", "event": "user_started"}).payload() == {
+    assert mailbox_payload(signal) == {"type": "turn.signal", "event": "user_started", "payload": {"source": "client"}}
+    assert mailbox_payload(command_from_realtime({"type": "turn.signal", "event": "user_started"})) == {
         "type": "turn.signal",
         "event": "user_started",
     }
@@ -440,7 +449,7 @@ def test_raw_wire_hints_cannot_override_the_normalized_typed_fields():
         hints={"is_speech": 0, "rms": 0.001},
     )
 
-    payload = command.payload()
+    payload = mailbox_payload(command)
 
     assert payload["is_speech"] is False, "the normalized field wins over the raw hint"
     assert payload["rms"] == 0.001, "a hint with no typed counterpart still comes through"
@@ -450,4 +459,4 @@ def test_a_hint_survives_when_its_typed_field_is_unset():
     """Unset typed fields are absent from the payload, so the hint is the only value."""
     command = AppendAudio(audio=b"\x00\x00" * 8, hints={"is_speech": True})
 
-    assert command.payload()["is_speech"] is True
+    assert mailbox_payload(command)["is_speech"] is True

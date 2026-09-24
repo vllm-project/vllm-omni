@@ -26,8 +26,6 @@ import pytest
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.engine.duplex import commands
-from vllm_omni.engine.duplex.commands import DuplexCommand
 from vllm_omni.engine.duplex.config import DuplexSessionConfig, DuplexSessionState
 from vllm_omni.engine.duplex.contracts import (
     DuplexOutputContext,
@@ -38,7 +36,6 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexStageSubmissionResult,
     duplex_resource_request_id,
 )
-from vllm_omni.engine.duplex.events import DuplexEvent
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
     DuplexControlResultMessage,
@@ -51,6 +48,9 @@ from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats, StageStats
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
+from vllm_omni.protocol.duplex import commands
+from vllm_omni.protocol.duplex.commands import DuplexCommand
+from vllm_omni.protocol.duplex.events import DuplexEvent
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -361,8 +361,8 @@ async def test_open_announces_the_session_and_reserves_the_stage0_request() -> N
         assert created.session_id == SESSION_ID
         assert created.session["id"] == SESSION_ID
         assert created.session["capabilities"]["supports_input_append"] is True
-        assert created.to_realtime()["type"] == "session.created"
-        assert "incarnation" not in created.to_realtime()
+        assert created.to_wire()["type"] == "session.created"
+        assert "incarnation" not in created.to_wire()
         assert h.session.state == DuplexSessionState.OPEN
         # Admission reserves the resumable Stage0 request atomically with the open.
         assert [context.request_id for context in h.port.ensured] == [h.stage0_request_id(epoch=0)]
@@ -836,7 +836,7 @@ async def test_listen_decision_is_consumed_and_never_forwarded_to_tts() -> None:
         assert types(events) == ["response.listen"]
         assert events[0].details["reason"] == "model_listen"
         assert events[0].details["model_listen"] is True
-        assert events[0].to_realtime()["response"]["status"] == "listening"
+        assert events[0].to_wire()["response"]["status"] == "listening"
         assert h.session.active_response_id is None
     finally:
         await close_harness(h)
@@ -1294,7 +1294,7 @@ async def test_conversation_items_can_be_injected_and_deleted() -> None:
 
 def _stage_metrics_of(event: DuplexEvent) -> dict[str, dict[str, object]]:
     """Per-stage engine metrics as the client reads them off one wire event."""
-    payload = event.to_realtime()
+    payload = event.to_wire()
     metadata = payload.get("metadata")
     assert isinstance(metadata, dict), payload
     vllm_omni = metadata.get("vllm_omni")
@@ -1476,7 +1476,7 @@ async def test_duplex_stage_request_stamps_wall_clock_request_timestamp() -> Non
 
 def _response_request_metrics_of(event: object) -> dict[str, object]:
     """Server request-start clocks as the client reads them off one wire event."""
-    payload = event.to_realtime()
+    payload = event.to_wire()
     metadata = payload.get("metadata")
     assert isinstance(metadata, dict), payload
     vllm_omni = metadata.get("vllm_omni")
@@ -1506,7 +1506,7 @@ async def test_first_audio_delta_carries_server_request_start_metrics() -> None:
 
         clock["now"] = 1002.0
         later = await h.deliver_and_settle(tts_output(request_id, samples=48000, text="hello"))
-        later_payload = find(later, "response.output_audio.delta").to_realtime()
+        later_payload = find(later, "response.output_audio.delta").to_wire()
         later_metadata = later_payload.get("metadata")
         later_vllm_omni = later_metadata.get("vllm_omni") if isinstance(later_metadata, dict) else None
         later_metrics = later_vllm_omni.get("response_request_metrics") if isinstance(later_vllm_omni, dict) else None

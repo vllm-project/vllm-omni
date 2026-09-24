@@ -26,15 +26,6 @@ from dataclasses import dataclass, replace
 from fastapi import WebSocket, WebSocketDisconnect
 from vllm.logger import init_logger
 
-from vllm_omni.engine.duplex.commands import DuplexCommand, DuplexCommandError
-from vllm_omni.engine.duplex.events import (
-    DuplexEvent,
-    SessionClosed,
-    SessionCreated,
-    SessionReplaced,
-    SessionResumed,
-    SessionResyncRequired,
-)
 from vllm_omni.engine.duplex.messages import DuplexSessionError
 from vllm_omni.entrypoints.duplex.realtime_input import RealtimeEnvelope, parse_resume_request
 from vllm_omni.entrypoints.duplex.session_attachment import (
@@ -51,7 +42,14 @@ from vllm_omni.entrypoints.duplex.websocket import (
     receive_text_with_timeout,
 )
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni, DuplexSessionHandle
-from vllm_omni.protocol.duplex import RealtimeInputDefaults
+from vllm_omni.protocol.duplex import DuplexCommand, DuplexEvent, RealtimeInputDefaults, RealtimeProtocolError
+from vllm_omni.protocol.duplex.events import (
+    SessionClosed,
+    SessionCreated,
+    SessionReplaced,
+    SessionResumed,
+    SessionResyncRequired,
+)
 
 logger = init_logger(__name__)
 
@@ -253,7 +251,7 @@ class OmniDuplexSessionHandler:
             await send_json(envelope.error_payload("invalid_resume_token", "Invalid duplex session resume token"))
             return None
         except DuplexJournalGapError:
-            await send_json(SessionResyncRequired(session_id=session_id, reason="journal_gap").to_realtime())
+            await send_json(SessionResyncRequired(session_id=session_id, reason="journal_gap").to_wire())
             return None
         except (KeyError, ValueError) as exc:
             await send_json(envelope.error_payload("session_resume_conflict", str(exc)))
@@ -275,7 +273,7 @@ class OmniDuplexSessionHandler:
                 session=dict(handle.public_session),
                 attachment_generation=generation,
                 resume_token=token.plaintext,
-            ).to_realtime()
+            ).to_wire()
 
         try:
             resumed = await self._attachment_registry.resume(
@@ -301,7 +299,7 @@ class OmniDuplexSessionHandler:
         if replaced is not None:
             with suppress(Exception):
                 await replaced.send(
-                    SessionReplaced(session_id=session_id, attachment_generation=replaced.generation).to_realtime()
+                    SessionReplaced(session_id=session_id, attachment_generation=replaced.generation).to_wire()
                 )
             with suppress(Exception):
                 await replaced.close("session_replaced")
@@ -385,7 +383,7 @@ class OmniDuplexSessionHandler:
             await asyncio.wait_for(asyncio.shield(pump), _PUMP_DRAIN_TIMEOUT_S)
 
     async def _send_event(self, session_id: str, event: DuplexEvent) -> None:
-        payload = event.to_realtime()
+        payload = event.to_wire()
         journal = not isinstance(event, _UNJOURNALED_EVENTS) and session_id not in self._resync_required_sessions
         try:
             try:
@@ -395,7 +393,7 @@ class OmniDuplexSessionHandler:
                 self._resync_required_sessions.add(session_id)
                 if first_overflow:
                     resync = SessionResyncRequired(session_id=session_id, reason="journal_overflow")
-                    await self._attachment_registry.send_event(session_id, resync.to_realtime(), journal=False)
+                    await self._attachment_registry.send_event(session_id, resync.to_wire(), journal=False)
                 await self._attachment_registry.send_event(session_id, payload, journal=False)
         except KeyError:
             # Attachment already closed (takeover or teardown); the journal is gone.
@@ -503,7 +501,7 @@ class OmniDuplexSessionHandler:
     ) -> None:
         try:
             command = envelope.translate(payload)
-        except DuplexCommandError as exc:
+        except RealtimeProtocolError as exc:
             await send_json(envelope.command_error_payload(exc))
             return
         # ``translate`` folds a session.update's audio settings into the

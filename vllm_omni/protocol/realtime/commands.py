@@ -13,7 +13,7 @@ heartbeat, explicit close, generic turn signals) are a separate vocabulary in
 
 Decoding a payload *into* these stays with the consumer, because which command
 a given event becomes can depend on what that consumer supports --- see
-``vllm_omni.engine.duplex.realtime_commands.translate_realtime_command``.
+``vllm_omni.protocol.duplex.commands.decode_duplex_command``.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ class RealtimeCommand:
     There is deliberately no rendering method here. A server receives commands,
     it does not emit them, and how a runtime represents one internally is its
     own business --- the duplex engine renders its mailbox dictionary in
-    ``vllm_omni.engine.duplex.commands``.
+    ``vllm_omni.engine.duplex.mailbox``.
     """
 
     #: OpenAI Realtime client event this command decodes from.

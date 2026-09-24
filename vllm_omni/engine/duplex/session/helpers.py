@@ -21,8 +21,8 @@ import pybase64 as base64
 
 from vllm_omni.engine.duplex.config import DuplexPlaybackCommitPolicy
 from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_request_id
-from vllm_omni.engine.duplex.events import ErrorEvent, OverlapDecision, error_event
 from vllm_omni.engine.duplex.plugin import payload_turn_id
+from vllm_omni.protocol.duplex.events import ErrorEvent, OverlapDecision, error_event
 
 if TYPE_CHECKING:
     from collections.abc import Mapping

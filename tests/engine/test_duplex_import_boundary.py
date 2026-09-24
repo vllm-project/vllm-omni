@@ -92,8 +92,10 @@ import vllm_omni.entrypoints.duplex_omni
 import vllm_omni.entrypoints.duplex.serving
 
 expected_eager = (
-    "vllm_omni.engine.duplex.commands",
-    "vllm_omni.engine.duplex.events",
+    "vllm_omni.protocol.duplex.commands",
+    "vllm_omni.protocol.duplex.events",
+    "vllm_omni.engine.duplex.mailbox",
+    "vllm_omni.engine.duplex.projection",
     "vllm_omni.engine.duplex.session.engine_session",
     "vllm_omni.engine.duplex.session.manager",
     "vllm_omni.engine.duplex.plugin",
@@ -225,14 +227,18 @@ def test_engine_duplex_uses_canonical_contract_module_names() -> None:
     core_dir = REPO_ROOT / "vllm_omni" / "experimental" / "fullduplex" / "core"
 
     for name in (
-        "commands.py",
         "contracts.py",
-        "events.py",
+        "mailbox.py",
         "messages.py",
         "plugin.py",
+        "projection.py",
         "intermediate.py",
     ):
         assert (engine_dir / name).is_file()
+    # the wire vocabulary lives in vllm_omni.protocol; the engine keeps only
+    # its own representation (mailbox rendering, projection state)
+    for removed in ("audio.py", "commands.py", "events.py", "realtime_commands.py", "realtime_events.py"):
+        assert not (engine_dir / removed).exists()
     # one session and everything that runs it lives in the session subpackage
     for name in (
         "__init__.py",

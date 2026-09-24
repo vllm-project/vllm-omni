@@ -18,14 +18,6 @@ from tests.engine.duplex.test_session_runner import (
     tts_output,
 )
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.engine.duplex.commands import (
-    AckPlayback,
-    CancelResponse,
-    ClearOutputAudio,
-    Commit,
-    CreateResponse,
-    UpdateSession,
-)
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.messages import OpenDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
@@ -33,6 +25,14 @@ from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.model_executor.models.qwen3_omni.duplex.input import QwenPcmBuffer
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import MAX_PROMPT_IMAGES, Qwen3OmniDuplexPlugin
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.protocol.duplex.commands import (
+    AckPlayback,
+    CancelResponse,
+    ClearOutputAudio,
+    Commit,
+    CreateResponse,
+    UpdateSession,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -103,7 +103,7 @@ async def test_two_committed_turns_stream_text_and_audio_and_release_requests():
             await h.run(append_audio())
             assert len(h.port.submissions) == i
             await h.run(Commit(final=True, create_response=True))
-            assert len(h.port.submissions) == i + 1, [e.to_realtime() for e in h.events]
+            assert len(h.port.submissions) == i + 1, [e.to_wire() for e in h.events]
             request_id = h.port.submissions[-1].context.request_id
             ids.append(request_id)
             assert h.session.active_request_id == request_id
@@ -161,7 +161,7 @@ async def test_clear_completed_qwen_playback_allows_next_manual_turn(played_ms):
         await h.run(append_audio(value=-0.25))
         await h.run(Commit(final=True, create_response=False))
         await h.run(CreateResponse())
-        assert len(h.port.submissions) == 2, [event.to_realtime() for event in h.events]
+        assert len(h.port.submissions) == 2, [event.to_wire() for event in h.events]
         latest = h.port.submissions[-1]
         assert latest.context.request_id != old.request_id
         assert latest.prompt["prompt"] == repr(
@@ -189,7 +189,7 @@ async def test_clear_completed_qwen_playback_allows_next_manual_turn(played_ms):
         assert h.session.playback.as_dict() == new_playback
         terminals = [event for event in h.events if event.type == "response.done" and event.response_id == response_id]
         assert len(terminals) == 1 and terminals[0].status == "completed"
-        assert not any(event.to_realtime().get("type") == "error" for event in h.events)
+        assert not any(event.to_wire().get("type") == "error" for event in h.events)
     finally:
         await h.manager.shutdown()
 
@@ -256,7 +256,7 @@ async def test_vad_interrupts_queued_qwen_audio_and_keeps_the_new_utterance(gene
         events = await h.run(append_audio(value=-0.25))
         if generation_finished:
             cleared = [event for event in events if event.type == "output_audio_buffer.cleared"]
-            assert len(cleared) == 1, [event.to_realtime() for event in events]
+            assert len(cleared) == 1, [event.to_wire() for event in events]
             assert cleared[0].response_id == response_id
         else:
             assert any(event.type == "response.done" and event.status == "cancelled" for event in events)
@@ -414,7 +414,7 @@ async def test_late_playback_ack_keeps_answer_before_new_user_input():
         )
         current_response = h.session.active_response_id
         events = await h.run(AckPlayback(response_id=response_id, played_ms=1000))
-        assert not any(e.to_realtime().get("type") == "error" for e in events)
+        assert not any(e.to_wire().get("type") == "error" for e in events)
         assert [m["role"] for m in h.session.history] == ["user", "assistant", "user"]
         assert h.session.history[1]["content"] == "first answer"
         assert h.session.active_response_id == current_response
@@ -611,13 +611,13 @@ def image_item(item_id="camera"):
 
 @pytest.mark.asyncio
 async def test_image_item_is_context_until_response_create_and_delete_removes_it():
-    from vllm_omni.engine.duplex.commands import CreateResponse, DeleteItem
+    from vllm_omni.protocol.duplex.commands import CreateResponse, DeleteItem
 
     h = await open_qwen()
     try:
-        from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
+        from vllm_omni.engine.duplex.mailbox import command_from_realtime
 
-        await h.run(translate_realtime_command({"type": "conversation.item.create", "item": image_item()}))
+        await h.run(command_from_realtime({"type": "conversation.item.create", "item": image_item()}))
         assert not h.port.submissions
         await h.run(CreateResponse())
         assert len(h.port.submissions) == 1
@@ -638,7 +638,7 @@ async def test_image_item_is_context_until_response_create_and_delete_removes_it
 
 @pytest.mark.asyncio
 async def test_image_context_reaches_audio_turn_and_survives_commit():
-    from vllm_omni.engine.duplex.commands import CreateItem
+    from vllm_omni.protocol.duplex.commands import CreateItem
 
     h = await open_qwen()
     try:
@@ -657,7 +657,7 @@ async def test_image_context_reaches_audio_turn_and_survives_commit():
 
 @pytest.mark.asyncio
 async def test_multiple_commits_before_response_keep_one_combined_audio_in_history():
-    from vllm_omni.engine.duplex.commands import CreateItem
+    from vllm_omni.protocol.duplex.commands import CreateItem
 
     h = await open_qwen()
     try:
@@ -667,7 +667,7 @@ async def test_multiple_commits_before_response_keep_one_combined_audio_in_histo
         await h.run(append_audio(value=0.2))
         await h.run(Commit(final=True, create_response=False))
         await h.run(CreateResponse())
-        assert len(h.port.submissions) == 1, [e.to_realtime() for e in h.events]
+        assert len(h.port.submissions) == 1, [e.to_wire() for e in h.events]
         first = h.port.submissions[-1]
         audio = first.prompt["multi_modal_data"]["audio"]
         assert len(audio) == 1
@@ -691,7 +691,7 @@ async def test_multiple_commits_before_response_keep_one_combined_audio_in_histo
 @pytest.mark.asyncio
 @pytest.mark.parametrize("image_after_commit", [False, True])
 async def test_multimodal_turn_is_merged_retained_and_evicted_with_its_answer(image_after_commit):
-    from vllm_omni.engine.duplex.commands import CreateItem
+    from vllm_omni.protocol.duplex.commands import CreateItem
 
     h = await open_qwen()
     try:
@@ -734,7 +734,7 @@ async def test_multimodal_turn_is_merged_retained_and_evicted_with_its_answer(im
             assert h.session.history[-1]["content"] == f"answer-{turn}"
         # Prompt eviction leaves source items individually addressable by the client.
         assert "camera" in h.session.history_item_ids
-        assert not any(e.to_realtime().get("type") == "error" for e in h.events)
+        assert not any(e.to_wire().get("type") == "error" for e in h.events)
     finally:
         await h.manager.shutdown()
 
@@ -747,7 +747,7 @@ async def test_image_only_item_reaches_the_prompt_the_way_the_camera_sends_it():
     or audio, so an image-only item was acknowledged to the client and then
     dropped. Nothing reported it and every prompt that followed was blind.
     """
-    from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
+    from vllm_omni.engine.duplex.mailbox import command_from_realtime
 
     h = await open_qwen()
     try:
@@ -757,7 +757,7 @@ async def test_image_only_item_reaches_the_prompt_the_way_the_camera_sends_it():
             "role": "user",
             "content": [{"type": "input_image", "image_url": "data:image/jpeg;base64," + camera_frame()}],
         }
-        await h.run(translate_realtime_command({"type": "conversation.item.create", "item": item}))
+        await h.run(command_from_realtime({"type": "conversation.item.create", "item": item}))
         assert [
             part
             for message in h.session.history
@@ -782,8 +782,8 @@ async def test_one_item_carrying_both_speech_and_a_picture_keeps_both():
     id; registering the spoken message there would overwrite an image stored
     under the same id, so the picture has to become its own item.
     """
-    from vllm_omni.engine.duplex.commands import CreateResponse
-    from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
+    from vllm_omni.engine.duplex.mailbox import command_from_realtime
+    from vllm_omni.protocol.duplex.commands import CreateResponse
 
     h = await open_qwen()
     try:
@@ -796,7 +796,7 @@ async def test_one_item_carrying_both_speech_and_a_picture_keeps_both():
                 {"type": "input_audio", "audio": pcm16_base64(), "format": "pcm16", "sample_rate_hz": 16000},
             ],
         }
-        await h.run(translate_realtime_command({"type": "conversation.item.create", "item": item}))
+        await h.run(command_from_realtime({"type": "conversation.item.create", "item": item}))
         await h.run(CreateResponse())
         mm = h.port.submissions[-1].prompt["multi_modal_data"]
         assert len(mm["image"]) == 1, "the picture was dropped on its way out of a mixed item"
@@ -807,14 +807,14 @@ async def test_one_item_carrying_both_speech_and_a_picture_keeps_both():
 
 @pytest.mark.asyncio
 async def test_image_limit_rejects_atomically_and_delete_reclaims_capacity():
-    from vllm_omni.engine.duplex.commands import CreateItem, DeleteItem
+    from vllm_omni.protocol.duplex.commands import CreateItem, DeleteItem
 
     h = await open_qwen()
     try:
         for i in range(8):
             await h.run(CreateItem(item=image_item(f"camera_{i}")))
         events = await h.run(CreateItem(item=image_item("overflow")))
-        assert any(e.to_realtime()["type"] == "error" for e in events)
+        assert any(e.to_wire()["type"] == "error" for e in events)
         assert len(h.session.history) == 8
         await h.run(DeleteItem(item_id="camera_0"))
         await h.run(CreateItem(item=image_item("replacement")))
@@ -924,7 +924,7 @@ async def test_visual_capture_records_submitted_pixels_and_request(tmp_path, mon
 
     from PIL import Image
 
-    from vllm_omni.engine.duplex.commands import CreateItem
+    from vllm_omni.protocol.duplex.commands import CreateItem
 
     monkeypatch.setenv("VLLM_OMNI_QWEN_VISUAL_DEBUG_DIR", str(tmp_path))
     h = await open_qwen()

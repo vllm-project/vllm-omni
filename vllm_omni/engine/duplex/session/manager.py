@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 
-from vllm_omni.engine.duplex.commands import AppendAudio, Commit, DuplexCommand
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
     DuplexStagePort,
@@ -34,7 +33,6 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_resource_request_belongs_to_session,
     duplex_resource_request_id,
 )
-from vllm_omni.engine.duplex.events import DuplexEvent, ErrorEvent, SessionClosed, SessionExpired, error_event
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
     DuplexControlResultMessage,
@@ -49,6 +47,9 @@ from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexRuntimeConfi
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity, DuplexLeaseConfig, DuplexLeaseState
 from vllm_omni.engine.duplex.turn_detection import SileroVADBackendProvider
+from vllm_omni.protocol.duplex import DuplexCommand, DuplexEvent
+from vllm_omni.protocol.duplex.commands import AppendAudio, Commit
+from vllm_omni.protocol.duplex.events import ErrorEvent, SessionClosed, SessionExpired, error_event
 
 if TYPE_CHECKING:
     import janus

@@ -29,26 +29,6 @@ from typing import TYPE_CHECKING, TypeVar
 
 from vllm.logger import init_logger
 
-from vllm_omni.engine.duplex.commands import (
-    AckPlayback,
-    AppendAudio,
-    AppendText,
-    BargeIn,
-    CancelInput,
-    CancelResponse,
-    ClearInput,
-    ClearOutputAudio,
-    CloseSession,
-    Commit,
-    CreateItem,
-    CreateResponse,
-    DeleteItem,
-    DuplexCommand,
-    Heartbeat,
-    SignalTurn,
-    TruncateItem,
-    UpdateSession,
-)
 from vllm_omni.engine.duplex.config import (
     DuplexConfigError,
     DuplexOverlapPolicy,
@@ -61,18 +41,13 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexOutputDecision,
     DuplexStagePort,
 )
-from vllm_omni.engine.duplex.events import (
-    DuplexEvent,
-    InputCleared,
-    SessionExpired,
-    SessionHeartbeatAck,
-)
+from vllm_omni.engine.duplex.mailbox import mailbox_payload
 from vllm_omni.engine.duplex.plugin import (
     DuplexModelPlugin,
     DuplexModelSessionState,
     PcmAppendReservation,
 )
-from vllm_omni.engine.duplex.realtime_events import (
+from vllm_omni.engine.duplex.projection import (
     RealtimeProjectionState,
     discard_pending_input_audio,
     note_input_append,
@@ -103,6 +78,32 @@ from vllm_omni.engine.duplex.turn_detection import (
 )
 from vllm_omni.metrics.stats import StageRequestStats
 from vllm_omni.protocol.duplex import convert_input_audio_with_rate
+from vllm_omni.protocol.duplex.commands import (
+    AckPlayback,
+    AppendAudio,
+    AppendText,
+    BargeIn,
+    CancelInput,
+    CancelResponse,
+    ClearInput,
+    ClearOutputAudio,
+    CloseSession,
+    Commit,
+    CreateItem,
+    CreateResponse,
+    DeleteItem,
+    DuplexCommand,
+    Heartbeat,
+    SignalTurn,
+    TruncateItem,
+    UpdateSession,
+)
+from vllm_omni.protocol.duplex.events import (
+    DuplexEvent,
+    InputCleared,
+    SessionExpired,
+    SessionHeartbeatAck,
+)
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -554,7 +555,7 @@ class DuplexSessionRunner:
             # handler re-reserves whatever the input buffer actually retains.
             admission = len(command.audio) + sum(len(frame) for frame in command.video_frames)
             session.release_input_bytes(admission)
-            await self._on_append_audio(command.payload())
+            await self._on_append_audio(mailbox_payload(command))
         elif isinstance(command, AppendText):
             session.mark_user_input_activity()
             self._emit_error(
@@ -571,7 +572,7 @@ class DuplexSessionRunner:
             if resolved.payload is not None:
                 await self._on_commit(resolved.payload)
         elif isinstance(command, CreateResponse):
-            await self._on_commit(command.payload())
+            await self._on_commit(mailbox_payload(command))
         elif isinstance(command, ClearInput):
             self._on_clear_input()
         elif isinstance(command, CancelResponse):
@@ -585,7 +586,7 @@ class DuplexSessionRunner:
             for payload in control.payloads:
                 await self._on_cancel(payload)
         elif isinstance(command, CancelInput | BargeIn):
-            await self._on_cancel(command.payload())
+            await self._on_cancel(mailbox_payload(command))
         elif isinstance(command, SignalTurn):
             if command.event == "conversation.item.retrieve":
                 self._emit_events(
@@ -598,7 +599,7 @@ class DuplexSessionRunner:
                     )
                 )
                 return
-            payload = command.payload()
+            payload = mailbox_payload(command)
             if command.event in _CANCEL_EVENTS:
                 inner = payload.get("payload")
                 normalized: dict[str, object] = dict(inner) if isinstance(inner, Mapping) else {}
@@ -610,7 +611,7 @@ class DuplexSessionRunner:
         elif isinstance(command, UpdateSession):
             await self.control.on_session_update(dict(command.patch), realtime_event_id=command.event_id)
         elif isinstance(command, AckPlayback):
-            self._emit_events(playback_ledger.apply_playback_ack(self.session, command.payload()))
+            self._emit_events(playback_ledger.apply_playback_ack(self.session, mailbox_payload(command)))
         elif isinstance(command, Heartbeat):
             self._on_heartbeat(command)
         elif isinstance(command, CreateItem):
@@ -663,7 +664,7 @@ class DuplexSessionRunner:
         session.cancel_pending_input()
         projector = self.out.projector
         if projector is not None:
-            from vllm_omni.engine.duplex.realtime_events import clear_input_buffer
+            from vllm_omni.engine.duplex.projection import clear_input_buffer
 
             clear_input_buffer(projector)
         self._emit_events([InputCleared()])

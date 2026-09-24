@@ -40,21 +40,28 @@ in one file instead of at every call site.
 
 What stays outside
 ------------------
-The *mailbox* half of a command does not live here. A duplex command carries
-two different things: the client event it decodes from (wire, this package) and
-the dictionary the session runner consumes (engine). They genuinely differ ---
-``session.update``, ``conversation.item.create`` / ``.delete`` / ``.truncate``
-all travel on the runner's ``turn.signal`` channel --- so ``payload()`` and its
-``type`` stay in ``vllm_omni.engine.duplex.commands``. Events have no such
-half, which is why :data:`~vllm_omni.protocol.duplex.events.DuplexEvent` can be
-a plain alias of ``RealtimeEvent`` while ``DuplexCommand`` cannot.
+Anything that is the duplex engine's *internal representation* rather than
+wire contract: the runner's mailbox dictionary a command is rendered to
+(``vllm_omni.engine.duplex.mailbox``), the per-session projection state that
+turns internal events into these typed ones
+(``vllm_omni.engine.duplex.projection``), and what the engine can serve
+(``DUPLEX_REALTIME_CAPABILITIES``, also in the mailbox module, because it
+depends on the engine's VAD backend). ``DuplexCommand`` and ``DuplexEvent``
+are therefore plain aliases of ``RealtimeCommand`` / ``RealtimeEvent``: a
+duplex command or event carries nothing a Realtime one does not.
 """
 
+from vllm_omni.protocol.duplex.commands import (
+    DuplexCommand,
+    build_append_audio,
+    decode_duplex_command,
+)
 from vllm_omni.protocol.duplex.errors import (
     REALTIME_ERROR_TYPES_BY_CODE,
     RealtimeProtocolError,
     realtime_error_type,
 )
+from vllm_omni.protocol.duplex.events import DuplexEvent, error_event
 from vllm_omni.protocol.realtime.audio import (
     MAX_INPUT_SAMPLE_RATE_HZ,
     MIN_INPUT_SAMPLE_RATE_HZ,
@@ -117,21 +124,26 @@ __all__ = [
     "REALTIME_INPUT_AUDIO_FORMATS",
     "REALTIME_INPUT_HINT_KEYS",
     "REALTIME_OUTPUT_AUDIO_FORMATS",
+    "DuplexCommand",
+    "DuplexEvent",
     "RealtimeAudioAppend",
     "RealtimeInputDefaults",
     "RealtimeProtocolCapabilities",
     "RealtimeProtocolError",
     "RealtimeSessionRejection",
     "apply_realtime_session_defaults",
+    "build_append_audio",
     "convert_input_audio_with_rate",
     "convert_output_audio",
     "copy_realtime_input_hints",
     "decode_audio_append",
+    "decode_duplex_command",
     "decode_g711_alaw",
     "decode_g711_ulaw",
     "encode_float32_mono_wav_base64",
     "encode_g711_alaw",
     "encode_g711_ulaw",
+    "error_event",
     "input_audio_transcription_config",
     "input_explicitly_non_speech",
     "input_looks_like_speech",

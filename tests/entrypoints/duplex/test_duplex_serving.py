@@ -15,13 +15,13 @@ import pytest
 from fastapi import WebSocketDisconnect
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexCapabilities
-from vllm_omni.engine.duplex.events import AudioDelta, DuplexEvent, SessionClosed, SessionCreated
 from vllm_omni.engine.duplex.messages import DuplexSessionError
 from vllm_omni.entrypoints.duplex.realtime_input import RealtimeEnvelope, parse_resume_request
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
 from vllm_omni.entrypoints.duplex.websocket import MAX_EVENT_BYTES
+from vllm_omni.protocol.duplex import commands
+from vllm_omni.protocol.duplex.events import AudioDelta, DuplexEvent, SessionClosed, SessionCreated
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

@@ -334,7 +334,7 @@ class SessionControl:
             if not session.capabilities.supports_image_input:
                 self._out.emit_error("unsupported", "This model does not support input_image conversation items")
                 return
-            from vllm_omni.engine.duplex.realtime_commands import validate_realtime_video_frames
+            from vllm_omni.protocol.duplex import validate_realtime_video_frames
 
             urls: list[str] = []
             for part in images:

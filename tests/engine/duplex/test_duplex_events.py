@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Typed duplex events: pure ``to_realtime()`` rendering and the stateful Realtime projection."""
+"""Typed duplex events: pure ``to_wire()`` rendering and the stateful Realtime projection."""
 
 from __future__ import annotations
 
@@ -10,9 +10,16 @@ import inspect
 
 import pytest
 
-from vllm_omni.engine.duplex import events as events_module
-from vllm_omni.engine.duplex.commands import ClearOutputAudio, TruncateItem
-from vllm_omni.engine.duplex.events import (
+from vllm_omni.engine.duplex.projection import (
+    RealtimeProjectionState,
+    project_internal_event,
+    resolve_clear_output_audio,
+    resolve_truncate_item,
+    retrieve_item_events,
+)
+from vllm_omni.protocol.duplex import events as events_module
+from vllm_omni.protocol.duplex.commands import ClearOutputAudio, TruncateItem
+from vllm_omni.protocol.duplex.events import (
     REALTIME_ERROR_TYPES_BY_CODE,
     AudioDelta,
     DuplexEvent,
@@ -39,13 +46,6 @@ from vllm_omni.engine.duplex.events import (
     TranscriptDone,
     TurnEvent,
     error_event,
-)
-from vllm_omni.engine.duplex.realtime_events import (
-    RealtimeProjectionState,
-    project_internal_event,
-    resolve_clear_output_audio,
-    resolve_truncate_item,
-    retrieve_item_events,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -77,10 +77,10 @@ def _public_event_classes() -> list[type[DuplexEvent]]:
 
 
 @pytest.mark.parametrize("event_cls", _public_event_classes(), ids=lambda cls: cls.__name__)
-def test_to_realtime_renders_wire_type_event_id_and_documented_fields(event_cls: type[DuplexEvent]):
+def test_to_wire_renders_wire_type_event_id_and_documented_fields(event_cls: type[DuplexEvent]):
     event = event_cls(session_id="duplex-hidden", epoch=7)
 
-    wire = event.to_realtime()
+    wire = event.to_wire()
 
     assert wire["type"] == event.type
     assert wire["event_id"] == event.event_id
@@ -105,23 +105,23 @@ def test_to_realtime_renders_wire_type_event_id_and_documented_fields(event_cls:
 def test_optional_wire_fields_are_omitted_when_none():
     created = SessionCreated(session={"id": "sid"})
     assert created.optional_wire_fields == frozenset({"attachment_generation", "resume_token"})
-    wire = created.to_realtime()
+    wire = created.to_wire()
     assert "attachment_generation" not in wire
     assert "resume_token" not in wire
     assert wire["session"] == {"id": "sid"}
 
-    with_resume = SessionCreated(session={"id": "sid"}, attachment_generation=2, resume_token="tok").to_realtime()
+    with_resume = SessionCreated(session={"id": "sid"}, attachment_generation=2, resume_token="tok").to_wire()
     assert with_resume["attachment_generation"] == 2
     assert with_resume["resume_token"] == "tok"
 
-    delta = AudioDelta(response_id="resp_1", item_id="item_resp_1", delta="AAAA").to_realtime()
+    delta = AudioDelta(response_id="resp_1", item_id="item_resp_1", delta="AAAA").to_wire()
     assert "sample_rate_hz" not in delta
     assert "metadata" not in delta
     assert delta["format"] == "pcm16"
     assert delta["output_index"] == 0
     assert delta["content_index"] == 0
 
-    transcript = TranscriptDelta(response_id="resp_1", item_id="item_resp_1", delta="hi").to_realtime()
+    transcript = TranscriptDelta(response_id="resp_1", item_id="item_resp_1", delta="hi").to_wire()
     assert "metadata" not in transcript
     assert (
         TranscriptDelta(
@@ -129,17 +129,17 @@ def test_optional_wire_fields_are_omitted_when_none():
             item_id="item_resp_1",
             delta="hi",
             metadata={"vllm_omni": {"response_request_metrics": {"ttft_ms": 200.0}}},
-        ).to_realtime()["metadata"]["vllm_omni"]["response_request_metrics"]["ttft_ms"]
+        ).to_wire()["metadata"]["vllm_omni"]["response_request_metrics"]["ttft_ms"]
         == 200.0
     )
 
-    anonymous_listen = Listen(session_id="sid", epoch=0, details={"reason": "silence"}).to_realtime()
+    anonymous_listen = Listen(session_id="sid", epoch=0, details={"reason": "silence"}).to_wire()
     assert "response_id" not in anonymous_listen
     assert "id" not in anonymous_listen["response"]
     assert anonymous_listen["response"]["status"] == "listening"
     assert anonymous_listen["response"]["metadata"] == {"reason": "silence"}
 
-    bound_listen = Listen(session_id="sid", epoch=0, response_id="resp_1").to_realtime()
+    bound_listen = Listen(session_id="sid", epoch=0, response_id="resp_1").to_wire()
     assert bound_listen["response_id"] == "resp_1"
     assert bound_listen["response"]["id"] == "resp_1"
 
@@ -167,7 +167,7 @@ def test_error_event_maps_codes_to_openai_error_types_and_echoes_client_event_id
         "param": "session",
         "retryable": True,
     }
-    wire = error.to_realtime()
+    wire = error.to_wire()
     assert wire["type"] == "error"
     assert wire["error"] == error.error
     # The server event id and the echoed client event id are distinct.
@@ -194,7 +194,7 @@ def test_audio_delta_decodes_base64_and_invalid_payloads_yield_none():
     delta = AudioDelta(delta=base64.b64encode(raw).decode("ascii"), format="pcm16", sample_rate_hz=24000)
 
     assert delta.audio == raw
-    assert delta.to_realtime()["sample_rate_hz"] == 24000
+    assert delta.to_wire()["sample_rate_hz"] == 24000
     assert AudioDelta(delta="@@not base64@@").audio is None
 
 
@@ -204,14 +204,14 @@ def test_session_closed_and_expired_are_the_only_terminal_events():
 
     assert closed.is_terminal is True
     assert expired.is_terminal is True
-    assert closed.to_realtime() == {
+    assert closed.to_wire() == {
         "type": "session.closed",
         "event_id": closed.event_id,
         "session_id": "sid",
         "reason": "client_close",
         "event": {"type": "session.closed"},
     }
-    assert expired.to_realtime() == {
+    assert expired.to_wire() == {
         "type": "session.expired",
         "event_id": expired.event_id,
         "session_id": "sid",
@@ -236,7 +236,7 @@ def test_raw_event_prefixes_internal_type_and_wraps_details():
     raw = DuplexRawEvent(internal_type="model.custom", details={"type": "model.custom", "value": (1, 2)})
 
     assert raw.type == "duplex.model.custom"
-    assert raw.to_realtime() == {
+    assert raw.to_wire() == {
         "type": "duplex.model.custom",
         "event_id": raw.event_id,
         "event": {"type": "model.custom", "value": [1, 2]},
@@ -244,7 +244,7 @@ def test_raw_event_prefixes_internal_type_and_wraps_details():
 
 
 def test_turn_event_and_overlap_decision_carry_session_identity_on_the_wire():
-    turn = TurnEvent(session_id="sid", epoch=2, event="barge_in", turn_state="barge_in").to_realtime()
+    turn = TurnEvent(session_id="sid", epoch=2, event="barge_in", turn_state="barge_in").to_wire()
     assert turn == {
         "type": "turn.event",
         "event_id": turn["event_id"],
@@ -255,7 +255,7 @@ def test_turn_event_and_overlap_decision_carry_session_identity_on_the_wire():
     }
     decision = OverlapDecision(
         session_id="sid", epoch=2, policy="listen_only", action="ignore", reason="short", details={"ms": 300}
-    ).to_realtime()
+    ).to_wire()
     assert decision["policy"] == "listen_only"
     assert decision["action"] == "ignore"
     assert decision["metadata"] == {"ms": 300}
@@ -298,12 +298,12 @@ def test_projection_of_the_main_internal_event_sequence():
     ]
     assert state.active_response_id == "resp_1"
     assert response_created[0].response_id == "resp_1"
-    assert response_created[0].to_realtime()["response"]["status"] == "in_progress"
+    assert response_created[0].to_wire()["response"]["status"] == "in_progress"
     assert isinstance(response_created[1], ItemAdded)
     assert isinstance(response_created[2], ItemCreated)
     assert response_created[1].item_id == "item_resp_1"
     assert response_created[3].item_id == "item_resp_1"
-    assert response_created[4].to_realtime()["part"] == {"type": "audio", "transcript": ""}
+    assert response_created[4].to_wire()["part"] == {"type": "audio", "transcript": ""}
 
     audio_delta = project_internal_event(
         state,
@@ -349,7 +349,7 @@ def test_projection_of_the_main_internal_event_sequence():
     assert isinstance(committed[2], InputCommitted)
     assert committed[2].previous_item_id == "item_resp_1"
     assert committed[2].item_id == committed[0].item_id
-    assert committed[2].to_realtime()["event"]["input_commit_seq"] == 1
+    assert committed[2].to_wire()["event"]["input_commit_seq"] == 1
     assert committed[0].item["content"] == [{"type": "input_text", "text": "hello"}]
 
     project_internal_event(state, {"type": "response.created", "response_id": "resp_2"})
@@ -372,7 +372,7 @@ def test_projection_of_the_main_internal_event_sequence():
     closed = project_internal_event(state, {"type": "session.closed", "reason": "client_close"})
     assert _types(closed) == ["session.closed"]
     assert closed[0].is_terminal is True
-    assert closed[0].to_realtime()["reason"] == "client_close"
+    assert closed[0].to_wire()["reason"] == "client_close"
 
 
 def test_projection_of_output_audio_buffer_clear_emits_cleared_before_terminals():
@@ -475,7 +475,7 @@ def test_one_truncate_command_truncates_retrieved_transcript_once():
     assert signal["event"] == "conversation.item.truncate"
     project_internal_event(state, {"type": "conversation.item.truncated", **payload})
 
-    retrieved = retrieve_item_events(state, {"item_id": "item_resp_1"})[0].to_realtime()
+    retrieved = retrieve_item_events(state, {"item_id": "item_resp_1"})[0].to_wire()
     assert retrieved["item"]["content"][0]["transcript"] == "abcd"
     # Keep the cursor: later output must not restore the untruncated item.
     assert state.item_truncation_cursors["item_resp_1"] == (0, 4_000)
@@ -491,7 +491,7 @@ def test_projection_leaves_error_to_typed_emit_sites():
     assert len(projected) == 1
     assert isinstance(projected[0], DuplexRawEvent)
     assert projected[0].type == "duplex.error"
-    assert projected[0].to_realtime()["event"]["code"] == "bad_event"
+    assert projected[0].to_wire()["event"]["code"] == "bad_event"
 
 
 def test_response_speak_projection_keeps_vllm_omni_request_metrics():
@@ -517,7 +517,7 @@ def test_response_speak_projection_keeps_vllm_omni_request_metrics():
 
     assert _types(events) == ["response.speak"]
     assert isinstance(events[0], Speak)
-    assert events[0].to_realtime()["metadata"]["vllm_omni"]["response_request_metrics"]["ttft_ms"] == 200.0
+    assert events[0].to_wire()["metadata"]["vllm_omni"]["response_request_metrics"]["ttft_ms"] == 200.0
 
 
 def test_text_then_audio_projects_ttft_on_transcript_and_ttfp_on_audio_delta():
@@ -547,7 +547,7 @@ def test_text_then_audio_projects_ttft_on_transcript_and_ttfp_on_audio_delta():
 
     assert _types(text_only) == ["response.output_audio_transcript.delta"]
     assert isinstance(text_only[0], TranscriptDelta)
-    text_metrics = text_only[0].to_realtime()["metadata"]["vllm_omni"]["response_request_metrics"]
+    text_metrics = text_only[0].to_wire()["metadata"]["vllm_omni"]["response_request_metrics"]
     assert text_metrics["ttft_ms"] == 200.0
     assert "ttfp_ms" not in text_metrics
 
@@ -573,6 +573,6 @@ def test_text_then_audio_projects_ttft_on_transcript_and_ttfp_on_audio_delta():
     assert "response.output_audio.delta" in _types(audio)
     audio_delta = next(event for event in audio if event.type == "response.output_audio.delta")
     assert isinstance(audio_delta, AudioDelta)
-    audio_metrics = audio_delta.to_realtime()["metadata"]["vllm_omni"]["response_request_metrics"]
+    audio_metrics = audio_delta.to_wire()["metadata"]["vllm_omni"]["response_request_metrics"]
     assert audio_metrics["ttft_ms"] == 200.0
     assert audio_metrics["ttfp_ms"] == 400.0

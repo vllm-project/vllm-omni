@@ -20,19 +20,49 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from vllm_omni.engine.duplex.config import DuplexSessionState
-from vllm_omni.engine.duplex.events import (
-    DOMAIN_TERMINAL_EVENTS,
-    MODEL_OUTPUT_EVENTS,
-    DuplexEvent,
-    error_event,
-)
-from vllm_omni.engine.duplex.realtime_events import (
+from vllm_omni.engine.duplex.projection import (
     RealtimeProjectionState,
     discard_pending_input_audio,
     project_internal_event,
 )
 from vllm_omni.engine.duplex.session import overlap_policy
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
+from vllm_omni.protocol.duplex import DuplexEvent, error_event
+
+#: Session-internal event types that end a turn or the session. These are the
+#: runner's epoch-filter policy, not wire contract: an event of one of these
+#: types may never be dropped as stale.
+DOMAIN_TERMINAL_EVENTS = frozenset(
+    {
+        "response.done",
+        "response.listen",
+        "audio.cancelled",
+        "input.cancelled",
+        "session.closed",
+    }
+)
+
+#: Session-internal event types produced by the model side of a turn, and so
+#: subject to the epoch filter.
+MODEL_OUTPUT_EVENTS = frozenset(
+    {
+        "response.created",
+        "response.listen",
+        "response.speak",
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_audio.delta",
+        "response.output_audio.done",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.text.delta",
+        "response.text.done",
+        "response.message",
+        "response.output_item.done",
+        "response.content_part.done",
+        "response.done",
+    }
+)
 
 
 class SessionEmitter:

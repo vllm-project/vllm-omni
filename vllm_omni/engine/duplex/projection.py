@@ -1,26 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Session-internal duplex events -> typed :class:`DuplexEvent` objects (stateful projection).
+"""The per-session Realtime projection: internal events -> typed :data:`DuplexEvent` objects.
 
-This is the former ``entrypoints/duplex/realtime_output.py`` projector plus the
-projection-relevant fields of ``realtime_state.py``, now owned by the session
-runner through :class:`RealtimeProjectionState`. The projection consumes the
-state (response / item ids, content-part bookkeeping) when it *constructs*
-events; rendering an event to wire JSON (``event.to_realtime()``) is pure and
-lives on the event classes in ``vllm_omni.engine.duplex.events``.
+The session runner owns one :class:`RealtimeProjectionState` per session. The
+projection consumes that state (response / item ids, content-part
+bookkeeping) when it *constructs* events; rendering an event to wire JSON
+(``event.to_wire()``) is pure and lives on the event classes in
+``vllm_omni.protocol.duplex.events``.
 
 Besides the output projection (:func:`project_internal_event`) the state also
-carries the input-side bookkeeping the old input translator kept (input buffer
-flags, conversation items, response-id fallbacks); the ``resolve_*`` /
-``note_*`` helpers give the runner the same behaviour for the corresponding
-commands.
+carries the input-side bookkeeping (input buffer flags, conversation items,
+response-id fallbacks); the ``resolve_*`` / ``note_*`` helpers resolve a typed
+command against it into the mailbox payload(s) the runner executes and the
+events it emits.
 
 What is *not* here is the model- and runtime-agnostic half of the codec ---
 audio format negotiation, conversation-item shape and truncation, transcript
-extraction, audio conversion. That lives in ``vllm_omni.protocol.realtime`` so
-a non-duplex Realtime surface can use it without the duplex session; this
-module is the duplex consumer of it (RFC #6592 P0a).
+extraction, audio conversion. That lives in ``vllm_omni.protocol.realtime``,
+reached through ``vllm_omni.protocol.duplex``, so a non-duplex Realtime
+surface can use it without the duplex session.
 """
 
 from __future__ import annotations
@@ -30,8 +29,23 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
-from vllm_omni.engine.duplex.commands import (
-    AppendAudio,
+from vllm_omni.engine.duplex.mailbox import mailbox_payload
+from vllm_omni.protocol.duplex import (
+    RealtimeInputDefaults,
+    RealtimeProtocolError,
+    apply_realtime_session_defaults,
+    build_append_audio,
+    convert_output_audio,
+    copy_realtime_input_hints,
+    input_looks_like_speech,
+    input_transcript_from_item,
+    parse_realtime_audio_format,
+    realtime_audio_format_object,
+    realtime_output_format,
+    truncate_realtime_item_content,
+    validate_realtime_item_truncate,
+)
+from vllm_omni.protocol.duplex.commands import (
     CancelResponse,
     ClearOutputAudio,
     Commit,
@@ -39,7 +53,7 @@ from vllm_omni.engine.duplex.commands import (
     DeleteItem,
     TruncateItem,
 )
-from vllm_omni.engine.duplex.events import (
+from vllm_omni.protocol.duplex.events import (
     AudioDelta,
     AudioDone,
     ContentPartAdded,
@@ -78,20 +92,6 @@ from vllm_omni.engine.duplex.events import (
     TranscriptDelta,
     TranscriptDone,
     error_event,
-)
-from vllm_omni.engine.duplex.realtime_commands import build_append_audio
-from vllm_omni.protocol.duplex import (
-    RealtimeInputDefaults,
-    apply_realtime_session_defaults,
-    convert_output_audio,
-    copy_realtime_input_hints,
-    input_looks_like_speech,
-    input_transcript_from_item,
-    parse_realtime_audio_format,
-    realtime_audio_format_object,
-    realtime_output_format,
-    truncate_realtime_item_content,
-    validate_realtime_item_truncate,
 )
 
 if TYPE_CHECKING:
@@ -1202,7 +1202,7 @@ def note_input_append(
     """Update the input-buffer projection for one appended chunk; returns typed events.
 
     ``payload`` is the internal ``input_audio_buffer.append`` dictionary
-    (``AppendAudio.payload()``), optionally after ``apply_turn_detection_result``;
+    (``mailbox_payload(AppendAudio)``), optionally after ``apply_turn_detection_result``;
     ``vad_result`` is the ``TurnDetectionResult`` when server VAD is active. The
     returned events are ``input_audio_buffer.speech_started`` /
     ``speech_stopped`` exactly as the old translator produced them.
@@ -1393,7 +1393,7 @@ def resolve_delete_item(state: RealtimeProjectionState, command: DeleteItem) -> 
             ],
         )
     _remove_conversation_item(state, command.item_id)
-    return ResolvedControl(payloads=[command.payload()], events=[])
+    return ResolvedControl(payloads=[mailbox_payload(command)], events=[])
 
 
 def resolve_truncate_item(state: RealtimeProjectionState, command: TruncateItem) -> ResolvedControl:
@@ -1422,7 +1422,7 @@ def resolve_truncate_item(state: RealtimeProjectionState, command: TruncateItem)
         "played_ms": int(command.audio_end_ms),
         "truncate": True,
     }
-    return ResolvedControl(payloads=[command.payload(), ack_payload], events=[])
+    return ResolvedControl(payloads=[mailbox_payload(command), ack_payload], events=[])
 
 
 def _duplicate_function_call_output(state: RealtimeProjectionState, call_id: object) -> tuple[bool, bool]:
@@ -1522,8 +1522,8 @@ def resolve_create_item(state: RealtimeProjectionState, command: CreateItem) -> 
                     defaults=state.defaults,
                     hints_source={**item, **part},
                 )
-            except Exception as exc:  # DuplexCommandError from validation/conversion
-                code = getattr(exc, "code", "bad_event")
+            except RealtimeProtocolError as exc:
+                code = exc.code
                 if code == "unsupported_audio_format":
                     continue
                 return ResolvedControl(
@@ -1536,7 +1536,7 @@ def resolve_create_item(state: RealtimeProjectionState, command: CreateItem) -> 
             ):
                 continue
             state.input_speech_started = True
-            payload = append.payload()
+            payload = mailbox_payload(append)
             copy_realtime_input_hints(part, payload)
             copy_realtime_input_hints(item, payload)
             audio_payloads.append(payload)
@@ -1576,16 +1576,10 @@ def resolve_create_item(state: RealtimeProjectionState, command: CreateItem) -> 
     return ResolvedControl(payloads=[signal_payload], events=ack_events)
 
 
-def append_audio_payload(command: AppendAudio) -> dict[str, object]:
-    """Internal ``input_audio_buffer.append`` payload for a command (convenience for the runner)."""
-    return command.payload()
-
-
 __all__ = [
     "RealtimeProjectionState",
     "ResolvedCommit",
     "ResolvedControl",
-    "append_audio_payload",
     "clear_input_buffer",
     "discard_pending_input_audio",
     "emit_input_speech_started",

@@ -4,7 +4,7 @@
 """OpenAI Realtime server events: typed classes and their wire rendering.
 
 Every event is a frozen dataclass with explicit fields, and the Realtime wire
-JSON is *derived* from those fields by :meth:`RealtimeEvent.to_realtime`. That
+JSON is *derived* from those fields by :meth:`RealtimeEvent.to_wire`. That
 rendering is pure --- it never consults session state --- which is why it can
 live here, away from whoever owns the session. The stateful part (response and
 item ids, content-part bookkeeping) is consumed when the events are
@@ -99,7 +99,7 @@ class RealtimeEvent:
             data[f.name] = wire_value(value)
         return data
 
-    def to_realtime(self) -> dict[str, object]:
+    def to_wire(self) -> dict[str, object]:
         """The Realtime wire JSON object for this event (derived from the fields)."""
         return {"type": self.wire_type, "event_id": self.event_id, **self._wire_fields()}
 

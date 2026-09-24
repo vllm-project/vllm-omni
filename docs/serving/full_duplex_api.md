@@ -141,7 +141,7 @@ the [Realtime Duplex API guide](realtime_duplex_api.md#capability-negotiation-by
 `vllm_omni.entrypoints.duplex_omni.DuplexOmni` runs the same engine-resident
 sessions in-process: `open_session()` returns a `DuplexSessionHandle` whose
 `submit()` takes typed `DuplexCommand` objects and whose `events()` yields
-typed `DuplexEvent` objects (each with a `to_realtime()` wire rendering).
+typed `DuplexEvent` objects (each with a `to_wire()` wire rendering).
 `vllm_omni.clients.inline_duplex.InlineDuplexClient` exposes that handle
 behind the `DuplexClient` API. See the
 [Realtime Duplex API guide](realtime_duplex_api.md#using-the-python-api).

@@ -3,7 +3,7 @@
 
 import pytest
 
-from vllm_omni.engine.duplex.realtime_events import (
+from vllm_omni.engine.duplex.projection import (
     RealtimeProjectionState,
     project_internal_event,
 )
