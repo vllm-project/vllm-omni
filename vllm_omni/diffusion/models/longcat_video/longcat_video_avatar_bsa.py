@@ -492,9 +492,10 @@ def _get_select_indices_from_score(
     threshold = threshold.expand(batch, -1, seq_q, -1)
     weights_sorted = torch.sort(weights, dim=-1, descending=True)
     cdf = torch.cumsum(weights_sorted.values, dim=-1)
-    num_selected = torch.searchsorted(cdf, threshold, right=True).squeeze(-1)
+    num_selected = torch.searchsorted(cdf, threshold, right=False).squeeze(-1) + 1
     if selected_topk is not None:
         num_selected[num_selected < selected_topk] = selected_topk
+    num_selected = torch.clamp(num_selected, max=score.shape[-1])
     block_indices_lens = num_selected.to(torch.int32)
     return weights_sorted.indices, block_indices_lens
 

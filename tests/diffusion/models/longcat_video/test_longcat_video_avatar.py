@@ -10,6 +10,9 @@ import pytest
 import torch
 from PIL import Image
 
+from vllm_omni.diffusion.models.longcat_video.longcat_video_avatar_bsa import (
+    _get_select_indices_from_score,
+)
 from vllm_omni.diffusion.models.longcat_video.longcat_video_avatar_transformer import (
     Attention,
     LongCatVideoAvatarTransformer3DModel,
@@ -195,10 +198,48 @@ def test_longcat_video_avatar_bsa_toggle_is_opt_in():
     assert not model.blocks[0].attn.enable_bsa
 
 
-def test_longcat_video_avatar_bsa_skips_cpu_and_incompatible_shapes():
+@pytest.mark.parametrize(
+    ("cdf_threshold", "expected_len"),
+    [
+        (0.0, 1),
+        (0.61, 2),
+        (1.1, 3),
+    ],
+)
+def test_longcat_video_avatar_bsa_cdf_selection_uses_lower_bound_count(
+    cdf_threshold: float,
+    expected_len: int,
+):
+    score = torch.log(torch.tensor([[[[0.6, 0.3, 0.1]]]], dtype=torch.float32))
+
+    _, block_indices_lens = _get_select_indices_from_score(
+        score,
+        sparsity=None,
+        cdf_threshold=cdf_threshold,
+        sm_scale=1.0,
+    )
+
+    assert block_indices_lens.item() == expected_len
+
+
+def test_longcat_video_avatar_bsa_skips_cpu():
     attention = Attention(dim=8, num_heads=1, enable_bsa=True)
     q = torch.randn(1, 1, 16, 8)
     k = torch.randn(1, 1, 16, 8)
+
+    assert attention._bsa_latent_shapes(q, k, (4, 2, 2)) is None
+
+
+def test_longcat_video_avatar_bsa_skips_incompatible_cuda_metadata_shapes():
+    class TensorMetadata:
+        device = torch.device("cuda")
+
+        def __init__(self, shape: tuple[int, ...]) -> None:
+            self.shape = shape
+
+    attention = Attention(dim=8, num_heads=1, enable_bsa=True)
+    q = TensorMetadata((1, 1, 16, 8))
+    k = TensorMetadata((1, 1, 16, 8))
 
     assert attention._bsa_latent_shapes(q, k, (4, 2, 2)) is None
 
