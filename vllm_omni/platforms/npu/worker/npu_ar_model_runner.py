@@ -640,73 +640,77 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         defer_kv_connector_finalize = self.speculative_config is not None and (
             get_pp_group().is_last_rank or self.broadcast_pp_output
         )
-        with (
-            record_function_or_nullcontext("forward"),
-            set_ascend_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                aclgraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=batch_desc,
-                num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
-                model_instance=self.model,
-                skip_compiled=has_encoder_input,
-                has_sinks=self._has_sinks,
-                eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
-            ),
-            self.maybe_get_kv_connector_output(
-                scheduler_output,
-                **(
-                    {"defer_finalize": defer_kv_connector_finalize}
+        self._prefix_cache_prepare_write_layout()
+        try:
+            with (
+                record_function_or_nullcontext("forward"),
+                set_ascend_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    aclgraph_runtime_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
+                    model_instance=self.model,
+                    skip_compiled=has_encoder_input,
+                    has_sinks=self._has_sinks,
+                    eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
                 ),
-            ) as kv_connector_output,
-        ):
-            if self.cache_config.mamba_cache_mode == "align":
-                mamba_utils.do_mamba_copy_block(preprocess_bufs)
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-            )
-        with record_function_or_nullcontext("post process"):
-            #  -------------------------------------- Omni-new -------------------------------------------------
-            # [Omni] Map pending ropes metadata to req_ids.
-            flush_pending_metadata = getattr(self.model, "flush_pending_metadata", None)
-            if callable(flush_pending_metadata):
-                flush_pending_metadata(req_ids[:num_reqs])
-
-            # [Omni] Hand the model the batch's req_ids in logits order, for
-            # models that gate logits per request. Mirrors gpu_ar_model_runner.
-            # Only valid without spec decode: there logits_indices carries several
-            # rows per request, so row i no longer corresponds to req_ids[i].
-            if spec_decode_metadata is None:
-                set_batch_req_ids = getattr(self.model, "set_batch_req_ids", None)
-                if callable(set_batch_req_ids):
-                    set_batch_req_ids(req_ids[:num_reqs])
-
-            hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
-
-            if multimodal_outputs is not None:
-                keys_or_type = (
-                    list(multimodal_outputs.keys())
-                    if isinstance(multimodal_outputs, Mapping)
-                    else type(multimodal_outputs)
+                self.maybe_get_kv_connector_output(
+                    scheduler_output,
+                    **({"defer_finalize": defer_kv_connector_finalize}),
+                ) as kv_connector_output,
+            ):
+                if self.cache_config.mamba_cache_mode == "align":
+                    mamba_utils.do_mamba_copy_block(preprocess_bufs)
+                hidden_states = self._model_forward(
+                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
                 )
-                logger.debug(f"[AR] execute_model: multimodal_outputs keys = {keys_or_type}")
-            else:
-                logger.debug("[AR] execute_model: multimodal_outputs is None")
-            #  -------------------------------------- Omni-new -------------------------------------------------
-            aux_hidden_states = None
-            if self.use_aux_hidden_state_outputs:
-                hidden_states, aux_hidden_states = hidden_states
+        except BaseException:
+            self._prefix_cache_abort_prepared_step()
+            raise
+        with record_function_or_nullcontext("post process"):
+            with self._prefix_cache_prepared_step_guard():
+                #  -------------------------------------- Omni-new -------------------------------------------------
+                # [Omni] Map pending ropes metadata to req_ids.
+                flush_pending_metadata = getattr(self.model, "flush_pending_metadata", None)
+                if callable(flush_pending_metadata):
+                    flush_pending_metadata(req_ids[:num_reqs])
 
-            #  -------------------------------------- Omni-new -------------------------------------------------
-            prefix_cache_step_id = self._prefix_cache_save_step(
-                hidden_states,
-                multimodal_outputs,
-                num_tokens_unpadded=num_tokens_unpadded,
-                num_tokens_padded=num_tokens_padded,
-            )
-            #  -------------------------------------- Omni-new -------------------------------------------------
+                # [Omni] Hand the model the batch's req_ids in logits order, for
+                # models that gate logits per request. Mirrors gpu_ar_model_runner.
+                # Only valid without spec decode: there logits_indices carries several
+                # rows per request, so row i no longer corresponds to req_ids[i].
+                if spec_decode_metadata is None:
+                    set_batch_req_ids = getattr(self.model, "set_batch_req_ids", None)
+                    if callable(set_batch_req_ids):
+                        set_batch_req_ids(req_ids[:num_reqs])
+
+                hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
+
+                if multimodal_outputs is not None:
+                    keys_or_type = (
+                        list(multimodal_outputs.keys())
+                        if isinstance(multimodal_outputs, Mapping)
+                        else type(multimodal_outputs)
+                    )
+                    logger.debug(f"[AR] execute_model: multimodal_outputs keys = {keys_or_type}")
+                else:
+                    logger.debug("[AR] execute_model: multimodal_outputs is None")
+                #  -------------------------------------- Omni-new -------------------------------------------------
+                aux_hidden_states = None
+                if self.use_aux_hidden_state_outputs:
+                    hidden_states, aux_hidden_states = hidden_states
+
+                #  -------------------------------------- Omni-new -------------------------------------------------
+                prefix_cache_step_id = self._prefix_cache_save_step(
+                    hidden_states,
+                    multimodal_outputs,
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    num_tokens_padded=num_tokens_padded,
+                )
+                #  -------------------------------------- Omni-new -------------------------------------------------
 
             if not self.broadcast_pp_output:
                 # Common case.

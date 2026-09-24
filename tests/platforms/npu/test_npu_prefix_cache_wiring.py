@@ -26,6 +26,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
 from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
 
@@ -75,6 +76,33 @@ def test_execute_model_state_keeps_prefix_cache_sid_last():
     assert gpu_fields[-1] == "prefix_cache_step_id"
 
 
+def test_both_runners_guard_post_forward_work_through_prefix_cache_save():
+    """Exceptions after forward but before save must abort prepared reads."""
+    for path in (_GPU_RUNNER, _NPU_RUNNER):
+        tree = ast.parse(path.read_text())
+        guarded_save = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.With, ast.AsyncWith)):
+                continue
+            guards = [
+                item.context_expr.func.attr
+                for item in node.items
+                if isinstance(item.context_expr, ast.Call)
+                and isinstance(item.context_expr.func, ast.Attribute)
+            ]
+            if "_prefix_cache_prepared_step_guard" not in guards:
+                continue
+            calls = {
+                child.func.attr
+                for child in ast.walk(node)
+                if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
+            }
+            if {"extract_multimodal_outputs", "_prefix_cache_save_step"} <= calls:
+                guarded_save = True
+                break
+        assert guarded_save, f"post-forward prefix-cache save is not exception-guarded in {path}"
+
+
 class _FakeView:
     """Minimal group-view double (mirrors tests/core/test_prefix_cache)."""
 
@@ -119,8 +147,16 @@ def _run_step(mgr, view, req_id, blocks, start_pos, sched, *, hit=0, finished=()
         finished_req_ids=set(finished),
         num_scheduled_tokens={req_id: sched},
     )
-    mgr.new_step_starts(sched_out)
-    return mgr.save_outputs(hidden, {}, num_tokens_unpadded=sched, num_tokens_padded=sched)
+    adapter = PrefixCacheSchedulerAdapter()
+    mgr.new_step_starts(adapter.translate_scheduler_output(sched_out))
+    layout = adapter.build_write_layout(view, num_scheduled_tokens=sched_out.num_scheduled_tokens)
+    return mgr.save_outputs(
+        hidden,
+        {},
+        num_tokens_unpadded=sched,
+        num_tokens_padded=sched,
+        write_layout=layout,
+    )
 
 
 def _expected_rows(slots: torch.Tensor) -> torch.Tensor:
@@ -134,7 +170,7 @@ def _make_npu_mode_manager(monkeypatch) -> tuple[OmniPrefixCacheManager, _FakeVi
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     view = _FakeView()
     config = PrefixCacheConfig(num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE)
-    return OmniPrefixCacheManager(config, view), view
+    return OmniPrefixCacheManager(config), view
 
 
 def test_npu_mode_auto_selects_eager_and_roundtrips(monkeypatch):

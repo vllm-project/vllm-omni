@@ -30,6 +30,7 @@ except ModuleNotFoundError:
     sys.modules["vllm"] = _vllm
     sys.modules["vllm.logger"] = _vllm_logger
 
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheStep, PrefixCacheWriteLayout
 from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig, StageCacheOutputs
 from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
 
@@ -102,10 +103,21 @@ class _CacheStub:
     def __init__(self):
         self.save_calls = []
         self.materialize_calls = []
+        self.prepare_calls = []
+        self.abort_calls = 0
+        self.save_error = None
         self.outs = StageCacheOutputs(hidden_states=None, mm_outputs={})
 
-    def save_outputs(self, hidden, mm, *, num_tokens_unpadded, num_tokens_padded):
-        self.save_calls.append((hidden, mm, num_tokens_unpadded, num_tokens_padded))
+    def prepare_read_plans(self, layout):
+        self.prepare_calls.append(layout)
+
+    def abort_prepared_step(self):
+        self.abort_calls += 1
+
+    def save_outputs(self, hidden, mm, *, num_tokens_unpadded, num_tokens_padded, write_layout):
+        if self.save_error is not None:
+            raise self.save_error
+        self.save_calls.append((hidden, mm, num_tokens_unpadded, num_tokens_padded, write_layout))
         return 7
 
     def materialize(self, step_id, req_ids):
@@ -160,6 +172,11 @@ def test_save_step_gates_and_passthrough(monkeypatch):
     _patch_pp(monkeypatch, is_last=True)
     assert save() is None  # cache off
     r.omni_prefix_cache = stub
+    r._prefix_cache_adapter = SimpleNamespace(
+        build_write_layout=lambda view, *, num_scheduled_tokens: PrefixCacheWriteLayout((), 0)
+    )
+    r._prefix_cache_group_view = SimpleNamespace()
+    r._prefix_cache_step = PrefixCacheStep((), ())
     r.is_pooling_model = True
     assert save() is None  # pooling stage never writes
     r.is_pooling_model = False
@@ -167,7 +184,68 @@ def test_save_step_gates_and_passthrough(monkeypatch):
     assert save() is None  # not the last PP rank
     _patch_pp(monkeypatch, is_last=True)
     assert save() == 7
-    assert stub.save_calls == [(hidden, {}, 2, 2)]  # empty mm stays {}
+    assert stub.save_calls == [(hidden, {}, 2, 2, PrefixCacheWriteLayout((), 0))]  # empty mm stays {}
+
+
+def test_write_layout_is_prepared_once_and_reused_by_save(monkeypatch):
+    _patch_pp(monkeypatch, is_last=True)
+    r = _Runner()
+    stub = _CacheStub()
+    layout = PrefixCacheWriteLayout((), 0)
+    r.omni_prefix_cache = stub
+    r._prefix_cache_adapter = SimpleNamespace(
+        build_write_layout=lambda view, *, num_scheduled_tokens: layout
+    )
+    r._prefix_cache_group_view = SimpleNamespace()
+    r._prefix_cache_step = PrefixCacheStep((), ())
+
+    r._prefix_cache_prepare_write_layout()
+    assert stub.prepare_calls == [layout]
+    hidden = torch.zeros(2, 2)
+    assert r._prefix_cache_save_step(hidden, None, num_tokens_unpadded=2, num_tokens_padded=2) == 7
+    assert stub.save_calls[0][-1] is layout
+    assert r._prefix_cache_write_layout is None
+
+
+def test_abort_prepared_layout_releases_manager_state(monkeypatch):
+    _patch_pp(monkeypatch, is_last=True)
+    r = _Runner()
+    stub = _CacheStub()
+    r.omni_prefix_cache = stub
+    r._prefix_cache_write_layout = PrefixCacheWriteLayout((), 0)
+    r._prefix_cache_abort_prepared_step()
+    assert stub.abort_calls == 1
+    assert r._prefix_cache_write_layout is None
+
+
+def test_prepared_step_guard_aborts_post_forward_failure():
+    r = _Runner()
+    stub = _CacheStub()
+    r.omni_prefix_cache = stub
+    r._prefix_cache_write_layout = PrefixCacheWriteLayout((), 0)
+
+    with pytest.raises(RuntimeError, match="post-forward failure"):
+        with r._prefix_cache_prepared_step_guard():
+            raise RuntimeError("post-forward failure")
+
+    assert stub.abort_calls == 1
+    assert r._prefix_cache_write_layout is None
+
+
+def test_save_failure_aborts_prepared_manager_state(monkeypatch):
+    _patch_pp(monkeypatch, is_last=True)
+    r = _Runner()
+    stub = _CacheStub()
+    stub.save_error = RuntimeError("save failed")
+    r.omni_prefix_cache = stub
+    r._prefix_cache_adapter = SimpleNamespace()
+    r._prefix_cache_group_view = SimpleNamespace()
+    r._prefix_cache_step = PrefixCacheStep((), ())
+    r._prefix_cache_write_layout = PrefixCacheWriteLayout((), 0)
+    with pytest.raises(RuntimeError, match="save failed"):
+        r._prefix_cache_save_step(torch.zeros(1, 2), None, num_tokens_unpadded=1, num_tokens_padded=1)
+    assert stub.abort_calls == 1
+    assert r._prefix_cache_write_layout is None
 
 
 def test_materialize_requires_explicit_step_and_snapshot_req_ids():
