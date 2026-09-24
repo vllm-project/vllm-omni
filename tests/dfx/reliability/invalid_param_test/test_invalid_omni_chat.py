@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Invalid inputs on Qwen3-Omni: ``POST /v1/chat/completions``, ``WS /v1/video/chat/stream``, ``WS /v1/realtime``."""
+"""Invalid inputs on omni chat: ``POST /v1/chat/completions``, ``WS /v1/video/chat/stream``, ``WS /v1/realtime``."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient, dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path
 
 pytestmark = [pytest.mark.slow, pytest.mark.omni]
@@ -75,6 +75,12 @@ def _chat_completions_request_without_expectations(omni_server: OmniServer, case
     elif case_id == "audio_format_unsupported":
         body["modalities"] = ["text", "audio"]
         body["audio"] = {"voice": "alloy", "format": "aac"}
+    elif case_id == "audio_data_url_corrupt":
+        body["messages"] = dummy_messages_from_mix_data(
+            audio_data_url="data:audio/invalid;base64,AAAA",
+            content_text="What is the capital of China? Answer in 20 words.",
+        )
+        body["stream"] = True
     else:
         raise AssertionError(f"unknown chat completions invalid case_id {case_id!r}")
     return {"json": body, "timeout": 120}
@@ -143,6 +149,12 @@ def _chat_completions_request_without_expectations(omni_server: OmniServer, case
             400,
             ("Invalid audio format", "aac", "Supported formats"),
             id="unsupported_audio_format",
+        ),
+        pytest.param(
+            "audio_data_url_corrupt",
+            400,
+            "Invalid or corrupted audio data",
+            id="invalid_audio_data_url",
         ),
     ],
 )
