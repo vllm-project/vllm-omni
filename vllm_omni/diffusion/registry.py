@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import importlib
+from operator import attrgetter
 
 import torch.nn as nn
 from vllm.logger import init_logger
@@ -465,14 +466,31 @@ def initialize_model(
             model = model_class(od_config=od_config)
 
         vae_pp_size = od_config.parallel_config.vae_patch_parallel_size
-        is_distributed_vae = hasattr(model, "vae") and isinstance(model.vae, DistributedVaeMixin)
-        if vae_pp_size > 1 and not is_distributed_vae:
-            logger.warning(
-                "vae_patch_parallel_size=%d is set but VAE patch parallelism is NOT enabled for %s; ignoring.",
-                vae_pp_size,
-                od_config.model_class_name,
-            )
-        if vae_pp_size > 1 and is_distributed_vae and not od_config.vae_use_tiling:
+        distributed_vae = getattr(model, "vae", None)
+        if not isinstance(distributed_vae, DistributedVaeMixin):
+            distributed_vae = None
+        if (vae_pp_size > 1 or od_config.vae_use_tiling) and distributed_vae is None:
+            declared_vaes: list[DistributedVaeMixin] = []
+            for name in getattr(model, "_vae_modules", ()):
+                try:
+                    component = attrgetter(name)(model)
+                except AttributeError:
+                    continue
+                if isinstance(component, DistributedVaeMixin) and all(
+                    component is not candidate for candidate in declared_vaes
+                ):
+                    declared_vaes.append(component)
+            if len(declared_vaes) == 1:
+                distributed_vae = declared_vaes[0]
+            else:
+                logger.warning(
+                    "vae_patch_parallel_size=%d is set but found %d compatible VAEs for %s; ignoring.",
+                    vae_pp_size,
+                    len(declared_vaes),
+                    od_config.model_class_name,
+                )
+
+        if vae_pp_size > 1 and distributed_vae is not None and not od_config.vae_use_tiling:
             logger.info(
                 "vae_patch_parallel_size=%d requires vae_use_tiling; automatically enabling it.",
                 vae_pp_size,
@@ -485,8 +503,9 @@ def initialize_model(
         if hasattr(model, "vae") and hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
 
-        if is_distributed_vae:
-            model.vae.set_parallel_size(vae_pp_size, mode=od_config.parallel_config.vae_parallel_mode)
+        if distributed_vae is not None:
+            setattr(distributed_vae, "use_tiling", od_config.vae_use_tiling)
+            distributed_vae.set_parallel_size(vae_pp_size, mode=od_config.parallel_config.vae_parallel_mode)
 
         # Apply sequence parallelism if enabled
         # This follows diffusers' pattern where enable_parallelism() is called

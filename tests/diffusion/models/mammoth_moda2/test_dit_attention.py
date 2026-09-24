@@ -164,6 +164,12 @@ def test_shared_layer_owns_no_parameters_and_keeps_checkpoint_keys():
         assert expected in keys, expected
 
 
+def test_mammoth_attention_stays_local_when_sp_group_only_serves_vae() -> None:
+    """Mammoth has no _sp_plan, so VAE PP ranks must not shard full DiT attention."""
+    block = _block(2)
+    assert block.attn.omni_attn.skip_sequence_parallel is True
+
+
 @pytest.mark.parametrize("with_mask", [True, False], ids=["empty_mask", "no_mask"])
 def test_empty_text_stream_skips_the_kernel(monkeypatch, with_mask):
     """CFG's unconditional branch carries zero text tokens (the pipeline's default

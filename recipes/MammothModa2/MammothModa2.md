@@ -205,6 +205,27 @@ per-request message, so it appears only after sending a text-to-image request
 with `VLLM_LOGGING_LEVEL=DEBUG`; it is not a startup marker. Seeing the legacy
 generation model runner for stage 1 is a failed migration.
 
+#### Experimental two-rank VAE patch decode
+
+To split the DiT stage's tiled VAE decode across two GPUs, keep AR on a
+separate GPU and configure stage 1 as a two-rank group (at least three GPUs
+total):
+
+```bash
+vllm serve ./MammothModa2-Preview --omni \
+  --deploy-config vllm_omni/deploy/mammoth_moda2.yaml \
+  --stage-overrides '{"0":{"devices":"0"},"1":{"devices":"1,2","ulysses_degree":2,"vae_patch_parallel_size":2}}' \
+  --port 8099
+```
+
+Mammoth's DiT attention is replicated, not sequence-sharded: the two-rank
+group is used to coordinate VAE tiles. The registry enables VAE tiling
+automatically when `vae_patch_parallel_size=2`. The VAE-only path was measured
+on two RTX 3090s; this three-GPU AR→DiT deployment has not been validated
+end-to-end and needs sufficient memory for a full DiT copy on each stage-1
+GPU. Compare it against a one-rank stage-1 run on the same checkpoint, prompt,
+seed, and image size before drawing request-level performance conclusions.
+
 #### Migration benchmark
 
 The request-mode migration was checked on 2x NVIDIA A800 80GB PCIe with AR on
