@@ -34,6 +34,8 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
+from vllm_omni.diffusion.models.qwen_image_21.ops.qk_norm_rope import apply_qk_norm_rope
+from vllm_omni.diffusion.models.qwen_image_21.ops.swiglu import fused_silu_mul
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -289,7 +291,9 @@ class QwenImage21SwiGLUFeedForward(nn.Module):
         self.activation_fn = nn.SiLU()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.out(self.activation_fn(self.gate_layer(hidden_states)) * self.proj(hidden_states))
+        # One launch instead of `silu` + `mul`, and no BF16 activation intermediate. The
+        # two projections stay independent, so no per-forward `torch.cat` is introduced.
+        return self.out(fused_silu_mul(self.gate_layer(hidden_states), self.proj(hidden_states)))
 
 
 class QwenImage21AdaLayerNormContinuous(nn.Module):
@@ -522,17 +526,21 @@ class QwenImage21Attention(nn.Module):
         qkv, _ = self.to_qkv(hidden_states)
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
-        query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
-        query = query.unflatten(-1, (self.num_heads, self.head_dim))
-        key = key.unflatten(-1, (self.num_kv_heads, self.head_dim))
-        value = value.unflatten(-1, (self.num_kv_heads, self.head_dim))
-
-        query = self.norm_q(query).to(value.dtype)
-        key = self.norm_k(key).to(value.dtype)
-
-        query = self._apply_rotary_emb(query, freqs)
-        key = self._apply_rotary_emb(key, freqs)
+        # Q and K are adjacent in the packed projection, so the whole norm + rotation
+        # chain fuses into one launch over a strided view; V is untouched. The helper
+        # falls back to norm_q/norm_k + `_apply_rotary_emb` for any ineligible input.
+        query, key = apply_qk_norm_rope(
+            qkv[..., : q_size + kv_size].unflatten(-1, (self.num_heads + self.num_kv_heads, self.head_dim)),
+            self.norm_q.weight,
+            self.norm_k.weight,
+            freqs,
+            self.norm_q.eps,
+            self.num_heads,
+        )
+        value = qkv[..., q_size + kv_size :].unflatten(-1, (self.num_kv_heads, self.head_dim))
+        query = query.to(value.dtype)
+        key = key.to(value.dtype)
 
         cached_key = cached_value = None
         if kv_cache is not None:
