@@ -12,7 +12,8 @@ Transformer ResBlocks:
 
 where ``scale`` and ``shift`` are per-(batch, channel) conditioning signals
 derived from the timestep embedding. Eager PyTorch spends four kernels and three
-full-size intermediates on this; the fused version does it in one pass.
+full-size intermediates on this; the fused version needs no intermediates and one
+launch (two for activations large enough to split, see below).
 
 Large activations additionally take a split reduction so the work is spread over
 the whole device instead of ``B * num_groups`` CTAs; see
@@ -147,7 +148,11 @@ def fused_adaptive_group_norm_silu(
     """
     Fused Adaptive GroupNorm + SiLU.
 
-    Computes SiLU(GroupNorm(x) * (1 + scale) + shift) in one fused operation, avoiding intermediate tensors.
+    Computes SiLU(GroupNorm(x) * (1 + scale) + shift) without materializing the
+    intermediate tensors eager would, reducing memory traffic and launch overhead.
+    Small activations run as one Triton launch; large ones split the reduction over two
+    (statistics, then normalize) to spread the work across the device, which is still
+    two reads of the input either way.
 
     - x: (B, C, *spatial), any spatial rank >= 1.
     - weight, bias: per-channel parameters, shape (C,).

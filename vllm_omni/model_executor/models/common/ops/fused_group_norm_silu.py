@@ -5,10 +5,11 @@
 
 """Fused GroupNorm + SiLU operator.
 
-This operator fuses GroupNorm followed by SiLU activation into a single kernel,
-reducing memory traffic and kernel launch overhead. The implementation uses
-Triton for CUDA/ROCm compatibility, and falls back to native PyTorch ops when
-Triton is unavailable (NPU, CPU, ...), so callers never need a platform check.
+This operator fuses GroupNorm followed by SiLU activation into one launch (two
+for activations large enough to split, see below), reducing memory traffic and
+kernel launch overhead. The implementation uses Triton for CUDA/ROCm
+compatibility, and falls back to native PyTorch ops when Triton is unavailable
+(NPU, CPU, ...), so callers never need a platform check.
 
 Measured against eager ``F.silu(F.group_norm(...))`` on one L20X, bf16, 32
 groups: 1.1-1.5x at the DiT ResBlock's activation sizes, where both paths are
