@@ -153,6 +153,23 @@ def _percentile(samples: list[float], quantile: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
+def count_kernels(torch: Any, call: Callable) -> int | None:
+    """CUDA kernel launches per call (None where CUPTI is unavailable)."""
+    if not torch.cuda.is_available():
+        return None
+    try:
+        from torch.profiler import ProfilerActivity, profile
+    except Exception:
+        return None
+    try:
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            call()
+            torch.cuda.synchronize()
+    except Exception:
+        return None
+    return sum(event.count for event in prof.key_averages() if event.device_type == torch.autograd.DeviceType.CUDA)
+
+
 def measure_pair(torch: Any, reference: Callable, fused: Callable, args: argparse.Namespace) -> dict:
     cuda = getattr(torch, "cuda")
     functions = (reference, fused)
