@@ -158,6 +158,7 @@ The following tables show which models support each feature:
 | **Nextstep_1(T2I)**      |     ❓     |     ❓      |           ❌           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **OmniGen2**             |     ❌     |     ✅      |           ✅           |       ❌        |         ✅         |          ❌          |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **Ovis-Image**           |     ❌     |     ✅      |           ❌           |       ✅        |         ❌         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
+| **Sana-Sprint 0.6B** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ |
 | **Qwen-Image**           |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ✅        |        ✅         |
 | **Qwen-Image-2512**      |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ✅        |        ✅         |
 | **Qwen-Image-Edit**      |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
