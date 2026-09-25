@@ -10,6 +10,9 @@ from transformers import Qwen2Config, Qwen3VLProcessor
 from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -921,6 +924,20 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                 architectures=["MammothModa2DiTPipeline"],
             )
             self.model = self.dit
+            # TODO(#7134): drop this block once stage-1 is DIFFUSION. Stage-1
+            # is currently LLM_GENERATION, whose runner does not call
+            # ``_compile_transformer``, so ``_dit_modules`` is never picked up
+            # unless we drive ``regionally_compile`` ourselves.
+            if not getattr(vllm_config.model_config, "enforce_eager", True):
+                from vllm_omni.diffusion.compile import regionally_compile
+
+                dit_modules = getattr(self.dit, "_dit_modules", None) or ("gen_transformer",)
+                for attr_name in dit_modules:
+                    submodel = getattr(self.dit, attr_name, None)
+                    if submodel is None:
+                        continue
+                    regionally_compile(submodel, dynamic=True)
+                    logger.info("MammothModa2 DiT: regional torch.compile on %s.", attr_name)
         elif self.model_stage == "vae":
             # Reserved: VAEs not implemented yet; raise explicit error.
             raise NotImplementedError("MammothModa2 VAE stage not implemented yet.")
