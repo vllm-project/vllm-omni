@@ -883,6 +883,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 f"MiniCPM-o continuous Talker received {len(request_sampling_params)} "
                 f"sampling params for {len(infos)} requests"
             )
+        # Remaining request output budget per request (runner-side
+        # ``max_tokens - num_output_tokens``). The engine truncates the sampled
+        # ids at the request limit while the connector concatenates every
+        # emitted codec frame, so the codec loop has to stop emitting at the
+        # same place (PR #7929 review).
+        request_max_tokens_remaining = kwargs.get("request_max_tokens_remaining")
+        if request_max_tokens_remaining is not None and len(request_max_tokens_remaining) != len(infos):
+            raise RuntimeError(
+                f"MiniCPM-o continuous Talker received {len(request_max_tokens_remaining)} "
+                f"remaining-token budgets for {len(infos)} requests"
+            )
         emit_duplex_metadata = any(isinstance(info, dict) and info.get("native_duplex") is True for info in infos)
 
         stop_rows: list[torch.Tensor] = []
@@ -962,6 +973,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._merge_request_codec_params(
                 state,
                 request_sampling_params[index] if request_sampling_params is not None else None,
+                max_tokens_remaining=(
+                    request_max_tokens_remaining[index] if request_max_tokens_remaining is not None else None
+                ),
             )
             if state.get("finished"):
                 stop_rows.append(row_stop)
@@ -988,7 +1002,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # steps after each 25-frame cadence boundary (see
             # _turn_end_boundary_eos_masked and state["turn_end_drain"];
             # MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS is 4 chunks, so the window
-            # lands on steps 25-29 / 50-54 / 75-79 / 100-103). The EOS masking
+            # lands on steps 25-29 / 50-54 / 75-79 / 100-104). The EOS masking
             # lives in the sampling core (talker_codec_sample.
             # prepare_codec_logits / greedy_codec_sample), so the periodic
             # window rides along as the eos_window_masked flag below -- the same
@@ -1146,7 +1160,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             multimodal_outputs={"codes": {"audio": codec_deltas}, "meta": meta_outputs},
         )
 
-    def _merge_request_codec_params(self, state: dict[str, Any], sampling_params: Any) -> None:
+    def _merge_request_codec_params(
+        self,
+        state: dict[str, Any],
+        sampling_params: Any,
+        *,
+        max_tokens_remaining: int | None = None,
+    ) -> None:
         """Pin one request's effective codec sampling knobs into its state.
 
         The request's SamplingParams -- the engine merges the stage's
@@ -1157,6 +1177,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         decoding. Values already pinned (offline duplex states) and missing
         sampling params (CPU tests, dummy runs without the runner hook) fall
         back to the statically resolved deployment values.
+
+        ``max_tokens_remaining`` is the runner-computed request output budget
+        (``SamplingParams.max_tokens - num_output_tokens``). It tightens this
+        segment's frame ceiling so the emitted codec frames stay aligned with
+        the ids the engine accepts; ``None`` leaves the stage-resolved codec
+        budget in charge.
         """
         if sampling_params is None or not isinstance(state, dict):
             return
@@ -1182,6 +1208,18 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 requested = getattr(sampling_params, "min_new_tokens", None)
             if requested is not None and int(requested) > 0:
                 state["min_tokens"] = int(requested)
+        # The request's remaining output budget caps this segment's frame
+        # ceiling: the scheduler truncates the sampled ids at the request limit
+        # while the connector concatenates every emitted codec frame, so the
+        # codec loop must stop emitting where the engine stops accepting. The
+        # stage-resolved codec budget is the ceiling only when the request
+        # carries no limit of its own; a smaller request limit tightens it,
+        # never the other way round (PR #7929 review).
+        if max_tokens_remaining is not None:
+            current = _codec_int_param(state, "max_tokens", self._codec_max_tokens)
+            ceiling = int(state.get("step") or 0) + max(int(max_tokens_remaining), 0)
+            if ceiling < current:
+                state["max_tokens"] = ceiling
 
     def _request_generator(self, request_id: str, device: torch.device) -> torch.Generator:
         generator = self._request_generators.get(request_id)
@@ -1204,10 +1242,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if device_states is None:
             device_states = {}
             self._request_codec_device_states = device_states
+        request_states = getattr(self, "_request_audio_states", {})
+        request_state = request_states.get(request_id, {})
         device_state = device_states.get(request_id)
         if device_state is None:
-            request_states = getattr(self, "_request_audio_states", {})
-            request_state = request_states.get(request_id, {})
             device_state = make_device_state(
                 history,
                 step=step,
@@ -1215,6 +1253,18 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 finished=False,
             )
             device_states[request_id] = device_state
+        else:
+            # The host state can tighten the frame ceiling after the device
+            # state was built: _merge_request_codec_params clamps
+            # state["max_tokens"] to the request's remaining output budget,
+            # while a reused device state still holds its creation-time value.
+            # Without this refresh the codec loop and the engine can stop at
+            # different frames, which is what the emitted codes must not do.
+            # Refresh in place: swapping the tensor would re-capture the
+            # per-request sampling graph.
+            budget = _codec_int_param(request_state, "max_tokens", self._codec_max_tokens)
+            if int(device_state.max_tokens.item()) != budget:
+                device_state.max_tokens.fill_(budget)
         device_inputs_by_request = getattr(self, "_request_codec_device_inputs", None)
         if device_inputs_by_request is None:
             device_inputs_by_request = {}
@@ -1255,7 +1305,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # request's pinned values from its own state.
             top_k=_codec_int_param(request_state, "codec_top_k", self._codec_top_k),
             top_p=_codec_float_param(request_state, "codec_top_p", self._codec_top_p),
-            min_tokens_to_keep=3,
             eos_window_masked=eos_window_masked,
         )
         probabilities = torch.softmax(logits, dim=-1)
@@ -1300,6 +1349,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 finished=False,
             )
             device_states[request_id] = device_state
+        elif int(device_state.max_tokens.item()) != int(max_tokens):
+            # Same refresh as _sample_audio_code: the caller passes the host
+            # state's current frame ceiling, which the request's remaining
+            # output budget may have tightened after this device state was
+            # built. Refreshing in place keeps the per-request sampling graph.
+            device_state.max_tokens.fill_(int(max_tokens))
 
         device_inputs_by_request = getattr(self, "_request_codec_device_inputs", None)
         if device_inputs_by_request is None:
@@ -1324,7 +1379,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             device_state,
             min_tokens_tensor,
             penalty_tensor,
-            top_k=_codec_int_param(request_state, "codec_top_k", self._codec_top_k),
             eos_token_id=self._codec_eos_id,
             eos_window_masked=eos_window_masked,
         )

@@ -1441,6 +1441,24 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                         req.sampling_params if (req := self.requests.get(req_id)) is not None else None
                         for req_id in self.input_batch.req_ids
                     ]
+                    # Remaining request output budget per request, so the
+                    # in-model K-step codec loop stops emitting frames where the
+                    # engine stops accepting tokens: the scheduler truncates the
+                    # sampled ids at the request limit, but the connector still
+                    # concatenates every emitted codec frame (PR #7929 review).
+                    # None means the request carries no max_tokens, which leaves
+                    # the stage-resolved codec budget in charge. Same order as
+                    # request_sampling_params.
+                    model_kwargs_extra["request_max_tokens_remaining"] = [
+                        (
+                            max(int(req.sampling_params.max_tokens) - int(req.num_output_tokens), 0)
+                            if (req := self.requests.get(req_id)) is not None
+                            and req.sampling_params is not None
+                            and req.sampling_params.max_tokens is not None
+                            else None
+                        )
+                        for req_id in self.input_batch.req_ids
+                    ]
             except Exception as e:
                 # Visible on purpose: the fallback is the equal rows-per-request
                 # split, which can re-introduce the cross-request corruption this

@@ -5,8 +5,9 @@
 
 Production stochastic sampling uses a logits-filter boundary implemented in
 graph-capturable tensor ops: history counting, temperature, repetition
-penalty, EOS mask, top-p and top-k, while native NPU operators keep softmax
-and ``torch.multinomial`` semantics (including Generator state) unchanged.
+penalty, EOS mask, top-k, then top-p over the top-k-filtered distribution
+keeping at least one candidate, while native NPU operators keep softmax and
+``torch.multinomial`` semantics (including Generator state) unchanged.
 """
 
 from __future__ import annotations
@@ -17,7 +18,6 @@ import torch
 
 VOCAB_SIZE = 6562
 HISTORY_WINDOW = 16
-MIN_TOKENS_TO_KEEP = 3
 
 
 @dataclass(frozen=True)
@@ -67,7 +67,6 @@ def prepare_codec_logits(
     eos_token_id: int,
     top_k: int,
     top_p: float,
-    min_tokens_to_keep: int = MIN_TOKENS_TO_KEEP,
     eos_window_masked: bool = False,
 ) -> torch.Tensor:
     """Prepare and filter logits without changing native NPU RNG semantics.
@@ -76,14 +75,8 @@ def prepare_codec_logits(
     step counter -- the duplex turn-end drain window (a few frames after each
     cadence boundary), which the ``step < min_tokens`` criterion cannot express.
     """
-    logits = raw_logits.float() / temperature.reshape(1, 1)
-    positions = torch.arange(HISTORY_WINDOW, dtype=torch.int32, device=raw_logits.device).reshape(1, -1)
-    valid = positions < state.history_len.reshape(1, 1)
-    safe_tokens = torch.where(valid, state.history, torch.zeros_like(state.history)).to(torch.long)
-    counts = torch.zeros((1, VOCAB_SIZE), dtype=torch.float32, device=raw_logits.device)
-    counts.scatter_add_(1, safe_tokens, valid.to(torch.float32))
-    alpha = torch.pow(repetition_penalty.reshape(1, 1), counts)
-    logits = torch.where(logits < 0, logits * alpha, logits / alpha)
+    logits = raw_logits.float()
+    # Engine step 5a: the stop/EOS mask is applied before the penalties.
     eos = logits[..., eos_token_id : eos_token_id + 1]
     if eos_window_masked:
         eos = torch.full_like(eos, float("-inf"))
@@ -94,19 +87,31 @@ def prepare_codec_logits(
             eos,
         )
     logits = torch.cat([logits[..., :eos_token_id], eos, logits[..., eos_token_id + 1 :]], dim=-1)
+    # Engine step 6a: repetition penalty over the codec history window.
+    positions = torch.arange(HISTORY_WINDOW, dtype=torch.int32, device=raw_logits.device).reshape(1, -1)
+    valid = positions < state.history_len.reshape(1, 1)
+    safe_tokens = torch.where(valid, state.history, torch.zeros_like(state.history)).to(torch.long)
+    counts = torch.zeros((1, VOCAB_SIZE), dtype=torch.float32, device=raw_logits.device)
+    counts.scatter_add_(1, safe_tokens, valid.to(torch.float32))
+    alpha = torch.pow(repetition_penalty.reshape(1, 1), counts)
+    logits = torch.where(logits < 0, logits * alpha, logits / alpha)
+    # Engine step 7b: temperature is applied after the penalties. The division
+    # also gives the in-place masks below a tensor of their own.
+    logits = logits / temperature.reshape(1, 1)
+    # Engine step 7d: top-k first (topk_topp_sampler.py:392).
+    if top_k > 0:
+        keep = min(VOCAB_SIZE, int(top_k))
+        threshold = torch.topk(logits, keep, dim=-1).values[..., -1, None]
+        logits.masked_fill_(logits < threshold, float("-inf"))
+    # Engine step 7d: top-p runs over the top-k-filtered distribution and keeps
+    # at least one candidate (topk_topp_sampler.py:404/:415).
     if 0.0 < float(top_p) < 1.0:
         sorted_logits, sorted_indices = torch.sort(logits, descending=False, dim=-1)
         cumulative_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
         remove = cumulative_probs <= (1.0 - float(top_p))
-        remove[..., -min_tokens_to_keep:] = False
+        remove[..., -1:] = False
         remove = remove.scatter(-1, sorted_indices, remove)
         logits.masked_fill_(remove, float("-inf"))
-    if top_k > 0:
-        # Honor the request's explicit top_k exactly: min_tokens_to_keep is a
-        # top_p-only floor (vLLM semantics), not a top_k widening.
-        keep = min(VOCAB_SIZE, int(top_k))
-        threshold = torch.topk(logits, keep, dim=-1).values[..., -1, None]
-        logits.masked_fill_(logits < threshold, float("-inf"))
     return logits
 
 
@@ -154,23 +159,21 @@ def greedy_codec_sample(
     min_tokens: torch.Tensor,
     repetition_penalty: torch.Tensor,
     *,
-    top_k: int,
     eos_token_id: int,
     eos_window_masked: bool = False,
 ) -> TalkerCodecSampleResult:
     """Greedy codec sample in graph-capturable tensor ops.
 
+    The engine's greedy branch returns the argmax after the stop/EOS mask and
+    the penalties and skips temperature, top-k and top-p entirely
+    (``vllm/v1/sample/sampler.py:30-60``), so no top-k mask belongs on this
+    path -- masking candidates below the argmax cannot change the argmax itself.
+
     ``eos_window_masked`` masks the codec EOS for this frame regardless of the
     step counter -- see prepare_codec_logits.
     """
-    positions = torch.arange(HISTORY_WINDOW, dtype=torch.int32, device=raw_logits.device).reshape(1, -1)
-    valid = positions < state.history_len.reshape(1, 1)
-    safe_tokens = torch.where(valid, state.history, torch.zeros_like(state.history)).to(torch.long)
-    counts = torch.zeros((1, VOCAB_SIZE), dtype=torch.float32, device=raw_logits.device)
-    counts.scatter_add_(1, safe_tokens, valid.to(torch.float32))
-    alpha = torch.pow(repetition_penalty.reshape(1, 1), counts)
-    penalized = torch.where(raw_logits < 0, raw_logits * alpha, raw_logits / alpha)
-
+    penalized = raw_logits.float()
+    # Engine step 5a: the stop/EOS mask is applied before the penalties.
     eos = penalized[..., eos_token_id : eos_token_id + 1]
     if eos_window_masked:
         eos = torch.full_like(eos, float("-inf"))
@@ -181,10 +184,14 @@ def greedy_codec_sample(
             eos,
         )
     penalized = torch.cat([penalized[..., :eos_token_id], eos, penalized[..., eos_token_id + 1 :]], dim=-1)
-    if top_k > 0:
-        keep = min(VOCAB_SIZE, max(int(top_k), MIN_TOKENS_TO_KEEP))
-        threshold = torch.topk(penalized, keep, dim=-1).values[..., -1, None]
-        penalized = penalized.masked_fill(penalized < threshold, float("-inf"))
+    # Engine step 6a: repetition penalty over the codec history window.
+    positions = torch.arange(HISTORY_WINDOW, dtype=torch.int32, device=raw_logits.device).reshape(1, -1)
+    valid = positions < state.history_len.reshape(1, 1)
+    safe_tokens = torch.where(valid, state.history, torch.zeros_like(state.history)).to(torch.long)
+    counts = torch.zeros((1, VOCAB_SIZE), dtype=torch.float32, device=raw_logits.device)
+    counts.scatter_add_(1, safe_tokens, valid.to(torch.float32))
+    alpha = torch.pow(repetition_penalty.reshape(1, 1), counts)
+    penalized = torch.where(penalized < 0, penalized * alpha, penalized / alpha)
     sampled = torch.argmax(penalized, dim=-1).to(torch.int32)
 
     active = ~state.finished
