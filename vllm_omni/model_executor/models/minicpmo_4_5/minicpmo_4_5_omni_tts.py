@@ -34,6 +34,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
+    VOCAB_SIZE as _CODEC_VOCAB_SIZE,
     TalkerCodecDeviceState,
     TalkerCodecSampleResult,
     codec_sample_result,
@@ -234,6 +235,14 @@ def resolve_codec_sampling_params(
         raise ValueError("codec_sampling_params.min_tokens must be >= 0")
     if resolved["max_tokens"] <= 0:
         raise ValueError("codec_sampling_params.max_tokens must be > 0")
+    # Same constraint the engine enforces on SamplingParams
+    # (vllm/sampling_params.py:610-613): a floor above the ceiling can never be
+    # satisfied, so reject it here instead of silently accepting it.
+    if resolved["min_tokens"] > resolved["max_tokens"]:
+        raise ValueError(
+            "codec_sampling_params.min_tokens must be <= max_tokens, got "
+            f"{resolved['min_tokens']} > {resolved['max_tokens']}"
+        )
     logger.info("MiniCPM-o Talker codec sampling %s (from %s)", resolved, sources)
     return resolved
 
@@ -242,6 +251,159 @@ def _codec_float_param(state: Any, key: str, fallback: float) -> float:
     """Float counterpart of _codec_int_param; same None-means-unset rule."""
     value = state.get(key) if isinstance(state, Mapping) else None
     return float(fallback if value is None else value)
+
+
+def _codec_bool_param(state: Any, key: str, fallback: bool) -> bool:
+    """Bool counterpart of _codec_int_param; same None-means-unset rule."""
+    value = state.get(key) if isinstance(state, Mapping) else None
+    return bool(fallback if value is None else value)
+
+
+def _codec_stop_ids(state: Any) -> tuple[int, ...]:
+    """The request's extra stop ids, deduplicated in a stable order.
+
+    Populated by ``_merge_request_codec_params`` from
+    ``SamplingParams.stop_token_ids``. The engine validates these against
+    ``model_config.get_vocab_size()`` before the request is accepted
+    (``vllm/sampling_params.py:874-895``), so surviving ids are in-vocabulary
+    for the model -- but the codec head is only ``_CODEC_VOCAB_SIZE`` wide, so
+    anything at or beyond it is dropped here, the same way
+    ``_codec_allowed_ids_mask`` and ``_codec_logit_bias_items`` drop theirs,
+    which keeps the index tensors in range. The engine censors and stops on
+    ``all_stop_token_ids`` = eos + these ids + extra eos ids
+    (``builtin.py:196-207``, ``v1/core/sched/utils.py:105``); K-step has no
+    engine layer left, so it censors and stops on them itself. Empty means the
+    request set none, i.e. the codec-EOS-only behaviour.
+    """
+    value = state.get("codec_stop_token_ids") if isinstance(state, Mapping) else None
+    if not value:
+        return ()
+    return tuple(
+        sorted({int(token_id) for token_id in value if 0 <= int(token_id) < _CODEC_VOCAB_SIZE})
+    )
+
+
+def _codec_allowed_ids_mask(state: Any, device: torch.device) -> torch.Tensor | None:
+    """Censor mask for the request's codec whitelist, or None when unset.
+
+    The engine builds ``allowed_token_ids_mask`` with True on the ids to
+    censor (``v1/worker/gpu_input_batch.py:463-466``) and applies it as
+    ``masked_fill_(-inf)`` (``sampler.py:393-394``). The request's list is
+    keyed by the text vocabulary, so ids outside the codec vocabulary are
+    dropped; a list with nothing left in range is treated as unset rather
+    than producing an all ``-inf`` row.
+    """
+    value = state.get("codec_allowed_token_ids") if isinstance(state, Mapping) else None
+    if not value:
+        return None
+    keep = sorted({int(token_id) for token_id in value if 0 <= int(token_id) < _CODEC_VOCAB_SIZE})
+    if not keep:
+        return None
+    mask = torch.ones((1, _CODEC_VOCAB_SIZE), dtype=torch.bool, device=device)
+    mask[0, torch.tensor(keep, dtype=torch.long, device=device)] = False
+    return mask
+
+
+def _codec_logit_bias_items(state: Any) -> tuple[tuple[int, ...], tuple[float, ...]]:
+    """The request's codec logit biases as parallel tuples, in a stable order.
+
+    ``LogitBiasLogitsProcessor`` adds ``bias`` to ``logits[req, tok]``
+    (``builtin.py:161-164``). The request's dict is keyed by the text
+    vocabulary, so keys outside the codec vocabulary are dropped.
+    """
+    value = state.get("codec_logit_bias") if isinstance(state, Mapping) else None
+    if not isinstance(value, Mapping):
+        return (), ()
+    pairs = sorted(
+        (int(token_id), float(bias))
+        for token_id, bias in value.items()
+        if 0 <= int(token_id) < _CODEC_VOCAB_SIZE
+    )
+    if not pairs:
+        return (), ()
+    return tuple(token_id for token_id, _ in pairs), tuple(bias for _, bias in pairs)
+
+
+def _codec_filter_inputs(state: Any, device: torch.device) -> dict[str, Any]:
+    """Whitelist mask and logit-bias tuples for the codec filters.
+
+    Returns an empty mapping when the request set neither, so the call site
+    keeps the sampler's no-op defaults.
+    """
+    inputs: dict[str, Any] = {}
+    mask = _codec_allowed_ids_mask(state, device)
+    if mask is not None:
+        inputs["allowed_token_ids_mask"] = mask
+    bias_ids, bias_values = _codec_logit_bias_items(state)
+    if bias_ids:
+        inputs["logit_bias_ids"] = bias_ids
+        inputs["logit_bias_values"] = bias_values
+    return inputs
+
+
+def _codec_full_bins_input(state: Any, device: torch.device) -> torch.Tensor | None:
+    """A zeroed whole-stream counter when the request uses the stream penalties.
+
+    Returns None when the request sets neither ``frequency_penalty`` nor
+    ``presence_penalty``, so the sampler skips both the tensor and the per-frame
+    scatter. The tensor lives in the request's device state, which survives
+    across chunks, so the counts stay whole-stream; it is advanced in place.
+    """
+    if not (
+        _codec_float_param(state, "codec_frequency_penalty", 0.0)
+        or _codec_float_param(state, "codec_presence_penalty", 0.0)
+    ):
+        return None
+    return torch.zeros(_CODEC_VOCAB_SIZE, dtype=torch.float32, device=device)
+
+
+def _codec_has_repeating_pattern(
+    token_ids: Sequence[int],
+    pattern_len: int,
+    repetition_min_count: int,
+) -> bool:
+    """Tail-repetition test, copied from ``v1/core/sched/utils.py:10-25``."""
+    for n in range(1, pattern_len + 1):
+        target_token = token_ids[-n]
+        for m in range(1, repetition_min_count):
+            if token_ids[-(pattern_len * m + n)] != target_token:
+                return False
+    return True
+
+
+def _codec_repetition_detected(state: Any) -> bool:
+    """Whether the codec stream hit the request's repetition pattern.
+
+    Mirrors ``check_sequence_repetition`` (``v1/core/sched/utils.py:28-59``):
+    every pattern length in ``[min_pattern_size, max_pattern_size]`` is tried and
+    the tail must repeat at least ``min_count`` times. The engine runs this in
+    ``check_stop`` over the request's whole output; the K-step path keeps the same
+    list host-side, because the model samples the codec ids itself. An unset
+    ``repetition_detection`` returns immediately, so the default pays nothing.
+    """
+    params = state.get("codec_repetition_detection") if isinstance(state, Mapping) else None
+    if params is None:
+        return False
+    token_ids = state.get("codec_full_ids")
+    if not token_ids:
+        return False
+    max_pattern_size = int(getattr(params, "max_pattern_size", 0) or 0)
+    min_pattern_size = int(getattr(params, "min_pattern_size", 0) or 0)
+    min_count = int(getattr(params, "min_count", 0) or 0)
+    if min_pattern_size <= 0:
+        min_pattern_size = 1
+    if max_pattern_size <= 0 or min_count < 2 or min_pattern_size > max_pattern_size:
+        return False
+    for pattern_len in range(min_pattern_size, max_pattern_size + 1):
+        if pattern_len * min_count > len(token_ids):
+            return False
+        if _codec_has_repeating_pattern(token_ids, pattern_len, min_count):
+            return True
+    return False
+
+
+
+
 
 
 def _codec_int_param(state: Any, key: str, fallback: int) -> int:
@@ -1033,10 +1195,28 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     # stub this method with the sampled tensor itself.
                     sampled = stochastic_result.reshape(()).to(torch.long)
             sampled_id = int(sampled.item())
-            is_eos = sampled_id == self._codec_eos_id
+            full_ids = state.get("codec_full_ids")
+            if isinstance(full_ids, list):
+                full_ids.append(sampled_id)
+            if _codec_bool_param(state, "codec_ignore_eos", False):
+                # ignore_eos blanks the engine's _eos_token_id
+                # (vllm/sampling_params.py:670-671), so a sampled codec EOS is
+                # just another frame and the request runs to its length budget.
+                is_eos = False
+            else:
+                is_eos = sampled_id == self._codec_eos_id
+            # stop_token_ids: the engine ends the request on any of these ids
+            # (v1/core/sched/utils.py:105); the codec stream ends it on the codec
+            # EOS, so both stop conditions apply here.
+            if not is_eos and sampled_id in _codec_stop_ids(state):
+                is_eos = True
             state["step"] = _codec_int_param(state, "step", 0) + 1
             reached_limit = int(state["step"]) >= _codec_int_param(state, "max_tokens", self._codec_max_tokens)
-            finished = is_eos or reached_limit
+            # The engine stops the request when check_stop sees the pattern
+            # (v1/core/sched/utils.py:125-133); the K-step path owns the
+            # codec ids, so it has to make that call itself.
+            repetition_stop = _codec_repetition_detected(state)
+            finished = is_eos or reached_limit or repetition_stop
             state["finished"] = finished
             # MiniCPMTTS.generate_chunk consumes the boundary sample but
             # returns only codes that were fed into the retained KV state.
@@ -1192,11 +1372,34 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             ("codec_top_p", "top_p"),
             ("codec_repetition_penalty", "repetition_penalty"),
             ("codec_seed", "seed"),
+            ("codec_min_p", "min_p"),
+            ("codec_ignore_eos", "ignore_eos"),
+            ("codec_allowed_token_ids", "allowed_token_ids"),
+            ("codec_logit_bias", "logit_bias"),
+            ("codec_frequency_penalty", "frequency_penalty"),
+            ("codec_presence_penalty", "presence_penalty"),
         ):
             if state.get(key) is None:
                 value = getattr(sampling_params, attr, None)
                 if value is not None:
                     state[key] = value
+        # stop_token_ids joins the codec censor set: while a request sits below
+        # its min_tokens floor the engine masks every id of all_stop_token_ids
+        # (builtin.py:196-207) and stops on them afterwards
+        # (v1/core/sched/utils.py:105). Only a non-empty list is pinned, so the
+        # default keeps the codec-EOS-only behaviour.
+        if state.get("codec_stop_token_ids") is None:
+            requested_stop_ids = getattr(sampling_params, "stop_token_ids", None)
+            if requested_stop_ids:
+                state["codec_stop_token_ids"] = [int(token_id) for token_id in requested_stop_ids]
+        # repetition_detection is a whole-stream pattern test
+        # (v1/core/sched/utils.py:28-59), so its record has to keep every
+        # emitted codec id. Started here, appended per frame below.
+        if state.get("codec_repetition_detection") is None:
+            detection = getattr(sampling_params, "repetition_detection", None)
+            if detection is not None:
+                state["codec_repetition_detection"] = detection
+                state.setdefault("codec_full_ids", [])
         # The K-step codec sampler is the only min-length guard left (the NPU
         # runner neutralizes vLLM's MinTokensLogitsProcessor), so the request
         # floor must reach it. Pin only a positive floor: the engine default 0
@@ -1251,6 +1454,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 step=step,
                 max_tokens=_codec_int_param(request_state, "max_tokens", self._codec_max_tokens),
                 finished=False,
+                full_bins=_codec_full_bins_input(request_state, hidden_state.device),
             )
             device_states[request_id] = device_state
         else:
@@ -1305,6 +1509,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # request's pinned values from its own state.
             top_k=_codec_int_param(request_state, "codec_top_k", self._codec_top_k),
             top_p=_codec_float_param(request_state, "codec_top_p", self._codec_top_p),
+            min_p=_codec_float_param(request_state, "codec_min_p", 0.0),
+            min_tokens_stop_ids=_codec_stop_ids(request_state),
+            **_codec_filter_inputs(request_state, hidden_state.device),
+            frequency_penalty=_codec_float_param(request_state, "codec_frequency_penalty", 0.0),
+            presence_penalty=_codec_float_param(request_state, "codec_presence_penalty", 0.0),
             eos_window_masked=eos_window_masked,
         )
         probabilities = torch.softmax(logits, dim=-1)
@@ -1317,6 +1526,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             device_state,
             sampled,
             eos_token_id=eos_id,
+            ignore_eos=_codec_bool_param(request_state, "codec_ignore_eos", False),
         )
         device_states[request_id] = result.state
         return result
@@ -1340,6 +1550,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if device_states is None:
             device_states = {}
             self._request_codec_device_states = device_states
+        request_state = getattr(self, "_request_audio_states", {}).get(request_id, {})
         device_state = device_states.get(request_id)
         if device_state is None:
             device_state = make_device_state(
@@ -1347,6 +1558,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 step=step,
                 max_tokens=max_tokens,
                 finished=False,
+                full_bins=_codec_full_bins_input(request_state, hidden_state.device),
             )
             device_states[request_id] = device_state
         elif int(device_state.max_tokens.item()) != int(max_tokens):
@@ -1361,7 +1573,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             device_inputs_by_request = {}
             self._request_codec_device_inputs = device_inputs_by_request
         device_inputs = device_inputs_by_request.get(request_id)
-        request_state = getattr(self, "_request_audio_states", {}).get(request_id, {})
         if device_inputs is None:
             device_inputs = (
                 torch.tensor([min_tokens], dtype=torch.int32, device=hidden_state.device),
@@ -1380,6 +1591,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             min_tokens_tensor,
             penalty_tensor,
             eos_token_id=self._codec_eos_id,
+            min_tokens_stop_ids=_codec_stop_ids(request_state),
+            **_codec_filter_inputs(request_state, hidden_state.device),
+            frequency_penalty=_codec_float_param(request_state, "codec_frequency_penalty", 0.0),
+            presence_penalty=_codec_float_param(request_state, "codec_presence_penalty", 0.0),
+            ignore_eos=_codec_bool_param(request_state, "codec_ignore_eos", False),
             eos_window_masked=eos_window_masked,
         )
         device_states[request_id] = result.state
