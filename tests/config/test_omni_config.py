@@ -127,7 +127,7 @@ def test_mammothmoda2_diffusion_stage_projects_native_backend_config() -> None:
     assert stage.diffusion_config.model_class_name == "MammothModa2DiTPipeline"
     assert stage.diffusion_config.model == "/models/MammothModa2-Preview"
     assert stage.diffusion_config.step_execution is False
-    assert stage.scheduler_config.max_num_seqs == 1
+    assert stage.scheduler_config.max_num_seqs == 8
     assert stage.connector_config.omni_kv_config == {"need_recv_cache": False}
 
 

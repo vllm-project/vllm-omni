@@ -223,6 +223,51 @@ def _make_sched_output(*request_ids: str) -> DiffusionSchedulerOutput:
     )
 
 
+class TestStepModeTimeout:
+    def test_missing_reply_closes_executor_and_prevents_dispatch(self, monkeypatch):
+        from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+        executor, req_q, res_q = _make_executor(num_gpus=2)
+
+        def dequeue(timeout=None):
+            try:
+                return res_q.get(timeout=timeout)
+            except queue.Empty as exc:
+                # Match MessageQueue's timeout contract in step mode.
+                raise TimeoutError from exc
+
+        executor._result_mq = SimpleNamespace(dequeue=dequeue)
+        executor._shutdown_cleaner = None
+        executor._finalizer = weakref.finalize(executor, lambda: None)
+        executor._pump_stop = threading.Event()
+        executor._futures_lock = threading.RLock()
+        executor._rpc_futures = {}
+        executor._output_futures = {}
+        executor._batch_split_map = {}
+        failure_callback = Mock()
+        executor.register_failure_callback(failure_callback)
+        monkeypatch.setattr(executor_module, "_DLO_DP_WAVE_TIMEOUT_S", 0.05)
+
+        # No worker replies: exercise the real RPC deadline and shutdown path.
+        with pytest.raises(TimeoutError, match="timed out"):
+            executor.execute_step(_make_sched_output("A"))
+
+        assert req_q.get_nowait()["method"] == "execute_stepwise"
+        assert executor._is_failed
+        assert executor._closed
+        assert executor._pump_stop.is_set()
+        assert executor._broadcast_mq is None
+        assert executor._result_mq is None
+        failure_callback.assert_called_once_with()
+        with pytest.raises(EngineDeadError):
+            executor.check_health()
+
+        for dispatch in (executor.execute_step, executor.execute_request, executor.execute_batch):
+            with pytest.raises(RuntimeError, match="DiffusionExecutor is closed"):
+                dispatch(_make_sched_output("B", "C"))
+        assert req_q.empty()
+
+
 class TestRequestModeDispatch:
     """Request-batch-capable dispatch uses ``execute_batch`` for request-mode cycles."""
 
@@ -570,6 +615,61 @@ class TestRequestModeDispatch:
         result = executor.execute_request(_make_sched_output("A"))
 
         assert result.runner_outputs[0].result.error == "timed out"
+        assert executor.collective_rpc.call_args.kwargs["timeout"] == executor_module._DLO_DP_WAVE_TIMEOUT_S
+        executor._fail_closed_on_dp_wave_timeout.assert_called_once()
+
+    def test_single_rank_local_request_times_out_and_fails_closed(self):
+        """A no-AllGather wave must be bounded too (#6964).
+
+        Without a timeout the dequeue deadline is ``None``, so a rank that
+        never replies leaves ``collective_rpc()`` retrying forever.
+        """
+        from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+            diffusion_offload_config={
+                "mode": "layer",
+                "components": ["dit"],
+                "layer_options": {"dit": {"weight_transfer": "rank-local"}},
+            },
+        )
+        executor.collective_rpc = Mock(side_effect=TimeoutError("timed out"))
+        executor._fail_closed_on_dp_wave_timeout = Mock()
+
+        result = executor.execute_request(_make_sched_output("A"))
+
+        assert result.runner_outputs[0].result.error == "timed out"
+        assert executor.collective_rpc.call_args.kwargs["timeout"] == executor_module._DLO_DP_WAVE_TIMEOUT_S
+        executor._fail_closed_on_dp_wave_timeout.assert_called_once()
+
+    def test_rank_local_batch_wave_times_out_and_fails_closed(self):
+        """Two concurrent requests take ``execute_model_batch`` (#6964).
+
+        That path had no timeout at all, which is why the report only
+        reproduced with concurrency.
+        """
+        from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+            diffusion_offload_config={
+                "mode": "layer",
+                "components": ["dit"],
+                "layer_options": {"dit": {"weight_transfer": "rank-local"}},
+            },
+        )
+        executor.collective_rpc = Mock(side_effect=TimeoutError("timed out"))
+        executor._fail_closed_on_dp_wave_timeout = Mock()
+
+        with pytest.raises(TimeoutError):
+            executor.execute_batch(_make_sched_output("A", "B"))
+
+        assert executor.collective_rpc.call_args.args[0] == "execute_model_batch"
         assert executor.collective_rpc.call_args.kwargs["timeout"] == executor_module._DLO_DP_WAVE_TIMEOUT_S
         executor._fail_closed_on_dp_wave_timeout.assert_called_once()
 

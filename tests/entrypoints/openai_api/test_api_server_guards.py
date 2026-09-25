@@ -821,6 +821,46 @@ def test_speech_without_handler_preserves_not_found_http_error() -> None:
     assert exc_info.value.detail == "The model does not support Speech API"
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "detail"),
+    [
+        ("modalities", [123], "modalities must be a list of strings"),
+        ("logprobs", "yes", "logprobs must be a boolean"),
+    ],
+)
+def test_chat_completion_raw_body_guards_reject_lax_types(field, value, detail) -> None:
+    """The HTTP boundary rejects values that upstream Pydantic would coerce."""
+    app = FastAPI()
+    app.state.openai_serving_chat = None
+    app.state.serving_tokenization = None
+    app.add_api_route("/v1/chat/completions", api_server.create_chat_completion, methods=["POST"])
+    client = TestClient(app)
+
+    payload = {
+        "model": "demo-model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": False,
+        field: value,
+    }
+    response = client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 400
+    assert detail in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "raw_body",
+    [
+        {"modalities": None},
+        {"logprobs": None},
+        {"modalities": None, "logprobs": None},
+    ],
+)
+def test_chat_completion_raw_body_guards_allow_null_defaults(raw_body) -> None:
+    """Explicit JSON null keeps the upstream request model's default behavior."""
+    api_server._validate_chat_completion_raw_body(raw_body)
+
+
 @pytest.mark.asyncio
 async def test_multi_api_rejects_runtime_voice_upload() -> None:
     app = FastAPI()
