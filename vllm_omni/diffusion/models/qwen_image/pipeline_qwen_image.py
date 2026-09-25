@@ -25,6 +25,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.layers.cfg_l2 import try_fused_cfg_l2
 from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
@@ -278,6 +279,29 @@ class QwenImagePipeline(
 
     supports_step_execution: ClassVar[bool] = True
 
+    def combine_cfg_noise(
+        self,
+        positive_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
+        negative_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
+        true_cfg_scale: float,
+        cfg_normalize: bool = False,
+        kwargs: dict[str, Any] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        if self._use_fused_cfg_l2 and cfg_normalize:
+            # predict_noise_maybe_with_cfg wraps even a single output in a
+            # one-element tuple. Multi-output tuples keep the inherited path.
+            p = positive_noise_pred
+            n = negative_noise_pred
+            if isinstance(p, tuple) and isinstance(n, tuple) and len(p) == len(n) == 1:
+                p, n = p[0], n[0]
+            if isinstance(p, torch.Tensor) and isinstance(n, torch.Tensor):
+                fused = try_fused_cfg_l2(p, n, true_cfg_scale)
+                if fused is not None:
+                    return fused
+        return super().combine_cfg_noise(
+            positive_noise_pred, negative_noise_pred, true_cfg_scale, cfg_normalize, kwargs
+        )
+
     def __init__(
         self,
         *,
@@ -285,6 +309,9 @@ class QwenImagePipeline(
         prefix: str = "",
     ):
         super().__init__()
+        # Qualify the ordinary T2I consumer only. Subclasses keep their own CFG
+        # hooks and behavior, including custom normalization implementations.
+        self._use_fused_cfg_l2 = type(self) is QwenImagePipeline
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
         self.weights_sources = [
