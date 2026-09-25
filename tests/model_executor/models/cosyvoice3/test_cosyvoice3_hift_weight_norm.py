@@ -119,7 +119,7 @@ def test_hift_fold_preserves_audio_and_leaves_f0_unchanged(weight_norm_api, caus
     assert torch.isfinite(before).all()
     torch.testing.assert_close(after, before, rtol=0, atol=0)
     for name, module in normalized.items():
-        # F0 is a separate RFC workstream; do not silently fold it here.
+        # The generator entry point must leave F0 to its separate fold call.
         assert _has_weight_norm(module) == name.startswith("f0_predictor.")
     for name, value in hift.f0_predictor.state_dict().items():
         torch.testing.assert_close(value, f0_state[name], rtol=0, atol=0)
@@ -171,7 +171,7 @@ def test_load_weights_folds_loaded_not_initial_weights(tmp_path, weight_norm_api
     assert not any(
         _has_weight_norm(module) for name, module in model.hift.named_modules() if not name.startswith("f0_predictor.")
     )
-    assert _has_weight_norm(model.hift.f0_predictor.condnet[0])
+    assert not any(_has_weight_norm(module) for module in model.hift.f0_predictor.modules())
     assert not model.hift.training
     assert not model.flow_model.training
     for name, value in model.flow_model.state_dict().items():
@@ -234,12 +234,13 @@ def test_fold_preserves_multichunk_audio_and_finalize(weight_norm_api, sampling_
     torch.testing.assert_close(after, before, rtol=0, atol=0)
 
 
-def test_shipped_config_generator_folds_exactly_77_layers():
-    """Pin the RFC #6870 C4 count against the shipped config, so silent
-    config drift (or a fold that quietly stops covering layers) shows up
-    here: conv_pre 1 + ups 3 + 9 resblocks x 6 + 3 source resblocks x 6
-    + conv_post 1 = 77. Construction only (no forward), so the full
-    512-channel model stays cheap on CPU."""
+def test_shipped_config_folds_77_generator_and_five_f0_layers(weight_norm_api):
+    """Pin separate C4/C5 counts for both APIs on the shipped configuration.
+
+    Generator: conv_pre 1 + ups 3 + 9 resblocks x 6 + 3 source resblocks x 6
+    + conv_post 1 = 77. F0 adds five condnet convolutions. Construction only
+    (no forward), so the full 512-channel model stays cheap on CPU.
+    """
     from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
     hift_cfg = dict(CosyVoice3Config().hift)
@@ -251,8 +252,13 @@ def test_shipped_config_generator_folds_exactly_77_layers():
     )
     generator = hifigan.CausalHiFTGenerator(f0_predictor=f0, **hift_cfg)
 
+    assert sum(_has_weight_norm(module) for module in generator.modules()) == 82
     assert generator.remove_weight_norm() == 77
     assert generator.remove_weight_norm() == 0
     remaining = [name for name, m in generator.named_modules() if _has_weight_norm(m)]
     assert len(remaining) == 5
     assert all(name.startswith("f0_predictor.") for name in remaining)
+    assert f0.remove_weight_norm() == 5
+    assert f0.remove_weight_norm() == 0
+    assert generator.remove_weight_norm() == 0
+    assert not any(_has_weight_norm(module) for module in generator.modules())

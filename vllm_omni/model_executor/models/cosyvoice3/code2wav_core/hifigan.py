@@ -1118,6 +1118,14 @@ class CausalConvRNNF0Predictor(nn.Module):
             if isinstance(layer, CausalConv1d) and layer.causal_type == "left"
         )
 
+    def remove_weight_norm(self) -> int:
+        """Fold the five F0 convolutions after loading on the execution device.
+
+        Repeated calls are no-ops. Load original checkpoints into a fresh
+        predictor, before folding changes the state-dict keys.
+        """
+        return sum(_fold_weight_norm(layer) for layer in self.condnet)
+
     def forward(self, x: torch.Tensor, finalize: bool = True) -> torch.Tensor:
         if finalize is True:
             x = self.condnet[0](x)
