@@ -1232,7 +1232,13 @@ class Cosmos3VFMTransformer(nn.Module):
 
     _sp_plan = {
         "gen_sp_prepare": {
-            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            0: SequenceParallelInput(
+                split_dim=1,
+                expected_dims=3,
+                split_output=True,
+                auto_pad=True,
+                clone_shard=True,
+            ),
             1: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True, auto_pad=True),
             2: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True, auto_pad=True),
         },
