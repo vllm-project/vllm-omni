@@ -311,16 +311,40 @@ def _engine_core_outputs(tag: str, timestamp: float) -> SimpleNamespace:
     return SimpleNamespace(outputs=[tag], timestamp=timestamp, scheduler_stats=None, finished_requests=None)
 
 
-def _terminal_engine_core_outputs(request_id: str, timestamp: float = 1.0) -> EngineCoreOutputs:
+def _terminal_engine_core_outputs(
+    request_id: str,
+    timestamp: float = 1.0,
+    *,
+    finish_reason: FinishReason = FinishReason.STOP,
+) -> EngineCoreOutputs:
     return EngineCoreOutputs(
         outputs=[
             EngineCoreOutput(
                 request_id=request_id,
                 new_token_ids=[],
-                finish_reason=FinishReason.STOP,
+                finish_reason=finish_reason,
             )
         ],
         timestamp=timestamp,
+        finished_requests={request_id},
+    )
+
+
+def _error_engine_core_outputs(
+    request_id: str,
+    reason: str,
+) -> EngineCoreOutputs:
+    """Terminal ERROR output as emitted by the oversized-chunk rejection."""
+    return EngineCoreOutputs(
+        outputs=[
+            EngineCoreOutput(
+                request_id=request_id,
+                new_token_ids=[],
+                finish_reason=FinishReason.ERROR,
+                stop_reason=reason,
+            )
+        ],
+        timestamp=1.0,
         finished_requests={request_id},
     )
 
@@ -494,6 +518,21 @@ async def _get_output_message(orchestrator_fixture: OrchestratorFixture, *, time
             continue
         if isinstance(msg, OutputMessage):
             return msg
+
+
+async def _get_error_message(orchestrator_fixture: OrchestratorFixture, *, timeout: float = 2.0) -> ErrorMessage:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            msg = orchestrator_fixture.output_sync_q.get_nowait()
+        except queue.Empty:
+            await asyncio.sleep(0.01)
+            continue
+        if isinstance(msg, ErrorMessage):
+            return msg
+        if isinstance(msg, OutputMessage):
+            raise AssertionError("Received OutputMessage instead of ErrorMessage")
+    raise AssertionError("Timed out waiting for orchestrator error")
 
 
 async def _get_rpc_message(
@@ -940,6 +979,200 @@ async def test_async_chunk_processed_terminal_and_raw_terminal_finishes_once(orc
         assert terminal_msg.engine_outputs is processed_terminal
         assert terminal_msg.finished is True
         await _wait_for(lambda: request_id not in orchestrator_fixture.orchestrator.request_states)
+        await asyncio.sleep(0.05)
+        with pytest.raises(queue.Empty):
+            orchestrator_fixture.output_sync_q.get_nowait()
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_raw_terminal_error_preserved_and_finishes_once(orchestrator_factory) -> None:
+    """An oversized-chunk ERROR terminal reaches the client as an error.
+
+    Regression for the raw-terminal fallback that used to replace
+    ``FinishReason.ERROR`` and its ``stop_reason`` with an empty successful
+    STOP output.
+    """
+    request_id = "req-stream-error-terminal"
+    reason = "async chunk requires 65552 tokens, but max_num_scheduled_tokens is 65536"
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        async_chunk=True,
+    )
+    request = FakePromptRequest(
+        request_id=request_id,
+        prompt_token_ids=[1, 2, 3, 4],
+    )
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id=request_id,
+            prompt=request,
+            original_prompt={"prompt": "stream audio"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+        stage1.push_engine_core_outputs(_error_engine_core_outputs(request_id, reason))
+
+        error_msg = await _get_error_message(orchestrator_fixture)
+
+        assert isinstance(error_msg, ErrorMessage)
+        assert (error_msg.request_id, error_msg.stage_id, error_msg.error) == (request_id, 1, reason)
+        assert error_msg.fatal is False
+        await _wait_for(lambda: request_id not in orchestrator_fixture.orchestrator.request_states)
+        # abort=True cleanup reached every stage holding the request.
+        assert stage0.abort_calls == [[request_id]]
+        assert stage1.abort_calls == [[request_id]]
+        await asyncio.sleep(0.05)
+        with pytest.raises(queue.Empty):
+            orchestrator_fixture.output_sync_q.get_nowait()
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_raw_terminal_error_multi_final_stage_fails_fast(orchestrator_factory) -> None:
+    """A final-stage ERROR fails fast instead of waiting for the other final stage."""
+    request_id = "req-stream-error-multi-final"
+    reason = "async chunk requires 65552 tokens, but max_num_scheduled_tokens is 65536"
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    stage2 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1, stage2],
+        output_processors=[
+            FakeOutputProcessor(),
+            FakeOutputProcessor(),
+            FakeOutputProcessor(),
+        ],
+        async_chunk=True,
+    )
+    request = FakePromptRequest(
+        request_id=request_id,
+        prompt_token_ids=[1, 2, 3, 4],
+    )
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id=request_id,
+            prompt=request,
+            original_prompt={"prompt": "stream audio"},
+            sampling_params_list=[_sampling_params(), _sampling_params(), _sampling_params()],
+            final_stage_id=2,
+            final_output_stage_ids=[1, 2],
+        )
+
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1 and len(stage2.add_request_calls) == 1)
+        # Only stage-1 terminates, with ERROR; stage-2 never finishes.
+        stage1.push_engine_core_outputs(_error_engine_core_outputs(request_id, reason))
+
+        # Without fail-fast the fallback would wait for stage-2 forever and
+        # this get would time out.
+        error_msg = await _get_error_message(orchestrator_fixture)
+
+        assert isinstance(error_msg, ErrorMessage)
+        assert (error_msg.request_id, error_msg.stage_id, error_msg.error) == (request_id, 1, reason)
+        assert error_msg.fatal is False
+        await _wait_for(lambda: request_id not in orchestrator_fixture.orchestrator.request_states)
+        # The still-running final stage was aborted with the request.
+        assert stage2.abort_calls == [[request_id]]
+        await asyncio.sleep(0.05)
+        with pytest.raises(queue.Empty):
+            orchestrator_fixture.output_sync_q.get_nowait()
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_raw_terminal_length_keeps_empty_fallback(orchestrator_factory) -> None:
+    """Non-ERROR raw terminals keep the existing empty-output fallback."""
+    request_id = "req-stream-length-terminal"
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        async_chunk=True,
+    )
+    request = FakePromptRequest(
+        request_id=request_id,
+        prompt_token_ids=[1, 2, 3, 4],
+    )
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id=request_id,
+            prompt=request,
+            original_prompt={"prompt": "stream audio"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+        stage1.push_engine_core_outputs(_terminal_engine_core_outputs(request_id, finish_reason=FinishReason.LENGTH))
+
+        terminal_msg = await _get_output_message(orchestrator_fixture)
+
+        assert terminal_msg.request_id == request_id
+        assert terminal_msg.stage_id == 1
+        assert terminal_msg.finished is True
+        engine_output = terminal_msg.engine_outputs
+        assert getattr(engine_output, "error", None) is None
+        assert engine_output.outputs[0].finish_reason == "stop"
+        assert engine_output.outputs[0].multimodal_output["audio"].numel() == 0
+        assert engine_output.finished is True
+        await _wait_for(lambda: request_id not in orchestrator_fixture.orchestrator.request_states)
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_non_final_stage_error_fails_request(orchestrator_factory) -> None:
+    """An ERROR terminal from a non-final stage fails the whole request."""
+    request_id = "req-stream-error-stage0"
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        async_chunk=True,
+    )
+    request = FakePromptRequest(
+        request_id=request_id,
+        prompt_token_ids=[1, 2, 3, 4],
+    )
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id=request_id,
+            prompt=request,
+            original_prompt={"prompt": "stream audio"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+        reason = "stage 0 blew up"
+        stage0.push_engine_core_outputs(_error_engine_core_outputs(request_id, reason))
+
+        error_msg = await _get_error_message(orchestrator_fixture)
+
+        assert isinstance(error_msg, ErrorMessage)
+        assert (error_msg.request_id, error_msg.stage_id, error_msg.error) == (request_id, 0, reason)
+        assert error_msg.fatal is False
+        await _wait_for(lambda: request_id not in orchestrator_fixture.orchestrator.request_states)
+        assert stage0.abort_calls == [[request_id]]
+        assert stage1.abort_calls == [[request_id]]
         await asyncio.sleep(0.05)
         with pytest.raises(queue.Empty):
             orchestrator_fixture.output_sync_q.get_nowait()
@@ -2028,16 +2261,16 @@ async def test_raw_stage_error_reaches_caller_before_normal_terminal_routing(moc
             )
         ]
     )
-    terminal_ids: set[str] = set()
+    terminal_outputs: dict[str, Any] = {}
 
-    await orchestrator._process_llm_stage_outputs(stage_id, 0, raw, terminal_ids)
+    await orchestrator._process_llm_stage_outputs(stage_id, 0, raw, terminal_outputs)
 
     error = output_queue.get_nowait()
     assert isinstance(error, ErrorMessage)
     assert (error.request_id, error.stage_id, error.error) == ("stuck", stage_id, reason)
     cleanup.assert_awaited_once_with(["stuck"], abort=True, release_owners=True)
     normal_terminal.assert_not_awaited()
-    assert not terminal_ids
+    assert not terminal_outputs
     assert output_queue.empty()
 
 

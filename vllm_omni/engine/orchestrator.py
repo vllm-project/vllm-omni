@@ -774,19 +774,20 @@ class OrchestratorBase:
         stage_id: int,
         replica_id: int,
         raw_outputs: Any,
-        raw_terminal_request_ids: set[str],
+        raw_terminal_outputs: dict[str, Any],
     ) -> list[Any]:
         """Process one raw LLM poll result; returns processed request outputs.
 
         Shared by the legacy poll loop and the event-driven dispatcher so both
         run the exact same per-output handling. Callers own the
         ``EngineDeadError`` catch, since eviction needs the replica id, and
-        supply ``raw_terminal_request_ids`` — the per-poll accumulator this
-        fills for the caller to drain through
-        ``_finish_raw_terminal_requests`` once routing is done.
+        supply ``raw_terminal_outputs`` — the per-poll accumulator this
+        fills (request id -> terminal ``EngineCoreOutput``) for the caller to
+        drain through ``_finish_raw_terminal_requests`` once routing is done.
         """
         pool = self.stage_pools[stage_id]
         await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
+
         for eco in raw_outputs.outputs:
             # Emit kv_wait_s before _handle_kv_ready_raw_outputs'
             # async_chunk early-return so it lands in all modes.
@@ -800,12 +801,18 @@ class OrchestratorBase:
                     kv_params.get("connector_type") or "unknown",
                     float(kv_wait_s),
                 )
+
             req_state = self.request_states.get(getattr(eco, "request_id", None))
             if req_state is None:
                 continue
+
+            segment_finished = bool(getattr(eco, "is_segment_finished", False))
+
+            # A non-session ERROR is fatal to the whole request. Handle it
+            # before normal terminal routing so it reaches the client once.
             if (
                 getattr(eco, "finish_reason", None) == FinishReason.ERROR
-                and not getattr(eco, "is_segment_finished", False)
+                and not segment_finished
                 and not req_state.session_owned
             ):
                 reason = getattr(eco, "stop_reason", None)
@@ -815,8 +822,9 @@ class OrchestratorBase:
                     error=reason if isinstance(reason, str) and reason else "Stage request failed",
                 )
                 continue
+
+            # Only streaming requests maintain the per-stage segment snapshot.
             if req_state.streaming.enabled:
-                segment_finished = bool(getattr(eco, "is_segment_finished", False))
                 raw_mm = self._completion_multimodal_output(eco, None)
                 req_state.streaming.segments[stage_id] = StreamingSegmentState(
                     finished=segment_finished,
@@ -828,26 +836,45 @@ class OrchestratorBase:
                     "new_prompt_len_snapshot",
                     None,
                 )
-            if await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state):
-                raw_terminal_request_ids.add(req_state.request_id)
-            await self._report_duplex_session_request_error(stage_id, replica_id, eco, req_state)
-        iteration_stats = IterationStats() if (self._stat_logger is not None and raw_outputs.outputs) else None
+
+            if await self._apply_raw_terminal_stage_finish(
+                stage_id,
+                eco,
+                req_state,
+            ):
+                raw_terminal_outputs[req_state.request_id] = eco
+
+            await self._report_duplex_session_request_error(
+                stage_id,
+                replica_id,
+                eco,
+                req_state,
+            )
+
+        iteration_stats = IterationStats() if self._stat_logger is not None and raw_outputs.outputs else None
         processed = await pool.process_llm_raw_outputs(
             replica_id,
             raw_outputs,
             iteration_stats=iteration_stats,
         )
+
         if self._stat_logger is not None and (raw_outputs.scheduler_stats is not None or iteration_stats is not None):
             key = (stage_id, replica_id)
             if key not in self._stage_replica_to_engine_idx:
                 engine_idx = len(self._stage_replica_to_engine_idx)
-                self._stat_logger.register_replica(engine_idx, str(stage_id), str(replica_id))
+                self._stat_logger.register_replica(
+                    engine_idx,
+                    str(stage_id),
+                    str(replica_id),
+                )
                 self._stage_replica_to_engine_idx[key] = engine_idx
+
             self._stat_logger.record(
                 raw_outputs.scheduler_stats,
                 iteration_stats,
                 engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
             )
+
         _sched_stats = raw_outputs.scheduler_stats
         if (
             self._prom_metrics is not None
@@ -859,6 +886,7 @@ class OrchestratorBase:
                 replica_id,
                 int(_sched_stats.num_waiting_reqs),
             )
+
         return processed
 
     def _absorb_diffusion_metrics(self, stage_id: int, replica_id: int, diffusion_output: Any) -> bool:
@@ -885,7 +913,7 @@ class OrchestratorBase:
                 for replica_id in pool.available_replica_ids():
                     if self._shutdown_event.is_set():
                         return
-                    raw_terminal_request_ids: set[str] = set()
+                    raw_terminal_outputs: dict[str, Any] = {}
 
                     # Shared catch so a dead replica on either poll path is
                     # evicted rather than tearing down every stage (#4285).
@@ -908,7 +936,7 @@ class OrchestratorBase:
                                 continue
 
                             processed = await self._process_llm_stage_outputs(
-                                stage_id, replica_id, raw_outputs, raw_terminal_request_ids
+                                stage_id, replica_id, raw_outputs, raw_terminal_outputs
                             )
                     except asyncio.CancelledError:
                         raise
@@ -926,7 +954,7 @@ class OrchestratorBase:
                         raise
 
                     await self._handle_processed_outputs(stage_id, replica_id, processed)
-                    await self._finish_raw_terminal_requests(stage_id, replica_id, raw_terminal_request_ids)
+                    await self._finish_raw_terminal_requests(stage_id, replica_id, raw_terminal_outputs)
                     idle = False
 
             self._orch_monitor.note_loop(idle=idle)
@@ -1141,7 +1169,7 @@ class OrchestratorBase:
                     )
                     raise payload
 
-                raw_terminal_request_ids: set[str] = set()
+                raw_terminal_outputs: dict[str, Any] = {}
                 try:
                     if kind == "diffusion":
                         pool = self.stage_pools[stage_id]
@@ -1153,7 +1181,7 @@ class OrchestratorBase:
                         processed = [payload]
                     else:
                         processed = await self._process_llm_stage_outputs(
-                            stage_id, replica_id, payload, raw_terminal_request_ids
+                            stage_id, replica_id, payload, raw_terminal_outputs
                         )
                 except asyncio.CancelledError:
                     raise
@@ -1173,7 +1201,7 @@ class OrchestratorBase:
                     raise
 
                 await self._handle_processed_outputs(stage_id, replica_id, processed)
-                await self._finish_raw_terminal_requests(stage_id, replica_id, raw_terminal_request_ids)
+                await self._finish_raw_terminal_requests(stage_id, replica_id, raw_terminal_outputs)
                 # Mirrors the legacy loop, which sets idle=False only after a
                 # poll produced outputs that were routed -- an evicted replica
                 # `continue`s above without marking the tick active.
@@ -1626,30 +1654,93 @@ class OrchestratorBase:
         self,
         stage_id: int,
         replica_id: int,
-        request_ids: set[str],
+        raw_terminal_outputs: dict[str, Any],
     ) -> None:
         """Finish requests whose raw terminal had no processed output."""
         pool = self.stage_pools[stage_id]
-        for request_id in request_ids:
+
+        for request_id, eco in raw_terminal_outputs.items():
             req_state = self.request_states.get(request_id)
             if req_state is None or req_state.session_owned:
                 continue
+
+            # A raw ERROR terminal (e.g. an oversized async chunk rejection)
+            # must reach the client as an error, not as the empty successful
+            # fallback below. Fail fast -- before the pending-output and
+            # all-stages rendezvous -- because raw_terminal_outputs only lives
+            # for this poll and the rejection reason cannot survive a later poll.
+            if getattr(eco, "finish_reason", None) == FinishReason.ERROR:
+                reason = getattr(eco, "stop_reason", None) or (
+                    f"Stage-{stage_id} terminated request {request_id} with an internal error"
+                )
+                logger.warning(
+                    "[Orchestrator] req=%s stage-%s raw terminal finished with error: %s",
+                    request_id,
+                    stage_id,
+                    reason,
+                )
+                error_output = OmniRequestOutput.from_error(
+                    request_id,
+                    str(reason),
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                    error_type="server_error",
+                )
+                await self.output_async_queue.put(
+                    OutputMessage(
+                        request_id=request_id,
+                        stage_id=stage_id,
+                        replica_id=replica_id,
+                        engine_outputs=error_output,
+                        metrics=None,
+                        finished=True,
+                        stage_submit_ts=req_state.stage_submit_ts.get(stage_id),
+                    )
+                )
+                await self._cleanup_request_ids(
+                    [
+                        request_id,
+                        *self._cfg_tracker.cleanup_parent(request_id),
+                    ],
+                    abort=True,
+                )
+                continue
+
+            # A processed terminal output may have arrived before every submitted
+            # stage reported completion. Keep that real output instead of replacing
+            # it with the empty raw-terminal fallback below.
             pending = req_state.pending_final_output
             if pending is not None:
-                if set(req_state.stage_submit_ts).issubset(req_state.finished_stage_ids):
+                submitted_stage_ids = set(req_state.stage_submit_ts)
+                if submitted_stage_ids.issubset(req_state.finished_stage_ids):
                     req_state.pending_final_output = None
                     await self.output_async_queue.put(pending)
-                    await self._cleanup_request_ids([request_id, *self._cfg_tracker.cleanup_parent(request_id)])
+                    await self._cleanup_request_ids(
+                        [
+                            request_id,
+                            *self._cfg_tracker.cleanup_parent(request_id),
+                        ]
+                    )
+
                 # A real terminal output is pending; do not replace it with
                 # the swallowed-output fallback before upstream completion.
                 continue
+
+            # Ordinary raw terminals are client completions only when they
+            # come from a configured final-output stage. ERROR terminals are
+            # handled above for every stage because they terminate the whole
+            # request rather than advance the pipeline.
             if not pool.final_output:
                 continue
+
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
             if not final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids):
                 continue
 
-            final_output_type = getattr(pool.stage_client, "final_output_type", None)
+            final_output_type = getattr(
+                pool.stage_client,
+                "final_output_type",
+                None,
+            )
             logger.info(
                 "[Orchestrator] req=%s stage-%s raw terminal produced no processed terminal; returning empty %s output",
                 request_id,
@@ -1672,7 +1763,12 @@ class OrchestratorBase:
                     stage_submit_ts=req_state.stage_submit_ts.get(stage_id),
                 )
             )
-            await self._cleanup_request_ids([request_id, *self._cfg_tracker.cleanup_parent(request_id)])
+            await self._cleanup_request_ids(
+                [
+                    request_id,
+                    *self._cfg_tracker.cleanup_parent(request_id),
+                ]
+            )
 
     def _maybe_clone_diffusion_params_for_cfg(self, request_id: str, params: Any) -> Any:
         """Attach CFG companion ids to diffusion sampling params when needed."""
