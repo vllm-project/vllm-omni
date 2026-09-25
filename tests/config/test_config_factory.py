@@ -2857,6 +2857,28 @@ class TestPlatformOverrides:
             config = deploy.stages[0].compilation_config or {}
             assert "+rotary_embedding" not in config.get("custom_ops", [])
 
+    def test_qwen3_omni_talker_sampling_is_seeded(self):
+        """The only stochastic Qwen3-Omni stage must stay reproducible.
+
+        Dropping this seed (as #4986 did) leaves the talker sampling codec
+        tokens unseeded at temperature 0.9, which reopened the audio-vs-text
+        nightly failures in #6090. Pin it so a cleanup cannot remove it again
+        without failing here.
+        """
+        deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
+        pipeline = resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(pipeline, PipelineConfig)
+
+        for platform in ("cpu", "cuda", "musa", "npu", "rocm", "xpu"):
+            deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform)
+            stages = merge_pipeline_deploy(pipeline, deploy)
+            talker_sampling = stages[1].yaml_extras["default_sampling_params"]
+            assert talker_sampling["temperature"] > 0.0, "talker is expected to sample, not decode greedily"
+            assert talker_sampling.get("seed") == 42, f"talker sampling lost its seed on {platform}"
+
     def test_minicpmo_4_5_cuda_caps_talker_kv_cache(self):
         pipeline = resolve_pipeline_config("minicpmo_4_5")
         assert isinstance(pipeline, PipelineConfig)

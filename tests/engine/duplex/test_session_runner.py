@@ -73,6 +73,9 @@ class RecordingStagePort(DuplexStagePort):
         self.cleanups: list[tuple[list[str], bool]] = []
         self.aborts: list[list[str]] = []
         self.fail_submit: Exception | None = None
+        #: When set, ``submit`` parks on it after signalling ``submit_started``.
+        self.submit_gate: asyncio.Event | None = None
+        self.submit_started = asyncio.Event()
 
     @property
     def stage_count(self) -> int:
@@ -87,6 +90,9 @@ class RecordingStagePort(DuplexStagePort):
     async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
         if self.fail_submit is not None:
             raise self.fail_submit
+        if self.submit_gate is not None:
+            self.submit_started.set()
+            await self.submit_gate.wait()
         self.submissions.append(submission)
         return DuplexStageSubmissionResult(
             request_id=submission.context.request_id,
@@ -163,7 +169,7 @@ class Harness:
 
     def deliver(
         self,
-        output: object,
+        output: SimpleNamespace,
         *,
         stage_id: int = 1,
         segment_finished: bool = False,
@@ -186,7 +192,7 @@ class Harness:
             raise AssertionError("stage output is missing request_id")
         return self.runner.on_stage_output(stage_id, output, metrics, request_id=request_id, context=context)
 
-    async def deliver_and_settle(self, output: object, **kwargs: Any) -> list[DuplexEvent]:
+    async def deliver_and_settle(self, output: SimpleNamespace, **kwargs: Any) -> list[DuplexEvent]:
         self.deliver(output, **kwargs)
         return await self.settle()
 
@@ -1622,5 +1628,135 @@ async def test_server_vad_speech_stopped_still_commits_a_turn_mode_session() -> 
         assert "input_audio_buffer.speech_stopped" in types(events)
         assert "input_audio_buffer.committed" in types(events)
         assert len(_final_submissions(h)) == 1, "the detector's stop commits the turn and starts the response"
+    finally:
+        await close_harness(h)
+
+
+# --------------------------------------------------------------------------- #
+# Cancelled append and its precreated response (#7636 Issue 2)                #
+# --------------------------------------------------------------------------- #
+
+
+async def _commit_with_pending_response(h: Harness) -> str:
+    """Commit a turn whose final append parks in the stage port; return the precreated response id."""
+    await h.run(append_audio())
+    h.port.submit_gate = asyncio.Event()
+    h.submit(commands.Commit(create_response=True))
+    await asyncio.wait_for(h.port.submit_started.wait(), timeout=2.0)
+    # The parked append keeps the runner "busy": settle only until the mailbox is quiet.
+    events = await h.settle(timeout_s=0.3)
+    assert "response.created" in types(events)
+    response_id = h.session.active_response_id
+    assert response_id is not None
+    assert h.runner.tasks.append_tail is not None and not h.runner.tasks.append_tail.done()
+    return response_id
+
+
+@pytest.mark.asyncio
+async def test_an_append_cancelled_from_outside_fails_the_response_it_precreated() -> None:
+    """A cancelled append gives back the response it precreated, as its docstring promises.
+
+    The ``CancelledError`` branch used to roll back only the PCM reservation,
+    so ``active_response_id`` stayed pinned to a response nobody would ever
+    finish: the client had seen ``response.created`` and waited forever.
+    """
+    h = await open_harness(auto_response=False)
+    try:
+        response_id = await _commit_with_pending_response(h)
+
+        pending = h.runner.tasks.append_tail
+        assert pending is not None
+        pending.cancel()
+        events = await h.settle()
+
+        done = find(events, "response.done")
+        assert done.response_id == response_id
+        assert done.status == "failed"
+        assert done.response["status_details"]["reason"] == "append_cancelled"
+        assert h.session.active_response_id is None
+        assert h.session.state == DuplexSessionState.OPEN
+
+        # The cancelled append counts as a failed one: the chain behind it is
+        # refused with the documented error, not left hanging.
+        h.port.submit_gate = None
+        await h.run(append_audio())
+        events = await h.run(commands.Commit(create_response=True))
+        assert "response.created" not in types(events)
+        assert find(events, "error").code == "commit_aborted"
+        assert h.session.active_response_id is None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_response_cancel_of_a_pending_append_ends_the_response_once_as_cancelled() -> None:
+    """When the runner cancels the append itself, it owns the response: one terminal, status cancelled.
+
+    The append must not also fail the response on its way out, or the client
+    would get a failed ``response.done`` for a response it cancelled.
+    """
+    h = await open_harness(auto_response=False)
+    try:
+        response_id = await _commit_with_pending_response(h)
+
+        events = await h.run(commands.CancelResponse())
+
+        terminals = [event for event in events if event.type == "response.done"]
+        assert [event.response_id for event in terminals] == [response_id]
+        assert terminals[0].status == "cancelled"
+        assert h.session.active_response_id is None
+        assert h.session.state == DuplexSessionState.OPEN
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_closing_the_session_with_a_pending_append_emits_no_failed_response() -> None:
+    """A close ends the active response itself; the append it cancels stays quiet."""
+    h = await open_harness(auto_response=False)
+    try:
+        await _commit_with_pending_response(h)
+
+        events = await h.run(commands.CloseSession(reason="client_close"))
+        events += await h.settle()
+
+        assert [event.type for event in events if event.type == "response.done"] == []
+        assert "session.closed" in types(events)
+        assert h.session.active_response_id is None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_input_clear_racing_a_queued_append_drops_it_as_the_clients_doing() -> None:
+    """An ``input_audio_buffer.clear`` that lands while an append waits its turn is not a runtime failure.
+
+    The clear deactivates the queued append's reservation; when its turn
+    comes it gives everything back and stops, without an error and without
+    failing the session, and its reason is the client's clear rather than
+    ``runtime_append_failed``.
+    """
+    h = await open_harness()
+    try:
+        h.port.submit_gate = asyncio.Event()
+        h.submit(append_audio())
+        await asyncio.wait_for(h.port.submit_started.wait(), timeout=2.0)
+        h.submit(append_audio())
+        await h.settle(timeout_s=0.3)
+        assert len(h.runner.tasks.append_tasks) == 2, "the second append is queued behind the parked one"
+        queued = h.runner.tasks.append_tail
+        assert queued is not None and not queued.done()
+
+        h.submit(commands.ClearInput())
+        events = await h.settle(timeout_s=0.3)
+        assert types(events) == ["input_audio_buffer.cleared"]
+
+        h.port.submit_gate.set()
+        events = await h.settle()
+        assert queued.done() and queued.result() is False, "the cleared append never ran"
+        assert len(h.port.submissions) == 1, "only the append that was already in flight reached the stage"
+        assert [event.type for event in events if event.type in {"error", "response.done", "session.closed"}] == []
+        assert h.session.pending_input_bytes == 0
+        assert h.session.state == DuplexSessionState.OPEN
     finally:
         await close_harness(h)

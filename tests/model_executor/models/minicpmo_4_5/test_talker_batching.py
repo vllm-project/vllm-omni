@@ -4,12 +4,14 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
 import pytest
 import torch
 import torch.nn as nn
+from torch.overrides import TorchFunctionMode
 
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
     MiniCPMO45OmniForConditionalGeneration,
@@ -684,7 +686,8 @@ def test_make_omni_output_packs_the_previous_codec_id() -> None:
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_make_omni_output_reads_history_from_runner_cpu_buffer(monkeypatch, device) -> None:
+@pytest.mark.parametrize("default_device", [None, "cpu"])
+def test_make_omni_output_reads_history_from_runner_cpu_buffer(device, default_device) -> None:
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA codec output")
     from types import SimpleNamespace
@@ -719,16 +722,20 @@ def test_make_omni_output_reads_history_from_runner_cpu_buffer(monkeypatch, devi
     assert source.device.type == "cpu"
     torch.testing.assert_close(source, torch.tensor([[3]], dtype=torch.long))
 
-    original_tolist = torch.Tensor.tolist
     readback_devices = []
 
-    def cpu_only_tolist(tensor):
-        readback_devices.append(tensor.device.type)
-        assert tensor.device.type == "cpu", "codec history must use the CPU transport delta"
-        return original_tolist(tensor)
+    class CpuOnlyToList(TorchFunctionMode):
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            if func is torch.Tensor.tolist:
+                tensor = args[0]
+                readback_devices.append(tensor.device.type)
+                assert tensor.device.type == "cpu", "codec history must use the CPU transport delta"
+            return func(*args, **(kwargs or {}))
 
-    with monkeypatch.context() as patch:
-        patch.setattr(torch.Tensor, "tolist", cpu_only_tolist)
+    # A Tensor.tolist monkeypatch is re-entered by default-device dispatch.
+    # Observe dispatch directly so each CPU readback is counted once.
+    device_context = torch.device(default_device) if default_device is not None else nullcontext()
+    with device_context, CpuOnlyToList():
         output = model.make_omni_output(
             torch.ones(1, 2, device=device),
             model_intermediate_buffer=infos,

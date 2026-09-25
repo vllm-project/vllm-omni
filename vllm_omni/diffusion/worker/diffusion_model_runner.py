@@ -31,8 +31,9 @@ from vllm_omni.diffusion.cache.prompt_embed_cache import (
     resolve_prompt_embed_cache_config,
 )
 from vllm_omni.diffusion.cache.selector import get_cache_backend
+from vllm_omni.diffusion.cancellation import check_request_cancellation, request_cancellation_scope
 from vllm_omni.diffusion.compile import regionally_compile
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedError, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
@@ -853,15 +854,29 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
                 ),
                 paged_kv_context,
+                request_cancellation_scope(
+                    [getattr(req, "cancellation_signal", None) for req in reqs],
+                    enabled=getattr(self.pipeline, "supports_request_cancellation", False) is True,
+                ),
             ):
                 with record_function(record_name):
-                    raw_outputs = self.pipeline.forward(batch)
-                    outputs = _normalize_pipeline_outputs(
-                        raw_outputs,
-                        expected_count=len(reqs),
-                        allow_single_output=allow_single_output,
-                        pipeline_name=type(self.pipeline).__name__,
-                    )
+                    try:
+                        check_request_cancellation()
+                        raw_outputs = self.pipeline.forward(batch)
+                        outputs = _normalize_pipeline_outputs(
+                            raw_outputs,
+                            expected_count=len(reqs),
+                            allow_single_output=allow_single_output,
+                            pipeline_name=type(self.pipeline).__name__,
+                        )
+                    except DiffusionRequestAbortedError as exc:
+                        # The checkpoint aborts only a fully cancelled wave;
+                        # a mixed batch must keep running for its live peers.
+                        logger.info(
+                            "Stopped cancelled diffusion request(s) %s at a model execution boundary",
+                            [req.request_id for req in reqs],
+                        )
+                        outputs = [DiffusionOutput(aborted=True, abort_message=str(exc)) for _ in reqs]
                 with record_function("prepare_output_for_transport"):
                     outputs = [
                         self._prepare_output_for_transport(output, req.sampling_params)

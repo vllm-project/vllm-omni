@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
 import queue
@@ -432,3 +432,68 @@ def test_finalize_aborted_request_without_async_output_skips_drop() -> None:
 
     assert output.aborted is True
     engine.executor.drop_output.assert_not_called()
+
+
+@pytest.mark.parametrize("scheduler_fails", [False, True])
+def test_fail_engine_releases_cancellation_signals_after_workers_stop(scheduler_fails):
+    from multiprocessing.shared_memory import SharedMemory
+
+    from vllm_omni.diffusion.cancellation import RequestCancellationRegistry
+
+    engine = _make_engine()
+    engine._fail_pending_rpcs = Mock()
+    registry = RequestCancellationRegistry()
+    engine._request_cancellations = registry
+    name = registry.create("running")
+
+    def shutdown():
+        # Cancellation is visible before shutdown, and late readers can attach.
+        reader = SharedMemory(name=name)
+        try:
+            assert reader.buf[0] == 1
+        finally:
+            reader.close()
+
+    engine.executor.shutdown.side_effect = shutdown
+    engine.scheduler.close = Mock(side_effect=RuntimeError("scheduler cleanup failed") if scheduler_fails else None)
+    try:
+        if scheduler_fails:
+            with pytest.raises(RuntimeError, match="scheduler cleanup failed"):
+                engine._fail_engine(RuntimeError("engine failed"))
+        else:
+            engine._fail_engine(RuntimeError("engine failed"))
+            engine.close()
+            engine.executor.shutdown.assert_called_once_with()
+        with pytest.raises(FileNotFoundError):
+            SharedMemory(name=name)
+        assert not registry._signals
+    finally:
+        registry.close()
+
+
+def test_close_retains_cancellation_signal_until_stuck_worker_stops():
+    from multiprocessing.shared_memory import SharedMemory
+
+    from vllm_omni.diffusion.cancellation import RequestCancellationRegistry
+
+    engine = _make_engine()
+    registry = RequestCancellationRegistry()
+    engine._request_cancellations = registry
+    name = registry.create("running")
+    engine.worker_thread = Mock()
+    engine.worker_thread.is_alive.side_effect = [True, True, False, False]
+    try:
+        engine.close()
+        engine.executor.shutdown.assert_not_called()
+        reader = SharedMemory(name=name)
+        try:
+            assert reader.buf[0] == 1
+        finally:
+            reader.close()
+        engine.close()
+        engine.executor.shutdown.assert_called_once_with()
+        with pytest.raises(FileNotFoundError):
+            SharedMemory(name=name)
+        assert not registry._signals
+    finally:
+        registry.close()

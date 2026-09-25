@@ -56,7 +56,6 @@ EXCLUDED_MODELS = [
     "MingImageDiffusionPipeline",
     "MingImageLayeredDiffusionPipeline",
     "InternVLAA1Pipeline",
-    "StableDiffusion3Pipeline",
     "HunyuanImage3ForCausalMM",
     "ErnieImagePipeline",
     "NextStep11Pipeline",
