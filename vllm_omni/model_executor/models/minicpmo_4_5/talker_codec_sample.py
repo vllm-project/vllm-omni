@@ -118,68 +118,26 @@ def _censor_stop_logits(
     return logits.index_copy(-1, stop_index, censored)
 
 
-def _censor_disallowed_logits(
-    logits: torch.Tensor,
-    allowed_token_ids_mask: torch.Tensor | None,
-) -> torch.Tensor:
-    """Blank every id the request's whitelist excludes.
-
-    The engine precomputes a boolean mask whose True entries are the ids to
-    censor (``v1/worker/gpu_input_batch.py:463-466``) and applies it as
-    ``logits.masked_fill_(mask, -inf)`` (``sampler.py:393-394``). ``None`` means
-    the request set no whitelist, which is the existing behaviour.
-    """
-    if allowed_token_ids_mask is None:
-        return logits
-    return logits.masked_fill(allowed_token_ids_mask, float("-inf"))
-
-
-def _apply_logit_bias(
-    logits: torch.Tensor,
-    logit_bias_ids: tuple[int, ...],
-    logit_bias_values: tuple[float, ...],
-) -> torch.Tensor:
-    """Add the request's per-id biases.
-
-    Mirrors ``LogitBiasLogitsProcessor.apply`` (``builtin.py:161-164``), which
-    the engine runs after the censoring masks and before the penalties, so a
-    censored id stays censored. Empty ids means the request set no bias.
-    """
-    if not logit_bias_ids:
-        return logits
-    bias_index = torch.tensor(logit_bias_ids, dtype=torch.long, device=logits.device)
-    bias_values = torch.tensor(logit_bias_values, dtype=logits.dtype, device=logits.device)
-    current = logits.index_select(-1, bias_index)
-    return logits.index_copy(-1, bias_index, current + bias_values)
-
-
 def _filter_codec_logits(
     logits: torch.Tensor,
     state: TalkerCodecDeviceState,
     min_tokens: torch.Tensor,
     *,
     stop_ids: tuple[int, ...],
-    allowed_token_ids_mask: torch.Tensor | None,
-    logit_bias_ids: tuple[int, ...],
-    logit_bias_values: tuple[float, ...],
     eos_window_masked: bool,
 ) -> torch.Tensor:
-    """The masks both sampling paths share, in the engine's order.
+    """The stop censoring both sampling paths share.
 
-    ``allowed ids -> stop censoring -> logit bias`` are all applied by the engine
-    before its penalties (``sampler.py:393-405``); the bias is last because it is
-    additive while the other two write ``-inf``, so a censored id must not be
-    revived by a bias.
+    The engine blanks every ``all_stop_token_ids`` entry before its penalties
+    (``sampler.py:393-405``), so the K-step path does the same here.
     """
-    logits = _censor_disallowed_logits(logits, allowed_token_ids_mask)
-    logits = _censor_stop_logits(
+    return _censor_stop_logits(
         logits,
         state,
         min_tokens,
         stop_ids=stop_ids,
         eos_window_masked=eos_window_masked,
     )
-    return _apply_logit_bias(logits, logit_bias_ids, logit_bias_values)
 
 
 def _repetition_penalty_scaling(
@@ -243,9 +201,6 @@ def prepare_codec_logits(
     top_p: float,
     min_p: float = 0.0,
     min_tokens_stop_ids: tuple[int, ...] = (),
-    allowed_token_ids_mask: torch.Tensor | None = None,
-    logit_bias_ids: tuple[int, ...] = (),
-    logit_bias_values: tuple[float, ...] = (),
     frequency_penalty: float = 0.0,
     presence_penalty: float = 0.0,
     eos_window_masked: bool = False,
@@ -255,23 +210,17 @@ def prepare_codec_logits(
     ``min_p`` mirrors the engine's argmax-invariant ``MinPLogitsProcessor``,
     which runs after temperature and before top-k/top-p (``builtin.py:102-113``).
     ``min_tokens_stop_ids`` widens the censored stop set beyond the codec EOS;
-    ``allowed_token_ids_mask`` applies the request's whitelist;
-    ``logit_bias_ids``/``logit_bias_values`` add the request's per-id biases;
     ``frequency_penalty``/``presence_penalty`` subtract the whole-stream counts.
     Every one of them is a no-op at its default value.
     """
     stop_ids = _stop_id_tuple(eos_token_id, min_tokens_stop_ids)
     logits = raw_logits.float()
-    # Engine steps 5a / 3-4 / 5b: whitelist, stop censoring and bias, in the
-    # order the engine applies them, before any penalty.
+    # Engine step 3-4: stop censoring, before any penalty.
     logits = _filter_codec_logits(
         logits,
         state,
         min_tokens,
         stop_ids=stop_ids,
-        allowed_token_ids_mask=allowed_token_ids_mask,
-        logit_bias_ids=logit_bias_ids,
-        logit_bias_values=logit_bias_values,
         eos_window_masked=eos_window_masked,
     )
     # Engine step 6a: repetition penalty over the codec history window.
@@ -390,9 +339,6 @@ def greedy_codec_sample(
     *,
     eos_token_id: int,
     min_tokens_stop_ids: tuple[int, ...] = (),
-    allowed_token_ids_mask: torch.Tensor | None = None,
-    logit_bias_ids: tuple[int, ...] = (),
-    logit_bias_values: tuple[float, ...] = (),
     frequency_penalty: float = 0.0,
     presence_penalty: float = 0.0,
     ignore_eos: bool = False,
@@ -411,15 +357,12 @@ def greedy_codec_sample(
     """
     stop_ids = _stop_id_tuple(eos_token_id, min_tokens_stop_ids)
     penalized = raw_logits.float()
-    # Engine steps 5a / 3-4 / 5b: same masks as the random path.
+    # Engine step 3-4: same stop censoring as the random path.
     penalized = _filter_codec_logits(
         penalized,
         state,
         min_tokens,
         stop_ids=stop_ids,
-        allowed_token_ids_mask=allowed_token_ids_mask,
-        logit_bias_ids=logit_bias_ids,
-        logit_bias_values=logit_bias_values,
         eos_window_masked=eos_window_masked,
     )
     # Engine steps 6a/6b/6c: same penalties as the random path.
