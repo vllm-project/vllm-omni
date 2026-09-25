@@ -36,6 +36,7 @@ from vllm_omni.transformers_utils.repo_utils import hf_api
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
+from .ltx2_audio_transformer import LTX2AudioTransformerModel
 from .ltx2_request import LTXCheckpointKind, validate_ltx_checkpoint
 from .ltx2_transformer import (
     LTX2VideoTransformer3DModel,
@@ -149,6 +150,28 @@ LTX25_FULL_COMPONENT_PROFILE = LTXComponentProfile(
     preserve_connector_attention_mask=True,
 )
 
+# Text-to-audio keeps the checkpoint's audio branch and shared text
+# conditioning components, but deliberately omits the video VAE.  The
+# Transformer itself is an audio-only projection of the full checkpoint and
+# is constructed by ``initialize_audio_pipeline_components``.
+LTX2_T2A_COMPONENT_PROFILE = replace(
+    LTX2_COMPONENT_PROFILE,
+    name="ltx2_text_to_audio",
+    vae_modules=("audio_vae",),
+)
+
+LTX23_T2A_COMPONENT_PROFILE = replace(
+    LTX23_COMPONENT_PROFILE,
+    name="ltx2_3_text_to_audio",
+    vae_modules=("audio_vae",),
+)
+
+LTX25_T2A_COMPONENT_PROFILE = replace(
+    LTX25_FULL_COMPONENT_PROFILE,
+    name="ltx2_5_text_to_audio",
+    vae_modules=("audio_vae",),
+)
+
 
 LTX2_DISTILLED_COMPONENT_PROFILE = LTXComponentProfile(
     name="ltx2_distilled",
@@ -229,6 +252,9 @@ LTX25_TWO_STAGE_COMPONENT_PROFILE = replace(
 )
 
 _COMPONENT_PROFILES: dict[tuple[str, str], LTXComponentProfile] = {
+    ("text_to_audio", "2"): LTX2_T2A_COMPONENT_PROFILE,
+    ("text_to_audio", "2.3"): LTX23_T2A_COMPONENT_PROFILE,
+    ("text_to_audio", "2.5"): LTX25_T2A_COMPONENT_PROFILE,
     ("one_stage", "2"): LTX2_COMPONENT_PROFILE,
     ("one_stage", "2.3"): LTX23_COMPONENT_PROFILE,
     ("one_stage", "2.5"): LTX25_FULL_COMPONENT_PROFILE,
@@ -248,7 +274,7 @@ _COMPONENT_PROFILES: dict[tuple[str, str], LTXComponentProfile] = {
 
 def resolve_ltx_checkpoint_kind(pipeline_kind: str) -> LTXCheckpointKind | None:
     """Derive checkpoint requirements from the execution contract."""
-    if pipeline_kind in {"one_stage", "two_stage"}:
+    if pipeline_kind in {"one_stage", "two_stage", "text_to_audio"}:
         return "regular"
     if pipeline_kind in {"distilled_one_stage", "distilled_two_stage"}:
         return "distilled"
@@ -568,6 +594,23 @@ def get_ltx2_post_process_func(od_config: Any):
     return post_process_func
 
 
+def get_ltx2_audio_post_process_func(od_config: Any):
+    """Build the audio-only LTX engine-output adapter."""
+    output_sample_rate = _detect_vocoder_output_sample_rate(
+        od_config.model,
+        revision=getattr(od_config, "revision", None),
+    )
+
+    def post_process_func(output: torch.Tensor):
+        audio = output.detach().cpu() if isinstance(output, torch.Tensor) else output
+        result: dict[str, Any] = {"audio": audio}
+        if output_sample_rate is not None:
+            result["audio_sample_rate"] = output_sample_rate
+        return result
+
+    return post_process_func
+
+
 def _load_component(
     component_cls: type,
     model: str,
@@ -587,6 +630,31 @@ def _load_component(
         revision=revision,
         torch_dtype=dtype,
     )
+
+
+def _load_ltx_vocoder(
+    profile: LTXComponentProfile,
+    model: str,
+    *,
+    local_files_only: bool,
+    dtype: torch.dtype,
+    revision: str | None,
+    prefetch_list: tuple[str, ...] = _LTX_COMPONENT_SUBFOLDERS,
+) -> Any:
+    """Load the profile's BWE vocoder, with the legacy-vocoder fallback."""
+    component_kwargs = {
+        "local_files_only": local_files_only,
+        "dtype": dtype,
+        "revision": revision,
+        "prefetch_list": prefetch_list,
+    }
+    try:
+        return _load_component(profile.vocoder_cls, model, "vocoder", **component_kwargs)
+    except (TypeError, OSError, ValueError):
+        fallback_cls = profile.vocoder_fallback_cls
+        if fallback_cls is None or fallback_cls is profile.vocoder_cls:
+            raise
+        return _load_component(fallback_cls, model, "vocoder", **component_kwargs)
 
 
 def _load_ltx25_native_diffusion_decoder(
@@ -730,26 +798,13 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         dtype=dtype,
         revision=revision,
     )
-    try:
-        pipeline.vocoder = _load_component(
-            profile.vocoder_cls,
-            model,
-            "vocoder",
-            local_files_only=local_files_only,
-            dtype=dtype,
-            revision=revision,
-        )
-    except (TypeError, OSError, ValueError):
-        if profile.vocoder_fallback_cls is None or profile.vocoder_fallback_cls is profile.vocoder_cls:
-            raise
-        pipeline.vocoder = _load_component(
-            profile.vocoder_fallback_cls,
-            model,
-            "vocoder",
-            local_files_only=local_files_only,
-            dtype=dtype,
-            revision=revision,
-        )
+    pipeline.vocoder = _load_ltx_vocoder(
+        profile,
+        model,
+        local_files_only=local_files_only,
+        dtype=dtype,
+        revision=revision,
+    )
 
     if "latent_upsampler" in profile.resident_modules:
         upsampler_config = os.path.join(model, "latent_upsampler", "config.json")
@@ -872,3 +927,19 @@ def create_transformer_from_config(
         kwargs["quant_config"] = quant_config
 
     return LTX2VideoTransformer3DModel(**kwargs)
+
+
+def create_audio_transformer_from_config(
+    config: dict,
+    quant_config: QuantizationConfig | None = None,
+) -> LTX2AudioTransformerModel:
+    """Project a full LTX config onto its audio-only Transformer arguments."""
+    if not config and quant_config is None:
+        return LTX2AudioTransformerModel()
+
+    signature = inspect.signature(LTX2AudioTransformerModel.__init__)
+    allowed_keys = set(signature.parameters)
+    kwargs = {key: value for key, value in config.items() if key in allowed_keys}
+    if quant_config is not None:
+        kwargs["quant_config"] = quant_config
+    return LTX2AudioTransformerModel(**kwargs)

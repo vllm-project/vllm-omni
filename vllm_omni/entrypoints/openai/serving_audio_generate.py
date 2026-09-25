@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 
 import torch
@@ -14,6 +17,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     OpenAICreateAudioGenerateRequest,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_extras.registry import get_extra_body_params
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -81,19 +85,40 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
 
             if request.guidance_scale is not None:
                 sampling_params_list[0].guidance_scale = request.guidance_scale
+                sampling_params_list[0].guidance_scale_provided = True
 
             if request.num_inference_steps is not None:
                 sampling_params_list[0].num_inference_steps = request.num_inference_steps
 
             # Set up audio duration parameters
+            audio_extra_args = {}
             if request.audio_length is not None:
                 audio_length = request.audio_length
                 audio_start = request.audio_start if request.audio_start is not None else 0.0
                 audio_end_in_s = audio_start + audio_length
-                sampling_params_list[0].extra_args = {
-                    "audio_start_in_s": audio_start,
-                    "audio_end_in_s": audio_end_in_s,
-                }
+                audio_extra_args.update(
+                    {
+                        "audio_length": audio_length,
+                        "audio_start_in_s": audio_start,
+                        "audio_end_in_s": audio_end_in_s,
+                    }
+                )
+            if request.num_frames is not None:
+                audio_extra_args["num_frames"] = request.num_frames
+            if request.extra_params:
+                conflicts = request.extra_params.keys() & audio_extra_args.keys()
+                if conflicts:
+                    names = ", ".join(sorted(conflicts))
+                    raise ValueError(f"Audio parameters were provided more than once: {names}")
+                registered = get_extra_body_params(self.engine_client.model_type)
+                unsupported = request.extra_params.keys() - registered
+                if unsupported:
+                    names = ", ".join(sorted(unsupported))
+                    raise ValueError(f"Unsupported model-specific audio parameters: {names}")
+                audio_extra_args.update(request.extra_params)
+            sampling_params_list[0].extra_args = audio_extra_args
+            if request.frame_rate is not None:
+                sampling_params_list[0].frame_rate = request.frame_rate
 
             logger.info("Audio generation request %s", request_id)
             _rl = getattr(self, "request_logger", None)
@@ -135,7 +160,7 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
                 return self.create_error_response("Audio generation model did not produce audio output.")
 
             audio_tensor = audio_output[audio_key]
-            sample_rate = audio_output.get("sr", default_sr)
+            sample_rate = audio_output.get("audio_sample_rate", audio_output.get("sr", default_sr))
             if hasattr(sample_rate, "item"):
                 sample_rate = sample_rate.item()
 
