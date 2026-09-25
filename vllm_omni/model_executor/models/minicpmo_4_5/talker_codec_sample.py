@@ -354,9 +354,7 @@ def advance_codec_device_state(
     history = torch.where(emit.reshape(1, 1), candidate, state.history)
     history_len = torch.clamp(state.history_len + emit.to(torch.int32), max=HISTORY_WINDOW)
     _advance_full_bins(state, sampled, emit)
-    return TalkerCodecDeviceState(
-        history, history_len, next_step, state.max_tokens, finished, state.full_bins
-    )
+    return TalkerCodecDeviceState(history, history_len, next_step, state.max_tokens, finished, state.full_bins)
 
 
 def codec_sample_result(
@@ -450,8 +448,6 @@ def greedy_codec_sample(
     _advance_full_bins(state, sampled, emit)
     return TalkerCodecSampleResult(
         sampled_token=sampled,
-        state=TalkerCodecDeviceState(
-            history, history_len, next_step, state.max_tokens, finished, state.full_bins
-        ),
+        state=TalkerCodecDeviceState(history, history_len, next_step, state.max_tokens, finished, state.full_bins),
         emit=emit,
     )
