@@ -219,7 +219,12 @@ def test_moss_reference_transcript_mode(variant, ref_text, mode, mocker):
     reference = [torch.ones((3, 12), dtype=torch.int64)]
     unified = torch.arange(52, dtype=torch.int64).reshape(1, 4, 13)
     processor = mocker.Mock(return_value={"input_ids": unified})
-    server = mocker.Mock(_moss_variant="local", uploaded_speakers={"speaker": {}})
+    server = mocker.Mock(
+        _moss_variant="local",
+        uploaded_speakers={
+            "speaker": {"embedding_source": "audio", "created_at": 123, "file_path": "/test.safetensors"}
+        },
+    )
     server._voice_created_at.return_value = 123
     request = OpenAICreateSpeechRequest(
         input="Target.", ref_text=ref_text, language="English", voice="Speaker", seed=0, max_new_tokens=2048
@@ -780,3 +785,42 @@ def test_qwen3_validate_rejects_no_voice_no_default_then_accepts():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_registered_voice_salt_does_not_materialize_audio():
+    from vllm_omni.entrypoints.openai.tts_adapters.base import conditioning_cache_salt
+
+    class NoRepr(str):
+        def __repr__(self):
+            raise AssertionError("Uploaded audio must not be serialized on the hot path")
+
+    request = OpenAICreateSpeechRequest(input="Target.", voice="speaker").model_copy(
+        update={"ref_audio": NoRepr("data:audio/wav;base64,AAAA")}
+    )
+    salt = conditioning_cache_salt(request, registered_voice=("speaker", 123))
+    assert salt
+    with pytest.raises(AssertionError, match="must not be serialized"):
+        conditioning_cache_salt(request)
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [("input", "Different target."), ("ref_text", "Different reference."), ("language", "Chinese")],
+)
+def test_registered_voice_salt_preserves_request_conditioning(field, value):
+    from vllm_omni.entrypoints.openai.tts_adapters.base import conditioning_cache_salt
+
+    request = OpenAICreateSpeechRequest(input="Target.", voice="speaker")
+    salt = conditioning_cache_salt(request, registered_voice=("speaker", 123))
+    changed = request.model_copy(update={field: value})
+    assert conditioning_cache_salt(changed, registered_voice=("speaker", 123)) != salt
+
+
+@pytest.mark.parametrize("key", ["ref_audio_2_cache_key", "task_type", "ref_text"])
+def test_registered_voice_salt_preserves_resolved_conditioning(key):
+    from vllm_omni.entrypoints.openai.tts_adapters.base import conditioning_cache_salt
+
+    request = OpenAICreateSpeechRequest(input="Target.", voice="speaker")
+    first = conditioning_cache_salt(request, {key: "a"}, registered_voice=("speaker", 123))
+    second = conditioning_cache_salt(request, {key: "b"}, registered_voice=("speaker", 123))
+    assert first != second

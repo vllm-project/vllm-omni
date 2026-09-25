@@ -227,6 +227,7 @@ def test_sleep_then_wakeup_roundtrip(sleep_capable_engine):
 @pytest.fixture
 def pure_diffusion_engine(mocker):
     engine = mocker.MagicMock()
+    engine.config_path = None
     engine.stage_configs = [{"stage_type": "diffusion"}]
     engine.sleep = mocker.AsyncMock(return_value=[FakeAck(stage_id=0)])
     engine.wake_up = mocker.AsyncMock(return_value=[FakeAck(stage_id=0)])

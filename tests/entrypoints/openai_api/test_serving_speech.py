@@ -2138,7 +2138,9 @@ class TestTTSMethods:
         speech_server._tts_model_type = "moss_tts"
         speech_server._adapter = speech_server._get_tts_adapter()
         speech_server._adapter._moss_variant = "ttsd"
-        speech_server.uploaded_speakers = {"alice": {}}
+        speech_server.uploaded_speakers = {
+            "alice": {"embedding_source": "audio", "created_at": 42, "file_path": "/test.safetensors"}
+        }
         mocker.patch.object(speech_server, "_voice_created_at", return_value=42)
 
         proc = mocker.MagicMock()
@@ -2160,16 +2162,16 @@ class TestTTSMethods:
         req = OpenAICreateSpeechRequest(
             input="hello",
             voice="alice",
-            ref_audio="data:audio/wav;base64,aaa",
             ref_audio_2="data:audio/wav;base64,bbb",
         )
+        assert speech_server._adapter._bind_registered_reference(req) is None
         params = await speech_server._adapter._build_moss_tts_params(req, has_inline_ref_audio=False)
         assert sorted(seen) == [
-            ("data:audio/wav;base64,aaa", "alice"),
             ("data:audio/wav;base64,bbb", None),
+            ("registered:alice:42", "alice"),
         ]
         # Per-slot salt keys survive the concurrent (gather) encode order.
-        assert params["ref_audio_cache_key"] == "rk:data:audio/wav;base64,aaa"
+        assert "ref_audio_cache_key" not in params
         assert params["ref_audio_2_cache_key"] == "rk:data:audio/wav;base64,bbb"
 
     def test_precomputed_qwen3_voice_infers_base_without_ref_audio(self, speech_server):

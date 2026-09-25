@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Process-wide thread-safe LRU cache for speaker extraction artifacts.
 
 Keyed by ``(model_type, speaker_name, created_at)`` so each upload generation
@@ -17,9 +20,10 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.config.speech_cache import SpeechCacheConfig
+
 logger = init_logger(__name__)
 
-_MAX_BYTES = 512 * 1024**2  # 512 MiB
 _CUSTOM_VOICE_MANIFEST = "custom_voice_manifest.json"
 _CUSTOM_VOICE_SCHEMA_VERSION = 1
 
@@ -228,7 +232,9 @@ def load_validated_profile_tensors(
 class SpeakerEmbeddingCache:
     """Thread-safe in-memory LRU cache for speaker extraction artifacts."""
 
-    def __init__(self, *, max_bytes: int = _MAX_BYTES):
+    def __init__(self, *, max_bytes: int | None = None):
+        if max_bytes is None:
+            max_bytes = SpeechCacheConfig().speaker_max_bytes
         self._cache: OrderedDict[tuple[str, str, int], dict[str, Any]] = OrderedDict()
         self._sizes: dict[tuple[str, str, int], int] = {}
         self._total_bytes = 0
@@ -265,6 +271,8 @@ class SpeakerEmbeddingCache:
             self._insert_locked(key, artifacts)
 
     def _insert_locked(self, key: tuple[str, str, int], artifacts: dict[str, Any]) -> None:
+        if self._max_bytes <= 0:
+            return
         size = _estimate_tensor_bytes(artifacts)
         if size > self._max_bytes:
             logger.warning("Speaker cache skip: entry %s size=%dB exceeds max_bytes=%dB", key, size, self._max_bytes)
@@ -320,11 +328,16 @@ class SpeakerEmbeddingCache:
             }
 
 
-def get_speaker_cache() -> SpeakerEmbeddingCache:
-    """Return the process-wide speaker cache singleton."""
+def get_speaker_cache(*, max_bytes: int | None = None) -> SpeakerEmbeddingCache:
+    """Return the process-wide cache; reject conflicting explicit budgets."""
     global _SINGLETON
-    if _SINGLETON is None:
-        with _SINGLETON_LOCK:
-            if _SINGLETON is None:
-                _SINGLETON = SpeakerEmbeddingCache()
-    return _SINGLETON
+    with _SINGLETON_LOCK:
+        if _SINGLETON is None:
+            _SINGLETON = SpeakerEmbeddingCache(max_bytes=max_bytes)
+        elif max_bytes is not None and _SINGLETON.stats()["max_bytes"] != max_bytes:
+            raise ValueError(
+                "Conflicting speech_cache.speaker_max_bytes: "
+                f"the process-wide speaker cache is already initialized with {_SINGLETON.stats()['max_bytes']} bytes, "
+                f"but the requested budget is {max_bytes} bytes"
+            )
+        return _SINGLETON

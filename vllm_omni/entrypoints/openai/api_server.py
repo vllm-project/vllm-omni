@@ -91,6 +91,8 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm_omni.config.endpoint_policy import (
     shutdown_unsupported_routes,
 )
+from vllm_omni.config.speech_cache import SpeechCacheConfig
+from vllm_omni.config.stage_config import load_deploy_config
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.engine.stage_runtime import OmniClientConfig
 from vllm_omni.entrypoints.async_omni import ABORT_TIMEOUT_S, AsyncOmni
@@ -762,6 +764,12 @@ async def omni_init_app_state(
         state: FastAPI application state object to initialize
         args: Parsed command-line arguments
     """
+    # AsyncOmni already exposes the selected deploy path, including the model's
+    # default YAML. Reuse the loader for base_config inheritance; API-only cache
+    # settings need not be carried through the engine or stage configurations.
+    deploy_path = getattr(engine_client, "config_path", None)
+    speech_cache_config = load_deploy_config(deploy_path).speech_cache if deploy_path else SpeechCacheConfig()
+
     # Get vllm_config from engine_client (following 0.14.0 pattern)
     vllm_config = await openai_app_state._get_vllm_config(engine_client)
 
@@ -844,6 +852,7 @@ async def omni_init_app_state(
             diffusion_engine=engine_client,
             model_name=model_name,
             stage_configs=diffusion_stage_configs,
+            speech_cache_config=speech_cache_config,
             allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),
             allowed_media_domains=getattr(args, "allowed_media_domains", None),
         )
@@ -1153,6 +1162,7 @@ async def omni_init_app_state(
         state.openai_serving_models,
         request_logger=request_logger,
         model_name=model_name,
+        speech_cache_config=speech_cache_config,
         forced_aligner_enabled=build_forced_aligner_config(
             getattr(args, "forced_aligner", None),
             getattr(args, "forced_aligner_config", None),

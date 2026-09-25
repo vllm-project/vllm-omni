@@ -1029,3 +1029,64 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --enforce-eager \
     --uvicorn-log-level debug
 ```
+
+### Reusing reference audio
+
+The voice upload API and cache settings below are shared serving features.
+For repeated voices, upload the reference once and reuse its name. The example
+uses MOSS-TTS Local: uploading stores the audio, and the first speech request
+encodes it. MOSS-TTS Local can then reuse cached reference codes without resolving
+the waveform while the speaker cache entry remains resident. After a server
+restart or speaker-cache eviction, another speech request warms the codes again.
+Reference processing and cache-hit behavior for other models depend on their
+serving adapters.
+
+```bash
+curl --fail http://localhost:8123/v1/audio/voices \
+  -F 'name=my-speaker' \
+  -F 'consent=user_consent_id' \
+  -F 'audio_sample=@/path/to/reference.wav'
+
+# Run once to warm the reference codes, then reuse the same voice.
+curl --fail http://localhost:8123/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5","voice":"my-speaker","input":"Hello, world.","response_format":"wav"}' \
+  --output speech.wav
+```
+
+If you have the reference transcript, upload it with `-F 'ref_text=...'`.
+MOSS-TTS Local uses a reference transcript for continuation conditioning; omitting
+it uses reference-audio conditioning instead. Keep this choice consistent when
+comparing benchmarks. Supplying inline `ref_audio` overrides the uploaded voice
+and does not use the named-voice cache shortcut.
+
+The separate decoded-waveform resolve cache defaults to **4 GiB and 2048 entries
+per speech server instance**. These are LRU limits, not preallocated memory or a
+limit on total server RSS. Waveforms retain their source sampling rate and are
+stored as owned, contiguous float32 arrays in **CPU memory**. The byte limit
+counts numeric buffers (four bytes per mono sample), not the encoded file size
+or GPU memory.
+Either limit can cause eviction. Configure the API-process caches in the deploy
+YAML passed to `--deploy-config` (alongside `stages`, not inside a stage):
+
+```yaml
+speech_cache:
+  resolve_max_bytes: 4294967296
+  resolve_max_entries: 2048
+  speaker_max_bytes: 536870912
+```
+
+All values must be non-negative integers. Either resolve limit set to `0`
+disables waveform storage; `speaker_max_bytes: 0` disables speaker artifact
+storage. Invalid values fail configuration loading. `base_config` inheritance
+merges this section by field, preserving unspecified values from the base.
+Restart the service to apply changes. The effective settings are logged at startup.
+
+The speaker budget defaults to **512 MiB** and counts cached tensor bytes,
+not Python metadata or total process RSS. It configures the API process's
+speaker cache. MOSS reference codes are cached as **CPU int32 tensors**; this
+budget does not reserve GPU memory or include the reference encoder's GPU
+weights and working memory. The shared cache itself does not move tensors
+between devices; other adapters determine the device of their cached artifacts.
+Separate model-worker caches are not controlled by this section. The process-wide singleton rejects a
+conflicting explicit budget instead of silently ignoring it.

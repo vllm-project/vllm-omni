@@ -18,6 +18,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction
+from vllm_omni.config.speech_cache import SpeechCacheConfig
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
@@ -583,6 +584,7 @@ class DeployConfig:
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
     active_stream_window: int = 0
     duplex_session: DuplexSessionRuntimeConfig = field(default_factory=DuplexSessionRuntimeConfig)
+    speech_cache: SpeechCacheConfig = field(default_factory=SpeechCacheConfig)
     connectors: dict[str, Any] | None = None
     edges: list[dict[str, Any]] | None = None
     stages: list[StageDeployConfig] = field(default_factory=list)
@@ -683,16 +685,20 @@ _DEEP_MERGE_KEYS = frozenset(
 )
 
 
+_DEPLOY_DEEP_MERGE_KEYS = frozenset({"speech_cache"})
+
+
+def _merge_config_fields(base: dict, overlay: dict, *, deep_merge_keys: frozenset[str]) -> dict:
+    """Recursively merge selected fields; overlay replaces all other fields."""
+    base_nested = {k: v for k, v in base.items() if k in deep_merge_keys}
+    overlay_nested = {k: v for k, v in overlay.items() if k in deep_merge_keys}
+    merged_nested = _get_recursively_merged_dict(original=base_nested, update=overlay_nested)
+    return {**base, **overlay, **merged_nested}
+
+
 def _deep_merge_stage(base: dict, overlay: dict) -> dict:
     """Deep-merge ``_DEEP_MERGE_KEYS`` so thin overlays don't drop base keys."""
-    # Deep merge _DEEP_MERGE_KEYS recursively
-    base_merge_dict = {k: v for k, v in base.items() if k in _DEEP_MERGE_KEYS}
-    overlay_merge_dict = {k: v for k, v in overlay.items() if k in _DEEP_MERGE_KEYS}
-
-    # Get the merge dict; priority is base < overlay < merged sub
-    merged_subdict = _get_recursively_merged_dict(original=base_merge_dict, update=overlay_merge_dict)
-    merged_dict = {**base, **overlay, **merged_subdict}
-    return merged_dict
+    return _merge_config_fields(base, overlay, deep_merge_keys=_DEEP_MERGE_KEYS)
 
 
 def _get_recursively_merged_dict(original: dict, update: dict) -> dict:
@@ -774,10 +780,11 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
 
     # Merge top-level scalars: overlay wins. Structured sections are merged
     # below so a thin overlay does not discard inherited runtime contracts.
-    merged = {
-        **base_dict,
-        **{k: v for k, v in raw_dict.items() if k not in ("connectors", "stages", "platforms")},
-    }
+    merged = _merge_config_fields(
+        base_dict,
+        {k: v for k, v in raw_dict.items() if k not in ("connectors", "stages", "platforms")},
+        deep_merge_keys=_DEPLOY_DEEP_MERGE_KEYS,
+    )
     merged_connectors = _merge_connectors(base_dict.get("connectors"), raw_dict.get("connectors"))
     if merged_connectors is not None:
         merged["connectors"] = merged_connectors
@@ -798,6 +805,9 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
             "define topology in PipelineConfig and deployment overrides under `stages`."
         )
 
+    speech_cache = raw_dict.get("speech_cache", {})
+    if not isinstance(speech_cache, dict):
+        raise ValueError("speech_cache must be a mapping")
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
 
     model_runner = raw_dict.get("model_runner", "v1")
@@ -805,6 +815,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         raise ValueError(f"model_runner must be one of ('v1', 'v2'), got {model_runner!r}")
 
     kwargs: dict[str, Any] = {
+        "speech_cache": SpeechCacheConfig(**speech_cache),
         "async_chunk": raw_dict.get("async_chunk", True),
         "session_mode": raw_dict.get("session_mode", "turn"),
         "model_runner": model_runner,
