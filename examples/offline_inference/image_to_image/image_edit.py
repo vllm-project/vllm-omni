@@ -39,6 +39,20 @@ Usage (multiple images):
         --cfg-scale 4.0 \
         --guidance-scale 1.0
 
+Usage (JoyAI-Image-Edit, single image):
+    python image_edit.py \
+        --model jdopensource/JoyAI-Image-Edit-Diffusers \
+        --image input.png \
+        --prompt "Change the background to a clean studio while preserving the subject." \
+        --height 1024 \
+        --width 1024 \
+        --num-inference-steps 50 \
+        --cfg-scale 4.0 \
+        --output output_joyai_edit.png
+
+    Note: JoyAI-Image-Edit snaps requested dimensions to the nearest supported
+    Joy bucket; for square outputs, use 1024x1024.
+
 Usage (with cache-dit acceleration):
     python image_edit.py \
         --image input.png \
@@ -523,6 +537,18 @@ def parse_args() -> argparse.Namespace:
             "silently masking with a possibly-wrong prompt."
         ),
     )
+    parser.add_argument(
+        "--init-timeout",
+        type=int,
+        default=600,
+        help="Overall pipeline initialization timeout in seconds.",
+    )
+    parser.add_argument(
+        "--stage-init-timeout",
+        type=int,
+        default=300,
+        help="Per-stage initialization timeout in seconds.",
+    )
     return parser.parse_args()
 
 
@@ -593,6 +619,8 @@ def main():
         enable_cpu_offload=args.enable_cpu_offload,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
+        init_timeout=args.init_timeout,
+        stage_init_timeout=args.stage_init_timeout,
     )
     if args.enforce_eager is not None:
         omni_kwargs["enforce_eager"] = args.enforce_eager

@@ -28,6 +28,9 @@ EXCLUDED_MODELS = [
     "GlmImagePipeline",
     "ZImagePipeline",
     "OvisImagePipeline",
+    # Uses a custom Qwen3-VL text encoder and Joy transformer; covered by the
+    # dedicated Joy pipeline tests and real-checkpoint image-edit E2E.
+    "JoyImageEditPipeline",
     # Requires upstream AR hidden states and token boundaries; covered by
     # dedicated MammothModa2 bridge/pipeline tests and real-checkpoint E2E.
     "MammothModa2DiTPipeline",
