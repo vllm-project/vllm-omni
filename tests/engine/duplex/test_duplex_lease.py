@@ -85,6 +85,32 @@ def test_detach_grace_and_resume_advance_the_lease_generation() -> None:
         session.resume_lease(expected_lease_generation=0)
 
 
+def test_a_resume_replayed_under_its_control_id_answers_without_resuming_again() -> None:
+    """A caller that lost the answer (cancelled or timed-out waiter) asks again with the same id.
+
+    The engine must tell it the generation that resume produced, not bump the
+    lease a second time, and must still refuse any other resume against the
+    old generation.
+    """
+    clock = FakeMonotonicClock(10.0)
+    session = _session("sid-replay", clock)
+    session.detach_lease()
+
+    assert session.resume_lease(expected_lease_generation=0, control_id="rpc-a") == 1
+    clock.advance(5.0)
+    session.detach_lease()
+
+    assert session.resume_lease(expected_lease_generation=0, control_id="rpc-a") == 1
+    assert session.lease_generation == 1
+    assert session.lease.detached_at == 15.0, "a replay is an answer, not a new resume"
+    with pytest.raises(ValueError, match="lease generation mismatch"):
+        session.resume_lease(expected_lease_generation=0, control_id="rpc-b")
+
+    assert session.resume_lease(expected_lease_generation=1, control_id="rpc-b") == 2
+    with pytest.raises(ValueError, match="lease generation mismatch"):
+        session.resume_lease(expected_lease_generation=0, control_id="rpc-a")
+
+
 def test_active_operation_prevents_mid_transaction_expiry() -> None:
     clock = FakeMonotonicClock(0.0)
     session = _session("sid-operation", clock, idle_ttl_s=5.0)

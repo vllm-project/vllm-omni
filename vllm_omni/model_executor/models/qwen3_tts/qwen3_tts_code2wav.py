@@ -260,6 +260,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         intermediate_tensors: Any = None,
         inputs_embeds: torch.Tensor | None = None,
         runtime_additional_information: list[dict[str, Any]] | None = None,
+        model_intermediate_buffer: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
         """Decode codec codes into audio waveform.
@@ -285,6 +286,13 @@ class Qwen3TTSCode2Wav(nn.Module):
                 multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
             )
 
+        # vLLM's runner renamed this per-request side channel to
+        # ``model_intermediate_buffer``.  Keep accepting the old explicit
+        # argument for older runners, and use the new name when it is empty.
+        # Without this fallback, the non-async-chunk/full-payload path decodes
+        # placeholder input_ids instead of the codec payload from Stage 0.
+        if not runtime_additional_information:
+            runtime_additional_information = model_intermediate_buffer
         runtime_infos = runtime_additional_information or []
         ids = input_ids.reshape(-1).to(dtype=torch.long)
         request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))

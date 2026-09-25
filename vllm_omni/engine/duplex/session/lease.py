@@ -40,6 +40,12 @@ class DuplexLeaseState:
     detached_at: float | None = None
     active_operations: set[str] = field(default_factory=set)
     terminal_reason: str | None = None
+    #: Control id of the resume that produced ``generation`` (``None`` for the
+    #: open). A resume replayed with the same id is answered with the current
+    #: generation instead of bumping it again: the caller lost the first
+    #: answer (its RPC waiter was cancelled or timed out) and is finding out
+    #: whether the resume landed.
+    resumed_by: str | None = None
 
     @property
     def expires_at(self) -> float | None:
@@ -61,11 +67,16 @@ class DuplexLeaseState:
         self.touch(now, DuplexLeaseActivity.DETACH)
         self.detached_at = now
 
-    def resume(self, now: float, *, expected_generation: int) -> int:
+    def resume(self, now: float, *, expected_generation: int, control_id: str | None = None) -> int:
         self._require_open()
+        if control_id is not None and control_id == self.resumed_by:
+            # The same resume asking again: it already produced this
+            # generation, so answer without changing anything.
+            return self.generation
         if expected_generation != self.generation:
             raise ValueError(f"duplex lease generation mismatch: expected {self.generation}, got {expected_generation}")
         self.generation += 1
+        self.resumed_by = control_id
         self.detached_at = None
         self.last_activity = now
         return self.generation
@@ -104,6 +115,7 @@ class DuplexLeaseState:
             return False
         self.terminal_reason = reason
         self.generation += 1
+        self.resumed_by = None
         self.detached_at = None
         self.active_operations.clear()
         return True

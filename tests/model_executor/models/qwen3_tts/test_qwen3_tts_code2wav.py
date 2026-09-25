@@ -25,6 +25,7 @@ class _FakeDecoder(nn.Module):
         self.total_upsample = total_upsample
         self.decode_calls: list[dict[str, object]] = []
         self.batched_decode_calls: list[dict[str, object]] = []
+        self.batched_decode_codes: list[torch.Tensor] = []
         self.decode_codes: list[torch.Tensor] = []
         self.cudagraph_calls: list[dict[str, int | torch.device]] = []
 
@@ -64,6 +65,7 @@ class _FakeDecoder(nn.Module):
         left_context_size: int = 25,
         max_batch_size: int = 0,
     ) -> list[torch.Tensor]:
+        self.batched_decode_codes.append(codes.detach().cpu().clone())
         self.batched_decode_calls.append(
             {
                 "chunk_size": chunk_size,
@@ -201,6 +203,26 @@ def test_forward_uses_decoder_audio_contract_without_context():
     audio = out.multimodal_outputs["model_outputs"][0]
     expected = torch.arange(24, dtype=torch.float32)
     torch.testing.assert_close(audio, expected)
+
+
+def test_forward_reads_current_model_intermediate_buffer_for_full_payload():
+    """Full-payload sync mode must decode connector codec ids, not placeholders."""
+    model = _make_model()
+    placeholder_ids = torch.zeros(12, dtype=torch.long)
+    payload_codes = torch.arange(12, dtype=torch.long) + 17
+
+    model.forward(
+        input_ids=placeholder_ids,
+        runtime_additional_information=[],
+        model_intermediate_buffer=[
+            {
+                "codes": {"audio": payload_codes},
+                "meta": {"left_context_size": 0},
+            }
+        ],
+    )
+
+    torch.testing.assert_close(model.decoder.batched_decode_codes[-1], payload_codes.reshape(1, _NUM_QUANTIZERS, 6))
 
 
 @pytest.mark.parametrize("skipped_length", [0, 1], ids=["empty", "malformed"])

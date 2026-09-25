@@ -313,13 +313,12 @@ steps:
           HF_HUB_OFFLINE: "1"
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         commands:
-          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - export BENCHMARK_DIR=tests/dfx/perf/results
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "npu and A3" --test-config-file tests/dfx/perf/tests/test_hunyuanvideo15_t2v_vllm_omni.json
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "npu and A3" --test-config-file tests/dfx/perf/tests/test_hunyuanvideo15_t2v_vllm_omni.json
             EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
-            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
       - label: ":full_moon: Diffusion X2V · Wan 2.2 Function Test"
         source_file_dependencies: diffusion_wan22_function
