@@ -361,13 +361,20 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     """
     video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(24, 24, 20)['base64']}"
     image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(24, 24)['base64']}"
-    audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1)['base64']}"
+    # A loop of the default single word "test" can make the answer repeat
+    # to the token limit, leaving TTS/ASR to count a long run of identical words
+    # (#7630). Exercise speech perception with a meaningful phrase instead.
+    audio = generate_synthetic_audio(5, 1, phrase_text="The weather is sunny today.")
+    audio_data_url = f"data:audio/wav;base64,{audio['base64']}"
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
         video_data_url=video_data_url,
         image_data_url=image_data_url,
         audio_data_url=audio_data_url,
-        content_text=get_prompt("mix"),
+        content_text=(
+            "Briefly describe the image and video, and summarize what the voice says. "
+            "Answer in one short sentence without repeating the spoken phrase."
+        ),
     )
 
     request_config = {

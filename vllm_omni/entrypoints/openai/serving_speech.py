@@ -2726,8 +2726,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 total_ms,
                 e,
             )
-            logger.exception("Speech generation failed: %s", e)
-            return self.create_error_response(f"Speech generation failed: {e}")
+            return self.create_error_response(
+                f"Speech generation failed: {e}",
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     @staticmethod
     def _merge_batch_item(
