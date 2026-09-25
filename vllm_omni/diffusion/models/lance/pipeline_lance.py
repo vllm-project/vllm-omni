@@ -59,6 +59,10 @@ from vllm_omni.diffusion.models.bagel.pipeline_bagel import (
     BagelPipeline,
     add_special_tokens,
 )
+from vllm_omni.diffusion.utils.prompt_utils import (
+    pre_tokenized_negative_prompt_ids,
+    pre_tokenized_prompt_ids,
+)
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -688,6 +692,11 @@ class LancePipeline(BagelPipeline):
         else:
             prompt = str(first_prompt)
             extra_args = {}
+        # A caller may have tokenized the prompt already; those ids are then used
+        # as-is instead of the text above (see ``OmniCustomPrompt``).
+        prompt_token_ids = pre_tokenized_prompt_ids(first_prompt)
+        negative_prompt_token_ids = pre_tokenized_negative_prompt_ids(first_prompt)
+        text_prompt: str | list[int] = prompt_token_ids if prompt_token_ids is not None else prompt
         # Sampling-side extras override prompt-side.
         sp_extra = getattr(req.sampling_params, "extra_args", {}) or {}
         extra_args = {**extra_args, **sp_extra}
@@ -737,7 +746,7 @@ class LancePipeline(BagelPipeline):
         gen_input_text, newlens, new_rope = self.bagel.prepare_prompts(
             curr_kvlens=gen_context["kv_lens"],
             curr_rope=gen_context["ropes"],
-            prompts=[prompt],
+            prompts=[text_prompt],
             tokenizer=self.tokenizer,
             new_token_ids=self.new_token_ids,
         )
@@ -758,10 +767,13 @@ class LancePipeline(BagelPipeline):
         # ---- Build CFG text-unconditional KV cache (empty prompt) ----
         if cfg_text_scale > 1.0:
             neg_prompt = str(extra_args.get("negative_prompt") or "")
+            neg_text_prompt: str | list[int] = (
+                negative_prompt_token_ids if negative_prompt_token_ids is not None else neg_prompt
+            )
             neg_input, neg_newlens, neg_rope = self.bagel.prepare_prompts(
                 curr_kvlens=cfg_text_context["kv_lens"],
                 curr_rope=cfg_text_context["ropes"],
-                prompts=[neg_prompt],
+                prompts=[neg_text_prompt],
                 tokenizer=self.tokenizer,
                 new_token_ids=self.new_token_ids,
             )

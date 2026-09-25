@@ -1,5 +1,50 @@
 import torch
 
+#: Keys a diffusion prompt may use to carry pre-tokenized prompt ids.
+#: ``OmniCustomPrompt`` declares ``prompt_ids``; ``prompt_token_ids`` is accepted
+#: as an alias because the executor's emptiness check and the existing
+#: HunyuanImage3 writer both use that spelling.
+PROMPT_ID_KEYS = ("prompt_ids", "prompt_token_ids")
+NEGATIVE_PROMPT_ID_KEYS = ("negative_prompt_ids", "negative_prompt_token_ids")
+
+
+def _single_prompt_ids(ids: object, *, key: str) -> list[int]:
+    """Unwrap the single prompt a diffusion request carries and cast it to ``int``."""
+    if not isinstance(ids, (list, tuple)) or not ids:
+        raise ValueError(f"`{key}` must be a non-empty list or tuple of token ids, got {ids!r}")
+    first = ids[0]
+    if isinstance(first, (list, tuple)):
+        if len(ids) != 1:
+            raise ValueError(f"`{key}` holds {len(ids)} prompts, but a diffusion request carries a single prompt")
+        ids = first
+    return [int(token_id) for token_id in ids]
+
+
+def _pre_tokenized_ids(prompt: object, *, keys: tuple[str, ...]) -> list[int] | None:
+    if not isinstance(prompt, dict):
+        return None
+    for key in keys:
+        ids = prompt.get(key)
+        if ids:
+            return _single_prompt_ids(ids, key=key)
+    return None
+
+
+def pre_tokenized_prompt_ids(prompt: object) -> list[int] | None:
+    """Return the pre-tokenized prompt ids of ``prompt``, if it carries any.
+
+    ``OmniCustomPrompt`` exists so that a caller who has already tokenized the
+    prompt can stop the pipeline from tokenizing it again. Pipelines that
+    support that use these ids verbatim, so the caller owns the exact token
+    sequence, wrappers included.
+    """
+    return _pre_tokenized_ids(prompt, keys=PROMPT_ID_KEYS)
+
+
+def pre_tokenized_negative_prompt_ids(prompt: object) -> list[int] | None:
+    """Return the pre-tokenized negative prompt ids of ``prompt``, if it carries any."""
+    return _pre_tokenized_ids(prompt, keys=NEGATIVE_PROMPT_ID_KEYS)
+
 
 def validate_prompt_sequence_lengths(
     attention_mask: torch.Tensor,

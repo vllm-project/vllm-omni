@@ -1407,8 +1407,13 @@ class Bagel(CFGParallelMixin, nn.Module):
 
         newlens, new_rope = list(), list()
         for prompt, curr_kvlen, curr_position_id in zip(prompts, curr_kvlens, curr_rope):
-            text_ids = tokenizer.encode(prompt, add_special_tokens=False)
-            text_ids = [new_token_ids["bos_token_id"]] + text_ids + [new_token_ids["eos_token_id"]]
+            if isinstance(prompt, str):
+                text_ids = tokenizer.encode(prompt, add_special_tokens=False)
+                text_ids = [new_token_ids["bos_token_id"]] + text_ids + [new_token_ids["eos_token_id"]]
+            else:
+                # Pre-tokenized prompt, as ``OmniCustomPrompt`` allows: the caller
+                # owns the exact sequence, so no bos/eos wrapper is added here.
+                text_ids = [int(token_id) for token_id in prompt]
             text_token_lens.append(len(text_ids))
             packed_text_ids.extend(text_ids)
             packed_text_position_ids.extend(range(curr_position_id, curr_position_id + len(text_ids)))
