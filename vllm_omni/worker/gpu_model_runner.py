@@ -1446,18 +1446,36 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                     # engine stops accepting tokens: the scheduler truncates the
                     # sampled ids at the request limit, but the connector still
                     # concatenates every emitted codec frame (PR #7929 review).
-                    # None means the request carries no max_tokens, which leaves
-                    # the stage-resolved codec budget in charge. Same order as
-                    # request_sampling_params.
-                    model_kwargs_extra["request_max_tokens_remaining"] = [
+                    # Both of the engine's length stops are folded in
+                    # (v1/core/sched/utils.py:111-117): the request's
+                    # max_tokens - num_output_tokens, and the context's
+                    # max_model_len - num_tokens. None means the request carries
+                    # no max_tokens, which leaves the stage-resolved codec budget
+                    # in charge. Same order as request_sampling_params.
+                    context_budget = [
                         (
-                            max(int(req.sampling_params.max_tokens) - int(req.num_output_tokens), 0)
+                            self.max_model_len - int(req.num_tokens)
                             if (req := self.requests.get(req_id)) is not None
-                            and req.sampling_params is not None
-                            and req.sampling_params.max_tokens is not None
                             else None
                         )
                         for req_id in self.input_batch.req_ids
+                    ]
+                    model_kwargs_extra["request_max_tokens_remaining"] = [
+                        (
+                            max(
+                                min(
+                                    int(req.sampling_params.max_tokens) - int(req.num_output_tokens),
+                                    context_budget[index],
+                                ),
+                                0,
+                            )
+                            if (req := self.requests.get(req_id)) is not None
+                            and req.sampling_params is not None
+                            and req.sampling_params.max_tokens is not None
+                            and context_budget[index] is not None
+                            else None
+                        )
+                        for index, req_id in enumerate(self.input_batch.req_ids)
                     ]
             except Exception as e:
                 # Visible on purpose: the fallback is the equal rows-per-request
