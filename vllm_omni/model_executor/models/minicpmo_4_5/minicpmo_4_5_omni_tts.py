@@ -269,9 +269,8 @@ def _codec_stop_ids(state: Any) -> tuple[int, ...]:
     ``model_config.get_vocab_size()`` before the request is accepted
     (``vllm/sampling_params.py:874-895``), so surviving ids are in-vocabulary
     for the model -- but the codec head is only ``_CODEC_VOCAB_SIZE`` wide, so
-    anything at or beyond it is dropped here, the same way
-    ``_codec_allowed_ids_mask`` and ``_codec_logit_bias_items`` drop theirs,
-    which keeps the index tensors in range. The engine censors and stops on
+    anything at or beyond it is dropped here, which keeps the index tensor in
+    range. The engine censors and stops on
     ``all_stop_token_ids`` = eos + these ids + extra eos ids
     (``builtin.py:196-207``, ``v1/core/sched/utils.py:105``); K-step has no
     engine layer left, so it censors and stops on them itself. Empty means the
@@ -281,62 +280,6 @@ def _codec_stop_ids(state: Any) -> tuple[int, ...]:
     if not value:
         return ()
     return tuple(sorted({int(token_id) for token_id in value if 0 <= int(token_id) < _CODEC_VOCAB_SIZE}))
-
-
-def _codec_allowed_ids_mask(state: Any, device: torch.device) -> torch.Tensor | None:
-    """Censor mask for the request's codec whitelist, or None when unset.
-
-    The engine builds ``allowed_token_ids_mask`` with True on the ids to
-    censor (``v1/worker/gpu_input_batch.py:463-466``) and applies it as
-    ``masked_fill_(-inf)`` (``sampler.py:393-394``). The request's list is
-    keyed by the text vocabulary, so ids outside the codec vocabulary are
-    dropped; a list with nothing left in range is treated as unset rather
-    than producing an all ``-inf`` row.
-    """
-    value = state.get("codec_allowed_token_ids") if isinstance(state, Mapping) else None
-    if not value:
-        return None
-    keep = sorted({int(token_id) for token_id in value if 0 <= int(token_id) < _CODEC_VOCAB_SIZE})
-    if not keep:
-        return None
-    mask = torch.ones((1, _CODEC_VOCAB_SIZE), dtype=torch.bool, device=device)
-    mask[0, torch.tensor(keep, dtype=torch.long, device=device)] = False
-    return mask
-
-
-def _codec_logit_bias_items(state: Any) -> tuple[tuple[int, ...], tuple[float, ...]]:
-    """The request's codec logit biases as parallel tuples, in a stable order.
-
-    ``LogitBiasLogitsProcessor`` adds ``bias`` to ``logits[req, tok]``
-    (``builtin.py:161-164``). The request's dict is keyed by the text
-    vocabulary, so keys outside the codec vocabulary are dropped.
-    """
-    value = state.get("codec_logit_bias") if isinstance(state, Mapping) else None
-    if not isinstance(value, Mapping):
-        return (), ()
-    pairs = sorted(
-        (int(token_id), float(bias)) for token_id, bias in value.items() if 0 <= int(token_id) < _CODEC_VOCAB_SIZE
-    )
-    if not pairs:
-        return (), ()
-    return tuple(token_id for token_id, _ in pairs), tuple(bias for _, bias in pairs)
-
-
-def _codec_filter_inputs(state: Any, device: torch.device) -> dict[str, Any]:
-    """Whitelist mask and logit-bias tuples for the codec filters.
-
-    Returns an empty mapping when the request set neither, so the call site
-    keeps the sampler's no-op defaults.
-    """
-    inputs: dict[str, Any] = {}
-    mask = _codec_allowed_ids_mask(state, device)
-    if mask is not None:
-        inputs["allowed_token_ids_mask"] = mask
-    bias_ids, bias_values = _codec_logit_bias_items(state)
-    if bias_ids:
-        inputs["logit_bias_ids"] = bias_ids
-        inputs["logit_bias_values"] = bias_values
-    return inputs
 
 
 def _codec_full_bins_input(state: Any, device: torch.device) -> torch.Tensor | None:
@@ -1368,8 +1311,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             ("codec_seed", "seed"),
             ("codec_min_p", "min_p"),
             ("codec_ignore_eos", "ignore_eos"),
-            ("codec_allowed_token_ids", "allowed_token_ids"),
-            ("codec_logit_bias", "logit_bias"),
             ("codec_frequency_penalty", "frequency_penalty"),
             ("codec_presence_penalty", "presence_penalty"),
         ):
@@ -1505,7 +1446,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             top_p=_codec_float_param(request_state, "codec_top_p", self._codec_top_p),
             min_p=_codec_float_param(request_state, "codec_min_p", 0.0),
             min_tokens_stop_ids=_codec_stop_ids(request_state),
-            **_codec_filter_inputs(request_state, hidden_state.device),
             frequency_penalty=_codec_float_param(request_state, "codec_frequency_penalty", 0.0),
             presence_penalty=_codec_float_param(request_state, "codec_presence_penalty", 0.0),
             eos_window_masked=eos_window_masked,
@@ -1586,7 +1526,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             penalty_tensor,
             eos_token_id=self._codec_eos_id,
             min_tokens_stop_ids=_codec_stop_ids(request_state),
-            **_codec_filter_inputs(request_state, hidden_state.device),
             frequency_penalty=_codec_float_param(request_state, "codec_frequency_penalty", 0.0),
             presence_penalty=_codec_float_param(request_state, "codec_presence_penalty", 0.0),
             ignore_eos=_codec_bool_param(request_state, "codec_ignore_eos", False),
