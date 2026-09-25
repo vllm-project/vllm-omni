@@ -333,6 +333,17 @@ async def omni_run_server_worker(
 
         # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
         app = build_openai_app(args, supported_tasks)
+        if engine_client.engine.tracer_provider is not None:
+            from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+            FastAPIInstrumentor.instrument_app(
+                app,
+                tracer_provider=engine_client.engine.tracer_provider,
+                exclude_spans=["send", "receive"],
+                excluded_urls="health,healthz,metrics",
+            )
+            # Upstream build_app may already have cached the uninstrumented stack.
+            app.middleware_stack = None
         app.state.api_server_count = api_server_count
 
         # OMNI: Remove upstream routes that we override with omni-specific handlers

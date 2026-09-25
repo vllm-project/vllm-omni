@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for vllm_omni.engine.arg_utils — invariants that must
 hold for the orchestrator/engine/server CLI flag partition."""
 
@@ -28,7 +28,7 @@ def test_no_ambiguous_overlap_with_real_engine():
     """
     # Fields on both classes by design: orchestrator captures them to prevent
     # uniform per-stage propagation; redistributed via DeployConfig.
-    orchestrator_captured = {"async_chunk", "tokenizer"}
+    orchestrator_captured = {"async_chunk", "tokenizer", "otlp_traces_endpoint"}
 
     orch = orchestrator_field_names()
     engine = {f.name for f in fields(OmniEngineArgs)}

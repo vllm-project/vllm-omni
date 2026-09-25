@@ -220,6 +220,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         *,
         abort: bool = False,
         release_owners: bool = False,
+        trace_error: str | None = None,
     ) -> list[OutputMessage]:
         if not request_ids:
             return []
@@ -241,7 +242,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 cleanup_ids.extend(stale_request_ids)
             cleanup_ids = list(dict.fromkeys(cleanup_ids))
         try:
-            outputs = await super()._cleanup_request_ids(cleanup_ids, abort=abort)
+            outputs = await super()._cleanup_request_ids(
+                cleanup_ids, abort=abort, release_owners=release_owners, trace_error=trace_error
+            )
         except BaseException:
             if closing_session_ids:
                 self.session_manager.defer_request_cleanups(closing_session_ids)

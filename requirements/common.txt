@@ -1,4 +1,6 @@
 # Common dependencies for all platforms
+opentelemetry-api>=1.28.0
+opentelemetry-sdk>=1.28.0
 # kernels==0.16.1 requires the LayerRepository version=/revision= integration
 # introduced in transformers 5.13. Keep the tested upper bound: 5.15 has
 # a reported model-construction regression; later versions need validation.

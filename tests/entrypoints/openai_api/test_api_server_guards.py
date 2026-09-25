@@ -58,6 +58,7 @@ from starlette.requests import Request
 from starlette.websockets import WebSocketDisconnect
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.engine.omni_engine_base import OmniEngineBase
 from vllm_omni.entrypoints.openai import api_server
 from vllm_omni.entrypoints.serve.utils import errors as serve_errors
 
@@ -90,16 +91,39 @@ def test_omni_api_worker_sets_parent_death_signal_before_validation(mocker):
 
 
 @pytest.mark.asyncio
-async def test_omni_run_server_worker_forwards_client_config(monkeypatch):
+@pytest.mark.parametrize("tracing_enabled", [False, True])
+async def test_omni_run_server_worker_forwards_client_config(monkeypatch, tracing_enabled):
+    import httpx
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from vllm_omni.tracing import capture_trace_headers
+
+    if tracing_enabled:
+        pytest.importorskip("opentelemetry.instrumentation.fastapi")
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    app = FastAPI()
+
+    @app.get("/trace")
+    async def trace_context():
+        return capture_trace_headers()
+
+    app.middleware_stack = app.build_middleware_stack()
+
     captured: dict[str, object] = {}
 
     @asynccontextmanager
     async def fake_build_async_omni(*_args, **kwargs):
         captured.update(kwargs)
-        yield _FakeEngineClient(vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=1)))
+        engine = _FakeEngineClient(vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=1)))
+        engine.engine.tracer_provider = provider if tracing_enabled else None
+        yield engine
 
     monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
-    monkeypatch.setattr(api_server, "build_openai_app", lambda *_args: FastAPI())
+    monkeypatch.setattr(api_server, "build_openai_app", lambda *_args: app)
     monkeypatch.setattr(api_server, "omni_init_app_state", lambda *_args: asyncio.sleep(0))
     monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda *_args: None)
 
@@ -110,6 +134,18 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch):
 
     async def fake_serve_http(app, **_kwargs):
         assert app.state.api_server_count == 2
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+            for sampled in ("01", "00"):
+                parent = f"00-12345678901234567890123456789012-1234567890123456-{sampled}"
+                response = await client.get("/trace", headers={"traceparent": parent, "tracestate": "vendor=state"})
+                assert response.status_code == 200
+                carrier = response.json()
+                if tracing_enabled:
+                    assert carrier["traceparent"].split("-")[1] == parent.split("-")[1]
+                    assert int(carrier["traceparent"].split("-")[3], 16) & 1 == int(sampled, 16)
+                    assert carrier["tracestate"] == "vendor=state"
+                else:
+                    assert carrier == {}
         task = asyncio.create_task(asyncio.sleep(0))
         await asyncio.sleep(0)
         return task
@@ -121,6 +157,11 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch):
 
     await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), args, config)
     assert captured["client_config"] is config
+    spans = exporter.get_finished_spans()
+    assert len(spans) == int(tracing_enabled)
+    if tracing_enabled:
+        assert spans[0].parent.span_id == int("1234567890123456", 16)
+    provider.shutdown()
 
 
 # FastAPI/Starlette auto-adds HEAD on every GET route. Including HEAD here
@@ -367,6 +408,8 @@ class _FakeSocket:
 
 class _FakeEngineClient:
     def __init__(self, *, stage_configs=None, endpoint_restrictions=None, vllm_config=None) -> None:
+        self.engine = object.__new__(OmniEngineBase)
+        self.engine.tracer_provider = None
         self.stage_configs = stage_configs if stage_configs is not None else []
         self.endpoint_restrictions = endpoint_restrictions if endpoint_restrictions is not None else {}
         self.model_config = SimpleNamespace()

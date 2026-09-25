@@ -31,6 +31,7 @@ from vllm_omni.engine.omni_engine_base import OmniEngineBase, StageRuntimeInfo
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorBase
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
+from vllm_omni.tracing import capture_trace_headers
 
 logger = init_logger(__name__)
 
@@ -263,6 +264,7 @@ class AsyncOmniEngine(OmniEngineBase):
         message_type: Literal["add_request", "streaming_update"] = "add_request",
     ) -> StageSubmissionMessage:
         """Build an add_request message after stage-0 preprocessing."""
+        trace_headers = capture_trace_headers(trace_headers)
         request_timestamp = float(arrival_time) if arrival_time is not None else time.time()
         effective_sampling_params_list: list[OmniSamplingParams] = (
             list(cast(Sequence[OmniSamplingParams], sampling_params_list))
@@ -401,6 +403,7 @@ class AsyncOmniEngine(OmniEngineBase):
             request_timestamp=request_timestamp,
             enqueue_ts=time.perf_counter(),
             request_artifact_dirs=request_artifact_dirs or None,
+            trace_headers=trace_headers,
         )
 
     def _build_cfg_companions(
@@ -631,6 +634,7 @@ class AsyncOmniEngine(OmniEngineBase):
         lora_request: Any = None,
         *,
         resumable: bool = True,
+        trace_headers: Mapping[str, str] | None = None,
     ) -> None:
         """Send an incremental streaming update for an existing request."""
         msg = self._build_add_request_message(
@@ -643,6 +647,7 @@ class AsyncOmniEngine(OmniEngineBase):
             arrival_time=arrival_time,
             lora_request=lora_request,
             resumable=resumable,
+            trace_headers=trace_headers,
             message_type="streaming_update",
         )
         self.request_queue.sync_q.put(msg)
@@ -659,6 +664,7 @@ class AsyncOmniEngine(OmniEngineBase):
         lora_request: Any = None,
         *,
         resumable: bool = True,
+        trace_headers: Mapping[str, str] | None = None,
     ) -> None:
         """Async wrapper for add_streaming_update()."""
         self.add_streaming_update(
@@ -671,6 +677,7 @@ class AsyncOmniEngine(OmniEngineBase):
             arrival_time=arrival_time,
             lora_request=lora_request,
             resumable=resumable,
+            trace_headers=trace_headers,
         )
 
     def submit_interaction(

@@ -276,6 +276,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
+                    trace_headers=trace_headers,
                     first_chunk_submitted=first_chunk_submitted,
                 )
                 await first_chunk_submitted
@@ -288,6 +289,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
+                    trace_headers=trace_headers,
                 )
             submit_ts = time.time()
             stage_first_ts = cast(list[float | None], req_state.metrics.stage_first_ts)
@@ -360,6 +362,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         final_output_stage_ids: Sequence[int],
         arrival_time: float,
         lora_request: Any = None,
+        trace_headers: Mapping[str, str] | None = None,
         first_chunk_submitted: asyncio.Future[None] | None = None,
     ) -> asyncio.Task:
         """Submit a streaming input generator as incremental stage-0 updates."""
@@ -421,6 +424,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                 final_output_stage_ids=final_output_stage_ids,
                                 arrival_time=arrival_time,
                                 lora_request=lora_request,
+                                trace_headers=trace_headers,
                                 resumable=True,
                             )
                         )
@@ -437,6 +441,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                 final_output_stage_ids=final_output_stage_ids,
                                 arrival_time=arrival_time,
                                 lora_request=lora_request,
+                                trace_headers=trace_headers,
                                 resumable=True,
                             )
                         )
@@ -464,6 +469,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                     final_output_stage_ids=final_output_stage_ids,
                                     arrival_time=arrival_time,
                                     lora_request=lora_request,
+                                    trace_headers=trace_headers,
                                     resumable=False,
                                 )
                             )
@@ -478,6 +484,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                     final_output_stage_ids=final_output_stage_ids,
                                     arrival_time=arrival_time,
                                     lora_request=lora_request,
+                                    trace_headers=trace_headers,
                                     resumable=False,
                                 )
                             )
@@ -1163,7 +1170,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
     async def is_tracing_enabled(self) -> bool:
         """Check if tracing is enabled."""
-        return False
+        return self.engine.tracer_provider is not None
 
     async def notify_kv_transfer_request_rejected(
         self,

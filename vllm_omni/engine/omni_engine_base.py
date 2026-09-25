@@ -139,8 +139,11 @@ class OmniEngineBase:
         tokenizer: str | None = None,
         trust_remote_code: bool | None = None,
         client_config: OmniClientConfig | None = None,
+        otlp_traces_endpoint: str | None = None,
         **kwargs: Any,
     ) -> None:
+        from vllm_omni.tracing import create_tracer_provider
+
         self.model = model
         self.tokenizer = tokenizer
         # Cached by get_diffusion_od_config().
@@ -314,6 +317,7 @@ class OmniEngineBase:
         # Launch orchestrator background thread
         startup_future: concurrent.futures.Future = concurrent.futures.Future()
 
+        self.tracer_provider = create_tracer_provider(otlp_traces_endpoint)
         self.orchestrator_thread = threading.Thread(
             target=self._bootstrap_orchestrator,
             args=(
@@ -457,6 +461,7 @@ class OmniEngineBase:
                 engines_waiting_counter=self._engines_waiting_counter,
                 transfer_emitter=self._transfer_emitter,
                 prom_metrics=self._prom_metrics,
+                tracer=self.tracer_provider.get_tracer("vllm_omni") if self.tracer_provider is not None else None,
                 log_stats=self._log_stats,
                 enable_orch_monitor=self._enable_orch_monitor,
                 event_driven_orch_default=self._event_driven_orch_default,
@@ -498,6 +503,8 @@ class OmniEngineBase:
             finally:
                 asyncio.set_event_loop(None)
                 loop.close()
+                if self.tracer_provider is not None:
+                    self.tracer_provider.shutdown()
 
     def _validate_deployment(self) -> None:
         """Seam: check ``pipeline_config`` / ``deploy_config`` before stages start (default: nothing)."""
