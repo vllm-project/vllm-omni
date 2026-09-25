@@ -493,6 +493,110 @@ def test_request_sampling_params_pin_codec_knobs():
     assert gen2.initial_seed() == 42
 
 
+def test_request_max_tokens_remaining_caps_kstep_frames():
+    """The request's remaining output budget caps the K-step frame ceiling.
+
+    The scheduler truncates the sampled ids at the request limit while the
+    connector concatenates every emitted codec frame, so a request whose limit
+    falls inside a K-frame step must stop emitting frames at the limit instead
+    of running on to the stage's codec budget (review on PR #7929).
+    """
+    model = _make_talker(k_step_frames=8, scripted_samples=[42])
+    model._codec_max_tokens = 4032
+    state = {"step": 0, "max_tokens": 4032, "codes": torch.tensor([10, 11])}
+    model._request_audio_states["r1"] = state
+
+    model.make_omni_output(
+        torch.randn(1, 8),
+        model_intermediate_buffer=[{"request_id": "r1"}],
+        request_token_spans=[(0, 1)],
+        request_sample_eligible=[True],
+        request_sampling_params=[
+            SimpleNamespace(temperature=0.0, top_k=25, top_p=0.85, repetition_penalty=1.0, seed=7)
+        ],
+        request_max_tokens_remaining=[3],
+    )
+    # K=8 frames were available, but the request had only 3 tokens left.
+    assert state["max_tokens"] == 3
+
+    # A request without a limit keeps the stage-resolved codec budget.
+    model2 = _make_talker(k_step_frames=8, scripted_samples=[43])
+    model2._codec_max_tokens = 4032
+    state2 = {"step": 0, "max_tokens": 4032, "codes": torch.tensor([10, 11])}
+    model2._request_audio_states["r2"] = state2
+    model2.make_omni_output(
+        torch.randn(1, 8),
+        model_intermediate_buffer=[{"request_id": "r2"}],
+        request_token_spans=[(0, 1)],
+        request_sample_eligible=[True],
+        request_sampling_params=[
+            SimpleNamespace(temperature=0.0, top_k=25, top_p=0.85, repetition_penalty=1.0, seed=7)
+        ],
+        request_max_tokens_remaining=[None],
+    )
+    assert state2["max_tokens"] == 4032
+
+
+def test_reused_device_state_follows_tightened_max_tokens():
+    """A reused codec device state picks up the caller's tightened ceiling.
+
+    ``_merge_request_codec_params`` clamps ``state["max_tokens"]`` to the
+    request's remaining output budget on later steps, but the device state is
+    built once and reused. If it kept its creation-time budget, the codec loop
+    would emit past the frame the engine stops accepting ids at -- the
+    alignment the review asked to close (PR #7929).
+    """
+    model = _make_talker(k_step_frames=8, scripted_samples=[42])
+    model._codec_max_tokens = 4032
+    model._codec_repetition_penalty = 1.05
+    model.head_code = nn.ModuleList([nn.Linear(8, _NUM_AUDIO_TOKENS, bias=False)])
+    # _make_talker installs a scripted stub; this test needs the real boundary.
+    real_greedy = type(model)._sample_audio_code_greedy
+    model._sample_audio_code_greedy = real_greedy.__get__(model, type(model))
+    state = {"step": 0, "max_tokens": 4032, "codes": torch.tensor([10, 11])}
+    model._request_audio_states["r1"] = state
+    hidden = torch.randn(1, 8)
+
+    # Step 1: no request limit, so the device state starts at the stage budget.
+    model._sample_audio_code_greedy(hidden, state["codes"], "r1", 0, 0, state["max_tokens"])
+    assert int(model._request_codec_device_states["r1"].max_tokens.item()) == 4032
+
+    # Step 2: the host ceiling was tightened to 3; the reused device state has
+    # to follow it instead of staying at 4032.
+    state["max_tokens"] = 3
+    model._sample_audio_code_greedy(hidden, state["codes"], "r1", 1, 0, state["max_tokens"])
+    assert int(model._request_codec_device_states["r1"].max_tokens.item()) == 3
+
+
+def test_reused_device_state_follows_tightened_max_tokens_stochastic():
+    """The stochastic boundary refreshes the reused device state the same way.
+
+    ``_sample_audio_code`` reads the ceiling from the request state rather than
+    from an argument, so it needs its own check that a reused device state does
+    not keep the creation-time budget (PR #7929).
+    """
+    model = _make_talker(k_step_frames=8, scripted_samples=[42])
+    model._codec_max_tokens = 4032
+    model._codec_temperature = 0.8
+    model._codec_repetition_penalty = 1.05
+    model._codec_top_k = 0
+    model._codec_top_p = 1.0
+    model._codec_seed = 42
+    model.head_code = nn.ModuleList([nn.Linear(8, _NUM_AUDIO_TOKENS, bias=False)])
+    real_sample = type(model)._sample_audio_code
+    model._sample_audio_code = real_sample.__get__(model, type(model))
+    state = {"step": 0, "max_tokens": 4032, "codes": torch.tensor([10, 11])}
+    model._request_audio_states["r1"] = state
+    hidden = torch.randn(1, 8)
+
+    model._sample_audio_code(hidden, state["codes"], "r1", 0)
+    assert int(model._request_codec_device_states["r1"].max_tokens.item()) == 4032
+
+    state["max_tokens"] = 5
+    model._sample_audio_code(hidden, state["codes"], "r1", 1)
+    assert int(model._request_codec_device_states["r1"].max_tokens.item()) == 5
+
+
 def test_default_sampling_params_feed_codec_resolution():
     """``default_sampling_params`` sits between the YAML block and tts_config.
 
@@ -565,35 +669,47 @@ def test_request_min_tokens_reaches_codec_state():
     assert state_alias["min_tokens"] == 7
 
 
-def test_top_k_filter_honors_explicit_top_k():
-    """top_k is kept exact; min_tokens_to_keep is a top_p-only floor.
+def test_top_k_then_top_p_matches_single_frame_order():
+    """K-step filtering follows the engine's order: top-k, then top-p.
 
-    Passing min_tokens_to_keep=3 must not widen an explicit top_k of 1 or 2
-    -- otherwise K-step sampling changes the single-frame contract (top_k=1
-    would no longer be greedy) (PR #7929 review).
+    The single-frame path applies top-k first and then computes top-p over the
+    top-k-filtered distribution, keeping at least one candidate
+    (vllm/v1/sample/ops/topk_topp_sampler.py:392/:404/:415). Filtering top-p
+    first -- or holding a floor of three candidates -- changes the sampling
+    distribution even for identical logits and sampling parameters, so enabling
+    K-step decoding would silently alter the single-frame contract
+    (PR #7929 review).
     """
     from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
         make_device_state,
         prepare_codec_logits,
     )
 
-    logits = torch.full((1, _NUM_AUDIO_TOKENS), -1.0)
-    logits[0, 10] = 5.0
-    logits[0, 11] = 4.0
-    logits[0, 12] = 3.0
     device_state = make_device_state(torch.zeros(0, dtype=torch.int32), step=0, max_tokens=100, finished=False)
     kwargs = dict(
         state=device_state,
         min_tokens=torch.tensor([0]),
-        temperature=torch.tensor([0.8]),
+        temperature=torch.tensor([1.0]),
         repetition_penalty=torch.tensor([1.0]),
         eos_token_id=_EOS_ID,
-        top_p=1.0,
-        min_tokens_to_keep=3,
     )
-    for top_k, expected in ((1, 1), (2, 2)):
-        filtered = prepare_codec_logits(logits.clone(), top_k=top_k, **kwargs)
-        assert int(torch.isfinite(filtered).sum()) == expected
+    # The review's example: candidate weights [40, 30, 20, 10] with top_k=3 and
+    # top_p=0.5. The engine keeps two candidates -- top-p runs over the
+    # renormalized top-3 distribution [0.444, 0.333, 0.222], whose ascending
+    # cumsum first exceeds 0.5 at the second candidate. Keeping three
+    # candidates was the reported bug.
+    weights = torch.tensor([40.0, 30.0, 20.0, 10.0])
+    logits = torch.full((1, _NUM_AUDIO_TOKENS), -1e4)
+    logits[0, 10:14] = weights.log()
+    filtered = prepare_codec_logits(logits.clone(), top_k=3, top_p=0.5, **kwargs)
+    assert int(torch.isfinite(filtered).sum()) == 2
+    # An explicit top_k is honored exactly: top_k=1 keeps a single candidate.
+    filtered_top_k_one = prepare_codec_logits(logits.clone(), top_k=1, top_p=1.0, **kwargs)
+    assert int(torch.isfinite(filtered_top_k_one).sum()) == 1
+    # top-p alone keeps at least one candidate, like the engine's `at least one`
+    # row (topk_topp_sampler.py:415).
+    filtered_top_p_only = prepare_codec_logits(logits.clone(), top_k=0, top_p=0.01, **kwargs)
+    assert int(torch.isfinite(filtered_top_p_only).sum()) >= 1
 
 
 def test_eos_window_mask_hides_codec_eos():

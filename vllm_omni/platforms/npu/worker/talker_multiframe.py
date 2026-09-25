@@ -38,11 +38,17 @@ D2H carries them out at the end of the step.
 ## What makes it correct
 
 * **Stop is still per frame.** ``make_omni_output`` evaluates the codec EOS and
-  the token limit on every frame exactly as it does today. A request that ends
+  the frame ceiling on every frame exactly as it does today. A request that ends
   at frame j reports its stop row there; frames j+1..K-1 take the "already
   finished" early return, emit an empty delta and report a stop row too. vLLM's
   rejection sampler sees the first stop and truncates the request to j+1
   tokens, which is the same sequence a one-frame-per-step run would produce.
+  The ceiling is not only the stage-resolved codec budget: the runner also
+  passes each request's remaining output budget
+  (``SamplingParams.max_tokens - num_output_tokens``) and the codec merge clamps
+  it into ``state["max_tokens"]``, so a request limit that falls inside a
+  K-frame step ends the loop where the engine stops accepting ids instead of
+  emitting frames past it (PR #7929 review).
 * **The emitted codes are unchanged.** The extra frames after a stop contribute
   nothing: their deltas are empty or the ``-1`` sentinel the connector already
   drops (``_codec_scalars``). So the audio is expected to be bit-identical, not
