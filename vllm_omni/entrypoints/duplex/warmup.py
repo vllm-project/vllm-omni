@@ -94,6 +94,26 @@ def _warmup_jpeg_b64() -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+_DEFAULT_SILENCE_SAMPLES = 16000
+_DEFAULT_SILENCE_SAMPLE_RATE_HZ = 16000
+
+
+def warmup_silence_unit(plugin: object | None) -> dict[str, object]:
+    """The append the silent-frames warmup sends: the plugin's silence unit, or the 16 kHz default."""
+    factory = getattr(plugin, "silence_unit_payload", None)
+    if callable(factory):
+        unit = dict(factory())
+        if isinstance(unit.get("audio"), str) and isinstance(unit.get("format"), str):
+            unit.setdefault("sample_rate_hz", _DEFAULT_SILENCE_SAMPLE_RATE_HZ)
+            return unit
+    samples = int(getattr(plugin, "silence_continuation_samples", _DEFAULT_SILENCE_SAMPLES))
+    return {
+        "audio": base64.b64encode(bytes(samples * 4)).decode("ascii"),
+        "format": "pcm_f32le",
+        "sample_rate_hz": _DEFAULT_SILENCE_SAMPLE_RATE_HZ,
+    }
+
+
 async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
     """Run one throwaway realtime session before real clients are admitted.
 
@@ -121,9 +141,14 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
             model_name = served
         else:
             model_name = args.model
-        # One silence unit as the engine-side plugin defines it (DuplexOmniEngine.plugin).
-        frame_samples = int(getattr(plugin, "silence_continuation_samples", 16000))
-        native_append = plugin.capabilities(max_sessions=1).supports_core_resumable_request if plugin else True
+        # One silence unit as the engine-side plugin defines it (DuplexOmniEngine.plugin):
+        # the unit's format, rate and length are the model's, not a fixed 16 kHz.
+        unit = warmup_silence_unit(plugin)
+        frame_samples = len(base64.b64decode(str(unit["audio"]))) // 4
+        capabilities = getattr(plugin, "capabilities", None)
+        native_append = (
+            bool(capabilities(max_sessions=1).supports_core_resumable_request) if callable(capabilities) else True
+        )
         from vllm_omni.clients.duplex import build_realtime_url
 
         url = (
@@ -163,6 +188,10 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
             "turn_detection": None,
             "extra_body": {"auto_response": native_append},
         }
+        if kind != "video_turn":
+            session["input_audio_format"] = unit["format"]
+            session["sample_rate_hz"] = unit["sample_rate_hz"]
+            session["audio"] = {"input": {"sample_rate_hz": unit["sample_rate_hz"]}}
         if kind == "video_turn":
             # The default AURA prompt answers with <|silent|> unless the user
             # asked for something. This session is thrown away; force one short
@@ -205,9 +234,17 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
                 )
                 sent = 1
             else:
-                silence = base64.b64encode(bytes(frame_samples * 4)).decode("ascii")
                 while sent < warmup_frames:
-                    await ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": silence}))
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "input_audio_buffer.append",
+                                "audio": unit["audio"],
+                                "format": unit["format"],
+                                "sample_rate_hz": unit["sample_rate_hz"],
+                            }
+                        )
+                    )
                     sent += 1
                     await asyncio.sleep(0.08)
             if not native_append:
@@ -251,4 +288,5 @@ __all__ = [
     "_warmup_duplex_realtime",
     "lookup_duplex_plugin",
     "startup_warmup_kind",
+    "warmup_silence_unit",
 ]

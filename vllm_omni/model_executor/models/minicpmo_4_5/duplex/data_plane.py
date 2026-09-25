@@ -12,7 +12,7 @@ from vllm.logger import init_logger
 from vllm_omni.engine.duplex.contracts import (
     duplex_resource_request_belongs_to_session,
 )
-from vllm_omni.engine.duplex.plugin import DuplexDataPlane
+from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexDataPlaneContext
 from vllm_omni.outputs.duplex import get_duplex_output_decision
 
 logger = init_logger(__name__)
@@ -21,17 +21,8 @@ EncodeAudio = Callable[[object, int, str, float | None], str | None]
 
 
 @dataclass(frozen=True, slots=True)
-class MiniCPMO45DataPlaneContext:
-    """Serving state needed to project one MiniCPM data-plane output."""
-
-    epoch: int = 0
-    turn_id: int = 0
-    active_response_turn_id: int | None = None
-    active_response_id: str | None = None
-    auto_responds: bool = False
-    response_format: str = "wav"
-    speed: float | None = None
-    modalities: tuple[str, ...] = ()
+class MiniCPMO45DataPlaneContext(DuplexDataPlaneContext):
+    """Serving state needed to project one MiniCPM data-plane output (the framework fields)."""
 
 
 @dataclass(slots=True)

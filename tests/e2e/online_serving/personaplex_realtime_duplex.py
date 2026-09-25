@@ -11,7 +11,6 @@ import hashlib
 import json
 import math
 import time
-import uuid
 import wave
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
@@ -125,10 +124,11 @@ def _input_identity(
     return {"path": str(resolved), "sha256": actual}
 
 
-def _realtime_url(base_url: str, model: str, session_id: str) -> str:
+def _realtime_url(base_url: str, model: str) -> str:
+    """The duplex Realtime URL; the session id is allocated by the server, never chosen here."""
     parts = urlsplit(base_url)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    query.update(duplex="1", model=model, autostart="0", session_id=session_id)
+    query.update(duplex="1", model=model, autostart="0")
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
@@ -197,16 +197,27 @@ def _audio_bytes(client: RawRealtimeProbe) -> bytes:
     return b"".join(chunk for _, chunk in _validated_audio_chunks(client) if chunk)
 
 
+def _session_id(created: dict[str, object]) -> str | None:
+    """The server-allocated id announced in ``session.created``."""
+    session = created.get("session")
+    if isinstance(session, dict):
+        for key in ("id", "session_id"):
+            value = session.get(key)
+            if isinstance(value, str) and value:
+                return value
+    value = created.get("session_id")
+    return value if isinstance(value, str) and value else None
+
+
 async def _open_session(
     args: argparse.Namespace,
     *,
-    session_id: str,
     persona: str,
     expect_error: bool = False,
 ) -> tuple[RawRealtimeProbe, dict[str, object]]:
-    client = RawRealtimeProbe(_realtime_url(args.url, args.model, session_id))
+    client = RawRealtimeProbe(_realtime_url(args.url, args.model))
     await client.__aenter__()
-    await client.send(_session_update(args, session_id=session_id, persona=persona))
+    await client.send(_session_update(args, persona=persona))
     event_type = "error" if expect_error else "session.created"
     await wait_for(
         lambda: client.events.count(event_type) > 0,
@@ -216,11 +227,10 @@ async def _open_session(
     return client, _events(client, event_type)[-1]
 
 
-def _session_update(args: argparse.Namespace, *, session_id: str, persona: str) -> dict[str, object]:
+def _session_update(args: argparse.Namespace, *, persona: str) -> dict[str, object]:
     return {
         "type": "session.update",
         "session": {
-            "session_id": session_id,
             "model": args.model,
             "modalities": ["audio", "text"],
             "input_audio_format": "pcm_f32le",
@@ -426,13 +436,11 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    ids = {name: f"personaplex-{name}-{uuid.uuid4().hex}" for name in ("primary", "secondary", "replacement")}
-    primary, created = await _open_session(args, session_id=ids["primary"], persona=args.persona)
-    secondary, secondary_created = await _open_session(
-        args,
-        session_id=ids["secondary"],
-        persona=args.secondary_persona,
-    )
+    primary, created = await _open_session(args, persona=args.persona)
+    secondary, secondary_created = await _open_session(args, persona=args.secondary_persona)
+    ids = {"primary": _session_id(created), "secondary": _session_id(secondary_created)}
+    if not ids["primary"] or not ids["secondary"] or ids["primary"] == ids["secondary"]:
+        raise AssertionError(f"server did not allocate distinct session ids: {ids}")
     capabilities = _capabilities(created)
     if _capabilities(secondary_created) != capabilities:
         raise AssertionError("concurrent sessions returned different capabilities")
@@ -446,12 +454,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
     if any(capabilities.get(key) != value for key, value in expected_capabilities.items()):
         raise AssertionError(f"unexpected PersonaPlex capabilities: {capabilities}")
 
-    overflow, error = await _open_session(
-        args,
-        session_id=f"personaplex-overflow-{uuid.uuid4().hex}",
-        persona=args.persona,
-        expect_error=True,
-    )
+    overflow, error = await _open_session(args, persona=args.persona, expect_error=True)
     error_body = error.get("error")
     overflow_code = error_body.get("code") if isinstance(error_body, dict) else error.get("code")
     await overflow.__aexit__(None, None, None)
@@ -492,11 +495,10 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
     _save(output_dir, "primary", primary, primary_audio)
     await _close_session(primary, timeout_s=args.timeout_s)
 
-    replacement, replacement_created = await _open_session(
-        args,
-        session_id=ids["replacement"],
-        persona=args.replacement_persona,
-    )
+    replacement, replacement_created = await _open_session(args, persona=args.replacement_persona)
+    ids["replacement"] = _session_id(replacement_created)
+    if not ids["replacement"] or ids["replacement"] in {ids["primary"], ids["secondary"]}:
+        raise AssertionError(f"replacement session id was not freshly allocated: {ids}")
     if _capabilities(replacement_created) != capabilities:
         raise AssertionError("replacement session returned different capabilities")
     continuation_frames, replacement_frames = await asyncio.gather(
@@ -694,8 +696,9 @@ async def _run_load_session(
     ready: asyncio.Future[None],
     start: asyncio.Future[float],
 ) -> dict[str, object]:
-    session_id = f"personaplex-load-{index}-{uuid.uuid4().hex}"
-    client = RawRealtimeProbe(_realtime_url(args.url, args.model, session_id), close_timeout_s=args.cleanup_timeout_s)
+    # Label only: the server allocates the real session id (read back from session.created).
+    session_id = f"personaplex-load-{index}"
+    client = RawRealtimeProbe(_realtime_url(args.url, args.model), close_timeout_s=args.cleanup_timeout_s)
     sends: list[tuple[float, float, float]] = []
     error: str | None = None
     cleanup_error: str | None = None
@@ -706,10 +709,9 @@ async def _run_load_session(
     try:
         async with client:
             try:
-                await asyncio.wait_for(
-                    client.send(_session_update(args, session_id=session_id, persona=args.persona)), args.timeout_s
-                )
+                await asyncio.wait_for(client.send(_session_update(args, persona=args.persona)), args.timeout_s)
                 await _wait_load_event(client, "session.created", args.timeout_s)
+                session_id = _session_id(_events(client, "session.created")[-1]) or session_id
                 capabilities = _capabilities(_events(client, "session.created")[-1])
                 if (
                     capabilities.get("chunk_period_ms") != 80

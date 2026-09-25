@@ -18,7 +18,7 @@ from base64 import b64decode
 from binascii import Error as BinasciiError
 from collections.abc import Mapping
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
@@ -38,6 +38,11 @@ from vllm_omni.engine.duplex.plugin import (
     EncodeAudio,
     reject_changed_runtime_value,
 )
+from vllm_omni.model_executor.common.duplex.payload import payload_sample_count as _duplex_pcm_sample_count
+from vllm_omni.model_executor.common.request_outputs import coerce_int as _coerce_int
+from vllm_omni.model_executor.common.request_outputs import coerce_int_list as _coerce_int_list
+from vllm_omni.model_executor.common.request_outputs import first_completion as _first_completion
+from vllm_omni.model_executor.common.request_outputs import multimodal_output as _multimodal_output
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.capabilities import (
     minicpmo45_native_capabilities,
 )
@@ -54,7 +59,6 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.session import (
 )
 
 if TYPE_CHECKING:
-    import torch
     from transformers import PreTrainedTokenizerBase
     from vllm.config import ModelConfig
 
@@ -166,19 +170,6 @@ def _duplex_vision_tokens(payload: object, *, tile_pixels: int | None = None) ->
         return _DUPLEX_VISION_TOKENS_PER_FRAME
     blocks = _duplex_base_frame_blocks(frames[0], tile_pixels) + (len(frames) - 1)
     return blocks * _DUPLEX_VISION_TOKENS_PER_FRAME
-
-
-def _duplex_pcm_sample_count(payload: object) -> int | None:
-    if not isinstance(payload, dict):
-        return None
-    audio = payload.get("audio") or payload.get("data")
-    if payload.get("format") != "pcm_f32le" or not isinstance(audio, str):
-        return None
-    try:
-        raw = b64decode(audio, validate=True)
-    except (BinasciiError, ValueError):
-        return None
-    return len(raw) // 4
 
 
 def duplex_payload_is_exact_chunks(payload: object) -> bool:
@@ -295,48 +286,6 @@ def build_duplex_data_plane_prompt(
 
 
 # ---- engine policy helpers: listen decision ----
-
-
-def _coerce_int(value: object) -> int | None:
-    detach = getattr(value, "detach", None)
-    if callable(detach):
-        try:
-            flat: torch.Tensor = detach().cpu().reshape(-1)
-            if flat.numel() == 0:
-                return None
-            value = flat[0].item()
-        except Exception:
-            return None
-    try:
-        return int(cast(Any, value))  # Any: duck-typed scalar (int/float/str/tensor item)
-    except (TypeError, ValueError):
-        return None
-
-
-def _coerce_int_list(value: object) -> list[int]:
-    if value is None:
-        return []
-    if hasattr(value, "detach"):
-        try:
-            value = value.detach().cpu().reshape(-1).tolist()
-        except Exception:
-            return []
-    if not isinstance(value, (list, tuple)):
-        return []
-    return [token_id for item in value if (token_id := _coerce_int(item)) is not None]
-
-
-def _first_completion(output: object) -> object | None:
-    outputs = getattr(output, "outputs", None)
-    return outputs[0] if isinstance(outputs, list) and outputs else None
-
-
-def _multimodal_output(output: object, completion: object | None) -> dict[str, object]:
-    metadata = getattr(output, "multimodal_output", None)
-    if isinstance(metadata, dict):
-        return metadata
-    metadata = getattr(completion, "multimodal_output", None) if completion is not None else None
-    return metadata if isinstance(metadata, dict) else {}
 
 
 def _special_token_ids(metadata: dict[str, object]) -> dict[str, int]:
