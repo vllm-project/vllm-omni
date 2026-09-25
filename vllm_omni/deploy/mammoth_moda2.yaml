@@ -15,7 +15,8 @@ stages:
 
   - stage_id: 1
     devices: "0"
-    max_num_seqs: 1
+    max_num_seqs: 8
+    request_batch_max_wait_ms: 20
     gpu_memory_utilization: 0.3
     enforce_eager: true
     trust_remote_code: true

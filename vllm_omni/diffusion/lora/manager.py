@@ -573,8 +573,7 @@ class DiffusionLoRAManager:
 
     def _bind_adapter_weights(self, lora_model: LoRAModel, scale: float) -> None:
         binding_validator = getattr(self.pipeline, "_validate_diffusion_lora_binding", None)
-        # Track bindings unconditionally. The zero-binding guard below needs this
-        # bookkeeping on every pipeline, not only the ones that supply a validator.
+        # Track successful bindings for generic and model-specific validation.
         lora_names_by_id = {id(weights): name for name, weights in lora_model.loras.items()}
         bound_lora_names: set[str] = set()
 
@@ -680,24 +679,21 @@ class DiffusionLoRAManager:
                         or len(output_sizes) != n_slices
                         or deinterleaved.shape[0] != sum(output_sizes)
                     ):
-                        logger.warning(
-                            "Skipping LoRA for %s: cannot establish HunyuanImage-3 fused-QKV layout",
-                            full_module_name,
+                        raise ValueError(
+                            f"LoRA adapter {lora_model.id} binding is incomplete for {full_module_name}: "
+                            "cannot establish HunyuanImage-3 fused-QKV layout "
+                            f"(lora_b.shape[0]={lora_weights.lora_b.shape[0]}, "
+                            f"expected output_sizes={output_sizes})"
                         )
-                        lora_layer.reset_lora(0)
-                        continue
                     b_splits = list(torch.split(deinterleaved, list(output_sizes), dim=0))
                 else:
                     total = sum(output_slices)
                     if lora_weights.lora_b.shape[0] != total:
-                        logger.warning(
-                            "Skipping LoRA for %s due to shape mismatch: lora_b[0]=%d != sum(output_slices)=%d",
-                            full_module_name,
-                            lora_weights.lora_b.shape[0],
-                            total,
+                        raise ValueError(
+                            f"LoRA adapter {lora_model.id} binding is incomplete for {full_module_name}: "
+                            f"lora_b.shape[0]={lora_weights.lora_b.shape[0]} != "
+                            f"sum(output_slices)={total} for output_slices={tuple(output_slices)}"
                         )
-                        lora_layer.reset_lora(0)
-                        continue
                     b_splits = list(torch.split(lora_weights.lora_b, list(output_slices), dim=0))
 
                 lora_a_list = [lora_weights.lora_a] * n_slices
@@ -722,11 +718,13 @@ class DiffusionLoRAManager:
                 scale,
             )
 
-        if not bound_lora_names:
+        unbound_lora_names = sorted(set(lora_model.loras) - bound_lora_names)
+        if not bound_lora_names or unbound_lora_names:
             raise ValueError(
-                f"LoRA adapter {lora_model.id} applies to no layer: expected target modules in "
-                f"{sorted(self._expected_lora_modules)} but received {sorted(lora_model.loras)}. "
-                "Activating it would leave the base model unchanged."
+                f"LoRA adapter {lora_model.id} binding is incomplete: "
+                f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, "
+                f"unbound modules={unbound_lora_names}; "
+                f"expected target modules in {sorted(self._expected_lora_modules)}"
             )
 
         if callable(binding_validator):

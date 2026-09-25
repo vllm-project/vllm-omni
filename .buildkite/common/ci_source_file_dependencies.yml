@@ -188,6 +188,10 @@ source_file_dependencies:
 
   # --- models ---
   # --- omni / tts jobs ---
+  entrypoints_function:
+    - tests/entrypoints/
+    - vllm_omni/entrypoints/
+
   omni_qwen3_omni_function:
     - *qwen3_omni
     - tests/e2e/offline_inference/test_qwen3_omni.py

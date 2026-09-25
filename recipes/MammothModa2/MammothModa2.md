@@ -59,7 +59,9 @@ the measured results are summarized below.
 ### Optional FP8 AR KV cache
 
 For CUDA deployments, `mammoth_moda2_fp8_kv.yaml` is an opt-in preset that
-stores the Stage 0 AR KV cache as FP8 E4M3. Stage 1 remains on
+keeps the Stage 0 AR KV cache of decoder layer 0 in BF16 and stores the other
+27 layers as FP8 E4M3 (`kv_cache_dtype_skip_layers: ["0"]`; write the layer
+indices as quoted strings). Stage 1 remains on
 `kv_cache_dtype=auto`; its DiT execution is unaffected. This setting quantizes
 only the autoregressive KV cache. It is neither FP8 weight/activation
 quantization nor vLLM-Omni diffusion KV-cache quantization.
@@ -78,9 +80,9 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --output mammoth_t2i.png
 ```
 
-The preset was validated on one NVIDIA H800 80GB with CUDA and
-FlashAttention 3. The native and FP8 runs used the same model, code revision,
-and downstream configuration.
+The preset was first validated on one NVIDIA H800 80GB with CUDA and
+FlashAttention 3, with every layer in FP8. The native and FP8 runs used the
+same model, code revision, and downstream configuration.
 
 | Metric | Native BF16 (`kv_cache_dtype=auto`) | FP8 E4M3 (`fp8_e4m3`) | Change |
 | --- | ---: | ---: | ---: |
@@ -97,9 +99,30 @@ twice as many tokens because FP8 reduces the bytes per cached token. This is a
 capacity/concurrency tradeoff: the measured AR and end-to-end latencies were
 higher than the native-BF16 baseline.
 
-1024x1024 fixed-seed smoke test completed successfully with no obvious visual
-failure. FP8 is lossy, so numerical or image-quality equivalence with BF16 is
-not implied.
+On H800, a 1024x1024 fixed-seed smoke test with every layer in FP8 completed
+successfully with no obvious visual failure. FP8 is lossy, so numerical or
+image-quality equivalence with BF16 is not implied.
+
+On one A800 80GB (vLLM 0.30.0), FP8 KV layers run on FlashInfer and BF16 layers
+on FlashAttention 2. Text-to-image at 1024x1024, 50 steps, guidance 4.0, seeds 42
+and 1-5, with a studio tabby cat prompt and a peephole-view Samoyed prompt;
+an image counts when it shows the prompted subject and scene.
+
+| Stage 0 KV cache | GPU KV cache size | Cat images that follow the prompt | Samoyed images that follow the prompt |
+| --- | ---: | ---: | ---: |
+| BF16 on all 28 layers (`auto`) | 147,408 tokens | 6/6 | 6/6 |
+| FP8 E4M3 on all 28 layers | 294,816 tokens | 1/6 | 0/6 |
+| Layer 0 BF16, other 27 layers FP8 E4M3 (this preset) | 284,640 tokens | 6/6 | 6/6 |
+
+The KV cache sizes above still count the 28 attention layers of the replaced
+Qwen-VL language model, which #8095 removes: with it, BF16 goes from 147,408 to
+294,816 tokens and all-FP8 from 294,816 to 589,632. The prompt-following
+columns do not depend on it.
+
+With all 28 layers in FP8, most cat images become a framed print on a wall.
+Keeping layer 0 in BF16 restores them; keeping only layer 27, which has the
+largest key magnitude, does not. The H800 numbers above were measured with all 28
+layers in FP8; this preset has been run on A800 only.
 
 ### 1x L40S 48GB
 

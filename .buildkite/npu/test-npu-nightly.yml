@@ -247,6 +247,42 @@ steps:
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
             exit $$EXIT
+      - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image · Single-NPU"
+        source_file_dependencies: diffusion_qwen_image_perf
+        key: nightly-diffusion-x2iat-performance-qwen-image-single-npu
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_TOKEN: "${HF_TOKEN}"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        commands:
+          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "npu and A3 and cards_1" --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
+            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+            exit $$EXIT
+      - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image · 4-NPU"
+        source_file_dependencies: diffusion_qwen_image_perf
+        key: nightly-diffusion-x2iat-performance-qwen-image-4npu
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_4
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_TOKEN: "${HF_TOKEN}"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        commands:
+          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "npu and A3 and cards_4" --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
+            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+            exit $$EXIT
   - group: ":card_index_dividers: Diffusion X2V Model Test"
     key: nightly-diffusion-x2v-group
     depends_on: upload-nightly-pipeline
@@ -277,13 +313,12 @@ steps:
           HF_HUB_OFFLINE: "1"
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         commands:
-          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - export BENCHMARK_DIR=tests/dfx/perf/results
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "npu and A3" --test-config-file tests/dfx/perf/tests/test_hunyuanvideo15_t2v_vllm_omni.json
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "npu and A3" --test-config-file tests/dfx/perf/tests/test_hunyuanvideo15_t2v_vllm_omni.json
             EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
-            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
       - label: ":full_moon: Diffusion X2V · Wan 2.2 Function Test"
         source_file_dependencies: diffusion_wan22_function

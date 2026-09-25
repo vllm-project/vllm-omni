@@ -25,6 +25,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from vllm_omni.diffusion.cancellation import RequestCancellationRegistry
 from vllm_omni.diffusion.data import (
     DIFFUSION_REQUEST_LIFECYCLE_KEY,
     DIFFUSION_REQUEST_STARTED,
@@ -180,6 +181,19 @@ def _max_num_seqs(od_config: OmniDiffusionConfig) -> int:
         return 1
 
 
+def supports_request_cancellation(od_config: OmniDiffusionConfig) -> bool:
+    """Whether the local pipeline checks cooperative cancellation boundaries."""
+    model_cls = _resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
+    if model_cls is None:
+        name = (
+            "DiffusersAdapterPipeline"
+            if uses_diffusers_adapter(od_config)
+            else getattr(od_config, "model_class_name", None)
+        )
+        model_cls = DiffusionModelRegistry._try_load_model_cls(name)
+    return getattr(model_cls, "supports_request_cancellation", False) is True
+
+
 def _uses_dlo_dp_concurrency(od_config: OmniDiffusionConfig) -> bool:
     parallel_config = getattr(od_config, "parallel_config", None)
     dp_size = getattr(parallel_config, "data_parallel_size", 1)
@@ -230,6 +244,8 @@ class DiffusionEngine:
     # don't hit AttributeError when _busy_loop accesses them.
     dp_concurrent: bool = False
     _scheduling_paused: bool = False
+    # Disabled until runtime initialization resolves the pipeline capability.
+    _request_cancellations: RequestCancellationRegistry | None = None
 
     def __init__(
         self,
@@ -393,6 +409,9 @@ class DiffusionEngine:
         self._shutting_down = False
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
+        self._request_cancellations = (
+            RequestCancellationRegistry() if supports_request_cancellation(self.od_config) else None
+        )
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
         # pause_scheduler(mode="keep"): no new batch is scheduled while set.
         self._scheduling_paused = False
@@ -913,6 +932,8 @@ class DiffusionEngine:
             # path, and repeating executor.shutdown() is unsafe.
             self._shutting_down = True
             self._closed = True
+            if self._request_cancellations is not None:
+                self._request_cancellations.cancel_all()
             if self.stop_event is not None:
                 self.stop_event.set()
             streams = list(self._out_streams.values())
@@ -925,7 +946,13 @@ class DiffusionEngine:
         # If Worker shutdown fails, retain the Scheduler reservations. A
         # remote producer may still be writing into those allocations.
         self.executor.shutdown()
-        self.scheduler.close()
+        try:
+            self.scheduler.close()
+        finally:
+            # Workers are down, so readers cannot attach or use the signals.
+            # Release them even if scheduler cleanup itself fails.
+            if self._request_cancellations is not None:
+                self._request_cancellations.close()
         self._shutdown_complete = True
 
     def _emit_finished_outputs(
@@ -1106,7 +1133,15 @@ class DiffusionEngine:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
             queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
-            request_id = self.scheduler.add_request(request)
+            if self._request_cancellations is not None:
+                request.cancellation_signal = self._request_cancellations.create(request.request_id)
+            try:
+                request_id = self.scheduler.add_request(request)
+            except BaseException:
+                if self._request_cancellations is not None:
+                    self._request_cancellations.finish(request.request_id)
+                    request.cancellation_signal = None
+                raise
             self._out_streams[request_id] = queue
             self._cv.notify_all()
 
@@ -1517,6 +1552,8 @@ class DiffusionEngine:
                 return
             if not self._closed:
                 self._closed = True
+                if self._request_cancellations is not None:
+                    self._request_cancellations.cancel_all()
                 if self.stop_event is not None:
                     self.stop_event.set()
                 pending_streams = list(self._out_streams.values())
@@ -1532,6 +1569,9 @@ class DiffusionEngine:
             if worker_thread.is_alive():
                 worker_thread.join(timeout=10)
             if worker_thread.is_alive():
+                # Keep cancellation names available: an in-flight worker may
+                # not have attached its readers yet. A later close releases
+                # them after execution and executor shutdown have completed.
                 logger.warning(
                     "Worker thread did not terminate within 10s; scheduler and executor shutdown will be deferred."
                 )
@@ -1550,6 +1590,8 @@ class DiffusionEngine:
         else:
             self.scheduler.close()
             self.executor.shutdown()
+        if self._request_cancellations is not None:
+            self._request_cancellations.close()
         self._shutdown_complete = True
 
     def abort(self, request_id: str | Iterable[str]) -> None:
@@ -1558,6 +1600,10 @@ class DiffusionEngine:
         with self._cv:
             if self._closed:
                 return
+            if self._request_cancellations is not None:
+                # Do not queue this behind the full-forward executor call.
+                # Scheduler state is still mutated only by the busy loop.
+                self._request_cancellations.cancel(request_ids)
             for req_id in request_ids:
                 self.abort_queue.put(req_id)
             self._cv.notify_all()
@@ -1601,6 +1647,8 @@ class DiffusionEngine:
         state = self.scheduler.get_request_state(request_id)
         popped_state = self.scheduler.pop_request_state(request_id)
         state = state or popped_state
+        if self._request_cancellations is not None:
+            self._request_cancellations.finish(request_id)
 
         if state is None:
             raise RuntimeError(f"Diffusion scheduler lost state for request {request_id}.")

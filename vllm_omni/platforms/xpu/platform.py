@@ -138,6 +138,10 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
         return free, total
 
     @classmethod
+    def memory_reserved(cls, device: torch.device | int | None = None) -> int:
+        return int(torch.xpu.memory_reserved(device))
+
+    @classmethod
     def get_profiler_cls(cls) -> str:
         """Return XPU-specific profiler that handles XPU events."""
         return "vllm_omni.platforms.xpu.profiler.XPUTorchProfilerWrapper"

@@ -631,8 +631,33 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                 dtype=torch.bool,
                 device=image_hidden_states.device,
             )
-            text_hidden_states = torch.cat([text_hidden_states, image_hidden_states], dim=1)
-            text_attention_mask = torch.cat([text_attention_mask, image_attention_mask], dim=1)
+            # When batch requests have unequal text lengths, right-padded text_hidden_states
+            # followed by concatenated image_hidden_states places padding in the middle of
+            # the row: [valid text, pad, valid image]. Since downstream rope_embedder and
+            # joint_hidden_states prefix-pack using encoder_seq_lengths (sum of valid mask),
+            # middle padding causes image queries to be truncated.
+            # Compact each row so valid tokens are placed contiguously at the start.
+            if batch_size > 1 and not text_attention_mask.all():
+                text_lens = text_attention_mask.sum(dim=-1).tolist()
+                img_lens = image_attention_mask.sum(dim=-1).tolist()
+                max_valid_len = max(t + img for t, img in zip(text_lens, img_lens))
+                compact_hidden_states = text_hidden_states.new_zeros(
+                    batch_size, max_valid_len, text_hidden_states.shape[-1]
+                )
+                compact_attention_mask = torch.zeros((batch_size, max_valid_len), dtype=torch.bool, device=device)
+                for i in range(batch_size):
+                    t_len = text_lens[i]
+                    i_len = img_lens[i]
+                    if t_len > 0:
+                        compact_hidden_states[i, :t_len] = text_hidden_states[i, :t_len]
+                    if i_len > 0:
+                        compact_hidden_states[i, t_len : t_len + i_len] = image_hidden_states[i, :i_len]
+                    compact_attention_mask[i, : t_len + i_len] = True
+                text_hidden_states = compact_hidden_states
+                text_attention_mask = compact_attention_mask
+            else:
+                text_hidden_states = torch.cat([text_hidden_states, image_hidden_states], dim=1)
+                text_attention_mask = torch.cat([text_attention_mask, image_attention_mask], dim=1)
 
         img_tokens = rearrange(hidden_states, "b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=p, p2=p)
         img_tokens = self.x_embedder(img_tokens)
