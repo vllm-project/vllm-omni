@@ -35,6 +35,8 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     VOCAB_SIZE as _CODEC_VOCAB_SIZE,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     TalkerCodecDeviceState,
     TalkerCodecSampleResult,
     codec_sample_result,
@@ -278,9 +280,7 @@ def _codec_stop_ids(state: Any) -> tuple[int, ...]:
     value = state.get("codec_stop_token_ids") if isinstance(state, Mapping) else None
     if not value:
         return ()
-    return tuple(
-        sorted({int(token_id) for token_id in value if 0 <= int(token_id) < _CODEC_VOCAB_SIZE})
-    )
+    return tuple(sorted({int(token_id) for token_id in value if 0 <= int(token_id) < _CODEC_VOCAB_SIZE}))
 
 
 def _codec_allowed_ids_mask(state: Any, device: torch.device) -> torch.Tensor | None:
@@ -315,9 +315,7 @@ def _codec_logit_bias_items(state: Any) -> tuple[tuple[int, ...], tuple[float, .
     if not isinstance(value, Mapping):
         return (), ()
     pairs = sorted(
-        (int(token_id), float(bias))
-        for token_id, bias in value.items()
-        if 0 <= int(token_id) < _CODEC_VOCAB_SIZE
+        (int(token_id), float(bias)) for token_id, bias in value.items() if 0 <= int(token_id) < _CODEC_VOCAB_SIZE
     )
     if not pairs:
         return (), ()
@@ -400,10 +398,6 @@ def _codec_repetition_detected(state: Any) -> bool:
         if _codec_has_repeating_pattern(token_ids, pattern_len, min_count):
             return True
     return False
-
-
-
-
 
 
 def _codec_int_param(state: Any, key: str, fallback: int) -> int:
