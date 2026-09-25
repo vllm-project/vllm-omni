@@ -1,0 +1,55 @@
+# Wan2.x Encode/Generation (EG) disaggregated diffusion pipeline (2 stages).
+#
+# This is the OPT-IN disaggregated topology; select it explicitly with
+#   --deploy-config vllm_omni/deploy/wan2_2_eg.yaml
+# (the single-stage ``wan2_2.yaml`` stays the default for Wan).
+#
+# Structure (stage roles, cross-stage handoff processor, payload keys, input
+# sources, final output) is defined in code by ``WAN2_2_EG_PIPELINE`` in
+# ``vllm_omni/model_executor/models/wan2_2/pipeline.py`` (registry key
+# ``wan2_2_eg``, per RFC #4021). This YAML only supplies runtime wiring:
+#
+#   Stage 0 (encode): UMT5 + optional TI2V VAE encoder -> conditioning (card 0).
+#   Stage 1 (generation): DiT + decoder-only VAE -> video (card 1), consuming
+#                       stage-0 conditioning without text or VAE encoding.
+
+pipeline: wan2_2_eg
+async_chunk: false
+
+trust_remote_code: true
+distributed_executor_backend: "mp"
+
+connectors:
+  wan_encode_connector:
+    name: NixlConnector
+    extra:
+      host: "auto"
+      zmq_port: 50081
+      backends: ["UCX"]
+      lease_seconds: 300
+      transfer_timeout_s: 300
+
+stages:
+  # Stage 0 — encode: UMT5/tokenizer; TI2V also retains the VAE encoder half.
+  # Pure T2V does not load a VAE here. No DiT is loaded.
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    tensor_parallel_size: 1
+    output_connectors:
+      to_stage_1: wan_encode_connector
+    default_sampling_params:
+      seed: 42
+
+  # Stage 1 — generation: DiT + decoder-only VAE; consumes complete conditioning.
+  - stage_id: 1
+    devices: "1"
+    max_num_seqs: 1
+    enforce_eager: true
+    tensor_parallel_size: 1
+    vae_use_tiling: true
+    input_connectors:
+      from_stage_0: wan_encode_connector
+    default_sampling_params:
+      seed: 42
