@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.models.omnivoice import pipeline_omnivoice
 from vllm_omni.diffusion.models.omnivoice.pipeline_omnivoice import (
     OmniVoicePipeline,
     _PreparedOmniVoiceRequest,
@@ -19,6 +20,28 @@ from vllm_omni.model_executor.models.omnivoice.omnivoice_generator import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize(
+    "sampling_params",
+    [
+        OmniDiffusionSamplingParams(seed=42),
+        OmniDiffusionSamplingParams(extra_args={"seed": 42}),
+    ],
+)
+def test_prepare_request_input_honors_both_seed_entrypoints(monkeypatch, sampling_params) -> None:
+    """Keep typed and legacy seed inputs working during the migration."""
+    pipeline = object.__new__(OmniVoicePipeline)
+    pipeline.duration_estimator = SimpleNamespace(estimate_duration=lambda *args: 1)
+    pipeline.tokenizer = SimpleNamespace(encode=lambda text: SimpleNamespace(ids=[1]))
+    pipeline.device = torch.device("cpu")
+    pipeline.config = SimpleNamespace(num_audio_codebook=1, audio_mask_id=0)
+    monkeypatch.setattr(pipeline_omnivoice, "_tokenize_with_nonverbal_tags", lambda text, tokenizer: [2])
+
+    prepared = pipeline._prepare_request_input("Hello", sampling_params)
+
+    assert isinstance(prepared, _PreparedOmniVoiceRequest)
+    assert prepared.seed == 42
 
 
 def test_sdpa_fallback_mask_preserves_packed_sequence_boundaries() -> None:

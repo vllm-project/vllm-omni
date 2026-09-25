@@ -461,6 +461,8 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         voice_name = None
         extra = sampling_params.extra_args or {}
         seed = sampling_params.seed
+        if seed is None:
+            seed = extra.get("seed")
         try:
             chunk_duration = _parse_chunking_seconds(
                 "audio_chunk_duration",
