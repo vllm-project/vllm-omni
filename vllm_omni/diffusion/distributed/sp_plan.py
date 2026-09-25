@@ -240,12 +240,13 @@ class SequenceParallelInput:
     expected_dims: int | None = None
     split_output: bool = False
     auto_pad: bool = False
+    pad_key: str | None = None
 
     def __repr__(self) -> str:
         return (
             f"SequenceParallelInput(split_dim={self.split_dim}, "
             f"expected_dims={self.expected_dims}, split_output={self.split_output}, "
-            f"auto_pad={self.auto_pad})"
+            f"auto_pad={self.auto_pad}), pad_key={self.pad_key!r})"
         )
 
 
@@ -270,9 +271,14 @@ class SequenceParallelOutput:
 
     gather_dim: int
     expected_dims: int | None = None
+    pad_key: str | None = None
 
     def __repr__(self) -> str:
-        return f"SequenceParallelOutput(gather_dim={self.gather_dim}, expected_dims={self.expected_dims})"
+        return (
+            f"SequenceParallelOutput(gather_dim={self.gather_dim}, "
+            f"expected_dims={self.expected_dims}), "
+            f"pad_key={self.pad_key!r})"
+        )
 
 
 @dataclass(frozen=True)
