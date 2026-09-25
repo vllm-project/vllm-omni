@@ -15,6 +15,7 @@ from vllm_omni.diffusion.models.ming_image.pipeline import (
 from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.ming_flash_omni.ming_flash_omni_thinker import (
     MingFlashOmniThinkerForConditionalGeneration,
@@ -127,14 +128,18 @@ def test_pipeline_rejects_multiple_outputs_per_prompt():
 
 
 @pytest.mark.parametrize(
-    ("guidance_scale", "expected"),
-    ((0.0, False), (1.0, False), (1.0001, True), (2.0, True)),
+    ("guidance_scale", "ming_expected", "z_image_expected"),
+    ((0.0, False, False), (1.0, False, True), (1.0001, True, True), (2.0, True, True)),
 )
-def test_cfg_is_only_enabled_above_one(guidance_scale, expected):
-    pipeline = ZImagePipeline.__new__(ZImagePipeline)
-    pipeline._guidance_scale = guidance_scale
+def test_ming_cfg_is_only_enabled_above_one(guidance_scale, ming_expected, z_image_expected):
+    # Ming-Image follows the vendor threshold; the shared Z-Image base keeps diffusers semantics.
+    ming_pipeline = MingImageDiffusionPipeline.__new__(MingImageDiffusionPipeline)
+    ming_pipeline._guidance_scale = guidance_scale
+    z_image_pipeline = ZImagePipeline.__new__(ZImagePipeline)
+    z_image_pipeline._guidance_scale = guidance_scale
 
-    assert pipeline.do_classifier_free_guidance is expected
+    assert ming_pipeline.do_classifier_free_guidance is ming_expected
+    assert z_image_pipeline.do_classifier_free_guidance is z_image_expected
 
 
 def _source_output(prefix_len: int = 4):
@@ -225,6 +230,26 @@ def test_multimodal_processor_applies_generation_template(monkeypatch: pytest.Mo
     assert template_calls == [("edit this image", True)]
     assert captured["inputs"].prompt == [101, 102]
     assert captured["inputs"].hf_processor_mm_kwargs["modalities"] == ["image"]
+
+
+@pytest.mark.parametrize(
+    ("pipeline_config", "expected_class_name"),
+    ((MING_IMAGE_PIPELINE, "MingImageDiffusionPipeline"), (None, None)),
+)
+def test_engine_od_config_falls_back_to_registered_pipeline_class(monkeypatch, pipeline_config, expected_class_name):
+    # Ming-Image ships neither a root config.json nor model_index.json for now,
+    # so class-name resolution returns None; serving must still find the extras (e.g. num_layers).
+    monkeypatch.setattr("vllm_omni.diffusion.data.resolve_model_class_name", lambda model, **kwargs: None)
+    engine = object.__new__(AsyncOmniEngine)
+    engine.model = "inclusionAI/Ming-Image-0.1-Design-Layer"
+    engine.pipeline_config = pipeline_config
+    engine._diffusion_od_config_view = None
+
+    od_config = engine.get_diffusion_od_config()
+
+    assert od_config.model_class_name == expected_class_name
+    assert ("num_layers" in get_extra_body_params(od_config.model_class_name)) is (expected_class_name is not None)
+    assert engine.get_diffusion_od_config() is od_config
 
 
 def test_two_stage_topology_and_request_metadata():

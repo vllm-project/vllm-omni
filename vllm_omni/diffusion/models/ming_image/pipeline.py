@@ -107,6 +107,11 @@ class MingImageDiffusionPipeline(ZImagePipeline):
     _encoder_modules: ClassVar[list[str]] = ["conditioning"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
 
+    @property
+    def do_classifier_free_guidance(self) -> bool:
+        # The vendor Ming-Image pipeline only enables CFG above 1.0
+        return self._guidance_scale > 1
+
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         del prefix
         nn.Module.__init__(self)
