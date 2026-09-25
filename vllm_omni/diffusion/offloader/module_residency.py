@@ -98,6 +98,12 @@ class PinnedModuleStager:
     A module iterable is treated as one staging group. It uses one copy stream
     and one reusable completion event. Tensors sharing storage keep their
     shapes, strides, offsets, dtypes, and aliases across every transition.
+
+    With ``retain_device_storage`` the device storages survive ``offload``:
+    ``load`` then only rebinds to the same fixed storages (weights are
+    immutable, so no H2D copy repeats). The stable storage addresses keep
+    CUDA-graph-captured weight pointers valid across offload/load swaps, at
+    the cost of keeping the device storage resident while offloaded.
     """
 
     def __init__(
@@ -108,6 +114,7 @@ class PinnedModuleStager:
         pin_memory: bool = True,
         copy_stream: Any | None = None,
         cache_retention: BoundedAllocatorCache | None = None,
+        retain_device_storage: bool = False,
     ) -> None:
         modules = (module,) if isinstance(module, nn.Module) else tuple(module)
         if not modules or not all(isinstance(item, nn.Module) for item in modules):
@@ -117,6 +124,7 @@ class PinnedModuleStager:
         self.copy_stream = copy_stream if copy_stream is not None else current_omni_platform.Stream()
         self._ready_event = current_omni_platform.Event()
         self.cache_retention = cache_retention
+        self.retain_device_storage = retain_device_storage
         self.loaded = False
         self._groups = self._snapshot_groups(modules, pin_memory=pin_memory)
         self._device_storages: list[torch.Tensor] = []
@@ -234,6 +242,12 @@ class PinnedModuleStager:
     def load(self) -> None:
         if self.loaded:
             return
+        if self._device_storages:
+            # Storage retained from a previous load still holds the immutable
+            # weights; rebinding suffices, no H2D copy repeats.
+            self._bind(self._device_storages)
+            self.loaded = True
+            return
         try:
             self._load_once()
         except torch.OutOfMemoryError:
@@ -263,7 +277,8 @@ class PinnedModuleStager:
             self.loaded = False
             self._release_cache(force=True)
             raise
-        self._device_storages.clear()
+        if not self.retain_device_storage:
+            self._device_storages.clear()
         self.loaded = False
         self._release_cache()
 

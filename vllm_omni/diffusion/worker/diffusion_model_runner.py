@@ -200,7 +200,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self.kv_transfer_manager = (
             payload_transfer_manager if getattr(od_config, "kv_transfer_config", None) is None else None
         )
-        self.init_omni_connectors(od_config, payload_transfer_manager, synchronous=True)
+        self.init_omni_connectors(od_config, payload_transfer_manager, synchronous=True)  # type: ignore[arg-type]
         self._kv_connector = None
         from vllm_omni.diffusion.diffusion_kv.kv_connector import KVReceiveProgress, native_prefetch_enabled
 
@@ -243,6 +243,23 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         model = getattr(self.pipeline, attr_name, None)
         if model is None:
             return
+
+        if getattr(model, "enable_cuda_graph_decode", False):
+            # Decode-graph models still compile their blocks: graph capture
+            # records the compiled (fused) kernels. Inductor's own cudagraphs
+            # must stay off so the two graph layers never stack.
+            try:
+                import torch._inductor.config as inductor_config
+
+                inductor_config.triton.cudagraphs = False
+            except Exception as e:
+                logger.warning(
+                    "Model runner: could not disable inductor cudagraphs for the "
+                    "compile+CUDA-graph combo (%s); capture may fail and fall back "
+                    "to compiled eager decode.",
+                    e,
+                )
+            logger.info("Model runner: %s combines CUDA graph decode with torch.compile.", attr_name)
 
         compile_granularity = self.od_config.diffusion_compile_granularity
         compile_dynamic = self.od_config.diffusion_compile_dynamic
@@ -1453,7 +1470,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                 else req.denoise_completed
                             )
                             if finished and result is not None:
-                                self._maybe_send_stage_payload([req], [result])
+                                self._maybe_send_stage_payload([req], [result])  # type: ignore[list-item]
                             runner_output_list.append(
                                 RunnerOutput(
                                     request_id=req.request_id,

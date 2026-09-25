@@ -271,7 +271,7 @@ def test_ltx_reference_image_size_policy(tmp_path, model_version: str, expected:
 
 
 def test_reference_image_size_policy_threads_revision(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured = {}
+    captured: dict[str, Any] = {}
 
     def fake_policy(*, model, revision=None):
         captured.update(model=model, revision=revision)
@@ -493,6 +493,27 @@ def test_bagel_image_to_image_prompt_builder() -> None:
     assert result["mm_processor_kwargs"]["target_h"] == 256
     assert result["mm_processor_kwargs"]["target_w"] == 256
     assert result["negative_prompt"] == "ugly"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_qwen_image_21_image_to_image_prompt_builder() -> None:
+    dummy_image = Image.new("RGBA", (64, 64))
+    result = build_image_to_image_prompt(
+        "QwenImage21Pipeline",
+        prompt="make it dance",
+        negative_prompt="blurry",
+        input_image=dummy_image,
+        height=1024,
+        width=768,
+    )
+    assert result == {
+        "prompt": "make it dance",
+        "multi_modal_data": {"image": dummy_image},
+        "height": 1024,
+        "width": 768,
+        "negative_prompt": "blurry",
+    }
 
 
 @pytest.mark.core_model
@@ -785,7 +806,7 @@ def _patch_hunyuan_autotokenizer(monkeypatch: pytest.MonkeyPatch, tokenizer: obj
             return tokenizer
 
     fake_transformers = type(sys)("transformers")
-    fake_transformers.AutoTokenizer = _FakeAutoTokenizer
+    setattr(fake_transformers, "AutoTokenizer", _FakeAutoTokenizer)
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
     return calls
 

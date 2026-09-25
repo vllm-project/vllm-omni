@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -25,7 +28,7 @@ class E2EOperator:
         h_size = z.shape[0]
         w_size = z.shape[1]
 
-        tasks = []
+        tasks: list[TileTask] = []
         for i in range(rows_num):
             for j in range(cols_num):
                 tasks.append(
@@ -62,6 +65,7 @@ class E2EOperator:
 @dataclass
 class FakeWorldGroup:
     device_group: object
+    cpu_group: object = None
 
 
 class DummyMixin(DistributedVaeMixin):

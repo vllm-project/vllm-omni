@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Unit tests for SequentialOffloadBackend."""
 
@@ -282,6 +282,97 @@ def test_component_selective_model_offload_requires_swap_counterpart(component, 
 
     with pytest.raises(ValueError, match=message):
         backend.enable(pipeline)
+
+
+def test_persistent_dit_staging_reuses_fixed_device_storage(accelerator_device) -> None:
+    dit = _create_simple_module().to(accelerator_device)
+    encoder = _create_simple_module().to(accelerator_device)
+    original_weight = dit.linear.weight.detach().clone()
+
+    apply_sequential_offload(
+        dit_modules=[dit],
+        encoder_modules=[encoder],
+        device=accelerator_device,
+        pin_memory=False,
+        persistent_dit_staging=True,
+    )
+
+    dit_hook = dit._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME)
+    encoder_hook = encoder._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME)
+    assert dit_hook._stager is not None
+    assert encoder_hook._stager is None  # encoders keep plain move semantics
+
+    # Registration snapshots the CPU master and rebinds to it.
+    assert dit.linear.weight.device.type == "cpu"
+
+    dit_hook._to_gpu(dit)
+    first_ptr = dit.linear.weight.data_ptr()
+    assert dit.linear.weight.device == accelerator_device
+    torch.testing.assert_close(dit.linear.weight.data, original_weight)
+
+    # Offload via a *different* module's hook (the cross-module swap path),
+    # then reload: the same fixed device storage must be reused so that
+    # CUDA-graph-captured weight pointers stay valid.
+    encoder_hook._to_cpu(dit)
+    assert dit.linear.weight.device.type == "cpu"
+    dit_hook._to_gpu(dit)
+    assert dit.linear.weight.data_ptr() == first_ptr
+    torch.testing.assert_close(dit.linear.weight.data, original_weight)
+
+    # A second offload/load cycle through the DiT hook itself stays put too.
+    dit_hook._to_cpu(dit)
+    dit_hook._to_gpu(dit)
+    assert dit.linear.weight.data_ptr() == first_ptr
+
+    remove_sequential_offload([dit, encoder])
+
+
+def test_default_sequential_offload_releases_device_storage(accelerator_device) -> None:
+    """Without persistent staging, offloading keeps plain move semantics."""
+    dit = _create_simple_module().to(accelerator_device)
+    encoder = _create_simple_module().to(accelerator_device)
+
+    apply_sequential_offload(
+        dit_modules=[dit],
+        encoder_modules=[encoder],
+        device=accelerator_device,
+        pin_memory=False,
+    )
+
+    dit_hook = dit._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME)
+    assert dit_hook._stager is None  # no retained staging: GPU storage is freed on offload
+
+    dit_hook._to_gpu(dit)
+    assert dit.linear.weight.device == accelerator_device
+    dit_hook._to_cpu(dit)
+    assert dit.linear.weight.device.type == "cpu"
+
+    remove_sequential_offload([dit, encoder])
+
+
+@pytest.mark.parametrize(
+    ("decode_graphs", "expect_stager"),
+    [(True, True), (False, False)],
+)
+def test_model_level_persistent_staging_gated_on_decode_graph(
+    accelerator_device, decode_graphs: bool, expect_stager: bool
+) -> None:
+    """ModelLevelOffloadBackend only retains DiT staging for decode-graph models."""
+    pipeline = nn.Module()
+    pipeline.transformer = _create_simple_module()
+    if decode_graphs:
+        pipeline.transformer.enable_cuda_graph_decode = True
+    pipeline.text_encoder = _create_simple_module()
+    backend = ModelLevelOffloadBackend(
+        OffloadConfig(strategy=OffloadStrategy.MODEL_LEVEL, pin_cpu_memory=False),
+        accelerator_device,
+    )
+    backend.enable(pipeline)
+
+    hook = pipeline.transformer._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME)
+    assert (hook._stager is not None) is expect_stager
+
+    backend.disable()
 
 
 def test_sequential_offload_can_begin_with_dit_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:

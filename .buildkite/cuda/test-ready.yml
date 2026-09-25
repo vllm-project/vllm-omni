@@ -237,6 +237,18 @@ steps:
             "
         mirror_hardwares: h100_2
 
+      - label: "Diffusion · Qwen Image 2.1 Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_qwen_image_21.py
+          - tests/helpers/
+          - vllm_omni/diffusion/models/qwen_image_21/
+          - vllm_omni/diffusion/distributed/autoencoders/
+          - vllm_omni/diffusion/sched/
+          - vllm_omni/entrypoints/openai/
+        commands:
+          - timeout 30m pytest -s -v tests/e2e/online_serving/test_qwen_image_21.py -m 'core_model and cuda' --run-level 'core_model'
+        mirror_hardwares: h100_1
+
       - label: "Diffusion · Qwen Image Test"
         source_file_dependencies: diffusion_qwen_image_function
         commands:

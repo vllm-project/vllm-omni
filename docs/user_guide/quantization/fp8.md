@@ -1,4 +1,4 @@
-﻿# FP8 Quantization
+# FP8 Quantization
 
 ## Overview
 
@@ -17,7 +17,7 @@ in deep DiT blocks.
 ## Hardware Support
 
 | Device | Support |
-|--------|---------|
+| -------- | --------- |
 | NVIDIA Blackwell GPU (SM 100+) | ✅ |
 | NVIDIA Ada/Hopper GPU (SM 89+) | ✅ |
 | NVIDIA Ampere GPU (SM 80+) | ✅ |
@@ -93,8 +93,9 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 ### Diffusion Models
 
 | Model | HF models | Online | Pre-calibrated | Recommendation | `ignored_layers` | Text-Encoder quantization |
-|-------|-----------|:-------:|:------:|----------------|------------------|------------------|
+| ------- | ----------- | :-------: | :------: | ---------------- | ------------------ | ------------------ |
 | Qwen-Image | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Yes | Yes | Skip sensitive image-stream MLPs when quality regresses | `img_mlp` | |
+| Qwen-Image-2.1 | `Qwen/Qwen-Image-2.1` | Yes | Not validated | Skip image-stream MLPs for best fidelity; all-layer FP8 is loadable. On H200 (1024×1024, teapot prompt) DiT FP8-all is ~30.4 GB / 6.06 s vs BF16 ~36.9 GB / 7.34 s (~33 dB vs BF16). Text encoder FP8 covers the language model only — the vision tower and LM head stay BF16 | `img_mlp` | ✅︎ (language model only) |
 | Wan2.2 | Wan2.2 diffusion pipelines | Not validated | Not validated | Validate against BF16 before documenting as supported | TBD | |
 | LTX-2 | `Lightricks/LTX-2`, `rootonchair/LTX-2-19b-distilled` | Yes | Not validated | Transformer only; use dynamic phase LoRA for ordinary two-stage | None | |
 | LTX-2.3 | `diffusers/LTX-2.3-Diffusers`, `diffusers/LTX-2.3-Distilled-Diffusers` | Yes | Not validated | Transformer only; use dynamic phase LoRA for ordinary two-stage | None | |
@@ -109,20 +110,20 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 
-| Model | Scope | Format | Status |
-|-------|-------|--------|--------|
+| Model      | Scope                        | Format                                   | Status                              |
+| ---------- | ---------------------------- | ---------------------------------------- | ----------------------------------- |
 | Qwen3-Omni | Thinker language-model stage | [ModelOpt](modelopt.md) `quant_algo=FP8` | Tested for thinker memory reduction |
-| Qwen3-TTS | TTS language-model stage | Checkpoint config | Not validated |
+| Qwen3-TTS  | TTS language-model stage     | Checkpoint config                        | Not validated                       |
 
 Audio encoder, vision encoder, talker, and code2wav stay in BF16 unless a
 model-specific guide says otherwise.
 
 ### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
 
-| Model | Scope | Status | Notes |
-|-------|-------|--------|-------|
-| BAGEL | Stage-specific transformer or DiT module | Not validated | Route FP8 to the intended stage before enabling |
-| GLM-Image | Stage-specific transformer or DiT module | Not validated | Validate quality against BF16 baseline |
+| Model     | Scope                                    | Status        | Notes                                           |
+| --------- | ---------------------------------------- | ------------- | ----------------------------------------------- |
+| BAGEL     | Stage-specific transformer or DiT module | Not validated | Route FP8 to the intended stage before enabling |
+| GLM-Image | Stage-specific transformer or DiT module | Not validated | Validate quality against BF16 baseline          |
 
 ## Configuration
 
@@ -161,7 +162,7 @@ For a pipeline that exposes both a transformer and a quantization-aware text
 encoder, the scope is:
 
 | Configuration | Transformer | Text encoder | Components without supported quantizable layers |
-|---------------|-------------|--------------|-------------------------------------------------|
+| --------------- | ------------- | -------------- | ------------------------------------------------- |
 | `quantization="fp8"` | FP8 | FP8 | checkpoint precision |
 | `{"transformer": {"method": "fp8"}}` | FP8 | checkpoint precision | checkpoint precision |
 | `{"text_encoder": {"method": "fp8"}}` | checkpoint precision | FP8 | checkpoint precision |
@@ -210,7 +211,7 @@ does not fit the workload.
 ## Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `method` | str | - | Quantization method (`"fp8"`) |
 | `ignored_layers` | list[str] | `[]` | Layer name patterns to keep in BF16 |
 | `activation_scheme` | str | `"dynamic"` | `"dynamic"` selects online activation scaling, or `"static"` when scales are available |

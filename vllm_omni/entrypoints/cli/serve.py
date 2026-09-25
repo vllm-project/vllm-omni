@@ -606,6 +606,16 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--enable-cuda-graph-decode",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Capture fixed-shape KV-cache decode steps into CUDA graphs on models that implement them "
+                "(currently Qwen-Image-2.1). Independent of compilation_config.cudagraph_mode; "
+                "disable with --no-enable-cuda-graph-decode. --enforce-eager also disables it."
+            ),
+        )
+        omni_config_group.add_argument(
             "--fa-deterministic",
             dest="fa_deterministic",
             action="store_true",

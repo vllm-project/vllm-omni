@@ -86,6 +86,9 @@ from vllm_omni.model_extras.ming_image import (
 from vllm_omni.model_extras.ming_image import (
     build_text_to_image_prompt as build_ming_image_text_to_image_prompt,
 )
+from vllm_omni.model_extras.qwen_image_21 import (
+    build_image_to_image_prompt as build_qwen_image_21_image_to_image_prompt,
+)
 from vllm_omni.model_extras.sana_video import SANA_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.sensenova_u1 import (
     SENSENOVA_U1_EXTRA_BODY_PARAMS,
@@ -317,6 +320,9 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "text_to_image_prompt_builder": build_ming_image_text_to_image_prompt,
         "image_to_image_prompt_builder": build_ming_image_image_to_image_prompt,
     },
+    "QwenImage21Pipeline": {
+        "image_to_image_prompt_builder": build_qwen_image_21_image_to_image_prompt,
+    },
 }
 _EXTRA_SPECS["MingImageLayeredDiffusionPipeline"] = _EXTRA_SPECS["MingImageDiffusionPipeline"]
 
@@ -461,10 +467,10 @@ def build_text_to_image_prompt(
     if builder is None:
         return prompt
     return builder(
-        prompt=str(prompt["prompt"]),
-        negative_prompt=prompt.get("negative_prompt"),
-        height=height,
-        width=width,
+        str(prompt["prompt"]),
+        prompt.get("negative_prompt"),
+        height,
+        width,
     )
 
 
@@ -501,10 +507,10 @@ def build_image_to_video_prompt(
     if not isinstance(media_inputs, Mapping):
         raise TypeError("Canonical I2V prompt multi_modal_data must be a mapping.")
     return builder(
-        prompt=str(prompt["prompt"]),
-        negative_prompt=prompt.get("negative_prompt"),
-        media_inputs=media_inputs,
-        height=height,
-        width=width,
-        num_frames=num_frames,
+        str(prompt["prompt"]),
+        prompt.get("negative_prompt"),
+        media_inputs,
+        height,
+        width,
+        num_frames,
     )
