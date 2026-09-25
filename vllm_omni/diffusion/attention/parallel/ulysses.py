@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
+from vllm_omni.diffusion.attention.parallel.uaa_layout import pad_pack_heads, unpack_unpad_heads
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
 from vllm_omni.diffusion.forward_context import (
@@ -133,16 +134,8 @@ def _ulysses_all_to_all_any_qkv(
         raise ValueError(
             f"Invalid padded head count {padded_head_cnt} for original heads={orig_head_cnt}, world_size={world_size}."
         )
-    head_pad = padded_head_cnt - orig_head_cnt
-    if head_pad:
-        x = F.pad(x, (0, 0, 0, head_pad))
-
     head_cnt_local = padded_head_cnt // world_size
-
-    # (B, S_local, H, D) -> (world_size, S_local, B, H_local, D)
-    x_t = x.reshape(bsz, s_local, world_size, head_cnt_local, head_dim).permute(2, 1, 0, 3, 4).contiguous()
-    # (world_size, S_local, B, H_local, D) -> (world_size * S_local, B, H_local, D)
-    x_t = x_t.flatten(0, 1)
+    x_t = pad_pack_heads(x, world_size, padded_head_cnt)
 
     input_split_sizes = [s_local] * world_size
     output_split_sizes = seq_lens
@@ -202,13 +195,7 @@ def _ulysses_all_to_all_any_o(
 
         current_omni_platform.synchronize()
 
-    # (world_size * S_local, B, H_local, D) -> (B, S_local, H, D)
-    out = out.reshape(world_size, s_local, bsz, head_cnt_local, head_dim).permute(2, 1, 0, 3, 4).contiguous()
-    out = out.reshape(bsz, s_local, world_size * head_cnt_local, head_dim)
-
-    if out.shape[2] != orig_head_cnt:
-        out = out[:, :, :orig_head_cnt, :].contiguous()
-    return out
+    return unpack_unpad_heads(out, world_size, s_local, orig_head_cnt)
 
 
 @dataclass(frozen=True, slots=True)
