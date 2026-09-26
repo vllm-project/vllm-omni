@@ -41,6 +41,60 @@ class _FakePEModel:
         return torch.tensor([[1, 2, 3, 4]])
 
 
+class _EchoTokenizer(_FakeTokenizer):
+    def decode(self, token_ids, **_kwargs):
+        return " ".join(str(int(token_id)) for token_id in token_ids)
+
+
+class _StrictPEModel:
+    """Stands in for the ``transformers`` PE model.
+
+    ``GenerationMixin.generate()`` samples off the global RNG and rejects
+    keyword arguments it does not know about, so both halves of that contract
+    are enforced here.
+    """
+
+    _KNOWN_KWARGS = frozenset(
+        {"input_ids", "max_new_tokens", "do_sample", "temperature", "top_p", "pad_token_id", "eos_token_id"}
+    )
+
+    def __init__(self):
+        self.kwargs_seen = []
+
+    def generate(self, **kwargs):
+        unused = sorted(set(kwargs) - self._KNOWN_KWARGS)
+        if unused:
+            # transformers.GenerationMixin._validate_model_kwargs
+            raise ValueError(f"The following model_kwargs are not used by the model: {unused}")
+        self.kwargs_seen.append(kwargs)
+        return torch.multinomial(torch.ones(64), num_samples=6, replacement=True).unsqueeze(0)
+
+
+def _enhance_with_seed(seed):
+    pipe = ErnieImagePipeline.__new__(ErnieImagePipeline)
+    pipe.use_pe = True
+    pipe.pe_tokenizer = _EchoTokenizer()
+    pipe.pe_model = _StrictPEModel()
+
+    enhanced = pipe._enhance_prompt("original", torch.device("cpu"), generator=torch.Generator().manual_seed(seed))
+
+    return enhanced, pipe.pe_model
+
+
+def test_enhance_prompt_is_reproducible_for_a_fixed_seed():
+    first, model = _enhance_with_seed(1234)
+    again, _ = _enhance_with_seed(1234)
+    other, _ = _enhance_with_seed(4321)
+
+    # generate() never takes the request's generator: _validate_model_kwargs
+    # would raise, _enhance_prompt would swallow it and silently fall back to
+    # the un-enhanced prompt.
+    assert model.kwargs_seen and "generator" not in model.kwargs_seen[0]
+    assert first != "original"
+    assert first == again
+    assert first != other
+
+
 def test_enhance_prompt_uses_rank0_result_in_distributed(monkeypatch):
     pipe = ErnieImagePipeline.__new__(ErnieImagePipeline)
     pipe.use_pe = True
