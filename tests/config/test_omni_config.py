@@ -1040,6 +1040,7 @@ def test_sub_config_fields_match_structured_scopes():
         "mask_sp_padding",
         "hsdp_shard_size",
         "hsdp_replicate_size",
+        "enable_pipefusion",
     }
 
 
