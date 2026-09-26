@@ -22,6 +22,8 @@ class VideoGenerationDefaults:
     dimension_multiple: int = 16
     default_negative_prompt: str | None = ""
     duration_seconds: float | None = None
+    # Preserve the fixed-length contract of existing registered pipelines.
+    fixed_num_frames: bool = True
 
     @property
     def max_area(self) -> int:

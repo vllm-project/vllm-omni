@@ -118,6 +118,9 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supported_control_upload_types=("edge", "blur", "depth", "seg", "wsm"),
         final_output_type="video",
     ),
+    "SanaVideo2Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True, max_multimodal_image_inputs=1, final_output_type="video"
+    ),
     "SanaVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SanaImageToVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SanaWmPipeline": DiffusionModelMetadata(
