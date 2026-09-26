@@ -242,7 +242,7 @@ def test_rtd_requires_complete_scores_before_publishing(sample_paths, judge_http
     _, response, score = sample_paths
     sample = DuplexSample.from_row({"id": "sample", "split": "RTD_OCR", "video": "unused.mp4", "video_duration": 10})
     monkeypatch.setattr(evaluator, "materialize_media", lambda *args: "unused.mp4")
-    monkeypatch.setattr(evaluator, "_extract_frames", lambda *args: [b"jpeg"])
+    monkeypatch.setattr(evaluator, "_extract_frames", lambda *args, **kwargs: [b"jpeg"])
     judge_http.side_effect = [_reply(json.dumps(reply)) for reply in replies]
     if missing_field:
         with pytest.raises(ValueError, match=missing_field):
