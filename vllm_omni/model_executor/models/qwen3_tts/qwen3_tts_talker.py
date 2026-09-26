@@ -36,6 +36,7 @@ from vllm_omni.utils.speaker_cache import (
 from vllm_omni.worker.sampling_utils import get_tts_local_seed
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
+from .first_audio import talker_first_audio_enabled
 from .prompt_embeds_builder import PRECOMPUTED_TEXT_IDS_KEY, Qwen3TTSPromptEmbedsBuilder, resolve_x_vector_only
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
@@ -361,6 +362,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         }
     )
 
+    # Set by the MRV2 model state once eager frames are enabled.
+    eager_frames_active = False
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.vllm_config = vllm_config
@@ -404,6 +408,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # per-request additional_information.
         self.talker_mtp_output_key = ("codes", "audio")
         self.talker_mtp_graph_safe = True
+        # A frame's residual codebooks depend only on the Talker hidden and
+        # CB0 of the step that sampled it, so MRV2 may complete the frame at
+        # the end of that step instead of in the next step's preprocess.
+        self.mtp_eager_frames = talker_first_audio_enabled(vllm_config)
         # The runners bypass only the outer whole-MTP graph when explicit
         # generators are present, so seeded requests can still share one raw
         # batched MTP call with independent per-row streams.
@@ -722,6 +730,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
         model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
         async_chunk = bool(getattr(model_config, "async_chunk", False))
+        spans = kwargs.get("request_token_spans")
+        if async_chunk and self.eager_frames_active and spans is not None:
+            return self._make_eager_omni_output(hidden, info_dicts, spans)
         audio_codes_list: list[torch.Tensor] = []
         ref_code_len_segments: list[tuple[int | torch.Tensor, int, torch.device]] = []
         ref_code_list: list[torch.Tensor] = []
@@ -861,6 +872,44 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             assert codec_frame_valid_device is not None
             codec_frame_valid = torch.cat(codec_frame_valid_parts, dim=0)
             mm.setdefault("meta", {})["codec_frame_valid"] = codec_frame_valid[:span_len]
+        return OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm)
+
+    def _make_eager_omni_output(
+        self,
+        hidden: torch.Tensor,
+        info_dicts: list[Any],
+        spans: list[tuple[int, int]],
+    ) -> OmniOutput:
+        """Async-chunk output when the runner fills frames after sampling.
+
+        Every row that sampled this step gets its codes and validity from the
+        runner's eager MTP; the rest (non-final prefill chunks) carry no frame,
+        so the per-request buffer rows need not be gathered here.
+        """
+        num_tokens = spans[-1][1] if spans else 0
+        q = int(self.talker_config.num_code_groups)
+        mm: OmniPayload = {
+            "codes": {"audio": torch.zeros((num_tokens, q), dtype=torch.long, device=hidden.device)},
+            "meta": {
+                "codec_frame_valid": torch.zeros((num_tokens,), dtype=torch.int8, device=hidden.device),
+                "first_audio": torch.zeros((num_tokens,), dtype=torch.int8, device=hidden.device),
+            },
+        }
+        ref_rows = [
+            index
+            for index, info in enumerate(info_dicts)
+            if isinstance(info, dict)
+            and isinstance(ref := info.get("codes", {}).get("ref"), torch.Tensor)
+            and ref.numel() > 0
+            and _should_publish_async_ref_codes(info)
+        ]
+        if ref_rows:
+            empty = torch.empty(0, dtype=torch.long)
+            ref_code_list = [empty] * len(info_dicts)
+            for index in ref_rows:
+                ref_code_list[index] = info_dicts[index]["codes"]["ref"]
+                _mark_async_ref_codes_published(info_dicts[index])
+            mm["codes"]["ref"] = ref_code_list
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm)
 
     # -------------------- preprocess / postprocess --------------------
@@ -1087,7 +1136,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 f"preprocess_decode_batch expected {len(req_infos)} input ids, got {int(input_ids_flat.numel())}"
             )
 
-        codec_frame_valid_batch = (input_ids_flat >= 0) & (input_ids_flat < self._codebook_vocab_size)
+        eager = self.eager_frames_active
+        codec_frame_valid_batch = (
+            None if eager else (input_ids_flat >= 0) & (input_ids_flat < self._codebook_vocab_size)
+        )
         device = input_ids_flat.device
         dtype = self._embedding_dtype
         # Request-independent constant (see :meth:`_init_runtime_buffers`) —
@@ -1150,28 +1202,29 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 text_step = tts_pad_embed
                 next_text_offset = text_offset
 
-            last_hidden = hs.get("last")
-            if isinstance(last_hidden, torch.Tensor):
-                past_hidden = last_hidden.to(device=device, dtype=dtype).reshape(1, -1)
-            else:
-                # Match scalar preprocess(): EOS / async-scheduling races can
-                # arrive before postprocess has written last; zeros are filtered
-                # downstream the same way as the single-request path.
-                logger.warning_once(
-                    "Qwen3-TTS batched decode missing last hidden; zero-filling past_hidden "
-                    "to match scalar preprocess()"
-                )
-                past_hidden = torch.zeros_like(text_step)
-            past_hidden_list.append(past_hidden)
             text_step_list.append(text_step)
-
             info_update: dict[str, Any] = {
                 "meta": {
                     "talker_text_offset": int(next_text_offset),
                     "codec_streaming": codec_streaming,
-                    "codec_frame_valid": codec_frame_valid_batch[len(updates)].reshape(()),
                 },
             }
+            if not eager:
+                # Eager frames finished MTP last step: no hidden input or row validity needed.
+                last_hidden = hs.get("last")
+                if isinstance(last_hidden, torch.Tensor):
+                    past_hidden = last_hidden.to(device=device, dtype=dtype).reshape(1, -1)
+                else:
+                    # Match scalar preprocess(): EOS / async-scheduling races can
+                    # arrive before postprocess has written last; zeros are filtered
+                    # downstream the same way as the single-request path.
+                    logger.warning_once(
+                        "Qwen3-TTS batched decode missing last hidden; zero-filling past_hidden "
+                        "to match scalar preprocess()"
+                    )
+                    past_hidden = torch.zeros_like(text_step)
+                past_hidden_list.append(past_hidden)
+                info_update["meta"]["codec_frame_valid"] = codec_frame_valid_batch[len(updates)].reshape(())
             if trailing_text_update is not None:
                 info_update["hidden_states"] = {"trailing_text": trailing_text_update.detach()}
             updates.append(info_update)
@@ -1179,11 +1232,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if input_embeds is None:
             input_embeds = self.embed_input_ids(input_ids_flat.reshape(-1, 1).to(torch.long))
         inputs_embeds_out = input_embeds.to(device=device, dtype=dtype).reshape(len(req_infos), -1)
+        text_steps = torch.cat(text_step_list, dim=0)
         return (
             input_ids_flat,
             inputs_embeds_out,
-            torch.cat(past_hidden_list, dim=0),
-            torch.cat(text_step_list, dim=0),
+            text_steps if eager else torch.cat(past_hidden_list, dim=0),
+            text_steps,
             updates,
         )
 
@@ -1382,6 +1436,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         logger.info("Loaded %d weights for Qwen3TTSTalkerForConditionalGeneration", len(loaded))
         self._build_stacked_codec_embed()
+        if talker_first_audio_enabled(self.vllm_config):
+            from .first_frame_decoder import Qwen3TTSFirstFrameDecoder
+
+            self.first_frame_decoder = Qwen3TTSFirstFrameDecoder(self.model_path)
+            decoder_loaded = self.first_frame_decoder.load(self.vllm_config)
+            loaded = set(loaded) | {f"first_frame_decoder.{name}" for name in decoder_loaded}
         return loaded
 
     def _build_stacked_codec_embed(self) -> None:
@@ -1568,6 +1628,35 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
     # such as the NPU 310P graph-safety override apply to both runners.
     mtp = talker_mtp
     get_mtp_seed = staticmethod(get_tts_local_seed)
+
+    # Postprocess only stores the last hidden for the deferred decode MTP.
+    eager_frames_need_postprocess = False
+
+    def eager_decode_settled(self, info: dict[str, Any]) -> bool:
+        """Decode preprocess is a no-op for this row: its trailing text is spent.
+
+        From then on every decode step feeds the frame embedding plus the pad
+        text step and changes no per-request state (the non-streaming
+        CustomVoice/VoiceDesign case after the first decode).
+        """
+        hs = info.get("hidden_states")
+        tail = hs.get("trailing_text") if isinstance(hs, dict) else None
+        meta = info.get("meta")
+        offset = meta.get("talker_text_offset", 0) if isinstance(meta, dict) else 0
+        return isinstance(tail, torch.Tensor) and tail.numel() == 0 and not offset
+
+    def eager_settled_text_step(self) -> torch.Tensor:
+        return self._tts_pad_embed.reshape(1, -1)
+
+    def capture_first_frame_graphs(self) -> None:
+        # Set by load_weights when talker_first_audio_enabled accepts the connector option.
+        decoder = getattr(self, "first_frame_decoder", None)
+        if decoder is not None:
+            decoder.capture()
+
+    def mtp_frame_valid(self, layer0: torch.Tensor) -> torch.Tensor:
+        """Rows whose CB0 is a codec id rather than EOS/special; matches decode preprocess."""
+        return (layer0 >= 0) & (layer0 < self._codebook_vocab_size)
 
     @property
     def mtp_output_key(self) -> tuple[str, str]:

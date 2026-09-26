@@ -752,3 +752,37 @@ def test_load_weights_uses_model_dtype_before_precomputing_caches(dtype):
     assert _load_weights_noop(model) == {"decoder.fake_weight"}
     assert model.decoder.weight.dtype is dtype
     assert cache_dtypes == [dtype]
+
+
+@pytest.mark.parametrize("capture_fails", [False, True])
+def test_decode_autotune_restores_process_flags(mocker, monkeypatch, capture_fails):
+    monkeypatch.setattr(torch.backends.cudnn, "benchmark", False)
+    monkeypatch.setattr(torch.backends.cudnn, "benchmark_limit", 5)
+    original = (torch.backends.cudnn.enabled, torch.backends.cudnn.deterministic, torch.backends.cudnn.allow_tf32)
+    model = _make_model(
+        async_chunk=True,
+        device=torch.device("cuda"),
+        stage_connector_config={"extra": {"decode_cudnn_benchmark": True}},
+    )
+
+    observed = []
+
+    def capture(**kwargs):
+        observed.append(
+            (
+                torch.backends.cudnn.benchmark,
+                torch.backends.cudnn.benchmark_limit,
+                torch.backends.cudnn.enabled,
+                torch.backends.cudnn.deterministic,
+                torch.backends.cudnn.allow_tf32,
+            )
+        )
+        if capture_fails:
+            raise RuntimeError("capture failed")
+
+    capture_mock = mocker.patch.object(model, "_maybe_enable_decoder_cudagraph", side_effect=capture)
+    _load_weights_noop(model)
+    capture_mock.assert_called_once()
+    assert observed == [(True, 10, *original)]
+    assert torch.backends.cudnn.benchmark is False
+    assert torch.backends.cudnn.benchmark_limit == 5

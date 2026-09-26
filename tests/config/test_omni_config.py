@@ -886,6 +886,7 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
 
 def test_runtime_config_fields_match_structured_runtime_scope():
     assert {f.name for f in fields(OmniStageRuntimeConfig)} == {
+        "cuda_mps",
         "additional_config",
         "distributed_executor_backend",
         "worker_cls",
@@ -2051,6 +2052,28 @@ def test_async_chunk_rejects_mismatched_connector_edge(disabled_stage, builder):
             builder(pipeline, user_deploy_config=deploy)
 
 
+@pytest.mark.parametrize("scope", ["pipeline", "stage"])
+@pytest.mark.parametrize("from_yaml", [False, True])
+@pytest.mark.parametrize("builder", [merge_pipeline_deploy, VllmOmniConfig.from_pipeline_config])
+def test_async_chunk_rejects_quoted_false_before_selecting_processors(tmp_path, scope, from_yaml, builder):
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    if from_yaml:
+        path = tmp_path / "quoted_false.yaml"
+        path.write_text(
+            'async_chunk: "false"\n' if scope == "pipeline" else 'stages:\n  - stage_id: 0\n    async_chunk: "false"\n'
+        )
+        deploy = load_deploy_config(path)
+    elif scope == "pipeline":
+        deploy = DeployConfig(async_chunk="false")
+    else:
+        deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, async_chunk="false")])
+    with pytest.raises(ValueError, match="async_chunk must be a boolean"):
+        if builder is merge_pipeline_deploy:
+            builder(pipeline, deploy)
+        else:
+            builder(pipeline, user_deploy_config=deploy)
+
+
 @pytest.mark.parametrize("explicit", [False, True])
 def test_diffusion_quantization_origin_survives_projection_and_transport(monkeypatch, explicit):
     from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
@@ -2169,3 +2192,31 @@ def test_structured_diffusion_stage_keeps_shared_globals_outside_diffusion():
 def test_structured_diffusion_stage_rejects_explicit_shared_engine_field(field_name, config_kwargs):
     with pytest.raises(ValueError, match=rf"stage 0.*{field_name}"):
         _build_single_diffusion_config(**config_kwargs)
+
+
+def test_mps_is_explicit_only_in_experimental_single_gpu_profile():
+    assert not load_deploy_config(_DEPLOY_DIR / "qwen3_tts.yaml").cuda_mps
+    deploy = load_deploy_config(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2_single_gpu.yaml")
+    assert deploy.cuda_mps
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    stages = merge_pipeline_deploy(pipeline, deploy)
+    assert all(stage.yaml_runtime["cuda_mps"] is True for stage in stages)
+
+
+def test_mps_config_rejects_string_boolean(tmp_path):
+    path = tmp_path / "deploy.yaml"
+    path.write_text('cuda_mps: "false"\n')
+    with pytest.raises(ValueError, match="cuda_mps must be a boolean"):
+        load_deploy_config(path)
+
+
+def test_mps_stays_in_runtime_instead_of_engine_arguments():
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    config = _from_pipeline_key(
+        "qwen3_tts", deploy_config_path=str(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2_single_gpu.yaml")
+    )
+    for stage in config.stage_configs:
+        assert stage.runtime_config.cuda_mps
+        args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+        assert "cuda_mps" not in args

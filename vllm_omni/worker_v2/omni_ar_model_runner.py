@@ -192,6 +192,15 @@ class OmniARModelRunner(OmniGPUModelRunner):
                 input_batch,
                 grammar_output,
             )
+        run_eager_mtp = getattr(self.model_state, "run_eager_mtp", None)
+        if multimodal_outputs and run_eager_mtp is not None:
+            run_eager_mtp(
+                input_batch,
+                text_hidden,
+                sampler_output.sampled_token_ids,
+                multimodal_outputs,
+                self._dispatch_mtp_batch_descriptor,
+            )
         if self.pp_handler is not None:
             self.pp_handler.broadcast(
                 sampler_output.sampled_token_ids,

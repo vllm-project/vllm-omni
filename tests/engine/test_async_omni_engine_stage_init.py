@@ -10,6 +10,7 @@ import threading
 import time
 import types
 from dataclasses import dataclass, field
+from subprocess import CompletedProcess
 
 import pytest
 from omegaconf import OmegaConf
@@ -68,6 +69,49 @@ def test_stage_runtime_env_accepts_typed_runtime_config(monkeypatch):
         assert os.environ[env_key] == "typed-value"
 
     assert env_key not in os.environ
+
+
+@pytest.mark.parametrize(
+    "invalid_key,invalid_value",
+    [("INVALID=ENV", "value"), ("INVALID\0ENV", "value"), ("INVALID_ENV", "value\0")],
+    ids=["equals-in-key", "nul-in-key", "nul-in-value"],
+)
+def test_stage_runtime_env_restores_partial_application(monkeypatch, invalid_key, invalid_value):
+    existing_key = "VLLM_OMNI_TEST_EXISTING_STAGE_ENV"
+    new_key = "VLLM_OMNI_TEST_NEW_STAGE_ENV"
+    monkeypatch.setenv(existing_key, "original")
+    monkeypatch.delenv(new_key, raising=False)
+    runtime_config = OmniStageRuntimeConfig(
+        env={existing_key: "overridden", new_key: "temporary", invalid_key: invalid_value}
+    )
+
+    with pytest.raises(ValueError):
+        with stage_runtime_env(0, runtime_config):
+            pytest.fail("Invalid environment must prevent stage launch")
+
+    assert os.environ[existing_key] == "original"
+    assert new_key not in os.environ
+
+
+def test_stage_runtime_env_restores_after_launch_error(monkeypatch):
+    env_key = "VLLM_OMNI_TEST_STAGE_ENV_LAUNCH_ERROR"
+    monkeypatch.setenv(env_key, "original")
+
+    with pytest.raises(RuntimeError, match="stage launch failed"):
+        with stage_runtime_env(0, OmniStageRuntimeConfig(env={env_key: "temporary"})):
+            assert os.environ[env_key] == "temporary"
+            raise RuntimeError("stage launch failed")
+
+    assert os.environ[env_key] == "original"
+
+
+def test_stage_runtime_env_restores_first_value_for_normalized_keys(monkeypatch):
+    monkeypatch.setenv("123", "original")
+
+    with stage_runtime_env(0, {"env": {123: "first", "123": "second"}}):
+        assert os.environ["123"] == "second"
+
+    assert os.environ["123"] == "original"
 
 
 def test_orchestrator_startup_timeout_warns_how_to_raise_limits(monkeypatch):
@@ -1017,6 +1061,63 @@ def test_stage_runtime_launches_shared_engines_with_per_client_addresses(monkeyp
     )
     assert captured_launch_env == ["enabled" if stage_id == 0 else None for stage_id in stage_ids]
     assert os.environ.get("VLLM_OMNI_TEST_STAGE_RUNTIME_ENV") is None
+
+
+@pytest.mark.parametrize("client_count", [1, 2])
+def test_stage_launch_uses_configured_mps_pipe_and_rejects_conflicts(monkeypatch, client_count):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+    from vllm_omni.engine import cuda_mps
+
+    runtime = _make_stage_runtime()
+    plans = [_make_llm_plan(stage_id, stage_id=stage_id, vllm_config=_FakeVllmConfig()) for stage_id in (0, 1)]
+    for stage_id, plan in enumerate(plans):
+        plan.replicas[0].engine_args_dict = {}
+        plan.replicas[0].metadata.runtime_cfg = OmniStageRuntimeConfig(
+            cuda_mps=True,
+            devices="0",
+            env={"CUDA_MPS_PIPE_DIRECTORY": f"/operator/stage-{stage_id}"},
+        )
+    monkeypatch.setenv("CUDA_MPS_PIPE_DIRECTORY", "/operator/parent")
+    monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: plans)
+    monkeypatch.setattr(runtime, "_resolve_replica_physical_devices", lambda *_: "0")
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(runtime_mod, "physical_gpu_uuid", lambda _: "GPU-example")
+    monkeypatch.setattr(runtime_mod.current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(cuda_mps.shutil, "which", lambda _: "/bin/mps-control")
+    controls = []
+
+    def run_control(args, **kwargs):
+        controls.append(kwargs)
+        assert os.environ["CUDA_MPS_PIPE_DIRECTORY"] == "/operator/parent"
+        assert kwargs["env"]["CUDA_MPS_PIPE_DIRECTORY"] == "/operator/stage-0"
+        return CompletedProcess(args, 0, stdout="")
+
+    monkeypatch.setattr(cuda_mps.subprocess, "run", run_control)
+    launched = []
+
+    @contextlib.contextmanager
+    def launch(**kwargs):
+        launched.append(kwargs["stage_id"])
+        assert os.environ["CUDA_MPS_PIPE_DIRECTORY"] == "/operator/stage-0"
+        assert kwargs["stage_visible_devices"] == "GPU-example"
+        yield StageReplicaResources(
+            addresses=EngineZmqAddresses(
+                inputs=[f"ipc://input-{i}" for i in range(client_count)],
+                outputs=[f"ipc://output-{i}" for i in range(client_count)],
+            )
+        )
+
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", launch)
+    try:
+        with pytest.raises(ValueError, match="Conflicting CUDA_MPS_PIPE_DIRECTORY"):
+            with runtime.launch_stage_engines(client_count):
+                pytest.fail("Conflicting colocated MPS policies must prevent launch")
+        assert launched == [0]
+        assert os.environ["CUDA_MPS_PIPE_DIRECTORY"] == "/operator/parent"
+    finally:
+        runtime.shutdown()
+    assert len(controls) == 1
+    assert controls[0]["input"] == "get_server_list\n"
 
 
 @pytest.mark.parametrize("client_count", [1, 2])

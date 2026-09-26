@@ -20,6 +20,7 @@ x-qwen3-tts: &qwen3_tts
   - vllm_omni/model_executor/models/common/alias_free_activation.py
   - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
   - vllm_omni/deploy/qwen3_tts.yaml
+  - vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2_single_gpu.yaml
   - vllm_omni/entrypoints/openai/serving_speech.py
   - vllm_omni/entrypoints/openai/tts_adapters/
   - vllm_omni/engine/stage_pool.py
@@ -30,6 +31,9 @@ x-qwen3-tts: &qwen3_tts
   - vllm_omni/config/omni_config.py
   - vllm_omni/engine/orchestrator.py
   - vllm_omni/engine/stage_engine_core_proc.py
+  - vllm_omni/engine/cuda_mps.py
+  - vllm_omni/engine/stage_runtime.py
+  - vllm_omni/engine/stage_init_utils.py
   - vllm_omni/deploy/qwen3_tts_mrv2.yaml
   - vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2.yaml
   - vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2_b4.yaml

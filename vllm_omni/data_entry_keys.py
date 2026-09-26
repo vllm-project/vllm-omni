@@ -19,6 +19,10 @@ import msgspec
 import numpy as np
 import torch
 
+# Internal output routing markers shared by first-frame producers and orchestration.
+FIRST_AUDIO_KEY = "_omni_first_audio"
+FIRST_AUDIO_REQUIRED_KEY = "_omni_first_audio_required"
+
 REQUEST_ARTIFACT_DIRS_KEY = "_omni_request_artifact_dirs"
 TRANSFORM_OWNED_META_KEYS = frozenset({"minimax_h3_prepared_reference_videos"})
 
@@ -101,6 +105,7 @@ class OmniPayloadMeta(TypedDict, total=False):
     width: int
     decode_flag: bool
     codec_streaming: bool
+    first_audio: bool | torch.Tensor
     codec_frame_valid: bool | torch.Tensor
     ref_code_len: int
     ref_context_size: int
@@ -214,6 +219,7 @@ class MetaStruct(_StructBase):
     width: int | None = None
     decode_flag: bool | None = None
     codec_streaming: bool | None = None
+    first_audio: torch.Tensor | None = None
     codec_frame_valid: torch.Tensor | None = None
     ref_code_len: int | None = None
     # Expected FINAL length of a growing async-chunk sequence, when the

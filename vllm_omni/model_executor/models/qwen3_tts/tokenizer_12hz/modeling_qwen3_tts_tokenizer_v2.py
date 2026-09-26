@@ -997,6 +997,33 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         if count > 0:
             logger.info("Precomputed exp caches for %d SnakeBeta activations", count)
 
+    # Set by enable_time_major_conv(); a plain object so it stays out of state_dict().
+    _time_major_stack = None
+
+    def enable_time_major_conv(self) -> None:
+        """Run the upsample + decoder convs time-major: one tensor-core GEMM per conv.
+
+        Call after the decoder reaches its device and dtype (the stack keeps
+        GEMM-layout weight copies) and before CUDA graph capture.
+        """
+        from .time_major_stack import TimeMajorConvStack
+
+        self._time_major_stack = TimeMajorConvStack(self)
+        logger.info("Qwen3-TTS decoder: time-major (GEMM) conv stack enabled")
+
+    def _conv_decode(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Pre-transformer output ``[B, T, latent]`` -> unclamped waveform ``[B, 1, T * total_upsample]``."""
+        if self._time_major_stack is not None:
+            return self._time_major_stack(hidden)
+        hidden = hidden.permute(0, 2, 1)
+        for blocks in self.upsample:
+            for block in blocks:
+                hidden = block(hidden)
+        wav = hidden
+        for block in self.decoder:
+            wav = block(wav)
+        return wav
+
     def enable_cudagraph(
         self,
         capture_modes: tuple[str, ...] = ("icl", "xvec"),
@@ -1056,15 +1083,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         hidden = self.pre_conv(hidden).transpose(1, 2)
 
         hidden = self.pre_transformer(inputs_embeds=hidden).last_hidden_state
-        hidden = hidden.permute(0, 2, 1)
-        for blocks in self.upsample:
-            for block in blocks:
-                hidden = block(hidden)
-
-        wav = hidden
-        for block in self.decoder:
-            wav = block(wav)
-        return wav.clamp(min=-1, max=1)
+        return self._conv_decode(hidden).clamp(min=-1, max=1)
 
     def _decode_icl_first_chunk(
         self,
@@ -1126,20 +1145,32 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         caches.update({"past_key_values": prefix_cache})
         caches.update({"prefix_hidden": prefix_hidden})
 
-        hidden = hidden.permute(0, 2, 1)
-
-        for blocks in self.upsample:
-            for block in blocks:
-                hidden = block(hidden)
-        wav = hidden
-
-        for block in self.decoder:
-            wav = block(wav)
-        wav = wav.clamp(min=-1, max=1)
-        return wav
+        return self._conv_decode(hidden).clamp(min=-1, max=1)
 
     def _decode_xvec_first_chunk(self, codes: torch.Tensor, caches: dict) -> torch.Tensor:
         """Initialize prefixless incremental state from the first codec chunk."""
+        suffix_hidden = self._init_xvec_first_chunk_state(codes, caches)
+        return self._conv_decode(suffix_hidden).clamp(min=-1, max=1)
+
+    def _decode_xvec_first_chunk_state_only(self, codes: torch.Tensor, caches: dict) -> torch.Tensor:
+        """State for later chunks when the first chunk's audio was delivered upstream."""
+        return self._init_xvec_first_chunk_state(codes, caches)
+
+    # Capture hint only: the raw connector option does not guarantee that
+    # a request received upstream audio. Only its skip_first_audio marker does.
+    capture_first_audio_state_only = False
+
+    def _decode_stream_first_chunk(self, codes: torch.Tensor, caches: dict) -> torch.Tensor:
+        if not caches.get("skip_first_audio", False):
+            return self._decode_xvec_first_chunk(codes, caches)
+        if int(codes.shape[-1]) <= 1:
+            self._decode_xvec_first_chunk_state_only(codes, caches)
+            return codes.new_zeros((codes.shape[0], 1, 0), dtype=torch.float32)
+        # The Talker delivered only the first frame; a longer first chunk
+        # (adaptive or ramped schedules) still owes the audio of the rest.
+        return self._decode_xvec_first_chunk(codes, caches)[..., self.total_upsample :]
+
+    def _init_xvec_first_chunk_state(self, codes: torch.Tensor, caches: dict) -> torch.Tensor:
         hidden = self.quantizer.decode(codes)
         caches["decoder_prefix_frames"] = 0
         caches["ref_hidden"] = hidden[:, :, :0]
@@ -1172,16 +1203,8 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         ).last_hidden_state
         caches["past_key_values"] = empty_prefix_cache
         caches["prefix_hidden"] = suffix_hidden[:, :0, :]
-
-        hidden = suffix_hidden.permute(0, 2, 1)
-        for blocks in self.upsample:
-            for block in blocks:
-                hidden = block(hidden)
-        wav = hidden
-        for block in self.decoder:
-            wav = block(wav)
         caches["suffix_frames"] = int(codes.shape[-1])
-        return wav.clamp(min=-1, max=1)
+        return suffix_hidden
 
     def _decode_suffix(
         self,
@@ -1229,14 +1252,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         hidden = torch.cat([caches["prefix_hidden"], suffix_hidden], dim=1)
 
         required_frames = min(hidden.shape[1], new_frames + _DOWNSTREAM_CONTEXT_FRAME)
-        hidden = hidden[:, -required_frames:, :].permute(0, 2, 1)
-        for blocks in self.upsample:
-            for block in blocks:
-                hidden = block(hidden)
-
-        wav = hidden
-        for block in self.decoder:
-            wav = block(wav)
+        wav = self._conv_decode(hidden[:, -required_frames:, :])
         wav = wav[..., -new_frames * self.total_upsample :].clamp(min=-1, max=1)
         return wav, next_quantized, next_conv
 
@@ -1300,7 +1316,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
                     f"prefix_frames={prefix_frames}, total_frames={codes.shape[-1]}"
                 )
             if prefix_frames == 0:
-                return self._decode_xvec_first_chunk(codes, caches)
+                return self._decode_stream_first_chunk(codes, caches)
             return self._decode_icl_first_chunk(codes, caches, prefix_frames)
         else:
             decoder_prefix_frames = int(caches.get("decoder_prefix_frames", prefix_frames))
@@ -1546,7 +1562,11 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             return None
         batched_codes = torch.cat(codes_list, dim=0)
         batched_cache: dict[str, Any] = {}
-        output = self._decode_xvec_first_chunk(batched_codes, batched_cache)
+        skip_flags = {bool(cache.get("skip_first_audio", False)) for cache in request_caches}
+        if len(skip_flags) != 1:
+            return None
+        batched_cache["skip_first_audio"] = skip_flags.pop()
+        output = self._decode_stream_first_chunk(batched_codes, batched_cache)
         outputs: list[torch.Tensor] = []
         for row, cache in enumerate(request_caches):
             for key in ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv"):

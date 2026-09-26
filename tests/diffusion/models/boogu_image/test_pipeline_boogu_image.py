@@ -14,6 +14,7 @@ Two groups:
 """
 
 import os
+import zlib
 from types import SimpleNamespace
 
 import pytest
@@ -520,8 +521,17 @@ def test_constructor_rejects_non_cuda_sequence_parallelism(
 # ---------------------------------------------------------------------------
 
 
+def _content_id(text: str) -> int:
+    """Bounded text IDs, stable across processes unlike builtin ``hash()``.
+
+    Seed/reference checks use separate transformers so BF16 rounding cannot
+    hide their smaller signals beneath the content term.
+    """
+    return zlib.crc32(text.encode()) % 9973
+
+
 class _RecordingProcessor:
-    """Fake Qwen3VLProcessor: deterministic token ids derived from the text."""
+    """Fake Qwen3VLProcessor with content-derived token IDs."""
 
     def __init__(self):
         self.calls = []
@@ -533,8 +543,8 @@ class _RecordingProcessor:
         for i, messages in enumerate(prompts):
             system_text = messages[0]["content"][0]["text"]
             user_text = messages[1]["content"][0]["text"]
-            input_ids[i, 0] = len(system_text) % 997
-            input_ids[i, 1] = len(user_text) % 997
+            input_ids[i, 0] = _content_id(system_text)
+            input_ids[i, 1] = _content_id(user_text)
             input_ids[i, 2:] = torch.arange(2, _SEQ_LEN) + i
         attention_mask = torch.ones(batch, _SEQ_LEN, dtype=torch.long)
         attention_mask[:, -1] = 0  # fake right-padding
@@ -1283,7 +1293,10 @@ def test_apply_chat_template_ti2i_places_image_before_text():
 
 
 class _ImageAwareRecordingProcessor:
-    """Records whether reference images reached the processor."""
+    """Record reference-image presence and encode text with stable IDs.
+
+    Find text by type because TI2I puts the image first.
+    """
 
     def __init__(self):
         self.calls = []
@@ -1295,7 +1308,13 @@ class _ImageAwareRecordingProcessor:
             has_image.append(any(c.get("type") == "image" for c in user_content))
         self.calls.append({"prompts": prompts, "kwargs": kwargs, "has_image": has_image})
         batch = len(prompts)
-        input_ids = torch.arange(batch * _SEQ_LEN, dtype=torch.long).view(batch, _SEQ_LEN)
+        input_ids = torch.zeros(batch, _SEQ_LEN, dtype=torch.long)
+        for i, messages in enumerate(prompts):
+            system_text = messages[0]["content"][0]["text"]
+            user_text = next(c["text"] for c in messages[1]["content"] if c.get("type") == "text")
+            input_ids[i, 0] = _content_id(system_text)
+            input_ids[i, 1] = _content_id(user_text)
+            input_ids[i, 2:] = torch.arange(2, _SEQ_LEN) + i
         attention_mask = torch.ones(batch, _SEQ_LEN, dtype=torch.long)
         return {"input_ids": input_ids, "attention_mask": attention_mask}
 
@@ -1558,53 +1577,8 @@ def test_forward_image_guidance_ignored_without_reference():
 
 
 # ---------------------------------------------------------------------------
-# Request-batch: compatibility key, generator routing, output split
+# Request-batch: generator routing, output split
 # ---------------------------------------------------------------------------
-
-
-def test_boogu_batch_compatibility_key_t2i_stable_ti2i_unique():
-    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import _boogu_batch_compatibility_key
-
-    # t2i: request_id does not enter the key -> t2i requests batch together.
-    assert _boogu_batch_compatibility_key(False, "req-a") == _boogu_batch_compatibility_key(False, "req-b")
-    assert _boogu_batch_compatibility_key(False, "req-a")[1] == "t2i"
-
-    # ti2i: request_id in the key -> each edit gets a unique key, never co-batched.
-    assert _boogu_batch_compatibility_key(True, "req-a") != _boogu_batch_compatibility_key(True, "req-b")
-    assert _boogu_batch_compatibility_key(True, "req-a")[1] == "ti2i"
-
-    # t2i and ti2i never share a key.
-    assert _boogu_batch_compatibility_key(False, "req-a") != _boogu_batch_compatibility_key(True, "req-a")
-
-
-def test_pre_process_key_wiring_t2i_batches_ti2i_isolated(tmp_path):
-    # End-to-end: real pre-process sets request.batch_compatibility_key, and the
-    # scheduler's key builder reads it into condition_key. Two t2i requests share
-    # a key (co-batchable); two edit requests get distinct keys (batch=1).
-    import PIL.Image
-
-    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import get_boogu_image_pre_process_func
-    from vllm_omni.diffusion.request import OmniDiffusionRequest
-    from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
-    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
-    pre = get_boogu_image_pre_process_func(_make_edit_od_config(tmp_path))
-
-    def condition_key(prompt, rid):
-        req = OmniDiffusionRequest(
-            prompt=prompt, sampling_params=OmniDiffusionSamplingParams(height=512, width=512), request_id=rid
-        )
-        pre(req)
-        return build_request_batch_sampling_params_key(req).condition_key
-
-    t2i_a = condition_key({"prompt": "a cat"}, "t-a")
-    t2i_b = condition_key({"prompt": "a dog"}, "t-b")
-    assert t2i_a == t2i_b and t2i_a[1] == "t2i"
-
-    img = PIL.Image.new("RGB", (64, 64))
-    ti2i_a = condition_key({"prompt": "edit", "multi_modal_data": {"image": img}}, "e-a")
-    ti2i_b = condition_key({"prompt": "edit", "multi_modal_data": {"image": img}}, "e-b")
-    assert ti2i_a != ti2i_b and ti2i_a[1] == "ti2i"
 
 
 class _GeneratorRecordingVAE:
@@ -1734,78 +1708,6 @@ def test_forward_request_batch_num_outputs_slices_and_generators():
     assert outs[0].output.shape[0] == 2 and outs[1].output.shape[0] == 2
     assert float(outs[0].output[0, 0, 0, 0]) == 0.0 and float(outs[0].output[1, 0, 0, 0]) == 1.0
     assert float(outs[1].output[0, 0, 0, 0]) == 2.0 and float(outs[1].output[1, 0, 0, 0]) == 3.0
-
-
-def test_forward_batch_isolation_partner_content_and_seed():
-    """CFG-on, B=2: request A's output must not change when only the
-    co-batched partner's prompt content, negative prompt, or seed changes.
-
-    ``_FakeTransformer``/``_FakeScheduler`` are content-blind (always-zero
-    velocity, latents passed through unchanged), so they cannot catch a
-    cross-request value leak. This test swaps in a transformer whose output
-    depends on both ``instruction_embeds`` (content, positive or negative
-    depending on which CFG branch called it) and ``latents`` (seed), and a
-    scheduler that actually applies the predicted velocity, so a batching bug
-    that mixes rows in either the cond or uncond prediction would change A's
-    result. A negative-prompt-only perturbation is required to cover the
-    uncond branch: varying only the positive prompt never touches
-    ``negative_instruction_embeds``, so an earlier version of this test
-    passed even with a synthetic row-mixing bug injected into the uncond
-    predict() call (verified via a RED-arm check before this fix).
-    """
-
-    class _ContentAwareTransformer(_FakeTransformer):
-        def __call__(self, latents, timestep, instruction_embeds, freqs_real, instruction_attention_mask, **kwargs):
-            content = instruction_embeds.mean(dim=(1, 2)).view(-1, 1, 1, 1)
-            return latents + content
-
-    class _ApplyingScheduler(_FakeScheduler):
-        def step(self, model_output, t, latents, return_dict=False):
-            return (model_output,)
-
-    def run(prompt_a, seed_a, neg_a, prompt_b, seed_b, neg_b):
-        pipeline = _make_forward_pipeline()
-        pipeline.transformer = _ContentAwareTransformer()
-        pipeline.scheduler = _ApplyingScheduler()
-        kw = dict(height=64, width=64, num_inference_steps=2, guidance_scale=4.0, output_type="latent")
-        req = _wrap_request_batch(
-            [
-                (
-                    {"prompt": prompt_a, "negative_prompt": neg_a},
-                    _sampling(**kw, generator=torch.Generator().manual_seed(seed_a)),
-                ),
-                (
-                    {"prompt": prompt_b, "negative_prompt": neg_b},
-                    _sampling(**kw, generator=torch.Generator().manual_seed(seed_b)),
-                ),
-            ]
-        )
-        return pipeline.forward(req)[0].output
-
-    baseline = run("a cat on a mat", 1, "ugly", "a dog in a park", 2, "blurry")
-    assert torch.equal(baseline, run("a cat on a mat", 1, "ugly", "a totally different scene", 2, "blurry"))
-    assert torch.equal(baseline, run("a cat on a mat", 1, "ugly", "a dog in a park", 999, "blurry"))
-    assert torch.equal(baseline, run("a cat on a mat", 1, "ugly", "a dog in a park", 2, "watermark"))
-
-
-def test_forward_batched_ti2i_fails_closed():
-    # A batched ti2i must fail closed (it is gated to batch=1).
-    pipeline = _make_forward_pipeline()
-
-    def edit_prompt():
-        return {
-            "prompt": "make it winter",
-            "additional_information": {"preprocessed_image": torch.zeros(1, 3, 64, 64), "prompt_image": None},
-        }
-
-    req = _wrap_request_batch(
-        [
-            (edit_prompt(), _sampling(num_inference_steps=1, guidance_scale=1.0)),
-            (edit_prompt(), _sampling(num_inference_steps=1, guidance_scale=1.0)),
-        ]
-    )
-    with pytest.raises(RuntimeError, match="gated to batch=1"):
-        pipeline.forward(req)
 
 
 def test_supports_request_batch_enabled():

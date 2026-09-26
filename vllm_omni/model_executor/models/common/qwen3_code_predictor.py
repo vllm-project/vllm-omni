@@ -1077,6 +1077,64 @@ class CodePredictorWrapper(nn.Module):
             ]
         )
 
+    def _predict_step_logits(
+        self,
+        proj_buf: torch.Tensor,
+        bsz: int,
+        padded_bsz: int,
+        step: int,
+        is_npu_capturing: bool,
+    ) -> torch.Tensor:
+        """Run one residual-codebook step; model wrappers may specialize it."""
+        device = proj_buf.device
+        max_seq = self._num_groups + 1
+        model_fwd = self._compiled_model_fwd
+        lm_heads = self._lm_heads_list
+        graph_key: int | tuple[int, int] = padded_bsz
+        seq_len = max_seq
+        if self._prefix_reprefill_enabled:
+            actual_seq_len = step + 1
+            for prefix_seq_len in self._prefix_reprefill_seq_lens:
+                if prefix_seq_len < actual_seq_len:
+                    continue
+                prefix_key = (padded_bsz, prefix_seq_len)
+                if prefix_key in self._bucket_pos_ids:
+                    graph_key = prefix_key
+                    seq_len = prefix_seq_len
+                    break
+        pos_ids = self._bucket_pos_ids.get(graph_key)
+        if pos_ids is None:
+            pos_ids = (
+                torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(padded_bsz, -1).contiguous()
+            )
+
+        # Use captured device graph if available, otherwise call compiled fn.
+        device_graph_entry = self._device_graphs.get(graph_key)
+
+        # Let the outer graph record the regular forward during capture;
+        # normal inference still uses the inner graph replay fast path.
+        if device_graph_entry is not None and not is_npu_capturing:
+            device_graph_entry[0].replay()
+            hidden_out = device_graph_entry[1]
+        else:
+            hidden_out = model_fwd(proj_buf[:padded_bsz, :seq_len, :], pos_ids)
+
+        return lm_heads[step - 1](hidden_out[:bsz, step, :])
+
+    def _sample_per_call(
+        self,
+        logits: torch.Tensor,
+        inv_temperature: float,
+        top_k: int,
+        generator: _GeneratorLike,
+        uniforms: torch.Tensor | None,
+    ) -> torch.Tensor:
+        scaled = logits * inv_temperature
+        if top_k > 0:
+            topk_vals, _ = scaled.topk(top_k, dim=-1)
+            scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+        return self._sample_codes_gumbel(scaled, generator=generator, uniforms=uniforms)
+
     @torch.inference_mode()
     def forward(
         self,
@@ -1114,10 +1172,7 @@ class CodePredictorWrapper(nn.Module):
         self._ensure_buffers(device, dtype, padded_bsz)
 
         proj_buf = self._proj_buf
-        max_seq = num_groups + 1
         projection = self.small_to_mtp_projection
-        model_fwd = self._compiled_model_fwd
-        lm_heads = self._lm_heads_list
         codec_embeds = self._codec_embeds_list
         # torch-npu cannot replay an inner NPUGraph while the outer talker_mtp
         # graph is being captured. Capture state is constant for this forward.
@@ -1153,39 +1208,7 @@ class CodePredictorWrapper(nn.Module):
 
         # Autoregressive loop: predict layers 1..G-1
         for step in range(1, num_groups):
-            graph_key: int | tuple[int, int] = padded_bsz
-            seq_len = max_seq
-            if self._prefix_reprefill_enabled:
-                actual_seq_len = step + 1
-                for prefix_seq_len in self._prefix_reprefill_seq_lens:
-                    if prefix_seq_len < actual_seq_len:
-                        continue
-                    prefix_key = (padded_bsz, prefix_seq_len)
-                    if prefix_key in self._bucket_pos_ids:
-                        graph_key = prefix_key
-                        seq_len = prefix_seq_len
-                        break
-            pos_ids = self._bucket_pos_ids.get(graph_key)
-            if pos_ids is None:
-                pos_ids = (
-                    torch.arange(seq_len, device=device, dtype=torch.long)
-                    .unsqueeze(0)
-                    .expand(padded_bsz, -1)
-                    .contiguous()
-                )
-
-            # Use captured device graph if available, otherwise call compiled fn.
-            device_graph_entry = self._device_graphs.get(graph_key)
-
-            # Let the outer graph record the regular forward during capture;
-            # normal inference still uses the inner graph replay fast path.
-            if device_graph_entry is not None and not is_npu_capturing:
-                device_graph_entry[0].replay()
-                hidden_out = device_graph_entry[1]
-            else:
-                hidden_out = model_fwd(proj_buf[:padded_bsz, :seq_len, :], pos_ids)
-
-            logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
+            logits = self._predict_step_logits(proj_buf, bsz, padded_bsz, step, is_npu_capturing)
 
             # Sample next code via Gumbel-max.
             #
@@ -1216,12 +1239,8 @@ class CodePredictorWrapper(nn.Module):
             else:
                 # "per_call" mode: temperature-scaled + top-k -> Gumbel-max
                 if use_sampling:
-                    scaled = logits * inv_temperature
-                    if top_k > 0:
-                        topk_vals, _ = scaled.topk(top_k, dim=-1)
-                        scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
                     step_uniforms = sample_uniforms[:, step - 1, :] if sample_uniforms is not None else None
-                    code = self._sample_codes_gumbel(scaled, generator=sample_generator, uniforms=step_uniforms)
+                    code = self._sample_per_call(logits, inv_temperature, top_k, sample_generator, step_uniforms)
                 else:
                     code = logits.argmax(dim=-1, keepdim=True)
 
