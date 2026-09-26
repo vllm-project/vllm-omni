@@ -33,7 +33,7 @@ from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
 )
-from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline, parse_lora_request
+from vllm_omni.entrypoints.openai.utils import get_stage_type, is_video_generation_pipeline, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import (
     _encode_video_bytes,
     _PlanarFrameConverter,
@@ -189,6 +189,18 @@ class OmniOpenAIServingVideo:
 
     def _video_encoding_options(self) -> dict[str, bool]:
         transport = _config_value(self._resolve_diffusion_od_config(), "video_output_transport")
+        if transport is None:
+            # Remote diffusion clients expose only model metadata to the API.
+            # The resolved stage config still carries the effective transport options.
+            stages = self.stage_configs or getattr(self._engine_client, "stage_configs", None) or ()
+            for stage in stages:
+                if get_stage_type(stage) != "diffusion":
+                    continue
+                transport = _config_value(_config_value(stage, "diffusion_config"), "video_output_transport")
+                if transport is None:
+                    transport = _config_value(_config_value(stage, "engine_args"), "video_output_transport")
+                if transport is not None:
+                    break
         if _config_value(transport, "enable_borrowed_frames", False) is True:
             return {"enable_borrowed_frames": True}
         return {}
