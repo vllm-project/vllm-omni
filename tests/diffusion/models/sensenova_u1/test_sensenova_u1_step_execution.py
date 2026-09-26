@@ -153,6 +153,23 @@ class TestStepExecutionConfig:
         od_config = SimpleNamespace(step_execution=True, max_num_seqs=1)
         SenseNovaU1Pipeline._check_step_execution_config(od_config)
 
+    def test_request_batch_rejects_cache_acceleration_before_model_load(self):
+        od_config = SimpleNamespace(step_execution=False, max_num_seqs=2, cache_backend="tea_cache")
+        with pytest.raises(ValueError, match="cache_backend='none'"):
+            SenseNovaU1Pipeline(od_config=od_config)
+
+    @pytest.mark.parametrize(
+        ("max_num_seqs", "cache_backend"),
+        [(1, "tea_cache"), (2, "none"), (4, None)],
+    )
+    def test_request_batch_allows_supported_cache_configurations(self, max_num_seqs, cache_backend):
+        od_config = SimpleNamespace(
+            step_execution=False,
+            max_num_seqs=max_num_seqs,
+            cache_backend=cache_backend,
+        )
+        SenseNovaU1Pipeline._check_step_execution_config(od_config)
+
 
 class TestThinkStopRules:
     def test_think_end_takes_one_more_step_and_is_emitted(self):

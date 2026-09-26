@@ -384,6 +384,40 @@ def test_image_count_alias(count, legacy, expected):
     assert pre(req).sampling_params.num_outputs_per_prompt == expected
 
 
+def test_step_mode_legacy_image_count_matches_output_metric(monkeypatch):
+    req = _request(extra={"batch_size": 3})
+    pre = get_sensenova_u1_pre_process_func(SimpleNamespace(step_execution=True))
+    assert pre(req).sampling_params.num_outputs_per_prompt == 3
+    assert req.batch_compatibility_key is None
+
+    pipe = _pipeline()
+    p = pipe._parse_request(DiffusionRequestBatch([req]))
+    assert p.batch_size == 3
+    output = pipe._denoising_output({}, pipe._init_noise_and_schedule(p).image_prediction)
+    monkeypatch.setattr("vllm_omni.diffusion.output_formatter.supports_audio_output", lambda _: False)
+    [result] = format_diffusion_outputs(
+        request=req,
+        od_config=SimpleNamespace(model_class_name="SenseNovaU1Pipeline"),
+        diffusion_output=output,
+        output_data=output.output,
+        postprocess_output=normalize_diffusion_postprocess_output(output.output),
+    )
+    assert len(result.images) == result.metrics["image_num"] == 3
+
+
+def test_preprocess_resolves_through_real_registry():
+    from vllm_omni.diffusion import registry
+
+    config = SimpleNamespace(model_class_name="SenseNovaU1Pipeline", step_execution=False)
+    assert registry._DIFFUSION_PRE_PROCESS_FUNCS[config.model_class_name] == "get_sensenova_u1_pre_process_func"
+    pre = registry.get_diffusion_pre_process_func(config)
+    assert callable(pre)
+    req = _request(extra={"batch_size": 2})
+    assert pre(req) is req
+    assert req.sampling_params.num_outputs_per_prompt == 2
+    assert req.batch_compatibility_key is not None
+
+
 @pytest.mark.parametrize("count,legacy", [(2, 3), (0, None), (1, -1), (1, True), (1, 1.5)])
 def test_invalid_image_counts(count, legacy):
     with pytest.raises(ValueError):

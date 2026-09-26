@@ -432,8 +432,8 @@ def _to_pil(batch):
 
 def get_sensenova_u1_pre_process_func(od_config: OmniDiffusionConfig):
     def pre_process_func(request: OmniDiffusionRequest):
+        request.sampling_params.num_outputs_per_prompt = image_count(request.sampling_params)
         if not od_config.step_execution:
-            request.sampling_params.num_outputs_per_prompt = image_count(request.sampling_params)
             key = request_condition_key(request.prompt, request.sampling_params)
             # Text output remains a serial AR path. Image requests can combine
             # different think lengths after each one's prefix has been saved.
@@ -676,7 +676,7 @@ class SenseNovaU1Pipeline(
 
     @staticmethod
     def _check_step_execution_config(od_config: OmniDiffusionConfig) -> None:
-        """Refuse a configuration the model-local decode cache cannot serve.
+        """Reject unsupported step decode and request-batch cache configurations.
 
         ``paged_decode.py`` holds one set of buffers behind an identity block
         table, reused by whichever request fits them, because the pipeline has
@@ -685,9 +685,15 @@ class SenseNovaU1Pipeline(
         ``load_prefix`` would overwrite the first one's prefix. The cache moves
         to ``DiffusionKVCacheManager`` before this limit can be lifted.
         """
-        if not bool(getattr(od_config, "step_execution", False)):
-            return
         max_num_seqs = int(getattr(od_config, "max_num_seqs", 1) or 1)
+        if not bool(getattr(od_config, "step_execution", False)):
+            cache_backend = getattr(od_config, "cache_backend", "none")
+            if max_num_seqs > 1 and cache_backend not in (None, "none"):
+                raise ValueError(
+                    "SenseNova request batching with max_num_seqs>1 requires cache_backend='none'; "
+                    f"got cache_backend={cache_backend!r}."
+                )
+            return
         if max_num_seqs > 1:
             raise ValueError(
                 "The SenseNova-U1 pipeline supports max_num_seqs=1 under step execution: its "
