@@ -89,6 +89,15 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         # is preserved for fused NPU kernels.
         torch.npu.config.allow_internal_format = True
 
+        # Apply MOSS-TTS local depth NPUGraph patch here (not in __init__)
+        # to avoid a circular import: the patch imports MossTTSLocalDepthTransformer
+        # which triggers vllm_omni.platforms -> NPUOmniPlatform.__init__.
+        from vllm_omni.platforms.npu.models.moss_tts_local_depth import (
+            apply_moss_tts_local_depth_patch,
+        )
+
+        apply_moss_tts_local_depth_patch()
+
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
         return "vllm_omni.platforms.npu.worker.npu_ar_worker.NPUARWorker"

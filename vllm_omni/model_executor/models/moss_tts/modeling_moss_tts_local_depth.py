@@ -108,8 +108,16 @@ class _MossTTSLocalAttention(nn.Module):
         hidden_states: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         position: int = 0,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run a causal prefix, or one new token using frame-local K/V."""
+        """Run a causal prefix, or one new token using frame-local K/V.
+
+        When ``attn_mask`` is provided (NPUGraph path), the full ``kv_cache``
+        tensors are passed to SDPA as-is with the mask zeroing positions
+        ``[position+1, n_vq)`` -- fixed shapes for graph capture. Without
+        ``attn_mask`` (eager path), a dynamic slice ``[:position+1]`` is
+        used instead.
+        """
         batch_size, seq_len, _ = hidden_states.shape
         qkv = self.c_attn(hidden_states)
         query, key, value = qkv.split(self.embed_dim, dim=-1)
@@ -130,9 +138,15 @@ class _MossTTSLocalAttention(nn.Module):
             k_cache, v_cache = kv_cache
             k_cache[:, :, position : position + 1].copy_(key)
             v_cache[:, :, position : position + 1].copy_(value)
-            key = k_cache[:, :, : position + 1]
-            value = v_cache[:, :, : position + 1]
-        attn_output = F.scaled_dot_product_attention(query, key, value, is_causal=kv_cache is None)
+            if attn_mask is not None:
+                key = k_cache
+                value = v_cache
+            else:
+                key = k_cache[:, :, : position + 1]
+                value = v_cache[:, :, : position + 1]
+        attn_output = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attn_mask, is_causal=kv_cache is None and attn_mask is None
+        )
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, self.embed_dim)
         return self.c_proj(attn_output)
 
@@ -161,8 +175,9 @@ class _MossTTSLocalBlock(nn.Module):
         hidden_states: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         position: int = 0,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(self.ln_1(hidden_states), kv_cache, position)
+        hidden_states = hidden_states + self.attn(self.ln_1(hidden_states), kv_cache, position, attn_mask)
         hidden_states = hidden_states + self.mlp(self.ln_2(hidden_states))
         return hidden_states
 
@@ -197,16 +212,19 @@ class MossTTSLocalDepthTransformer(nn.Module):
         seq_embeds: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         position: int = 0,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.ln_f(self.h[0](seq_embeds, kv_cache, position))
+        return self.ln_f(self.h[0](seq_embeds, kv_cache, position, attn_mask))
 
     def setup_compile(self) -> None:
         if self._compiled_forward_prefix is not None:
             return
+
         if not current_omni_platform.supports_torch_inductor():
             self._compiled_forward_prefix = self._forward_prefix
             logger.warning_once("MOSS-TTS local depth torch.compile disabled on this platform")
             return
+
         self._compiled_forward_prefix = torch.compile(
             self._forward_prefix,
             # Share batch/position shapes instead of exhausting Dynamo's
@@ -217,10 +235,14 @@ class MossTTSLocalDepthTransformer(nn.Module):
         logger.info("MOSS-TTS local depth frame-local KV execution enabled with torch.compile")
 
     def _run_prefix(
-        self, seq_embeds: torch.Tensor, kv_cache: tuple[torch.Tensor, torch.Tensor], position: int
+        self,
+        seq_embeds: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        position: int,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         forward_prefix = self._compiled_forward_prefix or self._forward_prefix
-        return forward_prefix(seq_embeds, kv_cache, position)
+        return forward_prefix(seq_embeds, kv_cache, position, attn_mask)
 
     @staticmethod
     def _sample_channel(
