@@ -1676,6 +1676,8 @@ class SenseNovaU1Pipeline(
                 continue
 
             if name not in params_dict:
+                if name.startswith("fm_modules.fm_head."):
+                    raise ValueError(f"FM head checkpoint parameter is absent from the configured head: {name}")
                 continue
 
             param = params_dict[name]
