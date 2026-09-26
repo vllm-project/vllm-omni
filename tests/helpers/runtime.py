@@ -1015,17 +1015,18 @@ def iter_omni_server(
         server_args = params.server_args or []
         if model != original_model:
             server_args = [*server_args, "--served-model-name", original_model]
-        if params.use_omni and params.stage_init_timeout is not None:
-            server_args = [*server_args, "--stage-init-timeout", str(params.stage_init_timeout)]
-        else:
-            server_args = [*server_args, "--stage-init-timeout", "600"]
-        if params.init_timeout is not None:
-            server_args = [*server_args, "--init-timeout", str(params.init_timeout)]
-        else:
-            server_args = [*server_args, "--init-timeout", "900"]
-        # ``omni_server`` / ``omni_server_function``: match ``serve`` (``--disable-log-stats`` wins).
-        if "--disable-log-stats" not in server_args and "--log-stats" not in server_args:
-            server_args = [*server_args, "--log-stats"]
+        if params.use_omni:
+            if params.stage_init_timeout is not None:
+                server_args = [*server_args, "--stage-init-timeout", str(params.stage_init_timeout)]
+            else:
+                server_args = [*server_args, "--stage-init-timeout", "600"]
+            if params.init_timeout is not None:
+                server_args = [*server_args, "--init-timeout", str(params.init_timeout)]
+            else:
+                server_args = [*server_args, "--init-timeout", "900"]
+            # ``omni_server`` / ``omni_server_function``: match ``serve`` (``--disable-log-stats`` wins).
+            if "--disable-log-stats" not in server_args and "--log-stats" not in server_args:
+                server_args = [*server_args, "--log-stats"]
         if params.use_stage_cli:
             if not params.use_omni:
                 raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")
