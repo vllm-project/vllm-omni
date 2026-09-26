@@ -197,7 +197,9 @@ def create_base_diffusion_vllm_config(
     """Create the native vLLM 0.27 config used by diffusion."""
 
     return VllmConfig(
-        compilation_config=CompilationConfig(),
+        compilation_config=CompilationConfig(
+            custom_ops=["+quant_fp8"] if device.type == "cuda" and current_omni_platform.is_cuda() else []
+        ),
         device_config=DeviceConfig(device=device),
         additional_config=od_config.additional_config,
     )
