@@ -56,6 +56,35 @@ jobs:
         run: |
           bash scripts/build_wheel.sh --python python
 
+      - name: Validate runtime package data from source archive
+        run: |
+          set -euo pipefail
+          archive_dir="$(mktemp -d)"
+          install_dir="$(mktemp -d)"
+          vcs_wheels=(dist/*.whl)
+          if [[ ${#vcs_wheels[@]} -ne 1 || ! -f "${vcs_wheels[0]}" ]]; then
+            echo "Expected exactly one VCS-built wheel" >&2
+            exit 1
+          fi
+          git archive HEAD | tar -x -C "${archive_dir}"
+          (
+            cd "${archive_dir}"
+            VLLM_OMNI_TARGET_DEVICE=cuda \
+              VLLM_OMNI_VERSION_OVERRIDE=0.0.0 \
+              python -m build --wheel --outdir archive-dist
+          )
+          wheels=("${archive_dir}"/archive-dist/*.whl)
+          if [[ ${#wheels[@]} -ne 1 || ! -f "${wheels[0]}" ]]; then
+            echo "Expected exactly one archive-built wheel" >&2
+            exit 1
+          fi
+          python -m pip install --no-deps --target "${install_dir}" "${wheels[0]}"
+          python tools/check_wheel_package_data.py \
+            --source-root "${archive_dir}" \
+            --wheel "${wheels[0]}" \
+            --vcs-wheel "${vcs_wheels[0]}" \
+            --installed-root "${install_dir}"
+
       - name: Upload Wheel Artifact
         uses: actions/upload-artifact@v7
         with:

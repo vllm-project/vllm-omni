@@ -159,12 +159,25 @@ vllm-omni = "vllm_omni.entrypoints.cli.main:main"
 vllm_omni_register_models = "vllm_omni.engine.arg_utils:register_omni_models_to_vllm"
 
 
+[tool.setuptools]
+include-package-data = false
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["vllm_omni*"]
 
 [tool.setuptools.package-data]
-"vllm_omni" = ["_version.py", "py.typed", "transformers_utils/chat_templates/*.jinja"]
+"vllm_omni" = [
+    "_version.py",
+    "py.typed",
+    "deploy/*.md",
+    "deploy/*.yaml",
+    "diffusion/distributed/csrc/*.cu",
+    "diffusion/distributed/csrc/*.hpp",
+    "model_executor/models/covo_audio/speaker_prompt/*.npy",
+    "model_executor/models/step_audio2/assets/*.wav",
+    "transformers_utils/chat_templates/*.jinja",
+]
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm
