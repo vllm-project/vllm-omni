@@ -948,62 +948,79 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     break
                 continue
 
-            if not isinstance(msg, AsyncDiffusionOutput):
-                # Non-async message: place into the sync buffer for
-                # collective_rpc() to consume via Path 2.
-                self._sync_result_buffer.put(msg)
-                continue
+            # This thread is the sole reader of result_mq, so an exception
+            # escaping the dispatch costs the whole queue rather than one
+            # message: every later result goes undelivered while the server
+            # keeps reporting healthy. Contain it to the message that caused it.
+            try:
+                self._dispatch_result(msg)
+            except Exception:
+                logger.exception("Result pump failed to dispatch a message; dropping it")
 
-            # If shutdown started while we were dequeuing, drop this delivery
-            # so it cannot repopulate _completed_outputs after shutdown()
-            # cleared it (issue #6413 / #6439 review). OUTPUT_READY must still
-            # flow through the dispatch below: unpack_diffusion_output_shm()
-            # is the only receive-side path that unlinks named SHM segments,
-            # and the closed-time re-checks under _futures_lock already
-            # prevent any cache write after unpack.
-            if self._closed and msg.kind != AsyncOutputKind.OUTPUT_READY:
-                continue
+    def _dispatch_result(self, msg: Any) -> None:
+        """Route one dequeued message to whoever is waiting for it."""
+        if not isinstance(msg, AsyncDiffusionOutput):
+            # Non-async message: place into the sync buffer for
+            # collective_rpc() to consume via Path 2.
+            self._sync_result_buffer.put(msg)
+            return
 
-            if msg.kind in (AsyncOutputKind.RPC_RESULT, AsyncOutputKind.COMPUTE_DONE):
-                with self._futures_lock:
-                    fut = self._rpc_futures.pop(msg.rpc_id, None) if msg.rpc_id else None
-                if fut is not None and not fut.done():
-                    if msg.error:
-                        try_set_exception(fut, RuntimeError(msg.error))
-                    else:
-                        try_set_result(fut, msg)
-            elif msg.kind == AsyncOutputKind.OUTPUT_READY:
-                batch_id = msg.async_output_id
-                with self._futures_lock:
-                    per_req_map = self._batch_split_map.pop(batch_id, None) if batch_id else None
-                if per_req_map is not None:
-                    # Batch result: split into per-request DiffusionOutputs.
+        # If shutdown started while we were dequeuing, drop this delivery
+        # so it cannot repopulate _completed_outputs after shutdown()
+        # cleared it (issue #6413 / #6439 review). OUTPUT_READY must still
+        # flow through the dispatch below: unpack_diffusion_output_shm()
+        # is the only receive-side path that unlinks named SHM segments,
+        # and the closed-time re-checks under _futures_lock already
+        # prevent any cache write after unpack.
+        if self._closed and msg.kind != AsyncOutputKind.OUTPUT_READY:
+            return
+
+        if msg.kind in (AsyncOutputKind.RPC_RESULT, AsyncOutputKind.COMPUTE_DONE):
+            with self._futures_lock:
+                fut = self._rpc_futures.pop(msg.rpc_id, None) if msg.rpc_id else None
+            if fut is not None and not fut.done():
+                if msg.error:
+                    try_set_exception(fut, RuntimeError(msg.error))
+                else:
+                    try_set_result(fut, msg)
+        elif msg.kind == AsyncOutputKind.OUTPUT_READY:
+            batch_id = msg.async_output_id
+            if not batch_id:
+                # async_output_id is what routes a delivery back to its waiter.
+                # Without it there is nobody to resolve and nothing to cache, so
+                # the request hangs until its own timeout. Say so rather than
+                # dropping the message silently.
+                logger.error("Dropping OUTPUT_READY with no async_output_id; its request cannot be resolved")
+                return
+            with self._futures_lock:
+                per_req_map = self._batch_split_map.pop(batch_id, None)
+            if per_req_map is not None:
+                # Batch result: split into per-request DiffusionOutputs.
+                try:
+                    unpack_diffusion_output_shm(msg.output)
+                except Exception:
+                    logger.exception("SHM unpack failed for batch %s", batch_id)
+                self._deliver_batch_split(per_req_map, msg.output, msg.error)
+            else:
+                # Single-request result: unpack SHM first, then resolve or cache atomically.
+                output_result: DiffusionOutput | None = None
+                exc: Exception | None = None
+                if msg.error:
+                    exc = RuntimeError(msg.error)
+                else:
                     try:
                         unpack_diffusion_output_shm(msg.output)
-                    except Exception:
-                        logger.exception("SHM unpack failed for batch %s", batch_id)
-                    self._deliver_batch_split(per_req_map, msg.output, msg.error)
-                else:
-                    # Single-request result: unpack SHM first, then resolve or cache atomically.
-                    output_result: DiffusionOutput | None = None
-                    exc: Exception | None = None
-                    if msg.error:
-                        exc = RuntimeError(msg.error)
-                    else:
-                        try:
-                            unpack_diffusion_output_shm(msg.output)
-                            output_result = msg.output
-                        except Exception as e:
-                            logger.exception("SHM unpack failed in result pump")
-                            exc = e
+                        output_result = msg.output
+                    except Exception as e:
+                        logger.exception("SHM unpack failed in result pump")
+                        exc = e
 
-                    if batch_id:
-                        with self._futures_lock:
-                            if self._closed:
-                                # shutdown() cleared _completed_outputs while
-                                # we were unpacking; drop this delivery.
-                                continue
-                            self._finish_output(batch_id, output_result, exc)
+                with self._futures_lock:
+                    if self._closed:
+                        # shutdown() cleared _completed_outputs while
+                        # we were unpacking; drop this delivery.
+                        return
+                    self._finish_output(batch_id, output_result, exc)
 
     def _finish_output(
         self,
@@ -1087,14 +1104,22 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             # shutdown() has taken over; do not touch _completed_outputs.
             return
         for per_req_id, req_id in per_req_map.items():
-            req_output = batch_output.get_request_output(req_id) if batch_output is not None else None
             per_req_result: DiffusionOutput
-            if req_output is not None and req_output.result is not None:
-                per_req_result = req_output.result
-            elif error:
-                per_req_result = DiffusionOutput(error=error)
-            else:
-                per_req_result = DiffusionOutput(error="No output result for batch request")
+            try:
+                req_output = batch_output.get_request_output(req_id) if batch_output is not None else None
+                if req_output is not None and req_output.result is not None:
+                    per_req_result = req_output.result
+                elif error:
+                    per_req_result = DiffusionOutput(error=error)
+                else:
+                    per_req_result = DiffusionOutput(error="No output result for batch request")
+            except Exception as e:
+                # The split map has already been popped, so an exception escaping
+                # here would take every request later in this batch with it: they
+                # would never be resolved and would hang until their own timeout.
+                # One corrupt request costs one request.
+                logger.exception("Failed to extract batch output for request %s", req_id)
+                per_req_result = DiffusionOutput(error=f"Failed to extract batch output for request {req_id}: {e}")
             with self._futures_lock:
                 if self._closed:
                     # Belt-and-braces: re-check under the lock so a shutdown
