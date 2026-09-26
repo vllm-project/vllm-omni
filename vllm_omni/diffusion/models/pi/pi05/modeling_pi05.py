@@ -3,7 +3,7 @@
 """Inference-only π0.5 VLA math kernel for vllm-omni.
 
 Only the math that turns a robot observation into an action chunk; no serving or
-request glue. Deliberately shaped like ``models/pi0/modeling_pi0.py`` so the two
+request glue. Deliberately shaped like ``models/pi/pi0/modeling_pi0.py`` so the two
 can later be factored into a shared Pi-family module (RFC step 2) on a
 "behaviour unchanged" review.
 
@@ -32,15 +32,10 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.models.auto import CONFIG_MAPPING
-from transformers.models.gemma.modeling_gemma import (
-    GemmaForCausalLM,
-    apply_rotary_pos_emb,
-)
-from transformers.models.paligemma.modeling_paligemma import (
-    PaliGemmaForConditionalGeneration,
-)
+from transformers.models.gemma.modeling_gemma import apply_rotary_pos_emb
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+from vllm_omni.diffusion.models.pi.common import attention, backbone, checkpoint, flow_matching
 
 logger = logging.getLogger(__name__)
 
@@ -57,87 +52,22 @@ DEFAULT_STATE_NUM_BINS = 256  # openpi PaliGemmaTokenizer.tokenize()
 # Large negative value to fill masked-out positions in a float attention mask.
 # Matches OpenPI's constant exactly so that numerics line up during parity.
 # Ref: openpi/src/openpi/models/gemma.py
-OPENPI_ATTENTION_MASK_VALUE = -2.3819763e38
+OPENPI_ATTENTION_MASK_VALUE = attention.OPENPI_ATTENTION_MASK_VALUE
+make_att_2d_masks = attention.make_att_2d_masks
+prepare_attention_masks_4d = attention.prepare_attention_masks_4d
+create_sinusoidal_pos_embedding = flow_matching.create_sinusoidal_pos_embedding
 
 
 # ──────────────────────────────────────────────────────────────────────
 # Gemma variant configs (matches openpi/models/gemma.py get_config)
 # ──────────────────────────────────────────────────────────────────────
-class GemmaVariantConfig:
-    def __init__(self, width, depth, mlp_dim, num_heads, num_kv_heads, head_dim):
-        self.width = width
-        self.depth = depth
-        self.mlp_dim = mlp_dim
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_dim = head_dim
-
-
-def get_gemma_config(variant: str) -> GemmaVariantConfig:
-    if variant == "gemma_2b":
-        return GemmaVariantConfig(2048, 18, 16384, 8, 1, 256)
-    elif variant == "gemma_300m":
-        return GemmaVariantConfig(1024, 18, 4096, 8, 1, 256)
-    else:
-        raise ValueError(f"Unknown variant: {variant}")
+GemmaVariantConfig = backbone.GemmaVariantConfig
+get_gemma_config = backbone.get_gemma_config
 
 
 # ──────────────────────────────────────────────────────────────────────
 # Utility functions (match openpi/models_pytorch/pi0_pytorch.py)
 # ──────────────────────────────────────────────────────────────────────
-def create_sinusoidal_pos_embedding(
-    time: torch.Tensor,
-    dimension: int,
-    min_period: float = 4e-3,
-    max_period: float = 4.0,
-    device: torch.device = None,
-) -> torch.Tensor:
-    """Compute a sine/cosine positional embedding for scalar timesteps.
-
-    Ref: openpi/models_pytorch/pi0_pytorch.py create_sinusoidal_pos_embedding
-    """
-    if dimension % 2 != 0:
-        raise ValueError(f"dimension ({dimension}) must be divisible by 2")
-    if time.ndim != 1:
-        raise ValueError("time tensor must be 1-D (batch_size,)")
-    if device is None:
-        device = time.device
-
-    # Use float64 for the log-linear sweep and for the inner products, to
-    # match the reference implementation's numerical behaviour exactly.
-    dtype = torch.float64
-    fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
-    period = min_period * (max_period / min_period) ** fraction
-    scaling_factor = 1.0 / period * 2 * math.pi
-    sin_input = scaling_factor[None, :] * time[:, None].to(dtype)
-    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
-
-
-def make_att_2d_masks(pad_masks: torch.Tensor, att_masks: torch.Tensor) -> torch.Tensor:
-    """Build a 2D attention mask from a padding mask and an autoregressive mask.
-
-    Ref: openpi/models_pytorch/pi0_pytorch.py make_att_2d_masks
-    """
-    if att_masks.ndim != 2:
-        raise ValueError(f"att_masks must be 2-D, got {att_masks.ndim}-D")
-    if pad_masks.ndim != 2:
-        raise ValueError(f"pad_masks must be 2-D, got {pad_masks.ndim}-D")
-
-    cumsum = torch.cumsum(att_masks, dim=1)
-    att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
-    pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
-    return att_2d_masks & pad_2d_masks
-
-
-def prepare_attention_masks_4d(att_2d_masks: torch.Tensor) -> torch.Tensor:
-    """Convert ``(B, S, S)`` bool masks to ``(B, 1, S, S)`` float masks.
-
-    ``True`` → 0.0 (attend), ``False`` → ``OPENPI_ATTENTION_MASK_VALUE``.
-    """
-    att_2d_masks_4d = att_2d_masks[:, None, :, :]
-    return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
-
-
 class Pi05AdaRMSNorm(nn.Module):
     """Adaptive RMSNorm conditioned on the flow-matching timestep.
 
@@ -218,74 +148,9 @@ def _gated_residual(residual: torch.Tensor, out: torch.Tensor, gate: torch.Tenso
 # ──────────────────────────────────────────────────────────────────────
 # Dual-backbone: PaliGemma + AdaRMS action expert
 # ──────────────────────────────────────────────────────────────────────
-def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """Repeat KV heads for grouped-query attention.
-
-    ``(B, num_kv_heads, S, D) → (B, num_kv_heads * n_rep, S, D)``.
-    """
-    if n_rep == 1:
-        return hidden_states
-    b, nh, s, d = hidden_states.shape
-    hidden_states = hidden_states[:, :, None, :, :].expand(b, nh, n_rep, s, d)
-    return hidden_states.reshape(b, nh * n_rep, s, d)
-
-
-def _attend(query_states, key_states, value_states, attention_mask, num_kv_groups, scaling):
-    """Manual eager attention: ``softmax(Q Kᵀ · scale + mask) · V``.
-
-    The mask is sliced to ``key_states.shape[-2]`` so the same
-    ``(B, 1, Q, prefix+suffix)`` mask works in both the prefix pass (K length =
-    prefix) and the suffix pass (K length = prefix + suffix).
-    """
-    k = _repeat_kv(key_states, num_kv_groups)
-    v = _repeat_kv(value_states, num_kv_groups)
-    attn_weights = torch.matmul(query_states, k.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask[:, :, :, : k.shape[-2]]
-    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-    return torch.matmul(attn_weights, v)
-
-
 def _match(tensor: torch.Tensor, module: nn.Module) -> torch.Tensor:
     """Cast ``tensor`` to the dtype ``module``'s weight expects."""
     return tensor.to(module.weight.dtype) if tensor.dtype != module.weight.dtype else tensor
-
-
-def _compute_layer_prefix_only(layer_idx, hidden_states, attention_mask, position_ids, paligemma):
-    """Run one PaliGemma LM layer on the prefix, returning the layer output and
-    the post-RoPE ``(k, v)`` for the suffix pass.
-
-    Identical to π0: the prefix backbone is unchanged in π0.5 (no AdaRMS —
-    there is no timestep in the prefix).
-    """
-    model = paligemma.model.language_model
-    layer = model.layers[layer_idx]
-    residual = hidden_states
-    x = _match(layer.input_layernorm(hidden_states), layer.self_attn.q_proj)
-
-    hidden_shape = (*x.shape[:-1], -1, layer.self_attn.head_dim)
-    q = layer.self_attn.q_proj(x).view(hidden_shape).transpose(1, 2)
-    k = layer.self_attn.k_proj(x).view(hidden_shape).transpose(1, 2)
-    v = layer.self_attn.v_proj(x).view(hidden_shape).transpose(1, 2)
-
-    cos, sin = model.rotary_emb(v, position_ids)
-    q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
-
-    att = _attend(
-        q,
-        k,
-        v,
-        attention_mask,
-        num_kv_groups=layer.self_attn.num_key_value_groups,
-        scaling=1.0 / math.sqrt(layer.self_attn.head_dim),
-    )
-    att = att.transpose(1, 2).reshape(q.shape[0], -1, q.shape[1] * layer.self_attn.head_dim)
-
-    out = layer.self_attn.o_proj(_match(att, layer.self_attn.o_proj)) + residual
-    after_resid = out
-    normed = layer.post_attention_layernorm(out)
-    out = layer.mlp(_match(normed, layer.mlp.up_proj)) + after_resid
-    return out, (k, v)
 
 
 def _compute_layer_suffix_only(
@@ -323,7 +188,7 @@ def _compute_layer_suffix_only(
     k = torch.cat([k_prefix.to(k_suf.dtype), k_suf], dim=2)
     v = torch.cat([v_prefix.to(v_suf.dtype), v_suf], dim=2)
 
-    att = _attend(
+    att = attention.eager_attention(
         q,
         k,
         v,
@@ -355,42 +220,7 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
 
     def __init__(self, vlm_config, action_expert_config):
         super().__init__()
-
-        # PaliGemma prefix: identical to π0. It sees no timestep, so no AdaRMS.
-        vlm_config_hf = CONFIG_MAPPING["paligemma"]()
-        vlm_config_hf._vocab_size = 257152
-        vlm_config_hf.image_token_index = 257152
-        vlm_config_hf.text_config.hidden_size = vlm_config.width
-        vlm_config_hf.text_config.intermediate_size = vlm_config.mlp_dim
-        vlm_config_hf.text_config.num_attention_heads = vlm_config.num_heads
-        vlm_config_hf.text_config.head_dim = vlm_config.head_dim
-        vlm_config_hf.text_config.num_hidden_layers = vlm_config.depth
-        vlm_config_hf.text_config.num_key_value_heads = vlm_config.num_kv_heads
-        vlm_config_hf.text_config.hidden_activation = "gelu_pytorch_tanh"
-        vlm_config_hf.text_config.dtype = "float32"
-        vlm_config_hf.text_config.vocab_size = 257152
-        vlm_config_hf.vision_config.intermediate_size = 4304
-        vlm_config_hf.vision_config.projection_dim = 2048
-        vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
-        vlm_config_hf.vision_config.dtype = "float32"
-
-        action_expert_config_hf = CONFIG_MAPPING["gemma"](
-            head_dim=action_expert_config.head_dim,
-            hidden_size=action_expert_config.width,
-            intermediate_size=action_expert_config.mlp_dim,
-            num_attention_heads=action_expert_config.num_heads,
-            num_hidden_layers=action_expert_config.depth,
-            num_key_value_heads=action_expert_config.num_kv_heads,
-            vocab_size=257152,
-            hidden_activation="gelu_pytorch_tanh",
-            dtype="float32",
-        )
-
-        self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
-        self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
-        # The action expert doesn't embed tokens — it only consumes the
-        # suffix action embeddings we feed in.
-        self.gemma_expert.model.embed_tokens = None
+        self.paligemma, self.gemma_expert = backbone.build_backbones(vlm_config, action_expert_config)
 
         self.adarms_cond_dim = action_expert_config.width
         self._install_adarms_norms(action_expert_config)
@@ -405,34 +235,6 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
             layer.post_attention_layernorm = Pi05AdaRMSNorm(width, eps=eps, cond_dim=self.adarms_cond_dim)
         expert.norm = Pi05AdaRMSNorm(width, eps=eps, cond_dim=self.adarms_cond_dim)
 
-    def embed_image(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """Encode images with SigLIP vision tower + PaliGemma projector.
-
-        The two steps are run explicitly rather than via
-        ``PaliGemmaModel.get_image_features`` because that helper divides the
-        projector output by ``sqrt(text_hidden_size)``. Being explicit keeps the
-        scale unambiguous and matches π0 exactly (SigLIP is unchanged in π0.5).
-        """
-        # Shapes: pixel_values (B, 3, 224, 224) → SigLIP (B, 256, 1152)
-        #                                      → projector (B, 256, 2048)
-        vision_outputs = self.paligemma.model.vision_tower(pixel_values)
-        image_features = vision_outputs.last_hidden_state
-        return self.paligemma.model.multi_modal_projector(image_features)
-
-    def embed_language_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Embed language tokens, returning the ``* sqrt(hidden)``-scaled embedding.
-
-        The scaling location moved across transformers releases: at ≤5.3 the
-        normalizer lives inside ``GemmaModel.forward`` (which we bypass), and at
-        ≥5.4 ``GemmaTextScaledWordEmbedding`` self-applies it. Detect and avoid
-        double-scaling.
-        """
-        embed_tokens = self.paligemma.model.language_model.embed_tokens
-        lang_emb = embed_tokens(tokens)
-        if getattr(embed_tokens, "embed_scale", None) is None:
-            lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
-        return lang_emb
-
     def forward(
         self,
         attention_mask: torch.Tensor | None = None,
@@ -446,22 +248,16 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
         ``([prefix_out, suffix_out], past_key_values_or_None)``.
         """
         num_layers = self.paligemma.config.text_config.num_hidden_layers
-        pali_lm = self.paligemma.model.language_model
         expert_lm = self.gemma_expert.model
 
         if inputs_embeds[1] is None:
-            hidden_states = inputs_embeds[0]
-            kv_list: list[tuple[torch.Tensor, torch.Tensor]] = []
-            for layer_idx in range(num_layers):
-                hidden_states, kv = _compute_layer_prefix_only(
-                    layer_idx,
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    paligemma=self.paligemma,
-                )
-                kv_list.append(kv)
-            hidden_states = pali_lm.norm(hidden_states)
+            hidden_states, kv_list = backbone.execute_prefix(
+                inputs_embeds[0],
+                attention_mask,
+                position_ids,
+                self.paligemma,
+                align_module_input=_match,
+            )
             return [hidden_states, None], (kv_list if use_cache else None)
 
         if inputs_embeds[0] is not None:
@@ -542,56 +338,6 @@ class Pi05ForActionPrediction(nn.Module):
         self.time_mlp_in = nn.Linear(self.expert_width, self.expert_width)
         self.time_mlp_out = nn.Linear(self.expert_width, self.expert_width)
 
-    # ── Prefix embedding ─────────────────────────────────────────────
-    def embed_prefix(
-        self,
-        images: list[torch.Tensor],
-        image_masks: list[torch.Tensor],
-        lang_tokens: torch.Tensor,
-        lang_masks: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build prefix embeddings, per-token padding mask, and AR mask.
-
-        Prefix tokens form ``[img_cam_0..., ..., lang_tokens...]`` with fully
-        bidirectional attention (all-zero ``att_masks``). Identical to π0 — the
-        state is inside ``lang_tokens``, so nothing here changes shape-wise.
-
-        Cameras are embedded one at a time; each call is ``(B, 3, 224, 224)``.
-        The number of slots is fixed by ``config.max_cameras`` for the deployed
-        model; missing cameras occupy their slot with a false image mask.
-        """
-        num_views = len(images)
-        if len(image_masks) != num_views:
-            raise ValueError(
-                f"images and image_masks must contain the same number of views, got {num_views} and {len(image_masks)}."
-            )
-        max_cameras = int(self.config.max_cameras)
-        if num_views != max_cameras:
-            raise ValueError(f"Expected exactly max_cameras={max_cameras} image views, got {num_views}.")
-
-        embs: list[torch.Tensor] = []
-        pad_masks: list[torch.Tensor] = []
-        att_masks: list[int] = []
-
-        for img, img_mask in zip(images, image_masks):
-            img_emb = self.paligemma_with_expert.embed_image(img)
-            bsize, num_img_embs = img_emb.shape[:2]
-            embs.append(img_emb)
-            pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
-            att_masks += [0] * num_img_embs
-
-        lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
-        embs.append(lang_emb)
-        pad_masks.append(lang_masks)
-        att_masks += [0] * lang_emb.shape[1]
-
-        embs = torch.cat(embs, dim=1)
-        pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=embs.device)
-        att_masks = att_masks[None, :].expand(pad_masks.shape[0], -1)
-
-        return embs, pad_masks, att_masks
-
     # ── Timestep + suffix embedding ──────────────────────────────────
     def embed_timestep(self, timestep: torch.Tensor) -> torch.Tensor:
         """Timestep → AdaRMS conditioning vector ``(B, expert_width)``.
@@ -601,7 +347,7 @@ class Pi05ForActionPrediction(nn.Module):
         numerical error, not a crash.
         """
         model_dtype = self.action_in_proj.weight.dtype
-        time_emb = create_sinusoidal_pos_embedding(
+        time_emb = flow_matching.create_sinusoidal_pos_embedding(
             timestep,
             self.action_in_proj.out_features,
             min_period=getattr(self.config, "min_period", 4e-3),
@@ -724,9 +470,16 @@ class Pi05ForActionPrediction(nn.Module):
                     generator=generator,
                 )
 
-        # 1. Prefix embeddings + mask building.
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, image_masks, lang_tokens, lang_masks
+        # 1. Compose the ordered camera and language prefix. The deployed
+        # π0.5 layout always retains max_cameras slots; missing cameras occupy
+        # their slot with a false image mask. State is already in lang_tokens.
+        prefix_embs, prefix_pad_masks, prefix_att_masks = backbone.embed_multimodal_prefix(
+            images,
+            image_masks,
+            lang_tokens,
+            lang_masks,
+            paligemma=self.paligemma_with_expert.paligemma,
+            expected_num_views=int(self.config.max_cameras),
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -742,10 +495,8 @@ class Pi05ForActionPrediction(nn.Module):
         )
 
         # 3. Euler-integrated denoising from t=1 down to t=0.
-        dt = -1.0 / num_steps
         x_t = noise
-        for step in range(num_steps):
-            t = 1.0 + step * dt
+        for t, dt in flow_matching.make_euler_schedule(num_steps):
             time_tensor = torch.full((bsize,), t, dtype=torch.float32, device=device)
             v_t = self.denoise_step(
                 prefix_pad_masks=prefix_pad_masks,
@@ -753,7 +504,7 @@ class Pi05ForActionPrediction(nn.Module):
                 x_t=x_t,
                 timestep=time_tensor,
             )
-            x_t = x_t + dt * v_t
+            x_t = flow_matching.euler_step(x_t, v_t, dt)
         return x_t
 
     # ── Weight loading ───────────────────────────────────────────────
@@ -786,46 +537,12 @@ class Pi05ForActionPrediction(nn.Module):
         params_dict = dict(self.named_parameters())
         buffers_dict = dict(self.named_buffers())
 
-        _PALIGEMMA_SUBMODULES = ("vision_tower", "multi_modal_projector", "language_model")
         _EXPERT_PREFIX = "paligemma_with_expert.gemma_expert.model."
-
-        def _remap(name: str) -> str:
-            # Strip the leading "model." that LeRobot's PI05Policy wrapper adds.
-            if name.startswith("model."):
-                name = name[len("model.") :]
-
-            # π0-style timestep MLP names → π0.5 names.
-            if name.startswith("action_time_mlp_in."):
-                name = "time_mlp_in." + name[len("action_time_mlp_in.") :]
-            elif name.startswith("action_time_mlp_out."):
-                name = "time_mlp_out." + name[len("action_time_mlp_out.") :]
-
-            # Nested PaliGemma layout.
-            for sub in _PALIGEMMA_SUBMODULES:
-                flat = f"paligemma_with_expert.paligemma.{sub}."
-                nested = f"paligemma_with_expert.paligemma.model.{sub}."
-                if name.startswith(flat) and not name.startswith(nested):
-                    return nested + name[len(flat) :]
-
-            if name == "paligemma_with_expert.paligemma.lm_head.weight":
-                return "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
-
-            return name
-
-        def _fix_vision_tower(name: str) -> str:
-            """Reconcile SigLIP nesting across transformers versions (≤5.3 wraps
-            the encoder in ``vision_tower.vision_model.*``; ≥5.4 flattens it)."""
-            vt = "paligemma_with_expert.paligemma.model.vision_tower."
-            if not name.startswith(vt):
-                return name
-            rest = name[len(vt) :]
-            if name in params_dict or name in buffers_dict:
-                return name
-            if rest.startswith("vision_model."):
-                candidate = vt + rest[len("vision_model.") :]
-            else:
-                candidate = vt + "vision_model." + rest
-            return candidate if (candidate in params_dict or candidate in buffers_dict) else name
+        model_keys = params_dict.keys() | buffers_dict.keys()
+        prefix_aliases = (
+            ("action_time_mlp_in.", "time_mlp_in."),
+            ("action_time_mlp_out.", "time_mlp_out."),
+        )
 
         loaded = 0
         skipped: list[str] = []
@@ -833,7 +550,7 @@ class Pi05ForActionPrediction(nn.Module):
         filled_params: set = set()
 
         for name, loaded_weight in weights:
-            mapped = _fix_vision_tower(_remap(name))
+            mapped = checkpoint.resolve_parameter_name(name, model_keys, prefix_aliases=prefix_aliases)
 
             # Diagnose π0-shaped keys instead of dropping them quietly.
             is_expert_norm_weight = mapped.startswith(_EXPERT_PREFIX) and (

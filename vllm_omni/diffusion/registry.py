@@ -225,12 +225,12 @@ _DIFFUSION_MODELS = {
         "Gr00tN1d7Pipeline",
     ),
     "Pi0Pipeline": (
-        "pi0",
+        "pi.pi0",
         "pipeline_pi0",
         "Pi0Pipeline",
     ),
     "Pi05Pipeline": (
-        "pi05",
+        "pi.pi05",
         "pipeline_pi05",
         "Pi05Pipeline",
     ),

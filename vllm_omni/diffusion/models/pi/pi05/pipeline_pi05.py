@@ -32,9 +32,10 @@ from torch import nn
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.models.pi05.config import SUPPORTED_DTYPE_NAMES, Pi05Config
-from vllm_omni.diffusion.models.pi05.modeling_pi05 import Pi05ForActionPrediction
-from vllm_omni.diffusion.models.pi05.processor_pi05 import Pi05Processor
+from vllm_omni.diffusion.models.pi.common import pipeline as pipeline_helpers
+from vllm_omni.diffusion.models.pi.pi05.config import SUPPORTED_DTYPE_NAMES, Pi05Config
+from vllm_omni.diffusion.models.pi.pi05.modeling_pi05 import Pi05ForActionPrediction
+from vllm_omni.diffusion.models.pi.pi05.processor_pi05 import Pi05Processor
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE as PI05_PIPELINE
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -67,16 +68,10 @@ def _comparable(value):
     return list(value) if isinstance(value, (list, tuple)) else value
 
 
-def _pi05_post_process(x):
-    """Module-level identity post-process (picklable across the orchestrator's
-    multiprocess boundary — a local closure is not)."""
-    return x
-
-
-def get_pi05_post_process_func(od_config: OmniDiffusionConfig):
-    """π0.5 returns actions directly; post-processing is identity."""
-    del od_config
-    return _pi05_post_process
+# The registry imports this public name, and the returned module-level function
+# must remain picklable across the orchestrator's multiprocess boundary.
+_pi05_post_process = pipeline_helpers.identity_post_process
+get_pi05_post_process_func = pipeline_helpers.get_identity_post_process_func
 
 
 _LEROBOT_FLOAT32_IN_BFLOAT16 = (
@@ -127,14 +122,15 @@ class Pi05Pipeline(nn.Module):
         super().__init__()
         self.od_config = od_config
         self.prefix = prefix
-        self.model_dir = self._resolve_model_dir(od_config.model)
+        self.model_dir = pipeline_helpers.resolve_model_dir(od_config.model)
         self.config = self._build_config(od_config)
 
         custom_args = od_config.custom_pipeline_args or {}
-        self.tokenizer_source = str(custom_args.get("tokenizer", self._resolve_tokenizer_source()))
+        default_tokenizer = pipeline_helpers.resolve_tokenizer_source(self.model_dir, DEFAULT_PI05_TOKENIZER)
+        self.tokenizer_source = str(custom_args.get("tokenizer", default_tokenizer))
 
         self._torch_dtype = self._resolve_dtype(od_config)
-        self._device = self._resolve_device(od_config)
+        self._device = pipeline_helpers.resolve_device()
 
         self.tokenizer = self._load_tokenizer()
         self.model = self._initialize_model()
@@ -144,22 +140,6 @@ class Pi05Pipeline(nn.Module):
     # ------------------------------------------------------------------
     # Construction helpers
     # ------------------------------------------------------------------
-    @staticmethod
-    def _resolve_model_dir(model: str | None) -> str | None:
-        """Return a local directory for ``model``; download an HF repo id if needed."""
-        if not model:
-            return None
-        if os.path.isdir(model):
-            return model
-        # Via repo_utils' shared HfApi rather than huggingface_hub directly, so
-        # the download carries vLLM-Omni's user agent like every other repo access.
-        from vllm_omni.transformers_utils.repo_utils import hf_api
-
-        return hf_api().snapshot_download(
-            repo_id=model,
-            allow_patterns=["*.json", "*.safetensors", "*.model", "tokenizer*"],
-        )
-
     def _build_config(self, od_config: OmniDiffusionConfig) -> Pi05Config:
         """Read the config from the checkpoint, then let the deploy yaml override it."""
         checkpoint_config = Pi05Config.from_pretrained(self.model_dir) if self.model_dir else None
@@ -186,13 +166,6 @@ class Pi05Pipeline(nn.Module):
         resolved.update(od_config.model_config)
         return Pi05Config.from_model_config(resolved)
 
-    def _resolve_tokenizer_source(self) -> str:
-        """Prefer the checkpoint dir if it ships tokenizer files; else PaliGemma."""
-        if self.model_dir and os.path.isdir(self.model_dir):
-            if os.path.exists(os.path.join(self.model_dir, "tokenizer_config.json")):
-                return self.model_dir
-        return DEFAULT_PI05_TOKENIZER
-
     @staticmethod
     def _resolve_dtype(od_config: OmniDiffusionConfig) -> torch.dtype:
         """Resolve the dtype the weights are actually cast to.
@@ -211,15 +184,6 @@ class Pi05Pipeline(nn.Module):
             )
         return resolved
 
-    @staticmethod
-    def _resolve_device(od_config: OmniDiffusionConfig) -> torch.device:
-        from vllm_omni.diffusion.distributed.utils import get_local_device
-
-        try:
-            return get_local_device()
-        except Exception:  # noqa: BLE001
-            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     def _load_tokenizer(self):
         from transformers import AutoTokenizer
 
@@ -227,11 +191,8 @@ class Pi05Pipeline(nn.Module):
         # 200-token block whose live tokens must start at index 0.
         return AutoTokenizer.from_pretrained(self.tokenizer_source, padding_side="right")
 
-    def has_real_checkpoint(self) -> bool:
-        return bool(self.model_dir) and os.path.exists(os.path.join(self.model_dir, "model.safetensors"))
-
     def _initialize_model(self) -> Pi05ForActionPrediction:
-        if not self.has_real_checkpoint():
+        if not pipeline_helpers.has_safetensors_checkpoint(self.model_dir):
             expected = os.path.join(self.model_dir or "<missing-model-dir>", "model.safetensors")
             raise FileNotFoundError(f"π0.5 serving requires checkpoint weights at {expected}.")
         model = Pi05ForActionPrediction(self.config)
@@ -266,6 +227,7 @@ class Pi05Pipeline(nn.Module):
     # ------------------------------------------------------------------
     @torch.inference_mode()
     def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
+        num_steps = pipeline_helpers.resolve_num_inference_steps(req.sampling_params)
         extra_args = getattr(req.sampling_params, "extra_args", None) or {}
         robot_obs = extra_args.get("robot_obs")
 
@@ -274,7 +236,6 @@ class Pi05Pipeline(nn.Module):
             # doesn't crash. Mirrors DreamZero's dummy-run handling.
             first_prompt = req.prompts[0] if req.prompts else ""
             prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
-            num_steps = getattr(req.sampling_params, "num_inference_steps", None)
             if prompt == "dummy run" or num_steps == 1:
                 logger.info("Pi05Pipeline: dummy warmup request without robot_obs — returning zeros.")
                 return DiffusionOutput(
@@ -290,14 +251,6 @@ class Pi05Pipeline(nn.Module):
             )
 
         images, image_masks, lang_tokens, lang_masks = self.processor.build_model_inputs(robot_obs)
-
-        num_steps = getattr(req.sampling_params, "num_inference_steps", None)
-        if num_steps is not None and (
-            isinstance(num_steps, bool) or not isinstance(num_steps, (int, np.integer)) or int(num_steps) < 1
-        ):
-            raise ValueError(f"num_inference_steps must be a positive integer, got {num_steps!r}.")
-        if num_steps is not None:
-            num_steps = int(num_steps)
 
         actions = self.model.sample_actions(
             images=images,

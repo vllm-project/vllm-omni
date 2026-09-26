@@ -86,7 +86,7 @@ from vllm_omni.config.lora import LoRAConfig
 
 if "vllm_omni.config.pipeline_registry" in sys.modules:
     raise SystemExit("LoRAConfig import loaded pipeline_registry")
-if "vllm_omni.diffusion.models.pi0.pipeline_pi0" in sys.modules:
+if "vllm_omni.diffusion.models.pi.pi0.pipeline_pi0" in sys.modules:
     raise SystemExit("LoRAConfig import loaded PI0_PIPELINE")
 
 from vllm_omni.diffusion.data import DiffusionOutput
@@ -111,7 +111,7 @@ import sys
 
 from vllm_omni.config.pipeline_registry import resolve_pipeline_config
 
-if "vllm_omni.diffusion.models.pi0.pipeline_pi0" in sys.modules:
+if "vllm_omni.diffusion.models.pi.pi0.pipeline_pi0" in sys.modules:
     raise SystemExit("pipeline_registry imported the pi0 runtime pipeline")
 
 pipeline = resolve_pipeline_config("pi0")

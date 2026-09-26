@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Preprocessing for the π0 VLA model.
 
 Converts a raw robot observation (multi-camera images + language instruction +
@@ -35,6 +35,9 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from vllm_omni.diffusion.models.pi.common import image_processing
+from vllm_omni.diffusion.models.pi.common.text_processing import tokenize_fixed_length
+
 logger = logging.getLogger(__name__)
 
 # Defaults straight from the π0 reference configs.
@@ -58,25 +61,12 @@ def resize_with_pad(
     [-1, 1] is what lets the padded region blend with SigLIP-normalized
     pixels without adding signal at the boundary.
     """
-    if images.ndim != 4:
-        raise ValueError(f"Expected 4-D (B,C,H,W), got {images.ndim}-D")
-    _, _, cur_h, cur_w = images.shape
-    ratio = max(cur_w / target_width, cur_h / target_height)
-    rh, rw = int(cur_h / ratio), int(cur_w / ratio)
-    align_corners = False if mode == "bilinear" else None
-    resized = F.interpolate(images, size=(rh, rw), mode=mode, align_corners=align_corners)
-    resized = resized.clamp(-1.0, 1.0)
-    ph, rem_h = divmod(target_height - rh, 2)
-    pw, rem_w = divmod(target_width - rw, 2)
-    return F.pad(resized, (pw, pw + rem_w, ph, ph + rem_h), value=-1.0)
+    return image_processing.resize_with_pad(images, target_height, target_width, mode)
 
 
 def pil_image_to_tensor(image: Image.Image) -> torch.Tensor:
     """PIL → ``(1, C, H, W)`` float32 in ``[-1, 1]`` (SigLIP normalization)."""
-    if image.mode != "RGB":
-        image = image.convert("RGB")
-    arr = np.array(image, dtype=np.float32) / 255.0 * 2.0 - 1.0
-    return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+    return image_processing.pil_image_to_tensor(image)
 
 
 class Pi0ImageProcessor:
@@ -115,7 +105,7 @@ class Pi0ImageProcessor:
 
     def make_empty_image(self) -> torch.Tensor:
         """Fill tensor for an unused camera slot — pure -1, matches OpenPI/LeRobot."""
-        return torch.full((1, 3, self.image_size, self.image_size), -1.0)
+        return image_processing.make_empty_image(self.image_size)
 
 
 def tokenize_prompt(tokenizer, text: str, max_token_len: int = PI0_MAX_TOKEN_LEN):
@@ -127,15 +117,7 @@ def tokenize_prompt(tokenizer, text: str, max_token_len: int = PI0_MAX_TOKEN_LEN
     prompt = text or ""
     if not prompt.endswith("\n"):
         prompt = prompt + "\n"
-    enc = tokenizer(
-        prompt,
-        padding="max_length",
-        max_length=max_token_len,
-        truncation=True,
-        add_special_tokens=True,
-        return_tensors=None,
-    )
-    return list(enc["input_ids"]), list(enc["attention_mask"])
+    return tokenize_fixed_length(tokenizer, prompt, max_token_len)
 
 
 def _extract_images(robot_obs: dict, config) -> dict[str, Any]:
