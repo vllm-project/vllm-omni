@@ -54,6 +54,21 @@ tts_server_params = [
     )
 ]
 
+breakable_debug_server_params = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=get_deploy_config_path("audio8_tts.yaml"),
+            server_args=["--disable-log-stats"],
+            env_dict={
+                "VLLM_USE_BREAKABLE_CUDAGRAPH": "1",
+                "VLLM_LOGGING_LEVEL": "DEBUG",
+            },
+        ),
+        id="audio8_tts_breakable_debug",
+    )
+]
+
 
 @pytest.mark.core_model
 @pytest.mark.advanced_model
@@ -78,6 +93,33 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
         "min_audio_bytes": _MIN_AUDIO_BYTES,
     }
     openai_client.send_audio_speech_request(request_config, request_num=MAX_CONCURRENT)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.tts
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", breakable_debug_server_params, indirect=True)
+def test_breakable_cudagraph_debug_replay_002(omni_server, openai_client) -> None:
+    """The first replay after Breakable CUDA Graph capture must succeed.
+
+    Keep the requests sequential: the first request may create the graph, while
+    the second request must replay it. Before the runner fix, DEBUG-mode address
+    validation could fail on the first replay because ``logits_index`` was a
+    per-request tensor passed into the graph wrapper.
+    """
+    request_config = {
+        "model": omni_server.model,
+        "input": get_prompt(),
+        "stream": False,
+        "timeout": DEFAULT_AUDIO_SPEECH_TIMEOUT_S,
+        "response_format": "wav",
+        "min_audio_bytes": _MIN_AUDIO_BYTES,
+    }
+
+    for _ in range(2):
+        responses = openai_client.send_audio_speech_request(request_config)
+        assert len(responses) == 1
+        assert responses[0].success
 
 
 @pytest.mark.advanced_model
