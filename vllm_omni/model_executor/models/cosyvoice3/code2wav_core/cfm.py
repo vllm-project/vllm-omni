@@ -204,12 +204,64 @@ class ConditionalCFM(BASECFM):
             return out_e.to(x.dtype)
 
 
+# Upstream CosyVoice draws the flow's initial noise from one fixed buffer,
+# ``torch.randn([1, 80, 50 * 300])`` under seed 0, sliced by mel position. A
+# streaming decode regenerates its left context every chunk; fixed noise makes
+# that context come out as it was first emitted, so chunk boundaries line up.
+_FIXED_NOISE_SEED = 0
+_FIXED_NOISE_CHANNELS = 80
+_FIXED_NOISE_FRAMES = 50 * 300
+
+
 class CausalConditionalCFM(ConditionalCFM):
     def __init__(self, in_channels, cfm_params, n_spks=1, spk_emb_dim=64, estimator: torch.nn.Module = None):
         super().__init__(in_channels, cfm_params, n_spks, spk_emb_dim, estimator)
+        # A private CPU generator reproduces upstream's values without touching
+        # the global RNG or depending on the default device. Not a checkpoint key.
+        generator = torch.Generator(device="cpu").manual_seed(_FIXED_NOISE_SEED)
+        noise = torch.randn([1, _FIXED_NOISE_CHANNELS, _FIXED_NOISE_FRAMES], generator=generator, device="cpu")
+        self.register_buffer("rand_noise", noise, persistent=False)
+
+    def fixed_noise(
+        self,
+        mu: torch.Tensor,
+        prompt_len: int = 0,
+        noise_offset: int | torch.Tensor = 0,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """Initial noise indexed by absolute mel position.
+
+        Prompt positions ``[0, prompt_len)`` map to the start of the buffer.
+        Every later position ``p`` maps to ``p + noise_offset``, where
+        ``noise_offset`` (an int, or one per batch row) is the absolute mel
+        index of the first post-prompt frame, so a bounded left context reuses
+        the noise its frames were first generated with. Upstream never goes
+        past the buffer; here positions beyond it wrap around.
+        """
+        batch, _, length = mu.shape
+        if self.rand_noise.device != mu.device:
+            self.rand_noise = self.rand_noise.to(mu.device)
+        offset = torch.as_tensor(noise_offset, dtype=torch.long, device=mu.device).reshape(-1, 1)
+        positions = torch.arange(length, device=mu.device)
+        post_prompt_positions = positions + offset
+        noise_positions = torch.where(positions < prompt_len, positions, post_prompt_positions)
+        index = noise_positions % self.rand_noise.shape[-1]
+        noise = self.rand_noise[0][:, index.expand(batch, length)]
+        return noise.permute(1, 0, 2).to(mu.dtype) * temperature
 
     @torch.inference_mode()
-    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None, streaming: bool = False):
+    def forward(
+        self,
+        mu,
+        mask,
+        n_timesteps,
+        temperature=1.0,
+        spks=None,
+        cond=None,
+        streaming: bool = False,
+        prompt_len: int = 0,
+        noise_offset: int | torch.Tensor = 0,
+    ):
         """Forward diffusion
 
         Args:
@@ -222,6 +274,9 @@ class CausalConditionalCFM(ConditionalCFM):
             spks (torch.Tensor, optional): speaker ids. Defaults to None.
                 shape: (batch_size, spk_emb_dim)
             cond (Optional[Any], optional): Not used but kept for future purposes
+            prompt_len (int, optional): number of prompt mel frames, see ``fixed_noise``.
+            noise_offset (int | torch.Tensor, optional): absolute mel index of the
+                first post-prompt frame, see ``fixed_noise``.
 
         Returns:
             sample (torch.Tensor): generated mel-spectrogram
@@ -229,16 +284,8 @@ class CausalConditionalCFM(ConditionalCFM):
         """
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_noise_cache"):
-            z = (
-                torch.randn(
-                    (mu.size(0), mu.size(1), mu.size(2)),
-                    device=mu.device,
-                    dtype=mu.dtype,
-                )
-                * temperature
-            )
+            z = self.fixed_noise(mu, prompt_len=prompt_len, noise_offset=noise_offset, temperature=temperature)
 
-        # fix prompt and overlap part mu and z
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_t_span"):
             t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
 
@@ -318,7 +365,9 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         streaming: bool = True,
         finalize: bool = False,
         n_timesteps: int = 10,
+        noise_offset: int | torch.Tensor = 0,
     ):
+        """``noise_offset`` selects the flow's initial noise, see ``CausalConditionalCFM.fixed_noise``."""
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_speaker_embedding"):
             embedding = F.normalize(embedding, dim=1)
             embedding = self.spk_embed_affine_layer(embedding)
@@ -361,6 +410,8 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
             cond=conds,
             n_timesteps=max(1, int(n_timesteps)),
             streaming=streaming,
+            prompt_len=int(mel_len1),
+            noise_offset=noise_offset,
         )
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_crop_prompt_mel"):

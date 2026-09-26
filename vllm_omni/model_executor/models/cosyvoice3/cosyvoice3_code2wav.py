@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig
+from typing_extensions import NotRequired
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none, set_current_diffusion_config
@@ -57,6 +58,15 @@ def _build_dit_estimator(estimator_config: Mapping[str, Any]) -> DiT:
         return DiT(**estimator_config)
 
 
+class StreamCacheState(TypedDict):
+    """HiFT history and the number of flow tokens emitted for one stream."""
+
+    mel: torch.Tensor
+    mel_offset: int
+    phase_acc: torch.Tensor | None
+    flow_emitted_tokens: NotRequired[int]
+
+
 class StreamingFlowItem(TypedDict, total=False):
     """One entry of the batched-streaming item list passed to forward_streaming_batch."""
 
@@ -67,7 +77,7 @@ class StreamingFlowItem(TypedDict, total=False):
     prompt_token: torch.Tensor
     prompt_feat: torch.Tensor
     embedding: torch.Tensor
-    cache_state: dict[str, torch.Tensor] | None
+    cache_state: StreamCacheState | None
     token_offset_tokens: int
     finalize: bool
 
@@ -152,9 +162,7 @@ class CosyVoice3Code2Wav(nn.Module):
         self.mel_cache_len = 20
         self.source_cache_len = int(self.mel_cache_len * 256)
         self.speech_window = np.hamming(2 * self.source_cache_len)
-        # Must cover decode()'s own causal receptive field, not just the F0
-        # margin; window_len=48 already passes
-        # test_incremental_hift_bounded_window_is_close, so 64 has headroom.
+        # Cover decode()'s causal receptive field as well as the F0 margin.
         self._hift_window_len = 64
 
     @property
@@ -206,8 +214,14 @@ class CosyVoice3Code2Wav(nn.Module):
         token_lens: torch.Tensor | None = None,
         prompt_token_lens: torch.Tensor | None = None,
         prompt_feat_lens: torch.Tensor | None = None,
+        noise_offset_tokens: int | torch.Tensor = 0,
     ) -> torch.Tensor:
-        """Generate mel features via the upstream flow-model inference path."""
+        """Generate mel features via the upstream flow-model inference path.
+
+        ``noise_offset_tokens`` is the absolute stream index of the first token
+        in ``token`` (per row when batched), which keeps the flow's fixed
+        initial noise aligned with the stream.
+        """
         flow_weight = next(self.flow_model.parameters())
         device = flow_weight.device
         dtype = flow_weight.dtype
@@ -244,6 +258,7 @@ class CosyVoice3Code2Wav(nn.Module):
             streaming=streaming,
             finalize=finalize,
             n_timesteps=n_timesteps,
+            noise_offset=noise_offset_tokens * self.token_mel_ratio,
         )
 
         trim_mel = max(0, int(token_offset_tokens)) * int(self.token_mel_ratio)
@@ -256,9 +271,9 @@ class CosyVoice3Code2Wav(nn.Module):
         self,
         feat: torch.Tensor,
         *,
-        cache_state: dict[str, torch.Tensor] | None = None,
+        cache_state: StreamCacheState | None = None,
         finalize: bool = False,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
+    ) -> tuple[torch.Tensor, StreamCacheState | None]:
         hift_weight = self.hift.m_source.l_linear.weight
         chunk_mel = feat.to(device=hift_weight.device, dtype=hift_weight.dtype)
 
@@ -332,20 +347,28 @@ class CosyVoice3Code2Wav(nn.Module):
         }
         return emitted_speech.reshape(emitted_speech.shape[0], 1, -1), new_state
 
+    @staticmethod
+    def _stream_noise_offset(cache_state: StreamCacheState | None, token_offset_tokens: int) -> int:
+        """Absolute index of the first token resent to the flow: emitted so far minus the left context."""
+        emitted = 0
+        if cache_state is not None:
+            emitted = cache_state.get("flow_emitted_tokens", 0)
+        return max(0, emitted - token_offset_tokens)
+
     @torch.inference_mode()
     def forward_streaming_batch(
         self,
         items: list[StreamingFlowItem],
         *,
         n_timesteps: int = 10,
-    ) -> list[tuple[torch.Tensor, dict[str, torch.Tensor] | None]]:
+    ) -> list[tuple[torch.Tensor, StreamCacheState | None]]:
         """Batch the flow-matching mel path, then run HiFT per request.
 
         Items are grouped by prompt condition shape and finalization state.
         Codec tokens may have different lengths; those are padded within the
         group and passed to the flow as per-row token lengths.
         """
-        results: list[tuple[torch.Tensor, dict[str, torch.Tensor] | None] | None] = [None] * len(items)
+        results: list[tuple[torch.Tensor, StreamCacheState | None] | None] = [None] * len(items)
         groups: dict[tuple[int, int, int, bool], list[tuple[int, StreamingFlowItem]]] = {}
         for index, item in enumerate(items):
             assert isinstance(item["token"], torch.Tensor)
@@ -413,6 +436,10 @@ class CosyVoice3Code2Wav(nn.Module):
             prompt_token_lens = torch.full((len(group),), prompt_tokens.shape[1], dtype=torch.int32)
             prompt_feat_lens = torch.full((len(group),), prompt_feats.shape[1], dtype=torch.int32)
             finalize = bool(group[0][1].get("finalize", False))
+            noise_offsets = [
+                self._stream_noise_offset(item.get("cache_state"), int(item.get("token_offset_tokens", 0)))
+                for _, item in group
+            ]
 
             with cosyvoice3_batch_flow_profile(f"cosyvoice3_flow_batch_b{len(group)}_t{tokens.shape[1]}"):
                 feat = self._forward_mel(
@@ -427,6 +454,7 @@ class CosyVoice3Code2Wav(nn.Module):
                     token_lens=token_lens,
                     prompt_token_lens=prompt_token_lens,
                     prompt_feat_lens=prompt_feat_lens,
+                    noise_offset_tokens=torch.tensor(noise_offsets, dtype=torch.long),
                 )
 
             for row, (index, item) in enumerate(group):
@@ -438,14 +466,17 @@ class CosyVoice3Code2Wav(nn.Module):
                 row_feat = feat[row : row + 1, :, :valid_mel]
                 if trim_mel > 0:
                     row_feat = row_feat[:, :, trim_mel:]
-                results[index] = self._stream_hift_from_feat(
+                speech, new_state = self._stream_hift_from_feat(
                     row_feat,
                     cache_state=item.get("cache_state"),
                     finalize=finalize,
                 )
+                if new_state is not None:
+                    new_state["flow_emitted_tokens"] = noise_offsets[row] + valid_tokens
+                results[index] = (speech, new_state)
 
         assert all(result is not None for result in results), "every streaming item must produce exactly one result"
-        return cast(list[tuple[torch.Tensor, dict[str, torch.Tensor] | None]], results)
+        return cast(list[tuple[torch.Tensor, StreamCacheState | None]], results)
 
     @torch.inference_mode()
     def forward_streaming(
@@ -455,11 +486,11 @@ class CosyVoice3Code2Wav(nn.Module):
         prompt_feat: torch.Tensor,
         embedding: torch.Tensor,
         *,
-        cache_state: dict[str, torch.Tensor] | None = None,
+        cache_state: StreamCacheState | None = None,
         n_timesteps: int = 10,
         token_offset_tokens: int = 0,
         finalize: bool = False,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
+    ) -> tuple[torch.Tensor, StreamCacheState | None]:
         """Decode streaming audio using cumulative mel + emitted-speech offset.
 
         This mirrors upstream CosyVoice3 streaming semantics more closely than
@@ -468,6 +499,7 @@ class CosyVoice3Code2Wav(nn.Module):
         suffix. That preserves causal look-right handling without double
         trimming or duplicated overlap at chunk boundaries.
         """
+        noise_offset = self._stream_noise_offset(cache_state, token_offset_tokens)
         feat = self._forward_mel(
             token=token,
             prompt_token=prompt_token,
@@ -477,8 +509,13 @@ class CosyVoice3Code2Wav(nn.Module):
             token_offset_tokens=token_offset_tokens,
             streaming=True,
             finalize=finalize,
+            noise_offset_tokens=noise_offset,
         )
-        return self._stream_hift_from_feat(feat, cache_state=cache_state, finalize=finalize)
+        speech, new_state = self._stream_hift_from_feat(feat, cache_state=cache_state, finalize=finalize)
+        if new_state is not None:
+            valid_tokens = int(token.shape[1]) - int(self.flow_model.pre_lookahead_len)
+            new_state["flow_emitted_tokens"] = noise_offset + valid_tokens
+        return speech, new_state
 
     @torch.inference_mode()
     def forward(
