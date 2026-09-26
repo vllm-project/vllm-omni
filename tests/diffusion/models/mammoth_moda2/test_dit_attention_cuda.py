@@ -11,12 +11,14 @@ import vllm_omni.diffusion.attention.backends.sdpa as sdpa_backend
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import TransformerBlock
 
+from .helpers import initialize_block_weights
 from .test_dit_attention import _reference_attention
 
 pytestmark = [
     pytest.mark.core_model,
     pytest.mark.advanced_model,
     pytest.mark.cuda,
+    pytest.mark.usefixtures("mock_tp1"),
     *hardware_marks(res={"cuda": "L4"}, num_cards=1),
 ]
 
@@ -33,6 +35,7 @@ def test_real_shape_matches_previous_arithmetic_bf16(seq):
         .to(torch.bfloat16)
         .eval()
     )
+    initialize_block_weights(block)
     hidden = torch.randn(2, seq, DIM, device="cuda", dtype=torch.bfloat16)
     mask = torch.ones(2, seq, dtype=torch.bool, device="cuda")
     mask[0, seq - 300 :] = False
@@ -63,6 +66,7 @@ def test_empty_text_stream_on_the_default_backend():
         .to(torch.bfloat16)
         .eval()
     )
+    initialize_block_weights(block)
     hidden = torch.randn(1, 0, DIM, device="cuda", dtype=torch.bfloat16)
     mask = torch.ones(1, 0, dtype=torch.bool, device="cuda")
     angles = torch.rand(1, 0, block.head_dim, device="cuda")
@@ -95,6 +99,7 @@ def test_fp32_falls_back_to_sdpa_and_matches_reference(monkeypatch, seq, force_g
         .to(dt)
         .eval()
     )
+    initialize_block_weights(block)
     hidden = torch.randn(1, seq, DIM, device="cuda", dtype=dt)
     mask = torch.ones(1, seq, dtype=torch.bool, device="cuda")
     mask[:, -13:] = False
