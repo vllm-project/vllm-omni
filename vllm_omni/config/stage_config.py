@@ -1005,7 +1005,7 @@ def _build_engine_args(
     engine_args["retains_state_across_chunks"] = ps.retains_state_across_chunks
     if ps.execution_type == StageExecutionType.DIFFUSION and ps.model_arch:
         engine_args.setdefault("model_class_name", ps.model_arch)
-    if ps.engine_output_type:
+    if ps.engine_output_type is not None:
         engine_args["engine_output_type"] = ps.engine_output_type
     if next_stage_proc:
         engine_args["custom_process_next_stage_input_func"] = next_stage_proc

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Output modality types for vLLM-Omni.
 
 This module defines the OutputModality enum and TensorAccumulationStrategy
@@ -7,20 +9,7 @@ for type-safe multimodal output routing and tensor merging.
 
 from __future__ import annotations
 
-import re
 from enum import Enum, Flag, auto
-
-_MODALITY_ALIASES: dict[str, str] = {
-    "speech": "audio",
-    "images": "image",
-    "latents": "latent",
-    "wav": "audio",
-    "waveform": "audio",
-    "pixel_values": "image",
-    "pixels": "image",
-    "token_ids": "text",
-    "tokens": "text",
-}
 
 
 class OutputModalityNames(str, Enum):
@@ -38,13 +27,17 @@ class OutputModalityNames(str, Enum):
     IMAGE = "image"
     AUDIO = "audio"
     LATENT = "latent"
+    TOKEN_IDS = "token_ids"
 
 
 # Specify which output modalities may be drained when handling delta messages.
-# For some types, e.g., latents, we need to be careful to ensure the full context
-# is passed as the stream yields due to assumptions in the I/O processing and model
-# when async chunk isn't enabled.
-NON_DRAINABLE_MODALITIES = {OutputModalityNames.TEXT, OutputModalityNames.LATENT}
+# Retain intermediate outputs such as latents and token IDs across emissions
+# so downstream stages can receive full context when async chunk isn't enabled.
+NON_DRAINABLE_MODALITIES = {
+    OutputModalityNames.TEXT,
+    OutputModalityNames.LATENT,
+    OutputModalityNames.TOKEN_IDS,
+}
 DRAINABLE_MODALITIES = {mod for mod in OutputModalityNames if mod not in NON_DRAINABLE_MODALITIES}
 
 
@@ -56,6 +49,10 @@ class OutputModality(Flag):
     Single:   ``OutputModality.TEXT``, ``OutputModality.IMAGE``, ...
     Compound: ``OutputModality.TEXT | OutputModality.IMAGE``  (text+image)
 
+    TODO: Describe modality, representation, and update/retention rules per
+    named output field instead of sharing one stage-level type. Audit legacy
+    LATENT uses when introducing that contract.
+
     Note: POOLING is intentionally excluded. Pooling/embedding is vLLM's
     native path (pooling_output → PoolingRequestOutput), handled entirely
     by the base OutputProcessor. vLLM-Omni's layer does not participate.
@@ -65,29 +62,43 @@ class OutputModality(Flag):
     IMAGE = auto()
     AUDIO = auto()
     LATENT = auto()
+    """Continuous latent tensors used for further computation or decoding.
+
+    Existing LATENT producers may carry other representations; their current
+    payload contracts remain unchanged.
+    """
+
+    TOKEN_IDS = auto()
+    """Discrete vocabulary/codebook indices, e.g. GLM-Image's AR image tokens.
+
+    Unlike continuous latents, these values identify discrete symbols.
+    The distinction is semantic, not inferred from the tensor dtype.
+    """
 
     @classmethod
     def from_string(cls, s: str | None) -> OutputModality:
-        """Parse a free-text modality string into an OutputModality flag.
+        """Parse canonical modality names into an OutputModality flag.
 
-        Handles common aliases and compound strings separated by + or ,.
+        Names must be lowercase and contain no whitespace. Compound names
+        may be separated by + or ,. None preserves the default TEXT modality.
 
         Examples::
 
             OutputModality.from_string("text+image")
             # → OutputModality.TEXT | OutputModality.IMAGE
         """
-        if not s or not s.strip():
+        if s is None:
             return cls.TEXT
 
-        parts = [p.strip().lower() for p in re.split(r"[+,]", s.strip())]
         result = cls(0)
-        for p in parts:
-            p = _MODALITY_ALIASES.get(p, p)
+        for part in s.replace(",", "+").split("+"):
             try:
-                result |= cls[p.upper()]
-            except KeyError:
-                raise ValueError(f"Unknown modality: {p!r}. Supported: {[m.name.lower() for m in cls]}")
+                name = OutputModalityNames(part)
+            except ValueError:
+                raise ValueError(
+                    f"Unknown modality: {part!r}. Supported: {[m.value for m in OutputModalityNames]}"
+                ) from None
+            result |= cls[name.name]
         return result
 
     @property
@@ -103,7 +114,7 @@ class TensorAccumulationStrategy(Enum):
     """Strategy for merging incremental multimodal tensors."""
 
     CONCAT_DIM0 = "concat_dim0"
-    """Concatenate along dimension 0. Used for image/latent tensors."""
+    """Concatenate along dimension 0. Used for image/latent/token-ID tensors."""
 
     CONCAT_LAST = "concat_last"
     """Concatenate along the last dimension. Used for audio waveforms."""
@@ -156,4 +167,4 @@ def get_accumulation_strategy(
         return TensorAccumulationStrategy.CONCAT_LAST
     if OutputModality.IMAGE in modality or OutputModality.LATENT in modality:
         return TensorAccumulationStrategy.CONCAT_DIM0
-    return TensorAccumulationStrategy.CONCAT_DIM0  # default
+    return TensorAccumulationStrategy.CONCAT_DIM0  # TEXT / TOKEN_IDS default
