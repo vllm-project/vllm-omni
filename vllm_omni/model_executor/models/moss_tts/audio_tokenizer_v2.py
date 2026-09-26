@@ -302,6 +302,7 @@ def apply_rope(
     offset: torch.Tensor,
     max_period: float = 10_000,
     time_before_heads: bool = False,
+    cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
     """Apply rotary position embedding (GPT-J interleaved convention).
 
@@ -312,6 +313,12 @@ def apply_rope(
     ``[r0 r1 ... i0 i1 ...]``, apply ``npu_rotary_mul``, convert back. This
     fuses the 6 mul/add ops into 1 kernel. Result is bf16-identical
     (max_abs_diff = 1 ULP). Falls back to the eager path on non-NPU.
+
+    When ``cos_sin`` is provided (precomputed by the parent ``Transformer.forward``
+    and shared across all layers within that block), the per-layer cos/sin
+    computation is skipped -- one computation per transformer block instead of
+    one per layer (~86 redundant dispatches removed for a 92-layer / 6-block
+    decoder, ~15x reduction per block).
     """
     if time_before_heads:
         B, T, H, D = q.shape
@@ -322,24 +329,25 @@ def apply_rope(
     if D <= 0 or (D % 2) != 0:
         raise ValueError(f"RoPE requires an even last dimension, got D={D}")
 
-    ds = torch.arange(D // 2, device=q.device, dtype=torch.float32)
-    freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
-    ts = offset.float().view(-1, 1) + torch.arange(T, device=q.device, dtype=torch.float32)
-
-    if time_before_heads:
-        ts = ts.view(B, -1, 1, 1)
-    else:
-        ts = ts.view(B, 1, -1, 1)
-
     # Fast path: npu_rotary_mul (fused rotation kernel) on NPU.
     if q.device.type == "npu":
         import torch_npu
 
-        cos_d2 = torch.cos(freqs * ts)  # (..., 1, T, D//2)
-        sin_d2 = torch.sin(freqs * ts)
-        # neox cos/sin: cat([first_half, second_half]) -- each freq once per half.
-        cos = torch.cat([cos_d2, cos_d2], dim=-1)  # (..., 1, T, D)
-        sin = torch.cat([sin_d2, sin_d2], dim=-1)
+        if cos_sin is not None:
+            cos, sin = cos_sin
+        else:
+            ds = torch.arange(D // 2, device=q.device, dtype=torch.float32)
+            freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
+            ts = offset.float().view(-1, 1) + torch.arange(T, device=q.device, dtype=torch.float32)
+            if time_before_heads:
+                ts = ts.view(B, -1, 1, 1)
+            else:
+                ts = ts.view(B, 1, -1, 1)
+            cos_d2 = torch.cos(freqs * ts)  # (..., 1, T, D//2)
+            sin_d2 = torch.sin(freqs * ts)
+            # neox cos/sin: cat([first_half, second_half]) -- each freq once per half.
+            cos = torch.cat([cos_d2, cos_d2], dim=-1)  # (..., 1, T, D)
+            sin = torch.cat([sin_d2, sin_d2], dim=-1)
         dims = q.shape[:-1]
         # interleaved -> neox: [r0 i0 r1 i1 ...] -> [r0 r1 ... i0 i1 ...]
         q_neox = q.view(*dims, D // 2, 2).transpose(-1, -2).reshape(*dims, D).contiguous()
@@ -354,6 +362,15 @@ def apply_rope(
         return qo, ko
 
     # Eager fallback (non-NPU): original 14-op GPT-J rotation in fp32.
+    ds = torch.arange(D // 2, device=q.device, dtype=torch.float32)
+    freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
+    ts = offset.float().view(-1, 1) + torch.arange(T, device=q.device, dtype=torch.float32)
+
+    if time_before_heads:
+        ts = ts.view(B, -1, 1, 1)
+    else:
+        ts = ts.view(B, 1, -1, 1)
+
     dims = q.shape[:-1]
     q = q.view(*dims, D // 2, 2)
     k = k.view(*dims, D // 2, 2)
@@ -389,8 +406,9 @@ class MossAudioTokenizerRotaryEmbedding(nn.Module):
         k: torch.Tensor,
         offset: torch.Tensor,
         time_before_heads: bool = False,
+        cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
-        return apply_rope(q, k, offset, self.max_period, time_before_heads)
+        return apply_rope(q, k, offset, self.max_period, time_before_heads, cos_sin=cos_sin)
 
 
 # =============================================================================
@@ -767,6 +785,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         key: torch.Tensor,
         value: torch.Tensor,
         execution_context: StreamingExecutionContext | None = None,
+        cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         state = cast(MHAState | None, self._streaming_state)
         B, T = query.shape[:2]
@@ -789,7 +808,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         q, k, v = projected[0], projected[1], projected[2]
 
         if self.rope:
-            q, k = self.rope(q, k, offset, time_before_heads=False)
+            q, k = self.rope(q, k, offset, time_before_heads=False, cos_sin=cos_sin)
 
         k, v, pos_k = self._complete_kv(k, v, execution_context)
         pos_k = pos_k[:, None]
@@ -949,18 +968,20 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
         self,
         x: torch.Tensor,
         execution_context: StreamingExecutionContext | None = None,
+        cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         x_orig = x
         x = self.norm1(x)
-        update = self.self_attn(x, x, x, execution_context=execution_context)
+        update = self.self_attn(x, x, x, execution_context=execution_context, cos_sin=cos_sin)
         return x_orig.to(update) + self.layer_scale_1(update)
 
     def forward(
         self,
         x: torch.Tensor,
         execution_context: StreamingExecutionContext | None = None,
+        cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
-        x = self._sa_block(x, execution_context)
+        x = self._sa_block(x, execution_context, cos_sin)
         x = self._ff_block(x, execution_context)
         state = self._streaming_state
         if state is not None and execution_context is None:
@@ -1013,6 +1034,8 @@ class MossAudioTokenizerTransformer(StreamingModule):
         self.positional_embedding = positional_embedding
         self.max_period = max_period
         self.positional_scale = positional_scale
+        self.d_model = d_model
+        self.num_heads = num_heads
 
         self.rope: MossAudioTokenizerRotaryEmbedding | None = None
         if positional_embedding in {"rope", "sin_rope"}:
@@ -1062,6 +1085,18 @@ class MossAudioTokenizerTransformer(StreamingModule):
             positions = positions + offsets.view(-1, 1, 1)
             pos_emb = create_sin_embedding(positions, C, max_period=self.max_period, dtype=x.dtype)
             x = x + self.positional_scale * pos_emb
+
+        if self.rope is not None and x.device.type == "npu":
+            D = self.d_model // self.num_heads
+            ds = torch.arange(D // 2, device=x.device, dtype=torch.float32)
+            freqs = torch.exp(ds * (-math.log(self.rope.max_period) * 2 / D))
+            ts = offsets.float().view(-1, 1) + torch.arange(T, device=x.device, dtype=torch.float32)
+            ts = ts.view(-1, 1, T, 1)
+            cos_d2 = torch.cos(freqs * ts)
+            sin_d2 = torch.sin(freqs * ts)
+            cos = torch.cat([cos_d2, cos_d2], dim=-1)
+            sin = torch.cat([sin_d2, sin_d2], dim=-1)
+            kwargs["cos_sin"] = (cos, sin)
 
         for layer in self.layers:
             x = layer(x, *args, **kwargs)
