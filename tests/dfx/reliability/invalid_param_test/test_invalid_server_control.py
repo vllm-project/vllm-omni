@@ -13,8 +13,6 @@ from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
 
 pytestmark = [pytest.mark.slow, pytest.mark.diffusion, pytest.mark.omni]
 
-_SKIP_ISSUE_3649 = pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/3649")
-
 # One module-scoped server for this file. ``--enable-sleep-mode`` is required by the
 # level-2 wake contract test; invalid-JSON cases only hit request validation and are
 # unaffected. Do not mix ``omni_server`` (module) with ``omni_server_function`` here:
@@ -44,9 +42,8 @@ _QWEN_IMAGE = [
         pytest.param(
             "sleep",
             {"stage_ids": [], "level": 2},
-            ("stage_ids", "Field required", "Missing"),
+            ("stage_ids", "too_short", "at least 1"),
             id="sleep_empty_stage_ids",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "sleep",
@@ -65,7 +62,6 @@ _QWEN_IMAGE = [
             {"stage_ids": [0], "level": -1},
             ("level", "greater"),
             id="sleep_negative_level",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param("wakeup", {}, ("stage_ids", "missing", "Field required"), id="wakeup_missing_stage_ids"),
         pytest.param(
@@ -77,9 +73,8 @@ _QWEN_IMAGE = [
         pytest.param(
             "wakeup",
             {"stage_ids": []},
-            ("stage_ids", "length"),
+            ("stage_ids", "too_short", "at least 1"),
             id="wakeup_empty_stage_ids",
-            marks=_SKIP_ISSUE_3649,
         ),
     ],
 )
