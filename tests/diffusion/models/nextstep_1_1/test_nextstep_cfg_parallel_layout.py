@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +17,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 class _DummyImageHead:
     def __init__(self, token_dim: int):
         self.token_dim = token_dim
-        self.calls = []
+        self.calls: list[dict[str, int | float]] = []
 
     def sample(
         self,
@@ -43,7 +46,7 @@ class _DummyModel:
     def __init__(self, hidden_dim: int, token_dim: int):
         self.hidden_dim = hidden_dim
         self.image_head = _DummyImageHead(token_dim)
-        self.forward_batches = []
+        self.forward_batches: list[int] = []
 
     def image_out_projector(self, c: torch.Tensor) -> torch.Tensor:
         return c
@@ -52,7 +55,7 @@ class _DummyModel:
         bsz = sampled_tokens.shape[0]
         return torch.zeros(bsz, 1, self.hidden_dim, dtype=sampled_tokens.dtype, device=sampled_tokens.device)
 
-    def forward_model(self, inputs_embeds: torch.Tensor, attention_mask, past_key_values, use_cache: bool):
+    def __call__(self, inputs_embeds: torch.Tensor, attention_mask, past_key_values, use_cache: bool):
         del attention_mask, use_cache
         self.forward_batches.append(inputs_embeds.shape[0])
         return SimpleNamespace(

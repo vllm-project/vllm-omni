@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from NextStep-1.1 (https://huggingface.co/stepfun-ai/NextStep-1.1)
 # Original: models/nextstep_model.py — local version with TP-aware layers.
 
@@ -115,6 +115,10 @@ class NextStepConfig(LlamaConfig):
 
 class NextStepModel(nn.Module):
     _layerwise_offload_blocks_attrs = ["layers"]
+    _hsdp_shard_conditions = [
+        lambda name, module: isinstance(module, LlamaDecoderLayer)
+        or name in {"embed_tokens", "image_in_projector", "image_out_projector", "image_head.net"}
+    ]
 
     def __init__(self, config: NextStepConfig):
         super().__init__()
@@ -337,14 +341,20 @@ class NextStepModel(nn.Module):
 
     def forward_model(
         self,
-        inputs_embeds: torch.FloatTensor,
+        inputs_embeds: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         past_key_values: Cache | list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         cache_position: torch.LongTensor | None = None,
+        input_ids: torch.Tensor | None = None,
+        latents: torch.Tensor | None = None,
     ) -> BaseModelOutputWithPast:
+        if inputs_embeds is None:
+            assert input_ids is not None
+            inputs_embeds = self.prepare_inputs_embeds(input_ids, latents)
+
         output_attentions = (
             output_attentions if output_attentions is not None else getattr(self.config, "output_attentions", False)
         )
@@ -414,6 +424,9 @@ class NextStepModel(nn.Module):
     # ------------------------------------------------------------------
     # Weight loading with TP sharding support
     # ------------------------------------------------------------------
+
+    # Module entrypoint is required for root FSDP hooks during prefill and decode.
+    forward = forward_model
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [

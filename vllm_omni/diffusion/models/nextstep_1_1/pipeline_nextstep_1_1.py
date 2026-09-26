@@ -543,7 +543,7 @@ class NextStep11Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelin
                 [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))],
                 dim=-1,
             )
-            outputs = self.model.forward_model(
+            outputs = self.model(
                 inputs_embeds=cur_inputs_embeds,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
@@ -673,9 +673,9 @@ class NextStep11Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelin
             config=self.config,
             max_cache_len=max_cache_len,
         )
-        inputs_embeds = self.model.prepare_inputs_embeds(input_ids, latents)
-        outputs = self.model.forward_model(
-            inputs_embeds=inputs_embeds,
+        outputs = self.model(
+            input_ids=input_ids,
+            latents=latents,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=True,
