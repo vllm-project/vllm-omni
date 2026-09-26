@@ -29,6 +29,7 @@ from vllm_omni.engine.stage_client import (
     StagePoolDiffusionClient,
     StagePoolLLMClient,
 )
+from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt
 from vllm_omni.metrics import (
     count_audio_frames,
@@ -1369,7 +1370,10 @@ class StagePool:
         if client is None:
             return
         try:
-            client.shutdown()
+            if isinstance(client, StageEngineCoreClientBase):
+                client.shutdown(timeout=60.0)
+            else:
+                client.shutdown()
             logger.info(
                 "[StagePool] Stage %d replica %d shut down",
                 self.stage_id,

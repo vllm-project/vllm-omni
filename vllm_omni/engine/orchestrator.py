@@ -490,7 +490,7 @@ class OrchestratorBase:
                 self._membership.shutdown()
 
             self._orch_monitor.flush()
-            self._shutdown_stages()
+            await self._shutdown_stages()
 
             loop = asyncio.get_running_loop()
             pending = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task() and not t.done()]
@@ -2765,7 +2765,7 @@ class OrchestratorBase:
 
     # ---- Shutdown / lifecycle ----
 
-    def _shutdown_stages(self) -> None:
+    async def _shutdown_stages(self) -> None:
         """Shutdown all stage pools."""
         if self._stages_shutdown:
             return
@@ -2773,9 +2773,13 @@ class OrchestratorBase:
         self._stages_shutdown = True
         total = sum(pool.live_num_replicas for pool in self.stage_pools)
         logger.info("[Orchestrator] Shutting down all %d client(s)", total)
-        for pool in self.stage_pools:
-            for replica_id in pool.live_replica_ids():
-                pool.shutdown_replica(replica_id)
+        await asyncio.gather(
+            *(
+                asyncio.to_thread(pool.shutdown_replica, replica_id)
+                for pool in self.stage_pools
+                for replica_id in pool.live_replica_ids()
+            )
+        )
 
 
 class Orchestrator(OrchestratorBase):

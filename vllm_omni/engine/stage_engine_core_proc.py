@@ -179,6 +179,8 @@ class StageEngineCoreProc(EngineCoreProc):
             # Setting this env var allows the same graceful fallback to work.
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
             os.environ["VLLM_OMNI_REPLICA_ID"] = str(max(int(omni_replica_id), 0))
+            # 在 vLLM 缓存环境变量前设置，给 TP worker 的 CUDA 清理留出时间。
+            os.environ.setdefault("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", "45")
 
             # Patch the decoder type so process_input_sockets (started
             # during __init__) decodes OmniEngineCoreRequest (which

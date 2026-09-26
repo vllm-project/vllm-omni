@@ -963,6 +963,27 @@ async def test_run_shutdown(orchestrator_factory) -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_shutdown_starts_all_replicas_together(orchestrator_factory) -> None:
+    barrier = threading.Barrier(3)
+
+    class WaitingStageClient(FakeStageClient):
+        def shutdown(self) -> None:
+            barrier.wait(timeout=2)
+            super().shutdown()
+
+    encoders: list[FakeStageClient] = [WaitingStageClient(stage_type="llm") for _ in range(2)]
+    diffusion: FakeStageClient = WaitingStageClient(
+        stage_type="diffusion", final_output=True, final_output_type="image"
+    )
+    pools = _build_stage_pools([encoders, [diffusion]])
+    orchestrator_fixture = orchestrator_factory([], stage_pools=pools)
+
+    await _shutdown_orchestrator(orchestrator_fixture)
+
+    assert all(client.shutdown_calls == 1 for client in [*encoders, diffusion])
+
+
+@pytest.mark.asyncio
 async def test_run_abort(orchestrator_factory) -> None:
     stages = [
         FakeStageClient(stage_type="llm", final_output=False),

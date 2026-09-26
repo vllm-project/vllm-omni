@@ -22,7 +22,7 @@ from vllm_omni.engine.stage_runtime import StageRuntime
 logger = init_logger(__name__)
 
 SHUTDOWN_ENQUEUE_TIMEOUT_S = 1.0
-SHUTDOWN_JOIN_TIMEOUT_S = 30.0
+SHUTDOWN_JOIN_TIMEOUT_S = 90.0
 _WEAK_SHUTDOWN_JOIN_TIMEOUT_S = 1.0
 _JANUS_SYNC_QUEUE_SHUTDOWN = getattr(janus, "SyncQueueShutDown", None)
 _LEGACY_JANUS_QUEUE_CLOSED_MESSAGE = "Operation on the closed queue is forbidden"

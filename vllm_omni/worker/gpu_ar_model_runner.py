@@ -521,6 +521,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         """Release omni-specific GPU resources before upstream shutdown.
 
         Order of operations (must match upstream's expectation):
+          0. Stop connector I/O and release undelivered shared memory.
           1. Unfreeze Python GC so model weights are collected immediately
              when self.model is set to None (upstream Worker.init_device
              calls gc.freeze() / freeze_gc_heap()).
@@ -540,6 +541,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         exit that can trigger GPU OOM signals when the parent process
         concurrently cleans up its own GPU state.
         """
+        if getattr(self, "_omni_connector_initialized", False):
+            self.shutdown_omni_connectors()
+
         # 1. Unfreeze GC so model weights and GPU tensors are collected
         #    immediately when references are dropped (upstream Worker.shutdown
         #    also does this before any teardown).
