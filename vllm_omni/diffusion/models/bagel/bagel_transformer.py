@@ -484,12 +484,16 @@ class PackedAttentionMoT(nn.Module):
 
         self.rotary_op = RotaryEmbedding(is_neox_style=True)
 
+        # Text prefill, ViT/VAE cache updates and the CFG cache-update forward run
+        # on sequences every SP rank holds in full; only the sharded denoise path
+        # may enter the SP strategy.
         self.attn_causal = DiffusionAttention(
             num_heads=self.total_num_heads,
             head_size=self.head_dim,
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=True,
             num_kv_heads=self.total_num_kv_heads,
+            skip_sequence_parallel=True,
         )
         self.attn_noncausal = DiffusionAttention(
             num_heads=self.total_num_heads,
@@ -497,6 +501,14 @@ class PackedAttentionMoT(nn.Module):
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
             num_kv_heads=self.total_num_kv_heads,
+        )
+        self.attn_noncausal_local = DiffusionAttention(
+            num_heads=self.total_num_heads,
+            head_size=self.head_dim,
+            softmax_scale=1.0 / (self.head_dim**0.5),
+            causal=False,
+            num_kv_heads=self.total_num_kv_heads,
+            skip_sequence_parallel=True,
         )
 
     def _is_sp_active(self) -> bool:
@@ -583,7 +595,8 @@ class PackedAttentionMoT(nn.Module):
 
         # NOTE: we reshape to batched (1, S, H, D) for diffusion Attention
         # attn_out should be: (1, text_len + local_vae_len, H, D)
-        if self._is_sp_active():
+        # A cache update runs on the full VAE sequence on every rank: keep it local.
+        if self._is_sp_active() and not update_past_key_values:
             # Joint mechanism keeps text+cache replicated across SP ranks
             attn_out = self.attn_noncausal(
                 vae_q.unsqueeze(0),
@@ -631,7 +644,7 @@ class PackedAttentionMoT(nn.Module):
                 k_4d = torch.stack([torch.cat([t, v]) for t, v in zip(text_k_parts, vae_k_parts)])
                 v_4d = torch.stack([torch.cat([t, v]) for t, v in zip(text_v_parts, vae_v_parts)])
                 metadata = None
-            attn_out = self.attn_noncausal(q_4d, k_4d, v_4d, metadata)
+            attn_out = self.attn_noncausal_local(q_4d, k_4d, v_4d, metadata)
 
         attn_out = attn_out.reshape(num_branches, -1, self.q_size)
         text_attn = attn_out[:, :text_per_branch].reshape(-1, self.q_size)
@@ -747,7 +760,7 @@ class PackedAttentionMoT(nn.Module):
             )
             attn_out = attn_out_4d.permute(0, 2, 1, 3)
         else:
-            attn = self.attn_causal if is_causal else self.attn_noncausal
+            attn = self.attn_causal if is_causal else self.attn_noncausal_local
             attn_out = attn(
                 q.unsqueeze(0),
                 full_k.unsqueeze(0),
