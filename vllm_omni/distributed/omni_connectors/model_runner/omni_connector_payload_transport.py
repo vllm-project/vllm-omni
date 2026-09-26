@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import os
 import time
 from collections import deque
 from collections.abc import Callable
@@ -21,6 +22,9 @@ from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime i
     should_accumulate_full_payload_output,
 )
 from vllm_omni.outputs import OmniConnectorOutput
+
+# No-progress recheck for connectors without a change notification (SHM polls).
+_RECV_POLL_S = float(os.environ.get("VLLM_OMNI_CONNECTOR_RECV_POLL_MS", "5")) / 1000
 
 if TYPE_CHECKING:
     from vllm_omni.distributed.omni_connectors.connectors.base import (
@@ -189,10 +193,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         connector: OmniConnectorBase,
         from_stage: str,
         to_stage: str,
-        connector_get_key: str,
+        connector_get_key: str | None,
         metadata: dict[str, Any] | None = None,
     ) -> Any:
         """Receive one ordinary non-KV stage payload on the local leader rank only."""
+        if connector_get_key is None:
+            return None
         if not self._stage_payload_broadcast_groups():
             if metadata is None:
                 return connector.get(from_stage, to_stage, connector_get_key)
@@ -208,7 +214,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         connector: OmniConnectorBase,
         from_stage: str,
         to_stage: str,
-        connector_get_key: str,
+        connector_get_key: str | None,
         metadata: dict[str, Any] | None = None,
     ) -> Any:
         """Receive one full-payload transfer on the local leader rank only."""
@@ -225,7 +231,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         connector: OmniConnectorBase,
         from_stage: str,
         to_stage: str,
-        connector_get_key: str,
+        connector_get_key: str | None,
         metadata: dict[str, Any] | None = None,
     ) -> Any:
         """Receive one ordinary async chunk on the local leader rank only."""
@@ -803,7 +809,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 self._pending_save_counts[req_id] += 1
             sent_ids.append(req_id)
         if sent_ids:
-            self._work_available.set()
+            self._save_work_available.set()
         return sent_ids
 
     # ------------------------------------------------------------------ #
@@ -930,6 +936,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         """Background thread: poll connector for incoming data."""
         _recv_poll_count = 0
         while not self._stop_event.is_set():
+            snapshot = getattr(self._omni_connector, "get_wakeup_generation", None)
+            generation = snapshot() if callable(snapshot) else None
             with self._lock:
                 pending_ids = list(self._pending_load_reqs.keys())
 
@@ -951,8 +959,16 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             made_progress = self._poll_pending_requests_once(pending_ids)
 
             if not made_progress and not self._stop_event.is_set():
-                self._work_available.wait(timeout=0.005)
-                self._work_available.clear()
+                # Wait for a *new* arrival: existing future chunks may be
+                # blocked by scheduler ownership of the previous payload.
+                # A key-presence predicate would spin and compete for the
+                # GIL. Keep the existing 5 ms readiness recheck bound.
+                wait_for_change = getattr(self._omni_connector, "wait_for_change", None)
+                if generation is not None and callable(wait_for_change):
+                    wait_for_change(generation, timeout=0.005)
+                else:
+                    self._work_available.wait(timeout=_RECV_POLL_S)
+                    self._work_available.clear()
 
     _MAX_SEND_RETRIES = 3
 
@@ -986,8 +1002,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     self._requeue_or_drop_failed_send(task, error=send_error)
                 continue
 
-            self._work_available.wait(timeout=0.01)
-            self._work_available.clear()
+            self._save_work_available.wait(timeout=0.01)
+            self._save_work_available.clear()
 
     def _requeue_or_drop_failed_send(
         self,
@@ -1547,7 +1563,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         with self._lock:
             self._pending_save_reqs.setdefault(request_id, deque()).append(task)
             self._pending_save_counts[request_id] += 1
-        self._work_available.set()
+        self._save_work_available.set()
         return True, completion
 
     def _poll_pending_requests_once(self, pending_ids: list[str]) -> bool:
@@ -1564,8 +1580,25 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             self.publish_omni_connector_output_to_sink()
         return made_progress
 
+    @staticmethod
+    def _finish_marker_payload() -> OmniPayload:
+        return {"meta": {"finished": torch.tensor(True, dtype=torch.bool)}}
+
+    @staticmethod
+    def _request_is_finished(request: Any) -> bool:
+        is_finished = getattr(request, "is_finished", None)
+        return bool(is_finished()) if callable(is_finished) else False
+
     def _publish_chunk_cohort(self, entries: list[tuple[Any, Any]], *, wait_for_delivery: bool) -> int:
-        entries = [(request, payload) for request, payload in entries if payload is not None]
+        # A request's last chunk must carry its finish marker even when the
+        # processor has nothing left to send (e.g. its frames ended exactly on
+        # a chunk boundary), as the V1 chunk adapter guarantees; otherwise the
+        # receiver waits for input until its deadline.
+        entries = [
+            (request, payload if payload is not None else self._finish_marker_payload())
+            for request, payload in entries
+            if payload is not None or self._request_is_finished(request)
+        ]
         if not entries:
             return 0
         emitted = 0

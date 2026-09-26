@@ -294,3 +294,220 @@ def test_consumed_bad_payload_removes_lock_file(connector, monkeypatch):
     assert not os.path.exists(f"/dev/shm/shm_{key}_lockfile.lock")
     connector.reap_consumed()
     assert key not in connector._pending_keys
+
+
+# ── Arrival wakeups ───────────────────────────────────────────────────
+
+
+def _stage_connector(stage_id):
+    return SharedMemoryConnector({"stage_id": stage_id})
+
+
+def test_put_wakes_waiting_receiver():
+    sender, receiver = _stage_connector(70), _stage_connector(71)
+    try:
+        generation = receiver.get_wakeup_generation()
+        assert generation is not None
+        start = time.monotonic()
+        assert receiver.wait_for_change(generation, timeout=0.05) is False
+        assert time.monotonic() - start >= 0.04  # no arrival: blocks for the timeout
+
+        key = f"wake_{uuid.uuid4().hex}"
+        sender.put("70", "71", key, {"value": 1})
+        start = time.monotonic()
+        assert receiver.wait_for_change(generation, timeout=5) is True
+        assert time.monotonic() - start < 0.5
+        assert receiver.get("70", "71", key)[0] == {"value": 1}
+        # Drained: the next wait blocks again.
+        assert receiver.wait_for_change(receiver.get_wakeup_generation(), timeout=0.02) is False
+    finally:
+        sender.close()
+        receiver.close()
+
+
+def test_receiver_does_not_spin_after_sender_closes():
+    sender, receiver = _stage_connector(72), _stage_connector(73)
+    try:
+        receiver.get_wakeup_generation()
+        sender.put("72", "73", f"wake_{uuid.uuid4().hex}", {"value": 1})
+        sender.close()  # the only external writer goes away
+        generation = receiver.get_wakeup_generation()
+        receiver.wait_for_change(generation, timeout=1)
+        generation = receiver.get_wakeup_generation()
+        start = time.monotonic()
+        assert receiver.wait_for_change(generation, timeout=0.05) is False
+        assert time.monotonic() - start >= 0.04
+    finally:
+        receiver.close()
+
+
+def test_wakeups_can_be_disabled_and_close_unlinks_fifo(monkeypatch):
+    receiver = _stage_connector(74)
+    assert receiver.get_wakeup_generation() is not None
+    path = receiver._wake_path
+    assert os.path.exists(path)
+    receiver.close()
+    assert not os.path.exists(path)
+
+    monkeypatch.setenv("VLLM_OMNI_SHM_WAKEUP", "0")
+    sender, receiver = _stage_connector(75), _stage_connector(76)
+    try:
+        assert receiver.get_wakeup_generation() is None  # caller keeps its timed poll
+        key = f"wake_{uuid.uuid4().hex}"
+        assert sender.put("75", "76", key, {"value": 2})[0]
+        assert receiver.get("75", "76", key)[0] == {"value": 2}
+    finally:
+        sender.close()
+        receiver.close()
+
+
+def _sibling_receiver(stage_id, ready, result):
+    receiver = _stage_connector(stage_id)
+    generation = receiver.get_wakeup_generation()
+    ready.set()
+    start = time.monotonic()
+    woke = receiver.wait_for_change(generation, timeout=5)
+    result.put((woke, time.monotonic() - start))
+    receiver.close()
+
+
+def _sibling_sender(stage_id, key):
+    sender = _stage_connector(stage_id - 1)
+    sender.put(str(stage_id - 1), str(stage_id), key, {"value": 3})
+
+
+def test_sibling_stage_processes_share_wakeups():
+    # Stage engine processes are siblings under the launching process.
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("fork")
+    ready, result = ctx.Event(), ctx.Queue()
+    key = f"wake_{uuid.uuid4().hex}"
+    receiver = ctx.Process(target=_sibling_receiver, args=(78, ready, result))
+    receiver.start()
+    assert ready.wait(5)
+    time.sleep(0.05)
+    sender = ctx.Process(target=_sibling_sender, args=(78, key))
+    sender.start()
+    sender.join(5)
+    woke, waited = result.get(timeout=5)
+    receiver.join(5)
+    assert woke and waited < 1.0
+    cleanup = SharedMemoryConnector({})
+    cleanup.cleanup(key)
+
+
+def test_same_stage_receivers_are_independent_across_close_and_restart():
+    sender = _stage_connector(80)
+    first, second = _stage_connector(81), _stage_connector(81)
+    replacement = None
+    try:
+        first_generation = first.get_wakeup_generation()
+        second_generation = second.get_wakeup_generation()
+        assert first._wake_path != second._wake_path
+        sender._wake_receiver(81)
+        assert first.wait_for_change(first_generation, timeout=0.5)
+        assert second.wait_for_change(second_generation, timeout=0.5)
+        second_generation = second.get_wakeup_generation()
+        first.close()
+        assert first.get_wakeup_generation() is None
+        assert os.path.exists(second._wake_path)
+        replacement = _stage_connector(81)
+        replacement_generation = replacement.get_wakeup_generation()
+        sender._wake_receiver(81)
+        assert second.wait_for_change(second_generation, timeout=0.5)
+        assert replacement.wait_for_change(replacement_generation, timeout=0.5)
+    finally:
+        sender.close()
+        first.close()
+        second.close()
+        if replacement is not None:
+            replacement.close()
+
+
+def test_partial_receiver_open_closes_fd_and_removes_only_own_fifo(monkeypatch, tmp_path):
+    import errno
+
+    from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
+
+    monkeypatch.setattr(module, "_wakeup_path", lambda stage: str(tmp_path / f"stage_{stage}"))
+    receiver = _stage_connector(82)
+    peer_path = tmp_path / "stage_82_peer"
+    os.mkfifo(peer_path, 0o600)
+    original_open = os.open
+    opened = []
+
+    def fail_hold_open(path, flags, *args, **kwargs):
+        if flags & os.O_WRONLY:
+            raise OSError(errno.EMFILE, "injected fd exhaustion")
+        fd = original_open(path, flags, *args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    monkeypatch.setattr(module.os, "open", fail_hold_open)
+    try:
+        assert receiver.get_wakeup_generation() is None
+        assert list(tmp_path.iterdir()) == [peer_path]
+        assert len(opened) == 1
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(opened[0])
+    finally:
+        receiver.close()
+
+
+def test_wakeup_ignores_stale_fifo_and_non_fifo_paths(monkeypatch, tmp_path):
+    from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
+
+    monkeypatch.setattr(module, "_wakeup_path", lambda stage: str(tmp_path / f"stage_{stage}"))
+    sender, receiver = _stage_connector(83), _stage_connector(84)
+    plain = tmp_path / "stage_84_plain"
+    plain.write_text("unchanged")
+    (tmp_path / "stage_84_link").symlink_to(plain)
+    os.mkfifo(tmp_path / "stage_84_stale", 0o600)
+    try:
+        generation = receiver.get_wakeup_generation()
+        sender._wake_receiver(84)
+        assert receiver.wait_for_change(generation, timeout=0.5)
+        assert plain.read_text() == "unchanged"
+        assert (tmp_path / "stage_84_stale").exists()
+    finally:
+        sender.close()
+        receiver.close()
+
+
+def test_waiter_does_not_read_fd_reused_after_close(monkeypatch, tmp_path):
+    from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
+
+    receiver = _stage_connector(85)
+    generation = receiver.get_wakeup_generation()
+    read_fd = receiver._wake_read_fd
+    path = tmp_path / "unrelated_ipc"
+    path.write_bytes(b"untouched")
+    reused = []
+
+    def close_during_select(*args):
+        receiver.close()
+        fd = os.open(path, os.O_RDONLY)
+        if fd != read_fd:
+            os.dup2(fd, read_fd)
+            os.close(fd)
+        reused.append(read_fd)
+        return [read_fd], [], []
+
+    monkeypatch.setattr(module.select, "select", close_during_select)
+    try:
+        assert not receiver.wait_for_change(generation, timeout=0.1)
+        assert os.lseek(read_fd, 0, os.SEEK_CUR) == 0
+    finally:
+        for fd in reused:
+            os.close(fd)
+        receiver.close()
+
+
+@pytest.mark.parametrize("stage_id", [None, "s1", -1])
+def test_unsupported_stage_namespace_uses_polling(stage_id):
+    receiver = _stage_connector(stage_id)
+    try:
+        assert receiver.get_wakeup_generation() is None
+    finally:
+        receiver.close()

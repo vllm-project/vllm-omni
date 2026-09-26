@@ -822,6 +822,76 @@ def test_mrv2_fails_fast_on_platforms_without_native_workers(platform: str):
         _apply_platform_overrides(DeployConfig(model_runner="v2"), platform=platform)
 
 
+def _qwen3_omni_pipeline() -> PipelineConfig:
+    from dataclasses import replace
+
+    pipeline = _resolve_pipeline_or_skip("qwen3_omni_moe", Qwen3OmniMoeConfig())
+    return replace(pipeline, stages=tuple(replace(s, supports_native_mrv2_data_plane=True) for s in pipeline.stages))
+
+
+def test_stage_model_runner_overrides_deploy_runner(tmp_path: Path):
+    deploy_path = tmp_path / "qwen3_omni_mixed_runner.yaml"
+    deploy_path.write_text(
+        """\
+model_runner: v1
+async_chunk: true
+stages:
+  - stage_id: 0
+  - stage_id: 1
+    model_runner: v2
+  - stage_id: 2
+    model_runner: v2
+"""
+    )
+    deploy = load_deploy_config(deploy_path)
+    assert [stage.model_runner for stage in deploy.stages] == [None, "v2", "v2"]
+
+    pipeline = _qwen3_omni_pipeline()
+    legacy = merge_pipeline_deploy(pipeline, deploy)
+    assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in legacy] == [False, True, True]
+    # The test pipeline declares native support; only v2 stages use it.
+    assert [stage.yaml_engine_args["supports_native_mrv2_data_plane"] for stage in legacy] == [True, True, True]
+
+    structured = VllmOmniConfig.from_pipeline_config(pipeline, deploy_config_path=str(deploy_path))
+    assert [stage.model_config.use_v2_model_runner for stage in structured.stage_configs] == [False, True, True]
+
+
+def test_stage_model_runner_rejects_unknown_value(tmp_path: Path):
+    deploy_path = tmp_path / "bad_runner.yaml"
+    deploy_path.write_text("stages:\n  - stage_id: 0\n    model_runner: v3\n")
+    with pytest.raises(ValueError, match="model_runner must be 'v1' or 'v2'"):
+        load_deploy_config(deploy_path)
+
+
+def test_platform_v1_fallback_overrides_stage_v2():
+    deploy = DeployConfig(
+        stages=[StageDeployConfig(stage_id=0), StageDeployConfig(stage_id=1, model_runner="v2")],
+        platforms={"rocm": {"model_runner": "v1"}},
+    )
+    deploy = _apply_platform_overrides(deploy, platform="rocm")
+    assert deploy.model_runner == "v1"
+    assert deploy.stages[1].model_runner is None
+
+
+@pytest.mark.parametrize("platform", ["npu", "xpu"])
+def test_stage_mrv2_fails_fast_on_platforms_without_native_workers(platform: str):
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=1, model_runner="v2")])
+    with pytest.raises(NotImplementedError, match="Model Runner V2"):
+        _apply_platform_overrides(deploy, platform=platform)
+
+
+def test_downstream_mrv2_stage_requires_turn_sessions():
+    stages = [StageDeployConfig(stage_id=0), StageDeployConfig(stage_id=1, model_runner="v2")]
+    with pytest.raises(ValueError, match="session_mode 'turn' only"):
+        merge_pipeline_deploy(_qwen3_omni_pipeline(), DeployConfig(stages=stages, session_mode="duplex"))
+
+
+def test_v1_downstream_stage_keeps_duplex_sessions():
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0)], session_mode="duplex")
+    stages = merge_pipeline_deploy(_qwen3_omni_pipeline(), deploy)
+    assert not any(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+
+
 def test_qwen3_tts_high_concurrency_mrv2_profile_is_explicit_opt_in():
     assert load_deploy_config(_DEPLOY_DIR / "qwen3_tts_high_concurrency.yaml").model_runner == "v1"
     assert load_deploy_config(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2.yaml").model_runner == "v2"
@@ -2220,3 +2290,23 @@ def test_mps_stays_in_runtime_instead_of_engine_arguments():
         assert stage.runtime_config.cuda_mps
         args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
         assert "cuda_mps" not in args
+
+
+@pytest.mark.parametrize("platform", ["npu", "xpu"])
+def test_platform_stage_overlay_cannot_bypass_mrv2_support_check(platform):
+    deploy = DeployConfig(
+        model_runner="v1",
+        stages=[StageDeployConfig(stage_id=0)],
+        platforms={platform: {"stages": [{"stage_id": 0, "model_runner": "v2"}]}},
+    )
+    with pytest.raises(NotImplementedError, match="Model Runner V2"):
+        _apply_platform_overrides(deploy, platform=platform)
+
+
+def test_platform_stage_overlay_rejects_invalid_model_runner():
+    deploy = DeployConfig(
+        stages=[StageDeployConfig(stage_id=0)],
+        platforms={"cuda": {"stages": [{"stage_id": 0, "model_runner": "v3"}]}},
+    )
+    with pytest.raises(ValueError, match="model_runner must be 'v1' or 'v2'"):
+        _apply_platform_overrides(deploy, platform="cuda")

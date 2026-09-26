@@ -2,9 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import fcntl
+import glob
 import os
+import select
+import stat
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from multiprocessing import shared_memory as shm_pkg
 from typing import Any
@@ -17,6 +21,15 @@ from .base import OmniConnectorBase
 logger = get_connector_logger(__name__)
 
 
+def _wakeup_enabled() -> bool:
+    return os.environ.get("VLLM_OMNI_SHM_WAKEUP", "1") == "1"
+
+
+def _wakeup_path(to_stage: Any) -> str:
+    # Stage engine processes of one deployment share their launching parent.
+    return f"/dev/shm/omni_shm_wake_{os.getuid()}_{os.getppid()}_{int(to_stage)}"
+
+
 class SharedMemoryConnector(OmniConnectorBase):
     """Key-addressed local shared-memory connector.
 
@@ -25,6 +38,12 @@ class SharedMemoryConnector(OmniConnectorBase):
     remote-transport metadata such as ``source_host`` / ``source_port``
     (that is the RDMA connector's job).  When such metadata is passed in,
     the connector silently falls back to key-based lookup.
+
+    Arrival wakeups: each receiving connector owns a unique named FIFO. A
+    ``put`` broadcasts one byte to every FIFO for the destination stage, so the receive loop blocks in
+    ``wait_for_change`` until data arrives instead of re-polling on a fixed
+    interval. Wakeups are hints: a stage that cannot reach the FIFO (another
+    deployment layout, or ``VLLM_OMNI_SHM_WAKEUP=0``) keeps the timed poll.
     """
 
     def get_with_deadline(self, from_stage, to_stage, get_key, metadata=None, *, deadline):
@@ -42,6 +61,123 @@ class SharedMemoryConnector(OmniConnectorBase):
             "gets": 0,
             "bytes_transferred": 0,
         }
+        # Receiver side: FIFO read end (plus a write end of our own, so the
+        # FIFO never reports EOF when no sender has it open) and a counter of
+        # drained wakeups. Each receiver owns its path, including across restarts.
+        self._wake_lock = threading.Lock()
+        self._wake_read_fd: int | None = None
+        self._wake_hold_fd: int | None = None
+        self._wake_path: str | None = None
+        self._wake_generation = 0
+        self._wake_closed = False
+
+    def _open_wakeup_receiver(self) -> bool:
+        if self._wake_closed:
+            return False
+        if self._wake_read_fd is not None:
+            return True
+        if not _wakeup_enabled():
+            return False
+        try:
+            if int(self.stage_id) < 0:
+                return False
+            path = f"{_wakeup_path(self.stage_id)}_{uuid.uuid4().hex}"
+        except (TypeError, ValueError):
+            return False
+        read_fd = hold_fd = None
+        created = False
+        try:
+            os.mkfifo(path, 0o600)
+            created = True
+            read_fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            hold_fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as e:
+            for fd in (read_fd, hold_fd):
+                if fd is not None:
+                    os.close(fd)
+            if created:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+            logger.debug("SHM wakeup FIFO unavailable at %s: %s", path, e)
+            return False
+        self._wake_read_fd, self._wake_hold_fd, self._wake_path = read_fd, hold_fd, path
+        return True
+
+    def get_wakeup_generation(self) -> int | None:
+        """Snapshot before polling; a later arrival changes it (see ``wait_for_change``).
+
+        ``None`` when this stage has no wakeup FIFO: the caller keeps its timed poll.
+        """
+        with self._wake_lock:
+            return self._wake_generation if self._open_wakeup_receiver() else None
+
+    def wait_for_change(self, generation: int, *, timeout: float) -> bool:
+        """Block until a ``put`` to this stage since ``generation``, or ``timeout``."""
+        with self._wake_lock:
+            read_fd = self._wake_read_fd
+            if self._wake_closed or read_fd is None:
+                return False
+        if self._wake_generation == generation:
+            try:
+                readable, _, _ = select.select([read_fd], [], [], timeout)
+            except (OSError, ValueError):
+                return False
+            if not readable:
+                return False
+            with self._wake_lock:
+                if self._wake_closed or self._wake_read_fd != read_fd:
+                    return False
+                try:
+                    while os.read(read_fd, 4096):
+                        pass
+                except BlockingIOError:
+                    pass
+                except OSError:
+                    return False
+                self._wake_generation += 1
+        return self._wake_generation != generation
+
+    def _wake_receiver(self, to_stage: Any) -> None:
+        if not _wakeup_enabled():
+            return
+        try:
+            pattern = f"{_wakeup_path(to_stage)}_*"
+        except (TypeError, ValueError):
+            return  # non-numeric stage names use the ordinary polling path
+        with self._wake_lock:
+            if self._wake_closed:
+                return
+            # Discover every replica, including newly restarted receivers. Do
+            # not cache writers across receiver lifetimes or unlink peers' paths.
+            for path in glob.iglob(pattern):
+                fd = None
+                try:
+                    fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+                    if stat.S_ISFIFO(os.fstat(fd).st_mode):
+                        os.write(fd, b"\0")
+                except OSError:
+                    # Missing reader/file or full pipe: timed polling remains
+                    # the correctness fallback. A full FIFO already has hints.
+                    pass
+                finally:
+                    if fd is not None:
+                        os.close(fd)
+
+    def _close_wakeups(self) -> None:
+        with self._wake_lock:
+            self._wake_closed = True
+            for fd in (self._wake_read_fd, self._wake_hold_fd):
+                if fd is not None:
+                    os.close(fd)
+            self._wake_read_fd = self._wake_hold_fd = None
+            if self._wake_path is not None:
+                try:
+                    os.unlink(self._wake_path)
+                except FileNotFoundError:
+                    pass
+                self._wake_path = None
 
     def put(
         self,
@@ -65,6 +201,7 @@ class SharedMemoryConnector(OmniConnectorBase):
             metadata = {"shm": meta, "size": size}
             with self._pending_keys_lock:
                 self._pending_keys[put_key] = None
+            self._wake_receiver(to_stage)
 
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += size
@@ -184,6 +321,7 @@ class SharedMemoryConnector(OmniConnectorBase):
             keys = list(self._pending_keys)
         for key in keys:
             self.cleanup(key)
+        self._close_wakeups()
 
     def reap_consumed(self) -> None:
         """Bounded round-robin sweep; receivers unlink SHM in another process."""

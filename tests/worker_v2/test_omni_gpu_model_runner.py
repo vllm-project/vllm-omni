@@ -181,6 +181,84 @@ def test_capture_contract_uses_model_declaration(stage, declared):
     runner._configure_cudagraph_output_contract()
     assert runner._model_returns_tuple is declared
     assert runner._exclude_full_graph is declared
+    assert runner._full_graph_aux_outputs is False
+
+
+def _aux_output(num_tokens):
+    hidden = torch.arange(num_tokens * 2, dtype=torch.float32).reshape(num_tokens, 2)
+    return hidden, {"hidden_states": {"layers": {0: hidden + 1, 24: hidden + 2}}}
+
+
+def test_full_graph_aux_contract_keeps_full_and_round_trips_leaves():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(_returns_tuple=True, supports_mrv2_full_graph_aux_outputs=True)
+    runner._configure_cudagraph_output_contract()
+    assert runner._full_graph_aux_outputs and not runner._exclude_full_graph
+
+    calls = []
+
+    def forward(num_tokens=3):
+        calls.append(num_tokens)
+        return _aux_output(num_tokens)
+
+    runner.model.forward = forward
+    original_forward = runner.model.forward
+    runner.use_aux_hidden_state_outputs = False
+    full = SimpleNamespace(cg_mode=CUDAGraphMode.FULL)
+    runner.cudagraph_manager = SimpleNamespace(_capture_descs={CUDAGraphMode.FULL: [full]}, _candidates={})
+    runner.model_state = SimpleNamespace()
+    captured = {}
+
+    def capture(_self):
+        # The graph manager stores (hidden, leaves) in its aux buffers.
+        assert runner.use_aux_hidden_state_outputs is True
+        hidden, leaves = runner.model.forward(4)
+        captured["hidden"], captured["leaves"] = hidden, leaves
+        assert [tuple(leaf.shape) for leaf in leaves] == [(4, 2), (4, 2)]
+        runner.model.forward(2)  # smaller capture, same structure
+        return 1
+
+    with patch.object(GPUModelRunner, "capture_model", capture):
+        assert runner.capture_model() == 1
+    assert runner.model.forward is original_forward and runner.use_aux_hidden_state_outputs is False
+    assert runner.cudagraph_manager._capture_descs == {CUDAGraphMode.FULL: [full]}  # FULL kept
+
+    hidden, aux = runner._split_fullgraph_output((captured["hidden"], captured["leaves"]))
+    reference_hidden, reference_aux = _aux_output(4)
+    assert torch.equal(hidden, reference_hidden)
+    assert set(aux["hidden_states"]["layers"]) == {0, 24}
+    assert torch.equal(aux["hidden_states"]["layers"][24], reference_aux["hidden_states"]["layers"][24])
+
+
+@pytest.mark.parametrize(
+    "aux",
+    [
+        {},  # no leaves
+        {"layers": {0: torch.zeros(5, 2)}},  # leaf not on the token axis
+        {"layers": {0: 1.0}},  # non-tensor leaf
+    ],
+)
+def test_full_graph_aux_contract_rejects_invalid_outputs(aux):
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(_returns_tuple=True, supports_mrv2_full_graph_aux_outputs=True)
+    runner._configure_cudagraph_output_contract()
+    with pytest.raises(RuntimeError, match="supports_mrv2_full_graph_aux_outputs"):
+        runner._flatten_capture_aux_output((torch.zeros(3, 2), aux))
+
+
+def test_full_graph_aux_contract_rejects_structure_change():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(_returns_tuple=True, supports_mrv2_full_graph_aux_outputs=True)
+    runner._configure_cudagraph_output_contract()
+    runner._flatten_capture_aux_output((torch.zeros(3, 2), {"layers": {0: torch.zeros(3, 2)}}))
+    with pytest.raises(RuntimeError, match="structure changed"):
+        runner._flatten_capture_aux_output((torch.zeros(3, 2), {"layers": {1: torch.zeros(3, 2)}}))
+
+
+def test_full_graph_output_without_contract_is_hidden_only():
+    runner = object.__new__(OmniGPUModelRunner)
+    hidden = torch.ones(2, 2)
+    assert runner._split_fullgraph_output(hidden) == (hidden, None)
 
 
 @pytest.mark.parametrize("runner_kind", ["gpu", "ar", "generation"])
@@ -202,6 +280,7 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, monkeypatch):
         else hidden
     )
     runner._dummy_hidden = hidden
+    runner.model.requires_request_ids = False
     runner.model_config = SimpleNamespace()
     runner.vllm_config = SimpleNamespace()
     runner.req_states = SimpleNamespace()

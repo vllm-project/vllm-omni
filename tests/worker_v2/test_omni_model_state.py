@@ -19,6 +19,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _DummyInputBatch:
+    is_prefilling_np: np.ndarray
+
     input_ids: SimpleNamespace
     query_start_loc: torch.Tensor
 
@@ -592,3 +594,58 @@ def test_first_audio_marker_requires_accepted_delivery(monkeypatch, accepted):
     # A missing route must leave the normal codec path responsible for frame 0;
     # otherwise it skips the frame and the orchestrator waits forever for it.
     assert outputs["meta"]["first_audio"].tolist() == ["r0" in accepted, "r1" in accepted]
+
+
+class _FakeEvent:
+    def record(self, stream=None) -> None:
+        self.stream = stream
+
+
+def test_publish_sampled_embeddings_for_rows_whose_sample_is_kept(monkeypatch) -> None:
+    monkeypatch.setattr(torch.cuda, "Event", _FakeEvent)
+    state = _make_state()
+    state.model.publishes_sampled_embeddings = True
+    state.model.embed_input_ids = lambda ids: ids.to(torch.float32).reshape(-1, 1).repeat(1, 3)
+    # Rows: final prefill chunk, decode, non-final prefill chunk, one-chunk prefill.
+    batch = SimpleNamespace(
+        num_reqs=4,
+        num_scheduled_tokens=[4, 1, 2, 6],
+        num_computed_prefill_tokens_np=np.array([2, 9, 0, 0], dtype=np.int32),
+        prefill_len_np=np.array([6, 9, 5, 6], dtype=np.int32),
+        is_prefilling_np=np.array([True, False, True, True]),
+    )
+    extra, _done = state.publish_sampled_embeddings(batch, torch.tensor([[11], [12], [13], [14]]))
+    sampled = extra["embed"]["sampled"]
+    # A non-final prefill chunk's sample is discarded, so it publishes nothing.
+    assert [tuple(row.shape) for row in sampled] == [(1, 3), (1, 3), (0,), (1, 3)]
+    assert [row.tolist() for row in sampled if row.numel()] == [[[v] * 3] for v in (11.0, 12.0, 14.0)]
+
+    # Speculative steps sample several tokens per row: not published.
+    assert state.publish_sampled_embeddings(batch, torch.tensor([[11, 1], [12, 1], [13, 1], [14, 1]])) is None
+
+
+def test_publish_sampled_embeddings_is_opt_in() -> None:
+    state = _make_state()
+    state.model.publishes_sampled_embeddings = False
+    assert state.publish_sampled_embeddings(SimpleNamespace(num_reqs=1), torch.tensor([[1]])) is None
+
+
+@pytest.mark.parametrize("prefilling", [False, True])
+def test_identity_preprocess_skips_only_decode_rows(prefilling):
+    state = _make_state(has_preprocess=True)
+    state._decode_preprocess_is_identity = True
+    state._decode_preprocess = None
+    state.intermediate_buffer.buffers[0] = {"req_id": "r1"}
+    seen = []
+
+    def preprocess(input_ids, input_embeds, **info):
+        seen.append(info["req_id"])
+        return input_ids, input_embeds, {}
+
+    state.model.preprocess = preprocess
+    batch = _DummyInputBatch([0])
+    batch.is_prefilling_np = np.array([prefilling])
+    embeds = torch.ones(1, 4)
+    state.run_preprocess(batch, {"input_ids": torch.tensor([1]), "inputs_embeds": embeds})
+    assert seen == (["r1"] if prefilling else [])
+    assert torch.equal(embeds, torch.ones(1, 4))

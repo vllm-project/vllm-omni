@@ -51,6 +51,7 @@ class _NativeRequestState:
             output_token_ids=output,
             all_token_ids=prompt + output,
             output_token_count=len(self.output_token_ids),
+            last_output_token_id=self.output_token_ids[-1] if self.output_token_ids else None,
             additional_information=self.additional_information,
             sampling_params=self.sampling_params,
             num_computed_tokens=self.num_computed_tokens,
@@ -83,6 +84,11 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         self._native_send_lock = threading.Lock()
         self._native_outputs_in_flight: dict[str, int] = defaultdict(int)
         self._native_terminal_pending: set[str] = set()
+        # Stage payload builders read the stage config through
+        # ``_get_model_config()`` (e.g. Qwen3-Omni's Thinker reads
+        # ``hf_config.talker_config.accept_hidden_layer``).
+        self.vllm_config = vllm_config
+        self.model_config = model_config
         self.init_omni_connectors(model_config=model_config)
         self._delivery_manager = OmniDeliveryManager(
             delivery_timeout_s=self._connector_delivery_timeout(),
@@ -394,7 +400,9 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 for qual, qval in value.items():
                     if qual in span_handled:
                         continue
-                    if key == "meta" and qual == "finished":
+                    if key == "meta":
+                        # Per-chunk state (``finished``, the V1 sender's
+                        # ``is_segment_finished`` flag, ...), not rows.
                         merged_sub[qual] = qval
                         continue
                     if (key, qual) in override_keys:
@@ -563,6 +571,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         self._delivery_manager.shutdown(RuntimeError("MRv2 connector shutdown"))
         self._stop_event.set()
         self._work_available.set()
+        self._save_work_available.set()
 
         close_errors: list[BaseException] = []
         connector = getattr(self, "_omni_connector", None)

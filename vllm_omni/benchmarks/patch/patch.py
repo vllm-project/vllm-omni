@@ -1915,6 +1915,10 @@ async def async_request_openai_chat_omni_completions(
         wav_audio_params: tuple[int, int, int] | None = None
         wav_inconsistent_chunk_count = 0
         first_inconsistent_wav_params: tuple[int, int, int] | None = None
+        # Per-chunk arrival and PCM size of wav chunks, for the continuity
+        # (underrun) metric the speech endpoint already reports.
+        wav_chunk_arrivals_s: list[float] = []
+        wav_chunk_pcm_bytes: list[int] = []
         # For non-wav responses, accumulate encoded bytes then decode once.
         audio_bytes_buffer = bytearray()
         st = time.perf_counter()
@@ -2040,9 +2044,11 @@ async def async_request_openai_chat_omni_completions(
                                                             if first_inconsistent_wav_params is None:
                                                                 first_inconsistent_wav_params = params
                                                             continue
-                                                        wav_pcm_buffer.extend(
-                                                            wav_reader.readframes(wav_reader.getnframes())
-                                                        )
+                                                        chunk_pcm = wav_reader.readframes(wav_reader.getnframes())
+                                                        wav_pcm_buffer.extend(chunk_pcm)
+                                                        if chunk_pcm:
+                                                            wav_chunk_arrivals_s.append(timestamp - st)
+                                                            wav_chunk_pcm_bytes.append(len(chunk_pcm))
                                                 except Exception as ex:
                                                     logger.warning("Failed to parse wav audio chunk: %s", ex)
                                             else:
@@ -2105,6 +2111,17 @@ async def async_request_openai_chat_omni_completions(
                         )
                         if audio_frames > 0 and frame_rate > 0:
                             audio_duration_sec = audio_frames / float(frame_rate)
+                            continuity = compute_continuity_stats(
+                                chunk_arrival_times_s=wav_chunk_arrivals_s,
+                                chunk_bytes=wav_chunk_pcm_bytes,
+                                sample_rate=frame_rate,
+                                sample_width=sample_width,
+                                channels=channels,
+                                threshold_s=_audio_continuity_threshold_s(),
+                            )
+                            output.audio_underrun_s = continuity.max_underrun_s
+                            output.audio_continuity_ok = continuity.is_continuous
+                            output.audio_underrun_event_count = continuity.underrun_event_count
                         else:
                             logger.warning(
                                 "Unable to derive audio frames/duration from wav pcm "

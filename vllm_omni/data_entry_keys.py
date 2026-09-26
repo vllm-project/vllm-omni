@@ -41,6 +41,8 @@ class Embeddings(TypedDict, total=False):
     prepared_prefill: torch.Tensor
     prefill: torch.Tensor
     decode: torch.Tensor
+    # [1, H] embedding of the token sampled by a row's final prefill step (MRv2 producers).
+    sampled: torch.Tensor
     decode_token_start: int
     decode_token_end: int
     cached_decode: torch.Tensor
