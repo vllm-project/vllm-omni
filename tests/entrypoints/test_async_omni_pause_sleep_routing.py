@@ -826,3 +826,151 @@ def test_pause_and_sleep_do_not_reset_unselected_stages_or_reset_twice(operation
         assert omni._clear_frontend_mm_cache.await_count == int(0 in stage_ids)
 
     asyncio.run(run())
+
+
+_SLEEP_TAGS = {CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value}
+
+# In-process stages return OmniACK, subprocess stages return its dict form,
+# and StagePool returns an error dict when the RPC itself failed.
+_FAILED_DIFFUSION_RESULTS = [
+    pytest.param(OmniACK(task_id="t", status="ERROR", error_msg="out of memory"), id="ack"),
+    pytest.param({"task_id": "t", "status": "ERROR", "error_msg": "out of memory"}, id="ack-dict"),
+    pytest.param({"supported": False, "error": "out of memory"}, id="rpc-error"),
+]
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("result", _FAILED_DIFFUSION_RESULTS)
+def test_sleep_raises_when_diffusion_stage_fails(result):
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion"])
+        omni.collective_rpc = AsyncMock(return_value=[result])
+
+        with pytest.raises(RuntimeError, match="handle_sleep_task failed: out of memory"):
+            await omni.sleep(level=1)
+
+        # The stage may be partly asleep, so it stays on record for wake_up.
+        assert omni._sleeping_tags == _SLEEP_TAGS
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("result", _FAILED_DIFFUSION_RESULTS)
+def test_wake_up_raises_when_diffusion_stage_fails(result):
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion"])
+        await omni.sleep(level=1)
+        omni.collective_rpc = AsyncMock(return_value=[result])
+
+        with pytest.raises(RuntimeError, match="handle_wake_task failed: out of memory"):
+            await omni.wake_up()
+
+        assert omni._sleeping_tags == _SLEEP_TAGS
+        assert omni._paused is True
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_sleep_records_all_stages_when_diffusion_stage_fails():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "diffusion"])
+        omni._sleep_diffusion = AsyncMock(side_effect=RuntimeError("handle_sleep_task failed"))
+
+        with pytest.raises(RuntimeError):
+            await omni.sleep(level=1)
+
+        assert omni._stage_sleeping_tags == {0: _SLEEP_TAGS, 1: _SLEEP_TAGS}
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_wake_up_clears_ar_stage_when_diffusion_stage_fails():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "diffusion"])
+        await omni.sleep(level=1)
+        omni._wake_diffusion = AsyncMock(side_effect=RuntimeError("handle_wake_task failed"))
+
+        with pytest.raises(RuntimeError):
+            await omni.wake_up()
+
+        assert omni._stage_sleeping_tags == {1: _SLEEP_TAGS}
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_sleep_level2_is_recorded_when_diffusion_stage_fails():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "diffusion"])
+        omni._sleep_diffusion = AsyncMock(side_effect=RuntimeError("handle_sleep_task failed"))
+
+        with pytest.raises(RuntimeError):
+            await omni.sleep(level=2)
+
+        with pytest.raises(NotImplementedError):
+            await omni.wake_up(stage_ids=[0])
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_wake_up_reaches_diffusion_stage_after_failed_sleep():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion"])
+        omni.collective_rpc = AsyncMock(
+            return_value=[
+                [
+                    OmniACK(task_id="t", status="SUCCESS", stage_id=0, rank=0),
+                    OmniACK(task_id="t", status="ERROR", error_msg="out of memory"),
+                ]
+            ]
+        )
+        with pytest.raises(RuntimeError, match="out of memory"):
+            await omni.sleep(level=1)
+
+        omni.collective_rpc = AsyncMock(return_value=[OmniACK(task_id="t", status="SUCCESS", stage_id=0, rank=0)])
+        await omni.wake_up()
+
+        omni.collective_rpc.assert_awaited_once()
+        assert not omni._sleeping_tags
+        assert omni._paused is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_wake_up_clears_diffusion_stages_that_woke_before_a_failure():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion", "diffusion"])
+        await omni.sleep(level=1)
+        omni.collective_rpc = AsyncMock(
+            side_effect=[
+                [OmniACK(task_id="t", status="SUCCESS", stage_id=0, rank=0)],
+                [OmniACK(task_id="t", status="ERROR", error_msg="out of memory")],
+            ]
+        )
+
+        with pytest.raises(RuntimeError, match="out of memory"):
+            await omni.wake_up()
+
+        assert omni._stage_sleeping_tags == {1: _SLEEP_TAGS}
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_wake_up_settles_once_for_several_diffusion_stages(mocker):
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion", "diffusion"])
+        await omni.sleep(level=1)
+        settle = mocker.patch("vllm_omni.entrypoints.async_omni.asyncio.sleep", new=AsyncMock())
+
+        await omni.wake_up()
+
+        assert omni.collective_rpc.await_count == 3
+        settle.assert_awaited_once_with(0.1)
+
+    asyncio.run(run())

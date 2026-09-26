@@ -251,8 +251,8 @@ curl -X POST http://localhost:8000/v1/images/generations \
 
 | Method | Arguments | Return Type | Description |
 | :--- | :--- | :--- | :--- |
-| **sleep** | `stage_ids: List[int], level: int` | `List[OmniACK]` | Triggers hibernation for specified stages. |
-| **wake_up** | `stage_ids: List[int]` | `List[OmniACK]` | Reloads weights and re-maps memory. |
+| **sleep** | `stage_ids: List[int], level: int` | `List[OmniACK]` | Triggers hibernation for specified stages. Raises `RuntimeError` if a stage fails; the stages stay marked as sleeping, so `wake_up` brings them back. |
+| **wake_up** | `stage_ids: List[int]` | `List[OmniACK]` | Reloads weights and re-maps memory. Raises `RuntimeError` if a stage fails; that stage stays sleeping and the call can be retried. |
 | **pause_generation** | `mode: str, stage_ids: List[int]` | `None` | Stops admission; with `mode="keep"` also stops diffusion schedulers and returns after their ACK. |
 | **resume_generation** | `stage_ids: List[int]` | `None` | Reopens paused schedulers, then admission. |
 
@@ -261,7 +261,7 @@ curl -X POST http://localhost:8000/v1/images/generations \
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | **task_id** | `str` | Unique identifier for the operation. |
-| **status** | `str` | `SUCCESS` or `ERROR`. |
+| **status** | `str` | `SUCCESS` or `ERROR`. `sleep` and `wake_up` raise instead of returning an `ERROR` ACK, and `/v1/omni/sleep` and `/v1/omni/wakeup` return HTTP 500 with the error. |
 | **stage_id** | `int` | The ID of the stage that responded. |
 | **rank** | `int` | The rank ID within the Tensor Parallel group. |
 | **freed_bytes** | `int` | Actual amount of physical VRAM reclaimed. |
