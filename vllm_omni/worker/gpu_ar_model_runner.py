@@ -468,7 +468,47 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def _update_states(self, scheduler_output: SchedulerOutput) -> Callable | None:
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
         self._update_duplex_sampling_states(scheduler_output)
+        self._maybe_apply_duplex_window_reanchor()
         return deferred_state_corrections_fn
+
+    def _maybe_apply_duplex_window_reanchor(self) -> None:
+        """Apply in-place KV reanchor and rotation on worker before model forward."""
+        reanchor_hook = getattr(getattr(self, "model", None), "apply_duplex_kv_reanchor", None)
+        if callable(reanchor_hook):
+            reanchor_hook(self)
+            return
+
+        helper = getattr(self, "_duplex_window_helper", None)
+        if helper is not None and hasattr(helper, "maybe_apply_reanchor"):
+            helper.maybe_apply_reanchor(self)
+            return
+
+        # Fallback for dynamic runner inspection without hardcoding model classes
+        if not hasattr(self, "input_batch") or self.input_batch is None:
+            return
+        num_reqs = getattr(self.input_batch, "num_reqs", 0)
+        req_ids = self.input_batch.req_ids[:num_reqs]
+        has_reanchor = False
+        for req_id in req_ids:
+            info = self.model_intermediate_buffer.get(req_id)
+            if isinstance(info, dict) and isinstance(info.get("duplex"), dict):
+                if "stage0_reanchor" in info["duplex"]:
+                    has_reanchor = True
+                    break
+        if not has_reanchor:
+            return
+
+        model_module = getattr(getattr(self, "model", None), "__module__", "")
+        if "minicpmo_4_5" in model_module:
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+                MiniCPMO45DuplexWorkerHelper,
+            )
+
+            MiniCPMO45DuplexWorkerHelper.maybe_apply_reanchor(self)
+
+    def _maybe_apply_stage0_reanchor(self) -> None:
+        """Backward-compatible alias for _maybe_apply_duplex_window_reanchor."""
+        self._maybe_apply_duplex_window_reanchor()
 
     def _request_final_stage_id(self, req_id: str) -> int | None:
         info = self.model_intermediate_buffer.get(req_id)

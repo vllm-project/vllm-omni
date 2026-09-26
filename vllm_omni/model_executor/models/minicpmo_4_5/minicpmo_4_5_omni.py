@@ -110,6 +110,27 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             self.model = self.thinker
             self.talker = None
 
+            if getattr(getattr(vllm_config, "model_config", None), "session_mode", None) == "duplex":
+                from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+                    duplex_window_geometry,
+                    install_duplex_window_layers,
+                    validate_duplex_window_install,
+                )
+
+                geometry = duplex_window_geometry(
+                    prefix_tokens=96,
+                    window_tokens=6000,
+                    block_size=vllm_config.cache_config.block_size,
+                    max_model_len=vllm_config.model_config.max_model_len,
+                    high_watermark_tokens=8000,
+                )
+                install_duplex_window_layers(self.thinker, geometry=geometry)
+                validate_duplex_window_install(
+                    vllm_config.cache_config,
+                    vllm_config.model_config,
+                    geometry,
+                )
+
         elif self.model_stage == "tts":
             self.thinker = None
             # The Talker is always the runner-owned continuous codec producer.
@@ -161,6 +182,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         from vllm.v1.sample.sampler import Sampler
 
         return Sampler()
+
+    def apply_duplex_kv_reanchor(self, runner: Any) -> None:
+        """Apply in-place Stage-0 KV reanchor and rotation on worker before model forward."""
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+            MiniCPMO45DuplexWorkerHelper,
+        )
+
+        MiniCPMO45DuplexWorkerHelper.maybe_apply_reanchor(runner)
 
     def prepare_duplex_sampling(
         self,
@@ -387,6 +416,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             is_speech=bool(payload.get("is_speech", False)),
             final=bool(duplex.get("final")),
             stage0_window=(duplex.get("stage0_window") if isinstance(duplex.get("stage0_window"), dict) else None),
+            stage0_reanchor=(
+                duplex.get("stage0_reanchor") if isinstance(duplex.get("stage0_reanchor"), dict) else None
+            ),
         )
         update_result = dict(result)
         if result.get("stage0_window_replaced") is True:

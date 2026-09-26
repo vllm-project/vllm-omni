@@ -219,6 +219,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         is_speech: bool = False,
         final: bool = False,
         stage0_window: dict[str, object] | None = None,
+        stage0_reanchor: dict[str, object] | None = None,
     ) -> dict[str, object]:
         """Build scheduler-owned Stage0 input embeddings for one audio append.
 
@@ -239,6 +240,8 @@ class MiniCPMO45Stage0DuplexRuntime:
             result["input_token_ids"] = list(state.prepared_input_token_ids)
             return result
         self._require_special_token_ids()
+        if isinstance(stage0_reanchor, dict):
+            self._evict_window_units_for_reanchor(state, stage0_reanchor)
         if isinstance(stage0_window, dict):
             completed_ids = stage0_window.get("completed_token_ids")
             if isinstance(completed_ids, list):
@@ -434,6 +437,39 @@ class MiniCPMO45Stage0DuplexRuntime:
         state.window_units.append(_MiniCPMO45WindowUnit(embeds=embeds, token_ids=token_ids))
         state.pending_window_unit = None
         state.pending_window_generated_tokens.clear()
+
+    def _evict_window_units_for_reanchor(
+        self,
+        state: _MiniCPMO45Stage0SessionState,
+        stage0_reanchor: dict[str, Any],
+    ) -> None:
+        """Evict completed window units that were dropped by zero-copy KV re-anchor.
+
+        Ensures worker history (state.window_units) stays bounded over long streaming sessions
+        when zero-copy Re-RoPE KV reuse is active and prompt rebuild is bypassed.
+        """
+        delta = int(stage0_reanchor.get("delta", 0) or 0)
+        if delta <= 0 or not state.window_units:
+            return
+        dropped = 0
+        idx = 0
+        while idx < len(state.window_units):
+            unit_len = len(state.window_units[idx].token_ids)
+            if dropped + unit_len <= delta:
+                dropped += unit_len
+                idx += 1
+            else:
+                break
+        if idx > 0:
+            del state.window_units[:idx]
+        remaining_delta = delta - dropped
+        if remaining_delta > 0 and state.window_units:
+            first_unit = state.window_units[0]
+            if remaining_delta < len(first_unit.token_ids):
+                first_unit.token_ids = first_unit.token_ids[remaining_delta:]
+                first_unit.embeds = first_unit.embeds[remaining_delta:]
+            else:
+                del state.window_units[:1]
 
     def _window_replacement_parts(
         self,
