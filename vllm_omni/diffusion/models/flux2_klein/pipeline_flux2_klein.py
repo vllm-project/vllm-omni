@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Copyright 2025 Black Forest Labs and The HuggingFace Team. All rights reserved.
 #
@@ -43,11 +43,16 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
     Flux2Transformer2DModel,
 )
+from vllm_omni.diffusion.models.flux2_klein.quantization import (
+    Flux2KleinTextEncoderGraph,
+    prepare_flux2_klein_text_encoder_fp8,
+)
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.quantization import resolve_component_quant_config
 
 logger = init_logger(__name__)
 
@@ -242,6 +247,9 @@ class Flux2KleinPipeline(
             prefetch_list=flux2_subfolders,
             local_files_only=local_files_only,
         ).to(self._execution_device)
+        text_fp8_linears = prepare_flux2_klein_text_encoder_fp8(
+            self.text_encoder, od_config.quantization_config, self._execution_device
+        )
         self.tokenizer = Qwen2TokenizerFast.from_pretrained(
             model,
             subfolder="tokenizer",
@@ -256,7 +264,10 @@ class Flux2KleinPipeline(
         ).to(self._execution_device)
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, Flux2Transformer2DModel)
-        self.transformer = Flux2Transformer2DModel(quant_config=od_config.quantization_config, **transformer_kwargs)
+        self.transformer = Flux2Transformer2DModel(
+            quant_config=resolve_component_quant_config(od_config.quantization_config, "transformer"),
+            **transformer_kwargs,
+        )
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         self.latent_channels = self.vae.config.latent_channels if hasattr(self.vae, "config") else 16
@@ -279,6 +290,18 @@ class Flux2KleinPipeline(
             self.text_encoder_out_layers = self.text_encoder.config.text_encoder_out_layers
         else:
             self.text_encoder_out_layers = (9, 18, 27)
+        stable_encoder_weights = not (
+            od_config.diffusion_offload_config
+            or od_config.enable_cpu_offload
+            or od_config.enable_layerwise_offload
+            or od_config.enable_distributed_layerwise_offload
+            or od_config.host_weight_runtime_mode != "disabled"
+        )
+        self._text_encoder_graph = (
+            Flux2KleinTextEncoderGraph(self.text_encoder, self.text_encoder_out_layers)
+            if text_fp8_linears and not od_config.enforce_eager and stable_encoder_weights
+            else None
+        )
 
         self._guidance_scale = None
         self._attention_kwargs = None
@@ -306,6 +329,7 @@ class Flux2KleinPipeline(
         dtype: torch.dtype | None = None,
         device: torch.device | None = None,
         max_sequence_length: int = 512,
+        graph: Flux2KleinTextEncoderGraph | None = None,
     ):
         dtype = text_encoder.dtype if dtype is None else dtype
         device = text_encoder.device if device is None else device
@@ -338,15 +362,13 @@ class Flux2KleinPipeline(
         attention_mask = torch.cat(all_attention_masks, dim=0).to(device)
 
         # Forward pass through the model
-        output = text_encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
-        )
-
-        # Only use outputs from intermediate layers and stack them
-        out = torch.stack([output.hidden_states[k] for k in hidden_states_layers], dim=1)
+        if graph is None:
+            output = text_encoder.model(
+                input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, use_cache=False
+            )
+            out = torch.stack([output.hidden_states[k] for k in hidden_states_layers], dim=1)
+        else:
+            out = graph(input_ids, attention_mask)
         out = out.to(dtype=dtype, device=device)
 
         batch_size, num_channels, seq_len, hidden_dim = out.shape
@@ -536,6 +558,7 @@ class Flux2KleinPipeline(
                 tokenizer=self.tokenizer,
                 prompt=prompt,
                 hidden_states_layers=self.text_encoder_out_layers,
+                graph=self._text_encoder_graph,
                 device=device,
                 max_sequence_length=max_sequence_length,
             )
