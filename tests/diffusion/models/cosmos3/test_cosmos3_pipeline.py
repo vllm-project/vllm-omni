@@ -2383,6 +2383,48 @@ def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_
     torch.testing.assert_close(result, torch.full_like(latents, 254.0))
 
 
+@pytest.mark.parametrize(
+    "guidance,control,expected_names",
+    [
+        (3.0, 1.5, ["cond", "cond_no_control", "uncond"]),
+        (1.0, 1.5, ["cond", "cond_no_control"]),
+        (3.0, 1.0, ["cond", "uncond"]),
+        (1.0, 1.0, ["cond"]),
+    ],
+)
+def test_transfer_registers_actual_branches_before_any_forward(
+    make_cosmos3_pipeline, sequential_cfg_parallel, guidance, control, expected_names
+):
+    pipeline = make_cosmos3_pipeline()
+    latents = torch.zeros(1, 2, 1, 1, 1, dtype=torch.float64)
+    hint = torch.ones_like(latents)
+    seen = []
+
+    def begin_step(branches):
+        assert not pipeline.transformer.calls
+        seen.extend(branches)
+
+    pipeline._cache_begin_step = begin_step
+    mask = torch.ones(1, 1, 1, 1, 1)
+    pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([7]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=guidance,
+        control_guidance=control,
+        control_guidance_interval=None,
+        control_latents=[hint],
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "noisy_frame_mask": mask},
+        velocity_mask=mask,
+        condition_latents=torch.zeros_like(latents),
+    )
+    assert seen == expected_names
+    assert len(pipeline.transformer.calls) == len(expected_names)
+
+
 def test_diffuse_transfer_uses_named_seacache_contexts(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
     pipeline = make_cosmos3_pipeline()
     pipeline.scheduler.sigmas = torch.tensor([0.42])
