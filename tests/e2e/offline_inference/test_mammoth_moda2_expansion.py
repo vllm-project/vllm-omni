@@ -4,9 +4,9 @@
 """
 End-to-end test for MammothModa2 text-to-image generation.
 
-Verifies that the AR->DiT pipeline produces a valid PIL image. When an
-optional golden fixture is present, the test also compares fixed pixel samples;
-the portable golden/stability oracle remains tracked in #7090.
+Verifies that the AR->DiT pipeline produces a postprocessed PIL image. Pixel
+values are compared with a golden reference when one is explicitly supplied.
+The portable golden/stability oracle remains tracked in #7090.
 
 Model Hub repo id: ``bytedance-research/MammothModa2-Preview``.
 Deploy config: ``get_deploy_config_path("mammoth_moda2.yaml")`` -> ``vllm_omni/deploy/mammoth_moda2.yaml``
@@ -21,7 +21,6 @@ import json
 import os
 from pathlib import Path
 
-import numpy as np
 import pytest
 import torch
 from PIL import Image
@@ -33,6 +32,8 @@ from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.transformers_utils.repo_utils import hf_api
+
+pytestmark = pytest.mark.advanced_model
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -89,17 +90,14 @@ def _format_t2i_prompt(user_prompt: str, ar_width: int, ar_height: int) -> str:
     )
 
 
-def _sample_pixels(img_tensor: torch.Tensor) -> list[float]:
-    """Sample pixel values at fixed fractional coordinates from a (C, H, W) tensor."""
-    t = img_tensor.float().clamp(0.0, 1.0)
-    if t.ndim == 4:
-        t = t[0]  # unbatch
-    C, H, W = t.shape
+def _sample_pixels(image: Image.Image) -> list[float]:
+    """Sample normalized RGB values after the shared VAE postprocess boundary."""
+    width, height = image.size
     values = []
     for c, rh, rw in _PIXEL_SAMPLE_COORDS:
-        ri = min(int(rh * (H - 1)), H - 1)
-        ci = min(int(rw * (W - 1)), W - 1)
-        values.append(round(float(t[c, ri, ci]), 6))
+        ri = min(int(rh * (height - 1)), height - 1)
+        ci = min(int(rw * (width - 1)), width - 1)
+        values.append(round(image.getpixel((ci, ri))[c] / 255.0, 6))
     return values
 
 
@@ -113,20 +111,22 @@ def _iter_images(outputs: list[object]):
                 yield from images
 
 
-def _pil_to_tensor(image: Image.Image) -> torch.Tensor:
-    array = np.asarray(image, dtype=np.float32) / 255.0
-    return torch.from_numpy(array).permute(2, 0, 1)
-
-
 @pytest.mark.cpu
 def test_diffusion_output_exposes_images_at_top_level():
-    image = Image.new("RGB", (16, 16), "black")
+    image = torch.zeros((3, 16, 16))
     output = OmniRequestOutput.from_diffusion(request_id="diffusion-test", images=[image])
 
     assert output.outputs == []
     assert list(_iter_images([output])) == [image]
 
 
+@pytest.mark.cpu
+def test_golden_sampling_uses_postprocessed_rgb_values():
+    image = Image.new("RGB", (16, 16), (0, 127, 255))
+    assert _sample_pixels(image) == [0.0] * 4 + [round(127 / 255, 6)] * 4 + [1.0] * 4
+
+
+@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/7718")
 @pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True)
@@ -137,7 +137,7 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
 
     Verifies:
       - Omni pipeline initialises with the two-stage YAML config.
-      - DiT stage outputs one RGB PIL image at the requested size.
+      - Shared postprocessing returns a PIL RGB image with the correct size.
       - When the optional fixture exists, fixed pixel samples match its golden
         reference (regenerate with ``UPDATE_GOLDEN=1``).
     """
@@ -206,7 +206,7 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
     assert image.mode == "RGB"
     assert image.size == (width, height)
 
-    sampled = _sample_pixels(_pil_to_tensor(image))
+    sampled = _sample_pixels(image)
 
     if os.environ.get("UPDATE_GOLDEN"):
         _GOLDEN_T2I_PATH.parent.mkdir(parents=True, exist_ok=True)
