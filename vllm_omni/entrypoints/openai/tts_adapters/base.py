@@ -313,6 +313,15 @@ class TTSModelAdapter(ABC):
         to unrelated TTS models.
         """
 
+    def collect_response_metadata(self, audio_output: Mapping[str, Any], collect: dict) -> None:
+        """Fold engine-side metadata from the mm payload into ``collect``.
+
+        Non-streaming only. The orchestrator surfaces select ``collect``
+        entries as response headers (precedent: ``word_timestamps`` ->
+        ``X-Word-Timestamps``, ``audio_truncated`` -> ``X-Audio-Truncated``);
+        adapters opt in by setting the keys it knows. Default: no-op.
+        """
+
     async def warmup(self) -> None:
         return
 

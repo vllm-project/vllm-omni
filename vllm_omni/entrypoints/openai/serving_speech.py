@@ -2237,6 +2237,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if ts is not None:
                     collect["word_timestamps"] = ts
 
+            # Let the adapter fold engine-side metadata (e.g. YuE2's
+            # meta.truncated) into ``collect`` for response headers.
+            if collect is not None and (adapter := self._get_tts_adapter()) is not None:
+                adapter.collect_response_metadata(audio_output, collect)
+
+            # A model can flag a per-request synthesis failure through the
+            # adapter (e.g. YuE2's terminal NAR/VAE pass OOMing on one
+            # request); answer 500 instead of shipping a zero-length WAV.
+            # Raising (not returning a Response) keeps this function's
+            # tuple contract; create_speech maps TTSGenerationError to 500.
+            if collect is not None and collect.get("audio_synthesis_error"):
+                raise TTSGenerationError(
+                    "The model failed to synthesize audio for this request",
+                    retryable=False,
+                )
+
             audio_tensor = audio_output[audio_key]
             sr_raw = audio_output.get("sr", 24000)
             sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
@@ -2677,6 +2693,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         "(use the WebSocket streaming path for long transcripts)",
                         len(ts_json),
                     )
+            if collect.get("audio_truncated") is not None:
+                headers["X-Audio-Truncated"] = "true" if collect["audio_truncated"] else "false"
             return Response(content=audio_bytes, media_type=media_type, headers=headers)
 
         except asyncio.CancelledError:

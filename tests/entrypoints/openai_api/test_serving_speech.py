@@ -1099,6 +1099,38 @@ class TestTTSMethods:
         assert isinstance(audio_obj, CreateAudio)
         assert audio_obj.speed == 1.0
 
+    @pytest.mark.asyncio
+    async def test_audio_synthesis_error_flag_raises_tts_generation_error(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ):
+        """A model-flagged synthesis failure surfaces as a non-retryable
+        TTSGenerationError, so create_speech answers 500 instead of shipping a
+        zero-length WAV or crashing on an unpacked Response."""
+
+        async def mock_generate():
+            yield create_mock_audio_output_for_test()
+
+        mocker.patch.object(
+            speech_server,
+            "_prepare_speech_generation",
+            new=mocker.AsyncMock(return_value=("speech-synth-err", mock_generate(), {})),
+        )
+        adapter = mocker.MagicMock()
+        adapter.collect_response_metadata = lambda _audio_output, collect: collect.__setitem__(
+            "audio_synthesis_error", True
+        )
+        mocker.patch.object(speech_server, "_get_tts_adapter", return_value=adapter)
+
+        with pytest.raises(TTSGenerationError, match="failed to synthesize audio") as exc_info:
+            await speech_server._generate_audio_bytes(
+                OpenAICreateSpeechRequest(input="Hello"),
+                collect={},
+            )
+
+        assert exc_info.value.retryable is False
+
     def test_is_tts_detection_with_tts_stage(self, mocker: MockerFixture):
         """Test TTS model detection when TTS stage exists."""
         mock_engine_client = mocker.MagicMock()
