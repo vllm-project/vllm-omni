@@ -22,6 +22,7 @@ import threading
 import time
 import weakref
 from collections.abc import Sequence
+from functools import partial
 from itertools import chain
 from typing import Any
 
@@ -701,8 +702,9 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             slot_contaminated = True
             if self._shared_slot_group is not None:
                 slot_contaminated = self._shared_slot_group[self.current_slot] != self._group_id
-            if slot_contaminated:
-                # Another group (or no group) wrote to our slot — re-fetch
+            if slot_contaminated or not self.is_materialized:
+                # A failed pass can offload the first block before the tail
+                # prefetches it again, while the slot still belongs to this group.
                 self._prev_hook.prefetch_layer(self.current_slot, non_blocking=False)
             # Always wait for data to be ready (handles both sync and async paths)
             self._prev_hook._wait_for_weights(self.current_slot)
@@ -823,7 +825,7 @@ class PinnedResidentLayerGroup:
                     bufs,
                     tensor_transforms,
                 )
-                cpu_shards = {}
+                cpu_shards: dict[torch.dtype, torch.Tensor] = {}
             else:
                 cpu_shards, metadata = DistributedLayerwiseOffloadHook._shard_and_pin(
                     params,
@@ -1910,7 +1912,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         removal_error = run_cleanup_steps(
             (
                 "removing a distributed block hook",
-                lambda block=block: remove_distributed_block_hook(block),
+                partial(remove_distributed_block_hook, block),
             )
             for blocks in self._blocks
             for block in blocks
@@ -1918,7 +1920,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         encoder_error = run_cleanup_steps(
             (
                 "clearing distributed encoder state",
-                lambda module=module: clear_encoder_layerwise_state(module),
+                partial(clear_encoder_layerwise_state, module),
             )
             for module in self._encoder_modules
         )
