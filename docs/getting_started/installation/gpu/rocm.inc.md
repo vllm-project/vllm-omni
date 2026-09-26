@@ -10,9 +10,8 @@
 
 For ROCm, vLLM-Omni currently recommends the setup steps through Docker Images.
 
-vLLM-Omni depends on the matching major/minor release of vLLM. The 0.30
-development line uses vLLM 0.30.x. Published 0.28.0 wheels and images use vLLM
-0.28.x.
+vLLM-Omni depends on the matching major/minor release of vLLM. The vLLM-Omni
+0.30.x release line uses vLLM 0.30.x.
 
 The Dockerfile's `BASE_IMAGE` pin applies only to Docker builds. The
 `vllm-omni` package does not install vLLM as a dependency, so non-Docker source
@@ -23,12 +22,12 @@ installing vLLM-Omni, as shown below.
 
 #### Installation of vLLM
 
-These pre-built wheel instructions install the published vLLM-Omni 0.28.0 release. For the 0.30 development line, use the source-install instructions below.
+These pre-built wheel instructions install the published vLLM-Omni 0.30.0 release.
 
 vLLM-Omni is built based on vLLM. Please install it with command below.
 
 ```bash
-uv pip install vllm==0.28.0+rocm723 --extra-index-url https://wheels.vllm.ai/rocm/0.28.0/rocm723
+uv pip install vllm==0.30.0+rocm723 --extra-index-url https://wheels.vllm.ai/rocm/0.30.0/rocm723
 ```
 
 #### Installation of vLLM-Omni
@@ -37,7 +36,7 @@ uv pip install vllm==0.28.0+rocm723 --extra-index-url https://wheels.vllm.ai/roc
 # we need to add --no-build-isolation as the torch
 # is not obtained from pypi, we have to install using the
 # torch installed in our environment
-uv pip install vllm-omni==0.28.0
+uv pip install vllm-omni==0.30.0
 
 # Optional if want to run Qwen3 TTS
 uv pip uninstall onnxruntime # should be removed before we can install onnxruntime-rocm
@@ -166,7 +165,7 @@ docker run --rm \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   --env "HF_TOKEN=$HF_TOKEN" \
   -p 8091:8091 \
-  vllm/vllm-omni-rocm:v0.28.0 \
+  vllm/vllm-omni-rocm:v0.30.0 \
   --model Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
@@ -187,7 +186,7 @@ docker run --rm -it \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   --env "HF_TOKEN=$HF_TOKEN" \
   --entrypoint bash \
-  vllm/vllm-omni-rocm:v0.28.0
+  vllm/vllm-omni-rocm:v0.30.0
 ```
 
 # --8<-- [end:pre-built-images]
