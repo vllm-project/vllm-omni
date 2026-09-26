@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from LingBot-Video (https://github.com/Robbyant/lingbot-video).
 
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -696,6 +697,25 @@ class LingBotVideoBlock(nn.Module):
         return x
 
 
+@dataclass
+class LingBotVideoForwardMetadata:
+    """Fixed metadata for one request branch, latent grid and parallel configuration."""
+
+    text_lens_list: list[int]
+    rotary: torch.Tensor
+    attention_mask: torch.Tensor | None
+    moe_padding_mask: torch.Tensor | None
+    packed_indices: dict[str, torch.Tensor | int] | None
+    padding_size: int
+
+
+@dataclass
+class LingBotVideoMetadataCache:
+    """Request-owned holder, filled after the transformer's offload hooks run."""
+
+    metadata: LingBotVideoForwardMetadata | None = None
+
+
 class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
     _supports_gradient_checkpointing = False
     _repeated_blocks = ["LingBotVideoBlock"]
@@ -803,6 +823,103 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         self.norm_out_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))
         self.proj_out = nn.Linear(hidden_size, math.prod(patch_size) * out_channels)
 
+    def prepare_metadata(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_attention_mask: torch.Tensor | None = None,
+    ) -> LingBotVideoForwardMetadata:
+        """Prepare once per branch; rebuild when the grid, mask, device or SP layout changes."""
+        B, _, T, H, W = hidden_states.shape
+        pF, pH, pW = self.config.patch_size
+        gt, gh, gw = T // pF, H // pH, W // pW
+        n_video = gt * gh * gw
+        L = encoder_hidden_states.shape[1]
+        device = hidden_states.device
+        if encoder_attention_mask is not None:
+            text_lens_list = encoder_attention_mask.sum(dim=-1).long().cpu().tolist()
+        else:
+            text_lens_list = [L] * B
+        packed_batch = B > 1
+
+        joint_seq_len = B * n_video + sum(text_lens_list) if packed_batch else n_video + L
+
+        # Per-sample RoPE: video t-axis start = real text length of this sample + 1
+        rotary_parts = [self.rope(make_joint_position_ids(text_lens_list[i], gt, gh, gw, device)) for i in range(B)]
+        if packed_batch:
+            rotary = torch.cat(rotary_parts, dim=0).unsqueeze(0)
+        else:
+            rotary = torch.stack(rotary_parts, dim=0)  # (B, S, head_dim/2) complex64
+
+        parallel_config = getattr(self, "_parallel_config", None)
+        use_packed_attention = parallel_config is not None
+
+        attention_mask = None
+        moe_padding_mask = None
+        packed_indices = None
+        has_padding = encoder_attention_mask is not None and any(text_len < L for text_len in text_lens_list)
+        if packed_batch or use_packed_attention:
+            sample_seq_lens = [n_video + text_len for text_len in text_lens_list]
+            cu_seqlens = torch.zeros(B + 1, device=device, dtype=torch.int32)
+            cu_seqlens[1:] = torch.cumsum(
+                torch.tensor(sample_seq_lens, device=device, dtype=torch.int32),
+                dim=0,
+            )
+            packed_indices = {
+                "cu_seqlens_kv": cu_seqlens,
+                "max_seqlen_in_batch_kv": max(sample_seq_lens),
+            }
+            if packed_batch and not use_packed_attention:
+                packed_indices["attention_mask"] = _packed_block_attention_mask(sample_seq_lens, device)
+            has_padding = False
+        if has_padding:
+            key_mask = torch.cat(
+                [torch.ones(B, n_video, dtype=torch.bool, device=device), encoder_attention_mask.bool()],
+                dim=1,
+            )
+            attention_mask = key_mask[:, None, None, :]  # (B,1,1,S) -> SDPA broadcast
+            moe_padding_mask = key_mask.reshape(-1).float()  # (B*S,)
+        packed_cp = packed_indices is not None and parallel_config is not None
+        padding_size = 0
+        if packed_cp:
+            cp_config = parallel_config.context_parallel_config
+            cp_world_size = int(getattr(cp_config, "ulysses_degree", getattr(cp_config, "_world_size", 1)))
+            padding_size = (cp_world_size - (joint_seq_len % cp_world_size)) % cp_world_size
+            if padding_size:
+                rotary = torch.cat(
+                    [
+                        rotary,
+                        torch.zeros(
+                            rotary.shape[0],
+                            padding_size,
+                            rotary.shape[2],
+                            device=rotary.device,
+                            dtype=rotary.dtype,
+                        ),
+                    ],
+                    dim=1,
+                )
+                packed_indices["cu_seqlens_kv"] = torch.cat(
+                    [
+                        packed_indices["cu_seqlens_kv"],
+                        packed_indices["cu_seqlens_kv"][-1:] + padding_size,
+                    ],
+                    dim=0,
+                )
+                packed_indices["max_seqlen_in_batch_kv"] = max(
+                    int(packed_indices["max_seqlen_in_batch_kv"]),
+                    int(padding_size),
+                )
+
+        return LingBotVideoForwardMetadata(
+            text_lens_list=text_lens_list,
+            rotary=rotary,
+            attention_mask=attention_mask,
+            moe_padding_mask=moe_padding_mask,
+            packed_indices=packed_indices,
+            padding_size=padding_size,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,  # (B, C, T, H, W)
@@ -810,18 +927,21 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         encoder_hidden_states: torch.Tensor,  # (B, L, text_dim)
         encoder_attention_mask: torch.Tensor | None = None,  # (B, L) 1=valid
         return_dict: bool = True,
+        metadata_cache: LingBotVideoMetadataCache | None = None,
     ):
         B, C, T, H, W = hidden_states.shape
         pF, pH, pW = self.config.patch_size
         gt, gh, gw = T // pF, H // pH, W // pW
         n_video = gt * gh * gw
-        L = encoder_hidden_states.shape[1]
-        device = hidden_states.device
-        if encoder_attention_mask is not None:
-            text_lens = encoder_attention_mask.sum(dim=-1).long()
+        if metadata_cache is None:
+            prepared_metadata = self.prepare_metadata(hidden_states, encoder_hidden_states, encoder_attention_mask)
         else:
-            text_lens = torch.full((B,), L, dtype=torch.long, device=device)
-        text_lens_list = [int(v) for v in text_lens.detach().cpu().tolist()]
+            if metadata_cache.metadata is None:
+                metadata_cache.metadata = self.prepare_metadata(
+                    hidden_states, encoder_hidden_states, encoder_attention_mask
+                )
+            prepared_metadata = metadata_cache.metadata
+        text_lens_list = prepared_metadata.text_lens_list
         packed_batch = B > 1
 
         # patchify: token order (f h w), feature order (pf ph pw c) -- matches patchify_and_embed
@@ -853,90 +973,28 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         else:
             text = self.text_embedder(encoder_hidden_states)
             joint = torch.cat([x, text], dim=1)  # [video; text]
-        joint_seq_len = joint.shape[1]
-
-        # Per-sample RoPE: video t-axis start = real text length of this sample + 1
-        rotary_parts = [self.rope(make_joint_position_ids(text_lens_list[i], gt, gh, gw, device)) for i in range(B)]
-        if packed_batch:
-            rotary = torch.cat(rotary_parts, dim=0).unsqueeze(0)
-        else:
-            rotary = torch.stack(rotary_parts, dim=0)  # (B, S, head_dim/2) complex64
-
+        rotary = prepared_metadata.rotary
+        attention_mask = prepared_metadata.attention_mask
+        moe_padding_mask = prepared_metadata.moe_padding_mask
+        packed_indices = prepared_metadata.packed_indices
+        padding_size = prepared_metadata.padding_size
         parallel_config = getattr(self, "_parallel_config", None)
-        use_packed_attention = parallel_config is not None
-
-        attention_mask = None
-        moe_padding_mask = None
-        packed_indices = None
-        has_padding = encoder_attention_mask is not None and bool((text_lens < L).any())
-        if packed_batch or use_packed_attention:
-            sample_seq_lens = [n_video + text_len for text_len in text_lens_list]
-            cu_seqlens = torch.zeros(B + 1, device=device, dtype=torch.int32)
-            cu_seqlens[1:] = torch.cumsum(
-                torch.tensor(sample_seq_lens, device=device, dtype=torch.int32),
-                dim=0,
-            )
-            packed_indices = {
-                "cu_seqlens_kv": cu_seqlens,
-                "max_seqlen_in_batch_kv": max(sample_seq_lens),
-            }
-            if packed_batch and not use_packed_attention:
-                packed_indices["attention_mask"] = _packed_block_attention_mask(sample_seq_lens, device)
-            has_padding = False
-        if has_padding:
-            key_mask = torch.cat(
-                [torch.ones(B, n_video, dtype=torch.bool, device=device), encoder_attention_mask.bool()],
+        packed_cp = packed_indices is not None and parallel_config is not None
+        if padding_size:
+            joint = torch.cat(
+                [
+                    joint,
+                    torch.zeros(
+                        joint.shape[0],
+                        padding_size,
+                        joint.shape[2],
+                        device=joint.device,
+                        dtype=joint.dtype,
+                    ),
+                ],
                 dim=1,
             )
-            attention_mask = key_mask[:, None, None, :]  # (B,1,1,S) -> SDPA broadcast
-            moe_padding_mask = key_mask.reshape(-1).float()  # (B*S,)
-        packed_cp = packed_indices is not None and parallel_config is not None
-        padding_size = 0
-        if packed_cp:
-            cp_config = parallel_config.context_parallel_config
-            cp_world_size = int(getattr(cp_config, "ulysses_degree", getattr(cp_config, "_world_size", 1)))
-            padding_size = (cp_world_size - (joint_seq_len % cp_world_size)) % cp_world_size
-            if padding_size:
-                joint = torch.cat(
-                    [
-                        joint,
-                        torch.zeros(
-                            joint.shape[0],
-                            padding_size,
-                            joint.shape[2],
-                            device=joint.device,
-                            dtype=joint.dtype,
-                        ),
-                    ],
-                    dim=1,
-                )
-                rotary = torch.cat(
-                    [
-                        rotary,
-                        torch.zeros(
-                            rotary.shape[0],
-                            padding_size,
-                            rotary.shape[2],
-                            device=rotary.device,
-                            dtype=rotary.dtype,
-                        ),
-                    ],
-                    dim=1,
-                )
-                if packed_indices is None:
-                    raise RuntimeError("packed_indices must be initialized for packed context parallel.")
-                packed_indices["cu_seqlens_kv"] = torch.cat(
-                    [
-                        packed_indices["cu_seqlens_kv"],
-                        packed_indices["cu_seqlens_kv"][-1:] + padding_size,
-                    ],
-                    dim=0,
-                )
-                packed_indices["max_seqlen_in_batch_kv"] = max(
-                    int(packed_indices["max_seqlen_in_batch_kv"]),
-                    int(padding_size),
-                )
-                joint_seq_len = joint.shape[1]
+        joint_seq_len = joint.shape[1]
 
         timestep_for_embed = timestep.float()
         timestep_proj = self.time_proj(timestep_for_embed)

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import weakref
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import numpy as np
@@ -376,12 +378,30 @@ def test_batched_cfg_pads_image_conditioned_embeddings_and_masks():
     assert torch.equal(mask[1], torch.ones(9, dtype=torch.long))
 
 
+@dataclass(eq=False)
+class _PreparedInputObservation:
+    latent_shape: torch.Size
+    prompt_embeds: torch.Tensor
+    attention_mask: torch.Tensor | None
+
+
 class _RecordingTransformer(nn.Module):
     def __init__(self):
         super().__init__()
         self.anchor = nn.Parameter(torch.zeros(()))
         self.config = SimpleNamespace(in_channels=1)
         self.latent_inputs = []
+        self.prepared_metadata = []
+        self.forward_metadata = []
+
+    def prepare_metadata(self, latents, prompt_embeds, encoder_attention_mask=None):
+        metadata = _PreparedInputObservation(
+            latent_shape=latents.shape,
+            prompt_embeds=prompt_embeds,
+            attention_mask=encoder_attention_mask,
+        )
+        self.prepared_metadata.append(metadata)
+        return metadata
 
     def forward(
         self,
@@ -391,8 +411,17 @@ class _RecordingTransformer(nn.Module):
         *,
         encoder_attention_mask,
         return_dict,
+        metadata_cache=None,
     ):
-        del timestep, prompt_embeds, encoder_attention_mask, return_dict
+        del timestep, return_dict
+        assert metadata_cache is not None
+        if metadata_cache.metadata is None:
+            metadata_cache.metadata = self.prepare_metadata(latents, prompt_embeds, encoder_attention_mask)
+        prepared_metadata = metadata_cache.metadata
+        assert latents.shape == prepared_metadata.latent_shape
+        assert prompt_embeds is prepared_metadata.prompt_embeds
+        assert encoder_attention_mask is prepared_metadata.attention_mask
+        self.forward_metadata.append(prepared_metadata)
         self.latent_inputs.append(latents.detach().clone())
         return (torch.zeros_like(latents),)
 
@@ -427,6 +456,7 @@ class _CorruptingScheduler:
     ],
 )
 def test_ti2v_reinjects_clean_prefix_across_cfg_modes(
+    mocker,
     guidance_scale,
     batch_cfg,
     expected_prompts,
@@ -436,7 +466,9 @@ def test_ti2v_reinjects_clean_prefix_across_cfg_modes(
         LingBotGenerationMode,
         LingBotImageCondition,
     )
+    from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video as module
 
+    batch_inputs = mocker.spy(module, "_batch_cfg_prompt_inputs")
     pipeline = _make_pipeline()
     pipeline.transformer = _RecordingTransformer()
     pipeline.scheduler = _CorruptingScheduler()
@@ -475,11 +507,168 @@ def test_ti2v_reinjects_clean_prefix_across_cfg_modes(
     assert [call[0] for call in encode_calls] == expected_prompts
     assert all(call[1] == [vlm_image] for call in encode_calls)
     assert len(pipeline.transformer.latent_inputs) == expected_transformer_calls
+    expected_preparations = 2 if guidance_scale > 1.0 and not batch_cfg else 1
+    assert len(pipeline.transformer.prepared_metadata) == expected_preparations
+    for metadata in pipeline.transformer.prepared_metadata:
+        assert sum(item is metadata for item in pipeline.transformer.forward_metadata) == 2
+    assert batch_inputs.call_count == int(guidance_scale > 1.0 and batch_cfg)
     for item in pipeline.transformer.latent_inputs:
         expected_prefix = condition.clean_latent.expand(item.shape[0], -1, -1, -1, -1)
         assert torch.equal(item[:, :, :1], expected_prefix)
     assert torch.equal(latents[:, :, :1], condition.clean_latent)
     assert torch.equal(latents[:, :, 1:], torch.full((1, 1, 2, 1, 1), 14.0))
+
+
+@pytest.mark.parametrize("rank", [0, 1], ids=["positive-rank", "negative-rank"])
+def test_cfg_parallel_prepares_only_local_branch_once(monkeypatch, rank):
+    from vllm_omni.diffusion.models.lingbot_video import LingBotGenerationMode
+    from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video as module
+
+    monkeypatch.setattr(module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(module.dist, "get_rank", lambda group: rank)
+    monkeypatch.setattr(module.dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(module.dist, "get_global_rank", lambda group, group_rank: group_rank)
+    monkeypatch.setattr(module.dist, "broadcast", lambda tensor, **kwargs: tensor.zero_())
+    monkeypatch.setattr(module.dist, "barrier", lambda **kwargs: None)
+    pipeline = _make_pipeline()
+    pipeline.transformer = _RecordingTransformer()
+    pipeline.scheduler = _CorruptingScheduler()
+    pipeline.progress_bar = lambda timesteps: timesteps
+    pipeline.prepare_latents = lambda *args, **kwargs: torch.zeros(1, 1, 3, 1, 1)
+    encoded_prompts = []
+
+    def fake_encode(prompt, **kwargs):
+        encoded_prompts.append(prompt)
+        length = 2 if prompt == "positive" else 3
+        return torch.full((1, length, 4), float(length)), torch.ones(1, length, dtype=torch.long)
+
+    pipeline.encode_prompt = fake_encode
+    pipeline._generate(
+        prompt="positive",
+        negative_prompt="negative",
+        mode=LingBotGenerationMode.T2V,
+        height=16,
+        width=16,
+        num_frames=9,
+        num_inference_steps=2,
+        guidance_scale=2.0,
+        output_type="latent",
+        cfg_parallel_group=object(),
+    )
+
+    assert encoded_prompts == (["positive"] if rank == 0 else ["negative"])
+    assert len(pipeline.transformer.prepared_metadata) == 1
+    [metadata] = pipeline.transformer.prepared_metadata
+    assert metadata.attention_mask.shape == (1, 2 if rank == 0 else 3)
+    assert len(pipeline.transformer.forward_metadata) == 2
+    assert all(item is metadata for item in pipeline.transformer.forward_metadata)
+
+
+def test_generate_prepares_fresh_metadata_for_next_request():
+    from vllm_omni.diffusion.models.lingbot_video import LingBotGenerationMode
+
+    pipeline = _make_pipeline()
+    pipeline.transformer = _RecordingTransformer()
+    pipeline.scheduler = _CorruptingScheduler()
+    pipeline.progress_bar = lambda timesteps: timesteps
+    pipeline.prepare_latents = lambda frames, height, width, *args: torch.zeros(1, 1, 3, height // 16, width // 16)
+
+    def fake_encode(prompt, **kwargs):
+        length = 2 if prompt == "first" else 5
+        return torch.ones(1, length, 4), torch.ones(1, length, dtype=torch.long)
+
+    pipeline.encode_prompt = fake_encode
+    for prompt, width in [("first", 16), ("second", 32)]:
+        pipeline._generate(
+            prompt=prompt,
+            mode=LingBotGenerationMode.T2V,
+            height=16,
+            width=width,
+            num_frames=9,
+            num_inference_steps=2,
+            guidance_scale=1.0,
+            output_type="latent",
+        )
+
+    first, second = pipeline.transformer.prepared_metadata
+    assert first is not second
+    assert first.latent_shape == (1, 1, 3, 1, 1)
+    assert second.latent_shape == (1, 1, 3, 1, 2)
+    assert first.attention_mask.shape == (1, 2)
+    assert second.attention_mask.shape == (1, 5)
+    assert all(item is first for item in pipeline.transformer.forward_metadata[:2])
+    assert all(item is second for item in pipeline.transformer.forward_metadata[2:])
+
+
+@pytest.mark.parametrize(
+    ("guidance_scale", "batch_cfg", "cfg_parallel"),
+    [
+        pytest.param(1.0, False, False, id="cfg-disabled"),
+        pytest.param(2.0, False, False, id="sequential-cfg"),
+        pytest.param(2.0, True, False, id="batched-cfg"),
+        pytest.param(2.0, False, True, id="parallel-cfg"),
+    ],
+)
+def test_generate_releases_metadata_before_vae_decode(monkeypatch, guidance_scale, batch_cfg, cfg_parallel):
+    from vllm_omni.diffusion.models.lingbot_video import LingBotGenerationMode
+    from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video as module
+
+    metadata_refs = []
+
+    class Transformer(_RecordingTransformer):
+        def prepare_metadata(self, latents, prompt_embeds, encoder_attention_mask=None):
+            metadata = _PreparedInputObservation(latents.shape, prompt_embeds, encoder_attention_mask)
+            metadata_refs.append(weakref.ref(metadata))
+            return metadata
+
+        def forward(self, latents, timestep, prompt_embeds, **kwargs):
+            cache = kwargs["metadata_cache"]
+            if cache.metadata is None:
+                cache.metadata = self.prepare_metadata(latents, prompt_embeds, kwargs["encoder_attention_mask"])
+            assert any(ref() is cache.metadata for ref in metadata_refs)
+            return (torch.zeros_like(latents),)
+
+    if cfg_parallel:
+        monkeypatch.setattr(module.dist, "is_available", lambda: True)
+        monkeypatch.setattr(module.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(module.dist, "get_rank", lambda group: 0)
+        monkeypatch.setattr(module.dist, "get_world_size", lambda group: 2)
+        monkeypatch.setattr(module.dist, "get_global_rank", lambda group, group_rank: group_rank)
+        monkeypatch.setattr(module.dist, "broadcast", lambda tensor, **kwargs: tensor.zero_())
+        monkeypatch.setattr(module.dist, "barrier", lambda **kwargs: None)
+    pipeline = _make_pipeline()
+    pipeline.transformer = Transformer()
+    pipeline.scheduler = _CorruptingScheduler()
+    pipeline.progress_bar = lambda timesteps: timesteps
+    pipeline.prepare_latents = lambda *args, **kwargs: torch.zeros(1, 1, 3, 1, 1)
+    pipeline.encode_prompt = lambda *args, **kwargs: (
+        torch.ones(1, 2, 4),
+        torch.ones(1, 2, dtype=torch.long),
+    )
+    decoded = torch.ones(3, 16, 16, 3)
+
+    def decode(latents):
+        expected_preparations = 2 if guidance_scale > 1.0 and not batch_cfg and not cfg_parallel else 1
+        assert len(metadata_refs) == expected_preparations
+        assert all(ref() is None for ref in metadata_refs)
+        return decoded
+
+    pipeline._decode_latents = decode
+    actual = pipeline._generate(
+        prompt="positive",
+        mode=LingBotGenerationMode.T2V,
+        height=16,
+        width=16,
+        num_frames=9,
+        num_inference_steps=2,
+        guidance_scale=guidance_scale,
+        batch_cfg=batch_cfg,
+        cfg_parallel_group=object() if cfg_parallel else None,
+        output_type="pt",
+    )
+
+    assert actual is decoded
 
 
 def test_t2i_decodes_and_returns_the_unique_frame():

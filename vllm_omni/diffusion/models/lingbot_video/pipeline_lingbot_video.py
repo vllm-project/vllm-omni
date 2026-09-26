@@ -29,7 +29,10 @@ from vllm_omni.diffusion.models.lingbot_video.image_condition import (
     apply_clean_prefix,
     prepare_ti2v_image_condition,
 )
-from vllm_omni.diffusion.models.lingbot_video.lingbot_video_transformer import LingBotVideoTransformer3DModel
+from vllm_omni.diffusion.models.lingbot_video.lingbot_video_transformer import (
+    LingBotVideoMetadataCache,
+    LingBotVideoTransformer3DModel,
+)
 from vllm_omni.diffusion.models.lingbot_video.request_utils import (
     LingBotGenerationMode,
     normalize_lingbot_request,
@@ -696,6 +699,36 @@ class LingBotVideoPipeline(
                 vae_restore_device = vae_device
                 vae_offloaded = True
 
+        # These inputs and their attention/RoPE metadata are fixed for this request.
+        if cfg_parallel:
+            branch_embeds = prompt_embeds if cfg_parallel_rank == 0 else negative_embeds
+            branch_mask = prompt_mask if cfg_parallel_rank == 0 else negative_mask
+            if branch_embeds is None:
+                raise RuntimeError("CFG branch embeddings were not initialized.")
+            branch_embeds = branch_embeds.to(transformer_dtype)
+            branch_metadata = LingBotVideoMetadataCache()
+        else:
+            if prompt_embeds is None:
+                raise RuntimeError("Prompt embeddings were not initialized.")
+            prompt_model_input = prompt_embeds.to(transformer_dtype)
+            if do_cfg:
+                if negative_embeds is None or negative_mask is None:
+                    raise RuntimeError("Negative embeddings were not initialized for CFG.")
+                negative_embeds = negative_embeds.to(transformer_dtype)
+            if do_cfg and effective_batch_cfg:
+                cfg_embeds, cfg_mask = _batch_cfg_prompt_inputs(
+                    prompt_model_input,
+                    prompt_mask,
+                    negative_embeds,
+                    negative_mask,
+                    null_cond_clone_zero=False,
+                )
+                cfg_metadata = LingBotVideoMetadataCache()
+            else:
+                prompt_metadata = LingBotVideoMetadataCache()
+                if do_cfg:
+                    negative_metadata = LingBotVideoMetadataCache()
+
         cfg_latent_src = _group_global_rank(cfg_parallel_group, 0)
         cfg_uncond_src = _group_global_rank(cfg_parallel_group, 1)
         for timestep in self.progress_bar(self.scheduler.timesteps):
@@ -704,21 +737,14 @@ class LingBotVideoPipeline(
             timestep_batch = _transformer_timestep(timestep, transformer_dtype).expand(1).to(device)
             latent_model_input = latents
             if cfg_parallel:
-                if cfg_parallel_rank == 0:
-                    branch_embeds = prompt_embeds
-                    branch_mask = prompt_mask
-                else:
-                    branch_embeds = negative_embeds
-                    branch_mask = negative_mask
-                if branch_embeds is None:
-                    raise RuntimeError("CFG branch embeddings were not initialized.")
                 with _transformer_autocast(device, transformer_dtype):
                     branch_noise_pred = self.transformer(
                         latent_model_input,
                         timestep_batch,
-                        branch_embeds.to(transformer_dtype),
+                        branch_embeds,
                         encoder_attention_mask=branch_mask,
                         return_dict=False,
+                        metadata_cache=branch_metadata,
                     )[0].float()
                 if cfg_parallel_rank == 0:
                     noise_pred = branch_noise_pred
@@ -730,19 +756,7 @@ class LingBotVideoPipeline(
                     continue
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred - noise_pred_uncond)
             else:
-                if prompt_embeds is None:
-                    raise RuntimeError("Prompt embeddings were not initialized.")
-                prompt_model_input = prompt_embeds.to(transformer_dtype)
                 if do_cfg and effective_batch_cfg:
-                    if negative_embeds is None or negative_mask is None:
-                        raise RuntimeError("Negative embeddings were not initialized for CFG.")
-                    cfg_embeds, cfg_mask = _batch_cfg_prompt_inputs(
-                        prompt_model_input,
-                        prompt_mask,
-                        negative_embeds.to(transformer_dtype),
-                        negative_mask,
-                        null_cond_clone_zero=False,
-                    )
                     cfg_latents = torch.cat([latent_model_input, latent_model_input], dim=0)
                     cfg_timesteps = torch.cat([timestep_batch, timestep_batch], dim=0)
                     with _transformer_autocast(device, transformer_dtype):
@@ -752,6 +766,7 @@ class LingBotVideoPipeline(
                             cfg_embeds,
                             encoder_attention_mask=cfg_mask,
                             return_dict=False,
+                            metadata_cache=cfg_metadata,
                         )[0].float()
                     noise_pred, noise_pred_uncond = noise_batched.chunk(2, dim=0)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred - noise_pred_uncond)
@@ -763,18 +778,18 @@ class LingBotVideoPipeline(
                             prompt_model_input,
                             encoder_attention_mask=prompt_mask,
                             return_dict=False,
+                            metadata_cache=prompt_metadata,
                         )[0].float()
 
                 if do_cfg and not effective_batch_cfg:
-                    if negative_embeds is None or negative_mask is None:
-                        raise RuntimeError("Negative embeddings were not initialized for CFG.")
                     with _transformer_autocast(device, transformer_dtype):
                         noise_pred_uncond = self.transformer(
                             latent_model_input,
                             timestep_batch,
-                            negative_embeds.to(transformer_dtype),
+                            negative_embeds,
                             encoder_attention_mask=negative_mask,
                             return_dict=False,
+                            metadata_cache=negative_metadata,
                         )[0].float()
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred - noise_pred_uncond)
 
@@ -787,6 +802,16 @@ class LingBotVideoPipeline(
             )[0]
             if image_condition is not None:
                 latents = apply_clean_prefix(latents, image_condition.clean_latent)
+
+        # Release potentially large packed masks before restoring/decoding with the VAE.
+        if cfg_parallel:
+            del branch_metadata
+        elif do_cfg and effective_batch_cfg:
+            del cfg_metadata
+        else:
+            del prompt_metadata
+            if do_cfg:
+                del negative_metadata
 
         if cfg_parallel:
             dist.barrier(group=cfg_parallel_group)
