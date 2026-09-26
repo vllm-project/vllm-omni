@@ -17,6 +17,7 @@ import torch
 from vllm_omni.core.prefix_cache.interface import OmniPrefixCacheUnmatchError, PrefixCacheConfig
 
 if TYPE_CHECKING:
+    from vllm.v1.worker.block_table import BlockTable
     from vllm.v1.worker.gpu_input_batch import InputBatch
 
 
@@ -30,7 +31,9 @@ class FullAttentionGroupView:
     def __init__(self, input_batch: InputBatch, block_size: int):
         self._input_batch = input_batch
         self.block_size = block_size
-        check_prefix_cache_block_layout(input_batch.block_table[0], block_size)
+        table = input_batch.block_table[0]
+        check_prefix_cache_block_layout(table, block_size)
+        self.kernel_block_size = table.block_size
 
     def _block_table_cpu(self) -> torch.Tensor:
         return self._input_batch.block_table[0].block_table.cpu
@@ -46,7 +49,9 @@ class FullAttentionGroupView:
         information (positions are num_computed .. +num_scheduled per request).
         """
         block_table = self._block_table_cpu()
-        bs = self.block_size
+        # BlockTable expands allocator IDs into kernel-block IDs. Both
+        # geometries address the same flat token storage, including tails.
+        bs = self.kernel_block_size
         max_blocks = int(block_table.shape[1])
         computed = self._input_batch.num_computed_tokens_cpu
         parts: list[torch.Tensor] = []
@@ -67,28 +72,18 @@ class FullAttentionGroupView:
         return torch.cat(parts) if parts else torch.empty((0,), dtype=torch.long)
 
 
-def check_prefix_cache_block_layout(block_table: object, block_size: int) -> None:
+def check_prefix_cache_block_layout(block_table: BlockTable, block_size: int) -> None:
     """Reject block-table layouts ``step_slots_cpu`` cannot mirror.
 
-    The CPU slot math is ``table[req, pos // block_size] * block_size +
-    pos % block_size`` over allocator block ids. vLLM breaks that in two
-    cases: hybrid kernel blocks (the row holds ``blocks_per_kv_block``
-    kernel ids per allocator block, e.g. FlashInfer/FlashMLA with
-    ``--block-size 128``) and decode context parallel (tokens are striped
-    across ranks and hashed at ``block_size * dcp_world_size``).
+    Kernel-block splitting preserves flat token slots. Context parallelism
+    stripes tokens across ranks and requires a separate storage contract.
     """
-    if getattr(block_table, "use_hybrid_blocks", False) or int(getattr(block_table, "blocks_per_kv_block", 1)) != 1:
-        raise OmniPrefixCacheUnmatchError(
-            "omni prefix caching requires kernel_block_size == block_size; the attention backend "
-            f"splits each block into {getattr(block_table, 'blocks_per_kv_block', '?')} kernel blocks. "
-            "Pick a --block-size the backend supports natively or disable enable_prefix_caching"
-        )
-    if int(getattr(block_table, "dcp_world_size", 1)) != 1:
+    if block_table.dcp_world_size != 1:
         raise OmniPrefixCacheUnmatchError(
             "omni prefix caching does not support decode context parallel "
-            f"(dcp_world_size={getattr(block_table, 'dcp_world_size', '?')}); disable enable_prefix_caching"
+            f"(dcp_world_size={block_table.dcp_world_size}); disable enable_prefix_caching"
         )
-    kv_bs = getattr(block_table, "kv_cache_block_size", block_size)
+    kv_bs = block_table.kv_cache_block_size
     if int(kv_bs) != int(block_size):
         raise OmniPrefixCacheUnmatchError(
             f"omni prefix caching block_size {block_size} does not match the kv-cache block table ({kv_bs})"
@@ -139,9 +134,8 @@ def check_prefix_cache_token_accounting(cache_config: object, speculative_config
     ``num_computed_tokens_cpu`` optimistic (all drafts accepted) during the
     forward and corrects it after; ``step_slots_cpu`` would read the
     uncorrected value and mirror rows at the wrong slots. Refused as a
-    whole until that path is verified. ``prefix_match_unit`` smaller than
-    the block enables sub-block hits, which the hit registry rejects as
-    unaligned on the first hit; refuse at init instead.
+    whole until that path is verified. vLLM's single-group coordinator
+    requires the prefix hash unit to equal the allocator block size.
     """
     if speculative_config is not None:
         raise OmniPrefixCacheUnmatchError(

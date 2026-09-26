@@ -258,9 +258,10 @@ Which stages may set `enable_prefix_caching: true`:
 | Pooling stage | ignored | Never saves; the gate returns no config. |
 | `kv_role: kv_consumer` / `kv_both` | refused at kv-cache init (`OmniPrefixCacheUnmatchError`) | Producer KV shows up as `num_computed_tokens` and is indistinguishable from a local hit. |
 | Speculative decoding on the stage | refused at kv-cache init | Under async scheduling vLLM keeps `num_computed_tokens_cpu` optimistic (all drafts accepted) during the forward and corrects it afterwards; `step_slots_cpu` would mirror rows at the wrong slots. Not verified; refused as a whole. |
-| `prefix_match_unit` smaller than `block_size` | refused at kv-cache init | Sub-block hits make `num_computed_tokens` unaligned; the hit registry only mirrors whole blocks. |
+| `prefix_match_unit` smaller than `block_size` | refused at kv-cache init | vLLM 0.29.0's single-group coordinator requires the hash unit to equal its allocator block size. The cache can materialize exact token intervals, but this does not lift the scheduler limitation. |
 | Hybrid / sliding-window / multi-group kv cache (e.g. a talker with `attention_type: sliding_recompute`) | refused at kv-cache init | The cache mirrors exactly one full-attention block table. |
-| Attention backend whose kernel block size differs from `--block-size` (FlashInfer / FlashMLA / CutlassMLA with a block size they do not list natively), or decode context parallel | refused at first step (`FullAttentionGroupView`) | `step_slots_cpu` computes `table[req, pos // block_size] * block_size + pos % block_size` over allocator block ids; hybrid kernel blocks and DCP token striping change that row layout. FlashAttention / Triton accept any multiple of 16 and never split blocks. |
+| Attention backend whose kernel block size divides `--block-size` (e.g. FlashInfer with allocator blocks of 128 and kernel blocks of 16/32/64) | supported for a single full-attention group | The adapter's group view indexes the real kernel-block table using its kernel block size. Read snapshots retain allocator IDs; both address the same flat token slots. Only the actual scheduled/hit token interval is copied. |
+| Decode context parallel | refused at first step (`FullAttentionGroupView`) | Token striping needs a separate sharded storage contract. |
 | Codec decoder / Code2Wav stages (Qwen3-Omni stage 2, Qwen3-TTS stage 1) | keep `false` | Nothing downstream consumes their hidden states; the cache would only add device→host copies. Not validated. |
 | Diffusion stages | n/a | No vLLM KV cache to mirror. |
 
