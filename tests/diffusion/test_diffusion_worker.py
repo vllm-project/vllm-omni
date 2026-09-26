@@ -318,6 +318,58 @@ class TestDiffusionWorkerWakeUp:
 class TestDiffusionWorkerInitLoraManager:
     """Test DiffusionWorker.init_lora_manager method."""
 
+    def test_peft_passes_merge_on_load_to_manager(self, mocker: MockerFixture, mock_gpu_worker):
+        """PEFT forwards merge-on-load when weight residency is stable."""
+        from vllm_omni.diffusion.lora.manager import LoRABackend
+
+        manager_cls = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.DiffusionLoRAManager")
+        config = mock_gpu_worker.od_config
+        config.lora_backend = LoRABackend.PEFT
+        config.lora_path = "/path/to/lora.safetensors"
+        config.lora_scale = 1.0
+        config.lora_merge_on_load = True
+        config.enable_layerwise_offload = False
+        config.enable_distributed_layerwise_offload = False
+        config.dtype = torch.float16
+        config.max_cpu_loras = 2
+        mock_gpu_worker.model_runner.pipeline.lora_is_fused = False
+
+        mock_gpu_worker.init_lora_manager()
+
+        assert manager_cls.call_args.kwargs["merge_on_load"] is True
+
+    @pytest.mark.parametrize(
+        ("layerwise", "distributed"),
+        [(True, False), (False, True)],
+    )
+    def test_peft_disables_merge_on_load_with_offload(
+        self,
+        mocker: MockerFixture,
+        mock_gpu_worker,
+        layerwise: bool,
+        distributed: bool,
+    ):
+        """Moving weights cannot use persistent in-place merge state."""
+        from vllm_omni.diffusion.lora.manager import LoRABackend
+
+        manager_cls = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.DiffusionLoRAManager")
+        warning = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.logger.warning")
+        config = mock_gpu_worker.od_config
+        config.lora_backend = LoRABackend.PEFT
+        config.lora_path = "/path/to/lora.safetensors"
+        config.lora_scale = 1.0
+        config.lora_merge_on_load = True
+        config.enable_layerwise_offload = layerwise
+        config.enable_distributed_layerwise_offload = distributed
+        config.dtype = torch.float16
+        config.max_cpu_loras = 2
+        mock_gpu_worker.model_runner.pipeline.lora_is_fused = False
+
+        mock_gpu_worker.init_lora_manager()
+
+        assert manager_cls.call_args.kwargs["merge_on_load"] is False
+        warning.assert_called_once()
+
     def test_skips_when_lora_already_fused(self, mocker: MockerFixture, mock_gpu_worker):
         """When pipeline.lora_is_fused is True, init_lora_manager returns immediately."""
         from vllm_omni.diffusion.lora.manager import LoRABackend
