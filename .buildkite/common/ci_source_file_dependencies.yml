@@ -213,6 +213,9 @@ source_file_dependencies:
     - tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
     - tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json
     - tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json
+    - tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json
+    - vllm_omni/benchmarks/realtime_seed_tts.py
+    - vllm_omni/deploy/qwen3_omni_duplex.yaml
 
   omni_qwen3_omni_reliability:
     - *qwen3_omni

@@ -243,6 +243,9 @@ class SessionConfig:
     playback_commit_policy: str | None = None
     turn_detection: dict[str, object] | None = None
     idle_timeout_s: float | None = None
+    #: Caps the response length for every turn in the session. Left unset the
+    #: server decides, so existing callers send exactly what they sent before.
+    max_output_tokens: int | None = None
     extra_body: dict[str, object] = field(default_factory=dict)
 
     def to_session_payload(self, *, model: str) -> dict[str, object]:
@@ -276,6 +279,8 @@ class SessionConfig:
             payload["playback_commit_policy"] = self.playback_commit_policy
         if self.idle_timeout_s is not None:
             payload["idle_timeout_s"] = self.idle_timeout_s
+        if self.max_output_tokens is not None:
+            payload["max_output_tokens"] = self.max_output_tokens
         extra_body: dict[str, object] = {"auto_response": self.auto_response}
         extra_body.update(self.extra_body)
         payload["extra_body"] = extra_body
@@ -951,7 +956,8 @@ class DuplexClientBase(ABC):
             marker = self._closed_marker
             raise DuplexSessionClosedError(marker.reason if marker else "closed")
         payload = dict(event)
-        payload.setdefault("event_id", f"evt_{uuid4().hex}")
+        # setdefault returns the caller's id when it supplied one, ours otherwise.
+        event_id = str(payload.setdefault("event_id", f"evt_{uuid4().hex}"))
         try:
             await self._send_command(payload)
         except asyncio.CancelledError:
@@ -960,7 +966,7 @@ class DuplexClientBase(ABC):
             raise
         except Exception as exc:
             raise DuplexConnectionError(f"send failed: {exc}") from exc
-        return payload["event_id"]
+        return event_id
 
     # -- internals ---------------------------------------------------------------
 
@@ -1026,6 +1032,9 @@ class DuplexClientBase(ABC):
         if not self._accept_event(data):
             return
         event = wrap_event(data)
+        # Shared across the branches below: created makes one, the rest look an
+        # existing one up and may not find it.
+        handle: ResponseHandle | None
 
         if isinstance(event, SessionResumed):
             self._adopt_session(event)
@@ -1110,7 +1119,10 @@ class DuplexClientBase(ABC):
         for handle in self._responses.values():
             handle._finish(None)
         self._responses.clear()
-        for queue in (*self._subscribers, self._response_queue):
+        # Subscriber and response queues carry different item types; the marker
+        # goes to both, so widen to the common Queue rather than to object.
+        queues: tuple[asyncio.Queue, ...] = (*self._subscribers, self._response_queue)
+        for queue in queues:
             _put_drop_oldest(queue, marker)
 
 
@@ -1233,7 +1245,13 @@ class DuplexClient(DuplexClientBase):
         while True:
             try:
                 while True:
-                    raw = await self._ws.recv()
+                    # Re-read per message: _attempt_resume swaps the transport.
+                    # Raising here lands in the same handler an AttributeError
+                    # on a missing transport used to.
+                    ws = self._ws
+                    if ws is None:
+                        raise DuplexConnectionError("transport is not connected")
+                    raw = await ws.recv()
                     if isinstance(raw, (bytes, bytearray)):
                         continue
                     try:

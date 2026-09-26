@@ -349,6 +349,13 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
     """Add CLI arguments for Seed-TTS benchmarks."""
     group = parser.add_argument_group("Seed-TTS Dataset Options")
     group.add_argument(
+        "--seed-tts-reference-as-input",
+        action="store_true",
+        help="Send Seed-TTS reference speech as a real user audio turn alongside the target text, rather than as "
+        "ref_audio/ref_text voice-clone fields. Requires --backend openai-realtime-chat. Audio is normalized to "
+        "mono 24 kHz PCM16; a one-second silent tail is appended and streamed only in server-VAD mode.",
+    )
+    group.add_argument(
         "--seed-tts-locale",
         type=str,
         choices=["en", "zh"],
@@ -437,7 +444,11 @@ def extend_omni_choices(parser: argparse.ArgumentParser) -> None:
                 if extra:
                     action.choices = list(action.choices) + extra
             if action.dest == "backend" and action.choices is not None:
-                extra = [choice for choice in ("openai-image-edits-omni",) if choice not in action.choices]
+                extra = [
+                    choice
+                    for choice in ("openai-image-edits-omni", "openai-realtime-chat")
+                    if choice not in action.choices
+                ]
                 if extra:
                     action.choices = list(action.choices) + extra
 
