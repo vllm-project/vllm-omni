@@ -395,6 +395,8 @@ class StageDiffusionClient(StageClientBase):
             return None
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
+        if self._engine_dead:
+            return
         self._request_socket.send(
             self._encoder.encode(
                 {
@@ -507,7 +509,8 @@ class StageDiffusionClient(StageClientBase):
     def shutdown(self) -> None:
         self._shutting_down = True
         try:
-            self._request_socket.send(self._encoder.encode({"type": "shutdown"}))
+            # A blocking send never returns once the subprocess is gone.
+            self._request_socket.send(self._encoder.encode({"type": "shutdown"}), flags=zmq.NOBLOCK)
         except Exception:
             pass
 
