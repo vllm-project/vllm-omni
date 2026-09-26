@@ -259,10 +259,9 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         https://github.com/vllm-project/vllm/blob/v0.20.0/vllm/vllm_flash_attn/flash_attn_interface.py#L176
         https://github.com/vllm-project/vllm/blob/v0.20.0/vllm/_xpu_ops.py#L310
         """
-        from vllm_omni.diffusion.attention.backends.utils.fa import (
-            flash_attn_varlen_func,
-        )
+        from vllm_omni.diffusion.attention.backends.utils import fa as fa_utils
 
+        flash_attn_varlen_func = fa_utils.flash_attn_varlen_func
         if flash_attn_varlen_func is None:
             raise ImportError("Dense variable-length attention requires flash_attn_varlen_func")
         batch_size, q_len = query.size()[:2]
@@ -274,17 +273,25 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         key = key.flatten(0, 1)
         value = value.flatten(0, 1)
 
-        out = flash_attn_varlen_func(
-            q=query,
-            k=key,
-            v=value,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=q_len,
-            max_seqlen_k=k_len,
-            causal=self.causal,
-            softmax_scale=self.softmax_scale,
-        )
+        kwargs = {
+            "q": query,
+            "k": key,
+            "v": value,
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_k": cu_seqlens_k,
+            "max_seqlen_q": q_len,
+            "max_seqlen_k": k_len,
+            "causal": self.causal,
+            "softmax_scale": self.softmax_scale,
+        }
+        # vLLM's bundled flash_attn_varlen_func defaults to DEFAULT_FA_VERSION (2).
+        # Without an explicit version this path silently runs FA2 on a device where
+        # FA3 is available and selected, with no error and no warning. The packed
+        # path already resolves the version; do the same here.
+        if current_omni_platform.is_cuda():
+            kwargs["fa_version"] = fa_utils.resolve_vllm_flash_attn_version(None)
+
+        out = flash_attn_varlen_func(**kwargs)
         out = self._unwrap_flash_output(out)
         # (b s) h d -> b s h d
         return out.reshape(batch_size, q_len, *out.shape[1:])
