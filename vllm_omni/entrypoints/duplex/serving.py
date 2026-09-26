@@ -542,11 +542,29 @@ class OmniDuplexSessionHandler:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            # The socket died mid-send. The session is alive in the engine:
-            # treat it as a disconnect of the current attachment (the pump
-            # keeps journaling for a resume) instead of tearing the session down.
+            # The socket died mid-send. Usual case: keep the engine session for
+            # resume (detach the current attachment; the pump keeps journaling).
+            # Exception: ``session.created`` itself never reached the client, so
+            # nobody has the session id / resume token -- detach would burn an
+            # admission slot until idle expiry. Close instead (#7636 issue 9).
             logger.info("Duplex transport send failed for %s: %s", session_id, exc)
+            if isinstance(event, SessionCreated):
+                await self._close_undeliverable_session(session_id)
+                return
             await self._detach_current_attachment(session_id)
+
+    async def _close_undeliverable_session(self, session_id: str) -> None:
+        """Tear down a session whose ``session.created`` never reached the client.
+
+        Production admission frees after ``handle.close`` waits for
+        ``session.closed`` (manager cleanup). If close raises, the handle is
+        already marked closed and we must not detach.
+        """
+        handle = self._omni.get_session(session_id)
+        if handle is None or handle.closed:
+            return
+        with suppress(DuplexSessionError):
+            await handle.close(reason="session_created_undelivered")
 
     async def _detach_current_attachment(self, session_id: str) -> None:
         """Disconnect semantics for the socket currently attached to ``session_id``.

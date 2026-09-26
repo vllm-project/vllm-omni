@@ -386,6 +386,30 @@ async def test_transport_send_failure_detaches_the_session_instead_of_closing_it
 
 
 @pytest.mark.asyncio
+async def test_session_created_send_failure_closes_instead_of_detaching() -> None:
+    """If ``session.created`` never reaches the client, serving must close (#7636 #9).
+
+    Covers the serving branch only (close vs detach). Production admission is
+    released when ``handle.close()`` waits for ``session.closed`` after cleanup.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws = FakeWebSocket({"duplex": "1", "autostart": "0"})
+    # Fail every wire send before ``session.created`` is pumped out.
+    ws.break_sends()
+    task = asyncio.create_task(handler.handle_realtime_session(ws))
+    ws.feed(_session_update())
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert len(omni.handles) == 1
+    handle = next(iter(omni.handles.values()))
+    assert handle.closed
+    assert handle.close_reasons == ["session_created_undelivered"]
+    assert omni.detached == []
+    assert "session.created" not in ws.types()
+
+
+@pytest.mark.asyncio
 async def test_non_resumable_session_is_closed_on_disconnect() -> None:
     omni = FakeOmni(resumable=False)
     handler = _handler(omni)
