@@ -40,6 +40,7 @@ from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.t5_encoder.quantization import prepare_t5_fp8
 from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
     resolve_wan_output_fps,
     resolve_wan_preencode_batch_frames,
@@ -483,6 +484,7 @@ class Wan22Pipeline(
             local_files_only=local_files_only,
             torch_dtype=dtype,
         ).to(self.device)
+        prepare_t5_fp8(self.text_encoder, od_config.quantization_config, "text_encoder", quantize_attention=False)
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKLWan.from_pretrained,
             model,

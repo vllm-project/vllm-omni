@@ -30,6 +30,7 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
+from vllm_omni.diffusion.models.t5_encoder.quantization import prepare_t5_fp8
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
     resolve_wan_output_fps,
@@ -281,6 +282,8 @@ class Wan22I2VPipeline(
             local_files_only=local_files_only,
             torch_dtype=dtype,
         ).to(self.device)
+
+        prepare_t5_fp8(self.text_encoder, od_config.quantization_config, "text_encoder", quantize_attention=False)
 
         if self.has_image_encoder:
             self.image_processor = from_pretrained_with_prefetch(
