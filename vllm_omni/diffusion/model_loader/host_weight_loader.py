@@ -26,11 +26,13 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import HostWeightPlan, Te
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.model_loader.host_weights.contracts import FinalLayoutTensorPolicy
     from vllm_omni.diffusion.model_loader.host_weights.identity_adapter import FinalLayoutIdentityContext
     from vllm_omni.diffusion.model_loader.host_weights.source_identity import (
         NodeSourceDigestCache,
         PreparedWeightSource,
     )
+    from vllm_omni.host_weight_runtime import HostWeightResolution, HostWeightRuntime, RuntimeMode
 
 
 class _HWRCommitError(RuntimeError):
@@ -66,6 +68,26 @@ class HWRLoaderMixin:
         from vllm_omni.host_weight_runtime import CanonicalJson
 
         return hashlib.sha256(CanonicalJson.from_value(value).encoded).hexdigest()
+
+    @classmethod
+    def _fp8_quantization_identity(cls, config: object, component_names: Sequence[str]) -> object:
+        from vllm_omni.quantization import resolve_component_quant_config
+
+        fields = (
+            "activation_scheme",
+            "ignored_layers",
+            "is_checkpoint_fp8_serialized",
+            "store_dtype",
+            "weight_block_size",
+        )
+        return {
+            name: {
+                "method": resolved.get_name(),
+                **{field: cls._identity_value(getattr(resolved, field)) for field in fields},
+            }
+            for name in component_names
+            if (resolved := resolve_component_quant_config(config, name)) is not None
+        }
 
     @staticmethod
     def _snapshot_final_layout_tensors(model: nn.Module, names: Iterable[str]) -> dict[str, tuple[int, str]]:
@@ -218,18 +240,25 @@ class HWRLoaderMixin:
         *,
         load_format: str,
         sources: Sequence[object],
+        policy: FinalLayoutTensorPolicy | None = None,
         source_digest_cache: NodeSourceDigestCache | None = None,
+        quantization_identity: object | None = None,
+        canonical_sequence_parallel: bool = False,
     ) -> FinalLayoutIdentityContext:
         from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 
         from vllm_omni.diffusion.model_loader.host_weights import (
-            FINAL_LAYOUT_BF16_POLICY,
             FinalLayoutLoaderIdentity,
             FinalLayoutParallelIdentity,
             FinalLayoutRequest,
             ImplementationIdentity,
             build_final_layout_identity,
         )
+
+        if policy is None:
+            from vllm_omni.diffusion.model_loader.host_weights import FINAL_LAYOUT_BF16_POLICY
+
+            policy = FINAL_LAYOUT_BF16_POLICY
 
         parallel = self.parallel_config
         tp_size = int(getattr(parallel, "tensor_parallel_size", 1))
@@ -243,7 +272,7 @@ class HWRLoaderMixin:
             "model_class": f"{type(model).__module__}.{type(model).__qualname__}",
             "model_config": self._identity_value(getattr(self.od_config, "tf_model_config", None)),
             "load_format": load_format,
-            "quantization": self._identity_value(self.quant_config),
+            "quantization": quantization_identity,
         }
         contracts = [
             self._identity_value(getattr(dit, "host_weight_restore_contract")) for dit in getattr(modules, "dits", ())
@@ -280,6 +309,15 @@ class HWRLoaderMixin:
             use_hsdp=bool(getattr(parallel, "use_hsdp", False)),
             enable_expert_parallel=bool(getattr(parallel, "enable_expert_parallel", False)),
         )
+        if canonical_sequence_parallel:
+            semantic_parallel = dataclasses.replace(
+                semantic_parallel,
+                sequence_parallel_size=1,
+                ulysses_degree=1,
+                ring_degree=1,
+                allgather_degree=1,
+                ulysses_mode="strict",
+            )
         model_id = str(getattr(self.od_config, "model", "") or "")
         if not model_id:
             raise ValueError("final-layout HWR requires a canonical model identifier")
@@ -296,8 +334,164 @@ class HWRLoaderMixin:
             dit_modules=dit_modules,
             prepared_sources=prepared_sources,
             request=request,
-            policy=FINAL_LAYOUT_BF16_POLICY,
+            policy=policy,
             source_digest_cache=source_digest_cache,
+        )
+
+    def _build_hwr_runtime(
+        self,
+        mode: RuntimeMode,
+        *,
+        allow_local_build: bool,
+        allow_post_load_publish: bool = False,
+    ) -> HostWeightRuntime:
+        from vllm_omni.host_weight_runtime import (
+            HostWeightRuntime,
+            HostWeightRuntimeConfig,
+            ProductionPolicy,
+            StorageDomainPolicy,
+        )
+        from vllm_omni.host_weight_runtime.filesystem import detect_storage_class
+
+        root_value = getattr(self.od_config, "host_weight_runtime_root", None)
+        if not isinstance(root_value, str) or not root_value.strip():
+            raise ValueError("enabled Host Weight Runtime requires host_weight_runtime_root")
+        root = Path(root_value).expanduser()
+        return HostWeightRuntime.from_config(
+            HostWeightRuntimeConfig(
+                mode=mode,
+                domain=StorageDomainPolicy(root=root, storage_class=detect_storage_class(root)),
+                production=ProductionPolicy(
+                    allow_local_build=allow_local_build,
+                    allow_post_load_publish=allow_post_load_publish,
+                ),
+            )
+        )
+
+    @staticmethod
+    def _resolution_failure(resolution: HostWeightResolution) -> str:
+        report = resolution.report
+        failure = next(
+            (attempt.failure for attempt in reversed(report.attempts) if attempt.failure is not None),
+            None,
+        )
+        return failure.message if failure is not None else report.outcome.value
+
+    def _resolve_fp8_hwr(
+        self,
+        model: nn.Module,
+        modules: object,
+        *,
+        load_format: str,
+        device: torch.device,
+        sources: Sequence[object],
+    ) -> HostWeightPlan:
+        """Resolve one final-layout FP8 artifact through the shared HWR transaction."""
+        from vllm_omni.diffusion.model_loader.host_weight_plan import build_checkpoint_mmap_plan
+        from vllm_omni.diffusion.model_loader.host_weights import (
+            FINAL_LAYOUT_FP8_POLICY,
+            FinalLayoutFP8ModelPreparation,
+            FinalLayoutFP8Producer,
+            FinalLayoutTensorRestorer,
+            NodeSourceDigestCache,
+        )
+        from vllm_omni.diffusion.model_loader.host_weights.runtime_fp8 import (
+            RuntimeFP8UnavailableError,
+            validate_online_fp8,
+        )
+        from vllm_omni.host_weight_runtime import (
+            HostWeightLeaseCarrier,
+            ResolutionOutcome,
+            RuntimeMode,
+        )
+
+        dit_modules = tuple(zip(getattr(modules, "dit_names", ()), getattr(modules, "dits", ())))
+        validate_online_fp8(dit_modules)
+        parallel = self.parallel_config
+        checkpoint = build_checkpoint_mmap_plan(
+            model,
+            dit_modules=dit_modules,
+            sources=sources,
+            model_path=str(getattr(self.od_config, "model", "")) or None,
+            tensor_parallel_size=int(getattr(parallel, "tensor_parallel_size", 1)),
+            use_hsdp=bool(getattr(parallel, "use_hsdp", False)),
+            online_quantization=False,
+        )
+        if checkpoint.plan is None:
+            raise RuntimeFP8UnavailableError(checkpoint.fallback_reason or "checkpoint binding failed")
+
+        checkpoint_plan = checkpoint.plan
+        owned_sources = tuple(
+            source for source in sources if getattr(source, "prefix", "") in checkpoint_plan.planned_source_prefixes
+        )
+        mode = RuntimeMode(getattr(self.od_config, "host_weight_runtime_mode", "disabled"))
+        runtime = self._build_hwr_runtime(mode, allow_local_build=True)
+        domain = runtime.config.domain
+        assert domain is not None
+        digest_cache = NodeSourceDigestCache(
+            domain.root,
+            timeout_seconds=runtime.config.wait.coordination_timeout_seconds,
+        )
+
+        preparation = FinalLayoutFP8ModelPreparation(dit_modules)
+        preparation.prepare()
+        context = self._build_hwr_context(
+            model,
+            modules,
+            load_format=load_format,
+            sources=owned_sources,
+            policy=FINAL_LAYOUT_FP8_POLICY,
+            source_digest_cache=digest_cache,
+            quantization_identity=self._fp8_quantization_identity(
+                self.quant_config,
+                tuple(name for name, _ in dit_modules),
+            ),
+            canonical_sequence_parallel=True,
+        )
+        producer = FinalLayoutFP8Producer(
+            context,
+            model,
+            dit_modules,
+            checkpoint_plan,
+            device=device,
+        )
+        resolution = runtime.resolve(context.identity, producer=producer)
+        if resolution.report.outcome is ResolutionOutcome.CANONICAL_FALLBACK:
+            raise RuntimeFP8UnavailableError(self._resolution_failure(resolution))
+        if resolution.report.outcome is ResolutionOutcome.FAILED:
+            raise RuntimeError(f"Host Weight Runtime resolution failed: {self._resolution_failure(resolution)}")
+        lease = resolution.lease
+        assert lease is not None
+
+        try:
+            restore = FinalLayoutTensorRestorer(
+                context,
+                post_commit=preparation.activate_kernel_views,
+            ).plan_restore(model, lease)
+        except Exception as exc:
+            lease.close()
+            if mode is RuntimeMode.PREFERRED:
+                raise RuntimeFP8UnavailableError("runtime FP8 restore planning failed") from exc
+            raise
+        try:
+            restore.commit()
+        except Exception as exc:
+            lease.close()
+            raise _HWRCommitError(
+                "runtime FP8 restore commit failed; the partially restored model must be discarded"
+            ) from exc
+
+        logger.info(
+            "Resolved runtime FP8 host weights: outcome=%s, identity=%s",
+            resolution.report.outcome.value,
+            context.identity.key,
+        )
+        return HostWeightPlan(
+            backing_kind="host_weight_runtime",
+            bindings={name: TensorBinding(name, "") for name in context.tensor_names},
+            planned_source_prefixes=checkpoint_plan.planned_source_prefixes,
+            lease_carrier=HostWeightLeaseCarrier(lease),
+            runtime_mode=mode.value,
         )
 
     def _resolve_hwr(
@@ -317,14 +511,9 @@ class HWRLoaderMixin:
         )
         from vllm_omni.host_weight_runtime import (
             HostWeightLeaseCarrier,
-            HostWeightRuntime,
-            HostWeightRuntimeConfig,
-            ProductionPolicy,
             ResolutionOutcome,
             RuntimeMode,
-            StorageDomainPolicy,
         )
-        from vllm_omni.host_weight_runtime.filesystem import detect_storage_class
 
         mode = self._hwr_eligibility_mode(
             model,
@@ -355,22 +544,15 @@ class HWRLoaderMixin:
                 raise ValueError(f"required Host Weight Runtime path is ineligible: {message}")
             logger.info("Host Weight Runtime is ineligible; using the canonical DLO path: %s", message)
             return None
-        root_value = getattr(self.od_config, "host_weight_runtime_root", None)
-        if not isinstance(root_value, str) or not root_value.strip():
-            raise ValueError("enabled Host Weight Runtime requires host_weight_runtime_root")
-        root = Path(root_value).expanduser()
-        runtime = HostWeightRuntime.from_config(
-            HostWeightRuntimeConfig(
-                mode=mode,
-                domain=StorageDomainPolicy(root=root, storage_class=detect_storage_class(root)),
-                production=ProductionPolicy(
-                    allow_local_build=False,
-                    allow_post_load_publish=True,
-                ),
-            )
+        runtime = self._build_hwr_runtime(
+            mode,
+            allow_local_build=False,
+            allow_post_load_publish=True,
         )
+        domain = runtime.config.domain
+        assert domain is not None
         source_digest_cache = NodeSourceDigestCache(
-            root,
+            domain.root,
             timeout_seconds=runtime.config.wait.coordination_timeout_seconds,
         )
         context = self._build_hwr_context(
@@ -388,12 +570,7 @@ class HWRLoaderMixin:
             "outcome": resolution.report.outcome,
         }
         if resolution.report.outcome is ResolutionOutcome.FAILED:
-            failure = next(
-                (attempt.failure for attempt in reversed(resolution.report.attempts) if attempt.failure is not None),
-                None,
-            )
-            detail = failure.message if failure is not None else "resolution failed without a typed detail"
-            raise RuntimeError(f"Host Weight Runtime resolution failed: {detail}")
+            raise RuntimeError(f"Host Weight Runtime resolution failed: {self._resolution_failure(resolution)}")
         if resolution.report.outcome is not ResolutionOutcome.LOCAL_HIT:
             return state
 
@@ -442,6 +619,7 @@ class HWRLoaderMixin:
             bindings={name: TensorBinding(name, "") for name in context.tensor_names},
             planned_source_prefixes=planned_prefixes,
             lease_carrier=carrier,
+            runtime_mode=mode.value,
         )
         state["warm_snapshot"] = warm_snapshot
         return state
@@ -480,13 +658,9 @@ class HWRLoaderMixin:
         if self.host_weight_plan is None:
             return
         from vllm_omni.diffusion.offloader.startup import OffloadStartupState, attach_offload_startup_state
+        from vllm_omni.host_weight_runtime import RuntimeMode
 
-        hwr_state = self._hwr_state
-        allow_retry = False
-        if hwr_state is not None and isinstance(hwr_state.get("plan"), HostWeightPlan):
-            from vllm_omni.host_weight_runtime import RuntimeMode
-
-            allow_retry = hwr_state.get("mode") is RuntimeMode.PREFERRED
+        allow_retry = self.host_weight_plan.runtime_mode == RuntimeMode.PREFERRED.value
         attach_offload_startup_state(
             model,
             OffloadStartupState(
