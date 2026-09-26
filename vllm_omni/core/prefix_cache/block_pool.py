@@ -56,6 +56,10 @@ class PrefixBlockPool:
         self._caches[key] = storage
         logger.info("prefix_cache: initialized mirror %s for key %s", list(storage.shape), key)
 
+    def remove_key(self, key: str) -> None:
+        """Remove an unpublished key after a failed manager transaction."""
+        self._caches.pop(key, None)
+
     def ensure_key(self, key: str, dtype: torch.dtype, feat: int) -> None:
         storage = self.alloc_key(key, dtype, feat)
         if storage is not None:

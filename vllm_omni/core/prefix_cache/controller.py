@@ -684,6 +684,12 @@ class OmniPrefixCacheController:
             for ticket in tickets:
                 self._staged_bytes -= ticket.release(task.tid)
 
+    def release_unpinned_budget(self, ticket: _BudgetTicket) -> None:
+        """Uncharge a reserved clone if a failed save never handed it to a task."""
+        with self._wake:
+            if not ticket.tids:
+                self._staged_bytes -= ticket.release(0)
+
     def _reserve_bytes(self, nbytes: int) -> None:
         # GPU-byte budget: force-copy oldest pending tasks until under
         # budget. Bounded wait: their device→host has usually long completed.
@@ -775,6 +781,42 @@ class OmniPrefixCacheController:
 
     def get_task(self, tid: int) -> WriteTask | None:
         return self._tasks.get(tid)
+
+    def task_ids(self) -> set[int]:
+        """Return registered task ids for manager-side publish transactions."""
+        with self._lock:
+            return set(self._tasks)
+
+    def discard_unpublished(self, tids: Iterable[int]) -> None:
+        """Drop tasks registered before dispatch when publish aborts.
+
+        The manager registers tasks while holding its state lock and dispatches
+        them only after publish returns. Such tasks must still be PENDING or
+        QUEUED, so they can be removed without racing the worker.
+        """
+        pending: list[WriteTask] = []
+        with self._wake:
+            for tid in tids:
+                task = self._tasks.get(tid)
+                if task is None:
+                    continue
+                if task.state not in _NOT_YET_COPYING:
+                    raise OmniPrefixCacheUnmatchError(
+                        f"cannot roll back task {tid} after dispatch (state={task.state.name})"
+                    )
+                self._tasks.pop(tid, None)
+                try:
+                    self._queue_hi.remove(tid)
+                except ValueError:
+                    pass
+                try:
+                    self._queue_lo.remove(tid)
+                except ValueError:
+                    pass
+                pending.append(task)
+        for task in pending:
+            self._release_staged_bytes(task)
+            self._release_task_slot(task)
 
     def shutdown(self) -> None:
         self._staging_pool.close()

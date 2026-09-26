@@ -2064,6 +2064,95 @@ def test_save_releases_staging_if_commit_drained_writes_fails():
     mgr.materialize(sid, ["a"])
 
 
+def test_publish_failure_rolls_back_registered_tasks(monkeypatch):
+    mgr, view = make_manager()
+    real_stage = mgr._stage_deferred
+
+    def fail_after_immediate_registration(*args, **kwargs):
+        raise RuntimeError("injected publish failure")
+
+    monkeypatch.setattr(mgr, "_stage_deferred", fail_after_immediate_registration)
+    with pytest.raises(RuntimeError, match="injected publish failure"):
+        run_step(mgr, view, {"a": ([0], 0, 4)})
+    assert not mgr._controller.task_ids()
+    assert not mgr._request_tasks.tasks
+    assert not mgr._request_tasks.deferred
+    assert not mgr._step_ctxs
+    assert all(not busy for busy in mgr._controller._staging_pool._busy)
+    assert mgr._controller._staged_bytes == 0
+
+    monkeypatch.setattr(mgr, "_stage_deferred", real_stage)
+    sid = run_step(mgr, view, {"a": ([0], 0, 4)})
+    mgr.materialize(sid, ["a"])
+    mgr.shutdown()
+
+
+def test_publish_failure_before_task_registration_releases_reserved_budget(monkeypatch):
+    mgr, view = make_manager()
+    real_submit = mgr._submit_step_writes
+
+    def fail_before_registration(*args, **kwargs):
+        raise RuntimeError("injected registration failure")
+
+    monkeypatch.setattr(mgr, "_submit_step_writes", fail_before_registration)
+    with pytest.raises(RuntimeError, match="injected registration failure"):
+        run_step(mgr, view, {"a": ([0], 0, 4)})
+    assert mgr._controller._staged_bytes == 0
+    assert not mgr._controller.task_ids()
+    assert all(not busy for busy in mgr._controller._staging_pool._busy)
+
+    monkeypatch.setattr(mgr, "_submit_step_writes", real_submit)
+    sid = run_step(mgr, view, {"a": ([0], 0, 4)})
+    mgr.materialize(sid, ["a"])
+    mgr.shutdown()
+
+
+def test_publish_failure_restores_existing_deferred_writer(monkeypatch):
+    policy = ModelCachePolicy(deferred_keys=frozenset({"codes.audio"}))
+    mgr, view = make_manager(policy=policy)
+    mm = {"codes.audio": torch.ones((4, HIDDEN), dtype=DTYPE)}
+    first = run_step(mgr, view, {"a": ([0], 0, 4)}, mm=mm)
+    mgr.materialize(first, ["a"])
+    task = mgr._request_tasks.deferred["a"]
+    original_chunks = list(task.chunks)
+    original_budget = mgr._controller._staged_bytes
+    original_presence = mgr._slot_status.presence["codes.audio"].clone()
+    original_versions = mgr._slot_status.slot_versions["codes.audio"].clone()
+    real_stage = mgr._stage_deferred
+
+    def fail_after_deferred_append(*args, **kwargs):
+        real_stage(*args, **kwargs)
+        raise RuntimeError("injected post-append failure")
+
+    monkeypatch.setattr(mgr, "_stage_deferred", fail_after_deferred_append)
+    with pytest.raises(RuntimeError, match="injected post-append failure"):
+        run_step(mgr, view, {"a": ([0, 1], 4, 4)}, new_hits={"a": 4}, mm=mm)
+    assert mgr._request_tasks.deferred["a"] is task
+    assert task.chunks == original_chunks
+    assert mgr._controller._staged_bytes == original_budget
+    assert torch.equal(mgr._slot_status.presence["codes.audio"], original_presence)
+    assert torch.equal(mgr._slot_status.slot_versions["codes.audio"], original_versions)
+    assert not mgr._step_ctxs
+
+    monkeypatch.setattr(mgr, "_stage_deferred", real_stage)
+    sid = run_step(mgr, view, {"a": ([0, 1], 4, 4)}, mm=mm)
+    mgr.materialize(sid, ["a"])
+    mgr.shutdown()
+
+
+def test_materialize_rejects_missing_read_plan_instead_of_replanning():
+    mgr, view = make_manager()
+    seed = run_step(mgr, view, {"seed": ([0], 0, 4)})
+    mgr.materialize(seed, ["seed"])
+    sid = run_step(mgr, view, {"a": ([0, 1], 4, 1)}, new_hits={"a": 4})
+    ctx = mgr._step_ctxs[sid]
+    ctx.hit_plans["a"].pop(HIDDEN_KEY)
+    ctx.hit_prefetch["a"].pop(HIDDEN_KEY).cancel()
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="read plan missing"):
+        mgr.materialize(sid, ["a"])
+    mgr.shutdown()
+
+
 def test_fetch_host_maps_slots_across_layouts():
     """Identity, prefix, gapped, and a two-`_WriteChunk` gather."""
     from vllm_omni.core.prefix_cache.block_pool import PrefixBlockPool
