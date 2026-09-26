@@ -114,11 +114,15 @@ class BaseScheduler(ABC):
                 raise ValueError("paged_scheduler Diffusion KV requires native scheduler/hash block sizes")
             if kv_vllm_config is None:
                 raise ValueError("paged_scheduler Diffusion KV requires the native VllmConfig used for cache sizing")
+            max_rows_per_request = od_config.diffusion_kv_max_rows_per_request
+            if max_rows_per_request is None:
+                raise ValueError("paged_scheduler Diffusion KV requires diffusion_kv_max_rows_per_request")
             self._diffusion_kv_manager = DiffusionKVCacheManager(
                 kv_cache_config,
                 max_model_len=kv_vllm_config.model_config.max_model_len,
                 scheduler_block_size=scheduler_block_size,
                 hash_block_size=hash_block_size,
+                max_rows_per_request=max_rows_per_request,
                 max_in_flight_tokens=kv_vllm_config.max_in_flight_tokens,
                 enable_prefix_caching=bool(getattr(kv_vllm_config.cache_config, "enable_prefix_caching", False)),
                 prefix_caching_hash_algo=getattr(

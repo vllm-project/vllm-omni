@@ -345,8 +345,12 @@ def _runner(
         device="cuda:1",
     )
     backend._kv_cache_layer_adapters = {
-        "layer-0": SimpleNamespace(spec=SimpleNamespace(non_causal=False), kv_cache=None),
-        "layer-1": SimpleNamespace(spec=SimpleNamespace(non_causal=False), kv_cache=None),
+        "layer-0": SimpleNamespace(spec=SimpleNamespace(non_causal=False), kv_cache=None, cache_role="primary"),
+        "layer-1": SimpleNamespace(
+            spec=SimpleNamespace(non_causal=False),
+            kv_cache=None,
+            cache_role="cross_attention",
+        ),
     }
 
     config = SimpleNamespace(
@@ -420,8 +424,16 @@ def test_initialize_failure_does_not_publish_partial_cache_state(
         device="cuda:1",
     )
     backend._kv_cache_layer_adapters = {
-        "layer-0": SimpleNamespace(spec=SimpleNamespace(non_causal=False), kv_cache="placeholder-0"),
-        "layer-1": SimpleNamespace(spec=SimpleNamespace(non_causal=False), kv_cache="placeholder-1"),
+        "layer-0": SimpleNamespace(
+            spec=SimpleNamespace(non_causal=False),
+            kv_cache="placeholder-0",
+            cache_role="primary",
+        ),
+        "layer-1": SimpleNamespace(
+            spec=SimpleNamespace(non_causal=False),
+            kv_cache="placeholder-1",
+            cache_role="cross_attention",
+        ),
     }
     config = SimpleNamespace(
         num_blocks=32,
@@ -460,7 +472,11 @@ def test_initialize_rejects_config_for_different_registered_layers() -> None:
         device="cuda:1",
     )
     backend._kv_cache_layer_adapters = {
-        "expected-layer": SimpleNamespace(spec=SimpleNamespace(non_causal=False), kv_cache=None)
+        "expected-layer": SimpleNamespace(
+            spec=SimpleNamespace(non_causal=False),
+            kv_cache=None,
+            cache_role="primary",
+        )
     }
     config = SimpleNamespace(
         kv_cache_groups=[SimpleNamespace(layer_names=["other-layer"])],
@@ -494,6 +510,19 @@ def test_valid_sequence_and_context_install_into_native_rows(monkeypatch: pytest
         5,
         ((6, 7), (8,)),
     )
+    assert sequence_binding.cache_role == "primary"
+    assert context_binding.cache_role == "cross_attention"
+
+
+def test_context_install_rejects_unregistered_cache_role(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner, block_tables, _ = _runner(monkeypatch)
+    unknown = replace(_metadata().contexts[0], cache_role="unknown")
+
+    with pytest.raises(ValueError, match="unregistered cache role 'unknown'"):
+        runner.install_diffusion_kv_metadata(_metadata(contexts=(unknown,)))
+
+    assert block_tables.append_calls == []
+    assert runner._diffusion_kv_identity_to_row == {}
 
 
 def test_block_table_mutations_invalidate_prepared_attention_batches(

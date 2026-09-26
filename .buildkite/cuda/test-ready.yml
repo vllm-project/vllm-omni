@@ -41,7 +41,7 @@ steps:
       - label: "Diffusion · FlashAttention Test"
         timeout_in_minutes: 20
         commands:
-          - timeout 15m pytest -s -v tests/diffusion/attention/ -m 'core_model and cuda and L4 and cards_1' --run-level "core_model"
+          - timeout 15m pytest -s -v tests/diffusion/attention/ tests/diffusion/diffusion_kv/ -m 'core_model and cuda and L4 and cards_1' --run-level "core_model"
         mirror_hardwares: l4_1
 
       - label: "Diffusion · Offloader Test"

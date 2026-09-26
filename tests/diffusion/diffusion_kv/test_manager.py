@@ -57,6 +57,7 @@ def _manager(
     num_blocks: int,
     *,
     max_model_len: int = 64,
+    max_rows_per_request: int = 4,
     enable_prefix_caching: bool = False,
 ) -> DiffusionKVCacheManager:
     return DiffusionKVCacheManager(
@@ -64,6 +65,7 @@ def _manager(
         max_model_len=max_model_len,
         scheduler_block_size=BLOCK_SIZE,
         hash_block_size=BLOCK_SIZE,
+        max_rows_per_request=max_rows_per_request,
         enable_prefix_caching=enable_prefix_caching,
     )
 
@@ -299,11 +301,157 @@ def test_cfg_allocation_exception_rolls_back(monkeypatch) -> None:
     assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
 
 
-def test_rejects_independent_context_until_role_routing_is_implemented() -> None:
+def test_reserves_request_scoped_context_and_releases_it_with_the_request() -> None:
     manager = _manager(8)
+    free_before = manager.native_manager.block_pool.get_num_free_blocks()
+    context = DiffusionKVContext(context_id="text", cache_role="cross.text", num_tokens=8)
+    requests = (_request("public", 0, kv_contexts=(context,)),)
+
+    metadata = manager.reserve_request("public", requests)
+
+    assert metadata is not None
+    assert metadata.sequences[0].context_ids == ("text",)
+    assert len(metadata.contexts) == 1
+    assert metadata.contexts[0].context_id == "text"
+    assert metadata.contexts[0].cache_role == "cross.text"
+    assert metadata.contexts[0].num_tokens == 8
+    assert len(metadata.contexts[0].block_ids[0]) == 2
+    assert manager._requests["public"] == requests
+    assert [request.request_id for request in manager._context_requests["public"]] == [
+        "public/diffusion-kv/context/text"
+    ]
+    assert manager.native_manager.block_pool.get_num_free_blocks() == free_before - 4
+
+    manager.free_request("public")
+    assert "public" not in manager._context_requests
+    assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
+
+
+def test_context_with_block_hashes_never_reads_the_prefix_cache(monkeypatch) -> None:
+    manager = _manager(8, enable_prefix_caching=True)
+    free_before = manager.native_manager.block_pool.get_num_free_blocks()
+    context = DiffusionKVContext(context_id="ar", cache_role="ar_decode", num_tokens=8, block_hashes=(b"h0", b"h1"))
+    looked_up = []
+    real_lookup = manager.native_manager.get_computed_blocks
+
+    def recording_lookup(request):
+        looked_up.append(request.request_id)
+        return real_lookup(request)
+
+    monkeypatch.setattr(manager.native_manager, "get_computed_blocks", recording_lookup)
+
+    metadata = manager.reserve_request("public", (_request("public", 0, kv_contexts=(context,)),))
+
+    assert metadata is not None
+    assert all(shim.skip_reading_prefix_cache for shim in manager._context_requests["public"])
+    assert "public/diffusion-kv/context/ar" not in looked_up
+    manager.free_request("public")
+    assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
+
+
+def test_shared_context_is_allocated_once_for_multiple_sequences() -> None:
+    manager = _manager(8)
+    free_before = manager.native_manager.block_pool.get_num_free_blocks()
     context = DiffusionKVContext(context_id="text", cache_role="cross.text", num_tokens=8)
 
-    with pytest.raises(DiffusionKVAdmissionError, match="DiffusionKVContext"):
+    metadata = manager.reserve_request(
+        "public",
+        (
+            _request("public", 0, kv_contexts=(context,)),
+            _request("public", 1, kv_contexts=(context,)),
+        ),
+    )
+
+    assert metadata is not None
+    assert [sequence.context_ids for sequence in metadata.sequences] == [("text",), ("text",)]
+    assert [context_metadata.context_id for context_metadata in metadata.contexts] == ["text"]
+    assert manager.native_manager.block_pool.get_num_free_blocks() == free_before - 6
+
+
+def test_conflicting_shared_context_definitions_are_rejected_before_allocation() -> None:
+    manager = _manager(8)
+    free_before = manager.native_manager.block_pool.get_num_free_blocks()
+    text = DiffusionKVContext(context_id="shared", cache_role="cross.text", num_tokens=8)
+    image = DiffusionKVContext(context_id="shared", cache_role="cross.image", num_tokens=8)
+
+    with pytest.raises(ValueError, match="conflicting request-scoped contexts"):
+        manager.reserve_request(
+            "public",
+            (
+                _request("public", 0, kv_contexts=(text,)),
+                _request("public", 1, kv_contexts=(image,)),
+            ),
+        )
+
+    assert manager.has_request("public") is False
+    assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
+
+
+def test_context_allocation_failure_rolls_back_sequences_and_earlier_contexts(monkeypatch) -> None:
+    manager = _manager(12)
+    free_before = manager.native_manager.block_pool.get_num_free_blocks()
+    native_allocate = manager.native_manager.allocate_slots
+    num_calls = 0
+
+    def fail_third_allocation(*args, **kwargs):
+        nonlocal num_calls
+        num_calls += 1
+        if num_calls == 3:
+            raise RuntimeError("injected context allocation failure")
+        return native_allocate(*args, **kwargs)
+
+    monkeypatch.setattr(manager.native_manager, "allocate_slots", fail_third_allocation)
+    contexts = (
+        DiffusionKVContext(context_id="text", cache_role="cross.text", num_tokens=8),
+        DiffusionKVContext(context_id="image", cache_role="cross.image", num_tokens=8),
+    )
+
+    with pytest.raises(RuntimeError, match="injected context allocation failure"):
+        manager.reserve_request(
+            "public",
+            (_request("public", 0, kv_contexts=contexts),),
+        )
+
+    assert manager.has_request("public") is False
+    assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
+
+
+def test_context_capacity_pressure_rolls_back_partial_request() -> None:
+    manager = _manager(5)
+    assert manager.reserve_request("running", (_request("running", 0),)) is not None
+    free_before = manager.native_manager.block_pool.get_num_free_blocks()
+    context = DiffusionKVContext(context_id="text", cache_role="cross.text", num_tokens=8)
+
+    allocation = manager.reserve_request(
+        "waiting",
+        (_request("waiting", 0, kv_contexts=(context,)),),
+    )
+
+    assert allocation is None
+    assert manager.has_request("waiting") is False
+    assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
+
+
+def test_rejects_request_whose_contexts_can_never_fit_the_empty_pool() -> None:
+    # Three free blocks hold the two-block sequence but not the two-block
+    # context beside it. Without the context term the bound would admit the
+    # request, allocation would fail on every tick, and it would wait forever.
+    manager = _manager(4)
+    context = DiffusionKVContext(context_id="text", cache_role="cross.text", num_tokens=8)
+
+    with pytest.raises(DiffusionKVAdmissionError, match="cannot fit even when the block pool is empty"):
+        manager.reserve_request(
+            "public",
+            (_request("public", 0, kv_contexts=(context,)),),
+        )
+    assert manager.has_request("public") is False
+
+
+def test_rejects_context_longer_than_admission_bound() -> None:
+    manager = _manager(8, max_model_len=8)
+    context = DiffusionKVContext(context_id="text", cache_role="cross.text", num_tokens=9)
+
+    with pytest.raises(DiffusionKVAdmissionError, match="context 'text' exceeds max_model_len"):
         manager.reserve_request(
             "public",
             (_request("public", 0, kv_contexts=(context,)),),

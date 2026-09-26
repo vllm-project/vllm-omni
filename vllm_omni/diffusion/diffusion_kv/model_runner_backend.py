@@ -41,6 +41,7 @@ class _DiffusionKVRowInstall:
     identity: DiffusionKVIdentity
     token_len: int
     block_ids: tuple[tuple[int, ...], ...]
+    cache_role: str = "primary"
 
 
 @dataclass(frozen=True)
@@ -326,12 +327,15 @@ class DiffusionKVModelRunnerBackend:
         token_len: int,
         block_ids: tuple[list[int], ...],
         seen_identities: set[DiffusionKVIdentity],
+        cache_role: str = "primary",
     ) -> _DiffusionKVRowInstall:
         if identity in seen_identities:
             raise ValueError(f"Duplicate diffusion KV row identity: {identity!r}")
         seen_identities.add(identity)
         if type(token_len) is not int or token_len < 0:
             raise ValueError(f"Diffusion KV row {identity!r} has invalid token length {token_len!r}")
+        if type(cache_role) is not str or not cache_role:
+            raise ValueError(f"Diffusion KV row {identity!r} has invalid cache role {cache_role!r}")
 
         assert self.kv_cache_config is not None
         groups = self.kv_cache_config.kv_cache_groups
@@ -374,6 +378,7 @@ class DiffusionKVModelRunnerBackend:
             identity=identity,
             token_len=token_len,
             block_ids=tuple(normalized_groups),
+            cache_role=cache_role,
         )
 
     def _prepare_install(
@@ -427,15 +432,22 @@ class DiffusionKVModelRunnerBackend:
             )
 
         context_snapshots: list[object] = []
+        registered_cache_roles = {adapter.cache_role for adapter in self._kv_cache_layer_adapters.values()}
         for context in metadata.contexts:
             if type(context.context_id) is not str or not context.context_id:
                 raise ValueError("Diffusion KV context_id must be a non-empty string")
+            if context.cache_role not in registered_cache_roles:
+                raise ValueError(
+                    f"Diffusion KV context {context.context_id!r} uses unregistered cache role "
+                    f"{context.cache_role!r}; registered roles={sorted(registered_cache_roles)!r}"
+                )
             context_identity = (metadata.request_id, None, context.context_id)
             context_install = self._validate_row(
                 identity=context_identity,
                 token_len=context.num_tokens,
                 block_ids=context.block_ids,
                 seen_identities=seen_identities,
+                cache_role=context.cache_role,
             )
             installs.append(context_install)
             context_snapshots.append(
@@ -601,6 +613,7 @@ class DiffusionKVModelRunnerBackend:
                         row_index=row_index,
                         max_seq_len=install.token_len,
                         block_ids=install.block_ids,
+                        cache_role=install.cache_role,
                     )
         raise RuntimeError(f"Diffusion KV request state is missing logical length for {identity!r}")
 
