@@ -815,6 +815,26 @@ class TestSpeechAPI:
         assert response.status_code == 400
         assert "finite" in response.json()["detail"]
 
+    @pytest.mark.parametrize(
+        ("consent", "expected_message"),
+        [
+            ("", "consent cannot be empty or whitespace"),
+            ("   ", "consent cannot be empty or whitespace"),
+            ("consent/id", "consent must not contain path separators or NUL"),
+            ("c" * 1025, "consent too long"),
+        ],
+    )
+    def test_upload_voice_embedding_invalid_consent_rejected(self, client, consent, expected_message):
+        """Embedding uploads apply the same consent safeguards as audio uploads."""
+        data = {
+            "speaker_embedding": json.dumps([0.1] * 1024),
+            "consent": consent,
+            "name": "invalid_consent_embedding",
+        }
+        response = client.post("/v1/audio/voices", data=data)
+        assert response.status_code == 400
+        assert expected_message in response.json()["detail"]
+
     @pytest.mark.asyncio
     async def test_diffusion_create_speech_with_unknown_voice(self, mocker: MockerFixture):
         engine_client = mocker.MagicMock()
@@ -3783,6 +3803,28 @@ class TestSpeechBatchAPI:
         response = client.post("/v1/audio/speech/batch", json=payload)
         body = response.json()
         assert body["id"].startswith("speech-batch-")
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {
+                "task_type": "CustomVoice",
+                "voice": "default",
+                "items": [{"input": "Hello"}],
+            },
+            {
+                "task_type": "CustomVoice",
+                "items": [{"input": "Hello", "voice": "default"}],
+            },
+        ],
+    )
+    def test_batch_default_voice_is_treated_as_placeholder(self, client, payload):
+        """The API placeholder voice should follow single-request normalization in batches."""
+        response = client.post("/v1/audio/speech/batch", json=payload)
+        assert response.status_code == 200
+        assert response.json()["succeeded"] == 1
+        handler = client.app.state.openai_serving_speech
+        assert handler._validate_tts_request.call_args.args[0].voice is None
 
 
 class TestMergeBatchItem:

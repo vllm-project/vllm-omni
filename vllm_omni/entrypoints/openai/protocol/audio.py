@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import math
 from typing import Annotated, Any, Literal
+from urllib.parse import urlparse
 
 import numpy as np
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
@@ -193,6 +194,13 @@ class OpenAICreateSpeechRequest(BaseModel):
             "/v1/audio/speech/stream path."
         ),
     )
+
+    @field_validator("voice")
+    @classmethod
+    def validate_voice_not_empty(cls, v: str | None) -> str | None:
+        if v is not None and not v.strip():
+            raise ValueError("Invalid voice: voice cannot be empty or whitespace")
+        return v
 
     @field_validator("stream_format")
     @classmethod
@@ -443,6 +451,53 @@ class AudioResponse(BaseModel):
 # --- Batch Speech Models ---
 
 
+_SPEECH_MAX_INSTRUCTIONS_LENGTH = 500
+_SPEECH_MAX_NEW_TOKENS_MIN = 1
+_SPEECH_MAX_NEW_TOKENS_MAX = 4096
+
+_SPEECH_REF_AUDIO_VALID_SCHEMES = frozenset({"http", "https", "data", "file"})
+_REF_AUDIO_FORMAT_ERROR = "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
+
+
+def _validate_voice_not_empty(v: str | None) -> str | None:
+    if v is not None and not v.strip():
+        raise ValueError("Invalid voice: voice cannot be empty or whitespace")
+    return v
+
+
+def _validate_instructions_length(v: str | None) -> str | None:
+    if v is not None and len(v) > _SPEECH_MAX_INSTRUCTIONS_LENGTH:
+        raise ValueError(f"Instructions too long (max {_SPEECH_MAX_INSTRUCTIONS_LENGTH} characters)")
+    return v
+
+
+def _validate_max_new_tokens_range(v: int | None) -> int | None:
+    if v is not None:
+        if v < _SPEECH_MAX_NEW_TOKENS_MIN:
+            raise ValueError(f"max_new_tokens must be at least {_SPEECH_MAX_NEW_TOKENS_MIN}")
+        if v > _SPEECH_MAX_NEW_TOKENS_MAX:
+            raise ValueError(f"max_new_tokens cannot exceed {_SPEECH_MAX_NEW_TOKENS_MAX}")
+    return v
+
+
+def _validate_ref_audio_format(ref_audio: str) -> str | None:
+    """Validate a reference-audio URI and return an error message, if invalid."""
+    if not isinstance(ref_audio, str):
+        return _REF_AUDIO_FORMAT_ERROR
+    scheme = (urlparse(ref_audio).scheme or "").lower()
+    if scheme not in _SPEECH_REF_AUDIO_VALID_SCHEMES:
+        return _REF_AUDIO_FORMAT_ERROR
+    return None
+
+
+def _validate_ref_audio_uri(v: str | None) -> str | None:
+    if v is not None:
+        error = _validate_ref_audio_format(v)
+        if error:
+            raise ValueError(error)
+    return v
+
+
 class SpeechBatchItem(BaseModel):
     """Per-item input for batch speech. Only `input` is required;
     all other fields override the batch-level defaults when set."""
@@ -461,6 +516,33 @@ class SpeechBatchItem(BaseModel):
     max_new_tokens: int | None = Field(default=None, ge=1, le=_INT64_MAX)
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0, le=_INT64_MAX)
     non_streaming_mode: bool | None = None
+
+    @field_validator("input")
+    @classmethod
+    def validate_input_not_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("input cannot be empty")
+        return v
+
+    @field_validator("voice")
+    @classmethod
+    def validate_voice(cls, v: str | None) -> str | None:
+        return _validate_voice_not_empty(v)
+
+    @field_validator("instructions")
+    @classmethod
+    def validate_instructions(cls, v: str | None) -> str | None:
+        return _validate_instructions_length(v)
+
+    @field_validator("max_new_tokens")
+    @classmethod
+    def validate_max_new_tokens(cls, v: int | None) -> int | None:
+        return _validate_max_new_tokens_range(v)
+
+    @field_validator("ref_audio")
+    @classmethod
+    def validate_ref_audio(cls, v: str | None) -> str | None:
+        return _validate_ref_audio_uri(v)
 
 
 class BatchSpeechRequest(BaseModel):
@@ -482,6 +564,26 @@ class BatchSpeechRequest(BaseModel):
     max_new_tokens: int | None = Field(default=None, ge=1, le=_INT64_MAX)
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0, le=_INT64_MAX)
     non_streaming_mode: bool | None = None
+
+    @field_validator("voice")
+    @classmethod
+    def validate_voice(cls, v: str | None) -> str | None:
+        return _validate_voice_not_empty(v)
+
+    @field_validator("instructions")
+    @classmethod
+    def validate_instructions(cls, v: str | None) -> str | None:
+        return _validate_instructions_length(v)
+
+    @field_validator("max_new_tokens")
+    @classmethod
+    def validate_max_new_tokens(cls, v: int | None) -> int | None:
+        return _validate_max_new_tokens_range(v)
+
+    @field_validator("ref_audio")
+    @classmethod
+    def validate_ref_audio(cls, v: str | None) -> str | None:
+        return _validate_ref_audio_uri(v)
 
 
 class SpeechInputTokenDetails(BaseModel):

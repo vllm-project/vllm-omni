@@ -49,6 +49,9 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     SpeechInputTokenDetails,
     SpeechTokenUsage,
 )
+from vllm_omni.entrypoints.openai.protocol.audio import (
+    _validate_ref_audio_format as _validate_ref_audio_uri_format,
+)
 from vllm_omni.entrypoints.openai.speech_usage import (
     SpeechOutputTokenCounter,
     build_speech_usage,
@@ -113,6 +116,9 @@ _REMOTE_REF_AUDIO_SCHEMES = frozenset({"http", "https", "data"})
 _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES = 1024
 _REF_AUDIO_RESOLVE_CACHE_MAX_BYTES = 512 * 1024 * 1024
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
+_VOICE_UPLOAD_MAX_CONSENT_LEN = 1024
+_VOICE_UPLOAD_MAX_REF_TEXT_CHARS = 8192
+_VOICE_UPLOAD_MAX_SPEAKER_DESC_CHARS = 2048
 _DEFAULT_VOICE_NAME = "default"
 
 
@@ -200,6 +206,19 @@ def _validate_speaker_name(name: str) -> str:
     if not trimmed or trimmed in (".", "..") or any(c in trimmed for c in "/\\\x00"):
         raise ValueError(f"Invalid voice name {name!r}: must be non-empty, no path separators or NUL")
     return trimmed
+
+
+def _validate_voice_upload_consent(consent: str) -> str:
+    """Validate the consent identifier used in uploaded voice metadata and filenames."""
+    if not consent or not consent.strip():
+        raise ValueError("consent cannot be empty or whitespace")
+    if any(c in consent for c in "/\\\x00"):
+        raise ValueError("consent must not contain path separators or NUL")
+    if len(consent) > _VOICE_UPLOAD_MAX_CONSENT_LEN:
+        raise ValueError(
+            f"consent too long ({len(consent)} chars, max {_VOICE_UPLOAD_MAX_CONSENT_LEN}). Failed to save voice."
+        )
+    return consent
 
 
 def _validate_path_within_directory(file_path: Path, directory: Path) -> bool:
@@ -870,6 +889,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     ) -> dict:
         """Upload a new voice sample."""
         name = _validate_speaker_name(name)
+        consent = _validate_voice_upload_consent(consent)
+        if ref_text is not None and len(ref_text) > _VOICE_UPLOAD_MAX_REF_TEXT_CHARS:
+            raise ValueError(f"ref_text too long ({len(ref_text)} chars, max {_VOICE_UPLOAD_MAX_REF_TEXT_CHARS})")
+        if speaker_description is not None and len(speaker_description) > _VOICE_UPLOAD_MAX_SPEAKER_DESC_CHARS:
+            raise ValueError(
+                f"speaker_description too long ({len(speaker_description)} chars, "
+                f"max {_VOICE_UPLOAD_MAX_SPEAKER_DESC_CHARS})"
+            )
+
         # Normalize optional strings: treat whitespace-only as absent
         if ref_text is not None:
             ref_text = ref_text.strip() or None
@@ -1023,6 +1051,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             dict with voice information.
         """
         name = _validate_speaker_name(name)
+        consent = _validate_voice_upload_consent(consent)
         try:
             embedding = json.loads(embedding_json)
         except (json.JSONDecodeError, TypeError) as exc:
@@ -1169,12 +1198,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _validate_ref_audio_format(self, ref_audio: str | list[str] | None) -> str | None:
         """Validate ref_audio is a supported URI format. Returns error or None."""
-        if not isinstance(ref_audio, str):
-            return "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
-        scheme = (urlparse(ref_audio).scheme or "").lower()
-        if scheme not in {"http", "https", "data", "file"}:
-            return "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
-        return None
+        return _validate_ref_audio_uri_format(ref_audio)
 
     @staticmethod
     def _local_ref_audio_stat_path(ref_audio_str: str) -> str | None:
@@ -2732,6 +2756,60 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
 
+    def _pre_validate_batch(self, batch: BatchSpeechRequest) -> None:
+        """Validate batch-level and item-level fields before per-item processing.
+
+        Raises ValueError so the API handler returns HTTP 400 rather than
+        embedding the error inside per-item batch results.
+        """
+        batch_task = batch.task_type
+        available_speakers = self._get_available_speakers()
+        supported_languages = (
+            self._adapter.capabilities.supported_languages if self._adapter is not None else frozenset()
+        )
+
+        def _check_voice(voice: str, task_type: str | None) -> None:
+            effective_task = task_type or batch_task
+            if effective_task != "CustomVoice":
+                return
+            voice_lower = voice.lower()
+            if _is_default_voice(voice_lower, available_speakers):
+                return
+            if voice_lower not in available_speakers:
+                supported = ", ".join(sorted(available_speakers)) or "none"
+                raise ValueError(f"Invalid voice '{voice}'. Supported: {supported}")
+
+        def _check_language(language: str) -> None:
+            lang_title = language.title()
+            if not language.strip() or lang_title not in supported_languages:
+                supported = ", ".join(sorted(supported_languages))
+                raise ValueError(f"Invalid language '{language}'. Supported: {supported}")
+
+        def _check_base_ref_text(ref_text: str | None, x_vector_only: bool | None) -> None:
+            if x_vector_only:
+                return
+            if ref_text is not None and not ref_text.strip():
+                raise ValueError(
+                    "Base task requires non-empty 'ref_text' (transcript of "
+                    "the reference audio) unless 'x_vector_only_mode' is enabled"
+                )
+
+        if batch.voice is not None:
+            _check_voice(batch.voice, batch_task)
+        if batch.language is not None:
+            _check_language(batch.language)
+
+        for item in batch.items:
+            task = item.task_type or batch_task
+            if item.voice is not None:
+                _check_voice(item.voice, item.task_type)
+            if item.language is not None:
+                _check_language(item.language)
+            if task == "Base":
+                ref_text = item.ref_text if item.ref_text is not None else batch.ref_text
+                xvec = item.x_vector_only_mode if item.x_vector_only_mode is not None else batch.x_vector_only_mode
+                _check_base_ref_text(ref_text, xvec)
+
     @staticmethod
     def _merge_batch_item(
         batch: BatchSpeechRequest,
@@ -2783,9 +2861,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
+        self._pre_validate_batch(batch_request)
+
         batch_id = f"speech-batch-{random_uuid()}"
 
         merged_requests = [self._merge_batch_item(batch_request, item) for item in batch_request.items]
+        available_speakers = self._get_available_speakers()
+        for request in merged_requests:
+            if request.voice is not None and _is_default_voice(request.voice.lower(), available_speakers):
+                request.voice = None
 
         async def _run_item(idx: int, req: OpenAICreateSpeechRequest) -> SpeechBatchItemResult:
             has_inline_ref_audio = req.ref_audio is not None
