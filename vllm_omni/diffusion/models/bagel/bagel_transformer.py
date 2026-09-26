@@ -1521,6 +1521,7 @@ class Bagel(CFGParallelMixin, nn.Module):
         packed_text_indexes: torch.LongTensor,
         packed_position_ids: torch.LongTensor,
         packed_seqlens: torch.IntTensor,
+        return_inputs: bool = False,
     ):
         padded_latent = vae_model.encode(padded_images)
 
@@ -1565,6 +1566,15 @@ class Bagel(CFGParallelMixin, nn.Module):
             **extra_inputs,
         )
         past_key_values = output.past_key_values
+
+        if return_inputs:
+            # ``packed_latent`` already carries the projection, timestep
+            # and position embedding, so these are the rows the layers saw.
+            return past_key_values, {
+                "rows": packed_sequence,
+                "positions": packed_position_ids,
+                "gen_indexes": packed_vae_token_indexes,
+            }
 
         return past_key_values
 
@@ -1629,6 +1639,7 @@ class Bagel(CFGParallelMixin, nn.Module):
         vit_token_seqlens: torch.IntTensor,
         packed_position_ids: torch.LongTensor,
         packed_seqlens: torch.IntTensor,
+        return_inputs: bool = False,
     ):
         packed_text_embedding = self.language_model.forward(
             packed_text_ids=packed_text_ids,
@@ -1667,6 +1678,15 @@ class Bagel(CFGParallelMixin, nn.Module):
             **extra_inputs,
         )
         past_key_values = output.past_key_values
+
+        if return_inputs:
+            # The rows this segment feeds the layers.  A trainer with no
+            # ViT (or connector) cannot rebuild them, so an RL replay is
+            # handed them instead of recomputing.
+            return past_key_values, {
+                "rows": packed_sequence,
+                "positions": packed_position_ids,
+            }
 
         return past_key_values
 

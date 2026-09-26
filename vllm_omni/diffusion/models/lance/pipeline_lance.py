@@ -79,6 +79,35 @@ from .wan_vae import LanceWanVAE
 logger = init_logger(__name__)
 
 
+def unwrap_single_media_stream(value: object) -> object:
+    """Unwrap the one-item media list a request's conditioning stream carries.
+
+    ``multi_modal_data[modality]`` holds the request's media, so a single
+    reference arrives wrapped in a list.  The path that consumes it expects the
+    item itself; a longer list is a caller's own container and is left alone so
+    the existing "unsupported type" error still describes it.
+    """
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        return value[0]
+    return value
+
+
+def unwrap_single_video_stream(value: object) -> object:
+    """Like :func:`unwrap_single_media_stream`, for a video reference.
+
+    A decoded video is itself a list or tuple of frames, and
+    ``normalize_decoded_video_frames`` requires those frames to be PIL images, so
+    a single-item list of an image is a one-frame sequence rather than the
+    transport's wrapper.
+    """
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        inner = value[0]
+        if isinstance(inner, Image.Image):
+            return value
+        return inner
+    return value
+
+
 def _extract_user_instruction(rendered: str) -> str:
     """Pull just the user instruction out of a chat-template-rendered prompt.
 
@@ -182,6 +211,108 @@ class _LanceVaeCfg:
 class _LanceVitCfg:
     patch_size: int = 14
     hidden_size: int = 1280  # Qwen2.5-VL vision hidden (out_hidden_size=2048)
+
+
+def _edit_replay_condition(
+    segments: list[dict],
+    latent_input: dict,
+    anchor: float,
+    text_cap: int,
+) -> dict[str, torch.Tensor]:
+    """Bundle the rows a replaying trainer needs for a conditioned trajectory.
+
+    Used by both edit paths (image and video); the reference block is whatever
+    the caller prefilled, so a video reference simply contributes more ViT and
+    VAE rows than an image one.
+
+    The trainer has no ViT and no connector, so the reference's rows have to
+    travel with the trajectory; the text segments travel as token ids because the
+    system prompt and the assistant header are not otherwise available to it.
+    Context rows carry one scalar rope id broadcast across (t, h, w), so their
+    positions stay 1-D here.  The gen latent block's own positions are handed
+    over verbatim, which keeps a replay from having to re-derive the convention
+    that anchors it on the reference block.
+
+    Every tensor carries a leading batch axis: the rollout transport unbatches
+    one sample per ``rl`` field, so a bare ``(L, D)`` row block would lose its
+    first row.  The text segments are padded to ``text_cap`` with a mask so a
+    batch of instructions of different lengths still stacks.
+    """
+    by_role = {segment["role"]: segment for segment in segments}
+    required = ("prefix", "ref_vit", "ref_vae", "gen_instruction", "gen_separator")
+    missing = [role for role in required if role not in by_role]
+    if missing:
+        raise ValueError(f"edit replay export is missing segments: {missing}")
+
+    def pad(segment: dict, role: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ids, positions = segment["ids"], segment["positions"]
+        if ids.shape[0] > text_cap:
+            raise ValueError(f"edit replay segment {role!r} has {ids.shape[0]} tokens, above the {text_cap} cap.")
+        pad_len = text_cap - ids.shape[0]
+        keep = torch.ones(ids.shape[0], dtype=torch.bool)
+        if pad_len:
+            ids = torch.cat([ids, torch.zeros(pad_len, dtype=ids.dtype)])
+            positions = torch.cat([positions, torch.zeros(pad_len, dtype=positions.dtype)])
+            keep = torch.cat([keep, torch.zeros(pad_len, dtype=torch.bool)])
+        return ids, positions, keep
+
+    def as_mrope(segment: dict, role: str) -> torch.Tensor:
+        """Context positions as ``(3, L)``.
+
+        Text rows carry one rope id shared by all three axes while a reference's
+        image rows carry real ``(t, h, w)`` positions, so a 1-D segment is
+        broadcast and a 3-D one is handed through as it is.
+        """
+        positions = segment["positions"]
+        if positions.ndim == 1:
+            return positions.unsqueeze(0).expand(3, -1)
+        if positions.shape[0] == 3:
+            return positions
+        if positions.shape[-1] == 3:
+            return positions.transpose(0, 1)
+        raise ValueError(
+            f"{role} positions have shape {tuple(positions.shape)}; expected one rope id per row or (3, L)."
+        )
+
+    vit, vae = by_role["ref_vit"], by_role["ref_vae"]
+    ref_rows = torch.cat([vit["rows"], vae["rows"]], dim=0)
+    ref_positions = torch.cat(
+        [as_mrope(vit, "ref_vit"), as_mrope(vae, "ref_vae")],
+        dim=1,
+    )
+    # The ViT segment runs in "und" mode, so only the reference's VAE rows belong
+    # to the generation expert; the rest of the sequence is the text pathway.
+    # ``gen_indexes`` index the VAE segment, so they shift by the ViT row count.
+    ref_is_gen = torch.zeros(ref_rows.shape[0], dtype=torch.bool)
+    ref_is_gen[vit["rows"].shape[0] + vae["gen_indexes"].to(torch.long)] = True
+
+    gen_tail = {
+        "ids": torch.cat([by_role["gen_instruction"]["ids"], by_role["gen_separator"]["ids"]]),
+        "positions": torch.cat([by_role["gen_instruction"]["positions"], by_role["gen_separator"]["positions"]]),
+    }
+    cfg_tail = by_role.get("cfg_separator", by_role["gen_separator"])
+    gen_ids, gen_positions, gen_keep = pad(gen_tail, "gen_tail")
+    cfg_ids, cfg_positions, cfg_keep = pad(cfg_tail, "cfg_tail")
+
+    def batched(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.unsqueeze(0)
+
+    return {
+        "condition_prefix_ids": batched(by_role["prefix"]["ids"]),
+        "condition_prefix_positions": batched(by_role["prefix"]["positions"]),
+        "condition_ref_rows": batched(ref_rows),
+        "condition_ref_positions": batched(ref_positions),
+        "condition_ref_is_gen": batched(ref_is_gen),
+        "condition_gen_tail_ids": batched(gen_ids),
+        "condition_gen_tail_positions": batched(gen_positions),
+        "condition_gen_tail_mask": batched(gen_keep),
+        "condition_cfg_tail_ids": batched(cfg_ids),
+        "condition_cfg_tail_positions": batched(cfg_positions),
+        "condition_cfg_tail_mask": batched(cfg_keep),
+        "condition_latent_positions": batched(latent_input["packed_position_ids"].detach().cpu()),
+        "condition_latent_grid": batched(latent_input["packed_vae_position_ids"].detach().cpu()),
+        "rope_anchor": batched(torch.tensor([float(anchor)])),
+    }
 
 
 class LancePipeline(BagelPipeline):
@@ -513,7 +644,13 @@ class LancePipeline(BagelPipeline):
             "<|im_end|>\n<|im_start|>assistant\n",
         )
 
-    def _raw_text_prefill(self, ctx: dict, text_str: str) -> None:
+    def _raw_text_prefill(
+        self,
+        ctx: dict,
+        text_str: str,
+        collect: list | None = None,
+        collect_role: str = "prefix",
+    ) -> None:
         """Tokenize ``text_str`` (no bos/eos) and append to ``ctx`` KV cache."""
         text_ids = self.tokenizer.encode(text_str, add_special_tokens=False)
         if not text_ids:
@@ -521,24 +658,42 @@ class LancePipeline(BagelPipeline):
         curr_kvlen = ctx["kv_lens"][0]
         curr_rope = ctx["ropes"][0]
         seq_len = len(text_ids)
+        packed_text_ids = torch.tensor(text_ids, dtype=torch.long, device=self.device)
+        packed_text_position_ids = torch.arange(curr_rope, curr_rope + seq_len, dtype=torch.long, device=self.device)
         inp = {
             "text_token_lens": torch.tensor([seq_len], dtype=torch.int, device=self.device),
-            "packed_text_ids": torch.tensor(text_ids, dtype=torch.long, device=self.device),
-            "packed_text_position_ids": torch.arange(
-                curr_rope, curr_rope + seq_len, dtype=torch.long, device=self.device
-            ),
+            "packed_text_ids": packed_text_ids,
+            "packed_text_position_ids": packed_text_position_ids,
         }
         with torch.autocast(**self._autocast_kwargs()):
             ctx["past_key_values"] = self.bagel.forward_cache_update_text(ctx["past_key_values"], **inp)
         ctx["kv_lens"] = [curr_kvlen + seq_len]
         ctx["ropes"] = [curr_rope + seq_len]
+        if collect is not None:
+            # Text rows are cheap to reproduce (``embed_tokens`` of these ids),
+            # but the ids themselves - the system prompt and assistant header -
+            # are not otherwise available to a replaying trainer.
+            collect.append(
+                {
+                    "role": collect_role,
+                    "ids": packed_text_ids.detach().cpu(),
+                    "positions": packed_text_position_ids.detach().cpu(),
+                }
+            )
 
     # ``prepare_vit_*`` returns ``packed_indexes`` / ``packed_key_value_indexes``
     # / ``key_values_lens`` for historical reasons; ``forward_cache_update_vit``
     # post-main-merge no longer accepts them.
     _STALE_PREFILL_KEYS = ("packed_indexes", "packed_key_value_indexes", "key_values_lens")
 
-    def _vit_image_prefill(self, ctx: dict, images: list, transforms) -> None:
+    def _vit_image_prefill(
+        self,
+        ctx: dict,
+        images: list,
+        transforms,
+        collect: list | None = None,
+        collect_role: str = "vit",
+    ) -> None:
         """ViT prefill from PIL images via ``prepare_vit_images``."""
         inp, new_kvlens, new_rope = self.bagel.prepare_vit_images(
             curr_kvlens=ctx["kv_lens"],
@@ -549,11 +704,19 @@ class LancePipeline(BagelPipeline):
         )
         for k, v in inp.items():
             if torch.is_tensor(v):
-                inp[k] = v.to(self.device)
+                inp[k] = inp[k].to(self.device)
         for k in self._STALE_PREFILL_KEYS:
             inp.pop(k, None)
         with torch.autocast(**self._autocast_kwargs()):
-            ctx["past_key_values"] = self.bagel.forward_cache_update_vit(ctx["past_key_values"], **inp)
+            result = self.bagel.forward_cache_update_vit(
+                ctx["past_key_values"], **inp, return_inputs=collect is not None
+            )
+        if collect is None:
+            ctx["past_key_values"] = result
+        else:
+            ctx["past_key_values"], segment = result
+            if segment is not None:
+                collect.append({"role": collect_role, **segment})
         ctx["kv_lens"] = new_kvlens
         ctx["ropes"] = new_rope
 
@@ -562,6 +725,8 @@ class LancePipeline(BagelPipeline):
         ctx: dict,
         videos: list,
         precomputed_vit: list | None = None,
+        collect: list | None = None,
+        collect_role: str = "vit",
     ) -> None:
         """ViT prefill from videos via ``prepare_vit_videos``.
 
@@ -586,7 +751,15 @@ class LancePipeline(BagelPipeline):
         for k in self._STALE_PREFILL_KEYS:
             inp.pop(k, None)
         with torch.autocast(**self._autocast_kwargs()):
-            ctx["past_key_values"] = self.bagel.forward_cache_update_vit(ctx["past_key_values"], **inp)
+            result = self.bagel.forward_cache_update_vit(
+                ctx["past_key_values"], **inp, return_inputs=collect is not None
+            )
+        if collect is None:
+            ctx["past_key_values"] = result
+        else:
+            ctx["past_key_values"], segment = result
+            if segment is not None:
+                collect.append({"role": collect_role, **segment})
         ctx["kv_lens"] = new_kvlens
         ctx["ropes"] = new_rope
 
@@ -598,6 +771,8 @@ class LancePipeline(BagelPipeline):
         *,
         is_video: bool,
         latent_cache: list,
+        collect: list | None = None,
+        collect_role: str = "vae",
     ) -> None:
         """VAE prefill of a reference image / video at timestep 0.
 
@@ -616,12 +791,20 @@ class LancePipeline(BagelPipeline):
         )
         for k, v in inp.items():
             if torch.is_tensor(v):
-                inp[k] = v.to(self.device)
+                inp[k] = inp[k].to(self.device)
         if not latent_cache:
             latent_cache.append(self.vae.encode(inp["padded_images"].to(self.device)))
         inp["precomputed_latent"] = latent_cache[0]
         with torch.autocast(**self._autocast_kwargs()):
-            ctx["past_key_values"] = self.bagel.forward_cache_update_vae(self.vae, ctx["past_key_values"], **inp)
+            result = self.bagel.forward_cache_update_vae(
+                self.vae, ctx["past_key_values"], **inp, return_inputs=collect is not None
+            )
+        if collect is None:
+            ctx["past_key_values"] = result
+        else:
+            ctx["past_key_values"], segment = result
+            if segment is not None:
+                collect.append({"role": collect_role, **segment})
         ctx["kv_lens"] = new_kvlens
         ctx["ropes"] = new_rope
 
@@ -684,16 +867,36 @@ class LancePipeline(BagelPipeline):
         first_prompt = req.prompts[0]
         if isinstance(first_prompt, dict):
             prompt = first_prompt.get("prompt") or ""
+            user_text = first_prompt.get("user_text")
             extra_args = first_prompt.get("extra_args") or {}
         else:
             prompt = str(first_prompt)
+            user_text = None
             extra_args = {}
+        if user_text is None:
+            # Accept either the bare caption or an already rendered chat
+            # template (``render_lance_prompt`` output).  The segments below
+            # stay authoritative, so a rendered template is split back apart
+            # instead of being nested inside a second copy of the scaffolding.
+            user_text = prompt
+            if "<|im_start|>user\n" in user_text:
+                user_text = user_text.rpartition("<|im_start|>user\n")[2].partition("<|im_end|>")[0]
         # Sampling-side extras override prompt-side.
         sp_extra = getattr(req.sampling_params, "extra_args", {}) or {}
         extra_args = {**extra_args, **sp_extra}
 
-        # Video shape.  T = number of RGB frames (1..121), H/W in pixels.
-        T = int(extra_args.get("num_frames", 25))
+        # Video shape.  T = number of RGB frames (1..121), H/W in pixels.  The
+        # request's own sampling params win: a recipe that declares
+        # ``pipeline.num_frames``/``height``/``width`` means its rollout and its
+        # replay both work in that shape, so falling back to this node's defaults
+        # would generate a different latent block than the trainer reconstructs.
+        from vllm_omni.diffusion.request import resolve_video_num_frames
+
+        T = resolve_video_num_frames(
+            getattr(req.sampling_params, "num_frames", None),
+            default_num_frames=int(extra_args.get("num_frames", 25)),
+            is_dummy_run=req.is_dummy_run(),
+        )
         H = int(req.sampling_params.height or extra_args.get("video_height", 480))
         W = int(req.sampling_params.width or extra_args.get("video_width", 768))
         max_lat = self.bagel.max_latent_size
@@ -734,26 +937,15 @@ class LancePipeline(BagelPipeline):
         }
         cfg_text_context = deepcopy(gen_context)
 
-        gen_input_text, newlens, new_rope = self.bagel.prepare_prompts(
-            curr_kvlens=gen_context["kv_lens"],
-            curr_rope=gen_context["ropes"],
-            prompts=[prompt],
-            tokenizer=self.tokenizer,
-            new_token_ids=self.new_token_ids,
-        )
-        for k, v in gen_input_text.items():
-            if torch.is_tensor(v):
-                gen_input_text[k] = v.to(self.device)
-        with torch.autocast(
-            device_type=self.device.type,
-            enabled=self.device.type != "cpu",
-            dtype=self.od_config.dtype,
-        ):
-            gen_context["past_key_values"] = self.bagel.forward_cache_update_text(
-                gen_context["past_key_values"], **gen_input_text
-            )
-        gen_context["kv_lens"] = newlens
-        gen_context["ropes"] = new_rope
+        # Prefill the same upstream segments every other Lance task prefills:
+        # system prompt, then the user instruction, then the assistant header.
+        # ``_forward_t2v`` used to hand the bare caption to ``prepare_prompts``,
+        # which only wraps it in bos/eos, so the model was conditioned on
+        # ``<|im_start|>caption<|im_end|>`` with no task instruction at all.
+        seg1_str, seg5_str = self._segment_strings("t2v", "video")
+        self._raw_text_prefill(gen_context, seg1_str)
+        self._raw_text_prefill(gen_context, user_text)
+        self._raw_text_prefill(gen_context, seg5_str)
 
         # ---- Build CFG text-unconditional KV cache (empty prompt) ----
         if cfg_text_scale > 1.0:
@@ -812,7 +1004,7 @@ class LancePipeline(BagelPipeline):
             # before unpacking via ``**gen_input_lat``.
             for _drop in ("key_values_lens", "packed_indexes", "packed_key_value_indexes"):
                 gen_input_lat.pop(_drop, None)
-            latents, *_ = self.bagel.generate_image(
+            latents, trajectory_latents, trajectory_timesteps, trajectory_log_probs = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
                 cfg_text_past_key_values=cfg_text_context["past_key_values"],
                 cfg_img_past_key_values=None,  # no img CFG branch
@@ -830,15 +1022,35 @@ class LancePipeline(BagelPipeline):
                 # (derived from ``cfg_text_past_key_values``).
                 cfg_img_packed_position_ids=None,
                 # ``cfg_img_*`` index/lens kwargs removed — same as above.
+                # Same denoising contract as the image path: the scheduler the
+                # caller installed (RL replaces it with an SDE one) steps the
+                # sampler and records the trajectory when asked.
+                return_trajectory_latents=req.sampling_params.return_trajectory_latents,
+                scheduler=self.scheduler,
+                scheduler_kwargs=self.scheduler_kwargs,
             )
 
         frames_np = self._decode_video_from_latent(self.bagel, self.vae, latents[0], video_shape)
         # Convert numpy frames to PIL.Image list for downstream serialization.
         frames = [Image.fromarray(f) for f in frames_np]
         logger.info("Lance t2v: decoded %d frames at %dx%d", len(frames), frames[0].width, frames[0].height)
+
+        payload = {"video": frames}
+        # Trajectory payload for RL: the trainer replays these exact latents and
+        # timesteps, so it needs them whenever the caller asked for them.  The
+        # per-step frames are not decoded here; only the rollout's final video is.
+        trajectory_payload = {}
+        if trajectory_latents:
+            trajectory_payload["latents"] = torch.stack(trajectory_latents)
+            trajectory_payload["timesteps"] = torch.stack(trajectory_timesteps)
+        if trajectory_log_probs:
+            trajectory_payload["log_probs"] = torch.stack(trajectory_log_probs)
+        if trajectory_payload:
+            payload["trajectory"] = trajectory_payload
+
         return DiffusionOutput(
             output={
-                "payload": {"video": frames},
+                "payload": payload,
                 "metadata": {"video": {"shape": video_shape}},
             },
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
@@ -959,17 +1171,20 @@ class LancePipeline(BagelPipeline):
         # Single-slot cache shared between gen + cfg branches so the Wan2.2
         # VAE's ``mu + std * randn_like(std)`` sample is computed once.
         ref_latent_cache: list = []
+        # Rows a replaying trainer cannot rebuild are collected here and
+        # exported with the trajectory; see ``_edit_replay_condition``.
+        replay: list = []
 
         # ----- prefill segments in upstream order -----
         seg1_str, seg5_str = self._segment_strings("image_edit", "image")
 
         # seg1: system + user header  (shared)
-        self._raw_text_prefill(gen_context, seg1_str)
+        self._raw_text_prefill(gen_context, seg1_str, collect=replay, collect_role="prefix")
         if cfg_text_scale > 1.0:
             self._raw_text_prefill(cfg_text_context, seg1_str)
 
         # seg2: ViT(ref)  (shared)
-        self._vit_image_prefill(gen_context, image_input, vit_transforms)
+        self._vit_image_prefill(gen_context, image_input, vit_transforms, collect=replay, collect_role="ref_vit")
         if cfg_text_scale > 1.0:
             self._vit_image_prefill(cfg_text_context, image_input, vit_transforms)
 
@@ -989,7 +1204,15 @@ class LancePipeline(BagelPipeline):
         # that as the gen latent's ``curr_rope`` below.
         rope_before_vae = gen_context["ropes"][0]
         cfg_rope_before_vae = cfg_text_context["ropes"][0] if cfg_text_scale > 1.0 else rope_before_vae
-        self._vae_ref_prefill(gen_context, image_input, vae_transforms, is_video=False, latent_cache=ref_latent_cache)
+        self._vae_ref_prefill(
+            gen_context,
+            image_input,
+            vae_transforms,
+            is_video=False,
+            latent_cache=ref_latent_cache,
+            collect=replay,
+            collect_role="ref_vae",
+        )
         if cfg_text_scale > 1.0:
             self._vae_ref_prefill(
                 cfg_text_context, image_input, vae_transforms, is_video=False, latent_cache=ref_latent_cache
@@ -1002,13 +1225,13 @@ class LancePipeline(BagelPipeline):
         # past the user_text region.  seg5 (separator) therefore lands at
         # different absolute rope positions in gen vs cfg branches — that's
         # the intended behavior.
-        self._raw_text_prefill(gen_context, user_text)
+        self._raw_text_prefill(gen_context, user_text, collect=replay, collect_role="gen_instruction")
 
         # seg5: separator + assistant header  (gen + cfg).  Each branch
         # places it at its OWN current rope.
-        self._raw_text_prefill(gen_context, seg5_str)
+        self._raw_text_prefill(gen_context, seg5_str, collect=replay, collect_role="gen_separator")
         if cfg_text_scale > 1.0:
-            self._raw_text_prefill(cfg_text_context, seg5_str)
+            self._raw_text_prefill(cfg_text_context, seg5_str, collect=replay, collect_role="cfg_separator")
 
         # -- (4) Gen latent at the SAME rope position as the ref VAE block.
         # See the comment on `rope_before_vae` above.  Note the KV cache
@@ -1047,7 +1270,7 @@ class LancePipeline(BagelPipeline):
             # before unpacking via ``**gen_input_lat``.
             for _drop in ("key_values_lens", "packed_indexes", "packed_key_value_indexes"):
                 gen_input_lat.pop(_drop, None)
-            latents, *_ = self.bagel.generate_image(
+            latents, trajectory_latents, trajectory_timesteps, trajectory_log_probs = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
                 cfg_text_past_key_values=cfg_text_context["past_key_values"]
                 if cfg_text_scale > 1.0
@@ -1069,13 +1292,45 @@ class LancePipeline(BagelPipeline):
                     cfg_img_lat["cfg_packed_position_ids"] if cfg_img_lat is not None else None
                 ),
                 # ``cfg_img_*`` index/lens kwargs removed — same as above.
+                # Same denoising contract as the image path: the scheduler the
+                # caller installed (RL replaces it with an SDE one) steps the
+                # sampler and records the trajectory when asked.
+                return_trajectory_latents=req.sampling_params.return_trajectory_latents,
+                scheduler=self.scheduler,
+                scheduler_kwargs=self.scheduler_kwargs,
             )
 
         img = self._decode_image_from_latent(self.bagel, self.vae, latents[0], image_shape)
+
+        # Upstream places the noise QUERY block at the reference VAE block's
+        # positions, so its rotary anchor is the value *before* that block - not
+        # the text length a reimplementation would assume.  A reinforcement-
+        # learning trainer replaying this trajectory needs that, and the rows it
+        # cannot rebuild, so both travel with the output.
+        replay_condition = _edit_replay_condition(
+            replay,
+            gen_input_lat,
+            rope_before_vae,
+            text_cap=int(getattr(req.sampling_params, "max_sequence_length", None) or 128),
+        )
+
+        payload = {"image": img}
+        # Trajectory payload for RL: the trainer replays these exact latents and
+        # timesteps, so it needs them whenever the caller asked for them.  The
+        # per-step frames are not decoded here; only the rollout's final output is.
+        trajectory_payload = {}
+        if trajectory_latents:
+            trajectory_payload["latents"] = torch.stack(trajectory_latents)
+            trajectory_payload["timesteps"] = torch.stack(trajectory_timesteps)
+        if trajectory_log_probs:
+            trajectory_payload["log_probs"] = torch.stack(trajectory_log_probs)
+        if trajectory_payload:
+            payload["trajectory"] = trajectory_payload
+
         return DiffusionOutput(
             output={
-                "payload": {"image": img},
-                "metadata": {"image": {"shape": image_shape}},
+                "payload": payload,
+                "metadata": {"image": {"shape": image_shape}, "rl": replay_condition},
             },
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
@@ -1127,6 +1382,9 @@ class LancePipeline(BagelPipeline):
         image_input = mm_data.get("first_frame")
         if image_input is None:
             raise ValueError("i2v requires multi_modal_data.first_frame.")
+        # A conditioning stream arrives wrapped in the request's media list;
+        # ``_forward_image_edit`` normalizes the same way.
+        image_input = unwrap_single_media_stream(image_input)
 
         # Resolve image to (H, W, 3) uint8 RGB, then wrap as 1-frame video.
         if isinstance(image_input, _PILImage.Image):
@@ -1143,10 +1401,20 @@ class LancePipeline(BagelPipeline):
         sp_extra = getattr(req.sampling_params, "extra_args", {}) or {}
         extra_args = {**extra_args, **sp_extra}
 
-        # Output video shape — independent of input image dims.
-        num_frames_out = int(extra_args.get("num_frames", 61))
-        out_H = int(extra_args.get("video_height", 480))
-        out_W = int(extra_args.get("video_width", 848))
+        # Output video shape — independent of input image dims, but not of the
+        # request: a recipe that declares its shape means its rollout and its
+        # replay both work in that shape, and a node default instead would
+        # generate a latent block the trainer cannot reconstruct (61 frames at
+        # 848 wide against a 25-frame 768-wide replay is one concrete failure).
+        from vllm_omni.diffusion.request import resolve_video_num_frames
+
+        num_frames_out = resolve_video_num_frames(
+            getattr(req.sampling_params, "num_frames", None),
+            default_num_frames=int(extra_args.get("num_frames", 61)),
+            is_dummy_run=req.is_dummy_run(),
+        )
+        out_H = int(req.sampling_params.height or extra_args.get("video_height", 480))
+        out_W = int(req.sampling_params.width or extra_args.get("video_width", 848))
         origin_fps = float(extra_args.get("origin_fps", 24.0))
 
         # Upstream Lance i2v default is cfg_text_scale=4.0.  Note: vllm-omni's
@@ -1334,7 +1602,7 @@ class LancePipeline(BagelPipeline):
             # before unpacking via ``**gen_input_lat``.
             for _drop in ("key_values_lens", "packed_indexes", "packed_key_value_indexes"):
                 gen_input_lat.pop(_drop, None)
-            latents, *_ = self.bagel.generate_image(
+            latents, trajectory_latents, trajectory_timesteps, trajectory_log_probs = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
                 cfg_text_past_key_values=cfg_text_context["past_key_values"]
                 if cfg_text_scale > 1.0
@@ -1357,14 +1625,43 @@ class LancePipeline(BagelPipeline):
                 ),
                 # ``cfg_img_*`` index/lens kwargs removed — same as above.
                 frame_condition_token_indexes=frame_condition_token_indexes,
+                # Same denoising contract as the image path: the scheduler the
+                # caller installed (RL replaces it with an SDE one) steps the
+                # sampler and records the trajectory when asked.
+                return_trajectory_latents=req.sampling_params.return_trajectory_latents,
+                scheduler=self.scheduler,
+                scheduler_kwargs=self.scheduler_kwargs,
             )
 
         frames_np = self._decode_video_from_latent(self.bagel, self.vae, latents[0], out_shape)
         frames = [Image.fromarray(f) for f in frames_np]
+
+        payload = {"video": frames}
+        # Trajectory payload for RL: the trainer replays these exact latents and
+        # timesteps, so it needs them whenever the caller asked for them.  The
+        # per-step frames are not decoded here; only the rollout's final output is.
+        trajectory_payload = {}
+        if trajectory_latents:
+            trajectory_payload["latents"] = torch.stack(trajectory_latents)
+            trajectory_payload["timesteps"] = torch.stack(trajectory_timesteps)
+        if trajectory_log_probs:
+            trajectory_payload["log_probs"] = torch.stack(trajectory_log_probs)
+        if trajectory_payload:
+            payload["trajectory"] = trajectory_payload
+
+        # The first latent frame is pinned: the sampler holds ``timestep = 0`` at
+        # those tokens and restores them after every step, so a replay that
+        # applied the step's sigma there would score different velocities than the
+        # rollout did.  Which tokens they are travels with the trajectory; the
+        # pinned values themselves are already in the recorded latents.
+        replay = {
+            "frame_condition_token_indexes": frame_condition_token_indexes.detach().cpu().unsqueeze(0),
+        }
+
         return DiffusionOutput(
             output={
-                "payload": {"video": frames},
-                "metadata": {"video": {"shape": out_shape}},
+                "payload": payload,
+                "metadata": {"video": {"shape": out_shape}, "rl": replay},
             },
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
@@ -1417,6 +1714,10 @@ class LancePipeline(BagelPipeline):
         video_input = mm_data.get("video")
         if video_input is None:
             raise ValueError("video_edit requires multi_modal_data.video.")
+        # A conditioning stream arrives wrapped in the request's media list, but
+        # ``list``/``tuple`` is also how a decoded frame sequence arrives, so only
+        # a wrapper around something that is not a frame is unwrapped.
+        video_input = unwrap_single_video_stream(video_input)
         # Resolve to raw (T, H, W, 3) uint8 ndarray + origin_fps so the
         # upstream-style bucket resize + frame sampler can replicate the
         # exact preprocessing path.  If the caller passed an already-decoded
@@ -1525,6 +1826,9 @@ class LancePipeline(BagelPipeline):
 
         # Shared latent cache so gen + cfg branches see the same VAE sample.
         ref_latent_cache: list = []
+        # Rows a replaying trainer cannot rebuild are collected here and
+        # exported with the trajectory; see ``_edit_replay_condition``.
+        replay: list = []
 
         def _vae_transforms(_):
             return video_chw
@@ -1533,14 +1837,16 @@ class LancePipeline(BagelPipeline):
         seg1_str, seg5_str = self._segment_strings("video_edit", "video")
 
         # seg1: system + user header  (shared)
-        self._raw_text_prefill(gen_context, seg1_str)
+        self._raw_text_prefill(gen_context, seg1_str, collect=replay, collect_role="prefix")
         if cfg_text_scale > 1.0:
             self._raw_text_prefill(cfg_text_context, seg1_str)
 
         # seg2: ViT(ref)  (shared) — feed pre-bucketed patches directly so
         # the Qwen2VLImageProcessor smart-resize is bypassed.
         precomputed_vit = [(vit_pixels, vit_grid_thw)]
-        self._vit_video_prefill(gen_context, [video_raw], precomputed_vit=precomputed_vit)
+        self._vit_video_prefill(
+            gen_context, [video_raw], precomputed_vit=precomputed_vit, collect=replay, collect_role="ref_vit"
+        )
         if cfg_text_scale > 1.0:
             self._vit_video_prefill(cfg_text_context, [video_raw], precomputed_vit=precomputed_vit)
 
@@ -1549,21 +1855,29 @@ class LancePipeline(BagelPipeline):
         # modality==1≡2 trick).
         rope_before_vae = gen_context["ropes"][0]
         cfg_rope_before_vae = cfg_text_context["ropes"][0] if cfg_text_scale > 1.0 else rope_before_vae
-        self._vae_ref_prefill(gen_context, [video_chw], _vae_transforms, is_video=True, latent_cache=ref_latent_cache)
+        self._vae_ref_prefill(
+            gen_context,
+            [video_chw],
+            _vae_transforms,
+            is_video=True,
+            latent_cache=ref_latent_cache,
+            collect=replay,
+            collect_role="ref_vae",
+        )
         if cfg_text_scale > 1.0:
             self._vae_ref_prefill(
                 cfg_text_context, [video_chw], _vae_transforms, is_video=True, latent_cache=ref_latent_cache
             )
 
         # seg4: user instruction  (gen only — cfg branch skips per upstream).
-        self._raw_text_prefill(gen_context, user_text)
+        self._raw_text_prefill(gen_context, user_text, collect=replay, collect_role="gen_instruction")
 
         # seg5: separator + assistant header  (both gen and cfg, each at its
         # own current rope; cfg's lands earlier than gen's because cfg
         # skipped seg4).
-        self._raw_text_prefill(gen_context, seg5_str)
+        self._raw_text_prefill(gen_context, seg5_str, collect=replay, collect_role="gen_separator")
         if cfg_text_scale > 1.0:
-            self._raw_text_prefill(cfg_text_context, seg5_str)
+            self._raw_text_prefill(cfg_text_context, seg5_str, collect=replay, collect_role="cfg_separator")
 
         # seg6 (noise QUERY): gen latent at the SAME rope as the ref VAE
         # block.  KV cache still contains sys+ViT+VAE_ref+user_text+sep at
@@ -1600,7 +1914,7 @@ class LancePipeline(BagelPipeline):
             # before unpacking via ``**gen_input_lat``.
             for _drop in ("key_values_lens", "packed_indexes", "packed_key_value_indexes"):
                 gen_input_lat.pop(_drop, None)
-            latents, *_ = self.bagel.generate_image(
+            latents, trajectory_latents, trajectory_timesteps, trajectory_log_probs = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
                 cfg_text_past_key_values=cfg_text_context["past_key_values"]
                 if cfg_text_scale > 1.0
@@ -1622,14 +1936,44 @@ class LancePipeline(BagelPipeline):
                     cfg_img_lat["cfg_packed_position_ids"] if cfg_img_lat is not None else None
                 ),
                 # ``cfg_img_*`` index/lens kwargs removed — same as above.
+                # Same denoising contract as the image path: the scheduler the
+                # caller installed (RL replaces it with an SDE one) steps the
+                # sampler and records the trajectory when asked.
+                return_trajectory_latents=req.sampling_params.return_trajectory_latents,
+                scheduler=self.scheduler,
+                scheduler_kwargs=self.scheduler_kwargs,
             )
 
         frames_np = self._decode_video_from_latent(self.bagel, self.vae, latents[0], video_shape)
         frames = [Image.fromarray(f) for f in frames_np]
+
+        # As on the image path: the noise QUERY block is anchored on the
+        # reference VAE block, and a replaying trainer cannot rebuild the
+        # reference's ViT/VAE rows, so both travel with the output.
+        replay_condition = _edit_replay_condition(
+            replay,
+            gen_input_lat,
+            rope_before_vae,
+            text_cap=int(getattr(req.sampling_params, "max_sequence_length", None) or 128),
+        )
+
+        payload = {"video": frames}
+        # Trajectory payload for RL: the trainer replays these exact latents and
+        # timesteps, so it needs them whenever the caller asked for them.  The
+        # per-step frames are not decoded here; only the rollout's final output is.
+        trajectory_payload = {}
+        if trajectory_latents:
+            trajectory_payload["latents"] = torch.stack(trajectory_latents)
+            trajectory_payload["timesteps"] = torch.stack(trajectory_timesteps)
+        if trajectory_log_probs:
+            trajectory_payload["log_probs"] = torch.stack(trajectory_log_probs)
+        if trajectory_payload:
+            payload["trajectory"] = trajectory_payload
+
         return DiffusionOutput(
             output={
-                "payload": {"video": frames},
-                "metadata": {"video": {"shape": video_shape}},
+                "payload": payload,
+                "metadata": {"video": {"shape": video_shape}, "rl": replay_condition},
             },
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
