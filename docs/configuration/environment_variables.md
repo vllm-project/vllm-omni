@@ -93,6 +93,18 @@ depends on the installed kernels and model path.
 | `VLLM_VIDEO_ASYNC_CHUNK` | `on` or `off`; default `on` | Streaming video output; read on attribute access | Environment-only setting. Values are trimmed and case-normalized; an invalid value warns once and uses `on`. | Experimental |
 | `VLLM_VIDEO_AUDIO_DELTA_MODE` | `fast` or `slow`; default `fast` | Streaming video audio deltas; read on attribute access | Environment-only setting. Values are trimmed and case-normalized; an invalid value warns once and uses `fast`. | Experimental |
 
+### Duplex frame timing
+
+Opt-in per-frame timing instrumentation for the duplex async-chunk path.
+Every emitted line shares the `DUPLEX_FRAME_TIMING` prefix, so a running
+server can be tailed with `grep DUPLEX_FRAME_TIMING`; the hooks are no-ops
+while the feature flag is unset.
+
+| Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
+| --- | --- | --- | --- | --- |
+| `VLLM_OMNI_DUPLEX_FRAME_TIMING` | Boolean truthy spellings: `1`, `true`, `yes`, `on`; default off | Per-frame timing hooks on the duplex async-chunk path (session runner, chunk transfer adapter, PersonaPlex Code2Wav, session model channel); read once at process start | Environment-only setting. Values are case-normalized; any unrecognized value leaves instrumentation off. | Diagnostic |
+| `VLLM_OMNI_DUPLEX_FRAME_TIMING_LOG_EVERY` | Positive integer; default `1` (every event) | Throttle for per-event `DUPLEX_FRAME_TIMING` lines, counted per event name; read once at process start | Environment-only setting. A non-integer or `<1` value falls back to `1` (no throttling). | Diagnostic |
+
 ### NIXL stage transfer
 
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |

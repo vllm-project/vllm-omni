@@ -101,6 +101,7 @@ from vllm_omni.engine.duplex.session.model_channel import ModelChannel
 from vllm_omni.engine.duplex.turn_detection import (
     TurnDetectionResult,
 )
+from vllm_omni.metrics.duplex_frame_timing import log_append_event
 from vllm_omni.metrics.stats import StageRequestStats
 from vllm_omni.protocol.duplex import convert_input_audio_with_rate
 
@@ -1001,6 +1002,12 @@ class DuplexSessionRunner:
         if append_payload is None:
             self._maybe_schedule_vad_commit(vad_result)
             return
+        log_append_event(
+            session.session_id,
+            session.epoch,
+            pcm_reservation.byte_count,
+            session.capabilities.chunk_period_ms,
+        )
         await self._start_append(append_payload, final=False, pcm_reservation=pcm_reservation)
         self._maybe_schedule_vad_commit(vad_result)
 

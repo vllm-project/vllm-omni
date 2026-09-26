@@ -16,8 +16,15 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import ConstantList
 
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
+from vllm_omni.metrics.duplex_frame_timing import (
+    frame_timing_clock,
+    log_connector_get_event,
+    log_connector_put_event,
+    stamp_chunk_put,
+)
 
 from ..adapter import construct_next_stage_streaming_input_prompt
+from ..connectors.base import OmniConnectorBase
 from ..connectors.shm_connector import SharedMemoryConnector
 from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec, stage_receives_chunks
@@ -171,7 +178,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 "race to evict it).",
                 self._active_window,
             )
-        self.connector = self.create_connector(model_config)
+        # Narrow the base's Optional connector: this adapter always builds
+        # one before super().__init__ runs.
+        self.connector: OmniConnectorBase = self.create_connector(model_config)
         self.receives_chunks = stage_receives_chunks(model_config)
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
@@ -193,15 +202,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._adaptive_states: dict[str, Any] = {}
         self.upstream_exhausted_requests: set[str] = set()
         self.segment_finished_requests: set[str] = set()
-        self.request_payload = {}
+        self.request_payload: dict[str, Any] = {}
         self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
-        self.requests_with_ready_chunks = set()
+        self.requests_with_ready_chunks: set[str] = set()
         self.replaced_streaming_prompt_ids: set[str] = set()
-        self.requests_origin_status = {}
+        self.requests_origin_status: dict[str, RequestStatus] = {}
         self._active_streams: dict[str, Any] = {}
         # Private hold-queue for non-active running requests. Restored to
         # running_queue inside restore_queues(). Avoids calling
@@ -287,7 +296,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             request.prefill_stats = PrefillStats()
 
     @classmethod
-    def create_connector(cls, model_config: Any):
+    def create_connector(cls, model_config: Any) -> OmniConnectorBase:
         connector_config = getattr(model_config, "stage_connector_config", None)
         if connector_config is None:
             connector_config = {}
@@ -369,8 +378,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     def save_async(
         self,
-        multimodal_output: dict[str, Any] | None = None,
-        request: Request | None = None,
+        multimodal_output: dict[str, Any] | None,
+        request: Request,
         is_segment_finished: bool = False,
         new_token_ids: Iterable[int] | None = None,
         confirmed_num_computed_tokens: int | None = None,
@@ -505,6 +514,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
 
         # Use timeout=0 for non-blocking poll
+        get_t0 = frame_timing_clock()
         try:
             result = self.connector.get(
                 str(target_stage_id),
@@ -524,6 +534,20 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 if self._registered_load_entries.get(req_id) is not entry:
                     return True
             return False
+
+        # The producer's meta.put_t_ns stamp rides the chunk itself, so the
+        # handoff age is measurable even when the two stages are different
+        # processes; absent when the producer ran with the flag off.
+        received = result[0] if isinstance(result, tuple) and result else None
+        received_meta = received.get("meta") if isinstance(received, dict) else None
+        put_t_ns = received_meta.get("put_t_ns") if isinstance(received_meta, dict) else None
+        log_connector_get_event(
+            connector_get_key,
+            stage_id,
+            int(result[1]) if isinstance(result, tuple) else 0,
+            get_t0,
+            put_t_ns if isinstance(put_t_ns, int) and not isinstance(put_t_ns, bool) else None,
+        )
 
         with self._receiver_state_lock:
             # cleanup_receiver() can run while connector.get() is in flight.
@@ -832,12 +856,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # Include the in-flight key even if cancellation wins before put
             # returns or the connector raises after creating the segment.
             sender_token.num_puts = self.put_req_chunk[external_req_id] + 1
+        put_t0 = frame_timing_clock()
+        stamp_chunk_put(payload_data.meta)
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
             put_key=connector_put_key,
             data=payload_data,
         )
+        log_connector_put_event(connector_put_key, stage_id, success, size, put_t0)
 
         with self._sender_state_lock:
             if sender_token is not None:
@@ -1583,6 +1610,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         elif request_ids is not None:
             request_ids = set(request_ids)
         else:
+            # No explicit ids: the caller must have passed the request map
+            # this branch iterates.
+            assert requests is not None
             request_ids = requests.keys()
 
         connector_owned_ids = {
