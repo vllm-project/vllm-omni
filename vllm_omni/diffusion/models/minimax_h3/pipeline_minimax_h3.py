@@ -29,7 +29,8 @@ from vllm_omni.diffusion.cache.cachedit import (
 )
 from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.parallel_state import get_world_group, init_world_group
+from vllm_omni.diffusion.distributed.group_coordinator import GroupCoordinator
+from vllm_omni.diffusion.distributed.parallel_state import get_world_group
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import (
@@ -592,6 +593,29 @@ class _SingleRankEncoderGroup:
     def __init__(self, rank: int) -> None:
         self.rank_in_group = 0 if rank == 0 else -1
         self.device_group = None
+
+
+def _text_encoder_group_ranks(dit_world_size: int, tp_size: int) -> list[list[int]]:
+    """Tiled encoder TP groups so every DiT rank joins exactly one group.
+
+    ``GroupCoordinator`` asserts that every constructing rank is a member of
+    one of the groups, so with ``tp_size < dit_world_size`` a single
+    ``[0, tp_size)`` group crashes the ranks outside it.  Tiling the DiT world
+    into ``dit_world_size // tp_size`` contiguous groups keeps every rank a
+    member; only the first group (ranks < tp_size) actually encodes, the rest
+    just hold a valid group handle and receive the world-group broadcast of
+    the encoder output.
+    """
+    if tp_size < 1:
+        raise ValueError(f"text_encoder_tp_size must be >= 1, got {tp_size}")
+    if dit_world_size % tp_size != 0:
+        raise ValueError(
+            f"text_encoder_tp_size ({tp_size}) must divide the DiT group size "
+            f"({dit_world_size}): the encoder TP group tiles the DiT world into "
+            "equal contiguous groups, and ranks outside the first group still "
+            "need group membership."
+        )
+    return [list(range(offset, offset + tp_size)) for offset in range(0, dit_world_size, tp_size)]
 
 
 class MiniMaxH3Pipeline(
@@ -1324,21 +1348,21 @@ class MiniMaxH3Pipeline(
     def _build_text_encoder_group(self, text_encoder_tp_size: int) -> Any:
         """Create the encoder tensor-parallel process group.
 
-        The encoder group covers the first ``text_encoder_tp_size`` DiT ranks
-        (the DiT group is always global ranks ``[0, dit_world)``).  Every rank
-        participates in ``new_group`` so the collective completes; ranks
-        outside the group never run encoder collectives.  For a single-rank
-        encoder we return a lightweight placeholder so non-encoder ranks do
-        not need to join a ``GroupCoordinator`` that would assert on ranks
-        outside the group.
+        The encoder TP group tiles the DiT world into contiguous groups of
+        ``text_encoder_tp_size`` ranks (see ``_text_encoder_group_ranks``);
+        only the first group (ranks < tp_size) runs the encoder, and its
+        output is broadcast to every DiT rank over the world group.  Every
+        rank must hold group membership because ``GroupCoordinator`` asserts
+        on ranks outside all groups.  For a single-rank encoder we return a
+        lightweight placeholder instead.
         """
         if text_encoder_tp_size == 1:
             return _SingleRankEncoderGroup(rank=self._dit_rank)
-        ranks = list(range(text_encoder_tp_size))
-        return init_world_group(
-            ranks=ranks,
+        _, _, dit_world = _dit_rank_world()
+        return GroupCoordinator(
+            group_ranks=_text_encoder_group_ranks(dit_world, text_encoder_tp_size),
             local_rank=envs.LOCAL_RANK,
-            backend=current_omni_platform.dist_backend,
+            torch_distributed_backend=current_omni_platform.dist_backend,
         )
 
     def _encoder_group_broadcast_tensor(

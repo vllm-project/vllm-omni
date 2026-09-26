@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, QueryRange
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.attention.backends.utils import fa  # noqa: E402
@@ -626,6 +626,75 @@ def test_resolve_packed_seq_rejects_malformed_metadata(case):
         extra = base
 
     assert impl._resolve_packed_seq_npu(q, q, extra) is None
+
+
+# --- Test group A2: AllGather-KV (CP) local-Q/global-KV generalization -------
+#
+# With AllGather-KV sequence parallelism the backend sees a local query shard
+# against the global K/V. The strategy records the shard's position as a
+# single QueryRange; the resolver must then derive the shard's [real, pad]
+# boundary pair from the global real length instead of rejecting the contract
+# (used_q is global and exceeds the local shard length by construction).
+
+
+@pytest.mark.cpu
+def test_resolve_packed_seq_cp_local_query_shards():
+    """Each AllGather-KV rank resolves its own [real, pad] Q boundaries."""
+    impl = _npu_impl()
+    # Global packed layout: 5 real + 3 pad = 8 tokens; CP x2 splits Q into two
+    # 4-row shards. max_seqlen_* describe the GLOBAL real document length.
+    cu = torch.tensor([0, 5, 8], dtype=torch.int32)
+    extra = {"cu_seqlens_q": cu, "cu_seqlens_k": cu, "max_seqlen_q": 5, "max_seqlen_k": 5}
+    k_global = torch.randn(1, 8, 2, 4)
+    q_shard = torch.randn(1, 4, 2, 4)
+
+    # Rank 0 owns global rows [0, 4): all real, so the local pad document is
+    # empty (zero-length tail).
+    rank0_ranges = (QueryRange(local_start=0, local_end=4, global_start=0),)
+    assert impl._resolve_packed_seq_npu(q_shard, k_global, extra, rank0_ranges) == ([4, 4], [5, 8])
+
+    # Rank 1 owns global rows [4, 8): 1 real + 3 pad rows.
+    rank1_ranges = (QueryRange(local_start=0, local_end=4, global_start=4),)
+    assert impl._resolve_packed_seq_npu(q_shard, k_global, extra, rank1_ranges) == ([1, 4], [5, 8])
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "ranges",
+    [
+        # Joint layouts produce multiple ranges; the CP generalization is only
+        # defined for a single packed query range.
+        (
+            QueryRange(local_start=0, local_end=2, global_start=0),
+            QueryRange(local_start=2, local_end=4, global_start=4),
+        ),
+        # Shard starts beyond the global real document: nothing real locally.
+        (QueryRange(local_start=0, local_end=4, global_start=6),),
+        # Shard starts exactly at the real boundary: zero real rows locally.
+        (QueryRange(local_start=0, local_end=4, global_start=5),),
+    ],
+)
+def test_resolve_packed_seq_cp_rejects_unsupported_ranges(ranges):
+    impl = _npu_impl()
+    cu = torch.tensor([0, 5, 8], dtype=torch.int32)
+    extra = {"cu_seqlens_q": cu, "cu_seqlens_k": cu, "max_seqlen_q": 5, "max_seqlen_k": 5}
+    q_shard = torch.randn(1, 4, 2, 4)
+    k_global = torch.randn(1, 8, 2, 4)
+
+    assert impl._resolve_packed_seq_npu(q_shard, k_global, extra, ranges) is None
+
+
+@pytest.mark.cpu
+def test_resolve_packed_seq_without_ranges_keeps_square_contract():
+    """No query_ranges means no SP slicing: the square contract still applies
+    and a global-length used_q against a local-length query is rejected."""
+    impl = _npu_impl()
+    cu = torch.tensor([0, 5, 8], dtype=torch.int32)
+    extra = {"cu_seqlens_q": cu, "cu_seqlens_k": cu, "max_seqlen_q": 5, "max_seqlen_k": 5}
+    q_shard = torch.randn(1, 4, 2, 4)
+    k_global = torch.randn(1, 8, 2, 4)
+
+    assert impl._resolve_packed_seq_npu(q_shard, k_global, extra) is None
 
 
 # --- Test group B: env dispatch in forward_fa_npu (current behavior) --------

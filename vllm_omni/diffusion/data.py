@@ -267,8 +267,7 @@ class DiffusionParallelConfig:
 
     sequence_parallel_size: int | None = None
     """Number of sequence parallel groups.
-    sequence_parallel_size = ulysses_degree * ring_degree, or allgather_degree
-    when AllGather-KV is enabled."""
+    sequence_parallel_size = ulysses_degree * ring_degree * allgather_degree."""
 
     ulysses_degree: int = 1
     """Number of GPUs used for ulysses sequence parallelism."""
@@ -277,7 +276,8 @@ class DiffusionParallelConfig:
     """Number of GPUs used for ring sequence parallelism."""
 
     allgather_degree: int = 1
-    """Number of GPUs used for AllGather-KV sequence parallelism (causal=False only)."""
+    """Number of GPUs used for AllGather-KV sequence parallelism (causal=False only).
+    Composable with ``ulysses_degree``; not with ``ring_degree > 1``."""
 
     ulysses_mode: str = "strict"
     """Ulysses sequence-parallel mode.
@@ -361,15 +361,15 @@ class DiffusionParallelConfig:
             "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "
             f"but got {self.vae_parallel_mode!r}."
         )
-        if self.allgather_degree > 1:
-            assert self.ulysses_degree == 1 and self.ring_degree == 1, (
-                "AllGather-KV (allgather_degree>1) is mutually exclusive with Ulysses/Ring in v1. "
+        if self.allgather_degree > 1 and self.ring_degree > 1:
+            raise ValueError(
+                "AllGather-KV (allgather_degree>1) cannot be composed with Ring (ring_degree>1). "
+                "The supported two-dimensional topology is Ulysses x AllGather-KV "
+                "(ulysses_degree > 1 with ring_degree == 1). "
                 f"Got ulysses_degree={self.ulysses_degree}, ring_degree={self.ring_degree}, "
                 f"allgather_degree={self.allgather_degree}."
             )
-        expected_sp_size = (
-            self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
-        )
+        expected_sp_size = self.ulysses_degree * self.ring_degree * self.allgather_degree
         assert self.sequence_parallel_size == expected_sp_size, (
             f"Sequence parallel size must be {expected_sp_size}, but got {self.sequence_parallel_size}"
         )
@@ -385,9 +385,7 @@ class DiffusionParallelConfig:
 
     def __post_init__(self) -> None:
         if self.sequence_parallel_size is None:
-            self.sequence_parallel_size = (
-                self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
-            )
+            self.sequence_parallel_size = self.ulysses_degree * self.ring_degree * self.allgather_degree
 
         # Until the runtime WORLD size is known, an omitted DP dimension means
         # one replica. OmniDiffusionConfig resolves it against num_gpus below.

@@ -590,28 +590,19 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
             if plan is None:
                 continue
 
-            # AllGather-KV reuses the Ulysses sequence-sharding hooks.
-            allgather_degree = getattr(od_config.parallel_config, "allgather_degree", 1)
-            if allgather_degree > 1:
-                sp_config = SequenceParallelConfig(
-                    allgather_degree=allgather_degree,
-                )
-                mode = "allgather_kv"
-            else:
-                sp_config = SequenceParallelConfig(
-                    ulysses_degree=od_config.parallel_config.ulysses_degree,
-                    ring_degree=od_config.parallel_config.ring_degree,
-                )
-                # Apply hooks according to the plan
-                mode = (
-                    "hybrid"
-                    if sp_config.ulysses_degree > 1 and sp_config.ring_degree > 1
-                    else ("ulysses" if sp_config.ulysses_degree > 1 else "ring")
-                )
+            # The SP hooks shard by `sequence_parallel_size`, so carry the full
+            # degree triple; AllGather-KV and the composed topology reuse them as-is.
+            parallel_config = od_config.parallel_config
+            sp_config = SequenceParallelConfig(
+                ulysses_degree=parallel_config.ulysses_degree,
+                ring_degree=parallel_config.ring_degree,
+                allgather_degree=parallel_config.allgather_degree,
+            )
 
             logger.info(
                 f"Applying sequence parallelism to {transformer.__class__.__name__} ({attr}) "
-                f"(sp_size={sp_size}, mode={mode}, ulysses={sp_config.ulysses_degree}, ring={sp_config.ring_degree})"
+                f"(sp_size={sp_size}, ulysses={sp_config.ulysses_degree}, ring={sp_config.ring_degree}, "
+                f"allgather={sp_config.allgather_degree})"
             )
             apply_sequence_parallel(transformer, sp_config, plan)
             applied_count += 1
