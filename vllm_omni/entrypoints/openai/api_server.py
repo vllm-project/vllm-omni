@@ -341,6 +341,11 @@ async def omni_run_server_worker(
         remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
         remove_route_from_app(app, "/health", {"GET"})
         app.include_router(router)
+        if args.model_class_name == "SeedVR2Pipeline":
+            from vllm_omni.entrypoints.openai.video.seedvr2_long import router as seedvr2_long_router
+
+            app.state.seedvr2_long_port = args.port
+            app.include_router(seedvr2_long_router)
 
         # OMNI: Override upstream exception handlers with Omni-aware versions
         # that understand the multi-stage orchestrator lifecycle.

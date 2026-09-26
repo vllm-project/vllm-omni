@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 import zmq
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import set_torch_threads_for_runtime
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 
@@ -373,9 +374,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         num_gpus = cast(int, od_config.num_gpus)
         # Without this, every worker inherits one Torch thread per core, so an
-        # N-GPU run oversubscribes the host by N x core_count. Honours a
-        # user-provided OMP_NUM_THREADS.
-        set_multiprocessing_worker_envs()
+        # N-GPU run oversubscribes the host by N x core_count. The workers share
+        # the host, so each gets its share of the CPUs. Honours a user-provided
+        # OMP_NUM_THREADS.
+        set_multiprocessing_worker_envs(num_gpus)
         mp.set_start_method("spawn", force=True)
         processes = []
 
@@ -433,6 +435,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             reader.close()
 
         logger.debug("All workers are ready")
+        # The workers inherited their thread count; this process only schedules
+        # and preprocesses, so idle intra-op threads would just spin against them.
+        set_torch_threads_for_runtime()
 
         return processes, result_handles
 

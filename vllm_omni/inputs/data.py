@@ -15,6 +15,9 @@ from vllm.sampling_params import SamplingParams
 from vllm_omni.lora.request import LoRARequest
 
 DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
+# Colour transfer methods accepted by video restoration models (SeedVR2).
+COLOR_CORRECTION_METHODS: tuple[str, ...] = ("lab", "wavelet", "adain", "none")
+DEFAULT_COLOR_CORRECTION_METHOD = "lab"
 
 
 class OmniTextPrompt(TextPrompt):

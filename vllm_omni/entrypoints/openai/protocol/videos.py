@@ -18,7 +18,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 from vllm_omni.entrypoints.openai.image_api_utils import parse_size
-from vllm_omni.inputs.data import DIFFUSION_QUALITY_LEVELS
+from vllm_omni.inputs.data import COLOR_CORRECTION_METHODS, DIFFUSION_QUALITY_LEVELS
 
 # Bound int request fields to avoid overflow issues.
 _INT64_MIN = -(2**63)
@@ -233,6 +233,24 @@ class VideoGenerationRequest(BaseModel):
         default=None,
         description="Scheduler flow_shift for video models (Wan2.2)",
     )
+    color_correction_method: str | None = Field(
+        default=None,
+        description=(
+            "How restored colour is matched back to the input for video restoration "
+            "models (SeedVR2). 'lab' transfers colour in CIELAB space and preserves "
+            "detail, 'wavelet' transfers only the lowest frequency band, 'adain' "
+            "matches per-channel mean and standard deviation, and 'none' disables the "
+            "transfer. Defaults to 'lab' when omitted."
+        ),
+    )
+
+    @field_validator("color_correction_method")
+    @classmethod
+    def validate_color_correction_method(cls, value: str | None) -> str | None:
+        if value is not None and value not in COLOR_CORRECTION_METHODS:
+            raise ValueError(f"color_correction_method must be one of {list(COLOR_CORRECTION_METHODS)}, got {value!r}")
+        return value
+
     true_cfg_scale: float | None = Field(
         default=None,
         ge=0.0,

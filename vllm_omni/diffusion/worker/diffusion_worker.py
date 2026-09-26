@@ -32,6 +32,7 @@ from vllm.profiler.wrapper import CudaProfilerWrapper, WorkerProfiler
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.mem_utils import GiB_bytes, MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.system_utils import decorate_logs, set_process_title
+from vllm.utils.torch_utils import set_torch_threads_for_runtime
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.worker.utils import request_memory
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -1639,6 +1640,10 @@ class WorkerProc:
                 worker_extension_cls=worker_extension_cls,
                 custom_pipeline_args=custom_pipeline_args,
             )
+            # Startup is done. Steady-state serving gains nothing from intra-op
+            # threads, and N workers each spinning a host-sized OpenMP pool turn
+            # millisecond CPU ops into seconds of contention.
+            set_torch_threads_for_runtime()
             logger.info(f"Worker {rank}: Scheduler loop started.")
             pipe_writer.send(
                 {

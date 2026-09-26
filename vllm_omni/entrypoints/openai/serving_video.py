@@ -434,6 +434,8 @@ class OmniOpenAIServingVideo:
         )
         if "flow_shift" in provided_fields and request.flow_shift is not None:
             gen_params.extra_args["flow_shift"] = request.flow_shift
+        if "color_correction_method" in provided_fields and request.color_correction_method is not None:
+            gen_params.extra_args["color_correction_method"] = request.color_correction_method
         if "generate_sound" in provided_fields:
             gen_params.extra_args["generate_sound"] = request.generate_sound
         if "sound_duration" in provided_fields and request.sound_duration is not None:
