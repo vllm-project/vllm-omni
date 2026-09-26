@@ -9,7 +9,7 @@ The adapter delegates full pipeline execution to diffusers' ``__call__()``.
 It does NOT support:
 - CFG parallel (diffusers handles CFG via guidance_scale internally)
 - Sequence parallel (requires model-specific attention surgery)
-- TeaCache / Cache-DiT (requires hooking into transformer blocks)
+- TeaCache (use a native pipeline)
 - Step-wise execution (continuous batching)
 """
 
@@ -260,11 +260,10 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 "Sequence parallel is not supported with the diffusers backend. "
                 "It requires model-specific attention surgery."
             )
-        if self.od_config.cache_backend not in ("none", None):
+        if self.od_config.cache_backend not in ("none", None, "cache_dit"):
             raise NotImplementedError(
                 f"Cache backend '{self.od_config.cache_backend}' is not supported "
-                "with the diffusers backend. TeaCache/Cache-DiT require hooking "
-                "into individual transformer blocks."
+                "with the diffusers backend. Use cache_dit or a native pipeline."
             )
         if self.od_config.enforce_eager:
             raise NotImplementedError(
@@ -463,6 +462,8 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         # Request-time sampling params
         for key, value in sampling.__dict__.items():
+            if key == "guidance_scale_2" and not sampling.guidance_scale_2_provided:
+                continue
             if value is None:
                 continue
             if self._accept_call_kwargs is None or key in self._accept_call_kwargs:

@@ -689,6 +689,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         first_req = reqs[0]
         if self.cache_backend is None or not self.cache_backend.is_enabled():
             return
+        if not self.cache_backend.requires_request_refresh:
+            # The backend refreshes itself inside the pipeline call, so there is no
+            # step count to resolve here and nothing to report as missing.
+            return
 
         # Refresh cache context if needed. Batch admission groups requests by
         # RequestBatchSamplingParamsKey, so the first request's num_inference_steps applies
