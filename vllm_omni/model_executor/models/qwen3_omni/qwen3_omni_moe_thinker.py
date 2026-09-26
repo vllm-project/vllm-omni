@@ -78,7 +78,7 @@ from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLProcessingInfo,
 )
 from vllm.model_executor.models.qwen2_audio import Qwen2AudioProcessingInfo
-from vllm.model_executor.models.qwen3_moe import Qwen3MoeForCausalLM
+from vllm.model_executor.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeForCausalLM
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeModel as _Qwen3MoeLLMModel
 from vllm.model_executor.models.qwen3_omni_moe_thinker import (
     Qwen3Omni_VisionTransformer as _Qwen3Omni_VisionTransformer,
@@ -126,6 +126,10 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniThinkerMultiModalProcessor,
     _get_request_video_use_audio_in_video,
     _get_video_second_per_grid_t,
+)
+from vllm_omni.model_executor.models.qwen3_omni.hf_numerics import (
+    HFNumericsDecoderLayer,
+    HFNumericsRMSNorm,
 )
 from vllm_omni.model_executor.models.qwen3_omni.quantization import (
     Qwen3OmniNestedSupportsQuant,
@@ -553,6 +557,18 @@ ISO639_1_SUPPORTED_LANGS = {
     }
 )
 class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        hf_numerics = bool(vllm_config.additional_config.get("hf_numerics", False))
+        super().__init__(
+            vllm_config=vllm_config,
+            prefix=prefix,
+            decoder_layer_type=HFNumericsDecoderLayer if hf_numerics else Qwen3MoeDecoderLayer,
+        )
+        self.hf_numerics = hf_numerics
+        if hf_numerics:
+            config = vllm_config.model_config.hf_text_config
+            self.norm = HFNumericsRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -603,7 +619,14 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
             )
 
             if deepstack_input_embeds is not None and layer_idx in range(0, len(deepstack_input_embeds)):
-                hidden_states = hidden_states + deepstack_input_embeds[f"deepstack_input_embeds_{layer_idx}"]
+                if self.hf_numerics:
+                    # The next norm then takes the merged stream with no residual, as in HF.
+                    hidden_states = torch.ops.vllm_omni.hf_add_deepstack(
+                        hidden_states, residual, deepstack_input_embeds[f"deepstack_input_embeds_{layer_idx}"]
+                    )
+                    residual = None
+                else:
+                    hidden_states = hidden_states + deepstack_input_embeds[f"deepstack_input_embeds_{layer_idx}"]
 
         if not get_pp_group().is_last_rank:
             tensors = {"hidden_states": hidden_states, "residual": residual}
