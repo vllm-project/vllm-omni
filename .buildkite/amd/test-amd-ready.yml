@@ -304,6 +304,290 @@ steps:
         "$$R2_02_ARTIFACT_DIR/processes-after.txt" \
         2>&1 | tee "$$R2_02_ARTIFACT_DIR/process-cleanup.txt"
 
+- label: "ROCm · Distributed Core GPU Coverage"
+  agent_pool: mi300_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: NonBlocking
+  timeout_in_minutes: 30
+  artifact_paths:
+    - "artifacts/rocm-distributed-core/**/*"
+  commands:
+    - export ROCM_DISTRIBUTED_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-distributed-core"
+    - mkdir -p "$$ROCM_DISTRIBUTED_ARTIFACT_DIR"
+    - >-
+      ps -eo pid=,ppid=,lstart=,stat=,comm= >
+      "$$ROCM_DISTRIBUTED_ARTIFACT_DIR/processes-before.txt"
+    - |
+      python3 - <<'PY' > "$$ROCM_DISTRIBUTED_ARTIFACT_DIR/environment.txt"
+      import os
+      import platform
+      import torch
+
+      print(f"platform={platform.platform()}")
+      print(f"python={platform.python_version()}")
+      print(f"pytorch={torch.__version__}")
+      print(f"rocm={torch.version.hip}")
+      expected_gpus = int(os.environ["VLLM_CI_EXPECTED_GPU_COUNT"])
+      visible_gpus = torch.accelerator.device_count()
+      if not torch.version.hip:
+          raise RuntimeError("PyTorch is not a ROCm build")
+      if visible_gpus != expected_gpus:
+          raise RuntimeError(f"expected {expected_gpus} ROCm GPU(s), found {visible_gpus}")
+      print(f"visible_gpus={visible_gpus}")
+      print(f"expected_gpus={expected_gpus}")
+      print(f"image=rocm/vllm-omni:{os.environ.get('BUILDKITE_COMMIT', 'unknown')}")
+      print(f"build_created_at={os.environ.get('BUILDKITE_BUILD_CREATED_AT', 'unknown')}")
+      print(f"job_started_at={os.environ.get('BUILDKITE_JOB_STARTED_AT', 'unknown')}")
+      PY
+    # Keep the CUDA marker because this is the repository's generic GPU mark;
+    # L4 identifies the current CUDA source scope, not the AMD queue mapping.
+    - >-
+      timeout --signal=TERM --kill-after=1m 20m
+      pytest -s -v -ra
+      tests/distributed/
+      -m 'core_model and cuda and L4'
+      --run-level "core_model"
+      --durations=0
+      --junitxml="$$ROCM_DISTRIBUTED_ARTIFACT_DIR/pytest.xml"
+      2>&1 | tee "$$ROCM_DISTRIBUTED_ARTIFACT_DIR/pytest.log"
+    - >-
+      tail -n 100 "$$ROCM_DISTRIBUTED_ARTIFACT_DIR/pytest.log" >
+      "$$ROCM_DISTRIBUTED_ARTIFACT_DIR/pytest-summary.txt"
+    - |
+      python3 - <<'PY' | tee "$$ROCM_DISTRIBUTED_ARTIFACT_DIR/pytest-result.txt"
+      import os
+      from xml.etree import ElementTree
+
+      report = ElementTree.parse(
+          os.path.join(os.environ["ROCM_DISTRIBUTED_ARTIFACT_DIR"], "pytest.xml")
+      ).getroot()
+      suites = [report] if report.tag == "testsuite" else report.findall("./testsuite")
+      tests = sum(int(suite.attrib.get("tests", 0)) for suite in suites)
+      skipped = sum(int(suite.attrib.get("skipped", 0)) for suite in suites)
+      failures = sum(int(suite.attrib.get("failures", 0)) for suite in suites)
+      errors = sum(int(suite.attrib.get("errors", 0)) for suite in suites)
+      executed = tests - skipped
+      print(f"tests={tests} skipped={skipped} executed={executed} failures={failures} errors={errors}")
+      if tests == 0 or executed == 0 or failures or errors:
+          raise SystemExit("pytest did not produce a clean, non-empty executed test set")
+      PY
+    - |
+      sleep 5
+      ps -eo pid=,ppid=,lstart=,stat=,comm= > "$$ROCM_DISTRIBUTED_ARTIFACT_DIR/processes-after.txt"
+      awk '
+        NR == FNR {
+          if ($$9 != "ps") baseline[$$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7] = 1
+          next
+        }
+        $$9 != "ps" {
+          identity = $$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7
+          if (!(identity in baseline)) { print; leaked = 1 }
+        }
+        END {
+          if (leaked) { print "status=FAIL leaked_processes_detected=1"; exit 1 }
+          print "status=PASS leaked_processes=0"
+        }
+      ' "$$ROCM_DISTRIBUTED_ARTIFACT_DIR/processes-before.txt" \
+        "$$ROCM_DISTRIBUTED_ARTIFACT_DIR/processes-after.txt" \
+        2>&1 | tee "$$ROCM_DISTRIBUTED_ARTIFACT_DIR/process-cleanup.txt"
+
+- label: "ROCm · Tiny Diffusion Base GPU Coverage"
+  agent_pool: mi300_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: NonBlocking
+  timeout_in_minutes: 60
+  artifact_paths:
+    - "artifacts/rocm-tiny-diffusion-base/**/*"
+  commands:
+    - export ROCM_TINY_BASE_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-tiny-diffusion-base"
+    # AITER's process-shared JIT baton can strand sibling pytest-xdist workers
+    # while one worker compiles the first attention kernel. This parity job is
+    # backend-agnostic, so select Torch SDPA explicitly and run one xdist worker.
+    # Give MIOpen a per-job writable FindDb/cache and enable incremental tuning;
+    # sharing the database made concurrent jobs corrupt it. Most pipelines need
+    # fused SDPA to avoid excessive memory use and retain determinism. MIOpen has
+    # no usable solver for the affected tiny BF16 Conv3d/Conv1d shapes, so
+    # LongCat edit, Flux Kontext, and LTX2 use PyTorch's native convolution
+    # fallback. The three Qwen pipelines need math SDPA for their same-seed checks.
+    # Partitioning by model keeps every CUDA-equivalent case while applying each
+    # ROCm workaround narrowly.
+    - export VLLM_ROCM_USE_AITER=0
+    - export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA
+    - export MIOPEN_FIND_MODE=3
+    - export MIOPEN_FIND_ENFORCE=3
+    - export MIOPEN_USER_DB_PATH="/tmp/vllm-omni-miopen-$$BUILDKITE_JOB_ID/db"
+    - export MIOPEN_CUSTOM_CACHE_DIR="/tmp/vllm-omni-miopen-$$BUILDKITE_JOB_ID/cache"
+    - export VLLM_OMNI_ROCM_CI_DISABLE_MIOPEN=0
+    - export VLLM_OMNI_ROCM_CI_FORCE_MATH_SDPA=0
+    - >-
+      export PYTHONPATH="$$BUILDKITE_BUILD_CHECKOUT_PATH/.buildkite/amd/rocm-ci-sitecustomize:$${PYTHONPATH:-}"
+    - >-
+      mkdir -p
+      "$$ROCM_TINY_BASE_ARTIFACT_DIR"
+      "$$MIOPEN_USER_DB_PATH"
+      "$$MIOPEN_CUSTOM_CACHE_DIR"
+    - >-
+      ps -eo pid=,ppid=,lstart=,stat=,comm= >
+      "$$ROCM_TINY_BASE_ARTIFACT_DIR/processes-before.txt"
+    - |
+      python3 - <<'PY' > "$$ROCM_TINY_BASE_ARTIFACT_DIR/environment.txt"
+      import os
+      import platform
+      import torch
+
+      print(f"platform={platform.platform()}")
+      print(f"python={platform.python_version()}")
+      print(f"pytorch={torch.__version__}")
+      print(f"rocm={torch.version.hip}")
+      expected_gpus = int(os.environ["VLLM_CI_EXPECTED_GPU_COUNT"])
+      visible_gpus = torch.accelerator.device_count()
+      if not torch.version.hip:
+          raise RuntimeError("PyTorch is not a ROCm build")
+      if visible_gpus != expected_gpus:
+          raise RuntimeError(f"expected {expected_gpus} ROCm GPU(s), found {visible_gpus}")
+      print(f"visible_gpus={visible_gpus}")
+      print(f"expected_gpus={expected_gpus}")
+      print(f"vllm_rocm_use_aiter={os.environ.get('VLLM_ROCM_USE_AITER', 'unset')}")
+      print(f"diffusion_attention_backend={os.environ.get('DIFFUSION_ATTENTION_BACKEND', 'unset')}")
+      print(f"miopen_find_mode={os.environ.get('MIOPEN_FIND_MODE', 'unset')}")
+      print(f"miopen_find_enforce={os.environ.get('MIOPEN_FIND_ENFORCE', 'unset')}")
+      print(f"miopen_user_db_path={os.environ.get('MIOPEN_USER_DB_PATH', 'unset')}")
+      print(f"miopen_custom_cache_dir={os.environ.get('MIOPEN_CUSTOM_CACHE_DIR', 'unset')}")
+      print(f"default_cudnn_enabled={torch.backends.cudnn.enabled}")
+      print(f"default_flash_sdp_enabled={torch.backends.cuda.flash_sdp_enabled()}")
+      print(f"default_mem_efficient_sdp_enabled={torch.backends.cuda.mem_efficient_sdp_enabled()}")
+      print(f"default_math_sdp_enabled={torch.backends.cuda.math_sdp_enabled()}")
+      print(f"image=rocm/vllm-omni:{os.environ.get('BUILDKITE_COMMIT', 'unknown')}")
+      print(f"build_created_at={os.environ.get('BUILDKITE_BUILD_CREATED_AT', 'unknown')}")
+      print(f"job_started_at={os.environ.get('BUILDKITE_JOB_STARTED_AT', 'unknown')}")
+      PY
+    - >-
+      timeout --signal=TERM --kill-after=1m 30m
+      pytest -s -v -ra -n 1
+      tests/model_tests/diffusion/
+      -m 'core_model and cuda'
+      -k 'not (LTX2Pipeline or LongCatImageEditPipeline or FluxKontextPipeline or QwenImagePipeline or QwenImageEditPipeline or QwenImageEditPlusPipeline)'
+      --run-level "core_model"
+      --durations=0
+      --junitxml="$$ROCM_TINY_BASE_ARTIFACT_DIR/pytest-default.xml"
+      2>&1 | tee "$$ROCM_TINY_BASE_ARTIFACT_DIR/pytest-default.log"
+    - export VLLM_OMNI_ROCM_CI_DISABLE_MIOPEN=1
+    - |
+      python3 - <<'PY' >> "$$ROCM_TINY_BASE_ARTIFACT_DIR/environment.txt"
+      import torch
+
+      print(f"native_conv_cudnn_enabled={torch.backends.cudnn.enabled}")
+      PY
+    - >-
+      timeout --signal=TERM --kill-after=1m 15m
+      pytest -s -v -ra -n 1
+      tests/model_tests/diffusion/
+      -m 'core_model and cuda'
+      -k 'LongCatImageEditPipeline or FluxKontextPipeline'
+      --run-level "core_model"
+      --durations=0
+      --junitxml="$$ROCM_TINY_BASE_ARTIFACT_DIR/pytest-native-conv.xml"
+      2>&1 | tee "$$ROCM_TINY_BASE_ARTIFACT_DIR/pytest-native-conv.log"
+    - >-
+      timeout --signal=TERM --kill-after=1m 10m
+      pytest -s -v -ra -n 1
+      tests/model_tests/diffusion/
+      -m 'core_model and cuda'
+      -k 'LTX2Pipeline'
+      --run-level "core_model"
+      --durations=0
+      --junitxml="$$ROCM_TINY_BASE_ARTIFACT_DIR/pytest-ltx2.xml"
+      2>&1 | tee "$$ROCM_TINY_BASE_ARTIFACT_DIR/pytest-ltx2.log"
+    - export VLLM_OMNI_ROCM_CI_DISABLE_MIOPEN=0
+    - export VLLM_OMNI_ROCM_CI_FORCE_MATH_SDPA=1
+    - |
+      python3 - <<'PY' >> "$$ROCM_TINY_BASE_ARTIFACT_DIR/environment.txt"
+      import torch
+
+      print(f"qwen_flash_sdp_enabled={torch.backends.cuda.flash_sdp_enabled()}")
+      print(f"qwen_mem_efficient_sdp_enabled={torch.backends.cuda.mem_efficient_sdp_enabled()}")
+      print(f"qwen_math_sdp_enabled={torch.backends.cuda.math_sdp_enabled()}")
+      PY
+    - >-
+      timeout --signal=TERM --kill-after=1m 10m
+      pytest -s -v -ra -n 1
+      tests/model_tests/diffusion/
+      -m 'core_model and cuda'
+      -k 'QwenImagePipeline or QwenImageEditPipeline or QwenImageEditPlusPipeline'
+      --run-level "core_model"
+      --durations=0
+      --junitxml="$$ROCM_TINY_BASE_ARTIFACT_DIR/pytest-qwen-math.xml"
+      2>&1 | tee "$$ROCM_TINY_BASE_ARTIFACT_DIR/pytest-qwen-math.log"
+    - >-
+      {
+      echo '=== default fused SDPA partition ===';
+      tail -n 50 "$$ROCM_TINY_BASE_ARTIFACT_DIR/pytest-default.log";
+      echo '=== native convolution partition ===';
+      tail -n 50 "$$ROCM_TINY_BASE_ARTIFACT_DIR/pytest-native-conv.log";
+      echo '=== LTX2 FP32 vocoder partition ===';
+      tail -n 50 "$$ROCM_TINY_BASE_ARTIFACT_DIR/pytest-ltx2.log";
+      echo '=== Qwen math SDPA partition ===';
+      tail -n 50 "$$ROCM_TINY_BASE_ARTIFACT_DIR/pytest-qwen-math.log";
+      } > "$$ROCM_TINY_BASE_ARTIFACT_DIR/pytest-summary.txt"
+    - |
+      python3 - <<'PY' | tee "$$ROCM_TINY_BASE_ARTIFACT_DIR/pytest-result.txt"
+      import os
+      from xml.etree import ElementTree
+
+      artifact_dir = os.environ["ROCM_TINY_BASE_ARTIFACT_DIR"]
+      report_paths = [
+          os.path.join(artifact_dir, "pytest-default.xml"),
+          os.path.join(artifact_dir, "pytest-native-conv.xml"),
+          os.path.join(artifact_dir, "pytest-ltx2.xml"),
+          os.path.join(artifact_dir, "pytest-qwen-math.xml"),
+      ]
+      totals = {"tests": 0, "skipped": 0, "executed": 0, "failures": 0, "errors": 0}
+      for path in report_paths:
+          report = ElementTree.parse(path).getroot()
+          suites = [report] if report.tag == "testsuite" else report.findall("./testsuite")
+          tests = sum(int(suite.attrib.get("tests", 0)) for suite in suites)
+          skipped = sum(int(suite.attrib.get("skipped", 0)) for suite in suites)
+          failures = sum(int(suite.attrib.get("failures", 0)) for suite in suites)
+          errors = sum(int(suite.attrib.get("errors", 0)) for suite in suites)
+          executed = tests - skipped
+          print(
+              f"report={os.path.basename(path)} tests={tests} skipped={skipped} "
+              f"executed={executed} failures={failures} errors={errors}"
+          )
+          if tests == 0 or executed == 0 or failures or errors:
+              raise SystemExit(f"{path} did not contain a clean, non-empty executed test set")
+          for key, value in (
+              ("tests", tests),
+              ("skipped", skipped),
+              ("executed", executed),
+              ("failures", failures),
+              ("errors", errors),
+          ):
+              totals[key] += value
+      print(" ".join(f"total_{key}={value}" for key, value in totals.items()))
+      PY
+    - |
+      sleep 5
+      ps -eo pid=,ppid=,lstart=,stat=,comm= > "$$ROCM_TINY_BASE_ARTIFACT_DIR/processes-after.txt"
+      awk '
+        NR == FNR {
+          if ($$9 != "ps") baseline[$$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7] = 1
+          next
+        }
+        $$9 != "ps" {
+          identity = $$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7
+          if (!(identity in baseline)) { print; leaked = 1 }
+        }
+        END {
+          if (leaked) { print "status=FAIL leaked_processes_detected=1"; exit 1 }
+          print "status=PASS leaked_processes=0"
+        }
+      ' "$$ROCM_TINY_BASE_ARTIFACT_DIR/processes-before.txt" \
+        "$$ROCM_TINY_BASE_ARTIFACT_DIR/processes-after.txt" \
+        2>&1 | tee "$$ROCM_TINY_BASE_ARTIFACT_DIR/process-cleanup.txt"
+
 # - label: "Omni Model Test Qwen3-Omni"
 #   agent_pool: mi300_2
 #   depends_on: amd-build
@@ -317,6 +601,42 @@ steps:
 
 - group: ":card_index_dividers: E2E Test"
   steps:
+    - label: "ROCm · VeRL-Omni E2E Coverage"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      timeout_in_minutes: 30
+      artifact_paths:
+        - "artifacts/rocm-verl-omni-e2e/**/*"
+      commands:
+        - export ROCM_CI_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-verl-omni-e2e"
+        - mkdir -p "$$ROCM_CI_ARTIFACT_DIR"
+        - python3 -m pip install --no-deps "ray==2.56.1" "omegaconf==2.3.0"
+        - python3 -m pip show ray omegaconf > "$$ROCM_CI_ARTIFACT_DIR/dependencies.txt"
+        - python3 .buildkite/amd/scripts/rocm_ci_evidence.py environment --output "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+        - python3 .buildkite/amd/scripts/rocm_ci_evidence.py processes --output "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+        - export ROCM_TEST_STARTED_EPOCH=$$(date +%s)
+        - >-
+          timeout --signal=TERM --kill-after=1m 20m
+          pytest -s -v -ra
+          tests/e2e/features/rlhf_test/test_verl_omni_e2e.py
+          --durations=0
+          --junitxml="$$ROCM_CI_ARTIFACT_DIR/pytest.xml"
+          2>&1 | tee "$$ROCM_CI_ARTIFACT_DIR/pytest.log"
+        - echo "runtime_seconds=$$(( $$(date +%s) - ROCM_TEST_STARTED_EPOCH ))" >> "$$ROCM_CI_ARTIFACT_DIR/environment.txt"
+        - tail -n 100 "$$ROCM_CI_ARTIFACT_DIR/pytest.log" > "$$ROCM_CI_ARTIFACT_DIR/pytest-summary.txt"
+        - >-
+          python3 .buildkite/amd/scripts/rocm_ci_evidence.py pytest-result
+          --xml "$$ROCM_CI_ARTIFACT_DIR/pytest.xml"
+          --log "$$ROCM_CI_ARTIFACT_DIR/pytest.log"
+          --output "$$ROCM_CI_ARTIFACT_DIR/pytest-result.txt"
+        - >-
+          python3 .buildkite/amd/scripts/rocm_ci_evidence.py cleanup
+          --before "$$ROCM_CI_ARTIFACT_DIR/processes-before.txt"
+          --after "$$ROCM_CI_ARTIFACT_DIR/processes-after.txt"
+          --output "$$ROCM_CI_ARTIFACT_DIR/process-cleanup.txt"
+
     - label: "Qwen3-TTS E2E Test"
       agent_pool: mi300_1
       depends_on: amd-build
