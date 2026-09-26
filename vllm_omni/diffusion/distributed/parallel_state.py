@@ -221,9 +221,9 @@ class RankGenerator:
 
     def get_mask(self, order: str, token: str):
         ordered_token = order.split("-")
-        token = token.split("-")
+        tokens = token.split("-")
         mask = [False] * len(ordered_token)
-        for t in token:
+        for t in tokens:
             mask[ordered_token.index(t)] = True
         return mask
 
@@ -856,12 +856,14 @@ def _initialize_model_parallel(
     )
     global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
-    _PP = init_model_parallel_group(
+    _pp_group = init_model_parallel_group(
         group_ranks=get_rank_groups("pp"),
         local_rank=get_world_group().local_rank,
         backend=backend,
         parallel_mode="pipeline",
     )
+    assert isinstance(_pp_group, PipelineGroupCoordinator)
+    _PP = _pp_group
     vllm_parallel_state._PP = _PP
 
     global _SP
@@ -874,7 +876,7 @@ def _initialize_model_parallel(
         world_size=world_size,
         sp_group_ranks=sp_group_ranks,
     )
-    _SP = init_model_parallel_group(
+    _sp_group = init_model_parallel_group(
         group_ranks=sp_group_ranks,
         local_rank=get_world_group().local_rank,
         backend=backend,
@@ -883,6 +885,8 @@ def _initialize_model_parallel(
         ring_group=ring_pg,
         allgather_group=allgather_pg,
     )
+    assert isinstance(_sp_group, SequenceParallelGroupCoordinator)
+    _SP = _sp_group
     if use_moe_parallel_mapping:
         # Diffusion normally uses its own SP group. Map it to vLLM PCP only for
         # expert-parallel runtimes that rely on vLLM FusedMoE group semantics.
@@ -1020,6 +1024,11 @@ def initialize_model_parallel(
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
     global _DP, _CFG, _SP, _PP, _FS, _HSDP_REPLICATE, _EXPERT_PARALLEL_GROUP_RANKS
+
+    # Registered windows must be collectively released while their PG is live.
+    from vllm_omni.diffusion.distributed.flashinfer_ulysses import clear_flashinfer_ulysses_communicators
+
+    clear_flashinfer_ulysses_communicators()
 
     if vllm_parallel_state._DP and vllm_parallel_state._DP is not _DP:
         vllm_parallel_state._DP.destroy()
