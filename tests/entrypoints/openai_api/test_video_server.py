@@ -940,6 +940,23 @@ def test_magi2_serving_applies_native_defaults_and_rejects_explicit_frame_mismat
         )
 
 
+@pytest.mark.parametrize("num_frames", [None, 9, 193])
+def test_sana_video2_serving_preserves_variable_frame_count(num_frames):
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "SanaVideo2Pipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        diffusion_engine=engine,
+        model_name="Efficient-Large-Model/SANA-Video_2.0_5B_720p",
+    )
+    request = VideoGenerationRequest(prompt="A red boat", num_frames=num_frames)
+    asyncio.run(handler._run_and_extract(request, "sana2-frames"))
+    sampling = engine.captured_sampling_params_list[0]
+    assert sampling.num_frames == (193 if num_frames is None else num_frames)
+    assert (sampling.height, sampling.width) == (736, 1280)
+    assert sampling.fps == sampling.frame_rate == 24
+    assert sampling.num_inference_steps == 50
+
+
 def test_i2v_video_generation_with_image_reference_form(test_client, mocker: MockerFixture):
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
