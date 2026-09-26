@@ -13,15 +13,17 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.fastvideo_vsa import (
     FastVideoVSAImpl,
-    _construct_variable_block_sizes,
     _get_gate_compress,
-    _get_non_pad_index,
-    _get_tile_partition_indices,
 )
 from vllm_omni.diffusion.attention.ops.block_sparse import (
+    block_sparse_attn_bshd,
     build_prefix_dense_block_map,
-    fastvideo_block_sparse_attn_bshd,
     mean_pool_tiles,
+)
+from vllm_omni.diffusion.attention.ops.video_tiles import (
+    construct_variable_block_sizes,
+    get_non_pad_index,
+    get_tile_partition_indices,
 )
 
 logger = init_logger(__name__)
@@ -44,11 +46,11 @@ def _get_h3_tile_metadata(
         if remainder:
             prefix_sizes.append(remainder)
 
-    video_indices = _get_tile_partition_indices(video_shape, block_size, device) + prefix_len
-    video_sizes = _construct_variable_block_sizes(video_shape, block_size, device)
+    video_indices = get_tile_partition_indices(video_shape, block_size, device) + prefix_len
+    video_sizes = construct_variable_block_sizes(video_shape, block_size, device)
     partition = torch.cat([torch.arange(prefix_len, device=device, dtype=torch.long), video_indices])
     sizes = torch.cat([torch.tensor(prefix_sizes, device=device, dtype=torch.int32), video_sizes.to(torch.int32)])
-    non_pad = _get_non_pad_index(sizes, block_elements)
+    non_pad = get_non_pad_index(sizes, block_elements)
     untile = non_pad[torch.argsort(partition)]
     total = prefix_len + math.prod(video_shape)
     if int(sizes.sum()) != total or untile.numel() != total:
@@ -111,12 +113,7 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
             prefix_segments, video_shape, query.device
         )
         logical_blocks = int(sizes.numel())
-        # The native sm100a kernel assigns pairs of query blocks to CTAs. Its
-        # contract requires an even block count; the synthetic partner is
-        # transport-only and is removed before returning.
-        pair_pad = logical_blocks % 2
-        kernel_blocks = logical_blocks + pair_pad
-        target_shape = (query.shape[0], kernel_blocks * 64, query.shape[2], query.shape[3])
+        target_shape = (query.shape[0], logical_blocks * 64, query.shape[2], query.shape[3])
         q_tiled = torch.zeros(target_shape, device=query.device, dtype=query.dtype)
         k_tiled = torch.zeros_like(q_tiled)
         v_tiled = torch.zeros_like(q_tiled)
@@ -128,30 +125,28 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
         k_pool = mean_pool_tiles(k_tiled[:, : logical_blocks * 64], sizes, block_size=64)
         scores = torch.matmul(q_pool, k_pool.transpose(-2, -1)) * self.softmax_scale
         block_map = build_prefix_dense_block_map(scores, prefix_blocks, video_blocks, self.topk)
-        kernel_sizes = sizes
-        if pair_pad:
-            block_map = torch.nn.functional.pad(block_map, (0, 1, 0, 1), value=False)
-            kernel_sizes = torch.nn.functional.pad(sizes, (0, 1), value=0)
-
         logger.info_once(
             "FASTVIDEO_VSA H3 routing: seq_len=%d, prefix_segments=%s, video_shape=%s, "
-            "prefix_blocks=%d, video_blocks=%d, topk=%d, kernel_blocks=%d",
+            "prefix_blocks=%d, video_blocks=%d, topk=%d, logical_blocks=%d",
             query.shape[1],
             prefix_segments,
             video_shape,
             prefix_blocks,
             video_blocks,
             min(self.topk, video_blocks),
-            kernel_blocks,
-        )
-        output = fastvideo_block_sparse_attn_bshd(
-            q_tiled.contiguous(),
-            k_tiled.contiguous(),
-            v_tiled.contiguous(),
-            block_map.contiguous(),
-            kernel_sizes.contiguous(),
             logical_blocks,
-        )[:, : logical_blocks * 64]
+        )
+        output = block_sparse_attn_bshd(
+            q_tiled,
+            k_tiled,
+            v_tiled,
+            block_map,
+            sizes,
+            self.softmax_scale,
+            provider=self.provider,
+            precision=self.precision,
+        )
+        logger.info_once("H3 VSA executing provider=%s precision=%s", self.provider, self.precision)
 
         if gate is not None:
             gate_tiled = torch.zeros_like(q_tiled[:, : logical_blocks * 64])

@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import functools
 import importlib.util
 import math
 from collections.abc import Mapping
@@ -18,6 +17,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+from vllm_omni.diffusion.attention.ops.video_tiles import get_tile_metadata
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.platforms import current_omni_platform
 
@@ -87,73 +87,6 @@ if not hasattr(torch.ops.vllm_omni, "fastvideo_vsa_bshd"):
 _fastvideo_vsa_bshd_op = torch.ops.vllm_omni.fastvideo_vsa_bshd
 
 
-@functools.lru_cache(maxsize=32)
-def _get_tile_partition_indices(
-    dit_seq_shape: tuple[int, int, int],
-    tile_size: tuple[int, int, int],
-    device: torch.device,
-) -> torch.Tensor:
-    t_size, h_size, w_size = dit_seq_shape
-    tile_t, tile_h, tile_w = tile_size
-    indices = torch.arange(t_size * h_size * w_size, device=device, dtype=torch.long).reshape(t_size, h_size, w_size)
-    tiles = []
-    for tile_t_idx in range(math.ceil(t_size / tile_t)):
-        for tile_h_idx in range(math.ceil(h_size / tile_h)):
-            for tile_w_idx in range(math.ceil(w_size / tile_w)):
-                tiles.append(
-                    indices[
-                        tile_t_idx * tile_t : min((tile_t_idx + 1) * tile_t, t_size),
-                        tile_h_idx * tile_h : min((tile_h_idx + 1) * tile_h, h_size),
-                        tile_w_idx * tile_w : min((tile_w_idx + 1) * tile_w, w_size),
-                    ].flatten()
-                )
-    return torch.cat(tiles, dim=0)
-
-
-@functools.lru_cache(maxsize=32)
-def _construct_variable_block_sizes(
-    dit_seq_shape: tuple[int, int, int],
-    tile_size: tuple[int, int, int],
-    device: torch.device,
-) -> torch.Tensor:
-    num_tiles = tuple(math.ceil(seq_dim / tile_dim) for seq_dim, tile_dim in zip(dit_seq_shape, tile_size))
-
-    def _sizes(dim_len: int, tile: int, n_tiles: int) -> torch.Tensor:
-        sizes = torch.full((n_tiles,), tile, dtype=torch.int32, device=device)
-        remainder = dim_len - (n_tiles - 1) * tile
-        sizes[-1] = remainder if remainder > 0 else tile
-        return sizes
-
-    t_sizes = _sizes(dit_seq_shape[0], tile_size[0], num_tiles[0])
-    h_sizes = _sizes(dit_seq_shape[1], tile_size[1], num_tiles[1])
-    w_sizes = _sizes(dit_seq_shape[2], tile_size[2], num_tiles[2])
-    return (t_sizes[:, None, None] * h_sizes[None, :, None] * w_sizes[None, None, :]).reshape(-1)
-
-
-@functools.lru_cache(maxsize=32)
-def _get_non_pad_index(variable_block_sizes: torch.Tensor, max_block_size: int) -> torch.Tensor:
-    num_blocks = variable_block_sizes.shape[0]
-    device = variable_block_sizes.device
-    starts = torch.arange(num_blocks, device=device) * max_block_size
-    padded_index = starts[:, None] + torch.arange(max_block_size, device=device)[None, :]
-    valid = torch.arange(max_block_size, device=device)[None, :] < variable_block_sizes[:, None]
-    return padded_index[valid]
-
-
-@torch.compiler.disable
-def _get_tile_metadata(
-    dit_seq_shape: tuple[int, int, int],
-    tile_size: tuple[int, int, int],
-    block_elements: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    tile_partition_indices = _get_tile_partition_indices(dit_seq_shape, tile_size, device)
-    variable_block_sizes = _construct_variable_block_sizes(dit_seq_shape, tile_size, device)
-    non_pad_index = _get_non_pad_index(variable_block_sizes, block_elements)
-    untile_combined_index = non_pad_index[torch.argsort(tile_partition_indices)]
-    return tile_partition_indices, variable_block_sizes, non_pad_index, untile_combined_index
-
-
 def _get_vsa_dit_seq_shape(attn_metadata: AttentionMetadata | None) -> tuple[int, int, int] | None:
     if attn_metadata is None:
         return None
@@ -193,7 +126,7 @@ class FastVideoVSABackend(AttentionBackend):
 
     @classmethod
     def validate_available(cls) -> None:
-        if importlib.util.find_spec("fastvideo_kernel") is None:
+        if importlib.util.find_spec("fastvideo_kernel") is None and importlib.util.find_spec("flashinfer") is None:
             raise ImportError(
                 "FASTVIDEO_VSA requires the optional fastvideo-kernel package "
                 "included in vllm-omni[vsa]. Install with `uv pip install 'vllm-omni[vsa]'` "
@@ -238,6 +171,16 @@ class FastVideoVSAImpl(AttentionImpl):
         self.causal = causal
         self.qkv_layout = qkv_layout
 
+        self.provider = backend_kwargs.get("provider", "fastvideo")
+        self.precision = backend_kwargs.get("precision", "bf16")
+        if self.provider not in ("fastvideo", "flashinfer") or self.precision not in ("bf16", "sage"):
+            raise ValueError("VSA requires provider fastvideo/flashinfer and precision bf16/sage")
+        if self.precision == "sage" and self.provider != "flashinfer":
+            raise ValueError("Sage VSA requires the FlashInfer provider")
+        if self.provider == "flashinfer":
+            from vllm_omni.diffusion.attention.ops.flashinfer_block_sparse import require_flashinfer_sparse
+
+            require_flashinfer_sparse(self.precision)
         self.topk = int(backend_kwargs.get("topk", 64))
         self.block_size = self._parse_block_size(backend_kwargs.get("block_size", (4, 8, 8)))
         self.block_elements = self.block_size[0] * self.block_size[1] * self.block_size[2]
@@ -312,6 +255,8 @@ class FastVideoVSAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
     ) -> str | None:
+        if self.provider == "flashinfer":
+            return "FlashInfer VSA requires a model tile64 layout"
         if self.causal:
             return "causal attention is not supported"
         if self.block_elements != 256:
@@ -415,7 +360,7 @@ class FastVideoVSAImpl(AttentionImpl):
             )
 
         try:
-            tile_partition_indices, variable_block_sizes, non_pad_index, untile_combined_index = _get_tile_metadata(
+            tile_partition_indices, variable_block_sizes, non_pad_index, untile_combined_index = get_tile_metadata(
                 dit_seq_shape,
                 self.block_size,
                 self.block_elements,
