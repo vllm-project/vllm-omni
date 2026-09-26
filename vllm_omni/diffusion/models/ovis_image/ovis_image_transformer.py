@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Copyright 2025 Alibaba Ovis-Image Team and The HuggingFace. All rights reserved.
 #
@@ -367,6 +367,12 @@ class OvisImageTransformer2DModel(nn.Module):
 
     _repeated_blocks = ["OvisImageTransformerBlock", "OvisImageSingleTransformerBlock"]
     _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
+
+    @staticmethod
+    def _is_transformer_block(name: str, module: nn.Module) -> bool:
+        return isinstance(module, (OvisImageTransformerBlock, OvisImageSingleTransformerBlock))
+
+    _hsdp_shard_conditions = [_is_transformer_block]
 
     def __init__(
         self,

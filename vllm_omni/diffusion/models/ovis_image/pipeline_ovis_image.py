@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Copyright 2025 Alibaba Ovis-Image Team and The HuggingFace Team. All rights reserved.
 #
@@ -18,7 +18,8 @@
 import inspect
 import json
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from typing import Any, ClassVar
 
 import numpy as np
@@ -30,6 +31,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 )
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
+from torch.distributed.fsdp import FSDPModule
 from transformers import Qwen2TokenizerFast, Qwen3Model
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -551,6 +553,24 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMi
     def interrupt(self):
         return self._interrupt
 
+    @contextmanager
+    def _hsdp_denoising_context(self) -> Iterator[None]:
+        # Keep gathered weights for the denoising loop only. This trades active
+        # request memory for one all-gather per block instead of one per step.
+        if self.od_config.additional_config.get("hsdp_reshard_after_forward", True) or not isinstance(
+            self.transformer, FSDPModule
+        ):
+            yield
+            return
+        modules = [module for module in self.transformer.modules() if isinstance(module, FSDPModule)]
+        self.transformer.set_reshard_after_forward(False)
+        try:
+            yield
+        finally:
+            for module in reversed(modules):
+                module.reshard()
+            self.transformer.set_reshard_after_forward(True)
+
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
@@ -652,18 +672,19 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMi
             self._joint_attention_kwargs = {}
 
         # 6. Denoising loop using diffuse method
-        latents = self.diffuse(
-            latents=latents,
-            timesteps=timesteps,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds if do_classifier_free_guidance else None,
-            text_ids=text_ids,
-            negative_text_ids=negative_text_ids if do_classifier_free_guidance else None,
-            latent_image_ids=latent_image_ids,
-            do_true_cfg=do_classifier_free_guidance,
-            guidance_scale=guidance_scale,
-            cfg_normalize=False,
-        )
+        with self._hsdp_denoising_context():
+            latents = self.diffuse(
+                latents=latents,
+                timesteps=timesteps,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds if do_classifier_free_guidance else None,
+                text_ids=text_ids,
+                negative_text_ids=negative_text_ids if do_classifier_free_guidance else None,
+                latent_image_ids=latent_image_ids,
+                do_true_cfg=do_classifier_free_guidance,
+                guidance_scale=guidance_scale,
+                cfg_normalize=False,
+            )
 
         self._current_timestep = None
         if output_type == "latent":
