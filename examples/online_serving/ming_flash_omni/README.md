@@ -64,6 +64,11 @@ stages on separate devices. For an explicit single-GPU validation, use
 `cfg_parallel_size: 1`, places both stages on device 0, and enables
 `inline_diffusion`.
 
+For A6.1 CFG parallel validation, use
+`vllm_omni/deploy/ming_flash_omni_image_cfg_parallel.yaml`. It keeps the
+thinker on devices 0-3 and assigns devices 4-5 to the diffusion stage with
+`cfg_parallel_size: 2`.
+
 The profile's inline setting is a process-topology choice. It removes the
 `StageDiffusionProc` ZMQ hop for the diffusion stage. Naming the same device
 without `inline_diffusion` would still use `StageDiffusionClient`, ZMQ, and
