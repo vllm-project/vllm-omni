@@ -12,6 +12,7 @@ it would alone. These tests pin that multi-request contract:
   final pixels bit-for-bit;
 - heterogeneous waves stay safe: mixed t2i/it2i, unequal step counts, and a
   mid-flight admission that must not disturb the request already running;
+- cancelling one request releases its caches and leaves its wave peer intact;
 - driving two requests through the real runner batches them into shared waves.
 
 The driver below mirrors ``DiffusionModelRunner._execute_stepwise_core``: one
@@ -21,6 +22,7 @@ slice, with ``post_decode`` firing per request as soon as its own schedule is
 exhausted.
 """
 
+import gc
 import types
 
 import numpy as np
@@ -316,6 +318,18 @@ def test_step_scheduler_update_matches_reference_euler_step():
     assert torch.equal(ns.image_prediction, latents_before)
 
 
+def test_step_scheduler_ignores_none_noise_pred():
+    pipe = _make_setup()
+    ns, caches = _make_ns(), _make_caches()
+    req = _build_step_request(ns, caches)
+    latents_before = req.latents.clone()
+
+    pipe.step_scheduler(req, None)
+
+    assert req.step_index == 0
+    assert torch.equal(req.latents, latents_before)
+
+
 def test_denoise_step_concatenates_and_slices_per_request():
     """Two requests at different steps: rows concatenate, and runner-style
     per-request slices drive each scheduler update with its own t."""
@@ -478,6 +492,85 @@ def test_mid_flight_admission_continues_older_request(monkeypatch):
     # The admitted request completed its own schedule.
     assert req_b.step_index == STEPS
     assert outputs["req-b"].output["payload"]["image"] is not None
+
+
+def test_aborted_request_peer_unaffected(monkeypatch):
+    """Aborting one request mid-denoise releases its caches and spares peers.
+
+    The abort takes effect at a wave boundary: the runner retires the request
+    by dropping its state, and the pipeline frees the request-local caches
+    from the finalize hook ``prepare_encode`` attached to that state (the same
+    idempotent release ``post_decode`` runs on the completion path, which this
+    request never reaches). The wave peer keeps evolving exactly as a solo
+    run.
+    """
+    solo_calls, solo_out, _ = _solo_run(monkeypatch, seed=1234, request_id="req-a")
+
+    pipe = _make_setup()
+    recorder = _install_recorder(pipe)
+    _track_cleanup(monkeypatch, recorder)
+    caches_a = _make_caches()
+    cond_a = caches_a["cond"]
+    req_a = _build_step_request(_make_ns(seed=1234), caches_a, request_id="req-a")
+    # Admit req-b the way the runner does, through the real prepare_encode, so
+    # the finalize release is registered exactly as in serving.
+    req_b = _admit_request(pipe, "req-b")
+    caches_b = req_b.extra[SenseNovaU1Pipeline._STEP_KEY].caches
+    cond_b = caches_b["cond"]
+    uncond_b = caches_b["uncond"]
+
+    _drive_wave(pipe, [req_a, req_b])
+
+    # Cancel req-b between waves: the runner pops the state and drops every
+    # reference to it; the finalize release fires on collection.
+    del req_b
+    gc.collect()
+    assert recorder.cleaned == [cond_b, uncond_b]
+    assert not caches_b
+
+    while not req_a.denoise_completed:
+        _drive_wave(pipe, [req_a])
+    out_a = pipe.post_decode(req_a)
+
+    # Wave log: [a0, b0] then [a1], [a2]. req-a owns indices 0, 2, 3.
+    _assert_matching_calls(
+        [recorder.denoise_calls[i] for i in (0, 2, 3)],
+        solo_calls,
+    )
+    solo_img = solo_out.output["payload"]["image"]
+    assert np.array_equal(np.asarray(out_a.output["payload"]["image"]), np.asarray(solo_img))
+    # Peer caches released once; the aborted request's release is unchanged.
+    assert recorder.cleaned.count(cond_a) == 1
+    assert recorder.cleaned.count(cond_b) == 1
+
+
+def test_post_decode_releases_caches_even_on_decode_failure(monkeypatch):
+    pipe = _make_setup()
+    released = []
+    monkeypatch.setattr(pipe_mod, "clear_flash_kv_cache", lambda cache: released.append(cache))
+    ns, caches = _make_ns(), _make_caches()
+    req = _build_step_request(ns, caches, think_text="reasoning...")
+    cond, uncond = caches["cond"], caches["uncond"]
+
+    out = pipe.post_decode(req)
+    assert out.output["metadata"]["text"] == {"think_text": "reasoning..."}
+    assert released == [cond, uncond]
+    # The release empties the cache dict, so a repeat release is a no-op.
+    assert not caches
+    pipe.release_step_state(req)
+    assert released == [cond, uncond]
+
+    def exploding_decode(image_prediction, think_text=""):
+        raise RuntimeError("decode exploded")
+
+    pipe._build_diffusion_output = exploding_decode
+    # A fresh request proves the finally-path releases even when decode raises.
+    ns2, caches2 = _make_ns(), _make_caches()
+    cond2, uncond2 = caches2["cond"], caches2["uncond"]
+    req2 = _build_step_request(ns2, caches2)
+    with pytest.raises(RuntimeError, match="decode exploded"):
+        pipe.post_decode(req2)
+    assert released == [cond, uncond, cond2, uncond2]
 
 
 def test_step_batch_noise_is_per_request():

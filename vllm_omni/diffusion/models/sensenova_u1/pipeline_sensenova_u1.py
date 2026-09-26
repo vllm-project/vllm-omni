@@ -507,6 +507,36 @@ class _ARDecodeCursor:
 _MAX_THINK_TOKENS = 1024
 
 
+def _release_denoise_caches(caches: dict | None) -> None:
+    """Release a request's denoise flash KV caches (idempotent, None-safe).
+
+    Clearing the dict makes a repeat release a no-op, which the step paths
+    rely on: ``post_decode`` releases on the way out and the ``weakref``
+    backstop attached in ``prepare_encode`` releases again once the runner
+    drops the state of a request that never reached ``post_decode`` — an
+    abort, an interrupt, or a failure.
+    """
+
+    if not caches:
+        return
+    for key in ("cond", "uncond", "img_cond"):
+        value = caches.get(key)
+        if value is not None and not isinstance(value, dict):
+            clear_flash_kv_cache(value)
+    caches.clear()
+
+
+def _release_step_caches(step: SimpleNamespace | None) -> None:
+    """``weakref.finalize`` target: release the caches of a retired request.
+
+    Takes the step context rather than its caches dict because the dict is
+    only assembled when the prepare phase ends — after ``prepare_encode``
+    has attached this release to the state's lifetime.
+    """
+
+    _release_denoise_caches(step.caches if step is not None else None)
+
+
 class SenseNovaU1Pipeline(
     nn.Module,
     SupportsComponentDiscovery,
@@ -1740,12 +1770,8 @@ class SenseNovaU1Pipeline(
         z = z + (t_next - t) * v_pred
         return _unpatchify(z, self.patch_size * self.merge_size, p.image_size[1], p.image_size[0])
 
-    def _denoising_output(self, caches, image_prediction, think_text="") -> DiffusionOutput:
-        """Release the KV caches and build the image output."""
-        for key in ("cond", "uncond", "img_cond"):
-            if key in caches and not isinstance(caches[key], dict):
-                clear_flash_kv_cache(caches[key])
-
+    def _build_diffusion_output(self, image_prediction, think_text: str = "") -> DiffusionOutput:
+        """Convert the final image state to a DiffusionOutput."""
         images = _to_pil(image_prediction)
         img = images[0] if images else None
         metadata = {}
@@ -1758,15 +1784,27 @@ class SenseNovaU1Pipeline(
             }
         )
 
+    def _denoising_output(self, caches, image_prediction, think_text="") -> DiffusionOutput:
+        """Release the KV caches and build the image output."""
+        _release_denoise_caches(caches)
+        return self._build_diffusion_output(image_prediction, think_text)
+
     def _run_denoising_loop(self, ns, caches, p, think_text="", is_it2i: bool = False) -> DiffusionOutput:
-        """Shared denoising loop for both T2I and IT2I."""
+        """Shared denoising loop for both T2I and IT2I.
+
+        Cleanup runs from a ``finally`` block so the denoising caches are
+        released on normal completion and on exception paths alike.
+        """
         image_prediction = ns.image_prediction
 
-        for step_i in range(p.num_steps):
-            z, v_pred = self._denoise_one(image_prediction, ns, caches, p, step_i, is_it2i)
-            image_prediction = self._advance_latents(z, ns, p, step_i, v_pred)
+        try:
+            for step_i in range(p.num_steps):
+                z, v_pred = self._denoise_one(image_prediction, ns, caches, p, step_i, is_it2i)
+                image_prediction = self._advance_latents(z, ns, p, step_i, v_pred)
+        finally:
+            _release_denoise_caches(caches)
 
-        return self._denoising_output(caches, image_prediction, think_text)
+        return self._build_diffusion_output(image_prediction, think_text)
 
     # -----------------------------------------------------------------------
     # Step execution
@@ -1860,6 +1898,14 @@ class SenseNovaU1Pipeline(
             # A request that asked for no tokens at all has an empty loop, and
             # its prepare phase is over before it starts.
             self._finish_prepare(state)
+        # The shared runner retires an aborted, interrupted, or failed request
+        # by dropping its state — there is no pipeline-visible retirement
+        # callback — so the request-scoped flash KV caches are released
+        # attached to the state's lifetime rather than left to tensor
+        # refcounting. Idempotent with the release ``post_decode`` runs; the
+        # step context is captured (not its caches) because the caches are
+        # only assembled when the prepare phase ends.
+        weakref.finalize(state, _release_step_caches, step)
         return state
 
     def prepare_steps_remaining(self, state: StepRequestState) -> int | None:
@@ -1983,19 +2029,44 @@ class SenseNovaU1Pipeline(
     def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
         """One flow-matching update of this request's latents."""
         del kwargs
+        if noise_pred is None:
+            # The runner hands a request None when its wave produced no
+            # prediction (an interrupted denoise call): the request holds its
+            # step and tries again on the next wave.
+            return
         step = self._step_context(state)
         state.latents = self._advance_latents(step.z, step.ns, step.p, state.step_index, noise_pred)
         step.z = None
         state.step_index += 1
 
+    def release_step_state(self, state: StepRequestState, *, aborted: bool = False) -> None:
+        """Release what this request still holds: flash caches and decode ownership.
+
+        ``post_decode`` routes its cleanup through here, and tests call it
+        directly; the ``weakref`` backstop attached in ``prepare_encode``
+        covers a request the runner drops without a ``post_decode``. Both
+        releases are idempotent, so the backstop is a no-op on the normal
+        path.
+        """
+        del aborted
+        self._release_ar_decode(state)
+        step = state.extra.get(self._STEP_KEY)
+        if step is not None:
+            _release_denoise_caches(step.caches)
+
     def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
         """Build the output and release whatever this request still holds."""
         del kwargs
         step = self._step_context(state)
-        state.extra.pop(self._STEP_KEY, None)
-        if step.mode == "text":
-            return step.output
-        return self._denoising_output(step.caches, state.latents, step.think_text)
+        try:
+            if step.mode == "text":
+                return step.output
+            return self._build_diffusion_output(state.latents, step.think_text)
+        finally:
+            # Release even when the decode itself raises, so a failed request
+            # costs no more than an aborted one.
+            self.release_step_state(state)
+            state.extra.pop(self._STEP_KEY, None)
 
     # -----------------------------------------------------------------------
     # Weight loading
