@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # _sp_plan definition adapted from HuggingFace diffusers library (_cp_plan)
 
 # Copyright 2025 Alibaba Z-Image Team and The HuggingFace Team. All rights reserved.
@@ -25,7 +25,6 @@ import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -33,6 +32,8 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+from vllm_omni.diffusion.layers.norm import RMSNorm
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -50,10 +51,13 @@ from vllm_omni.diffusion.forward_context import (
     is_forward_context_available,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
+from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
 
+LEARNED_PADDING = "learned"
+ZERO_MASKED_PADDING = "zero_masked"
 logger = init_logger(__name__)
 
 
@@ -79,6 +83,8 @@ class UnifiedPrepare(nn.Module):
         cap_sin: torch.Tensor,
         x_item_seqlens: list[int],
         cap_item_seqlens: list[int],
+        x_attn_mask: torch.Tensor,
+        cap_attn_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Combine x and cap tensors into unified sequences.
 
@@ -108,8 +114,9 @@ class UnifiedPrepare(nn.Module):
         unified_cos = pad_sequence(unified_cos, batch_first=True, padding_value=0.0)
         unified_sin = pad_sequence(unified_sin, batch_first=True, padding_value=0.0)
         unified_attn_mask = torch.zeros((bsz, unified_max_item_seqlen), dtype=torch.bool, device=device)
-        for i, seq_len in enumerate(unified_item_seqlens):
-            unified_attn_mask[i, :seq_len] = 1
+        for i, (x_len, cap_len) in enumerate(zip(x_item_seqlens, cap_item_seqlens)):
+            unified_attn_mask[i, :x_len] = x_attn_mask[i, :x_len]
+            unified_attn_mask[i, x_len : x_len + cap_len] = cap_attn_mask[i, :cap_len]
 
         return unified, unified_cos, unified_sin, unified_attn_mask
 
@@ -207,6 +214,18 @@ def validate_zimage_tp_constraints(
     return ffn_hidden_dim, final_out_dims, supported_tp_candidates
 
 
+def _join_prefix(prefix: str, name: str) -> str:
+    return f"{prefix}.{name}" if prefix else name
+
+
+def _restore_linear_output_shape(output: torch.Tensor, input_: torch.Tensor) -> torch.Tensor:
+    if input_.dim() > 2 and output.dim() == 2:
+        token_count = math.prod(input_.shape[:-1])
+        if output.shape[0] == token_count:
+            return output.reshape(*input_.shape[:-1], output.shape[-1])
+    return output
+
+
 class TimestepEmbedder(nn.Module):
     def __init__(
         self, out_size, mid_size=None, frequency_embedding_size=256, quant_config: "QuantizationConfig | None" = None
@@ -214,12 +233,14 @@ class TimestepEmbedder(nn.Module):
         super().__init__()
         if mid_size is None:
             mid_size = out_size
+        # Time embedding MLP is kept full precision (quant_config=None) —
+        # small layers that feed adaLN; precision-sensitive (see #2728).
         self.mlp = nn.Sequential(
             ReplicatedLinear(
                 frequency_embedding_size,
                 mid_size,
                 bias=True,
-                quant_config=quant_config,
+                quant_config=None,
                 return_bias=False,
             ),
             nn.SiLU(),
@@ -227,27 +248,15 @@ class TimestepEmbedder(nn.Module):
                 mid_size,
                 out_size,
                 bias=True,
-                quant_config=quant_config,
+                quant_config=None,
                 return_bias=False,
             ),
         )
 
         self.frequency_embedding_size = frequency_embedding_size
 
-    @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
-        )
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
     def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_freq = timestep_embedding(t, self.frequency_embedding_size)
         weight_dtype = self.mlp[0].bias.dtype
         if weight_dtype.is_floating_point:
             t_freq = t_freq.to(weight_dtype)
@@ -264,6 +273,7 @@ class ZImageAttention(nn.Module):
         qk_norm: bool = True,
         eps: float = 1e-6,
         quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -279,7 +289,7 @@ class ZImageAttention(nn.Module):
             total_num_kv_heads=num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            prefix="to_qkv",
+            prefix=_join_prefix(prefix, "to_qkv"),
         )
 
         assert qk_norm is True
@@ -298,7 +308,7 @@ class ZImageAttention(nn.Module):
                     input_is_parallel=True,
                     return_bias=False,
                     quant_config=quant_config,
-                    prefix="to_out",
+                    prefix=_join_prefix(prefix, "to_out.0"),
                 )
             ]
         )
@@ -320,6 +330,7 @@ class ZImageAttention(nn.Module):
         sin: torch.Tensor,
     ):
         qkv, _ = self.to_qkv(hidden_states)
+        qkv = _restore_linear_output_shape(qkv, hidden_states)
         q_size = self.to_qkv.num_heads * self.head_dim
         kv_size = self.to_qkv.num_kv_heads * self.head_dim
         query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
@@ -352,7 +363,9 @@ class ZImageAttention(nn.Module):
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(dtype)
 
+        to_out_input = hidden_states
         hidden_states = self.to_out[0](hidden_states)
+        hidden_states = _restore_linear_output_shape(hidden_states, to_out_input)
 
         return hidden_states
 
@@ -372,7 +385,7 @@ class FeedForward(nn.Module):
             bias=False,
             return_bias=False,
             quant_config=quant_config,
-            prefix=prefix,
+            prefix=_join_prefix(prefix, "w13"),
         )
         self.act = SiluAndMul()
         self.w2 = RowParallelLinear(
@@ -382,11 +395,15 @@ class FeedForward(nn.Module):
             input_is_parallel=True,
             return_bias=False,
             quant_config=quant_config,
-            prefix=prefix,
+            prefix=_join_prefix(prefix, "w2"),
         )
 
     def forward(self, x):
-        return self.w2(self.act(self.w13(x)))
+        hidden_states = self.w13(x)
+        hidden_states = _restore_linear_output_shape(hidden_states, x)
+        hidden_states = self.act(hidden_states)
+        hidden_states = self.w2(hidden_states)
+        return _restore_linear_output_shape(hidden_states, x)
 
 
 class ZImageTransformerBlock(nn.Module):
@@ -400,6 +417,7 @@ class ZImageTransformerBlock(nn.Module):
         qk_norm: bool,
         modulation=True,
         quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.dim = dim
@@ -411,10 +429,14 @@ class ZImageTransformerBlock(nn.Module):
             qk_norm=qk_norm,
             eps=1e-5,
             quant_config=quant_config,
+            prefix=_join_prefix(prefix, "attention"),
         )
 
         self.feed_forward = FeedForward(
-            dim=dim, hidden_dim=int(dim / 3 * 8), quant_config=quant_config, prefix="feed_forward"
+            dim=dim,
+            hidden_dim=int(dim / 3 * 8),
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "feed_forward"),
         )
         self.layer_id = layer_id
 
@@ -426,9 +448,16 @@ class ZImageTransformerBlock(nn.Module):
 
         self.modulation = modulation
         if modulation:
+            # Modulation linear is kept at full precision (quant_config=None)
+            # — it produces scale/gate values that are precision-sensitive
+            # (see #2728, mirrors OmniGen2 fix).
             self.adaLN_modulation = nn.Sequential(
                 ReplicatedLinear(
-                    min(dim, ADALN_EMBED_DIM), 4 * dim, bias=True, return_bias=False, quant_config=quant_config
+                    min(dim, ADALN_EMBED_DIM),
+                    4 * dim,
+                    bias=True,
+                    quant_config=None,
+                    return_bias=False,
                 ),
             )
 
@@ -485,14 +514,24 @@ class FinalLayer(nn.Module):
     def __init__(self, hidden_size, out_channels, quant_config: "QuantizationConfig | None" = None):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        # Final output projection and its modulation are precision-sensitive
+        # (produce the output latent); keep at full precision (see #2728).
         self.linear = ReplicatedLinear(
-            hidden_size, out_channels, bias=True, quant_config=quant_config, return_bias=False
+            hidden_size,
+            out_channels,
+            bias=True,
+            quant_config=None,
+            return_bias=False,
         )
 
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             ReplicatedLinear(
-                min(hidden_size, ADALN_EMBED_DIM), hidden_size, bias=True, quant_config=quant_config, return_bias=False
+                min(hidden_size, ADALN_EMBED_DIM),
+                hidden_size,
+                bias=True,
+                quant_config=None,
+                return_bias=False,
             ),
         )
 
@@ -578,6 +617,15 @@ class ZImageTransformer2DModel(CachedTransformer):
         Note: Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in diffusers.
     """
 
+    # Fused projections and their checkpoint shard names (mirrors
+    # stacked_params_mapping in load_weights). ``w13`` is the Z-Image FFN
+    # fusion of ``w1``/``w3``; declared here so quantized-checkpoint adapters
+    # can resolve shard keys without a framework-level default entry.
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+        "w13": ["w1", "w3"],
+    }
+
     _repeated_blocks = ["ZImageTransformerBlock"]
     _layerwise_offload_blocks_attrs = ["layers"]
 
@@ -628,6 +676,8 @@ class ZImageTransformer2DModel(CachedTransformer):
         axes_dims=[32, 48, 48],
         axes_lens=[1024, 512, 512],
         quant_config: "QuantizationConfig | None" = None,
+        alignment_padding_mode: str = LEARNED_PADDING,
+        multi_frame_output: bool = True,
     ) -> None:
         super().__init__()
         # NOTE: `DiffusersPipelineLoader.load_model()` initializes this module
@@ -642,6 +692,12 @@ class ZImageTransformer2DModel(CachedTransformer):
         self.dim = dim
         self.n_heads = n_heads
 
+        if alignment_padding_mode not in {LEARNED_PADDING, ZERO_MASKED_PADDING}:
+            raise ValueError(f"Unsupported Z-Image alignment padding mode: {alignment_padding_mode!r}")
+        if type(multi_frame_output) is not bool:
+            raise ValueError("multi_frame_output must be boolean.")
+        self.alignment_padding_mode = alignment_padding_mode
+        self.multi_frame_output = multi_frame_output
         self.rope_theta = rope_theta
         self.t_scale = t_scale
         self.gradient_checkpointing = False
@@ -673,11 +729,13 @@ class ZImageTransformer2DModel(CachedTransformer):
         all_x_embedder = {}
         all_final_layer = {}
         for patch_idx, (patch_size, f_patch_size) in enumerate(zip(all_patch_size, all_f_patch_size)):
+            # x_embedder (patch embed) is a small precision-sensitive entry
+            # layer; keep full precision (see #2728).
             x_embedder = ReplicatedLinear(
                 f_patch_size * patch_size * patch_size * in_channels,
                 dim,
                 bias=True,
-                quant_config=quant_config,
+                quant_config=None,
                 return_bias=False,
             )
             all_x_embedder[f"{patch_size}-{f_patch_size}"] = x_embedder
@@ -700,6 +758,7 @@ class ZImageTransformer2DModel(CachedTransformer):
                     qk_norm,
                     modulation=True,
                     quant_config=quant_config,
+                    prefix=f"noise_refiner.{layer_id}",
                 )
                 for layer_id in range(n_refiner_layers)
             ]
@@ -715,18 +774,31 @@ class ZImageTransformer2DModel(CachedTransformer):
                     qk_norm,
                     modulation=False,
                     quant_config=quant_config,
+                    prefix=f"context_refiner.{layer_id}",
                 )
                 for layer_id in range(n_refiner_layers)
             ]
         )
         self.t_embedder = TimestepEmbedder(min(dim, ADALN_EMBED_DIM), mid_size=1024, quant_config=quant_config)
+        # Caption embedder maps text features -> hidden; keep full precision
+        # (see #2728).
         self.cap_embedder = nn.Sequential(
             RMSNorm(cap_feat_dim, eps=norm_eps),
-            ReplicatedLinear(cap_feat_dim, dim, bias=True, return_bias=False, quant_config=quant_config),
+            ReplicatedLinear(
+                cap_feat_dim,
+                dim,
+                bias=True,
+                quant_config=None,
+                return_bias=False,
+            ),
         )
 
-        self.x_pad_token = nn.Parameter(torch.empty((1, dim)))
-        self.cap_pad_token = nn.Parameter(torch.empty((1, dim)))
+        if alignment_padding_mode == LEARNED_PADDING:
+            self.x_pad_token = nn.Parameter(torch.empty((1, dim)))
+            self.cap_pad_token = nn.Parameter(torch.empty((1, dim)))
+        else:
+            self.register_parameter("x_pad_token", None)
+            self.register_parameter("cap_pad_token", None)
 
         self.layers = nn.ModuleList(
             [
@@ -738,6 +810,7 @@ class ZImageTransformer2DModel(CachedTransformer):
                     norm_eps,
                     qk_norm,
                     quant_config=quant_config,
+                    prefix=f"layers.{layer_id}",
                 )
                 for layer_id in range(n_layers)
             ]
@@ -767,6 +840,8 @@ class ZImageTransformer2DModel(CachedTransformer):
                 .permute(6, 0, 3, 1, 4, 2, 5)
                 .reshape(self.out_channels, F, H, W)
             )
+            if not self.multi_frame_output:
+                x[i] = x[i][:, :1]
         return x
 
     @staticmethod
@@ -784,6 +859,8 @@ class ZImageTransformer2DModel(CachedTransformer):
         all_cap_feats: list[torch.Tensor],
         patch_size: int,
         f_patch_size: int,
+        all_image_ref: list[torch.Tensor | None] | None = None,
+        all_cap_feats_2: list[torch.Tensor | None] | None = None,
     ):
         pH = pW = patch_size
         pF = f_patch_size
@@ -796,10 +873,16 @@ class ZImageTransformer2DModel(CachedTransformer):
         all_cap_pos_ids = []
         all_cap_pad_mask = []
         all_cap_feats_out = []
+        all_cap_feats_2_out = []
 
-        for i, (image, cap_feat) in enumerate(zip(all_image, all_cap_feats)):
+        if all_image_ref is None:
+            all_image_ref = [None] * len(all_image)
+        if all_cap_feats_2 is None:
+            all_cap_feats_2 = [None] * len(all_image)
+
+        for image, cap_feat, cap_feat_2, image_ref in zip(all_image, all_cap_feats, all_cap_feats_2, all_image_ref):
             ### Process Caption
-            cap_ori_len = len(cap_feat)
+            cap_ori_len = len(cap_feat) + (len(cap_feat_2) if cap_feat_2 is not None else 0)
             cap_padding_len = (-cap_ori_len) % SEQ_MULTI_OF
             # padded position ids
             cap_padded_pos_ids = self.create_coordinate_grid(
@@ -819,13 +902,17 @@ class ZImageTransformer2DModel(CachedTransformer):
                 )
             )
             # padded feature
-            cap_padded_feat = torch.cat(
-                [cap_feat, cap_feat[-1:].repeat(cap_padding_len, 1)],
-                dim=0,
-            )
-            all_cap_feats_out.append(cap_padded_feat)
+            if cap_feat_2 is None:
+                all_cap_feats_out.append(torch.cat([cap_feat, cap_feat[-1:].repeat(cap_padding_len, 1)], dim=0))
+            else:
+                all_cap_feats_out.append(cap_feat)
+                all_cap_feats_2_out.append(
+                    torch.cat([cap_feat_2, torch.zeros_like(cap_feat_2[-1:]).repeat(cap_padding_len, 1)])
+                )
 
             ### Process Image
+            if image_ref is not None:
+                image = torch.cat([image, image_ref], dim=1)
             C, F, H, W = image.size()
             all_image_size.append((F, H, W))
             F_tokens, H_tokens, W_tokens = F // pF, H // pH, W // pW
@@ -875,6 +962,7 @@ class ZImageTransformer2DModel(CachedTransformer):
             all_cap_pos_ids,
             all_image_pad_mask,
             all_cap_pad_mask,
+            all_cap_feats_2_out,
         )
 
     def forward(
@@ -884,6 +972,8 @@ class ZImageTransformer2DModel(CachedTransformer):
         cap_feats: list[torch.Tensor],
         patch_size=2,
         f_patch_size=1,
+        ref_x: list[torch.Tensor | None] | None = None,
+        cap_feats_2: list[torch.Tensor] | None = None,
     ):
         assert patch_size in self.all_patch_size
         assert f_patch_size in self.all_f_patch_size
@@ -901,7 +991,8 @@ class ZImageTransformer2DModel(CachedTransformer):
             cap_pos_ids,
             x_inner_pad_mask,
             cap_inner_pad_mask,
-        ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
+            cap_feats_2,
+        ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size, ref_x, cap_feats_2)
 
         # x embed & refine
         x_item_seqlens = [len(_) for _ in x]
@@ -915,9 +1006,14 @@ class ZImageTransformer2DModel(CachedTransformer):
         adaln_input = t.type_as(x)
         # Use torch.where instead of x[mask]= to avoid aten::index_put_/nonzero and cudaStreamSynchronize
         x_pad_mask = torch.cat(x_inner_pad_mask)
+        x_padding = (
+            self.x_pad_token.expand(x.shape[0], -1)
+            if self.alignment_padding_mode == LEARNED_PADDING
+            else torch.zeros_like(x)
+        )
         x = torch.where(
             x_pad_mask.unsqueeze(1).expand_as(x),
-            self.x_pad_token.expand(x.shape[0], -1),
+            x_padding,
             x,
         )
         x = list(x.split(x_item_seqlens, dim=0))
@@ -931,22 +1027,36 @@ class ZImageTransformer2DModel(CachedTransformer):
         x_attn_mask = torch.zeros((bsz, x_max_item_seqlen), dtype=torch.bool, device=device)
         for i, seq_len in enumerate(x_item_seqlens):
             x_attn_mask[i, :seq_len] = 1
+            if self.alignment_padding_mode == ZERO_MASKED_PADDING:
+                x_attn_mask[i, :seq_len].masked_fill_(x_inner_pad_mask[i], False)
 
         for layer in self.noise_refiner:
             x = layer(x, x_attn_mask, x_cos, x_sin, adaln_input)
 
         # cap embed & refine
         cap_item_seqlens = [len(_) for _ in cap_feats]
+        cap_feats = torch.cat(cap_feats, dim=0)
+        cap_feats = self.cap_embedder(cap_feats)
+        if cap_feats_2:
+            cap_feats = list(cap_feats.split(cap_item_seqlens, dim=0))
+            if len(cap_feats) != len(cap_feats_2):
+                raise ValueError("Primary and direct caption conditions must have equal batch size.")
+            cap_feats = [torch.cat([primary, direct], dim=0) for primary, direct in zip(cap_feats, cap_feats_2)]
+            cap_item_seqlens = [len(item) for item in cap_feats]
+            cap_feats = torch.cat(cap_feats, dim=0)
         assert all(_ % SEQ_MULTI_OF == 0 for _ in cap_item_seqlens)
         cap_max_item_seqlen = max(cap_item_seqlens)
 
-        cap_feats = torch.cat(cap_feats, dim=0)
-        cap_feats = self.cap_embedder(cap_feats)
         # Use torch.where instead of cap_feats[mask]= to avoid aten::index_put_/nonzero and cudaStreamSynchronize
         cap_pad_mask = torch.cat(cap_inner_pad_mask)
+        cap_padding = (
+            self.cap_pad_token.expand(cap_feats.shape[0], -1)
+            if self.alignment_padding_mode == LEARNED_PADDING
+            else torch.zeros_like(cap_feats)
+        )
         cap_feats = torch.where(
             cap_pad_mask.unsqueeze(1).expand_as(cap_feats),
-            self.cap_pad_token.expand(cap_feats.shape[0], -1),
+            cap_padding,
             cap_feats,
         )
         cap_feats = list(cap_feats.split(cap_item_seqlens, dim=0))
@@ -960,6 +1070,8 @@ class ZImageTransformer2DModel(CachedTransformer):
         cap_attn_mask = torch.zeros((bsz, cap_max_item_seqlen), dtype=torch.bool, device=device)
         for i, seq_len in enumerate(cap_item_seqlens):
             cap_attn_mask[i, :seq_len] = 1
+            if self.alignment_padding_mode == ZERO_MASKED_PADDING:
+                cap_attn_mask[i, :seq_len].masked_fill_(cap_inner_pad_mask[i], False)
 
         for layer in self.context_refiner:
             cap_feats = layer(cap_feats, cap_attn_mask, cap_cos, cap_sin)
@@ -967,9 +1079,17 @@ class ZImageTransformer2DModel(CachedTransformer):
         # Prepare unified tensors via UnifiedPrepare module
         # This enables _cp_plan to shard outputs via split_output=True
         unified, unified_cos, unified_sin, unified_attn_mask = self.unified_prepare(
-            x, x_cos, x_sin, cap_feats, cap_cos, cap_sin, x_item_seqlens, cap_item_seqlens
+            x,
+            x_cos,
+            x_sin,
+            cap_feats,
+            cap_cos,
+            cap_sin,
+            x_item_seqlens,
+            cap_item_seqlens,
+            x_attn_mask,
+            cap_attn_mask,
         )
-
         # Main transformer blocks
         for layer in self.layers:
             unified = layer(unified, unified_attn_mask, unified_cos, unified_sin, adaln_input)

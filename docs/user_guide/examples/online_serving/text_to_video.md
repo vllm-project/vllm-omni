@@ -3,17 +3,28 @@
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/text_to_video>.
 
 
-This example demonstrates how to deploy the Wan2.2 text-to-video model for online video generation using vLLM-Omni.
+This example demonstrates how to deploy text-to-video models for online video generation using vLLM-Omni.
 
-## Start Server
+## Supported Models
 
-### Basic Start
+| Model | Model ID |
+|-------|----------|
+| Wan2.1 T2V (1.3B) | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` |
+| Wan2.1 T2V (14B) | `Wan-AI/Wan2.1-T2V-14B-Diffusers` |
+| Wan2.2 T2V | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` |
+| LTX-2 | `Lightricks/LTX-2` |
+
+## Wan2.2 T2V
+
+### Start Server
+
+#### Basic Start
 
 ```bash
 vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni --port 8091
 ```
 
-### Start with Parameters
+#### Start with Parameters
 
 Or use the startup script:
 
@@ -79,15 +90,25 @@ curl -X POST http://localhost:8091/v1/videos/sync \
 Generated video files are stored on local disk by the async video API.
 Local file storage behavior can be controlled via the following environment variables:
 
-- `VLLM_OMNI_STORAGE_PATH`: directory used for generated files (default: `/tmp/storage`)
-- `VLLM_OMNI_STORAGE_MAX_CONCURRENCY`: max concurrent save/delete operations (default: `4`)
+- `VLLM_OMNI_SERVER_STORAGE__PATH`: directory used for generated files
+  (default: `/tmp/storage`)
+- `VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY`: max concurrent save/delete/open
+  operations (default: `4`)
+- `VLLM_OMNI_SERVER_STORAGE__FILE_TTL`: optional TTL for generated files in
+  seconds
+- `VLLM_OMNI_SERVER_STORAGE__TTL_SWEEP_INTERVAL`: optional sweep interval in
+  seconds for enforcing file TTL; defaults to `300` when TTL is set
 
 Example:
 
 ```bash
-export VLLM_OMNI_STORAGE_PATH=/var/tmp/vllm-omni-videos
-export VLLM_OMNI_STORAGE_MAX_CONCURRENCY=8
+export VLLM_OMNI_SERVER_STORAGE__PATH=/var/tmp/vllm-omni-videos
+export VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY=8
+export VLLM_OMNI_SERVER_STORAGE__FILE_TTL=86400
+export VLLM_OMNI_SERVER_STORAGE__TTL_SWEEP_INTERVAL=300
 ```
+
+See also: [Configuration Options](../../../configuration/README.md)
 
 ## API Calls
 
@@ -154,6 +175,9 @@ curl -X POST http://localhost:8091/v1/videos \
   -F "guidance_scale_2=4.0" \
   -F "boundary_ratio=0.875" \
   -F "flow_shift=5.0" \
+  -F "enable_frame_interpolation=true" \
+  -F "frame_interpolation_exp=1" \
+  -F "frame_interpolation_scale=1.0" \
   -F "seed=42"
 ```
 
@@ -167,7 +191,7 @@ curl -X POST http://localhost:8091/v1/videos \
 | `negative_prompt`     | str    | None    | Negative prompt                                  |
 | `width`               | int    | None    | Video width in pixels                            |
 | `height`              | int    | None    | Video height in pixels                           |
-| `num_frames`          | int    | None    | Number of frames to generate                     |
+| `num_frames`          | int    | 1       | Number of frames to generate; set explicitly for video generation |
 | `fps`                 | int    | None    | Frames per second for output video               |
 | `num_inference_steps` | int    | None    | Number of denoising steps                        |
 | `guidance_scale`      | float  | None    | CFG guidance scale (low-noise stage)             |
@@ -175,7 +199,45 @@ curl -X POST http://localhost:8091/v1/videos \
 | `boundary_ratio`      | float  | None    | Boundary split ratio for low/high DiT (Wan2.2)   |
 | `flow_shift`          | float  | None    | Scheduler flow shift (Wan2.2)                    |
 | `seed`                | int    | None    | Random seed (reproducible)                       |
+| `num_outputs_per_prompt` | int  | 1       | Number of videos to generate (1-10, MiniMax H3); only the first is returned, see below |
 | `lora`                | object | None    | LoRA configuration                               |
+| `enable_frame_interpolation` | bool | false | Enable RIFE frame interpolation before MP4 encoding |
+| `frame_interpolation_exp` | int | 1 | Interpolation exponent; 1=2x temporal resolution, 2=4x |
+| `frame_interpolation_scale` | float | 1.0 | RIFE inference scale; use 0.5 for high-resolution inputs |
+| `frame_interpolation_model_path` | str | None | Local directory or Hugging Face repo ID with `flownet.pkl`; defaults to `elfgum/RIFE-4.22.lite` |
+
+!!! note "Only the first output is returned"
+    `num_outputs_per_prompt` is forwarded to the pipeline, so the model does
+    generate that many videos and you pay the generation cost for all of them.
+    `/v1/videos` and `/v1/videos/sync` then return only the **first** one,
+    because an async video job stores a single file per video id. The server
+    logs a warning when it discards the extra outputs. Keep this at `1`
+    unless you have a specific reason to generate videos you will not receive.
+
+## Frame Interpolation
+
+Frame interpolation is an optional post-processing step for `/v1/videos` and
+`/v1/videos/sync`. It synthesizes intermediate frames between generated frames
+without rerunning the diffusion model. If the generated video has `N` frames,
+the interpolated output frame count is `(N - 1) * 2**exp + 1`. The encoder FPS
+is multiplied by `2**exp` so the output duration remains close to the original.
+
+Frame interpolation runs in the diffusion worker post-processing path instead of
+the API server encoding path, so it can reuse the worker's current accelerator
+device without blocking the FastAPI event loop.
+
+Example: generate 5 frames and interpolate to 9 frames:
+
+```bash
+curl -X POST http://localhost:8091/v1/videos/sync \
+  -F "prompt=A dog running through a park" \
+  -F "num_frames=5" \
+  -F "fps=8" \
+  -F "enable_frame_interpolation=true" \
+  -F "frame_interpolation_exp=1" \
+  -F "frame_interpolation_scale=1.0" \
+  -o sync_t2v_interpolated.mp4
+```
 
 ## Create Response Format
 
@@ -234,8 +296,24 @@ while true; do
 done
 ```
 
+## LTX-2
+
+```bash
+vllm serve Lightricks/LTX-2 --omni --port 8098
+```
+
+See the [LTX-2 recipe](../../../../recipes/LTX/LTX-2.md) for all checkpoints,
+pipeline selection, requests, defaults, and advanced options.
+
 ## Example materials
 
+??? abstract "response.json"
+    ``````json
+    --8<-- "examples/online_serving/text_to_video/response.json"
+    ``````
+??? abstract "run_curl_ltx2.sh"
+    ``````sh
+    --8<-- "examples/online_serving/text_to_video/run_curl_ltx2.sh"
 ??? abstract "run_curl_hunyuan_video_15.sh"
     ``````sh
     --8<-- "examples/online_serving/text_to_video/run_curl_hunyuan_video_15.sh"
@@ -248,6 +326,9 @@ done
     ``````sh
     --8<-- "examples/online_serving/text_to_video/run_server.sh"
     ``````
+??? abstract "run_server_ltx2.sh"
+    ``````sh
+    --8<-- "examples/online_serving/text_to_video/run_server_ltx2.sh"
 ??? abstract "run_server_hunyuan_video_15.sh"
     ``````sh
     --8<-- "examples/online_serving/text_to_video/run_server_hunyuan_video_15.sh"

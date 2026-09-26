@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Shared Fish Speech prompt construction helpers."""
 
 from __future__ import annotations
@@ -11,6 +14,7 @@ FISH_CLONE_SYSTEM_PROMPT_SUFFIX = "\n\nSpeech:\n"
 
 _LEGACY_SPEAKER_TAG_PATTERN = re.compile(r"<speaker:(\d+)>")
 _CANONICAL_SPEAKER_TAG_PATTERN = re.compile(r"<\|speaker:\d+\|>")
+_PHONEME_TAG_PATTERN = re.compile(r"<\|phoneme_(?:start|end)\|>")
 _CONTROL_TOKEN_PATTERN = re.compile(r"<\|[^>]+\|>")
 
 
@@ -21,7 +25,7 @@ def normalize_fish_speech_text(text: str, *, add_default_speaker: bool = False) 
     disallowed_tokens = [
         token
         for token in _CONTROL_TOKEN_PATTERN.findall(normalized)
-        if not _CANONICAL_SPEAKER_TAG_PATTERN.fullmatch(token)
+        if not (_CANONICAL_SPEAKER_TAG_PATTERN.fullmatch(token) or _PHONEME_TAG_PATTERN.fullmatch(token))
     ]
     if disallowed_tokens:
         disallowed_list = ", ".join(sorted(set(disallowed_tokens)))
@@ -38,10 +42,7 @@ def _encode_plain_text(tokenizer: Any, text: str) -> list[int]:
 
 
 def _encode_control_token(tokenizer: Any, token: str) -> list[int]:
-    vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
-    token_id = vocab.get(token)
-    if token_id is None:
-        token_id = tokenizer.convert_tokens_to_ids(token)
+    token_id = tokenizer.convert_tokens_to_ids(token)
     if token_id is None or token_id == getattr(tokenizer, "unk_token_id", None):
         raise ValueError(f"Fish Speech tokenizer is missing required control token: {token}")
     return [int(token_id)]
@@ -135,13 +136,3 @@ def estimate_fish_voice_clone_prompt_len_from_normalized(
         [0] * semantic_len,
     )
     return len(prompt_ids)
-
-
-def estimate_fish_voice_clone_prompt_len(tokenizer: Any, text: str, ref_text: str, semantic_len: int) -> int:
-    normalized_text, normalized_ref_text = normalize_fish_voice_clone_texts(text, ref_text)
-    return estimate_fish_voice_clone_prompt_len_from_normalized(
-        tokenizer,
-        normalized_text,
-        normalized_ref_text,
-        semantic_len,
-    )

@@ -1,0 +1,168 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from importlib.util import find_spec
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from vllm.logger import init_logger
+
+from vllm_omni.diffusion.layers.custom_op import CustomOp
+
+logger = init_logger(__name__)
+
+_HAS_MINDIESD = find_spec("mindiesd") is not None
+
+
+class LayerNorm(nn.LayerNorm, CustomOp):
+    """
+    LayerNorm implementation that inherits from both ``nn.LayerNorm`` and ``CustomOp``.
+    NPU:
+        Uses ``mindiesd.fast_layernorm(self, x)`` when MindIE-SD is installed.
+    CUDA / HIP / XPU / native:
+        Falls back to FP32 nn.LayerNorm implementation.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine: bool = True):
+        super().__init__(normalized_shape=dim, eps=eps, elementwise_affine=elementwise_affine)
+        # CustomOp.__init__ cannot be called here because it would re-run
+        # nn.Module initialization and clear LayerNorm parameters.
+        self._forward_method = CustomOp.dispatch_forward(self)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._forward_method(x)
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
+
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        if _HAS_MINDIESD:
+            try:
+                from mindiesd import fast_layernorm
+
+                return fast_layernorm(self, x)
+            except ImportError as e:
+                logger.warning_once(
+                    "mindiesd.fast_layernorm import failed, falling back to FP32 layer_norm: %s",
+                    e,
+                )
+
+        return self.forward_native(x)
+
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        origin_dtype = x.dtype
+        return F.layer_norm(
+            x.float(),
+            self.normalized_shape,
+            self.weight.float() if self.weight is not None else None,
+            self.bias.float() if self.bias is not None else None,
+            self.eps,
+        ).to(origin_dtype)
+
+
+class RMSNorm(CustomOp):
+    def __init__(self, hidden_size: int, eps: float = 1e-6, dtype: torch.dtype | None = None) -> None:
+        super().__init__()
+        weight_dtype = dtype or torch.get_default_dtype()
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=weight_dtype))
+        self.hidden_size = hidden_size
+        self.variance_epsilon = eps
+
+    def _forward_fused(self, x: torch.Tensor) -> torch.Tensor:
+        from vllm._custom_ops import rms_norm as fused_rms_norm
+
+        orig_shape = x.shape
+        hidden_size = orig_shape[-1]
+        x_2d = x.reshape(-1, hidden_size)
+        out = torch.empty_like(x_2d)
+        fused_rms_norm(out, x_2d, self.weight.data, self.variance_epsilon)
+        return out.reshape(orig_shape)
+
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is not None:
+            return self.forward_native(x, residual)
+        # During torch.compile tracing, fused_rms_norm writes to `out` in-place
+        # (returns None) and accesses self.weight.data, which is a DTensor under
+        # HSDP. Both patterns confuse inductor's compute_ancestors scheduler.
+        # Fall back to forward_native so inductor can fuse the pure-PyTorch ops
+        # itself.
+        if torch.compiler.is_compiling():
+            return self.forward_native(x)
+        try:
+            return self._forward_fused(x)
+        except Exception:
+            return self.forward_native(x)
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is not None:
+            return self.forward_native(x, residual)
+        if torch.compiler.is_compiling():
+            return self.forward_native(x)
+        try:
+            return self._forward_fused(x)
+        except Exception:
+            return self.forward_native(x)
+
+    def forward_musa(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is not None:
+            return self.forward_native(x, residual)
+        # Preserve the aten::rms_norm graph so dynamic Inductor can fuse the
+        # H3 Q/K norm with its inline RoPE path on MUSA.
+        return F.rms_norm(
+            x,
+            (self.hidden_size,),
+            self.weight,
+            self.variance_epsilon,
+        )
+
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        import torch_npu
+
+        if residual is not None:
+            output, _, updated_residual = torch_npu.npu_add_rms_norm(
+                x,
+                residual,
+                self.weight,
+                self.variance_epsilon,
+            )
+            return output, updated_residual
+
+        output = torch_npu.npu_rms_norm(x, gamma=self.weight, epsilon=self.variance_epsilon)[0]
+
+        return output
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is not None:
+            residual = residual + x
+            x = residual
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
+        variance = x.pow(2).mean(-1, keepdim=True)
+        out = x * torch.rsqrt(variance + self.variance_epsilon)
+        out = self.weight.to(torch.float32) * out
+        out = out.to(input_dtype)
+        return (out, residual) if residual is not None else out

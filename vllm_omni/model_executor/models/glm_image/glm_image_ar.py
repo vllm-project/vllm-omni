@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Adapted from
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/glm_image/modeling_glm_image.py
@@ -21,8 +21,11 @@
 # limitations under the License.
 """Inference-only GLM-Image model compatible with HuggingFace weights."""
 
+import math
 import os
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
+from functools import lru_cache
 from typing import Annotated, Literal
 
 import torch
@@ -79,7 +82,6 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItems,
 )
 from vllm.multimodal.parse import (
-    ImageProcessorItems,
     MultiModalDataItems,
     MultiModalDataParser,
 )
@@ -100,6 +102,15 @@ logger = init_logger(__name__)
 
 
 # === Multimodal Processing ===
+
+
+@lru_cache(maxsize=1)
+def _load_cached_glm_image_processor(processor_path: str, trust_remote_code: bool) -> GlmImageProcessor:
+    """Cache GLM-Image processor loading to avoid repeated from_pretrained cost."""
+    return GlmImageProcessor.from_pretrained(
+        processor_path,
+        trust_remote_code=trust_remote_code,
+    )
 
 
 class GlmImagePixelInputs(TensorSchema):
@@ -126,6 +137,14 @@ class GlmImageDataParser(MultiModalDataParser):
         parsers = super()._get_subparsers()
         parsers["img2img"] = self._parse_image_data
         return parsers
+
+    def parse_mm_data(self, mm_data, **kwargs):
+        # Normalize "img2img" to "image" so the rest of the pipeline
+        # (mm_hashes, _merge_mm_kwargs) uses a single modality key.
+        normalized = {}
+        for k, v in mm_data.items():
+            normalized["image" if k == "img2img" else k] = v
+        return super().parse_mm_data(normalized, **kwargs)
 
 
 class GlmImageProcessingInfo(BaseProcessingInfo):
@@ -168,11 +187,22 @@ class GlmImageProcessingInfo(BaseProcessingInfo):
             if not os.path.exists(processor_path):
                 processor_path = model_path
 
-        # Load processor directly from the correct path
-        return GlmImageProcessor.from_pretrained(
-            processor_path,
-            trust_remote_code=self.ctx.model_config.trust_remote_code,
-            **kwargs,
+        trust_remote_code = self.ctx.model_config.trust_remote_code
+
+        # Keep dynamic override behavior when kwargs are provided, but use a
+        # cached instance for the default path to reduce per-request overhead.
+        # Default path (without kwargs): high frequency, stable, safely reuse cache;
+        # with kwargs: maintain precise semantics, construct instantly per call, avoid mismatch risk.
+        if kwargs:
+            return GlmImageProcessor.from_pretrained(
+                processor_path,
+                trust_remote_code=trust_remote_code,
+                **kwargs,
+            )
+
+        return _load_cached_glm_image_processor(
+            processor_path=processor_path,
+            trust_remote_code=trust_remote_code,
         )
 
     def get_data_parser(self) -> GlmImageDataParser:
@@ -311,6 +341,30 @@ class GlmImageDummyInputsBuilder(BaseDummyInputsBuilder[GlmImageProcessingInfo])
         }
 
 
+_GLM_IMAGE_GRID_FACTOR = 32
+
+
+def _build_target_shape_scaffold(processor, *, height: int, width: int, is_text_to_image: bool) -> str:
+    """Return the grid scaffold HF appends to a GLM-Image generation prompt.
+
+    Mirrors ``GlmImageProcessor._build_prompt_with_target_shape`` (identical in
+    transformers 5.13 and 5.14) using only the processor's public token
+    attributes, so this does not depend on a private HF method that a stub or
+    a future release may not provide.
+    """
+    factor = _GLM_IMAGE_GRID_FACTOR
+    token_h = (height // factor * factor) // factor
+    token_w = (width // factor * factor) // factor
+    grid_bos, grid_eos, bos = processor.grid_bos_token, processor.grid_eos_token, processor.bos_token
+    scaffold = f"{grid_bos}{token_h} {token_w}{grid_eos}"
+    if is_text_to_image:
+        ratio = token_h / token_w
+        prev_token_h = int(math.sqrt(ratio) * (factor // 2))
+        prev_token_w = int(math.sqrt(1 / ratio) * (factor // 2))
+        scaffold += f"{grid_bos}{prev_token_h} {prev_token_w}{grid_eos}"
+    return scaffold + bos
+
+
 class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo]):
     """
     Multimodal processor for GLM-Image.
@@ -321,399 +375,122 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
     - Grid dimension calculation for M-RoPE position encoding
     """
 
-    def _call_hf_processor(
-        self,
-        prompt: str,
-        mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
-    ) -> BatchFeature:
-        """
-        Call the HuggingFace processor.
+    def _cached_apply_hf_processor(self, inputs, timing_ctx):
+        # i2i: prompt text must be modified based on mm data presence,
+        # and grid computation requires all images together — bypass cache.
+        if inputs.mm_data_items.get_all_counts().get("image", 0) > 0:
+            return self._apply_hf_processor(inputs, timing_ctx)
+        return super()._cached_apply_hf_processor(inputs, timing_ctx)
 
-        For text-to-image mode (no images), we need to:
-        1. Build the prompt with target grid dimensions
-        2. Build the image_grid_thw tensor for M-RoPE position encoding
-
-        For image-to-image mode:
-        1. Process source images through the image processor
-        2. Build prompt with image placeholders expanded
-        3. Build image_grid_thw including source and target grids
-        """
-        processor = self.info.get_hf_processor()
-
-        # Get target dimensions from mm_kwargs or use defaults
-        target_h = mm_kwargs.get("target_h", 1024) if mm_kwargs else 1024
-        target_w = mm_kwargs.get("target_w", 1024) if mm_kwargs else 1024
-
-        if not mm_data or not mm_data.get("images"):
-            # Text-to-image mode
-            if processor is not None:
-                # Build messages format expected by processor
-                messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
-
-                # Use apply_chat_template which handles target dimensions
-                hf_inputs = processor.apply_chat_template(
-                    messages,
-                    tokenize=True,
-                    target_h=target_h,
-                    target_w=target_w,
-                    return_dict=True,
-                    return_tensors="pt",
-                )
-
-                return hf_inputs
-            else:
-                # Fallback: just tokenize (this won't work properly for generation)
-                tokenizer = self.info.get_tokenizer()
-                prompt_ids = tokenizer.encode(prompt)
-                return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="pt")
-
-        # Image-to-image mode
-        # NOTE: Use "images" (plural) - this is what vLLM's ImageProcessorItems.get_processor_data() returns
-        images = mm_data.get("images")
-        if not isinstance(images, list):
-            images = [images]
-
-        logger.debug(
-            f"_call_hf_processor i2i: num_images={len(images)}, image_types={[type(img).__name__ for img in images]}"
-        )
-
-        if processor is not None:
-            # Build messages with image objects directly in content
-            # This is how GlmImageProcessor expects images - embedded in the content dict
-            # NOT as a separate images= parameter
-            #
-            # IMPORTANT: Remove <|image|> placeholders from prompt since apply_chat_template
-            # will automatically insert them for each image in content. Having both leads to
-            # index out of bounds when processing image_grid_thw.
-            clean_prompt = prompt.replace("<|image|>", "")
-            content = []
-            for img in images:
-                content.append({"type": "image", "image": img})
-            content.append({"type": "text", "text": clean_prompt})
-            messages = [{"role": "user", "content": content}]
-
-            logger.debug(f"_call_hf_processor: calling apply_chat_template with {len(images)} images in content")
-
-            # Use apply_chat_template - processor will process images when they're in content
-            hf_inputs = processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                target_h=target_h,
-                target_w=target_w,
-                return_dict=True,
-                return_tensors="pt",
+    def apply(self, inputs, timing_ctx):
+        """Add the generation scaffold before upstream expands source images."""
+        num_images = inputs.mm_data_items.get_all_counts().get("image", 0)
+        prompt_ids = list(inputs.prompt)
+        if num_images:
+            image_token_id = getattr(
+                self.info.get_hf_config(),
+                "image_token_id",
+                167855,
             )
+            missing = num_images - prompt_ids.count(image_token_id)
+            if missing > 0:
+                prompt_ids = [image_token_id] * missing + prompt_ids
 
-            logger.debug(f"_call_hf_processor: apply_chat_template returned keys: {list(hf_inputs.keys())}")
-
-            # IMPORTANT (i2i): vLLM multimodal encoder must see source-only grids
-            # (matching pixel_values and number of images), but M-RoPE needs full
-            # grids (source + target) to compute correct decode positions.
-            image_grid_thw = hf_inputs.get("image_grid_thw")
-            if image_grid_thw is not None:
-                # Preserve full grids for M-RoPE.
-                hf_inputs["mrope_image_grid_thw"] = image_grid_thw
-
-                # Expose source-only grids for MM.
-                # In most i2i requests, we process one prompt at a time here,
-                # so `len(images)` is the number of source images.
-                num_source_images = len(images)
-                if image_grid_thw.shape[0] != num_source_images:
-                    source_grids = image_grid_thw[:num_source_images]
-                    hf_inputs["image_grid_thw"] = source_grids
-                    logger.debug(
-                        "_call_hf_processor: adjusted image_grid_thw for MM from %s to %s (num_source_images=%d)",
-                        tuple(image_grid_thw.shape),
-                        tuple(source_grids.shape),
-                        num_source_images,
-                    )
-
-            # Debug: Analyze input_ids for image tokens
-            input_ids = hf_inputs.get("input_ids")
-            if input_ids is not None:
-                if hasattr(input_ids, "tolist"):
-                    ids_list = input_ids.tolist()
-                    if isinstance(ids_list[0], list):
-                        ids_list = ids_list[0]  # Unbatch
-                else:
-                    ids_list = list(input_ids)
-
-                # Get image token ID from config
-                hf_config = self.info.get_hf_config()
-                image_token_id = getattr(hf_config, "image_token_id", 167855)
-
-                # Count image tokens
-                image_token_count = ids_list.count(image_token_id)
-                logger.debug(
-                    f"_call_hf_processor: input_ids length={len(ids_list)}, "
-                    f"image_token_id={image_token_id}, "
-                    f"image_token_count={image_token_count}"
-                )
-
-                # Log first/last few tokens to understand structure
-                logger.debug(f"_call_hf_processor: first 20 tokens: {ids_list[:20]}")
-                logger.debug(f"_call_hf_processor: last 20 tokens: {ids_list[-20:]}")
-
-                # Find positions of image tokens
-                image_positions = [i for i, t in enumerate(ids_list) if t == image_token_id]
-                if image_positions:
-                    logger.debug(f"_call_hf_processor: image token positions (first 10): {image_positions[:10]}")
-
-            return hf_inputs
-        else:
-            # Fallback without processor - this is not ideal but prevents crashes
-            logger.warning("GlmImageProcessor not available, using fallback for i2i")
-            tokenizer = self.info.get_tokenizer()
-            hf_config = self.info.get_hf_config()
-
-            # Get image token
-            image_token_id = getattr(hf_config, "image_token_id", 167855)
-            try:
-                image_token = tokenizer.convert_ids_to_tokens(image_token_id)
-            except Exception:
-                image_token = "<|image|>"
-
-            # Build prompt with image placeholders
-            image_placeholders = image_token * len(images)
-            full_prompt = f"{image_placeholders}{prompt}"
-            prompt_ids = tokenizer.encode(full_prompt)
-            return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="pt")
-
-    def _apply_hf_processor_mm_only(
-        self,
-        mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object],
-    ) -> BatchFeature:
-        """
-        Apply the HF processor on the multi-modal data only.
-
-        GLM-Image requires special handling because apply_chat_template always
-        adds a target <|image|> placeholder in addition to source image placeholders.
-        This causes an IndexError when the HF processor tries to find grid info
-        for the target placeholder (which doesn't exist for source-only processing).
-
-        Solution: Call the image processor directly to get pixel_values and
-        image_grid_thw, bypassing apply_chat_template's target handling.
-        """
-        mm_counts = mm_items.get_all_counts()
-        num_images = mm_counts.get("image", 0)
-
-        if num_images == 0:
-            # No images - call parent implementation
-            return super()._apply_hf_processor_mm_only(
-                mm_items=mm_items,
-                hf_processor_mm_kwargs=hf_processor_mm_kwargs,
-                tokenization_kwargs=tokenization_kwargs,
-            )
-
-        # For i2i mode, we need to process images directly with the image processor
-        # to avoid the apply_chat_template target placeholder issue
         processor = self.info.get_hf_processor()
-        image_processor = processor.image_processor
-
-        # Get images from mm_items
-        images = mm_items.get_items("image", ImageProcessorItems)
-        image_list = [images.get(i) for i in range(images.get_count())]
-
-        logger.debug(f"_apply_hf_processor_mm_only: processing {len(image_list)} images directly")
-
-        # Process images directly with image processor
-        image_inputs = image_processor(
-            images=image_list,
-            return_tensors="pt",
-        )
-
-        # Get grid info for source images only (no target)
-        pixel_values = image_inputs.get("pixel_values")
-        image_grid_thw = image_inputs.get("image_grid_thw")
-        if image_grid_thw is not None and image_grid_thw.shape[0] != num_images:
-            # Be defensive: some processors may include extra target grids.
-            image_grid_thw = image_grid_thw[:num_images]
-            image_inputs["image_grid_thw"] = image_grid_thw
-
-        logger.debug(
-            f"_apply_hf_processor_mm_only: pixel_values shape=\
-                {pixel_values.shape if pixel_values is not None else None}, "
-            f"image_grid_thw shape={image_grid_thw.shape if image_grid_thw is not None else None}"
-        )
-
-        # Build input_ids with image token placeholders
-        # The _get_prompt_updates returns PromptReplacement(target=[image_token_id], ...)
-        # which needs to find image tokens in input_ids to replace them.
-        # We need to include one image_token_id per image so the replacement can work.
         tokenizer = self.info.get_tokenizer()
-        image_token_id = tokenizer.convert_tokens_to_ids("<|image|>")
-
-        # Build input_ids: [image_token] * num_images + tokenized text
-        # This way _apply_prompt_updates can find the image tokens and replace them
-        dummy_text = self.dummy_inputs.get_dummy_text(mm_counts)
-        text_ids = tokenizer.encode(dummy_text, add_special_tokens=False)
-        input_ids = [image_token_id] * num_images + text_ids
-
-        logger.debug(
-            f"_apply_hf_processor_mm_only: built input_ids with {num_images} image tokens + {len(text_ids)} text tokens"
+        # Append HF's target-shape scaffold without decoding/re-tokenizing the
+        # user's tokens. Text-to-image needs both target and preview grids; i2i
+        # needs only the target. Grid metadata alone does not supply these AR
+        # tokens.
+        target_grid = self._build_generation_grids(inputs.hf_processor_mm_kwargs)[0]
+        suffix = _build_target_shape_scaffold(
+            processor,
+            height=int(target_grid[1]) * 32,
+            width=int(target_grid[2]) * 32,
+            is_text_to_image=num_images == 0,
         )
+        suffix_ids = tokenizer.encode(suffix, add_special_tokens=False)
+        if prompt_ids[-len(suffix_ids) :] != suffix_ids:
+            prompt_ids.extend(suffix_ids)
+        inputs = replace(inputs, prompt=prompt_ids)
+        return super().apply(inputs, timing_ctx)
 
-        return BatchFeature(
-            dict(
-                input_ids=[input_ids],
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-            ),
-            tensor_type="pt",
+    def _build_generation_grids(self, hf_processor_mm_kwargs: Mapping[str, object]) -> torch.Tensor:
+        """Build generation grids for M-RoPE decode positions.
+
+        For GLM-Image generation, decode order is:
+        1) small preview grid
+        2) large target grid
+        3) EOS
+
+        We store grids as [large, small] to match HF processor behavior, and
+        decode logic consumes them in reverse order.
+        """
+
+        target_h = (
+            hf_processor_mm_kwargs.get("target_h") if isinstance(hf_processor_mm_kwargs.get("target_h"), int) else None
+        )
+        target_w = (
+            hf_processor_mm_kwargs.get("target_w") if isinstance(hf_processor_mm_kwargs.get("target_w"), int) else None
+        )
+        if target_h is None or target_w is None:
+            target_h = (
+                hf_processor_mm_kwargs.get("height") if isinstance(hf_processor_mm_kwargs.get("height"), int) else 1024
+            )
+            target_w = (
+                hf_processor_mm_kwargs.get("width") if isinstance(hf_processor_mm_kwargs.get("width"), int) else 1024
+            )
+
+        factor = 32
+        target_h = (target_h // factor) * factor
+        target_w = (target_w // factor) * factor
+        token_h = target_h // factor
+        token_w = target_w // factor
+
+        ratio = token_h / token_w if token_w > 0 else 1.0
+        small_token_h = max(1, int(math.sqrt(ratio) * (factor // 2)))
+        small_token_w = max(1, int(math.sqrt(1 / ratio) * (factor // 2)))
+
+        return torch.tensor(
+            [[1, token_h, token_w], [1, small_token_h, small_token_w]],
+            dtype=torch.long,
         )
 
     def _apply_hf_processor_main(
         self,
-        prompt: str | list[int],
         mm_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object],
-        *,
-        enable_hf_prompt_update: bool,
-    ) -> tuple[list[int], BatchFeature, bool]:
-        """
-        Override to handle GLM-Image i2i mode correctly.
-
-        Problem: When vLLM processes cached mm items (enable_hf_prompt_update=False),
-        the base implementation:
-        1. Gets prompt_ids from _apply_hf_processor_text_only (no image tokens)
-        2. Gets mm_data from _apply_hf_processor_mm_only
-        3. Returns is_update_applied=False
-
-        This causes _apply_prompt_updates to fail because prompt_ids has no image tokens.
-
-        Solution: For i2i mode, we build prompt_ids that include image placeholders,
-        and return is_update_applied=False so _apply_prompt_updates can expand them.
-        """
+    ) -> BatchFeature:
+        """Process source images under vLLM's token-only prompt contract."""
         mm_counts = mm_items.get_all_counts()
         num_images = mm_counts.get("image", 0)
+        if num_images == 0:
+            return BatchFeature({"mrope_image_grid_thw": self._build_generation_grids(hf_processor_mm_kwargs)})
 
-        logger.debug(f"_apply_hf_processor_main: mm_counts={mm_counts}, num_images={num_images}")
+        valid_mm_items = mm_items.select({key for key, count in mm_counts.items() if count > 0})
+        processor_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
+        images = processor_data.get("images")
+        if not images:
+            return BatchFeature(dict(passthrough_data))
 
-        if num_images == 0 or enable_hf_prompt_update:
-            # t2i mode or normal flow - use parent implementation
-            return super()._apply_hf_processor_main(
-                prompt=prompt,
-                mm_items=mm_items,
-                hf_processor_mm_kwargs=hf_processor_mm_kwargs,
-                tokenization_kwargs=tokenization_kwargs,
-                enable_hf_prompt_update=enable_hf_prompt_update,
+        processor = self.info.get_hf_processor()
+        image_inputs = processor.image_processor(
+            images=list(images),
+            return_tensors="pt",
+        )
+        image_grid_thw = image_inputs.get("image_grid_thw")
+        if image_grid_thw is not None:
+            source_grid_thw = image_grid_thw[:num_images]
+            image_inputs["image_grid_thw"] = source_grid_thw
+
+            target_grid = self._build_generation_grids(hf_processor_mm_kwargs)[:1].to(dtype=source_grid_thw.dtype)
+            image_inputs["mrope_image_grid_thw"] = torch.cat(
+                [source_grid_thw, target_grid],
+                dim=0,
             )
 
-        # i2i mode with enable_hf_prompt_update=False (cache miss scenario)
-        # We need to build prompt_ids with image placeholders
-        logger.debug(f"_apply_hf_processor_main: i2i mode with enable_hf_prompt_update=False, num_images={num_images}")
-
-        # Get mm data from our overridden _apply_hf_processor_mm_only
-        mm_processed_data = self._apply_hf_processor_mm_only(
-            mm_items=mm_items,
-            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
-            tokenization_kwargs=tokenization_kwargs,
-        )
-
-        # In this path we do NOT call HF apply_chat_template, so we must still
-        # provide full grids (source + target) for M-RoPE to compute decode positions.
-        # Keep `image_grid_thw` source-only for MM batching/validation.
-        try:
-            source_grid_thw = mm_processed_data.get("image_grid_thw")
-            if source_grid_thw is not None and isinstance(source_grid_thw, torch.Tensor):
-                # Compute target grid following HF GlmImageProcessor: factor=32.
-                # Prefer explicit target_h/target_w if present, otherwise fall back.
-                target_h = (
-                    hf_processor_mm_kwargs.get("target_h")
-                    if isinstance(hf_processor_mm_kwargs.get("target_h"), int)
-                    else None
-                )
-                target_w = (
-                    hf_processor_mm_kwargs.get("target_w")
-                    if isinstance(hf_processor_mm_kwargs.get("target_w"), int)
-                    else None
-                )
-                if target_h is None or target_w is None:
-                    # Some callers pass generation size as height/width.
-                    target_h = (
-                        hf_processor_mm_kwargs.get("height")
-                        if isinstance(hf_processor_mm_kwargs.get("height"), int)
-                        else 1024
-                    )
-                    target_w = (
-                        hf_processor_mm_kwargs.get("width")
-                        if isinstance(hf_processor_mm_kwargs.get("width"), int)
-                        else 1024
-                    )
-
-                factor = 32
-                target_h = (target_h // factor) * factor
-                target_w = (target_w // factor) * factor
-                token_h = target_h // factor
-                token_w = target_w // factor
-                target_grid = torch.tensor([[1, token_h, token_w]], dtype=source_grid_thw.dtype)
-
-                mm_processed_data["mrope_image_grid_thw"] = torch.cat([source_grid_thw, target_grid], dim=0)
-        except Exception:
-            # Best-effort only; M-RoPE has additional fallbacks.
-            pass
-
-        # Build prompt_ids with image placeholders
-        # _apply_prompt_updates will replace each [image_token_id] with expanded tokens
-        tokenizer = self.info.get_tokenizer()
-        image_token_id = tokenizer.convert_tokens_to_ids("<|image|>")
-
-        if isinstance(prompt, str):
-            # Match HF GlmImageProcessor behavior: append target grid tokens + BOS.
-            # This helps M-RoPE/grid parsing and keeps i2i vs t2i behavior aligned.
-            try:
-                grid_bos = getattr(tokenizer, "grid_bos_token", "")
-                grid_eos = getattr(tokenizer, "grid_eos_token", "")
-                bos = getattr(tokenizer, "bos_token", "")
-
-                # Use the same target sizes we used for mrope grids when available.
-                target_h = (
-                    hf_processor_mm_kwargs.get("target_h")
-                    if isinstance(hf_processor_mm_kwargs.get("target_h"), int)
-                    else None
-                )
-                target_w = (
-                    hf_processor_mm_kwargs.get("target_w")
-                    if isinstance(hf_processor_mm_kwargs.get("target_w"), int)
-                    else None
-                )
-                if target_h is None or target_w is None:
-                    target_h = (
-                        hf_processor_mm_kwargs.get("height")
-                        if isinstance(hf_processor_mm_kwargs.get("height"), int)
-                        else 1024
-                    )
-                    target_w = (
-                        hf_processor_mm_kwargs.get("width")
-                        if isinstance(hf_processor_mm_kwargs.get("width"), int)
-                        else 1024
-                    )
-
-                factor = 32
-                target_h = (target_h // factor) * factor
-                target_w = (target_w // factor) * factor
-                token_h = target_h // factor
-                token_w = target_w // factor
-
-                expanded_prompt = f"{prompt}{grid_bos}{token_h} {token_w}{grid_eos}{bos}"
-                text_ids = tokenizer.encode(expanded_prompt, add_special_tokens=False)
-            except Exception:
-                text_ids = tokenizer.encode(prompt, add_special_tokens=False)
-        else:
-            text_ids = list(prompt)
-
-        # Prepend image placeholders - one per image
-        prompt_ids = [image_token_id] * num_images + text_ids
-
-        logger.debug(f"_apply_hf_processor_main: built prompt_ids with {num_images} image placeholders")
-
-        # Return is_update_applied=False so _apply_prompt_updates will expand the placeholders
-        return prompt_ids, mm_processed_data, False
+        image_inputs.update(passthrough_data)
+        return image_inputs
 
     def _get_mm_fields_config(
         self,
@@ -724,7 +501,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         Get the multimodal field configuration.
 
         For GLM-Image i2i mode:
-        - image_grid_thw has been sliced in _call_hf_processor to only include source images
+        - image_grid_thw contains only source grids from _apply_hf_processor_main
         - pixel_values has shape [total_patches, C, H, W] - only for source images
 
         For t2i mode:
@@ -732,7 +509,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         """
         result = {}
 
-        # Get image_grid_thw if present (already sliced in _call_hf_processor)
+        # Get the source-only image_grid_thw if present.
         image_grid_thw = hf_inputs.get("image_grid_thw")
 
         if "pixel_values" in hf_inputs and image_grid_thw is not None:
@@ -749,44 +526,20 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
 
                 result["pixel_values"] = MultiModalFieldConfig.flat_from_sizes("image", image_grid_sizes)
 
-                # Register image_grid_thw - it's been sliced in _call_hf_processor
+                # Register image_grid_thw - it's been sliced in _apply_hf_processor_main
                 # to only include source image grids, so batching will work correctly
                 result["image_grid_thw"] = MultiModalFieldConfig.batched("image")
+
+                if "mrope_image_grid_thw" in hf_inputs:
+                    result["mrope_image_grid_thw"] = MultiModalFieldConfig.shared(
+                        "image",
+                        num_source_images,
+                        keep_on_cpu=True,
+                    )
 
         logger.debug(f"_get_mm_fields_config: result keys: {list(result.keys())}")
 
         return result
-
-    def _hf_processor_applies_updates(
-        self,
-        prompt_text: str,
-        mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object],
-    ) -> bool:
-        """
-        Return whether the HF processor applies prompt updates.
-
-        For GLM-Image i2i mode, the HF processor's apply_chat_template already
-        expands <|image|> to N tokens (e.g., 4096 for 64x64 grid).
-
-        By returning True, we tell vLLM that HF processor DID apply prompt updates,
-        so vLLM will use _find_mm_placeholders to locate the expanded tokens
-        instead of trying to apply replacements.
-
-        For t2i mode (no images), there are no image placeholders to expand.
-        """
-        # Check if we have images (i2i mode)
-        num_images = mm_items.get_all_counts().get("image", 0)
-        if num_images > 0:
-            logger.debug(
-                f"_hf_processor_applies_updates: returning True for i2i mode "
-                f"(num_images={num_images}) - HF processor already expanded tokens"
-            )
-            return True
-
-        # For t2i mode (no images), use default behavior
-        return True
 
     def _get_prompt_updates(
         self,
@@ -797,17 +550,8 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         """
         Get prompt updates for image tokens.
 
-        For GLM-Image image-to-image mode, the HF processor's apply_chat_template
-        already expands each <|image|> placeholder to the correct number of
-        image tokens (grid_h * grid_w tokens per source image).
-
-        The HF processor does:
-        1. Replace each <|image|> with num_image_tokens copies of <|placeholder|>
-        2. Replace all <|placeholder|> back to <|image|>
-
-        So the tokenized input already has the expanded tokens. We use
-        target=[image_token_id] to match each occurrence of the image token,
-        similar to how Qwen2VL handles this pattern.
+        Expand each source-image placeholder into grid_h * grid_w image tokens
+        through vLLM's token-based prompt updates.
 
         We use image_grid_thw from out_mm_kwargs to get the actual processed grid
         size, following the Qwen2VL pattern. This is critical because the HF processor
@@ -818,8 +562,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         """
         hf_config = self.info.get_hf_config()
 
-        # Get image token ID - this is the token that appears multiple times
-        # in the tokenized input after HF processor expansion
+        # Match the source-image placeholder in the tokenized input.
         image_token_id = getattr(hf_config, "image_token_id", 167855)
 
         # Debug: log mm_items info
@@ -2237,13 +1980,13 @@ class GlmImageModel(nn.Module):
                 upsampled_token_ids.append(tokens_upsampled.view(-1))
 
             prior_token_image_ids_info = {
-                "prior_token_image_ids": upsampled_token_ids,
+                "ids": {"prior_image": upsampled_token_ids},
                 "image_grid_thw": image_grid_thw.tolist(),
             }
 
             # Debug: log prior_token_image_ids_info
             shapes = [t.shape for t in upsampled_token_ids]
-            logger.info(
+            logger.debug(
                 f"[GlmImageModel.forward] Built prior_token_image_ids_info: "
                 f"num_images={len(upsampled_token_ids)}, shapes={shapes}, "
                 f"image_grid_thw={image_grid_thw.tolist()}"
@@ -2301,6 +2044,11 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
     # flag tells the runner to use those positions instead of the default
     # linear increments during decode.
     precomputed_mrope_decode = True
+
+    # The downstream GLM-Image diffusion stage consumes generated token ids and
+    # optional VQ-VAE image ids, not AR hidden states. Avoid copying one hidden
+    # vector to host at every decode step.
+    omni_pooler_payload_include_hidden = False
 
     packed_modules_mapping = {
         "qkv_proj": [
@@ -2449,13 +2197,11 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         # image_grid_thw is NOT included because:
         # 1. vLLM's pooling_output expects dict[str, torch.Tensor], not mixed types
         # 2. ar2diffusion doesn't need it - the grid info is already encoded in tensor shape
-        prior_token_info = {
-            "prior_token_image_ids": upsampled_token_ids,
-        }
+        prior_token_info = {"ids": {"prior_image": upsampled_token_ids}}
 
         # Debug: log prior_token_info
         shapes = [t.shape for t in upsampled_token_ids]
-        logger.info(
+        logger.debug(
             f"[_process_image_input] Built prior_token_info: "
             f"num_images={len(upsampled_token_ids)}, shapes={shapes}, "
             f"image_grid_thw={image_grid_thw.tolist()}"
@@ -2523,8 +2269,10 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         # Cache prior_token_info for retrieval in forward()
         # This is needed because vLLM doesn't pass pixel_values to forward
         self._prior_token_cache = prior_token_info
+        prior_image_ids = prior_token_info.get("ids", {}).get("prior_image", [])
         logger.debug(
-            f"embed_multimodal: cached prior_token_info with {len(prior_token_info['prior_token_image_ids'])} images"
+            "embed_multimodal: cached prior_token_info with %s images",
+            len(prior_image_ids),
         )
 
         return tuple(image_embeddings)
@@ -2667,9 +2415,23 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         # Input format: "text<sop>H W<eop><sop>h w<eop><bos>" where <bos>=image_start_token_id=16384
         # For 1024x1024: H=32, W=32 (large), h=16, w=16 (small preview)
         if not image_grid_thw:
+            # Preferred path for t2i: use explicit target size propagated from
+            # serving/request sampling params. This avoids fragile grid parsing
+            # from token IDs and matches HF processor grid construction.
+            target_h = kwargs.get("target_h")
+            target_w = kwargs.get("target_w")
+            if isinstance(target_h, int) and isinstance(target_w, int) and target_h > 0 and target_w > 0:
+                factor = 32
+                token_h = target_h // factor
+                token_w = target_w // factor
+                ratio = token_h / token_w if token_w > 0 else 1.0
+                small_h = max(1, int(math.sqrt(ratio) * (factor // 2)))
+                small_w = max(1, int(math.sqrt(1 / ratio) * (factor // 2)))
+                image_grid_thw = [[1, token_h, token_w], [1, small_h, small_w]]
+
             # Try to parse from kwargs (passed from processor)
             hf_config_arg = kwargs.get("hf_config")
-            if hf_config_arg is not None and hasattr(hf_config_arg, "image_grid_thw"):
+            if (not image_grid_thw) and hf_config_arg is not None and hasattr(hf_config_arg, "image_grid_thw"):
                 image_grid_thw = hf_config_arg.image_grid_thw
 
             # If still empty, try to infer from input tokens
@@ -2723,19 +2485,29 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         prompt_ends_with_start = len(input_tokens) > 0 and input_tokens[-1] == image_start_token_id
         if prompt_ends_with_start and len(image_grid_thw) == num_source_images and num_source_images > 0:
             # i2i mode: source grids exist but no target grids
-            # Parse target grids from prompt tokens or use defaults
-            parsed_grids = self._parse_grid_from_tokens(input_tokens, hf_config)
-            if parsed_grids:
-                # parsed_grids contains all grids mentioned in prompt
-                # For i2i, add only the generation target grids
-                if len(parsed_grids) > num_source_images:
-                    image_grid_thw = list(image_grid_thw) + parsed_grids[num_source_images:]
-                else:
-                    # Fallback: add default 1024x1024 generation grids (1 target for i2i)
-                    image_grid_thw = list(image_grid_thw) + [[1, 32, 32]]
+            # Prefer explicit target size propagated from request sampling params.
+            # This avoids fragile grid parsing from token IDs for non-1024 i2i.
+            target_h = kwargs.get("target_h")
+            target_w = kwargs.get("target_w")
+            if isinstance(target_h, int) and isinstance(target_w, int) and target_h > 0 and target_w > 0:
+                factor = 32
+                token_h = target_h // factor
+                token_w = target_w // factor
+                image_grid_thw = list(image_grid_thw) + [[1, token_h, token_w]]
             else:
-                # Fallback to default 1024x1024 grids for generation
-                image_grid_thw = list(image_grid_thw) + [[1, 32, 32]]
+                # Parse target grids from prompt tokens or use defaults
+                parsed_grids = self._parse_grid_from_tokens(input_tokens, hf_config)
+                if parsed_grids:
+                    # parsed_grids contains all grids mentioned in prompt
+                    # For i2i, add only the generation target grids
+                    if len(parsed_grids) > num_source_images:
+                        image_grid_thw = list(image_grid_thw) + parsed_grids[num_source_images:]
+                    else:
+                        # Fallback: add default 1024x1024 generation grid (1 target for i2i)
+                        image_grid_thw = list(image_grid_thw) + [[1, 32, 32]]
+                else:
+                    # Fallback to default 1024x1024 grid for generation
+                    image_grid_thw = list(image_grid_thw) + [[1, 32, 32]]
 
         llm_pos_ids_list: list[torch.Tensor] = []
 

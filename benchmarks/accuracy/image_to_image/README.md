@@ -16,9 +16,9 @@ What changed:
   `/v1/images/edits` endpoint to produce benchmark outputs in the expected
   directory structure.
 - The evaluator keeps the same VIEScore-style decomposition:
-  - `semantics_score`
-  - `quality_score`
-  - `overall_score = sqrt(semantics_score * quality_score)`
+    - `semantics_score`
+    - `quality_score`
+    - `overall_score = sqrt(semantics_score * quality_score)`
 - Judge calls are routed to a local OpenAI-compatible model served by
   `vllm-omni`, not a remote provider.
 
@@ -99,5 +99,5 @@ Notes:
 - This flow requires the optional Hugging Face `datasets` package.
 - `generate` writes `generation_manifest.json` with local output coverage.
 - The current repo marker set exposes `L4` but not `L5`, so if you promote an
-  end-to-end smoke test into CI, use the existing `advanced_model`, `benchmark`,
-  and `L4` markers or introduce a new repo-wide marker explicitly first.
+  end-to-end smoke test into CI, use the `full_model`, `benchmark`,
+  and `L4` markers for nightly (or `advanced_model` for merge) or introduce a new repo-wide marker explicitly first.

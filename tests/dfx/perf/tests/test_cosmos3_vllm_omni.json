@@ -1,0 +1,288 @@
+[
+  {
+    "test_name": "test_cosmos3_t2i_official_demo_2gpu",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": [
+              "H100",
+              "B200"
+            ]
+          },
+          "num_cards": 2
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "Cosmos3-Nano text-to-image official demo workload on 2 GPUs",
+    "server_params": {
+      "model": "nvidia/Cosmos3-Nano",
+      "serve_args": {
+        "cfg-parallel-size": 2,
+        "use-hsdp": true,
+        "hsdp-shard-size": 2,
+        "vae-patch-parallel-size": 2,
+        "vae-use-tiling": true,
+        "model-class-name": "Cosmos3OmniDiffusersPipeline",
+        "no-guardrails": true,
+        "stage-init-timeout": 900,
+        "init-timeout": 1200,
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "1024x1024_steps4",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/generations",
+        "num_prompts": 3,
+        "max_concurrency": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 1024,
+          "height": 1024,
+          "num_inference_steps": 4,
+          "seed": 42,
+          "guidance_scale": 7.0,
+          "flow_shift": 3.0,
+          "guardrails": false
+        },
+        "baseline": {
+          "H100": {
+            "request_throughput": 1.1958,
+            "mean_e2el_ms": 843.0,
+            "mean_peak_memory_mb": 80000.0
+          }
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_cosmos3_t2v_official_demo_2gpu",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": [
+              "H100",
+              "B200"
+            ]
+          },
+          "num_cards": 2
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "Cosmos3-Nano text-to-video official demo workload on 2 GPUs",
+    "server_params": {
+      "model": "nvidia/Cosmos3-Nano",
+      "serve_args": {
+        "cfg-parallel-size": 2,
+        "use-hsdp": true,
+        "hsdp-shard-size": 2,
+        "vae-patch-parallel-size": 2,
+        "vae-use-tiling": true,
+        "model-class-name": "Cosmos3OmniDiffusersPipeline",
+        "no-guardrails": true,
+        "stage-init-timeout": 900,
+        "init-timeout": 1200,
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "1280x720_frames189_steps4",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/videos",
+        "num_prompts": 3,
+        "max_concurrency": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 1280,
+          "height": 720,
+          "num_inference_steps": 4,
+          "num_frames": 189,
+          "fps": 24,
+          "seed": 42,
+          "guidance_scale": 6.0,
+          "flow_shift": 10.0,
+          "max_sequence_length": 4096,
+          "guardrails": false,
+          "use_resolution_template": false,
+          "use_duration_template": false
+        },
+        "baseline": {
+          "H100": {
+            "request_throughput": 0.0307,
+            "mean_e2el_ms": 32766.5,
+            "mean_peak_memory_mb": 28762.4762
+          }
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_cosmos3_i2v_official_demo_2gpu",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": [
+              "H100",
+              "B200"
+            ]
+          },
+          "num_cards": 2
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "Cosmos3-Nano image-to-video official demo workload on 2 GPUs",
+    "server_params": {
+      "model": "nvidia/Cosmos3-Nano",
+      "serve_args": {
+        "cfg-parallel-size": 2,
+        "use-hsdp": true,
+        "hsdp-shard-size": 2,
+        "vae-patch-parallel-size": 2,
+        "vae-use-tiling": true,
+        "model-class-name": "Cosmos3OmniDiffusersPipeline",
+        "no-guardrails": true,
+        "stage-init-timeout": 900,
+        "init-timeout": 1200,
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "1280x720_frames189_steps4",
+        "dataset_name": "random-mm",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/videos",
+        "num_prompts": 3,
+        "max_concurrency": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "random_mm_base_items_per_request": 1,
+        "random_mm_num_mm_items_range_ratio": 0,
+        "random_mm_limit_mm_per_prompt": {
+          "image": 1
+        },
+        "random_mm_bucket_config": {
+          "(720, 1280, 1)": 1.0
+        },
+        "extra_body": {
+          "width": 1280,
+          "height": 720,
+          "num_inference_steps": 4,
+          "num_frames": 189,
+          "fps": 24,
+          "seed": 42,
+          "guidance_scale": 6.0,
+          "flow_shift": 10.0,
+          "max_sequence_length": 4096,
+          "guardrails": false
+        },
+        "baseline": {
+          "H100": {
+            "request_throughput": 0.0305,
+            "mean_e2el_ms": 33100.9,
+            "mean_peak_memory_mb": 29441.1429
+          }
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_cosmos3_v2v_official_demo_2gpu",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": [
+              "H100",
+              "B200"
+            ]
+          },
+          "num_cards": 2
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "Cosmos3-Nano video-to-video official demo workload on 2 GPUs",
+    "server_params": {
+      "model": "nvidia/Cosmos3-Nano",
+      "serve_args": {
+        "cfg-parallel-size": 2,
+        "use-hsdp": true,
+        "hsdp-shard-size": 2,
+        "vae-patch-parallel-size": 2,
+        "vae-use-tiling": true,
+        "model-class-name": "Cosmos3OmniDiffusersPipeline",
+        "no-guardrails": true,
+        "stage-init-timeout": 900,
+        "init-timeout": 1200,
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "1280x720_frames189_steps4",
+        "dataset_name": "random-mm",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/videos",
+        "num_prompts": 3,
+        "max_concurrency": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "random_mm_base_items_per_request": 1,
+        "random_mm_num_mm_items_range_ratio": 0,
+        "random_mm_limit_mm_per_prompt": {
+          "video": 1
+        },
+        "random_mm_bucket_config": {
+          "(720, 1280, 189)": 1.0
+        },
+        "extra_body": {
+          "width": 1280,
+          "height": 720,
+          "num_inference_steps": 4,
+          "num_frames": 189,
+          "fps": 24,
+          "seed": 42,
+          "guidance_scale": 6.0,
+          "flow_shift": 10.0,
+          "max_sequence_length": 4096,
+          "guardrails": false,
+          "condition_frame_indexes_vision": [
+            0,
+            1
+          ],
+          "condition_video_keep": "first"
+        },
+        "baseline": {
+          "H100": {
+            "request_throughput": 0.0299,
+            "mean_e2el_ms": 33925.0,
+            "mean_peak_memory_mb": 29443.1429
+          }
+        }
+      }
+    ]
+  }
+]

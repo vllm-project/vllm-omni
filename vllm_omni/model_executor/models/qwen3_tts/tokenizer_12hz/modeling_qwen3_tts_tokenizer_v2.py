@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,6 +16,8 @@
 # limitations under the License.
 """PyTorch Qwen3TTSTokenizerV2 model."""
 
+import copy
+import inspect
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -21,16 +26,12 @@ from typing import Any
 import numpy as np
 import torch
 from torch import nn
-from torch.nn import Parameter
 from torch.nn import functional as F
 from transformers import MimiConfig, MimiModel
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.integrations import use_kernel_forward_from_hub
-from transformers.masking_utils import (
-    create_causal_mask,
-    create_sliding_window_causal_mask,
-)
+from transformers.masking_utils import create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast
@@ -39,6 +40,8 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import ModelOutput, auto_docstring, logging
 from transformers.utils.deprecation import deprecate_kwarg
+
+from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 
 from .configuration_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2Config,
@@ -196,10 +199,21 @@ class Qwen3TTSTokenizerV2CausalConvNet(nn.Module):
         self.padding = self.kernel_size - self.stride
 
     def _get_extra_padding_for_conv1d(self, hidden_state: torch.Tensor) -> int:
+        # Cache the result per input length — under cudagraph capture the set of lengths
+        # is fixed, so the LUT converges quickly and replaces the math.ceil call per replay.
         length = hidden_state.shape[-1]
+        cache = self.__dict__.get("_pad_lut")
+        if cache is None:
+            cache = {}
+            self.__dict__["_pad_lut"] = cache
+        cached = cache.get(length)
+        if cached is not None:
+            return cached
         n_frames = (length - self.kernel_size + self.padding) / self.stride + 1
         ideal_length = (math.ceil(n_frames) - 1) * self.stride + (self.kernel_size - self.padding)
-        return ideal_length - length
+        extra_padding = ideal_length - length
+        cache[length] = extra_padding
+        return extra_padding
 
     def forward(self, hidden_state):
         extra_padding = self._get_extra_padding_for_conv1d(hidden_state)
@@ -510,14 +524,62 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
         self.norm = Qwen3TTSTokenizerV2DecoderRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3TTSTokenizerV2DecoderRotatoryEmbedding(config=config)
         self.gradient_checkpointing = False
-        self.has_sliding_layers = "sliding_attention" in self.config.layer_types
         self.window_size = config.sliding_window
 
         self.input_proj = nn.Linear(config.latent_dim, config.hidden_size)
         self.output_proj = nn.Linear(config.hidden_size, config.latent_dim)
+        # Stateless calls with implicit positions share one broadcastable mask
+        # per warmup shape. Incremental or explicit-position calls build a live mask.
+        self._sliding_attention_mask_cache: dict[tuple[int, torch.dtype, torch.device, str], torch.Tensor | None] = {}
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def _apply(self, fn, recurse=True):
+        # A placement or dtype change invalidates every cached mask.
+        self._sliding_attention_mask_cache.clear()
+        return super()._apply(fn, recurse=recurse)
+
+    def _get_sliding_attention_mask(
+        self,
+        inputs_embeds: torch.Tensor,
+    ) -> torch.Tensor | None:
+        sequence_length = int(inputs_embeds.shape[1])
+        max_position_embeddings = int(self.config.max_position_embeddings)
+        if sequence_length > max_position_embeddings:
+            raise ValueError(
+                f"Input length {sequence_length} exceeds max_position_embeddings {max_position_embeddings}"
+            )
+
+        cache_key = (
+            sequence_length,
+            inputs_embeds.dtype,
+            inputs_embeds.device,
+            str(self.config._attn_implementation),
+        )
+        if cache_key not in self._sliding_attention_mask_cache:
+            mask_inputs = inputs_embeds[:1]
+            mask_kwargs = {
+                "config": self.config,
+                "attention_mask": None,
+                "past_key_values": None,
+                "position_ids": None,
+            }
+            sig = inspect.signature(create_sliding_window_causal_mask)
+            if "input_embeds" in sig.parameters:
+                mask_kwargs["input_embeds"] = mask_inputs
+                mask_kwargs["cache_position"] = torch.arange(
+                    sequence_length,
+                    device=inputs_embeds.device,
+                )
+            else:
+                mask_kwargs["inputs_embeds"] = mask_inputs
+            sliding_attention_mask = create_sliding_window_causal_mask(**mask_kwargs)
+            if sliding_attention_mask is not None:
+                sliding_attention_mask = sliding_attention_mask.contiguous()
+            self._sliding_attention_mask_cache[cache_key] = sliding_attention_mask
+
+        return self._sliding_attention_mask_cache[cache_key]
 
     # Note: @check_model_inputs decorator removed for vLLM compatibility
     # The decorator causes "unexpected keyword argument 'inputs_embeds'" error
@@ -533,6 +595,10 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
         cache_position=None,
         **kwargs,
     ) -> BaseModelOutputWithPast:
+        r"""
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+            Indices depicting the position of the input sequence tokens in the sequence. Used to update the cache.
+        """
         if input_ids is not None:
             raise ValueError("input_ids is not expected")
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -543,38 +609,51 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
 
         inputs_embeds = self.input_proj(inputs_embeds)
 
+        sequence_length = inputs_embeds.shape[1]
+        # Only internally generated positions are known to be contiguous and
+        # zero-based without reading CUDA tensor values back to the host.
+        # Explicit positions use the live mask path, including during capture.
+        uses_prepared_or_incremental_mask = (
+            attention_mask is not None
+            or bool(use_cache)
+            or past_key_values is not None
+            or cache_position is not None
+            or position_ids is not None
+        )
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+                past_seen_tokens,
+                past_seen_tokens + sequence_length,
+                device=inputs_embeds.device,
             )
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        # It may already have been prepared by e.g. `generate`
-        if not isinstance(causal_mask_mapping := attention_mask, dict):
-            # Prepare mask arguments
+        hidden_states = inputs_embeds
+
+        if isinstance(attention_mask, dict):
+            sliding_attention_mask = attention_mask["sliding_attention"]
+        elif uses_prepared_or_incremental_mask:
             mask_kwargs = {
                 "config": self.config,
-                "input_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
-                "cache_position": cache_position,
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }
-            # Create the masks
-            causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-            }
-            # The sliding window alternating layers are not always activated depending on the config
-            if self.has_sliding_layers:
-                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
-
-        hidden_states = inputs_embeds
+            sig = inspect.signature(create_sliding_window_causal_mask)
+            if "input_embeds" in sig.parameters:
+                mask_kwargs["input_embeds"] = inputs_embeds
+                mask_kwargs["cache_position"] = cache_position
+            else:
+                mask_kwargs["inputs_embeds"] = inputs_embeds
+            sliding_attention_mask = create_sliding_window_causal_mask(**mask_kwargs)
+        else:
+            sliding_attention_mask = self._get_sliding_attention_mask(inputs_embeds)
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -582,7 +661,7 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             hidden_states = decoder_layer(
                 hidden_states,
-                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                attention_mask=sliding_attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
@@ -597,130 +676,6 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
         )
-
-
-class SnakeBeta(nn.Module):
-    """
-    A modified Snake function which uses separate parameters for the magnitude of the periodic components
-    Shape:
-        - Input: (B, C, T)
-        - Output: (B, C, T), same shape as the input
-    Parameters:
-        - alpha - trainable parameter that controls frequency
-        - beta - trainable parameter that controls magnitude
-    References:
-        - This activation function is a modified version based on this paper
-          by Liu Ziyin, Tilman Hartwig, Masahito Ueda:
-          https://huggingface.co/papers/2006.08195
-    """
-
-    _triton_kernel = None  # None = untried, False = unavailable, callable = ready
-    _TRITON_MAX_BLOCK_T = 4096  # upper bound for time-axis tile size
-
-    @staticmethod
-    def _init_triton():
-        """Load and JIT-compile the fused Triton kernel (once)."""
-        if SnakeBeta._triton_kernel is not None:
-            return SnakeBeta._triton_kernel is not False
-        try:
-            import triton
-            import triton.language as tl
-        except ImportError:
-            SnakeBeta._triton_kernel = False
-            return False
-
-        @triton.jit
-        def _kernel(  # noqa: N803
-            x_ptr,
-            exp_alpha_ptr,
-            inv_beta_ptr,
-            out_ptr,
-            stride_b,
-            stride_c,
-            t_len,
-            block_t: tl.constexpr,
-        ):
-            """Fused SnakeBeta using precomputed exp(α) and 1/(exp(β)+ε)."""
-            bid = tl.program_id(0)
-            cid = tl.program_id(1)
-            t_off = tl.program_id(2) * block_t + tl.arange(0, block_t)
-            mask = t_off < t_len
-
-            x = tl.load(x_ptr + bid * stride_b + cid * stride_c + t_off, mask=mask, other=0.0)
-            ea = tl.load(exp_alpha_ptr + cid)
-            ib = tl.load(inv_beta_ptr + cid)
-            sin_val = tl.sin(x * ea)
-            result = x + ib * sin_val * sin_val
-
-            tl.store(out_ptr + bid * stride_b + cid * stride_c + t_off, result, mask=mask)
-
-        SnakeBeta._triton_kernel = _kernel
-        return True
-
-    def __init__(self, in_features, alpha=1.0):
-        super().__init__()
-        self.in_features = in_features
-
-        self.alpha = Parameter(torch.zeros(in_features) * alpha)
-        self.beta = Parameter(torch.zeros(in_features) * alpha)
-
-        self.no_div_by_zero = 0.000000001
-
-        # Precomputed buffers (populated by precompute_exp_cache)
-        self.register_buffer("_exp_alpha", None, persistent=False)
-        self.register_buffer("_inv_beta", None, persistent=False)
-
-    def precompute_exp_cache(self):
-        """Materialize exp(alpha) and 1/(exp(beta)+eps) as frozen buffers."""
-        with torch.no_grad():
-            self._exp_alpha = torch.exp(self.alpha).contiguous()
-            self._inv_beta = (1.0 / (torch.exp(self.beta) + self.no_div_by_zero)).contiguous()
-
-    @property
-    def _cached(self):
-        return self._exp_alpha is not None
-
-    def forward(self, hidden_states):
-        """SnakeBeta := x + 1/b * sin^2(x*a)"""
-        if hidden_states.is_cuda and not torch.is_grad_enabled() and self._init_triton():
-            try:
-                return self._triton_forward(hidden_states)
-            except Exception:
-                logger.warning("Triton SnakeBeta failed, falling back to eager", exc_info=True)
-                SnakeBeta._triton_kernel = False
-        return self._eager_forward(hidden_states)
-
-    def _eager_forward(self, hidden_states):
-        if self._cached:
-            exp_alpha = self._exp_alpha.unsqueeze(0).unsqueeze(-1)
-            inv_beta = self._inv_beta.unsqueeze(0).unsqueeze(-1)
-        else:
-            exp_alpha = torch.exp(self.alpha).unsqueeze(0).unsqueeze(-1)
-            inv_beta = (1.0 / (torch.exp(self.beta) + self.no_div_by_zero)).unsqueeze(0).unsqueeze(-1)
-        hidden_states = hidden_states + inv_beta * torch.pow(torch.sin(hidden_states * exp_alpha), 2)
-        return hidden_states
-
-    def _triton_forward(self, x):
-        import triton
-
-        if not self._cached:
-            self.precompute_exp_cache()
-
-        x = x.contiguous()
-        B, C, T = x.shape
-        out = torch.empty_like(x)
-        block_t = min(triton.next_power_of_2(T), self._TRITON_MAX_BLOCK_T)
-        self._triton_kernel[(B, C, triton.cdiv(T, block_t))](
-            x,
-            self._exp_alpha,
-            self._inv_beta,
-            out,
-            x.stride(0),
-            x.stride(1),
-            t_len=T,
-            block_t=block_t,
-        )
-        return out
 
 
 class Qwen3TTSTokenizerV2DecoderDecoderResidualUnit(nn.Module):
@@ -909,10 +864,15 @@ class SplitResidualVectorQuantizer(nn.Module):
         return quantized
 
 
+_CONV_CONTEXT_FRAME = 2
+_DOWNSTREAM_CONTEXT_FRAME = 12
+
+
 class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
     def __init__(self, config: Qwen3TTSTokenizerV2DecoderConfig):
         super().__init__(config)
         self.total_upsample = np.prod(config.upsample_rates + config.upsampling_ratios)
+        self.upsample_factor = np.prod(config.upsampling_ratios)
         self.pre_transformer = Qwen3TTSTokenizerV2DecoderTransformerModel._from_config(config)
 
         self.quantizer = SplitResidualVectorQuantizer(
@@ -958,6 +918,75 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         self._cudagraph_enabled = False
         self._cudagraph_wrapper = None
 
+    def model_local_kv_specs(self):
+        """Declare this decoder's attention KV.
+
+        Only the async-chunk path holds KV. In stateless mode the decoder runs
+        ``_forward_exact``, which calls ``pre_transformer`` without
+        ``use_cache`` and allocates no cache at all, so declaring a per-request
+        cache there invents memory that does not exist. The previous revision
+        did exactly that and reported over a gigabyte for stateless
+        deployments; the one before it hung the declaration off the CUDA-graph
+        wrapper and so reported zero under ``enforce_eager``, where the eager
+        async-chunk path does allocate. Both mistakes come from tying this to
+        the wrong condition.
+
+        Two entries when async-chunk is on: the retained per-request cache, and
+        the working copy ``_decode_icl_first_chunk`` deep-copies from it, which
+        is live at the same time.
+
+        The wrapper, when present, adds the graph-resident copies. It is a
+        plain object rather than a submodule, so the module-tree walk cannot
+        reach it; this is the hop it needs.
+        """
+        from vllm_omni.model_executor.models.model_local_kv import (
+            ModelLocalKVScope,
+            RowDriver,
+            spec_from_hf_config,
+        )
+
+        config = self.config
+        try:
+            dtype = next(self.parameters()).dtype
+        except StopIteration:  # parameterless stub, only reachable in tests
+            return []
+
+        window = int(getattr(config, "sliding_window", 0) or 0)
+        if window <= 1:
+            return []
+
+        specs = []
+        wrapper = getattr(self, "_cudagraph_wrapper", None)
+        # async_chunk is the wrapper's record of the mode; without a wrapper the
+        # decoder has not been told, and only the stateless path is reachable.
+        if wrapper is not None and getattr(wrapper, "async_chunk", False):
+            common = dict(
+                config=config,
+                dtype=dtype,
+                physical_capacity_positions=window - 1,
+                capacity_source=f"sliding_window({window}) - 1",
+                rows=RowDriver.MAX_NUM_SEQS,
+            )
+            specs.append(
+                spec_from_hf_config(
+                    name="codec_decoder_request",
+                    scope=ModelLocalKVScope.REQUEST,
+                    allocation_note="retained across chunks of one request",
+                    **common,
+                )
+            )
+            specs.append(
+                spec_from_hf_config(
+                    name="codec_decoder_working_copy",
+                    scope=ModelLocalKVScope.INVOCATION,
+                    allocation_note="deep-copied from the retained cache each chunk; live alongside it",
+                    **common,
+                )
+            )
+        if wrapper is not None:
+            specs.extend(wrapper.model_local_kv_specs())
+        return specs
+
     def precompute_snake_caches(self):
         """Precompute exp(alpha) and 1/(exp(beta)+eps) for all SnakeBeta modules."""
         count = 0
@@ -970,12 +999,20 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
     def enable_cudagraph(
         self,
-        capture_sizes: list[int] | None = None,
+        capture_modes: tuple[str, ...] = ("icl", "xvec"),
+        capture_batch_sizes: list[int] | None = None,
+        stateless_capture_sizes: list[int] | None = None,
         device: torch.device | None = None,
         codec_chunk_frames: int = 0,
         codec_left_context_frames: int = 0,
+        initial_codec_chunk_frames: int = 1,
+        codec_chunk_ramp: list[int] | None = None,
+        async_chunk: bool = True,
+        decode_chunk_size: int = 300,
+        decode_left_context: int = 25,
     ):
-        from ..cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
+        # from ..cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
+        from ..segmented_graph_wrapper import CUDAGraphDecoderWrapper
 
         if device is None:
             device = next(self.parameters()).device
@@ -985,31 +1022,36 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
         self._cudagraph_wrapper = CUDAGraphDecoderWrapper(
             decoder=self,
-            capture_sizes=capture_sizes,
+            capture_modes=capture_modes,
+            capture_batch_sizes=capture_batch_sizes,
+            stateless_capture_sizes=stateless_capture_sizes,
             num_quantizers=self.config.num_quantizers,
             enabled=True,
+            async_chunk=async_chunk,
+            initial_chunk_frames=initial_codec_chunk_frames,
+            codec_chunk_frames=codec_chunk_frames or 25,
+            codec_chunk_ramp=codec_chunk_ramp,
+            decode_chunk_size=decode_chunk_size,
+            decode_left_context=decode_left_context,
         )
+        self._incremental_chunk_frames = codec_chunk_frames or 25
+        self._incremental_chunk_ramp = list(codec_chunk_ramp or ())
         self._cudagraph_wrapper.warmup(
             device,
             dtype=torch.long,
-            codec_chunk_frames=codec_chunk_frames,
-            codec_left_context_frames=codec_left_context_frames,
         )
         self._cudagraph_enabled = True
         logger.info(
-            "CUDA Graph enabled for decoder: seq_lens=%s",
-            self._cudagraph_wrapper.capture_sizes,
+            "CUDA Graph enabled for decoder: batch_sizes=%s seq_lens=%s",
+            self._cudagraph_wrapper.capture_batch_sizes,
+            (
+                self._cudagraph_wrapper.icl_capture_sizes
+                if async_chunk
+                else self._cudagraph_wrapper.stateless_capture_sizes
+            ),
         )
 
-    def disable_cudagraph(self):
-        self._cudagraph_enabled = False
-        self._cudagraph_wrapper = None
-        logger.info("CUDA Graph disabled for decoder")
-
-    def forward(self, codes):
-        if codes.shape[1] != self.config.num_quantizers:
-            raise ValueError(f"Expected {self.config.num_quantizers} layer of codes, got {codes.shape[1]}")
-
+    def _forward_exact(self, codes):
         hidden = self.quantizer.decode(codes)
         hidden = self.pre_conv(hidden).transpose(1, 2)
 
@@ -1018,15 +1060,267 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         for blocks in self.upsample:
             for block in blocks:
                 hidden = block(hidden)
+
         wav = hidden
         for block in self.decoder:
             wav = block(wav)
         return wav.clamp(min=-1, max=1)
 
-    def chunked_decode(self, codes, chunk_size=300, left_context_size=25):
+    def _decode_icl_first_chunk(
+        self,
+        codes,
+        caches,
+        prefix_frames,
+        prefix_cache=None,
+        prefix_hidden_mask=None,
+        prefix_attention_mask=None,
+        suffix_attention_mask=None,
+    ):
+        # The CUDA graph path may left-pad a shorter request prefix to the
+        # captured sliding-window length.  Keep the decoder's physical layout
+        # separate from the request metadata so eager fallbacks slice the
+        # cached tensors at the correct boundary.
+        caches["decoder_prefix_frames"] = prefix_frames
+        hidden = self.quantizer.decode(codes)
+        if prefix_hidden_mask is not None:
+            hidden = hidden * prefix_hidden_mask
+        caches.update({"ref_hidden": hidden[:, :, :prefix_frames]})
+        caches.update({"suffix_quantized": hidden[:, :, prefix_frames:]})
+
+        hidden = self.pre_conv(hidden).transpose(1, 2)
+        caches.update({"ref_conv": hidden[:, :prefix_frames, :]})
+        caches.update({"suffix_conv": hidden[:, prefix_frames:, :]})
+
+        if hidden.shape[1] < prefix_frames:
+            raise ValueError(
+                "Qwen3-TTS ICL prefix cache requires at least prefix_frames inputs, "
+                f"got prefix_frames={prefix_frames}, total_frames={hidden.shape[1]}"
+            )
+        prefix_result = self.pre_transformer(
+            inputs_embeds=hidden[:, :prefix_frames, :],
+            attention_mask=prefix_attention_mask,
+            past_key_values=prefix_cache,
+            use_cache=True,
+        )
+
+        prefix_cache = prefix_result.past_key_values
+        working_cache = copy.deepcopy(prefix_cache)
+
+        suffix_result = self.pre_transformer(
+            inputs_embeds=hidden[:, prefix_frames:, :],
+            attention_mask=suffix_attention_mask,
+            past_key_values=working_cache,
+            use_cache=True,
+        )
+
+        prefix_hidden = prefix_result.last_hidden_state
+        if prefix_attention_mask is not None:
+            prefix_hidden = prefix_hidden * prefix_attention_mask.unsqueeze(-1)
+        hidden = torch.cat(
+            [
+                prefix_hidden,
+                suffix_result.last_hidden_state,
+            ],
+            dim=1,
+        )
+        caches.update({"past_key_values": prefix_cache})
+        caches.update({"prefix_hidden": prefix_hidden})
+
+        hidden = hidden.permute(0, 2, 1)
+
+        for blocks in self.upsample:
+            for block in blocks:
+                hidden = block(hidden)
+        wav = hidden
+
+        for block in self.decoder:
+            wav = block(wav)
+        wav = wav.clamp(min=-1, max=1)
+        return wav
+
+    def _decode_xvec_first_chunk(self, codes: torch.Tensor, caches: dict) -> torch.Tensor:
+        """Initialize prefixless incremental state from the first codec chunk."""
+        hidden = self.quantizer.decode(codes)
+        caches["decoder_prefix_frames"] = 0
+        caches["ref_hidden"] = hidden[:, :, :0]
+        caches["suffix_quantized"] = hidden
+
+        hidden = self.pre_conv(hidden).transpose(1, 2)
+        caches["ref_conv"] = hidden[:, :0, :]
+        caches["suffix_conv"] = hidden
+
+        empty_prefix_cache = caches.get("past_key_values")
+        if empty_prefix_cache is None:
+            empty_prefix_cache = DynamicCache(config=self.config)
+            head_dim = getattr(
+                self.config,
+                "head_dim",
+                self.config.hidden_size // self.config.num_attention_heads,
+            )
+            empty_prefix_cache.early_initialization(
+                batch_size=int(codes.shape[0]),
+                num_heads=self.config.num_key_value_heads,
+                head_dim=head_dim,
+                dtype=hidden.dtype,
+                device=hidden.device,
+            )
+        working_cache = copy.deepcopy(empty_prefix_cache)
+        suffix_hidden = self.pre_transformer(
+            inputs_embeds=hidden,
+            past_key_values=working_cache,
+            use_cache=True,
+        ).last_hidden_state
+        caches["past_key_values"] = empty_prefix_cache
+        caches["prefix_hidden"] = suffix_hidden[:, :0, :]
+
+        hidden = suffix_hidden.permute(0, 2, 1)
+        for blocks in self.upsample:
+            for block in blocks:
+                hidden = block(hidden)
+        wav = hidden
+        for block in self.decoder:
+            wav = block(wav)
+        caches["suffix_frames"] = int(codes.shape[-1])
+        return wav.clamp(min=-1, max=1)
+
+    def _decode_suffix(
+        self,
+        new_codes: torch.Tensor,
+        old_quantized: torch.Tensor,
+        old_conv: torch.Tensor,
+        caches: dict,
+        prefix_frames: int,
+        new_frames: int,
+        rolling: bool,
+        attention_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ref_hidden = caches["ref_hidden"]
+        conv_context = torch.cat([ref_hidden, old_quantized], dim=-1)[:, :, -_CONV_CONTEXT_FRAME:]
+        suffix_cache_length = int(self.config.sliding_window)
+
+        new_quantized = self.quantizer.decode(new_codes)
+        new_conv_input = torch.cat([conv_context, new_quantized], dim=-1)
+        new_conv = self.pre_conv(new_conv_input)
+        new_conv = new_conv[:, :, -new_codes.shape[-1] :].transpose(1, 2)
+
+        if rolling:
+            boundary_input = torch.cat(
+                [ref_hidden[:, :, -_CONV_CONTEXT_FRAME:], old_quantized[:, :, :_CONV_CONTEXT_FRAME]],
+                dim=-1,
+            )
+            boundary_conv = self.pre_conv(boundary_input)
+            boundary_conv = boundary_conv[:, :, -_CONV_CONTEXT_FRAME:].transpose(1, 2)
+            suffix_conv = torch.cat([boundary_conv, old_conv, new_conv], dim=1)
+        else:
+            suffix_conv = torch.cat([old_conv, new_conv], dim=1)
+
+        next_quantized = torch.cat([old_quantized, new_quantized], dim=-1)[:, :, -suffix_cache_length:]
+        next_conv = suffix_conv[:, -(suffix_cache_length - _CONV_CONTEXT_FRAME) :, :]
+
+        hidden = torch.cat([caches["ref_conv"], suffix_conv], dim=1)
+        hidden = hidden.transpose(1, 2).contiguous().transpose(1, 2)
+        working_cache = copy.deepcopy(caches["past_key_values"])
+        suffix_hidden = self.pre_transformer(
+            inputs_embeds=hidden[:, prefix_frames:, :],
+            attention_mask=attention_mask,
+            past_key_values=working_cache,
+            use_cache=True,
+        ).last_hidden_state
+        hidden = torch.cat([caches["prefix_hidden"], suffix_hidden], dim=1)
+
+        required_frames = min(hidden.shape[1], new_frames + _DOWNSTREAM_CONTEXT_FRAME)
+        hidden = hidden[:, -required_frames:, :].permute(0, 2, 1)
+        for blocks in self.upsample:
+            for block in blocks:
+                hidden = block(hidden)
+
+        wav = hidden
+        for block in self.decoder:
+            wav = block(wav)
+        wav = wav[..., -new_frames * self.total_upsample :].clamp(min=-1, max=1)
+        return wav, next_quantized, next_conv
+
+    def _is_suffix_cache_rolling(self, previous_suffix_frames: int, cached_frames: int) -> bool:
+        suffix_cache_length = int(self.config.sliding_window)
+        return previous_suffix_frames >= suffix_cache_length and cached_frames == suffix_cache_length
+
+    def decode_suffix(self, new_codes, caches, prefix_frames):
+        previous_suffix_frames = int(caches.get("suffix_frames", caches["suffix_quantized"].shape[-1]))
+        cached_frames = int(caches["suffix_quantized"].shape[-1])
+        suffix_cache_length = int(self.config.sliding_window)
+        rolling = self._is_suffix_cache_rolling(previous_suffix_frames, cached_frames)
+        retained_frames = suffix_cache_length if rolling else previous_suffix_frames
+        new_frames = int(new_codes.shape[-1])
+        max_new_frames = int(getattr(self, "_incremental_chunk_frames", 25))
+        if not 0 < new_frames <= max_new_frames:
+            raise ValueError(
+                f"Qwen3-TTS incremental decode expected 1..{max_new_frames} new frames, got new_frames={new_frames}"
+            )
+
+        attention_mask = torch.ones(
+            new_codes.shape[0],
+            prefix_frames + retained_frames + new_frames,
+            dtype=torch.bool,
+            device=new_codes.device,
+        )
+        attention_mask[:, : int(caches.get("prefix_pad_frames", 0))] = 0
+        output, next_quantized, next_conv = self._decode_suffix(
+            new_codes,
+            caches["suffix_quantized"],
+            caches["suffix_conv"],
+            caches,
+            prefix_frames,
+            new_frames,
+            rolling,
+            attention_mask=attention_mask,
+        )
+        caches["suffix_quantized"] = next_quantized
+        caches["suffix_conv"] = next_conv
+        caches["suffix_frames"] = retained_frames + new_frames
+        return output
+
+    def forward(self, codes, caches=None):
+        if codes.shape[1] != self.config.num_quantizers:
+            raise ValueError(f"Expected {self.config.num_quantizers} layer of codes, got {codes.shape[1]}")
+
+        if caches is None or caches.get("_is_dummy_run", False):
+            return self._forward_exact(codes)
+
+        prefix_frames = int(caches["prefix_frames"])
+        if prefix_frames < 0:
+            raise ValueError(
+                "Qwen3-TTS ICL prefix cache received invalid frame counts: "
+                f"prefix_frames={prefix_frames}, total_frames={codes.shape[-1]}"
+            )
+
+        if "suffix_quantized" not in caches:
+            if codes.shape[-1] < prefix_frames:
+                raise ValueError(
+                    "Qwen3-TTS ICL first chunk is shorter than its prefix: "
+                    f"prefix_frames={prefix_frames}, total_frames={codes.shape[-1]}"
+                )
+            if prefix_frames == 0:
+                return self._decode_xvec_first_chunk(codes, caches)
+            return self._decode_icl_first_chunk(codes, caches, prefix_frames)
+        else:
+            decoder_prefix_frames = int(caches.get("decoder_prefix_frames", prefix_frames))
+            return self.decode_suffix(codes, caches, decoder_prefix_frames)
+
+    def chunked_decode(
+        self,
+        codes,
+        caches=None,
+        chunk_size=300,
+        left_context_size=25,
+    ):
         # Use CUDA graph if enabled
         if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
-            return self._cudagraph_wrapper.chunked_decode_with_cudagraph(codes, chunk_size, left_context_size)
+            return self._cudagraph_wrapper.chunked_decode_with_cudagraph(
+                codes,
+                caches=caches,
+                chunk_size=chunk_size,
+                left_context_size=left_context_size,
+            )
 
         # Original implementation (eager mode)
         wavs = []
@@ -1035,10 +1329,396 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             end_index = min(start_index + chunk_size, codes.shape[-1])
             context_size = left_context_size if start_index - left_context_size > 0 else start_index
             codes_chunk = codes[..., start_index - context_size : end_index]
-            wav_chunk = self(codes_chunk)
-            wavs.append(wav_chunk[..., context_size * self.total_upsample :])
+            is_first_stateful_chunk = caches is not None and "suffix_quantized" not in caches
+            wav_chunk = self(codes_chunk, caches)
+            if caches is not None:
+                if is_first_stateful_chunk:
+                    logical_prefix_frames = int(caches["prefix_frames"])
+                    suffix_frames = codes_chunk.shape[-1] - logical_prefix_frames
+                    wav_chunk = wav_chunk[..., -suffix_frames * self.total_upsample :]
+                wavs.append(wav_chunk)
+            else:
+                wavs.append(wav_chunk[..., context_size * self.total_upsample :])
             start_index = end_index
-        return torch.cat(wavs, dim=-1)
+        output = torch.cat(wavs, dim=-1)
+        return output
+
+    def batched_request_decode(
+        self,
+        codes_list: list[torch.Tensor],
+        request_caches: list[dict[str, Any]],
+        *,
+        prefix_length: int,
+        initial_chunk_frames: int,
+        codec_chunk_frames: int,
+        transitions_by_mode: dict[str, dict[int, int]],
+        decode_icl_prefix_batch: Callable[[list[torch.Tensor], list[dict[str, Any]]], list[torch.Tensor] | None] | None,
+        decode_xvec_prefix_batch: Callable[[list[torch.Tensor], list[dict[str, Any]]], list[torch.Tensor] | None]
+        | None,
+        decode_suffix_batch: Callable[
+            [str, int, list[torch.Tensor], list[dict[str, Any]], list[int]], list[torch.Tensor] | None
+        ]
+        | None,
+        decode_fallback: Callable[[torch.Tensor, dict[str, Any]], torch.Tensor],
+        backend_max_batch_size: int = 0,
+    ) -> list[torch.Tensor]:
+        """Group stateful requests once, then execute them with a supplied backend.
+
+        The grouping policy is shared by CUDA Graph and eager execution.  A
+        backend may decline a grouped decode by returning ``None``; requests in
+        that group are then decoded individually through ``decode_fallback``.
+        """
+        if len(codes_list) != len(request_caches):
+            raise ValueError("codes_list and request_caches must have the same length")
+
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return [self._forward_exact(codes) for codes in codes_list]
+
+        outputs: list[torch.Tensor | None] = [None] * len(codes_list)
+        groups: dict[tuple[str, int], list[int]] = {}
+        for index, (codes, cache) in enumerate(zip(codes_list, request_caches, strict=True)):
+            if "suffix_quantized" not in cache:
+                prefix_frames = int(cache["prefix_frames"])
+                suffix_frames = int(codes.shape[-1]) - prefix_frames
+                if prefix_frames == 0:
+                    phase = "xvec_first"
+                elif 0 < prefix_frames <= prefix_length and suffix_frames == initial_chunk_frames:
+                    phase = "icl_prefix"
+                else:
+                    phase = "eager"
+                groups.setdefault((phase, 0), []).append(index)
+                continue
+
+            request_kv = cache["past_key_values"]
+            decoder_prefix = int(cache.get("decoder_prefix_frames", cache["prefix_frames"]))
+            mode = "xvec" if decoder_prefix == 0 else "icl"
+            expected_kv_length = 0 if mode == "xvec" else prefix_length
+            if decoder_prefix != expected_kv_length or request_kv.get_seq_length() != expected_kv_length:
+                groups.setdefault(("eager", 0), []).append(index)
+                continue
+
+            previous = int(cache.get("suffix_frames", cache["suffix_quantized"].shape[-1]))
+            rolling = self._is_suffix_cache_rolling(previous, int(cache["suffix_quantized"].shape[-1]))
+            target = (
+                prefix_length + codec_chunk_frames
+                if rolling
+                else next(
+                    (target for target, source in transitions_by_mode[mode].items() if source == previous),
+                    None,
+                )
+            )
+            new_frames = int(codes.shape[-1])
+            if target is None or not 0 < new_frames <= codec_chunk_frames:
+                groups.setdefault(("eager", 0), []).append(index)
+            else:
+                groups.setdefault((f"suffix:{mode}", target), []).append(index)
+
+        for (phase, target), indices in groups.items():
+            group_splits = (
+                [
+                    indices[start : start + backend_max_batch_size]
+                    for start in range(0, len(indices), backend_max_batch_size)
+                ]
+                if backend_max_batch_size > 0
+                else [indices]
+            )
+            for split_indices in group_splits:
+                group_codes = [codes_list[index] for index in split_indices]
+                group_caches = [request_caches[index] for index in split_indices]
+                group_outputs: list[torch.Tensor] | None = None
+                if phase == "icl_prefix" and decode_icl_prefix_batch is not None:
+                    group_outputs = decode_icl_prefix_batch(group_codes, group_caches)
+                elif phase == "xvec_first" and decode_xvec_prefix_batch is not None:
+                    group_outputs = decode_xvec_prefix_batch(group_codes, group_caches)
+                elif phase.startswith("suffix:") and decode_suffix_batch is not None:
+                    mode = phase.removeprefix("suffix:")
+                    new_frames = [int(codes.shape[-1]) for codes in group_codes]
+                    group_outputs = decode_suffix_batch(mode, target, group_codes, group_caches, new_frames)
+
+                if group_outputs is None:
+                    group_outputs = [
+                        decode_fallback(codes_list[index], request_caches[index]) for index in split_indices
+                    ]
+                for index, output in zip(split_indices, group_outputs, strict=True):
+                    outputs[index] = output
+
+        if any(output is None for output in outputs):
+            raise RuntimeError("stateful batched decode did not produce an output for every request")
+        return [output for output in outputs if output is not None]
+
+    @staticmethod
+    def _batch_dynamic_caches(request_caches: list[DynamicCache]) -> DynamicCache:
+        batched_cache = copy.deepcopy(request_caches[0])
+        for batched_layer, request_layers in zip(
+            batched_cache.layers,
+            zip(*(cache.layers for cache in request_caches), strict=True),
+            strict=True,
+        ):
+            if any(layer.keys is None or layer.values is None for layer in request_layers):
+                if not all(layer.keys is None and layer.values is None for layer in request_layers):
+                    raise ValueError("Cannot batch partially initialized request KV caches")
+                batched_layer.keys = None
+                batched_layer.values = None
+                continue
+            batched_layer.keys = torch.cat([layer.keys for layer in request_layers], dim=0)
+            batched_layer.values = torch.cat([layer.values for layer in request_layers], dim=0)
+        return batched_cache
+
+    @staticmethod
+    def _slice_dynamic_cache(cache: DynamicCache, row: int) -> DynamicCache:
+        # Preserve cache metadata and independent ownership without cloning the
+        # full batch for every request. Seed deepcopy with only the selected KV
+        # rows; it will copy the remaining cache structure normally.
+        memo: dict[int, Any] = {}
+        for layer in cache.layers:
+            for tensor in (layer.keys, layer.values):
+                if tensor is not None and id(tensor) not in memo:
+                    memo[id(tensor)] = tensor[row : row + 1].clone()
+        return copy.deepcopy(cache, memo)
+
+    @staticmethod
+    def _cache_tensors_are_batchable(request_caches: list[dict[str, Any]], keys: tuple[str, ...]) -> bool:
+        return all(
+            key in cache
+            and cache[key].shape[1:] == request_caches[0][key].shape[1:]
+            and cache[key].dtype == request_caches[0][key].dtype
+            and cache[key].device == request_caches[0][key].device
+            for cache in request_caches
+            for key in keys
+        )
+
+    def _decode_icl_prefix_eager_batch(
+        self,
+        codes_list: list[torch.Tensor],
+        request_caches: list[dict[str, Any]],
+        *,
+        prefix_length: int,
+        initial_chunk_frames: int,
+    ) -> list[torch.Tensor] | None:
+        batch_size = len(codes_list)
+        total_frames = prefix_length + initial_chunk_frames
+        batched_codes = codes_list[0].new_zeros((batch_size, codes_list[0].shape[1], total_frames))
+        hidden_mask = torch.ones((batch_size, 1, total_frames), dtype=self.dtype, device=batched_codes.device)
+        prefix_mask = torch.ones((batch_size, prefix_length), dtype=torch.bool, device=batched_codes.device)
+        suffix_mask = torch.ones((batch_size, total_frames), dtype=torch.bool, device=batched_codes.device)
+        prefix_pads: list[int] = []
+        for row, (codes, cache) in enumerate(zip(codes_list, request_caches, strict=True)):
+            prefix_frames = int(cache["prefix_frames"])
+            suffix_frames = int(codes.shape[-1]) - prefix_frames
+            if not 0 < prefix_frames <= prefix_length or suffix_frames != initial_chunk_frames:
+                return None
+            prefix_pad = prefix_length - prefix_frames
+            prefix_pads.append(prefix_pad)
+            batched_codes[row, :, prefix_pad:prefix_length].copy_(codes[0, :, :prefix_frames])
+            batched_codes[row, :, prefix_length:].copy_(codes[0, :, prefix_frames:])
+            hidden_mask[row, :, :prefix_pad] = 0
+            prefix_mask[row, :prefix_pad] = 0
+            suffix_mask[row, :prefix_pad] = 0
+
+        batched_cache: dict[str, Any] = {}
+        output = self._decode_icl_first_chunk(
+            batched_codes,
+            batched_cache,
+            prefix_length,
+            prefix_hidden_mask=hidden_mask,
+            prefix_attention_mask=prefix_mask,
+            suffix_attention_mask=suffix_mask,
+        )
+        outputs: list[torch.Tensor] = []
+        for row, (cache, prefix_pad) in enumerate(zip(request_caches, prefix_pads, strict=True)):
+            for key in ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv"):
+                cache[key] = batched_cache[key][row : row + 1].clone()
+            cache["past_key_values"] = self._slice_dynamic_cache(batched_cache["past_key_values"], row)
+            cache["decoder_prefix_frames"] = prefix_length
+            cache["prefix_pad_frames"] = prefix_pad
+            cache["suffix_frames"] = initial_chunk_frames
+            outputs.append(output[row : row + 1, :, -initial_chunk_frames * self.total_upsample :].clone())
+        return outputs
+
+    def _decode_xvec_prefix_eager_batch(
+        self,
+        codes_list: list[torch.Tensor],
+        request_caches: list[dict[str, Any]],
+        *,
+        initial_chunk_frames: int,
+    ) -> list[torch.Tensor] | None:
+        if any(int(codes.shape[-1]) != initial_chunk_frames for codes in codes_list):
+            return None
+        batched_codes = torch.cat(codes_list, dim=0)
+        batched_cache: dict[str, Any] = {}
+        output = self._decode_xvec_first_chunk(batched_codes, batched_cache)
+        outputs: list[torch.Tensor] = []
+        for row, cache in enumerate(request_caches):
+            for key in ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv"):
+                cache[key] = batched_cache[key][row : row + 1].clone()
+            cache["past_key_values"] = self._slice_dynamic_cache(batched_cache["past_key_values"], row)
+            cache["decoder_prefix_frames"] = 0
+            cache["suffix_frames"] = initial_chunk_frames
+            outputs.append(output[row : row + 1].clone())
+        return outputs
+
+    def _decode_suffix_eager_batch(
+        self,
+        mode: str,
+        target_frames: int,
+        codes_list: list[torch.Tensor],
+        request_caches: list[dict[str, Any]],
+        new_frames_list: list[int],
+        *,
+        prefix_length: int,
+        codec_chunk_frames: int,
+        transitions_by_mode: dict[str, dict[int, int]],
+    ) -> list[torch.Tensor] | None:
+        tensor_keys = ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv")
+        if not self._cache_tensors_are_batchable(request_caches, tensor_keys):
+            return None
+        previous_frames = transitions_by_mode[mode].get(target_frames)
+        if previous_frames is None:
+            return None
+        expected_new_frames = target_frames - previous_frames
+        if any(not 0 < new_frames <= expected_new_frames for new_frames in new_frames_list):
+            return None
+
+        batched_codes = codes_list[0].new_zeros((len(codes_list), codes_list[0].shape[1], expected_new_frames))
+        for row, (codes, new_frames) in enumerate(zip(codes_list, new_frames_list, strict=True)):
+            batched_codes[row, :, :new_frames].copy_(codes[0, :, -new_frames:])
+        batched_cache = {
+            key: torch.cat([cache[key] for cache in request_caches], dim=0)
+            for key in ("ref_hidden", "ref_conv", "prefix_hidden")
+        }
+        try:
+            batched_cache["past_key_values"] = self._batch_dynamic_caches(
+                [cache["past_key_values"] for cache in request_caches]
+            )
+        except ValueError:
+            return None
+        attention_mask = torch.ones(
+            len(codes_list),
+            (prefix_length if mode == "icl" else 0) + previous_frames + expected_new_frames,
+            dtype=torch.bool,
+            device=batched_codes.device,
+        )
+        if mode == "icl":
+            for row, cache in enumerate(request_caches):
+                attention_mask[row, : int(cache.get("prefix_pad_frames", 0))] = 0
+        old_quantized = torch.cat([cache["suffix_quantized"] for cache in request_caches], dim=0)
+        old_conv = torch.cat([cache["suffix_conv"] for cache in request_caches], dim=0)
+        rolling = self._is_suffix_cache_rolling(previous_frames, int(old_quantized.shape[-1]))
+        output, next_quantized, next_conv = self._decode_suffix(
+            batched_codes,
+            old_quantized,
+            old_conv,
+            batched_cache,
+            prefix_length if mode == "icl" else 0,
+            expected_new_frames,
+            rolling,
+            attention_mask=attention_mask,
+        )
+
+        outputs: list[torch.Tensor] = []
+        for row, (cache, new_frames) in enumerate(zip(request_caches, new_frames_list, strict=True)):
+            outputs.append(output[row : row + 1, :, : new_frames * self.total_upsample].clone())
+            if new_frames == expected_new_frames:
+                cache["suffix_quantized"] = next_quantized[row : row + 1].clone()
+                cache["suffix_conv"] = next_conv[row : row + 1].clone()
+                cache["suffix_frames"] = target_frames
+        return outputs
+
+    def batched_chunked_decode(
+        self,
+        codes,
+        lengths,
+        caches=None,
+        chunk_size=300,
+        left_context_size=25,
+        max_batch_size=0,
+    ):
+        if (
+            self._cudagraph_enabled
+            and self._cudagraph_wrapper is not None
+            and hasattr(self._cudagraph_wrapper, "batched_chunked_decode_with_cudagraph")
+        ):
+            return self._cudagraph_wrapper.batched_chunked_decode_with_cudagraph(
+                codes,
+                lengths,
+                caches=caches,
+                chunk_size=chunk_size,
+                left_context_size=left_context_size,
+                max_batch_size=max_batch_size,
+            )
+
+        if caches is not None:
+            prefix_length = int(getattr(self.config, "sliding_window", 0) or 0)
+            initial_codec_chunk_frames = int(getattr(self, "_initial_codec_chunk_frames", 1))
+            codec_chunk_frames = int(getattr(self, "_incremental_chunk_frames", 25))
+            chunk_ramp = list(getattr(self, "_incremental_chunk_ramp", ()) or ())
+            initial_chunk_frames = int(chunk_ramp[0]) if chunk_ramp else initial_codec_chunk_frames
+            transitions: dict[int, int] = {}
+            previous = initial_chunk_frames
+            for new_frames in chunk_ramp[1:]:
+                if previous >= prefix_length:
+                    break
+                target = previous + int(new_frames)
+                transitions[target] = previous
+                previous = target
+            while previous < prefix_length:
+                target = previous + codec_chunk_frames
+                transitions[target] = previous
+                previous = target
+            transitions[prefix_length + codec_chunk_frames] = prefix_length
+            codes_list = [codes[row : row + 1, :, :length] for row, length in enumerate(lengths)]
+            outputs = self.batched_request_decode(
+                codes_list,
+                caches,
+                prefix_length=prefix_length,
+                initial_chunk_frames=initial_chunk_frames,
+                codec_chunk_frames=codec_chunk_frames,
+                transitions_by_mode={"icl": transitions, "xvec": transitions},
+                decode_icl_prefix_batch=lambda group_codes, group_caches: self._decode_icl_prefix_eager_batch(
+                    group_codes,
+                    group_caches,
+                    prefix_length=prefix_length,
+                    initial_chunk_frames=initial_chunk_frames,
+                ),
+                decode_xvec_prefix_batch=lambda group_codes, group_caches: self._decode_xvec_prefix_eager_batch(
+                    group_codes,
+                    group_caches,
+                    initial_chunk_frames=initial_chunk_frames,
+                ),
+                decode_suffix_batch=lambda mode, target, group_codes, group_caches, new_frames: (
+                    self._decode_suffix_eager_batch(
+                        mode,
+                        target,
+                        group_codes,
+                        group_caches,
+                        new_frames,
+                        prefix_length=prefix_length,
+                        codec_chunk_frames=codec_chunk_frames,
+                        transitions_by_mode={"icl": transitions, "xvec": transitions},
+                    )
+                ),
+                decode_fallback=lambda request_codes, cache: self.chunked_decode(
+                    request_codes,
+                    caches=cache,
+                    chunk_size=chunk_size,
+                    left_context_size=left_context_size,
+                ),
+                backend_max_batch_size=max_batch_size,
+            )
+            return [output[0] for output in outputs]
+
+        from ..cuda_graph_decoder_wrapper import _batched_chunked_decode
+
+        padded = _batched_chunked_decode(
+            codes,
+            lengths,
+            decode_fn=self,
+            total_upsample=self.total_upsample,
+            chunk_size=chunk_size,
+            left_context_size=left_context_size,
+            max_batch_size=max_batch_size,
+        )
+        return [padded[row, :, : length * self.total_upsample] for row, length in enumerate(lengths)]
 
 
 class Qwen3TTSTokenizerV2Encoder(MimiModel):

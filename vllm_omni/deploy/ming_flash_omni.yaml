@@ -1,0 +1,56 @@
+# Ming-flash-omni-2.0 deploy: thinker + talker.
+#
+# Stage 0: Thinker: multimodal understanding -> text generation.
+#          TP=4 (or PP=4) across GPUs 0-3.
+# Stage 1: Talker: text -> audio waveform via CFM + AudioVAE.
+#          Generation worker, runs eager, colocates on the last GPU.
+#
+# Fields omitted from a stage fall back to StageDeployConfig dataclass
+# defaults (see vllm_omni/config/stage_config.py).
+#   * Stage 0 (thinker) owns GPUs 0-3 with gpu_memory_utilization=0.74,
+#     as we tend to fit talker in one of the devices. (For now,
+#     gpu mem util on different devices are not supported to be set
+#     independently for a single stage.)
+#   * Stage 1 (talker) colocates on GPU 3 with gpu_memory_utilization=0.18.
+#     This custom settings is verified and required on devices with 80GB memory.
+pipeline: ming_flash_omni
+async_chunk: false
+
+trust_remote_code: true
+distributed_executor_backend: mp
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.74
+    enforce_eager: false
+    tensor_parallel_size: 4
+    max_num_batched_tokens: 32768
+    devices: "0,1,2,3"
+    # disable fused allreduce+rms for flashinfer version mismatch for now
+    compilation_config:
+      pass_config:
+        fuse_allreduce_rms: false
+    default_sampling_params:
+      temperature: 0.4
+      top_p: 0.9
+      max_tokens: 2048
+      repetition_penalty: 1.05
+      detokenize: true
+      ignore_eos: false
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.18
+    enforce_eager: true
+    max_num_batched_tokens: 1000000
+    devices: "3"
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1
+
+# Ming-flash-omni-2.0 has only been verified on CUDA devices,
+# left empty intentionally. Add per-platform overrides here
+# when other backends (ROCm/XPU/NPU) are verified end-to-end.
+platforms: {}

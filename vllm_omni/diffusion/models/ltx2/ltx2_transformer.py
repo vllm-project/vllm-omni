@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2025 The Lightricks team and The HuggingFace Team.
 # All rights reserved.
 #
@@ -17,12 +20,13 @@ import inspect
 from collections.abc import Iterable
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed
 import torch.nn as nn
 import torch.nn.functional as F
+from cache_dit import ForwardPattern
 from diffusers.models.embeddings import PixArtAlphaCombinedTimestepSizeEmbeddings, PixArtAlphaTextProjection
 from diffusers.utils import (
     BaseOutput,
@@ -39,18 +43,41 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
+from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
+from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
+from .ltx2_sequence_parallel import LTX2VideoToAudioParallelAttention
 
 logger = init_logger(__name__)
 
 _RMSNORM_INIT_PARAMS = inspect.signature(RMSNorm.__init__).parameters
 
 
+def apply_keyframes_absolute_embedding(
+    hidden_states: torch.Tensor,
+    keyframes_mask: torch.Tensor | None,
+    embedding: torch.Tensor | None,
+) -> torch.Tensor:
+    """Add the official learned marker to first-frame/keyframe tokens."""
+    if keyframes_mask is None or embedding is None:
+        return hidden_states
+    mask = (keyframes_mask > 0).to(dtype=hidden_states.dtype)
+    return hidden_states + mask * embedding.to(device=hidden_states.device, dtype=hidden_states.dtype)
+
+
 def _make_rms_norm(hidden_size: int, *, eps: float, elementwise_affine: bool) -> nn.Module:
     """Bridge diffusers' RMSNorm API onto vLLM's `has_weight` variant."""
+    if not elementwise_affine:
+        return nn.RMSNorm(hidden_size, eps=eps, elementwise_affine=False)
+
     kwargs: dict[str, Any] = {"eps": eps}
     if "elementwise_affine" in _RMSNORM_INIT_PARAMS:
         kwargs["elementwise_affine"] = elementwise_affine
@@ -58,28 +85,42 @@ def _make_rms_norm(hidden_size: int, *, eps: float, elementwise_affine: bool) ->
         kwargs["has_weight"] = elementwise_affine
     elif not elementwise_affine:
         raise TypeError("RMSNorm backend does not support disabling affine weights.")
-    return RMSNorm(hidden_size, **kwargs)
+    norm = RMSNorm(hidden_size, **kwargs)
+    weight = getattr(norm, "weight", None)
+    if (
+        not elementwise_affine
+        and isinstance(weight, torch.Tensor)
+        and not isinstance(weight, nn.Parameter)
+        and "weight" not in dict(norm.named_buffers())
+    ):
+        delattr(norm, "weight")
+        norm.register_buffer("weight", weight, persistent=False)
+    return norm
 
 
 def apply_interleaved_rotary_emb(x: torch.Tensor, freqs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
     cos, sin = freqs
-    x_real, x_imag = x.unflatten(2, (-1, 2)).unbind(-1)  # [B, S, C // 2]
+    # Concrete pair count instead of -1 keeps SDPA shape static under torch.compile.
+    x_real, x_imag = x.unflatten(2, (x.shape[2] // 2, 2)).unbind(-1)  # [B, S, C // 2]
     x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(2)
-    out = (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
-    return out
+    return x * cos + x_rotated * sin
 
 
-def apply_split_rotary_emb(x: torch.Tensor, freqs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+def apply_split_rotary_emb(
+    x: torch.Tensor,
+    freqs: tuple[torch.Tensor, torch.Tensor],
+    *,
+    head_dim: int,
+) -> torch.Tensor:
+    # `head_dim` is plumbed in (not inferred via `-1`) so SDPA shape stays static under torch.compile.
     cos, sin = freqs
-
-    x_dtype = x.dtype
     needs_reshape = False
     if x.ndim != 4 and cos.ndim == 4:
         # cos is (#b, h, t, r) -> reshape x to (b, h, t, dim_per_head)
         # The cos/sin batch dim may only be broadcastable, so take batch size from x
         b = x.shape[0]
         _, h, t, _ = cos.shape
-        x = x.reshape(b, t, h, -1).swapaxes(1, 2)
+        x = x.reshape(b, t, h, head_dim).swapaxes(1, 2)
         needs_reshape = True
 
     # Split last dim (2*r) into (d=2, r)
@@ -89,7 +130,7 @@ def apply_split_rotary_emb(x: torch.Tensor, freqs: tuple[torch.Tensor, torch.Ten
     r = last // 2
 
     # (..., 2, r)
-    split_x = x.reshape(*x.shape[:-1], 2, r).float()  # Explicitly upcast to float
+    split_x = x.reshape(*x.shape[:-1], 2, r)
     first_x = split_x[..., :1, :]  # (..., 1, r)
     second_x = split_x[..., 1:, :]  # (..., 1, r)
 
@@ -106,9 +147,8 @@ def apply_split_rotary_emb(x: torch.Tensor, freqs: tuple[torch.Tensor, torch.Ten
     out = out.reshape(*out.shape[:-2], last)
 
     if needs_reshape:
-        out = out.swapaxes(1, 2).reshape(b, t, -1)
+        out = out.swapaxes(1, 2).reshape(b, t, h * head_dim)
 
-    out = out.to(dtype=x_dtype)
     return out
 
 
@@ -172,7 +212,16 @@ class LTX2AdaLayerNormSingle(nn.Module):
 
 
 class ColumnParallelApproxGELU(nn.Module):
-    def __init__(self, dim_in: int, dim_out: int, *, approximate: str, bias: bool = True):
+    def __init__(
+        self,
+        dim_in: int,
+        dim_out: int,
+        *,
+        approximate: str,
+        bias: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ):
         super().__init__()
         self.proj = ColumnParallelLinear(
             dim_in,
@@ -180,6 +229,8 @@ class ColumnParallelApproxGELU(nn.Module):
             bias=bias,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj" if prefix else "proj",
         )
         self.approximate = approximate
 
@@ -199,6 +250,8 @@ class LTX2FeedForward(nn.Module):
         bias: bool = True,
         dropout: float = 0.0,
         final_dropout: bool = False,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -210,13 +263,23 @@ class LTX2FeedForward(nn.Module):
         dropout_layer: nn.Module = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
         layers: list[nn.Module] = [
-            ColumnParallelApproxGELU(dim, inner_dim, approximate="tanh", bias=bias),
+            ColumnParallelApproxGELU(
+                dim,
+                inner_dim,
+                approximate="tanh",
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.net.0" if prefix else "net.0",
+            ),
             dropout_layer,
             RowParallelLinear(
                 inner_dim,
                 dim_out,
+                bias=bias,
                 input_is_parallel=True,
                 return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.net.2" if prefix else "net.2",
             ),
         ]
         if final_dropout:
@@ -282,6 +345,64 @@ class TensorParallelRMSNorm(nn.Module):
         return out.to(dtype=x_dtype)
 
 
+def to_ltx_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Convert an additive/expanded LTX mask to a 2D padding mask."""
+    if attention_mask.ndim > 2:
+        if attention_mask.is_floating_point():
+            valid = attention_mask >= 0
+        else:
+            valid = attention_mask.to(torch.bool)
+        batch_size = valid.shape[0]
+        key_length = valid.shape[-1]
+        attention_mask = valid.reshape(batch_size, -1, key_length).all(dim=1)
+    if attention_mask.is_floating_point():
+        attention_mask = attention_mask >= 0
+    if attention_mask.dtype != torch.bool:
+        attention_mask = attention_mask.to(torch.bool)
+    return attention_mask
+
+
+class _LTX2ParallelAttention(Attention):
+    """Preserve LTX SP collectives while applying model-specific padding masks."""
+
+    _SP_MODES = frozenset({"local", "video_self", "video_to_audio"})
+
+    def __init__(self, *args, ltx_sp_mode: str = "local", **kwargs):
+        if ltx_sp_mode not in self._SP_MODES:
+            raise ValueError(
+                f"Unsupported LTX sequence-parallel mode {ltx_sp_mode!r}; expected one of {sorted(self._SP_MODES)}."
+            )
+        super().__init__(*args, **kwargs)
+        self.ltx_sp_mode = ltx_sp_mode
+        self._video_to_audio_strategy = None
+
+    def _get_active_parallel_strategy(self):
+        base_strategy = super()._get_active_parallel_strategy()
+        if self.ltx_sp_mode == "local" or not base_strategy.enabled:
+            return self._no_parallel_strategy
+        if self.ltx_sp_mode == "video_self":
+            return base_strategy
+        if base_strategy.name != "ulysses":
+            raise NotImplementedError(
+                f"LTX video-to-audio sequence parallelism requires pure Ulysses; got strategy={base_strategy.name!r}."
+            )
+        if self._video_to_audio_strategy is None:
+            self._video_to_audio_strategy = LTX2VideoToAudioParallelAttention(
+                get_sp_group(),
+                use_sync=self.use_sync,
+            )
+        return self._video_to_audio_strategy
+
+    def _run_local_attention(self, query, key, value, attn_metadata):
+        attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        if attention_mask is not None:
+            # LTX masks describe K/V padding. Keep this semantic local to LTX:
+            # Flash varlen applies a 2D mask to both Q and K, while SP uses a
+            # broadcast 4D key mask that only SDPA consumes correctly.
+            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+        return super()._run_local_attention(query, key, value, attn_metadata)
+
+
 class LTX2AudioVideoAttnProcessor:
     r"""
     Processor for implementing attention (SDPA is used by default if you're using PyTorch 2.0) for the LTX-2.0 model.
@@ -298,24 +419,6 @@ class LTX2AudioVideoAttnProcessor:
                 "LTX attention processors require a minimum PyTorch version of 2.0. "
                 "Please upgrade your PyTorch installation."
             )
-
-    @staticmethod
-    def _to_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
-        # Convert additive/expanded masks into a 2D padding mask for flash-attn.
-        if attention_mask.ndim > 2:
-            if attention_mask.is_floating_point():
-                valid = attention_mask >= 0
-            else:
-                valid = attention_mask.to(torch.bool)
-            b = valid.shape[0]
-            key_len = valid.shape[-1]
-            valid = valid.reshape(b, -1, key_len).all(dim=1)
-            attention_mask = valid
-        if attention_mask.is_floating_point():
-            attention_mask = attention_mask >= 0
-        if attention_mask.dtype != torch.bool:
-            attention_mask = attention_mask.to(torch.bool)
-        return attention_mask
 
     @staticmethod
     def _is_sp_enabled() -> bool:
@@ -341,16 +444,15 @@ class LTX2AudioVideoAttnProcessor:
             return None
 
         if self._is_sp_enabled():
-            # In SP, Ulysses expects a 2D padding mask that matches query length.
-            # For cross-attention, encoder sequence length != query length, so drop the mask.
-            if encoder_hidden_states is not None and encoder_hidden_states.shape[1] != hidden_states.shape[1]:
-                return None
-            return self._to_padding_mask(attention_mask)
+            # Keep the full key mask replicated while strict Ulysses reshards
+            # Q/K/V. The broadcast Q dimension also works when cross-attention
+            # has different Q and K lengths, without changing generic Ulysses.
+            return to_ltx_padding_mask(attention_mask)[:, None, None, :]
 
         attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
         attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
         if attn.attn.attn_backend.get_name().upper() == "FLASH_ATTN":
-            attention_mask = self._to_padding_mask(attention_mask)
+            attention_mask = to_ltx_padding_mask(attention_mask)
         return attention_mask
 
     @staticmethod
@@ -422,6 +524,7 @@ class LTX2AudioVideoAttnProcessor:
         attention_mask: torch.Tensor | None = None,
         query_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         key_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        perturbation_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         is_self_attention = encoder_hidden_states is None
         batch_size, sequence_length, _ = hidden_states.shape if is_self_attention else encoder_hidden_states.shape
@@ -435,6 +538,10 @@ class LTX2AudioVideoAttnProcessor:
             sequence_length=sequence_length,
         )
 
+        # Compute gate logits from original hidden_states (before attention)
+        if attn.to_gate_logits is not None:
+            gate_logits = attn.to_gate_logits(hidden_states)
+
         if is_self_attention:
             encoder_hidden_states = hidden_states
 
@@ -445,8 +552,8 @@ class LTX2AudioVideoAttnProcessor:
             is_self_attention=is_self_attention,
         )
 
-        query = attn.norm_q(query)
-        key = attn.norm_k(key)
+        query = attn.norm_q(query).to(dtype=value.dtype)
+        key = attn.norm_k(key).to(dtype=value.dtype)
 
         if query_rotary_emb is not None:
             query_rotary_emb = self._slice_rope_for_tp(query_rotary_emb, attn)
@@ -458,17 +565,35 @@ class LTX2AudioVideoAttnProcessor:
                     key, key_rotary_emb if key_rotary_emb is not None else query_rotary_emb
                 )
             elif attn.rope_type == "split":
-                query = apply_split_rotary_emb(query, query_rotary_emb)
-                key = apply_split_rotary_emb(key, key_rotary_emb if key_rotary_emb is not None else query_rotary_emb)
+                query = apply_split_rotary_emb(query, query_rotary_emb, head_dim=attn.head_dim)
+                key = apply_split_rotary_emb(
+                    key,
+                    key_rotary_emb if key_rotary_emb is not None else query_rotary_emb,
+                    head_dim=attn.head_dim,
+                )
 
-        query = query.unflatten(2, (attn.heads, -1))
-        key = key.unflatten(2, (attn.heads, -1))
-        value = value.unflatten(2, (attn.heads, -1))
+        # Keep FP32 RoPE computation while satisfying attention dtype contracts.
+        query = query.to(dtype=value.dtype)
+        key = key.to(dtype=value.dtype)
+
+        query = query.unflatten(2, (attn.heads, attn.head_dim))
+        key = key.unflatten(2, (attn.heads, attn.head_dim))
+        value_heads = value.unflatten(2, (attn.heads, attn.head_dim))
 
         attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
-        hidden_states = attn.attn(query, key, value, attn_metadata)
+        hidden_states = attn.attn(query, key, value_heads, attn_metadata)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
+        if perturbation_mask is not None:
+            hidden_states = hidden_states * perturbation_mask + value * (1 - perturbation_mask)
+
+        # LTX-2.3: per-head gated attention
+        if attn.to_gate_logits is not None:
+            hidden_states = hidden_states.unflatten(2, (attn.heads, attn.head_dim))  # [B, T, H, D]
+            # 2.0 * sigmoid so zero-init gates produce 1.0 (identity)
+            gates = 2.0 * torch.sigmoid(gate_logits)  # [B, T, H]
+            hidden_states = hidden_states * gates.unsqueeze(-1)
+            hidden_states = hidden_states.flatten(2, 3)
 
         hidden_states = attn.to_out[0](hidden_states)
         if isinstance(hidden_states, tuple):
@@ -500,11 +625,21 @@ class LTX2Attention(torch.nn.Module):
         norm_eps: float = 1e-6,
         norm_elementwise_affine: bool = True,
         rope_type: str = "interleaved",
+        apply_gated_attention: bool = False,
+        pack_qkv: bool = True,
         processor=None,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+        disable_kv_quant: bool = False,
+        sequence_parallel_mode: str = "local",
     ):
         super().__init__()
-        if qk_norm != "rms_norm_across_heads":
-            raise NotImplementedError("Only 'rms_norm_across_heads' is supported as a valid value for `qk_norm`.")
+        # LTX-2 uses "rms_norm_across_heads", LTX-2.3 uses "rms_norm" -- both
+        # map to the same RMSNorm implementation applied across Q/K heads.
+        if qk_norm not in ("rms_norm_across_heads", "rms_norm"):
+            raise NotImplementedError(
+                f"Only 'rms_norm_across_heads' and 'rms_norm' are supported for `qk_norm`, got {qk_norm!r}."
+            )
 
         kv_heads = heads if kv_heads is None else kv_heads
 
@@ -524,12 +659,14 @@ class LTX2Attention(torch.nn.Module):
         self.to_q = None
         self.to_k = None
         self.to_v = None
-        if cross_attention_dim is None:
+        if cross_attention_dim is None and pack_qkv:
             self.to_qkv = QKVParallelLinear(
                 hidden_size=query_dim,
                 head_size=self.head_dim,
                 total_num_heads=heads,
                 bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_qkv" if prefix else "to_qkv",
             )
             self.query_num_heads = self.to_qkv.num_heads
             self.kv_num_heads = self.to_qkv.num_kv_heads
@@ -544,6 +681,8 @@ class LTX2Attention(torch.nn.Module):
                 bias=bias,
                 gather_output=False,
                 return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_q" if prefix else "to_q",
             )
             self.to_k = ColumnParallelLinear(
                 self.cross_attention_dim,
@@ -551,6 +690,8 @@ class LTX2Attention(torch.nn.Module):
                 bias=bias,
                 gather_output=False,
                 return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_k" if prefix else "to_k",
             )
             self.to_v = ColumnParallelLinear(
                 self.cross_attention_dim,
@@ -558,22 +699,40 @@ class LTX2Attention(torch.nn.Module):
                 bias=bias,
                 gather_output=False,
                 return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_v" if prefix else "to_v",
             )
 
         self.heads = self.query_num_heads
         tp_size = get_tensor_model_parallel_world_size()
-        self.norm_q = TensorParallelRMSNorm(
-            dim_head * self.query_num_heads,
-            eps=norm_eps,
-            elementwise_affine=norm_elementwise_affine,
-            tp_size=tp_size,
-        )
-        self.norm_k = TensorParallelRMSNorm(
-            dim_head * self.kv_num_heads,
-            eps=norm_eps,
-            elementwise_affine=norm_elementwise_affine,
-            tp_size=tp_size,
-        )
+        # At TP > 1 with rms_norm_across_heads, use TensorParallelRMSNorm
+        # which all-reduces squared sums to match global RMS statistics.
+        # At TP=1, use torch.nn.RMSNorm which is numerically identical to
+        # the diffusers reference (verified via hook-based comparison).
+        if tp_size > 1 and qk_norm == "rms_norm_across_heads":
+            self.norm_q = TensorParallelRMSNorm(
+                dim_head * self.query_num_heads,
+                eps=norm_eps,
+                elementwise_affine=norm_elementwise_affine,
+                tp_size=tp_size,
+            )
+            self.norm_k = TensorParallelRMSNorm(
+                dim_head * self.kv_num_heads,
+                eps=norm_eps,
+                elementwise_affine=norm_elementwise_affine,
+                tp_size=tp_size,
+            )
+        else:
+            self.norm_q = torch.nn.RMSNorm(
+                dim_head * self.query_num_heads,
+                eps=norm_eps,
+                elementwise_affine=norm_elementwise_affine,
+            )
+            self.norm_k = torch.nn.RMSNorm(
+                dim_head * self.kv_num_heads,
+                eps=norm_eps,
+                elementwise_affine=norm_elementwise_affine,
+            )
 
         self.to_out = torch.nn.ModuleList(
             [
@@ -583,17 +742,37 @@ class LTX2Attention(torch.nn.Module):
                     bias=out_bias,
                     input_is_parallel=True,
                     return_bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.to_out.0" if prefix else "to_out.0",
                 ),
                 torch.nn.Dropout(dropout) if dropout > 0 else torch.nn.Identity(),
             ]
         )
-        self.attn = Attention(
+        self.attn = _LTX2ParallelAttention(
             num_heads=self.query_num_heads,
             head_size=dim_head,
             num_kv_heads=self.kv_num_heads,
             softmax_scale=1.0 / (dim_head**0.5),
             causal=False,
+            prefix=prefix,
+            disable_kv_quant=disable_kv_quant,
+            ltx_sp_mode=sequence_parallel_mode,
         )
+
+        # LTX-2.3: per-head gated attention
+        # leave unquantized for this linear
+        if apply_gated_attention:
+            self.to_gate_logits = ColumnParallelLinear(
+                query_dim,
+                heads,
+                bias=True,
+                gather_output=False,
+                return_bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.to_gate_logits" if prefix else "to_gate_logits",
+            )
+        else:
+            self.to_gate_logits = None
 
         if processor is None:
             processor = self._default_processor_cls()
@@ -696,6 +875,10 @@ class LTX2VideoTransformerBlock(nn.Module):
         audio_num_attention_heads: int,
         audio_attention_head_dim,
         audio_cross_attention_dim: int,
+        video_gated_attn: bool = False,
+        video_cross_attn_adaln: bool = False,
+        audio_gated_attn: bool = False,
+        audio_cross_attn_adaln: bool = False,
         qk_norm: str = "rms_norm_across_heads",
         activation_fn: str = "gelu-approximate",
         attention_bias: bool = True,
@@ -703,8 +886,16 @@ class LTX2VideoTransformerBlock(nn.Module):
         eps: float = 1e-6,
         elementwise_affine: bool = False,
         rope_type: str = "interleaved",
+        perturbed_attn: bool = False,
+        ff_bias: bool = True,
+        audio_ff_bias: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
+        self.video_cross_attn_adaln = video_cross_attn_adaln
+        self.audio_cross_attn_adaln = audio_cross_attn_adaln
+        self.perturbed_attn = perturbed_attn
 
         # 1. Self-Attention (video and audio)
         self.norm1 = _make_rms_norm(dim, eps=eps, elementwise_affine=elementwise_affine)
@@ -718,6 +909,10 @@ class LTX2VideoTransformerBlock(nn.Module):
             out_bias=attention_out_bias,
             qk_norm=qk_norm,
             rope_type=rope_type,
+            apply_gated_attention=video_gated_attn,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn1" if prefix else "attn1",
+            sequence_parallel_mode="video_self",
         )
 
         self.audio_norm1 = _make_rms_norm(audio_dim, eps=eps, elementwise_affine=elementwise_affine)
@@ -731,6 +926,12 @@ class LTX2VideoTransformerBlock(nn.Module):
             out_bias=attention_out_bias,
             qk_norm=qk_norm,
             rope_type=rope_type,
+            apply_gated_attention=audio_gated_attn,
+            # The official checkpoint evaluates audio Q/K/V separately. Fusing
+            # the bf16 GEMMs changes denoise numerics enough to accumulate.
+            pack_qkv=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.audio_attn1" if prefix else "audio_attn1",
         )
 
         # 2. Prompt Cross-Attention
@@ -745,6 +946,10 @@ class LTX2VideoTransformerBlock(nn.Module):
             out_bias=attention_out_bias,
             qk_norm=qk_norm,
             rope_type=rope_type,
+            apply_gated_attention=video_gated_attn,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn2" if prefix else "attn2",
+            disable_kv_quant=True,
         )
 
         self.audio_norm2 = _make_rms_norm(audio_dim, eps=eps, elementwise_affine=elementwise_affine)
@@ -758,10 +963,15 @@ class LTX2VideoTransformerBlock(nn.Module):
             out_bias=attention_out_bias,
             qk_norm=qk_norm,
             rope_type=rope_type,
+            apply_gated_attention=audio_gated_attn,
+            quant_config=quant_config,
+            prefix=f"{prefix}.audio_attn2" if prefix else "audio_attn2",
+            disable_kv_quant=True,
         )
 
         # 3. Audio-to-Video (a2v) and Video-to-Audio (v2a) Cross-Attention
-        # Audio-to-Video (a2v) Attention --> Q: Video; K,V: Audio
+        # K/V here come from the other modality's latents (long sequences),
+        # so KV-cache quant remains enabled.
         self.audio_to_video_norm = _make_rms_norm(dim, eps=eps, elementwise_affine=elementwise_affine)
         self.audio_to_video_attn = LTX2Attention(
             query_dim=dim,
@@ -773,9 +983,11 @@ class LTX2VideoTransformerBlock(nn.Module):
             out_bias=attention_out_bias,
             qk_norm=qk_norm,
             rope_type=rope_type,
+            apply_gated_attention=video_gated_attn,
+            quant_config=quant_config,
+            prefix=f"{prefix}.audio_to_video_attn" if prefix else "audio_to_video_attn",
         )
 
-        # Video-to-Audio (v2a) Attention --> Q: Audio; K,V: Video
         self.video_to_audio_norm = _make_rms_norm(audio_dim, eps=eps, elementwise_affine=elementwise_affine)
         self.video_to_audio_attn = LTX2Attention(
             query_dim=audio_dim,
@@ -787,23 +999,58 @@ class LTX2VideoTransformerBlock(nn.Module):
             out_bias=attention_out_bias,
             qk_norm=qk_norm,
             rope_type=rope_type,
+            apply_gated_attention=audio_gated_attn,
+            quant_config=quant_config,
+            prefix=f"{prefix}.video_to_audio_attn" if prefix else "video_to_audio_attn",
+            sequence_parallel_mode="video_to_audio",
         )
 
         # 4. Feedforward layers
         self.norm3 = _make_rms_norm(dim, eps=eps, elementwise_affine=elementwise_affine)
-        self.ff = LTX2FeedForward(dim, activation_fn=activation_fn)
+        self.ff = LTX2FeedForward(
+            dim,
+            activation_fn=activation_fn,
+            bias=ff_bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.ff" if prefix else "ff",
+        )
 
         self.audio_norm3 = _make_rms_norm(audio_dim, eps=eps, elementwise_affine=elementwise_affine)
-        self.audio_ff = LTX2FeedForward(audio_dim, activation_fn=activation_fn)
+        self.audio_ff = LTX2FeedForward(
+            audio_dim,
+            activation_fn=activation_fn,
+            bias=audio_ff_bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.audio_ff" if prefix else "audio_ff",
+        )
 
         # 5. Per-Layer Modulation Parameters
-        # Self-Attention / Feedforward AdaLayerNorm-Zero mod params
-        self.scale_shift_table = nn.Parameter(torch.randn(6, dim) / dim**0.5)
-        self.audio_scale_shift_table = nn.Parameter(torch.randn(6, audio_dim) / audio_dim**0.5)
+        # LTX-2.3 with cross_attn_adaln uses 9 params (extra 3 for cross-attn modulation);
+        # LTX-2 uses 6.
+        video_mod_param_num = 9 if self.video_cross_attn_adaln else 6
+        audio_mod_param_num = 9 if self.audio_cross_attn_adaln else 6
+        self.scale_shift_table = nn.Parameter(torch.randn(video_mod_param_num, dim) / dim**0.5)
+        self.audio_scale_shift_table = nn.Parameter(torch.randn(audio_mod_param_num, audio_dim) / audio_dim**0.5)
+
+        # Prompt cross-attn additional modulation params (LTX-2.3)
+        self.cross_attn_adaln = video_cross_attn_adaln or audio_cross_attn_adaln
+        if self.cross_attn_adaln:
+            self.prompt_scale_shift_table = nn.Parameter(torch.randn(2, dim))
+            self.audio_prompt_scale_shift_table = nn.Parameter(torch.randn(2, audio_dim))
 
         # Per-layer a2v, v2a Cross-Attention mod params
         self.video_a2v_cross_attn_scale_shift_table = nn.Parameter(torch.randn(5, dim))
         self.audio_a2v_cross_attn_scale_shift_table = nn.Parameter(torch.randn(5, audio_dim))
+
+    @staticmethod
+    def get_mod_params(
+        scale_shift_table: torch.Tensor, temb: torch.Tensor, batch_size: int
+    ) -> tuple[torch.Tensor, ...]:
+        num_ada_params = scale_shift_table.shape[0]
+        ada_values = scale_shift_table[None, None].to(temb.device) + temb.reshape(
+            batch_size, temb.shape[1], num_ada_params, -1
+        )
+        return ada_values.unbind(dim=2)
 
     def forward(
         self,
@@ -817,143 +1064,191 @@ class LTX2VideoTransformerBlock(nn.Module):
         temb_ca_audio_scale_shift: torch.Tensor,
         temb_ca_gate: torch.Tensor,
         temb_ca_audio_gate: torch.Tensor,
+        temb_prompt: torch.Tensor | None = None,
+        temb_prompt_audio: torch.Tensor | None = None,
         video_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         audio_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         ca_video_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         ca_audio_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
         audio_encoder_attention_mask: torch.Tensor | None = None,
+        self_attention_mask: torch.Tensor | None = None,
+        audio_self_attention_mask: torch.Tensor | None = None,
         a2v_cross_attention_mask: torch.Tensor | None = None,
         v2a_cross_attention_mask: torch.Tensor | None = None,
+        use_a2v_cross_attention: bool = True,
+        use_v2a_cross_attention: bool = True,
+        video_self_attention_perturbation_mask: torch.Tensor | None = None,
+        audio_self_attention_perturbation_mask: torch.Tensor | None = None,
+        a2v_cross_attention_perturbation_mask: torch.Tensor | None = None,
+        v2a_cross_attention_perturbation_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size = hidden_states.size(0)
 
         # 1. Video and Audio Self-Attention
-        norm_hidden_states = self.norm1(hidden_states)
+        # 1.1. Video Self-Attention
+        video_ada_params = self.get_mod_params(self.scale_shift_table, temb, batch_size)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = video_ada_params[:6]
+        if self.video_cross_attn_adaln:
+            shift_text_q, scale_text_q, gate_text_q = video_ada_params[6:9]
 
-        num_ada_params = self.scale_shift_table.shape[0]
-        ada_values = self.scale_shift_table[None, None].to(temb.device) + temb.reshape(
-            batch_size, temb.size(1), num_ada_params, -1
-        )
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = ada_values.unbind(dim=2)
+        norm_hidden_states = self.norm1(hidden_states)
         norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
 
         attn_hidden_states = self.attn1(
             hidden_states=norm_hidden_states,
             encoder_hidden_states=None,
             query_rotary_emb=video_rotary_emb,
+            attention_mask=self_attention_mask,
+            perturbation_mask=video_self_attention_perturbation_mask,
         )
         hidden_states = hidden_states + attn_hidden_states * gate_msa
 
-        norm_audio_hidden_states = self.audio_norm1(audio_hidden_states)
-
-        num_audio_ada_params = self.audio_scale_shift_table.shape[0]
-        audio_ada_values = self.audio_scale_shift_table[None, None].to(temb_audio.device) + temb_audio.reshape(
-            batch_size, temb_audio.size(1), num_audio_ada_params, -1
-        )
+        # 1.2. Audio Self-Attention
+        audio_ada_params = self.get_mod_params(self.audio_scale_shift_table, temb_audio, batch_size)
         audio_shift_msa, audio_scale_msa, audio_gate_msa, audio_shift_mlp, audio_scale_mlp, audio_gate_mlp = (
-            audio_ada_values.unbind(dim=2)
+            audio_ada_params[:6]
         )
+        if self.audio_cross_attn_adaln:
+            audio_shift_text_q, audio_scale_text_q, audio_gate_text_q = audio_ada_params[6:9]
+
+        norm_audio_hidden_states = self.audio_norm1(audio_hidden_states)
         norm_audio_hidden_states = norm_audio_hidden_states * (1 + audio_scale_msa) + audio_shift_msa
 
         attn_audio_hidden_states = self.audio_attn1(
             hidden_states=norm_audio_hidden_states,
             encoder_hidden_states=None,
             query_rotary_emb=audio_rotary_emb,
+            attention_mask=audio_self_attention_mask,
+            perturbation_mask=audio_self_attention_perturbation_mask,
         )
         audio_hidden_states = audio_hidden_states + attn_audio_hidden_states * audio_gate_msa
 
-        # 2. Video and Audio Cross-Attention with the text embeddings
+        # 2. Video and Audio Cross-Attention with text embeddings (Q: Video/Audio; K,V: Text)
+        if self.cross_attn_adaln:
+            if temb_prompt is not None:
+                shift_text_kv, scale_text_kv = self.get_mod_params(
+                    self.prompt_scale_shift_table, temb_prompt, batch_size
+                )
+            else:
+                shift_text_kv, scale_text_kv = (
+                    self.prompt_scale_shift_table[None, None]
+                    .to(device=hidden_states.device, dtype=hidden_states.dtype)
+                    .unbind(dim=2)
+                )
+
+            if temb_prompt_audio is not None:
+                audio_shift_text_kv, audio_scale_text_kv = self.get_mod_params(
+                    self.audio_prompt_scale_shift_table, temb_prompt_audio, batch_size
+                )
+            else:
+                audio_shift_text_kv, audio_scale_text_kv = (
+                    self.audio_prompt_scale_shift_table[None, None]
+                    .to(device=audio_hidden_states.device, dtype=audio_hidden_states.dtype)
+                    .unbind(dim=2)
+                )
+
+        # 2.1. Video-Text Cross-Attention
         norm_hidden_states = self.norm2(hidden_states)
+        if self.video_cross_attn_adaln:
+            norm_hidden_states = norm_hidden_states * (1 + scale_text_q) + shift_text_q
+        if self.cross_attn_adaln:
+            encoder_hidden_states = encoder_hidden_states * (1 + scale_text_kv) + shift_text_kv
+
         attn_hidden_states = self.attn2(
             norm_hidden_states,
             encoder_hidden_states=encoder_hidden_states,
             query_rotary_emb=None,
             attention_mask=encoder_attention_mask,
         )
+        if self.video_cross_attn_adaln:
+            attn_hidden_states = attn_hidden_states * gate_text_q
         hidden_states = hidden_states + attn_hidden_states
 
+        # 2.2. Audio-Text Cross-Attention
         norm_audio_hidden_states = self.audio_norm2(audio_hidden_states)
+        if self.audio_cross_attn_adaln:
+            norm_audio_hidden_states = norm_audio_hidden_states * (1 + audio_scale_text_q) + audio_shift_text_q
+        if self.cross_attn_adaln:
+            audio_encoder_hidden_states = audio_encoder_hidden_states * (1 + audio_scale_text_kv) + audio_shift_text_kv
+
         attn_audio_hidden_states = self.audio_attn2(
             norm_audio_hidden_states,
             encoder_hidden_states=audio_encoder_hidden_states,
             query_rotary_emb=None,
             attention_mask=audio_encoder_attention_mask,
         )
+        if self.audio_cross_attn_adaln:
+            attn_audio_hidden_states = attn_audio_hidden_states * audio_gate_text_q
         audio_hidden_states = audio_hidden_states + attn_audio_hidden_states
 
         # 3. Audio-to-Video (a2v) and Video-to-Audio (v2a) Cross-Attention
-        norm_hidden_states = self.audio_to_video_norm(hidden_states)
-        norm_audio_hidden_states = self.video_to_audio_norm(audio_hidden_states)
+        if use_a2v_cross_attention or use_v2a_cross_attention:
+            norm_hidden_states = self.audio_to_video_norm(hidden_states)
+            norm_audio_hidden_states = self.video_to_audio_norm(audio_hidden_states)
 
-        # Combine global and per-layer cross attention modulation parameters
-        # Video
-        video_per_layer_ca_scale_shift = self.video_a2v_cross_attn_scale_shift_table[:4, :]
-        video_per_layer_ca_gate = self.video_a2v_cross_attn_scale_shift_table[4:, :]
+            # Combine global and per-layer cross attention modulation parameters
+            # Video
+            video_per_layer_ca_scale_shift = self.video_a2v_cross_attn_scale_shift_table[:4, :]
+            video_per_layer_ca_gate = self.video_a2v_cross_attn_scale_shift_table[4:, :]
 
-        video_ca_scale_shift_table = (
-            video_per_layer_ca_scale_shift[:, :, ...].to(temb_ca_scale_shift.dtype)
-            + temb_ca_scale_shift.reshape(batch_size, temb_ca_scale_shift.shape[1], 4, -1)
-        ).unbind(dim=2)
-        video_ca_gate = (
-            video_per_layer_ca_gate[:, :, ...].to(temb_ca_gate.dtype)
-            + temb_ca_gate.reshape(batch_size, temb_ca_gate.shape[1], 1, -1)
-        ).unbind(dim=2)
+            video_ca_ada_params = self.get_mod_params(video_per_layer_ca_scale_shift, temb_ca_scale_shift, batch_size)
+            video_ca_gate_param = self.get_mod_params(video_per_layer_ca_gate, temb_ca_gate, batch_size)
 
-        video_a2v_ca_scale, video_a2v_ca_shift, video_v2a_ca_scale, video_v2a_ca_shift = video_ca_scale_shift_table
-        a2v_gate = video_ca_gate[0].squeeze(2)
+            video_a2v_ca_scale, video_a2v_ca_shift, video_v2a_ca_scale, video_v2a_ca_shift = video_ca_ada_params
+            a2v_gate = video_ca_gate_param[0].squeeze(2)
 
-        # Audio
-        audio_per_layer_ca_scale_shift = self.audio_a2v_cross_attn_scale_shift_table[:4, :]
-        audio_per_layer_ca_gate = self.audio_a2v_cross_attn_scale_shift_table[4:, :]
+            # Audio
+            audio_per_layer_ca_scale_shift = self.audio_a2v_cross_attn_scale_shift_table[:4, :]
+            audio_per_layer_ca_gate = self.audio_a2v_cross_attn_scale_shift_table[4:, :]
 
-        audio_ca_scale_shift_table = (
-            audio_per_layer_ca_scale_shift[:, :, ...].to(temb_ca_audio_scale_shift.dtype)
-            + temb_ca_audio_scale_shift.reshape(batch_size, temb_ca_audio_scale_shift.shape[1], 4, -1)
-        ).unbind(dim=2)
-        audio_ca_gate = (
-            audio_per_layer_ca_gate[:, :, ...].to(temb_ca_audio_gate.dtype)
-            + temb_ca_audio_gate.reshape(batch_size, temb_ca_audio_gate.shape[1], 1, -1)
-        ).unbind(dim=2)
+            audio_ca_ada_params = self.get_mod_params(
+                audio_per_layer_ca_scale_shift, temb_ca_audio_scale_shift, batch_size
+            )
+            audio_ca_gate_param = self.get_mod_params(audio_per_layer_ca_gate, temb_ca_audio_gate, batch_size)
 
-        audio_a2v_ca_scale, audio_a2v_ca_shift, audio_v2a_ca_scale, audio_v2a_ca_shift = audio_ca_scale_shift_table
-        v2a_gate = audio_ca_gate[0].squeeze(2)
+            audio_a2v_ca_scale, audio_a2v_ca_shift, audio_v2a_ca_scale, audio_v2a_ca_shift = audio_ca_ada_params
+            v2a_gate = audio_ca_gate_param[0].squeeze(2)
 
-        # Audio-to-Video Cross Attention: Q: Video; K,V: Audio
-        mod_norm_hidden_states = norm_hidden_states * (1 + video_a2v_ca_scale.squeeze(2)) + video_a2v_ca_shift.squeeze(
-            2
-        )
-        mod_norm_audio_hidden_states = norm_audio_hidden_states * (
-            1 + audio_a2v_ca_scale.squeeze(2)
-        ) + audio_a2v_ca_shift.squeeze(2)
+            # 3.2. Audio-to-Video Cross Attention: Q: Video; K,V: Audio
+            if use_a2v_cross_attention:
+                mod_norm_hidden_states = norm_hidden_states * (
+                    1 + video_a2v_ca_scale.squeeze(2)
+                ) + video_a2v_ca_shift.squeeze(2)
+                mod_norm_audio_hidden_states = norm_audio_hidden_states * (
+                    1 + audio_a2v_ca_scale.squeeze(2)
+                ) + audio_a2v_ca_shift.squeeze(2)
 
-        a2v_attn_hidden_states = self.audio_to_video_attn(
-            mod_norm_hidden_states,
-            encoder_hidden_states=mod_norm_audio_hidden_states,
-            query_rotary_emb=ca_video_rotary_emb,
-            key_rotary_emb=ca_audio_rotary_emb,
-            attention_mask=a2v_cross_attention_mask,
-        )
+                a2v_attn_hidden_states = self.audio_to_video_attn(
+                    mod_norm_hidden_states,
+                    encoder_hidden_states=mod_norm_audio_hidden_states,
+                    query_rotary_emb=ca_video_rotary_emb,
+                    key_rotary_emb=ca_audio_rotary_emb,
+                    attention_mask=a2v_cross_attention_mask,
+                )
+                if a2v_cross_attention_perturbation_mask is not None:
+                    a2v_attn_hidden_states = a2v_attn_hidden_states * a2v_cross_attention_perturbation_mask
+                hidden_states = hidden_states + a2v_gate * a2v_attn_hidden_states
 
-        hidden_states = hidden_states + a2v_gate * a2v_attn_hidden_states
+            # 3.3. Video-to-Audio Cross Attention: Q: Audio; K,V: Video
+            if use_v2a_cross_attention:
+                mod_norm_hidden_states = norm_hidden_states * (
+                    1 + video_v2a_ca_scale.squeeze(2)
+                ) + video_v2a_ca_shift.squeeze(2)
+                mod_norm_audio_hidden_states = norm_audio_hidden_states * (
+                    1 + audio_v2a_ca_scale.squeeze(2)
+                ) + audio_v2a_ca_shift.squeeze(2)
 
-        # Video-to-Audio Cross Attention: Q: Audio; K,V: Video
-        mod_norm_hidden_states = norm_hidden_states * (1 + video_v2a_ca_scale.squeeze(2)) + video_v2a_ca_shift.squeeze(
-            2
-        )
-        mod_norm_audio_hidden_states = norm_audio_hidden_states * (
-            1 + audio_v2a_ca_scale.squeeze(2)
-        ) + audio_v2a_ca_shift.squeeze(2)
-
-        v2a_attn_hidden_states = self.video_to_audio_attn(
-            mod_norm_audio_hidden_states,
-            encoder_hidden_states=mod_norm_hidden_states,
-            query_rotary_emb=ca_audio_rotary_emb,
-            key_rotary_emb=ca_video_rotary_emb,
-            attention_mask=v2a_cross_attention_mask,
-        )
-
-        audio_hidden_states = audio_hidden_states + v2a_gate * v2a_attn_hidden_states
+                v2a_attn_hidden_states = self.video_to_audio_attn(
+                    mod_norm_audio_hidden_states,
+                    encoder_hidden_states=mod_norm_hidden_states,
+                    query_rotary_emb=ca_audio_rotary_emb,
+                    key_rotary_emb=ca_video_rotary_emb,
+                    attention_mask=v2a_cross_attention_mask,
+                )
+                if v2a_cross_attention_perturbation_mask is not None:
+                    v2a_attn_hidden_states = v2a_attn_hidden_states * v2a_cross_attention_perturbation_mask
+                audio_hidden_states = audio_hidden_states + v2a_gate * v2a_attn_hidden_states
 
         # 4. Feedforward
         norm_hidden_states = self.norm3(hidden_states) * (1 + scale_mlp) + shift_mlp
@@ -1157,7 +1452,10 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
             return self.prepare_audio_coords(*args, **kwargs)
 
     def forward(
-        self, coords: torch.Tensor, device: str | torch.device | None = None
+        self,
+        coords: torch.Tensor,
+        device: str | torch.device | None = None,
+        out_dtype: torch.dtype | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         device = device or coords.device
 
@@ -1224,13 +1522,18 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
             # Reshape freqs to be compatible with multi-head attention
             b = cos_freq.shape[0]
             t = cos_freq.shape[1]
+            # Concrete per-head dim instead of -1 — see apply_split_rotary_emb
+            r = self.dim // self.num_attention_heads // 2
 
-            cos_freq = cos_freq.reshape(b, t, self.num_attention_heads, -1)
-            sin_freq = sin_freq.reshape(b, t, self.num_attention_heads, -1)
+            cos_freq = cos_freq.reshape(b, t, self.num_attention_heads, r)
+            sin_freq = sin_freq.reshape(b, t, self.num_attention_heads, r)
 
             cos_freqs = torch.swapaxes(cos_freq, 1, 2)  # (B,H,T,D//2)
             sin_freqs = torch.swapaxes(sin_freq, 1, 2)  # (B,H,T,D//2)
 
+        if out_dtype is not None:
+            cos_freqs = cos_freqs.to(out_dtype)
+            sin_freqs = sin_freqs.to(out_dtype)
         return cos_freqs, sin_freqs
 
 
@@ -1261,10 +1564,34 @@ class LTX2VideoTransformer3DModel(nn.Module):
             The normalization layer to use.
     """
 
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "transformer_blocks": ForwardPattern.Pattern_0,
+        },
+        # LTX fuses all guidance passes into the batch dimension and invokes
+        # the transformer once per denoise step. Cache-DiT must therefore
+        # advance its step counter for every transformer forward.
+        has_separate_cfg=False,
+        check_forward_pattern=False,
+    )
+
     _supports_gradient_checkpointing = True
     _skip_layerwise_casting_patterns = ["norm"]
     _repeated_blocks = ["LTX2VideoTransformerBlock"]
+    _layerwise_offload_blocks_attrs = ["transformer_blocks"]
+    _hsdp_shard_conditions = [is_transformer_block_module]
     _sp_plan: dict[str, Any] | None = None
+    stacked_params_mapping = (
+        (".attn1.to_qkv", ".attn1.to_q", "q"),
+        (".attn1.to_qkv", ".attn1.to_k", "k"),
+        (".attn1.to_qkv", ".attn1.to_v", "v"),
+        (".audio_attn1.to_qkv", ".audio_attn1.to_q", "q"),
+        (".audio_attn1.to_qkv", ".audio_attn1.to_k", "k"),
+        (".audio_attn1.to_qkv", ".audio_attn1.to_v", "v"),
+    )
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+    }
 
     @staticmethod
     def _build_sp_plan(rope_type: str) -> dict[str, Any]:
@@ -1279,20 +1606,16 @@ class LTX2VideoTransformer3DModel(nn.Module):
 
         return {
             "": {
-                # Shard video/audio latents across sequence
+                # Keep only the long video stream sequence-sharded. Audio and
+                # prompt streams remain replicated on every SP rank.
                 "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, split_output=False),
-                "audio_hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, split_output=False),
-                # Shard prompt embeds across sequence
-                "encoder_hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, split_output=False),
-                "audio_encoder_hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, split_output=False),
-                # Shard video timestep when provided as (B, seq_len)
+                "keyframes_mask": SequenceParallelInput(split_dim=1, expected_dims=3, split_output=False),
+                # Keep per-token video timestep embeddings aligned with the
+                # video latent shard. LTX guidance supplies a separate,
+                # replicated audio_timestep under SP.
                 "timestep": SequenceParallelInput(split_dim=1, expected_dims=2, split_output=False),
             },
             "rope": {
-                0: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),
-                1: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),
-            },
-            "audio_rope": {
                 0: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),
                 1: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),
             },
@@ -1300,13 +1623,8 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 0: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),
                 1: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),
             },
-            "cross_attn_audio_rope": {
-                0: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),
-                1: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),
-            },
-            # Gather outputs before returning
+            # Video output is sharded; audio output is already replicated.
             "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
-            "audio_proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
         }
 
     def __init__(
@@ -1347,8 +1665,20 @@ class LTX2VideoTransformer3DModel(nn.Module):
         timestep_scale_multiplier: int = 1000,
         cross_attn_timestep_scale_multiplier: int = 1000,
         rope_type: str = "interleaved",
+        use_prompt_embeddings: bool = True,
+        perturbed_attn: bool = False,
+        gated_attn: bool = False,
+        cross_attn_mod: bool = False,
+        audio_gated_attn: bool = False,
+        audio_cross_attn_mod: bool = False,
+        ff_bias: bool = True,
+        audio_ff_bias: bool = True,
+        use_prompt_adaln_single: bool = True,
+        use_keyframes_abs_pos_embedding: bool = False,
+        quant_config: "QuantizationConfig | None" = None,
     ) -> None:
         super().__init__()
+        self.perturbed_attn = perturbed_attn
 
         out_channels = out_channels or in_channels
         audio_out_channels = audio_out_channels or audio_in_channels
@@ -1391,25 +1721,47 @@ class LTX2VideoTransformer3DModel(nn.Module):
             timestep_scale_multiplier=timestep_scale_multiplier,
             cross_attn_timestep_scale_multiplier=cross_attn_timestep_scale_multiplier,
             rope_type=rope_type,
+            ff_bias=ff_bias,
+            audio_ff_bias=audio_ff_bias,
+            use_prompt_adaln_single=use_prompt_adaln_single,
+            use_keyframes_abs_pos_embedding=use_keyframes_abs_pos_embedding,
         )
 
         # 1. Patchification input projections
         self.proj_in = nn.Linear(in_channels, inner_dim)
         self.audio_proj_in = nn.Linear(audio_in_channels, audio_inner_dim)
 
+        if use_keyframes_abs_pos_embedding:
+            self.keyframes_abs_pos_embedding = nn.Parameter(torch.zeros(1, inner_dim))
+
         # 2. Prompt embeddings
-        self.caption_projection = PixArtAlphaTextProjection(in_features=caption_channels, hidden_size=inner_dim)
-        self.audio_caption_projection = PixArtAlphaTextProjection(
-            in_features=caption_channels, hidden_size=audio_inner_dim
-        )
+        # LTX-2 (use_prompt_embeddings=True): caption projection in the transformer
+        # LTX-2.3 (use_prompt_embeddings=False): caption projection in the connectors
+        if use_prompt_embeddings:
+            self.caption_projection = PixArtAlphaTextProjection(in_features=caption_channels, hidden_size=inner_dim)
+            self.audio_caption_projection = PixArtAlphaTextProjection(
+                in_features=caption_channels, hidden_size=audio_inner_dim
+            )
 
         # 3. Timestep Modulation Params and Embedding
-        # 3.1. Global Timestep Modulation Parameters (except for cross-attention) and timestep + size embedding
-        # time_embed and audio_time_embed calculate both the timestep embedding and (global) modulation parameters
-        self.time_embed = LTX2AdaLayerNormSingle(inner_dim, num_mod_params=6, use_additional_conditions=False)
-        self.audio_time_embed = LTX2AdaLayerNormSingle(
-            audio_inner_dim, num_mod_params=6, use_additional_conditions=False
+        # 3.1. Global Timestep Modulation Parameters
+        # LTX-2.3 with cross_attn_mod uses 9 mod params (extra 3 for cross-attn); LTX-2 uses 6.
+        video_num_mod_params = 9 if cross_attn_mod else 6
+        audio_num_mod_params = 9 if audio_cross_attn_mod else 6
+        self.time_embed = LTX2AdaLayerNormSingle(
+            inner_dim, num_mod_params=video_num_mod_params, use_additional_conditions=False
         )
+        self.audio_time_embed = LTX2AdaLayerNormSingle(
+            audio_inner_dim, num_mod_params=audio_num_mod_params, use_additional_conditions=False
+        )
+
+        # 3.3. LTX-2.3: Prompt modulation from sigma
+        self.prompt_modulation = cross_attn_mod or audio_cross_attn_mod
+        if self.prompt_modulation and use_prompt_adaln_single:
+            self.prompt_adaln = LTX2AdaLayerNormSingle(inner_dim, num_mod_params=2, use_additional_conditions=False)
+            self.audio_prompt_adaln = LTX2AdaLayerNormSingle(
+                audio_inner_dim, num_mod_params=2, use_additional_conditions=False
+            )
 
         # 3.2. Global Cross Attention Modulation Parameters
         # Used in the audio-to-video and video-to-audio cross attention layers as a global set of modulation params,
@@ -1513,6 +1865,10 @@ class LTX2VideoTransformer3DModel(nn.Module):
                     audio_num_attention_heads=audio_num_attention_heads,
                     audio_attention_head_dim=audio_attention_head_dim,
                     audio_cross_attention_dim=audio_cross_attention_dim,
+                    video_gated_attn=gated_attn,
+                    video_cross_attn_adaln=cross_attn_mod,
+                    audio_gated_attn=audio_gated_attn,
+                    audio_cross_attn_adaln=audio_cross_attn_mod,
                     qk_norm=qk_norm,
                     activation_fn=activation_fn,
                     attention_bias=attention_bias,
@@ -1520,8 +1876,13 @@ class LTX2VideoTransformer3DModel(nn.Module):
                     eps=norm_eps,
                     elementwise_affine=norm_elementwise_affine,
                     rope_type=rope_type,
+                    perturbed_attn=perturbed_attn,
+                    ff_bias=ff_bias,
+                    audio_ff_bias=audio_ff_bias,
+                    quant_config=quant_config,
+                    prefix=f"transformer_blocks.{layer_idx}",
                 )
-                for _ in range(num_layers)
+                for layer_idx in range(num_layers)
             ]
         )
 
@@ -1555,8 +1916,12 @@ class LTX2VideoTransformer3DModel(nn.Module):
         audio_encoder_hidden_states: torch.Tensor,
         timestep: torch.LongTensor,
         audio_timestep: torch.LongTensor | None = None,
+        keyframes_mask: torch.Tensor | None = None,
+        sigma: torch.Tensor | None = None,
+        audio_sigma: torch.Tensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
         audio_encoder_attention_mask: torch.Tensor | None = None,
+        audio_attention_mask: torch.Tensor | None = None,
         num_frames: int | None = None,
         height: int | None = None,
         width: int | None = None,
@@ -1566,6 +1931,7 @@ class LTX2VideoTransformer3DModel(nn.Module):
         audio_coords: torch.Tensor | None = None,
         attention_kwargs: dict[str, Any] | None = None,
         return_dict: bool = True,
+        **kwargs,  # Accept extra diffusers kwargs (isolate_modalities, perturbation_mask, etc.)
     ) -> torch.Tensor:
         """
         Forward pass for LTX-2.0 audiovisual video transformer.
@@ -1589,6 +1955,8 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 Optional multiplicative text attention mask of shape `(batch_size, text_seq_len)`.
             audio_encoder_attention_mask (`torch.Tensor`, *optional*):
                 Optional multiplicative text attention mask of shape `(batch_size, text_seq_len)` for audio modeling.
+            audio_attention_mask (`torch.Tensor`, *optional*):
+                Optional audio-token key padding mask shared by audio self-attention and audio-to-video attention.
             num_frames (`int`, *optional*):
                 The number of latent video frames. Used if calculating the video coordinates for RoPE.
             height (`int`, *optional*):
@@ -1620,6 +1988,12 @@ class LTX2VideoTransformer3DModel(nn.Module):
         # Determine timestep for audio.
         audio_timestep = audio_timestep if audio_timestep is not None else timestep
 
+        def batch_step(step: torch.Tensor) -> torch.Tensor:
+            return step[:, 0] if step.ndim > 1 else step
+
+        sigma = sigma if sigma is not None else batch_step(timestep)
+        audio_sigma = audio_sigma if audio_sigma is not None else batch_step(audio_timestep)
+
         # convert encoder_attention_mask to a bias the same way we do for attention_mask
         if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
             encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
@@ -1641,16 +2015,29 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 batch_size, audio_num_frames, audio_hidden_states.device
             )
 
-        video_rotary_emb = self.rope(video_coords, device=hidden_states.device)
-        audio_rotary_emb = self.audio_rope(audio_coords, device=audio_hidden_states.device)
+        video_rotary_emb = self.rope(video_coords, device=hidden_states.device, out_dtype=hidden_states.dtype)
+        audio_rotary_emb = self.audio_rope(
+            audio_coords, device=audio_hidden_states.device, out_dtype=audio_hidden_states.dtype
+        )
 
-        video_cross_attn_rotary_emb = self.cross_attn_rope(video_coords[:, 0:1, :], device=hidden_states.device)
+        video_cross_attn_rotary_emb = self.cross_attn_rope(
+            video_coords[:, 0:1, :],
+            device=hidden_states.device,
+            out_dtype=hidden_states.dtype,
+        )
         audio_cross_attn_rotary_emb = self.cross_attn_audio_rope(
-            audio_coords[:, 0:1, :], device=audio_hidden_states.device
+            audio_coords[:, 0:1, :],
+            device=audio_hidden_states.device,
+            out_dtype=audio_hidden_states.dtype,
         )
 
         # 2. Patchify input projections
         hidden_states = self.proj_in(hidden_states)
+        hidden_states = apply_keyframes_absolute_embedding(
+            hidden_states,
+            keyframes_mask,
+            getattr(self, "keyframes_abs_pos_embedding", None),
+        )
         audio_hidden_states = self.audio_proj_in(audio_hidden_states)
 
         # 3. Prepare timestep embeddings and modulation parameters
@@ -1684,7 +2071,7 @@ class LTX2VideoTransformer3DModel(nn.Module):
             hidden_dtype=hidden_states.dtype,
         )
         video_cross_attn_a2v_gate, _ = self.av_cross_attn_video_a2v_gate(
-            timestep.flatten() * timestep_cross_attn_gate_scale_factor,
+            audio_sigma.flatten() * timestep_cross_attn_gate_scale_factor,
             batch_size=batch_size,
             hidden_dtype=hidden_states.dtype,
         )
@@ -1699,7 +2086,7 @@ class LTX2VideoTransformer3DModel(nn.Module):
             hidden_dtype=audio_hidden_states.dtype,
         )
         audio_cross_attn_v2a_gate, _ = self.av_cross_attn_audio_v2a_gate(
-            audio_timestep.flatten() * timestep_cross_attn_gate_scale_factor,
+            sigma.flatten() * timestep_cross_attn_gate_scale_factor,
             batch_size=batch_size,
             hidden_dtype=audio_hidden_states.dtype,
         )
@@ -1708,15 +2095,65 @@ class LTX2VideoTransformer3DModel(nn.Module):
         )
         audio_cross_attn_v2a_gate = audio_cross_attn_v2a_gate.view(batch_size, -1, audio_cross_attn_v2a_gate.shape[-1])
 
-        # 4. Prepare prompt embeddings
-        encoder_hidden_states = self.caption_projection(encoder_hidden_states)
-        encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.size(-1))
+        # 3.3. LTX-2.3: Compute prompt modulation from sigma
+        if self.prompt_modulation and self.config.use_prompt_adaln_single and sigma is not None:
+            temb_prompt, _ = self.prompt_adaln(sigma.flatten(), batch_size=batch_size, hidden_dtype=hidden_states.dtype)
+            temb_prompt_audio, _ = self.audio_prompt_adaln(
+                audio_sigma.flatten(), batch_size=batch_size, hidden_dtype=audio_hidden_states.dtype
+            )
+            temb_prompt = temb_prompt.view(batch_size, -1, temb_prompt.size(-1))
+            temb_prompt_audio = temb_prompt_audio.view(batch_size, -1, temb_prompt_audio.size(-1))
+        else:
+            temb_prompt = temb_prompt_audio = None
 
-        audio_encoder_hidden_states = self.audio_caption_projection(audio_encoder_hidden_states)
-        audio_encoder_hidden_states = audio_encoder_hidden_states.view(batch_size, -1, audio_hidden_states.size(-1))
+        # 4. Prepare prompt embeddings
+        # LTX-2: caption projection is in the transformer
+        # LTX-2.3: caption projection is in the connectors (already applied)
+        if hasattr(self, "caption_projection"):
+            encoder_hidden_states = self.caption_projection(encoder_hidden_states)
+            encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.size(-1))
+
+        if hasattr(self, "audio_caption_projection"):
+            audio_encoder_hidden_states = self.audio_caption_projection(audio_encoder_hidden_states)
+            audio_encoder_hidden_states = audio_encoder_hidden_states.view(batch_size, -1, audio_hidden_states.size(-1))
+
+        perturbation_kwargs = (attention_kwargs or {}).get("ltx_perturbation_kwargs", {})
+
+        def perturbation_mask_for(name: str, block_idx: int) -> torch.Tensor | None:
+            mask = perturbation_kwargs.get(f"{name}_mask")
+            blocks = perturbation_kwargs.get(f"{name}_blocks")
+            if mask is None or (blocks is not None and block_idx not in blocks):
+                return None
+            return mask
 
         # 5. Run transformer blocks
-        for block in self.transformer_blocks:
+        for block_idx, block in enumerate(self.transformer_blocks):
+            block_kwargs = {
+                "temb": temb,
+                "temb_audio": temb_audio,
+                "temb_ca_scale_shift": video_cross_attn_scale_shift,
+                "temb_ca_audio_scale_shift": audio_cross_attn_scale_shift,
+                "temb_ca_gate": video_cross_attn_a2v_gate,
+                "temb_ca_audio_gate": audio_cross_attn_v2a_gate,
+                "temb_prompt": temb_prompt,
+                "temb_prompt_audio": temb_prompt_audio,
+                "video_rotary_emb": video_rotary_emb,
+                "audio_rotary_emb": audio_rotary_emb,
+                "ca_video_rotary_emb": video_cross_attn_rotary_emb,
+                "ca_audio_rotary_emb": audio_cross_attn_rotary_emb,
+                "encoder_attention_mask": encoder_attention_mask,
+                "audio_encoder_attention_mask": audio_encoder_attention_mask,
+                "audio_self_attention_mask": audio_attention_mask,
+                "a2v_cross_attention_mask": audio_attention_mask,
+                "video_self_attention_perturbation_mask": perturbation_mask_for("video_self_attention", block_idx),
+                "audio_self_attention_perturbation_mask": perturbation_mask_for("audio_self_attention", block_idx),
+                "a2v_cross_attention_perturbation_mask": perturbation_mask_for("a2v_cross_attention", block_idx),
+                "v2a_cross_attention_perturbation_mask": perturbation_mask_for("v2a_cross_attention", block_idx),
+            }
+            # NOTE: We intentionally pass the first 4 args here positionally,
+            # because CacheDiT expects the first 2 args to be hidden_states
+            # and encoder_hidden_states, so passing them as kwargs will cause
+            # positional / keywords arg collisions.
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states, audio_hidden_states = self._gradient_checkpointing_func(
                     block,
@@ -1724,18 +2161,7 @@ class LTX2VideoTransformer3DModel(nn.Module):
                     audio_hidden_states,
                     encoder_hidden_states,
                     audio_encoder_hidden_states,
-                    temb,
-                    temb_audio,
-                    video_cross_attn_scale_shift,
-                    audio_cross_attn_scale_shift,
-                    video_cross_attn_a2v_gate,
-                    audio_cross_attn_v2a_gate,
-                    video_rotary_emb,
-                    audio_rotary_emb,
-                    video_cross_attn_rotary_emb,
-                    audio_cross_attn_rotary_emb,
-                    encoder_attention_mask,
-                    audio_encoder_attention_mask,
+                    **block_kwargs,
                 )
             else:
                 hidden_states, audio_hidden_states = block(
@@ -1743,20 +2169,8 @@ class LTX2VideoTransformer3DModel(nn.Module):
                     audio_hidden_states,
                     encoder_hidden_states,
                     audio_encoder_hidden_states,
-                    temb,
-                    temb_audio,
-                    video_cross_attn_scale_shift,
-                    audio_cross_attn_scale_shift,
-                    video_cross_attn_a2v_gate,
-                    audio_cross_attn_v2a_gate,
-                    video_rotary_emb,
-                    audio_rotary_emb,
-                    video_cross_attn_rotary_emb,
-                    audio_cross_attn_rotary_emb,
-                    encoder_attention_mask,
-                    audio_encoder_attention_mask,
+                    **block_kwargs,
                 )
-
         # 6. Output layers (including unpatchification)
         scale_shift_values = self.scale_shift_table[None, None] + embedded_timestep[:, :, None]
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
@@ -1784,16 +2198,8 @@ class LTX2VideoTransformer3DModel(nn.Module):
         Returns:
             Set of parameter names that were successfully loaded.
         """
-        stacked_params_mapping = [
-            (".attn1.to_qkv", ".attn1.to_q", "q"),
-            (".attn1.to_qkv", ".attn1.to_k", "k"),
-            (".attn1.to_qkv", ".attn1.to_v", "v"),
-            (".audio_attn1.to_qkv", ".audio_attn1.to_q", "q"),
-            (".audio_attn1.to_qkv", ".audio_attn1.to_k", "k"),
-            (".audio_attn1.to_qkv", ".audio_attn1.to_v", "v"),
-        ]
-
         params_dict = dict(self.named_parameters())
+        phase_adapter_parameter_name = getattr(self, "_phase_adapter_parameter_name", None)
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank() if tp_size > 1 else 0
         loaded_params: set[str] = set()
@@ -1814,15 +2220,30 @@ class LTX2VideoTransformer3DModel(nn.Module):
             return weight
 
         for name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
+            for param_name, weight_name, shard_id in self.stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                name = name.replace(weight_name, param_name)
+                packed_name = name.replace(weight_name, param_name)
+                if callable(phase_adapter_parameter_name):
+                    packed_name = phase_adapter_parameter_name(packed_name)
+                if packed_name not in params_dict:
+                    continue
+                name = packed_name
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                if callable(phase_adapter_parameter_name):
+                    name = phase_adapter_parameter_name(name)
+                if name not in params_dict:
+                    logger.warning(
+                        "Skipping transformer weight %s -- not found in model "
+                        "parameters. This may indicate an incomplete "
+                        "implementation or checkpoint mismatch.",
+                        name,
+                    )
+                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", None)
                 if weight_loader is not None:

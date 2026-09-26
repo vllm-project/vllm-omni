@@ -1,0 +1,47 @@
+# HunyuanImage-3.0-Instruct AR-only deploy.
+#
+# Use this when AR and DiT are deployed as independent services. This file
+# resolves to stage 0 only, avoiding the default two-stage topology.
+pipeline: hunyuan_image3_ar
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.75
+    trust_remote_code: true
+    enforce_eager: true
+    enable_prefix_caching: false
+    max_num_batched_tokens: 32768
+    devices: "0,1,2,3"
+    tensor_parallel_size: 4
+    hf_overrides:
+      rope_parameters:
+        mrope_section: [0, 32, 32]
+        rope_type: default
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 0.95
+      top_k: 1024
+      max_tokens: 1024
+      detokenize: true
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        gpu_memory_utilization: 0.75
+        devices: "0,1,2,3,4,5,6,7"
+        tensor_parallel_size: 8
+        max_num_batched_tokens: 8192
+
+  xpu:
+    stages:
+      - stage_id: 0
+        gpu_memory_utilization: 0.95
+        devices: "0,1,2,3,4,5,6,7"
+        tensor_parallel_size: 8
+        max_num_batched_tokens: 32784
+        quantization: fp8
+        enable_expert_parallel: true
+        worker_cls: vllm_omni.platforms.xpu.worker.xpu_ar_worker.XPUARWorker

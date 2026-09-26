@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2025 Xiaomi Corporation.
 import os
 from collections.abc import Iterable, Mapping, Sequence
@@ -27,14 +30,13 @@ from vllm.multimodal.inputs import (
 from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
-    BaseMultiModalProcessor,
     BaseProcessingInfo,
     ProcessorInputs,
     PromptReplacement,
     PromptUpdate,
     PromptUpdateDetails,
 )
-from vllm.multimodal.utils import group_mm_kwargs_by_modality
+from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.sequence import IntermediateTensors
 from vllm.utils.cache import LRUCache
 from vllm.utils.collection_utils import is_list_of
@@ -42,6 +44,7 @@ from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import (
     NO_INTERLEAVE_NEXT_TOKEN_ID,
@@ -276,20 +279,22 @@ class MiMoAudioDataParser(MultiModalDataParser):
                 self.device = torch.device(tokenizer_device)
         else:
             # Default to cuda (will use current GPU)
-            self.device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
+            self.device = torch.device(
+                f"cuda:{torch.accelerator.current_device_index()}" if torch.cuda.is_available() else "cpu"
+            )
 
         self.audio_tokenizer_path = os.environ.get("MIMO_AUDIO_TOKENIZER_PATH", None)
         if not self.audio_tokenizer_path:
             raise ValueError(
                 "Audio tokenizer path is not set. Provide "
-                "`model_config.audio_tokenizer_path` in the stage config "
+                "`model_config.audio_tokenizer_path` in the model configuration "
                 "or export MIMO_AUDIO_TOKENIZER_PATH."
             )
 
         if not os.path.exists(self.audio_tokenizer_path):
             raise ValueError(
                 "Audio tokenizer not exists. Provide "
-                "`model_config.audio_tokenizer_path` in the stage config "
+                "`model_config.audio_tokenizer_path` in the model configuration "
                 "or export MIMO_AUDIO_TOKENIZER_PATH."
             )
 
@@ -346,7 +351,7 @@ class MiMoAudioDataParser(MultiModalDataParser):
         return AudioProcessorItems(new_audios)
 
 
-class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProcessingInfo]):
+class MiMoAudioLLMMultiModalProcessor(OmniMultiModalProcessor[MiMoAudioLLMProcessingInfo]):
     def _call_hf_processor(
         self,
         prompt: str,
@@ -457,13 +462,7 @@ class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProces
 
             num_features = audio_output_lengths[item_idx] // 4
             if num_features == 0:
-                try:
-                    audios = mm_items.get_items("audio", AudioProcessorItems)
-                    audio_len = audios.get_audio_length(item_idx)
-                    raise ValueError(f"The audio (len={audio_len}) is too short to be represented inside the model")
-                except (AttributeError, KeyError):
-                    # If AudioProcessorItems is not available, use default
-                    num_features = 1
+                num_features = 1
 
             audio_tokens = [audio_token_id] * num_features
 
@@ -488,7 +487,7 @@ class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProces
         return [
             PromptReplacement(
                 modality="audio",
-                target=audio_token,
+                target=[audio_token_id],
                 replacement=get_replacement_mimo_audio,
             )
         ]
@@ -630,7 +629,7 @@ class MiMoAudioForConditionalGeneration(
                 )
             mm_kwargs.append((mm_feature.modality, mm_item))
 
-        for modality, num_items, mm_kwargs_group in group_mm_kwargs_by_modality(
+        for modality, num_items, mm_kwargs_group in group_and_batch_mm_kwargs(
             mm_kwargs,
             device=self.device,
             pin_memory=self.pin_memory,
@@ -797,9 +796,21 @@ class MiMoAudioForConditionalGeneration(
                 **kwargs,
             )
 
+            # next_speech_tokens is request-indexed (num_reqs, 1, 8, 4), not
+            # token-indexed, so ship it as a per-request list. The payload
+            # builder slices batched tensors by token offsets (start:end),
+            # which only coincides with the request index in pure-decode
+            # steps; in a mixed prefill+decode batch every request would
+            # receive the whole batch tensor, leaking codes across requests
+            # and crashing the downstream ragged-list conversion.
+            if next_speech_tokens is not None:
+                speech_token_payload = list(next_speech_tokens.split(1, dim=0))
+            else:
+                speech_token_payload = None
+
             return OmniOutput(
                 text_hidden_states=text_hidden_states.reshape(-1, text_hidden_states.shape[-1]),
-                multimodal_outputs={"code_predictor_codes": next_speech_tokens},
+                multimodal_outputs={"codes": {"audio": speech_token_payload}},
             )
 
         if self.model_stage == "code2wav":

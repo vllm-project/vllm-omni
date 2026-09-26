@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 This example shows how to use vLLM-Omni for running offline inference
 with the correct prompt format on Qwen2.5-Omni
 """
 
+import argparse
+import functools
+import json
 import os
 import time
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
-import librosa
 import numpy as np
 import soundfile as sf
 from PIL import Image
@@ -17,12 +19,27 @@ from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
+from vllm.multimodal.media.audio import load_audio
 from vllm.sampling_params import SamplingParams
-from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 SEED = 42
+
+
+def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]:
+    """Parse a CLI value as a JSON object, attributing errors to ``flag_name``."""
+    try:
+        config = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"{flag_name} must be valid JSON: {e}") from e
+    if not isinstance(config, dict):
+        raise argparse.ArgumentTypeError(f"{flag_name} must be a JSON object")
+    return config
+
+
+parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
 
 
 class QueryResult(NamedTuple):
@@ -96,7 +113,7 @@ def get_mixed_modalities_query(
     if audio_path:
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
+        audio_signal, sr = load_audio(audio_path, sr=sampling_rate)
         audio_data = (audio_signal.astype(np.float32), sr)
     else:
         audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
@@ -120,7 +137,9 @@ def get_use_audio_in_video_query(
     question = "Describe the content of the video, then convert what the baby say into text."
     prompt = (
         f"<|im_start|>system\n{default_system}<|im_end|>\n"
-        "<|im_start|>user\n<|vision_bos|><|VIDEO|><|vision_eos|><|audio_bos|><|AUDIO|><|audio_eos|>"
+        # With use_audio_in_video=True the processor interleaves the audio into
+        # the video placeholder, so no separate <|AUDIO|> placeholder is used.
+        "<|im_start|>user\n<|vision_bos|><|VIDEO|><|vision_eos|>"
         f"{question}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
@@ -130,7 +149,7 @@ def get_use_audio_in_video_query(
             raise FileNotFoundError(f"Video file not found: {video_path}")
         video_frames = video_to_ndarrays(video_path, num_frames=num_frames)
         # Extract audio from video file
-        audio_signal, sr = librosa.load(video_path, sr=sampling_rate)
+        audio_signal, sr = load_audio(video_path, sr=sampling_rate)
         audio = (audio_signal.astype(np.float32), sr)
     else:
         asset = VideoAsset(name="baby_reading", num_frames=num_frames)
@@ -165,7 +184,7 @@ def get_multi_audios_query(audio_path: str | None = None, sampling_rate: int = 1
     if audio_path:
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
+        audio_signal, sr = load_audio(audio_path, sr=sampling_rate)
         audio_data = (audio_signal.astype(np.float32), sr)
         # Use the provided audio as the first audio, default as second
         audio_list = [
@@ -261,7 +280,7 @@ def get_audio_query(question: str = None, audio_path: str | None = None, samplin
     if audio_path:
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
+        audio_signal, sr = load_audio(audio_path, sr=sampling_rate)
         audio_data = (audio_signal.astype(np.float32), sr)
     else:
         audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
@@ -289,7 +308,10 @@ query_map = {
 
 
 def main(args):
-    model_name = "Qwen/Qwen2.5-Omni-7B"
+    model_name = args.model
+    quantization_config = None
+    if args.quantization_config is not None:
+        quantization_config = json.loads(args.quantization_config)
 
     # Get paths from args
     video_path = getattr(args, "video_path", None)
@@ -320,14 +342,11 @@ def main(args):
         query_result = query_func(audio_path=audio_path, sampling_rate=sampling_rate)
     else:
         query_result = query_func()
-    omni = Omni(
-        model=model_name,
-        log_stats=args.log_stats,
-        stage_init_timeout=args.stage_init_timeout,
-        batch_timeout=args.batch_timeout,
-        init_timeout=args.init_timeout,
-        shm_threshold_bytes=args.shm_threshold_bytes,
-    )
+    args.quantization_config = quantization_config
+    omni_kwargs = vars(args).copy()
+    # Override CLI --model with the derived model_name.
+    omni_kwargs["model"] = model_name
+    omni = Omni(**omni_kwargs)
     thinker_sampling_params = SamplingParams(
         temperature=0.0,  # Deterministic - no randomness
         top_p=1.0,  # Disable nucleus sampling
@@ -377,11 +396,10 @@ def main(args):
         for i, prompt in enumerate(prompts):
             prompt["modalities"] = output_modalities
 
-    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
-    if profiler_enabled and hasattr(omni, "start_profile"):
+    profiler_enabled = args.profiler_config is not None
+    if profiler_enabled:
+        print("[Profiler] Starting profiling...")
         omni.start_profile(stages=[0])
-    elif profiler_enabled:
-        print("[Warn] VLLM_TORCH_PROFILER_DIR is set, but current engine does not support profiler controls.")
     omni_generator = omni.generate(prompts, sampling_params_list, py_generator=args.py_generator)
 
     # Determine output directory: prefer --output-dir; fallback to --output-wav
@@ -391,7 +409,7 @@ def main(args):
     total_requests = len(prompts)
     processed_count = 0
     for stage_outputs in omni_generator:
-        output = stage_outputs.request_output
+        output = stage_outputs
         if stage_outputs.final_output_type == "text":
             request_id = output.request_id
             text_output = output.outputs[0].text
@@ -417,7 +435,7 @@ def main(args):
             print(f"Request ID: {request_id}, Saved audio to {output_wav}")
 
         processed_count += 1
-        if profiler_enabled and hasattr(omni, "stop_profile") and processed_count >= total_requests:
+        if profiler_enabled and processed_count >= total_requests:
             print(f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop...")
             # Stop the profiler while workers are still alive
             omni.stop_profile()
@@ -430,7 +448,19 @@ def main(args):
 
 
 def parse_args():
-    parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser = TrackingArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="Qwen/Qwen2.5-Omni-7B",
+        help="Model name or local path.",
+    )
+    parser.add_argument(
+        "--quantization-config",
+        type=str,
+        default=None,
+        help="Optional JSON string forwarded to Omni(quantization_config=...).",
+    )
     parser.add_argument(
         "--query-type",
         "-q",
@@ -462,6 +492,12 @@ def parse_args():
         type=int,
         default=300,
         help="Timeout for initializing stages in seconds (default: 300)",
+    )
+    parser.add_argument(
+        "--profiler-config",
+        type=parse_profiler_config,
+        default=None,
+        help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
     )
     parser.add_argument(
         "--shm-threshold-bytes",
@@ -539,6 +575,39 @@ def parse_args():
         action="store_true",
         default=False,
         help="Use py_generator mode. The returned type of Omni.generate() is a Python Generator object.",
+    )
+    parser.add_argument(
+        "--deploy-config",
+        type=str,
+        default=None,
+        help="Optional explicit deploy YAML (otherwise the bundled default is used).",
+    )
+    parser.add_argument(
+        "--strategy-config",
+        type=str,
+        default=None,
+        help=(
+            "Optional composable-parallel strategy.yaml mapping role -> parallel axes "
+            "(e.g. tp / stage_replica). Overlaid onto the merged stage configs."
+        ),
+    )
+    parser.add_argument(
+        "--stage-overrides",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON of per-stage overrides applied on top of the default "
+            'deploy config, e.g. \'{"0": {"devices": "0,1"}}\' to give the '
+            "thinker a 2-GPU pool. Lets you run a strategy on the bundled default "
+            "deploy config without writing a bespoke deploy YAML."
+        ),
+    )
+    parser.add_argument(
+        "--omni-lb-policy",
+        type=str,
+        default=None,
+        choices=["random", "round-robin", "least-queue-length"],
+        help="StagePool load-balancer policy for replicated stages (orchestrator-level knob).",
     )
     return parser.parse_args()
 

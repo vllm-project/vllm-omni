@@ -27,7 +27,7 @@ pip install gdown
 Download the dataset from Google Drive:
 
 ```bash
-gdown --id 1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP
+gdown 1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP
 ```
 
 ### 4. Extract the Dataset
@@ -74,7 +74,7 @@ rm meta.lst
 # Full setup and benchmark
 cd benchmarks/build_dataset
 pip install gdown
-gdown --id 1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP
+gdown  1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP
 tar -xf seedtts_testset.tar
 cp seedtts_testset/en/meta.lst meta.lst
 python extract_tts_prompts.py -i meta.lst -o top100.txt -n 100

@@ -1,0 +1,641 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+
+import pytest
+
+from vllm_omni.entrypoints.duplex.session_attachment import (
+    DuplexEventJournal,
+    DuplexJournalGapError,
+    DuplexJournalOverflowError,
+    DuplexResumeCredential,
+    DuplexSessionAttachmentRegistry,
+    InvalidResumeTokenError,
+    ResumeToken,
+)
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
+def _decoded_token_bytes(token: ResumeToken) -> bytes:
+    padding = "=" * (-len(token.plaintext) % 4)
+    return base64.urlsafe_b64decode(token.plaintext + padding)
+
+
+def test_resume_credential_uses_256_bit_token_digest_and_redacted_repr(monkeypatch) -> None:
+    token = ResumeToken.generate()
+    credential = DuplexResumeCredential.from_token(token)
+    calls = []
+
+    import vllm_omni.entrypoints.duplex.session_attachment as attachment_module
+
+    original_compare = attachment_module.hmac.compare_digest
+
+    def recording_compare(left, right):
+        calls.append((left, right))
+        return original_compare(left, right)
+
+    monkeypatch.setattr(attachment_module.hmac, "compare_digest", recording_compare)
+
+    assert len(_decoded_token_bytes(token)) == 32
+    assert credential.verify(token.plaintext) is True
+    assert credential.verify("invalid-token") is False
+    assert len(calls) == 2
+    assert token.plaintext not in repr(token)
+    assert token.plaintext not in repr(credential)
+    assert not hasattr(credential, "plaintext")
+    assert len(credential.token_digest) == 32
+
+
+def test_resume_credential_rotation_revokes_old_token() -> None:
+    first = ResumeToken.generate()
+    credential = DuplexResumeCredential.from_token(first)
+
+    second = credential.rotate()
+
+    assert credential.verify(first.plaintext) is False
+    assert credential.verify(second.plaintext) is True
+    assert second.plaintext != first.plaintext
+
+
+def test_event_journal_sequences_acknowledges_and_replays_exact_payloads() -> None:
+    clock = _Clock()
+    journal = DuplexEventJournal(max_bytes=4096, ttl_s=60.0, clock=clock)
+
+    first = journal.record({"type": "response.output_audio.delta", "delta": "AAAA"})
+    second = journal.record({"type": "response.done", "response_id": "resp-1"})
+
+    assert first.sequence == 1
+    assert second.sequence == 2
+    assert first.payload["server_event_seq"] == 1
+    assert second.payload["server_event_seq"] == 2
+    assert first.encoded_bytes == len(
+        json.dumps(dict(first.payload), separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    )
+    assert [entry.sequence for entry in journal.replay_after(0)] == [1, 2]
+    assert journal.acknowledge(1) == 1
+    assert [entry.sequence for entry in journal.replay_after(1)] == [2]
+    assert journal.acknowledge(1) == 0
+
+
+def test_event_journal_ttl_pruning_reports_replay_gap() -> None:
+    clock = _Clock()
+    journal = DuplexEventJournal(max_bytes=4096, ttl_s=5.0, clock=clock)
+    journal.record({"type": "one"})
+    clock.advance(3.0)
+    journal.record({"type": "two"})
+    clock.advance(3.0)
+
+    assert journal.prune() == 1
+    with pytest.raises(DuplexJournalGapError, match="older than retained"):
+        journal.replay_after(0)
+    assert [entry.payload["type"] for entry in journal.replay_after(1)] == ["two"]
+
+
+def test_event_journal_overflow_is_explicit_and_does_not_evict_silently() -> None:
+    clock = _Clock()
+    journal = DuplexEventJournal(max_bytes=100, ttl_s=60.0, clock=clock)
+    first = journal.record({"type": "small", "value": "x"})
+
+    with pytest.raises(DuplexJournalOverflowError, match="byte limit"):
+        journal.record({"type": "large", "value": "x" * 200})
+
+    assert journal.overflowed is True
+    assert journal.retained_bytes == first.encoded_bytes
+    with pytest.raises(DuplexJournalGapError, match="overflowed"):
+        journal.replay_after(0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("journal", [False, True])
+async def test_registry_failed_send_is_accepted_only_when_journaled(mocker, journal: bool) -> None:
+    registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)
+    accepted = mocker.Mock()
+    expected_calls = [mocker.call()] if journal else []
+
+    async def failing_send(payload):
+        assert accepted.call_args_list == expected_calls
+        raise RuntimeError("transport lost")
+
+    await registry.create("sid-send-failure", send=failing_send, close=mocker.AsyncMock())
+
+    with pytest.raises(RuntimeError, match="transport lost"):
+        await registry.send_event(
+            "sid-send-failure",
+            {"type": "response.audio.delta", "delta": "AAAA"},
+            journal=journal,
+            on_accepted=accepted,
+        )
+
+    assert accepted.call_args_list == expected_calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("journal", [False, True])
+async def test_registry_detached_event_is_accepted_only_when_journaled(mocker, journal: bool) -> None:
+    registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)
+    send = mocker.AsyncMock()
+    accepted = mocker.Mock()
+    created = await registry.create("sid-detached-acceptance", send=send, close=mocker.AsyncMock())
+    await registry.detach("sid-detached-acceptance", attachment_generation=created.attachment_generation)
+
+    entry = await registry.send_event(
+        "sid-detached-acceptance",
+        {"type": "response.audio.delta", "delta": "AAAA"},
+        journal=journal,
+        on_accepted=accepted,
+    )
+
+    send.assert_not_awaited()
+    assert (entry is not None) is journal
+    assert accepted.call_count == int(journal)
+
+
+@pytest.mark.asyncio
+async def test_registry_unjournaled_event_is_accepted_after_successful_send(mocker) -> None:
+    registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)
+    accepted = mocker.Mock()
+
+    async def send(payload):
+        accepted.assert_not_called()
+
+    await registry.create("sid-live-acceptance", send=send, close=mocker.AsyncMock())
+
+    entry = await registry.send_event(
+        "sid-live-acceptance",
+        {"type": "response.audio.delta", "delta": "AAAA"},
+        journal=False,
+        on_accepted=accepted,
+    )
+
+    assert entry is None
+    accepted.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_registry_overflow_does_not_accept_or_send_event(mocker) -> None:
+    registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=100)
+    accepted = mocker.Mock()
+    send = mocker.AsyncMock()
+    await registry.create("sid-overflow-acceptance", send=send, close=mocker.AsyncMock())
+
+    with pytest.raises(DuplexJournalOverflowError, match="byte limit"):
+        await registry.send_event(
+            "sid-overflow-acceptance",
+            {"type": "response.audio.delta", "delta": "A" * 200},
+            on_accepted=accepted,
+        )
+
+    accepted.assert_not_called()
+    send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_registry_resume_rotates_token_replays_and_atomically_replaces_attachment() -> None:
+    clock = _Clock()
+    registry = DuplexSessionAttachmentRegistry(
+        replay_ttl_s=60.0,
+        replay_max_bytes_per_session=4096,
+        clock=clock,
+    )
+    sends_a = []
+    closes_a = []
+    sends_b = []
+    closes_b = []
+
+    async def send_a(payload):
+        sends_a.append(payload)
+
+    async def close_a(reason):
+        closes_a.append(reason)
+
+    async def send_b(payload):
+        sends_b.append(payload)
+
+    async def close_b(reason):
+        closes_b.append(reason)
+
+    created = await registry.create("sid", send=send_a, close=close_a)
+    await registry.send_event("sid", {"type": "event-1"})
+    await registry.send_event("sid", {"type": "event-2"})
+
+    resumed = await registry.resume(
+        "sid",
+        resume_token=created.resume_token.plaintext,
+        last_received_server_event_seq=1,
+        send=send_b,
+        close=close_b,
+    )
+
+    assert resumed.attachment_generation == 2
+    assert resumed.resume_token.plaintext != created.resume_token.plaintext
+    assert [entry.sequence for entry in resumed.replay_entries] == [2]
+    assert resumed.replaced_attachment is not None
+    assert resumed.replaced_attachment.generation == 1
+    assert await registry.is_current_attachment("sid", created.attachment_generation) is False
+    assert await registry.is_current_attachment("sid", resumed.attachment_generation) is True
+    assert await registry.detach("sid", attachment_generation=1) is False
+    assert await registry.detach("sid", attachment_generation=2) is True
+    assert [(payload["type"], payload["server_event_seq"]) for payload in sends_a] == [
+        ("event-1", 1),
+        ("event-2", 2),
+    ]
+    assert closes_a == [] and sends_b == [] and closes_b == []
+
+
+@pytest.mark.asyncio
+async def test_registry_detach_without_a_generation_targets_the_current_attachment_once() -> None:
+    registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)
+    sends: list[dict] = []
+
+    async def send(payload):
+        sends.append(payload)
+
+    async def close(reason):
+        return None
+
+    await registry.create("sid-current", send=send, close=close)
+
+    # The outbound pump outlives any one connection and only knows the session:
+    # ``None`` means "whichever socket is attached right now".
+    assert await registry.detach("sid-current", attachment_generation=None) is True
+    # A second report of the same dead socket is not a new detach, so it cannot
+    # restart the engine's disconnect grace window.
+    assert await registry.detach("sid-current", attachment_generation=None) is False
+    assert await registry.detach("sid-current", attachment_generation=1) is False
+    assert await registry.is_current_attachment("sid-current", 1) is False
+
+    # A detached session still journals for a later resume.
+    await registry.send_event("sid-current", {"type": "event-1"})
+    assert sends == []
+    assert await registry.detach("missing-session", attachment_generation=None) is False
+
+
+@pytest.mark.asyncio
+async def test_registry_resume_sends_activation_then_replay_before_new_live_events() -> None:
+    registry = DuplexSessionAttachmentRegistry(
+        replay_ttl_s=60.0,
+        replay_max_bytes_per_session=4096,
+    )
+    wire = []
+    activation_started = asyncio.Event()
+    release_activation = asyncio.Event()
+
+    async def old_send(payload):
+        del payload
+
+    async def close(reason):
+        del reason
+
+    async def new_send(payload):
+        wire.append(payload["type"])
+        if payload["type"] == "session.resumed":
+            activation_started.set()
+            await release_activation.wait()
+
+    created = await registry.create("sid-order", send=old_send, close=close)
+    await registry.detach("sid-order", attachment_generation=1)
+    await registry.send_event("sid-order", {"type": "replayed"})
+    resume_task = asyncio.create_task(
+        registry.resume(
+            "sid-order",
+            resume_token=created.resume_token.plaintext,
+            last_received_server_event_seq=0,
+            send=new_send,
+            close=close,
+            activation_payload_factory=lambda _token, _generation: {"type": "session.resumed"},
+        )
+    )
+    await activation_started.wait()
+    live_task = asyncio.create_task(registry.send_event("sid-order", {"type": "live"}))
+
+    release_activation.set()
+    await asyncio.gather(resume_task, live_task)
+
+    assert wire == ["session.resumed", "replayed", "live"]
+
+
+@pytest.mark.asyncio
+async def test_registry_resume_delivery_failure_keeps_one_shot_old_token_recovery() -> None:
+    registry = DuplexSessionAttachmentRegistry(
+        replay_ttl_s=60.0,
+        replay_max_bytes_per_session=4096,
+    )
+
+    async def send(payload):
+        del payload
+
+    async def failing_send(payload):
+        del payload
+        raise RuntimeError("transport lost before rotated token arrived")
+
+    async def close(reason):
+        del reason
+
+    created = await registry.create("sid-recovery", send=send, close=close)
+    await registry.detach("sid-recovery", attachment_generation=1)
+
+    with pytest.raises(RuntimeError, match="transport lost"):
+        await registry.resume(
+            "sid-recovery",
+            resume_token=created.resume_token.plaintext,
+            last_received_server_event_seq=0,
+            send=failing_send,
+            close=close,
+            activation_payload_factory=lambda token, generation: {
+                "type": "session.resumed",
+                "resume_token": token.plaintext,
+                "attachment_generation": generation,
+            },
+        )
+
+    recovered = await registry.resume(
+        "sid-recovery",
+        resume_token=created.resume_token.plaintext,
+        last_received_server_event_seq=0,
+        send=send,
+        close=close,
+    )
+
+    assert recovered.attachment_generation == 3
+    with pytest.raises(InvalidResumeTokenError):
+        await registry.resume(
+            "sid-recovery",
+            resume_token=created.resume_token.plaintext,
+            last_received_server_event_seq=0,
+            send=send,
+            close=close,
+        )
+
+
+@pytest.mark.asyncio
+async def test_registry_concurrent_resume_allows_exactly_one_rotated_token_winner() -> None:
+    registry = DuplexSessionAttachmentRegistry(
+        replay_ttl_s=60.0,
+        replay_max_bytes_per_session=4096,
+    )
+
+    async def send(payload):
+        del payload
+
+    async def close(reason):
+        del reason
+
+    created = await registry.create("sid-race", send=send, close=close)
+
+    async def attempt():
+        try:
+            return await registry.resume(
+                "sid-race",
+                resume_token=created.resume_token.plaintext,
+                last_received_server_event_seq=0,
+                send=send,
+                close=close,
+            )
+        except InvalidResumeTokenError as exc:
+            return exc
+
+    results = await asyncio.gather(attempt(), attempt())
+
+    assert sum(not isinstance(result, Exception) for result in results) == 1
+    assert sum(isinstance(result, InvalidResumeTokenError) for result in results) == 1
+
+
+@pytest.mark.asyncio
+async def test_registry_keeps_sessions_journals_and_tokens_isolated() -> None:
+    registry = DuplexSessionAttachmentRegistry(
+        replay_ttl_s=60.0,
+        replay_max_bytes_per_session=4096,
+    )
+
+    async def send(payload):
+        del payload
+
+    async def close(reason):
+        del reason
+
+    created_a = await registry.create("sid-a", send=send, close=close)
+    created_b = await registry.create("sid-b", send=send, close=close)
+    await registry.detach("sid-a", attachment_generation=1)
+    await registry.detach("sid-b", attachment_generation=1)
+    await registry.send_event("sid-a", {"type": "a-only"})
+    await registry.send_event("sid-b", {"type": "b-only"})
+
+    resumed_a = await registry.resume(
+        "sid-a",
+        resume_token=created_a.resume_token.plaintext,
+        last_received_server_event_seq=0,
+        send=send,
+        close=close,
+    )
+    resumed_b = await registry.resume(
+        "sid-b",
+        resume_token=created_b.resume_token.plaintext,
+        last_received_server_event_seq=0,
+        send=send,
+        close=close,
+    )
+
+    assert [entry.payload["type"] for entry in resumed_a.replay_entries] == ["a-only"]
+    assert [entry.payload["type"] for entry in resumed_b.replay_entries] == ["b-only"]
+    with pytest.raises(InvalidResumeTokenError):
+        await registry.resume(
+            "sid-a",
+            resume_token=resumed_b.resume_token.plaintext,
+            last_received_server_event_seq=1,
+            send=send,
+            close=close,
+        )
+
+
+@pytest.mark.asyncio
+async def test_registry_repr_never_contains_plaintext_tokens() -> None:
+    registry = DuplexSessionAttachmentRegistry(
+        replay_ttl_s=60.0,
+        replay_max_bytes_per_session=4096,
+    )
+
+    async def send(payload):
+        del payload
+
+    async def close(reason):
+        del reason
+
+    created = await registry.create("sid-repr", send=send, close=close)
+    await registry.detach("sid-repr", attachment_generation=1)
+    entry = await registry.send_event(
+        "sid-repr",
+        {"type": "session.resumed", "resume_token": created.resume_token.plaintext},
+    )
+
+    assert entry is not None
+    assert created.resume_token.plaintext not in repr(created)
+    assert created.resume_token.plaintext not in repr(entry)
+    assert created.resume_token.plaintext not in repr(registry)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_on", ["activation", "replay"])
+async def test_registry_resume_cancelled_mid_delivery_rolls_back_like_a_failure(cancel_on: str) -> None:
+    """Cancellation must take the same rollback as an ordinary delivery failure.
+
+    ``CancelledError`` derives from ``BaseException``, so an ``except
+    Exception`` around the activation and replay sends let a cancelled resume
+    keep its attachment as the current generation while the token it rotated
+    past was already gone — the session left attached to an unusable transport
+    with no way back. Both send points are covered because either can be the
+    one that gets cancelled.
+    """
+    registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)
+
+    async def send(payload):
+        del payload
+
+    async def close(reason):
+        del reason
+
+    created = await registry.create("sid-cancel", send=send, close=close)
+    # One journaled event, so the replay loop has something to send.
+    await registry.send_event("sid-cancel", {"type": "response.output_text.delta", "delta": "a"})
+    await registry.detach("sid-cancel", attachment_generation=1)
+
+    sends = 0
+    cancel_at = 1 if cancel_on == "activation" else 2
+
+    async def cancelling_send(payload):
+        del payload
+        nonlocal sends
+        sends += 1
+        if sends == cancel_at:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await registry.resume(
+            "sid-cancel",
+            resume_token=created.resume_token.plaintext,
+            last_received_server_event_seq=0,
+            send=cancelling_send,
+            close=close,
+            activation_payload_factory=lambda token, generation: {
+                "type": "session.resumed",
+                "resume_token": token.plaintext,
+                "attachment_generation": generation,
+            },
+        )
+
+    assert sends == cancel_at, "the send that was cancelled is the one under test"
+    # The cancelled attachment must not remain current...
+    assert not await registry.has_attachment("sid-cancel")
+    # ...and the token the caller presented has to work again, or the session
+    # is unreachable: resume() had already rotated past it.
+    recovered = await registry.resume(
+        "sid-cancel",
+        resume_token=created.resume_token.plaintext,
+        last_received_server_event_seq=0,
+        send=send,
+        close=close,
+    )
+    assert recovered.attachment_generation == 3
+
+
+@pytest.mark.asyncio
+async def test_release_hands_back_the_lease_generation_the_dropped_connection_was_serving(mocker) -> None:
+    """The lease generation travels with the attachment, so a detach is fenced on the right lease."""
+    registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)
+    send = mocker.AsyncMock()
+    created = await registry.create("sid-lease", send=send, close=mocker.AsyncMock(), lease_generation=0)
+
+    # An abandoned takeover hands its generation to the connection still attached.
+    assert await registry.settle_lease_generation("sid-lease", 1) is None
+    assert await registry.settle_lease_generation("sid-lease", 0) is None, "generations only move forward"
+
+    released = await registry.release_attachment("sid-lease", attachment_generation=created.attachment_generation)
+    assert released is not None
+    assert (released.attachment_generation, released.lease_generation) == (1, 1)
+    assert await registry.release_attachment("sid-lease", attachment_generation=None) is None
+    assert await registry.settle_lease_generation("sid-lease", 2) == 2, "nobody is attached: the caller detaches it"
+
+    resumed = await registry.resume(
+        "sid-lease",
+        resume_token=created.resume_token.plaintext,
+        last_received_server_event_seq=0,
+        send=send,
+        close=mocker.AsyncMock(),
+        lease_generation=3,
+    )
+    released = await registry.release_attachment("sid-lease", attachment_generation=resumed.attachment_generation)
+    assert released is not None and released.lease_generation == 3
+
+
+@pytest.mark.asyncio
+async def test_an_orphaned_generation_waits_for_the_resume_that_is_about_to_activate(mocker) -> None:
+    """While a resume is pending, an orphan goes to its activation, not to the socket it will replace."""
+    registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)
+    send = mocker.AsyncMock()
+    created = await registry.create("sid-pending", send=send, close=mocker.AsyncMock(), lease_generation=0)
+
+    await registry.begin_resume("sid-pending")
+    assert await registry.settle_lease_generation("sid-pending", 2) is None, "parked for the pending activation"
+    released = await registry.release_attachment("sid-pending", attachment_generation=created.attachment_generation)
+    assert released is not None and released.lease_generation == 0, "the replaced socket keeps its own lease"
+
+    resumed = await registry.resume(
+        "sid-pending",
+        resume_token=created.resume_token.plaintext,
+        last_received_server_event_seq=0,
+        send=send,
+        close=mocker.AsyncMock(),
+        lease_generation=1,
+    )
+    assert await registry.end_resume("sid-pending") is None, "the activation absorbed the orphan"
+    released = await registry.release_attachment("sid-pending", attachment_generation=resumed.attachment_generation)
+    assert released is not None and released.lease_generation == 2
+
+    # A pending resume that never activates leaves the orphan to whoever ends the claim.
+    await registry.begin_resume("sid-pending")
+    assert await registry.settle_lease_generation("sid-pending", 3) is None
+    assert await registry.end_resume("sid-pending") == 3
+
+
+@pytest.mark.asyncio
+async def test_a_rolled_back_activation_orphans_the_lease_it_was_handed(mocker) -> None:
+    """A provisional attachment may own a newer generation than its own resume produced."""
+    registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)
+    created = await registry.create("sid-rollback", send=mocker.AsyncMock(), close=mocker.AsyncMock())
+    await registry.detach("sid-rollback", attachment_generation=created.attachment_generation)
+
+    async def failing_activation(payload):
+        raise RuntimeError("socket closed during replay")
+
+    await registry.begin_resume("sid-rollback")
+    with pytest.raises(RuntimeError):
+        await registry.resume(
+            "sid-rollback",
+            resume_token=created.resume_token.plaintext,
+            last_received_server_event_seq=0,
+            send=failing_activation,
+            close=mocker.AsyncMock(),
+            activation_payload_factory=lambda token, generation: {"type": "session.resumed"},
+            lease_generation=1,
+        )
+    # Meanwhile a resume abandoned mid-RPC handed generation 2 to the provisional attachment.
+    # (Order does not matter: both land in the orphan slot while the claim is open.)
+    assert await registry.settle_lease_generation("sid-rollback", 2) is None
+    assert await registry.settle_lease_generation("sid-rollback", 1) is None
+    assert await registry.end_resume("sid-rollback") == 2, "the newest lease is the one to detach"

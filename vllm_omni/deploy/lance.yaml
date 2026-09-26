@@ -1,0 +1,20 @@
+# Lance (ByteDance) — single-stage diffusion pipeline selector.
+#
+# Lance's HF config.json is descriptive metadata (no ``model_type``),
+# so the loader can't auto-detect from the model dir alone.  This YAML
+# only tells the loader "use the Lance pipeline" — one stage, no multi-
+# stage orchestration.
+
+pipeline: lance
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    max_num_batched_tokens: 32768
+    max_num_seqs: 1
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "0"
+    default_sampling_params:
+      seed: 42

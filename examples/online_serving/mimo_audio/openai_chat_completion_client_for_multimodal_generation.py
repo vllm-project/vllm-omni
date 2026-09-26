@@ -12,7 +12,8 @@ from typing import Any
 import requests
 from openai import OpenAI
 from vllm.assets.audio import AudioAsset
-from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 # Modify OpenAI's API key and API base to use vLLM's API server.
 openai_api_key = "EMPTY"
@@ -327,7 +328,7 @@ def run_multimodal_generation(args) -> None:
 
     extra_body = {
         "sampling_params_list": sampling_params_list
-        # Optional, it has a default setting in stage_configs of the corresponding model.
+        # Optional; defaults come from the resolved pipeline and deploy config.
     }
 
     # Build messages list (filter None so concurrent tasks get valid structure)
@@ -493,7 +494,7 @@ def run_multimodal_generation(args) -> None:
 
 
 def parse_args():
-    parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser = TrackingArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
     parser.add_argument(
         "--query-type",
         "-q",

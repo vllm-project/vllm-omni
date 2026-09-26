@@ -1,9 +1,11 @@
-from unittest.mock import MagicMock, patch
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 import torch
+from pytest_mock import MockerFixture
 
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.flux2.flux2_transformer import (
     Flux2PosEmbed,
     Flux2Transformer2DModel,
@@ -12,14 +14,17 @@ from vllm_omni.diffusion.models.flux2.flux2_transformer import (
 
 # Initialize TP group before tests
 @pytest.fixture(scope="function", autouse=True)
-def setup_tp_group():
+def setup_tp_group(mocker: MockerFixture):
     """Set up TP group for each test function"""
-    with patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size", return_value=2):
-        with patch("vllm.distributed.parallel_state.get_tp_group") as mock_get_tp_group:
-            mock_tp_group = MagicMock()
-            mock_tp_group.world_size = 2
-            mock_get_tp_group.return_value = mock_tp_group
-            yield
+    mocker.patch(
+        "vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size",
+        return_value=2,
+    )
+    mock_get_tp_group = mocker.patch("vllm.distributed.parallel_state.get_tp_group")
+    mock_tp_group = mocker.MagicMock()
+    mock_tp_group.world_size = 2
+    mock_get_tp_group.return_value = mock_tp_group
+    yield
 
 
 class TestFlux2TransformerWeightLoading:
@@ -251,3 +256,28 @@ class TestFlux2PackedModuleMapping:
         assert len(loaded_params) == 2, "Should load two weights"
         assert "x_embedder.weight" in loaded_params
         assert any("to_qkv" in p for p in loaded_params), "to_q should be mapped to to_qkv"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+class TestFlux2TransformerLayerwiseOffload:
+    def test_layerwise_offload_blocks_attrs(self):
+        assert Flux2Transformer2DModel._layerwise_offload_blocks_attrs == [
+            "transformer_blocks",
+            "single_transformer_blocks",
+        ]
+
+    def test_get_blocks_from_dit(self):
+        from vllm_omni.diffusion.offloader.block_discovery import get_blocks_from_dit
+
+        # Block discovery only needs the ModuleList structure, not production dims.
+        model = Flux2Transformer2DModel(
+            num_layers=2,
+            num_single_layers=2,
+            num_attention_heads=2,
+            attention_head_dim=4,
+            joint_attention_dim=16,
+        )
+        attr_names, blocks = get_blocks_from_dit(model)
+        assert attr_names == ["transformer_blocks", "single_transformer_blocks"]
+        assert len(blocks) == 4

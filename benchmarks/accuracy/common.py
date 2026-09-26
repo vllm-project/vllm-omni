@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import base64
@@ -151,6 +154,9 @@ class VllmOmniImageClient:
         seed: int | None = None,
         negative_prompt: str | None = None,
         output_compression: int | None = None,
+        bot_task: str | None = None,
+        sys_type: str | None = None,
+        system_prompt: str | None = None,
     ) -> Image.Image:
         if not isinstance(images, list):
             images = [images]
@@ -170,6 +176,12 @@ class VllmOmniImageClient:
             data["negative_prompt"] = negative_prompt
         if output_compression is not None:
             data["output_compression"] = str(output_compression)
+        if bot_task is not None:
+            data["bot_task"] = bot_task
+        if sys_type is not None:
+            data["sys_type"] = sys_type
+        if system_prompt is not None:
+            data["system_prompt"] = system_prompt
 
         files = [
             (
@@ -191,7 +203,16 @@ class VllmOmniImageClient:
             )
             last_response = response
             if response.status_code != 404:
-                response.raise_for_status()
+                try:
+                    response.raise_for_status()
+                except requests.HTTPError as error:
+                    # Keep the server's validation detail in the exception;
+                    # otherwise multipart image tests only report a bare
+                    # ``400 Bad Request`` and hide the actionable cause.
+                    raise requests.HTTPError(
+                        f"{error}: {response.text}",
+                        response=response,
+                    ) from error
                 return decode_base64_image(response.json()["data"][0]["b64_json"])
 
         assert last_response is not None

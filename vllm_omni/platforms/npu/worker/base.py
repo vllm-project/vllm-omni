@@ -5,7 +5,12 @@
 
 import time
 
-from vllm_ascend.worker.worker import NPUWorker
+from vllm_omni.platforms.npu._310p import is_310p
+
+if is_310p():
+    from vllm_ascend._310p.worker_310p import NPUWorker310 as NPUWorker
+else:
+    from vllm_ascend.worker.worker import NPUWorker
 
 
 class OmniNPUWorkerBase(NPUWorker):
@@ -40,7 +45,7 @@ class OmniNPUWorkerBase(NPUWorker):
         if self.profiler is None:
             raise RuntimeError(
                 "Profiling is not enabled. For diffusion models, set --profiler-config via CLI. "
-                "For omni models, add profiler_config to your stage config file."
+                "For omni models, add profiler_config to the relevant deploy config stage."
             )
         if is_start:
             from vllm_omni.profiler import OmniTorchProfilerWrapper

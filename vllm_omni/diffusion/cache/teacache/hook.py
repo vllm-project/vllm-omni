@@ -23,8 +23,31 @@ from vllm_omni.diffusion.cache.teacache.state import TeaCacheState
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
+    get_sp_group,
+    model_parallel_is_initialized,
 )
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook, StateManager
+
+
+def _average_l1_stats_across_sp(mean_diff: torch.Tensor, mean_prev: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Average TeaCache L1 stats across sequence-parallel ranks.
+
+    Skip vs compute must be identical on every rank that participates in
+    transformer SP collectives. Sequence shards otherwise produce different
+    local means and deadlock. TP is not included: the residual TeaCache reads
+    is replicated across TP ranks. CFG/DP ranks are also excluded: they do
+    not share those collectives.
+    """
+    if not model_parallel_is_initialized():
+        return mean_diff, mean_prev
+
+    sp_group = get_sp_group()
+    if sp_group.world_size <= 1:
+        return mean_diff, mean_prev
+
+    stats = torch.stack((mean_diff.detach(), mean_prev.detach()))
+    stats = sp_group.all_reduce(stats) / sp_group.world_size
+    return stats[0], stats[1]
 
 
 class TeaCacheHook(ModelHook):
@@ -138,7 +161,16 @@ class TeaCacheHook(ModelHook):
         state = self.state_manager.get_state()
 
         # Decide whether to compute or cache based on modulated input similarity
-        should_compute = self._should_compute_full_transformer(state, ctx.modulated_input)
+        local_should_compute = self._should_compute_full_transformer(state, ctx.modulated_input)
+        sync_cache_decision = (ctx.extra_states or {}).get("synchronize_cache_decision")
+        if sync_cache_decision is not None:
+            should_compute = sync_cache_decision(local_should_compute)
+            # A rank that locally chose the cache path must reset its counter
+            # when another SP rank requires a full collective block execution.
+            if should_compute and not local_should_compute:
+                state.accumulated_rel_l1_distance = 0.0
+        else:
+            should_compute = local_should_compute
 
         if not should_compute and state.previous_residual is not None:
             # ============================================================================
@@ -196,6 +228,7 @@ class TeaCacheHook(ModelHook):
         1. Always compute first timestep
         2. For intermediate steps:
            - Compute relative L1 distance between current and previous modulated inputs
+           - Average that distance across SP so all ranks share the skip decision
            - Apply polynomial rescaling with model-specific coefficients
            - Accumulate rescaled distances
            - Compare to threshold: below = cache, above = compute
@@ -216,22 +249,23 @@ class TeaCacheHook(ModelHook):
         if state.previous_modulated_input is None:
             return True
 
-        # Compute relative L1 distance between consecutive modulated inputs
-        rel_distance = (
-            (
-                (modulated_inp - state.previous_modulated_input).abs().mean()
-                / (state.previous_modulated_input.abs().mean() + 1e-8)
-            )
-            .cpu()
-            .item()
-        )
+        # Compute relative L1 distance between consecutive modulated inputs.
+        # Reduce across SP before the threshold so every rank takes the same
+        # skip/compute path (otherwise a cache hit on one rank deadlocks
+        # waiting on collectives the miss path never enters).
+        mean_diff = (modulated_inp - state.previous_modulated_input).abs().mean()
+        mean_prev = state.previous_modulated_input.abs().mean()
+        mean_diff, mean_prev = _average_l1_stats_across_sp(mean_diff, mean_prev)
+        rel_distance = (mean_diff / (mean_prev + 1e-8)).item()
 
         # Apply model-specific polynomial rescaling
         rescaled_distance = float(self.rescale_func(rel_distance))
         state.accumulated_rel_l1_distance += abs(rescaled_distance)
 
         # Decision: below threshold = cache, above = compute
-        if state.accumulated_rel_l1_distance < self.config.rel_l1_thresh:
+        rel_l1_thresh = self.config.rel_l1_thresh
+        assert rel_l1_thresh is not None
+        if state.accumulated_rel_l1_distance < rel_l1_thresh:
             return False  # Use cache
         else:
             state.accumulated_rel_l1_distance = 0.0  # Reset accumulator

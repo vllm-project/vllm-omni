@@ -1,19 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections import defaultdict
 from types import SimpleNamespace
 
+import pytest
 import torch
 
-from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk, text2flow
+from vllm_omni.data_entry_keys import serialize_payload
+from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
+    talker2code2wav_async_chunk,
+    text2flow_full_payload,
+    text2flow_token_only,
+)
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _source_output(request_id: str, prompt_ids: list[int], out_ids: list[int], mm: dict):
+def _source_output(request_id: str, prompt_ids: list[int], out_ids: list[int], mm: dict, finished: bool = True):
     return SimpleNamespace(
         request_id=request_id,
         prompt_token_ids=prompt_ids,
-        outputs=[SimpleNamespace(token_ids=out_ids, multimodal_output=mm)],
+        finished=finished,
+        outputs=[SimpleNamespace(token_ids=out_ids, cumulative_token_ids=out_ids, multimodal_output=mm)],
     )
 
 
@@ -43,23 +52,73 @@ def _transfer_manager(
     )
 
 
-def test_text2flow_supports_batched_source_outputs():
-    stage_list = [
-        SimpleNamespace(
-            engine_outputs=[
-                _source_output("req-0", [10, 11], [1, 2, 3], {"speech_token": torch.tensor([[1, 2]])}),
-                _source_output("req-1", [20, 21], [4, 5], {"speech_token": torch.tensor([[3, 4]])}),
-            ]
-        )
+def test_text2flow_token_only_supports_batched_source_outputs():
+    source_outputs = [
+        _source_output("req-0", [10, 11], [1, 2, 3], {"speech_token": torch.tensor([[8, 9]])}),
+        _source_output("req-1", [20, 21], [4, 5], {"speech_token": torch.tensor([[6, 7]])}),
     ]
 
-    outputs = text2flow(stage_list=stage_list, engine_input_source=[0], prompt=None)
+    outputs = text2flow_token_only(source_outputs=source_outputs, prompt=None)
 
     assert len(outputs) == 2
     assert outputs[0]["prompt_token_ids"] == [1, 2, 3]
     assert outputs[1]["prompt_token_ids"] == [4, 5]
-    assert outputs[0]["additional_information"]["prefix_ids"] == [10, 11]
-    assert outputs[1]["additional_information"]["prefix_ids"] == [20, 21]
+    assert outputs[0]["additional_information"]["ids"]["prompt"] == [10, 11]
+    assert outputs[1]["additional_information"]["ids"]["prompt"] == [20, 21]
+
+
+def test_text2flow_token_only_strips_reference_speech_prefix_from_cumulative_ids():
+    source_outputs = [
+        _source_output(
+            "req-strip",
+            [10, 11],
+            [4, 5, 1, 2, 3],
+            {"embed": {"speech_token": torch.tensor([[4, 5]])}},
+        )
+    ]
+
+    outputs = text2flow_token_only(source_outputs=source_outputs, prompt=None)
+
+    assert len(outputs) == 1
+    assert outputs[0]["prompt_token_ids"] == [1, 2, 3]
+    assert outputs[0]["additional_information"]["ids"]["prompt"] == [10, 11]
+
+
+def test_text2flow_token_only_does_not_mark_prompt_trim():
+    # The talker prompt is wrapped with the CosyVoice3 instruction template in
+    # _build_cosyvoice3_prompt, so the talker emits target-only speech and no
+    # prompt-trim offset is required; the flow stage trims prompt_feat itself
+    # (issue #4644). Confirm no talker_prefill_offset is set.
+    source_outputs = [
+        _source_output(
+            "req-stop",
+            [10, 11],
+            [4, 5, 1, 2, 6562],
+            {"embed": {"speech_token": torch.tensor([[4, 5]])}},
+        )
+    ]
+
+    outputs = text2flow_token_only(source_outputs=source_outputs, prompt=None)
+
+    assert outputs[0]["prompt_token_ids"] == [1, 2, 6562]
+    meta = outputs[0]["additional_information"].get("meta") or {}
+    assert "talker_prefill_offset" not in meta
+
+
+def test_text2flow_full_payload_does_not_send_codec_ids():
+    payload = text2flow_full_payload(
+        None,
+        {
+            "embed.speech_token": torch.tensor([[1, 2]], dtype=torch.long),
+            "codes.audio": torch.tensor([7, 8, 9], dtype=torch.long),
+        },
+        SimpleNamespace(),
+    )
+
+    assert payload is not None
+    assert "codes" not in payload
+    assert "next_stage_prompt_len" not in payload["meta"]
+    assert torch.equal(payload["embed"]["speech_token"], torch.tensor([[1, 2]], dtype=torch.long))
 
 
 def test_talker2code2wav_async_chunk_final_payload_uses_absolute_token_offset():
@@ -68,30 +127,61 @@ def test_talker2code2wav_async_chunk_final_payload_uses_absolute_token_offset():
         external_req_id="rid-0",
         output_token_ids=[1, 2, 6562, 3],
         additional_information={
-            "speech_token": [torch.tensor([[11, 12, 13]])],
-            "speech_feat": [torch.tensor([[[0.1, 0.2], [0.3, 0.4]]])],
-            "embedding": [torch.tensor([[0.5, 0.6]])],
+            "embed": {
+                "speech_token": [torch.tensor([[11, 12, 13]])],
+                "speech_feat": [torch.tensor([[[0.1, 0.2], [0.3, 0.4]]])],
+                "embedding": [torch.tensor([[0.5, 0.6]])],
+            },
         },
         is_finished=lambda: True,
     )
 
     payload = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=True,
     )
 
     assert payload is not None
-    assert payload["finished"].item() is True
-    assert payload["code_predictor_codes"] == [1, 2, 3]
-    assert payload["token_offset"] == 0
-    assert payload["left_context_size"] == 0
-    assert payload["req_id"] == ["rid-0"]
-    assert payload["stream_finished"].item() is True
-    assert "speech_token" in payload
-    assert "speech_feat" in payload
-    assert "embedding" in payload
+    assert payload.meta.finished.item() is True
+    assert payload.codes.audio.tolist() == [1, 2, 3]
+    assert payload.meta.left_context_size == 0
+    assert payload.meta.req_id == ["rid-0"]
+    assert payload.meta.stream_finished.item() is True
+    assert payload.embed.speech_token is not None
+    assert payload.embed.speech_feat is not None
+    assert payload.embed.embedding is not None
+
+
+def test_talker2code2wav_async_chunk_decodes_bfloat16_conditioning():
+    speech_feat = torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.bfloat16)
+    additional_information = serialize_payload(
+        {
+            "embed": {
+                "speech_token": torch.tensor([[11]], dtype=torch.long),
+                "speech_feat": speech_feat,
+                "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.bfloat16),
+            }
+        }
+    )
+    request = SimpleNamespace(
+        external_req_id="rid-bfloat16",
+        output_token_ids=[1],
+        additional_information=additional_information,
+        is_finished=lambda: True,
+    )
+
+    payload = talker2code2wav_async_chunk(
+        transfer_manager=_transfer_manager(),
+        multimodal_output=None,
+        request=request,
+        is_finished=True,
+    )
+
+    assert payload is not None
+    assert payload.embed.speech_feat.dtype == torch.bfloat16
+    assert torch.equal(payload.embed.speech_feat, speech_feat)
 
 
 def test_talker2code2wav_async_chunk_emits_eof_when_finished_without_valid_codes():
@@ -105,14 +195,14 @@ def test_talker2code2wav_async_chunk_emits_eof_when_finished_without_valid_codes
 
     payload = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=True,
     )
 
     assert payload is not None
-    assert payload["code_predictor_codes"] == []
-    assert payload["finished"].item() is True
+    assert payload.codes.audio.tolist() == []
+    assert payload.meta.finished.item() is True
 
 
 def test_talker2code2wav_async_chunk_does_not_reemit_without_new_tokens():
@@ -126,20 +216,20 @@ def test_talker2code2wav_async_chunk_does_not_reemit_without_new_tokens():
 
     payload1 = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
     payload2 = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
 
     assert payload1 is not None
-    assert payload1["code_predictor_codes"] == [1, 2]
-    assert payload1["token_offset"] == 0
+    assert payload1.codes.audio.tolist() == [1, 2]
+    assert payload1.meta.left_context_size == 0
     assert payload2 is None
 
 
@@ -154,23 +244,23 @@ def test_talker2code2wav_async_chunk_waits_for_prelookahead_and_emits_cumulative
 
     payload_pending = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
     request.output_token_ids = [1, 2, 3]
     payload_ready = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
 
     assert payload_pending is None
     assert payload_ready is not None
-    assert payload_ready["code_predictor_codes"] == [1, 2, 3]
-    assert payload_ready["token_offset"] == 0
-    assert payload_ready["finished"].item() is False
+    assert payload_ready.codes.audio.tolist() == [1, 2, 3]
+    assert payload_ready.meta.left_context_size == 0
+    assert payload_ready.meta.finished.item() is False
 
 
 def test_talker2code2wav_async_chunk_final_flush_uses_previous_token_offset():
@@ -184,26 +274,26 @@ def test_talker2code2wav_async_chunk_final_flush_uses_previous_token_offset():
 
     payload_stream = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
     request.output_token_ids = [3, 4, 5, 6]
     payload_final = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=True,
     )
 
     assert payload_stream is not None
-    assert payload_stream["finished"].item() is False
-    assert payload_stream["code_predictor_codes"] == [3, 4, 5]
-    assert payload_stream["token_offset"] == 0
+    assert payload_stream.meta.finished.item() is False
+    assert payload_stream.codes.audio.tolist() == [3, 4, 5]
+    assert payload_stream.meta.left_context_size == 0
     assert payload_final is not None
-    assert payload_final["finished"].item() is True
-    assert payload_final["code_predictor_codes"] == [3, 4, 5, 6]
-    assert payload_final["token_offset"] == 2
+    assert payload_final.meta.finished.item() is True
+    assert payload_final.codes.audio.tolist() == [3, 4, 5, 6]
+    assert payload_final.meta.left_context_size == 2
 
 
 def test_talker2code2wav_async_chunk_respects_prompt_token_pad_on_first_chunk():
@@ -212,29 +302,29 @@ def test_talker2code2wav_async_chunk_respects_prompt_token_pad_on_first_chunk():
         external_req_id="rid-pad",
         output_token_ids=[8, 9, 10],
         additional_information={
-            "speech_token": [torch.tensor([[1, 2, 3]])],
+            "embed": {"speech_token": [torch.tensor([[1, 2, 3]])]},
         },
         is_finished=lambda: False,
     )
 
     payload_pending = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
     request.output_token_ids = [8, 9, 10, 11]
     payload_ready = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
 
     assert payload_pending is None
     assert payload_ready is not None
-    assert payload_ready["code_predictor_codes"] == [8, 9, 10, 11]
-    assert payload_ready["token_offset"] == 0
+    assert payload_ready.codes.audio.tolist() == [8, 9, 10, 11]
+    assert payload_ready.meta.left_context_size == 0
 
 
 def test_talker2code2wav_async_chunk_emits_terminal_eof_without_duplicate_audio():
@@ -248,20 +338,20 @@ def test_talker2code2wav_async_chunk_emits_terminal_eof_without_duplicate_audio(
 
     payload_stream = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
     payload_final = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=True,
     )
 
     assert payload_stream is not None
-    assert payload_stream["finished"].item() is False
-    assert payload_stream["code_predictor_codes"] == [3, 4]
+    assert payload_stream.meta.finished.item() is False
+    assert payload_stream.codes.audio.tolist() == [3, 4]
     assert payload_final is not None
-    assert payload_final["finished"].item() is True
-    assert payload_final["code_predictor_codes"] == []
+    assert payload_final.meta.finished.item() is True
+    assert payload_final.codes.audio.tolist() == []

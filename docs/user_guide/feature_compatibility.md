@@ -165,7 +165,7 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
 
 - **Tensor Parallelism — Text Encoder Not Sharded**: TP currently only shards the DiT blocks. Each TP rank retains a **full copy of the text encoder weights**, leading to significant GPU memory overhead proportional to TP degree. Tracked in [Issue #771](https://github.com/vllm-project/vllm-omni/issues/771).
 
-- **CPU Offloading — Two Modes Are Mutually Exclusive**: Model-level offload (`enable_cpu_offload`) and layerwise offload (`enable_layerwise_offload`) cannot be used simultaneously. If both are set, layerwise takes priority and model-level is silently ignored.
+- **CPU Offloading — Strategies Are Mutually Exclusive**: Distributed layerwise, layerwise, and model-level offload should not be enabled together. Selection priority is distributed layerwise, then layerwise, then model-level.
 
 - **CPU Offloading — VAE stays on GPU**: Both offloading strategies keep the VAE on GPU at all times. For high-resolution generation, VAE decode can still cause OOM. Mitigate by combining with `vae_use_tiling=True` or VAE Patch Parallelism.
 

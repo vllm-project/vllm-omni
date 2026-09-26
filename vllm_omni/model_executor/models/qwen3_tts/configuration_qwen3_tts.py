@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,7 +30,7 @@ class Qwen3TTSSpeakerEncoderConfig(PretrainedConfig):
     Args:
         mel_dim (`int`, *optional*, defaults to 128):
             The dimension of the input mel-spectrogram.
-        enc_dim (`int`, *optional*, defaults to 192):
+        enc_dim (`int`, *optional*, defaults to 1024):
             The dimension of the final speaker embedding.
         enc_channels (`list[int]`, *optional*, defaults to `[512, 512, 512, 512, 1536]`):
             A list of output channels for each TDNN/SERes2Net layer in the encoder.
@@ -80,11 +83,11 @@ class Qwen3TTSTalkerCodePredictorConfig(PretrainedConfig):
 
 
     Args:
-        vocab_size (`int`, *optional*, defaults to 151936):
+        vocab_size (`int`, *optional*, defaults to 2048):
             Vocabulary size of the Qwen3TTSTalkerCodePredictor model.
             Defines the number of different tokens that can be represented by the
             `inputs_ids` passed when calling [`Qwen3TTSTalkerCodePredictorModel`]
-        hidden_size (`int`, *optional*, defaults to 4096):
+        hidden_size (`int`, *optional*, defaults to 1024):
             Dimension of the hidden representations.
         intermediate_size (`int`, *optional*, defaults to 22016):
             Dimension of the MLP representations.
@@ -173,16 +176,13 @@ class Qwen3TTSTalkerCodePredictorConfig(PretrainedConfig):
     model_type = "qwen3_tts_talker_code_predictor"
     keys_to_ignore_at_inference = ["past_key_values"]
 
-    # Default tensor parallel plan for base model `Qwen3TTSTalkerCodePredictor`
-    base_model_tp_plan = {
-        "layers.*.self_attn.q_proj": "colwise",
-        "layers.*.self_attn.k_proj": "colwise",
-        "layers.*.self_attn.v_proj": "colwise",
-        "layers.*.self_attn.o_proj": "rowwise",
-        "layers.*.mlp.gate_proj": "colwise",
-        "layers.*.mlp.up_proj": "colwise",
-        "layers.*.mlp.down_proj": "rowwise",
-    }
+    # The code predictor currently runs TP=1.  Do not advertise a tensor
+    # parallel plan for the packed qkv/gate_up projections until the fused
+    # loader and ``_split_qkv`` path are taught TP-aware packing/sharding:
+    # a generic colwise split of the plain ``nn.Linear`` would split the
+    # packed [q, k, v] layout across ranks instead of preserving each rank's
+    # local q/k/v groups.
+    base_model_tp_plan = {}
     base_model_pp_plan = {
         "embed_tokens": (["input_ids"], ["inputs_embeds"]),
         "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
@@ -271,11 +271,11 @@ class Qwen3TTSTalkerConfig(PretrainedConfig):
 
 
     Args:
-        vocab_size (`int`, *optional*, defaults to 151936):
+        vocab_size (`int`, *optional*, defaults to 3072):
             Vocabulary size of the Qwen3TTSTalker model.
             Defines the number of different tokens that can be represented by the
             `inputs_ids` passed when calling [`Qwen3TTSTalkerModel`]
-        hidden_size (`int`, *optional*, defaults to 2048):
+        hidden_size (`int`, *optional*, defaults to 1024):
             Dimension of the hidden representations.
         intermediate_size (`int`, *optional*, defaults to 6144):
             Dimension of the MLP representations.
@@ -436,7 +436,6 @@ class Qwen3TTSTalkerConfig(PretrainedConfig):
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 
         if code_predictor_config is None:
-            code_predictor_config = {}
             self.code_predictor_config = Qwen3TTSTalkerCodePredictorConfig()
             logger.info("code_predictor_config is None. Initializing code_predictor model with default values")
         elif isinstance(code_predictor_config, Qwen3TTSTalkerCodePredictorConfig):
@@ -537,6 +536,10 @@ class Qwen3TTSConfig(PretrainedConfig):
         if any("Code2Wav" in str(a) for a in archs):
             if hasattr(config, "rope_parameters"):
                 delattr(config, "rope_parameters")
+            # Code2Wav doesn't use position embeddings, but vLLM validates
+            # max_model_len <= max_position_embeddings. Set a large value
+            # to allow the pipeline.yaml max_model_len (65536) to pass validation.
+            config.max_position_embeddings = 131072
         return config
 
 

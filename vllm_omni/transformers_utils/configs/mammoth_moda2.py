@@ -2,18 +2,28 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import ClassVar, Literal
 
-from transformers import AutoConfig, PretrainedConfig
+from transformers import AutoConfig, AutoTokenizer, PretrainedConfig
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLConfig,
     Qwen2_5_VLTextConfig,
     Qwen2_5_VLVisionConfig,
 )
+from transformers.models.qwen3_vl.configuration_qwen3_vl import (
+    Qwen3VLConfig,
+    Qwen3VLTextConfig,
+    Qwen3VLVisionConfig,
+)
+
+from vllm_omni.tokenizers.mammoth_moda2_tokenizer import MammothUTokenizer
 
 __all__ = [
     "Mammothmoda2Config",
     "Mammothmoda2Qwen2_5_VLConfig",
     "Mammothmoda2Qwen2_5_VLTextConfig",
     "Mammothmoda2Qwen2_5_VLVisionConfig",
+    "Mammothmoda2Qwen3VLConfig",
+    "Mammothmoda2Qwen3VLTextConfig",
+    "Mammothmoda2Qwen3VLVisionConfig",
 ]
 
 
@@ -207,6 +217,77 @@ class Mammothmoda2Qwen2_5_VLConfig(Qwen2_5_VLConfig):
         self.tokenizer_class = "MammothUTokenizer"
 
 
+class Mammothmoda2Qwen3VLVisionConfig(Qwen3VLVisionConfig):
+    model_type = "mammothmoda2_qwen3_vl_vision"
+    base_config_key = "vision_config"
+
+
+class Mammothmoda2Qwen3VLTextConfig(Qwen3VLTextConfig):
+    model_type = "mammothmoda2_qwen3_vl_text"
+    base_config_key = "text_config"
+
+    def __init__(
+        self,
+        extra_gen_vocab: bool = True,
+        gen_vocab_size: int = 32800,
+        gen_vocab_start_index: int | None = None,
+        moe_type: str = "ffn",
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.base_vocab_size = int(self.vocab_size)
+        self.extra_gen_vocab = extra_gen_vocab
+        self.gen_vocab_size = gen_vocab_size
+        self.gen_vocab_start_index = self.vocab_size if gen_vocab_start_index is None else gen_vocab_start_index
+        self.moe_type = moe_type
+        if self.extra_gen_vocab:
+            self.vocab_size = int(self.gen_vocab_start_index) + int(self.gen_vocab_size)
+
+
+class Mammothmoda2Qwen3VLConfig(Qwen3VLConfig):
+    """MammothModa2-Dev AR config backed by Qwen3-VL."""
+
+    model_type = "mammothmoda2_qwen3_vl"
+    sub_configs = {
+        "vision_config": Mammothmoda2Qwen3VLVisionConfig,
+        "text_config": Mammothmoda2Qwen3VLTextConfig,
+    }
+    keys_to_ignore_at_inference = ["past_key_values"]
+
+    def __init__(
+        self,
+        text_config: dict | PretrainedConfig | None = None,
+        vision_config: dict | PretrainedConfig | None = None,
+        extra_gen_vocab: bool = True,
+        gen_vocab_size: int = 32800,
+        gen_vocab_start_index: int | None = None,
+        moe_type: str = "ffn",
+        **kwargs,
+    ) -> None:
+        if isinstance(vision_config, dict):
+            vision_config = self.sub_configs["vision_config"](**vision_config)
+        elif vision_config is None:
+            vision_config = self.sub_configs["vision_config"]()
+        extras = {
+            "extra_gen_vocab": extra_gen_vocab,
+            "gen_vocab_size": gen_vocab_size,
+            "gen_vocab_start_index": gen_vocab_start_index,
+            "moe_type": moe_type,
+        }
+        if isinstance(text_config, dict):
+            for key, value in extras.items():
+                text_config.setdefault(key, value)
+            text_config = self.sub_configs["text_config"](**text_config)
+        elif text_config is None:
+            text_config = self.sub_configs["text_config"](**extras)
+        super().__init__(text_config=text_config, vision_config=vision_config, **kwargs)
+        self.extra_gen_vocab = getattr(self.text_config, "extra_gen_vocab", extra_gen_vocab)
+        self.gen_vocab_size = getattr(self.text_config, "gen_vocab_size", gen_vocab_size)
+        self.gen_vocab_start_index = getattr(self.text_config, "gen_vocab_start_index", gen_vocab_start_index)
+        self.moe_type = getattr(self.text_config, "moe_type", moe_type)
+        self.tokenizer_class = "MammothUTokenizer"
+
+
 class Mammothmoda2Config(PretrainedConfig):
     """Top-level MammothModa2 composition configuration"""
 
@@ -229,7 +310,8 @@ class Mammothmoda2Config(PretrainedConfig):
         architectures: list[str] | None = None,
         **kwargs,
     ) -> None:
-        super().__init__(**kwargs)
+        # Must set llm_config before super().__init__() because the parent's
+        # validation calls get_text_config() which accesses self.llm_config
         self.llm_config = AutoConfig.for_model(**llm_config) if llm_config is not None else None
         self.gen_vae_config = gen_vae_config
         self.gen_dit_config = gen_dit_config
@@ -243,8 +325,13 @@ class Mammothmoda2Config(PretrainedConfig):
         self.tokenizer_class = "MammothUTokenizer"
         self.architectures = ["Mammothmoda2Model"]
 
+        super().__init__(**kwargs)
+
     def get_text_config(self, decoder: bool = False) -> PretrainedConfig:  # noqa: ARG002
-        return self.llm_config
+        if self.llm_config is None:
+            return None
+        # llm_config is a Mammothmoda2Qwen2_5_VLConfig which has nested text_config
+        return self.llm_config.text_config
 
     def _require_llm_config(self) -> PretrainedConfig:
         if self.llm_config is None:
@@ -281,3 +368,10 @@ AutoConfig.register(Mammothmoda2Config.model_type, Mammothmoda2Config)
 AutoConfig.register(Mammothmoda2Qwen2_5_VLConfig.model_type, Mammothmoda2Qwen2_5_VLConfig)
 AutoConfig.register(Mammothmoda2Qwen2_5_VLTextConfig.model_type, Mammothmoda2Qwen2_5_VLTextConfig)
 AutoConfig.register(Mammothmoda2Qwen2_5_VLVisionConfig.model_type, Mammothmoda2Qwen2_5_VLVisionConfig)
+AutoConfig.register(Mammothmoda2Qwen3VLConfig.model_type, Mammothmoda2Qwen3VLConfig)
+AutoConfig.register(Mammothmoda2Qwen3VLTextConfig.model_type, Mammothmoda2Qwen3VLTextConfig)
+AutoConfig.register(Mammothmoda2Qwen3VLVisionConfig.model_type, Mammothmoda2Qwen3VLVisionConfig)
+# Register tokenizer_type -> the configs & AutoTokenizer
+AutoTokenizer.register(config_class=Mammothmoda2Config, slow_tokenizer_class=MammothUTokenizer)
+AutoTokenizer.register(config_class=Mammothmoda2Qwen2_5_VLConfig, slow_tokenizer_class=MammothUTokenizer)
+AutoTokenizer.register(config_class=Mammothmoda2Qwen3VLConfig, slow_tokenizer_class=MammothUTokenizer)

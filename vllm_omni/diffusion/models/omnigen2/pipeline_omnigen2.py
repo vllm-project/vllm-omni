@@ -8,7 +8,7 @@ import os
 import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import PIL.Image
@@ -29,14 +29,18 @@ from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.omnigen2.omnigen2_transformer import (
     OmniGen2RotaryPosEmbed,
     OmniGen2Transformer2DModel,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -255,44 +259,42 @@ def get_omnigen2_pre_process_func(
         request: OmniDiffusionRequest,
     ) -> OmniDiffusionRequest:
         """Pre-process requests for OmniGen2Pipeline."""
-        for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+        prompt = request.prompt
+        multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+        raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
 
-            if isinstance(prompt, str):
-                prompt = OmniTextPrompt(prompt=prompt)
-            if "additional_information" not in prompt:
-                prompt["additional_information"] = {}
+        if isinstance(prompt, str):
+            prompt = OmniTextPrompt(prompt=prompt)
+        if "additional_information" not in prompt:
+            prompt["additional_information"] = {}
 
-            if raw_image is not None:
-                if isinstance(raw_image, list):
-                    images = [PIL.Image.open(img) if isinstance(img, str) else img for img in raw_image]
-                elif isinstance(raw_image, str):
-                    images = [PIL.Image.open(raw_image)]
-                else:
-                    images = [raw_image]
+        if raw_image is not None:
+            if isinstance(raw_image, list):
+                images = [PIL.Image.open(img) if isinstance(img, str) else img for img in raw_image]
+            elif isinstance(raw_image, str):
+                images = [PIL.Image.open(raw_image)]
+            else:
+                images = [raw_image]
 
-                first_raw = images[0]
-                if isinstance(first_raw, PIL.Image.Image):
-                    new_h, new_w = image_processor.get_new_height_width(
-                        first_raw, max_pixels=1024 * 1024, max_side_length=1024
-                    )
-                    if request.sampling_params.height is None:
-                        request.sampling_params.height = new_h
-                    if request.sampling_params.width is None:
-                        request.sampling_params.width = new_w
+            first_raw = images[0]
+            if isinstance(first_raw, PIL.Image.Image):
+                new_h, new_w = image_processor.get_new_height_width(
+                    first_raw, max_pixels=1024 * 1024, max_side_length=1024
+                )
+                if request.sampling_params.height is None:
+                    request.sampling_params.height = new_h
+                if request.sampling_params.width is None:
+                    request.sampling_params.width = new_w
 
-                preprocessed_images = []
-                for image in images:
-                    if not (
-                        isinstance(image, torch.Tensor) and len(image.shape) > 1 and image.shape[1] == latent_channels
-                    ):
-                        image = image_processor.preprocess(image, max_pixels=1024 * 1024, max_side_length=1024)
-                    preprocessed_images.append(image)
+            preprocessed_images = []
+            for image in images:
+                if not (isinstance(image, torch.Tensor) and len(image.shape) > 1 and image.shape[1] == latent_channels):
+                    image = image_processor.preprocess(image, max_pixels=1024 * 1024, max_side_length=1024)
+                preprocessed_images.append(image)
 
-                prompt["additional_information"]["preprocessed_images"] = preprocessed_images
+            prompt["additional_information"]["preprocessed_images"] = preprocessed_images
 
-            request.prompts[i] = prompt
+        request.prompt = prompt
         return request
 
     return pre_process_func
@@ -619,7 +621,7 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class OmniGen2Pipeline(nn.Module):
+class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
     """
     Pipeline for text-to-image generation using OmniGen2.
 
@@ -632,6 +634,10 @@ class OmniGen2Pipeline(nn.Module):
     Args:
         od_config (OmniDiffusionConfig): The OmniDiffusion configuration.
     """
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["mllm"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
 
     def __init__(
         self,
@@ -667,20 +673,40 @@ class OmniGen2Pipeline(nn.Module):
             )
         ]
 
+        # See ``hub_prefetch.py`` for the transformers v5 multi-worker subfolder
+        # race; prefetch the whole component set before any from_pretrained.
+        omnigen2_subfolders = ["scheduler", "vae", "mllm", "processor"]
+        prefetch_subfolders(model, omnigen2_subfolders, local_files_only=local_files_only)
+
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
-        self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self.device
-        )
+        self.vae = from_pretrained_with_prefetch(
+            AutoencoderKL.from_pretrained,
+            model,
+            subfolder="vae",
+            prefetch_list=omnigen2_subfolders,
+            local_files_only=local_files_only,
+        ).to(self.device)
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, OmniGen2Transformer2DModel)
-        self.transformer = OmniGen2Transformer2DModel(**transformer_kwargs)
-        self.mllm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model, subfolder="mllm", local_files_only=local_files_only
+        self.transformer = OmniGen2Transformer2DModel(
+            **transformer_kwargs,
+            quant_config=od_config.quantization_config,
+        )
+        self.mllm = from_pretrained_with_prefetch(
+            Qwen2_5_VLForConditionalGeneration.from_pretrained,
+            model,
+            subfolder="mllm",
+            prefetch_list=omnigen2_subfolders,
+            local_files_only=local_files_only,
         ).to(self.device)
-        self.processor = Qwen2_5_VLProcessor.from_pretrained(
-            model, subfolder="processor", local_files_only=local_files_only
+        self.processor = from_pretrained_with_prefetch(
+            Qwen2_5_VLProcessor.from_pretrained,
+            model,
+            subfolder="processor",
+            prefetch_list=omnigen2_subfolders,
+            local_files_only=local_files_only,
         )
         self.vae_scale_factor = (
             2 ** (len(self.vae.config.block_out_channels) - 1) if hasattr(self, "vae") and self.vae is not None else 8
@@ -978,7 +1004,7 @@ class OmniGen2Pipeline(nn.Module):
     @torch.no_grad()
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
         prompt_embeds: torch.FloatTensor | None = None,
@@ -1171,14 +1197,6 @@ class OmniGen2Pipeline(nn.Module):
         self._num_timesteps = len(timesteps)
 
         for i, t in enumerate(timesteps):
-            model_pred = self.predict(
-                t=t,
-                latents=latents,
-                prompt_embeds=prompt_embeds,
-                freqs_cis=freqs_cis,
-                prompt_attention_mask=prompt_attention_mask,
-                ref_image_hidden_states=ref_latents,
-            )
             text_guidance_scale = (
                 self.text_guidance_scale if self.cfg_range[0] <= i / len(timesteps) <= self.cfg_range[1] else 1.0
             )
@@ -1186,8 +1204,26 @@ class OmniGen2Pipeline(nn.Module):
                 self.image_guidance_scale if self.cfg_range[0] <= i / len(timesteps) <= self.cfg_range[1] else 1.0
             )
 
+            positive_kwargs = dict(
+                t=t,
+                latents=latents,
+                prompt_embeds=prompt_embeds,
+                freqs_cis=freqs_cis,
+                prompt_attention_mask=prompt_attention_mask,
+                ref_image_hidden_states=ref_latents,
+            )
+            uncond_kwargs = dict(
+                t=t,
+                latents=latents,
+                prompt_embeds=negative_prompt_embeds,
+                freqs_cis=freqs_cis,
+                prompt_attention_mask=negative_prompt_attention_mask,
+                ref_image_hidden_states=None,
+            )
+
             if text_guidance_scale > 1.0 and image_guidance_scale > 1.0:
-                model_pred_ref = self.predict(
+                # 3-branch CFG: pos + ref_neg + uncond
+                ref_neg_kwargs = dict(
                     t=t,
                     latents=latents,
                     prompt_embeds=negative_prompt_embeds,
@@ -1195,31 +1231,24 @@ class OmniGen2Pipeline(nn.Module):
                     prompt_attention_mask=negative_prompt_attention_mask,
                     ref_image_hidden_states=ref_latents,
                 )
-
-                model_pred_uncond = self.predict(
-                    t=t,
-                    latents=latents,
-                    prompt_embeds=negative_prompt_embeds,
-                    freqs_cis=freqs_cis,
-                    prompt_attention_mask=negative_prompt_attention_mask,
-                    ref_image_hidden_states=None,
-                )
-
-                model_pred = (
-                    model_pred_uncond
-                    + image_guidance_scale * (model_pred_ref - model_pred_uncond)
-                    + text_guidance_scale * (model_pred - model_pred_ref)
+                model_pred = self.predict_noise_with_multi_branch_cfg(
+                    do_true_cfg=True,
+                    true_cfg_scale={
+                        "text": text_guidance_scale,
+                        "image": image_guidance_scale,
+                    },
+                    branches_kwargs=[positive_kwargs, ref_neg_kwargs, uncond_kwargs],
                 )
             elif text_guidance_scale > 1.0:
-                model_pred_uncond = self.predict(
-                    t=t,
-                    latents=latents,
-                    prompt_embeds=negative_prompt_embeds,
-                    freqs_cis=freqs_cis,
-                    prompt_attention_mask=negative_prompt_attention_mask,
-                    ref_image_hidden_states=None,
+                # 2-branch CFG: pos + uncond
+                model_pred = self.predict_noise_with_multi_branch_cfg(
+                    do_true_cfg=True,
+                    true_cfg_scale=text_guidance_scale,
+                    branches_kwargs=[positive_kwargs, uncond_kwargs],
                 )
-                model_pred = model_pred_uncond + text_guidance_scale * (model_pred - model_pred_uncond)
+            else:
+                # No CFG
+                model_pred = self.predict_noise(**positive_kwargs)
 
             latents = self.scheduler.step(model_pred, t, latents, return_dict=False)[0]
 
@@ -1249,21 +1278,39 @@ class OmniGen2Pipeline(nn.Module):
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
         timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
-        batch_size, num_channels_latents, height, width = latents.shape
-
         optional_kwargs = {}
         if "ref_image_hidden_states" in set(inspect.signature(self.transformer.forward).parameters.keys()):
             optional_kwargs["ref_image_hidden_states"] = ref_image_hidden_states
 
-        model_pred = self.transformer(
-            latents,
-            timestep,
-            prompt_embeds,
-            freqs_cis,
-            prompt_attention_mask,
-            **optional_kwargs,
-        )
+        with torch.autocast(
+            device_type=self.device.type,
+            enabled=self.device.type != "cpu",
+            dtype=self.od_config.dtype,
+        ):
+            model_pred = self.transformer(
+                latents,
+                timestep,
+                prompt_embeds,
+                freqs_cis,
+                prompt_attention_mask,
+                **optional_kwargs,
+            )
         return model_pred
+
+    def predict_noise(self, **kwargs):
+        """Override CFGParallelMixin.predict_noise to use self.predict."""
+        return self.predict(**kwargs)
+
+    def combine_multi_branch_cfg_noise(self, predictions, true_cfg_scale, cfg_normalize=False):
+        """Override: 3-branch dual scale or 2-branch standard CFG."""
+        if len(predictions) == 3:
+            text_scale = true_cfg_scale["text"]
+            image_scale = true_cfg_scale["image"]
+            pos, ref, uncond = predictions[0], predictions[1], predictions[2]
+            return uncond + image_scale * (ref - uncond) + text_scale * (pos - ref)
+        # 2-branch: standard CFG
+        pos, neg = predictions[0], predictions[1]
+        return neg + true_cfg_scale * (pos - neg)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

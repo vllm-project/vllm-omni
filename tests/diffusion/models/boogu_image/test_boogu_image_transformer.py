@@ -1,0 +1,848 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+import logging
+import os
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+# Small mock dimensions (head_dim = HIDDEN_SIZE / NUM_HEADS = 16 must equal
+# sum(AXES_DIM_ROPE)).
+HIDDEN_SIZE = 64
+NUM_HEADS = 4
+NUM_KV_HEADS = 2
+HEAD_DIM = HIDDEN_SIZE // NUM_HEADS
+AXES_DIM_ROPE = (8, 4, 4)
+AXES_LENS = (32, 16, 16)
+MULTIPLE_OF = 32
+NORM_EPS = 1e-5
+
+
+@pytest.fixture(autouse=True)
+def _init_distributed(request):
+    """Initialize the minimal single-rank distributed environment required by
+    the vLLM parallel linear layers (tensor-parallel group must exist)."""
+    if request.node.name.startswith(
+        ("test_real_rotary_", "test_packed_rope_table", "test_fused_qk_norm_rope", "test_fallback_with_no")
+    ):
+        yield
+        return
+
+    from vllm.distributed.parallel_state import (
+        cleanup_dist_env_and_memory,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+
+    os.environ.setdefault("MASTER_ADDR", "localhost")
+    os.environ.setdefault("MASTER_PORT", "29512")
+    init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method="env://",
+    )
+    initialize_model_parallel()
+    yield
+    cleanup_dist_env_and_memory()
+
+
+@pytest.fixture(autouse=True)
+def _force_default_gemm(monkeypatch):
+    """Force CPU-compatible GEMM dispatch for tests using CPU tensors.
+
+    vLLM's dispatch_unquantized_gemm() selects the backend by platform, not by
+    tensor device; CPU test tensors can crash on non-default backends."""
+    from vllm.model_executor.layers.utils import default_unquantized_gemm
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
+        lambda *_args, **_kwargs: default_unquantized_gemm,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _force_torch_sdpa():
+    """Pin TORCH_SDPA so CPU shape tests do not pick CUDA-only backends (FA3)."""
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.data import AttentionConfig
+
+    od_config = SimpleNamespace(
+        diffusion_attention_config=AttentionConfig(default="TORCH_SDPA"),
+        parallel_config=SimpleNamespace(ring_degree=1),
+    )
+    with set_current_diffusion_config(od_config):
+        yield
+
+
+def _randomize_parameters(module: torch.nn.Module) -> None:
+    """Fill parameters with small random values.
+
+    vLLM parallel linears allocate weights with `torch.empty` (real weights
+    arrive via `load_weights`), so uninitialized memory must be overwritten
+    before a forward pass."""
+    with torch.no_grad():
+        for param in module.parameters():
+            param.uniform_(-0.02, 0.02)
+
+
+def _identity_rotary_emb(batch_size: int, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Real-valued rotary frequencies encoding a zero rotation."""
+    return (
+        torch.ones(batch_size, seq_len, HEAD_DIM),
+        torch.zeros(batch_size, seq_len, HEAD_DIM),
+    )
+
+
+def _tiny_tf_model_config(**overrides):
+    config = {
+        "patch_size": 2,
+        "in_channels": 4,
+        "hidden_size": HIDDEN_SIZE,
+        "num_layers": 4,
+        "num_double_stream_layers": 2,
+        "num_refiner_layers": 2,
+        "num_attention_heads": NUM_HEADS,
+        "num_kv_heads": NUM_KV_HEADS,
+        "multiple_of": MULTIPLE_OF,
+        "norm_eps": NORM_EPS,
+        "axes_dim_rope": list(AXES_DIM_ROPE),
+        "axes_lens": list(AXES_LENS),
+        "instruction_feature_configs": {
+            "instruction_feat_dim": 32,
+            "reduce_type": "mean",
+            "num_instruction_feature_layers": 1,
+        },
+        "prompt_tuning_configs": {"use_prompt_tuning": False},
+        "timestep_scale": 1.0,
+    }
+    config.update(overrides)
+    return config
+
+
+def _tiny_od_config(**overrides):
+    from vllm_omni.diffusion.data import TransformerConfig
+
+    return SimpleNamespace(
+        tf_model_config=TransformerConfig.from_dict(_tiny_tf_model_config(**overrides)),
+        dtype=torch.float32,
+    )
+
+
+def test_boogu_image_transformer_import():
+    from vllm_omni.diffusion.models.boogu_image import BooguImageTransformer2DModel
+
+    assert BooguImageTransformer2DModel is not None
+
+
+def test_real_rotary_emb_matches_complex_reference():
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import apply_rotary_emb
+
+    torch.manual_seed(0)
+    x = torch.randn(2, 7, NUM_HEADS, HEAD_DIM)
+    angles = torch.randn(2, 7, HEAD_DIM // 2)
+    rotary_emb = (
+        angles.cos().repeat_interleave(2, dim=-1),
+        angles.sin().repeat_interleave(2, dim=-1),
+    )
+
+    actual = apply_rotary_emb(x, rotary_emb)
+    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], HEAD_DIM // 2, 2))
+    freqs_cis = torch.polar(torch.ones_like(angles), angles).unsqueeze(2)
+    expected = torch.view_as_real(x_complex * freqs_cis).flatten(3).type_as(x)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_real_rotary_frequency_tables_are_real_and_repeated():
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageDoubleStreamRotaryPosEmbed,
+    )
+
+    freqs_real = BooguImageDoubleStreamRotaryPosEmbed.get_freqs_real(AXES_DIM_ROPE, AXES_LENS, theta=10000)
+
+    assert len(freqs_real) == len(AXES_DIM_ROPE)
+    for (freqs_cos, freqs_sin), axis_dim, axis_len in zip(freqs_real, AXES_DIM_ROPE, AXES_LENS):
+        assert freqs_cos.shape == (axis_len, axis_dim)
+        assert freqs_sin.shape == (axis_len, axis_dim)
+        assert not freqs_cos.is_complex()
+        assert not freqs_sin.is_complex()
+        torch.testing.assert_close(freqs_cos[..., ::2], freqs_cos[..., 1::2])
+        torch.testing.assert_close(freqs_sin[..., ::2], freqs_sin[..., 1::2])
+
+
+def test_real_rotary_frequency_tables_use_float32_on_npu(monkeypatch):
+    from vllm_omni.diffusion.models.boogu_image import boogu_image_transformer
+
+    npu_platform = SimpleNamespace(is_npu=lambda: True, supports_float64=lambda: True)
+    monkeypatch.setattr(boogu_image_transformer, "current_omni_platform", npu_platform)
+
+    freqs_real = boogu_image_transformer.BooguImageDoubleStreamRotaryPosEmbed.get_freqs_real(
+        AXES_DIM_ROPE, AXES_LENS, theta=10000
+    )
+
+    assert all(freqs.dtype == torch.float32 for pair in freqs_real for freqs in pair)
+
+
+def test_real_rotary_frequency_tables_use_float32_on_mps(monkeypatch):
+    from vllm_omni.diffusion.models.boogu_image import boogu_image_transformer
+
+    platform = SimpleNamespace(
+        is_npu=lambda: False,
+        supports_float64=lambda: True,
+    )
+    monkeypatch.setattr(boogu_image_transformer, "current_omni_platform", platform)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+
+    freqs_real = boogu_image_transformer.BooguImageDoubleStreamRotaryPosEmbed.get_freqs_real(
+        AXES_DIM_ROPE, AXES_LENS, theta=10000
+    )
+
+    assert all(freqs.dtype == torch.float32 for pair in freqs_real for freqs in pair)
+
+
+def test_single_stream_block_shape():
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageTransformerBlock,
+    )
+
+    block = BooguImageTransformerBlock(
+        dim=HIDDEN_SIZE,
+        num_attention_heads=NUM_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        multiple_of=MULTIPLE_OF,
+        ffn_dim_multiplier=None,
+        norm_eps=NORM_EPS,
+        modulation=True,
+    )
+    _randomize_parameters(block)
+
+    batch_size, seq_len = 1, 16
+    hidden_states = torch.randn(batch_size, seq_len, HIDDEN_SIZE)
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
+    rotary_emb = _identity_rotary_emb(batch_size, seq_len)
+    temb = torch.randn(batch_size, min(HIDDEN_SIZE, 1024))
+
+    out = block(hidden_states, attention_mask, rotary_emb, temb)
+    assert out.shape == hidden_states.shape
+    assert torch.isfinite(out).all()
+
+    with pytest.raises(ValueError, match="temb"):
+        block(hidden_states, attention_mask, rotary_emb, None)
+
+
+def test_single_stream_block_no_modulation():
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageTransformerBlock,
+    )
+
+    block = BooguImageTransformerBlock(
+        dim=HIDDEN_SIZE,
+        num_attention_heads=NUM_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        multiple_of=MULTIPLE_OF,
+        ffn_dim_multiplier=None,
+        norm_eps=NORM_EPS,
+        modulation=False,
+    )
+    _randomize_parameters(block)
+
+    batch_size, seq_len = 2, 8
+    hidden_states = torch.randn(batch_size, seq_len, HIDDEN_SIZE)
+    out = block(hidden_states, None, _identity_rotary_emb(batch_size, seq_len))
+    assert out.shape == hidden_states.shape
+    assert torch.isfinite(out).all()
+
+
+def test_double_stream_block_shape():
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageDoubleStreamTransformerBlock,
+    )
+
+    block = BooguImageDoubleStreamTransformerBlock(
+        dim=HIDDEN_SIZE,
+        num_attention_heads=NUM_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        multiple_of=MULTIPLE_OF,
+        ffn_dim_multiplier=None,
+        norm_eps=NORM_EPS,
+        modulation=True,
+    )
+    _randomize_parameters(block)
+
+    batch_size = 1
+    img_len, instruct_len = 16, 8
+    total_len = img_len + instruct_len
+
+    img_hidden_states = torch.randn(batch_size, img_len, HIDDEN_SIZE)
+    instruct_hidden_states = torch.randn(batch_size, instruct_len, HIDDEN_SIZE)
+    img_attention_mask = torch.ones(batch_size, img_len, dtype=torch.bool)
+    joint_attention_mask = torch.ones(batch_size, total_len, dtype=torch.bool)
+    image_rotary_emb = _identity_rotary_emb(batch_size, img_len)
+    rotary_emb = _identity_rotary_emb(batch_size, total_len)
+    temb = torch.randn(batch_size, min(HIDDEN_SIZE, 1024))
+
+    img_out, instruct_out = block(
+        img_hidden_states,
+        instruct_hidden_states,
+        img_attention_mask,
+        joint_attention_mask,
+        image_rotary_emb,
+        rotary_emb,
+        temb=temb,
+        encoder_seq_lengths=[instruct_len] * batch_size,
+        seq_lengths=[total_len] * batch_size,
+    )
+
+    assert img_out.shape == img_hidden_states.shape
+    assert instruct_out.shape == instruct_hidden_states.shape
+    assert torch.isfinite(img_out).all()
+    assert torch.isfinite(instruct_out).all()
+
+
+def test_transformer_instantiates():
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageTransformer2DModel,
+    )
+
+    model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
+
+    assert BooguImageTransformer2DModel._repeated_blocks == [
+        "BooguImageTransformerBlock",
+        "BooguImageContextRefinerTransformerBlock",
+        "BooguImageSingleStreamTransformerBlock",
+    ]
+    assert BooguImageTransformer2DModel._layerwise_offload_blocks_attrs == [
+        "single_stream_layers",
+        "double_stream_layers",
+    ]
+
+    assert len(model.noise_refiner) == 2
+    assert len(model.ref_image_refiner) == 2
+    assert len(model.context_refiner) == 2
+    assert len(model.double_stream_layers) == 2
+    assert len(model.single_stream_layers) == 2  # num_layers - num_double_stream_layers
+    assert model.image_index_embedding.shape == (5, HIDDEN_SIZE)
+    # patch_size^2 * in_channels -> hidden_size
+    assert model.x_embedder.in_features == 2 * 2 * 4
+    assert model.x_embedder.out_features == HIDDEN_SIZE
+
+
+@pytest.fixture
+def recording_quant_config():
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+    class RecordingQuantConfig(QuantizationConfig):
+        def __init__(self):
+            super().__init__()
+            self.prefixes: list[str] = []
+
+        @classmethod
+        def get_name(cls):
+            return "recording"
+
+        @classmethod
+        def get_supported_act_dtypes(cls):
+            return [torch.float32]
+
+        @classmethod
+        def get_min_capability(cls):
+            return 0
+
+        @classmethod
+        def get_config_filenames(cls):
+            return []
+
+        @classmethod
+        def from_config(cls, config):
+            return cls()
+
+        def get_quant_method(self, layer, prefix):
+            self.prefixes.append(prefix)
+            return UnquantizedLinearMethod()
+
+    return RecordingQuantConfig()
+
+
+def test_transformer_propagates_quant_config_and_prefix(recording_quant_config):
+    from vllm.model_executor.layers.linear import LinearBase
+
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageTransformer2DModel,
+    )
+
+    model = BooguImageTransformer2DModel(
+        od_config=_tiny_od_config(),
+        quant_config=recording_quant_config,
+        prefix="transformer",
+    )
+
+    configured_prefixes = set()
+    for name, module in model.named_modules():
+        if isinstance(module, LinearBase):
+            qualified_name = f"transformer.{name}"
+            assert module.prefix == qualified_name
+            assert module.quant_config is recording_quant_config
+            configured_prefixes.add(qualified_name)
+
+    assert set(recording_quant_config.prefixes) == configured_prefixes
+    assert {name for name, module in model.named_modules() if isinstance(module, torch.nn.Linear)} == {
+        "x_embedder",
+        "ref_image_patch_embedder",
+        "time_caption_embed.timestep_embedder.linear_1",
+        "time_caption_embed.timestep_embedder.linear_2",
+        "time_caption_embed.caption_embedder.1",
+    }
+
+
+def test_transformer_preprocesses_multiple_instruction_feature_layers():
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageTransformer2DModel,
+    )
+
+    instruction_feature_configs = {
+        "instruction_feat_dim": 32,
+        "reduce_type": "concat",
+        "num_instruction_feature_layers": 2,
+    }
+    model = BooguImageTransformer2DModel(
+        od_config=_tiny_od_config(instruction_feature_configs=instruction_feature_configs)
+    )
+    hidden_states = [torch.randn(1, 8, 32), torch.randn(1, 8, 32)]
+
+    processed = model.preprocess_instruction_hidden_states(hidden_states)
+
+    assert model.preprocessed_instruction_feat_dim == 64
+    assert processed.shape == (1, 8, 64)
+    assert torch.equal(processed, torch.cat(hidden_states, dim=-1))
+
+
+def test_transformer_validates_rope_dims():
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageTransformer2DModel,
+    )
+
+    with pytest.raises(ValueError, match="axes_dim_rope"):
+        BooguImageTransformer2DModel(od_config=_tiny_od_config(axes_dim_rope=[8, 8, 8]))
+
+
+def test_transformer_rejects_prompt_tuning():
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageTransformer2DModel,
+    )
+
+    with pytest.raises(NotImplementedError, match="[Pp]rompt tuning"):
+        BooguImageTransformer2DModel(od_config=_tiny_od_config(prompt_tuning_configs={"use_prompt_tuning": True}))
+
+
+_QKV_FANOUT = {
+    "to_qkv": ("to_q", "to_k", "to_v"),
+    "img_to_qkv": ("img_to_q", "img_to_k", "img_to_v"),
+    "instruct_to_qkv": ("instruct_to_q", "instruct_to_k", "instruct_to_v"),
+}
+
+
+def _native_to_checkpoint_weights(name: str, param: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+    """Inverse of ``load_weights`` remapping: native param -> diffusers weights.
+
+    The diffusers checkpoint stores fused projections as separate matrices, so a
+    single merged native param (QKV or FFN gate/up) fans out into several
+    checkpoint weights. Returns ``(diffusers_name, value)`` pairs whose values,
+    when fed through ``load_weights``, reassemble into the original ``param``.
+
+    - ``.to_out.<suffix>`` -> ``.to_out.0.<suffix>`` (diffusers ModuleList wrap).
+    - promoted joint-attention projections move back under ``.processor.``.
+    """
+    q_size = NUM_HEADS * HEAD_DIM
+    kv_size = NUM_KV_HEADS * HEAD_DIM
+
+    # Fused QKV projections split back into per-matrix q/k/v weights.
+    for token, (q_name, k_name, v_name) in _QKV_FANOUT.items():
+        marker = f".{token}."
+        if marker in name:
+            q, k, v = param[:q_size], param[q_size : q_size + kv_size], param[q_size + kv_size :]
+            results = []
+            for sub_name, value in ((q_name, q), (k_name, k), (v_name, v)):
+                ckpt_name = name.replace(marker, f".{sub_name}.")
+                if token != "to_qkv":
+                    # Joint-attention projections live under `.processor.` upstream.
+                    ckpt_name = ckpt_name.replace(".img_instruct_attn.", ".img_instruct_attn.processor.")
+                results.append((ckpt_name, value))
+            return results
+
+    # Fused FFN gate/up splits into linear_1 (gate) / linear_3 (input).
+    if ".gate_up_proj." in name:
+        inner = param.shape[0] // 2
+        return [
+            (name.replace(".gate_up_proj.", ".linear_1."), param[:inner]),
+            (name.replace(".gate_up_proj.", ".linear_3."), param[inner:]),
+        ]
+
+    # Default: 1:1 with the existing diffusers name promotions.
+    if ".to_out." in name:
+        name = name.replace(".to_out.", ".to_out.0.")
+    for proj in ("instruct_out", "img_out"):
+        token = f".img_instruct_attn.{proj}."
+        if token in name:
+            name = name.replace(token, f".img_instruct_attn.processor.{proj}.")
+            break
+    return [(name, param)]
+
+
+def test_transformer_exposes_stacked_params_mapping():
+    """The packed -> sub-layer mapping must be discoverable from the module tree.
+
+    ``diffusion/lora/loader.py`` and the quantized weight loaders read
+    ``stacked_params_mapping`` off the model, so it has to exist before (and
+    independently of) ``load_weights``.
+    """
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        _BOOGU_STACKED_PARAMS_MAPPING,
+        BooguImageTransformer2DModel,
+    )
+
+    model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
+
+    assert tuple(model.stacked_params_mapping) == _BOOGU_STACKED_PARAMS_MAPPING
+    # A per-instance copy, so consumers cannot mutate the module constant.
+    assert model.stacked_params_mapping is not _BOOGU_STACKED_PARAMS_MAPPING
+
+    # Every entry is a (param, shard, shard_id) triple.
+    for param_name, shard_name, shard_id in model.stacked_params_mapping:
+        assert param_name.startswith(".") and shard_name.startswith(".")
+        assert shard_id in {"q", "k", "v", 0, 1}
+
+    # The mapping targets exactly the fused projections this port creates.
+    mapped_leaves = {param.strip(".").split(".")[-1] for param, _, _ in model.stacked_params_mapping}
+    assert mapped_leaves == {"to_qkv", "img_to_qkv", "instruct_to_qkv", "gate_up_proj"}
+
+
+def test_transformer_load_weights_round_trip():
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageTransformer2DModel,
+    )
+
+    model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
+    native_params = dict(model.named_parameters())
+
+    # Build synthetic diffusers-named weights. Fused native projections fan out
+    # into the separate matrices the diffusers checkpoint stores.
+    expected: dict[str, torch.Tensor] = {}
+    checkpoint_weights: dict[str, torch.Tensor] = {}
+    for native_name, param in native_params.items():
+        full = torch.randn_like(param)
+        expected[native_name] = full
+        for ckpt_name, value in _native_to_checkpoint_weights(native_name, full):
+            checkpoint_weights[ckpt_name] = value
+
+    # Every checkpoint name is unique; merged params fan out to >=1 weight.
+    assert len(checkpoint_weights) >= len(native_params)
+
+    loaded = model.load_weights(list(checkpoint_weights.items()))
+
+    # No missing / unexpected parameters.
+    assert loaded == set(native_params.keys())
+
+    # Values landed on the right parameters (TP=1: weight_loader copies verbatim;
+    # fused shards are placed at their q/k/v / gate/up offsets).
+    reloaded = dict(model.named_parameters())
+    for native_name in native_params:
+        assert torch.allclose(reloaded[native_name], expected[native_name])
+
+
+def test_transformer_load_weights_rejects_partial_fused_params():
+    """A fused parameter must not count as loaded until all its shards arrive.
+
+    The loader compares parameter *names*, so reporting ``to_qkv`` complete
+    after a single ``to_q`` would let a checkpoint carrying only ``to_q`` start
+    up with the ``k``/``v`` slices left uninitialized.
+    """
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageTransformer2DModel,
+    )
+
+    model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
+    native_params = dict(model.named_parameters())
+
+    complete_name = "noise_refiner.0.attn.to_qkv.weight"
+    partial_name = "noise_refiner.0.feed_forward.gate_up_proj.weight"
+    assert complete_name in native_params
+    assert partial_name in native_params
+
+    weights = list(_native_to_checkpoint_weights(complete_name, native_params[complete_name]))
+    # Only the gate half of the FFN, so its fused parameter stays incomplete.
+    gate_ckpt, gate_value = _native_to_checkpoint_weights(partial_name, native_params[partial_name])[0]
+    weights.append((gate_ckpt, gate_value))
+
+    loaded = model.load_weights(weights)
+
+    assert complete_name in loaded
+    assert partial_name not in loaded
+
+
+def test_transformer_load_weights_warns_for_unexpected_and_unloaded():
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageTransformer2DModel,
+    )
+
+    # vllm_omni's logger hierarchy hangs off vLLM's `vllm` logger, which sets
+    # propagate=False, so records never reach the root logger that pytest's
+    # caplog listens on. Capture at the emitting logger instead.
+    messages: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            messages.append(record.getMessage())
+
+    log = logging.getLogger("vllm_omni.diffusion.models.boogu_image.boogu_image_transformer")
+    handler = _Capture(level=logging.WARNING)
+    log.addHandler(handler)
+    try:
+        model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
+        native_params = dict(model.named_parameters())
+        # A non-fused parameter, so one checkpoint entry loads it completely.
+        loaded_name = "x_embedder.weight"
+        assert loaded_name in native_params
+        (checkpoint_name, checkpoint_value), *_ = _native_to_checkpoint_weights(loaded_name, native_params[loaded_name])
+        checkpoint_value = torch.randn_like(checkpoint_value)
+
+        loaded = model.load_weights(
+            [
+                (checkpoint_name, checkpoint_value),
+                ("unexpected.weight", torch.ones(1)),
+            ]
+        )
+    finally:
+        log.removeHandler(handler)
+
+    text = "\n".join(messages)
+    assert loaded == {loaded_name}
+    assert "Skipping unexpected checkpoint weight unexpected.weight" in text
+    assert "Model parameters not loaded from checkpoint" in text
+    assert next(name for name in native_params if name != loaded_name) in text
+
+
+def test_transformer_forward_t2i_shape():
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageDoubleStreamRotaryPosEmbed,
+        BooguImageTransformer2DModel,
+    )
+
+    model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
+    _randomize_parameters(model)
+    model.eval()
+
+    batch_size = 1
+    in_channels = 4
+    latent_h = latent_w = 8  # multiples of patch_size (2)
+    instruct_len = 8
+    instruction_feat_dim = 32  # matches _tiny_tf_model_config
+
+    latents = torch.randn(batch_size, in_channels, latent_h, latent_w)
+    timestep = torch.full((batch_size,), 0.5)
+    instruction_hidden_states = torch.randn(batch_size, instruct_len, instruction_feat_dim)
+    instruction_attention_mask = torch.ones(batch_size, instruct_len, dtype=torch.bool)
+    freqs_real = BooguImageDoubleStreamRotaryPosEmbed.get_freqs_real(model.axes_dim_rope, model.axes_lens, theta=10000)
+
+    with torch.no_grad():
+        out = model(latents, timestep, instruction_hidden_states, freqs_real, instruction_attention_mask)
+
+    assert out.shape == (batch_size, model.out_channels, latent_h, latent_w)
+    assert torch.isfinite(out).all()
+
+
+def test_transformer_forward_ti2i_shape():
+    """Editing path: a non-empty ``ref_image_hidden_states`` exercises the
+    reference-image patch embedder + refiner and must not change the output
+    shape (the output tracks the noise-latent dimensions)."""
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageDoubleStreamRotaryPosEmbed,
+        BooguImageTransformer2DModel,
+    )
+
+    model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
+    _randomize_parameters(model)
+    model.eval()
+
+    batch_size = 1
+    in_channels = 4
+    latent_h = latent_w = 8
+    ref_h, ref_w = 6, 10  # a differently-sized reference latent
+    instruct_len = 8
+    instruction_feat_dim = 32
+
+    latents = torch.randn(batch_size, in_channels, latent_h, latent_w)
+    timestep = torch.full((batch_size,), 0.5)
+    instruction_hidden_states = torch.randn(batch_size, instruct_len, instruction_feat_dim)
+    instruction_attention_mask = torch.ones(batch_size, instruct_len, dtype=torch.bool)
+    freqs_real = BooguImageDoubleStreamRotaryPosEmbed.get_freqs_real(model.axes_dim_rope, model.axes_lens, theta=10000)
+
+    # One sample, one reference image (Boogu editing supports a single ref).
+    ref_image_hidden_states = [[torch.randn(in_channels, ref_h, ref_w)]]
+
+    with torch.no_grad():
+        out = model(
+            latents,
+            timestep,
+            instruction_hidden_states,
+            freqs_real,
+            instruction_attention_mask,
+            ref_image_hidden_states=ref_image_hidden_states,
+        )
+
+    assert out.shape == (batch_size, model.out_channels, latent_h, latent_w)
+    assert torch.isfinite(out).all()
+
+
+# ---------------------------------------------------------------------------
+# The three tests below are for the fused qk-norm+RoPE kernel's wiring into
+# this transformer: the packed-table layout conversion, the fused path against
+# the previous eager chain, and the fallback when no packed table is present.
+# They need CUDA (the module-level marks are CPU; these add the cuda mark and
+# skip on CPU-only runners) and real Boogu geometry rather than the mock dims
+# above.
+# ---------------------------------------------------------------------------
+
+_FUSED_HEAD_DIM = 120
+_FUSED_Q_HEADS = 28
+_FUSED_KV_HEADS = 7
+_FUSED_EPS = 1e-5
+
+
+def _fused_rotary_pair(tokens: int):
+    theta = torch.randn(1, tokens, _FUSED_HEAD_DIM // 2, device="cuda", dtype=torch.float32)
+    return (
+        torch.cos(theta).repeat_interleave(2, dim=-1),
+        torch.sin(theta).repeat_interleave(2, dim=-1),
+    )
+
+
+def _fused_norms():
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.layernorm import RMSNorm
+
+    with set_current_vllm_config(VllmConfig()):
+        norm_q = RMSNorm(_FUSED_HEAD_DIM, eps=_FUSED_EPS).cuda().to(torch.bfloat16)
+        norm_k = RMSNorm(_FUSED_HEAD_DIM, eps=_FUSED_EPS).cuda().to(torch.bfloat16)
+    with torch.no_grad():
+        norm_q.weight.copy_(torch.randn(_FUSED_HEAD_DIM))
+        norm_k.weight.copy_(torch.randn(_FUSED_HEAD_DIM))
+    return norm_q, norm_k
+
+
+def _operand_ulp_bound(x, weight, cos, sin):
+    """One bf16 rounding of a normalized operand, propagated through RoPE."""
+    import torch.nn.functional as F
+
+    n = F.rms_norm(x, (_FUSED_HEAD_DIM,), weight, _FUSED_EPS).float().abs()
+    c = cos[..., ::2].float().abs().unsqueeze(2)
+    s = sin[..., ::2].float().abs().unsqueeze(2)
+    even_mag = n[..., ::2] * c + n[..., 1::2] * s
+    odd_mag = n[..., ::2] * s + n[..., 1::2] * c
+    return 2.0**-6 * torch.stack((even_mag, odd_mag), dim=-1).flatten(-2) + 1e-6
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_packed_rope_table_layout(monkeypatch):
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        _with_packed_rope_table,
+    )
+
+    monkeypatch.delenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", raising=False)
+    torch.manual_seed(0)
+    tokens = 2311  # above _FUSED_MIN_TOKENS
+    cos, sin = _fused_rotary_pair(tokens)
+    out = _with_packed_rope_table((cos, sin))
+    assert len(out) == 3
+    assert out[0] is cos and out[1] is sin
+    packed = out[2]
+    assert packed.shape == (tokens, _FUSED_HEAD_DIM)
+    assert packed.dtype == torch.float32 and packed.is_contiguous()
+    half = _FUSED_HEAD_DIM // 2
+    assert torch.equal(packed[:, :half], cos[0, :, ::2])
+    assert torch.equal(packed[:, half:], sin[0, :, ::2])
+    # Below _FUSED_MIN_TOKENS the tuple passes through unchanged (host-bound
+    # regime: the fused path would cost more than it saves).
+    short = _with_packed_rope_table(_fused_rotary_pair(17))
+    assert len(short) == 2
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_fused_qk_norm_rope_matches_eager_chain():
+    """The fused path vs the previous eager chain at real Boogu shapes.
+
+    Every element must sit within one bf16 ulp of a normalized operand
+    propagated through the rotation (the two paths legitimately differ by
+    single- vs double-rounding of the norm's weight multiply).
+    """
+    from vllm.triton_utils import HAS_TRITON
+
+    if not HAS_TRITON:
+        pytest.skip("Triton required")
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        _qk_norm_rope,
+        _with_packed_rope_table,
+    )
+
+    torch.manual_seed(0)
+    norm_q, norm_k = _fused_norms()
+    q = torch.randn(1, 4139, _FUSED_Q_HEADS, _FUSED_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 4139, _FUSED_KV_HEADS, _FUSED_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    cos, sin = _fused_rotary_pair(4139)
+    with_table = _with_packed_rope_table((cos, sin))
+
+    fused = _qk_norm_rope(q, k, norm_q, norm_k, with_table, torch.bfloat16)
+    eager = _qk_norm_rope(q, k, norm_q, norm_k, (cos, sin), torch.bfloat16)
+    for fused_t, eager_t, x, w in zip(fused, eager, (q, k), (norm_q.weight, norm_k.weight)):
+        bound = _operand_ulp_bound(x, w, cos, sin)
+        diff = (fused_t.float() - eager_t.float()).abs()
+        assert (diff <= bound).all(), "fused path beyond one operand ulp of the eager chain"
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_fallback_with_no_packed_table():
+    """Without a packed table the helper is bit-exact to the old chain."""
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        _qk_norm_rope,
+        apply_rotary_emb,
+    )
+
+    torch.manual_seed(0)
+    norm_q, norm_k = _fused_norms()
+    q = torch.randn(1, 64, _FUSED_Q_HEADS, _FUSED_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 64, _FUSED_KV_HEADS, _FUSED_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    cos, sin = _fused_rotary_pair(64)
+
+    out_q, out_k = _qk_norm_rope(q, k, norm_q, norm_k, (cos, sin), torch.bfloat16)
+    ref_q = apply_rotary_emb(norm_q(q), (cos, sin)).to(torch.bfloat16)
+    ref_k = apply_rotary_emb(norm_k(k), (cos, sin)).to(torch.bfloat16)
+    assert torch.equal(out_q, ref_q)
+    assert torch.equal(out_k, ref_k)
+
+
+def test_packed_rope_table_env_override(monkeypatch):
+    """VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS steers the packing gate: 0 packs
+    even a 43-token table, a huge value leaves a 4139-token table untouched,
+    unset keeps the 2048 default routing."""
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        _with_packed_rope_table,
+    )
+
+    env = "VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS"
+    short, long = _identity_rotary_emb(1, 43), _identity_rotary_emb(1, 4139)
+
+    monkeypatch.setenv(env, "0")
+    assert len(_with_packed_rope_table(short)) == 3
+    monkeypatch.setenv(env, str(10**9))
+    assert _with_packed_rope_table(long) is long
+    monkeypatch.delenv(env)
+    assert len(_with_packed_rope_table(long)) == 3
+    assert _with_packed_rope_table(short) is short

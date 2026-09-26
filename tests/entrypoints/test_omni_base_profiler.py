@@ -1,8 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for OmniBase and AsyncOmni profiler methods."""
 
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
 
 import pytest
+from pytest_mock import MockerFixture
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -11,31 +15,33 @@ class TestOmniBaseProfiler:
     """Test suite for OmniBase profiler methods (start_profile, stop_profile)."""
 
     @pytest.fixture
-    def mock_engine(self):
+    def mock_engine(self, mocker: MockerFixture):
         """Create a mock AsyncOmniEngine for testing."""
-        engine = MagicMock()
+        engine = mocker.MagicMock()
         engine.num_stages = 3
         engine.is_alive.return_value = True
-        engine.default_sampling_params_list = [MagicMock() for _ in range(3)]
-        engine.get_stage_metadata.side_effect = lambda i: {
-            "final_output_type": "text" if i == 0 else "audio",
-            "final_output": True,
-        }
+        engine.default_sampling_params_list = [mocker.MagicMock() for _ in range(3)]
+        engine.get_stage_metadata.side_effect = lambda i: SimpleNamespace(
+            final_output_type="text" if i == 0 else "audio",
+            final_output=True,
+        )
         engine.collective_rpc.return_value = [None, None, None]
         return engine
 
     @pytest.fixture
-    def omni_base_instance(self, mock_engine):
+    def omni_base_instance(self, mock_engine, mocker: MockerFixture):
         """Create an OmniBase instance with mocked dependencies."""
-        with (
-            patch("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", return_value=mock_engine),
-            patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", side_effect=lambda x: x),
-            patch("vllm_omni.entrypoints.omni_base.weakref.finalize"),
-        ):
-            from vllm_omni.entrypoints.omni_base import OmniBase
+        from vllm_omni.entrypoints.omni_base import OmniBase
 
-            instance = OmniBase(model="test-model")
-            return instance
+        # ``OmniBase`` builds its engine through the ``_create_engine`` seam that
+        # ``AsyncOmni`` / ``DuplexOmni`` implement; there is no module-level
+        # engine class to patch any more.
+        mocker.patch.object(OmniBase, "_create_engine", return_value=mock_engine)
+        mocker.patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", side_effect=lambda x: x)
+        mocker.patch("vllm_omni.entrypoints.omni_base.weakref.finalize")
+
+        instance = OmniBase(model="test-model")
+        return instance
 
     def test_start_profile_calls_collective_rpc(self, omni_base_instance, mock_engine):
         """Test that start_profile calls collective_rpc with correct arguments."""
@@ -46,6 +52,20 @@ class TestOmniBaseProfiler:
             args=(True, None),
             stage_ids=None,
         )
+
+    def test_removed_diffusion_batch_size_fails_loudly(self, mock_engine, mocker: MockerFixture):
+        """Legacy diffusion_batch_size callers receive an actionable error."""
+        from vllm_omni.entrypoints.omni_base import OmniBase
+
+        # ``OmniBase`` builds its engine through the ``_create_engine`` seam that
+        # ``AsyncOmni`` / ``DuplexOmni`` implement; there is no module-level
+        # engine class to patch any more.
+        mocker.patch.object(OmniBase, "_create_engine", return_value=mock_engine)
+        mocker.patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", side_effect=lambda x: x)
+        mocker.patch("vllm_omni.entrypoints.omni_base.weakref.finalize")
+
+        with pytest.raises(TypeError, match="diffusion_batch_size.*max_num_seqs"):
+            OmniBase(model="test-model", diffusion_batch_size=8)
 
     def test_start_profile_with_prefix(self, omni_base_instance, mock_engine):
         """Test that start_profile passes profile_prefix to collective_rpc."""

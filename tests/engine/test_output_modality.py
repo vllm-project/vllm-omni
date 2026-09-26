@@ -14,7 +14,7 @@ import torch
 # ── Load modules without triggering vllm_omni.__init__ ─────────────
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-_ENGINE_DIR = Path(__file__).resolve().parents[2] / "vllm_omni" / "engine"
+_OUTPUTS_DIR = Path(__file__).resolve().parents[2] / "vllm_omni" / "outputs"
 
 
 def _load_module(name: str, filepath: Path):
@@ -26,17 +26,22 @@ def _load_module(name: str, filepath: Path):
 
 
 _om_mod = _load_module(
-    "vllm_omni.engine.output_modality",
-    _ENGINE_DIR / "output_modality.py",
+    "vllm_omni.outputs.output_modality",
+    _OUTPUTS_DIR / "output_modality.py",
+)
+_load_module(
+    "vllm_omni.outputs.utils",
+    _OUTPUTS_DIR / "utils.py",
 )
 _mm_mod = _load_module(
-    "vllm_omni.engine.mm_outputs",
-    _ENGINE_DIR / "mm_outputs.py",
+    "vllm_omni.outputs.mm_outputs",
+    _OUTPUTS_DIR / "mm_outputs.py",
 )
 
 OutputModality = _om_mod.OutputModality
 TensorAccumulationStrategy = _om_mod.TensorAccumulationStrategy
 get_accumulation_strategy = _om_mod.get_accumulation_strategy
+register_key_accumulation_strategy = _om_mod.register_key_accumulation_strategy
 MultimodalPayload = _mm_mod.MultimodalPayload
 MultimodalCompletionOutput = _mm_mod.MultimodalCompletionOutput
 
@@ -81,7 +86,7 @@ def test_multimodal_payload_and_completion_output():
     assert p is not None
     assert "waveform" in p.tensors and torch.equal(p.primary_tensor, data["waveform"])
     assert p.metadata["sample_rate"] == 16000
-    assert not p.is_empty and len(p) == 1
+    assert not p.is_empty and len(p) == 2  # 1 tensor + 1 metadata
 
     # None/empty returns None
     assert MultimodalPayload.from_dict(None) is None
@@ -125,7 +130,7 @@ def test_output_modality_printed_examples(capsys):
     print(f"    tensors keys : {list(p.tensors.keys())}")
     print(f"    primary_tensor: shape={p.primary_tensor.shape}, dtype={p.primary_tensor.dtype}")
     print(f"    metadata      : {p.metadata}")
-    print(f"    is_empty={p.is_empty}, len={len(p)}")
+    print(f"    is_empty={p.is_empty}, len={len(p)}")  # len = tensors + metadata
     print(f"  from_dict(None) -> {MultimodalPayload.from_dict(None)}")
     print(f"  from_dict({{}})   -> {MultimodalPayload.from_dict({})}")
 
@@ -152,3 +157,90 @@ def test_output_modality_printed_examples(capsys):
     captured = capsys.readouterr()
     assert "OutputModality Parsing" in captured.out
     assert "MultimodalPayload" in captured.out
+
+
+def test_get_accumulation_strategy_key_override_precedence():
+    """A registered per-key override wins over the modality-wide default;
+    any other key under the same modality keeps using that default."""
+    assert get_accumulation_strategy(OutputModality.AUDIO, "unregistered.key") == TensorAccumulationStrategy.CONCAT_LAST
+
+    register_key_accumulation_strategy("__test_override__.frames", TensorAccumulationStrategy.CONCAT_DIM0)
+    assert (
+        get_accumulation_strategy(OutputModality.AUDIO, "__test_override__.frames")
+        == TensorAccumulationStrategy.CONCAT_DIM0
+    )
+    # A plain waveform key under the same AUDIO modality is unaffected.
+    assert get_accumulation_strategy(OutputModality.AUDIO, "waveform") == TensorAccumulationStrategy.CONCAT_LAST
+    assert get_accumulation_strategy(OutputModality.AUDIO) == TensorAccumulationStrategy.CONCAT_LAST
+
+
+def _talker_codec_frame_payload(audio_key: str, ref_key: str) -> MultimodalPayload:
+    """Synthetic stand-in for a TTS talker's accumulated per-step output.
+
+    ``audio_key`` grows one ``[1, num_codebooks]`` row per decode step on top
+    of a ``[5, num_codebooks]`` prefill block (Qwen3-TTS's ``codes.audio``);
+    ``ref_key`` re-emits the same constant ``[100, num_codebooks]``
+    reference-context matrix unchanged at every step (Qwen3-TTS's
+    ``codes.ref``). Neither is a waveform chunk.
+    """
+    payload = MultimodalPayload()
+    payload.tensors[audio_key] = [
+        torch.zeros(5, 16),
+        torch.full((1, 16), 1.0),
+        torch.full((1, 16), 2.0),
+        torch.full((1, 16), 3.0),
+    ]
+    ref_block = torch.arange(100 * 16, dtype=torch.float32).reshape(100, 16)
+    payload.tensors[ref_key] = [ref_block.clone(), ref_block.clone(), ref_block.clone()]
+    return payload
+
+
+def test_consolidate_tensors_default_audio_strategy_corrupts_codec_frame_keys():
+    """Reproduces both failure modes of forcing codec-frame keys through the
+    AUDIO modality's waveform-tuned default (CONCAT_LAST) with no per-key
+    override registered: the audio-frames key's dim-0 growth makes
+    CONCAT_LAST's dim=-1 concat raise (mismatched dim 0), which the
+    flatten-chunks fallback turns into a 1-D blob instead of the intended
+    ``[8, 16]``; the ref-frames key's matching last dim lets CONCAT_LAST
+    "succeed" by silently concatenating three identical ``[100, 16]`` blocks
+    into ``[100, 48]`` instead of keeping a single copy.
+    """
+    payload = _talker_codec_frame_payload("unregistered.codes.audio", "unregistered.codes.ref")
+
+    payload.consolidate_tensors(OutputModality.AUDIO)
+
+    assert tuple(payload.tensors["unregistered.codes.audio"].shape) != (8, 16)
+    assert tuple(payload.tensors["unregistered.codes.ref"].shape) == (100, 48)
+
+
+def test_consolidate_tensors_with_qwen3_tts_key_overrides_is_correct():
+    """With the per-key overrides Qwen3-TTS's pipeline module registers
+    (``codes.audio`` -> CONCAT_DIM0, ``codes.ref`` -> REPLACE), both keys
+    consolidate correctly under the AUDIO modality despite not being
+    waveform chunks."""
+    register_key_accumulation_strategy("codes.audio", TensorAccumulationStrategy.CONCAT_DIM0)
+    register_key_accumulation_strategy("codes.ref", TensorAccumulationStrategy.REPLACE)
+
+    payload = _talker_codec_frame_payload("codes.audio", "codes.ref")
+    expected_ref = payload.tensors["codes.ref"][0]
+
+    payload.consolidate_tensors(OutputModality.AUDIO)
+
+    assert tuple(payload.tensors["codes.audio"].shape) == (8, 16)
+    assert tuple(payload.tensors["codes.ref"].shape) == (100, 16)
+    assert torch.equal(payload.tensors["codes.ref"], expected_ref)
+
+
+def test_consolidate_tensors_raises_with_key_name_instead_of_silently_keeping_last():
+    """A concat failure under a non-CONCAT_LAST strategy must be surfaced
+    with the offending key name rather than resolved by silently keeping
+    only the last chunk. Previously the except-branch only special-cased
+    the literal key ``"audio"``, so any other mismatched key (e.g. a
+    codec-frame key routed to CONCAT_DIM0) was corrupted instead of
+    failing loudly.
+    """
+    payload = MultimodalPayload()
+    payload.tensors["latent.frames"] = [torch.zeros(2, 8), torch.zeros(3, 9)]
+
+    with pytest.raises(RuntimeError, match="latent.frames"):
+        payload.consolidate_tensors(OutputModality.LATENT)

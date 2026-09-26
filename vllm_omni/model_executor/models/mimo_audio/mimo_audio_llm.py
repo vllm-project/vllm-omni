@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2025 Xiaomi Corporation.
 import logging
 import threading
@@ -50,10 +53,17 @@ from vllm.multimodal.processing import (
     PromptUpdate,
     PromptUpdateDetails,
 )
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema
 
 from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import MiMoAudioConfig
+from vllm_omni.model_executor.models.model_local_kv import (
+    ModelLocalKVScope,
+    ModelLocalKVSpec,
+    RowDriver,
+    spec_from_hf_config,
+)
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
@@ -150,7 +160,6 @@ class MiMoLocalDecodeBuffer:
         dtype = next(model.hidden_states_downcast.parameters()).dtype
         hidden_size = model.local_config.hidden_size
 
-        self.pool = torch.cuda.graph_pool_handle()
         self.input_tensor = torch.zeros((max_batch_size, 1, hidden_size), dtype=dtype, device=device)
         self.sampler = MiMoLocalSamplerTensor(
             temperature=torch.ones(max_batch_size, dtype=torch.float32, device=device),
@@ -231,7 +240,7 @@ class MiMoLocalDecodeCudaGraph:
         cuda_graph = torch.cuda.CUDAGraph()
         if eager_run_first:
             model.base_local_forward(input_tensor, local_sampler=sampler)
-        with torch.cuda.graph(cuda_graph, buffer.pool):
+        with torch.cuda.graph(cuda_graph, pool=current_platform.get_global_graph_pool()):
             output_tensor = model.base_local_forward(input_tensor, local_sampler=sampler)
 
         return cls(
@@ -263,7 +272,6 @@ class MiMoInputLocalTransformerBuffer:
         hidden_size = model.input_local_config.hidden_size
         group_size = model.group_size
 
-        self.pool = torch.cuda.graph_pool_handle()
         self.input_tensor = torch.zeros((max_batch_size, group_size, hidden_size), dtype=dtype, device=device)
         self.lock = threading.Lock()
 
@@ -311,7 +319,7 @@ class MiMoInputLocalTransformerCudaGraph:
             out = model.input_local_transformer(inputs_embeds=input_tensor, return_dict=True, is_causal=False)
             _ = out.last_hidden_state
 
-        with torch.cuda.graph(cuda_graph, buffer.pool):
+        with torch.cuda.graph(cuda_graph, pool=current_platform.get_global_graph_pool()):
             out = model.input_local_transformer(inputs_embeds=input_tensor, return_dict=True, is_causal=False)
             output_tensor = out.last_hidden_state
 
@@ -388,35 +396,25 @@ class MimoAudioDummyInputsBuilder(BaseDummyInputsBuilder[MimoAudioProcessingInfo
 
 
 class MimoAudioMultiModalProcessor(BaseMultiModalProcessor[MimoAudioProcessingInfo]):
-    def _call_hf_processor(
+    def _preprocess_hf_mm_data(
         self,
-        prompt: str,
         mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, Any],
-        tok_kwargs: Mapping[str, object],
-    ) -> BatchFeature:
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> tuple[Mapping[str, object], Mapping[str, object]]:
+        mm_data, hf_processor_mm_kwargs = super()._preprocess_hf_mm_data(
+            mm_data,
+            hf_processor_mm_kwargs,
+        )
+        mm_data = dict(mm_data)
         audios = mm_data.pop("audios", [])
         if audios:
             mm_data["audio"] = audios
-
-        # Text-only input not supported in composite processor
-        if not mm_data.get("audio", []):
-            prompt_ids = self.info.get_tokenizer().encode(prompt)
-            prompt_ids = self._apply_hf_processor_tokens_only(prompt_ids)
-            return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="pt")
-
-        feature_extractor = self.info.get_feature_extractor(**mm_kwargs)
-        mm_kwargs = dict(
-            **mm_kwargs,
-            sampling_rate=feature_extractor.sampling_rate,
-        )
-
-        return super()._call_hf_processor(
-            prompt=prompt,
-            mm_data=mm_data,
-            mm_kwargs=mm_kwargs,
-            tok_kwargs=tok_kwargs,
-        )
+            feature_extractor = self.info.get_feature_extractor(**hf_processor_mm_kwargs)
+            hf_processor_mm_kwargs = {
+                **hf_processor_mm_kwargs,
+                "sampling_rate": feature_extractor.sampling_rate,
+            }
+        return mm_data, hf_processor_mm_kwargs
 
     def _get_mm_fields_config(
         self,
@@ -478,7 +476,7 @@ class MimoAudioMultiModalProcessor(BaseMultiModalProcessor[MimoAudioProcessingIn
         return [
             PromptReplacement(
                 modality="audio",
-                target=audio_token,
+                target=[audio_token_id],
                 replacement=get_replacement_mimo_audio,
             )
         ]
@@ -520,13 +518,18 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
 
         vllm_config.model_config.hf_config = self.config
 
-        # Configure MRoPE parameters for multimodal rotary embeddings
+        # Configure MRoPE parameters for multimodal rotary embeddings.
+        # NOTE: In transformers >=5.x, `rope_scaling` is a property alias whose setter *replaces*
+        # `rope_parameters` wholesale. If we assign `rope_scaling = mrope_config` first, any
+        # pre-existing `rope_theta` key inside `rope_parameters` (standardized from the checkpoint's
+        # top-level `rope_theta`) is silently dropped, which breaks `Qwen2RotaryEmbedding`'s
+        # `compute_default_rope_parameters` (it reads `config.rope_parameters["rope_theta"]`).
+        # Update `rope_parameters` in-place instead so the standardized `rope_theta` is preserved.
         mrope_config = {
             "mrope_section": [16, 24, 24],
             "rope_type": "default",
             "type": "default",
         }
-        setattr(vllm_config.model_config.hf_config, "rope_scaling", mrope_config)
         vllm_config.model_config.hf_config.rope_parameters.update(mrope_config)
 
         self.model = init_vllm_registered_model(
@@ -537,8 +540,29 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             architectures=["Qwen2ForCausalLM"],
         )
 
+        # vLLM 0.28 turned SupportsPP.make_empty_intermediate_tensors from a
+        # method into a bare annotation, so declaring SupportsPP no longer
+        # supplies one. Delegate to the inner model, as the other omni talkers do.
+        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
+
         self.device = current_omni_platform.get_torch_device()
+        # global_sampler MUST stay greedy (do_sample=False) so its token decision
+        # matches vLLM's external sampler (SamplingParams temperature=0.0).  Both
+        # run argmax on the same logits, so they always agree on whether the next
+        # token is <|empty|> (audio step) or a real text token.  Enabling
+        # do_sample=True here without also routing vLLM's sampled token back into
+        # this gate check would cause the two to diverge and corrupt KV-cache state.
         self.global_sampler = MiMoSampler(do_sample=False, temperature=0.6, top_p=0.95)
+        # local_sampler drives audio-code generation inside local_forward.  Keep
+        # it greedy (do_sample=False) so the CUDA-graph path (use_cg gate in
+        # local_forward) stays active AND so the audio codes — and therefore the
+        # `new_audio_emb` written into `_cached_new_audio_emb_by_req` — are
+        # deterministic.  That cache is fed back into `inputs_embeds` on the next
+        # decode step (see `_prepare_multimodal_embeddings_with_cache`), so any
+        # stochasticity here propagates into subsequent *text* logits via the
+        # audio-embedding feedback path and destabilises text continuations even
+        # though `global_sampler` is greedy.  Voice diversity must be tackled in
+        # the codec/vocoder path (stage-1), not by randomising local_sampler.
         self.local_sampler = MiMoSampler(do_sample=False, temperature=0.9, top_p=0.95)
         self.removed_tokens = None
 
@@ -726,6 +750,67 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
     def get_language_model(self) -> torch.nn.Module:
         return self.model
 
+    def model_local_kv_specs(self) -> list[ModelLocalKVSpec]:
+        """Declare the local transformer's decode cache and its graph copies.
+
+        The cache is created per call inside ``base_local_forward`` and is
+        bounded by the decode loop, not by sequence length: the loop runs
+        ``group_size + max(delay_pattern)`` steps regardless of how long the
+        utterance is.
+
+        The second entry is the one that matters. ``base_local_forward`` runs
+        inside ``torch.cuda.graph`` during capture, so each captured bucket
+        leaves a cache's worth of tensors pinned in the graph pool for the
+        process lifetime. There is no Python object left to inspect -- the
+        cache is a local in the captured frame -- so the width comes from the
+        buckets that captured successfully, which is why it reads
+        ``local_forward_cg_by_bs`` rather than MIMO_CUDAGRAPH_BATCH_SIZES: a
+        bucket whose capture raised is logged and skipped.
+
+        Both entries are declared, and summing them over-states a single step:
+        a given call either replays a captured bucket or runs eagerly, never
+        both. The graph pool is resident regardless, so the sum is the right
+        ceiling for the process and the wrong number for one request.
+        """
+        delay_iters = self.group_size + max(self.delay_pattern)
+        dtype = next(self.local_transformer.parameters()).dtype
+        bound = f"group_size({self.group_size}) + max(delay_pattern)({max(self.delay_pattern)})"
+        specs = [
+            spec_from_hf_config(
+                self.local_config,
+                name="local_transformer",
+                dtype=dtype,
+                physical_capacity_positions=delay_iters,
+                capacity_source=bound,
+                scope=ModelLocalKVScope.INVOCATION,
+                # One cache, B rows wide -- not B caches. base_local_forward
+                # builds a single DynamicCache whose batch dimension is the
+                # number of requests in the group.
+                rows=RowDriver.MAX_NUM_SEQS,
+                allocation_note="one batched allocation per eager call; graph replay uses the pool entry instead",
+            )
+        ]
+        captured_rows = sum(self.local_forward_cg_by_bs)
+        if captured_rows:
+            specs.append(
+                spec_from_hf_config(
+                    self.local_config,
+                    name="local_transformer_graph_pool",
+                    dtype=dtype,
+                    physical_capacity_positions=delay_iters,
+                    capacity_source=bound,
+                    scope=ModelLocalKVScope.MODEL,
+                    rows=RowDriver.FIXED,
+                    rows_fixed=captured_rows,
+                    rows_reason=f"sum of captured buckets {sorted(self.local_forward_cg_by_bs)}",
+                    allocation_note=(
+                        "pinned in the CUDA graph pool; capture is gated only on cuda.is_available(), "
+                        "so this stays resident under enforce_eager too"
+                    ),
+                )
+            )
+        return specs
+
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         if kwargs.get("modality_preprocess") is None:
             mm_dummy_embeddings = []
@@ -789,7 +874,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         local_embeds: torch.FloatTensor,  # [1, 1, hidden_size]
         tokens_dtype: torch.dtype = torch.int64,
         tokens_device: torch.device = torch.device(
-            f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
+            f"cuda:{torch.accelerator.current_device_index()}" if torch.cuda.is_available() else "cpu"
         ),
         local_sampler: MiMoSampler | MiMoLocalSamplerTensor | None = None,
     ):
@@ -802,7 +887,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             device=tokens_device,
         )
         if local_sampler is None:
-            local_sampler = MiMoSampler(do_sample=False, temperature=0.6, top_p=0.9)
+            local_sampler = MiMoSampler(do_sample=False, temperature=0.9, top_p=0.95)
 
         past_key_values = DynamicCache()
         for t in range(delay_iters):
@@ -843,12 +928,12 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         local_embeds: torch.FloatTensor,  # [1, 1, hidden_size]
         tokens_dtype: torch.dtype = torch.int64,
         tokens_device: torch.device = torch.device(
-            f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
+            f"cuda:{torch.accelerator.current_device_index()}" if torch.cuda.is_available() else "cpu"
         ),
         local_sampler: MiMoSampler | None = None,
     ):
         if local_sampler is None:
-            local_sampler = MiMoSampler(do_sample=False, temperature=0.6, top_p=0.9)
+            local_sampler = MiMoSampler(do_sample=False, temperature=0.9, top_p=0.95)
 
         b = int(local_embeds.shape[0])
         use_cg = (local_sampler.do_sample is None or local_sampler.do_sample is False) and bool(
@@ -877,20 +962,28 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         input_ids: torch.Tensor,
         *,
         request_ids: list[str],
-        query_start_loc: torch.Tensor,
+        query_start_loc_list: list[int],
         kwargs: dict,
     ) -> tuple[dict[str, any], dict]:
         has_merge_mm_embedding = False
         merge_mm_embedding_info: dict[str, any] = {}
         seq_len = input_ids.shape[1] if input_ids.ndim == 2 else input_ids.shape[0]
 
-        for req_idx, req_id in enumerate(request_ids):
-            query_start_loc_by_req = int(query_start_loc[req_idx].item())
-            query_end_loc_by_req = int(query_start_loc[req_idx + 1].item())
-            input_ids_by_req = input_ids[query_start_loc_by_req:query_end_loc_by_req]
-            seq_len_by_req = input_ids_by_req.shape[1] if input_ids_by_req.ndim == 2 else input_ids_by_req.shape[0]
+        # Only each request's start token is ever read below, and only for
+        # single-token requests. Gather just those start offsets (num_reqs elements)
+        # to host instead of copying the whole flattened sequence every forward.
+        # query_start_loc entries are flat token offsets, so we index the flattened
+        # ids by the same offsets and derive per-request length from the boundaries.
+        flat_input_ids = input_ids.reshape(-1)
+        start_positions = query_start_loc_list[:-1]
+        start_is_empty_cpu = (flat_input_ids[start_positions] == self.empty_token_id).cpu().tolist()
 
-            if seq_len_by_req == 1 and bool(input_ids_by_req == self.empty_token_id):
+        for req_idx, req_id in enumerate(request_ids):
+            query_start_loc_by_req = query_start_loc_list[req_idx]
+            query_end_loc_by_req = query_start_loc_list[req_idx + 1]
+            seq_len_by_req = query_end_loc_by_req - query_start_loc_by_req
+
+            if seq_len_by_req == 1 and start_is_empty_cpu[req_idx]:
                 merge_mm_embedding_info[req_id] = {
                     "query_start_loc": query_start_loc_by_req,
                     "query_end_loc": query_end_loc_by_req,
@@ -1015,13 +1108,19 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
+        # Materialize the request boundaries on the host once instead of one
+        # `.item()` sync per boundary in the loops below.
         _forward_context = get_forward_context()
-        _default_query_start_loc = torch.tensor([0, input_ids.shape[-1]], device=input_ids.device)
-        query_start_loc = (
-            next(iter(_forward_context.attn_metadata.values())).query_start_loc
-            if _forward_context.attn_metadata is not None
-            else _default_query_start_loc
-        )
+        if _forward_context.attn_metadata is not None:
+            query_start_loc = next(iter(_forward_context.attn_metadata.values())).query_start_loc
+            query_start_loc_list = query_start_loc.tolist()
+        else:
+            # Single implicit request over all tokens. Build the host boundaries
+            # directly (no .tolist() D2H); the small device tensor is still needed
+            # for logits_indices below.
+            n_tokens = int(input_ids.shape[-1])
+            query_start_loc_list = [0, n_tokens]
+            query_start_loc = torch.tensor([0, n_tokens], device=input_ids.device)
 
         runtime_additional_information = kwargs.get("runtime_additional_information", [])
         if runtime_additional_information:
@@ -1034,7 +1133,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         merge_mm_embedding_info, has_merge_mm_embedding, kwargs = self._collect_merge_mm_embedding_info(
             input_ids,
             request_ids=request_ids,
-            query_start_loc=query_start_loc,
+            query_start_loc_list=query_start_loc_list,
             kwargs=kwargs,
         )
 
@@ -1057,15 +1156,18 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         batch_next_speech_tokens: torch.Tensor | None = None
 
         if not is_capturing and next_ids is not None and num_reqs > 0:
-            if (next_ids == self.empty_token_id).any():
+            # Copy the empty-token mask to host once; the `.any()` gate and the
+            # per-request checks below then avoid a GPU sync each.
+            next_is_empty_cpu = (next_ids == self.empty_token_id).cpu()
+            if bool(next_is_empty_cpu.any()):
                 batch_hs_list = []
                 valid_mask = []
 
                 for req_idx in range(num_reqs):
-                    start = int(query_start_loc[req_idx].item())
-                    end = int(query_start_loc[req_idx + 1].item())
+                    start = query_start_loc_list[req_idx]
+                    end = query_start_loc_list[req_idx + 1]
                     hs_req = hidden_states[start:end][-1:, :]
-                    is_empty = bool(next_ids[req_idx] == self.empty_token_id)
+                    is_empty = bool(next_is_empty_cpu[req_idx])
                     valid_mask.append(is_empty)
 
                     if not is_empty:
@@ -1133,17 +1235,14 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
         loaded_params: set[str] = set()
+        if self.quant_config is not None:
+            cache_scale_mapper = self.quant_config.get_cache_scale_mapper()
+            if cache_scale_mapper is not None:
+                weights = cache_scale_mapper.apply(weights)
+
         for name, loaded_weight in weights:
             if name.startswith("model."):
                 name = "model." + name
-            if self.quant_config is not None and (scale_name := self.quant_config.get_cache_scale(name)):
-                # Loading kv cache quantization scales
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
-                weight_loader(param, loaded_weight)
-                loaded_params.add(scale_name)
-                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if name.startswith("input_local_transformer.") or name.startswith("local_transformer."):

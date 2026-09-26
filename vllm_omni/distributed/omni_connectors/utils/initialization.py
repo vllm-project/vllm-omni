@@ -4,12 +4,15 @@
 """Utilities for OmniConnector configuration and validation."""
 
 import json
-import sys
+import os
+import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from ..factory import OmniConnectorFactory
-from .config import ConnectorSpec, OmniTransferConfig
+from .config import TRANSFER_ENGINE_CONNECTOR_NAMES, ConnectorSpec, OmniTransferConfig
+from .env import expand_env_int
+from .local_rank import get_connector_local_rank
 from .logging import get_connector_logger
 
 if TYPE_CHECKING:
@@ -23,10 +26,107 @@ logger = get_connector_logger(__name__)
 # collide with request-forwarding endpoints that share the same base port.
 KV_TRANSFER_PORT_OFFSET = 100
 
+# Port stride between TP ranks so each worker binds a unique ZMQ port
+# when TP > 1.  Must be larger than the maximum number of pipeline stages.
+# Formula:
+#   zmq_port = base + KV_TRANSFER_PORT_OFFSET
+#            + replica * KV_REPLICA_PORT_STRIDE
+#            + rank * KV_RANK_PORT_STRIDE
+#            + stage
+KV_RANK_PORT_STRIDE = 16
+
+# Port stride between Omni replicas of the same stage.  This reserves a
+# comfortably sized block per replica for TP-rank and stage offsets.
+KV_REPLICA_PORT_STRIDE = 1024
+
+REQUEST_FORWARDING_PORT_OFFSET = 0
+ORCHESTRATOR_PORT_OFFSET = 200
+
+ConnectorPurpose = Literal["request_forwarding", "kv_transfer", "orchestrator"]
+
+
+def compute_connector_zmq_port(
+    base_port: int,
+    *,
+    purpose: ConnectorPurpose,
+    from_stage: int,
+    local_rank: int = 0,
+    replica_id: int = 0,
+) -> int:
+    """Return a collision-free connector endpoint for an edge and worker."""
+    purpose_offsets = {
+        "request_forwarding": REQUEST_FORWARDING_PORT_OFFSET,
+        "kv_transfer": KV_TRANSFER_PORT_OFFSET,
+        "orchestrator": ORCHESTRATOR_PORT_OFFSET,
+    }
+    if purpose not in purpose_offsets:
+        raise ValueError(f"Unsupported connector purpose: {purpose}")
+    if not 0 <= from_stage < KV_RANK_PORT_STRIDE:
+        raise ValueError(f"from_stage must be in [0, {KV_RANK_PORT_STRIDE}), got {from_stage}")
+    if local_rank < 0:
+        raise ValueError(f"local_rank must be non-negative, got {local_rank}")
+    if replica_id < 0:
+        raise ValueError(f"replica_id must be non-negative, got {replica_id}")
+
+    port = (
+        base_port
+        + purpose_offsets[purpose]
+        + replica_id * KV_REPLICA_PORT_STRIDE
+        + local_rank * KV_RANK_PORT_STRIDE
+        + from_stage
+    )
+    if not 1 <= port <= 65535:
+        raise ValueError(f"Resolved connector port must be in [1, 65535], got {port}")
+    return port
+
+
+def resolve_connector_spec(
+    spec: ConnectorSpec,
+    *,
+    stage_id: int,
+    role: str | None,
+    purpose: ConnectorPurpose = "request_forwarding",
+    local_rank: int = 0,
+    replica_id: int = 0,
+) -> ConnectorSpec:
+    """Copy and resolve a connector spec for one stage worker."""
+    extra = dict(spec.extra or {})
+    extra["stage_id"] = stage_id
+    if role is not None:
+        extra["role"] = role
+    if spec.name not in TRANSFER_ENGINE_CONNECTOR_NAMES:
+        return ConnectorSpec(name=spec.name, extra=extra)
+
+    resolved_port = None
+    if role != "receiver" or "sender_zmq_port" not in extra:
+        resolved_port = compute_connector_zmq_port(
+            expand_env_int(extra.get("zmq_port", 50051), "zmq_port"),
+            purpose=purpose,
+            from_stage=int(extra.get("from_stage", stage_id)),
+            local_rank=local_rank,
+            replica_id=replica_id,
+        )
+    if role == "receiver":
+        extra.setdefault("sender_host", extra.get("host", "127.0.0.1"))
+        extra.setdefault("sender_zmq_port", resolved_port)
+        extra.pop("zmq_port", None)
+        outgoing = extra.get("outgoing")
+        if spec.name == "NixlConnector" and isinstance(outgoing, dict):
+            extra["zmq_port"] = compute_connector_zmq_port(
+                expand_env_int(outgoing.get("zmq_port", 50051), "zmq_port"),
+                purpose=purpose,
+                from_stage=int(outgoing.get("from_stage", stage_id)),
+                local_rank=local_rank,
+                replica_id=replica_id,
+            )
+            extra["host"] = outgoing.get("host", "auto")
+    else:
+        extra["zmq_port"] = resolved_port
+    return ConnectorSpec(name=spec.name, extra=extra)
+
 
 def initialize_connectors_from_config(
     config_path: str | Path | None = None,
-    default_shm_threshold: int = 65536,
     purpose: str = "request_forwarding",
     caller_stage_id: int | str | None = None,
     is_sender: bool | None = None,
@@ -37,7 +137,7 @@ def initialize_connectors_from_config(
     Returns:
         tuple: (OmniTransferConfig, dict of {(from, to): connector_instance})
     """
-    transfer_config = load_omni_transfer_config(config_path, default_shm_threshold=default_shm_threshold)
+    transfer_config = load_omni_transfer_config(config_path)
 
     if not transfer_config:
         logger.info("No OmniTransferConfig provided")
@@ -68,50 +168,40 @@ def create_connectors_from_config(
     Returns:
         A dictionary of connectors.
     """
-    purpose_port_offsets = {
-        "request_forwarding": 0,
-        "kv_transfer": KV_TRANSFER_PORT_OFFSET,
-    }
-    port_offset = purpose_port_offsets.get(purpose, 0)
-    orchestrator_port_offset = 200
-
     connectors = {}
     for edge_key, connector_spec in connectors_config.items():
         from_stage, to_stage = edge_key
         try:
-            if connector_spec.name == "MooncakeTransferEngineConnector":
+            if connector_spec.name in TRANSFER_ENGINE_CONNECTOR_NAMES:
                 extra = dict(connector_spec.extra) if connector_spec.extra else {}
-                base_port = extra.get("zmq_port", 50051)
                 try:
-                    stage_offset = int(from_stage)
-                except (TypeError, ValueError):
-                    stage_offset = 0
+                    from_stage_id = int(from_stage)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Transfer-engine stage id must be an integer, got {from_stage!r}") from exc
 
-                if str(caller_stage_id) == "orchestrator":
-                    adjusted_port = base_port + orchestrator_port_offset + stage_offset
-                else:
-                    adjusted_port = base_port + port_offset + stage_offset
-                extra["zmq_port"] = adjusted_port
-
+                is_orchestrator = str(caller_stage_id) == "orchestrator"
+                local_rank = 0 if is_orchestrator else get_connector_local_rank()
+                resolved_purpose: ConnectorPurpose = "orchestrator" if is_orchestrator else purpose  # type: ignore[assignment]
                 if is_sender is not None:
-                    extra["role"] = "sender" if is_sender else "receiver"
-                    if not is_sender:
-                        extra.setdefault("sender_host", extra.get("host", "127.0.0.1"))
-                        extra.setdefault("sender_zmq_port", adjusted_port)
-                elif caller_stage_id is not None:
-                    caller_str = str(caller_stage_id)
-                    if caller_str == from_stage:
-                        extra["role"] = "sender"
-                    elif caller_str == to_stage:
-                        extra["role"] = "receiver"
-                        extra.setdefault("sender_host", extra.get("host", "127.0.0.1"))
-                        extra.setdefault("sender_zmq_port", adjusted_port)
-                    else:
-                        extra["role"] = "sender"
+                    role = "sender" if is_sender else "receiver"
+                elif caller_stage_id is not None and str(caller_stage_id) == to_stage:
+                    role = "receiver"
+                elif caller_stage_id is not None and str(caller_stage_id) == from_stage:
+                    role = "sender"
                 else:
-                    extra["role"] = extra.get("role", "auto")
-
-                connector = OmniConnectorFactory.create_connector(ConnectorSpec(name=connector_spec.name, extra=extra))
+                    role = str(extra.get("role", "auto"))
+                extra["from_stage"] = from_stage_id
+                extra["to_stage"] = int(to_stage)
+                replica_id = max(int(os.environ.get("VLLM_OMNI_REPLICA_ID", "0")), 0)
+                resolved_spec = resolve_connector_spec(
+                    ConnectorSpec(name=connector_spec.name, extra=extra),
+                    stage_id=int(caller_stage_id) if str(caller_stage_id).isdigit() else from_stage_id,
+                    role=role,
+                    purpose=resolved_purpose,
+                    local_rank=local_rank,
+                    replica_id=replica_id,
+                )
+                connector = OmniConnectorFactory.create_connector(resolved_spec)
             else:
                 connector = OmniConnectorFactory.create_connector(connector_spec)
             connectors[edge_key] = connector
@@ -158,12 +248,16 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
             # Incoming edge → this stage is the receiver
             extra = dict(spec.extra) if spec.extra else {}
             extra.setdefault("role", "receiver")
+            extra["from_stage"] = int(from_stage)
+            extra["to_stage"] = int(to_stage)
             stage_connectors_config[f"from_stage_{from_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
         elif from_stage == target_stage and target_stage == "0":
             # Outgoing edge for stage 0 — included for async_chunk spec
             # extraction (omni_stage.py), NOT for connector instantiation.
             extra = dict(spec.extra) if spec.extra else {}
             extra.setdefault("role", "sender")
+            extra["from_stage"] = int(from_stage)
+            extra["to_stage"] = int(to_stage)
             stage_connectors_config[f"to_stage_{to_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
 
     return stage_connectors_config
@@ -172,7 +266,6 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
 def load_omni_transfer_config(
     config_path: str | Path | None = None,
     config_dict: dict[str, Any] | None = None,
-    default_shm_threshold: int = 65536,
 ) -> OmniTransferConfig | None:
     """Load OmniTransferConfig from file or dict."""
     if config_path is None and config_dict is None:
@@ -200,6 +293,19 @@ def load_omni_transfer_config(
 
     if config_dict is None:
         return None
+
+    # Normalize new-schema (top-level ``connectors`` + ``stages``) into the
+    # legacy ``runtime.connectors`` + ``stage_args`` shape the parser reads.
+    if "stages" in config_dict and "stage_args" not in config_dict:
+        normalized: dict[str, Any] = dict(config_dict)
+        runtime = dict(normalized.get("runtime") or {})
+        if "connectors" in normalized and "connectors" not in runtime:
+            runtime["connectors"] = normalized["connectors"]
+        if "edges" in normalized and "edges" not in runtime:
+            runtime["edges"] = normalized["edges"]
+        normalized["runtime"] = runtime
+        normalized["stage_args"] = normalized["stages"]
+        config_dict = normalized
 
     # Parse connectors
     connectors = {}
@@ -294,10 +400,7 @@ def load_omni_transfer_config(
                     expected_edges.add(edge_key)
                     if edge_key not in connectors:
                         logger.info(f"Auto-configuring SharedMemoryConnector for edge {edge_key}")
-                        connectors[edge_key] = ConnectorSpec(
-                            name="SharedMemoryConnector",
-                            extra={"shm_threshold_bytes": default_shm_threshold},
-                        )
+                        connectors[edge_key] = ConnectorSpec(name="SharedMemoryConnector")
 
             # Fallback: infer edges from engine_input_source for each stage
             for stage_config in stage_args:
@@ -312,9 +415,7 @@ def load_omni_transfer_config(
 
                     if edge_key not in connectors:
                         logger.info(f"Auto-configuring SharedMemoryConnector for edge {edge_key}")
-                        connectors[edge_key] = ConnectorSpec(
-                            name="SharedMemoryConnector", extra={"shm_threshold_bytes": default_shm_threshold}
-                        )
+                        connectors[edge_key] = ConnectorSpec(name="SharedMemoryConnector")
 
         except Exception as e:
             logger.warning(f"Failed to auto-configure SHM connectors: {e}")
@@ -338,22 +439,16 @@ def load_omni_transfer_config(
 
 
 def initialize_orchestrator_connectors(
-    config_path: str | None, worker_backend: str | None = "multi_process", shm_threshold_bytes: int = 65536
+    config_path: str | None,
 ) -> tuple[OmniTransferConfig | None, dict[tuple[str, str], OmniConnectorBase]]:
     """Initialize connectors shared at orchestrator level.
     Args:
         config_path: The path to the configuration file.
-        worker_backend: The backend to use for the worker.
     Returns:
         A tuple containing the OmniTransferConfig and a dictionary of connectors.
     """
-    if worker_backend == "ray":
-        default_shm_threshold = sys.maxsize
-    else:
-        default_shm_threshold = max(0, shm_threshold_bytes)
     transfer_config, connectors = initialize_connectors_from_config(
         config_path,
-        default_shm_threshold=default_shm_threshold,
         purpose="request_forwarding",
         caller_stage_id="orchestrator",
         is_sender=True,
@@ -385,7 +480,16 @@ def build_stage_connectors(
     connectors_config: dict[str, Any],
     purpose: str = "request_forwarding",
 ) -> dict[tuple[str, str], Any] | None:
-    """Instantiate OmniConnectors for a stage based on config."""
+    """Instantiate OmniConnectors for a stage based on config.
+
+    Deprecated: prefer ``get_stage_connector_config`` plus the unified
+    connector factory. Kept as a thin shim so legacy callers keep working.
+    """
+    warnings.warn(
+        "build_stage_connectors is deprecated; use get_stage_connector_config and OmniConnectorFactory instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if not connectors_config:
         return {}
 

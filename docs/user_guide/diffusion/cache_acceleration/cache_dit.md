@@ -6,6 +6,7 @@
 - [Overview](#overview)
 - [Quick Start](#quick-start)
 - [Example Script](#example-script)
+- [Request-Scoped Quality](#request-scoped-quality-minimax-h3)
 - [Acceleration Methods](#acceleration-methods)
 - [Configuration Parameters](#configuration-parameters)
 - [Best Practices](#best-practices)
@@ -70,6 +71,39 @@ omni = Omni(
 ---
 
 ## Example Script
+
+### Multi-Stage Models (MammothModa2)
+
+MammothModa2 is a multi-stage AR→DiT pipeline; the diffusion runner owns the
+Cache-DiT lifecycle of its DiT stage. Configure it on the **DiT stage entry**
+of the deploy YAML so the acceleration only applies to the denoising stage:
+
+```yaml
+# deploy YAML (see vllm_omni/deploy/mammoth_moda2.yaml)
+stages:
+  - stage_id: 1
+    # ... other DiT stage settings ...
+    cache_backend: cache_dit
+    cache_config:
+      Fn_compute_blocks: 1
+      Bn_compute_blocks: 0
+      max_warmup_steps: 4
+      residual_diff_threshold: 0.24
+      max_continuous_cached_steps: 3
+    enable_cache_dit_summary: true   # log skip-ratio stats per request
+```
+
+Behavior notes:
+
+- Only the repeated main-layer stack is cached; the Q-Former refiners always run.
+- Sequential-CFG parity requires the unconditional pass on every denoise step,
+  so the `cfg_range` skip optimization is not used: outside the interval CFG is
+  neutralized with `scale=1.0` instead of skipping the uncond forward.
+- Requests with `text_guidance_scale = 1.0` run with cache hooks disabled.
+- `residual_diff_threshold` defaults to `0.24` (measured ~1.7-2.2x at 50 steps,
+  PSNR 27-34 dB vs uncached). For 20-step generation — especially with a
+  partial `cfg_range` — use `0.12` for noticeably closer parity at a modest
+  speed cost.
 
 ### Offline Inference
 
@@ -139,6 +173,43 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
   --cache-backend cache_dit \
   --cache-config '{"Fn_compute_blocks": 1, "residual_diff_threshold": 0.12}'
 ```
+
+## Request-Scoped Quality (MiniMax H3)
+
+MiniMax H3 can switch Cache-DiT at the request boundary without enabling a
+cache backend at server startup. Add a quality field to an online request:
+
+```bash
+# Native reference path for this request.
+-F 'quality=lossless'
+
+# H3's conservative Cache-DiT profile for this request.
+-F 'quality=high'
+```
+
+For offline inference, set the same field on the sampling parameters:
+
+```python
+OmniDiffusionSamplingParams(
+    quality="high",
+    num_inference_steps=50,
+    extra_args={"task": "t2va", "duration": 5.0, "audio_flow_shift": 3.0},
+)
+```
+
+| Server startup | Request quality | Behavior |
+|---|---|---|
+| `--cache-backend cache_dit` | omitted | Use or restore the startup Cache-DiT profile |
+| `--cache-backend cache_dit` | `lossless` | Remove Cache-DiT hooks and run the reference path |
+| `--cache-backend cache_dit` | `high` | Use or install H3's conservative Cache-DiT profile |
+| no Cache-DiT | omitted or `lossless` | Run the reference path |
+| no Cache-DiT | `high` | Install H3's conservative Cache-DiT profile |
+
+The startup option is only needed when omitted-quality requests should use the
+server-configured Cache-DiT profile by default.
+
+See the [MiniMax H3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md#request-scoped-quality)
+for a complete request and measured trade-off.
 
 ---
 
@@ -283,3 +354,10 @@ Using Cache-DiT acceleration:
 
 1. ✅ **Enable Cache-DiT** - Set `cache_backend="cache_dit"` to get 1.5x-3x speedup with optimized defaults
 2. ✅ **(Optional) Customize** - Adjust `cache_config` parameters for specific speed/quality trade-offs
+
+---
+
+## Additional Resources
+
+- [Cache-DiT documentation](https://cache-dit.readthedocs.io/en/latest/)
+- [Cache-DiT API reference](https://cache-dit.readthedocs.io/en/latest/user_guide/CACHE_API/)

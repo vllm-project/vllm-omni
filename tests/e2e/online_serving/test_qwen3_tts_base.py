@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E Online tests for Qwen3-TTS model with text input and audio output.
 
@@ -10,24 +10,23 @@ actual model inference, not mocks.
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
-
-from pathlib import Path
 
 import pytest
+from vllm.platforms import current_platform
 
-from tests.conftest import OmniServerParams
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import get_asset_path
+from tests.helpers.runtime import OmniServerParams
+from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+DEFAULT_AUDIO_SPEECH_TIMEOUT_S = 180.0
 
-REF_AUDIO_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
+# Vendored under tests/assets/qwen3_tts/clone_2.wav so the server does not need
+# to fetch the reference audio over HTTPS at request time (CI runners in some
+# regions cannot reach the original Aliyun OSS host; see issue #3263).
+REF_AUDIO_URL = get_asset_path("qwen3_tts/clone_2.wav", as_data_url=True)
 REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
-
-
-def get_stage_config(name: str = "qwen3_tts.yaml"):
-    """Get the stage config path from vllm_omni model_executor stage_configs."""
-    return str(Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / name)
 
 
 def get_prompt(prompt_type="text"):
@@ -48,20 +47,28 @@ tts_server_params = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
-            stage_config_path=get_stage_config("qwen3_tts.yaml"),
-            server_args=["--trust-remote-code", "--disable-log-stats"],
+            stage_config_path=get_deploy_config_path("qwen3_tts.yaml"),
+            server_args=["--trust-remote-code"],
         ),
         id="async_chunk",
-    )
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=get_deploy_config_path("qwen3_tts_mrv2.yaml"),
+            server_args=["--trust-remote-code"],
+        ),
+        id="async_chunk_mrv2",
+        marks=pytest.mark.skipif(not current_platform.is_cuda(), reason="MRV2 validation is CUDA-only"),
+    ),
 ]
 
 
 @pytest.mark.advanced_model
-@pytest.mark.core_model
-@pytest.mark.omni
+@pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_text_to_audio_001(omni_server, openai_client) -> None:
+def test_text_to_audio_001(omni_server, online_client) -> None:
     """
     Test text input processing and audio output via OpenAI API.
     Deploy Setting: default yaml
@@ -75,20 +82,21 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "input": get_prompt(),
         "stream": False,
+        "timeout": DEFAULT_AUDIO_SPEECH_TIMEOUT_S,
         "response_format": "wav",
         "task_type": "Base",
         "voice": "clone",
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
     }
-    openai_client.send_audio_speech_request(request_config, request_num=get_max_batch_size("few"))
+    online_client.send_audio_speech_request(request_config, request_num=get_max_batch_size("few"))
 
 
 @pytest.mark.advanced_model
-@pytest.mark.omni
+@pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_text_to_audio_002(omni_server, openai_client) -> None:
+def test_text_to_audio_002(omni_server, online_client) -> None:
     """
     Test text input processing and audio output via OpenAI API.
     Deploy Setting: default yaml
@@ -101,10 +109,12 @@ def test_text_to_audio_002(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "input": get_prompt(),
         "stream": True,
+        "stream_format": "audio",
+        "timeout": DEFAULT_AUDIO_SPEECH_TIMEOUT_S,
         "response_format": "wav",
         "task_type": "Base",
         "voice": "clone",
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
     }
-    openai_client.send_audio_speech_request(request_config)
+    online_client.send_audio_speech_request(request_config)

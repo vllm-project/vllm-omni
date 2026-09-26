@@ -53,7 +53,7 @@ Record these parameters when reporting performance results.
 
 ```bash
 python benchmarks/diffusion/diffusion_benchmark_serving.py \
-    --backend v1/videos \
+    --endpoint /v1/videos \
     --dataset <DATASET_NAME> \
     --task t2v \
     --num-prompts <N> \
@@ -66,7 +66,7 @@ python benchmarks/diffusion/diffusion_benchmark_serving.py \
 
 | Parameter              | Description                       |
 | ---------------------- | --------------------------------- |
-| `--backend`            | Serving backend (use `v1/videos`) |
+| `--endpoint`           | API endpoint (use `/v1/videos`; leading `/` is optional) |
 | `--dataset`            | Dataset name (`random` or custom) |
 | `--task`               | Task type (e.g., `t2v`)           |
 | `--num-prompts`        | Total number of requests          |
@@ -120,7 +120,7 @@ python benchmarks/diffusion/diffusion_benchmark_serving.py \
 
 ```bash
 python benchmarks/diffusion/diffusion_benchmark_serving.py \
-    --backend v1/videos \
+    --endpoint /v1/videos \
     --dataset random \
     --task t2v \
     --num-prompts 1 \

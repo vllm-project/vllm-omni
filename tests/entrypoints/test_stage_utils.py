@@ -4,7 +4,9 @@ import sys
 import pytest
 from pytest_mock import MockerFixture
 
-from vllm_omni.entrypoints.stage_utils import set_stage_devices
+from vllm_omni.entrypoints.stage_utils import _map_device_list, resolve_stage_physical_devices, set_stage_devices
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _make_dummy_torch(call_log):
@@ -55,7 +57,6 @@ def _make_mock_platform(mocker, device_type: str = "cuda", env_var: str = "CUDA_
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-@pytest.mark.usefixtures("clean_gpu_memory_between_tests")
 def test_set_stage_devices_respects_logical_ids(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     # Preserve an existing logical mapping and ensure devices "0,1" map through it.
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "6,7")
@@ -77,7 +78,6 @@ def test_set_stage_devices_respects_logical_ids(mocker: MockerFixture, monkeypat
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-@pytest.mark.usefixtures("clean_gpu_memory_between_tests")
 def test_set_stage_devices_handles_not_enough_devices(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     # Preserve an existing logical mapping and ensure devices "0,1" map through it.
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "6,7")
@@ -92,12 +92,12 @@ def test_set_stage_devices_handles_not_enough_devices(mocker: MockerFixture, mon
         mock_platform,
     )
 
-    # Raise since we need 4 GPUs, but we only have 2 visible
-    with pytest.raises(ValueError):
-        set_stage_devices(stage_id=0, devices="0,1,2,3")
+    # Keep the logical mapping and resolve to the visible subset.
+    set_stage_devices(stage_id=0, devices="0,1,2,3")
+
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "6,7"
 
 
-@pytest.mark.usefixtures("clean_gpu_memory_between_tests")
 def test_set_stage_devices_npu_platform(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     """Test that set_stage_devices works correctly for NPU platform."""
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "4,5")
@@ -132,3 +132,107 @@ def test_set_stage_devices_npu_platform(mocker: MockerFixture, monkeypatch: pyte
     set_stage_devices(stage_id=0, devices="0,1")
 
     assert os.environ["ASCEND_RT_VISIBLE_DEVICES"] == "4,5"
+
+
+# ---- _map_device_list unit tests ----
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_index_mapping():
+    """Device IDs < num_visible not in set are treated as indices."""
+    result = _map_device_list(0, ["0", "1"], ["6", "7", "8", "9"])
+    assert result == ["6", "7"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_physical_fallback():
+    """Device IDs >= num_visible are treated as physical IDs and passed through."""
+    result = _map_device_list(1, ["2"], ["0", "1"])
+    assert result == ["2"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_physical_fallback_multi():
+    """Multiple device IDs >= num_visible all pass through as physical IDs."""
+    result = _map_device_list(1, ["2", "3"], ["0", "1"])
+    assert result == ["2", "3"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_physical_fallback_mixed():
+    """When some devices are >= num_visible but some < num_visible, index mapping applies for the subset."""
+    # "1" < num_visible(2) so index mapping applies: visible[1] = "5"
+    # "2" >= num_visible(2) so it's dropped via the partial mapping path
+    result = _map_device_list(1, ["1", "2"], ["0", "5"])
+    assert result == ["5"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_index_with_gaps():
+    """Index-based mapping works with non-contiguous visible device lists."""
+    result = _map_device_list(0, ["0", "1"], ["4", "5", "7"])
+    assert result == ["4", "5"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_index_mapping_no_idempotency():
+    """Device IDs < num_visible not in visible set map via index even when no ID matches literally."""
+    # "0","1" with visible ["2","3"]: idempotency check fails (none in set),
+    # but index mapping succeeds: visible[0]="2", visible[1]="3"
+    result = _map_device_list(0, ["0", "1"], ["2", "3"])
+    assert result == ["2", "3"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_partial_mapping():
+    """When only a subset can map, returns the mapped subset (no error)."""
+    result = _map_device_list(0, ["0", "1", "2"], ["5", "6"])
+    assert result == ["5", "6"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_multi_replica_offset_cvd():
+    """Logical indices from split_devices_for_replicas must map through an offset
+    CUDA_VISIBLE_DEVICES, not be treated as physical IDs.
+    """
+    visible = ["2", "3", "4", "5"]
+    assert _map_device_list(1, ["1"], visible) == ["3"]
+    assert _map_device_list(1, ["2"], visible) == ["4"]
+    assert _map_device_list(1, ["2", "3"], visible) == ["4", "5"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_resolve_stage_physical_devices_uses_visible_baseline(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
+    assert resolve_stage_physical_devices(1, "1", visible_baseline="3,4,5") == "4"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_resolve_stage_physical_devices_captured_unset_ignores_live_env(monkeypatch: pytest.MonkeyPatch):
+    """Parallel init captures an unset CUDA_VISIBLE_DEVICES as None.
+
+    A sibling thread may then narrow the live env for spawn. The captured
+    None must not fall back to that live value, or logical device 0 would
+    map onto the other stage's GPU.
+    """
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "6,7")
+    assert resolve_stage_physical_devices(0, "0", visible_baseline=None) == "0"
+    assert resolve_stage_physical_devices(1, "1", visible_baseline=None) == "1"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_raises_on_non_numeric():
+    """Non-numeric device IDs raise ValueError."""
+    with pytest.raises(ValueError, match="must be non-negative integers"):
+        _map_device_list(0, ["a"], ["0", "1"])

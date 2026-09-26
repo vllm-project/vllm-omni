@@ -614,8 +614,8 @@ Examples:
         if not torch.cuda.is_available():
             print("[ERROR] CUDA is not available but GPU mode was requested.")
             sys.exit(1)
-        if args.gpu_id >= torch.cuda.device_count():
-            print(f"[ERROR] GPU {args.gpu_id} not available. Found {torch.cuda.device_count()} GPUs.")
+        if args.gpu_id >= torch.accelerator.device_count():
+            print(f"[ERROR] GPU {args.gpu_id} not available. Found {torch.accelerator.device_count()} GPUs.")
             sys.exit(1)
         print(f"[INFO] Using GPU {args.gpu_id}: {torch.cuda.get_device_name(args.gpu_id)}")
 

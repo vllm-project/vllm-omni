@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E offline tests for Qwen3-TTS Base model with text input and audio output.
 
@@ -11,38 +11,46 @@ Same structure as test_qwen3_omni (models, stage_configs, test_params, parametri
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
-
-from pathlib import Path
 
 import pytest
+from vllm.platforms import current_platform
 
-from tests.conftest import modify_stage_config
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import get_asset_path
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
-REF_AUDIO_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
+# See tests/e2e/online_serving/test_qwen3_tts_base.py for the vendored-asset rationale.
+REF_AUDIO_URL = get_asset_path("qwen3_tts/clone_2.wav", as_data_url=True)
 REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 
 
 def get_cuda_graph_config():
-    path = modify_stage_config(
-        get_stage_config(),
+    """Build a temp deploy yaml mirroring the deleted qwen3_tts_no_async_chunk.yaml.
+
+    Composes the synchronous (no-async-chunk) variant on top of the bundled
+    qwen3_tts.yaml prod default, with cudagraphs disabled. Replaces the deleted
+    standalone variant yaml; same effective config, no checked-in file needed.
+    """
+    return modify_stage_config(
+        get_deploy_config_path("qwen3_tts.yaml"),
         updates={
-            "stage_args": {
+            "async_chunk": False,
+            "stages": {
                 0: {
-                    "engine_args.enforce_eager": "true",
+                    "max_num_seqs": 1,
+                    "gpu_memory_utilization": 0.2,
+                    "enforce_eager": True,
+                    "async_scheduling": False,
                 },
-                1: {"engine_args.enforce_eager": "true"},
+                1: {
+                    "gpu_memory_utilization": 0.2,
+                    "enforce_eager": True,
+                    "async_scheduling": False,
+                },
             },
         },
     )
-    return path
-
-
-def get_stage_config(name: str = "qwen3_tts_no_async_chunk.yaml"):
-    """Get the no_async_chunk stage config path (async_chunk disable, cuda_graph disabled)."""
-    return str(Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / name)
 
 
 # Same structure as test_qwen3_omni: models, stage_configs, test_params
@@ -50,7 +58,12 @@ tts_server_params = [
     pytest.param(
         (MODEL, get_cuda_graph_config()),
         id="no_cuda_graph",
-    )
+    ),
+    pytest.param(
+        (MODEL, get_deploy_config_path("qwen3_tts_mrv2.yaml")),
+        id="async_chunk_mrv2",
+        marks=pytest.mark.skipif(not current_platform.is_cuda(), reason="MRV2 validation is CUDA-only"),
+    ),
 ]
 
 
@@ -60,10 +73,10 @@ def get_prompt():
 
 
 @pytest.mark.advanced_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.tts
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", tts_server_params, indirect=True)
-def test_text_to_audio_001(omni_runner, omni_runner_handler) -> None:
+def test_text_to_audio_001(omni_runner, offline_client) -> None:
     """
     Test text input processing and audio output via offline Omni runner.
     Deploy Setting: qwen3_tts_no_async_chunk.yaml + enforce_eager=true
@@ -80,4 +93,4 @@ def test_text_to_audio_001(omni_runner, omni_runner_handler) -> None:
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
     }
-    omni_runner_handler.send_audio_speech_request(request_config)
+    offline_client.send_audio_speech_request(request_config)

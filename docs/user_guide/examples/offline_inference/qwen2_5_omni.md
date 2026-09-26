@@ -1,10 +1,10 @@
-# Qwen2.5-Omni
+# Qwen2.5-Omni: Offline inference
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/qwen2_5_omni>.
 
 
 ## Setup
-Please refer to the [stage configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation appropriately for your hardware setup.
+See the [pipeline and deploy configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation for your hardware.
 
 ## Run examples
 
@@ -63,14 +63,6 @@ If media file paths are not provided, the script will use default assets. Suppor
 - `mixed_modalities`: Audio + image + video
 - `use_audio_in_video`: Extract audio from video
 - `text`: Text-only query
-
-### FAQ
-
-If you encounter error about backend of librosa, try to install ffmpeg with command below.
-```
-sudo apt update
-sudo apt install ffmpeg
-```
 
 ## Example materials
 

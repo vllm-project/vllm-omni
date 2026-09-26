@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from collections import OrderedDict
 from collections.abc import Iterable
 from typing import Any
 
 import torch
 import torch.nn as nn
+from cache_dit import ForwardPattern
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps, apply_rotary_emb, get_1d_rotary_pos_embed
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
@@ -15,18 +17,161 @@ from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.platforms import current_platform
+from vllm.triton_utils import HAS_TRITON
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope_min_tokens
+from vllm_omni.diffusion.layers.fused_qk_rope import fused_qk_rope, fused_qk_rope_supported
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+RotaryEmbedding = tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, int]
+
+# All LongCat production attention spans contain at least 512 tokens.  Reuse
+# the shared Q/K fusion threshold override so deployments can retain a
+# hardware-specific crossover without adding another environment variable.
+_FUSED_MIN_TOKENS = 512
+_FUSED_QK_ROPE = HAS_TRITON and current_platform.is_cuda()
+_FAILED_QK_ROPE_SIGNATURES_MAX_SIZE = 128
+_FAILED_QK_ROPE_SIGNATURES: OrderedDict[tuple[object, ...], None] = OrderedDict()
+
+
+def _fusion_enabled(sequence_parallel_size: int | None, *, enforce_eager: bool) -> bool:
+    return (
+        _FUSED_QK_ROPE
+        and enforce_eager
+        and not torch.compiler.is_compiling()
+        and not torch.is_grad_enabled()
+        and not (sequence_parallel_size is not None and sequence_parallel_size > 1)
+    )
+
+
+def _prepare_rotary_emb(
+    txt_cos: torch.Tensor,
+    txt_sin: torch.Tensor,
+    img_cos: torch.Tensor,
+    img_sin: torch.Tensor,
+    *,
+    enable_fusion: bool,
+) -> RotaryEmbedding:
+    """Join text/image tables and resolve the shared token gate once."""
+
+    joint = torch.cat((txt_cos, img_cos), dim=0), torch.cat((txt_sin, img_sin), dim=0)
+    if not enable_fusion:
+        return joint
+    return joint[0], joint[1], fused_qk_norm_rope_min_tokens(_FUSED_MIN_TOKENS)
+
+
+def _apply_qk_rope_reference(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    rotary_emb: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        apply_rotary_emb(query, rotary_emb, sequence_dim=1),
+        apply_rotary_emb(key, rotary_emb, sequence_dim=1),
+    )
+
+
+def _qk_rope_signature(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[object, ...]:
+    """Identify a runtime layout for failure-cache fallback."""
+
+    return (
+        query.device.type,
+        query.device.index,
+        query.dtype,
+        tuple(query.shape),
+        tuple(query.stride()),
+        tuple(key.shape),
+        tuple(key.stride()),
+        cos.dtype,
+        tuple(cos.shape),
+        tuple(cos.stride()),
+        tuple(sin.stride()),
+    )
+
+
+def _is_failed_qk_rope_signature(signature: tuple[object, ...]) -> bool:
+    if signature not in _FAILED_QK_ROPE_SIGNATURES:
+        return False
+    _FAILED_QK_ROPE_SIGNATURES.move_to_end(signature)
+    return True
+
+
+def _record_failed_qk_rope_signature(signature: tuple[object, ...]) -> None:
+    _FAILED_QK_ROPE_SIGNATURES[signature] = None
+    _FAILED_QK_ROPE_SIGNATURES.move_to_end(signature)
+    while len(_FAILED_QK_ROPE_SIGNATURES) > _FAILED_QK_ROPE_SIGNATURES_MAX_SIZE:
+        _FAILED_QK_ROPE_SIGNATURES.popitem(last=False)
+
+
+def _can_use_fused_qk_rope(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    sequence_parallel_size: int | None,
+    min_tokens: int | None,
+) -> bool:
+    """Keep compile, autograd, capture, SP, and unsupported inputs native."""
+
+    if (
+        torch.compiler.is_compiling()
+        or torch.is_grad_enabled()
+        or (sequence_parallel_size is not None and sequence_parallel_size > 1)
+        or min_tokens is None
+        or not fused_qk_rope_supported(query, key, cos, sin)
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return False
+    return query.shape[0] * query.shape[1] >= min_tokens
+
+
+def _apply_qk_rope(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    rotary_emb: RotaryEmbedding | None,
+    sequence_parallel_size: int | None,
+    min_tokens: int | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply one paired RoPE launch, falling back after launch failures."""
+
+    if rotary_emb is None:
+        return query, key
+    rotary_pair = rotary_emb[:2]
+    cos, sin = rotary_pair
+    if not _can_use_fused_qk_rope(query, key, cos, sin, sequence_parallel_size, min_tokens):
+        return _apply_qk_rope_reference(query, key, rotary_pair)
+
+    signature = _qk_rope_signature(query, key, cos, sin)
+    if _is_failed_qk_rope_signature(signature):
+        return _apply_qk_rope_reference(query, key, rotary_pair)
+
+    try:
+        return fused_qk_rope(query, key, cos, sin)
+    except Exception as exc:  # noqa: BLE001 - optimized-path failures must fall back
+        _record_failed_qk_rope_signature(signature)
+        logger.warning(
+            "Disabling LongCat paired Q/K RoPE fusion for signature %s after failure: %s",
+            signature,
+            exc,
+        )
+        return _apply_qk_rope_reference(query, key, rotary_pair)
 
 
 class FeedForward(nn.Module):
@@ -119,7 +264,7 @@ class LongCatImageAttention(nn.Module):
         text_key: torch.Tensor,
         text_value: torch.Tensor,
         text_seq_len: int,
-        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None,
+        image_rotary_emb: RotaryEmbedding | None,
     ) -> torch.Tensor:
         """
         Apply RoPE separately to text and image Q/K, then run SP attention with joint tensors.
@@ -137,7 +282,7 @@ class LongCatImageAttention(nn.Module):
             Attention output with shape (B, txt_len + img_len/SP, H, D)
         """
         if image_rotary_emb is not None:
-            freqs_cos, freqs_sin = image_rotary_emb
+            freqs_cos, freqs_sin = image_rotary_emb[:2]
             txt_rotary_emb = (freqs_cos[:text_seq_len], freqs_sin[:text_seq_len])
             img_rotary_emb_split = (freqs_cos[text_seq_len:], freqs_sin[text_seq_len:])
             # Apply RoPE to image Q/K
@@ -163,7 +308,7 @@ class LongCatImageAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None = None,
-        image_rotary_emb: torch.Tensor | None = None,
+        image_rotary_emb: RotaryEmbedding | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -194,6 +339,8 @@ class LongCatImageAttention(nn.Module):
 
         query = self.norm_q(query)
         key = self.norm_k(key)
+        rotary_pair = image_rotary_emb[:2] if image_rotary_emb is not None else None
+        min_tokens = image_rotary_emb[2] if image_rotary_emb is not None and len(image_rotary_emb) > 2 else None
 
         if self.added_kv_proj_dim is not None:
             encoder_qkv, _ = self.add_kv_proj(encoder_hidden_states)
@@ -220,7 +367,7 @@ class LongCatImageAttention(nn.Module):
                     text_key=encoder_key,
                     text_value=encoder_value,
                     text_seq_len=encoder_query.shape[1],
-                    image_rotary_emb=image_rotary_emb,
+                    image_rotary_emb=rotary_pair,
                 )
             else:
                 # Non-SP Mode: Concat first, then apply RoPE to full sequence
@@ -228,10 +375,15 @@ class LongCatImageAttention(nn.Module):
                 joint_key = torch.cat([encoder_key, key], dim=1)
                 joint_value = torch.cat([encoder_value, value], dim=1)
 
-                if image_rotary_emb is not None:
-                    # Apply RoPE to full (text + image) sequence
-                    joint_query = apply_rotary_emb(joint_query, image_rotary_emb, sequence_dim=1)
-                    joint_key = apply_rotary_emb(joint_key, image_rotary_emb, sequence_dim=1)
+                # Keep the native RMSNorm and text-then-image concatenation
+                # order, then combine only the two independent RoPE calls.
+                joint_query, joint_key = _apply_qk_rope(
+                    joint_query,
+                    joint_key,
+                    rotary_pair,
+                    sp_size,
+                    min_tokens,
+                )
 
                 hidden_states = self.attn(
                     joint_query,
@@ -270,13 +422,17 @@ class LongCatImageAttention(nn.Module):
                     text_key=key[:, :text_seq_len],
                     text_value=value[:, :text_seq_len],
                     text_seq_len=text_seq_len,
-                    image_rotary_emb=image_rotary_emb,
+                    image_rotary_emb=rotary_pair,
                 )
             else:
                 # Non-SP Mode: standard path
-                if image_rotary_emb is not None:
-                    query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
-                    key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+                query, key = _apply_qk_rope(
+                    query,
+                    key,
+                    rotary_pair,
+                    sp_size,
+                    min_tokens,
+                )
 
                 hidden_states = self.attn(
                     query,
@@ -343,7 +499,7 @@ class LongCatImageTransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
-        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        image_rotary_emb: RotaryEmbedding | None = None,
         joint_attention_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
@@ -534,7 +690,7 @@ class LongCatImageSingleTransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
-        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        image_rotary_emb: RotaryEmbedding | None = None,
         joint_attention_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -581,6 +737,14 @@ class LongCatImageTransformer2DModel(nn.Module):
     Supports Sequence Parallelism (Ulysses and Ring) when configured via OmniDiffusionConfig.
     """
 
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "transformer_blocks": ForwardPattern.Pattern_1,
+            "single_transformer_blocks": ForwardPattern.Pattern_1,
+        },
+        has_separate_cfg=True,
+    )
+
     _repeated_blocks = ["LongCatImageTransformerBlock", "LongCatImageSingleTransformerBlock"]
     _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
 
@@ -622,6 +786,7 @@ class LongCatImageTransformer2DModel(nn.Module):
 
         # Store parallel config for SP support
         self.parallel_config = od_config.parallel_config
+        self.enforce_eager = bool(getattr(od_config, "enforce_eager", False))
 
         self.pos_embed = LongCatImagePosEmbed(theta=10000, axes_dim=axes_dims_rope)
         self.rope_preparer = RoPEPreparer(self.pos_embed)
@@ -691,11 +856,15 @@ class LongCatImageTransformer2DModel(nn.Module):
         # txt_cos/txt_sin (outputs 0, 1) remain replicated for dual-stream attention
         txt_cos, txt_sin, img_cos, img_sin = self.rope_preparer(txt_ids, img_ids)
 
-        # Reconstruct image_rotary_emb with chunked values
-        # Final shape: (txt_seq_len + img_seq_len // SP, head_dim)
-        image_rotary_emb = (
-            torch.cat([txt_cos, img_cos], dim=0),
-            torch.cat([txt_sin, img_sin], dim=0),
+        # Preserve the ordinary full-width tables.  A third scalar only marks
+        # the eligible eager SP=1 route and resolves the shared threshold once
+        # for all attention blocks in this transformer call.
+        image_rotary_emb = _prepare_rotary_emb(
+            txt_cos,
+            txt_sin,
+            img_cos,
+            img_sin,
+            enable_fusion=_fusion_enabled(sp_size, enforce_eager=self.enforce_eager),
         )
 
         for block in self.transformer_blocks:

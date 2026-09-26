@@ -1,23 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
+from collections.abc import Callable
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from vllm import SamplingParams
+from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
 
+from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.engine.messages import OutputMessage
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
-from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
+from vllm_omni.engine.stage_engine_core_client import (
+    DPLBStageEngineCoreClient,
+    StageEngineCoreClient,
+)
+from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _DummySenderStage:
+    stage_type = "llm"
+    final_output = False
+
     def __init__(self, sender_info):
         self._sender_info = sender_info
-        self.engine_outputs = None
-
-    def set_engine_outputs(self, outputs):
-        self.engine_outputs = outputs
 
     def get_kv_sender_info(self):
         return self._sender_info
@@ -25,21 +36,150 @@ class _DummySenderStage:
 
 class _DummyDiffusionStage:
     stage_type = "diffusion"
-    custom_process_input_func = None
+    final_output = True
+    custom_process_input_func: Callable[..., Any] | None = None
 
     def __init__(self, engine_input_source=None):
         self.engine_input_source = engine_input_source or [0]
         self.calls = []
 
-    async def add_request_async(self, request_id, prompt, sampling_params, kv_sender_info=None):
+    async def add_request_async(
+        self, request_id, prompt, sampling_params, kv_sender_info=None, payload_sender_info=None
+    ):
         self.calls.append(
             {
                 "request_id": request_id,
                 "prompt": prompt,
                 "sampling_params": sampling_params,
                 "kv_sender_info": kv_sender_info,
+                "payload_sender_info": payload_sender_info,
             }
         )
+
+
+def _build_sender_pool(stage_id: int, sender_info: dict[str, object]) -> StagePool:
+    return StagePool(
+        stage_id,
+        _DummySenderStage(sender_info),
+        output_processor=object(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+
+
+@pytest.mark.parametrize(
+    ("client_class", "base_client_class"),
+    [
+        (StageEngineCoreClient, AsyncMPClient),
+        (DPLBStageEngineCoreClient, DPLBAsyncMPClient),
+    ],
+)
+def test_stage_engine_core_client_builds_payload_sender_info_after_base_init(
+    monkeypatch, client_class, base_client_class
+):
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            omni_kv_config=None,
+            hf_config=None,
+            stage_connector_config=None,
+        )
+    )
+    metadata = SimpleNamespace(
+        stage_id=0,
+        replica_id=0,
+        stage_type="llm",
+        model_stage="main",
+        is_comprehension=False,
+        requires_multimodal_data=False,
+        engine_input_source=[],
+        final_output=False,
+        final_output_type=None,
+        default_sampling_params=None,
+        prompt_transform_func=None,
+        prompt_expand_func=None,
+        custom_process_input_func=None,
+    )
+
+    def fake_base_init(self, config, *_args, **_kwargs):
+        self.vllm_config = config
+        self.resources = SimpleNamespace(engine_dead=False)
+
+    monkeypatch.setattr(base_client_class, "__init__", fake_base_init)
+
+    client = client_class(vllm_config, object, metadata=metadata)
+
+    assert client.vllm_config is vllm_config
+    assert client.get_payload_sender_info() is None
+
+
+@pytest.mark.parametrize("outgoing", [False, True])
+@pytest.mark.parametrize("base_port", [None, 48000])
+def test_payload_sender_endpoint_matches_resolver_with_unequal_replicas(outgoing, base_port):
+    from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
+    from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_connector_spec
+
+    edge = {"host": "10.0.0.2", "from_stage": 1}
+    if base_port is not None:
+        edge["zmq_port"] = base_port
+    extra = (
+        {
+            "role": "receiver",
+            "host": "10.0.0.1",
+            "zmq_port": 47000,
+            "from_stage": 0,
+            "outgoing": edge,
+        }
+        if outgoing
+        else {"role": "sender", **edge}
+    )
+    client = object.__new__(StageEngineCoreClient)
+    client.stage_id = 1
+    client.replica_id = 3
+    client.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(stage_connector_config={"name": "NixlConnector", "extra": extra})
+    )
+    producer = resolve_connector_spec(
+        ConnectorSpec(name="NixlConnector", extra=extra),
+        stage_id=1,
+        role=extra["role"],
+        replica_id=client.replica_id,
+    )
+    consumer = resolve_connector_spec(
+        ConnectorSpec(name="NixlConnector", extra=edge), stage_id=2, role="receiver", replica_id=7
+    )
+
+    sender_info = client._build_payload_sender_info()
+
+    assert sender_info == {
+        "host": "10.0.0.2",
+        "zmq_port": (50051 if base_port is None else base_port) + 3 * 1024 + 1,
+    }
+    assert sender_info["zmq_port"] == producer.extra["zmq_port"]
+    assert sender_info["zmq_port"] != consumer.extra["sender_zmq_port"]
+
+
+@pytest.mark.parametrize("initialized", [False, True])
+def test_intermediate_payload_sender_ignores_incoming_kv_endpoint(initialized):
+    client = object.__new__(StageEngineCoreClient)
+    client.stage_id = 1
+    client.replica_id = 3
+    client.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            stage_connector_config={
+                "name": "NixlConnector",
+                "extra": {
+                    "role": "receiver",
+                    "host": "10.0.0.1",
+                    "zmq_port": 47000,
+                    "from_stage": 0,
+                    "outgoing": {"host": "10.0.0.2", "zmq_port": 48000, "from_stage": 1},
+                },
+            }
+        )
+    )
+    client._omni_kv_config = {"connector_config": {"type": "NixlConnector", "role": "receiver", "zmq_port": 47100}}
+    client._kv_sender_info = {"host": "10.0.0.1", "zmq_port": 47100} if initialized else None
+
+    assert client._build_payload_sender_info() == {"host": "10.0.0.2", "zmq_port": 51073}
 
 
 def test_stage_engine_core_client_builds_kv_sender_info_from_tcp_address():
@@ -123,16 +263,99 @@ def test_stage_engine_core_client_preserves_explicit_loopback_sender_host():
     }
 
 
+def test_stage_engine_core_client_payload_sender_uses_unresolved_base_port():
+    client = object.__new__(StageEngineCoreClient)
+    client.stage_id = 0
+    client.replica_id = 0
+    client.client_addresses = {"input_address": "tcp://10.20.30.40:1234"}
+    client.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            stage_connector_config={
+                "name": "NixlConnector",
+                "extra": {"role": "sender", "from_stage": 0, "zmq_port": 50171},
+            },
+            omni_kv_config={"connector_config": {"type": "NixlConnector", "role": "sender", "zmq_port": 50171}},
+        )
+    )
+    client._omni_kv_config = client.vllm_config.model_config.omni_kv_config
+
+    assert client._build_payload_sender_info() == {
+        "host": "10.20.30.40",
+        "zmq_port": 50071,
+    }
+
+
+def test_stage_engine_core_client_payload_sender_preserves_stage_port_without_kv_config():
+    client = object.__new__(StageEngineCoreClient)
+    client.stage_id = 0
+    client.replica_id = 0
+    client.client_addresses = {"input_address": "tcp://10.20.30.40:1234"}
+    client.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            stage_connector_config={
+                "name": "NixlConnector",
+                "extra": {"role": "sender", "from_stage": 0, "zmq_port": 50071},
+            },
+            omni_kv_config=None,
+        )
+    )
+    client._omni_kv_config = None
+
+    assert client._build_payload_sender_info() == {
+        "host": "10.20.30.40",
+        "zmq_port": 50071,
+    }
+
+
+def test_stage_engine_core_client_payload_sender_falls_back_to_kv_connector_config():
+    client = object.__new__(StageEngineCoreClient)
+    client.stage_id = 0
+    client.replica_id = 0
+    client.client_addresses = {"input_address": "tcp://10.20.30.40:1234"}
+    client.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            stage_connector_config=None,
+            omni_kv_config={
+                "connector_config": {
+                    "type": "NixlConnector",
+                    "role": "sender",
+                    "zmq_port": 50171,
+                }
+            },
+        )
+    )
+    client._omni_kv_config = client.vllm_config.model_config.omni_kv_config
+
+    assert client._build_payload_sender_info() == {
+        "host": "10.20.30.40",
+        "zmq_port": 50071,
+    }
+
+
+def test_stage_engine_core_client_payload_sender_falls_back_to_initialized_kv_sender():
+    client = object.__new__(StageEngineCoreClient)
+    client.stage_id = 0
+    client.replica_id = 0
+    client.client_addresses = {"input_address": "tcp://10.20.30.40:1234"}
+    client.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_connector_config=None))
+    client._omni_kv_config = None
+    client._kv_sender_info = {"host": "10.20.30.40", "zmq_port": 50171}
+
+    assert client._build_payload_sender_info() == {
+        "host": "10.20.30.40",
+        "zmq_port": 50071,
+    }
+
+
 def test_forward_to_diffusion_attaches_kv_sender_info():
     orchestrator = object.__new__(Orchestrator)
-    sender_stage = _DummySenderStage({"host": "10.0.0.2", "zmq_port": 50151})
     diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
+    sender_pool = _build_sender_pool(0, {"host": "10.0.0.2", "zmq_port": 50151})
+    diffusion_pool = StagePool(1, diffusion_stage)
 
     orchestrator.num_stages = 2
-    orchestrator.stage_clients = [sender_stage, diffusion_stage]
-    orchestrator._companion_map = {}
-    orchestrator.stage_vllm_configs = [None, None]
-    orchestrator.output_processors = [None, None]
+    orchestrator.stage_pools = [sender_pool, diffusion_pool]
+    orchestrator._cfg_tracker = CfgCompanionTracker()
 
     params = OmniDiffusionSamplingParams()
     req_state = OrchestratorRequestState(
@@ -143,9 +366,8 @@ def test_forward_to_diffusion_attaches_kv_sender_info():
     )
 
     output = SimpleNamespace(request_id="req-1", finished=True)
-    asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-1", 0, output, req_state))
+    asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-1", sender_pool.stage_id, output, req_state))
 
-    assert sender_stage.engine_outputs == [output]
     assert diffusion_stage.calls[0]["request_id"] == "req-1"
     assert diffusion_stage.calls[0]["kv_sender_info"] == {
         0: {"host": "10.0.0.2", "zmq_port": 50151},
@@ -153,17 +375,46 @@ def test_forward_to_diffusion_attaches_kv_sender_info():
     assert req_state.stage_submit_ts[1] > 0
 
 
+def test_diffusion_resubmission_preserves_sender_endpoints():
+    orchestrator = object.__new__(Orchestrator)
+    diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
+    sender_pool = _build_sender_pool(0, {"host": "10.0.0.2", "zmq_port": 50151})
+    payload_endpoint = {"host": "10.0.0.2", "zmq_port": 50071}
+    sender_pool.stage_client.get_payload_sender_info = lambda: payload_endpoint
+    diffusion_pool = StagePool(1, diffusion_stage)
+    orchestrator.num_stages = 2
+    orchestrator.stage_pools = [sender_pool, diffusion_pool]
+    orchestrator._cfg_tracker = CfgCompanionTracker()
+    state = OrchestratorRequestState(
+        request_id="streaming",
+        prompt={"prompt": "hello"},
+        sampling_params_list=[SamplingParams(max_tokens=4), OmniDiffusionSamplingParams()],
+        final_stage_id=1,
+    )
+    output = SimpleNamespace(request_id="streaming", finished=True)
+
+    async def forward_twice():
+        await orchestrator._forward_to_next_stage("streaming", 0, output, state)
+        await orchestrator._forward_to_next_stage("streaming", 0, output, state)
+
+    asyncio.run(forward_twice())
+
+    assert len(diffusion_stage.calls) == 2
+    for call in diffusion_stage.calls:
+        assert call["kv_sender_info"] == {0: {"host": "10.0.0.2", "zmq_port": 50151}}
+        assert call["payload_sender_info"] == payload_endpoint
+
+
 def test_forward_to_diffusion_uses_engine_input_source_for_kv_sender_info():
     orchestrator = object.__new__(Orchestrator)
-    source_stage = _DummySenderStage({"host": "10.0.0.2", "zmq_port": 50151})
-    previous_stage = _DummySenderStage({"host": "10.0.0.9", "zmq_port": 59999})
     diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
+    source_pool = _build_sender_pool(0, {"host": "10.0.0.2", "zmq_port": 50151})
+    previous_pool = _build_sender_pool(1, {"host": "10.0.0.9", "zmq_port": 59999})
+    diffusion_pool = StagePool(2, diffusion_stage)
 
     orchestrator.num_stages = 3
-    orchestrator.stage_clients = [source_stage, previous_stage, diffusion_stage]
-    orchestrator._companion_map = {}
-    orchestrator.stage_vllm_configs = [None, None, None]
-    orchestrator.output_processors = [None, None, None]
+    orchestrator.stage_pools = [source_pool, previous_pool, diffusion_pool]
+    orchestrator._cfg_tracker = CfgCompanionTracker()
 
     params = OmniDiffusionSamplingParams()
     req_state = OrchestratorRequestState(
@@ -174,20 +425,65 @@ def test_forward_to_diffusion_uses_engine_input_source_for_kv_sender_info():
     )
 
     output = SimpleNamespace(request_id="req-3", finished=True)
-    asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-3", 1, output, req_state))
+    asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-3", previous_pool.stage_id, output, req_state))
 
-    assert previous_stage.engine_outputs == [output]
     assert diffusion_stage.calls[0]["kv_sender_info"] == {
         0: {"host": "10.0.0.2", "zmq_port": 50151},
     }
 
 
+def test_forward_to_diffusion_returns_terminal_error_for_empty_custom_inputs():
+    orchestrator = object.__new__(Orchestrator)
+    diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
+    setattr(diffusion_stage, "custom_process_input_func", lambda *_args, **_kwargs: [])
+    sender_pool = _build_sender_pool(0, {"host": "10.0.0.2", "zmq_port": 50151})
+    diffusion_pool = StagePool(1, diffusion_stage)
+
+    class _AsyncQueue:
+        def __init__(self):
+            self.items = []
+
+        async def put(self, item):
+            self.items.append(item)
+
+    orchestrator.num_stages = 2
+    orchestrator.stage_pools = [sender_pool, diffusion_pool]
+    orchestrator._cfg_tracker = CfgCompanionTracker()
+    orchestrator.output_async_queue = _AsyncQueue()
+    orchestrator.request_states = {}
+    orchestrator._pd_kv_params = {}
+
+    params = OmniDiffusionSamplingParams()
+    req_state = OrchestratorRequestState(
+        request_id="req-empty",
+        prompt={"prompt": "hello"},
+        sampling_params_list=[SamplingParams(max_tokens=4), params],
+        final_stage_id=1,
+    )
+    orchestrator.request_states["req-empty"] = req_state
+
+    output = SimpleNamespace(request_id="req-empty", finished=True)
+    asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-empty", 0, output, req_state))
+
+    assert diffusion_stage.calls == []
+    assert len(orchestrator.output_async_queue.items) == 1
+    terminal_msg = orchestrator.output_async_queue.items[0]
+    assert isinstance(terminal_msg, OutputMessage)
+    assert terminal_msg.type == "output"
+    assert terminal_msg.request_id == "req-empty"
+    assert terminal_msg.stage_id == 1
+    assert terminal_msg.finished is True
+    assert "produced no valid inputs" in terminal_msg.engine_outputs.error
+    assert "req-empty" not in orchestrator.request_states
+
+
 def test_prewarm_diffusion_attaches_kv_sender_info():
     orchestrator = object.__new__(Orchestrator)
-    sender_stage = _DummySenderStage({"host": "10.0.0.3", "zmq_port": 50151})
     diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
+    sender_pool = _build_sender_pool(0, {"host": "10.0.0.3", "zmq_port": 50151})
+    diffusion_pool = StagePool(1, diffusion_stage)
 
-    orchestrator.stage_clients = [sender_stage, diffusion_stage]
+    orchestrator.stage_pools = [sender_pool, diffusion_pool]
     orchestrator.num_stages = 2
 
     req_state = OrchestratorRequestState(
@@ -205,3 +501,122 @@ def test_prewarm_diffusion_attaches_kv_sender_info():
         0: {"host": "10.0.0.3", "zmq_port": 50151},
     }
     assert req_state.stage_submit_ts[1] > 0
+
+
+def test_prewarm_submits_bound_payload_endpoint_for_concurrent_replicas():
+    orchestrator = object.__new__(Orchestrator)
+    endpoints = {"a": {"host": "10.0.0.2", "zmq_port": 52099}, "b": {"host": "10.0.0.3", "zmq_port": 54147}}
+    source = SimpleNamespace(
+        get_bound_client=lambda key: SimpleNamespace(get_payload_sender_info=lambda: endpoints[key]),
+        get_bound_replica_id=lambda key: {"a": 2, "b": 4}[key],
+    )
+    submitted = {}
+
+    async def submit(key, state, request, **kwargs):
+        await asyncio.sleep(0)
+        submitted[key] = request
+
+    target = SimpleNamespace(
+        stage_type="llm",
+        stage_client=SimpleNamespace(engine_input_source=[0]),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(hf_config=None, max_model_len=64)),
+        submit_initial=submit,
+        get_bound_replica_id=lambda key: {"a": 7, "b": 1}[key],
+    )
+    orchestrator.stage_pools = [source, target]
+    orchestrator._stage_receives_async_chunks = lambda stage: True
+    orchestrator._record_duplex_stage_submission = lambda *args: None
+    orchestrator._emit_tx_edge = lambda **kwargs: None
+
+    async def dispatch(callback, **kwargs):
+        await callback()
+        return True
+
+    orchestrator._dispatch_or_fail_request = dispatch
+
+    async def run():
+        await asyncio.gather(
+            *[
+                orchestrator._prewarm_async_chunk_stages(
+                    key,
+                    SimpleNamespace(prompt_token_ids=[1]),
+                    OrchestratorRequestState(
+                        request_id=key,
+                        prompt={},
+                        sampling_params_list=[SamplingParams(), SamplingParams()],
+                        final_stage_id=1,
+                    ),
+                )
+                for key in endpoints
+            ]
+        )
+
+    asyncio.run(run())
+    from vllm_omni.engine import OmniEngineCoreRequest
+
+    assert all(isinstance(request, OmniEngineCoreRequest) for request in submitted.values())
+    assert {key: request.payload_sender_info for key, request in submitted.items()} == endpoints
+
+
+@pytest.mark.asyncio
+async def test_async_pipeline_defers_sync_stage_until_audio_finishes(mocker):
+    from vllm import PoolingParams, RequestOutput
+    from vllm.config import VllmConfig
+
+    from vllm_omni.config.model import OmniModelConfig
+    from vllm_omni.engine import OmniEngineCoreRequest
+
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.async_chunk = True
+    orchestrator._pd_pair = None
+    orchestrator._cfg_tracker = CfgCompanionTracker()
+    orchestrator.output_async_queue = asyncio.Queue()
+    orchestrator._duplex_output_decision = lambda *args: None
+    orchestrator._is_duplex_session_request = lambda state: False
+    orchestrator._forward_to_next_stage = mocker.AsyncMock()
+    orchestrator._cleanup_request_ids = mocker.AsyncMock()
+    # A sender stage stands in for Code2Wav, whose audio is also a final output.
+    audio_pool = _build_sender_pool(0, {})
+    audio_pool.stage_client.final_output = True
+    aligner = _DummyDiffusionStage()
+    aligner_pool = StagePool(
+        1,
+        aligner,
+        stage_vllm_config=mocker.Mock(
+            spec=VllmConfig, model_config=mocker.Mock(spec=OmniModelConfig, async_chunk=False)
+        ),
+    )
+    orchestrator.stage_pools = [audio_pool, aligner_pool]
+    state = OrchestratorRequestState(
+        request_id="aligned",
+        prompt={"additional_information": {"text": ["Hello world"]}},
+        sampling_params_list=[SamplingParams(), PoolingParams(task="token_classify")],
+        final_stage_id=1,
+        final_output_stage_ids={0, 1},
+    )
+
+    await orchestrator._prewarm_async_chunk_stages(
+        "aligned", mocker.Mock(spec=OmniEngineCoreRequest, prompt_token_ids=[1, 2]), state
+    )
+    assert aligner.calls == []
+    assert 1 not in state.stage_submit_ts
+
+    output = RequestOutput("aligned", None, [1, 2], None, [], False)
+    await orchestrator._route_output(0, 0, output, state, None)
+    orchestrator._forward_to_next_stage.assert_not_awaited()
+    output.finished = True
+    await orchestrator._route_output(0, 0, output, state, None)
+    orchestrator._forward_to_next_stage.assert_awaited_once_with(
+        "aligned",
+        0,
+        output,
+        state,
+        src_replica_id=0,
+        is_streaming_session=False,
+        is_final_update=False,
+    )
+    orchestrator._cleanup_request_ids.assert_not_awaited()
+    await orchestrator._route_output(1, 0, output, state, None)
+    orchestrator._cleanup_request_ids.assert_awaited_once()
+    messages = [orchestrator.output_async_queue.get_nowait() for _ in range(3)]
+    assert [message.finished for message in messages] == [False, False, True]

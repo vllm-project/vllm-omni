@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project and the HuggingFace Team.
 # All rights reserved.
 #
@@ -35,6 +36,7 @@ based on the plan specification.
 from __future__ import annotations
 
 import inspect
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -46,8 +48,10 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     AnySequenceParallelInput,
     SequenceParallelConfig,
     SequenceParallelInput,
+    SequenceParallelInputType,
     SequenceParallelModelPlan,
     SequenceParallelOutput,
+    SequenceParallelOutputType,
     SequenceParallelPartialInput,
 )
 from vllm_omni.diffusion.distributed.sp_sharding import sp_gather, sp_shard
@@ -69,18 +73,18 @@ class ModuleForwardMetadata:
     """
 
     cached_parameter_indices: dict[str, int] | None = None
-    _cls: type | None = None
+    _cls: type[nn.Module] | None = None
 
     def _get_parameter_from_args_kwargs(
         self,
-        identifier: str,
-        args: tuple = (),
-        kwargs: dict | None = None,
+        identifier: str | int,
+        args: Sequence[Any] = (),
+        kwargs: dict[str, Any] | None = None,
     ) -> tuple[Any, bool, int | None]:
         """Get a parameter value from args or kwargs by name.
 
         Args:
-            identifier: The parameter name to look up.
+            identifier: The parameter name to look up, or a positional index.
             args: Positional arguments passed to forward.
             kwargs: Keyword arguments passed to forward.
 
@@ -94,6 +98,11 @@ class ModuleForwardMetadata:
             ValueError: If parameter not found in signature.
         """
         kwargs = kwargs or {}
+
+        if isinstance(identifier, int):
+            if identifier < len(args):
+                return args[identifier], False, identifier
+            return None, False, identifier
 
         # First check kwargs
         if identifier in kwargs:
@@ -164,7 +173,7 @@ class SequenceParallelSplitHook(ModelHook):
 
     def __init__(
         self,
-        metadata: dict[str | int, AnySequenceParallelInput | list[AnySequenceParallelInput]],
+        metadata: SequenceParallelInputType,
         config: SequenceParallelConfig,
     ) -> None:
         super().__init__()
@@ -173,6 +182,12 @@ class SequenceParallelSplitHook(ModelHook):
         self.module_forward_metadata: ModuleForwardMetadata | None = None
         # Cache for text lengths resolved from kwargs
         self._text_len_cache: dict[str, int] = {}
+        self._shard_groups = {
+            sp_input.shard_group
+            for value in metadata.values()
+            for sp_input in (value if isinstance(value, (list, tuple)) else (value,))
+            if isinstance(sp_input, SequenceParallelInput) and sp_input.shard_group is not None
+        }
 
     def initialize_hook(self, module: nn.Module) -> nn.Module:
         cls = _unwrap_module(module).__class__
@@ -184,6 +199,16 @@ class SequenceParallelSplitHook(ModelHook):
         args_list = list(args)
         # Clear text length cache for this forward pass
         self._text_len_cache.clear()
+        if self._shard_groups:
+            from vllm_omni.diffusion.forward_context import (
+                get_forward_context,
+                is_forward_context_available,
+            )
+
+            if is_forward_context_available():
+                ctx = get_forward_context()
+                for shard_group in self._shard_groups:
+                    ctx.sp_shard_metadata.pop(shard_group, None)
 
         for name, spm in self.metadata.items():
             # Skip if this is a split_output entry (handled in post_forward)
@@ -191,6 +216,8 @@ class SequenceParallelSplitHook(ModelHook):
                 continue
 
             # Get the parameter value
+            if self.module_forward_metadata is None:
+                raise RuntimeError("SequenceParallelSplitHook.initialize_hook must run before forward")
             input_val, is_kwarg, index = self.module_forward_metadata._get_parameter_from_args_kwargs(
                 name, args_list, kwargs
             )
@@ -200,6 +227,10 @@ class SequenceParallelSplitHook(ModelHook):
 
             # Shard the input
             if isinstance(input_val, torch.Tensor):
+                if not isinstance(spm, (SequenceParallelInput, SequenceParallelPartialInput)):
+                    raise ValueError(
+                        f"Expected SequenceParallelInput for tensor parameter '{name}', got {type(spm).__name__}"
+                    )
                 input_val = self._prepare_sp_input(input_val, spm, args_list, kwargs)
             elif isinstance(input_val, (list, tuple)):
                 # Handle list/tuple of tensors with per-element config
@@ -221,6 +252,8 @@ class SequenceParallelSplitHook(ModelHook):
 
             # Update args or kwargs
             if is_kwarg:
+                if not isinstance(name, str):
+                    raise TypeError(f"Keyword parameter name must be str, got {type(name).__name__}")
                 kwargs[name] = input_val
             elif index is not None and index < len(args_list):
                 args_list[index] = input_val
@@ -247,6 +280,7 @@ class SequenceParallelSplitHook(ModelHook):
 
         output_list = [output] if is_tensor else list(output)
         actually_sharded = False
+        equal_rank_seq_lens = True
 
         for index, spm in self.metadata.items():
             if not isinstance(index, int):
@@ -260,18 +294,21 @@ class SequenceParallelSplitHook(ModelHook):
             output_list[index] = self._prepare_sp_input(original, spm, self._last_args, self._last_kwargs)
             if output_list[index] is not original:
                 actually_sharded = True
+                equal_rank_seq_lens &= isinstance(spm, SequenceParallelInput) and spm.auto_pad
 
         # Mark SP as active only if at least one tensor was actually sharded
         if actually_sharded and is_forward_context_available():
-            get_forward_context()._sp_shard_depth += 1
+            ctx = get_forward_context()
+            ctx._sp_shard_depth += 1
+            ctx._sp_equal_pad_stack.append(equal_rank_seq_lens)
 
         return output_list[0] if is_tensor else type(output)(output_list)
 
     def _resolve_text_len(
         self,
         sp_input: SequenceParallelPartialInput,
-        args: tuple,
-        kwargs: dict,
+        args: Sequence[Any],
+        kwargs: dict[str, Any],
     ) -> int:
         """Resolve text length from the source specification."""
         source = sp_input.text_len_source
@@ -285,6 +322,8 @@ class SequenceParallelSplitHook(ModelHook):
 
         # Try to get from kwargs/args
         try:
+            if self.module_forward_metadata is None:
+                raise RuntimeError("SequenceParallelSplitHook.initialize_hook must run before forward")
             val, _, _ = self.module_forward_metadata._get_parameter_from_args_kwargs(source, args, kwargs)
             if val is None:
                 raise ValueError(f"Parameter '{source}' is None, cannot determine text length.")
@@ -306,14 +345,21 @@ class SequenceParallelSplitHook(ModelHook):
         self,
         x: torch.Tensor,
         sp_input: AnySequenceParallelInput,
-        args: tuple = (),
-        kwargs: dict | None = None,
+        args: Sequence[Any] = (),
+        kwargs: dict[str, Any] | None = None,
     ) -> torch.Tensor:
         """Shard a tensor according to the input specification."""
         kwargs = kwargs or {}
 
         if sp_input.expected_dims is not None and x.dim() != sp_input.expected_dims:
             logger.warning_once(f"Expected tensor with {sp_input.expected_dims} dims, got {x.dim()}. Skipping split.")
+            return x
+
+        split_dim = (
+            sp_input.split_dim if isinstance(sp_input, (SequenceParallelInput, SequenceParallelPartialInput)) else None
+        )
+        if split_dim is not None and x.size(split_dim) == 0:
+            logger.warning_once("Skip sharding for zero-sized tensors.")
             return x
 
         def _raise_strict_divisibility_error(*, dim: int, seq_len: int, sp_size: int) -> None:
@@ -346,7 +392,11 @@ class SequenceParallelSplitHook(ModelHook):
         if isinstance(sp_input, SequenceParallelInput):
             # Full split with optional auto-padding
             if sp_input.auto_pad:
-                return self._shard_with_auto_pad(x, sp_input.split_dim)
+                return self._shard_with_auto_pad(
+                    x,
+                    sp_input.split_dim,
+                    sp_input.shard_group,
+                )
             _maybe_validate_strict_divisibility(dim=sp_input.split_dim, seq_len=x.size(sp_input.split_dim))
             return sp_shard(x, sp_input.split_dim, validate=False)
         elif isinstance(sp_input, SequenceParallelPartialInput):
@@ -367,15 +417,19 @@ class SequenceParallelSplitHook(ModelHook):
         else:
             raise ValueError(f"Unsupported input config type: {type(sp_input).__name__}")
 
-    def _shard_with_auto_pad(self, x: torch.Tensor, dim: int) -> torch.Tensor:
-        """Shard tensor with automatic padding and attention mask creation.
+    def _shard_with_auto_pad(
+        self,
+        x: torch.Tensor,
+        dim: int,
+        shard_group: str | None,
+    ) -> torch.Tensor:
+        """Pad and shard a tensor while recording its global sequence length.
 
-        When sequence length is not divisible by SP world size, this method:
-        1. Pads the tensor to make it divisible
-        2. Creates an attention mask indicating valid vs padding positions
-        3. Stores the mask and padding info in ForwardContext
+        Models with several independent sequences read the recorded length back
+        via `shard_group` to build masks. Legacy singleton padding fields are
+        also populated for single-sequence models.
         """
-        from vllm_omni.diffusion.attention.selector import get_attn_backend
+        from vllm_omni.diffusion.attention.selector import get_attn_backend_for_capability
         from vllm_omni.diffusion.distributed.parallel_state import (
             get_ring_parallel_world_size,
             get_sequence_parallel_rank,
@@ -388,15 +442,37 @@ class SequenceParallelSplitHook(ModelHook):
             return x
 
         seq_len = x.size(dim)
+        rank = get_sequence_parallel_rank()
         remainder = seq_len % world_size
 
+        if shard_group is not None and is_forward_context_available():
+            ctx = get_forward_context()
+            existing = ctx.sp_shard_metadata.setdefault(shard_group, seq_len)
+            if existing != seq_len:
+                raise ValueError(
+                    f"All tensors in shard_group={shard_group!r} must have the "
+                    f"same global sequence length, but got {existing} and {seq_len}."
+                )
+
         if remainder == 0:
-            # No padding needed
+            # Keyed groups record their length even when no padding is needed.
             return sp_shard(x, dim, validate=False)
 
         # Check backend compatibility
-        attn_backend = get_attn_backend(-1)
-        if not attn_backend.supports_attention_mask:
+        attention_config = None
+        if is_forward_context_available():
+            od_config = get_forward_context().omni_diffusion_config
+            if od_config is not None:
+                attention_config = od_config.diffusion_attention_config
+
+        attn_backend = get_attn_backend_for_capability(
+            role="self",
+            attention_config=attention_config,
+        )
+        attention_spec = None
+        if attention_config is not None:
+            attention_spec, _ = attention_config.resolve_with_source(role="self")
+        if not attn_backend.supports_attention_mask(attention_spec):
             raise ValueError(
                 f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "
                 f"Cannot use {attn_backend.get_name()} which does not support attention_mask. "
@@ -422,8 +498,11 @@ class SequenceParallelSplitHook(ModelHook):
         x_padded = torch.cat([x, padding], dim=dim)
 
         # Store padding info in forward context (only once, for primary tensor)
-        # Attention layers will create masks dynamically using this info
-        if is_forward_context_available():
+        # Attention layers will create masks dynamically using this info.
+        # Keyed groups record their length in sp_shard_metadata above and must
+        # not clobber the legacy singleton fields, whose semantics assume a
+        # single sequence per boundary.
+        if shard_group is None and is_forward_context_available():
             ctx = get_forward_context()
             # Only set if not already set (first auto_pad tensor wins)
             if ctx.sp_original_seq_len is None:
@@ -435,7 +514,6 @@ class SequenceParallelSplitHook(ModelHook):
                 )
 
         # Shard the padded tensor
-        rank = get_sequence_parallel_rank()
         return x_padded.chunk(world_size, dim=dim)[rank]
 
 
@@ -451,12 +529,14 @@ class SequenceParallelGatherHook(ModelHook):
 
     def __init__(
         self,
-        metadata: SequenceParallelOutput | list[SequenceParallelOutput],
+        metadata: SequenceParallelOutputType,
         config: SequenceParallelConfig,
     ) -> None:
         super().__init__()
         if isinstance(metadata, SequenceParallelOutput):
             metadata = [metadata]
+        elif isinstance(metadata, tuple):
+            metadata = list(metadata)
         self.metadata = metadata
         self.config = config
 
@@ -479,12 +559,6 @@ class SequenceParallelGatherHook(ModelHook):
         if len(output) != len(self.metadata):
             raise ValueError(f"Expected {len(self.metadata)} outputs, got {len(output)}.")
 
-        # Check if padding was applied during split
-        original_seq_len = None
-        if is_forward_context_available():
-            ctx = get_forward_context()
-            original_seq_len = ctx.sp_original_seq_len
-
         actually_gathered = False
 
         for i, spm in enumerate(self.metadata):
@@ -502,6 +576,15 @@ class SequenceParallelGatherHook(ModelHook):
             gathered = sp_gather(x, spm.gather_dim, validate=False)
 
             # Remove padding if it was applied
+            original_seq_len = None
+            if is_forward_context_available():
+                ctx = get_forward_context()
+                if spm.shard_group is None:
+                    original_seq_len = ctx.sp_original_seq_len
+                else:
+                    original_seq_len = ctx.sp_shard_metadata.get(spm.shard_group)
+                    if original_seq_len is None:
+                        raise RuntimeError(f"No SP shard metadata was registered for shard_group={spm.shard_group!r}.")
             if original_seq_len is not None and gathered.size(spm.gather_dim) > original_seq_len:
                 gathered = gathered.narrow(spm.gather_dim, 0, original_seq_len)
                 logger.debug(f"Removed padding: gathered shape {gathered.shape} (original_seq_len={original_seq_len})")
@@ -513,6 +596,11 @@ class SequenceParallelGatherHook(ModelHook):
         if actually_gathered and is_forward_context_available():
             ctx = get_forward_context()
             ctx._sp_shard_depth = max(0, ctx._sp_shard_depth - 1)
+            if ctx._sp_equal_pad_stack:
+                ctx._sp_equal_pad_stack.pop()
+            for spm in self.metadata:
+                if spm is not None and spm.shard_group is not None:
+                    ctx.sp_shard_metadata.pop(spm.shard_group, None)
 
         return output[0] if is_tensor else type(output)(output)
 
@@ -613,6 +701,7 @@ def apply_sequence_parallel(
         logger.debug(f"Applying SP hooks to '{module_id}' ({len(submodule)} module(s))")
 
         for m in submodule:
+            hook: SequenceParallelSplitHook | SequenceParallelGatherHook
             if isinstance(sp_model_plan, dict):
                 # Input specification
                 hook = SequenceParallelSplitHook(sp_model_plan, config)
@@ -621,6 +710,8 @@ def apply_sequence_parallel(
                 # Output specification
                 if isinstance(sp_model_plan, SequenceParallelOutput):
                     sp_model_plan = [sp_model_plan]
+                elif isinstance(sp_model_plan, tuple):
+                    sp_model_plan = list(sp_model_plan)
                 if not all(isinstance(x, SequenceParallelOutput) or x is None for x in sp_model_plan):
                     raise ValueError(f"Expected SequenceParallelOutput elements, got {sp_model_plan}")
                 hook = SequenceParallelGatherHook(sp_model_plan, config)
@@ -662,87 +753,3 @@ def remove_sequence_parallel(
                 continue
 
             registry.remove_hook(hook_name)
-
-
-def enable_sequence_parallel_for_model(
-    model: nn.Module,
-    config: SequenceParallelConfig | None = None,
-) -> None:
-    """Enable sequence parallelism for a model using its _sp_plan.
-
-    This is a convenience function that reads the model's _sp_plan attribute
-    and applies sequence parallelism automatically.
-
-    Note: This corresponds to `enable_context_parallel_for_model` in diffusers,
-    but uses vLLM-Omni's _sp_plan instead of diffusers' _cp_plan.
-
-    The function performs two main tasks:
-    1. Applies _sp_plan hooks to shard inputs and gather outputs
-    2. Ensures Attention layers are configured for the correct parallel mode
-       (handled automatically by vLLM-Omni's forward_context mechanism)
-
-    Args:
-        model: The model to enable SP for. Must have a _sp_plan attribute.
-        config: Optional config. If None, uses default based on current
-            parallel state.
-
-    Raises:
-        ValueError: If model has no _sp_plan defined.
-
-    Note:
-        vLLM-Omni supports Ulysses + Ring hybrid parallelism:
-        - ulysses_degree > 1: Uses All-to-All communication over Q/K/V heads
-        - ring_degree > 1: Uses Ring attention with K/V passing
-        - Both > 1: Hybrid mode (Ulysses handles head redistribution,
-          Ring handles K/V circulation)
-    """
-    from vllm_omni.diffusion.distributed.parallel_state import (
-        get_ring_parallel_world_size,
-        get_ulysses_parallel_world_size,
-    )
-    from vllm_omni.diffusion.distributed.sp_plan import get_sp_plan_from_model
-
-    plan = get_sp_plan_from_model(model)
-    if plan is None:
-        raise ValueError(
-            f"Model {model.__class__.__name__} has no _sp_plan defined. "
-            f"Define _sp_plan as a class attribute or pass a plan explicitly."
-        )
-
-    if config is None:
-        # Create config from current parallel state
-        ulysses_degree = get_ulysses_parallel_world_size()
-        ring_degree = get_ring_parallel_world_size()
-        config = SequenceParallelConfig(
-            ulysses_degree=ulysses_degree,
-            ring_degree=ring_degree,
-        )
-        if ulysses_degree > 1 and ring_degree > 1:
-            mode = "hybrid"
-        elif ulysses_degree > 1:
-            mode = "ulysses"
-        else:
-            mode = "ring"
-        logger.info(
-            f"Created SP config from parallel state: "
-            f"ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, "
-            f"mode={mode}"
-        )
-
-    apply_sequence_parallel(model, config, plan)
-    logger.info(f"Enabled sequence parallelism for {model.__class__.__name__}")
-
-
-def disable_sequence_parallel_for_model(model: nn.Module) -> None:
-    """Disable sequence parallelism for a model.
-
-    Note: This corresponds to `disable_context_parallel_for_model` in diffusers.
-
-    Args:
-        model: The model to disable SP for.
-    """
-    from vllm_omni.diffusion.distributed.sp_plan import get_sp_plan_from_model
-
-    plan = get_sp_plan_from_model(model)
-    if plan is not None:
-        remove_sequence_parallel(model, plan)

@@ -16,12 +16,18 @@ import itertools
 import torch
 from transformers import PretrainedConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
+
+from vllm_omni.platforms import current_omni_platform
+
+if current_omni_platform.is_npu():
+    from vllm_ascend.ops.rotary_embedding import AscendMRotaryEmbedding as _BaseMRotaryEmbedding
+else:
+    from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding as _BaseMRotaryEmbedding
 
 logger = init_logger(__name__)
 
 
-class OmniMRotaryEmbedding(MRotaryEmbedding):
+class OmniMRotaryEmbedding(_BaseMRotaryEmbedding):
     """Omni-extended MRotaryEmbedding with multimodal position computation.
 
     Extends the upstream MRotaryEmbedding with additional class methods for

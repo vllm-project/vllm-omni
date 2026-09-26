@@ -1,0 +1,300 @@
+[
+  {
+    "test_name": "test_minimax_h3_t2v_4gpu",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": [
+              "H100",
+              "B200"
+            ]
+          },
+          "num_cards": 4
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "MiniMax-H3 T2VA text-to-video+audio on 4 GPUs (USP4 + HSDP4, encoder-TP4, VAE-PP4 tile)",
+    "server_params": {
+      "model": "MiniMaxAI/MiniMax-H3",
+      "serve_args": {
+        "trust-remote-code": true,
+        "task-type": "fl2va",
+        "num-gpus": 4,
+        "usp": 4,
+        "ring": 1,
+        "use-hsdp": true,
+        "hsdp-shard-size": 4,
+        "text-encoder-tp-size": 4,
+        "vae-patch-parallel-size": 4,
+        "vae-parallel-mode": "tile",
+        "vae-use-tiling": true,
+        "stage-init-timeout": 1800,
+        "init-timeout": 1800,
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "1344x768_frames209_steps8",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/videos",
+        "num_prompts": 3,
+        "max_concurrency": 1,
+        "num_warmups": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 1344,
+          "height": 768,
+          "num_inference_steps": 8,
+          "num_frames": 209,
+          "fps": 24,
+          "seed": 42,
+          "flow_shift": 12.0,
+          "extra_params": "{\"task\":\"t2va\",\"duration\":8.7,\"aspect_ratio\":\"16:9\",\"audio_flow_shift\":3.0}"
+        },
+        "baseline": {
+          "H100": {
+            "request_throughput": 0.0211,
+            "mean_e2el_ms": 38325.2,
+            "mean_peak_memory_mb": 54219.6
+          }
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_minimax_h3_ti2v_4gpu",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": [
+              "H100",
+              "B200"
+            ]
+          },
+          "num_cards": 4
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "MiniMax-H3 FL2VA first-frame image-to-video+audio on 4 GPUs (USP4 + HSDP4, encoder-TP4, VAE-PP4 tile)",
+    "server_params": {
+      "model": "MiniMaxAI/MiniMax-H3",
+      "serve_args": {
+        "trust-remote-code": true,
+        "task-type": "fl2va",
+        "num-gpus": 4,
+        "usp": 4,
+        "ring": 1,
+        "use-hsdp": true,
+        "hsdp-shard-size": 4,
+        "text-encoder-tp-size": 4,
+        "vae-patch-parallel-size": 4,
+        "vae-parallel-mode": "tile",
+        "vae-use-tiling": true,
+        "stage-init-timeout": 1800,
+        "init-timeout": 1800,
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "1344x768_frames209_steps8",
+        "dataset_name": "random-mm",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/videos",
+        "num_prompts": 3,
+        "max_concurrency": 1,
+        "num_warmups": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "random_mm_base_items_per_request": 1,
+        "random_mm_num_mm_items_range_ratio": 0,
+        "random_mm_limit_mm_per_prompt": {
+          "image": 1
+        },
+        "random_mm_bucket_config": {
+          "(768, 1344, 1)": 1.0
+        },
+        "extra_body": {
+          "width": 1344,
+          "height": 768,
+          "num_inference_steps": 8,
+          "num_frames": 209,
+          "fps": 24,
+          "seed": 42,
+          "flow_shift": 12.0,
+          "extra_params": "{\"task\":\"fl2va\",\"duration\":8.7,\"audio_flow_shift\":3.0}"
+        },
+        "baseline": {
+          "H100": {
+            "request_throughput": 0.0212,
+            "mean_e2el_ms": 38138.5,
+            "mean_peak_memory_mb": 54622.8
+          }
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_minimax_h3_v2v_4gpu",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": [
+              "H100",
+              "B200"
+            ]
+          },
+          "num_cards": 4
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "MiniMax-H3 Ref2VA video-reference-to-video+audio on 4 GPUs (USP4 + HSDP4, encoder-TP4, VAE-PP4 tile)",
+    "server_params": {
+      "model": "MiniMaxAI/MiniMax-H3",
+      "serve_args": {
+        "trust-remote-code": true,
+        "task-type": "ref2va",
+        "num-gpus": 4,
+        "usp": 4,
+        "ring": 1,
+        "use-hsdp": true,
+        "hsdp-shard-size": 4,
+        "text-encoder-tp-size": 4,
+        "vae-patch-parallel-size": 4,
+        "vae-parallel-mode": "tile",
+        "vae-use-tiling": true,
+        "stage-init-timeout": 1800,
+        "init-timeout": 1800,
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "1344x768_frames209_steps8",
+        "dataset_name": "random-mm",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/videos",
+        "num_prompts": 3,
+        "max_concurrency": 1,
+        "num_warmups": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "random_mm_base_items_per_request": 1,
+        "random_mm_num_mm_items_range_ratio": 0,
+        "random_mm_limit_mm_per_prompt": {
+          "video": 1
+        },
+        "random_mm_bucket_config": {
+          "(480, 832, 209)": 1.0
+        },
+        "extra_body": {
+          "width": 1344,
+          "height": 768,
+          "num_inference_steps": 8,
+          "num_frames": 209,
+          "fps": 24,
+          "seed": 42,
+          "flow_shift": 12.0,
+          "extra_params": "{\"task\":\"ref2va\",\"duration\":8.7,\"aspect_ratio\":\"16:9\",\"audio_flow_shift\":3.0}"
+        },
+        "baseline": {
+          "H100": {
+            "request_throughput": 0.0077,
+            "mean_e2el_ms": 105750.8,
+            "mean_peak_memory_mb": 55180.8
+          }
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_minimax_h3_t2v_dlo_4gpu",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": [
+              "H100",
+              "B200"
+            ]
+          },
+          "num_cards": 4
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "MiniMax-H3 T2VA with 4-card distributed layerwise offload (DLO), 8 denoise steps (USP4 + HSDP4, encoder-TP4, VAE-PP4 tile)",
+    "server_params": {
+      "model": "MiniMaxAI/MiniMax-H3",
+      "serve_args": {
+        "trust-remote-code": true,
+        "task-type": "fl2va",
+        "num-gpus": 4,
+        "usp": 4,
+        "ring": 1,
+        "use-hsdp": true,
+        "hsdp-shard-size": 4,
+        "text-encoder-tp-size": 4,
+        "vae-patch-parallel-size": 4,
+        "vae-parallel-mode": "tile",
+        "vae-use-tiling": true,
+        "stage-init-timeout": 1800,
+        "init-timeout": 1800,
+        "enable-diffusion-pipeline-profiler": true,
+        "enable-distributed-layerwise-offload": true,
+        "dlo-no-use-allgather": true,
+        "dlo-resident-layers": 8,
+        "enforce-eager": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "1344x768_frames209_steps8",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/videos",
+        "num_prompts": 3,
+        "max_concurrency": 1,
+        "num_warmups": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 1344,
+          "height": 768,
+          "num_inference_steps": 8,
+          "num_frames": 209,
+          "fps": 24,
+          "seed": 42,
+          "flow_shift": 12.0,
+          "extra_params": "{\"task\":\"t2va\",\"duration\":8.7,\"aspect_ratio\":\"16:9\",\"audio_flow_shift\":3.0}"
+        },
+        "baseline": {
+          "H100": {
+            "request_throughput": 0.0212,
+            "mean_e2el_ms": 38208.9,
+            "mean_peak_memory_mb": 36218.4
+          }
+        }
+      }
+    ]
+  }
+]

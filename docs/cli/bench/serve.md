@@ -1,30 +1,36 @@
 # vLLM-Omni Benchmark CLI Guide
+
 The vllm bench command launches the vLLM-Omni benchmark to evaluate the performance of multimodal models.
 
 ## Notes
-We currently only support using the "openai-chat-omni" backend.
+
+vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, and `openai-realtime-duplex` serving benchmark backends. It also adds the `omniinteract` dataset.
 
 ## Basic Parameter Description
+
 You can use `vllm bench serve --omni --help=all` to get descriptions of all parameters. The commonly used parameters are described below:
-- `--omni`  
+
+- `--omni`
   Enable Omni (multimodal) mode, supporting multimodal inputs and outputs such as images, videos, and audio.
 
-- `--backend`  
-  Specify the backend adapter as openai-chat-omni, using OpenAI Chat compatible API behavior as the protocol. Currently only openai-chat-omni is supported.
+- `--backend`
+  Specify the backend adapter. vLLM-Omni adds `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, and `openai-realtime-duplex` to the upstream vLLM backend choices.
 
-- `--model`  
+- `--model`
   The model identifier to load, filled according to the models supported by vLLM-Omni.
 
-- `--endpoint`  
+- `--endpoint`
   The API endpoint exposed externally, to which clients send their requests.
 
-- `--dataset-name`  
-  The name of the dataset used; random-mm indicates generating random multimodal inputs (images, videos, audio).
+- `--dataset-name`
+  The name of the dataset used; `random-mm` generates random multimodal inputs (images, videos, audio),
+  `omniinteract` replays official OmniInteract videos, and `videomme` loads Video-MME MCQ videos
+  (`lmms-eval/Video-MME`, MiniCPM OmniEvalKit packing).
 
-- `--num-prompts`  
+- `--num-prompts`
   The total number of requests to send, an integer.
 
-- `--max-concurrency`  
+- `--max-concurrency`
   "Maximum number of concurrent requests. This can be used "
         "to help simulate an environment where a higher level component "
         "is enforcing a maximum number of concurrent requests. While the "
@@ -34,69 +40,73 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
         "actual request rate may be lower than specified with --request-rate, "
         "if the server is not processing requests fast enough to keep up."
 
-- `--request-rate`  
+- `--request-rate`
   "Number of requests per second. If this is inf, "
         "then all the requests are sent at time 0. "
         "Otherwise, we use Poisson process or gamma distribution "
         "to synthesize the request arrival times."
 
-- `--ignore-eos`  
+- `--ignore-eos`
   "Set ignore_eos flag when sending the benchmark request."
 
-- `--metric-percentiles`  
+- `--metric-percentiles`
   Comma-separated list of percentiles for selected metrics. "
         "To report 25-th, 50-th, and 75-th percentiles, use \"25,50,75\". "
         "Default value is \"99\"."
         "Use \"--percentile-metrics\" to select metrics.
 
-- `--percentile-metrics`  
+- `--percentile-metrics`
         "Comma-separated list of selected metrics to report percentiles."
                     "This argument specifies the metrics to report percentiles."
-                    'Allowed metric names are "ttft", "tpot", "itl", "e2el", "audio_ttfp", "audio_rtf", "audio_duration". '
+                    'Allowed metric names are "ttft", "tpot", "itl", "ttfc", "tpoc", "icl", '
+                    '"tpop", "e2el", "audio_ttfp", "audio_rtf", "audio_duration". '
 
-- `--save-result`  
+- `--print-stage`
+Print per-stage benchmark metrics for --omni serving when stage metrics are returned by the server. Disabled by default.
+
+- `--save-result`
 Specify to save benchmark results to a json file
 
-- `--save-detailed`  
+- `--save-detailed`
 "When saving the results, whether to include per request "
         "information such as response, error, ttfs, tpots, etc."
 
-- `--result-dir`  
+- `--result-dir`
  "Specify directory to save benchmark json results."
         "If not specified, results are saved in the current directory."
 
-- `--result-filename`  
+- `--result-filename`
 "Specify the filename to save benchmark json results."
         "If not specified, results will be saved in "
         "{label}-{args.request_rate}qps-{base_model_id}-{current_dt}.json"
 
-- `--random-prefix-len`  
+- `--random-prefix-len`
   Number of fixed prefix tokens before the random context in a request.
   The total input length is the sum of random-prefix-len and a random
-  context length sampled from [input_len * (1 - range_ratio),
-  input_len * (1 + range_ratio)].Only the random and random-mm modes
+  context length sampled from [input_len *(1 - range_ratio),
+  input_len* (1 + range_ratio)].Only the random and random-mm modes
   support this parameter.
 
-- `--random-input-len`  
+- `--random-input-len`
   Number of input tokens per request.Only the random and random-mm modes support this parameter.
 
-- `--random-output-len`  
+- `--random-output-len`
   Number of output tokens per request.Only the random and random-mm modes support this parameter.
 
-- `--random-range-ratio`  
+- `--random-range-ratio`
   Range ratio for sampling input/output length,
   used only for random sampling. Must be in the range [0, 1) to define
   a symmetric sampling range
-  [length * (1 - range_ratio), length * (1 + range_ratio)].
+  [length *(1 - range_ratio), length* (1 + range_ratio)].
   Only the random and random-mm modes support this parameter.
 
-- `--random-mm-base-items-per-request`  
+- `--random-mm-base-items-per-request`
   Base number of multimodal items per request for random-mm.
   Actual per-request count is sampled around this base using
   --random-mm-num-mm-items-range-ratio.
   Only the random-mm mode supports this parameter.
 
-- `--random-mm-limit-mm-per-prompt`  
+- `--random-mm-limit-mm-per-prompt`
   Per-modality hard caps for items attached per request, e.g.
   '{"image": 3, "video": 1, "audio": 1}'. The sampled per-request item
   count is clamped to the sum of these limits. When a modality
@@ -104,7 +114,7 @@ Specify to save benchmark results to a json file
   renormalized.
   Only the random-mm mode supports this parameter.
 
-- `--random-mm-num-mm-items-range-ratio`  
+- `--random-mm-num-mm-items-range-ratio`
   Range ratio r in [0, 1] for sampling items per request.
   We sample uniformly from the closed integer range
   [floor(n*(1-r)), ceil(n*(1+r))]
@@ -115,7 +125,7 @@ Specify to save benchmark results to a json file
   An error is raised if the computed min exceeds the max.
   Only the random-mm mode supports this parameter.
 
-- `--random-mm-bucket-config`  
+- `--random-mm-bucket-config`
   The bucket config is a dictionary mapping a multimodal item
   sampling configuration to a probability.
   Currently allows for 3 modalities: audio, images and videos.
@@ -133,6 +143,7 @@ Specify to save benchmark results to a json file
 ## Usage Examples
 
 ### Online Benchmark
+
 <details class="admonition abstract" markdown="1">
 <summary>Show more</summary>
 
@@ -158,7 +169,9 @@ vllm bench serve \
   --dataset-path ShareGPT_V3_unfiltered_cleaned_split.json \
   --percentile-metrics ttft,tpot,itl,e2el
 ```
+
 If successful, you will see the following output:
+
 ```text
 ============ Serving Benchmark Result ============
 Successful requests:                     2
@@ -260,10 +273,192 @@ Median AUDIO_RTF:                        0.47
 P99 AUDIO_RTF:                           0.48
 ==================================================
 ```
+
 Notes:
 We use audio generation time / audio duration to calculate RTF.
 
 </details>
+
+### OmniInteract Realtime Benchmark
+
+OmniInteract runs each video as one native-duplex WebSocket sample in the standard serving-benchmark lifecycle:
+
+```bash
+vllm bench serve --omni \
+  --backend openai-realtime-duplex \
+  --dataset-name omniinteract \
+  --dataset-path /path/to/OmniInteract \
+  --model openbmb/MiniCPM-o-4_5 \
+  --base-url http://127.0.0.1:8000 \
+  --endpoint /v1/realtime \
+  --omniinteract-ref-audio /path/to/reference.wav \
+  --omniinteract-output-dir ./omniinteract-artifacts \
+  --num-prompts 3 \
+  --num-warmups 0
+```
+
+`--dataset-path` accepts an extracted directory, `data.tar[.gz]`, or a Hugging Face dataset ID; omitting it uses
+`lucky-lance/OmniInteract`. `--num-prompts` is the total across subsets and defaults to 3 for OmniInteract; explicit `0`
+selects all and oversize values use all available cases. Reference audio is required, and OmniInteract uses the
+`/v1/realtime` endpoint.
+
+To replay an existing sample set (for example `sampled_cases.jsonl` from a prior run), pass
+`--omniinteract-video-list` instead of discovering cases. List order is preserved; `--num-prompts` takes the prefix of
+the list (`0` or a value larger than the list length runs every row). Do not combine video-list mode with `--seed`,
+`--dataset-path`, `--omniinteract-scenario-tags`, or `--omniinteract-scenario-focus`.
+
+Use `--omniinteract-scenario-tags` to steer small runs toward paper-table scenarios (`realtime`, `proactive`,
+`nested`, `interrupted`, `1qna`). By default the sampler covers each requested tag with at least one matching case
+(when available under `--omniinteract-subsets`), then fills the remaining `--num-prompts` budget from other cases.
+Add `--omniinteract-scenario-focus` to run only cases that match those tags. Example smoke coverage:
+
+```bash
+  --num-prompts 5 \
+  --omniinteract-scenario-tags realtime proactive nested interrupted 1qna
+```
+
+Audio is replayed as 16 kHz PCM16 in 200 ms chunks and video at 1 FPS with real-time pacing. All selected media is decoded
+before timing and remains in client memory for the run, so `--max-concurrency` does not limit media preparation memory; use
+explicit `--num-prompts 0` only when the client has enough RAM for the full dataset. Media commands are bounded by
+`--omniinteract-media-timeout-s`, and concurrency defaults to 1. Standard request-rate, warmup, result-saving, and summary
+options apply. Use `--omniinteract-require-response` only for functional E2E cases; LISTEN is a valid benchmark result.
+
+Each completed case writes `output.wav`, `wav_transcript.json`, `events.json`, `result.json`, and a final `.done` marker under
+`--omniinteract-output-dir`. The root also contains `batch_summary.json`, `official_eval_manifest.jsonl` (eligible cases only),
+and `sampled_cases.jsonl` (every sampled case as absolute `video_path` / official `output_name` / `subset` rows for Lucky-Lance
+OmniInteract `batch_inference_minicpmo.py --video_list`); failed cases write
+`.failed.json`. Runs sharing one output root are serialized. Completion validates transport, response lifecycle, and artifacts,
+not answer accuracy. Transcript timestamps are serialized playback-queue times. Playback ACKs report cumulative progress
+incrementally along that serialized clock, like a live listener; the first ack for a response goes out as soon as its audio
+arrives, checkpointing the response's history position so a later committed user input updates it in place. A residual
+`playback_ack_too_late` rejection is recorded as an artifact warning rather than failing the case. Clipped or cancelled
+outputs are ineligible and omitted from the official manifest; `audio_clipped_bytes` records output beyond the rounded video
+horizon.
+
+Accuracy evaluation is opt-in and requires an already-running text judge with an OpenAI-compatible Chat Completions API. The
+benchmark does not launch or stop the judge server. Add the following options to the command above:
+
+```bash
+vllm serve Qwen/Qwen2.5-7B-Instruct \
+  --served-model-name Qwen2.5-7B-Instruct \
+  --port 8001
+```
+
+Then add to the benchmark command:
+
+```bash
+  --omniinteract-evaluate \
+  --omniinteract-judge-base-url http://127.0.0.1:8001 \
+  --omniinteract-judge-model Qwen2.5-7B-Instruct
+```
+
+`--omniinteract-judge-model` must match that judge process's `--served-model-name` (or its `--model`
+string if `--served-model-name` is omitted). It is not a checkpoint path to load, and it is not the
+Omni DUT `--served-model-name`. Point `--omniinteract-judge-base-url` at the judge, not at the Omni
+realtime endpoint.
+
+The early / core / interrupted-partial judge prompts follow the official English
+templates in [Lucky-Lance/OmniInteract](https://github.com/Lucky-Lance/OmniInteract)
+`eval/evaluation/llm_judge.py` (commit `de304cef35fd9a50a5caadb5090c34cfbf0dd868`).
+They correspond to the OmniInteract paper appendix
+([arXiv:2605.26485](https://arxiv.org/abs/2605.26485)) Listing A.1 (early-stage),
+Listing A.2 (interrupted partial quality), and Listing A.3 (core-stage).
+A local OpenAI-compatible judge is not the paper's GPT-4o judge, so reported
+IA-QTF1 numbers are protocol-compatible rather than official paper-table scores.
+
+After artifact publication, the evaluator builds `[start, t_a, end)` slots, judges early and core response text, writes
+per-case details plus `evaluation/unified_eval_summary.json`, and prints IA-QTF1 columns
+(1Q1A realtime / proactive / nested / Global, 1QnA, All Global), interruption diagnostics (NOR / PAQ / CSM), and nested
+metrics (NCCS, inner / outer IA-QTF1, missed outer). Slices and sections with no slots in the evaluated sample are
+omitted from the terminal report. The header lists how many evaluated cases carry each scenario tag
+(`realtime`, `proactive`, `nested`, `interrupted`, `1qna`). Realtime and proactive
+exclude nested inner/outer slots; 1Q1A Global recomputes F1 from those three TP/FP/FN aggregates; All Global includes every
+scored slot plus unmatched-chunk false positives. Plain `wav_transcript.json` timestamps provide chunk-level approximate
+timing. If transcript chunks include `aligned_words`, the evaluator splits boundary-crossing chunks and derives trigger
+timing from word alignment.
+
+Per-response TTFT and TTFP start when the server begins executing the native model-turn request that owns the response. RTF
+continues to use client receipt of `response.created` through the last audio packet, divided by emitted audio duration. Global
+TTFT, TTFP, and RTF cover the complete input-stream window. TPOT/ITL use engine stage-0 timing; ITL is emitted only when every
+token interval is present within a continuous generation segment. Model-unit pacing and gaps between generation segments are
+excluded from TPOT/ITL. Raw request metrics retain `response_created_to_first_text_ms` and
+`response_created_to_first_audio_ms` as client-envelope diagnostics.
+
+The checked-in local performance configuration measures four deterministic cases from `1q1a`, `1q1a_math`, and
+`1qna` (12 videos total), with no benchmark warmups and a maximum concurrency of two. Each subset also sends one readiness request before its
+measured cases. The runner starts MiniCPM-o 4.5 on the first visible GPU and a text judge
+(`Qwen/Qwen2.5-7B-Instruct`) on the second (`CUDA_VISIBLE_DEVICES=1` relative to the process). After artifacts land it
+scores All Global IA-QTF1 through that local judge. This is protocol-compatible with the paper metric, not a GPT-4o
+paper-table score. Run it from the repository root with two visible GPUs:
+
+```bash
+export HF_HOME=/path/to/persistent/huggingface-cache
+export BENCHMARK_DIR=tests/dfx/perf/results
+bash tools/nightly/run_nightly_jobs.sh \
+  --test-type local \
+  --model-type omni \
+  --label-substr minicpmo_4_5_omniinteract
+```
+
+The first run downloads the pinned OmniInteract archive and the judge weights into `HF_HOME`; later runs reuse that cache.
+
+It requires every case to commit its input, complete any emitted response lifecycles, and publish the expected WAV,
+transcript, event, and result artifacts without errors. A valid LISTEN-only case may have no response audio or transcript
+chunks. Official-manifest eligibility is reported separately because clipped or cancelled output is a benchmark-quality
+signal, not a transport failure. Accuracy must finish with `status=ok` on every subset. After all three subsets finish,
+All Global IA-QTF1 is recomputed from pooled `Global_TP` / `Global_FP` / `Global_FN` and must be at or above
+`omniinteract_aggregate_min_ia_qtf1` (checked in as `0.2`).
+
+### Video-MME Benchmark
+
+Video-MME (`--dataset-name videomme`) scores multiple-choice video QA. Default packing is
+OmniEvalKit MiniCPM `minicpm-frames` (up to 96 sampled frames as `image_url`). Pass a local
+mirror with `--dataset-path` / `--videomme-parquet` + `--videomme-video-dir`, or a Hugging
+Face dataset id (`lmms-eval/Video-MME` by default; any `org/name` is accepted when
+`--dataset-name videomme` is explicit). Relative `--videomme-video-dir` values are resolved
+to absolute `file://` URLs. For those URLs, start the server with
+`--allowed-local-media-path` covering the video root; otherwise use `--videomme-inline-local-video`.
+
+For MiniCPM-o 4.5, the default deployment allows 64 images per request. To run the
+96-frame recipe, start the server with a stage 0 override (replace `/path/to/Video-MME`
+with the local video root shared by the benchmark client and server):
+
+```bash
+vllm serve openbmb/MiniCPM-o-4_5 --omni \
+  --allowed-local-media-path /path/to/Video-MME \
+  --stage-overrides '{"0":{"limit_mm_per_prompt":{"image":96,"audio":64,"video":1}}}'
+```
+
+The override applies to this server invocation only. Alternatively, use
+`--videomme-max-frames 64` in the benchmark to stay within the default image limit;
+this evaluates a different frame-sampling setting from the 96-frame recipe.
+
+Run the benchmark against that server:
+
+```bash
+vllm bench serve --omni \
+  --backend openai-chat-omni \
+  --dataset-name videomme \
+  --dataset-path /path/to/Video-MME \
+  --videomme-pack-mode minicpm-frames \
+  --videomme-max-frames 96 \
+  --model openbmb/MiniCPM-o-4_5 \
+  --endpoint /v1/chat/completions \
+  --num-prompts 8 \
+  --max-concurrency 1 \
+  --save-result
+```
+
+Accuracy keys (`videomme_accuracy`, per-duration / domain / task breakdowns) are written into
+the saved JSON. `videomme_accuracy` excludes HTTP failures; `videomme_accuracy_incl_http_fail`
+counts them as wrong. `videomme_submitted` / `videomme_unique_question_ids` show when
+oversampling made the request count differ from unique-question coverage.
+`videomme_skipped_rows` counts rows skipped during sampling because of missing or unreadable
+media or invalid question fields. The opt-in accuracy runner rejects skipped rows, HTTP
+failures, duplicate question IDs, and missing gold answers. This checks the sampled subset;
+it does not establish that a supplied local mirror contains the entire official dataset.
+Use `--videomme-save-eval-items` (or `VIDEOMME_SAVE_EVAL_ITEMS=1`) for per-request
+`videomme_eval_items` rows.
 
 ### Multi-Modal Benchmark
 
@@ -276,7 +471,9 @@ Generate synthetic image、video、audio inputs alongside random text prompts to
 
 Notes:
 
-- Works only with online benchmark via the OpenAI backend (`--backend openai-chat-omni`) and endpoint `/v1/chat/completions`.
+- Works only with online benchmark via:
+    - the OpenAI chat backend (`--backend openai-chat-omni`) and endpoint `/v1/chat/completions`.
+    - the OpenAI edit image backend (`--backend openai-image-edits-omni`) and endpoint `/v1/images/edits`.
 
 Start the server (example):
 
@@ -287,6 +484,7 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni
 It is recommended to use the flag `--ignore-eos` to simulate real responses. You can set the size of the output via the arg `random-output-len`.
 
 Then run the benchmarking script:
+
 ```bash
 vllm bench serve \
     --omni \
@@ -306,7 +504,7 @@ vllm bench serve \
   --ignore-eos \
   --percentile-metrics ttft,tpot,itl \
   --random-output-len 2 \
-  --extra_body '{"modalities": ["text"]}'
+  --extra-body '{"modalities": ["text"]}'
 ```
 
 If successful, you will see the following output:
@@ -356,4 +554,181 @@ How sampling works:
 - If a modality (e.g., image) reaches its limit from `--random-mm-limit-mm-per-prompt`, all buckets of that modality are excluded and the remaining bucket probabilities are renormalized before continuing.
 This should be seen as an edge case, and if this behavior can be avoided by setting `--random-mm-limit-mm-per-prompt` to a large number. Note that this might result in errors due to engine config `--limit-mm-per-prompt`.
 - The resulting request contains synthetic image data in `multi_modal_data` (OpenAI Chat format). When `random-mm` is used with the OpenAI Chat backend, prompts remain text and MM content is attached via `multi_modal_data`.
+
+</details>
+
+### Image / video generation
+
+For `/v1/images/generations`, `/v1/images/edits`, and `/v1/videos`, set `--endpoint` to that path and omit `--backend`. The endpoint path is registered as the bench request adapter, so a separate named backend is not required.
+
+Example (`/v1/images/generations`):
+
+```bash
+vllm bench serve --omni \
+  --endpoint /v1/images/generations \
+  --dataset-name random \
+  --model ~/models/Qwen/Qwen-Image \
+  --tokenizer ~/models/Qwen/Qwen-Image/tokenizer \
+  --max-concurrency 1 \
+  --num-warmups 2 \
+  --num-prompts 10 \
+  --random-input-len 64 \
+  --random-output-len 1 \
+  --ignore-eos \
+  --percentile-metrics e2el \
+  --extra-body '{
+    "num_inference_steps": 20,
+    "seed": 42,
+    "true_cfg_scale": 4.0
+  }'
+```
+
+If successful, following output is like:
+
+```text
+============ Serving Benchmark Result ============
+Successful requests:                     3  
+Failed requests:                         0  
+Maximum request concurrency:             1  
+Benchmark duration (s):                  8.42  
+Request throughput (req/s):              0.36  
+Peak concurrent requests:                2.00  
+-------------------Peak Memory--------------------
+Mean PEAK_MEMORY_MB (MB):                58832.00  
+Median PEAK_MEMORY_MB (MB):              58832.00  
+P99 PEAK_MEMORY_MB (MB):                 58832.00  
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          2798.16  
+Median E2EL (ms):                        2799.83  
+P99 E2EL (ms):                           2800.03  
+================== Image Result ==================
+Total images generated:                  3  
+Image throughput (img/s):                0.36  
+Average pixels per image:                1048576.00
+Mean denoise step latency (ms):          136.59  
+---------------- Image Generation ----------------
+Mean IMAGE_GENERATION (ms):              2731.84  
+Median IMAGE_GENERATION (ms):            2732.02  
+P99 IMAGE_GENERATION (ms):               2734.65  
+==================================================
+```
+
+Use the same pattern with `--endpoint /v1/images/edits` or `--endpoint /v1/videos` (and model-specific `--extra-body` as needed). Pure image/video runs omit the Text Result section when there is no generated text.
+
+`/v1/images/edits` defaults to **non-streaming JSON** (`stream=false`) so single-stage edit models are not rejected by the server. For multi-stage pipelines that need SSE (AR TTFT / image chunks), pass `"stream": true` in `--extra-body`.
+
+`/v1/videos` is an async job API: the client creates a job, then polls until `completed`/`failed`. Measured **e2el** therefore includes client poll sleep and any overshoot after the job actually finishes. Tune polling via `--extra-body`:
+
+- `poll_interval_s` (default `2.0`): sleep between status polls
+- `poll_timeout_s` (default `21600`, i.e. 6 hours): give up waiting for the job
+
+**VIDEO_RTF** prefers server-reported generation time when available:
+
+- `video_rtf = video_generation_time_ms / 1000 / video_duration`, where `video_generation_time_ms` comes from response `stage_durations` (or `inference_time_s` as fallback)
+- If generation time is missing, falls back to `e2el / video_duration` (this fallback *does* include poll overhead)
+
+### Multi-Stage Benchmark
+
+<details class="admonition abstract" markdown="1">
+<summary>Show more</summary>
+
+Start the server (change the port and model):
+
+```bash
+vllm serve --omni --port 29999 --model ~/Qwen3-Omni-30B-A3B-Instruct
+```
+
+Then run the benchmarking script (remember to add the flag `--print-stage`):
+
+```bash
+vllm bench serve --omni \
+  --dataset-name random \
+  --port 29999 \
+  --max-concurrency 1 \
+  --num-warmups 2 \
+  --model ~/Qwen3-Omni-30B-A3B-Instruct \
+  --endpoint /v1/chat/completions \
+  --backend openai-chat-omni \
+  --num-prompts 3 \
+  --random-input-len 2500 \
+  --ignore-eos \
+  --percentile-metrics ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,ttfc,tpoc,icl \
+  --random-output-len 900 \
+  --extra-body '{"modalities": ["text","audio"]}' \
+  --print-stage
+```
+
+Besides the "Serving Benchmark Result", there will be "Stage Benchmark Result" below:
+
+```text
+============= Stage Benchmark Result =============
+=============== Stage 0 (thinker) ================
+-------------------Stage Timing-------------------
+Mean stage_gen_time (ms):                18243.16
+Median stage_gen_time (ms):              18220.83
+P99 stage_gen_time (ms):                 18296.75
+================== Text Result ===================
+Stage generated tokens:                  2700
+-----------Serving Time to First Token------------
+Mean Serving TTFT (ms):                  816.31
+Median Serving TTFT (ms):                818.94
+P99 Serving TTFT (ms):                   829.76
+-----Time per Output Token (excl. 1st token)------
+Mean TPOP (ms):                          19.41
+Median TPOP (ms):                        19.40
+P99 TPOP (ms):                           19.47
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           19.41
+Median ITL (ms):                         19.12
+P99 ITL (ms):                            23.58
+================ Stage 1 (talker) ================
+-------------------Stage Timing-------------------
+Mean stage_gen_time (ms):                18849.64
+Median stage_gen_time (ms):              13641.15
+P99 stage_gen_time (ms):                 33655.58
+============= Internal Stream Result =============
+-----------Serving Time to First Chunk------------
+Mean Serving TTFC (ms):                  1029.14
+Median Serving TTFC (ms):                1027.98
+P99 Serving TTFC (ms):                   1032.59
+-----Time per Output Chunk (excl. 1st chunk)------
+Mean TPOP (ms):                          17.53
+Median TPOP (ms):                        18.70
+P99 TPOP (ms):                           18.88
+---------------Inter-chunk Latency----------------
+Mean ICL (ms):                           16.27
+Median ICL (ms):                         18.19
+P99 ICL (ms):                            25.86
+=============== Stage 2 (code2wav) ===============
+-------------------Stage Timing-------------------
+Mean stage_gen_time (ms):                18860.74
+Median stage_gen_time (ms):              13655.84
+P99 stage_gen_time (ms):                 33659.79
+================== Audio Result ==================
+Stage audio duration generated(s):       260.11
+Stage audio frames generated:            6242730
+-----------Serving Time to First Packet-----------
+Mean Serving AUDIO_TTFP (ms):            1366.16
+Median Serving AUDIO_TTFP (ms):          1367.20
+P99 Serving AUDIO_TTFP (ms):             1368.26
+-----------------Real Time Factor-----------------
+Mean AUDIO_RTF:                          0.24
+Median AUDIO_RTF:                        0.26
+P99 AUDIO_RTF:                           0.27
+```
+
+Explanation:
+
+- stage_gen_time: Time from submitting a request to a specific stage to that stage finishing generation.
+
+- Serving TTFC (Time to First Chunk): Time from the HTTP request being accepted by the serving frontend to
+  the stage producing its first non-empty output chunk. Keep the name TTFT in text stage, TTFP in audio stage
+  for easier mapping.
+
+- TPOP (Time per Output Chunk): Average time from the first output chunk to stage completion, divided by the
+  number of remaining output chunks. The TPOP abbreviation follows Qwen3.5-Omni Technical Report.
+
+- ICL (Inter-Chunk Latency): Time between two consecutive output chunks produced by the same stage. Keep the
+  name ITL in text stage for easier mapping.
+
 </details>

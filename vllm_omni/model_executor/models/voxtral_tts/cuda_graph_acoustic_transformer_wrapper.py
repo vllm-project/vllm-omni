@@ -48,13 +48,13 @@ class CUDAGraphAcousticTransformerWrapper:
         self.n_acoustic_codebook = self.acoustic_transformer.model_args.n_acoustic_codebook
         self.acoustic_embeddings_levels = self.acoustic_transformer.acoustic_embeddings_levels
 
-        self.cfg_alpha = 1.2
-        self.n_steps = 8
+        self.n_steps = self.acoustic_transformer.acoustic_transformer_args.n_decoding_steps
 
         # Graph storage
         self.graphs: dict[int, CUDAGraph] = {}
         self.static_inputs: dict[int, torch.Tensor] = {}
         self.static_noise: dict[int, torch.Tensor] = {}
+        self.static_cfg_alpha: dict[int, torch.Tensor] = {}
         self.static_fake_eos: dict[int, torch.Tensor] = {}
         self.static_audio_codes: dict[int, torch.Tensor] = {}
 
@@ -73,17 +73,25 @@ class CUDAGraphAcousticTransformerWrapper:
         )
 
         # Pre-create persistent buffers
-        self.timesteps = torch.linspace(0, 1, self.n_steps, device=device, dtype=dtype)
+        self.timesteps = torch.linspace(0, 1, self.n_steps + 1, device=device, dtype=dtype)
+        # Precompute schedule constants (dt, projected time embeddings) so the captured
+        # graph indexes a table instead of re-running them on every replay.
+        self.dts = self.timesteps[1:] - self.timesteps[:-1]
+        with torch.no_grad():
+            t_emb_table = self.acoustic_transformer.time_embedding(self.timesteps.view(-1, 1)).to(dtype)
+            self.t_proj_table = self.acoustic_transformer.time_projection(t_emb_table)
         self.fake_eos_one = torch.tensor(1.0, dtype=dtype, device=device)
         self.fake_eos_zero = torch.tensor(0.0, dtype=dtype, device=device)
 
         # Phase 1: Eager warmup for ALL capture sizes
         for size in self.capture_sizes:
             dummy = torch.zeros(size, hidden_dim, device=device, dtype=dtype)
+            dummy_cfg_alpha = torch.full((size, 1), 1.2, device=device, dtype=dtype)
+            dummy_noise = torch.randn(size, self.n_acoustic_codebook, device=device, dtype=dtype)
             with torch.no_grad():
-                self._forward_cudagraph_compatible(dummy)
+                self._forward_cudagraph_compatible(dummy, cfg_alpha=dummy_cfg_alpha, noise=dummy_noise)
 
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
 
         # Phase 2: Capture graphs
         for size in self.capture_sizes:
@@ -105,7 +113,12 @@ class CUDAGraphAcousticTransformerWrapper:
             len(self.capture_sizes),
         )
 
-    def _forward_cudagraph_compatible(self, hidden_states: torch.Tensor, noise: torch.Tensor | None = None):
+    def _forward_cudagraph_compatible(
+        self,
+        hidden_states: torch.Tensor,
+        cfg_alpha: torch.Tensor,
+        noise: torch.Tensor,
+    ):
         """
         The actual computation captured by the CUDA graph.
 
@@ -117,6 +130,7 @@ class CUDAGraphAcousticTransformerWrapper:
         - Calls _predict_velocity directly
         - Uses a pre-allocated noise buffer to avoid baking random state
           into the CUDA graph
+        - Uses a pre-allocated cfg_alpha buffer for per-request CFG strength
         """
         at = self.acoustic_transformer
         B = hidden_states.shape[0]
@@ -132,30 +146,27 @@ class CUDAGraphAcousticTransformerWrapper:
         # --- Flow matching: Euler ODE ---
         should_decode = semantic_code.squeeze(1) != self.end_audio_token_id
 
-        if noise is not None:
-            x = noise
-        else:
-            x = torch.randn(B, self.n_acoustic_codebook, device=hidden_states.device, dtype=hidden_states.dtype)
+        x = noise
 
-        # Pre-compute zero hidden states for unconditional CFG branch
-        hidden_states_zero = torch.zeros_like(hidden_states)
+        # Hoist the step-invariant concat + llm_projection out of the loop; inside the
+        # captured graph these would otherwise be baked in and replayed every step.
+        llm_batched = torch.cat([hidden_states, torch.zeros_like(hidden_states)], dim=0)  # (2B, D)
+        llm_proj_batched = at.llm_projection(llm_batched)  # (2B, D)
 
         timesteps = self.timesteps
         for i in range(len(timesteps) - 1):
-            t = timesteps[i]
-            dt = timesteps[i + 1] - timesteps[i]
+            dt = self.dts[i]
 
-            # Batch conditional + unconditional velocity in a single forward pass
-            t_emb = at.time_embedding(t.view(-1, 1).repeat(B, 1)).to(hidden_states.dtype)
+            # Batch cond + uncond in a single pass; reuse the cached projected-t_emb row.
+            t_proj = self.t_proj_table[i].unsqueeze(0).expand(B, -1)
             x_batched = torch.cat([x, x], dim=0)  # (2B, C)
-            llm_batched = torch.cat([hidden_states, hidden_states_zero], dim=0)  # (2B, D)
-            t_emb_batched = t_emb.repeat(2, 1)  # (2B, D)
+            t_proj_batched = t_proj.repeat(2, 1)  # (2B, D)
 
-            v_all = at._predict_velocity(x_t=x_batched, llm_output=llm_batched, t_emb=t_emb_batched)
+            v_all = at._predict_velocity(x_t=x_batched, llm_proj=llm_proj_batched, t_proj=t_proj_batched)
             v_t, uncond_v_t = v_all[:B], v_all[B:]
 
-            # CFG combination
-            v_t = self.cfg_alpha * v_t + (1 - self.cfg_alpha) * uncond_v_t
+            # CFG combination (cfg_alpha is (B, 1), v_t is (B, C))
+            v_t = cfg_alpha * v_t + (1 - cfg_alpha) * uncond_v_t
 
             x = x + v_t * dt
 
@@ -188,23 +199,25 @@ class CUDAGraphAcousticTransformerWrapper:
         """Capture a CUDA graph for a specific batch size."""
         static_input = torch.zeros(size, hidden_dim, device=device, dtype=dtype)
         static_noise = torch.randn(size, self.n_acoustic_codebook, device=device, dtype=dtype)
+        static_cfg_alpha = torch.full((size, 1), 1.2, device=device, dtype=dtype)
 
         # Stabilizing eager run
         with torch.no_grad():
-            _ = self._forward_cudagraph_compatible(static_input, noise=static_noise)
+            _ = self._forward_cudagraph_compatible(static_input, cfg_alpha=static_cfg_alpha, noise=static_noise)
 
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
 
         graph = CUDAGraph()
         with torch.no_grad():
             with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
                 static_fake_eos, static_audio_codes = self._forward_cudagraph_compatible(
-                    static_input, noise=static_noise
+                    static_input, cfg_alpha=static_cfg_alpha, noise=static_noise
                 )
 
         self.graphs[size] = graph
         self.static_inputs[size] = static_input
         self.static_noise[size] = static_noise
+        self.static_cfg_alpha[size] = static_cfg_alpha
         self.static_fake_eos[size] = static_fake_eos
         self.static_audio_codes[size] = static_audio_codes
 
@@ -218,6 +231,7 @@ class CUDAGraphAcousticTransformerWrapper:
     def __call__(
         self,
         hidden_states: torch.Tensor,
+        cfg_alpha: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]] | None]:
         """
         Drop-in replacement for model.compute_mm_logits().
@@ -229,15 +243,23 @@ class CUDAGraphAcousticTransformerWrapper:
         actual_size = hidden_states.shape[0]
 
         if not self.enabled or not self._warmed_up:
-            return self.model.compute_mm_logits(hidden_states)
+            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha)
+
+        # Inner graph replay is illegal during an outer stream capture.
+        if torch.cuda.is_current_stream_capturing():
+            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha)
 
         padded_size = self._get_padded_size(actual_size)
         if padded_size is None or padded_size not in self.graphs:
-            return self.model.compute_mm_logits(hidden_states)
+            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha)
 
         # Zero static input, then copy actual data
         self.static_inputs[padded_size].zero_()
         self.static_inputs[padded_size][:actual_size] = hidden_states
+
+        # Copy per-request cfg_alpha into static buffer (pad with 1.2 default)
+        self.static_cfg_alpha[padded_size].fill_(1.2)
+        self.static_cfg_alpha[padded_size][:actual_size, 0] = cfg_alpha
 
         # Fill noise buffer with fresh random values before replay so the
         # flow-matching ODE starts from different initial noise each time.
@@ -250,8 +272,8 @@ class CUDAGraphAcousticTransformerWrapper:
         fake_eos = self.static_fake_eos[padded_size][:actual_size].clone()
         audio_codes = self.static_audio_codes[padded_size][:actual_size].clone()
 
-        # Package into expected format: (fake_eos, {"audio": [list of tensors]})
+        # Package into expected format: (fake_eos, {"codes": {"audio": [list of tensors]}})
         audio_list = list(torch.split(audio_codes.unsqueeze(1), 1, dim=0))
-        mm_tokens = {"audio": audio_list}
+        mm_tokens = {"codes": {"audio": audio_list}}
 
         return fake_eos, mm_tokens

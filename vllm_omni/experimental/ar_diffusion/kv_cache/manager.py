@@ -1,0 +1,730 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Engine-level KV cache orchestration for AR-Diffusion models.
+
+This is the *body* of AR-Diffusion's KV management: it owns a vLLM ``KVCacheManager`` (a
+single chunk-window group) and the per-request adapter lifecycle, and exposes the
+per-chunk operations a rollout needs — allocate, slot mapping, commit, window
+lookup, free. It lives in the model runner (worker / GPU side), co-located with
+the model and the KV tensors. The main-process ``ARDiffusionEngine`` only
+selects the engine and is otherwise thin.
+"""
+
+from __future__ import annotations
+
+import inspect
+import os
+from collections.abc import Collection, Iterable, Sequence
+from dataclasses import dataclass
+from typing import Any, cast
+
+import torch
+from vllm.logger import init_logger
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheSpec,
+)
+from vllm.v1.request import RequestStatus
+
+from vllm_omni.diffusion.diffusion_kv.layout import build_kv_cache_tensor
+from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionKVBranchSpec
+from vllm_omni.experimental.ar_diffusion.kv_cache.config import (
+    KV_GATHER_ENV,
+    ARDiffusionKVConfig,
+    contiguous_kv_gather_enabled,
+)
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
+    ChunkWindowManager,
+    ChunkWindowSpec,
+    allocate_kv_pool_with_views,
+    chunk_slot_mapping,
+    pool_write_chunk,
+    resident_block_ids,
+)
+
+_log = init_logger(__name__)
+
+
+class ARDiffusionRequestAdapter:
+    """Duck-types the subset of ``vllm.v1.request.Request`` that the
+    ``KVCacheManager`` reads (``allocate_slots`` / ``get_computed_blocks`` /
+    ``free`` and the coordinator they call into).
+
+    It is intentionally NOT a full ``Request``. The conformance test exercises a
+    real ``KVCacheManager`` against this adapter so the surface cannot silently
+    drift across vLLM versions.
+
+    ``completed_chunks`` and ``absolute_num_computed_tokens`` track the model
+    timeline. vLLM sees compacted storage positions through ``num_computed_tokens``
+    and ``num_tokens``. A chunk's denoise steps reuse the same slots; only a
+    successful commit advances the timeline and compacts evicted metadata.
+    """
+
+    def __init__(
+        self,
+        request_id: str,
+        *,
+        chunk_size: int,
+        prefill_prefix_tokens: int = 0,
+    ) -> None:
+        self.request_id = request_id
+        self._chunk_size = chunk_size
+        self._prefill = prefill_prefix_tokens
+        self._completed_chunks = 0
+        self.compacted_tokens = 0
+        # Filled only when cross-request prefix reuse is enabled (Phase 3).
+        self.block_hashes: list = []
+        self.skip_reading_prefix_cache = True
+        self.num_preemptions = 0
+        # vLLM watermark gate reads this; map the request lifecycle onto it.
+        self.status = RequestStatus.WAITING
+        # vLLM 0.26 KVCacheManager.allocate_slots reads this when computing
+        # remove_skipped_blocks. Always 0 here: an AR-Diffusion request only
+        # advances num_computed_tokens on on_chunk_committed(), so there are
+        # never optimistically-counted in-flight tokens to subtract.
+        self.num_in_flight_tokens = 0
+
+    @property
+    def absolute_num_computed_tokens(self) -> int:
+        """Cumulative model position, unaffected by storage compaction."""
+        return self._prefill + self._completed_chunks * self._chunk_size
+
+    @property
+    def num_computed_tokens(self) -> int:
+        """Committed position in the compact vLLM block table."""
+        return self.absolute_num_computed_tokens - self.compacted_tokens
+
+    @property
+    def num_tokens(self) -> int:
+        """Storage position once the in-flight chunk is committed."""
+        return self.num_computed_tokens + self._chunk_size
+
+    @property
+    def num_prompt_tokens(self) -> int:
+        """The prefill prefix length (read by ``cache_blocks`` when caching)."""
+        return self._prefill
+
+    @property
+    def completed_chunks(self) -> int:
+        return self._completed_chunks
+
+    def on_chunk_committed(self) -> None:
+        """Advance by one chunk. Call once per chunk, not per denoise step."""
+        self._completed_chunks += 1
+
+
+def compute_num_blocks(
+    available_bytes: int,
+    gpu_memory_fraction: float,
+    page_size_bytes: int,
+) -> int:
+    """Number of KV blocks that fit in ``fraction`` of the memory budget."""
+    if page_size_bytes <= 0:
+        raise ValueError(f"page_size_bytes must be positive, got {page_size_bytes}")
+    if not 0.0 < gpu_memory_fraction <= 1.0:
+        raise ValueError(f"gpu_memory_fraction must be in (0, 1], got {gpu_memory_fraction}")
+    budget = int(available_bytes * gpu_memory_fraction)
+    return max(0, budget // page_size_bytes)
+
+
+def build_kv_manager(
+    spec: KVCacheSpec,
+    layer_names: Sequence[str],
+    num_blocks: int,
+    max_model_len: int,
+    *,
+    enable_caching: bool = False,
+) -> KVCacheManager:
+    """Build a ``KVCacheManager`` with a single KV cache group for ``spec``.
+
+    Args:
+        spec: The KV cache spec for the group (e.g. a ``ChunkWindowSpec``).
+        layer_names: Attention layers sharing this group's block table.
+        num_blocks: Total physical blocks in the pool.
+        max_model_len: Upper bound on a request's sequence length.
+        enable_caching: Cross-request prefix caching (Phase 3); off in Phase 1.
+    """
+    layer_names = list(layer_names)
+    group = KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)
+    tensors = [build_kv_cache_tensor(spec, num_blocks, layer_names)]
+    config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=tensors,
+        kv_cache_groups=[group],
+    )
+    kwargs = dict(max_model_len=max_model_len, hash_block_size=spec.block_size, enable_caching=enable_caching)
+    params = inspect.signature(KVCacheManager).parameters
+    if "scheduler_block_size" in params:
+        kwargs["scheduler_block_size"] = spec.block_size
+    if "max_num_batched_tokens" in params:
+        kwargs["max_num_batched_tokens"] = max_model_len
+    return KVCacheManager(config, **kwargs)
+
+
+@dataclass
+class HistoryStagingState:
+    """What the staged history window currently holds: whose session and which visible blocks.
+
+    Owned by the cache next to the buffers themselves; ``ARDiffusionPagedForwardContext`` reads it to decide
+    whether a forward may keep the staged history and writes back what it staged.
+    """
+
+    adapter: Any | None = None  # weakref to the session adapter the window was staged for
+    signature: tuple[Any, ...] | None = None
+
+
+class ARDiffusionKVCache:
+    """Own the paged KV pool and KV-branch-local storage for one model.
+
+    Build once per loaded model (dimensions known); then per request:
+    ``begin_request`` → per chunk (``allocate_chunk`` → ``chunk_write_slots`` →
+    [model writes K/V] → ``commit_chunk``) → ``end_request``.
+    """
+
+    def __init__(
+        self,
+        config: ARDiffusionKVConfig,
+        *,
+        num_layers: int,
+        num_kv_heads: int,
+        head_size: int,
+        dtype: torch.dtype,
+        block_size: int,
+        max_model_len: int,
+        available_bytes: int,
+        kv_branches: tuple[ARDiffusionKVBranchSpec, ...],
+        session_capacity: int,
+        cross_attention_lengths: dict[str, int] | None = None,
+        cross_attention_kv_heads: dict[str, int] | None = None,
+        device: torch.device | None = None,
+        frames_per_block: int = 1,
+        max_scratch_tokens_per_branch: int = 0,
+        model_owned_state_bytes_per_session: int = 0,
+    ) -> None:
+        if not config.enable:
+            raise ValueError("ARDiffusionKVCache built with a disabled ARDiffusionKVConfig")
+        if config.window_chunks is None:
+            raise ValueError("Phase 1 requires a bounded window (window_chunks)")
+        if config.chunk_size <= 0:
+            raise ValueError("ARDiffusionKVConfig.chunk_size must be set (> 0)")
+        if not kv_branches:
+            raise ValueError("ARDiffusionKVCache requires at least one KV branch")
+        if session_capacity <= 0:
+            raise ValueError(f"session_capacity must be positive, got {session_capacity}")
+        kv_branch_names = [kv_branch.name for kv_branch in kv_branches]
+        if len(kv_branch_names) != len(set(kv_branch_names)):
+            raise ValueError(f"ARDiffusionKVCache KV branch names must be unique, got {kv_branch_names}")
+        local_indices = {kv_branch.local_index for kv_branch in kv_branches}
+        if local_indices != set(range(max(local_indices) + 1)):
+            raise ValueError(
+                "ARDiffusionKVCache KV branch local_index values must be contiguous from zero, "
+                f"got {sorted(local_indices)}"
+            )
+
+        self.config = config
+        self.kv_branches = kv_branches
+        self.requested_session_capacity = session_capacity
+        self._kv_branch_local_indices = {kv_branch.name: kv_branch.local_index for kv_branch in kv_branches}
+        self.num_local_kv_branches = max(local_indices) + 1
+        if frames_per_block <= 0:
+            raise ValueError(f"frames_per_block must be positive, got {frames_per_block}")
+        if max_scratch_tokens_per_branch < 0:
+            raise ValueError(f"max_scratch_tokens_per_branch must be non-negative, got {max_scratch_tokens_per_branch}")
+        if model_owned_state_bytes_per_session < 0:
+            raise ValueError(
+                f"model_owned_state_bytes_per_session must be non-negative, got {model_owned_state_bytes_per_session}"
+            )
+        self.frames_per_block = int(frames_per_block)
+        self.block_size = block_size
+        self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
+        self.head_size = head_size
+        self.dtype = dtype
+        self.cross_attention_lengths = dict(cross_attention_lengths or {})
+        # A cross-attention cache may hold more heads than the self-attention share: a model that keeps every
+        # local head on every rank, rather than sharding heads across the sequence-parallel group, stores the
+        # full local set here. Absent means the self-attention head count, which is what every caller did before.
+        self.cross_attention_kv_heads = {
+            name: int((cross_attention_kv_heads or {}).get(name, num_kv_heads)) for name in self.cross_attention_lengths
+        }
+        invalid_heads = {n: h for n, h in self.cross_attention_kv_heads.items() if h <= 0}
+        if invalid_heads:
+            raise ValueError(f"cross_attention_kv_heads must be positive, got {invalid_heads}")
+        unknown_heads = set(cross_attention_kv_heads or {}) - set(self.cross_attention_lengths)
+        if unknown_heads:
+            raise ValueError(f"cross_attention_kv_heads names unknown caches: {sorted(unknown_heads)}")
+        invalid_cross = {name: length for name, length in self.cross_attention_lengths.items() if length <= 0}
+        if invalid_cross:
+            raise ValueError(f"cross_attention_lengths must be positive, got {invalid_cross}")
+        self.device = device or torch.device("cpu")
+        self._allocate_tensors = device is not None
+        self._adapters: dict[str, ARDiffusionRequestAdapter] = {}
+        self._cross_sessions: dict[
+            str,
+            dict[str, dict[str, tuple[list[torch.Tensor], list[torch.Tensor]]]],
+        ] = {}
+
+        self.spec = ChunkWindowSpec(
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=dtype,
+            sliding_window=config.window_chunks * config.chunk_size,
+            chunk_size=config.chunk_size,
+            window_chunks=config.window_chunks,
+            sink_chunks=config.sink_chunks,
+            reset_at_boundary=config.reset_at_boundary,
+        )
+
+        # Scratch blocks are outside KVCacheManager ownership. A non-committing
+        # forward needs one block per current frame plus space for any
+        # model-declared action/state tokens that coexist with video KV.
+        declared_scratch_blocks = (max_scratch_tokens_per_branch + block_size - 1) // block_size
+        minimum_scratch_blocks = self.frames_per_block + declared_scratch_blocks
+        override = os.environ.get("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH")
+        override_blocks = int(override) if override is not None else 0
+        if override_blocks < 0:
+            raise ValueError("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH must be non-negative")
+        scratch_per_kv_branch = max(minimum_scratch_blocks, override_blocks)
+        self.scratch_blocks_per_kv_branch = scratch_per_kv_branch
+        self.scratch_num_blocks = self.num_local_kv_branches * scratch_per_kv_branch
+
+        # The self-attention pool, scratch pool, and lazily materialized
+        # cross-attention caches share one hard memory budget. Select the largest
+        # feasible resident-session count rather than raising a block-count floor
+        # past that budget. All resident sessions need a complete sink + window;
+        # only one request can be in flight, so frames_per_block is counted once.
+        page_size_bytes = self.spec.page_size_bytes * num_layers
+        self.available_memory_bytes = available_bytes
+        self.configured_memory_budget_bytes = int(available_bytes * config.gpu_memory_fraction)
+        # Reuse the public helper's validation for the memory fraction/page size.
+        compute_num_blocks(available_bytes, config.gpu_memory_fraction, page_size_bytes)
+        self.scratch_reserved_bytes = self.scratch_num_blocks * page_size_bytes
+        self.model_owned_state_bytes_per_session = model_owned_state_bytes_per_session
+
+        def _cross_pool_bytes(length: int, heads: int) -> int:
+            return int(2 * len(self.kv_branches) * length * heads * head_size * dtype.itemsize * num_layers)
+
+        self.cross_attention_bytes_per_session = sum(
+            _cross_pool_bytes(length, self.cross_attention_kv_heads[name])
+            for name, length in self.cross_attention_lengths.items()
+        )
+
+        def _required_managed_blocks(capacity: int) -> int:
+            resident_per_session = config.sink_chunks + config.window_chunks
+            return self.num_local_kv_branches * (capacity * resident_per_session + self.frames_per_block) + 2
+
+        # reuse_history_staging keeps one contiguous K and V buffer per layer,
+        # sized to the padded visible window (sink + window plus the
+        # action-capacity block build_block_table always reserves), for the
+        # whole worker. It is allocated lazily on the first prepared forward,
+        # which is after admission, so it has to be reserved here or admission
+        # can succeed and that first forward run out of memory. Only the
+        # contiguous-gather attention path consumes it.
+        self.history_staging_reserved_bytes = 0
+        self.history_staging_tokens = 0
+        if config.reuse_history_staging:
+            if contiguous_kv_gather_enabled():
+                self.history_staging_tokens = (
+                    self.spec.sliding_window + config.sink_chunks * config.chunk_size + block_size
+                )
+                self.history_staging_reserved_bytes = int(
+                    2 * num_layers * self.history_staging_tokens * num_kv_heads * head_size * dtype.itemsize
+                )
+            else:
+                _log.warning(
+                    "reuse_history_staging is set but the contiguous K/V gather path (%s=1) is off: "
+                    "staging has no consumer and is neither budgeted nor allocated.",
+                    KV_GATHER_ENV,
+                )
+
+        def _required_bytes(capacity: int) -> int:
+            return (
+                self.scratch_reserved_bytes
+                + self.history_staging_reserved_bytes
+                + capacity * self.cross_attention_bytes_per_session
+                + capacity * self.model_owned_state_bytes_per_session
+                + _required_managed_blocks(capacity) * page_size_bytes
+            )
+
+        one_session_bytes = _required_bytes(1)
+        if one_session_bytes > available_bytes:
+            raise ValueError(
+                "AR-Diffusion available device memory cannot fit one session: "
+                f"available={available_bytes} bytes, required={one_session_bytes} bytes "
+                "(managed self-attention + cross-attention + scratch + model-owned state + K/V staging)."
+            )
+        self.memory_budget_bytes = max(self.configured_memory_budget_bytes, one_session_bytes)
+        if self.memory_budget_bytes > self.configured_memory_budget_bytes:
+            _log.warning(
+                "AR-Diffusion raised the configured memory budget from %d to %d bytes "
+                "to admit one session that fits actual free device memory",
+                self.configured_memory_budget_bytes,
+                self.memory_budget_bytes,
+            )
+
+        effective_capacity = 0
+        required_managed_blocks = 0
+        for candidate in range(session_capacity, 0, -1):
+            candidate_managed_blocks = _required_managed_blocks(candidate)
+            if _required_bytes(candidate) <= self.memory_budget_bytes:
+                effective_capacity = candidate
+                required_managed_blocks = candidate_managed_blocks
+                break
+        assert effective_capacity > 0
+
+        self.session_capacity = effective_capacity
+        self.cross_attention_reserved_bytes = self.cross_attention_bytes_per_session * effective_capacity
+        self.model_owned_state_reserved_bytes = self.model_owned_state_bytes_per_session * effective_capacity
+        self_attn_budget_bytes = (
+            self.memory_budget_bytes
+            - self.scratch_reserved_bytes
+            - self.history_staging_reserved_bytes
+            - self.cross_attention_reserved_bytes
+            - self.model_owned_state_reserved_bytes
+        )
+        num_blocks = self_attn_budget_bytes // page_size_bytes
+        assert num_blocks >= required_managed_blocks
+        if effective_capacity < session_capacity:
+            _log.warning(
+                "AR-Diffusion resident session capacity reduced from %d to %d by the KV memory budget",
+                session_capacity,
+                effective_capacity,
+            )
+        if self.cross_attention_reserved_bytes:
+            _log.info(
+                "AR-Diffusion cross-attn reservation: %.1f MiB/session × %d sessions = %.1f MiB",
+                self.cross_attention_bytes_per_session / (1024 * 1024),
+                effective_capacity,
+                self.cross_attention_reserved_bytes / (1024 * 1024),
+            )
+        if self.model_owned_state_reserved_bytes:
+            _log.info(
+                "AR-Diffusion model-owned state reservation: %.1f MiB/session × %d sessions = %.1f MiB",
+                self.model_owned_state_bytes_per_session / (1024 * 1024),
+                effective_capacity,
+                self.model_owned_state_reserved_bytes / (1024 * 1024),
+            )
+
+        layer_names = [f"ar_diffusion.layer.{i}" for i in range(num_layers)]
+        self.manager = build_kv_manager(self.spec, layer_names, num_blocks, max_model_len)
+        self.managed_num_blocks = num_blocks
+        self.num_blocks = num_blocks
+        self.num_blocks_total = self.managed_num_blocks + self.scratch_num_blocks
+        self.null_block_id = self.manager.block_pool.null_block.block_id
+
+        # Allocate the per-layer paged K/V pools on the given device.
+        # Per layer, ``[k_cache, v_cache]`` -- separate allocations; see
+        # allocate_kv_pool_with_views for why they are not one tensor.
+        self._kv_pools: list[list[torch.Tensor]] = []
+        self._k_pools: list[torch.Tensor] = []
+        self._v_pools: list[torch.Tensor] = []
+        if device is not None:
+            self._kv_pools, self._k_pools, self._v_pools = allocate_kv_pool_with_views(
+                self.num_blocks_total,
+                block_size,
+                num_layers,
+                num_kv_heads,
+                head_size,
+                dtype,
+                device,
+            )
+        # reuse_history_staging: one contiguous (K, V) pair per layer, sized to the padded visible window this
+        # cache admits and budgeted above, owned here next to the pools it stages from. Allocated outside any
+        # capture and marked static, so compiled regions treat it as a stable input rather than a new tensor.
+        self.history_staging: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self.history_staging_state = HistoryStagingState()
+        if self.history_staging_tokens and device is not None:
+            for _ in range(num_layers):
+                pair = (
+                    torch.empty((self.history_staging_tokens, num_kv_heads, head_size), device=device, dtype=dtype),
+                    torch.empty((self.history_staging_tokens, num_kv_heads, head_size), device=device, dtype=dtype),
+                )
+                for buffer in pair:
+                    torch._dynamo.mark_static_address(buffer)
+                self.history_staging.append(pair)
+
+    # -- cross-attention pool access -------------------------------------------
+    # Cross-attn KV is static once populated — write once (from text encoder),
+    # read many (every denoising step). Not managed through the paged block pool.
+
+    def _kv_branch_index(self, kv_branch: str) -> int:
+        try:
+            return self._kv_branch_local_indices[kv_branch]
+        except KeyError as exc:
+            expected = tuple(self._kv_branch_local_indices)
+            raise KeyError(f"Unknown AR-Diffusion KV branch {kv_branch!r}; expected {expected}") from exc
+
+    def _cross_attention_pool(
+        self,
+        session_id: str,
+        cache_name: str,
+        kv_branch: str,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        if cache_name not in self.cross_attention_lengths:
+            raise KeyError(
+                f"Unknown AR-Diffusion cross-attention cache {cache_name!r}; "
+                f"expected {tuple(self.cross_attention_lengths)}"
+            )
+        self._kv_branch_index(kv_branch)
+        session = self._cross_sessions.get(session_id)
+        if session is None:
+            raise RuntimeError(
+                f"AR-Diffusion cross-attention cache {cache_name!r} for session {session_id!r} "
+                "was read before it was populated"
+            )
+        pool = session.get(cache_name, {}).get(kv_branch)
+        if pool is None:
+            raise RuntimeError(
+                f"AR-Diffusion cross-attention cache {cache_name!r} for session {session_id!r} "
+                f"and KV branch {kv_branch!r} was read before it was populated"
+            )
+        return pool
+
+    def is_cross_attention_populated(self, session_id: str, cache_name: str, kv_branch: str) -> bool:
+        """Whether a complete logical-branch cache has been published."""
+        if cache_name not in self.cross_attention_lengths:
+            raise KeyError(
+                f"Unknown AR-Diffusion cross-attention cache {cache_name!r}; "
+                f"expected {tuple(self.cross_attention_lengths)}"
+            )
+        self._kv_branch_index(kv_branch)
+        session = self._cross_sessions.get(session_id)
+        return session is not None and kv_branch in session.get(cache_name, {})
+
+    def populate_cross_attention(
+        self,
+        session_id: str,
+        cache_name: str,
+        kv_branch: str,
+        layer_kv: Iterable[tuple[torch.Tensor, torch.Tensor]],
+    ) -> None:
+        """Atomically populate one logical branch of a named cross-attention cache.
+
+        ``layer_kv`` must yield exactly one ``(k, v)`` pair per model layer.
+        Inputs have shape ``(B, length, local_kv_heads, head_size)``; batch zero
+        is copied because AR-Diffusion currently supports one sequence per
+        forward. The new cache is published only after every layer is copied,
+        so failed projection/copy work cannot expose partially initialized KV.
+        """
+        try:
+            length = self.cross_attention_lengths[cache_name]
+        except KeyError as exc:
+            raise KeyError(
+                f"Unknown AR-Diffusion cross-attention cache {cache_name!r}; "
+                f"expected {tuple(self.cross_attention_lengths)}"
+            ) from exc
+        self._kv_branch_index(kv_branch)
+        session = self._cross_sessions.get(session_id)
+        if session is None and len(self._cross_sessions) >= self.session_capacity:
+            raise RuntimeError(
+                "AR-Diffusion cross-attention session capacity exhausted; "
+                "the runner must evict a session before allocating another"
+            )
+        if not self._allocate_tensors:
+            raise RuntimeError("AR-Diffusion cross-attention tensors require a configured pool device")
+
+        shape = (length, self.cross_attention_kv_heads[cache_name], self.head_size)
+        expected_input_shape = (1, *shape)
+        k_pool = [torch.empty(shape, dtype=self.dtype, device=self.device) for _ in range(self.num_layers)]
+        v_pool = [torch.empty(shape, dtype=self.dtype, device=self.device) for _ in range(self.num_layers)]
+        populated_layers = 0
+        for layer_idx, (k, v) in enumerate(layer_kv):
+            if layer_idx >= self.num_layers:
+                raise ValueError(
+                    f"AR-Diffusion cross-attention cache {cache_name!r} expected {self.num_layers} layers, "
+                    f"got more than {self.num_layers}"
+                )
+            if not isinstance(k, torch.Tensor) or not isinstance(v, torch.Tensor):
+                raise ValueError(
+                    f"AR-Diffusion cross-attention cache {cache_name!r} layer {layer_idx} "
+                    f"must yield torch.Tensor k/v, got {type(k).__name__} and {type(v).__name__}"
+                )
+            if tuple(k.shape) != expected_input_shape or tuple(v.shape) != expected_input_shape:
+                raise ValueError(
+                    f"AR-Diffusion cross-attention cache {cache_name!r} layer {layer_idx} expected "
+                    f"k/v shape {expected_input_shape}, got {tuple(k.shape)} and {tuple(v.shape)}"
+                )
+            k_pool[layer_idx].copy_(k[0])
+            v_pool[layer_idx].copy_(v[0])
+            populated_layers += 1
+        if populated_layers != self.num_layers:
+            raise ValueError(
+                f"AR-Diffusion cross-attention cache {cache_name!r} expected {self.num_layers} layers, "
+                f"got {populated_layers}"
+            )
+
+        if session is None:
+            session = {}
+            self._cross_sessions[session_id] = session
+        session.setdefault(cache_name, {})[kv_branch] = (k_pool, v_pool)
+
+    def read_cross_attention_kv(
+        self,
+        session_id: str,
+        cache_name: str,
+        layer_idx: int,
+        kv_branch: str,
+    ) -> dict[str, torch.Tensor | bool]:
+        """Return a model-facing K/V dict for one named cross-attention pool."""
+        k_pool, v_pool = self._cross_attention_pool(session_id, cache_name, kv_branch)
+        return {
+            "is_init": True,
+            "k": k_pool[layer_idx].unsqueeze(0),
+            "v": v_pool[layer_idx].unsqueeze(0),
+        }
+
+    def retain_cross_attention(self, session_id: str, cache_names: Collection[str]) -> None:
+        """Release named cross-attention caches not retained by an internal reset."""
+        session = self._cross_sessions.get(session_id)
+        if session is None:
+            return
+        keep = set(cache_names)
+        for cache_name in tuple(session):
+            if cache_name not in keep:
+                del session[cache_name]
+        if not session:
+            self._cross_sessions.pop(session_id, None)
+
+    def release_cross_attention(self, session_id: str) -> None:
+        """Release every named cross-attention allocation for one session."""
+        self._cross_sessions.pop(session_id, None)
+
+    # -- request lifecycle ---------------------------------------------------
+
+    def begin_request(self, request_id: str, *, prefill_prefix_tokens: int = 0) -> ARDiffusionRequestAdapter:
+        adapter = ARDiffusionRequestAdapter(
+            request_id,
+            chunk_size=self.spec.chunk_size,
+            prefill_prefix_tokens=prefill_prefix_tokens,
+        )
+        self._adapters[request_id] = adapter
+        _log.debug("AR-Diffusion begin_request: req=%s prefill=%d", request_id, prefill_prefix_tokens)
+        return adapter
+
+    def end_request(self, adapter: ARDiffusionRequestAdapter) -> None:
+        _log.debug(
+            "AR-Diffusion end_request: req=%s chunks=%d free=%d",
+            adapter.request_id,
+            adapter.completed_chunks,
+            self.manager.block_pool.get_num_free_blocks(),
+        )
+        self.manager.free(adapter)
+        self._adapters.pop(adapter.request_id, None)
+
+    # -- per-chunk operations ------------------------------------------------
+
+    def allocate_chunk(self, adapter: ARDiffusionRequestAdapter) -> list[int]:
+        """Allocate a chunk's blocks (evicting out-of-window blocks first).
+
+        Returns the request's compact storage block table.
+        """
+        table = self.allocate_token_slots(adapter, self.spec.chunk_size)
+        resident = resident_block_ids(table, self.null_block_id)
+        _log.debug(
+            "AR-Diffusion allocate_chunk: req=%s chunk=%d table_len=%d resident=%d free=%d",
+            adapter.request_id,
+            adapter.completed_chunks,
+            len(table),
+            len(resident),
+            self.manager.block_pool.get_num_free_blocks(),
+        )
+        return table
+
+    def allocate_token_slots(self, adapter: ARDiffusionRequestAdapter, num_tokens: int) -> list[int]:
+        """Allocate managed blocks for an in-flight video span without committing it."""
+        if num_tokens <= 0:
+            raise ValueError(f"num_tokens must be positive, got {num_tokens}")
+        # vLLM clips slot allocation at max_model_len. Admit the entire
+        # in-flight span in compact storage coordinates, independent of the
+        # model's absolute frame positions.
+        self.manager.max_model_len = max(self.manager.max_model_len, adapter.num_computed_tokens + num_tokens)
+        blocks = self.manager.allocate_slots(adapter, num_new_tokens=num_tokens)
+        if blocks is None:
+            raise RuntimeError("AR-Diffusion KV pool exhausted while allocating paged attention slots")
+        return self.block_table(adapter)
+
+    def block_table(self, adapter: ARDiffusionRequestAdapter) -> list[int]:
+        return list(self.manager.get_block_ids(adapter.request_id)[0])
+
+    def chunk_write_slots(self, adapter: ARDiffusionRequestAdapter) -> torch.Tensor:
+        """Slot mapping for the in-flight chunk — the K/V write target."""
+        return chunk_slot_mapping(
+            self.block_table(adapter),
+            adapter.num_computed_tokens,
+            self.spec.chunk_size,
+            self.block_size,
+        )
+
+    def scratch_block_ids(self, kv_branch: str, start: int, count: int) -> list[int]:
+        """Return KV-branch-local scratch block ids outside manager ownership."""
+        if count < 0 or start < 0:
+            raise ValueError(f"scratch start/count must be non-negative, got start={start}, count={count}")
+        if start + count > self.scratch_blocks_per_kv_branch:
+            raise RuntimeError(
+                "AR-Diffusion paged attention scratch blocks exhausted: "
+                f"need [{start}, {start + count}) of {self.scratch_blocks_per_kv_branch}. "
+                "Declare max_scratch_tokens_per_branch in the pipeline capability "
+                "or increase AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH."
+            )
+        kv_branch_offset = self.scratch_blocks_per_kv_branch * self._kv_branch_index(kv_branch)
+        base = self.managed_num_blocks + kv_branch_offset + start
+        return list(range(base, base + count))
+
+    def key_cache(self, layer_idx: int) -> torch.Tensor:
+        return self._kv_pools[layer_idx][0]
+
+    def value_cache(self, layer_idx: int) -> torch.Tensor:
+        return self._kv_pools[layer_idx][1]
+
+    def window_block_ids(self, adapter: ARDiffusionRequestAdapter) -> list[int]:
+        """Resident (non-null) managed blocks visible to paged attention."""
+        return [int(block_id) for block_id in resident_block_ids(self.block_table(adapter), self.null_block_id)]
+
+    def commit_chunk(self, adapter: ARDiffusionRequestAdapter) -> None:
+        """Advance the adapter by one chunk after its K/V is written.
+
+        This standalone primitive is used by low-level manager tests. The
+        paged-attention path uses :meth:`ARDiffusionKVState.commit_paged_context`,
+        advances the adapter only after the forward succeeds. Call once per
+        committed chunk, not per denoise step.
+        """
+        _log.debug("AR-Diffusion commit: req=%s before=%d", adapter.request_id, adapter.completed_chunks)
+        adapter.on_chunk_committed()
+        self.manager.remove_skipped_blocks(
+            adapter.request_id,
+            adapter.num_computed_tokens,
+            num_prompt_tokens=adapter.num_prompt_tokens,
+        )
+        window_manager = cast(ChunkWindowManager, self.manager.coordinator.single_type_managers[0])
+        adapter.compacted_tokens += window_manager.compact_block_table(adapter.request_id)
+        _log.debug("AR-Diffusion commit: req=%s after=%d", adapter.request_id, adapter.completed_chunks)
+
+    # -- pool-backed K/V access --------------------------------------------
+
+    def write_chunk_kv(
+        self,
+        layer_index: int,
+        new_k: torch.Tensor,
+        new_v: torch.Tensor,
+        adapter: ARDiffusionRequestAdapter,
+    ) -> None:
+        """Write one layer's committed-chunk K/V into the pool."""
+        slots = self.chunk_write_slots(adapter)
+        _log.debug(
+            "AR-Diffusion write: req=%s layer=%d chunk=%d shapes=%s dev=%s",
+            adapter.request_id,
+            layer_index,
+            adapter.completed_chunks,
+            (tuple(new_k.shape), tuple(new_v.shape)),
+            slots.device,
+        )
+        pool_write_chunk(
+            self._k_pools[layer_index],
+            self._v_pools[layer_index],
+            new_k,
+            new_v,
+            slots,
+        )

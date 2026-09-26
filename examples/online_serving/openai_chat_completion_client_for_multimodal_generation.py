@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import base64
 import concurrent.futures
 import os
@@ -6,7 +9,8 @@ from typing import NamedTuple
 import requests
 from openai import OpenAI
 from vllm.assets.audio import AudioAsset
-from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 SEED = 42
 
@@ -197,7 +201,14 @@ def _build_prompt_for_query_type(
         return query_func(custom_prompt=custom_prompt)
     if query_type == "use_audio_in_video":
         return query_func(video_path=video_path, custom_prompt=custom_prompt)
-    # use_mixed_modalities / use_multi_audios
+    if query_type == "use_mixed_modalities":
+        return query_func(
+            video_path=video_path,
+            image_path=image_path,
+            audio_path=audio_path,
+            custom_prompt=custom_prompt,
+        )
+    # use_multi_audios
     return query_func(custom_prompt=custom_prompt)
 
 
@@ -407,7 +418,7 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
             audio_path=audio_path,
         )
         extra_body = {
-            # Optional, it has default settings in stage configs. you can override them here.
+            # Optional; defaults come from the resolved pipeline and deploy config.
         }
         if args.query_type == "use_audio_in_video":
             extra_body["mm_processor_kwargs"] = {"use_audio_in_video": True}
@@ -449,7 +460,8 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
                         f.write(audio_data)
                     print(f"Audio saved to {audio_file_path}")
                     count += 1
-                elif choice.message.content:
+                # A choice can contain both audio and text.
+                if choice.message.content:
                     print("Chat completion output from text:", choice.message.content)
     else:
         printed_content = False
@@ -478,7 +490,7 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
 
 
 def parse_args():
-    parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser = TrackingArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
     parser.add_argument(
         "--query-type",
         "-q",

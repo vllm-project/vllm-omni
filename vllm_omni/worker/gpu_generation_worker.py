@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import gc
 import os
 
@@ -8,12 +11,16 @@ from vllm.tracing import instrument
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.utils import report_usage_stats
-from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
-from vllm.v1.worker.utils import request_memory
+from vllm.v1.worker.gpu_worker import (
+    CompilationTimes,
+    init_worker_distributed_environment,
+)
 from vllm.v1.worker.workspace import init_workspace_manager
 
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.base import OmniGPUWorkerBase
 from vllm_omni.worker.gpu_generation_model_runner import GPUGenerationModelRunner
+from vllm_omni.worker.memory_utils import request_memory_tolerant
 from vllm_omni.worker.mixins import OmniWorkerMixin
 
 logger = init_logger(__name__)
@@ -22,13 +29,15 @@ logger = init_logger(__name__)
 class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
     """GPU Worker for Generation model (non-autoregressive waveform generation).
 
-    Usage in stage config:
-        worker_cls: "vllm_omni.worker.gpu_generation_model_runner.GPUGenerationModelRunner"
+    Selected for stages whose pipeline topology uses
+    ``execution_type=StageExecutionType.LLM_GENERATION``.
     """
+
+    model_runner_cls = GPUGenerationModelRunner
 
     @instrument(span_name="Init device")
     def init_device(self):
-        if self.device_config.device_type == "cuda":
+        if self.device_config.device_type in ("cuda", "musa"):
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             parallel_config = self.parallel_config
@@ -51,13 +60,13 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
                 assert self.local_rank < torch.accelerator.device_count(), (
                     f"DP adjusted local rank {self.local_rank} is out of bounds. "
                 )
-                visible_device_count = torch.accelerator.device_count() if torch.cuda.is_available() else 0
+                visible_device_count = torch.accelerator.device_count()
                 assert self.parallel_config.local_world_size <= visible_device_count, (
                     f"local_world_size ({self.parallel_config.local_world_size}) must "
                     f"be less than or equal to the number of visible devices "
                     f"({visible_device_count})."
                 )
-            self.device = torch.device(f"cuda:{self.local_rank}")
+            self.device = current_omni_platform.get_torch_device(self.local_rank)
             torch.accelerator.set_device_index(self.device)
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
@@ -83,7 +92,7 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
             # take current memory snapshot
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
-            self.requested_memory = request_memory(init_snapshot, self.cache_config)
+            self.requested_memory = request_memory_tolerant(init_snapshot, self.cache_config)
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
             logger.debug("worker requested memory: %sGiB", format_gib(self.requested_memory))
         else:
@@ -93,13 +102,28 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
 
+        self.use_v2_model_runner = bool(getattr(self.model_config, "use_v2_model_runner", False))
         if self.use_v2_model_runner:
-            # OMNI: v2 model runner does not yet include omni hooks.
-            logger.warning("OMNI GPUGenerationWorker forces v1 model runner for omni hooks.")
-            self.use_v2_model_runner = False
+            from vllm_omni.worker_v2.omni_generation_model_runner import (
+                OmniGenerationModelRunner,
+            )
 
-        self.model_runner = GPUGenerationModelRunner(self.vllm_config, self.device)
+            logger.info("Using MR v2 OmniGenerationModelRunner for generation stage.")
+            self.model_runner = OmniGenerationModelRunner(self.vllm_config, self.device)
+        else:
+            self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+
+    @instrument(span_name="Compile/warmup")
+    def compile_or_warm_up_model(self) -> CompilationTimes:
+        """Generation stages have no KV cache or sampler — skip warmup_kernels."""
+        if not self.use_v2_model_runner:
+            return super().compile_or_warm_up_model()
+        import time
+
+        start = time.perf_counter()
+        self.model_runner.profile_run()
+        return CompilationTimes(language_model=time.perf_counter() - start, encoder=0.0)

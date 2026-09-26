@@ -8,15 +8,32 @@ produced by generator2tokenizer_async_chunk and cut leading context samples
 from decoded audio arrays.
 """
 
+import functools
+
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts import (
-    apply_ctx_frames_cutting,
-    parse_batched_audio_input,
-)
-
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@functools.lru_cache(maxsize=1)
+def _voxtral_tts_parsers():
+    # ``vllm_omni...voxtral_tts`` does ``from vllm.model_executor.models.utils import ...``.
+    # If that module was first pulled in under a different import context in the
+    # same process, ``direct_register_custom_op`` for ``sequence_parallel_chunk_impl``
+    # can run twice.  Match ``tests.model_executor.helpers`` + pin ``utils`` first.
+    from tests.model_executor.helpers import bootstrap_vllm_layer_custom_op_modules
+
+    bootstrap_vllm_layer_custom_op_modules()
+    import vllm.model_executor.models.utils  # noqa: F401
+
+    from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts import (
+        apply_ctx_frames_cutting,
+        parse_batched_audio_input,
+    )
+
+    return parse_batched_audio_input, apply_ctx_frames_cutting
+
 
 NUM_CODEBOOKS = 37
 
@@ -37,6 +54,7 @@ def _make_input_ids(*requests: tuple[int, int, torch.Tensor]) -> torch.Tensor:
 
 def test_parse_single_request():
     """Single request is parsed correctly."""
+    parse_batched_audio_input, _ = _voxtral_tts_parsers()
     ctx_frames = 3
     context_length = 5
     total_frames = ctx_frames + context_length
@@ -54,6 +72,7 @@ def test_parse_single_request():
 
 def test_parse_multiple_requests():
     """Multiple requests in a batch are parsed correctly."""
+    parse_batched_audio_input, _ = _voxtral_tts_parsers()
     req1 = (2, 4, torch.ones((6, NUM_CODEBOOKS), dtype=torch.long))
     req2 = (0, 3, torch.full((3, NUM_CODEBOOKS), 7, dtype=torch.long))
     input_ids = _make_input_ids(req1, req2)
@@ -70,6 +89,7 @@ def test_parse_multiple_requests():
 
 def test_parse_zero_ctx_frames():
     """ctx_frames=0 means no context, just chunk data."""
+    parse_batched_audio_input, _ = _voxtral_tts_parsers()
     ctx_frames = 0
     context_length = 10
     tokens = torch.randint(0, 100, (context_length, NUM_CODEBOOKS))
@@ -83,6 +103,7 @@ def test_parse_zero_ctx_frames():
 
 def test_parse_fails_on_misaligned_input():
     """Input not divisible by num_codebooks should raise AssertionError."""
+    parse_batched_audio_input, _ = _voxtral_tts_parsers()
     # 2 header elements + 5 data elements (not divisible by 37)
     input_ids = torch.tensor([0, 1] + [0] * 5)
     with pytest.raises(AssertionError, match="divisible by"):
@@ -91,6 +112,7 @@ def test_parse_fails_on_misaligned_input():
 
 def test_parse_custom_num_codebooks():
     """Works with a non-default num_codebooks value."""
+    parse_batched_audio_input, _ = _voxtral_tts_parsers()
     cb = 4
     ctx_frames = 1
     context_length = 2
@@ -111,6 +133,7 @@ def test_parse_custom_num_codebooks():
 
 def test_cut_removes_leading_samples():
     """Context frames are removed from the front of the audio array."""
+    _, apply_ctx_frames_cutting = _voxtral_tts_parsers()
     downsample_factor = 240
     ctx_frames = 5
     total_samples = 2400  # 10 frames * 240
@@ -126,6 +149,7 @@ def test_cut_removes_leading_samples():
 
 def test_cut_zero_ctx_frames_unchanged():
     """ctx_frames=0 leaves the audio unchanged."""
+    _, apply_ctx_frames_cutting = _voxtral_tts_parsers()
     downsample_factor = 240
     audio = torch.randn(2400)
 
@@ -137,6 +161,7 @@ def test_cut_zero_ctx_frames_unchanged():
 
 def test_cut_multiple_requests():
     """Each request in the batch gets its own ctx_frames cut."""
+    _, apply_ctx_frames_cutting = _voxtral_tts_parsers()
     downsample_factor = 100
     audio1 = torch.arange(1000, dtype=torch.float32)  # 10 frames
     audio2 = torch.arange(500, dtype=torch.float32)  # 5 frames
@@ -152,6 +177,7 @@ def test_cut_multiple_requests():
 
 def test_cut_all_frames_returns_empty():
     """Cutting all frames returns an empty tensor."""
+    _, apply_ctx_frames_cutting = _voxtral_tts_parsers()
     downsample_factor = 100
     ctx_frames = 5
     audio = torch.randn(500)  # exactly 5 frames

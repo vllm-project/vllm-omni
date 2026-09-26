@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 OmniVoice model for vLLM-Omni two-stage TTS pipeline.
 
@@ -11,23 +11,24 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torchaudio
 from transformers.feature_extraction_utils import BatchFeature
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
+from vllm.inputs.llm import MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import (
-    MultiModalDataDict,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
 from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
-    BaseMultiModalProcessor,
     BaseProcessingInfo,
     ProcessorInputs,
     PromptIndexTargets,
@@ -36,8 +37,10 @@ from vllm.multimodal.processing import (
 )
 from vllm.sequence import IntermediateTensors
 
-from vllm_omni.model_executor.models.omnivoice.config import OmniVoiceConfig
+from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
+from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 
 logger = init_logger(__name__)
 
@@ -61,12 +64,28 @@ class OmniVoiceMultiModalProcessingInfo(BaseProcessingInfo):
         )
 
 
-class OmniVoiceMultiModalProcessor(BaseMultiModalProcessor[OmniVoiceMultiModalProcessingInfo]):
+class OmniVoiceMultiModalProcessor(OmniMultiModalProcessor[OmniVoiceMultiModalProcessingInfo]):
     """Processes text + optional reference audio for OmniVoice.
 
     For voice cloning: text + reference audio → tokenized reference
     For auto voice: text only
     """
+
+    def apply(self, inputs: ProcessorInputs, timing_ctx):
+        tokenizer = self.info.get_tokenizer()
+        prompt_text = tokenizer.decode(inputs.prompt, skip_special_tokens=False)
+        # Tokenize once here; _apply_hf_processor_main below only encodes the
+        # reference audio, so the media path never re-tokenizes the text.
+        prompt_ids = self._encode_prompt_text(prompt_text, inputs.hf_processor_mm_kwargs).reshape(-1).tolist()
+        inputs = replace(
+            inputs,
+            prompt=prompt_ids,
+            hf_processor_mm_kwargs={
+                **inputs.hf_processor_mm_kwargs,
+                self._OMNI_PROMPT_TEXT_KEY: prompt_text,
+            },
+        )
+        return super().apply(inputs, timing_ctx)
 
     def _ensure_cached_runtime_components(self, model_dir: str, config: OmniVoiceConfig) -> None:
         cached_model_dir = getattr(self, "_cached_model_dir", None)
@@ -77,50 +96,56 @@ class OmniVoiceMultiModalProcessor(BaseMultiModalProcessor[OmniVoiceMultiModalPr
 
         self.text_tokenizer = AutoTokenizer.from_pretrained(model_dir)
 
-        # Audio tokenizer for encoding reference audio
+        # Audio tokenizer for encoding reference audio (requires transformers>=5.3)
         audio_tokenizer_path = os.path.join(model_dir, "audio_tokenizer")
-        if os.path.isdir(audio_tokenizer_path):
-            try:
-                from transformers import (
-                    AutoFeatureExtractor,
-                    HiggsAudioV2TokenizerModel,
-                )
-            except ImportError as e:
-                raise ImportError(
-                    "OmniVoice voice cloning requires transformers with "
-                    "HiggsAudioV2TokenizerModel. Upgrade transformers or "
-                    "use text-only mode (no reference audio)."
-                ) from e
+        try:
+            from transformers import (
+                AutoFeatureExtractor,
+                HiggsAudioV2TokenizerModel,
+            )
 
             self.audio_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(audio_tokenizer_path, device_map="cpu")
             self.feature_extractor = AutoFeatureExtractor.from_pretrained(audio_tokenizer_path)
             self.audio_tokenizer.eval()
-        else:
+        except ImportError:
             self.audio_tokenizer = None
             self.feature_extractor = None
-            logger.warning(
-                "audio_tokenizer not found at %s, voice cloning disabled",
-                audio_tokenizer_path,
-            )
+            logger.warning("Voice cloning disabled (requires transformers>=5.3.0).")
 
         self._cached_model_dir = model_dir
 
-    def _call_hf_processor(
+    def _apply_hf_processor_main(
         self,
-        prompt: str,
-        mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
     ) -> BatchFeature:
+        """Encode the reference audio, if any; the prompt was tokenized in apply().
+
+        Upstream calls this for every request, including text-only ones and
+        ones whose audio is already cached (empty ``mm_items``), so it must not
+        touch the text tokenizer.
+        """
+        valid_items = mm_items.select({key for key, count in mm_items.get_all_counts().items() if count > 0})
+        mm_data, passthrough = self._get_hf_mm_data(valid_items)
+        audio = self._get_reference_audio(mm_data)
+        if audio is None:
+            return BatchFeature(dict(passthrough))
+        processed = self._encode_reference_audio(*audio)
+        processed.update(passthrough)
+        return processed
+
+    def _get_reference_audio(self, mm_data: Mapping[str, object]) -> tuple[object, int] | None:
+        audio = mm_data.get("audio", None)
+        if audio is None:
+            audios = mm_data.get("audios")
+            if audios is not None:
+                audio = audios[0], self.info.ctx.get_hf_config().sample_rate
+        return audio
+
+    def _encode_prompt_text(self, prompt: str, mm_kwargs: Mapping[str, object]) -> torch.Tensor:
         config = self.info.ctx.get_hf_config()
         model_dir = self.info.ctx.model_config.model
         self._ensure_cached_runtime_components(model_dir, config)
-
-        audio = mm_data.get("audio", None)
-        if audio is None:
-            audio = mm_data.get("audios")
-            if audio is not None:
-                audio = audio[0], config.sample_rate
 
         # Build text prompt with control tokens
         lang = mm_kwargs.get("lang", None)
@@ -144,19 +169,14 @@ class OmniVoiceMultiModalProcessor(BaseMultiModalProcessor[OmniVoiceMultiModalPr
             full_text = prompt
 
         text_prompt = f"{style_text}<|text_start|>{full_text}<|text_end|>"
-        text_tokens = self.text_tokenizer(text_prompt, return_tensors="pt").input_ids.squeeze(0)  # [N_text]
+        return self.text_tokenizer(text_prompt, return_tensors="pt").input_ids.squeeze(0)  # [N_text]
 
-        if audio is None:
-            # Text-only path (auto voice mode)
-            return BatchFeature(
-                {
-                    "input_ids": text_tokens,
-                    "input_len": [len(text_tokens)],
-                }
-            )
+    def _encode_reference_audio(self, audio_signal: object, sr: int) -> BatchFeature:
+        """Voice cloning: encode the reference audio to 8-codebook tokens."""
+        config = self.info.ctx.get_hf_config()
+        model_dir = self.info.ctx.model_config.model
+        self._ensure_cached_runtime_components(model_dir, config)
 
-        # Voice cloning: encode reference audio to tokens
-        audio_signal, sr = audio
         if isinstance(audio_signal, np.ndarray):
             audio_signal = torch.from_numpy(audio_signal).float()
         if audio_signal.dim() == 1:
@@ -166,29 +186,23 @@ class OmniVoiceMultiModalProcessor(BaseMultiModalProcessor[OmniVoiceMultiModalPr
         if self.feature_extractor is not None:
             target_sr = self.feature_extractor.sampling_rate
             if sr != target_sr:
-                import torchaudio
-
                 audio_signal = torchaudio.functional.resample(audio_signal, sr, target_sr)
 
         # Encode reference audio to 8-codebook tokens
-        if self.audio_tokenizer is not None:
-            with torch.inference_mode():
-                ref_audio_tokens = self.audio_tokenizer.encode(audio_signal)  # [8, T_ref]
-                if ref_audio_tokens.dim() == 3:
-                    ref_audio_tokens = ref_audio_tokens.squeeze(0)  # [8, T_ref]
-        else:
-            raise RuntimeError(
-                "Audio tokenizer not available for voice cloning. Ensure audio_tokenizer/ exists in model directory."
-            )
+        if self.audio_tokenizer is None:
+            raise RuntimeError("Voice cloning requires transformers>=5.3.0. Try: uv pip install 'transformers>=5.3.0'")
 
-        ft = BatchFeature(
+        with torch.inference_mode():
+            ref_audio_tokens = self.audio_tokenizer.encode(audio_signal)  # [8, T_ref]
+            if ref_audio_tokens.dim() == 3:
+                ref_audio_tokens = ref_audio_tokens.squeeze(0)  # [8, T_ref]
+
+        return BatchFeature(
             {
-                "input_ids": text_tokens,
                 "ref_audio_tokens": ref_audio_tokens,  # [8, T_ref]
                 "ref_audio_len": [ref_audio_tokens.shape[1]],
             }
         )
-        return ft
 
     def _get_mm_fields_config(
         self,
@@ -199,15 +213,6 @@ class OmniVoiceMultiModalProcessor(BaseMultiModalProcessor[OmniVoiceMultiModalPr
             "ref_audio_tokens": MultiModalFieldConfig.batched("audio"),
             "ref_audio_len": MultiModalFieldConfig.batched("audio"),
         }
-
-    def _hf_processor_applies_updates(
-        self,
-        prompt_text: str,
-        mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object],
-    ) -> bool:
-        return False
 
     def _get_prompt_updates(
         self,
@@ -392,13 +397,12 @@ class OmniVoiceModel(
         target_ids = torch.full((num_codebooks, target_len), mask_id, dtype=torch.long, device=device)
 
         # Conditional: [text] [ref_audio?] [target_mask]
+        cond_audio_start = text_ids.shape[1]
         if ref_audio_tokens is not None:
             ref_tokens = ref_audio_tokens.to(device)  # [8, T_ref]
             cond_ids = torch.cat([text_ids, ref_tokens, target_ids], dim=1)
-            cond_audio_start = text_ids.shape[1]
         else:
             cond_ids = torch.cat([text_ids, target_ids], dim=1)
-            cond_audio_start = text_ids.shape[1]
 
         cond_len = cond_ids.shape[1]
 
@@ -500,15 +504,15 @@ class OmniVoiceModel(
         if os.path.isdir(model_dir):
             return model_dir
         # HF hub model ID — resolve to local cache
-        from huggingface_hub import snapshot_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
-        return snapshot_download(model_dir)
+        return hf_api().snapshot_download(model_dir)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         try:
             device = next(self.parameters()).device
         except StopIteration:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = current_omni_platform.get_torch_device()
 
         model_dir = self._resolve_model_dir()
 

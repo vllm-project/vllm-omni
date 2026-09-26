@@ -1,0 +1,4 @@
+interface:
+  display_name: "vLLM Omni Perf Opt"
+  short_description: "Profile and optimize vLLM Omni diffusion performance."
+  default_prompt: "Analyze and optimize a vLLM Omni diffusion workload using baselines, traces, parallel strategy modeling, and prioritized optimization plans."

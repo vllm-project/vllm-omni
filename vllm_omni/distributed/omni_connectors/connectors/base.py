@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from abc import ABC, abstractmethod
 from typing import Any
@@ -34,13 +34,21 @@ class OmniConnectorBase(ABC):
         pass
 
     @abstractmethod
-    def get(self, from_stage: str, to_stage: str, get_key: str, metadata=None) -> tuple[Any, int] | None:
+    def get(
+        self, from_stage: str, to_stage: str, get_key: str, metadata: dict[str, Any] | None = None
+    ) -> tuple[Any, int] | None:
         """Retrieve Python object and payload size (bytes).
 
         Args:
             from_stage: Source stage identifier
             to_stage: Destination stage identifier
             get_key: Unique request identifier
+            metadata: Optional transport-specific metadata.  When provided,
+                the connector uses it directly (e.g. source_host, source_port,
+                data_size) instead of querying the sender.  For heterogeneous
+                TP the manager may supply partial metadata (host/port only);
+                the connector will query the sender at that address to fill
+                in data_size.
 
         Returns:
             Tuple of (Python object, serialized byte size) if found, None otherwise
@@ -51,6 +59,24 @@ class OmniConnectorBase(ABC):
     def cleanup(self, request_id: str) -> None:
         """Clean up resources for a request."""
         pass
+
+    def get_with_deadline(
+        self,
+        from_stage: str,
+        to_stage: str,
+        get_key: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        deadline: float,
+    ) -> tuple[Any, int] | None:
+        """Receive with a monotonic deadline; blocking backends must override this."""
+        raise NotImplementedError(f"{type(self).__name__} does not support deadline-aware receive")
+
+    def abandon_get(self, get_key: str) -> None:
+        """Retire unresolved discovery attempts; never cancel an active DMA READ."""
+
+    def reap_consumed(self) -> None:
+        """Release producer bookkeeping for payloads consumed by another process."""
 
     @abstractmethod
     def health(self) -> dict[str, Any]:

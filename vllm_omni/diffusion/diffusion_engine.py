@@ -1,355 +1,1274 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import copy
+import inspect
+import os
 import queue
 import threading
 import time
-from collections.abc import Iterable
-from typing import Any
+from collections.abc import AsyncGenerator, Iterable
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import PIL.Image
 import torch
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.utils.import_utils import resolve_obj_by_qualname
+from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from vllm_omni.diffusion.cancellation import RequestCancellationRegistry
 from vllm_omni.diffusion.data import (
+    DIFFUSION_REQUEST_LIFECYCLE_KEY,
+    DIFFUSION_REQUEST_STARTED,
     DiffusionOutput,
     DiffusionRequestAbortedError,
     OmniDiffusionConfig,
+    uses_diffusers_adapter,
 )
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode, is_scheduler_paged_kv_mode
+from vllm_omni.diffusion.diffusion_kv.initialization import initialize_diffusion_kv_control_plane
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
+from vllm_omni.diffusion.io_support import (
+    get_dummy_run_num_frames,
+    get_dummy_run_num_image_inputs,
+    image_color_format,
+    supports_audio_output,
+    supports_multimodal_input,
+)
+from vllm_omni.diffusion.offloader.config import any_selected_component_uses_allgather
+from vllm_omni.diffusion.output_formatter import (
+    format_diffusion_outputs,
+    format_empty_diffusion_outputs,
+    normalize_diffusion_postprocess_output,
+)
+from vllm_omni.diffusion.postprocess.media import finalize_diffusion_media
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
     get_diffusion_post_process_func,
     get_diffusion_pre_process_func,
+    get_diffusion_prefix_cache_func,
 )
-from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, StepScheduler
-from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
-from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
+from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
+from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus, DiffusionSchedulerOutput
+from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
+from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
-from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.metrics.utils import (
+    diffusion_scheduler_waiting_metrics,
+    extract_diffusion_denoise_ms,
+    extract_diffusion_vae_decode_ms,
+)
+
+if TYPE_CHECKING:
+    from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
+_ASYNC_OUTPUT_TIMEOUT_ENV = "VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"
+_ASYNC_OUTPUT_TIMEOUT_DEFAULT = 600.0  # seconds
 
-def supports_image_input(model_class_name: str) -> bool:
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+
+def _async_output_timeout() -> float:
+    """Seconds to wait for one step's background D2H/SHM copy.
+
+    The copy itself finishes in milliseconds, but it is queued behind the GPU
+    work for that step, so the wall-clock wait tracks step time — a single-GPU
+    box legitimately runs tens of seconds per step on large shapes. A tight
+    bound therefore does not catch a hung engine (worker death and a dead
+    result pump are surfaced by the worker monitor and ``check_health``); it
+    only aborts renders that are still making progress, throwing away the
+    denoise that already completed. The default matches
+    ``_DLO_DP_WAVE_TIMEOUT_S`` in the same subsystem.
+
+    Resolved here rather than at import so a malformed value degrades to the
+    default instead of raising on the request path: this runs inside
+    ``step_streaming``/``add_req_and_wait_for_response``, where a typo in the
+    environment must not start failing generations.
+    """
+    raw = os.environ.get(_ASYNC_OUTPUT_TIMEOUT_ENV)
+    if raw is None:
+        return _ASYNC_OUTPUT_TIMEOUT_DEFAULT
+    try:
+        timeout = float(raw)
+    except ValueError:
+        logger.warning_once(
+            "Ignoring %s=%r: not a number. Using the default %.1fs.",
+            _ASYNC_OUTPUT_TIMEOUT_ENV,
+            raw,
+            _ASYNC_OUTPUT_TIMEOUT_DEFAULT,
+        )
+        return _ASYNC_OUTPUT_TIMEOUT_DEFAULT
+    if timeout <= 0:
+        logger.warning_once(
+            "Ignoring %s=%r: must be positive. Using the default %.1fs.",
+            _ASYNC_OUTPUT_TIMEOUT_ENV,
+            raw,
+            _ASYNC_OUTPUT_TIMEOUT_DEFAULT,
+        )
+        return _ASYNC_OUTPUT_TIMEOUT_DEFAULT
+    return timeout
+
+
+__all__ = [
+    "DiffusionEngine",
+    "DiffusionExecutionMode",
+    "_RpcTask",
+    "_move_tensor_tree_to_cpu",
+    "get_dummy_run_num_frames",
+    "image_color_format",
+    "supports_audio_output",
+    "supports_multimodal_input",
+]
+
+
+def _func_accepts_parameter(func: object | None, parameter_name: str) -> bool:
+    if not callable(func):
+        return False
+    parameters = inspect.signature(func).parameters
+    return parameter_name in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+
+
+def _resolve_custom_pipeline_cls(custom_pipeline_args: dict[str, Any] | None) -> type | None:
+    if not custom_pipeline_args or "pipeline_class" not in custom_pipeline_args:
+        return None
+
+    pipeline_cls = custom_pipeline_args["pipeline_class"]
+
+    if isinstance(pipeline_cls, type):
+        return pipeline_cls
+    if isinstance(pipeline_cls, str):
+        try:
+            return resolve_obj_by_qualname(pipeline_cls)
+        except (AttributeError, ImportError, ValueError) as exc:
+            raise ValueError(f"Failed to resolve custom diffusion pipeline class {pipeline_cls!r}.") from exc
+    raise TypeError(
+        f"custom_pipeline_args['pipeline_class'] must be a qualified name string or a class, "
+        f"got {type(pipeline_cls).__name__}"
+    )
+
+
+def supports_request_batch(od_config: OmniDiffusionConfig) -> bool:
+    model_cls = _resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
+    if model_cls is not None:
+        return bool(getattr(model_cls, "supports_request_batch", False))
+
+    if uses_diffusers_adapter(od_config):
+        model_cls = DiffusionModelRegistry._try_load_model_cls("DiffusersAdapterPipeline")
+        return bool(getattr(model_cls, "supports_request_batch", False))
+
+    model_cls = DiffusionModelRegistry._try_load_model_cls(getattr(od_config, "model_class_name", None))
     if model_cls is None:
         return False
-    return bool(getattr(model_cls, "support_image_input", False))
+    return bool(getattr(model_cls, "supports_request_batch", False))
 
 
-def supports_audio_input(model_class_name: str) -> bool:
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+def _max_num_seqs(od_config: OmniDiffusionConfig) -> int:
+    try:
+        return max(1, int(getattr(od_config, "max_num_seqs", 1)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def supports_request_cancellation(od_config: OmniDiffusionConfig) -> bool:
+    """Whether the local pipeline checks cooperative cancellation boundaries."""
+    model_cls = _resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
     if model_cls is None:
-        return False
-    return bool(getattr(model_cls, "support_audio_input", False))
+        name = (
+            "DiffusersAdapterPipeline"
+            if uses_diffusers_adapter(od_config)
+            else getattr(od_config, "model_class_name", None)
+        )
+        model_cls = DiffusionModelRegistry._try_load_model_cls(name)
+    return getattr(model_cls, "supports_request_cancellation", False) is True
 
 
-def image_color_format(model_class_name: str) -> str:
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    return getattr(model_cls, "color_format", "RGB")
+def _uses_dlo_dp_concurrency(od_config: OmniDiffusionConfig) -> bool:
+    parallel_config = getattr(od_config, "parallel_config", None)
+    dp_size = getattr(parallel_config, "data_parallel_size", 1)
+    return dp_size > 1 and any_selected_component_uses_allgather(od_config)
 
 
-def supports_audio_output(model_class_name: str) -> bool:
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    if model_cls is None:
-        return False
-    return bool(getattr(model_cls, "support_audio_output", False))
+def _move_tensor_tree_to_cpu(value: object) -> object:
+    if isinstance(value, torch.Tensor):
+        return value.cpu() if value.device.type != "cpu" else value
+    if isinstance(value, dict):
+        return {key: _move_tensor_tree_to_cpu(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_move_tensor_tree_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_tensor_tree_to_cpu(item) for item in value)
+    return value
+
+
+@dataclass
+class _RpcTask:
+    """A pending collective_rpc invocation queued for the busy loop."""
+
+    method: str
+    args: tuple
+    kwargs: dict | None
+    deadline: float | None
+    unique_reply_rank: int | None
+    future: concurrent.futures.Future = field(default_factory=concurrent.futures.Future)
+
+
+class DiffusionExecutionMode(str, Enum):
+    REQUEST_BATCH = "request_batch"
+    STEP_BATCH = "step_batch"
 
 
 class DiffusionEngine:
     """The diffusion engine for vLLM-Omni diffusion models."""
 
+    #: Import path of the model runner this engine's workers should build, or
+    #: ``None`` for the platform default. Subclasses declare their runner here
+    #: (e.g. the AR-Diffusion engine), the worker resolves it through
+    #: :meth:`resolve_engine_class` — so engine->runner routing lives on the
+    #: engine class itself, and ``od_config.diffusion_model_runner_cls``
+    #: remains a pure explicit user override (never mutated by engines).
+    default_diffusion_model_runner_cls: str | None = None
+
+    # Class-level defaults so tests using object.__new__ (without __init__)
+    # don't hit AttributeError when _busy_loop accesses them.
+    dp_concurrent: bool = False
+    _scheduling_paused: bool = False
+    # Disabled until runtime initialization resolves the pipeline capability.
+    _request_cancellations: RequestCancellationRegistry | None = None
+
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
-        scheduler: SchedulerInterface | None = None,
+        scheduler: BaseScheduler | None = None,
     ):
         """Initialize the diffusion engine.
 
         Args:
-            config: The configuration for the diffusion engine.
+            od_config: The configuration for the diffusion engine.
+            scheduler: Optional scheduler override for tests or custom engine
+                integrations. When omitted, the engine selects a scheduler
+                from the resolved execution mode.
         """
         self.od_config = od_config
+        # Set after the paged-KV profile request has gone through model-owned
+        # preprocessing. Real requests are admitted only within this measured
+        # activation envelope: (max execution sequences, max seq_len,
+        # max target_len).
+        self._diffusion_kv_profile_limits: tuple[int, int, int] | None = None
 
+        self._init_process_hooks(od_config)
+        self.execution_mode = self._resolve_execution_mode(od_config)
+        self._init_executor(od_config)
+        try:
+            profile_requests = self._prepare_diffusion_kv_profile_requests()
+            kv_control_plane = initialize_diffusion_kv_control_plane(
+                self.executor,
+                od_config,
+                profile_requests=profile_requests,
+            )
+            if kv_control_plane is None:
+                self._init_scheduler(od_config, scheduler)
+            else:
+                (
+                    kv_cache_config,
+                    scheduler_block_size,
+                    hash_block_size,
+                    kv_vllm_config,
+                ) = kv_control_plane
+                self._init_scheduler(
+                    od_config,
+                    scheduler,
+                    kv_cache_config,
+                    scheduler_block_size=scheduler_block_size,
+                    hash_block_size=hash_block_size,
+                    kv_vllm_config=kv_vllm_config,
+                )
+            self._init_runtime_state()
+            self._init_execute_fn()
+            self._log_execution_mode(od_config)
+        except Exception:
+            # close() cannot be used because runtime synchronization state may not exist yet.
+            scheduler_to_close = getattr(self, "scheduler", None)
+            if scheduler_to_close is not None:
+                try:
+                    scheduler_to_close.close()
+                except Exception:
+                    logger.exception("Failed to close Scheduler after DiffusionEngine initialization failed")
+            try:
+                self.executor.shutdown()
+            except Exception:
+                logger.exception("Failed to shut down Executor after DiffusionEngine initialization failed")
+            raise
+
+    def _init_process_hooks(self, od_config: OmniDiffusionConfig) -> None:
         self.post_process_func = get_diffusion_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
+        self.prefix_cache_func = get_diffusion_prefix_cache_func(od_config) if self._prefix_cache_enabled() else None
+        if self._prefix_cache_enabled() and self.prefix_cache_func is None:
+            raise ValueError(
+                "enable_prefix_caching=True requires a registered prefix-cache hook for "
+                f"{od_config.model_class_name!r}; "
+                "disable enable_prefix_caching or use a supported native pipeline such as HunyuanImage3ForCausalMM"
+            )
+        # Cache whether the model-specific postprocess accepts request-level
+        # sampling params so step() can support both legacy and extended hooks.
+        self._post_process_accepts_sampling_params = _func_accepts_parameter(self.post_process_func, "sampling_params")
 
+    def _resolve_execution_mode(self, od_config: OmniDiffusionConfig) -> DiffusionExecutionMode:
+        self.step_execution = bool(getattr(od_config, "step_execution", False))
+        if od_config.streaming_output and not self.step_execution:
+            logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
+            od_config.step_execution = True
+            self.step_execution = True
+
+        if self.step_execution:
+            self.supports_request_batch = False
+            return DiffusionExecutionMode.STEP_BATCH
+
+        self.supports_request_batch = supports_request_batch(od_config)
+        if not self.supports_request_batch and _max_num_seqs(od_config) > 1 and not _uses_dlo_dp_concurrency(od_config):
+            raise ValueError(
+                f"{getattr(od_config, 'model_class_name', None)!r} does not support request-level batching. "
+                "Use max_num_seqs=1 for serial request execution, or choose a pipeline with "
+                "supports_request_batch=True."
+            )
+        return DiffusionExecutionMode.REQUEST_BATCH
+
+    def _init_executor(self, od_config: OmniDiffusionConfig) -> None:
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
-        self.step_execution = bool(getattr(od_config, "step_execution", False))
-        self.scheduler: SchedulerInterface = scheduler or (
-            StepScheduler() if self.step_execution else RequestScheduler()
-        )
-        self.scheduler.initialize(od_config)
+
+    def _init_scheduler(
+        self,
+        od_config: OmniDiffusionConfig,
+        scheduler: BaseScheduler | None = None,
+        kv_cache_config: KVCacheConfig | None = None,
+        *,
+        scheduler_block_size: int | None = None,
+        hash_block_size: int | None = None,
+        kv_vllm_config: VllmConfig | None = None,
+    ) -> None:
+        if scheduler is not None:
+            self.scheduler = scheduler
+        elif self.execution_mode == DiffusionExecutionMode.STEP_BATCH:
+            self.scheduler = StepScheduler()
+        else:
+            self.scheduler = RequestScheduler()
+        if kv_cache_config is None:
+            self.scheduler.initialize(od_config)
+        else:
+            self.scheduler.initialize(
+                od_config,
+                kv_cache_config=kv_cache_config,
+                scheduler_block_size=scheduler_block_size,
+                hash_block_size=hash_block_size,
+                kv_vllm_config=kv_vllm_config,
+            )
+
+    def _init_runtime_state(self) -> None:
+        # DP multi-concurrency: allow batching dp_size requests so each
+        # worker processes a different request in parallel.  Only enabled
+        # for distributed layerwise offload (which shards weights and
+        # needs all ranks active simultaneously).  Ordinary DP with a
+        # non-batch pipeline should not schedule multiple requests.
+        dp_size = getattr(getattr(self.od_config, "parallel_config", None), "data_parallel_size", 1)
+        if _uses_dlo_dp_concurrency(self.od_config):
+            self.scheduler.max_num_running_reqs = dp_size
+            self.dp_concurrent = True
+            logger.info(
+                "dp_concurrent: max_num_running_reqs=%d, batch_wait=%sms",
+                dp_size,
+                self.od_config.request_batch_max_wait_ms,
+            )
+        else:
+            self.dp_concurrent = False
+        self.main_loop: asyncio.AbstractEventLoop | None = None
+        self.stop_event: threading.Event | None = None
+        self.worker_thread: threading.Thread | None = None
+        self._loop_started = False
+        self._init_lock = asyncio.Lock()
+        # _rpc_lock is retained solely as the underlying lock for self._cv,
+        # which is used to signal the busy loop. Worker-call serialization is
+        # now handled structurally by routing all executor calls through the
+        # busy loop rather than via mutual exclusion.
         self._rpc_lock = threading.RLock()
+        self._cv = threading.Condition(self._rpc_lock)
+        self._out_streams: dict[str, asyncio.Queue[DiffusionOutput]] = {}
+        self._closed = False
+        self._shutting_down = False
+        self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
-        self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
+        self._request_cancellations = (
+            RequestCancellationRegistry() if supports_request_cancellation(self.od_config) else None
+        )
+        self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
+        # pause_scheduler(mode="keep"): no new batch is scheduled while set.
+        self._scheduling_paused = False
+        # Copied onto the existing output metrics payload so queue monitoring
+        # reuses the normal diffusion result path without additional IPC.
+        self._scheduler_num_waiting_reqs = 0
 
-        try:
-            self._dummy_run()
-        except Exception as e:
-            logger.error(f"Dummy run failed: {e}")
-            self.close()
-            raise e
+    def _init_execute_fn(self) -> None:
+        if self.execution_mode == DiffusionExecutionMode.STEP_BATCH:
+            self.execute_fn = self.executor.execute_step
+        else:
+            self.execute_fn = self.executor.execute_batch
 
-    def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
+    def _log_execution_mode(self, od_config: OmniDiffusionConfig) -> None:
+        if self.execution_mode == DiffusionExecutionMode.REQUEST_BATCH:
+            logger.info(
+                "[RequestBatch] engine init max_num_seqs=%s max_wait_ms=%s",
+                getattr(od_config, "max_num_seqs", None),
+                getattr(od_config, "request_batch_max_wait_ms", None),
+            )
+
+    async def _check_and_start_background_loop(self):
+        if self._closed:
+            raise RuntimeError("DiffusionEngine is closed.")
+        if self._loop_started:
+            return
+
+        async with self._init_lock:
+            # double check, in case of lock queue issue
+            if self._closed:
+                raise RuntimeError("DiffusionEngine is closed.")
+            if self._loop_started:
+                return
+
+            self.main_loop = asyncio.get_running_loop()
+            self.stop_event = threading.Event()
+            self.worker_thread = threading.Thread(target=self._busy_loop)
+            self.worker_thread.start()
+            self._loop_started = True
+
+    async def step_streaming(self, request: OmniDiffusionRequest) -> AsyncGenerator[list[OmniRequestOutput], None]:
+        await self._check_and_start_background_loop()
+
         diffusion_engine_start_time = time.perf_counter()
 
-        # Apply pre-processing if available
         preprocess_time = 0.0
-        if self.pre_process_func is not None:
-            preprocess_start_time = time.perf_counter()
-            request = self.pre_process_func(request)
+        has_preprocessor = getattr(self, "pre_process_func", None) is not None
+        preprocess_start_time = time.perf_counter() if has_preprocessor else None
+        request = self._prepare_request_for_admission(request)
+        if preprocess_start_time is not None:
             preprocess_time = time.perf_counter() - preprocess_start_time
-            logger.info(f"Pre-processing completed in {preprocess_time:.4f} seconds")
+            logger.debug("Pre-processing completed in %.4f seconds", preprocess_time)
 
         exec_start_time = time.perf_counter()
-        output = self.add_req_and_wait_for_response(request)
-        exec_total_time = time.perf_counter() - exec_start_time
+        request_id = self._add_prepared_request(request)
+        generator = self.get_output_stream(request_id)
+        async for output in generator:
+            exec_total_time = time.perf_counter() - exec_start_time
+            output_ready_wait_time = 0.0
+            # Async mode: wait for background D2H/SHM to complete.
+            if output.async_output_id:
+                output_ready_wait_start_time = time.perf_counter()
+                fut = self.executor.wait_output_ready(output.async_output_id)
+                timeout = _async_output_timeout()
+                try:
+                    output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
+                except (TimeoutError, asyncio.TimeoutError):
+                    describe = getattr(self.executor, "describe_pending_state", None)
+                    logger.error(
+                        "Timed out after %.1fs waiting for async output; set %s to a larger value "
+                        "to allow slower steps. Executor state: %s",
+                        timeout,
+                        _ASYNC_OUTPUT_TIMEOUT_ENV,
+                        describe(output.async_output_id) if describe else "unavailable",
+                    )
+                    raise
+                output_ready_wait_time = time.perf_counter() - output_ready_wait_start_time
+            postprocess_start_time = time.perf_counter()
+            scheduler_metrics = diffusion_scheduler_waiting_metrics(getattr(self, "_scheduler_num_waiting_reqs", 0))
+            try:
+                formatted_outputs = self.postprocess_output(request, output)
+            except Exception as exc:
+                # Preserve the latest scheduler snapshot across terminal
+                # abort/error paths, which do not produce formatted outputs.
+                setattr(exc, "diffusion_metrics", scheduler_metrics)
+                raise
+            postprocess_time = time.perf_counter() - postprocess_start_time
+            step_total_ms = (time.perf_counter() - diffusion_engine_start_time) * 1000
+            logger.debug(
+                "DiffusionEngine.step_streaming breakdown: preprocess=%.2f ms, "
+                "add_req_and_wait=%.2f ms, output_ready_wait=%.2f ms, "
+                "postprocess=%.2f ms, total=%.2f ms",
+                preprocess_time * 1000,
+                exec_total_time * 1000,
+                output_ready_wait_time * 1000,
+                postprocess_time * 1000,
+                step_total_ms,
+            )
+            for request_output in formatted_outputs:
+                metrics_update = {
+                    "preprocess_time_ms": preprocess_time * 1000,
+                    "diffusion_engine_exec_time_ms": exec_total_time * 1000,
+                    "output_ready_wait_time_ms": output_ready_wait_time * 1000,
+                    "postprocess_time_ms": postprocess_time * 1000,
+                    **scheduler_metrics,
+                }
+                if request.scheduler_queue_wait_ms is not None:
+                    metrics_update["scheduler_queue_wait_ms"] = request.scheduler_queue_wait_ms
+                vae_decode_ms = extract_diffusion_vae_decode_ms(output)
+                if vae_decode_ms is not None:
+                    metrics_update["vae_decode_time_ms"] = vae_decode_ms
+                forward_ms = extract_diffusion_denoise_ms(output)
+                if forward_ms is not None:
+                    metrics_update["forward_time_ms"] = forward_ms
+                kv_recv_ms = getattr(output, "kv_recv_ms", 0.0)
+                if kv_recv_ms > 0:
+                    metrics_update["kv_recv_time_ms"] = kv_recv_ms
+                request_output.metrics.update(metrics_update)
+            yield formatted_outputs
 
+    async def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
+        """Deprecated compatibility wrapper over ``step_streaming()``.
+
+        Use ``step_streaming()`` for new callers. This method drains the
+        unified output stream and returns only the final output batch, matching
+        the historical non-streaming ``step()`` behavior.
+        """
+        logger.warning_once(
+            "DiffusionEngine.step() is deprecated; use step_streaming() and consume the final output batch instead."
+        )
+        final_output: list[OmniRequestOutput] | None = None
+        async for output in self.step_streaming(request):
+            final_output = output
+        return final_output or []
+
+    def postprocess_output(
+        self,
+        request: OmniDiffusionRequest,
+        output: DiffusionOutput,
+    ) -> list[OmniRequestOutput]:
+        """Convert a DiffusionOutput to a list of OmniRequestOutput."""
         if output.aborted:
             raise DiffusionRequestAbortedError(output.abort_message or "Diffusion request aborted.")
         if output.error:
-            raise RuntimeError(f"{output.error}")
-        logger.info("Generation completed successfully.")
-
-        if output.output is None:
-            logger.warning("Output is None, returning empty OmniRequestOutput")
-            return [
-                OmniRequestOutput.from_diffusion(
-                    request_id=request.request_ids[i] if i < len(request.request_ids) else "",
-                    images=[],
-                    prompt=prompt,
-                    metrics={},
-                    latents=None,
+            if is_client_error_status(output.error_status_code):
+                raise client_error_from_metadata(
+                    output.error,
+                    status_code=output.error_status_code,
+                    error_type=output.error_type,
                 )
-                for i, prompt in enumerate(request.prompts)
-            ]
+            raise RuntimeError(output.error)
+        if output.request_started:
+            return format_empty_diffusion_outputs(
+                request,
+                finished=False,
+                custom_output={DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED},
+            )
 
-        # When CPU offload is enabled, move output to CPU before
-        # post-processing to avoid device OOM — model weights may still
-        # reside on the device and leave no headroom for intermediates.
-        output_data = output.output
-        if (
-            self.od_config.enable_cpu_offload
-            and isinstance(output_data, torch.Tensor)
-            and output_data.device.type != "cpu"
-        ):
-            output_data = output_data.cpu()
+        if output.media is not None:
+            if output.output is not None:
+                raise ValueError("DiffusionOutput cannot contain both media and legacy output")
+            media = output.media.to_cpu() if self.od_config.enable_cpu_offload else output.media
+            output_data = media.video.tensor
+            outputs = finalize_diffusion_media(media, sampling_params=request.sampling_params)
+        else:
+            if output.output is None:
+                logger.warning("Output is None, returning empty OmniRequestOutput")
+                return format_empty_diffusion_outputs(request, finished=output.finished)
 
-        postprocess_start_time = time.perf_counter()
-        outputs = self.post_process_func(output_data) if self.post_process_func is not None else output_data
-        audio_payload = None
-        if isinstance(outputs, dict):
-            audio_payload = outputs.get("audio")
-            outputs = outputs.get("video", outputs)
-        postprocess_time = time.perf_counter() - postprocess_start_time
-        logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
+            # When CPU offload is enabled, move output to CPU before
+            # post-processing to avoid device OOM — model weights may still
+            # reside on the device and leave no headroom for intermediates.
+            output_data = output.output
+            if self.od_config.enable_cpu_offload:
+                output_data = _move_tensor_tree_to_cpu(output_data)
 
-        step_total_ms = (time.perf_counter() - diffusion_engine_start_time) * 1000
-        logger.info(
-            "DiffusionEngine.step breakdown: preprocess=%.2f ms, "
-            "add_req_and_wait=%.2f ms, postprocess=%.2f ms, total=%.2f ms",
-            preprocess_time * 1000,
-            exec_total_time * 1000,
-            postprocess_time * 1000,
-            step_total_ms,
+            if self.post_process_func is not None:
+                # Some video pipelines need request-level controls during
+                # postprocess (for example worker-side frame interpolation).
+                postprocess_kwargs: dict[str, object] = {}
+                if self._post_process_accepts_sampling_params:
+                    postprocess_kwargs["sampling_params"] = request.sampling_params
+                outputs = self.post_process_func(output_data, **postprocess_kwargs)
+            else:
+                outputs = output_data
+
+        postprocess_output = normalize_diffusion_postprocess_output(outputs)
+
+        return format_diffusion_outputs(
+            request=request,
+            od_config=self.od_config,
+            diffusion_output=output,
+            output_data=output_data,
+            postprocess_output=postprocess_output,
         )
 
-        # Convert to OmniRequestOutput format
-        # Ensure outputs is a list
-        if not isinstance(outputs, list):
-            outputs = [outputs] if outputs is not None else []
+    def _busy_loop(self):
+        assert self.stop_event is not None
+        while not self.stop_event.is_set():
+            self._process_aborts_queue()
+            self._process_rpc_queue()
+            if self._scheduling_paused:
+                # No wave runs while paused, so requests finished by an abort
+                # would otherwise wait for the resume to surface.
+                with self._cv:
+                    pending_finished = self.scheduler.pending_finished_request_ids()
+                self._emit_finished_outputs(pending_finished, None)
 
-        metrics = {
-            "preprocess_time_ms": preprocess_time * 1000,
-            "diffusion_engine_exec_time_ms": (time.perf_counter() - diffusion_engine_start_time) * 1000,
-            "diffusion_engine_total_time_ms": exec_total_time * 1000,
-            "image_num": int(request.sampling_params.num_outputs_per_prompt),
-            "resolution": int(request.sampling_params.resolution),
-            "postprocess_time_ms": postprocess_time * 1000,
-        }
-        if self.pre_process_func is not None:
-            metrics["preprocessing_time_ms"] = preprocess_time * 1000
+            with self._cv:
+                while (
+                    (self._scheduling_paused or not self.scheduler.has_requests())
+                    and self._rpc_queue.empty()
+                    and self.abort_queue.empty()
+                    and not self.stop_event.is_set()
+                ):
+                    self._cv.wait(timeout=1.0)
 
-        # Handle single request or multiple requests
-        if len(request.prompts) == 1:
-            # Single request: return single OmniRequestOutput
-            prompt = request.prompts[0]
-            request_id = request.request_ids[0] if request.request_ids else ""
+                if self.stop_event.is_set():
+                    break
 
-            if supports_audio_output(self.od_config.model_class_name):
-                request_audio_payload = outputs[0] if len(outputs) == 1 else outputs
-                return [
-                    OmniRequestOutput.from_diffusion(
-                        request_id=request_id,
-                        images=[],
-                        prompt=prompt,
-                        metrics=metrics,
-                        latents=output.trajectory_latents,
-                        multimodal_output={"audio": request_audio_payload},
-                        final_output_type="audio",
-                        stage_durations=output.stage_durations,
-                        peak_memory_mb=output.peak_memory_mb,
-                    ),
-                ]
+                if self._scheduling_paused or not self.scheduler.has_requests():
+                    # Only RPC / abort work pending; loop back to drain it.
+                    continue
+
+                self._wait_for_admission_if_needed_locked()
+                if self._scheduling_paused:
+                    # The gate closed while the batching wait released the lock.
+                    continue
+
+                try:
+                    sched_output = self.scheduler.schedule()
+                except Exception as exc:
+                    self._fail_engine(exc)
+                    return
+                self._scheduler_num_waiting_reqs = max(int(sched_output.num_waiting_reqs), 0)
+
+            self._emit_request_started_outputs(sched_output)
+
+            if sched_output.is_empty:
+                self._emit_finished_outputs(sched_output.finished_req_ids, None)
+                continue
+
+            try:
+                self._prepare_kv_for_forward(sched_output)
+                runner_output: BaseRunnerOutput = (
+                    self.execute_fn(sched_output)
+                    if sched_output.scheduled_request_ids
+                    else BatchRunnerOutput.from_list([])
+                )
+                self._poll_native_kv()
+                worker_execution_completed = True
+            except Exception as exc:
+                if self._closed:
+                    return
+                worker_execution_completed = False
+                logger.error(
+                    "Execution failed for diffusion requests %s", sched_output.scheduled_request_ids, exc_info=True
+                )
+                runner_output = BatchRunnerOutput.from_list(
+                    [
+                        RunnerOutput(
+                            request_id=request_id,
+                            step_index=None,
+                            finished=True,
+                            result=DiffusionOutput.from_exception(exc),
+                        )
+                        for request_id in sched_output.scheduled_request_ids
+                    ]
+                )
+
+            self._process_aborts_queue()
+            self._process_rpc_queue()
+            try:
+                finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
+                self._emit_outputs(
+                    finished_req_ids,
+                    sched_output.scheduled_request_ids,
+                    runner_output,
+                    worker_execution_completed=worker_execution_completed,
+                )
+            except Exception as exc:
+                self._fail_engine(exc)
+                return
+
+            if not sched_output.scheduled_request_ids and self.scheduler._kv_draining_requests:
+                # Only exceptional in-flight receives need idle polling. New
+                # requests / aborts wake this wait immediately.
+                with self._cv:
+                    self._cv.wait(timeout=0.01)
+
+        # Engine is stopping: fail any RPCs still queued so callers don't hang.
+        self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
+
+    def _emit_request_started_outputs(self, sched_output: DiffusionSchedulerOutput) -> None:
+        """Notify opted-in callers when requests leave the scheduler queue."""
+        for new_req in sched_output.scheduled_new_reqs:
+            request = getattr(new_req, "req", None)
+            sampling_params = getattr(request, "sampling_params", None)
+            if getattr(sampling_params, "emit_request_lifecycle", False):
+                self._put_output(
+                    new_req.request_id,
+                    DiffusionOutput(finished=False, request_started=True),
+                )
+
+    def _wait_for_admission_if_needed_locked(self) -> None:
+        """Apply scheduler admission policy while holding the engine condition.
+
+        Caller must hold ``self._cv``.
+        """
+        assert self.stop_event is not None
+        start = time.monotonic()
+        decision = self.scheduler.get_admission_wait_decision(
+            now=start,
+            dp_concurrent=self.dp_concurrent,
+        )
+        if not decision.should_wait:
+            return
+
+        last_waiting = -1
+        stable_since = start
+
+        while not self.stop_event.is_set() and not self._scheduling_paused:
+            waiting = self.scheduler.num_waiting_requests()
+            now = time.monotonic()
+
+            if waiting > last_waiting:
+                stable_since = now
+                last_waiting = waiting
+
+            if self.scheduler.should_end_admission_wait(
+                decision,
+                now=now,
+                stable_since=stable_since,
+            ):
+                break
+
+            remaining = decision.deadline - now if decision.deadline is not None else 0.002
+            self._cv.wait(timeout=min(max(remaining, 0.0), 0.002))
+
+        waited_ms = (time.monotonic() - start) * 1000.0
+        final_waiting = self.scheduler.num_waiting_requests()
+        if final_waiting > 0:
+            logger.info(
+                "[RequestBatch] admission wait done waiting=%d max_batch=%d waited_ms=%.1f",
+                final_waiting,
+                decision.max_batch,
+                waited_ms,
+            )
+
+    def _process_rpc_queue(self) -> None:
+        """Execute pending collective_rpc tasks from the busy-loop thread.
+
+        Running these here means executor calls are naturally serialized
+        against execute_fn() without any mutual-exclusion locking.
+        """
+        while True:
+            try:
+                task = self._rpc_queue.get_nowait()
+            except queue.Empty:
+                return
+
+            self._run_rpc_task(task)
+
+            if task.method == "pause_scheduler":
+                # A dequeued pause ends this drain whatever became of it, so
+                # the batch that just ran is delivered before anything the
+                # caller queued behind the pause. The rest of the queue is
+                # picked up on the next pass of the busy loop.
+                return
+
+    def _run_rpc_task(self, task: _RpcTask) -> None:
+        fut = task.future
+        if fut.cancelled() or fut.done():
+            return
+
+        remaining: float | None = None
+        if task.deadline is not None:
+            remaining = task.deadline - time.monotonic()
+            if remaining <= 0:
+                if not fut.done():
+                    fut.set_exception(TimeoutError(f"RPC call to {task.method} timed out before execution."))
+                return
+
+        try:
+            if task.method == "pause_scheduler":
+                result = self._run_pause_barrier(remaining)
+            elif task.method == "resume_scheduler":
+                result = self._open_scheduling_gate()
             else:
-                mm_output = {}
-                if audio_payload is not None:
-                    mm_output["audio"] = audio_payload
-                return [
-                    OmniRequestOutput.from_diffusion(
-                        request_id=request_id,
-                        images=outputs,
-                        prompt=prompt,
-                        metrics=metrics,
-                        latents=output.trajectory_latents,
-                        trajectory_latents=output.trajectory_latents,
-                        trajectory_timesteps=output.trajectory_timesteps,
-                        trajectory_log_probs=output.trajectory_log_probs,
-                        trajectory_decoded=output.trajectory_decoded,
-                        custom_output=output.custom_output or {},
-                        multimodal_output=mm_output,
-                        stage_durations=output.stage_durations,
-                        peak_memory_mb=output.peak_memory_mb,
-                    ),
-                ]
+                result = self.executor.collective_rpc(
+                    method=task.method,
+                    timeout=remaining,
+                    args=task.args,
+                    kwargs=task.kwargs,
+                    unique_reply_rank=task.unique_reply_rank,
+                )
+        except BaseException as exc:  # noqa: BLE001 - propagate to caller
+            # The future may have been cancelled (e.g. by a sync timeout
+            # or asyncio cancellation) while the executor call was
+            # running. Setting state on a cancelled/done future raises
+            # InvalidStateError, which would kill the busy loop.
+            if not fut.done():
+                fut.set_exception(exc)
         else:
-            # Multiple requests: return list of OmniRequestOutput
-            # Split images based on num_outputs_per_prompt for each request
-            results = []
-            output_idx = 0
+            if not fut.done():
+                fut.set_result(result)
 
-            for i, prompt in enumerate(request.prompts):
-                request_id = request.request_ids[i] if i < len(request.request_ids) else ""
+    def _fail_pending_rpcs(self, exc: BaseException) -> None:
+        while True:
+            try:
+                task = self._rpc_queue.get_nowait()
+            except queue.Empty:
+                return
+            if not task.future.done():
+                task.future.set_exception(exc)
 
-                # Get images for this request
-                num_outputs = request.sampling_params.num_outputs_per_prompt
-                start_idx = output_idx
-                end_idx = start_idx + num_outputs
-                request_outputs = outputs[start_idx:end_idx] if output_idx < len(outputs) else []
-                output_idx = end_idx
+    def _check_pause_request(self, kwargs: dict | None) -> None:
+        mode = (kwargs or {}).get("mode")
+        if mode != "keep":
+            raise ValueError(f"DiffusionEngine pause supports mode='keep' only, got {mode!r}.")
+        if self.execution_mode != DiffusionExecutionMode.REQUEST_BATCH:
+            raise NotImplementedError("DiffusionEngine pause supports request-level execution only.")
 
-                if supports_audio_output(self.od_config.model_class_name):
-                    request_audio_payload = request_outputs[0] if len(request_outputs) == 1 else request_outputs
-                    results.append(
-                        OmniRequestOutput.from_diffusion(
-                            request_id=request_id,
-                            images=[],
-                            prompt=prompt,
-                            metrics=metrics,
-                            latents=output.trajectory_latents,
-                            multimodal_output={"audio": request_audio_payload},
-                            final_output_type="audio",
-                            stage_durations=output.stage_durations,
-                            peak_memory_mb=output.peak_memory_mb,
-                        ),
-                    )
-                else:
-                    mm_output = {}
-                    if audio_payload is not None:
-                        sliced_audio = audio_payload
-                        if isinstance(audio_payload, (list, tuple)):
-                            sliced_audio = audio_payload[start_idx:end_idx]
-                            if len(sliced_audio) == 1:
-                                sliced_audio = sliced_audio[0]
-                        elif hasattr(audio_payload, "shape") and getattr(audio_payload, "shape", None) is not None:
-                            if len(audio_payload.shape) > 0 and audio_payload.shape[0] >= end_idx:
-                                sliced_audio = audio_payload[start_idx:end_idx]
-                                if num_outputs == 1:
-                                    sliced_audio = sliced_audio[0]
-                        mm_output["audio"] = sliced_audio
-                    results.append(
-                        OmniRequestOutput.from_diffusion(
-                            request_id=request_id,
-                            images=request_outputs,
-                            prompt=prompt,
-                            metrics=metrics,
-                            latents=output.trajectory_latents,
-                            trajectory_latents=output.trajectory_latents,
-                            trajectory_timesteps=output.trajectory_timesteps,
-                            trajectory_log_probs=output.trajectory_log_probs,
-                            trajectory_decoded=output.trajectory_decoded,
-                            custom_output=output.custom_output or {},
-                            multimodal_output=mm_output,
-                            stage_durations=output.stage_durations,
-                            peak_memory_mb=output.peak_memory_mb,
-                        ),
-                    )
+    def _run_pause_barrier(self, timeout: float | None) -> None:
+        """Return once every worker has finished the device work of the batch that ran."""
+        self.executor.collective_rpc("synchronize_device", timeout=timeout, kwargs={"timeout": timeout})
 
-            return results
+    def _open_scheduling_gate(self) -> None:
+        with self._cv:
+            self._scheduling_paused = False
+            self._cv.notify_all()
+
+    def _run_engine_control(self, method: str, timeout: float | None, kwargs: dict | None) -> None:
+        """Bootstrap-path dispatch for engine-local control methods."""
+        if method == "pause_scheduler":
+            self._check_pause_request(kwargs)
+            self._scheduling_paused = True
+            return self._run_pause_barrier(timeout)
+        return self._open_scheduling_gate()
+
+    def _remove_diffusion_kv_requests(self, request_ids: Iterable[str]) -> None:
+        """Clear terminal Worker rows while Scheduler owns the allocations."""
+
+        od_config = getattr(self, "od_config", None)
+        if od_config is None or not is_scheduler_paged_kv_mode(
+            getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+        ):
+            return
+        unique_request_ids = list(dict.fromkeys(request_ids))
+        if unique_request_ids:
+            scheduler = getattr(self, "scheduler", None)
+            target_builder = getattr(scheduler, "get_diffusion_kv_cleanup_targets", None)
+            cleanup_targets = target_builder(unique_request_ids) if target_builder is not None else unique_request_ids
+            try:
+                if cleanup_targets:
+                    self.executor.remove_diffusion_kv_requests(cleanup_targets)
+            except Exception as exc:
+                self._fail_engine(exc)
+                raise
+
+    def _prepare_kv_for_forward(self, sched_output: DiffusionSchedulerOutput) -> None:
+        if (
+            getattr(sched_output, "kv_connector_metadata", None) is None
+            and getattr(sched_output, "kv_prefetch_connector_metadata", None) is None
+            and not getattr(sched_output, "kv_required_request_ids", None)
+            and not getattr(sched_output, "kv_poll_only", False)
+        ):
+            return
+        try:
+            output = self.executor.prepare_kv_for_forward(sched_output)
+            assert output is not None
+            self.scheduler.update_kv_connector_output(output)
+            if not self.abort_queue.empty():
+                self._process_aborts_queue()
+            required_ids = sched_output.kv_required_request_ids
+            if required_ids is None:
+                required_ids = sched_output.kv_transfer_request_ids
+            incomplete = required_ids - (output.finished_recving or set())
+            sched_output.finished_req_ids.update(self.scheduler.fail_incomplete_kv_loads(incomplete))
+            # Timed-out/cancelled requests must never reach model execution.
+            terminal = {
+                rid
+                for rid in sched_output.scheduled_request_ids
+                if (state := self.scheduler.get_request_state(rid)) is not None and state.is_finished()
+            }
+            if terminal:
+                sched_output.finished_req_ids.update(terminal)
+                sched_output.scheduled_new_reqs = [
+                    req for req in sched_output.scheduled_new_reqs if req.request_id not in terminal
+                ]
+                sched_output.scheduled_cached_reqs.request_ids = [
+                    rid for rid in sched_output.scheduled_cached_reqs.request_ids if rid not in terminal
+                ]
+                # is_empty / started-output handling may have already cached it.
+                sched_output.__dict__.pop("scheduled_request_ids", None)
+            drained = self.scheduler.completed_kv_drains()
+            if drained:
+                self._remove_diffusion_kv_requests(drained)
+                self.scheduler.release_kv_drains(drained)
+        except Exception as exc:
+            self._fail_engine(exc)
+            raise
+
+    def _poll_native_kv(self, *, drain_request_ids: list[str] | None = None) -> None:
+        poll = getattr(self.scheduler, "native_kv_poll_output", None)
+        if poll is None:
+            return
+        output = poll(drain_request_ids=drain_request_ids)
+        if output is not None:
+            self._prepare_kv_for_forward(output)
+
+    def _fail_engine(self, exc: Exception) -> None:
+        with self._cv:
+            if getattr(self, "_shutdown_complete", False) or getattr(self, "_shutting_down", False):
+                return
+            # Mark shutdown before invoking any component callbacks.  A
+            # failing shutdown can re-enter this method from another error
+            # path, and repeating executor.shutdown() is unsafe.
+            self._shutting_down = True
+            self._closed = True
+            if self._request_cancellations is not None:
+                self._request_cancellations.cancel_all()
+            if self.stop_event is not None:
+                self.stop_event.set()
+            streams = list(self._out_streams.values())
+            self._cv.notify_all()
+
+        logger.error("Diffusion engine failed; stopping workers before releasing KV pages", exc_info=exc)
+        for stream in streams:
+            self._put_queue_output(stream, DiffusionOutput.from_exception(exc))
+        self._fail_pending_rpcs(exc)
+        # If Worker shutdown fails, retain the Scheduler reservations. A
+        # remote producer may still be writing into those allocations.
+        self.executor.shutdown()
+        try:
+            self.scheduler.close()
+        finally:
+            # Workers are down, so readers cannot attach or use the signals.
+            # Release them even if scheduler cleanup itself fails.
+            if self._request_cancellations is not None:
+                self._request_cancellations.close()
+        self._shutdown_complete = True
+
+    def _emit_finished_outputs(
+        self,
+        finished_ids: set[str],
+        runner_output: BaseRunnerOutput | None = None,
+        missing_result_error: str = "Diffusion execution finished without a final output",
+        worker_cleaned_ids: set[str] | None = None,
+    ) -> None:
+        self._remove_diffusion_kv_requests(finished_ids - (worker_cleaned_ids or set()))
+        for rid in finished_ids:
+            if runner_output is not None:
+                _output = runner_output.get_request_output(rid)
+            else:
+                _output = None
+            out = self._finalize_finished_request(rid, _output, missing_result_error)
+            self._put_output(rid, out)
+
+    def _emit_outputs(
+        self,
+        finished_ids: set[str],
+        scheduled_request_ids: list[str],
+        runner_output: BaseRunnerOutput,
+        *,
+        worker_execution_completed: bool = False,
+    ) -> None:
+        """Emit output chunks for every request through the unified output stream."""
+        finished_ids = set(finished_ids)
+        worker_cleaned_ids = finished_ids.intersection(scheduled_request_ids) if worker_execution_completed else set()
+        if self.execution_mode != DiffusionExecutionMode.STEP_BATCH:
+            self._emit_finished_outputs(
+                finished_ids,
+                runner_output,
+                worker_cleaned_ids=worker_cleaned_ids,
+            )
+            return
+
+        self._remove_diffusion_kv_requests(finished_ids - worker_cleaned_ids)
+
+        delivered_finished_req_ids: set[str] = set()
+
+        # finished_ids may have some requests that are not scheduler in this round.
+        # First handle this-round requests.
+        for request_id in scheduled_request_ids:
+            req_output = runner_output.get_request_output(request_id)
+            if request_id in finished_ids:
+                # This entire request is finished (this is the last chunk)
+                out = self._finalize_finished_request(
+                    request_id,
+                    req_output,
+                    missing_result_error="Diffusion step execution finished without a final output.",
+                )
+                self._put_output(request_id, out)
+                delivered_finished_req_ids.add(request_id)
+            elif req_output is not None and req_output.result is not None:
+                # This is a non-terminal chunk. It is not in scheduler's
+                # finished_ids, but it still belongs on the request stream.
+                self._put_output(request_id, req_output.result)
+
+        # Then handle other requests that are finished in this round.
+        for request_id in finished_ids - delivered_finished_req_ids:
+            out = self._finalize_finished_request(
+                request_id,
+                missing_result_error="Diffusion step request finished without execution output.",
+            )
+            self._put_output(request_id, out)
+
+    def _has_output_stream(self, request_id: str) -> bool:
+        with self._cv:
+            return request_id in self._out_streams
 
     @staticmethod
-    def make_engine(
-        config: OmniDiffusionConfig,
-        scheduler: SchedulerInterface | None = None,
-    ) -> DiffusionEngine:
-        """Factory method to create a DiffusionEngine instance.
+    def resolve_engine_class(config: OmniDiffusionConfig) -> type[DiffusionEngine]:
+        """Resolve the engine class selected by ``config.engine_backend``.
+
+        Mirrors ``DiffusionExecutor.get_class``: accepts ``"default"``, a
+        ``DiffusionEngine`` subclass, or an import-path string (e.g. a deploy
+        config's ``engine_backend``). Kept separate from :meth:`make_engine` so the
+        selection is testable without constructing an engine (which runs a dummy forward).
 
         Args:
             config: The configuration for the diffusion engine.
 
         Returns:
-            An instance of DiffusionEngine.
+            The ``DiffusionEngine`` (sub)class to instantiate.
         """
-        return DiffusionEngine(config, scheduler=scheduler)
+        backend = getattr(config, "engine_backend", "default") or "default"
+
+        if isinstance(backend, type):
+            if not issubclass(backend, DiffusionEngine):
+                raise TypeError(f"engine_backend must be a DiffusionEngine subclass. Got {backend}.")
+            return backend
+        if backend == "default":
+            return DiffusionEngine
+        if isinstance(backend, str):
+            try:
+                engine_class = resolve_obj_by_qualname(backend)
+            except (ImportError, ValueError) as e:
+                raise ValueError(
+                    f"Failed to load engine_backend '{backend}'. Ensure it is a valid python path. Error: {e}"
+                ) from e
+            if not issubclass(engine_class, DiffusionEngine):
+                raise TypeError(f"engine_backend must resolve to a DiffusionEngine subclass. Got {engine_class}.")
+            return engine_class
+        raise ValueError(f"Unknown engine_backend: {backend!r}")
+
+    @staticmethod
+    def make_engine(
+        config: OmniDiffusionConfig,
+        scheduler: BaseScheduler | None = None,
+    ) -> DiffusionEngine:
+        """Factory method to create the engine selected by ``config.engine_backend``.
+
+        Args:
+            config: The configuration for the diffusion engine.
+            scheduler: Optional scheduler override. When omitted, the selected
+                engine chooses the scheduler from its execution mode.
+
+        Returns:
+            An instance of the resolved ``DiffusionEngine`` (sub)class.
+        """
+        engine_class = DiffusionEngine.resolve_engine_class(config)
+        engine = engine_class(config, scheduler=scheduler)
+        engine.run_startup_warmup()
+        return engine
+
+    def _prefix_cache_enabled(self) -> bool:
+        config = getattr(self, "od_config", None)
+        return getattr(config, "diffusion_kv_mode", None) is DiffusionKVCacheMode.PAGED_SCHEDULER and bool(
+            getattr(config, "enable_prefix_caching", False)
+        )
+
+    def _prepare_request_for_admission(self, request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        """Run model-owned preprocessing once, before entering Engine locks."""
+
+        pre_process_func = getattr(self, "pre_process_func", None)
+        if pre_process_func is not None:
+            request = pre_process_func(request)
+        self._validate_diffusion_kv_profile_limits(request)
+        # Gate cache-input preparation itself: disabled caching must not inspect
+        # tensors / RNG state or copy token IDs just to discard their hashes.
+        # Both dependency hashing and preprocessing stay outside Engine locks.
+        prefix_cache_func = getattr(self, "prefix_cache_func", None)
+        if self._prefix_cache_enabled() and prefix_cache_func is not None and request.diffusion_kv_requests:
+            prefix_cache_func(request)
+        return request
+
+    def _validate_diffusion_kv_profile_limits(self, request: OmniDiffusionRequest) -> None:
+        """Keep admitted paged-KV requests within the profiled activation shape."""
+
+        profile_limits = getattr(self, "_diffusion_kv_profile_limits", None)
+        if profile_limits is None:
+            return
+        kv_requests = request.diffusion_kv_requests
+        if not kv_requests:
+            return
+
+        request_limits = (
+            len(kv_requests),
+            max(kv_request.seq_len for kv_request in kv_requests),
+            max(kv_request.target_len for kv_request in kv_requests),
+        )
+        if any(actual > profiled for actual, profiled in zip(request_limits, profile_limits, strict=True)):
+            request_sequences, request_seq_len, request_target_len = request_limits
+            profile_sequences, profile_seq_len, profile_target_len = profile_limits
+            raise ValueError(
+                f"Diffusion KV request {request.request_id!r} exceeds the startup memory-profile envelope: "
+                f"sequences={request_sequences} (profiled={profile_sequences}), "
+                f"max_seq_len={request_seq_len} (profiled={profile_seq_len}), "
+                f"max_target_len={request_target_len} (profiled={profile_target_len}). "
+                "Reduce the request shape or extend the model's paged-KV profile recipe."
+            )
+
+    def _add_prepared_request(self, request: OmniDiffusionRequest) -> str:
+        """Admit a request whose model-owned preprocessing is complete."""
+
+        with self._cv:
+            if self._closed:
+                raise RuntimeError("DiffusionEngine is closed.")
+            queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+            if self._request_cancellations is not None:
+                request.cancellation_signal = self._request_cancellations.create(request.request_id)
+            try:
+                request_id = self.scheduler.add_request(request)
+            except BaseException:
+                if self._request_cancellations is not None:
+                    self._request_cancellations.finish(request.request_id)
+                    request.cancellation_signal = None
+                raise
+            self._out_streams[request_id] = queue
+            self._cv.notify_all()
+
+        return request_id
+
+    def add_request(self, request: OmniDiffusionRequest) -> str:
+        request = self._prepare_request_for_admission(request)
+        return self._add_prepared_request(request)
+
+    async def get_output_stream(self, request_id: str) -> AsyncGenerator[DiffusionOutput, None]:
+        with self._cv:
+            queue = self._out_streams.get(request_id)
+        if queue is None:
+            raise RuntimeError(f"Request {request_id} not found in output queue.")
+        try:
+            while True:
+                output: DiffusionOutput = await queue.get()
+                yield output
+                if output.finished:
+                    break
+        except Exception as e:
+            logger.error(f"Wait for response failed: {e}")
+            raise
+        finally:
+            with self._cv:
+                if self._out_streams.get(request_id) is queue:
+                    self._out_streams.pop(request_id, None)
+
+    def async_add_req_and_stream_response(self, request: OmniDiffusionRequest) -> AsyncGenerator[DiffusionOutput, None]:
+        request_id = self.add_request(request)
+        return self.get_output_stream(request_id)
+
+    async def async_add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        """Deprecated compatibility wrapper over ``async_add_req_and_stream_response()``.
+
+        Use ``async_add_req_and_stream_response()`` for new callers. This
+        method drains the unified output stream and returns only the final
+        ``DiffusionOutput``, matching the historical non-streaming behavior.
+        """
+        logger.warning_once(
+            "DiffusionEngine.async_add_req_and_wait_for_response() is deprecated; "
+            "use async_add_req_and_stream_response() and consume the final output instead."
+        )
+        final_output: DiffusionOutput | None = None
+        async for output in self.async_add_req_and_stream_response(request):
+            final_output = output
+        if final_output is None:
+            raise RuntimeError("Diffusion execution completed without an output.")
+        return final_output
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        request = self._prepare_request_for_admission(request)
         with self._rpc_lock:
-            target_sched_req_id = self.scheduler.add_request(request)
+            if self._closed:
+                raise RuntimeError("DiffusionEngine is closed.")
+            target_request_id = self.scheduler.add_request(request)
 
             # keep scheduling and executing until the target request is finished
             while True:
                 self._process_aborts_queue()
-                sched_output = self.scheduler.schedule()
+                try:
+                    sched_output = self.scheduler.schedule()
+                except Exception as exc:
+                    self._fail_engine(exc)
+                    raise
                 if sched_output.is_empty:
-                    if target_sched_req_id in sched_output.finished_req_ids:
-                        return self._finalize_finished_request(target_sched_req_id)
+                    if target_request_id in sched_output.finished_req_ids:
+                        self._remove_diffusion_kv_requests([target_request_id])
+                        return self._finalize_finished_request(target_request_id)
                     if not self.scheduler.has_requests():
                         raise RuntimeError("Diffusion scheduler has no runnable requests.")
                     continue
 
-                # NOTE: add_req_and_wait_for_response() is synchronous, and
-                # the scheduler currently enforces _max_batch_size = 1 (see
-                # vllm_omni/diffusion/sched/base_scheduler.py), so we directly
-                # take the single scheduled request here.
-                sched_req_id = sched_output.scheduled_req_ids[0]
+                # NOTE: add_req_and_wait_for_response() is synchronous, will be only called
+                # within _dummy_run, only one request will be scheduled
+                request_id = target_request_id
                 try:
-                    runner_output = self.execute_fn(sched_output)
+                    self._prepare_kv_for_forward(sched_output)
+                    runner_output: BaseRunnerOutput = (
+                        self.execute_fn(sched_output)
+                        if sched_output.scheduled_request_ids
+                        else BatchRunnerOutput.from_list([])
+                    )
+                    self._poll_native_kv()
+                except EngineDeadError:
+                    raise
                 except Exception as exc:
-                    logger.error("Execution failed for diffusion request %s", sched_req_id, exc_info=True)
+                    if self._closed:
+                        raise
+                    logger.error("Execution failed for diffusion request %s", request_id, exc_info=True)
                     runner_output = RunnerOutput(
-                        req_id=sched_req_id,
+                        request_id=request_id,
                         step_index=None,
                         finished=True,
-                        result=DiffusionOutput(error=str(exc)),
+                        result=DiffusionOutput.from_exception(exc),
                     )
 
                 self._process_aborts_queue()
 
                 finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
-                if target_sched_req_id in finished_req_ids:
-                    return self._finalize_finished_request(
-                        target_sched_req_id,
-                        runner_output=runner_output,
+
+                # sync func should receive one result
+                if (
+                    sched_output.scheduled_request_ids
+                    and isinstance(runner_output, BatchRunnerOutput)
+                    and len(runner_output) != 1
+                ):
+                    raise ValueError("Sync func should receive one result at one time")
+                if target_request_id in finished_req_ids:
+                    self._remove_diffusion_kv_requests([target_request_id])
+                    req_output = runner_output.get_request_output(target_request_id)
+                    output = self._finalize_finished_request(
+                        target_request_id,
+                        runner_output=req_output,
                         missing_result_error="Diffusion execution finished without a final output.",
                     )
+                    if output.async_output_id:
+                        fut = self.executor.wait_output_ready(output.async_output_id)
+                        output = fut.result(timeout=_async_output_timeout())
+                    return output
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
-        """Start or stop torch profiling on all diffusion workers.
+        """Start or stop profiling on all diffusion workers.
 
         Args:
             is_start: True to start profiling, False to stop.
-            profile_prefix: Optional prefix for trace filename (vLLM compat).
-
-        Note:
-            Matches vLLM's worker.profile() signature for consistency.
-            Traces are saved automatically via on_trace_ready callback.
+            profile_prefix: Optional prefix for trace filename.
         """
         if is_start:
             if profile_prefix is None:
@@ -366,52 +1285,168 @@ class DiffusionEngine:
             if is_start:
                 raise RuntimeError(f"Could not {action} profiler: {e}") from e
 
-    def _dummy_run(self):
-        """A dummy run to warm up the model."""
-        num_inference_steps = 1
-        height = 512
-        width = 512
-        if supports_image_input(self.od_config.model_class_name):
-            # Provide a dummy image input if the model supports it
-            color_format = image_color_format(self.od_config.model_class_name)
-            dummy_image = PIL.Image.new(color_format, (width, height))
-        else:
-            dummy_image = None
+    def run_startup_warmup(self) -> None:
+        try:
+            self._dummy_run()
+        except Exception as e:
+            logger.error(f"Dummy run failed: {e}")
+            self.close()
+            raise
 
-        if supports_audio_input(self.od_config.model_class_name):
+    def _make_dummy_request(
+        self,
+        *,
+        height: int,
+        width: int,
+        guidance_scale: float,
+        num_image_inputs: int = 1,
+        num_inference_steps: int = 1,
+        num_frames: int | None = None,
+    ) -> OmniDiffusionRequest | None:
+        """Build a startup request; explicit frame counts bypass the warmup policy."""
+        prompt = OmniTextPrompt(prompt="dummy run")
+        model_class_name = self.od_config.model_class_name
+        if model_class_name is None:
+            raise RuntimeError("Dummy request requires a resolved model_class_name")
+        supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
+        if supports_image_input:
+            color_format = image_color_format(model_class_name)
+            images = [PIL.Image.new(color_format, (width, height)) for _ in range(num_image_inputs)]
+            prompt.setdefault("multi_modal_data", {})["image"] = images[0] if len(images) == 1 else images
+
+        if supports_audio_input:
             audio_sr = 16000
-            audio_duration_sec = 4
-            audio_array = np.random.randn(audio_sr * audio_duration_sec).astype(np.float32)
-            dummy_audio = audio_array[audio_sr * 1 : audio_sr * 3]
-        else:
-            dummy_audio = None
+            prompt.setdefault("multi_modal_data", {})["audio"] = np.random.randn(audio_sr * 2).astype(np.float32)
 
-        prompt: OmniTextPrompt = {
-            "prompt": "dummy run",
-            "multi_modal_data": {"image": dummy_image, "audio": dummy_audio},
-        }
-        req = OmniDiffusionRequest(
-            prompts=[prompt],
-            request_ids=["dummy_req_id"],
+        if num_frames is None:
+            num_frames = get_dummy_run_num_frames(model_class_name, supports_audio_input)
+        if num_frames <= 0:
+            return None
+        return OmniDiffusionRequest(
+            prompt=prompt,
+            request_id=DUMMY_DIFFUSION_REQUEST_ID,
             sampling_params=OmniDiffusionSamplingParams(
                 height=height,
                 width=width,
                 num_inference_steps=num_inference_steps,
-                # Keep warmup path minimal and robust across text encoders.
-                # Some models may fail when warmup implicitly triggers
-                # classifier-free guidance with an empty negative prompt.
-                guidance_scale=0.0,
+                num_frames=num_frames,
+                guidance_scale=guidance_scale,
                 num_outputs_per_prompt=1,
-                # Disable CFG for warmup to avoid triggering CFG parallel
-                # validation when cfg_parallel_size > 1.
                 extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
             ),
         )
+
+    def _prepare_diffusion_kv_profile_requests(self) -> list[OmniDiffusionRequest] | None:
+        """Prepare the per-rank request batch used to profile paged-KV headroom.
+
+        The profile executes directly on each Worker before the Scheduler and
+        its KV manager exist. It uses the maximum number of requests that one
+        rank can execute together. DLO+DP is the exception because each rank
+        executes one request from the collective wave.
+
+        Hunyuan is currently the only model integrated with
+        ``paged_scheduler``. The stage's configured default resolution (or
+        1024x1024 when absent), enabled CFG, and the maximum advertised
+        reference-image count exercise its first-step activation peak.
+        Admission compares each preprocessed request's CFG count and tokenized
+        sequence/target shape with the resulting per-request profile envelope.
+        Future paged model integrations must extend this recipe for their
+        serving limits (for example, video frame count) rather than reusing it
+        silently.
+        """
+
+        if (
+            getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is not DiffusionKVCacheMode.PAGED_SCHEDULER
+        ):
+            return None
+        model_class_name = self.od_config.model_class_name
+        if model_class_name is None:
+            raise RuntimeError("Diffusion KV profiling requires a resolved model_class_name")
+        additional_config = getattr(self.od_config, "additional_config", {}) or {}
+        profile_height = additional_config.get("diffusion_kv_profile_height", 1024)
+        profile_width = additional_config.get("diffusion_kv_profile_width", 1024)
+        request = self._make_dummy_request(
+            height=profile_height,
+            width=profile_width,
+            guidance_scale=5.0,
+            num_image_inputs=get_dummy_run_num_image_inputs(model_class_name),
+            # Hunyuan skips generic warmup, but paged KV still needs its
+            # prepared image request to measure the startup memory envelope.
+            num_frames=1,
+        )
+        if request is None:
+            raise RuntimeError("paged_scheduler requires a runnable Diffusion KV memory profile request")
+        request = self._prepare_request_for_admission(request)
+        kv_requests = request.diffusion_kv_requests
+        if not kv_requests:
+            raise RuntimeError("paged_scheduler profile preprocessing must produce Diffusion KV requests")
+        self._diffusion_kv_profile_limits = (
+            len(kv_requests),
+            max(kv_request.seq_len for kv_request in kv_requests),
+            max(kv_request.target_len for kv_request in kv_requests),
+        )
+        dlo_dp_request_mode = self.execution_mode is DiffusionExecutionMode.REQUEST_BATCH and _uses_dlo_dp_concurrency(
+            self.od_config
+        )
+        profile_batch_size = 1 if dlo_dp_request_mode else _max_num_seqs(self.od_config)
+        profile_requests: list[OmniDiffusionRequest] = []
+        for index in range(profile_batch_size):
+            profile_request = copy.copy(request)
+            profile_request.request_id = f"{DUMMY_DIFFUSION_REQUEST_ID}/kv-profile-{index}"
+            profile_request.sampling_params = copy.deepcopy(request.sampling_params)
+            # Preprocessing owns request geometry and prepared model inputs,
+            # but native KV requests remain Scheduler-only mutable state. The
+            # profile bypasses Scheduler admission and must not send them to
+            # the Worker.
+            profile_request.diffusion_kv_requests = None
+            profile_requests.append(profile_request)
+        return profile_requests
+
+    def _dummy_run(self):
+        """A dummy run to warm up the model."""
+        req = self._make_dummy_request(
+            height=512,
+            width=512,
+            guidance_scale=0.0,
+            # Dummy warmup must exercise at least one denoising iteration in
+            # every execution mode. Some pipelines (for example BAGEL) perform
+            # ``num_inference_steps - 1`` scheduler updates and reject an empty
+            # one-step schedule.
+            num_inference_steps=2,
+        )
+        if req is None:
+            logger.info("Skipping dummy warmup run (num_frames=0)")
+            return
         logger.info("dummy run to warm up the model")
-        request = self.pre_process_func(req) if self.pre_process_func is not None else req
-        output = self.add_req_and_wait_for_response(request)
+        output = self.add_req_and_wait_for_response(req)
         if output.error:
             raise RuntimeError(f"Dummy run failed: {output.error}")
+
+    def _submit_rpc(
+        self,
+        method: str,
+        timeout: float | None,
+        args: tuple,
+        kwargs: dict | None,
+        unique_reply_rank: int | None,
+    ) -> _RpcTask:
+        assert isinstance(method, str), "Only string method names are supported for now"
+        deadline = None if timeout is None else time.monotonic() + timeout
+        task = _RpcTask(
+            method=method,
+            args=args,
+            kwargs=kwargs,
+            deadline=deadline,
+            unique_reply_rank=unique_reply_rank,
+        )
+        with self._cv:
+            if method == "pause_scheduler":
+                self._check_pause_request(kwargs)
+                self._scheduling_paused = True
+            self._rpc_queue.put(task)
+            self._cv.notify_all()
+        return task
 
     def collective_rpc(
         self,
@@ -422,6 +1457,10 @@ class DiffusionEngine:
         unique_reply_rank: int | None = None,
     ) -> Any:
         """Call a method on worker processes and get results immediately.
+
+        The call is enqueued and executed by the engine's busy loop between
+        scheduler steps, so it is naturally serialized against per-request
+        execute_fn() invocations without any explicit mutual-exclusion lock.
 
         Args:
             method: The method name (str) to execute on workers
@@ -435,45 +1474,149 @@ class DiffusionEngine:
         """
         assert isinstance(method, str), "Only string method names are supported for now"
 
-        deadline = None if timeout is None else time.monotonic() + timeout
-        acquired = False
+        # If the busy loop hasn't started yet (e.g. during _dummy_run in
+        # __init__, or before the first async request after construction),
+        # there is no busy-loop thread to drain the RPC queue. Fall back to
+        # calling the executor directly, but serialize concurrent callers
+        # via self._cv's underlying lock so multiple threads in this window
+        # cannot race on the shared broadcast_mq / result_mq transport.
+        if not self._loop_started:
+            with self._cv:
+                # Re-check under the lock: the busy loop may have started
+                # between the outer check and acquiring the lock, in which
+                # case we should use the queued path for proper ordering.
+                if not self._loop_started:
+                    if method in ("pause_scheduler", "resume_scheduler"):
+                        return self._run_engine_control(method, timeout, kwargs)
+                    return self.executor.collective_rpc(
+                        method=method,
+                        timeout=timeout,
+                        args=args,
+                        kwargs=kwargs,
+                        unique_reply_rank=unique_reply_rank,
+                    )
+
+        task = self._submit_rpc(method, timeout, args, kwargs, unique_reply_rank)
         try:
-            if deadline is None:
-                self._rpc_lock.acquire()
-                acquired = True
-            else:
-                lock_timeout = max(0, deadline - time.monotonic())
-                acquired = self._rpc_lock.acquire(timeout=lock_timeout)
-            if not acquired:
-                raise TimeoutError(f"RPC call to {method} timed out waiting for engine lock.")
+            return task.future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError as exc:
+            task.future.cancel()
+            raise TimeoutError(f"RPC call to {method} timed out.") from exc
 
-            rpc_timeout = None if deadline is None else max(0, deadline - time.monotonic())
-            if deadline is not None and rpc_timeout <= 0:
-                raise TimeoutError(f"RPC call to {method} timed out.")
+    async def async_collective_rpc(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        unique_reply_rank: int | None = None,
+    ) -> Any:
+        """Async variant of :meth:`collective_rpc` for event-loop callers.
 
-            return self.executor.collective_rpc(
-                method=method,
-                timeout=rpc_timeout,
-                args=args,
-                kwargs=kwargs,
-                unique_reply_rank=unique_reply_rank,
-            )
-        finally:
-            if acquired:
-                self._rpc_lock.release()
+        Enqueue a task keyed by a future and ``await`` the result without
+        blocking the loop.
+        """
+        await self._check_and_start_background_loop()
+        task = self._submit_rpc(method, timeout, args, kwargs, unique_reply_rank)
+        aio_fut = asyncio.wrap_future(task.future)
+        try:
+            if timeout is None:
+                return await aio_fut
+            return await asyncio.wait_for(aio_fut, timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            task.future.cancel()
+            raise TimeoutError(f"RPC call to {method} timed out.") from exc
+
+    def _put_queue_output(
+        self,
+        queue: asyncio.Queue[DiffusionOutput],
+        output: DiffusionOutput,
+    ) -> None:
+        loop = self.main_loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(queue.put_nowait, output)
+        else:
+            queue.put_nowait(output)
+
+    def _put_output(self, request_id: str, output: DiffusionOutput) -> None:
+        with self._cv:
+            queue = self._out_streams.get(request_id)
+        if queue is None:
+            return
+        self._put_queue_output(queue, output)
 
     def close(self) -> None:
-        if hasattr(self, "scheduler"):
-            self.scheduler.close()
-        if hasattr(self, "executor"):
+        pending_streams: list[asyncio.Queue[DiffusionOutput]] = []
+        with self._cv:
+            if self._closed and self._shutdown_complete:
+                return
+            if not self._closed:
+                self._closed = True
+                if self._request_cancellations is not None:
+                    self._request_cancellations.cancel_all()
+                if self.stop_event is not None:
+                    self.stop_event.set()
+                pending_streams = list(self._out_streams.values())
+                self._out_streams.clear()
+                self._cv.notify_all()
+
+        closed_output = DiffusionOutput(error="DiffusionEngine is closed.")
+        for stream in pending_streams:
+            self._put_queue_output(stream, closed_output)
+
+        worker_thread = self.worker_thread
+        if worker_thread is not None:
+            if worker_thread.is_alive():
+                worker_thread.join(timeout=10)
+            if worker_thread.is_alive():
+                # Keep cancellation names available: an in-flight worker may
+                # not have attached its readers yet. A later close releases
+                # them after execution and executor shutdown have completed.
+                logger.warning(
+                    "Worker thread did not terminate within 10s; scheduler and executor shutdown will be deferred."
+                )
+                return
+            else:
+                self._loop_started = False
+        else:
+            self._loop_started = False
+
+        if getattr(self.scheduler, "_native_prefetch_enabled", False):
+            # No new schedules after the busy loop exits. Finish outstanding
+            # writes before shutting down consumers and releasing reservations.
+            self._poll_native_kv(drain_request_ids=list(self.scheduler._kv_loading_request_ids))
             self.executor.shutdown()
+            self.scheduler.close()
+        else:
+            self.scheduler.close()
+            self.executor.shutdown()
+        if self._request_cancellations is not None:
+            self._request_cancellations.close()
+        self._shutdown_complete = True
 
     def abort(self, request_id: str | Iterable[str]) -> None:
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
-        for req_id in request_ids:
-            self.abort_queue.put(req_id)
+
+        with self._cv:
+            if self._closed:
+                return
+            if self._request_cancellations is not None:
+                # Do not queue this behind the full-forward executor call.
+                # Scheduler state is still mutated only by the busy loop.
+                self._request_cancellations.cancel(request_ids)
+            for req_id in request_ids:
+                self.abort_queue.put(req_id)
+            self._cv.notify_all()
 
     def _process_aborts_queue(self) -> None:
+        with self._cv:
+            try:
+                self._drain_abort_queue()
+            except Exception as exc:
+                self._fail_engine(exc)
+                raise
+
+    def _drain_abort_queue(self) -> None:
         if self.abort_queue.empty():
             return
 
@@ -486,32 +1629,39 @@ class DiffusionEngine:
 
     def _abort_requests(self, request_ids: str | Iterable[str]) -> None:
         request_ids = [request_ids] if isinstance(request_ids, str) else list(request_ids)
+        request_ids = list(dict.fromkeys(request_ids))
 
-        sched_req_ids: list[str] = []
-        for request_id in dict.fromkeys(request_ids):
-            sched_req_id = self.scheduler.get_sched_req_id(request_id)
-            if sched_req_id is not None:
-                sched_req_ids.append(sched_req_id)
+        self._poll_native_kv(drain_request_ids=request_ids)
 
-        for sched_req_id in dict.fromkeys(sched_req_ids):
-            if self.scheduler.get_request_state(sched_req_id) is not None:
-                self.scheduler.finish_requests(sched_req_id, DiffusionRequestStatus.FINISHED_ABORTED)
+        for request_id in request_ids:
+            if self.scheduler.get_request_state(request_id) is not None:
+                self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+        self._remove_diffusion_kv_requests(request_ids)
 
     def _finalize_finished_request(
         self,
-        sched_req_id: str,
+        request_id: str,
         runner_output: RunnerOutput | None = None,
         missing_result_error: str = "Diffusion scheduler finished target request without execution output.",
     ) -> DiffusionOutput:
-        state = self.scheduler.get_request_state(sched_req_id)
-        popped_state = self.scheduler.pop_request_state(sched_req_id)
+        state = self.scheduler.get_request_state(request_id)
+        popped_state = self.scheduler.pop_request_state(request_id)
         state = state or popped_state
+        if self._request_cancellations is not None:
+            self._request_cancellations.finish(request_id)
 
         if state is None:
-            raise RuntimeError(f"Diffusion scheduler lost state for request {sched_req_id}.")
+            raise RuntimeError(f"Diffusion scheduler lost state for request {request_id}.")
 
         if state.status == DiffusionRequestStatus.FINISHED_ABORTED:
-            request_id = state.req.request_ids[0] if state.req.request_ids else sched_req_id
+            # An aborted request is never waited on, so a pending async output
+            # would be cached forever by the executor result pump (issue #6413).
+            # Tell the executor to drop it before returning the aborted result.
+            if runner_output is not None and runner_output.async_output_id is not None:
+                self.executor.drop_output(runner_output.async_output_id)
+            # Preserve runner-provided abort details when available.
+            if runner_output is not None and runner_output.result is not None and runner_output.result.aborted:
+                return runner_output.result
             return DiffusionOutput(
                 aborted=True,
                 abort_message=f"Request {request_id} aborted.",
@@ -519,5 +1669,11 @@ class DiffusionEngine:
 
         if runner_output is not None and runner_output.result is not None:
             return runner_output.result
+
+        if runner_output is not None and runner_output.async_output_id is not None:
+            return DiffusionOutput(async_output_id=runner_output.async_output_id)
+
+        if state.status == DiffusionRequestStatus.FINISHED_ERROR and state.error:
+            return DiffusionOutput(error=state.error)
 
         return DiffusionOutput(error=missing_result_error)

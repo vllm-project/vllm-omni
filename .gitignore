@@ -46,6 +46,8 @@ htmlcov/
 .cache
 nosetests.xml
 coverage.xml
+coverage-*.xml
+coverage-*.xml.gz
 *.cover
 *.py,cover
 .hypothesis/
@@ -158,10 +160,23 @@ cython_debug/
 
 # Claude
 CLAUDE.md
-.claude/
+/.claude/*
+!.claude/skills/
+!.claude/skills/readme.md
+!.claude/skills/add-diffusion-model/
+!.claude/skills/add-diffusion-model/SKILL.md
+!.claude/skills/add-diffusion-model/references/
+!.claude/skills/add-diffusion-model/references/*.md
+!.claude/skills/add-tts-model/
+!.claude/skills/add-tts-model/SKILL.md
+!.claude/skills/review-pr/
+!.claude/skills/review-pr/SKILL.md
+!.claude/skills/review-pr/references/
+!.claude/skills/review-pr/references/*.md
 
 # Codex
 AGENTS.md
+.codex
 .codex/
 
 # cursor
@@ -191,9 +206,11 @@ checkpoints/
 # Cache directories
 cache/
 !vllm_omni/diffusion/cache/
+!tests/diffusion/cache/
 .cache/
 diffusion_cache/
 kv_cache/
+!vllm_omni/experimental/ar_diffusion/kv_cache/
 
 # Logs
 logs/
@@ -225,15 +242,23 @@ data/
 datasets/
 *.csv
 *.json
+!recipes/cosmos3/negative_prompt.json
+!tests/dfx/perf/tests/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
+# Omni-DuplexEval CI config JSON (e.g. accuracy/omni_duplex_eval)
+!tests/e2e/accuracy/omni_duplex_eval/*.json
 *.jsonl
+# Shared Hunyuan IT2I input for accuracy tests and vllm bench.
+!tests/assets/hunyuan_image3/it2i.jsonl
 *.parquet
 
 # Output files
 outputs/
+!vllm_omni/outputs/
 results/
 generated/
 output_*/
+/tests/e2e/accuracy/artifacts/
 
 # Configuration overrides
 configs/local.yaml
@@ -241,7 +266,6 @@ configs/production.yaml
 configs/development.yaml
 
 # Docker
-.dockerignore
 Dockerfile.dev
 discussion
 tmp_test
@@ -250,3 +274,14 @@ tmp_test
 vllm_omni/_version.py
 # output files
 *.wav
+# Vendored test reference audio (small, intentionally checked in)
+!tests/assets/**/*.wav
+.worktrees/
+# CI overlay yamls materialized from tests/utils.py:_CI_OVERLAYS at test time
+tests/.ci_generated/
+
+# Local Lance precision-matching dump scripts (not part of the repo)
+lance_compare/
+
+# Linting binaries downloaded by local pre-commit hooks
+shellcheck*/

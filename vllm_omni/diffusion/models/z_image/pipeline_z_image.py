@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Copyright 2025 Alibaba Z-Image Team and The HuggingFace Team. All rights reserved.
 #
@@ -19,27 +19,30 @@ import inspect
 import json
 import os
 from collections.abc import Callable, Iterable
-from typing import Any
+from typing import Any, ClassVar
 
 import PIL.Image
 import torch
 import torch.nn as nn
-from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
+from diffusers.image_processor import VaeImageProcessor
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import logging
 from diffusers.utils.torch_utils import randn_tensor
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.utils import create_transformers_model
 from vllm_omni.diffusion.models.z_image.z_image_transformer import (
     ZImageTransformer2DModel,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -158,7 +161,13 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
+class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
+    supports_request_batch = False
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+
     def __init__(
         self,
         *,
@@ -170,25 +179,52 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
+                subfolder="text_encoder",
+                revision=od_config.revision,
+                prefix="text_encoder.",
+            ),
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
                 subfolder="transformer",
-                revision=None,
+                revision=od_config.revision,
                 prefix="transformer.",
                 fall_back_to_pt=True,
-            )
+            ),
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="vae",
+                revision=od_config.revision,
+                prefix="vae.",
+            ),
         ]
         self._execution_device = get_local_device()
         model = od_config.model
         local_files_only = os.path.exists(model)
+
+        # See ``hub_prefetch.py`` for the transformers v5 subfolder race.
+        prefetch_subfolders(
+            model,
+            ["scheduler", "text_encoder", "vae", "tokenizer"],
+            local_files_only=local_files_only,
+        )
+
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
 
-        self.text_encoder = AutoModel.from_pretrained(
+        text_encoder_config = AutoConfig.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
+        )
+        self.text_encoder = create_transformers_model(
+            AutoModelForCausalLM,
+            od_config,
+            hf_config=text_encoder_config,
         ).to(self._execution_device)
-        self.vae = DistributedAutoencoderKL.from_pretrained(
-            model, subfolder="vae", local_files_only=local_files_only
-        ).to(self._execution_device)
+        if text_encoder_config.tie_word_embeddings:
+            self.text_encoder.lm_head.weight = self.text_encoder.get_input_embeddings().weight
+
+        vae_config = DistributedAutoencoderKL.load_config(model, subfolder="vae", local_files_only=local_files_only)
+        self.vae = DistributedAutoencoderKL.from_config(vae_config).to(self._execution_device)
         self.transformer = ZImageTransformer2DModel(quant_config=od_config.quantization_config)
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
@@ -374,124 +410,21 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
     def interrupt(self):
         return self._interrupt
 
-    def forward(
-        self,
-        req: OmniDiffusionRequest,
-        prompt: str | list[str] | None = None,
-        image: PipelineImageInput = None,
-        strength: float = 0.6,
-        height: int = 1024,
-        width: int = 1024,
-        num_inference_steps: int = 50,
-        sigmas: list[float] | None = None,
-        guidance_scale: float = 5.0,
-        cfg_normalization: bool = False,
-        cfg_truncation: float = 1.0,
-        negative_prompt: str | list[str] | None = None,
-        num_images_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        latents: torch.FloatTensor | None = None,
-        prompt_embeds: list[torch.FloatTensor] | None = None,
-        negative_prompt_embeds: list[torch.FloatTensor] | None = None,
-        output_type: str | None = "pil",
-        return_dict: bool = True,
-        joint_attention_kwargs: dict[str, Any] | None = None,
-        callback_on_step_end: Callable[[int, int, dict], None] | None = None,
-        callback_on_step_end_tensor_inputs: list[str] = ["latents"],
-        max_sequence_length: int = 512,
-    ) -> DiffusionOutput:
-        r"""
-        Function invoked when calling the pipeline for generation.
-
-        Args:
-            prompt (`str` or `list[str]`, *optional*):
-                The prompt or prompts to guide the image generation. If not defined, one has to pass `prompt_embeds`.
-                instead.
-            image (`PipelineImageInput`, *optional*):
-                The image to use for img2img generation. If provided, the pipeline
-                will perform img2img instead of text-to-image.
-            strength (`float`, *optional*, defaults to 0.6):
-                Indicates extent to transform the reference `image`. Must be between 0 and 1.
-            height (`int`, *optional*, defaults to 1024):
-                The height in pixels of the generated image.
-            width (`int`, *optional*, defaults to 1024):
-                The width in pixels of the generated image.
-            num_inference_steps (`int`, *optional*, defaults to 50):
-                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
-                expense of slower inference.
-            sigmas (`list[float]`, *optional*):
-                Custom sigmas to use for the denoising process with schedulers which support a `sigmas` argument in
-                their `set_timesteps` method. If not defined, the default behavior when `num_inference_steps` is passed
-                will be used.
-            guidance_scale (`float`, *optional*, defaults to 5.0):
-                Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
-                `guidance_scale` is defined as `w` of equation 2. of [Imagen
-                Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
-                0`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
-                usually at the expense of lower image quality.
-            cfg_normalization (`bool`, *optional*, defaults to False):
-                Whether to apply configuration normalization.
-            cfg_truncation (`float`, *optional*, defaults to 1.0):
-                The truncation value for configuration.
-            negative_prompt (`str` or `list[str]`, *optional*):
-                The prompt or prompts not to guide the image generation. If not defined, one has to pass
-                `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `guidance_scale` is
-                less than or equal to `0`).
-            num_images_per_prompt (`int`, *optional*, defaults to 1):
-                The number of images to generate per prompt.
-            generator (`torch.Generator` or `list[torch.Generator]`, *optional*):
-                One or a list of [torch generator(s)](https://pytorch.org/docs/stable/generated/torch.Generator.html)
-                to make generation deterministic.
-            latents (`torch.FloatTensor`, *optional*):
-                Pre-generated noisy latents, sampled from a Gaussian distribution, to be used as inputs for image
-                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
-                tensor will be generated by sampling using the supplied random `generator`.
-            prompt_embeds (`list[torch.FloatTensor]`, *optional*):
-                Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
-                provided, text embeddings will be generated from `prompt` input argument.
-            negative_prompt_embeds (`list[torch.FloatTensor]`, *optional*):
-                Pre-generated negative text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
-                weighting. If not provided, negative_prompt_embeds will be generated from `negative_prompt` input
-                argument.
-            output_type (`str`, *optional*, defaults to `"pil"`):
-                The output format of the generate image. Choose between
-                [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`~pipelines.stable_diffusion.ZImagePipelineOutput`] instead of a plain
-                tuple.
-            joint_attention_kwargs (`dict`, *optional*):
-                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
-                `self.processor` in
-                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
-            callback_on_step_end (`Callable`, *optional*):
-                A function that calls at the end of each denoising steps during the inference. The function is called
-                with the following arguments: `callback_on_step_end(self: DiffusionPipeline, step: int, timestep: int,
-                callback_kwargs: Dict)`. `callback_kwargs` will include a list of all tensors as specified by
-                `callback_on_step_end_tensor_inputs`.
-            callback_on_step_end_tensor_inputs (`list`, *optional*):
-                The list of tensor inputs for the `callback_on_step_end` function. The tensors specified in the list
-                will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
-                `._callback_tensor_inputs` attribute of your pipeline class.
-            max_sequence_length (`int`, *optional*, defaults to 512):
-                Maximum sequence length to use with the `prompt`.
-
-        Examples:
-
-        Returns:
-            [`~pipelines.z_image.ZImagePipelineOutput`] or `tuple`: [`~pipelines.z_image.ZImagePipelineOutput`] if
-            `return_dict` is True, otherwise a `tuple`. When returning a tuple, the first element is a list with the
-            generated images.
-        """
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
-        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
+        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts]
+
         if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
             negative_prompt = None
         elif req.prompts:
             negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
 
-        # Handle img2img: extract image from request
-        if image is None and req.prompts:
+        prompt_embeds = None
+        negative_prompt_embeds = None
+
+        image = None
+        if req.prompts:
             if len(req.prompts) > 1:
                 logger.warning(
                     "This model only supports a single prompt for img2img, not a batched request. "
@@ -506,9 +439,9 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
                     else:
                         image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else raw_image
 
-        # strength is currently only applicable for Z-Image I2I; other pipelines ignore this parameter
-        strength = req.sampling_params.strength if req.sampling_params.strength is not None else strength
-        if strength is not None and image is None:
+        explicit_strength = req.sampling_params.strength is not None
+        strength = req.sampling_params.strength if explicit_strength else 0.6
+        if explicit_strength and image is None:
             logger.warning(
                 "strength parameter (%.2f) is only applicable for image-to-image (I2I) generation. "
                 "It will be ignored for text-to-image (T2I) generation.",
@@ -518,20 +451,24 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         if image is not None and strength is not None and (strength < 0 or strength > 1):
             raise ValueError(f"The value of strength should be in [0.0, 1.0] but is {strength}")
 
-        height = req.sampling_params.height or height
-        width = req.sampling_params.width or width
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        height = req.sampling_params.height or 1024
+        width = req.sampling_params.width or 1024
+        num_inference_steps = req.sampling_params.num_inference_steps or 50
         generator = req.sampling_params.generator
-        sigmas = req.sampling_params.sigmas or sigmas
-        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
-        guidance_scale = (
-            req.sampling_params.guidance_scale if req.sampling_params.guidance_rescale is not None else guidance_scale
-        )
+        sigmas = req.sampling_params.sigmas
+        max_sequence_length = req.sampling_params.max_sequence_length or 512
+        guidance_scale = req.sampling_params.guidance_scale
         num_images_per_prompt = (
-            req.sampling_params.num_outputs_per_prompt
-            if req.sampling_params.num_outputs_per_prompt > 0
-            else num_images_per_prompt
+            req.sampling_params.num_outputs_per_prompt if req.sampling_params.num_outputs_per_prompt > 0 else 1
         )
+        latents = req.sampling_params.latents
+
+        cfg_normalization = req.sampling_params.cfg_normalize
+        cfg_truncation = req.sampling_params.extra_args.get("cfg_truncation", 1.0)
+        joint_attention_kwargs: dict[str, Any] | None = None
+        callback_on_step_end: Callable[[int, int, dict], None] | None = None
+        callback_on_step_end_tensor_inputs = ["latents"]
+        output_type = req.sampling_params.output_type or "pil"
 
         vae_scale = self.vae_scale_factor * 2
         if height % vae_scale != 0:
@@ -553,33 +490,20 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         self._cfg_normalization = cfg_normalization
         self._cfg_truncation = cfg_truncation
         # 2. Define call parameters
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            batch_size = len(prompt_embeds)
+        batch_size = len(prompt)
 
-        # If prompt_embeds is provided and prompt is None, skip encoding
-        if prompt_embeds is not None and prompt is None:
-            if self.do_classifier_free_guidance and negative_prompt_embeds is None:
-                raise ValueError(
-                    "When `prompt_embeds` is provided without `prompt`, "
-                    "`negative_prompt_embeds` must also be provided for classifier-free guidance."
-                )
-        else:
-            (
-                prompt_embeds,
-                negative_prompt_embeds,
-            ) = self.encode_prompt(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                do_classifier_free_guidance=self.do_classifier_free_guidance,
-                prompt_embeds=prompt_embeds,
-                negative_prompt_embeds=negative_prompt_embeds,
-                device=device,
-                max_sequence_length=max_sequence_length,
-            )
+        (
+            prompt_embeds,
+            negative_prompt_embeds,
+        ) = self.encode_prompt(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            do_classifier_free_guidance=self.do_classifier_free_guidance,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            device=device,
+            max_sequence_length=max_sequence_length,
+        )
 
         # 4. Prepare latent variables
         num_channels_latents = self.transformer.in_channels
@@ -660,7 +584,8 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         # 5. Prepare timesteps
         if image is None:
-            image_seq_len = (latents.shape[2] // 2) * (latents.shape[3] // 2)
+            # for both [B, C, H, W] and multi-layer/frame [B, C, F, H, W]
+            image_seq_len = (latents.shape[-2] // 2) * (latents.shape[-1] // 2)
             mu = calculate_shift(
                 image_seq_len,
                 self.scheduler.config.get("base_image_seq_len", 256),
@@ -719,7 +644,8 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             latents_typed = latents.to(self.od_config.dtype)
 
             if apply_cfg:
-                latent_model_input = latents_typed.repeat(2, 1, 1, 1)
+                repeat_dims = (2,) + (1,) * (latents_typed.ndim - 1)
+                latent_model_input = latents_typed.repeat(*repeat_dims)
                 prompt_embeds_model_input = prompt_embeds + negative_prompt_embeds
                 timestep_model_input = timestep.repeat(2)
             else:
@@ -727,9 +653,13 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 prompt_embeds_model_input = prompt_embeds
                 timestep_model_input = timestep
 
-            latent_model_input = latent_model_input.unsqueeze(2)
+            if latent_model_input.ndim == 4:
+                latent_model_input = latent_model_input.unsqueeze(2)
             latent_model_input_list = list(latent_model_input.unbind(dim=0))
 
+            if getattr(self, "_uses_cudagraph_trees", False):
+                # check Ming-Image
+                torch.compiler.cudagraph_mark_step_begin()
             model_out_list = self.transformer(
                 latent_model_input_list,
                 timestep_model_input,
@@ -766,7 +696,8 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             else:
                 noise_pred = torch.stack([t.float() for t in model_out_list], dim=0)
 
-            noise_pred = noise_pred.squeeze(2)
+            if latents.ndim == 4:
+                noise_pred = noise_pred.squeeze(2)
             noise_pred = -noise_pred
 
             # compute the previous noisy sample x_t -> x_t-1
@@ -792,14 +723,16 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             image = self.vae.decode(latents, return_dict=False)[0]
             # image = self.image_processor.postprocess(image, output_type=output_type)
 
-        return DiffusionOutput(
-            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-        )
+        stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
+        return DiffusionOutput(output=image, stage_durations=stage_durations)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         loaded_weights = loader.load_weights(weights)
         # Record components loaded by diffusers submodules to satisfy strict checks.
         loaded_weights |= {f"vae.{name}" for name, _ in self.vae.named_parameters()}
-        loaded_weights |= {f"text_encoder.{name}" for name, _ in self.text_encoder.named_parameters()}
+        # downstream pipelines (e.g. MingImagePipeline) may set ``self.text_encoder = None`` when they
+        # bring their own conditioning path.
+        if self.text_encoder is not None:
+            loaded_weights |= {f"text_encoder.{name}" for name, _ in self.text_encoder.named_parameters()}
         return loaded_weights

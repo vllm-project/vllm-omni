@@ -5,7 +5,10 @@
 Main entry points for vLLM-Omni inference and serving.
 
 - [vllm_omni.entrypoints.async_omni.AsyncOmni][]
-- [vllm_omni.entrypoints.cfg_companion_tracker.CfgCompanionTracker][]
+- [vllm_omni.entrypoints.async_omni_base.AsyncOmniBase][]
+- [vllm_omni.entrypoints.duplex_omni.DuplexOmni][]
+- [vllm_omni.entrypoints.duplex_omni.DuplexSessionHandle][]
+- [vllm_omni.engine.cfg_companion_tracker.CfgCompanionTracker][]
 - [vllm_omni.entrypoints.cli.benchmark.base.OmniBenchmarkSubcommandBase][]
 - [vllm_omni.entrypoints.cli.benchmark.main.OmniBenchmarkSubcommand][]
 - [vllm_omni.entrypoints.cli.benchmark.serve.OmniBenchmarkServingSubcommand][]
@@ -14,6 +17,38 @@ Main entry points for vLLM-Omni inference and serving.
 - [vllm_omni.entrypoints.omni.Omni][]
 - [vllm_omni.entrypoints.omni_base.OmniBase][]
 - [vllm_omni.entrypoints.pd_utils.PDDisaggregationMixin][]
+
+## Clients
+
+Client libraries for full-duplex sessions: the Realtime WebSocket client, the in-process client over `DuplexOmni`, and the per-model session presets.
+
+- [vllm_omni.clients.duplex.AudioDelta][]
+- [vllm_omni.clients.duplex.AudioFormat][]
+- [vllm_omni.clients.duplex.ConnectionResumed][]
+- [vllm_omni.clients.duplex.DuplexClient][]
+- [vllm_omni.clients.duplex.DuplexClientBase][]
+- [vllm_omni.clients.duplex.DuplexClientError][]
+- [vllm_omni.clients.duplex.DuplexConnectionError][]
+- [vllm_omni.clients.duplex.DuplexEvent][]
+- [vllm_omni.clients.duplex.DuplexProtocolError][]
+- [vllm_omni.clients.duplex.DuplexSessionClosedError][]
+- [vllm_omni.clients.duplex.ErrorEvent][]
+- [vllm_omni.clients.duplex.EventCollector][]
+- [vllm_omni.clients.duplex.ListenDecision][]
+- [vllm_omni.clients.duplex.ReconnectPolicy][]
+- [vllm_omni.clients.duplex.ResponseCreated][]
+- [vllm_omni.clients.duplex.ResponseDone][]
+- [vllm_omni.clients.duplex.ResponseHandle][]
+- [vllm_omni.clients.duplex.SessionClosed][]
+- [vllm_omni.clients.duplex.SessionConfig][]
+- [vllm_omni.clients.duplex.SessionCreated][]
+- [vllm_omni.clients.duplex.SessionExpired][]
+- [vllm_omni.clients.duplex.SessionResumed][]
+- [vllm_omni.clients.duplex.SpeakDecision][]
+- [vllm_omni.clients.duplex.TextDelta][]
+- [vllm_omni.clients.duplex.TranscriptDelta][]
+- [vllm_omni.clients.duplex.WebSocketTransport][]
+- [vllm_omni.clients.inline_duplex.InlineDuplexClient][]
 
 ## Inputs
 
@@ -46,23 +81,22 @@ Engine classes for offline and online inference.
 - [vllm_omni.engine.PromptEmbedsPayload][]
 - [vllm_omni.engine.arg_utils.OmniEngineArgs][]
 - [vllm_omni.engine.async_omni_engine.AsyncOmniEngine][]
-- [vllm_omni.engine.mm_outputs.MultimodalCompletionOutput][]
-- [vllm_omni.engine.mm_outputs.MultimodalPayload][]
 - [vllm_omni.engine.orchestrator.Orchestrator][]
 - [vllm_omni.engine.orchestrator.OrchestratorRequestState][]
-- [vllm_omni.engine.output_modality.OutputModality][]
-- [vllm_omni.engine.output_modality.TensorAccumulationStrategy][]
-- [vllm_omni.engine.output_processor.MultimodalOutputProcessor][]
-- [vllm_omni.engine.output_processor.OmniRequestState][]
 - [vllm_omni.engine.stage_engine_core_client.StageEngineCoreClient][]
 - [vllm_omni.engine.stage_init_utils.StageMetadata][]
 - [vllm_omni.engine.stage_init_utils.StartedLlmStage][]
+- [vllm_omni.outputs.mm_outputs.MultimodalCompletionOutput][]
+- [vllm_omni.outputs.mm_outputs.MultimodalPayload][]
+- [vllm_omni.outputs.output_modality.OutputModality][]
+- [vllm_omni.outputs.output_modality.TensorAccumulationStrategy][]
+- [vllm_omni.outputs.output_processor.MultimodalOutputProcessor][]
+- [vllm_omni.outputs.output_processor.OmniRequestState][]
 
 ## Core
 
 Core scheduling and caching components.
 
-- [vllm_omni.core.sched.omni_ar_scheduler.KVCacheTransferData][]
 - [vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler][]
 - [vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler][]
 - [vllm_omni.core.sched.output.OmniCachedRequestData][]
@@ -92,14 +126,12 @@ Core scheduling and caching components.
 Configuration classes.
 
 - [vllm_omni.config.model.OmniModelConfig][]
-- [vllm_omni.config.stage_config.ModelPipeline][]
 - [vllm_omni.config.stage_config.StageConfig][]
 - [vllm_omni.config.stage_config.StageConfigFactory][]
 - [vllm_omni.config.stage_config.StageType][]
 - [vllm_omni.diffusion.cache.teacache.config.TeaCacheConfig][]
 - [vllm_omni.distributed.omni_connectors.utils.config.ConnectorSpec][]
 - [vllm_omni.distributed.omni_connectors.utils.config.OmniTransferConfig][]
-- [vllm_omni.model_executor.models.cosyvoice3.config.CosyVoice3Config][]
 - [vllm_omni.model_executor.models.fish_speech.configuration_fish_speech.FishSpeechConfig][]
 - [vllm_omni.model_executor.models.fish_speech.configuration_fish_speech.FishSpeechFastARConfig][]
 - [vllm_omni.model_executor.models.fish_speech.configuration_fish_speech.FishSpeechSlowARConfig][]
@@ -116,10 +148,13 @@ Configuration classes.
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1DecoderConfig][]
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1DecoderDiTConfig][]
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1EncoderConfig][]
+- [vllm_omni.transformers_utils.configs.cosyvoice3.CosyVoice3Config][]
 - [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Config][]
 - [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLConfig][]
 - [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLTextConfig][]
 - [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLVisionConfig][]
+- [vllm_omni.transformers_utils.configs.omnivoice.OmniVoiceConfig][]
+- [vllm_omni.transformers_utils.configs.voxcpm2.VoxCPM2Config][]
 
 ## Workers
 
@@ -130,7 +165,7 @@ Worker classes and model runners for distributed inference.
 - [vllm_omni.diffusion.worker.diffusion_worker.DiffusionWorker][]
 - [vllm_omni.diffusion.worker.diffusion_worker.WorkerProc][]
 - [vllm_omni.diffusion.worker.diffusion_worker.WorkerWrapperBase][]
-- [vllm_omni.diffusion.worker.utils.DiffusionRequestState][]
+- [vllm_omni.diffusion.worker.utils.StepRequestState][]
 - [vllm_omni.diffusion.worker.utils.RunnerOutput][]
 - [vllm_omni.platforms.npu.worker.npu_ar_model_runner.ExecuteModelState][]
 - [vllm_omni.platforms.npu.worker.npu_ar_model_runner.NPUARModelRunner][]

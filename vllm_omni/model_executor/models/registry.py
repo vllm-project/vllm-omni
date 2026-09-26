@@ -1,10 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from vllm.model_executor.models.registry import (
     _VLLM_MODELS,
     _LazyRegisteredModel,
     _ModelRegistry,
+    _resolve_module_name,
 )
 
 _OMNI_MODELS = {
+    "BreezeForConditionalGeneration": ("breeze_tts_2", "modeling_breeze", "BreezeForConditionalGeneration"),
+    "BreezeCode2Wav": ("breeze_tts_2", "code2wav", "BreezeCode2Wav"),
     "Qwen2_5OmniForConditionalGeneration": (
         "qwen2_5_omni",
         "qwen2_5_omni",
@@ -52,10 +58,66 @@ _OMNI_MODELS = {
         "qwen3_omni_code2wav",
         "Qwen3OmniMoeCode2Wav",
     ),
+    # Step-Audio2 models
+    "StepAudio2ForCausalLM": (
+        "step_audio2",
+        "step_audio2",
+        "StepAudio2ForConditionalGeneration",
+    ),
+    "StepAudio2ForConditionalGeneration": (
+        "step_audio2",
+        "step_audio2",
+        "StepAudio2ForConditionalGeneration",
+    ),
+    "StepAudio2ThinkerForConditionalGeneration": (
+        "step_audio2",
+        "step_audio2_thinker",
+        "StepAudio2ThinkerForConditionalGeneration",
+    ),
+    "StepAudio2Token2WavModel": (
+        "step_audio2",
+        "step_audio2_token2wav",
+        "StepAudio2Token2WavForConditionalGeneration",
+    ),
+    "StepAudio2Token2WavForConditionalGeneration": (
+        "step_audio2",
+        "step_audio2_token2wav",
+        "StepAudio2Token2WavForConditionalGeneration",
+    ),
     "CosyVoice3Model": (
         "cosyvoice3",
         "cosyvoice3",
         "CosyVoice3Model",
+    ),
+    "AuKForConditionalGeneration": (
+        "auk",
+        "auk",
+        "AuKForConditionalGeneration",
+    ),
+    "NemotronDenseForCausalLM": (
+        "audex",
+        "audex_thinker",
+        "NemotronDenseForCausalLM",
+    ),
+    "AudexCode2Wav": (
+        "audex",
+        "audex_code2wav",
+        "AudexCode2Wav",
+    ),
+    "AudexXCodec1": (
+        "audex",
+        "audex_xcodec",
+        "AudexXCodec1",
+    ),
+    "NemotronDenseAudexForConditionalGeneration": (
+        "audex",
+        "audex_omni",
+        "NemotronDenseAudexForConditionalGeneration",
+    ),
+    "NemotronHAudexForConditionalGeneration": (
+        "audex",
+        "audex_omni",
+        "NemotronHAudexForConditionalGeneration",
     ),
     "OmniVoiceModel": (
         "omnivoice",
@@ -72,10 +134,15 @@ _OMNI_MODELS = {
         "mammoth_moda2",
         "MammothModa2ARForConditionalGeneration",
     ),
-    "MammothModa2DiTPipeline": (
+    "MammothModa2Qwen3ARForConditionalGeneration": (
         "mammoth_moda2",
-        "pipeline_mammothmoda2_dit",
-        "MammothModa2DiTPipeline",
+        "mammoth_moda2",
+        "MammothModa2Qwen3ARForConditionalGeneration",
+    ),
+    "MammothModa2Qwen3ForCausalLM": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2Qwen3ForCausalLM",
     ),
     "MammothModa2ForConditionalGeneration": (
         "mammoth_moda2",
@@ -102,8 +169,74 @@ _OMNI_MODELS = {
         "qwen3_tts_code2wav",
         "Qwen3TTSCode2Wav",
     ),
+    ## personaplex (Moshi finetune, full-duplex S2S; 2-stage audio->audio offline pipeline)
+    # built by lead: personaplex_talker module + PersonaPlexTalkerForConditionalGeneration.
+    "PersonaPlexTalkerForConditionalGeneration": (
+        "personaplex",
+        "personaplex_talker",
+        "PersonaPlexTalkerForConditionalGeneration",
+    ),
+    "PersonaPlexCode2Wav": (
+        "personaplex",
+        "personaplex_code2wav",
+        "PersonaPlexCode2Wav",
+    ),
+    ## nemotron_voicechat (NVIDIA-NemotronLabs-VoiceChat-11B, full-duplex S2S;
+    ## 3-stage offline speech->speech pipeline: thinker/talker/code2wav)
+    "NemotronVoiceChatThinkerForConditionalGeneration": (
+        "nemotron_voicechat",
+        "nemotron_voicechat_thinker",
+        "NemotronVoiceChatThinkerForConditionalGeneration",
+    ),
+    "NemotronVoiceChatTalkerForConditionalGeneration": (
+        "nemotron_voicechat",
+        "nemotron_voicechat_talker",
+        "NemotronVoiceChatTalkerForConditionalGeneration",
+    ),
+    "NemotronVoiceChatCode2Wav": (
+        "nemotron_voicechat",
+        "nemotron_voicechat_code2wav",
+        "NemotronVoiceChatCode2Wav",
+    ),
+    ## higgs-audio v2
+    "HiggsAudioV2ForConditionalGeneration": (
+        "higgs_audio_v2",
+        "higgs_audio_v2_talker",
+        "HiggsAudioV2TalkerForConditionalGeneration",
+    ),
+    "HiggsAudioV2TalkerForConditionalGeneration": (
+        "higgs_audio_v2",
+        "higgs_audio_v2_talker",
+        "HiggsAudioV2TalkerForConditionalGeneration",
+    ),
+    "HiggsAudioV2Code2WavForConditionalGeneration": (
+        "higgs_audio_v2",
+        "higgs_audio_v2_code2wav",
+        "HiggsAudioV2Code2WavForConditionalGeneration",
+    ),
+    ## higgs-audio v3
+    "HiggsMultimodalQwen3ForConditionalGeneration": (
+        "higgs_audio_v3",
+        "higgs_audio_v3_talker",
+        "HiggsAudioV3TalkerForConditionalGeneration",
+    ),
+    "HiggsAudioV3TalkerForConditionalGeneration": (
+        "higgs_audio_v3",
+        "higgs_audio_v3_talker",
+        "HiggsAudioV3TalkerForConditionalGeneration",
+    ),
+    "HiggsAudioV3Code2WavForConditionalGeneration": (
+        "higgs_audio_v3",
+        "higgs_audio_v3_code2wav",
+        "HiggsAudioV3Code2WavForConditionalGeneration",
+    ),
     ## mimo_audio
     "MiMoAudioModel": (
+        "mimo_audio",
+        "mimo_audio",
+        "MiMoAudioForConditionalGeneration",
+    ),
+    "MiMoV2ASRForCausalLM": (
         "mimo_audio",
         "mimo_audio",
         "MiMoAudioForConditionalGeneration",
@@ -118,11 +251,33 @@ _OMNI_MODELS = {
         "mimo_audio_code2wav",
         "MiMoAudioToken2WavForConditionalGenerationVLLM",
     ),
+    ## ming-tts
+    "MingTTSForConditionalGeneration": (
+        "ming_tts",
+        "ming_tts",
+        "MingTTSForConditionalGeneration",
+    ),
+    "MingLLMModel": (
+        "ming_tts",
+        "ming_tts_llm",
+        "MingLLMModel",
+    ),
+    "MingAudioVAEModel": (
+        "ming_tts",
+        "ming_tts_audio_vae",
+        "MingAudioVAEModel",
+    ),
     ## glm_image
     "GlmImageForConditionalGeneration": (
         "glm_image",
         "glm_image_ar",
         "GlmImageForConditionalGeneration",
+    ),
+    ## glm_tts
+    "GLMTTSForConditionalGeneration": (
+        "glm_tts",
+        "glm_tts",
+        "GLMTTSForConditionalGeneration",
     ),
     "OmniBagelForConditionalGeneration": (
         "bagel",
@@ -145,6 +300,29 @@ _OMNI_MODELS = {
         "fish_speech_dac_decoder",
         "FishSpeechDACDecoder",
     ),
+    ## Gepard-1.0 (nineninesix) — single-stage native-AR FSQ/NanoCodec TTS
+    "GepardTalkerForConditionalGeneration": (
+        "gepard",
+        "gepard_talker",
+        "GepardTalkerForConditionalGeneration",
+    ),
+    ## audio8_tts (Audio8 TTS Preview 0.6B)
+    "Audio8TTSSlowARForConditionalGeneration": (
+        "audio8_tts",
+        "audio8_tts_slow_ar",
+        "Audio8TTSSlowARForConditionalGeneration",
+    ),
+    "Audio8TTSCodecDecoder": (
+        "audio8_tts",
+        "audio8_tts_codec_decoder",
+        "Audio8TTSCodecDecoder",
+    ),
+    ## VoxCPM2
+    "VoxCPM2TalkerForConditionalGeneration": (
+        "voxcpm2",
+        "voxcpm2_talker",
+        "VoxCPM2TalkerForConditionalGeneration",
+    ),
     ## Voxtral TTS
     "VoxtralTTSForConditionalGeneration": (
         "voxtral_tts",
@@ -157,6 +335,154 @@ _OMNI_MODELS = {
         "VoxtralTTSAudioGenerationForConditionalGeneration",
     ),
     "VoxtralTTSAudioTokenizer": ("voxtral_tts", "voxtral_tts_audio_tokenizer", "VoxtralTTSAudioTokenizer"),
+    ## covo_audio
+    "CovoAudioForCausalLM": (
+        "covo_audio",
+        "covo_audio",
+        "CovoAudioForConditionalGeneration",
+    ),
+    "CovoAudioForConditionalGeneration": (
+        "covo_audio",
+        "covo_audio",
+        "CovoAudioForConditionalGeneration",
+    ),
+    "CovoAudioModel": (
+        "covo_audio",
+        "covo_audio",
+        "CovoAudioForConditionalGeneration",
+    ),
+    "CovoAudioLLMModel": (
+        "covo_audio",
+        "covo_audio_llm",
+        "CovoAudioLLMForConditionalGeneration",
+    ),
+    "CovoAudioCode2WavModel": (
+        "covo_audio",
+        "covo_audio_code2wav",
+        "CovoAudioCode2WavForConditionalGeneration",
+    ),
+    ## MOSS-TTS-Nano
+    "MossTTSNanoForCausalLM": (
+        "moss_tts_nano",
+        "modeling_moss_tts_nano",
+        "MossTTSNanoForGeneration",
+    ),
+    ## MOSS-TTS (full variants: Delay + Realtime)
+    # MossTTSDelayModel: MOSS-TTS (8B), MOSS-TTSD (8B), MOSS-SoundEffect (8B), MOSS-VoiceGenerator (1.7B)
+    "MossTTSDelayModel": (
+        "moss_tts",
+        "modeling_moss_tts_talker",
+        "MossTTSDelayTalkerForGeneration",
+    ),
+    # MossTTSRealtime: MOSS-TTS-Realtime (1.7B)
+    "MossTTSRealtime": (
+        "moss_tts",
+        "modeling_moss_tts_talker",
+        "MossTTSRealtimeTalkerForGeneration",
+    ),
+    # MossTTSLocalModel: MOSS-TTS-Local-Transformer-v1.5
+    "MossTTSLocalModel": (
+        "moss_tts",
+        "modeling_moss_tts_talker",
+        "MossTTSLocalTalkerForGeneration",
+    ),
+    # Stage-1 codec decoder (shared by all 5 variants)
+    "MossTTSCodecDecoder": (
+        "moss_tts",
+        "modeling_moss_tts_codec",
+        "MossTTSCodecDecoder",
+    ),
+    ## IndexTTS2
+    "IndexTTS2TalkerForConditionalGeneration": (
+        "indextts2",
+        "indextts2_talker",
+        "IndexTTS2TalkerForConditionalGeneration",
+    ),
+    "IndexTTS2S2MelDecoder": (
+        "indextts2",
+        "indextts2_s2mel_decoder",
+        "IndexTTS2S2MelDecoder",
+    ),
+    ## IndexTTS 2.5 (shared implementations, versioned HF config)
+    "IndexTTS25TalkerForConditionalGeneration": (
+        "indextts2",
+        "indextts2_talker",
+        "IndexTTS2TalkerForConditionalGeneration",
+    ),
+    "IndexTTS25S2MelDecoder": (
+        "indextts2",
+        "indextts2_s2mel_decoder",
+        "IndexTTS2S2MelDecoder",
+    ),
+    ## Ming-flash-omni-2.0
+    "MingFlashOmniForConditionalGeneration": (
+        "ming_flash_omni",
+        "ming_flash_omni",
+        "MingFlashOmniForConditionalGeneration",
+    ),
+    "MingFlashOmniThinkerForConditionalGeneration": (
+        "ming_flash_omni",
+        "ming_flash_omni_thinker",
+        "MingFlashOmniThinkerForConditionalGeneration",
+    ),
+    "MingImageForConditionalGeneration": (
+        "ming_image",
+        "model",
+        "MingImageForConditionalGeneration",
+    ),
+    "MingFlashOmniTalkerForConditionalGeneration": (
+        "ming_flash_omni",
+        "ming_flash_omni_talker",
+        "MingFlashOmniTalkerForConditionalGeneration",
+    ),
+    # Alias: HF repo currently ships this architecture name in config.json
+    "BailingMM2NativeForConditionalGeneration": (
+        "ming_flash_omni",
+        "ming_flash_omni",
+        "MingFlashOmniForConditionalGeneration",
+    ),
+    # MiniCPM-o 4.5 Omni models
+    "MiniCPMO45OmniForConditionalGeneration": (
+        "minicpmo_4_5",
+        "minicpmo_4_5_omni",
+        "MiniCPMO45OmniForConditionalGeneration",
+    ),
+    "MiniCPMO45OmniLLMForConditionalGeneration": (
+        "minicpmo_4_5",
+        "minicpmo_4_5_omni_llm",
+        "MiniCPMO45OmniLLMForConditionalGeneration",
+    ),
+    "MiniCPMO45OmniTTSForConditionalGeneration": (
+        "minicpmo_4_5",
+        "minicpmo_4_5_omni_tts",
+        "MiniCPMO45OmniTTSForConditionalGeneration",
+    ),
+    "MiniCPMO45Code2Wav": (
+        "minicpmo_4_5",
+        "minicpmo_4_5_code2wav",
+        "MiniCPMO45Code2Wav",
+    ),
+    "AuraQwen3VLForConditionalGeneration": (
+        "aura_omni",
+        "qwen3_vl",
+        "AuraQwen3VLForConditionalGeneration",
+    ),
+    "MiniMaxH3Encoder": (
+        "minimax_h3",
+        "encoder",
+        "MiniMaxH3Encoder",
+    ),
+    ## MiniMax-Music3 (text-to-music; AR talker -> flow-matching acoustic decoder)
+    "MiniMaxMusic3TalkerForConditionalGeneration": (
+        "minimax_music3",
+        "talker",
+        "MiniMaxMusic3TalkerForConditionalGeneration",
+    ),
+    "MiniMaxMusic3AcousticForConditionalGeneration": (
+        "minimax_music3",
+        "acoustic",
+        "MiniMaxMusic3AcousticForConditionalGeneration",
+    ),
 }
 
 
@@ -169,7 +495,7 @@ OmniModelRegistry = _ModelRegistry(
     {
         **{
             model_arch: _LazyRegisteredModel(
-                module_name=f"vllm.model_executor.models.{mod_relname}",
+                module_name=_resolve_module_name(mod_relname),
                 class_name=cls_name,
             )
             for model_arch, (mod_relname, cls_name) in _VLLM_MODELS.items()

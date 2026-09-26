@@ -44,18 +44,29 @@ Layered RGBA output:
 
 import argparse
 import asyncio
+import json
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 from PIL import Image
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
+
+
+def parse_profiler_config(value: str) -> dict[str, Any]:
+    try:
+        config = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"--profiler-config must be valid JSON: {e}") from e
+    if not isinstance(config, dict):
+        raise argparse.ArgumentTypeError("--profiler-config must be a JSON object")
+    return config
 
 
 # ===========================
@@ -99,6 +110,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae-use-slicing", action="store_true")
     parser.add_argument("--vae-use-tiling", action="store_true")
     parser.add_argument("--enable-cpu-offload", action="store_true")
+    parser.add_argument(
+        "--profiler-config",
+        type=parse_profiler_config,
+        default=None,
+        help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
+    )
 
     return parser.parse_args()
 
@@ -121,12 +138,6 @@ async def main():
 
     # ---- Torch setup ----
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
-    parallel_config = DiffusionParallelConfig(
-        ulysses_degree=args.ulysses_degree,
-        ring_degree=args.ring_degree,
-        cfg_parallel_size=args.cfg_parallel_size,
-        tensor_parallel_size=args.tensor_parallel_size,
-    )
 
     # ---- Cache Config ----
     if args.cache_backend == "cache_dit":
@@ -153,17 +164,21 @@ async def main():
         vae_use_tiling=args.vae_use_tiling,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
-        parallel_config=parallel_config,
+        ulysses_degree=args.ulysses_degree,
+        ring_degree=args.ring_degree,
+        cfg_parallel_size=args.cfg_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
         enforce_eager=args.enforce_eager,
         enable_cpu_offload=args.enable_cpu_offload,
         diffusion_load_format="dummy",
         custom_pipeline_args={"pipeline_class": "custom_pipeline.CustomPipeline"},
+        profiler_config=args.profiler_config,
     )
 
     print(">>> Pipeline loaded successfully")
 
     # ---- Profiling + Info ----
-    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+    profiler_enabled = args.profiler_config is not None
     print(f"\n{'=' * 60}")
     print("Generation Configuration")
     print(f"Model: {args.model}")
@@ -209,7 +224,7 @@ async def main():
     if not outputs:
         raise ValueError("No output produced from omni.generate()")
 
-    first_out = outputs[0].request_output
+    first_out = outputs[0]
     req_out: OmniRequestOutput = first_out
 
     # Verify trajectory data (from custom pipeline)

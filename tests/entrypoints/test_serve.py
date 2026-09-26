@@ -1,0 +1,1218 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+"""Unit tests for the Omni serve CLI helpers."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from multiprocessing.reduction import ForkingPickler
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from pytest_mock import MockerFixture
+from vllm.v1.engine.utils import EngineZmqAddresses
+
+from vllm_omni.config.omni_config import (
+    VllmOmniDiffusionStageConfig,
+    normalize_and_validate_diffusion_engine_ingress_kwargs,
+)
+from vllm_omni.config.resolver import OmniConfigResolution
+from vllm_omni.engine.stage_engine_startup import StageReplicaResources
+from vllm_omni.engine.stage_runtime import StageEngineLaunch
+from vllm_omni.entrypoints.cli.serve import (
+    OmniServeCommand,
+    _parse_stage_overrides,
+    run_headless,
+)
+from vllm_omni.entrypoints.utils import parse_stage_overrides
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@dataclass(frozen=True)
+class _FakeProcess:
+    sentinel: str
+    exitcode: int | None
+    name: str
+    pid: int
+
+
+@dataclass
+class _FakeProcessOwner:
+    processes: list[_FakeProcess]
+
+
+@dataclass
+class _FakeStageEngineArgs:
+    async_chunk: bool
+    enable_sleep_mode: bool
+
+
+@dataclass
+class _FakeStageConfig:
+    stage_id: int
+    engine_args: _FakeStageEngineArgs
+
+
+def _resolved(*stages: SimpleNamespace) -> OmniConfigResolution:
+    return OmniConfigResolution(config_path="/fake/stages.yaml", stage_configs=tuple(stages))
+
+
+def test_serve_parser_accepts_no_async_chunk_and_marks_it_explicit() -> None:
+    """``--no-async-chunk`` should parse to ``async_chunk=False`` and mark the
+    shared deploy-level dest as explicitly provided by the user."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    cmd = OmniServeCommand()
+    cmd.subparser_init(subparsers)
+
+    argv = ["serve", "fake-model", "--omni", "--no-async-chunk"]
+    args = parser.parse_args(argv)
+    assert args.async_chunk is False
+
+    explicit = args.get_explicit_kwargs_dict()
+    assert args.get_explicit_kwargs_dict()
+    assert not explicit["async_chunk"]
+    assert (args.api_server_count or 1) == 1
+    assert "api_server_count" not in explicit
+
+
+def test_serve_parser_accepts_vae_fast_path() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni"])
+    assert args.vae_fast_path == "lossless"
+    assert "vae_fast_path" not in args.get_explicit_kwargs_dict()
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--vae-fast-path", "channels_last"])
+    assert args.vae_fast_path == "channels_last"
+    assert args.get_explicit_kwargs_dict()["vae_fast_path"] == "channels_last"
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "fake-model", "--omni", "--vae-fast-path", "fast"])
+
+
+def _parse_serve_args(argv: list[str]) -> TrackingNamespace:
+    """Parse a ``serve`` argv through the real Omni parser, returning the
+    TrackingNamespace (with ``explicit_keys``) that ``validate`` receives."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+    return parser.parse_args(argv)
+
+
+def test_no_guardrails_is_only_forwarded_as_model_config(mocker: MockerFixture) -> None:
+    """The CLI alias must not reach the strict diffusion config validator."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subparser")
+    OmniServeCommand().subparser_init(subparsers)
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--no-guardrails"])
+    assert args.get_explicit_kwargs_dict()["no_guardrails"] is True
+
+    # Keep the real CLI parser and config validator, but do not start a server.
+    args.headless = True
+    mocker.patch.dict("os.environ", {"VLLM_DISABLE_LOG_LOGO": "1"})
+    mocker.patch("vllm_omni.entrypoints.cli.serve.run_headless")
+    OmniServeCommand.cmd(args)
+
+    explicit = args.get_explicit_kwargs_dict()
+    normalized = normalize_and_validate_diffusion_engine_ingress_kwargs(explicit, stage_id=0)
+    assert normalized["model_config"]["guardrails"] is False
+    assert "no_guardrails" not in explicit
+
+
+def test_omni_serve_requires_model_when_none_provided() -> None:
+    """Regression for https://github.com/vllm-project/vllm-omni/issues/4158:
+    ``vllm serve --omni`` with no model must fail fast instead of silently
+    falling back to vLLM's default model and crashing in the diffusion worker.
+    """
+    args = _parse_serve_args(["serve", "--omni"])
+    cmd = OmniServeCommand()
+    with pytest.raises(ValueError, match="requires an explicit model"):
+        cmd.validate(args)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        # A deploy YAML supplied *without* an explicit model must still trip
+        # the guard. It carries per-stage engine args only -- the
+        # checkpoint is always threaded in from ``args.model`` -- so its mere
+        # presence does not establish that a model was provided. Without an
+        # explicit model ``args.model`` stays at vLLM's default and the launch
+        # reproduces the issue-4158 diffusion-registry crash.
+        ["serve", "--omni", "--deploy-config", "deploy.yaml"],
+        # An empty/whitespace model must not satisfy the guard either -- this is
+        # the ``--model "$MODEL"``-with-unset-var footgun. Otherwise the empty
+        # value flows downstream and crashes with the same confusing error.
+        ["serve", "", "--omni"],  # empty positional
+        ["serve", "--omni", "--model", ""],  # empty --model
+        ["serve", "--omni", "--model", "   "],  # whitespace-only --model
+    ],
+)
+def test_omni_serve_rejects_missing_or_empty_model(argv: list[str]) -> None:
+    """Regression for review feedback on PR #4167: a deploy YAML is not a
+    model source, so ``--deploy-config`` alone must not bypass the
+    require-a-model guard; neither may an empty/whitespace model value."""
+    args = _parse_serve_args(argv)
+    cmd = OmniServeCommand()
+    with pytest.raises(ValueError, match="requires an explicit model"):
+        cmd.validate(args)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["serve", "fake-model", "--omni"],  # positional model
+        ["serve", "--omni", "--model", "fake-model"],  # --model flag
+        # An explicit model with a deploy YAML is the legitimate multi-stage
+        # path and must pass the guard.
+        ["serve", "fake-model", "--omni", "--deploy-config", "deploy.yaml"],
+    ],
+)
+def test_omni_serve_accepts_explicit_model(argv: list[str], mocker: MockerFixture) -> None:
+    """A model supplied positionally or via ``--model`` -- with or without a
+    deploy YAML -- must NOT trip the require-a-model guard. Downstream
+    validation is mocked so only the new guard is exercised."""
+    mocker.patch(
+        "vllm_omni.diffusion.utils.hf_utils.is_diffusion_model",
+        return_value=False,
+    )
+    mocker.patch("vllm_omni.entrypoints.cli.serve.validate_parsed_serve_args")
+
+    args = _parse_serve_args(argv)
+    cmd = OmniServeCommand()
+    # Must not raise the "requires a model" error for any of these.
+    cmd.validate(args)
+
+
+@pytest.mark.parametrize(
+    "model_class,exists,native",
+    [
+        ("AnimaPipeline", True, True),
+        ("AnimaModularPipeline", True, True),
+        ("AnimaPipeline", False, False),
+        ("FluxPipeline", True, False),
+        (None, True, False),
+    ],
+)
+def test_serve_native_checkpoint_validation(model_class, exists, native, tmp_path, mocker):
+    checkpoint = tmp_path / "anima.safetensors"
+    if exists:
+        checkpoint.touch()
+    argv = ["serve", str(checkpoint), "--omni"]
+    if model_class is not None:
+        argv.extend(["--model-class-name", model_class])
+    args = _parse_serve_args(argv)
+    detect_model = mocker.patch("vllm_omni.diffusion.utils.hf_utils.is_diffusion_model", return_value=False)
+    validate_llm = mocker.patch("vllm_omni.entrypoints.cli.serve.validate_parsed_serve_args")
+
+    OmniServeCommand().validate(args)
+
+    if native:
+        detect_model.assert_not_called()
+        validate_llm.assert_not_called()
+    else:
+        detect_model.assert_called_once_with(str(checkpoint))
+        validate_llm.assert_called_once_with(args)
+
+
+def test_serve_parser_accepts_strategy_config() -> None:
+    """``--strategy-config`` must parse onto the ``strategy_config`` dest and be
+    forwarded as an explicit kwarg so the engine can overlay the strategy."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    cmd = OmniServeCommand()
+    cmd.subparser_init(subparsers)
+
+    argv = ["serve", "fake-model", "--omni", "--strategy-config", "/tmp/strategy.yaml"]
+    args = parser.parse_args(argv)
+    assert args.strategy_config == "/tmp/strategy.yaml"
+    assert args.get_explicit_kwargs_dict()["strategy_config"] == "/tmp/strategy.yaml"
+
+
+def test_serve_parser_accepts_deploy_config() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--deploy-config", "/tmp/deploy.yaml"])
+
+    assert args.deploy_config == "/tmp/deploy.yaml"
+    assert args.get_explicit_kwargs_dict()["deploy_config"] == "/tmp/deploy.yaml"
+
+
+def test_serve_parser_accepts_video_output_transport() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        ["serve", "fake-model", "--omni", "--video-output-transport", '{"enable_device_postprocess": true}']
+    )
+
+    expected = {"enable_device_postprocess": True}
+    assert args.video_output_transport == expected
+    assert args.get_explicit_kwargs_dict()["video_output_transport"] == expected
+
+
+@pytest.mark.parametrize("value", ["{not json", "[]"])
+def test_serve_parser_rejects_invalid_video_output_transport(value: str) -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "fake-model", "--omni", "--video-output-transport", value])
+
+
+def test_tracking_namespace_is_picklable_for_spawned_api_workers() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--api-server-count", "2"])
+    args._omni_stage_client_configs = [{"stage_addresses": {0: {0: {"input_address": "ipc://input"}}}}]
+
+    restored = ForkingPickler.loads(ForkingPickler.dumps(args))
+
+    assert restored.api_server_count == 2
+    assert restored.get_explicit_kwargs_dict()["api_server_count"] == 2
+    assert restored._omni_stage_client_configs == args._omni_stage_client_configs
+
+
+@pytest.mark.parametrize("native_checkpoint", [False, True])
+def test_serve_validate_rejects_multiple_api_servers_for_diffusion(
+    mocker: MockerFixture, tmp_path, native_checkpoint: bool
+) -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    cmd = OmniServeCommand()
+    cmd.subparser_init(subparsers)
+    argv = ["serve", "fake-diffusion-model", "--omni", "--api-server-count", "2"]
+    if native_checkpoint:
+        checkpoint = tmp_path / "anima.safetensors"
+        checkpoint.touch()
+        argv[1] = str(checkpoint)
+        argv.extend(["--model-class-name", "AnimaPipeline"])
+    args = parser.parse_args(argv)
+
+    mocker.patch("vllm_omni.diffusion.utils.hf_utils.is_diffusion_model", return_value=not native_checkpoint)
+    validate = mocker.patch("vllm_omni.entrypoints.cli.serve.validate_parsed_serve_args")
+
+    with pytest.raises(ValueError, match="not supported for diffusion"):
+        cmd.validate(args)
+
+    validate.assert_not_called()
+
+
+def test_serve_validate_rejects_sleep_mode_with_multiple_api_servers(mocker: MockerFixture) -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    cmd = OmniServeCommand()
+    cmd.subparser_init(subparsers)
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--api-server-count", "2", "--enable-sleep-mode"])
+
+    mocker.patch("vllm_omni.diffusion.utils.hf_utils.is_diffusion_model", return_value=False)
+    mocker.patch("vllm_omni.entrypoints.cli.serve.validate_parsed_serve_args")
+
+    with pytest.raises(ValueError, match="enable-sleep-mode"):
+        cmd.validate(args)
+
+
+@pytest.mark.parametrize("typed", [False, True])
+@pytest.mark.parametrize("downstream_async_chunk", [False, True])
+def test_build_multi_api_stage_runtime_matches_current_constructor(
+    mocker: MockerFixture, typed: bool, downstream_async_chunk: bool
+) -> None:
+    from vllm_omni.entrypoints.cli import serve as serve_module
+
+    args = TrackingNamespace(
+        argparse.Namespace(
+            model="dummy-model",
+            model_tag=None,
+            stage_init_timeout=1,
+            tokenizer=None,
+            disable_log_stats=False,
+        ),
+        frozenset({"model"}),
+    )
+    if typed:
+        from vllm_omni.config.omni_config import VllmOmniARStageConfig
+        from vllm_omni.config.stage_config import StagePipelineConfig
+
+        stages = [
+            VllmOmniARStageConfig(stage_pipeline_config=StagePipelineConfig(stage_id=i, model_stage="ar"))
+            for i in range(2)
+        ]
+        stages[1].connector_config.async_chunk = downstream_async_chunk
+    else:
+        stages = [
+            _FakeStageConfig(
+                stage_id=i,
+                engine_args=_FakeStageEngineArgs(
+                    async_chunk=bool(i and downstream_async_chunk), enable_sleep_mode=False
+                ),
+            )
+            for i in range(2)
+        ]
+    mocker.patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", return_value="dummy-model")
+    mocker.patch(
+        "vllm_omni.config.config_factory.with_trust_remote_code_override",
+        side_effect=lambda kwargs, _trust: kwargs,
+    )
+    mocker.patch("vllm_omni.entrypoints.utils.parse_stage_overrides", return_value={})
+    mocker.patch(
+        "vllm_omni.config.resolver.resolve_omni_config",
+        return_value=OmniConfigResolution(config_path="dummy-config", stage_configs=tuple(stages)),
+    )
+
+    runtime = serve_module._build_multi_api_stage_runtime(args, 2)
+
+    assert runtime._client_count == 1
+    assert runtime._client_index == 0
+    assert runtime._async_chunk is downstream_async_chunk
+
+
+@pytest.mark.parametrize("typed", [False, True])
+def test_build_multi_api_stage_runtime_rejects_sleep_enabled_in_stage_config(
+    mocker: MockerFixture, typed: bool
+) -> None:
+    from vllm_omni.entrypoints.cli import serve as serve_module
+
+    args = TrackingNamespace(
+        argparse.Namespace(
+            model="dummy-model",
+            model_tag=None,
+            stage_init_timeout=1,
+            tokenizer=None,
+            disable_log_stats=False,
+        ),
+        frozenset({"model"}),
+    )
+    stage_config = _FakeStageConfig(
+        stage_id=3,
+        engine_args=_FakeStageEngineArgs(async_chunk=False, enable_sleep_mode=True),
+    )
+    if typed:
+        from vllm_omni.config.omni_config import VllmOmniARStageConfig
+        from vllm_omni.config.stage_config import StagePipelineConfig
+
+        typed_stage = VllmOmniARStageConfig(stage_pipeline_config=StagePipelineConfig(stage_id=3, model_stage="ar"))
+        typed_stage.model_config.enable_sleep_mode = True
+        stage_config = typed_stage
+    mocker.patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", return_value="dummy-model")
+    mocker.patch(
+        "vllm_omni.config.config_factory.with_trust_remote_code_override",
+        side_effect=lambda kwargs, _trust: kwargs,
+    )
+    mocker.patch("vllm_omni.entrypoints.utils.parse_stage_overrides", return_value={})
+    mocker.patch(
+        "vllm_omni.config.resolver.resolve_omni_config",
+        return_value=OmniConfigResolution(config_path="dummy-config", stage_configs=(stage_config,)),
+    )
+
+    with pytest.raises(ValueError, match=r"sleep mode.*stage\(s\) \[3\]"):
+        serve_module._build_multi_api_stage_runtime(args, 2)
+
+
+def test_run_multi_api_server_omni_starts_workers_after_shared_engine_launch(mocker: MockerFixture) -> None:
+    from vllm_omni.entrypoints.cli import serve as serve_module
+
+    args = TrackingNamespace(
+        argparse.Namespace(api_server_count=2, shutdown_timeout=1),
+        frozenset({"api_server_count", "shutdown_timeout"}),
+    )
+    socket = mocker.Mock()
+    primary_addresses = EngineZmqAddresses(
+        inputs=["ipc://input-0", "ipc://input-1"],
+        outputs=["ipc://output-0", "ipc://output-1"],
+    )
+    engine_launch = StageEngineLaunch(
+        client_configs=[{"client_count": 2, "client_index": index, "stage_addresses": {}} for index in range(2)],
+        resources=[StageReplicaResources(addresses=primary_addresses)],
+    )
+    runtime = mocker.MagicMock()
+    runtime.launch_stage_engines.return_value.__enter__.return_value = engine_launch
+    runtime.launch_stage_engines.return_value.__exit__.return_value = False
+
+    manager = mocker.Mock()
+    manager.processes = [mocker.Mock()]
+    manager.gather_actual_addresses.return_value = (primary_addresses.inputs, primary_addresses.outputs)
+
+    mocker.patch.object(serve_module, "_build_multi_api_stage_runtime", return_value=runtime)
+    mocker.patch.object(serve_module, "_wait_for_multi_api_server_completion")
+    mocker.patch("signal.signal")
+    mocker.patch("vllm.entrypoints.openai.api_server.setup_server", return_value=("127.0.0.1:8000", socket))
+    mocker.patch("vllm.v1.metrics.prometheus.setup_multiprocess_prometheus")
+    start_manager = mocker.patch.object(serve_module, "_start_api_server_process_manager", return_value=manager)
+
+    serve_module.run_multi_api_server_omni(args)
+
+    assert args._omni_stage_client_configs is engine_launch.client_configs
+    start_manager.assert_called_once()
+    manager_kwargs = start_manager.call_args.kwargs
+    assert manager_kwargs["cleanup_timeout"] == 1
+    assert manager_kwargs["num_servers"] == 2
+    assert manager_kwargs["input_addresses"] == ["ipc://input-0", "ipc://input-1"]
+    assert manager_kwargs["target_server_fn"] is serve_module.run_omni_api_server_worker_proc
+    assert engine_launch.watched_frontend_processes == manager.processes
+    runtime.shutdown.assert_called_once_with()
+    socket.close.assert_called_once_with()
+
+
+def test_start_api_server_process_manager_cleans_up_partial_start(mocker: MockerFixture) -> None:
+    from vllm_omni.entrypoints.cli import serve as serve_module
+
+    first_process = mocker.Mock(name="first_process")
+    second_process = mocker.Mock(name="second_process")
+    first_process.pid = 1234
+    second_process.pid = None
+    second_process.start.side_effect = RuntimeError("spawn failed")
+    parent_pipes = [mocker.Mock(name="parent_pipe_0"), mocker.Mock(name="parent_pipe_1")]
+    child_pipes = [mocker.Mock(name="child_pipe_0"), mocker.Mock(name="child_pipe_1")]
+    spawn_context = mocker.Mock()
+    spawn_context.Process.side_effect = [first_process, second_process]
+    spawn_context.Pipe.side_effect = list(zip(parent_pipes, child_pipes))
+    mocker.patch("vllm.v1.utils.multiprocessing.get_context", return_value=spawn_context)
+    shutdown = mocker.patch("vllm.v1.utils.shutdown")
+
+    with pytest.raises(RuntimeError, match="spawn failed"):
+        serve_module._start_api_server_process_manager(
+            cleanup_timeout=1.5,
+            listen_address="127.0.0.1:8000",
+            sock=mocker.Mock(),
+            args=argparse.Namespace(),
+            num_servers=2,
+            input_addresses=["ipc://input-0", "ipc://input-1"],
+            output_addresses=["ipc://output-0", "ipc://output-1"],
+            target_server_fn=mocker.Mock(),
+        )
+
+    first_process.start.assert_called_once_with()
+    second_process.start.assert_called_once_with()
+    for pipe in parent_pipes:
+        pipe.close.assert_called_once_with()
+    shutdown.assert_called_once_with([first_process], timeout=1.5)
+
+
+def test_wait_for_multi_api_server_completion_rejects_engine_failure(
+    mocker: MockerFixture,
+) -> None:
+    from vllm_omni.entrypoints.cli import serve as serve_module
+
+    api_process = _FakeProcess(sentinel="api-0", exitcode=None, name="api-0", pid=10)
+    engine_process = _FakeProcess(sentinel="engine-0", exitcode=4, name="engine-0", pid=20)
+    manager = _FakeProcessOwner(processes=[api_process])
+    engine_launch = StageEngineLaunch(
+        client_configs=[],
+        resources=[StageReplicaResources(manager=_FakeProcessOwner(processes=[engine_process]))],
+    )
+    mocker.patch("multiprocessing.connection.wait", return_value=["engine-0"])
+
+    with pytest.raises(RuntimeError, match=r"Shared stage engine process engine-0 .* exited with code 4"):
+        serve_module._wait_for_multi_api_server_completion(manager, engine_launch)
+
+
+def test_serve_parser_rejects_stage_configs_path() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "fake-model", "--omni", "--stage-configs-path", "/tmp/stages.yaml"])
+
+
+def test_serve_parser_accepts_four_way_cfg_parallelism() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--cfg-parallel-size", "4"])
+
+    assert args.cfg_parallel_size == 4
+
+
+def test_serve_parser_accepts_robot_openpi_idle_timeout() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--robot-openpi-idle-timeout", "0"])
+
+    assert args.robot_openpi_idle_timeout == 0
+    assert args.get_explicit_kwargs_dict()["robot_openpi_idle_timeout"] == 0
+
+
+def test_serve_parser_rejects_negative_robot_openpi_idle_timeout() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "fake-model", "--omni", "--robot-openpi-idle-timeout", "-1"])
+
+
+def test_serve_parser_accepts_ulysses_a2a_permute() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--ulysses-a2a-permute"])
+
+    assert args.ulysses_a2a_permute is True
+    assert args.get_explicit_kwargs_dict()["ulysses_a2a_permute"] is True
+
+
+def test_serve_parser_accepts_diffusion_quantization_config() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+    expected = {"transformer": {"method": "torchao_float8_weight_only"}}
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Boogu/Boogu-Image-0.1-Base-fp8",
+            "--omni",
+            "--diffusion-quantization-config",
+            '{"transformer":{"method":"torchao_float8_weight_only"}}',
+        ]
+    )
+
+    assert args.diffusion_quantization_config == expected
+    assert args.get_explicit_kwargs_dict()["diffusion_quantization_config"] == expected
+
+
+def _make_headless_args(*, explicit_keys: frozenset[str] | None = None, **kwargs) -> TrackingNamespace:
+    defaults = {
+        "model": "fake-model",
+        "stage_id": 0,
+        "replica_id": 0,
+        "omni_master_address": "127.0.0.1",
+        "omni_master_port": 26000,
+        "omni_replica_address": None,
+        "omni_dp_size_local": 1,
+        "worker_backend": "multi_process",
+        "deploy_config": None,
+        "log_stats": False,
+        "disable_log_stats": False,
+        "stage_init_timeout": 600,
+        "tokenizer": None,
+    }
+    ns_kwargs = {**defaults, **kwargs}
+    ns = argparse.Namespace(**ns_kwargs)
+    return TrackingNamespace(
+        unfiltered_ns=ns,
+        explicit_keys=frozenset(ns.__dict__.keys()) if explicit_keys is None else explicit_keys,
+    )
+
+
+def test_run_headless_requires_stage_id() -> None:
+    args = _make_headless_args(stage_id=None)
+    with pytest.raises(ValueError, match="--stage-id is required"):
+        run_headless(args)
+
+
+def test_run_headless_requires_master_address() -> None:
+    args = _make_headless_args(omni_master_address=None)
+    with pytest.raises(ValueError, match="--omni-master-address and --omni-master-port"):
+        run_headless(args)
+
+
+def test_run_headless_requires_master_port() -> None:
+    args = _make_headless_args(omni_master_port=None)
+    with pytest.raises(ValueError, match="--omni-master-address and --omni-master-port"):
+        run_headless(args)
+
+
+def test_run_headless_rejects_non_multiprocess_worker_backend() -> None:
+    args = _make_headless_args(worker_backend="ray")
+    with pytest.raises(ValueError, match="worker_backend=multi_process"):
+        run_headless(args)
+
+
+# ---------------------------------------------------------------------------
+# --stage-overrides parsing at the serving boundary
+# ---------------------------------------------------------------------------
+
+
+def test_parse_stage_overrides_valid_json() -> None:
+    """A valid JSON string is parsed into the nested per-stage dict."""
+    parsed = _parse_stage_overrides('{"0": {"devices": "0,1"}, "1": {"devices": "2"}}')
+    assert parsed == {"0": {"devices": "0,1"}, "1": {"devices": "2"}}
+
+
+def test_serve_parser_parses_stage_overrides_before_resolution() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "fake-model",
+            "--omni",
+            "--stage-overrides",
+            '{"0": {"devices": "0,1"}}',
+        ]
+    )
+
+    assert args.stage_overrides == {"0": {"devices": "0,1"}}
+
+
+def test_serve_parser_accepts_empty_stage_overrides_as_noop() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--stage-overrides", "{}"])
+
+    assert args.stage_overrides == {}
+
+
+def test_parse_stage_overrides_invalid_json_raises() -> None:
+    """Invalid JSON fails at the serving boundary with the raw input."""
+    bad = "{not valid json}"
+    with pytest.raises(argparse.ArgumentTypeError) as excinfo:
+        _parse_stage_overrides(bad)
+    message = str(excinfo.value)
+    assert message.startswith("--stage-overrides is not valid JSON:")
+    assert f"Got: {bad!r}" in message
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ['{"abc": {}}', '{"-1": {}}', '{"1.5": {}}', '{"\uff10": {}}'],
+)
+def test_parse_stage_overrides_rejects_invalid_stage_ids(payload: str) -> None:
+    with pytest.raises(argparse.ArgumentTypeError, match="non-negative integer stage ids"):
+        _parse_stage_overrides(payload)
+
+
+def test_parse_stage_overrides_preserves_arbitrary_override_fields() -> None:
+    parsed = _parse_stage_overrides(
+        '{"0": {"extras": {"ltx2_use_conv_vae": true}, "kv_cache_dtype": "fp8", "typo_field_xyz": 1}}'
+    )
+    assert parsed["0"] == {
+        "extras": {"ltx2_use_conv_vae": True},
+        "kv_cache_dtype": "fp8",
+        "typo_field_xyz": 1,
+    }
+
+
+def test_parse_stage_overrides_rejects_non_dict_top_level() -> None:
+    """Top-level must be a JSON object (dict). A list, scalar, or non-dict
+    mapping is rejected with a ValueError naming ``--stage-overrides`` and
+    pointing at the bad shape. Without this guard, ``json.loads`` happily
+    returns a list/scalar and the override silently never applies."""
+    for bad in ("[1, 2, 3]", '"oops"', "42"):
+        with pytest.raises(ValueError, match="must be a JSON object"):
+            parse_stage_overrides(bad)
+
+
+def test_parse_stage_overrides_rejects_non_integer_stage_id() -> None:
+    """Stage-id keys must be non-negative ASCII integer strings. Letters,
+    signs, floats, Unicode digit classes, and integer (non-string) keys all
+    fail. ``str.isdigit() and str.isascii()`` is the minimal check: it
+    rejects ``"-1"``, ``"abc"``, ``"1.5"``, fullwidth ``"０"``, and bare ``1``.
+
+    Note: ``json.loads`` normalizes integer object keys (``{"1": {}}``) into
+    the string ``"1"`` and would pass our digit check, so the integer-key case
+    is exercised via the already-parsed-dict code path (``parse_stage_overrides({1: {}})``)."""
+    bad_string_keys = ('"abc"', '"-1"', '"1.5"', '"\uff10"')
+    for bad_key in bad_string_keys:
+        with pytest.raises(ValueError, match="non-negative integer stage ids"):
+            parse_stage_overrides("{" + bad_key + ": {}}")
+    # Integer (non-string) key: must reach the structural check, not the JSON
+    # parser, so pass an already-parsed mapping directly.
+    with pytest.raises(ValueError, match="non-negative integer stage ids"):
+        parse_stage_overrides({1: {}})
+
+
+def test_parse_stage_overrides_accepts_stage_merge_extras_and_engine_args() -> None:
+    """Three classes of keys pass through the shape-only parser:
+
+    - ``extras`` is read by the default-diffusion fallback
+      (``async_omni_engine.py``); registered pipelines carry it on
+      ``StagePipelineConfig.extras`` directly.
+    - Engine arguments (``kv_cache_dtype``, ``stage_connector_spec``, ...)
+      are forwarded as ``stage_<id>_<key>`` and applied via
+      ``OmniEngineArgs``.
+    - Unknown keys parse through and are dropped with a warning at
+      ``filter_dataclass_kwargs`` (see
+      ``tests/entrypoints/test_utils.py::TestFilterDataclassKwargs``).
+
+    ``typo_field_xyz`` in the payload exercises the third case.
+    """
+    parsed = parse_stage_overrides(
+        '{"0": {"extras": {"ltx2_use_conv_vae": true},'
+        ' "kv_cache_dtype": "fp8", "seed": 42,'
+        ' "stage_connector_spec": {"name": "SharedMemoryConnector", "extra": {}},'
+        ' "typo_field_xyz": 1}}'
+    )
+    assert parsed == {
+        "0": {
+            "extras": {"ltx2_use_conv_vae": True},
+            "kv_cache_dtype": "fp8",
+            "seed": 42,
+            "stage_connector_spec": {"name": "SharedMemoryConnector", "extra": {}},
+            "typo_field_xyz": 1,
+        },
+    }
+    # Already-parsed mapping path carries the same trust.
+    assert parse_stage_overrides(dict(parsed)) == parsed
+
+
+def test_parse_stage_overrides_accepts_empty_inner_dict() -> None:
+    """Per-stage overrides may be empty (``{}``): shape stays valid, every
+    stage simply receives no per-stage tweaks. Locks in the
+    ``not parsed`` -> ``None`` short-circuit's twin: an outer
+    non-empty dict with empty inner dicts is a valid no-op pass-through."""
+    parsed = parse_stage_overrides('{"0": {}, "1": {}}')
+    assert parsed == {"0": {}, "1": {}}
+
+
+def test_run_headless_forwards_parsed_stage_overrides(mocker: MockerFixture) -> None:
+    """The headless resolver receives the mapping parsed by argparse."""
+    captured: dict = {}
+
+    def _fake_resolve(*args, **kwargs):
+        captured["args"] = args
+        captured.update(kwargs)
+        # Return a stage that does NOT match stage_id=0 so run_headless stops
+        # right after the resolver call (we only care about how it was called).
+        return _resolved(SimpleNamespace(stage_id=99))
+
+    mocker.patch(
+        "vllm_omni.config.resolver.resolve_omni_config",
+        side_effect=_fake_resolve,
+    )
+
+    args = _make_headless_args(
+        stage_id=0,
+        deploy_config="/tmp/deploy.yaml",
+        strategy_config="/tmp/strategy.yaml",
+        stage_overrides={"0": {"devices": "0,1"}, "1": {"devices": "2"}},
+    )
+    with pytest.raises(ValueError, match="No stage config found for stage_id=0"):
+        run_headless(args)
+
+    assert captured["args"] == ("fake-model",)
+    assert captured["deploy_config_path"] == "/tmp/deploy.yaml"
+    assert captured["stage_overrides"] == {"0": {"devices": "0,1"}, "1": {"devices": "2"}}
+    assert captured["strategy_config_path"] == "/tmp/strategy.yaml"
+
+
+def test_parse_stage_overrides_rejects_non_mapping_values() -> None:
+    with pytest.raises(argparse.ArgumentTypeError, match="JSON object"):
+        _parse_stage_overrides('["not", "a", "mapping"]')
+    with pytest.raises(argparse.ArgumentTypeError, match="must be an object"):
+        _parse_stage_overrides('{"0": "not a mapping"}')
+
+
+def test_run_headless_raises_when_stage_id_not_in_configs(mocker: MockerFixture) -> None:
+    """Headless looks up its assigned stage_id in the loaded deploy YAML and
+    fails fast when the launcher's --stage-id doesn't match any entry."""
+    other_stage = SimpleNamespace(stage_id=99)
+    mocker.patch(
+        "vllm_omni.config.resolver.resolve_omni_config",
+        return_value=_resolved(other_stage),
+    )
+
+    args = _make_headless_args(stage_id=0)
+    with pytest.raises(ValueError, match="No stage config found for stage_id=0"):
+        run_headless(args)
+
+
+# ---------------------------------------------------------------------------
+# run_headless happy paths
+# ---------------------------------------------------------------------------
+
+
+def _make_stage_cfg(stage_id: int, stage_type: str) -> SimpleNamespace:
+    """Build a stage config that satisfies every attribute run_headless reads.
+
+    Notably ``engine_args`` is a real dict (not a Mock) so
+    ``get_stage_devices_per_replica`` can call ``.get("tensor_parallel_size")``
+    and feed the result through ``int()`` without TypeError.
+    """
+    return SimpleNamespace(
+        stage_id=stage_id,
+        stage_type=stage_type,
+        # No "devices" key -> split_devices_for_replicas skipped, each replica
+        # inherits the launcher's CUDA_VISIBLE_DEVICES.
+        runtime=None,
+        engine_args={},
+    )
+
+
+def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: MockerFixture) -> None:
+    """LLM headless: each loop iteration registers with auto-assigned
+    replica_id (master picks a free slot) and spawns one
+    ``StageEngineCoreProcManager`` per local replica."""
+    from vllm_omni.engine.stage_engine_startup import StageRegistrationResponse
+
+    stage_cfg = _make_stage_cfg(0, stage_type="llm")
+    stage_cfg.engine_args["async_chunk"] = True
+    parallel_config = SimpleNamespace(
+        data_parallel_size_local=1,
+        data_parallel_rank=0,
+        data_parallel_rank_local=0,
+        node_rank_within_dp=0,
+    )
+    vllm_config = SimpleNamespace(parallel_config=parallel_config, needs_dp_coordinator=False)
+    engine_manager = mocker.Mock()
+
+    mocker.patch(
+        "vllm_omni.config.resolver.resolve_omni_config",
+        return_value=_resolved(stage_cfg),
+    )
+    mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
+    mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
+    mocker.patch(
+        "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
+        return_value=(None, None, None),
+    )
+    mock_connector_spec = mocker.patch(
+        "vllm_omni.engine.stage_init_utils.get_stage_connector_spec",
+        return_value={},
+    )
+    mocker.patch("vllm_omni.engine.stage_init_utils.build_engine_args_dict", return_value={})
+    mocker.patch(
+        "vllm_omni.engine.stage_init_utils.build_vllm_config",
+        return_value=(vllm_config, object),
+    )
+    mock_register = mocker.patch(
+        "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
+        return_value=StageRegistrationResponse(
+            handshake_address="tcp://127.0.0.1:26001",
+            input_address="tcp://127.0.0.1:26002",
+            output_address="tcp://127.0.0.1:26003",
+            replica_id=0,
+            coordinator_router_address="tcp://127.0.0.1:26100",
+        ),
+    )
+    mock_manager_cls = mocker.patch(
+        "vllm_omni.engine.stage_engine_core_proc_manager.StageEngineCoreProcManager",
+        return_value=engine_manager,
+    )
+    mocker.patch("signal.signal")
+
+    run_headless(_make_headless_args(stage_id=0))
+
+    # The launcher must request auto-assignment (replica_id=None) and the
+    # full response so it can wire the master-allocated coordinator into the
+    # spawned subprocess. LLM uses head-owned sockets: the head binds all
+    # three sockets (handshake, input, output) and the worker connects.
+    assert mock_register.call_count == 1
+    kwargs = mock_register.call_args.kwargs
+    assert kwargs["omni_master_address"] == "127.0.0.1"
+    assert kwargs["omni_master_port"] == 26000
+    assert kwargs["omni_stage_id"] == 0
+    assert kwargs["omni_stage_config"] is stage_cfg
+    assert kwargs["replica_id"] is None
+    assert "socket_ownership" not in kwargs
+    assert mock_connector_spec.call_args.kwargs["async_chunk"] is True
+
+    assert mock_manager_cls.call_count == 1
+    mgr_kwargs = mock_manager_cls.call_args.kwargs
+    assert mgr_kwargs["local_engine_count"] == 1
+    assert mgr_kwargs["local_client"] is False
+    assert mgr_kwargs["handshake_address"] == "tcp://127.0.0.1:26001"
+    assert mgr_kwargs["omni_stage_id"] == 0
+    assert mgr_kwargs["omni_coordinator_address"] == "tcp://127.0.0.1:26100"
+    assert mgr_kwargs["omni_replica_base_id"] == 0
+
+    engine_manager.monitor_engine_liveness.assert_called_once_with()
+    engine_manager.shutdown.assert_called_once_with()
+
+
+def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(mocker: MockerFixture) -> None:
+    """``--omni-dp-size-local=N`` must spawn N managers, each with its own
+    master-assigned replica_id, and join all of them before returning."""
+    from vllm_omni.engine.stage_engine_startup import StageRegistrationResponse
+
+    stage_cfg = _make_stage_cfg(0, stage_type="llm")
+    parallel_config = SimpleNamespace(
+        data_parallel_size_local=1,
+        data_parallel_rank=0,
+        data_parallel_rank_local=0,
+        node_rank_within_dp=0,
+    )
+    vllm_config = SimpleNamespace(parallel_config=parallel_config, needs_dp_coordinator=False)
+    manager_a = mocker.Mock()
+    manager_b = mocker.Mock()
+
+    mocker.patch(
+        "vllm_omni.config.resolver.resolve_omni_config",
+        return_value=_resolved(stage_cfg),
+    )
+    mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
+    mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
+    mocker.patch(
+        "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
+        return_value=(None, None, None),
+    )
+    mocker.patch("vllm_omni.engine.stage_init_utils.get_stage_connector_spec", return_value={})
+    mocker.patch("vllm_omni.engine.stage_init_utils.build_engine_args_dict", return_value={})
+    mocker.patch(
+        "vllm_omni.engine.stage_init_utils.build_vllm_config",
+        return_value=(vllm_config, object),
+    )
+    mocker.patch(
+        "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
+        side_effect=[
+            StageRegistrationResponse(
+                handshake_address=f"tcp://127.0.0.1:2700{idx}",
+                input_address=f"tcp://127.0.0.1:2710{idx}",
+                output_address=f"tcp://127.0.0.1:2720{idx}",
+                replica_id=idx,
+                coordinator_router_address=None,
+            )
+            for idx in (0, 1)
+        ],
+    )
+    mock_manager_cls = mocker.patch(
+        "vllm_omni.engine.stage_engine_core_proc_manager.StageEngineCoreProcManager",
+        side_effect=[manager_a, manager_b],
+    )
+    mocker.patch("signal.signal")
+
+    run_headless(_make_headless_args(stage_id=0, omni_dp_size_local=2))
+
+    assert mock_manager_cls.call_count == 2
+    assigned_ids = [call.kwargs["omni_replica_base_id"] for call in mock_manager_cls.call_args_list]
+    assert assigned_ids == [0, 1]
+
+    # Multi-replica path joins the monitor threads instead of calling
+    # ``monitor_engine_liveness`` synchronously on the main thread, but every
+    # manager must still be shut down in the finally block.
+    manager_a.shutdown.assert_called_once_with()
+    manager_b.shutdown.assert_called_once_with()
+
+
+def test_run_headless_diffusion_registers_and_spawns_proc(mocker: MockerFixture) -> None:
+    """Diffusion headless: registers as auto-assign, spawns a single
+    ``StageDiffusionProc`` per local replica, and waits for it via
+    ``multiprocessing.connection.wait``."""
+    from vllm_omni.engine.stage_engine_startup import StageRegistrationResponse
+
+    stage_cfg = _make_stage_cfg(1, stage_type="diffusion")
+    od_config = mocker.Mock()
+    proc = mocker.Mock(sentinel=object(), exitcode=0)
+    proc.is_alive.return_value = False
+
+    mocker.patch(
+        "vllm_omni.config.resolver.resolve_omni_config",
+        return_value=_resolved(stage_cfg),
+    )
+    mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
+    mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
+    mocker.patch(
+        "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
+        return_value=(None, None, None),
+    )
+    mocker.patch(
+        "vllm_omni.engine.stage_init_utils.extract_legacy_stage_metadata",
+        return_value=SimpleNamespace(stage_id=1, stage_type="diffusion"),
+    )
+    mock_inject = mocker.patch("vllm_omni.engine.stage_init_utils.inject_kv_stage_info")
+    mocker.patch("vllm_omni.engine.stage_init_utils.build_diffusion_config", return_value=od_config)
+    mock_register = mocker.patch(
+        "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
+        return_value=StageRegistrationResponse(
+            handshake_address="tcp://127.0.0.1:26001",
+            input_address="tcp://127.0.0.1:26002",
+            output_address="tcp://127.0.0.1:26003",
+            replica_id=0,
+            coordinator_router_address="tcp://127.0.0.1:26100",
+        ),
+    )
+    fake_manager = SimpleNamespace(
+        proc=proc,
+        addresses=SimpleNamespace(
+            inputs=["tcp://127.0.0.1:26002"],
+            outputs=["tcp://127.0.0.1:26003"],
+        ),
+        shutdown=mocker.Mock(),
+    )
+    mock_manager = mocker.patch(
+        "vllm_omni.diffusion.stage_diffusion_proc.StageDiffusionProcManager.launch_headless",
+        return_value=fake_manager,
+    )
+    # Replace the blocking wait with one that returns the only proc's sentinel
+    # immediately so the test does not hang.
+    mocker.patch(
+        "multiprocessing.connection.wait",
+        side_effect=lambda sentinels: [sentinels[0]],
+    )
+    mocker.patch("signal.signal")
+
+    run_headless(_make_headless_args(stage_id=1))
+
+    mock_inject.assert_called_once()
+    assert mock_inject.call_args.args[0] is stage_cfg
+    assert mock_inject.call_args.args[1] == 1
+    assert mock_inject.call_args.args[2] == [stage_cfg]
+
+    reg_kwargs = mock_register.call_args.kwargs
+    assert reg_kwargs["omni_master_address"] == "127.0.0.1"
+    assert reg_kwargs["omni_master_port"] == 26000
+    assert reg_kwargs["omni_stage_id"] == 1
+    assert reg_kwargs["omni_stage_config"] is stage_cfg
+    assert reg_kwargs["replica_id"] is None
+    assert "socket_ownership" not in reg_kwargs
+
+    manager_kwargs = mock_manager.call_args.kwargs
+    assert manager_kwargs["handshake_address"] == "tcp://127.0.0.1:26001"
+    assert manager_kwargs["addresses"].inputs == ["tcp://127.0.0.1:26002"]
+    assert manager_kwargs["addresses"].outputs == ["tcp://127.0.0.1:26003"]
+    assert manager_kwargs["omni_coordinator_address"] == "tcp://127.0.0.1:26100"
+    assert manager_kwargs["omni_stage_id"] == 1
+    assert manager_kwargs["omni_replica_id"] == 0
+
+
+def test_run_headless_generic_diffusion_launches_structured_stage(mocker: MockerFixture) -> None:
+    """Headless resolution starts the typed stage through the real group launcher."""
+    from vllm_omni.engine import stage_engine_startup as startup_module
+
+    mocker.patch("vllm_omni.config.resolver.StageConfigFactory.create_from_model", return_value=None)
+    mocker.patch(
+        "vllm_omni.config.resolver._resolve_generic_diffusion_model_class",
+        return_value=(True, "FakeDiffusionPipeline"),
+    )
+    mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
+    mocker.patch.object(startup_module.stage_init_utils, "load_omni_transfer_config_for_model", return_value=None)
+    mocker.patch.object(
+        startup_module.initialization,
+        "resolve_omni_kv_config_for_stage",
+        return_value=(None, None, None),
+    )
+    captured: dict[str, Any] = {}
+    od_config = SimpleNamespace()
+
+    def _build_diffusion_config(model, stage_config, metadata):
+        captured.update(model=model, stage_config=stage_config, metadata=metadata)
+        return od_config
+
+    def _launch_replica_group(**kwargs):
+        captured.update(group_kwargs=kwargs)
+        captured["manager"] = kwargs["launch_one"](0)
+
+    def _launch_replica(**kwargs):
+        captured.update(replica_kwargs=kwargs)
+        return SimpleNamespace(exitcode=None)
+
+    mocker.patch.object(startup_module.stage_init_utils, "build_diffusion_config", side_effect=_build_diffusion_config)
+    mocker.patch.object(startup_module, "launch_headless_replica_group", side_effect=_launch_replica_group)
+    mocker.patch.object(startup_module, "launch_headless_diffusion_replica", side_effect=_launch_replica)
+
+    explicit_keys = frozenset(
+        {
+            "model",
+            "stage_id",
+            "omni_master_address",
+            "omni_master_port",
+            "worker_backend",
+            "model_class_name",
+            "num_gpus",
+        }
+    )
+    args = _make_headless_args(
+        explicit_keys=explicit_keys,
+        model="generic-diffusion",
+        model_class_name="FakeDiffusionPipeline",
+        num_gpus=1,
+    )
+
+    run_headless(args)
+
+    stage = captured["stage_config"]
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert captured["metadata"].stage_type == "diffusion"
+    assert captured["metadata"].model_stage == "diffusion"
+    assert captured["model"] == "generic-diffusion"
+    assert captured["group_kwargs"]["stage_id"] == 0
+    assert captured["group_kwargs"]["omni_dp_size_local"] == 1
+    assert captured["group_kwargs"]["per_replica_devices"] == ["0"]
+    assert captured["replica_kwargs"]["stage_config"] is stage
+    assert captured["replica_kwargs"]["stage_id"] == 0
+    assert captured["replica_kwargs"]["omni_master_address"] == "127.0.0.1"
+    assert captured["replica_kwargs"]["omni_master_port"] == 26000
+    assert captured["replica_kwargs"]["od_config"] is od_config
+    assert stage.runtime_config.devices == "0"
+
+
+def test_run_headless_diffusion_raises_on_nonzero_proc_exit(mocker: MockerFixture) -> None:
+    """A diffusion replica that exits with a non-zero code must surface as a
+    RuntimeError from ``run_headless`` (the head needs the signal to roll
+    back its own stage init)."""
+    from vllm_omni.engine.stage_engine_startup import StageRegistrationResponse
+
+    stage_cfg = _make_stage_cfg(1, stage_type="diffusion")
+    proc = mocker.Mock(sentinel=object(), exitcode=137, name="proc-stage1-rep0")
+    proc.is_alive.return_value = False
+
+    mocker.patch(
+        "vllm_omni.config.resolver.resolve_omni_config",
+        return_value=_resolved(stage_cfg),
+    )
+    mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
+    mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
+    mocker.patch(
+        "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
+        return_value=(None, None, None),
+    )
+    mocker.patch(
+        "vllm_omni.engine.stage_init_utils.extract_legacy_stage_metadata",
+        return_value=SimpleNamespace(stage_id=1, stage_type="diffusion"),
+    )
+    mocker.patch("vllm_omni.engine.stage_init_utils.inject_kv_stage_info")
+    mocker.patch("vllm_omni.engine.stage_init_utils.build_diffusion_config", return_value=mocker.Mock())
+    mocker.patch(
+        "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
+        return_value=StageRegistrationResponse(
+            handshake_address="tcp://127.0.0.1:26001",
+            input_address="tcp://127.0.0.1:26002",
+            output_address="tcp://127.0.0.1:26003",
+            replica_id=0,
+            coordinator_router_address=None,
+        ),
+    )
+    mocker.patch(
+        "vllm_omni.diffusion.stage_diffusion_proc.StageDiffusionProcManager.launch_headless",
+        return_value=SimpleNamespace(proc=proc, shutdown=mocker.Mock()),
+    )
+    mocker.patch(
+        "multiprocessing.connection.wait",
+        side_effect=lambda sentinels: [sentinels[0]],
+    )
+    mocker.patch("signal.signal")
+
+    with pytest.raises(RuntimeError, match=r"exited with code 137"):
+        run_headless(_make_headless_args(stage_id=1))
+
+
+@pytest.mark.parametrize("name", ["unfiltered_ns", "explicit_keys", "missing", "__dict__"])
+def test_tracking_namespace_uninitialized_access_raises_attribute_error(name):
+    namespace = object.__new__(TrackingNamespace)
+    with pytest.raises(AttributeError):
+        getattr(namespace, name)
+
+
+@pytest.mark.parametrize("deep", [False, True])
+def test_tracking_namespace_copy_preserves_tracking(deep):
+    import copy
+
+    namespace = TrackingNamespace(
+        argparse.Namespace(model="example", api_server_count=2), frozenset({"api_server_count"})
+    )
+    restored = copy.deepcopy(namespace) if deep else copy.copy(namespace)
+    assert restored.get_explicit_kwargs_dict() == {"api_server_count": 2}
+    assert restored.model == "example"

@@ -1,15 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Stage input processor for Qwen3-TTS: Talker -> Code2Wav."""
 
+import time
+from collections.abc import Mapping
 from typing import Any
 
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.data_entry_keys import (
+    CodesStruct,
+    MetaStruct,
+    OmniPayload,
+    OmniPayloadStruct,
+    to_dict,
+)
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
+    AdaptiveChunkController,
+    compute_adaptive_emit,
     compute_dynamic_initial_chunk_size,
+    compute_ramp_emit,
     max_ic_for_chunk_size,
+    parse_adaptive_config,
+    parse_chunk_ramp,
 )
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
+    extract_full_utterance_decode_from_request,
     extract_language_from_prompt,
     extract_language_from_request,
     extract_speaker_from_prompt,
@@ -19,110 +37,40 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
 logger = init_logger(__name__)
 
 
-def talker2code2wav(
-    stage_list: list[Any],
-    engine_input_source: list[int],
-    prompt: Any = None,
-    requires_multimodal_data: bool = False,
-) -> list[Any]:
-    """Non-async: collect all talker codes, then pass to code2wav at once."""
-    from vllm_omni.inputs.data import OmniTokensPrompt
-    from vllm_omni.model_executor.stage_input_processors.qwen3_omni import _validate_stage_inputs
+def _qwen3_tts_degenerate_finished_payload():
+    """Single-placeholder-frame finished payload for a degenerate talker take.
 
-    talker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
-    code2wav_inputs: list[OmniTokensPrompt] = []
-    for i, talker_output in enumerate(talker_outputs):
-        if not talker_output.finished:
-            # Non-async decode should only run once, after talker has
-            # accumulated the final code sequence.
-            continue
-        output = talker_output.outputs[0]
-        # audio_codes shape: [num_frames, Q] where Q=num_quantizers (16)
-        audio_codes = output.multimodal_output["audio_codes"].to(torch.long)
-        token_ids = output.token_ids
-        # token_ids provides an upper bound on the newly generated codec span.
-        # audio_codes may still contain zero-padded / invalid rows, so trim only
-        # after filtering valid frames instead of trying to align EOS indices.
-        seq_len = max(len(token_ids) - 1, 0)
-        # Filter invalid frames: zero-padded (EOS) and frames containing
-        # out-of-range values (e.g. stop_token_id=2150 exceeds codebook_size=2048).
-        _CODEBOOK_SIZE = 2048
-        valid_mask = audio_codes.any(dim=1) & (audio_codes.max(dim=1).values < _CODEBOOK_SIZE)
-        audio_codes = audio_codes[valid_mask]
-        if seq_len > 0 and audio_codes.ndim == 2 and int(audio_codes.shape[0]) > seq_len:
-            audio_codes = audio_codes[-seq_len:]
-        ref_code = output.multimodal_output.get("ref_code")
-        ref_code_len = output.multimodal_output.get("ref_code_len")
-        if isinstance(ref_code_len, torch.Tensor):
-            ref_code_len = int(ref_code_len.reshape(-1)[-1].item()) if ref_code_len.numel() > 0 else 0
-        elif ref_code_len is None:
-            ref_code_len = 0
-        else:
-            ref_code_len = int(ref_code_len)
-        if isinstance(ref_code, list):
-            ref_code = ref_code[0] if ref_code else None
-        if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-            ref_code = ref_code.to(torch.long).cpu().contiguous()
-            if ref_code.ndim == 1:
-                num_quantizers = int(audio_codes.shape[1]) if audio_codes.ndim == 2 and audio_codes.shape[1] > 0 else 16
-                if ref_code.numel() % num_quantizers != 0:
-                    logger.warning(
-                        "Ignoring malformed ref_code with %d elements not divisible by num_quantizers=%d",
-                        ref_code.numel(),
-                        num_quantizers,
-                    )
-                    ref_code = None
-                else:
-                    ref_code = ref_code.reshape(-1, num_quantizers)
-            elif ref_code.ndim != 2:
-                logger.warning("Ignoring malformed ref_code shape %s", tuple(ref_code.shape))
-                ref_code = None
-            if isinstance(ref_code, torch.Tensor) and ref_code_len > 0 and int(ref_code.shape[0]) > ref_code_len:
-                logger.warning(
-                    "Trimming ref_code from %d frames to ref_code_len=%d before Code2Wav.",
-                    int(ref_code.shape[0]),
-                    ref_code_len,
-                )
-                ref_code = ref_code[:ref_code_len]
-            if not isinstance(ref_code, torch.Tensor):
-                ref_code_len = 0
-            else:
-                ref_code_len = int(ref_code.shape[0])
-                audio_codes = torch.cat([ref_code.to(audio_codes.device), audio_codes], dim=0)
-        else:
-            ref_code_len = 0
-        # Code2Wav expects codebook-major flat: [Q*num_frames]
-        codec_codes = audio_codes.transpose(0, 1).cpu().reshape(-1).tolist()
-        additional_information: dict[str, Any] = {}
-        if ref_code_len > 0:
-            additional_information["left_context_size"] = [ref_code_len]
-        # Propagate speaker and language from the original prompt so they are
-        # available as runtime_additional_information in later pipeline stages,
-        # consistent with qwen3-omni and qwen2.5-omni stage input processors.
-        speaker = extract_speaker_from_prompt(prompt, index=i)
-        if speaker is not None:
-            additional_information["speaker"] = speaker
-        language = extract_language_from_prompt(prompt, index=i)
-        if language is not None:
-            additional_information["language"] = language
-        code2wav_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=codec_codes,
-                multi_modal_data=None,
-                mm_processor_kwargs=None,
-                additional_information=additional_information if additional_information else None,
-            )
-        )
-    return code2wav_inputs
+    Returning ``None`` here makes the connector silently drop the request, and
+    Stage-1's wait gate then polls to ``connector_get_max_wait`` (#4463).
+    Returning an *empty* finished payload (zero codec frames) is no better on
+    full-payload deploys: it produces a zero-token Stage-1 request, which the
+    generation scheduler placeholder-schedules once and then never collects
+    (the ``required_tokens <= 0`` branch only finishes requests through the
+    async-chunk transfer adapter). The request is left parked in ``running``
+    while the base-scheduler fallback schedules it at ``num_new_tokens = -1``,
+    which killed the whole stage EngineCore before #5269 and no-ops after it,
+    so the request never finishes either way (#5196, #5471).
+
+    The placeholder is one all-ones frame, emitted flat (codebook-major, the
+    same wire format the normal path below produces). Its values are valid by
+    ``_filter_audio_codes_qwen3_tts`` (non-negative, not all-zero, below
+    ``_CODEBOOK_SIZE``), so the request runs the normal one-shot code2wav
+    path and finishes cleanly with a single frame (~80 ms at 12 Hz) of
+    placeholder audio.
+    """
+    return {
+        "codes": {"audio": torch.ones(_NUM_QUANTIZERS_DEFAULT, dtype=torch.long)},
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
 
 
-def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
-    audio_codes = pooling_output.get("audio_codes")
+def _extract_last_frame(multimodal_output: OmniPayload | dict[str, Any]) -> torch.Tensor | None:
+    audio_codes = multimodal_output.get("codes", {}).get("audio")
     if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
         return None
     if audio_codes.ndim == 2:
         frame = audio_codes[-1]
-        if frame.numel() == 0 or not bool(frame.any().item()):
+        if frame.numel() == 0:
             return None
         return frame.to(torch.long).reshape(-1)
     if audio_codes.ndim == 1:
@@ -130,12 +78,37 @@ def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
     raise ValueError(f"Invalid audio_codes shape for Qwen3-TTS async_chunk: {tuple(audio_codes.shape)}")
 
 
+def _should_append_async_frame(
+    multimodal_output: OmniPayload | dict[str, Any],
+    frame: torch.Tensor,
+) -> bool:
+    meta = multimodal_output.get("meta", {})
+    frame_valid = meta.get("codec_frame_valid") if isinstance(meta, Mapping) else None
+    if isinstance(frame_valid, torch.Tensor):
+        if frame_valid.numel() == 0:
+            raise ValueError("codec_frame_valid must not be empty")
+        # A single request can carry a multi-token prefill span. The model
+        # emits one validity entry per codec row, while _extract_last_frame()
+        # selects the final row from that span.
+        return bool(frame_valid.reshape(-1)[-1].item())
+    if frame_valid is not None:
+        return bool(frame_valid)
+    # Compatibility for payload producers predating the explicit validity
+    # contract. Real Qwen3-TTS outputs carry codec_frame_valid and avoid this
+    # value-dependent synchronization.
+    return bool(frame.any().item())
+
+
+def _append_tensor_frame(transfer_manager: Any, request_id: str, frame: torch.Tensor) -> None:
+    transfer_manager.code_prompt_token_ids[request_id].append(frame.detach().to(torch.long).reshape(-1).contiguous())
+
+
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
-    pooling_output: dict[str, Any] | None,
+    multimodal_output: OmniPayload | dict[str, Any] | None,
     request: Any,
     is_finished: bool = False,
-) -> dict[str, Any] | None:
+) -> OmniPayloadStruct | None:
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
     request_payload = getattr(transfer_manager, "request_payload", None)
@@ -143,14 +116,13 @@ def talker2code2wav_async_chunk(
         request_payload = {}
         transfer_manager.request_payload = request_payload
 
-    if isinstance(pooling_output, dict):
-        frame = _extract_last_frame(pooling_output)
-        if frame is not None:
-            codec_codes = frame.cpu().tolist()
-            transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
-        ref_code = pooling_output.get("ref_code")
+    if isinstance(multimodal_output, Mapping):
+        frame = _extract_last_frame(multimodal_output)
+        if frame is not None and _should_append_async_frame(multimodal_output, frame):
+            _append_tensor_frame(transfer_manager, request_id, frame)
+        ref_code = multimodal_output.get("codes", {}).get("ref")
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
-            request_payload[request_id] = ref_code.to(torch.long).cpu().contiguous()
+            request_payload[request_id] = ref_code.detach().to(torch.long).contiguous()
     elif not finished:
         return None
 
@@ -159,10 +131,30 @@ def talker2code2wav_async_chunk(
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     chunk_size = int(cfg.get("codec_chunk_frames", 25))
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
+    configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
+    ref_code_context_frames = int(cfg.get("ref_code_context_frames") or left_context_size_config)
+
+    # Ramp: parse once per transfer_manager (config is static for the adapter's
+    # lifetime). When active, ramp replaces IC/steady entirely — skip dynamic IC.
+    if not hasattr(transfer_manager, "_ramp_parsed"):
+        transfer_manager._ramp_parsed = parse_chunk_ramp(cfg, steady=chunk_size)
+    ramp = transfer_manager._ramp_parsed
+
+    # Adaptive: parse once per transfer_manager.
+    # Takes precedence over fixed ramp when both are configured.
+    if not hasattr(transfer_manager, "_adaptive_parsed"):
+        transfer_manager._adaptive_parsed = parse_adaptive_config(cfg)
+    (
+        adaptive_enabled,
+        adaptive_min,
+        adaptive_margin,
+        adaptive_divisor,
+        adaptive_delta_min,
+    ) = transfer_manager._adaptive_parsed
 
     # Per-request override takes priority over dynamic IC.
-    per_request_override = False
-    initial_chunk_size = 0
+    fixed_initial_chunk_size = configured_initial_chunk_size > 0
+    initial_chunk_size = configured_initial_chunk_size
     additional_information = getattr(request, "additional_information", None)
 
     if (
@@ -173,10 +165,15 @@ def talker2code2wav_async_chunk(
         entry = additional_information.entries["initial_codec_chunk_frames"]
         if entry.list_data is not None and len(entry.list_data) == 1:
             initial_chunk_size = int(entry.list_data[0])
-            per_request_override = True
+            fixed_initial_chunk_size = True
 
     # Dynamic IC: cache per request so boundaries stay stable for its lifetime.
-    if not per_request_override:
+    # Skipped when fixed ramp is active (ramp replaces IC/steady entirely) or
+    # a fixed IC is configured — unless adaptive is active, in which case
+    # dynamic IC always runs (used for chunk 0), even if
+    # initial_codec_chunk_frames is configured.
+    skip_dynamic_ic = (ramp is not None or fixed_initial_chunk_size) and not adaptive_enabled
+    if not skip_dynamic_ic:
         _ic_cache = getattr(transfer_manager, "_cached_ic", None)
         if _ic_cache is None:
             _ic_cache = {}
@@ -188,11 +185,18 @@ def talker2code2wav_async_chunk(
             _ic_cache[request_id] = compute_dynamic_initial_chunk_size(active, capacity, max_ic)
         initial_chunk_size = _ic_cache[request_id]
 
-    if chunk_size <= 0 or left_context_size_config < 0 or initial_chunk_size < 0:
+    if (
+        chunk_size <= 0
+        or left_context_size_config < 0
+        or configured_initial_chunk_size < 0
+        or initial_chunk_size < 0
+        or ref_code_context_frames < 0
+    ):
         raise ValueError(
             f"Invalid codec chunk config: codec_chunk_frames={chunk_size}, "
             f"codec_left_context_frames={left_context_size_config}, "
-            f"initial_codec_chunk_frames={initial_chunk_size}"
+            f"initial_codec_chunk_frames={initial_chunk_size}, "
+            f"ref_code_context_frames={ref_code_context_frames}"
         )
 
     if initial_chunk_size > chunk_size:
@@ -203,68 +207,523 @@ def talker2code2wav_async_chunk(
         )
         initial_chunk_size = chunk_size
     length = len(transfer_manager.code_prompt_token_ids[request_id])
+    emitted_frames = getattr(transfer_manager, "_qwen3_tts_emitted_frames", None)
+    if emitted_frames is None:
+        emitted_frames = {}
+        transfer_manager._qwen3_tts_emitted_frames = emitted_frames
+    if request_id in emitted_frames and length <= emitted_frames[request_id]:
+        if finished:
+            return OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                meta=MetaStruct(request_id=request_id, left_context_size=0, finished=torch.tensor(True)),
+            )
+        return None
+
+    # Full-utterance Code2Wav is gated by ``full_utterance_decode`` (explicit
+    # opt-in via additional_information). Do not reuse ``non_streaming_mode``:
+    # that flag is prompt construction only and VoiceDesign defaults it to True
+    # even for streaming responses (#4198, #6898 review). When True, defer
+    # connector chunks until the talker finishes so Code2Wav decodes once.
+    full_utterance_decode = extract_full_utterance_decode_from_request(request)
+    if full_utterance_decode is True and not finished:
+        return None
 
     if length <= 0:
         if finished:
-            return {
-                "code_predictor_codes": [],
-                "finished": True,
-            }
+            return OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                meta=MetaStruct(
+                    request_id=request_id,
+                    left_context_size=0,
+                    finished=torch.tensor(True, dtype=torch.bool),
+                ),
+            )
         return None
 
-    in_initial_phase = initial_chunk_size > 0 and initial_chunk_size < chunk_size and length <= chunk_size
+    if full_utterance_decode is True:
+        first_chunk = int(transfer_manager.put_req_chunk.get(request_id, 0)) <= 0
+        context_length = length
+    elif adaptive_enabled:
+        _adaptive_states = getattr(transfer_manager, "_adaptive_states", None)
+        if _adaptive_states is None:
+            _adaptive_states = {}
+            transfer_manager._adaptive_states = _adaptive_states
 
-    if in_initial_phase:
-        # IC phase: emit every initial_chunk_size frames with growing left context.
-        if not finished and length % initial_chunk_size != 0:
+        ctrl = _adaptive_states.get(request_id)
+        chunk_index = transfer_manager.ramp_chunk_count.get(request_id, 0)
+        first_chunk = chunk_index <= 0
+
+        if ctrl is None or chunk_index == 0:
+            use_first_chunk = initial_chunk_size > 0 and initial_chunk_size < chunk_size
+
+            if use_first_chunk and length <= initial_chunk_size:
+                if not finished and length < initial_chunk_size:
+                    return None
+                context_length = length if finished and length < initial_chunk_size else initial_chunk_size
+            else:
+                initial_coverage = initial_chunk_size if use_first_chunk else 0
+                adjusted = length - initial_coverage
+                if not finished and adjusted % chunk_size != 0:
+                    return None
+                chunk_length = adjusted % chunk_size
+                context_length = chunk_length if chunk_length != 0 else chunk_size
+
+            # Chunk 0: target_size equals context_length (no overshoot possible
+            # — IC logic emits exactly what's accumulated up to the IC boundary).
+            target_size = context_length
+
+            now = time.monotonic()
+            ctrl = AdaptiveChunkController(
+                first_emit_time=now,
+                last_emit_time=now,
+                ramp_divisor=adaptive_divisor,
+                ramp_delta_min=adaptive_delta_min,
+            )
+            _adaptive_states[request_id] = ctrl
+        else:
+            now = time.monotonic()
+            target_size = ctrl.compute_next_chunk_size(
+                now,
+                adaptive_min,
+                chunk_size,
+                adaptive_margin,
+            )
+            emit, context_length = compute_adaptive_emit(
+                length,
+                ctrl.accumulated_at_last_emit,
+                target_size,
+                finished,
+            )
+            if not emit:
+                return None
+            if context_length == 0:
+                ctrl.log_summary(request_id)
+                return OmniPayloadStruct(
+                    codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                    meta=MetaStruct(
+                        request_id=request_id,
+                        left_context_size=0,
+                        finished=torch.tensor(True, dtype=torch.bool),
+                    ),
+                )
+
+    elif ramp is not None:
+        chunk_index = transfer_manager.ramp_chunk_count.get(request_id, 0)
+        first_chunk = chunk_index <= 0
+        emit, context_length = compute_ramp_emit(length, chunk_index, ramp, chunk_size, finished)
+        if not emit:
             return None
-        context_length = (
-            length % initial_chunk_size if (finished and length % initial_chunk_size != 0) else initial_chunk_size
-        )
+        if context_length == 0:
+            return OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                meta=MetaStruct(
+                    request_id=request_id,
+                    left_context_size=0,
+                    finished=torch.tensor(True, dtype=torch.bool),
+                ),
+            )
     else:
-        # Normal phase: offset so the first normal emit picks up after IC phase.
-        # IC is stateless (may change with load); any mismatch is absorbed by left_context.
-        initial_coverage = (
-            (chunk_size // initial_chunk_size) * initial_chunk_size if 0 < initial_chunk_size < chunk_size else 0
-        )
-        adjusted = length - initial_coverage
-        if not finished and adjusted % chunk_size != 0:
-            return None
-        chunk_length = adjusted % chunk_size
-        context_length = chunk_length if chunk_length != 0 else chunk_size
+        first_chunk = int(transfer_manager.put_req_chunk.get(request_id, 0)) <= 0
+        use_first_chunk = initial_chunk_size > 0 and initial_chunk_size < chunk_size
 
-    end_index = min(length, left_context_size_config + context_length)
-    left_context_size = max(0, end_index - context_length)
-    window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
+        if use_first_chunk and length <= initial_chunk_size:
+            if not finished and length < initial_chunk_size:
+                return None
+            context_length = length if finished and length < initial_chunk_size else initial_chunk_size
+        else:
+            initial_coverage = initial_chunk_size if use_first_chunk else 0
+            adjusted = length - initial_coverage
+            if not finished and adjusted % chunk_size != 0:
+                return None
+            chunk_length = adjusted % chunk_size
+            context_length = chunk_length if chunk_length != 0 else chunk_size
 
-    # Prepend ref_code as decoder context for every chunk so the vocoder
-    # maintains voice-clone speaker identity throughout the stream.  The HF
-    # reference decodes ref_code + all_codes in one pass; without ref_code
-    # context on later chunks the decoder loses speaker identity and produces
-    # distorted audio.  Use `.get()` (not `.pop()`) to keep ref_code for
-    # subsequent chunks.
+    if finished and first_chunk:
+        context_length = length
+    if request_id in emitted_frames:
+        context_length = min(context_length, length - emitted_frames[request_id])
+
+    if adaptive_enabled:
+        ctrl = transfer_manager._adaptive_states.get(request_id)
+        if ctrl is not None:
+            ctrl.record_emit(time.monotonic(), context_length, length, target_size)
+            if finished:
+                ctrl.log_summary(request_id)
+
+    # Code2Wav keeps the quantizer/conv/Transformer context per request. Ship
+    # only the newly completed codec frames after the first chunk.
+    window_frames = transfer_manager.code_prompt_token_ids[request_id][-context_length:]
+    left_context_size = 0
+
+    # ICL reference codes are part of the first decoder initialization only.
+    # Follow-up chunks rely entirely on the request-local decoder cache.
     ref_code = request_payload.get(request_id)
+    emitted_chunks = int(transfer_manager.put_req_chunk.get(request_id, 0))
+    ref_context_size = 0
+    ref_context_request_id: str | None = None
+    ref_context_included = False
     if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-        ref_frames = ref_code.tolist()
-        window_frames = ref_frames + window_frames
-        left_context_size += len(ref_frames)
+        if ref_code.ndim == 1:
+            num_quantizers = len(window_frames[0])
+            if ref_code.numel() % num_quantizers == 0:
+                ref_code = ref_code.reshape(-1, num_quantizers)
+            else:
+                logger.warning(
+                    "Ignoring malformed ref_code with %d elements not divisible by num_quantizers=%d",
+                    ref_code.numel(),
+                    num_quantizers,
+                )
+                ref_code = None
+        elif ref_code.ndim != 2:
+            logger.warning("Ignoring malformed ref_code shape %s", tuple(ref_code.shape))
+            ref_code = None
+    if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
+        ref_context = ref_code
+        if ref_code_context_frames > 0 and int(ref_context.shape[0]) > ref_code_context_frames:
+            logger.debug(
+                "Qwen3-TTS async chunk uses the last %d/%d ref_code frames as bounded Code2Wav context.",
+                ref_code_context_frames,
+                int(ref_context.shape[0]),
+            )
+            ref_context = ref_context[-ref_code_context_frames:]
+        ref_context_size = int(ref_context.shape[0]) if ref_context.ndim > 1 else 0
+        if ref_context_size > 0:
+            if emitted_chunks <= 0:
+                ref_context_request_id = request_id
+                ref_frames = ref_context.tolist()
+                window_frames = ref_frames + window_frames
+                ref_context_included = True
+                left_context_size = ref_context_size
 
     num_quantizers = len(window_frames[0])
     num_frames = len(window_frames)
-    code_predictor_codes = [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)]
+    code_predictor_codes = torch.tensor(
+        [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)],
+        dtype=torch.long,
+    )
 
-    info: dict[str, Any] = {
-        "code_predictor_codes": code_predictor_codes,
-        "left_context_size": left_context_size,
-        "finished": finished,
+    meta = MetaStruct(
+        request_id=request_id,
+        left_context_size=left_context_size,
+        finished=torch.tensor(finished, dtype=torch.bool),
+    )
+    if ref_context_size > 0 and ref_context_request_id is not None:
+        meta.ref_context_size = ref_context_size
+        meta.ref_context_request_id = ref_context_request_id
+        meta.ref_context_included = ref_context_included
+
+    emitted_frames[request_id] = length
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=code_predictor_codes),
+        meta=meta,
+        speaker=extract_speaker_from_request(request),
+        language=extract_language_from_request(request),
+    )
+
+
+def _copy_async_chunk_tensors_to_cpu(
+    tensors: list[torch.Tensor],
+) -> list[torch.Tensor]:
+    """Materialize one producer cohort with at most one D2H per device."""
+    if not tensors:
+        return []
+
+    outputs: list[torch.Tensor | None] = [None] * len(tensors)
+    by_device: dict[torch.device, list[tuple[int, torch.Tensor]]] = {}
+    for index, tensor in enumerate(tensors):
+        value = tensor.detach().to(dtype=torch.long).reshape(-1).contiguous()
+        if value.device.type == "cpu":
+            outputs[index] = value
+        else:
+            by_device.setdefault(value.device, []).append((index, value))
+
+    for entries in by_device.values():
+        lengths = [int(value.numel()) for _, value in entries]
+        combined = torch.cat([value for _, value in entries], dim=0).to(device="cpu")
+        offset = 0
+        for (index, source), length in zip(entries, lengths):
+            outputs[index] = combined[offset : offset + length].reshape(source.shape).contiguous()
+            offset += length
+
+    return [value for value in outputs if value is not None]
+
+
+def talker2code2wav_async_chunk_batch(
+    transfer_manager: Any,
+    pooling_outputs: list[OmniPayload | dict[str, Any] | None],
+    requests: list[Any],
+    is_finished: list[bool],
+) -> list[OmniPayloadStruct | None]:
+    """Build one Talker model-step worth of Code2Wav payloads.
+
+    MRv2 invokes this hook from its ordered native output worker. Codec frames
+    and first-chunk reference codes from the same model step are copied as a
+    cohort, while chunk boundaries and request metadata remain delegated to the
+    scalar builder below.
+    """
+    if not (len(pooling_outputs) == len(requests) == len(is_finished)):
+        raise ValueError("batch codec inputs must have identical lengths")
+
+    request_payload = getattr(transfer_manager, "request_payload", None)
+    if request_payload is None:
+        request_payload = {}
+        transfer_manager.request_payload = request_payload
+
+    selected: list[torch.Tensor] = []
+    destinations: list[tuple[str, str, tuple[int, ...]]] = []
+    for pooling_output, request in zip(pooling_outputs, requests):
+        if not isinstance(pooling_output, Mapping):
+            continue
+        request_id = request.external_req_id
+        frame = _extract_last_frame(pooling_output)
+        if frame is not None and _should_append_async_frame(pooling_output, frame):
+            selected.append(frame)
+            destinations.append(("frame", request_id, tuple(frame.shape)))
+
+        ref_code = pooling_output.get("codes", {}).get("ref")
+        if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
+            selected.append(ref_code)
+            destinations.append(("ref", request_id, tuple(ref_code.shape)))
+
+    copied = _copy_async_chunk_tensors_to_cpu(selected)
+    for value, (kind, request_id, shape) in zip(copied, destinations):
+        value = value.reshape(shape)
+        if kind == "frame":
+            _append_tensor_frame(transfer_manager, request_id, value)
+        else:
+            request_payload[request_id] = value.contiguous()
+
+    payloads: list[OmniPayloadStruct | None] = []
+    for request, finished in zip(requests, is_finished):
+        payloads.append(
+            talker2code2wav_async_chunk(
+                transfer_manager=transfer_manager,
+                multimodal_output={},
+                request=request,
+                is_finished=finished,
+            )
+        )
+    return payloads
+
+
+# ============================================================================
+# Worker-connector data plane (non-async-chunk path).
+# AR runner's `flatten_payload` converts the model emit
+# `multimodal_outputs={"codes": {"audio": ..., "ref": ...},
+# "meta": {"ref_code_len": ..., "codec_streaming": ...}}` to flat dotted
+# keys (`codes.audio`, `codes.ref`, `meta.ref_code_len`,
+# `meta.codec_streaming`) before the full-payload accumulator runs.
+# - codes.audio is 2-D so default CONCAT across steps builds the full sequence.
+# - codes.ref is a list (not Tensor with dim>=2) so accumulator LATEST-wins
+#   keeps the prefill-emitted ref tensor across decode steps (which don't emit
+#   ref again).
+# - meta.ref_code_len is 1-D so LATEST-wins; consumer reads [-1].
+# ============================================================================
+
+# Per-model REPLACE-keys for the full-payload accumulator.  qwen3_tts's
+# producer side emits codec frames that should CONCAT (codes.audio) plus
+# scalars/lists that are correctly handled by default LATEST-wins, so this
+# stays empty.
+_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset()
+
+_CODEBOOK_SIZE = 2048
+_NUM_QUANTIZERS_DEFAULT = 16
+
+
+def _filter_audio_codes_qwen3_tts(audio_codes: torch.Tensor) -> torch.Tensor:
+    """Filter zero-padded, out-of-range, and negative-padded codec frames."""
+    if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
+        return audio_codes
+    if audio_codes.ndim != 2:
+        return audio_codes
+    valid_mask = (
+        (audio_codes >= 0).all(dim=1) & audio_codes.any(dim=1) & (audio_codes.max(dim=1).values < _CODEBOOK_SIZE)
+    )
+    return audio_codes[valid_mask]
+
+
+def _coerce_ref_code_len(raw) -> int:
+    """Coerce mm["meta"]["ref_code_len"] / pooling_output["meta.ref_code_len"]
+    raw value (Tensor | int | None) into a non-negative int; clamps any
+    negative input to 0 since downstream code treats this as a frame count."""
+    if isinstance(raw, torch.Tensor):
+        value = int(raw.reshape(-1)[-1].item()) if raw.numel() > 0 else 0
+    elif raw is None:
+        value = 0
+    else:
+        value = int(raw)
+    return max(value, 0)
+
+
+def _normalize_ref_code(ref_code, num_quantizers: int, ref_code_len: int):
+    """Coerce ref_code into a [ref_len, Q] tensor or None."""
+    if isinstance(ref_code, list):
+        ref_code = ref_code[0] if ref_code else None
+    if not isinstance(ref_code, torch.Tensor) or ref_code.numel() == 0:
+        return None, 0
+    ref_code = ref_code.to(torch.long).cpu().contiguous()
+    if ref_code.ndim == 1:
+        if ref_code.numel() % num_quantizers != 0:
+            return None, 0
+        ref_code = ref_code.reshape(-1, num_quantizers)
+    elif ref_code.ndim != 2:
+        return None, 0
+    if ref_code_len > 0 and int(ref_code.shape[0]) > ref_code_len:
+        ref_code = ref_code[:ref_code_len]
+    return ref_code, int(ref_code.shape[0])
+
+
+def talker2code2wav_token_only(
+    source_outputs: list,
+    prompt=None,
+    _requires_multimodal_data: bool = False,
+) -> list:
+    """Sync-side placeholder for the non-async-chunk Stage-1 (code2wav) input.
+
+    Sized to the expected codec token count (codebook-major flat:
+    Q * (ref_frames + audio_frames)).  Speaker / language metadata are
+    extracted from `prompt` and threaded via `additional_information`.
+    Actual codec ids are delivered via the worker connector payload built
+    by `talker2code2wav_full_payload`.
+    """
+    from vllm_omni.inputs.data import OmniTokensPrompt
+
+    code2wav_inputs: list = []
+    for i, talker_output in enumerate(source_outputs):
+        if not talker_output.finished:
+            continue
+        output = talker_output.outputs[0]
+        mm = output.multimodal_output if hasattr(output, "multimodal_output") else None
+        mm = mm if isinstance(mm, dict) else {}
+        mm_codes = mm.get("codes", {}) if isinstance(mm, dict) else {}
+        token_ids = getattr(output, "cumulative_token_ids", []) or []
+        seq_len = max(len(token_ids) - 1, 0)
+
+        audio = mm_codes.get("audio") if isinstance(mm_codes, dict) else None
+        if isinstance(audio, torch.Tensor) and audio.numel() > 0:
+            audio = audio.to(torch.long)
+            audio = _filter_audio_codes_qwen3_tts(audio)
+            if seq_len > 0 and audio.ndim == 2 and int(audio.shape[0]) > seq_len:
+                audio = audio[-seq_len:]
+            num_audio_frames = int(audio.shape[0]) if audio.ndim == 2 else 0
+            num_quantizers = int(audio.shape[1]) if audio.ndim == 2 and audio.shape[1] > 0 else _NUM_QUANTIZERS_DEFAULT
+        else:
+            num_audio_frames = 0
+            num_quantizers = _NUM_QUANTIZERS_DEFAULT
+
+        ref_code_raw = mm_codes.get("ref") if isinstance(mm_codes, dict) else None
+        ref_code_len_raw = mm.get("meta", {}).get("ref_code_len") if isinstance(mm.get("meta"), dict) else None
+        ref_code_len = _coerce_ref_code_len(ref_code_len_raw)
+        _, ref_frames = _normalize_ref_code(ref_code_raw, num_quantizers, ref_code_len)
+
+        # Codebook-major flat: Q * (ref_frames + audio_frames)
+        prompt_len = num_quantizers * (ref_frames + num_audio_frames)
+
+        additional_info = to_dict(
+            OmniPayloadStruct(
+                meta=MetaStruct(left_context_size=ref_frames) if ref_frames > 0 else None,
+                speaker=extract_speaker_from_prompt(prompt, index=i),
+                language=extract_language_from_prompt(prompt, index=i),
+            )
+        )
+        code2wav_inputs.append(
+            OmniTokensPrompt(
+                prompt_token_ids=[0] * prompt_len,
+                additional_information=additional_info if additional_info else None,
+                multi_modal_data=None,
+                mm_processor_kwargs=None,
+            )
+        )
+    return code2wav_inputs
+
+
+def talker2code2wav_full_payload(
+    transfer_manager,
+    pooling_output,
+    request,
+):
+    """Producer-side payload builder.
+
+    Reads accumulated codec from `pooling_output["codes.audio"]` (CONCAT
+    across steps via flatten_payload), latest `pooling_output["codes.ref"]`
+    (prefill-emitted), and latest `pooling_output["meta.ref_code_len"]`.
+    Filters invalid frames, crops to seq_len, prepends ref, and flattens
+    codebook-major for code2wav consumption.
+    """
+    del transfer_manager
+    rid = getattr(request, "request_id", "?")
+    if not isinstance(pooling_output, dict):
+        logger.warning(
+            "qwen3_tts.talker2code2wav_full_payload: pooling_output not a dict "
+            "(type=%s) for req=%s; consumer wait gate may hang.",
+            type(pooling_output).__name__,
+            rid,
+        )
+        return _qwen3_tts_degenerate_finished_payload()
+
+    # codes.audio — try flat dotted first (flatten_payload), then nested fallback.
+    audio = pooling_output.get("codes.audio")
+    if audio is None:
+        codes_nested = pooling_output.get("codes")
+        if isinstance(codes_nested, dict):
+            audio = codes_nested.get("audio")
+    if not isinstance(audio, torch.Tensor) or audio.numel() == 0:
+        logger.warning(
+            "qwen3_tts.talker2code2wav_full_payload: missing/empty codes.audio "
+            "(keys=%s) for req=%s; consumer wait gate may hang.",
+            list(pooling_output.keys()),
+            rid,
+        )
+        return _qwen3_tts_degenerate_finished_payload()
+    audio = audio.to(torch.long)
+    audio = _filter_audio_codes_qwen3_tts(audio)
+    if audio.numel() == 0:
+        logger.warning(
+            "qwen3_tts.talker2code2wav_full_payload: audio empty after codec "
+            "filter (negative/all-zero/out-of-range rows dropped) for req=%s.",
+            rid,
+        )
+        return _qwen3_tts_degenerate_finished_payload()
+
+    output_token_ids = list(getattr(request, "output_token_ids", None) or [])
+    seq_len = max(len(output_token_ids) - 1, 0)
+    if seq_len > 0 and audio.ndim == 2 and int(audio.shape[0]) > seq_len:
+        audio = audio[-seq_len:]
+
+    num_quantizers = int(audio.shape[1]) if audio.ndim == 2 and audio.shape[1] > 0 else _NUM_QUANTIZERS_DEFAULT
+
+    # meta.ref_code_len — flat dotted then nested fallback.
+    ref_code_len_raw = pooling_output.get("meta.ref_code_len")
+    if ref_code_len_raw is None:
+        meta_nested = pooling_output.get("meta")
+        if isinstance(meta_nested, dict):
+            ref_code_len_raw = meta_nested.get("ref_code_len")
+    ref_code_len = _coerce_ref_code_len(ref_code_len_raw)
+
+    # codes.ref — flat dotted then nested fallback.
+    ref_code_raw = pooling_output.get("codes.ref")
+    if ref_code_raw is None:
+        codes_nested = pooling_output.get("codes")
+        if isinstance(codes_nested, dict):
+            ref_code_raw = codes_nested.get("ref")
+    ref_code, ref_frames = _normalize_ref_code(ref_code_raw, num_quantizers, ref_code_len)
+    if ref_code is not None:
+        audio = torch.cat([ref_code.to(audio.device), audio], dim=0)
+
+    codec_codes = audio.transpose(0, 1).to(device="cpu", dtype=torch.long).reshape(-1).contiguous()
+    meta: dict[str, Any] = {"finished": torch.tensor(True, dtype=torch.bool)}
+    # Co-locate the Code2Wav trim length with the ref prepend it describes.
+    # The orchestrator-side ``talker2code2wav_token_only`` channel derives
+    # left_context_size from the stage-0 RequestOutput ``multimodal_output``,
+    # which no longer carries the talker codec (ref reads as absent, so it
+    # emits left_context_size=0).  This producer is the authoritative side
+    # that actually prepends ``ref_code``; if it does not also emit the
+    # matching ``left_context_size`` the consumer trims nothing and the
+    # reference audio leaks into the output (issue #4421).  Mirrors the
+    # async-chunk path, which already ships left_context_size in-band.
+    if ref_code is not None and ref_frames > 0:
+        meta["left_context_size"] = ref_frames
+    return {
+        "codes": {"audio": codec_codes},
+        "meta": meta,
     }
-    # Propagate speaker and language from the request so they are available
-    # as runtime_additional_information in subsequent pipeline stages, consistent
-    # with qwen3-omni and qwen2.5-omni stage input processors.
-    speaker = extract_speaker_from_request(request)
-    if speaker is not None:
-        info["speaker"] = speaker
-    language = extract_language_from_request(request)
-    if language is not None:
-        info["language"] = language
-    return info

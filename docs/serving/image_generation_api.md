@@ -32,6 +32,19 @@ curl -X POST http://localhost:8000/v1/images/generations \
   }' | jq -r '.data[0].b64_json' | base64 -d > dragon.png
 ```
 
+**Using curl save to file:**
+
+```bash
+curl -o dragon.png -X POST http://localhost:8000/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "a dragon laying over the spine of the Green Mountains of Vermont",
+    "size": "1024x1024",
+    "seed": 42,
+    "response_format":"file"
+  }'
+```
+
 **Using Python:**
 
 ```python
@@ -57,6 +70,36 @@ img = Image.open(io.BytesIO(img_bytes))
 img.save("cat.png")
 ```
 
+**Using Python save to file:**
+
+```python
+import requests
+import base64
+from PIL import Image
+import io
+import re
+
+response = requests.post(
+    "http://localhost:8000/v1/images/generations",
+    json={
+        "prompt": "a black and white cat wearing a princess tiara",
+        "size": "1024x1024",
+        "num_inference_steps": 50,
+        "seed": 42,
+        "response_format":"file"
+    }
+)
+
+# save to file
+content_disposition = response.headers.get("Content-Disposition", "")
+match = re.search(r'filename="?(.+)"?', content_disposition)
+filename = match.group(1) if match else "save.png"
+with open(filename, "wb") as f:
+    for chunk in response.iter_content(8192):
+        f.write(chunk)
+print("saved:", filename)
+```
+
 **Using OpenAI SDK:**
 
 ```python
@@ -79,7 +122,7 @@ response = client.images.generate(
 
 ### Endpoint
 
-```
+```text
 POST /v1/images/generations
 Content-Type: application/json
 ```
@@ -89,18 +132,18 @@ Content-Type: application/json
 #### OpenAI Standard Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `prompt` | string | **required** | Text description of the desired image |
 | `model` | string | server's model | Model to use (optional, should match server if specified) |
 | `n` | integer | 1 | Number of images to generate (1-10) |
 | `size` | string | model defaults | Image dimensions in WxH format (e.g., "1024x1024", "512x512") |
-| `response_format` | string | "b64_json" | Response format (only "b64_json" supported) |
+| `response_format` | string | "b64_json" | Response format (`"b64_json"` or `"file"`) |
 | `user` | string | null | User identifier for tracking |
 
 #### vllm-omni Extension Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `negative_prompt` | string | null | Text describing what to avoid in the image |
 | `num_inference_steps` | integer | model defaults | Number of diffusion steps |
 | `guidance_scale` | float | model defaults | Classifier-free guidance scale (typically 0.0-20.0) |
@@ -223,6 +266,7 @@ curl http://localhost:8000/v1/images/generations \
 ### Out of Memory
 
 If you encounter OOM errors:
+
 1. Reduce image size: `"size": "512x512"`
 2. Reduce inference steps: `"num_inference_steps": 25`
 3. Generate fewer images: `"n": 1`

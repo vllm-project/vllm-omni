@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Tests of common diffusion feature combinations in online serving mode
 for Z-Image.
@@ -13,12 +16,10 @@ exercise Z-Image's supported feature combinations:
 
 import pytest
 
-from tests.conftest import (
-    OmniServer,
-    OmniServerParams,
-    OpenAIClientHandler,
-)
-from tests.utils import hardware_marks
+from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
+
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 MODEL = "Tongyi-MAI/Z-Image-Turbo"
 PROMPT = "A high-detail studio photo of an orange tabby cat sitting on a laptop keyboard."
@@ -100,13 +101,11 @@ def _get_diffusion_feature_cases():
                 ],
             ),
             id="layerwise_hsdp",
-            marks=[*FOUR_CARD_MARKS, pytest.mark.skip(reason="issue #2435")],
+            marks=[*FOUR_CARD_MARKS],
         ),
     ]
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases(),
@@ -114,7 +113,7 @@ def _get_diffusion_feature_cases():
 )
 def test_zimage(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
 ):
     """Exercise supported Z-Image diffusion features in minimal CI cases."""
     request_config = {
@@ -129,4 +128,4 @@ def test_zimage(
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)

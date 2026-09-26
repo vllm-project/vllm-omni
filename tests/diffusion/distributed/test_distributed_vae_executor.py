@@ -1,4 +1,5 @@
-from unittest.mock import MagicMock, patch
+from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -58,48 +59,51 @@ class E2EOperator:
         return torch.cat(tiles, dim=0)
 
 
+@dataclass
+class FakeWorldGroup:
+    device_group: object
+
+
 class DummyMixin(DistributedVaeMixin):
     def __init__(self):
         self.use_tiling = True
-        self.distributed_executor = MagicMock()
-        self.distributed_executor.parallel_size = 2
-        self.distributed_executor.group = None
+        self.distributed_executor = SimpleNamespace(parallel_size=2, group=None)
 
 
 @pytest.fixture(autouse=True)
-def mock_dist():
-    with (
-        patch.object(dist, "get_world_size", return_value=2),
-        patch.object(dist, "get_rank", return_value=0),
-        patch.object(dist, "is_initialized", return_value=True),
-        patch.object(dist, "all_reduce", return_value=None),
-        patch.object(dist, "gather", return_value=None),
-        patch.object(dist, "broadcast", return_value=None),
-    ):
-        yield
+def mock_dist(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(dist, "get_world_size", lambda *args, **kwargs: 2)
+    monkeypatch.setattr(dist, "get_rank", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(dist, "gather", lambda *args, **kwargs: None)
+    monkeypatch.setattr(dist, "broadcast", lambda *args, **kwargs: None)
 
 
 @pytest.fixture(autouse=True)
-def mock_dit_group():
-    with patch(
-        "vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor.get_dit_group",
-        new=MagicMock(return_value=None),
-    ):
-        yield
+def mock_world_group(monkeypatch: pytest.MonkeyPatch):
+    group = object()
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor.get_world_group",
+        lambda: FakeWorldGroup(device_group=group),
+    )
+    return group
 
 
 @pytest.fixture(autouse=True)
-def mock_dist_vae_executor():
-    with (
-        patch.object(DistributedVaeExecutor, "gather_tensors", side_effect=lambda x: [x]),
-        patch.object(DistributedVaeExecutor, "broadcast_tensor", side_effect=lambda x: x),
-    ):
-        yield
+def mock_dist_vae_executor(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(DistributedVaeExecutor, "gather_tensors", lambda self, x: [x])
+    monkeypatch.setattr(DistributedVaeExecutor, "broadcast_tensor", lambda self, x: x)
 
 
 # ============================
 # Unitest
 # ============================
+
+
+def test_uses_dedicated_world_device_group(mock_world_group):
+    executor = DistributedVaeExecutor()
+    assert executor.group is mock_world_group
 
 
 def test_balance_tasks():

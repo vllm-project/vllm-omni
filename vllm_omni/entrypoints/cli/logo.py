@@ -1,6 +1,7 @@
+import os
 import re
 
-from vllm.logger import current_formatter_type, init_logger
+from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
@@ -41,5 +42,11 @@ _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
 
 def log_logo() -> None:
-    logo = LOGO if current_formatter_type(logger) == "color" else _ANSI_RE.sub("", LOGO)
+    # Bypass current_formatter_type() which has fragile handler-count/name
+    # checks that fail in some runtime configurations. Instead, directly
+    # check the env vars that control colored output — matching vLLM's
+    # _use_color() logic. main.py sets VLLM_LOGGING_COLOR=1 before any
+    # vLLM import, so this env var is the authoritative source of truth.
+    use_color = "NO_COLOR" not in os.environ and os.environ.get("VLLM_LOGGING_COLOR") != "0"
+    logo = LOGO if use_color else _ANSI_RE.sub("", LOGO)
     logger.info(logo)

@@ -1,67 +1,60 @@
+from collections.abc import Mapping
 from typing import Any
 
 import torch
-from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
-from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.data_entry_keys import (
+    CodesStruct,
+    MetaStruct,
+    OmniPayload,
+    OmniPayloadStruct,
+)
 
 logger = init_logger(__name__)
 
 
-def generator2tokenizer(
-    stage_list,
-    engine_input_source,
-    prompt: OmniTokensPrompt | TextPrompt = None,
-    requires_multimodal_data: bool = False,
-):
-    if not engine_input_source:
-        raise ValueError("engine_input_source cannot be empty")
-    source_stage_id = engine_input_source[0]
-    if source_stage_id >= len(stage_list):
-        raise IndexError(f"Invalid stage_id: {source_stage_id}")
-    if stage_list[source_stage_id].engine_outputs is None:
-        raise RuntimeError(f"Stage {source_stage_id} has no outputs yet")
-
-    generator_outputs = stage_list[source_stage_id].engine_outputs
-    tokenizer_inputs = []
-    for generator_output in generator_outputs:
-        output = generator_output.outputs[0]
-        audio_tokens = torch.cat(output.multimodal_output["audio"], dim=-1).flatten().detach().cpu().tolist()
-        tokenizer_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=audio_tokens,
-                multi_modal_data=None,
-                mm_processor_kwargs=None,
-            )
-        )
-
-    return tokenizer_inputs
-
-
-def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
-    audio = pooling_output.get("audio")
-    if not isinstance(audio, torch.Tensor) or audio.numel() == 0:
+def _codec_audio_tensors(multimodal_output: OmniPayload | dict[str, Any]) -> list[torch.Tensor] | None:
+    """Inter-stage codec frames from ``codes.audio``."""
+    if not isinstance(multimodal_output, Mapping):
         return None
-    return audio.flatten()
+    codes = multimodal_output.get("codes")
+    if not isinstance(codes, Mapping) or "audio" not in codes:
+        return None
+    audio = codes["audio"]
+    if isinstance(audio, torch.Tensor):
+        return [audio]
+    if isinstance(audio, list) and audio:
+        return audio
+    return None
+
+
+def _extract_last_frame(multimodal_output: OmniPayload | dict[str, Any]) -> torch.Tensor | None:
+    audio_tensors = _codec_audio_tensors(multimodal_output)
+    if not audio_tensors:
+        return None
+    frame = audio_tensors[-1]
+    if not isinstance(frame, torch.Tensor) or frame.numel() == 0:
+        return None
+    return frame.flatten()
 
 
 def generator2tokenizer_async_chunk(
     transfer_manager: Any,
-    pooling_output: dict[str, Any],
+    multimodal_output: OmniPayload | dict[str, Any],
     request: Any,
     is_finished: bool = False,
-) -> dict[str, Any] | None:
+) -> OmniPayloadStruct | None:
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
 
-    if isinstance(pooling_output, dict):
-        frame = _extract_last_frame(pooling_output)
+    if isinstance(multimodal_output, Mapping):
+        frame = _extract_last_frame(multimodal_output)
         if frame is not None:
             codec_codes = frame.cpu().tolist()
             transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
     elif not finished:
-        # Some steps may not produce pooling_output. Only flush on finish.
+        # Some steps may not produce multimodal_output. Only flush on finish.
         return None
 
     connector = getattr(transfer_manager, "connector", None)
@@ -81,10 +74,10 @@ def generator2tokenizer_async_chunk(
     # finished and nothing was produced, emit an EOF marker.
     if length <= 0:
         if finished:
-            return {
-                "code_predictor_codes": [],
-                "finished": torch.tensor(True, dtype=torch.bool),
-            }
+            return OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+            )
         return None
 
     # Use a small chunk size at begin
@@ -104,7 +97,12 @@ def generator2tokenizer_async_chunk(
     # Pack context + chunk into codebook-major flat codes for adapter.
     code_predictor_codes = torch.tensor(window_frames).reshape(-1).tolist()
 
-    return {
-        "code_predictor_codes": [int(ctx_frames)] + [int(context_length)] + code_predictor_codes,
-        "finished": torch.tensor(finished, dtype=torch.bool),
-    }
+    return OmniPayloadStruct(
+        codes=CodesStruct(
+            audio=torch.tensor(
+                [int(ctx_frames), int(context_length)] + code_predictor_codes,
+                dtype=torch.long,
+            ),
+        ),
+        meta=MetaStruct(finished=torch.tensor(finished, dtype=torch.bool)),
+    )

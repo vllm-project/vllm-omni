@@ -328,6 +328,7 @@ class T5EncoderModel(nn.Module):
     def __init__(self, config: T5Config, prefix: str = ""):
         super().__init__()
         self.config = config
+        self.prefix = prefix
         self.shared = VocabParallelEmbedding(config.vocab_size, config.d_model)
         self.encoder = T5Stack(config, self.shared, prefix=f"{prefix}.encoder")
 
@@ -359,29 +360,62 @@ class T5EncoderModel(nn.Module):
             ("wi", "wi_1", 1),
         ]
 
+        model_prefix = self.prefix
+
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
             original_name = name
+
+            if model_prefix and name.startswith(model_prefix + "."):
+                name = name[len(model_prefix) + 1 :]
+
             lookup_name = name
 
+            matched = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if f".{weight_name}." not in name:
                     continue
-                lookup_name = name.replace(weight_name, param_name)
-                if lookup_name not in params_dict:
-                    continue
-                param = params_dict[lookup_name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                lookup_name = name.replace(f".{weight_name}.", f".{param_name}.", 1)
+                if lookup_name in params_dict:
+                    param = params_dict[lookup_name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                    matched = True
+                    break
+
+            if not matched:
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                    matched = True
+
+            is_embed = "encoder.embed_tokens" in lookup_name
+            is_shared = lookup_name.startswith("shared.") or ".shared." in lookup_name
+            target_name = None
+
+            if is_embed or is_shared:
+                if is_embed:
+                    target_name = lookup_name.replace("encoder.embed_tokens", "shared")
+                else:
+                    target_name = lookup_name.replace("shared.", "encoder.embed_tokens.", 1)
+
+                if not matched and target_name in params_dict:
+                    weight_loader = getattr(params_dict[target_name], "weight_loader", default_weight_loader)
+                    weight_loader(params_dict[target_name], loaded_weight)
+                    loaded_params.add(target_name)
+                    matched = True
+
+            if not matched:
+                continue
+
+            if target_name is not None and target_name in params_dict and target_name not in loaded_params:
+                if target_name != lookup_name:
+                    weight_loader = getattr(params_dict[target_name], "weight_loader", default_weight_loader)
+                    weight_loader(params_dict[target_name], loaded_weight)
+                    loaded_params.add(target_name)
 
             loaded_params.add(original_name)
             loaded_params.add(lookup_name)

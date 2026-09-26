@@ -15,6 +15,36 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 
+
+def _default_rope_init(config, device=None, seq_len=None, layer_type=None):
+    """Vanilla sinusoidal RoPE (no scaling).
+
+    transformers>=5.0 removed the 'default' entry from
+    ``ROPE_INIT_FUNCTIONS``; reimplement the original behaviour so that
+    ``rope_type='default'`` configs keep working.
+
+    transformers>=5.0 also no longer promotes ``rope_theta`` to a top-level
+    attribute on configs that only declare it inside ``rope_parameters`` /
+    ``rope_scaling`` (e.g. NextStep-1.1). Resolve it defensively before
+    computing the inverse frequency so the init does not explode on those
+    configs.
+    """
+    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is None:
+        for attr in ("rope_parameters", "rope_scaling"):
+            params = getattr(config, attr, None)
+            if isinstance(params, dict) and "rope_theta" in params:
+                rope_theta = params["rope_theta"]
+                break
+    if rope_theta is None:
+        rope_theta = 10000.0
+    inv_freq = 1.0 / (
+        float(rope_theta) ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim)
+    )
+    return inv_freq, 1.0
+
+
 # ---------------------------------------------------------------------------
 # Utilities (inlined from remote utils/model_utils.py)
 # ---------------------------------------------------------------------------
@@ -77,7 +107,7 @@ class LlamaRotaryEmbedding(nn.Module):
         super().__init__()
         self.rope_type = "default"
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS.get(self.rope_type, _default_rope_init)
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 

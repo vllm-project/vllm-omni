@@ -17,6 +17,7 @@ from vllm_omni.model_executor.models.fish_speech.dac_utils import (
     DAC_SAMPLE_RATE,
     build_dac_codec,
 )
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -129,7 +130,7 @@ def encode_reference_audio_codes(
         (dtype=torch.long).
     """
     if device is None:
-        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        device = current_omni_platform.get_torch_device()
     else:
         device = torch.device(device)
     dtype = torch.float32
