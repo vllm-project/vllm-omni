@@ -119,40 +119,140 @@ class TestCapabilityDeclaration:
         assert supports_resumable_prepare(pipe) is True
 
 
-class TestStepExecutionConfig:
-    """The decode cache holds one sequence, so two of them must not be admitted."""
+class TestDecodeOwnership:
+    """The decode buffers hold one sequence, so the decode phases serialize.
 
-    def test_construction_rejects_the_configuration_before_it_loads_anything(self):
-        od_config = SimpleNamespace(step_execution=True, max_num_seqs=4)
-        # __init__ reaches the guard before it resolves a model path, so this
-        # also pins that the guard is wired in rather than merely defined.
-        with pytest.raises(ValueError, match="max_num_seqs=1"):
-            SenseNovaU1Pipeline(od_config=od_config)
+    ``max_num_seqs > 1`` is allowed: a request whose prepare phase needs the
+    buffers while another one is mid-decode keeps its whole phase queued, and
+    the requests past their prepare phase batch their denoise waves.
+    """
 
-    def test_the_guard_runs_again_on_the_first_request(self):
-        pipe = _pipeline({1: EOS})
-        pipe.od_config = SimpleNamespace(step_execution=True, max_num_seqs=4)
-        state = StepRequestState(
-            request_id="req-1",
-            sampling=OmniDiffusionSamplingParams(num_inference_steps=25, seed=42),
-            prompt={"prompt": "hello", "modalities": ["text"]},
-        )
-        with pytest.raises(ValueError, match="max_num_seqs=1"):
-            pipe.prepare_encode(state)
+    def test_the_buffers_are_exclusive_while_a_cursor_is_live(self):
+        pipe = _text_pipeline({1: 2, 2: EOS}, first_token=1)
+        holder = _text_state("req-a")
+        other = _text_state("req-b")
 
-    @pytest.mark.parametrize("max_num_seqs", [2, 8])
-    def test_step_execution_refuses_more_than_one_sequence(self, max_num_seqs):
-        od_config = SimpleNamespace(step_execution=True, max_num_seqs=max_num_seqs)
-        with pytest.raises(ValueError, match="max_num_seqs=1"):
-            SenseNovaU1Pipeline._check_step_execution_config(od_config)
+        pipe.prepare_encode(holder)
+        assert pipe._acquire_ar_decode(holder) is True, "the owner re-acquires freely"
+        assert pipe._acquire_ar_decode(other) is False, "a second request must not take the buffers"
 
-    def test_request_mode_is_unaffected(self):
-        od_config = SimpleNamespace(step_execution=False, max_num_seqs=8)
-        SenseNovaU1Pipeline._check_step_execution_config(od_config)
+    def test_a_second_decode_request_queues_until_the_first_finishes(self):
+        pipe = _text_pipeline({1: 2, 2: EOS}, first_token=1)
+        first = _text_state("req-a")
+        second = _text_state("req-b")
 
-    def test_step_execution_with_one_sequence_is_allowed(self):
-        od_config = SimpleNamespace(step_execution=True, max_num_seqs=1)
-        SenseNovaU1Pipeline._check_step_execution_config(od_config)
+        pipe.prepare_encode(first)
+        pipe.prepare_encode(second)
+        assert pipe.prepare_steps_remaining(first) == 16
+        # Queued: the begin tick plus the whole token budget.
+        assert pipe.prepare_steps_remaining(second) == 1 + 16
+
+        # A queued prepare_step neither begins the request nor decodes.
+        prefill_calls = pipe.language_model.calls
+        pipe.prepare_step(second)
+        assert pipe.language_model.calls == prefill_calls
+        assert pipe.prepare_steps_remaining(second) == 1 + 16
+
+        # The first request finishes and frees the buffers...
+        while pipe.prepare_steps_remaining(first) is not None:
+            pipe.prepare_step(first)
+        assert pipe._acquire_ar_decode(second) is True
+
+        # ...so the next tick begins the queued request (prefill, no token)...
+        pipe.prepare_step(second)
+        assert pipe.language_model.calls == prefill_calls + 1
+        assert pipe.prepare_steps_remaining(second) == 16
+
+        # ...and the request then decodes to the same text as the first.
+        while pipe.prepare_steps_remaining(second) is not None:
+            pipe.prepare_step(second)
+        assert pipe.post_decode(second).output["payload"]["text"] == "1,2"
+
+    def test_the_owner_self_releases_when_its_state_is_dropped(self):
+        """An aborted request frees the buffers without a retirement callback."""
+        import gc
+
+        pipe = _text_pipeline({1: 2, 2: EOS}, first_token=1)
+        aborted = _text_state("req-a")
+
+        pipe.prepare_encode(aborted)
+        pipe.prepare_step(aborted)
+        owner_ref = pipe._ar_decode_owner
+        assert owner_ref is not None and owner_ref() is aborted
+
+        # The runner retires the request by forgetting its state; the weak
+        # reference notices without any callback having to run.
+        del aborted
+        gc.collect()
+        assert pipe._ar_decode_owner() is None
+
+        late = _text_state("req-b")
+        pipe.prepare_encode(late)
+        assert pipe.prepare_steps_remaining(late) == 16, "the late request began at once"
+
+    def test_a_queued_request_reports_the_budget_of_its_own_loop(self):
+        pipe = _text_pipeline({1: 2, 2: EOS}, first_token=1)
+        holder = _text_state("req-a")
+        short = _text_state("req-b")
+        short.sampling.extra_args["max_tokens"] = 5
+
+        pipe.prepare_encode(holder)
+        pipe.prepare_encode(short)
+        assert pipe.prepare_steps_remaining(short) == 1 + 5
+
+    def test_a_queued_think_request_begins_when_the_buffers_free_up(self):
+        pipe = _text_pipeline({1: 2, 2: THINK_END}, first_token=1)
+        schedule = SimpleNamespace(image_prediction=torch.zeros(1, 3, 8, 8), timesteps=torch.linspace(0, 1, 4))
+        pipe._init_noise_and_schedule = lambda p: schedule
+        prefix_calls = []
+
+        def _t2i_prefix(p, ns):
+            prefix_calls.append(p)
+            return SimpleNamespace(cursor=_think_cursor(pipe, first_token=1), past_kv_cond=None)
+
+        pipe._t2i_prefix = _t2i_prefix
+        pipe._t2i_caches = lambda p, ns, ctx: ({"cond": {}}, "thought")
+
+        holder = _text_state("req-a")
+        pipe.prepare_encode(holder)
+        pipe.prepare_step(holder)
+
+        queued = _text_state("req-b")
+        queued.prompt = {"prompt": "draw the sky", "modalities": ["image"]}
+        # Think mode is what makes an image request want the decode buffers.
+        queued.sampling.extra_args["think"] = True
+        pipe.prepare_encode(queued)
+        assert prefix_calls == [], "the queued request must not run its prefix"
+        assert pipe.prepare_steps_remaining(queued) == 1 + 1024
+
+        while pipe.prepare_steps_remaining(holder) is not None:
+            pipe.prepare_step(holder)
+        pipe.prepare_step(queued)
+        assert len(prefix_calls) == 1, "the begin ran the prefix exactly once"
+
+        while pipe.prepare_steps_remaining(queued) is not None:
+            pipe.prepare_step(queued)
+        assert pipe._STEP_KEY in queued.extra
+        assert queued.extra[pipe._STEP_KEY].think_text == "thought"
+
+    def test_requests_without_a_decode_never_queue(self):
+        """A non-thinking image request prepares fully behind a live decode."""
+        pipe = _text_pipeline({1: 2, 2: EOS}, first_token=1)
+        schedule = SimpleNamespace(image_prediction=torch.zeros(1, 3, 8, 8), timesteps=torch.linspace(0, 1, 4))
+        pipe._init_noise_and_schedule = lambda p: schedule
+        pipe._t2i_prefix = lambda p, ns: SimpleNamespace(cursor=None, past_kv_cond="kv")
+        pipe._t2i_caches = lambda p, ns, ctx: ({"cond": {}}, "")
+
+        holder = _text_state("req-a")
+        pipe.prepare_encode(holder)
+        pipe.prepare_step(holder)
+
+        image = _text_state("req-b")
+        image.prompt = {"prompt": "draw the sky", "modalities": ["image"]}
+        pipe.prepare_encode(image)
+
+        assert pipe.prepare_steps_remaining(image) is None, "ready to denoise at once"
+        assert image.extra[pipe._STEP_KEY].caches == {"cond": {}}
 
 
 class TestThinkStopRules:
@@ -409,7 +509,7 @@ class TestPrepareProtocolOnTheRealPipeline:
         schedule = SimpleNamespace(image_prediction=torch.zeros(1, 3, 8, 8), timesteps=torch.linspace(0, 1, 4))
         pipe._init_noise_and_schedule = lambda p: schedule
         pipe._t2i_prefix = lambda p, ns: SimpleNamespace(cursor=None, past_kv_cond="kv")
-        pipe._t2i_caches = lambda p, ns, ctx: ({"cond": "kv"}, "")
+        pipe._t2i_caches = lambda p, ns, ctx: ({"cond": {}}, "")
 
         state = _text_state()
         state.prompt = {"prompt": "draw the sky", "modalities": ["image"]}
@@ -418,7 +518,7 @@ class TestPrepareProtocolOnTheRealPipeline:
         assert pipe.prepare_steps_remaining(state) is None
         assert state.total_steps == 3, "the state carries one entry per denoise interval"
         assert state.latents is schedule.image_prediction
-        assert state.extra[pipe._STEP_KEY].caches == {"cond": "kv"}
+        assert state.extra[pipe._STEP_KEY].caches == {"cond": {}}
 
     def test_image_request_with_think_prepares_before_it_denoises(self):
         pipe = _text_pipeline({1: 2, 2: THINK_END}, first_token=1)
@@ -430,7 +530,7 @@ class TestPrepareProtocolOnTheRealPipeline:
 
         def _caches(p, ns, ctx):
             finished_with.append(ctx.cursor)
-            return {"cond": "kv"}, "thought"
+            return {"cond": {}}, "thought"
 
         pipe._t2i_caches = _caches
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 import os
+import weakref
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -500,6 +501,12 @@ class _ARDecodeCursor:
         return 0 if self.done else max(self.max_steps - self.steps_taken, 0)
 
 
+#: Token budget the think loop gets when the request does not override it.
+#: Doubles as the upper bound reported for a queued prepare phase (see
+#: :meth:`SenseNovaU1Pipeline.prepare_steps_remaining`).
+_MAX_THINK_TOKENS = 1024
+
+
 class SenseNovaU1Pipeline(
     nn.Module,
     SupportsComponentDiscovery,
@@ -527,6 +534,14 @@ class SenseNovaU1Pipeline(
     supports_step_execution: ClassVar[bool] = True
     supports_resumable_prepare: ClassVar[bool] = True
 
+    # The request whose think/text cursor currently owns the model-local AR
+    # decode buffers (see ``paged_decode.py``), as a weak reference: the owner
+    # stops owning the moment the runner drops its state, with no callback
+    # ordering to rely on. A plain request id could not tell a retired owner
+    # from a live one. Class-level default so pipelines built without
+    # ``__init__`` (tests) read ``None``.
+    _ar_decode_owner: weakref.ReferenceType | None = None
+
     # CPU-offload protocol: language_model carries the denoising blocks; the
     # vision and FM modules are lightweight encoders pinned on GPU during the
     # diffusion loop. There is no separate VAE.
@@ -541,7 +556,6 @@ class SenseNovaU1Pipeline(
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
-        self._check_step_execution_config(od_config)
         self.od_config = od_config
         self.device = get_local_device()
         model_path = od_config.model
@@ -644,27 +658,41 @@ class SenseNovaU1Pipeline(
             enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler,
         )
 
-    @staticmethod
-    def _check_step_execution_config(od_config: OmniDiffusionConfig) -> None:
-        """Refuse a configuration the model-local decode cache cannot serve.
+    # -----------------------------------------------------------------------
+    # AR decode ownership
+    # -----------------------------------------------------------------------
+
+    def _acquire_ar_decode(self, state: StepRequestState) -> bool:
+        """Take the model-local AR decode buffers for this request, if free.
 
         ``paged_decode.py`` holds one set of buffers behind an identity block
-        table, reused by whichever request fits them, because the pipeline has
-        served one sequence per forward. Under step execution two requests can
-        be inside their decode phase at the same time, and the second one's
-        ``load_prefix`` would overwrite the first one's prefix. The cache moves
-        to ``DiffusionKVCacheManager`` before this limit can be lifted.
+        table: ``load_prefix`` overwrites them, so a second live cursor would
+        corrupt the first one's decode. Instead of refusing
+        ``max_num_seqs > 1``, the pipeline serializes the decode phases across
+        the requests of a step batch — every request whose prepare phase needs
+        a cursor (think, or a text output) takes these buffers for the whole
+        phase and the others keep their whole prepare phase queued; denoising
+        requests never touch the buffers, so a queued request's peers keep
+        stepping through their denoise waves while it waits.
+
+        The owner is held by weak reference: when the runner drops an aborted,
+        interrupted, or failed request mid-decode, the buffers free themselves
+        rather than waiting for a callback. Under CPython reference counting
+        that happens at a deterministic point in the tick, identically on
+        every DiT rank.
         """
-        if not bool(getattr(od_config, "step_execution", False)):
-            return
-        max_num_seqs = int(getattr(od_config, "max_num_seqs", 1) or 1)
-        if max_num_seqs > 1:
-            raise ValueError(
-                "The SenseNova-U1 pipeline supports max_num_seqs=1 under step execution: its "
-                "autoregressive decode runs on a model-local paged cache that holds one sequence "
-                "at a time; "
-                f"got max_num_seqs={max_num_seqs}."
-            )
+
+        owner = self._ar_decode_owner() if self._ar_decode_owner is not None else None
+        if owner is None or owner is state:
+            self._ar_decode_owner = weakref.ref(state)
+            return True
+        return False
+
+    def _release_ar_decode(self, state: StepRequestState) -> None:
+        """Give up the AR decode buffers if this request is holding them."""
+
+        if self._ar_decode_owner is not None and self._ar_decode_owner() is state:
+            self._ar_decode_owner = None
 
     # -----------------------------------------------------------------------
     # Helpers
@@ -891,7 +919,9 @@ class SenseNovaU1Pipeline(
         )
         return outputs
 
-    def _begin_think(self, prefix_outputs, past_key_values, t_idx, max_think_tokens=1024) -> _ARDecodeCursor:
+    def _begin_think(
+        self, prefix_outputs, past_key_values, t_idx, max_think_tokens=_MAX_THINK_TOKENS
+    ) -> _ARDecodeCursor:
         """Seed the think cursor from the prefix logits, before the first token."""
         return _ARDecodeCursor(
             eos_token_id=self.tokenizer.convert_tokens_to_ids("<|im_end|>"),
@@ -1759,11 +1789,14 @@ class SenseNovaU1Pipeline(
         A request that thinks, and a request whose whole output is text, both
         continue in ``prepare_step``. A request that does not think is ready for
         ``denoise_step`` when this returns.
+
+        A request whose prepare phase needs the AR decode buffers while
+        another request is mid-decode does not start here at all: its whole
+        phase stays queued (see ``_acquire_ar_decode``) and begins on a later
+        tick, so several requests may be scheduled while the decode side stays
+        serial and the denoise side keeps batching.
         """
         del kwargs
-        # ``step_execution`` can also be turned on after the pipeline is built,
-        # when ``streaming_output`` implies it, so the guard runs here as well.
-        self._check_step_execution_config(self.od_config)
         if OmniDiffusionRequest.is_dummy_run_request_id(state.request_id):
             self._warm_ar_decode()
         p = self._parse_request(SimpleNamespace(prompts=[state.prompt], sampling_params=state.sampling))
@@ -1780,21 +1813,29 @@ class SenseNovaU1Pipeline(
                 think_text="",
                 output=None,
                 z=None,
+                cursor=None,
+                queued=False,
+                input_images=input_images,
             )
-            step.cursor = self._begin_text_request(p, input_images)
+            if self._acquire_ar_decode(state):
+                step.cursor = self._begin_text_request(p, input_images)
+                step.input_images = None
+            else:
+                step.queued = True
         else:
             ns = self._init_noise_and_schedule(p)
-            prefix = self._it2i_prefix(p, ns, input_images) if input_images is not None else self._t2i_prefix(p, ns)
             step = SimpleNamespace(
                 mode="it2i" if input_images is not None else "t2i",
                 p=p,
                 ns=ns,
-                prefix=prefix,
+                prefix=None,
                 caches=None,
                 think_text="",
                 output=None,
                 z=None,
-                cursor=prefix.cursor,
+                cursor=None,
+                queued=False,
+                input_images=input_images,
             )
             # ``ns.timesteps`` holds num_steps + 1 boundaries; the request takes
             # one step per interval, so the state carries the intervals and the
@@ -1804,24 +1845,51 @@ class SenseNovaU1Pipeline(
             state.step_index = 0
             state.do_true_cfg = p.cfg_scale > 1
             state.img_shapes = [p.image_size]
+            if not p.think_mode or self._acquire_ar_decode(state):
+                if input_images is not None:
+                    step.prefix = self._it2i_prefix(p, ns, input_images)
+                else:
+                    step.prefix = self._t2i_prefix(p, ns)
+                step.cursor = step.prefix.cursor
+                step.input_images = None
+            else:
+                step.queued = True
 
         state.extra[self._STEP_KEY] = step
-        if step.cursor is None or step.cursor.finished:
+        if not step.queued and (step.cursor is None or step.cursor.finished):
             # A request that asked for no tokens at all has an empty loop, and
             # its prepare phase is over before it starts.
             self._finish_prepare(state)
         return state
 
     def prepare_steps_remaining(self, state: StepRequestState) -> int | None:
-        """Tokens this request may still decode, or ``None`` once prepare is done."""
+        """Tokens this request may still decode, or ``None`` once prepare is done.
+
+        A queued request has not begun, so its bound is the budget its loop
+        would get plus the tick that begins it; ``None`` would tell the runner
+        the phase is over.
+        """
         step = state.extra.get(self._STEP_KEY)
-        if step is None or step.cursor is None:
+        if step is None:
+            return None
+        if getattr(step, "queued", False):
+            if step.mode == "text":
+                return 1 + int(step.p.extra_args.get("max_tokens", 512))
+            return 1 + _MAX_THINK_TOKENS
+        if step.cursor is None:
             return None
         return step.cursor.steps_remaining
 
     def prepare_step(self, state: StepRequestState) -> None:
         """Decode one token of the think or text loop."""
         step = self._step_context(state)
+        if getattr(step, "queued", False):
+            # Another request still owns the decode buffers; this tick is not
+            # this request's to spend on a begin either.
+            if not self._acquire_ar_decode(state):
+                return
+            self._begin_queued_prepare(state)
+            return
         cursor = step.cursor
         if cursor is None or cursor.finished:
             return
@@ -1830,6 +1898,27 @@ class SenseNovaU1Pipeline(
         else:
             self._think_step(cursor)
         if cursor.finished:
+            self._finish_prepare(state)
+
+    def _begin_queued_prepare(self, state: StepRequestState) -> None:
+        """Start a queued prepare phase now that the decode buffers are free.
+
+        The begin is this tick's whole prepare work, matching a request that
+        began in ``prepare_encode`` and decodes its first token on the next
+        tick.
+        """
+        step = self._step_context(state)
+        if step.mode == "text":
+            step.cursor = self._begin_text_request(step.p, step.input_images)
+        elif step.mode == "it2i":
+            step.prefix = self._it2i_prefix(step.p, step.ns, step.input_images)
+            step.cursor = step.prefix.cursor
+        else:
+            step.prefix = self._t2i_prefix(step.p, step.ns)
+            step.cursor = step.prefix.cursor
+        step.queued = False
+        step.input_images = None
+        if step.cursor is None or step.cursor.finished:
             self._finish_prepare(state)
 
     def _finish_prepare(self, state: StepRequestState) -> None:
@@ -1843,6 +1932,7 @@ class SenseNovaU1Pipeline(
             step.caches, step.think_text = self._t2i_caches(step.p, step.ns, step.prefix)
         step.cursor = None
         step.prefix = None
+        self._release_ar_decode(state)
 
     def denoise_step(
         self,
@@ -1857,11 +1947,21 @@ class SenseNovaU1Pipeline(
         forwards stay separate here; the rows line up with
         ``InputBatch.latents`` because every request contributes as many rows as
         its own latents have.
+
+        That request-local ownership is also what makes heterogeneous waves
+        safe: mixed t2i/it2i, different step counts, and requests at different
+        step indices all forward independently (request size and CFG settings
+        are additionally kept homogeneous per wave by the scheduler's
+        step-batch compatibility key). A packed forward would need varlen
+        attention over per-request prefixes, as MiniMax-H3 does on backends
+        that isolate packed cu_seqlens, and is left as a follow-up.
         """
         del kwargs
         states = tuple(states if states is not None else input_batch.states)
         if not states:
             raise ValueError("SenseNova denoise_step requires at least one request state.")
+        if len(states) > 1:
+            logger.debug("SenseNova-U1.5 denoise step: %d request(s), one forward each", len(states))
         predictions = []
         for state in states:
             step = self._step_context(state)

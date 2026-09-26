@@ -25,14 +25,19 @@ execution the decode steps do reach the scheduler, one per tick through
 ``prepare_step``, but the cache they run on is still this one: one set of
 buffers behind an identity block table, reused by whichever request fits them,
 not general paged-KV support. ``load_prefix`` overwrites those buffers, so a
-second sequence would corrupt the first, which is why the pipeline refuses
-``max_num_seqs > 1`` under step execution. The scheduler therefore still cannot
-admit, pool, evict or reuse a prefix for a decode step. The buffers are released
-when sleep discards the memory they were captured against.
+second sequence would corrupt the first, which is why the pipeline serializes
+the decode phases instead of refusing ``max_num_seqs > 1``: at most one think
+or text cursor is live at a time (see ``_acquire_ar_decode`` in the pipeline)
+and a request that arrives while another one is decoding keeps its whole
+prepare phase queued, while requests past their prepare phase batch their
+denoise waves untouched. The scheduler therefore still cannot admit, pool,
+evict or reuse a prefix for a decode step. The buffers are released when sleep
+discards the memory they were captured against.
 
 Delete this file once the decode KV moves to ``DiffusionKVCacheManager``; that
-is what lifts the single-sequence limit, and it is the change that makes the
-manager, not this file, the thing the scheduler reserves against.
+is what lifts the one-decode-at-a-time serialization (and with it the queued
+prepare phases), and it is the change that makes the manager, not this file,
+the thing the scheduler reserves against.
 """
 
 from __future__ import annotations
