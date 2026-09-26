@@ -12,7 +12,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.signal import get_window
 from torch.nn import Conv1d, ConvTranspose1d
-from torch.nn.utils import remove_weight_norm
+from torch.nn.utils import parametrize
+from torch.nn.utils import remove_weight_norm as remove_legacy_weight_norm
+from torch.nn.utils.weight_norm import WeightNorm
 
 try:
     from torch.nn.utils.parametrizations import weight_norm
@@ -39,6 +41,44 @@ def init_weights(m, mean=0.0, std=0.01):
 
 def get_padding(kernel_size, dilation=1):
     return int((kernel_size * dilation - dilation) / 2)
+
+
+def _normalize_folded_weight(module: nn.Module, name: str = "weight") -> None:
+    """Keep ordinary Parameters; replace plain or inference tensors.
+
+    In inference_mode, the legacy API can leave an inference Parameter,
+    while the parametrization API can leave a plain inference tensor.
+    Rebuild those outside inference_mode so they remain usable afterward.
+    """
+    weight = getattr(module, name)
+    if isinstance(weight, nn.Parameter) and not weight.is_inference():
+        return
+    with torch.inference_mode(False):
+        frozen = nn.Parameter(weight.detach().clone(), requires_grad=False)
+    delattr(module, name)
+    module.register_parameter(name, frozen)
+
+
+def _fold_weight_norm(module: nn.Module) -> int:
+    """Fold one weight-normalized layer into a plain ``weight``, in place.
+
+    Supports both APIs: the modern ``torch.nn.utils.parametrizations`` API
+    (what this module is built with when torch provides it) and the legacy
+    ``WeightNorm`` forward-pre-hook. Returns 1 when a weight norm was
+    folded and 0 when there was nothing to fold (e.g. on a second call).
+    """
+    if parametrize.is_parametrized(module, "weight"):
+        # Removes every parametrization registered on "weight"; only
+        # weight_norm is applied to the layers in this module.
+        parametrize.remove_parametrizations(module, "weight", leave_parametrized=True)
+        _normalize_folded_weight(module)
+        return 1
+    for hook in list(module._forward_pre_hooks.values()):
+        if isinstance(hook, WeightNorm):
+            remove_legacy_weight_norm(module, name=hook.name)
+            _normalize_folded_weight(module, hook.name)
+            return 1
+    return 0
 
 
 class ResBlock(torch.nn.Module):
@@ -92,10 +132,13 @@ class ResBlock(torch.nn.Module):
             x = xt + x
         return x
 
-    def remove_weight_norm(self):
+    def remove_weight_norm(self) -> int:
+        """Fold this block's conv weight norms; returns the folded count."""
+        folded = 0
         for idx in range(len(self.convs1)):
-            remove_weight_norm(self.convs1[idx])
-            remove_weight_norm(self.convs2[idx])
+            folded += _fold_weight_norm(self.convs1[idx])
+            folded += _fold_weight_norm(self.convs2[idx])
+        return folded
 
 
 def _carry_phase_at_boundary(
@@ -570,18 +613,24 @@ class HiFTGenerator(nn.Module):
         )
         self.f0_predictor = f0_predictor
 
-    def remove_weight_norm(self):
+    def remove_weight_norm(self) -> int:
+        """Fold the generator's frozen weight norms into plain weights.
+
+        Returns how many convolutions were folded. ``source_downs`` and
+        ``m_source`` carry no weight norm. ``f0_predictor`` is excluded:
+        causal inference runs it on CPU for precision, and folding it is
+        tracked separately in RFC #6870 (C5).
+        """
+        folded = 0
         for layer in self.ups:
-            remove_weight_norm(layer)
+            folded += _fold_weight_norm(layer)
         for block in self.resblocks:
-            block.remove_weight_norm()
-        remove_weight_norm(self.conv_pre)
-        remove_weight_norm(self.conv_post)
-        self.m_source.remove_weight_norm()
-        for layer in self.source_downs:
-            remove_weight_norm(layer)
+            folded += block.remove_weight_norm()
+        folded += _fold_weight_norm(self.conv_pre)
+        folded += _fold_weight_norm(self.conv_post)
         for block in self.source_resblocks:
-            block.remove_weight_norm()
+            folded += block.remove_weight_norm()
+        return folded
 
     def _stft(self, x):
         if x.device.type == "npu":
@@ -1068,6 +1117,14 @@ class CausalConvRNNF0Predictor(nn.Module):
             for layer in self.condnet
             if isinstance(layer, CausalConv1d) and layer.causal_type == "left"
         )
+
+    def remove_weight_norm(self) -> int:
+        """Fold the five F0 convolutions after loading on the execution device.
+
+        Repeated calls are no-ops. Load original checkpoints into a fresh
+        predictor, before folding changes the state-dict keys.
+        """
+        return sum(_fold_weight_norm(layer) for layer in self.condnet)
 
     def forward(self, x: torch.Tensor, finalize: bool = True) -> torch.Tensor:
         if finalize is True:
