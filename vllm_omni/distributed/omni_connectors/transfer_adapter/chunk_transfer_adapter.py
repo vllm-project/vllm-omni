@@ -191,6 +191,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # request-global for connector key continuity).
         self.ramp_chunk_count: dict[str, int] = defaultdict(int)
         self._adaptive_states: dict[str, Any] = {}
+        self._ramp_total_emitted: dict[str, int] = defaultdict(int)
         self.upstream_exhausted_requests: set[str] = set()
         self.segment_finished_requests: set[str] = set()
         self.request_payload = {}
@@ -904,6 +905,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             getattr(self, "_qwen3_tts_emitted_frames", {}).pop(external_req_id, None)
             self.ramp_chunk_count.pop(external_req_id, None)
             self._adaptive_states.pop(external_req_id, None)
+            self._ramp_total_emitted.pop(external_req_id, None)
             cached_ic = getattr(self, "_cached_ic", None)
             if cached_ic is not None:
                 cached_ic.pop(external_req_id, None)
@@ -1036,6 +1038,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._segment_generation.pop(external_req_id, None)
         self.ramp_chunk_count.pop(external_req_id, None)
         self._adaptive_states.pop(external_req_id, None)
+        self._ramp_total_emitted.pop(external_req_id, None)
         self._pending_streaming_prefills.pop(external_req_id, None)
 
         cached_ic = getattr(self, "_cached_ic", None)
