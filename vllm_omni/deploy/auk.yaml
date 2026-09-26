@@ -40,11 +40,18 @@ stages:
   # Stage 1: AuKPipeline (DiT + BigVGAN-flow VAE encoder and decoder).
   # Shares GPU 0 with the encoder; 32 Euler steps at CFG 2.0 is the Base
   # recipe, and AuK-Flash overrides both with its distilled 4-step grid.
+  # Not eager: the codec decode is compiled into bucketed CUDA graphs at
+  # startup (about a minute more on a cold Inductor cache, ~30 s warm, and
+  # about 1 GB of graph pools); clips longer than the largest bucket are
+  # decoded in overlapping tiles of it. The DiT stays eager unless
+  # diffusion_compile_granularity is set to full. Buckets, tile size and the
+  # plain-graph cache are tunable through model_config:
+  #   model_config: {auk_vae_compile_shapes: [128, 256, 512], auk_vae_tile_frames: 512, auk_vae_max_graphs: 32}
   - stage_id: 1
     devices: "0"
     max_num_seqs: 1
     gpu_memory_utilization: 0.35
-    enforce_eager: true
+    enforce_eager: false
     default_sampling_params:
       seed: 0
       num_inference_steps: 32
