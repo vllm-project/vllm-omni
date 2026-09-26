@@ -4,15 +4,114 @@
 
 import math
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from transformers.models.gemma.modeling_gemma import apply_rotary_pos_emb
+from transformers.models.auto import CONFIG_MAPPING
+from transformers.models.gemma.modeling_gemma import GemmaForCausalLM, apply_rotary_pos_emb
+from transformers.models.paligemma.modeling_paligemma import PaliGemmaForConditionalGeneration
 
 from vllm_omni.diffusion.models.pi.common import attention
 
 PrefixKV = tuple[torch.Tensor, torch.Tensor]
 ModuleInputAligner = Callable[[torch.Tensor, nn.Module], torch.Tensor]
+
+
+@dataclass(frozen=True)
+class GemmaVariantConfig:
+    """OpenPI Gemma dimensions used by the Pi-family backbones."""
+
+    width: int
+    depth: int
+    mlp_dim: int
+    num_heads: int
+    num_kv_heads: int
+    head_dim: int
+
+
+def get_gemma_config(variant: str) -> GemmaVariantConfig:
+    """Return the OpenPI dimensions for a supported Gemma variant."""
+    if variant == "gemma_2b":
+        return GemmaVariantConfig(2048, 18, 16384, 8, 1, 256)
+    if variant == "gemma_300m":
+        return GemmaVariantConfig(1024, 18, 4096, 8, 1, 256)
+    raise ValueError(f"Unknown variant: {variant}")
+
+
+def build_backbones(
+    vlm_config: GemmaVariantConfig,
+    action_expert_config: GemmaVariantConfig,
+) -> tuple[PaliGemmaForConditionalGeneration, GemmaForCausalLM]:
+    """Build the common PaliGemma prefix and stock Gemma action expert.
+
+    Variants may modify the returned expert after construction. Pi0 keeps the
+    stock RMSNorms, while Pi0.5 replaces them with timestep-conditioned AdaRMS
+    modules. The returned modules are assigned directly to each concrete
+    model's existing ``paligemma`` and ``gemma_expert`` attributes, preserving
+    checkpoint names.
+    """
+    vlm_config_hf = CONFIG_MAPPING["paligemma"]()
+    vlm_config_hf._vocab_size = 257152
+    vlm_config_hf.image_token_index = 257152
+    vlm_config_hf.text_config.hidden_size = vlm_config.width
+    vlm_config_hf.text_config.intermediate_size = vlm_config.mlp_dim
+    vlm_config_hf.text_config.num_attention_heads = vlm_config.num_heads
+    vlm_config_hf.text_config.head_dim = vlm_config.head_dim
+    vlm_config_hf.text_config.num_hidden_layers = vlm_config.depth
+    vlm_config_hf.text_config.num_key_value_heads = vlm_config.num_kv_heads
+    vlm_config_hf.text_config.hidden_activation = "gelu_pytorch_tanh"
+    # transformers >= 5 uses ``dtype``; older versions still accept
+    # ``torch_dtype``. PretrainedConfig normalizes one to the other.
+    vlm_config_hf.text_config.dtype = "float32"
+    vlm_config_hf.text_config.vocab_size = 257152
+    vlm_config_hf.vision_config.intermediate_size = 4304
+    vlm_config_hf.vision_config.projection_dim = 2048
+    vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
+    vlm_config_hf.vision_config.dtype = "float32"
+
+    action_expert_config_hf = CONFIG_MAPPING["gemma"](
+        head_dim=action_expert_config.head_dim,
+        hidden_size=action_expert_config.width,
+        intermediate_size=action_expert_config.mlp_dim,
+        num_attention_heads=action_expert_config.num_heads,
+        num_hidden_layers=action_expert_config.depth,
+        num_key_value_heads=action_expert_config.num_kv_heads,
+        vocab_size=257152,
+        hidden_activation="gelu_pytorch_tanh",
+        dtype="float32",
+    )
+
+    paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
+    gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
+    # The action expert consumes projected state/action embeddings, not tokens.
+    gemma_expert.model.embed_tokens = None
+    return paligemma, gemma_expert
+
+
+def embed_image(paligemma: nn.Module, pixel_values: torch.Tensor) -> torch.Tensor:
+    """Encode images explicitly through SigLIP and the multimodal projector.
+
+    ``PaliGemmaModel.get_image_features`` has changed scaling behavior across
+    Transformers releases. Calling the two stable submodules directly keeps
+    Pi0 and Pi0.5 on the same unambiguous path.
+    """
+    vision_outputs = paligemma.model.vision_tower(pixel_values)
+    return paligemma.model.multi_modal_projector(vision_outputs.last_hidden_state)
+
+
+def embed_language_tokens(paligemma: nn.Module, tokens: torch.Tensor) -> torch.Tensor:
+    """Return canonical Gemma-scaled language embeddings across releases.
+
+    Transformers <=5.3 applies ``sqrt(hidden_size)`` inside ``GemmaModel.forward``
+    (which the Pi kernels bypass). In >=5.4 the embedding module self-applies
+    that scale. Detecting ``embed_scale`` prevents both missing and double scale.
+    """
+    embed_tokens = paligemma.model.language_model.embed_tokens
+    embeddings = embed_tokens(tokens)
+    if getattr(embed_tokens, "embed_scale", None) is None:
+        embeddings = embeddings * math.sqrt(embeddings.shape[-1])
+    return embeddings
 
 
 def _keep_input_dtype(tensor: torch.Tensor, module: nn.Module) -> torch.Tensor:
@@ -27,8 +126,7 @@ def embed_multimodal_prefix(
     lang_tokens: torch.Tensor,
     lang_masks: torch.Tensor,
     *,
-    embed_image: Callable[[torch.Tensor], torch.Tensor],
-    embed_language_tokens: Callable[[torch.Tensor], torch.Tensor],
+    paligemma: nn.Module,
     expected_num_views: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compose ordered camera and language embeddings into one prefix.
@@ -39,10 +137,10 @@ def embed_multimodal_prefix(
     every token in the slot. Language embeddings and their padding mask follow
     the image slots.
 
-    ``embed_language_tokens`` owns any Gemma embedding scaling. Image tokens
-    have already passed through the vision projector and are not scaled here.
-    All prefix block markers are false, making the prefix bidirectional; each
-    variant declares its own causal boundary when it appends the suffix.
+    Language embedding scaling and the explicit SigLIP/projector path are owned
+    here so variants cannot drift. All prefix block markers are false, making
+    the prefix bidirectional; each variant declares its own causal boundary
+    when it appends the suffix.
 
     Camera count remains caller-owned: variants with a fixed deployment layout
     pass ``expected_num_views``; variants without one leave it unset.
@@ -59,12 +157,12 @@ def embed_multimodal_prefix(
     padding_masks: list[torch.Tensor] = []
 
     for image, image_mask in zip(images, image_masks):
-        image_embedding = embed_image(image)
+        image_embedding = embed_image(paligemma, image)
         batch_size, num_image_tokens = image_embedding.shape[:2]
         embeddings.append(image_embedding)
         padding_masks.append(image_mask[:, None].expand(batch_size, num_image_tokens))
 
-    language_embedding = embed_language_tokens(lang_tokens)
+    language_embedding = embed_language_tokens(paligemma, lang_tokens)
     embeddings.append(language_embedding)
     padding_masks.append(lang_masks)
 
@@ -136,3 +234,27 @@ def execute_prefix_layer(
     normalized = align_module_input(normalized, layer.mlp.up_proj)
     hidden_states = layer.mlp(normalized) + residual
     return hidden_states, (key, value)
+
+
+def execute_prefix(
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    position_ids: torch.Tensor,
+    paligemma: nn.Module,
+    *,
+    align_module_input: ModuleInputAligner = _keep_input_dtype,
+) -> tuple[torch.Tensor, list[PrefixKV]]:
+    """Execute the complete shared PaliGemma prefix and collect its KV cache."""
+    language_model = paligemma.model.language_model
+    kv_cache: list[PrefixKV] = []
+    for layer_idx in range(len(language_model.layers)):
+        hidden_states, layer_kv = execute_prefix_layer(
+            layer_idx,
+            hidden_states,
+            attention_mask,
+            position_ids,
+            paligemma,
+            align_module_input=align_module_input,
+        )
+        kv_cache.append(layer_kv)
+    return language_model.norm(hidden_states), kv_cache

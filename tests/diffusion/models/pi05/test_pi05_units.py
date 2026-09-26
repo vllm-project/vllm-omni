@@ -825,8 +825,7 @@ def test_prefix_length_is_fixed_and_valid_len_tracks_masks(num_real_views, tiny_
         masks,
         lang,
         lang_mask,
-        embed_image=tiny_model.paligemma_with_expert.embed_image,
-        embed_language_tokens=tiny_model.paligemma_with_expert.embed_language_tokens,
+        paligemma=tiny_model.paligemma_with_expert.paligemma,
         expected_num_views=int(tiny_model.config.max_cameras),
     )
     assert embs.shape[1] == 256 * 3 + 200

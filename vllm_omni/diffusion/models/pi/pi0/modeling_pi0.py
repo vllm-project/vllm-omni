@@ -37,14 +37,7 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.models.auto import CONFIG_MAPPING
-from transformers.models.gemma.modeling_gemma import (
-    GemmaForCausalLM,
-    apply_rotary_pos_emb,
-)
-from transformers.models.paligemma.modeling_paligemma import (
-    PaliGemmaForConditionalGeneration,
-)
+from transformers.models.gemma.modeling_gemma import apply_rotary_pos_emb
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.models.pi.common import attention, backbone, checkpoint, flow_matching
@@ -74,23 +67,8 @@ create_sinusoidal_pos_embedding = flow_matching.create_sinusoidal_pos_embedding
 # ──────────────────────────────────────────────────────────────────────
 
 
-class GemmaVariantConfig:
-    def __init__(self, width, depth, mlp_dim, num_heads, num_kv_heads, head_dim):
-        self.width = width
-        self.depth = depth
-        self.mlp_dim = mlp_dim
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_dim = head_dim
-
-
-def get_gemma_config(variant: str) -> GemmaVariantConfig:
-    if variant == "gemma_2b":
-        return GemmaVariantConfig(2048, 18, 16384, 8, 1, 256)
-    elif variant == "gemma_300m":
-        return GemmaVariantConfig(1024, 18, 4096, 8, 1, 256)
-    else:
-        raise ValueError(f"Unknown variant: {variant}")
+GemmaVariantConfig = backbone.GemmaVariantConfig
+get_gemma_config = backbone.get_gemma_config
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -257,83 +235,7 @@ class PaliGemmaWithActionExpert(nn.Module):
 
     def __init__(self, vlm_config, action_expert_config):
         super().__init__()
-
-        # Build HF PaliGemma config from the variant dims we expose.
-        # NOTE: we do NOT set use_adarms / adarms_cond_dim — those are
-        # OpenPI-only attributes used by π0.5, not π0.
-        vlm_config_hf = CONFIG_MAPPING["paligemma"]()
-        vlm_config_hf._vocab_size = 257152
-        vlm_config_hf.image_token_index = 257152
-        vlm_config_hf.text_config.hidden_size = vlm_config.width
-        vlm_config_hf.text_config.intermediate_size = vlm_config.mlp_dim
-        vlm_config_hf.text_config.num_attention_heads = vlm_config.num_heads
-        vlm_config_hf.text_config.head_dim = vlm_config.head_dim
-        vlm_config_hf.text_config.num_hidden_layers = vlm_config.depth
-        vlm_config_hf.text_config.num_key_value_heads = vlm_config.num_kv_heads
-        vlm_config_hf.text_config.hidden_activation = "gelu_pytorch_tanh"
-        # transformers ≥ 5 uses ``dtype``; older versions still accept
-        # ``torch_dtype``. We set the canonical name; HF's PretrainedConfig
-        # normalizes one to the other internally.
-        vlm_config_hf.text_config.dtype = "float32"
-        vlm_config_hf.text_config.vocab_size = 257152
-        vlm_config_hf.vision_config.intermediate_size = 4304
-        vlm_config_hf.vision_config.projection_dim = 2048
-        vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
-        vlm_config_hf.vision_config.dtype = "float32"
-
-        action_expert_config_hf = CONFIG_MAPPING["gemma"](
-            head_dim=action_expert_config.head_dim,
-            hidden_size=action_expert_config.width,
-            intermediate_size=action_expert_config.mlp_dim,
-            num_attention_heads=action_expert_config.num_heads,
-            num_hidden_layers=action_expert_config.depth,
-            num_key_value_heads=action_expert_config.num_kv_heads,
-            vocab_size=257152,
-            hidden_activation="gelu_pytorch_tanh",
-            dtype="float32",
-        )
-
-        self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
-        self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
-        # The action expert doesn't embed tokens — it only consumes the
-        # suffix state/action embeddings we feed in.
-        self.gemma_expert.model.embed_tokens = None
-
-    def embed_image(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """Encode images with SigLIP vision tower + PaliGemma projector.
-
-        We run the two steps explicitly instead of calling
-        ``PaliGemmaModel.get_image_features`` because that convenience
-        method historically has returned either the projected tensor (old)
-        or the raw vision-tower output (new). Being explicit makes us
-        independent of which transformers release we're on.
-        """
-        # Shapes: pixel_values (B, 3, 224, 224) → SigLIP (B, 256, 1152)
-        #                                      → projector (B, 256, 2048)
-        vision_outputs = self.paligemma.model.vision_tower(pixel_values)
-        image_features = vision_outputs.last_hidden_state
-        return self.paligemma.model.multi_modal_projector(image_features)
-
-    def embed_language_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Embed language tokens with PaliGemma's embedding table, returning the
-        ``* sqrt(hidden)``-scaled embedding (PaliGemma/Gemma convention).
-
-        The scaling location moved across transformers releases:
-          * ≤ 5.3: ``embed_tokens`` is a plain ``nn.Embedding`` and the
-            ``* sqrt(hidden)`` normalizer lives inside ``GemmaModel.forward``
-            (which we bypass) — so we apply it explicitly here.
-          * ≥ 5.4: ``embed_tokens`` is a ``GemmaTextScaledWordEmbedding`` that
-            self-applies ``embed_scale = hidden_size ** 0.5`` — applying it again
-            would double-scale (≈45×). We detect this and skip the manual scale.
-        This makes ``embed_language_tokens`` return the canonical scaled embedding
-        on every transformers version.
-        """
-        embed_tokens = self.paligemma.model.language_model.embed_tokens
-        lang_emb = embed_tokens(tokens)
-        # If the embedding already self-scales (transformers ≥ 5.4), don't repeat it.
-        if getattr(embed_tokens, "embed_scale", None) is None:
-            lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
-        return lang_emb
+        self.paligemma, self.gemma_expert = backbone.build_backbones(vlm_config, action_expert_config)
 
     def forward(
         self,
@@ -347,25 +249,18 @@ class PaliGemmaWithActionExpert(nn.Module):
         ``([prefix_out, suffix_out], past_key_values_or_None)``.
         """
         num_layers = self.paligemma.config.text_config.num_hidden_layers
-        pali_lm = self.paligemma.model.language_model
         expert_lm = self.gemma_expert.model
 
         if inputs_embeds[1] is None:
             # Prefix-only: PaliGemma LM on (images + language) tokens; the
             # per-layer post-RoPE K/V is collected into a list that the
             # suffix pass will consume directly.
-            hidden_states = inputs_embeds[0]
-            kv_list: list[tuple[torch.Tensor, torch.Tensor]] = []
-            for layer_idx in range(num_layers):
-                hidden_states, kv = backbone.execute_prefix_layer(
-                    layer_idx,
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    self.paligemma,
-                )
-                kv_list.append(kv)
-            hidden_states = pali_lm.norm(hidden_states)
+            hidden_states, kv_list = backbone.execute_prefix(
+                inputs_embeds[0],
+                attention_mask,
+                position_ids,
+                self.paligemma,
+            )
             return [hidden_states, None], (kv_list if use_cache else None)
 
         if inputs_embeds[0] is not None:
@@ -628,8 +523,7 @@ class Pi0ForActionPrediction(nn.Module):
             image_masks,
             lang_tokens,
             lang_masks,
-            embed_image=self.paligemma_with_expert.embed_image,
-            embed_language_tokens=self.paligemma_with_expert.embed_language_tokens,
+            paligemma=self.paligemma_with_expert.paligemma,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1

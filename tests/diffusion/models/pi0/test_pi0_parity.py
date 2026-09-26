@@ -300,8 +300,7 @@ def _diagnose_divergence(
         img_masks,
         lang_tokens,
         lang_masks,
-        embed_image=omni_model.paligemma_with_expert.embed_image,
-        embed_language_tokens=omni_model.paligemma_with_expert.embed_language_tokens,
+        paligemma=omni_model.paligemma_with_expert.paligemma,
     )
     total_diff = (lr_prefix_embs.float() - sg_prefix_embs.float()).abs().max().item()
     print(f"[diag] prefix_embs max |Δ| = {total_diff:.2e}   (shape={tuple(sg_prefix_embs.shape)})")

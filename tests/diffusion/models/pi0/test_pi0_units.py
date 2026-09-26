@@ -36,6 +36,8 @@ from vllm_omni.diffusion.models.pi0.processor_pi0 import (
     tokenize_prompt,
 )
 
+from vllm_omni.diffusion.models.pi.common import backbone
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
@@ -599,7 +601,7 @@ def test_version_stable_embed_image():
     model = _selfconsist_model(device)
     g = torch.Generator(device="cpu").manual_seed(7)
     img = torch.rand(1, 3, 224, 224, generator=g, dtype=torch.float32).to(device)
-    std = model.paligemma_with_expert.embed_image(img).float().std().item()
+    std = backbone.embed_image(model.paligemma_with_expert.paligemma, img).float().std().item()
     assert abs(std - _GOLDEN_EMBED_IMAGE_STD) < 0.05, (
         f"embed_image std drifted: {std} vs {_GOLDEN_EMBED_IMAGE_STD} — "
         "likely a vision_tower weight-load regression under this transformers version."

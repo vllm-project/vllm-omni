@@ -5,7 +5,7 @@
 Only the parameters that actually shape runtime behaviour live here; the
 transformer dimensions (hidden size, head count, ...) are derived from
 ``paligemma_variant`` / ``action_expert_variant`` inside the model via
-``get_gemma_config`` (see ``modeling_pi0``).
+``get_gemma_config`` in the shared Pi-family backbone module.
 
 The resolver reads the **raw LeRobot ``config.json``** (the field surface of
 ``lerobot.policies.pi0.PI0Config``): only the recognized dataclass fields are
