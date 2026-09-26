@@ -60,4 +60,7 @@ rewind have not been validated for PersonaPlex.
 - Session config (voice / persona / sampling) is passed per session via
   `extra_body`; see
   `vllm_omni/model_executor/models/personaplex/duplex/serving_adapter.py`.
+- Stage 0 uses VLLM FULL CUDA graphs on the temporal transformer. The depformer is a
+  separate per-padded-B graph, on by default via `hf_overrides.depformer_cuda_graphs: true`
+  in `personaplex.yaml`. Delete that `hf_overrides` block to run the depformer eager.
 - Full runbook: [`recipes/NVIDIA/PersonaPlex.md`](../../../recipes/NVIDIA/PersonaPlex.md).

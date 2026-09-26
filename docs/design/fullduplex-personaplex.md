@@ -58,6 +58,8 @@ The unified implementation supports:
 - continuous user input while assistant audio is generated or played;
 - bundled `.pt` voice prompts and a session persona;
 - greedy text and depformer sampling, matching the current PersonaPlex port;
+- Stage 0 depformer CUDA graphs (`hf_overrides.depformer_cuda_graphs`; shipped
+  on in `personaplex.yaml`). Capture failure falls back to eager;
 - `/v1/realtime?duplex=1` (the wire vocabulary is catalogued in the
   [Realtime Duplex API](../serving/realtime_duplex_api.md) serving guide);
 - the public client preset
@@ -160,6 +162,16 @@ Cleanup is keyed by the full `(session_id, incarnation)` identity. Every live
 session has an independent Mimi encoder instance; encoder convolution/KV state
 is never shared between asynchronously scheduled sessions. A finished or
 aborted scheduler request resets and returns only that session's encoder.
+
+### Stage 0 CUDA graphs
+
+The AR runner FULL-graphs Helium. The depformer is launch-bound (16-step
+unroll), so `CUDAGraphDepformerWrapper` captures `PersonaPlexDepformer.forward`
+per padded batch with statc KV. Sizes come from Stage 0
+`compilation_config.cudagraph_capture_sizes.`. `personaplex.yaml` sets
+`hf_overrides.depformer_cuda_graphs: true`. `enforce_eager: true` disables graphs.
+Shape mismatch or capture failure replays eager. Graphed vs eager codes are tested
+in `tests/model_executor/models/personaplex/duplex/`;
 
 ### Stage 1 streaming decoder
 
