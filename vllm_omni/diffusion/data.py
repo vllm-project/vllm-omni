@@ -1919,10 +1919,12 @@ def _in_range(value: Any, name: str, lo: float, hi: float | None) -> float | Non
 
 @dataclass
 class SkipSoftmaxSpec:
-    """User-facing skip-softmax controls for the TRTLLM_ATTN backend.
+    """User-facing skip-softmax controls for TRTLLM_ATTN and FLASHINFER_ATTN.
 
     ``target_sparsity`` uses the checkpoint's calibrated curve (a·exp(b·s)); ``threshold``
     is the calibration-free absolute skip threshold. They are mutually exclusive.
+    FLASHINFER_ATTN supports an absolute threshold and eager timestep gating
+    with SM120 FP8 cute-dsl-prims, but not calibrated target sparsity.
     """
 
     target_sparsity: float | None = None
@@ -2039,11 +2041,26 @@ class AttentionSpec:
         self.skip_softmax = self._coerce(self.skip_softmax, SkipSoftmaxSpec, "skip_softmax")
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
         self.block_sparse = self._coerce(self.block_sparse, BlockSparseSpec, "block_sparse")
-        if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
+        if self.skip_softmax is not None and self.backend.upper() not in ("TRTLLM_ATTN", "FLASHINFER_ATTN"):
             raise ValueError(
-                f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
-                "Remove skip_softmax or set backend to TRTLLM_ATTN."
+                f"skip_softmax is only supported by the TRTLLM_ATTN and FLASHINFER_ATTN backends, "
+                f"but backend={self.backend!r}. Remove skip_softmax or set a supported backend."
             )
+        if self.backend.upper() == "FLASHINFER_ATTN":
+            prims = self.quant is not None and self.quant.flashinfer_backend == "cute-dsl-prims"
+            if self.skip_softmax is not None:
+                if not prims:
+                    raise ValueError("FLASHINFER_ATTN skip_softmax requires quant.flashinfer_backend='cute-dsl-prims'.")
+                if self.skip_softmax.target_sparsity is not None:
+                    raise ValueError(
+                        "FLASHINFER_ATTN supports an absolute skip_softmax.threshold; target_sparsity is not supported."
+                    )
+            if (
+                prims
+                and self.quant is not None
+                and (self.quant.dtype_qk != "fp8_e4m3" or self.quant.dtype_vo != "fp8_e4m3")
+            ):
+                raise ValueError("FLASHINFER_ATTN cute-dsl-prims requires quant.dtype_qk=quant.dtype_vo='fp8_e4m3'.")
         if self.quant is not None and self.backend.upper() not in ("TRTLLM_ATTN", "FLASHINFER_ATTN"):
             raise ValueError(
                 f"quant is only supported by the TRTLLM_ATTN and FLASHINFER_ATTN backends, but "

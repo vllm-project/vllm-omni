@@ -30,6 +30,21 @@ logger = init_logger(__name__)
 HEAD_SIZE_UNKNOWN = -1
 
 
+def _specialize_backend_cls(backend_cls: type[AttentionBackend], spec: AttentionSpec) -> type[AttentionBackend]:
+    # PRIMS consumes native packed offsets, while the existing FlashInfer
+    # wrapper path only implements uniform batches. Expose capabilities for
+    # the selected variant so H3 can avoid rebuilding a padding mask.
+    if (
+        backend_cls.get_name() == "FLASHINFER_ATTN"
+        and spec.quant is not None
+        and spec.quant.flashinfer_backend == "cute-dsl-prims"
+    ):
+        from vllm_omni.diffusion.attention.backends.flashinfer_attn import FlashInferSM120AttentionBackend
+
+        return FlashInferSM120AttentionBackend
+    return backend_cls
+
+
 def _load_backend_cls(cls_path: str) -> type[AttentionBackend]:
     """Load a backend class from its fully qualified path.
 
@@ -137,7 +152,7 @@ def get_attn_backend_for_role(
         )
 
     if spec is not None:
-        backend_cls = _cached_get_backend_cls(spec.backend, head_size)
+        backend_cls = _specialize_backend_cls(_cached_get_backend_cls(spec.backend, head_size), spec)
         _log_backend_resolution(
             role=role,
             role_category=role_category,
@@ -179,5 +194,5 @@ def get_attn_backend_for_capability(
     if spec is not None:
         from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 
-        return DiffusionAttentionBackendEnum[spec.backend.upper()].get_class()
+        return _specialize_backend_cls(DiffusionAttentionBackendEnum[spec.backend.upper()].get_class(), spec)
     return _cached_get_backend_cls(None, HEAD_SIZE_UNKNOWN)

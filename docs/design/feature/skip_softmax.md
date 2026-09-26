@@ -1,5 +1,10 @@
 # Skip-Softmax
 
+SM120 FP8 `FLASHINFER_ATTN` also supports Skip-Softmax through FlashInfer's
+direct PRIMS API. That path consumes the final threshold without sequence-length
+normalization; see [SM120 FP8 Skip-Softmax](../../user_guide/diffusion/attention_backends/dense_backends.md#sm120-fp8-skip-softmax).
+The calibration and factor conversion below describe the TRTLLM path.
+
 Skip-Softmax is the sparse-attention mode of the `TRTLLM_ATTN` backend. It implements
 [BLASST](https://arxiv.org/abs/2512.12087) (Dynamic BLocked Attention Sparsity via Softmax
 Thresholding), which adds a per-tile skip test to the FlashAttention main loop. This page describes the algorithm, how the user configuration is resolved

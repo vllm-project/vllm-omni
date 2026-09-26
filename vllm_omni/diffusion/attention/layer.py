@@ -590,6 +590,10 @@ class Attention(nn.Module):
             )
 
     def _run_ring_attention(self, query, key, value, attn_metadata):
+        if getattr(self.attention, "flashinfer_backend", None) == "cute-dsl-prims":
+            raise NotImplementedError(
+                "FLASHINFER_ATTN cute-dsl-prims is not supported with ring sequence parallelism; use Ulysses SP."
+            )
         if attn_metadata is not None and attn_metadata.attn_mask is not None:
             raise ValueError("Ring attention does not support attn_mask; use Ulysses SP or disable mask_sp_padding.")
         skip = getattr(self.attention, "skip", None)
