@@ -23,6 +23,30 @@ def test_dense_flash_capability_tracks_mindiesd(monkeypatch, available):
     assert NPUOmniPlatform.supports_diffusion_dense_flash_attention() is available
 
 
+def test_usp_executor_uses_technical_platform_switch() -> None:
+    pytest.importorskip("vllm_ascend")
+    from vllm_omni.platforms.npu.platform import NPUOmniPlatform
+    from vllm_omni.platforms.npu.usp import AscendUSPExecutor
+
+    groups = SimpleNamespace(ulysses_group=object(), ring_group=object())
+    disabled = SimpleNamespace(enable_usp=False)
+    assert NPUOmniPlatform.build_diffusion_usp_executor(disabled, groups) is None
+
+    enabled = SimpleNamespace(
+        enable_usp=True,
+        ulysses_degree=2,
+        ring_degree=4,
+        allgather_degree=1,
+        ulysses_mode="strict",
+    )
+    executor = NPUOmniPlatform.build_diffusion_usp_executor(enabled, groups)
+
+    assert isinstance(executor, AscendUSPExecutor)
+    assert executor.sp_group is groups
+    assert executor.ulysses_degree == 2
+    assert executor.ring_degree == 4
+
+
 def test_paged_config_uses_ascend_kernel_block_size() -> None:
     pytest.importorskip("vllm_ascend")
     from vllm_ascend.attention.attention_v1 import AscendAttentionBackend

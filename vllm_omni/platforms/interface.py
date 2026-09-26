@@ -157,6 +157,16 @@ class OmniPlatform(Platform):
         return True
 
     @classmethod
+    def build_diffusion_usp_executor(
+        cls,
+        parallel_config: Any,
+        sp_group: Any,
+    ) -> Any | None:
+        """Build a platform-specific unified sequence-parallel executor."""
+
+        return None
+
+    @classmethod
     def supports_torch_inductor(cls) -> bool:
         """Check if the platform supports torch.compile with inductor backend."""
         raise NotImplementedError
