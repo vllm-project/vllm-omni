@@ -888,6 +888,13 @@ class OmniServeCommand(CLISubcommand):
             "New integrations should use mode=layer and configure weight transfer per component.",
         )
         omni_config_group.add_argument(
+            "--offload-text-encoder",
+            action="store_true",
+            default=False,
+            help="Offload the text encoder to CPU after encoding to maximize available VRAM "
+            "for the DiT denoise stage (e.g. enabling Cache-DiT acceleration and multi-reference inputs).",
+        )
+        omni_config_group.add_argument(
             "--dlo-use-allgather",
             dest="dlo_use_allgather",
             action="store_true",

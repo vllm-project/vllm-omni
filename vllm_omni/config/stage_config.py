@@ -496,8 +496,8 @@ class StageDeployConfig:
     # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool | None = None
     enable_layerwise_offload: bool | None = None
-
     enable_distributed_layerwise_offload: bool | None = None
+    offload_text_encoder: bool | None = None
     dlo_use_allgather: bool | None = None
     dlo_resident_layers: int | None = None
     host_weight_runtime_mode: str | None = None

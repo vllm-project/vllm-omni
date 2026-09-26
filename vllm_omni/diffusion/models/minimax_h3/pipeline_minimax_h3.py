@@ -838,6 +838,7 @@ class MiniMaxH3Pipeline(
         self.device = get_local_device()
         self.load_text_encoder = od_config.model_loaded.get("text_encoder", True)
         self.load_vae_encoder = od_config.model_loaded.get("vae_encoder", True)
+        self.offload_text_encoder = bool(getattr(od_config, "offload_text_encoder", False))
         if self.load_vae_encoder is False and self.load_text_encoder is True:
             raise ValueError(
                 "MiniMax H3 does not support local text encoding with external media conditioning; "
@@ -1151,6 +1152,15 @@ class MiniMaxH3Pipeline(
             }
             if missing_gates := required_gates - transformer_loaded:
                 raise ValueError(f"FastH3 V2 checkpoint is missing compression gates: {sorted(missing_gates)}")
+        if (
+            getattr(self, "offload_text_encoder", False)
+            and getattr(self, "text_encoder", None) is not None
+            and not self._uses_manual_component_offload(self.text_encoder)
+        ):
+            logger.info("Initial offload of MiniMax H3 Qwen3-VL text encoder to CPU after weights loaded...")
+            self.text_encoder.offload_to_cpu()
+            self._release_stage_cache()
+            logger.info("Initial text encoder offload complete.")
         return loaded_with_prefix
 
     @property
@@ -1427,6 +1437,21 @@ class MiniMaxH3Pipeline(
         if self._uses_manual_component_offload(self.text_encoder):
             with self._component_on_device(self.text_encoder):
                 return self.text_encoder.encode_ids(input_ids, **vision_kwargs)
+
+        if getattr(self, "offload_text_encoder", False):
+            logger.info(
+                "Moving MiniMax H3 Qwen3-VL text encoder to device: %s (rank=%d)...",
+                self.device,
+                getattr(self, "_dit_rank", 0),
+            )
+            self.text_encoder.load_to_device()
+            try:
+                return self.text_encoder.encode_ids(input_ids, **vision_kwargs)
+            finally:
+                logger.info("Offloading MiniMax H3 Qwen3-VL text encoder to CPU to free VRAM for DiT...")
+                self.text_encoder.offload_to_cpu()
+                self._release_stage_cache()
+                logger.info("Qwen3-VL text encoder offloaded to CPU.")
 
         # Keep Qwen resident when it is not selected for layerwise offload.
         self.text_encoder.load_to_device()

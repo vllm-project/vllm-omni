@@ -633,3 +633,55 @@ def test_requested_model_offload_without_backend_uses_resident_components():
     assert actual is expected
     pipeline.text_encoder.load_to_device.assert_called_once_with()
     pipeline.text_encoder.encode_ids.assert_called_once()
+
+
+def test_offload_text_encoder_stages_and_frees_memory():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = SimpleNamespace(
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=False,
+        offload_text_encoder=True,
+    )
+    pipeline.offload_text_encoder = True
+    pipeline._model_cpu_offload_modules = []
+    pipeline.text_encoder = Mock()
+    pipeline._release_stage_cache = Mock()
+    expected = torch.ones(2, 3)
+    pipeline.text_encoder.encode_ids.return_value = expected
+
+    actual = pipeline._encode_text_hidden(torch.tensor([1, 2]), {})
+
+    assert actual is expected
+    pipeline.text_encoder.load_to_device.assert_called_once_with()
+    pipeline.text_encoder.encode_ids.assert_called_once()
+    pipeline.text_encoder.offload_to_cpu.assert_called_once_with()
+    pipeline._release_stage_cache.assert_called_once_with()
+
+
+def test_offload_text_encoder_frees_on_exception():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = SimpleNamespace(
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=False,
+        offload_text_encoder=True,
+    )
+    pipeline.offload_text_encoder = True
+    pipeline._model_cpu_offload_modules = []
+    pipeline.text_encoder = Mock()
+    pipeline._release_stage_cache = Mock()
+    pipeline.text_encoder.encode_ids.side_effect = RuntimeError("encoding failed")
+
+    with pytest.raises(RuntimeError, match="encoding failed"):
+        pipeline._encode_text_hidden(torch.tensor([1, 2]), {})
+
+    pipeline.text_encoder.load_to_device.assert_called_once_with()
+    pipeline.text_encoder.offload_to_cpu.assert_called_once_with()
+    pipeline._release_stage_cache.assert_called_once_with()

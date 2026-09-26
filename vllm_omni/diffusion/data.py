@@ -928,6 +928,9 @@ class OmniDiffusionConfig:
     enable_layerwise_offload: bool = False
     # Distributed layer-wise offloading with H2D + AllGather overlap (RFC-1)
     enable_distributed_layerwise_offload: bool = False
+    # Offload only the text encoder to CPU after text/media encoding to maximize
+    # available VRAM for the DiT denoise stage (e.g. Cache-DiT acceleration).
+    offload_text_encoder: bool = False
     # If True: shard weights 1/dp_size + AllGather (saves CPU memory, requires
     # concurrent requests in DP mode). If False: each rank streams the standard
     # loader's rank-local tensors (including TP-local shards) via H2D only.
