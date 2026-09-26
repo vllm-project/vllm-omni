@@ -44,6 +44,29 @@ Two model variants are provided:
 - GitHub: <https://github.com/baidu/ERNIE-Image>
 - Blog: <https://ernie-image.github.io/>
 
+## Online FP8
+
+Enable dynamic FP8 for both the DiT and Mistral language decoder with an
+unquantized ERNIE-Image or ERNIE-Image-Turbo checkpoint:
+
+```bash
+vllm serve baidu/ERNIE-Image-Turbo --omni \
+  --quantization-config '{"transformer": {"method": "fp8"}, "text_encoder": {"method": "fp8"}}' \
+  --port 8091
+```
+
+Text encoder FP8 quantizes attention and MLP projections in
+`text_encoder.language_model.layers`. Token embeddings, normalization,
+the vision tower, multimodal projector, optional Prompt Enhancer and VAE
+retain their original precision. A global `--quantization fp8` continues to
+apply to the DiT only. Text encoder FP8 requires BF16 or FP16 source weights
+and a GPU supported by vLLM's FP8 backend; prequantized checkpoints and static
+activation scales are unsupported for this component.
+
+Use `ignored_layers` within the `text_encoder` configuration to retain selected
+projections at their original precision. Layer names use the complete prefix,
+for example `text_encoder.language_model.layers.0.self_attn.q_proj`.
+
 ## Hardware Support
 
 This recipe currently documents tested configurations for CUDA GPU serving.
@@ -129,17 +152,17 @@ curl -X POST http://localhost:8091/v1/images/generations \
   `--enable-cpu-offload` to reduce GPU memory footprint by offloading
   components to CPU when not in use.
 - **Key flags:**
-  - `--omni` — enables vLLM-Omni diffusion serving.
+    - `--omni` — enables vLLM-Omni diffusion serving.
 - **Advanced features:**
-  - **TP (Tensor Parallelism):** `--tensor-parallel-size <N>` — distribute
+    - **TP (Tensor Parallelism):** `--tensor-parallel-size <N>` — distribute
     model weights across N GPUs.
-  - **SP (Sequence Parallelism):** `--usp <N>` (Ulysses SP) and `--ring <N>`
+    - **SP (Sequence Parallelism):** `--usp <N>` (Ulysses SP) and `--ring <N>`
     (Ring SP) for long-sequence workloads.
-  - **HSDP:** `--use-hsdp` enables Hybrid Sharded Data Parallelism; use
+    - **HSDP:** `--use-hsdp` enables Hybrid Sharded Data Parallelism; use
     `--hsdp-shard-size` and `--hsdp-replicate-size` for fine-grained control.
-  - **Cache-DiT:** `--cache-backend cache_dit` caches DiT intermediate outputs
+    - **Cache-DiT:** `--cache-backend cache_dit` caches DiT intermediate outputs
     for faster generation; configure via `--cache-config`.
-  - **Layer offload:** `--enable-layerwise-offload` offloads DiT layers to CPU
+    - **Layer offload:** `--enable-layerwise-offload` offloads DiT layers to CPU
     for memory-constrained scenarios.
 - **Prompt Enhancer (PE):** ERNIE-Image includes an optional 3B-parameter
   Prompt Enhancer model that expands brief user inputs into richer structured
@@ -147,5 +170,5 @@ curl -X POST http://localhost:8091/v1/images/generations \
   body to disable it if you prefer direct prompt processing or want to use
   larger LLMs (e.g., Gemini, ChatGPT) for prompt enhancement instead.
 - **Recommended settings:**
-  - ERNIE-Image: `num_inference_steps=50`, `guidance_scale=4.0`
-  - ERNIE-Image-Turbo: `num_inference_steps=8`, `guidance_scale=1.0`
+    - ERNIE-Image: `num_inference_steps=50`, `guidance_scale=4.0`
+    - ERNIE-Image-Turbo: `num_inference_steps=8`, `guidance_scale=1.0`

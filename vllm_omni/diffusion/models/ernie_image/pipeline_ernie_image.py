@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from: https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/ernie_image/pipeline_ernie_image.py
 
 import json
@@ -22,6 +22,7 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.ernie_image.ernie_image_transformer import ErnieImageTransformer2DModel
+from vllm_omni.diffusion.models.ernie_image.quantization import prepare_ernie_text_encoder_fp8
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
@@ -29,6 +30,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.quantization.component_config import resolve_component_quant_config
 
 logger = init_logger(__name__)
 
@@ -109,6 +111,7 @@ class ErnieImagePipeline(
             torch_dtype=od_config.dtype,
             local_files_only=local_files_only,
         ).to(self._execution_device)
+        prepare_ernie_text_encoder_fp8(self.text_encoder, od_config.quantization_config, self._execution_device)
         self.tokenizer = AutoTokenizer.from_pretrained(
             model,
             subfolder="tokenizer",
@@ -155,7 +158,8 @@ class ErnieImagePipeline(
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, ErnieImageTransformer2DModel)
         self.transformer = ErnieImageTransformer2DModel(
-            quant_config=od_config.quantization_config, **transformer_kwargs
+            quant_config=resolve_component_quant_config(od_config.quantization_config, "transformer"),
+            **transformer_kwargs,
         )
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels)) if getattr(self, "vae", None) else 16
