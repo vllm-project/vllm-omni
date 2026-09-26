@@ -1,3 +1,4 @@
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,11 @@ from vllm_omni.diffusion.models.flux.pipeline_flux import FluxPipeline
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+_FLUX_PIPELINE_LOGGER = "vllm_omni.diffusion.models.flux.pipeline_flux"
+# Unique string the fake tokenizer would emit if a warning path decoded the
+# removed prompt tail; its presence in logs means prompt text leaked.
+_PROMPT_SENTINEL = "redaction-sentinel-7f3a9c"
 
 
 def _make_flux_sampling(**overrides):
@@ -182,3 +188,71 @@ def test_forward_collates_request_prompt_tensors_for_flux(monkeypatch):
     torch.testing.assert_close(prepare_latents_call["latents"], torch.cat([latents_a, latents_b], dim=0))
     torch.testing.assert_close(outputs[0].output, torch.tensor([[0.0]]))
     torch.testing.assert_close(outputs[1].output, torch.tensor([[1.0]]))
+
+
+def _make_truncating_tokenizer(kept_len, full_len):
+    """Tokenizer truncating to kept_len; batch_decode leaks the sentinel.
+
+    The leak mirrors the pre-fix bug: if a warning path ever decodes the
+    removed prompt tail, the sentinel lands in the logs and the test fails.
+    """
+
+    def tokenizer(prompts, **kwargs):
+        ids_len = kept_len if kwargs.get("truncation") else full_len
+        return SimpleNamespace(input_ids=torch.zeros(1, ids_len, dtype=torch.long))
+
+    tokenizer.batch_decode = lambda input_ids: [_PROMPT_SENTINEL]
+    return tokenizer
+
+
+def _make_t5_encoder():
+    def text_encoder(input_ids, **kwargs):
+        return (torch.zeros(1, input_ids.shape[-1], 16),)
+
+    text_encoder.dtype = torch.float32
+    return text_encoder
+
+
+def _make_clip_encoder():
+    def text_encoder(input_ids, **kwargs):
+        return SimpleNamespace(pooler_output=torch.zeros(1, 8))
+
+    text_encoder.dtype = torch.float32
+    return text_encoder
+
+
+def _warning_messages(caplog):
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_t5_truncation_warning_never_logs_prompt_text(caplog):
+    pipeline = _make_flux_pipeline()
+    kept_len, full_len = 512, 560
+    pipeline.tokenizer_2 = _make_truncating_tokenizer(kept_len, full_len)
+    pipeline.text_encoder_2 = _make_t5_encoder()
+    prompt = f"a long prompt ending in {_PROMPT_SENTINEL}"
+
+    with caplog.at_level(logging.WARNING, logger=_FLUX_PIPELINE_LOGGER):
+        pipeline._get_t5_prompt_embeds(prompt, max_sequence_length=kept_len)
+
+    warnings = _warning_messages(caplog)
+    assert any(f"{full_len - kept_len} tokens were removed" in m for m in warnings), warnings
+    assert _PROMPT_SENTINEL not in caplog.text
+    assert prompt not in caplog.text
+
+
+def test_clip_truncation_warning_never_logs_prompt_text(caplog):
+    pipeline = _make_flux_pipeline()
+    kept_len, full_len = 77, 90
+    pipeline.tokenizer_max_length = kept_len
+    pipeline.tokenizer = _make_truncating_tokenizer(kept_len, full_len)
+    pipeline.text_encoder = _make_clip_encoder()
+    prompt = f"a long prompt ending in {_PROMPT_SENTINEL}"
+
+    with caplog.at_level(logging.WARNING, logger=_FLUX_PIPELINE_LOGGER):
+        pipeline._get_clip_prompt_embeds(prompt)
+
+    warnings = _warning_messages(caplog)
+    assert any(f"{full_len - kept_len} tokens were removed" in m for m in warnings), warnings
+    assert _PROMPT_SENTINEL not in caplog.text
+    assert prompt not in caplog.text
