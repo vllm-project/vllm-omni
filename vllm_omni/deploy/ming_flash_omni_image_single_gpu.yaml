@@ -1,0 +1,59 @@
+# Ming-flash-omni-2.0 A6 validation profile.
+#
+# This profile places the thinker and image-generation stages on one physical
+# GPU and keeps the diffusion engine inline in the orchestrator process.  It is
+# an opt-in validation profile; the default image profile remains unchanged.
+# cfg_parallel_size=1 is intentional: one GPU cannot provide two CFG ranks.
+#
+# The inline client removes the StageDiffusionProc ZMQ hop.  A non-inline
+# single-GPU profile would still use StageDiffusionClient, ZMQ, and CPU-side
+# serialization even when both stages name the same device.
+pipeline: ming_flash_omni_image
+async_chunk: false
+
+trust_remote_code: true
+distributed_executor_backend: mp
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.45
+    enforce_eager: true
+    tensor_parallel_size: 1
+    devices: "0"
+    output_connectors:
+      to_stage_1: shared_memory_connector
+    default_sampling_params:
+      temperature: 0.4
+      top_p: 0.9
+      top_k: 1
+      max_tokens: 1
+      seed: 42
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.5
+    enforce_eager: true
+    devices: "0"
+    engine_args:
+      inline_diffusion: true
+      parallel_config:
+        tensor_parallel_size: 1
+        cfg_parallel_size: 1
+    input_connectors:
+      from_stage_0: shared_memory_connector
+    default_sampling_params:
+      seed: 42
+
+connectors:
+  shared_memory_connector:
+    name: SharedMemoryConnector
+
+edges:
+  - from: 0
+    to: 1
+    window_size: -1
+    max_inflight: 1
+
+platforms: {}

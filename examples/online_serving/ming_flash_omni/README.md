@@ -56,6 +56,21 @@ Ming-flash-omni-2.0 also exposes an image-generation (diffusion) stage. Launch w
 
 The image-generation stage is a standard vLLM-Omni diffusion pipeline (`MingImagePipeline`); its request knobs are declared in `vllm_omni/model_extras/ming_flash_omni.py` and routed through `extra_body`, so they no longer need a bespoke `sampling_params_list` recipe (that form is still available for per-stage thinker sampling — see below).
 
+### A6 validation profiles
+
+The default `ming_flash_omni_image.yaml` keeps the thinker and diffusion
+stages on separate devices. For an explicit single-GPU validation, use
+`vllm_omni/deploy/ming_flash_omni_image_single_gpu.yaml`. It sets
+`cfg_parallel_size: 1`, places both stages on device 0, and enables
+`inline_diffusion`.
+
+The profile's inline setting is a process-topology choice. It removes the
+`StageDiffusionProc` ZMQ hop for the diffusion stage. Naming the same device
+without `inline_diffusion` would still use `StageDiffusionClient`, ZMQ, and
+`OmniMsgpackEncoder` CPU serialization. The profile must be validated on a
+machine with enough free VRAM; no memory or latency result is implied by the
+YAML alone.
+
 ### Launch
 
 ```bash
