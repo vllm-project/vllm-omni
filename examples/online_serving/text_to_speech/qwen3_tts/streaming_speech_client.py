@@ -58,7 +58,7 @@ Usage:
         --ref-text "Transcript of reference audio"
 
 Requirements:
-    pip install websockets
+    pip install websockets regex
 """
 
 import argparse
@@ -69,10 +69,26 @@ import os
 import wave
 
 try:
+    import regex
+except ImportError:
+    print("Please install regex: pip install regex")
+    raise SystemExit(1)
+
+try:
     import websockets
 except ImportError:
     print("Please install websockets: pip install websockets")
     raise SystemExit(1)
+
+
+# One character of any CJK script, matched by Unicode script property.
+#
+# A code-point range such as "一" <= c <= "鿿" covers only the BMP CJK Unified
+# Ideographs block. That silently misses kana and hangul -- Japanese and Korean
+# text then falls through to the space-splitting branch and is sent as a single
+# message, which is the very degradation --simulate-stt exists to avoid -- and
+# it also misses the CJK extensions outside the BMP.
+_CJK_RE = regex.compile(r"[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]")
 
 
 def frame_basename(msg: dict) -> str:
@@ -116,12 +132,46 @@ def timestamp_words_text(timestamps: list[dict] | None) -> str:
     return " ".join(str(item.get("word", "")) for item in timestamps if item.get("word"))
 
 
+def simulate_stt_units(text: str) -> list[str]:
+    """Split text into token-sized pieces for ``--simulate-stt``.
+
+    Space-delimited text is split into words, which is roughly one LLM token
+    each. Text containing CJK cannot use that rule because CJK is not written
+    with spaces, so each CJK character becomes its own piece (also roughly one
+    token) while runs of other characters are kept together.
+
+    "CJK" means any Han, Hiragana, Katakana or Hangul character, matched by
+    Unicode script property (see ``_CJK_RE``) rather than by code-point block.
+    """
+    if not _CJK_RE.search(text):
+        words = text.split(" ")
+        # Keep the separating space on all but the last word so that
+        # "".join(units) reproduces the original text.
+        return [w + (" " if i < len(words) - 1 else "") for i, w in enumerate(words)]
+
+    units: list[str] = []
+    pending = ""
+    for c in text:
+        if _CJK_RE.match(c):
+            if pending:
+                units.append(pending)
+                pending = ""
+            units.append(c)
+        else:
+            pending += c
+    if pending:
+        units.append(pending)
+    return units
+
+
 async def send_utterance(ws, text: str, simulate_stt: bool, stt_delay: float) -> None:
     """Send one utterance's text, then input.done to flush it."""
     if simulate_stt:
-        words = text.split(" ")
-        for i, word in enumerate(words):
-            chunk = word + (" " if i < len(words) - 1 else "")
+        # Feed the text in token-sized pieces and let the server's
+        # split_granularity do the segmentation. Splitting on punctuation here
+        # would duplicate the server's job and make it impossible to tell which
+        # layer is responsible for the boundaries.
+        for chunk in simulate_stt_units(text):
             await ws.send(
                 json.dumps(
                     {
