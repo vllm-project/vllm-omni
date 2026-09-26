@@ -1,0 +1,51 @@
+# Benchmark deploy config: LingBot-World 2.0 on four Ascend 910B1 (64GB), Ulysses SP-4, eager.
+#
+# NPU adaptation of usp4_compiled.yaml (the realtime topology): torch.compile /
+# CUDA graphs are off (enforce_eager: true) and the device is an NPU.
+#
+# Why four cards on NPU when the GPU reference runs one: a 910B1 has 64GB.
+# The single-card geometry needs 45.4 GiB weights + 35.2 GiB one-session KV
+# (23 resident frames x 1.19 GiB/frame/page + scratch + cross + streaming
+# decoder state) = 80.6 GiB and cannot fit at any gpu_memory_fraction; the
+# one-session admission check runs against actual free memory. With Ulysses
+# SP-4 the self-attention KV pool shards by head (40 -> 10 heads/rank), so
+# each rank needs only ~12.0 GiB of KV/scratch/state and the DEFAULT cache
+# geometry (window=9 + sink=9 frames) fits with ~3.2 GiB slack.
+#
+# Serve it under a 4-card canhazgpu reservation (ASCEND_RT_VISIBLE_DEVICES
+# must carry the physical card ids, e.g. 0,1,2,5):
+#
+#   vllm-omni serve /dataset/home/dxw/models/lingbot-world-v2-14b-causal-fast-diffusers \
+#     --omni --deploy-config benchmarks/lingbot_world/configs/npu_usp4_eager.yaml \
+#     --port 8000
+
+pipeline: lingbot_world
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: LingBotWorldCausalDMDPipeline
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    step_execution: true
+    streaming_output: true
+    parallel_config:
+      tensor_parallel_size: 1
+      sequence_parallel_size: 4
+      ulysses_degree: 4
+      ring_degree: 1
+    default_sampling_params:
+      num_inference_steps: 4
+      output_type: pil
+      extra_args:
+        flow_shift: 5.0
+    model_config:
+      ar_diffusion_height: 480
+      ar_diffusion_width: 832
+      ar_diffusion_kv_config:
+        gpu_memory_fraction: 0.6
+        warmup_cudagraph: false
