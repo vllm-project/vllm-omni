@@ -254,19 +254,16 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             if isinstance(user_sine, torch.Tensor) and user_sine.numel() >= n_user
             else sil
         )
-        total = int(prefill_text.numel())
-        rows = []
-        for i in range(span):
-            pos = offset + i
-            text_tok = int(prefill_text[pos].item()) if pos < total else zero_text
-            stack = torch.zeros((1, 1 + n_q, 1), dtype=torch.long, device=device)
-            stack[:, 0] = text_tok
-            if sil is not None:
-                stack[0, 1 : 1 + n_user, 0] = sil[:n_user]  # agent rows = encoded silence
-            if user is not None:
-                stack[0, 1 + n_user : 1 + 2 * n_user, 0] = user[:n_user]
-            rows.append(self.input_embeddings(stack).reshape(1, -1))
-        return torch.cat(rows, dim=0)  # [span, hidden]
+
+        stack = torch.zeros((1, 1 + n_q, span), dtype=torch.long, device=device)
+        stack[:, 0] = zero_text
+        text = prefill_text[offset : offset + span]
+        stack[0, 0, : text.numel()] = text.to(device)
+        if sil is not None:
+            stack[0, 1 : 1 + n_user] = sil[:n_user, None]
+        if user is not None:
+            stack[0, 1 + n_user : 1 + 2 * n_user] = user[:n_user, None]
+        return self.input_embeddings(stack).reshape(span, -1)  # [span, hidden]
 
     @staticmethod
     def _user_frame(info: dict[str, Any], frame_idx: int) -> torch.Tensor | None:
