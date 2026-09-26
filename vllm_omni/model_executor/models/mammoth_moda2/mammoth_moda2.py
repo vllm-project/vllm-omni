@@ -423,29 +423,18 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
         if not self.extra_gen_vocab or self.gen_embed_tokens is None:
             return self.embed_tokens(input_ids)
 
-        gen_mask = input_ids >= int(self.gen_vocab_start_index)
-        if not gen_mask.any():
-            return self.embed_tokens(input_ids)
-        if gen_mask.all():
-            gen_ids = input_ids - int(self.gen_vocab_start_index)
-            return self.gen_embed_tokens(gen_ids)
-
-        flat_ids = input_ids.reshape(-1)
-        flat_mask = gen_mask.reshape(-1)
-        out = torch.empty(
-            (flat_ids.shape[0], self.config.hidden_size),
-            dtype=self.embed_tokens.weight.dtype,  # type: ignore[attr-defined]
-            device=flat_ids.device,
-        )
-
-        base_pos = torch.where(~flat_mask)[0]
-        gen_pos = torch.where(flat_mask)[0]
-        if base_pos.numel() > 0:
-            out[base_pos] = self.embed_tokens(flat_ids[base_pos])
-        if gen_pos.numel() > 0:
-            gen_ids = flat_ids[gen_pos] - int(self.gen_vocab_start_index)
-            out[gen_pos] = self.gen_embed_tokens(gen_ids)
-        return out.view(*input_ids.shape, -1).contiguous()
+        # Shape-static dual-vocab lookup: no host-side .any()/.all() branches and
+        # no data-dependent scatter, so the same code is safe under torch.compile
+        # and CUDA graph capture. Ids are clamped to 0 for the table they don't
+        # belong to; the discarded lane is masked out by the final select,
+        # keeping both gathers in-bounds by construction.
+        gen_start = int(self.gen_vocab_start_index)
+        gen_mask = input_ids >= gen_start
+        base_ids = torch.where(gen_mask, torch.zeros_like(input_ids), input_ids)
+        gen_ids = torch.where(gen_mask, input_ids - gen_start, torch.zeros_like(input_ids))
+        base_emb = self.embed_tokens(base_ids)
+        gen_emb = self.gen_embed_tokens(gen_ids)
+        return torch.where(gen_mask.unsqueeze(-1), gen_emb, base_emb)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.get_input_embeddings(input_ids)
@@ -719,6 +708,16 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
         # These are passed by the vllm-omni runner via kwargs, so caching them in the model is sufficient.
         self._last_runtime_additional_information: list[dict[str, Any]] | None = None
 
+    def set_runtime_additional_information(self, runtime_infos: Any) -> None:
+        """Refresh the cached per-request metadata outside the captured forward.
+
+        The runner calls this every step in current batch order. A replayed
+        FULL decode graph skips the Python forward (which also assigns this
+        cache), so without this hook the constraint logic in compute_logits
+        would read a stale, differently-ordered list after batch condensation.
+        """
+        self._last_runtime_additional_information = runtime_infos if isinstance(runtime_infos, list) else None
+
     def _apply_t2i_token_constraints(self, logits: torch.Tensor) -> torch.Tensor:
         """Applies per-request token constraints.
 
@@ -883,6 +882,10 @@ class MammothModa2Qwen3ARForConditionalGeneration(Qwen3VLForConditionalGeneratio
         runtime_infos = kwargs.get("runtime_additional_information")
         self._last_runtime_additional_information = runtime_infos if isinstance(runtime_infos, list) else None
         return super().forward(*args, **kwargs)
+
+    def set_runtime_additional_information(self, runtime_infos: Any) -> None:
+        """Refresh the cached per-request metadata outside the captured forward (see runner)."""
+        self._last_runtime_additional_information = runtime_infos if isinstance(runtime_infos, list) else None
 
     def compute_logits(self, hidden_states: torch.Tensor):
         logits = super().compute_logits(hidden_states)
