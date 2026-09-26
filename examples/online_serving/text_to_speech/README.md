@@ -914,6 +914,15 @@ python qwen3_tts/streaming_speech_client.py \
 The client writes one PCM file per sentence and a matching
 `sentence_XXX_timestamps.json` sidecar.
 
+Audio remains incremental, but word alignment is sentence-final: the server
+collects the complete audio for the aligner while forwarding the original
+audio chunks to the client. The timestamp-only chunk arrives after the audio;
+its offsets refer to the complete utterance, not to the last audio chunk.
+Clients should not expect timestamps on each audio chunk or interpret missing
+intermediate timestamps as an error. Audio retained for alignment is scoped to
+the request and released when it finishes or is cancelled; longer utterances
+therefore require more host memory than audio-only streaming.
+
 Non-streaming requests can also ask for timestamps: pass
 `"word_timestamps": true` to `POST /v1/audio/speech` and read the
 `X-Word-Timestamps` response header (JSON list of `{word, start_ms, end_ms}`,
