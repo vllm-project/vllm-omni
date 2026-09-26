@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -41,6 +42,9 @@ from transformers.models.paligemma.modeling_paligemma import (
     PaliGemmaForConditionalGeneration,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.models.pi05.cuda_graph_pi05 import Pi05CUDAGraphs
 
 logger = logging.getLogger(__name__)
 
@@ -542,6 +546,10 @@ class Pi05ForActionPrediction(nn.Module):
         self.time_mlp_in = nn.Linear(self.expert_width, self.expert_width)
         self.time_mlp_out = nn.Linear(self.expert_width, self.expert_width)
 
+        # ``None`` runs ``sample_actions`` eagerly (the baseline). ``Pi05Pipeline``
+        # installs a ``Pi05CUDAGraphs`` unless the stage sets ``enforce_eager``.
+        self.cuda_graphs: Pi05CUDAGraphs | None = None
+
     # ── Prefix embedding ─────────────────────────────────────────────
     def embed_prefix(
         self,
@@ -724,16 +732,21 @@ class Pi05ForActionPrediction(nn.Module):
                     generator=generator,
                 )
 
+        # The three regions below run through CUDA graphs when installed; each
+        # falls back to its eager call on its own.
+        graphs = self.cuda_graphs
+        embed_prefix = self.embed_prefix if graphs is None else graphs.embed_prefix
+        prefix_forward = self.paligemma_with_expert.forward if graphs is None else graphs.prefix_forward
+        denoise_step = self.denoise_step if graphs is None else graphs.denoise_step
+
         # 1. Prefix embeddings + mask building.
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, image_masks, lang_tokens, lang_masks
-        )
+        prefix_embs, prefix_pad_masks, prefix_att_masks = embed_prefix(images, image_masks, lang_tokens, lang_masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         prefix_att_2d_masks_4d = prepare_attention_masks_4d(prefix_att_2d_masks)
 
         # 2. Forward prefix through PaliGemma LM, producing a list[(k, v)] cache.
-        _, past_key_values = self.paligemma_with_expert.forward(
+        _, past_key_values = prefix_forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -747,7 +760,7 @@ class Pi05ForActionPrediction(nn.Module):
         for step in range(num_steps):
             t = 1.0 + step * dt
             time_tensor = torch.full((bsize,), t, dtype=torch.float32, device=device)
-            v_t = self.denoise_step(
+            v_t = denoise_step(
                 prefix_pad_masks=prefix_pad_masks,
                 past_key_values=past_key_values,
                 x_t=x_t,

@@ -37,6 +37,7 @@ from vllm_omni.diffusion.models.pi05.config import (
     load_lerobot_norm_stats,
     resolve_excluded_action_indices,
 )
+from vllm_omni.diffusion.models.pi05.cuda_graph_pi05 import Pi05CUDAGraphs
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import (
     GemmaVariantConfig,
     Pi05AdaRMSNorm,
@@ -382,6 +383,36 @@ def test_pipeline_crops_actions_to_checkpoint_output_schema(monkeypatch):
     result = pipeline.forward(request)
 
     assert result.output["actions"].shape == (config.chunk_size, 7)
+
+
+class _GraphTarget:
+    """Stands in for the model: all ``_install_cuda_graphs`` touches is the slot."""
+
+    cuda_graphs = None
+
+
+@pytest.mark.parametrize(
+    "enforce_eager,device,installed",
+    [
+        (True, "cuda", False),
+        (False, "cuda", True),
+        # No CUDA device: the knob asks for graphs, the pipeline stays eager.
+        (False, "cpu", False),
+        (True, "cpu", False),
+    ],
+)
+def test_pipeline_installs_cuda_graphs_unless_enforce_eager(enforce_eager, device, installed):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
+
+    pipeline = object.__new__(Pi05Pipeline)
+    pipeline._device = torch.device(device)
+    pipeline.model = _GraphTarget()
+
+    pipeline._install_cuda_graphs(SimpleNamespace(enforce_eager=enforce_eager))
+
+    assert isinstance(pipeline.model.cuda_graphs, Pi05CUDAGraphs) is installed
 
 
 def test_load_lerobot_norm_stats_unknown_mode_raises(tmp_path):
@@ -858,6 +889,56 @@ def test_sample_actions_uses_request_generator(tiny_model):
 
     assert torch.equal(first, repeated)
     assert not torch.equal(first, different)
+
+
+class _RecordingCUDAGraphs(Pi05CUDAGraphs):
+    """Records which ``sample_actions`` region runs through the graph path."""
+
+    def __init__(self, model):
+        super().__init__(model)
+        self.calls: list[str] = []
+
+    def embed_prefix(self, *args, **kwargs):
+        self.calls.append("embed_prefix")
+        return super().embed_prefix(*args, **kwargs)
+
+    def prefix_forward(self, *args, **kwargs):
+        self.calls.append("prefix_forward")
+        return super().prefix_forward(*args, **kwargs)
+
+    def denoise_step(self, *args, **kwargs):
+        self.calls.append("denoise_step")
+        return super().denoise_step(*args, **kwargs)
+
+
+@pytest.mark.slow
+def test_sample_actions_routes_each_region_through_cuda_graphs(tiny_model):
+    """Once installed, every region goes through ``cuda_graphs`` (the denoise
+    step once per step), and falling back to eager reproduces the baseline bit
+    for bit. The real-checkpoint check is ``test_pi05_cuda_graph_parity.py``."""
+    model = tiny_model.eval()
+    images = [torch.zeros(1, 3, 224, 224) for _ in range(3)]
+    masks = [torch.tensor([True]), torch.tensor([False]), torch.tensor([False])]
+    lang = torch.zeros(1, 200, dtype=torch.long)
+    lang_mask = torch.ones(1, 200, dtype=torch.bool)
+    noise = torch.randn(1, 4, 8, generator=torch.Generator().manual_seed(42))
+
+    def run():
+        return model.sample_actions(
+            images=images, image_masks=masks, lang_tokens=lang, lang_masks=lang_mask, noise=noise, num_steps=3
+        )
+
+    graphs = _RecordingCUDAGraphs(model)
+    with torch.no_grad():
+        eager = run()
+        model.cuda_graphs = graphs
+        try:
+            optimized = run()
+        finally:
+            model.cuda_graphs = None
+
+    assert graphs.calls == ["embed_prefix", "prefix_forward"] + ["denoise_step"] * 3
+    assert torch.equal(optimized, eager)
 
 
 # ----------------------------------------------------------------------------
