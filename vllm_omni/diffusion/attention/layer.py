@@ -37,6 +37,14 @@ from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
+# ``AttentionMetadata.extra`` key. A model sets it on one call to run this
+# layer's SDPA compatibility kernel instead of the selected backend, keeping
+# the parallel strategy's pre/post-processing. A user-explicit backend still
+# wins. BAGEL sets it on its AllGather-KV denoising path, whose long trajectory
+# amplifies the reduction-order drift of asymmetric-Q/K FlashAttention against
+# the sequence-parallel reference.
+PREFER_SDPA_KERNEL = "prefer_sdpa_kernel"
+
 
 def _try_extract_layer_index(prefix: str) -> int | None:
     if not prefix:
@@ -256,14 +264,21 @@ class Attention(nn.Module):
                     attn_backend_explicit=self.backend_explicit,
                 )
 
-        self.parallel_strategy = build_parallel_attention_strategy(
-            scatter_idx=scatter_idx,
-            gather_idx=gather_idx,
-            use_sync=use_sync,
-            causal=causal,
-        )
         # Local strategy when SP is intentionally inactive outside sharded regions.
         self._no_parallel_strategy = NoParallelAttention()
+        if skip_sequence_parallel:
+            # A layer that opts out of SP never runs a strategy, so it is not
+            # held to strategy-specific constraints either -- e.g. the
+            # AllGather-KV non-causal requirement on a model's causal prefill
+            # layer that only ever sees the full sequence replicated per rank.
+            self.parallel_strategy = self._no_parallel_strategy
+        else:
+            self.parallel_strategy = build_parallel_attention_strategy(
+                scatter_idx=scatter_idx,
+                gather_idx=gather_idx,
+                use_sync=use_sync,
+                causal=causal,
+            )
 
         self.layer_idx: int | None = _try_extract_layer_index(prefix)
 
@@ -522,6 +537,13 @@ class Attention(nn.Module):
             return cast(nn.Module, self.attention)(query, key, value, attn_metadata)
 
         self._assert_metadata_compatible(attn_metadata)
+
+        if attn_metadata is not None and attn_metadata.extra.get(PREFER_SDPA_KERNEL, False):
+            attn_metadata = replace(
+                attn_metadata, extra={k: v for k, v in attn_metadata.extra.items() if k != PREFER_SDPA_KERNEL}
+            )
+            if self.sdpa_fallback is not None and not self.backend_explicit:
+                return cast(AttentionImpl, self.sdpa_fallback).forward(query, key, value, attn_metadata)
 
         if (
             self.allow_fp32_fallback

@@ -23,6 +23,7 @@ See supported models list in [Diffusion Features - Supported Models](../../diffu
 - **DeepSpeed Ulysses Sequence Parallel (Ulysses-SP)** ([paper](https://arxiv.org/pdf/2309.14509)): Uses all-to-all communication for subset of attention heads per device
 - **Ring-Attention** ([paper](https://arxiv.org/abs/2310.01889)): Uses ring-based P2P communication with sharded sequence dimension throughout
 - **Hybrid Ulysses + Ring**: Combines both for larger scale parallelism (`ulysses_degree × ring_degree`)
+- **AllGather-KV**: Keeps Q sequence-sharded and all-gathers only K/V per attention layer. Especially useful for GQA denoisers where K/V have substantially fewer heads than Q (BAGEL first).
 
 ---
 
@@ -84,6 +85,30 @@ omni = Omni(
     parallel_config=DiffusionParallelConfig(ulysses_degree=2, ring_degree=2)  # 4 GPUs total
 )
 ```
+
+**AllGather-KV** (BAGEL first):
+
+```python
+omni = Omni(
+    model="ByteDance-Seed/BAGEL-7B-MoT",
+    parallel_config=DiffusionParallelConfig(allgather_degree=4),
+)
+```
+
+AllGather-KV trades replicated full-sequence K/V memory for lower communication
+volume. It is mutually exclusive with Ulysses and Ring. For parallel degree `P`
+and GQA head ratio `R = Hq / Hkv`, its per-rank communication volume relative to
+Ulysses is `P / (R + 1)` (ignoring collective implementation overhead). BAGEL
+has `R=7`, so `allgather_degree=4` communicates half as many bytes as
+Ulysses-SP 4.
+
+BAGEL launches asynchronous K/V All-Gathers between independent K, V, and Q
+projections, so the communication can be fully hidden when the V/Q projection
+window covers the collective latency, and keeps the latent shard local across
+the denoising loop (gathered once for VAE decode). Full K/V must fit on each
+rank, sequence shards must be equal and unmasked, and quantized QKV projections
+must expose independent projection slices to use the overlap path. A ready-made
+recipe is `vllm_omni/deploy/bagel_allgather_kv4.yaml`.
 
 ---
 
@@ -153,6 +178,12 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 --ring 2
 vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2 --ring 2
 ```
 
+**AllGather-KV:**
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --allgather-degree 4
+```
+
 ---
 
 ## Configuration Parameters
@@ -163,11 +194,13 @@ In `DiffusionParallelConfig`:
 |-----------|------|---------|-------------|
 | `ulysses_degree` | int | 1 | Number of GPUs for Ulysses-SP. Uses all-to-all communication. |
 | `ring_degree` | int | 1 | Number of GPUs for Ring-Attention. Uses P2P ring communication. |
+| `allgather_degree` | int | 1 | Number of GPUs for AllGather-KV. Q remains local; K/V are all-gathered per layer. Mutually exclusive with Ulysses/Ring. |
 | `ulysses_mode` | str | `"default"` | Ulysses attention mode. Set to `"advanced_uaa"` to handle arbitrary sequence lengths and head counts without padding. |
 | `mask_sp_padding` | bool | `False` | When the sequence length is not divisible by the SP size, tokens are auto-padded with zeros. Set to `True` to mask those padding tokens (strict, but uses the slower varlen attention path); the default `False` leaves them unmasked, keeping the fast path with negligible numerical impact. |
 
 **Notes:**
-- Total sequence parallel size equals to `ulysses_degree × ring_degree`
+- Total sequence parallel size equals `ulysses_degree × ring_degree`, or `allgather_degree` when AllGather-KV is enabled
+- `allgather_degree > 1` requires `ulysses_degree=1` and `ring_degree=1`
 - Degrees must evenly divide the sequence length for optimal performance (or use `ulysses_mode="advanced_uaa"` for Ulysses-SP)
 - `mask_sp_padding` is an experimental feature, currently only supported by `Wan2.2`, `Wan2.2 Vace`, `Qwen-Image`, `Flux 2`, and `HunyuanVideo 1.5`
 

@@ -45,6 +45,85 @@ from vllm_omni.diffusion.distributed.sp_sharding import sp_shard, sp_gather
 | `sp_shard()` | Manual tensor sharding | Splits tensor across SP workers |
 | `sp_gather()` | Manual tensor gathering | Gathers sharded tensors from all workers |
 
+### AllGather-KV
+
+AllGather-KV is a third attention communication strategy under the SP
+umbrella, alongside Ulysses and Ring (`allgather_degree`, implemented in
+`attention/parallel/allgather_kv.py`):
+
+- Ulysses exchanges Q/K/V with All-to-All and reverses the exchange for output.
+- Ring keeps Q local and circulates K/V blocks.
+- AllGather-KV keeps Q local and All-Gathers K/V once per attention layer.
+
+Ring attention uses online softmax to merge successive K/V blocks while those
+blocks circulate; its running maximum, exponential sum, and output accumulator
+remain on the rank that owns Q. AllGather-KV starts from the same local-Q
+decomposition but materializes full K/V with one collective, then invokes a
+regular attention backend with `query_ranges` describing the rank's slice of
+the global query. Every local query sees the same global K/V in both
+strategies, although different reduction orders need not be bitwise identical.
+
+For GQA models such as BAGEL (`Hq=28`, `Hkv=4`), AllGather-KV removes Q and
+output communication from the attention strategy and communicates only the
+smaller K/V tensors. The tradeoff is that every rank stores full-sequence K/V.
+
+Let `P` be the parallel degree and `R = Hq / Hkv`. For equal sequence shards,
+the per-rank communication-volume ratio to Ulysses is:
+
+```text
+V_AllGatherKV / V_Ulysses = P / (R + 1)
+```
+
+This counts the K/V All-Gather for AllGather-KV and the Q/K/V forward plus
+output reverse All-to-All for Ulysses, while ignoring collective implementation
+overhead. For BAGEL with `P=4` and `R=7`, AllGather-KV communicates half as
+many bytes as Ulysses. It communicates less whenever `P < R+1`.
+
+#### Overlapping the collective with projection (BAGEL)
+
+The strategy's `pre_attention` gathers K/V synchronously. A model can instead
+gather K/V itself while it still has independent work to do, then set
+`AttentionMetadata.extra[ALLGATHER_KV_PRE_GATHERED] = True` so the strategy
+skips its own gather; joint handling and query-range slicing still run.
+`async_all_gather_sequence()` in the same module starts the collective and
+returns a handle whose `wait()` yields the `(B, world * S_local, ...)` tensor,
+in the same layout as `SequenceParallelGroupCoordinator.all_gather(dim=1)`.
+
+BAGEL's generation path uses this to split the generation-expert projection
+and schedule it as K projection → asynchronous K All-Gather → V projection →
+asynchronous V All-Gather → Q projection. K communication overlaps V/Q
+projection and V communication overlaps Q projection; communication leaves the
+critical path only when those compute windows cover the collective latency.
+The per-component projection (`MoTQKVParallelLinear.forward_gen_component`)
+needs unpacked BF16/FP16/FP32 generation weights; packed quantized weights fall
+back to the fused path without overlap. Prompt prefill continues to use the
+frozen text expert and is not part of this denoising-only overlap.
+
+BAGEL also keeps the latent shard local across the whole denoising loop under
+AllGather-KV: MLP, CFG combination, and Euler updates stay sequence-local, the
+`cfg_renorm_type="global"` norm is reduced over the AllGather group, and the
+latent is gathered once for VAE decode instead of once per step. That
+persistent-shard loop is used when no custom scheduler, trajectory recording,
+or frame-conditioning tokens are requested; those paths keep the per-step
+gather.
+
+Only the sharded denoising sequence goes through the strategy. BAGEL's
+prefill-time phases (text, ViT and VAE cache updates, understanding) see the
+full sequence replicated on every rank; under AllGather-KV those layers are
+built with `skip_sequence_parallel=True` and run locally, which also keeps the
+strategy's non-causal requirement away from BAGEL's causal prefill layer. A
+layer that opts out of SP never asks the factory for a strategy.
+
+The BAGEL AllGather-KV denoising path pins the SDPA kernel for numerical
+alignment by setting `AttentionMetadata.extra[PREFER_SDPA_KERNEL]` on that
+call (a user-explicit backend still wins). Although dense FlashAttention
+accepts asymmetric Q/K lengths, its small reduction-order differences compound
+across the denoise trajectory. A stable Flash kernel for this shape remains
+follow-up work.
+
+AllGather-KV requires equal unmasked sequence shards and is mutually exclusive
+with Ulysses/Ring. Full K/V must fit on every rank.
+
 ---
 
 ## UAA Mode (Experimental)

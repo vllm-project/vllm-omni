@@ -38,7 +38,12 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.transformers_utils.configs.bagel import BagelConfig
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata as DiffusionAttentionMetadata
+from vllm_omni.diffusion.attention.layer import PREFER_SDPA_KERNEL
 from vllm_omni.diffusion.attention.layer import Attention as DiffusionAttention
+from vllm_omni.diffusion.attention.parallel.allgather_kv import (
+    ALLGATHER_KV_PRE_GATHERED,
+    async_all_gather_sequence,
+)
 from vllm_omni.diffusion.cache.cachedit import BagelCachedAdapter, CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -426,6 +431,24 @@ class BaseNavitOutputWithPast(ModelOutput):
     past_key_values: NaiveCache | None = None
 
 
+def sp_replicated_phases_run_locally(parallel_config: DiffusionParallelConfig | None) -> bool:
+    """Whether BAGEL's replicated phases must bypass the sequence-parallel strategy.
+
+    The causal text prefill, the ViT/VAE cache updates and the CFG cache-update
+    forward all run on sequences that every SP rank holds in full. Handing them
+    to a strategy is wrong for every strategy we have: AllGather-KV rejects the
+    causal layer and would gather one copy of K/V per rank, and Ulysses/Ring
+    all-to-all the identical per-rank copies as if they were shards (a causal
+    prefill then attends across copies, a cache update sees its K/V duplicated
+    world_size times). So any sequence parallelism at all means "run locally".
+    """
+    if parallel_config is None:
+        return False
+    if getattr(parallel_config, "allgather_degree", 1) > 1:
+        return True
+    return (getattr(parallel_config, "sequence_parallel_size", None) or 1) > 1
+
+
 class PackedAttentionMoT(nn.Module):
     """Packed attention with Mixture-of-Tokens routing for understanding/generation.
 
@@ -484,12 +507,26 @@ class PackedAttentionMoT(nn.Module):
 
         self.rotary_op = RotaryEmbedding(is_neox_style=True)
 
+        # Prefill-time attention (text / ViT / VAE cache updates, understanding)
+        # sees the full sequence replicated on every SP rank. Ulysses splits
+        # heads and keeps the full sequence, so those phases stay correct under
+        # it. AllGather-KV would gather one copy of K/V per rank and rejects a
+        # causal layer outright, so under AllGather-KV the replicated phases run
+        # their kernel locally; only the sharded denoising path uses the strategy.
+        # Ulysses/Ring have the same problem in a different guise: every rank
+        # holds an identical copy of a replicated sequence, and the all-to-all
+        # would splice those copies together as if they were shards (a causal
+        # text prefill then leaks across copies, a cache update sees its K/V
+        # duplicated world_size times). So every SP strategy runs the
+        # replicated phases locally.
+        replicated_local = sp_replicated_phases_run_locally(parallel_config)
         self.attn_causal = DiffusionAttention(
             num_heads=self.total_num_heads,
             head_size=self.head_dim,
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=True,
             num_kv_heads=self.total_num_kv_heads,
+            skip_sequence_parallel=replicated_local,
         )
         self.attn_noncausal = DiffusionAttention(
             num_heads=self.total_num_heads,
@@ -498,12 +535,110 @@ class PackedAttentionMoT(nn.Module):
             causal=False,
             num_kv_heads=self.total_num_kv_heads,
         )
+        self.attn_noncausal_local: DiffusionAttention | None = (
+            DiffusionAttention(
+                num_heads=self.total_num_heads,
+                head_size=self.head_dim,
+                softmax_scale=1.0 / (self.head_dim**0.5),
+                causal=False,
+                num_kv_heads=self.total_num_kv_heads,
+                skip_sequence_parallel=True,
+            )
+            if replicated_local
+            else None
+        )
+
+    def _replicated_noncausal_attn(self) -> DiffusionAttention:
+        """Non-causal attention for a sequence that is replicated across SP ranks."""
+        return self.attn_noncausal_local if self.attn_noncausal_local is not None else self.attn_noncausal
 
     def _is_sp_active(self) -> bool:
         """Check if SP is active for this attention layer."""
         if not is_forward_context_available():
             return False
         return get_forward_context().sp_active
+
+    def _is_allgather_kv_active(self) -> bool:
+        return self._is_sp_active() and self.parallel_config is not None and self.parallel_config.allgather_degree > 1
+
+    def _forward_gen_allgather_kv(
+        self,
+        packed_query_sequence: torch.Tensor,
+        packed_query_position_embeddings: torch.Tensor,
+        past_key_values: NaiveCache | None,
+        packed_vae_token_indexes: torch.Tensor,
+        packed_text_indexes: torch.Tensor,
+    ) -> tuple[torch.Tensor, NaiveCache | None]:
+        """Generation-only AllGather-KV path with K→V→Q projection/communication overlap."""
+        text_hidden = packed_query_sequence[packed_text_indexes].to(torch.bfloat16)
+        vae_hidden = packed_query_sequence[packed_vae_token_indexes].to(torch.bfloat16)
+        cos, sin = [x[..., : self.head_dim // 2] for x in packed_query_position_embeddings]
+        text_cos, text_sin = cos[packed_text_indexes], sin[packed_text_indexes]
+        vae_cos, vae_sin = cos[packed_vae_token_indexes], sin[packed_vae_token_indexes]
+
+        vae_k = self.qkv_proj.forward_gen_component(vae_hidden, "k")
+        vae_k = vae_k.view(-1, self.num_kv_heads, self.head_dim)
+        vae_k = self.k_norm.forward_gen(vae_k.to(torch.float32))
+        vae_k = self.rotary_op(vae_k.to(vae_cos.dtype).unsqueeze(0), vae_cos, vae_sin).squeeze(0).to(torch.bfloat16)
+        cp_group = get_sp_group().allgather_group
+        key_gather = async_all_gather_sequence(vae_k.unsqueeze(0), cp_group)
+
+        vae_v = self.qkv_proj.forward_gen_component(vae_hidden, "v")
+        vae_v = vae_v.view(-1, self.num_kv_heads, self.head_dim).to(torch.bfloat16)
+        value_gather = async_all_gather_sequence(vae_v.unsqueeze(0), cp_group)
+
+        vae_q = self.qkv_proj.forward_gen_component(vae_hidden, "q")
+        vae_q = vae_q.view(-1, self.num_heads, self.head_dim)
+        vae_q = self.q_norm.forward_gen(vae_q.to(torch.float32))
+        vae_q = self.rotary_op(vae_q.to(vae_cos.dtype).unsqueeze(0), vae_cos, vae_sin).squeeze(0).to(torch.bfloat16)
+
+        # The two replicated image-marker tokens stay on the frozen text expert.
+        text_qkv, _ = self.qkv_proj(text_hidden)
+        text_q, text_k, text_v = text_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        text_q = self.q_norm(text_q.view(-1, self.num_heads, self.head_dim).to(torch.float32))
+        text_k = self.k_norm(text_k.view(-1, self.num_kv_heads, self.head_dim).to(torch.float32))
+        text_v = text_v.view(-1, self.num_kv_heads, self.head_dim)
+        text_q = (
+            self.rotary_op(text_q.to(text_cos.dtype).unsqueeze(0), text_cos, text_sin).squeeze(0).to(torch.bfloat16)
+        )
+        text_k = (
+            self.rotary_op(text_k.to(text_cos.dtype).unsqueeze(0), text_cos, text_sin).squeeze(0).to(torch.bfloat16)
+        )
+        text_v = text_v.to(torch.bfloat16)
+
+        vae_k_global = key_gather.wait()
+        vae_v_global = value_gather.wait()
+        if past_key_values is not None and past_key_values.key_cache[self.layer_idx] is not None:
+            ctx_k = torch.cat([past_key_values.key_cache[self.layer_idx], text_k], dim=0)
+            ctx_v = torch.cat([past_key_values.value_cache[self.layer_idx], text_v], dim=0)
+        else:
+            ctx_k, ctx_v = text_k, text_v
+
+        attn_out = self.attn_noncausal(
+            vae_q.unsqueeze(0),
+            vae_k_global,
+            vae_v_global,
+            DiffusionAttentionMetadata(
+                joint_query=text_q.unsqueeze(0),
+                joint_key=ctx_k.unsqueeze(0),
+                joint_value=ctx_v.unsqueeze(0),
+                joint_strategy="front",
+                # K/V are already gathered above; SDPA keeps the denoise
+                # trajectory aligned with the sequence-parallel reference.
+                extra={ALLGATHER_KV_PRE_GATHERED: True, PREFER_SDPA_KERNEL: True},
+            ),
+        ).squeeze(0)
+
+        text_len = text_q.shape[0]
+        text_attn = attn_out[:text_len].reshape(text_len, self.q_size)
+        vae_attn = attn_out[text_len:].reshape(-1, self.q_size)
+        text_out, _ = self.o_proj(text_attn)
+        vae_out, _ = self.o_proj.forward_gen(vae_attn)
+
+        full_output = text_out.new_zeros((packed_query_sequence.shape[0], self.hidden_size))
+        full_output[packed_text_indexes] = text_out
+        full_output[packed_vae_token_indexes] = vae_out
+        return full_output, past_key_values
 
     def _forward_gen(
         self,
@@ -533,6 +668,19 @@ class PackedAttentionMoT(nn.Module):
         Currently we shouldn't need it in the model, and it would be ideal to handle
         packing/batching etc in a more model agnostic way.
         """
+        if (
+            self._is_allgather_kv_active()
+            and not update_past_key_values
+            and self.qkv_proj.supports_separate_gen_projection
+        ):
+            return self._forward_gen_allgather_kv(
+                packed_query_sequence=packed_query_sequence,
+                packed_query_position_embeddings=packed_query_position_embeddings,
+                past_key_values=past_key_values,
+                packed_vae_token_indexes=packed_vae_token_indexes,
+                packed_text_indexes=packed_text_indexes,
+            )
+
         text_indices = packed_text_indexes
         vae_indices = packed_vae_token_indexes
 
@@ -583,7 +731,12 @@ class PackedAttentionMoT(nn.Module):
 
         # NOTE: we reshape to batched (1, S, H, D) for diffusion Attention
         # attn_out should be: (1, text_len + local_vae_len, H, D)
-        if self._is_sp_active():
+        # A cache update (update_past_key_values) runs on the full, unsharded VAE
+        # sequence, so under AllGather-KV it is a replicated phase: build the
+        # per-branch sequences by hand below and run attention locally, exactly
+        # like the non-SP path, instead of handing joint tensors to a strategy.
+        replicated_phase = self._is_sp_active() and update_past_key_values
+        if self._is_sp_active() and not replicated_phase:
             # Joint mechanism keeps text+cache replicated across SP ranks
             attn_out = self.attn_noncausal(
                 vae_q.unsqueeze(0),
@@ -631,14 +784,13 @@ class PackedAttentionMoT(nn.Module):
                 k_4d = torch.stack([torch.cat([t, v]) for t, v in zip(text_k_parts, vae_k_parts)])
                 v_4d = torch.stack([torch.cat([t, v]) for t, v in zip(text_v_parts, vae_v_parts)])
                 metadata = None
-            attn_out = self.attn_noncausal(q_4d, k_4d, v_4d, metadata)
+            attn_out = self._replicated_noncausal_attn()(q_4d, k_4d, v_4d, metadata)
 
         attn_out = attn_out.reshape(num_branches, -1, self.q_size)
         text_attn = attn_out[:, :text_per_branch].reshape(-1, self.q_size)
         vae_attn = attn_out[:, text_per_branch:].reshape(-1, self.q_size)
         text_len = text_attn.shape[0]
 
-        # MoT output projection over local [text, vae] order.
         local_packed = torch.cat([text_attn, vae_attn], dim=0)
         local_text_idx = torch.arange(text_len, device=local_packed.device)
         local_vae_idx = torch.arange(text_len, text_len + vae_attn.shape[0], device=local_packed.device)
@@ -747,7 +899,7 @@ class PackedAttentionMoT(nn.Module):
             )
             attn_out = attn_out_4d.permute(0, 2, 1, 3)
         else:
-            attn = self.attn_causal if is_causal else self.attn_noncausal
+            attn = self.attn_causal if is_causal else self._replicated_noncausal_attn()
             attn_out = attn(
                 q.unsqueeze(0),
                 full_k.unsqueeze(0),
@@ -1349,6 +1501,15 @@ class Bagel(CFGParallelMixin, nn.Module):
         sp_size = self._sp_size
         sp_rank = get_sequence_parallel_rank()
         num_vae = x_t.shape[0]
+        if (
+            self.parallel_config is not None
+            and self.parallel_config.allgather_degree > 1
+            and num_vae % self.parallel_config.allgather_degree != 0
+        ):
+            raise ValueError(
+                f"BAGEL AllGather-KV requires VAE token count ({num_vae}) to be divisible by "
+                f"allgather_degree ({self.parallel_config.allgather_degree})."
+            )
         assert num_vae % sp_size == 0, f"VAE token count {num_vae} not divisible by SP size {sp_size}"
         chunk = num_vae // sp_size
         start = sp_rank * chunk
@@ -1798,6 +1959,122 @@ class Bagel(CFGParallelMixin, nn.Module):
         output_device = generated_sequence[0].device
         return torch.stack([i.to(output_device) for i in generated_sequence], dim=0)
 
+    def _generate_image_allgather_kv(
+        self,
+        x_t: torch.Tensor,
+        timesteps: torch.Tensor,
+        dts: torch.Tensor,
+        packed_text_ids: torch.Tensor,
+        packed_text_indexes: torch.Tensor,
+        packed_vae_position_ids: torch.Tensor,
+        packed_vae_token_indexes: torch.Tensor,
+        packed_seqlens: torch.Tensor,
+        packed_position_ids: torch.Tensor,
+        past_key_values: NaiveCache,
+        cfg_interval: tuple[float, float],
+        cfg_text_scale: float,
+        cfg_text_packed_position_ids: torch.Tensor | None,
+        cfg_text_past_key_values: NaiveCache | None,
+        cfg_img_scale: float,
+        cfg_img_packed_position_ids: torch.Tensor | None,
+        cfg_img_past_key_values: NaiveCache | None,
+        cfg_renorm_type: str,
+        cfg_renorm_min: float,
+    ):
+        """Denoise with a persistent local sequence shard.
+
+        Attention gathers K/V per layer. MLP, CFG combination, and Euler updates
+        remain sequence-local. The latent is gathered only once for VAE decode.
+        """
+
+        def split_branch(position_ids: torch.Tensor):
+            return self._split_vae_for_sp(
+                x_t,
+                packed_vae_position_ids,
+                packed_vae_token_indexes,
+                packed_text_indexes,
+                packed_seqlens,
+                position_ids,
+            )
+
+        (
+            local_x_t,
+            local_vae_pos_ids,
+            local_vae_indexes,
+            local_text_indexes,
+            local_seqlens,
+            local_position_ids,
+        ) = split_branch(packed_position_ids)
+
+        cfg_text_position_ids = None
+        if cfg_text_scale > 1.0:
+            if cfg_text_packed_position_ids is None or cfg_text_past_key_values is None:
+                raise ValueError("Text CFG inputs are required when cfg_text_scale > 1.")
+            cfg_text_position_ids = split_branch(cfg_text_packed_position_ids)[-1]
+
+        cfg_img_position_ids = None
+        if cfg_img_scale > 1.0:
+            if cfg_img_packed_position_ids is None or cfg_img_past_key_values is None:
+                raise ValueError("Image CFG inputs are required when cfg_img_scale > 1.")
+            cfg_img_position_ids = split_branch(cfg_img_packed_position_ids)[-1]
+
+        for i, t_value in enumerate(timesteps.tolist()):
+            local_timestep = timesteps[i].expand(local_x_t.shape[0])
+            v_t = self._forward_single_branch_local(
+                local_x_t,
+                local_timestep,
+                local_vae_pos_ids,
+                local_vae_indexes,
+                local_text_indexes,
+                local_seqlens,
+                local_position_ids,
+                packed_text_ids,
+                past_key_values,
+            )
+
+            in_cfg_window = t_value > cfg_interval[0] and t_value <= cfg_interval[1]
+            cfg_text_scale_i = cfg_text_scale if in_cfg_window else 1.0
+            cfg_img_scale_i = cfg_img_scale if in_cfg_window else 1.0
+            if cfg_text_scale_i > 1.0:
+                cfg_text_v_t = self._forward_single_branch_local(
+                    local_x_t,
+                    local_timestep,
+                    local_vae_pos_ids,
+                    local_vae_indexes,
+                    local_text_indexes,
+                    local_seqlens,
+                    cfg_text_position_ids,
+                    packed_text_ids,
+                    cfg_text_past_key_values,
+                )
+                cfg_img_v_t = None
+                if cfg_img_scale_i > 1.0:
+                    cfg_img_v_t = self._forward_single_branch_local(
+                        local_x_t,
+                        local_timestep,
+                        local_vae_pos_ids,
+                        local_vae_indexes,
+                        local_text_indexes,
+                        local_seqlens,
+                        cfg_img_position_ids,
+                        packed_text_ids,
+                        cfg_img_past_key_values,
+                    )
+                v_t = self._combine_cfg(
+                    v_t,
+                    cfg_text_v_t,
+                    cfg_img_v_t,
+                    cfg_text_scale_i,
+                    cfg_img_scale_i,
+                    cfg_renorm_type,
+                    cfg_renorm_min,
+                    global_norm_group=get_sp_group().allgather_group,
+                )
+            local_x_t = local_x_t - v_t.to(local_x_t.device) * dts[i]
+
+        full_x_t = self._gather_vae_for_sp(local_x_t)
+        return full_x_t.split((packed_seqlens - 2).tolist()), None, None, None
+
     def generate_image(
         self,
         packed_text_ids: torch.LongTensor,
@@ -1882,6 +2159,36 @@ class Bagel(CFGParallelMixin, nn.Module):
                 return_trajectory_latents=return_trajectory_latents,
                 scheduler=scheduler,
                 scheduler_kwargs=scheduler_kwargs,
+            )
+
+        use_persistent_allgather_kv = (
+            self.parallel_config is not None
+            and self.parallel_config.allgather_degree > 1
+            and scheduler is None
+            and not return_trajectory_latents
+            and frame_condition_token_indexes is None
+        )
+        if use_persistent_allgather_kv:
+            return self._generate_image_allgather_kv(
+                x_t=x_t,
+                timesteps=timesteps,
+                dts=dts,
+                packed_text_ids=packed_text_ids,
+                packed_text_indexes=packed_text_indexes,
+                packed_vae_position_ids=packed_vae_position_ids,
+                packed_vae_token_indexes=packed_vae_token_indexes,
+                packed_seqlens=packed_seqlens,
+                packed_position_ids=packed_position_ids,
+                past_key_values=past_key_values,
+                cfg_interval=cfg_interval,
+                cfg_text_scale=cfg_text_scale,
+                cfg_text_packed_position_ids=cfg_text_packed_position_ids,
+                cfg_text_past_key_values=cfg_text_past_key_values,
+                cfg_img_scale=cfg_img_scale,
+                cfg_img_packed_position_ids=cfg_img_packed_position_ids,
+                cfg_img_past_key_values=cfg_img_past_key_values,
+                cfg_renorm_type=cfg_renorm_type,
+                cfg_renorm_min=cfg_renorm_min,
             )
 
         # ── SP + CFG: sequential single-branch forwards ──
@@ -2200,6 +2507,7 @@ class Bagel(CFGParallelMixin, nn.Module):
         cfg_img_scale: float,
         cfg_renorm_type: str,
         cfg_renorm_min: float,
+        global_norm_group: dist.ProcessGroup | None = None,
     ) -> torch.Tensor:
         """Combine 3-branch CFG predictions with renormalization.
 
@@ -2211,6 +2519,7 @@ class Bagel(CFGParallelMixin, nn.Module):
             cfg_img_scale: image guidance scale
             cfg_renorm_type: "text_channel", "global", or "channel"
             cfg_renorm_min: minimum renormalization scale
+            global_norm_group: process group used to aggregate sharded global norms
         """
         if cfg_renorm_type == "text_channel":
             v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
@@ -2232,8 +2541,18 @@ class Bagel(CFGParallelMixin, nn.Module):
 
             # NOTE norm is computed over all dimensions, thus currently only supports batch_size = 1 with navit
             if cfg_renorm_type == "global":
-                norm_v_t = torch.norm(v_t)
-                norm_v_t_ = torch.norm(v_t_)
+                if global_norm_group is None:
+                    norm_v_t = torch.norm(v_t)
+                    norm_v_t_ = torch.norm(v_t_)
+                else:
+                    norm_squares = torch.stack(
+                        (
+                            v_t.float().square().sum(),
+                            v_t_.float().square().sum(),
+                        )
+                    )
+                    dist.all_reduce(norm_squares, op=dist.ReduceOp.SUM, group=global_norm_group)
+                    norm_v_t, norm_v_t_ = norm_squares.sqrt().unbind()
             elif cfg_renorm_type == "channel":
                 norm_v_t = torch.norm(v_t, dim=-1, keepdim=True)
                 norm_v_t_ = torch.norm(v_t_, dim=-1, keepdim=True)
@@ -2341,6 +2660,50 @@ class Bagel(CFGParallelMixin, nn.Module):
             true_cfg_scale["cfg_renorm_min"],
         )
 
+    def _forward_single_branch_local(
+        self,
+        local_x_t: torch.Tensor,
+        timestep: torch.Tensor,
+        local_vae_pos_ids: torch.Tensor,
+        local_vae_indexes: torch.Tensor,
+        local_text_indexes: torch.Tensor,
+        local_seqlens: torch.Tensor,
+        local_position_ids: torch.Tensor,
+        packed_text_ids: torch.Tensor,
+        past_key_values: NaiveCache,
+    ) -> torch.Tensor:
+        """Run all transformer blocks while keeping the sequence shard local."""
+        packed_text_embedding = self.language_model.forward(
+            packed_text_ids=packed_text_ids,
+            return_embeddings_only=True,
+        ).packed_query_sequence
+        packed_sequence = packed_text_embedding.new_zeros((int(local_seqlens.sum()), self.hidden_size))
+        packed_sequence[local_text_indexes] = packed_text_embedding
+
+        packed_pos_embed = self.latent_pos_embed(local_vae_pos_ids)
+        packed_timestep_embeds = self.time_embedder(timestep)
+        x_t_emb = self.vae2llm(local_x_t) + packed_timestep_embeds + packed_pos_embed
+        if x_t_emb.dtype != packed_sequence.dtype:
+            x_t_emb = x_t_emb.to(packed_sequence.dtype)
+        packed_sequence[local_vae_indexes] = x_t_emb
+
+        extra_inputs = {}
+        if self.use_moe:
+            extra_inputs["mode"] = "gen"
+            extra_inputs["packed_vae_token_indexes"] = local_vae_indexes
+            extra_inputs["packed_text_indexes"] = local_text_indexes
+
+        output = self.language_model.forward(
+            packed_query_sequence=packed_sequence,
+            query_lens=local_seqlens,
+            packed_query_position_ids=local_position_ids,
+            past_key_values=past_key_values,
+            update_past_key_values=False,
+            is_causal=False,
+            **extra_inputs,
+        )
+        return self.llm2vae(output.packed_query_sequence)[local_vae_indexes]
+
     def forward_single_branch(
         self,
         x_t: torch.Tensor,
@@ -2379,40 +2742,17 @@ class Bagel(CFGParallelMixin, nn.Module):
                 packed_position_ids,
             )
 
-            packed_text_embedding = self.language_model.forward(
+            local_v_t = self._forward_single_branch_local(
+                local_x_t=local_x_t,
+                timestep=timestep[: local_x_t.shape[0]],
+                local_vae_pos_ids=local_vae_pos_ids,
+                local_vae_indexes=local_vae_indexes,
+                local_text_indexes=local_text_indexes,
+                local_seqlens=local_seqlens,
+                local_position_ids=local_position_ids,
                 packed_text_ids=packed_text_ids,
-                return_embeddings_only=True,
-            ).packed_query_sequence
-            packed_sequence = packed_text_embedding.new_zeros((int(local_seqlens.sum()), self.hidden_size))
-            packed_sequence[local_text_indexes] = packed_text_embedding
-
-            # i2v relaxes this: per-token timestep (cond=0, noncond=t) is valid.
-            packed_pos_embed = self.latent_pos_embed(local_vae_pos_ids)
-            local_timestep = timestep[: local_x_t.shape[0]]
-            packed_timestep_embeds = self.time_embedder(local_timestep)
-            x_t_emb = self.vae2llm(local_x_t) + packed_timestep_embeds + packed_pos_embed
-            if x_t_emb.dtype != packed_sequence.dtype:
-                x_t_emb = x_t_emb.to(packed_sequence.dtype)
-            packed_sequence[local_vae_indexes] = x_t_emb
-
-            extra_inputs = {}
-            if self.use_moe:
-                extra_inputs["mode"] = "gen"
-                extra_inputs["packed_vae_token_indexes"] = local_vae_indexes
-                extra_inputs["packed_text_indexes"] = local_text_indexes
-
-            output = self.language_model.forward(
-                packed_query_sequence=packed_sequence,
-                query_lens=local_seqlens,
-                packed_query_position_ids=local_position_ids,
                 past_key_values=past_key_values,
-                update_past_key_values=False,
-                is_causal=False,
-                **extra_inputs,
             )
-
-            local_v_t = self.llm2vae(output.packed_query_sequence)
-            local_v_t = local_v_t[local_vae_indexes]
             return self._gather_vae_for_sp(local_v_t)
 
         # Original non-SP path
