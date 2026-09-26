@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import contextlib
 import os
+import queue
 import signal
+from logging import DEBUG
 from typing import Any
 
 import vllm.v1.engine.core as _vllm_engine_core_module
@@ -117,6 +119,53 @@ class StageEngineCoreProc(EngineCoreProc):
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
         scheduler_request.payload_sender_info = getattr(request, "payload_sender_info", None)
         return scheduler_request, current_wave
+
+    def _get_input_queue_request(self, block: bool) -> tuple[EngineCoreRequestType, Any]:
+        if not block:
+            return self.input_queue.get(block=False)
+
+        # A signal delivered to another thread only schedules its Python
+        # handler on the main thread. An indefinite Queue.get can keep that
+        # handler pending, including the handler that triggers SignalCallback
+        # to wake this queue. Periodically return to Python inside this wait.
+        while self.is_running():
+            try:
+                return self.input_queue.get(timeout=1.0)
+            except queue.Empty:
+                # Do not return to run_busy_loop: that would perform an
+                # engine step even though the engine is still idle.
+                continue
+        raise queue.Empty
+
+    def _process_input_queue(self) -> None:
+        """Keep vLLM's idle wait responsive to pending shutdown signals."""
+        # Keep this aligned with EngineCoreProc._process_input_queue in
+        # vLLM v0.30.0. Only the blocking get differs; retaining the loop here
+        # preserves idle callbacks, abort draining and nonblocking operation.
+        waited = False
+        while not self.has_work() and self.is_running():
+            self._notify_idle_state_callbacks()
+            if self.input_queue.empty():
+                with self.aborts_queue.mutex:
+                    self.aborts_queue.queue.clear()
+                if logger.isEnabledFor(DEBUG):
+                    logger.debug("EngineCore waiting for work.")
+                    waited = True
+            block = self.process_input_queue_block
+            try:
+                req = self._get_input_queue_request(block)
+                self._handle_client_request(*req)
+            except queue.Empty:
+                break
+            if not block:
+                break
+
+        if waited:
+            logger.debug("EngineCore loop active.")
+
+        while not self.input_queue.empty():
+            req = self.input_queue.get_nowait()
+            self._handle_client_request(*req)
 
     @staticmethod
     def run_stage_core(
