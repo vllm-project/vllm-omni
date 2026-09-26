@@ -138,6 +138,17 @@ repos:
       types_or: [python, pyi, rust, proto, shell]
       files: \.(py|pyi|rs|proto|sh)$
 
+    - id: check-import-dependencies
+      name: Check import dependency declarations
+      entry: python tools/pre_commit/check_import_dependencies.py
+      language: python
+      additional_dependencies: [packaging>=24.0, "tomli>=2.0; python_version < '3.11'"]
+      # Always run so dependency deletions (which pre-commit does not pass as
+      # filenames) also reach the full-tree check. Python-only changes still
+      # scan complete changed files; CI invokes this hook with --all-files.
+      always_run: true
+      require_serial: true
+
     - id: check-forbidden-imports
       name: Check forbidden imports
       entry: python tools/pre_commit/check_forbidden_imports.py
