@@ -38,6 +38,13 @@ connectors:
       # HiFTGraphWrapper.derive_capture_bucket_size explicitly includes it.
       enable_hift_graph: true
       enable_cfm_graph: true
+      enable_whole_euler: true
+      # Hierarchical micro-batch CUDA graph scheduling:
+      # B in [1, 3] replays serial B=1; B in [4, 16] micro-batches into native B=4 chunks;
+      # B > 16 falls back to fused Batched Eager mode.
+      micro_batch_size: 4
+      max_graph_batch: 16
+      max_serial_batch: 4
       cfm_max_graphs: 32
       cfm_graph_bucket_frames: 16
 

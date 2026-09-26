@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import nullcontext
@@ -15,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
-from .cuda_graph_wrapper import CFMGraphWrapper, HiFTGraphWrapper
+from .cuda_graph_wrapper import CFMGraphWrapper, HiFTGraphWrapper, WholeEulerCFMGraphWrapper, _fused_euler_step
 
 logger = init_logger(__name__)
 
@@ -105,29 +106,26 @@ def _zero_padded_cnn_cache(
 ) -> None:
     """Clear the cache positions that come from padded frames, in place.
 
-    Each block's CNN cache holds the tail of its convolution output
-    (``new_cnn_cache = x[..., -causal_padding[0]:]``, inside ``stepaudio2``),
-    so when the padding sits at the chunk tail those positions are
-    padding-derived and would otherwise become the next chunk's left context.
-    Padding is at most ``pad_frames`` wide, so only the trailing positions that
-    can come from it are cleared; the valid part of the window is kept.
+    Vectorized across all DiT blocks in a single slice operation to eliminate
+    per-block Python loops and separate kernel launches.
     """
-    blocks = estimator.blocks
-    if pad_frames > 0 and blocks and len(blocks) == cnn_cache.shape[0]:
+    if pad_frames <= 0:
+        return
+    if isinstance(cnn_cache, torch.Tensor):
         width = int(cnn_cache.shape[-1])
-        if width > 0 and all(int(block.conv.block[1].causal_padding[0]) == width for block in blocks):
-            # _estimator_buffers packs equal-width blocks into one tensor.
-            # Clear their shared tail with one write instead of one per block.
-            cnn_cache[..., max(0, width - pad_frames) :] = 0.0
-            return
-
-    for index, block in enumerate(estimator.blocks):
-        width = int(block.conv.block[1].causal_padding[0])
         if width <= 0:
-            continue
-        zero_from = max(0, width - pad_frames)
-        if zero_from < width:
-            cnn_cache[index][..., zero_from:] = 0.0
+            return
+        cnn_cache[..., max(0, width - pad_frames) :] = 0.0
+        return
+    blocks = getattr(estimator, "blocks", None)
+    if blocks is not None and len(blocks) == len(cnn_cache):
+        for index, block in enumerate(blocks):
+            width = int(block.conv.block[1].causal_padding[0])
+            if width <= 0:
+                continue
+            zero_from = max(0, width - pad_frames)
+            if zero_from < width:
+                cnn_cache[index][..., zero_from:] = 0.0
 
 
 def plan_token2wav_encode_slices(
@@ -297,6 +295,7 @@ class BatchedToken2Wav(nn.Module):
             token2wav.speech_window.detach().clone(),
             persistent=False,
         )
+        self._timeline_cache: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
         self.hift_graph_wrapper: HiFTGraphWrapper | None = None
         graph_config = dict(hift_graph_config or {})
         if bool(graph_config.get("enabled", False)):
@@ -312,26 +311,79 @@ class BatchedToken2Wav(nn.Module):
                         "MiniCPM-o HiFT CUDA Graph requires source_cache_len to be divisible by mel_cache_len"
                     )
                 capture_batch_sizes = graph_config.get("capture_batch_sizes", [1])
-                logger.info("Enabling HiFT CUDA Graph with batch sizes %s", capture_batch_sizes)
+                max_serial_batch = int(
+                    graph_config.get(
+                        "max_serial_batch",
+                        os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "4"),
+                    )
+                )
+                logger.info(
+                    "Enabling HiFT CUDA Graph with batch sizes %s (max_serial_batch=%d)",
+                    capture_batch_sizes,
+                    max_serial_batch,
+                )
                 self.hift_graph_wrapper = HiFTGraphWrapper(
                     token2wav=token2wav,
                     connector_config=dict(connector_config),
                     capture_batch_sizes=capture_batch_sizes,
+                    max_serial_batch=max_serial_batch,
                 )
                 with torch.inference_mode(), _autocast_disabled(hift_parameter.device):
                     self.hift_graph_wrapper.capture()
                 logger.info("HiFT CUDA Graph captured successfully")
         self._cfm_graph_wrapper: CFMGraphWrapper | None = None
+        self._whole_euler_graph_wrapper: WholeEulerCFMGraphWrapper | None = None
         cfm_graph_cfg = dict(cfm_graph_config or {})
         if bool(cfm_graph_cfg.get("enabled", False)):
             flow_parameter = next(self.flow.parameters(), None)
             if flow_parameter is not None and flow_parameter.device.type == "cuda":
                 estimator = self.flow.decoder.estimator
+                max_graphs = int(cfm_graph_cfg.get("max_graphs", 32))
+                max_serial_batch = int(
+                    cfm_graph_cfg.get(
+                        "max_serial_batch",
+                        os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "4"),
+                    )
+                )
+                max_graph_batch_cfg = cfm_graph_cfg.get("max_graph_batch")
+                max_graph_batch = int(max_graph_batch_cfg) if max_graph_batch_cfg is not None else None
+                micro_batch_size_cfg = cfm_graph_cfg.get("micro_batch_size")
+                micro_batch_size = (
+                    int(micro_batch_size_cfg)
+                    if micro_batch_size_cfg is not None
+                    else int(os.getenv("VLLM_OMNI_GRAPH_MICRO_BATCH_SIZE", "4"))
+                )
+                if bool(cfm_graph_cfg.get("enable_whole_euler", True)) and self._trt_stepper is None:
+                    self._whole_euler_graph_wrapper = WholeEulerCFMGraphWrapper(
+                        estimator=estimator,
+                        n_timesteps=self.n_timesteps,
+                        inference_cfg_rate=getattr(self.flow.decoder, "inference_cfg_rate", 0.7),
+                        att_cache_dtype=self._estimator_att_cache_dtype,
+                        max_graphs=max_graphs,
+                        max_serial_batch=max_serial_batch,
+                        max_graph_batch=max_graph_batch,
+                        micro_batch_size=micro_batch_size,
+                    )
+                    logger.info(
+                        "Whole-Euler CFM CUDA Graph enabled "
+                        "(max_graphs=%d, max_serial_batch=%d, max_graph_batch=%s, micro_batch_size=%d)",
+                        max_graphs,
+                        max_serial_batch,
+                        str(max_graph_batch),
+                        micro_batch_size,
+                    )
+                elif self._trt_stepper is not None and bool(cfm_graph_cfg.get("enable_whole_euler", True)):
+                    logger.info("Whole-Euler CFM CUDA Graph disabled because TensorRT stepper is configured")
                 self._cfm_graph_wrapper = CFMGraphWrapper(
                     graph_fn=estimator.blocks_forward_chunk,
-                    max_graphs=int(cfm_graph_cfg.get("max_graphs", 32)),
+                    max_graphs=max_graphs,
+                    max_serial_batch=max_serial_batch,
                 )
-                logger.info("CFM CUDA Graph enabled (max_graphs=%d)", int(cfm_graph_cfg.get("max_graphs", 32)))
+                logger.info(
+                    "CFM CUDA Graph enabled (max_graphs=%d, max_serial_batch=%d)",
+                    max_graphs,
+                    max_serial_batch,
+                )
             else:
                 logger.info(
                     "CFM CUDA Graph is disabled on device type %s",
@@ -341,7 +393,9 @@ class BatchedToken2Wav(nn.Module):
         # chunk up to a multiple of this many frames so the graph cache key
         # space stays small (0 disables bucketing, e.g. when graphs are off).
         self._cfm_graph_bucket_frames = (
-            int(cfm_graph_cfg.get("bucket_frames", 0)) if self._cfm_graph_wrapper is not None else 0
+            int(cfm_graph_cfg.get("bucket_frames", 0))
+            if (self._cfm_graph_wrapper is not None or self._whole_euler_graph_wrapper is not None)
+            else 0
         )
         if self._cfm_graph_bucket_frames > 1:
             logger.info(
@@ -507,6 +561,9 @@ class BatchedToken2Wav(nn.Module):
         attn_mask: torch.Tensor | None = None,
         valid_lengths: list[int] | None = None,
         valid_frames: int | None = None,
+        att_out_buffer: Any = None,
+        time_embedding: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._trt_stepper is not None and valid_lengths is None:
             out, new_cnn, new_att = self._trt_stepper.step(
@@ -519,7 +576,8 @@ class BatchedToken2Wav(nn.Module):
                 att_cache=att_cache,
             )
             return out.to(mu.dtype), new_cnn, new_att
-        time_embedding = estimator.t_embedder(time).unsqueeze(1)
+        if time_embedding is None:
+            time_embedding = estimator.t_embedder(time).unsqueeze(1)
         width = int(x.shape[-1])
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
         if valid_frames is not None and valid_frames < width:
@@ -665,6 +723,15 @@ class BatchedToken2Wav(nn.Module):
 
         return estimator.final_layer(x, time_embedding).transpose(1, 2)
 
+    def _get_timeline(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        key = (device, dtype)
+        timeline = self._timeline_cache.get(key)
+        if timeline is None:
+            t = torch.linspace(0, 1, self.n_timesteps + 1, device=device, dtype=dtype)
+            timeline = (1 - torch.cos(t * 0.5 * torch.pi)).contiguous()
+            self._timeline_cache[key] = timeline
+        return timeline
+
     def _decode_cfm(
         self,
         mu: torch.Tensor,
@@ -684,18 +751,28 @@ class BatchedToken2Wav(nn.Module):
         batch_size = int(mu.shape[0])
         offset = int(att_cache.shape[4]) if att_cache is not None else 0
         mel_frames = int(mu.shape[2])
+        graphs_active = (
+            (
+                (
+                    self._whole_euler_graph_wrapper is not None
+                    and getattr(self._whole_euler_graph_wrapper, "enabled", True)
+                    and self._trt_stepper is None
+                )
+                or (
+                    self._cfm_graph_wrapper is not None
+                    and getattr(self._cfm_graph_wrapper, "enabled", True)
+                    and self._trt_stepper is None
+                )
+            )
+            if valid_lengths is None
+            else False
+        )
         pad_frames = _cfm_pad_frames(
             mel_frames=mel_frames,
             offset=offset,
             noise_capacity=int(decoder.rand_noise.shape[2]),
             bucket_frames=self._cfm_graph_bucket_frames,
-            disabled=(
-                valid_lengths is not None
-                or self._cfm_graph_wrapper is None
-                # `_disable` keeps the wrapper object alive, so check the flag
-                # too: padding under a disabled wrapper is pure overhead.
-                or not self._cfm_graph_wrapper.enabled
-            ),
+            disabled=(valid_lengths is not None or not graphs_active),
         )
         if pad_frames:
             # Replicate rather than zero: a repeated last frame is a closer
@@ -718,14 +795,7 @@ class BatchedToken2Wav(nn.Module):
             # is what removes them; zeroing alone would not, since a zero row
             # still occupies part of the softmax denominator.
             x[:, :, mel_frames:] = 0.0
-        timeline = torch.linspace(
-            0,
-            1,
-            self.n_timesteps + 1,
-            device=mu.device,
-            dtype=mu.dtype,
-        )
-        timeline = 1 - torch.cos(timeline * 0.5 * torch.pi)
+        timeline = self._get_timeline(mu.device, mu.dtype)
         time = timeline[0].expand(batch_size)
         mu_cfg = torch.cat((mu, torch.zeros_like(mu)), dim=0)
         speakers_cfg = torch.cat((speakers, torch.zeros_like(speakers)), dim=0)
@@ -761,10 +831,34 @@ class BatchedToken2Wav(nn.Module):
                 device=mu.device,
             )
             attn_mask[:, :, mel_frames : mel_frames + pad_frames] = False
+
+        if (
+            valid_lengths is None
+            and self._trt_stepper is None
+            and self._whole_euler_graph_wrapper is not None
+            and getattr(self._whole_euler_graph_wrapper, "enabled", True)
+        ):
+            whole_euler_result = self._whole_euler_graph_wrapper.replay(
+                x=x,
+                mu_cfg=mu_cfg,
+                speakers_cfg=speakers_cfg,
+                cond_cfg=cond_cfg,
+                cnn_cache=cnn_cache,
+                att_cache=att_cache,
+                attn_mask=attn_mask,
+                mel_frames=mel_frames,
+                pad_frames=pad_frames,
+            )
+            if whole_euler_result is not None:
+                return whole_euler_result
+
         next_cnn: list[torch.Tensor] = []
         next_att_cache: torch.Tensor | None = None
         ragged_att_cache: list[torch.Tensor] | None = None
         dt = timeline[1] - timeline[0]
+        time_embeddings = [
+            estimator.t_embedder(timeline[s].expand(2 * batch_size)).unsqueeze(1) for s in range(self.n_timesteps)
+        ]
         with _token2wav_sdpa_context(mu.device):
             for step in range(self.n_timesteps):
                 old_cnn = cnn_cache[step] if cnn_cache is not None else None
@@ -781,13 +875,13 @@ class BatchedToken2Wav(nn.Module):
                     attn_mask=attn_mask,
                     valid_lengths=valid_lengths,
                     valid_frames=mel_frames if pad_frames else None,
+                    time_embedding=time_embeddings[step],
                 )
                 if pad_frames:
                     _zero_padded_cnn_cache(step_cnn, estimator, pad_frames)
-                conditional, unconditional = estimate.split(batch_size, dim=0)
-                velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional
-                x = x + dt * velocity
-                _zero_padded_frames(x, mel_frames if pad_frames else None)
+                x = _fused_euler_step(x, estimate, float(dt), decoder.inference_cfg_rate, batch_size)
+                if pad_frames:
+                    _zero_padded_frames(x, mel_frames)
                 time = time + dt
                 if step + 1 < self.n_timesteps:
                     dt = timeline[step + 2] - time[0]

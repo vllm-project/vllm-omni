@@ -268,14 +268,33 @@ class MiniCPMO45Code2Wav(nn.Module):
             raise ValueError(f"Invalid MiniCPM-o connector chunk configuration: {self._connector_config}")
         raw_capture_batch_sizes = extra.get("hift_graph_capture_batch_sizes")
         capture_batch_sizes = [1] if raw_capture_batch_sizes is None else raw_capture_batch_sizes
+        max_serial_batch_raw = extra.get("max_serial_batch")
+        if max_serial_batch_raw is None:
+            max_serial_batch = int(os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "4"))
+        else:
+            max_serial_batch = int(max_serial_batch_raw)
         self._hift_graph_config = {
             "enabled": bool(extra.get("enable_hift_graph", False)),
             "capture_batch_sizes": capture_batch_sizes,
+            "max_serial_batch": max_serial_batch,
         }
+        enable_whole_euler_raw = extra.get("enable_whole_euler")
+        if enable_whole_euler_raw is None:
+            enable_whole_euler = os.getenv("VLLM_OMNI_ENABLE_WHOLE_EULER", "1") not in ("0", "false", "False")
+        else:
+            enable_whole_euler = bool(enable_whole_euler_raw)
+        max_graph_batch_raw = extra.get("max_graph_batch")
+        max_graph_batch = int(max_graph_batch_raw) if max_graph_batch_raw is not None else None
+        micro_batch_size_raw = extra.get("micro_batch_size")
+        micro_batch_size = int(micro_batch_size_raw) if micro_batch_size_raw is not None else None
         self._cfm_graph_config = {
             "enabled": bool(extra.get("enable_cfm_graph", False)),
             "max_graphs": int(extra.get("cfm_max_graphs", 32)),
             "bucket_frames": int(extra.get("cfm_graph_bucket_frames", 0)),
+            "enable_whole_euler": enable_whole_euler,
+            "max_serial_batch": max_serial_batch,
+            "max_graph_batch": max_graph_batch,
+            "micro_batch_size": micro_batch_size,
         }
         self._ref_max_seconds = float(extra.get("ref_audio_max_seconds", _REF_MAX_SECONDS))
         if self._ref_max_seconds <= 0:
