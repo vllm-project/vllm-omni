@@ -34,7 +34,6 @@ classifiers = [
 # without requiring extras like [cuda]. See requirements/ directory for platform-specific dependencies.
 
 [project.optional-dependencies]
-
 dev = [
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
@@ -204,6 +203,8 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+# V1.2 encoder retains reference mathematical argument names.
+"vllm_omni/diffusion/models/cosmos3/lidar_encoder/**" = ["N803"]
 "examples/**" = ["E501"]  # Allow long lines in examples
 "tests/**" = ["E501"]  # Allow long lines in tests
 # MiniCPM-o reference modeling code vendored from upstream HF/transformers/MiniCPM-o.

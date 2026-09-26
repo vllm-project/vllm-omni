@@ -226,7 +226,7 @@ def _metadata_video_fps(metadata: DiffusionMetadata) -> float | None:
     if not isinstance(video_metadata, dict):
         return None
     fps = video_metadata.get("fps")
-    return fps if isinstance(fps, (int, float)) and not isinstance(fps, bool) else None
+    return fps if isinstance(fps, int | float) and not isinstance(fps, bool) else None
 
 
 def _format_audio_multimodal_output(
@@ -261,7 +261,7 @@ def _build_multimodal_output(
     if postprocess_output.metadata:
         mm_output["metadata"] = postprocess_output.metadata
     for key, value in postprocess_output.outputs.items():
-        if key in {"audio", "actions", "trajectory"}:
+        if key in {"audio", "actions", "trajectory", "lidar"}:
             mm_output[key] = value
     if audio_sample_rate is not None:
         mm_output["audio_sample_rate"] = audio_sample_rate

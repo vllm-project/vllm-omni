@@ -74,6 +74,15 @@ def normalize_omni_diffusion_kwargs(
     """Normalize diffusion kwargs, deferring defaults until sources are merged."""
     config_kwargs = dict(raw_kwargs)
 
+    # Serving resolves the pipeline class before constructing the config.
+    # Keep regional compilation's shared default, but use static shapes for
+    # Cosmos3 multiview unless the caller explicitly requests dynamic shapes.
+    if (
+        config_kwargs.get("model_class_name") == "Cosmos3MultiviewPipeline"
+        and config_kwargs.get("diffusion_compile_dynamic") is None
+    ):
+        config_kwargs["diffusion_compile_dynamic"] = False
+
     dtype = config_kwargs.get("dtype")
     if dtype is None:
         if apply_defaults:

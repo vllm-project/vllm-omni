@@ -12,6 +12,7 @@ import os
 import threading
 import time
 from concurrent.futures import CancelledError as FutureCancelledError
+from concurrent.futures import Future
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,7 +37,11 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoParams,
     VideoResponse,
 )
-from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
+from vllm_omni.entrypoints.openai.serving_video import (
+    MultiviewVideoLayout,
+    OmniOpenAIServingVideo,
+    ReferenceImage,
+)
 from vllm_omni.entrypoints.openai.storage import LocalStorageManager
 from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
 from vllm_omni.entrypoints.openai.video.generation import helpers as video_generation_helpers
@@ -167,6 +172,149 @@ def test_preencode_rejects_invalid_batch_frames_before_generation(batch_frames):
         handler.shutdown()
 
 
+@pytest.mark.parametrize("value", [0, 1, "true", None, [], {}])
+def test_parallel_multiview_encoding_rejects_non_boolean_before_generation(value):
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    request = VideoGenerationRequest(prompt="test", extra_params={"parallel_multiview_encoding": value})
+    try:
+        with pytest.raises(HTTPException, match="parallel_multiview_encoding") as exc:
+            asyncio.run(handler.generate_video_bytes(request, "invalid-parallel-option"))
+        assert exc.value.status_code == 400
+        assert engine.captured_prompt is None
+    finally:
+        handler.shutdown()
+
+
+def test_parallel_multiview_layout_rejects_duplicate_cameras_and_frame_mismatch():
+    with pytest.raises(ValueError, match="unique"):
+        OmniOpenAIServingVideo._multiview_layout_from_metadata(
+            {"multiview": {"cameras": ["front", "front"], "frames_per_view": 3}}
+        )
+
+    layout = MultiviewVideoLayout(("front", "rear"), 3)
+    with pytest.raises(ValueError, match="describes 6 frames, got 5"):
+        OmniOpenAIServingVideo._validate_multiview_video(
+            video=np.zeros((5, 8, 8, 3), dtype=np.uint8),
+            layout=layout,
+        )
+
+
+def test_parallel_multiview_preserves_encoder_failure(mocker: MockerFixture):
+    from vllm_omni.diffusion.utils.video_encoding import (
+        EncodingCancelledError,
+        VideoEncodingScheduler,
+        calculate_encoding_allocation,
+    )
+
+    handler = OmniOpenAIServingVideo.for_diffusion(FakeAsyncOmni(), model_name="test-model")
+    handler._video_encoding_scheduler.shutdown()
+    handler._video_encoding_scheduler = VideoEncodingScheduler(cpu_count=6)
+    barrier = threading.Barrier(3)
+    original_error = RuntimeError("actual camera encoder failure")
+
+    def encode(frames, *, cancel_event, **kwargs):
+        barrier.wait(5)
+        if frames[0][0, 0, 0] == 2:
+            raise original_error
+        assert cancel_event.wait(5)
+        raise EncodingCancelledError("video segment encoding was cancelled")
+
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video.encode_video_segment", side_effect=encode)
+    frames = np.stack([np.full((8, 8, 3), i, dtype=np.uint8) for i in range(3)])
+    try:
+        with pytest.raises(RuntimeError, match="actual camera encoder failure") as exc:
+            asyncio.run(
+                handler._encode_parallel_multiview(
+                    frames,
+                    request_id="camera-failure",
+                    layout=MultiviewVideoLayout(("front", "rear", "left"), 1),
+                    fps=24,
+                    allocation=calculate_encoding_allocation(3, 6),
+                    video_codec_options=None,
+                )
+            )
+        assert exc.value is original_error
+    finally:
+        handler.shutdown()
+
+
+def test_parallel_multiview_pil_frames_reach_legacy_encoder(mocker: MockerFixture):
+    handler = OmniOpenAIServingVideo.for_diffusion(FakeAsyncOmni(), model_name="test-model")
+    frames = [Image.new("RGB", (8, 8)) for _ in range(6)]
+    result = MockVideoResult(
+        frames,
+        multimodal_output={
+            "video": frames,
+            "metadata": {"multiview": {"cameras": ["front", "rear"], "frames_per_view": 3}},
+        },
+    )
+    mocker.patch.object(handler, "_run_generation", return_value=result)
+    encoder = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"legacy-video"
+    )
+    request = VideoGenerationRequest(prompt="test", extra_params={"parallel_multiview_encoding": True})
+    try:
+        encoded = asyncio.run(handler.generate_video_bytes(request, "pil-fallback"))
+        assert encoded[0] == b"legacy-video"
+        assert encoder.call_args.args[0] is frames
+    finally:
+        handler.shutdown()
+
+
+def test_parallel_multiview_repeated_cancellation_closes_late_segments(mocker: MockerFixture):
+    import tempfile
+
+    from vllm_omni.diffusion.utils.video_encoding import EncodedSegment, ScheduledResult, calculate_encoding_allocation
+
+    handler = OmniOpenAIServingVideo.for_diffusion(FakeAsyncOmni(), model_name="test-model")
+    buffers = [tempfile.SpooledTemporaryFile(max_size=1) for _ in range(2)]
+    for buffer in buffers:
+        buffer.write(b"spilled segment")
+    segments = [EncodedSegment(buffer, 1, 8, 8) for buffer in buffers]
+    futures = [Future(), Future()]
+    futures[0].set_result(ScheduledResult(segments[0], 0, 0))
+    futures[1].set_running_or_notify_cancel()
+    mocker.patch.object(handler._video_encoding_scheduler, "submit", side_effect=futures)
+
+    async def exercise():
+        draining = asyncio.Event()
+
+        async def interrupted_drain(request_id):
+            draining.set()
+            await asyncio.Event().wait()
+
+        mocker.patch.object(handler, "_cancel_and_drain_encoding", side_effect=interrupted_drain)
+        task = asyncio.create_task(
+            handler._encode_parallel_multiview(
+                np.zeros((2, 8, 8, 3), dtype=np.uint8),
+                request_id="cancel-twice",
+                layout=MultiviewVideoLayout(("front", "rear"), 1),
+                fps=24,
+                allocation=calculate_encoding_allocation(2, 4),
+                video_codec_options=None,
+            )
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.wait_for(draining.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert buffers[0].closed
+        assert not buffers[1].closed
+
+    try:
+        asyncio.run(exercise())
+        # A worker can finish successfully even after the event loop is closed.
+        futures[1].set_result(ScheduledResult(segments[1], 0, 0))
+        assert all(buffer.closed for buffer in buffers)
+    finally:
+        for buffer in buffers:
+            buffer.close()
+        handler.shutdown()
+
+
 def test_preencoded_video_bytes_preserve_metadata(mocker: MockerFixture):
     from vllm_omni.entrypoints.openai.serving_video import VideoGenerationArtifacts
 
@@ -201,6 +349,55 @@ def test_preencoded_video_bytes_preserve_metadata(mocker: MockerFixture):
             },
         )
         encoder.assert_not_called()
+    finally:
+        handler.shutdown()
+
+
+def test_parallel_multiview_encoding_serves_raw_and_base64_in_camera_order(mocker: MockerFixture):
+    from vllm_omni.diffusion.utils.video_encoding import calculate_encoding_allocation
+    from vllm_omni.entrypoints.openai.serving_video import VideoGenerationArtifacts
+
+    handler = OmniOpenAIServingVideo.for_diffusion(FakeAsyncOmni(), model_name="test-model")
+    if calculate_encoding_allocation(2, handler._video_encoding_scheduler.cpu_count).workers < 2:
+        handler.shutdown()
+        pytest.skip("parallel multiview encoding requires at least four affinity CPUs")
+
+    frames = np.zeros((6, 24, 32, 3), dtype=np.uint8)
+    frames[:3, ..., 0] = 220
+    frames[3:, ..., 2] = 220
+    artifacts = VideoGenerationArtifacts(
+        videos=[frames],
+        audios=[None],
+        actions=[None],
+        audio_sample_rate=24000,
+        output_fps=12.0,
+        stage_durations={},
+        peak_memory_mb=0.0,
+        multiview_layout=MultiviewVideoLayout(("front", "rear"), 3),
+    )
+    mocker.patch.object(handler, "_run_and_extract", return_value=artifacts)
+    legacy_raw = mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes")
+    legacy_base64 = mocker.patch("vllm_omni.entrypoints.openai.serving_video.encode_video_base64")
+    request = VideoGenerationRequest(
+        prompt="test",
+        extra_params={
+            "parallel_multiview_encoding": True,
+            "video_codec_options": {"preset": "ultrafast"},
+        },
+    )
+    try:
+        raw_result = asyncio.run(handler.generate_video_bytes(request, "parallel-raw"))
+        raw_bytes = raw_result[0]
+        base64_result = asyncio.run(handler.generate_videos(request, "parallel-base64"))
+        assert base64.b64decode(base64_result.data[0].b64_json)
+
+        with av.open(io.BytesIO(raw_bytes), "r", format="mp4") as container:
+            decoded = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
+        assert len(decoded) == 6
+        assert np.mean(decoded[0][..., 0]) > np.mean(decoded[0][..., 2])
+        assert np.mean(decoded[3][..., 2]) > np.mean(decoded[3][..., 0])
+        legacy_raw.assert_not_called()
+        legacy_base64.assert_not_called()
     finally:
         handler.shutdown()
 

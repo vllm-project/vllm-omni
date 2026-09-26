@@ -111,10 +111,16 @@ from .transfer import (
     transfer_max_frames_from_extra_args,
     uint8_cthw_to_normalized_5d,
 )
-from .transformer_cosmos3 import Cosmos3VFMTransformer, _tf_config_get, resolve_sound_gen
+from .transformer_cosmos3 import (
+    COSMOS3_MULTIVIEW_BACKBONE_TYPE,
+    Cosmos3VFMTransformer,
+    _tf_config_get,
+    resolve_sound_gen,
+)
 from .transformer_cosmos3_edge import COSMOS3_EDGE_BACKBONE_TYPE, Cosmos3EdgeVFMTransformer
 from .utils import (
     COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION,
+    COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE,
     COSMOS3_VAE_TEMPORAL_COMPRESSION,
     ROBOLAB_CONCAT_VIEW_DESCRIPTION,
     ROBOLAB_DEFAULT_ACTION_CHUNK_SIZE,
@@ -171,10 +177,6 @@ COSMOS3_T2I_SYSTEM_PROMPT = "You are a helpful assistant who will generate image
 COSMOS3_TRANSFER_SYSTEM_PROMPT = (
     "You are a helpful assistant that generates images or videos following the user's instructions"
     " and control signals (edge maps, blur, depth, or segmentation)."
-)
-COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE = (
-    "Follow the {hint_names} control video precisely: shape, contour, silhouette, position, and motion of every "
-    "visible structure must align with the {hint_names} signal at every frame."
 )
 
 COSMOS3_T2V_DEFAULT_HEIGHT = 720
@@ -300,6 +302,10 @@ def resolve_cosmos3_transformer_cls(model_config: Any) -> type[Cosmos3VFMTransfo
         return Cosmos3VFMTransformer
     if backbone_type == COSMOS3_EDGE_BACKBONE_TYPE:
         return Cosmos3EdgeVFMTransformer
+    if backbone_type == COSMOS3_MULTIVIEW_BACKBONE_TYPE:
+        from .transformer_cosmos3_multiview import Cosmos3MultiviewVFMTransformer
+
+        return Cosmos3MultiviewVFMTransformer
     raise ValueError(f"Unsupported Cosmos3 transformer backbone_type={backbone_type!r}.")
 
 
@@ -716,6 +722,58 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
             fps_value = 24.0
         return int(fps_value) if fps_value.is_integer() else fps_value
 
+    def _postprocess_multiview_video(
+        video: torch.Tensor,
+        multiview: Mapping[str, Any],
+        *,
+        output_type: str,
+        guardrails_enabled: bool,
+    ) -> np.ndarray | torch.Tensor | list[list[PIL.Image.Image]]:
+        """Process one camera at a time into the final CPU presentation buffer."""
+        cameras = multiview.get("cameras")
+        frames_per_view = multiview.get("frames_per_view")
+        if (
+            not isinstance(cameras, list | tuple)
+            or not cameras
+            or not isinstance(frames_per_view, int)
+            or isinstance(frames_per_view, bool)
+            or frames_per_view <= 0
+        ):
+            raise ValueError("Cosmos3 multiview output requires cameras and a positive integer frames_per_view.")
+        if video.ndim != 5 or video.shape[:2] != (1, 3) or video.shape[2] != len(cameras) * frames_per_view:
+            raise ValueError("Cosmos3 multiview output must have shape [1, 3, V*F, H, W] matching its metadata.")
+        if output_type not in ("np", "pt", "pil"):
+            raise ValueError(f"{output_type} does not exist. Please choose one of ['np', 'pt', 'pil']")
+
+        processed_video = None
+        for view_index in range(len(cameras)):
+            frame_start = view_index * frames_per_view
+            # Move only this camera to the host, even if an in-process caller
+            # supplies a CUDA tensor. Guardrail conversions then stay on CPU.
+            view = video.narrow(2, frame_start, frames_per_view).detach().cpu()
+            if guardrails_enabled:
+                view = check_video_safety(view)
+            processed_view = video_processor.postprocess_video(view, output_type=output_type)
+            if processed_video is None:
+                if output_type == "pil":
+                    processed_video = [[]]
+                else:
+                    output_shape = (1, video.shape[2], *processed_view.shape[2:])
+                    if output_type == "np":
+                        processed_video = np.empty(output_shape, dtype=processed_view.dtype)
+                    else:
+                        processed_video = torch.empty(output_shape, dtype=processed_view.dtype, device="cpu")
+            if output_type == "pil":
+                processed_video[0].extend(processed_view[0])
+            else:
+                processed_video[:, frame_start : frame_start + frames_per_view] = processed_view
+            # Do not retain converted camera clips and concatenate them later:
+            # that would duplicate the complete processed multiview output.
+            del view, processed_view
+
+        assert processed_video is not None
+        return processed_video
+
     def post_process_func(
         output: torch.Tensor | dict[str, torch.Tensor] | tuple,
         output_type: str = "np",
@@ -734,24 +792,29 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
             return action
 
         pending_action = None
-        pending_action_metadata: dict[str, Any] = {}
+        pending_lidar = None
         envelope_public_metadata: dict[str, Any] = {}
         if isinstance(output, dict) and isinstance(output.get("payload"), dict):
             envelope_payload = dict(output.get("payload") or {})
             metadata = output.get("metadata") or {}
             envelope_metadata = metadata if isinstance(metadata, dict) else {}
             envelope_public_metadata = {key: value for key, value in envelope_metadata.items() if key != "internal"}
+            pending_lidar = envelope_payload.pop("lidar", None)
+            if pending_lidar is not None:
+                if "video" not in envelope_payload:
+                    raise ValueError("Cosmos3 LiDAR output requires a video payload.")
+                # Numeric range images must never pass through RGB processing.
+                pending_lidar = pending_lidar.detach().to(device="cpu", dtype=torch.float32).contiguous()
             action = envelope_payload.pop("actions", None)
             if action is not None:
                 pending_action = _postprocess_action(action, envelope_metadata)
-                pending_action_metadata = envelope_public_metadata
                 if not envelope_payload:
                     return {
                         "payload": {
                             "video": [],
                             "actions": pending_action,
                         },
-                        "metadata": pending_action_metadata,
+                        "metadata": envelope_public_metadata,
                     }
             output = envelope_payload
 
@@ -801,21 +864,24 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
                 }
             return processed_image
         guardrails_enabled = is_guardrails_enabled(od_config, sampling_params)
-        if guardrails_enabled:
-            video = check_video_safety(video)
-        processed_video = video_processor.postprocess_video(video, output_type=output_type)
+        multiview = envelope_public_metadata.get("multiview")
+        if isinstance(multiview, Mapping):
+            processed_video = _postprocess_multiview_video(
+                video, multiview, output_type=output_type, guardrails_enabled=guardrails_enabled
+            )
+        else:
+            if guardrails_enabled:
+                video = check_video_safety(video)
+            processed_video = video_processor.postprocess_video(video, output_type=output_type)
+        auxiliary_payload = {}
+        if pending_action is not None:
+            auxiliary_payload["actions"] = pending_action
+        if pending_lidar is not None:
+            auxiliary_payload["lidar"] = pending_lidar
         if audio is None:
-            if pending_action is not None:
+            if auxiliary_payload or envelope_public_metadata:
                 return {
-                    "payload": {
-                        "video": processed_video,
-                        "actions": pending_action,
-                    },
-                    "metadata": pending_action_metadata,
-                }
-            if envelope_public_metadata:
-                return {
-                    "payload": {"video": processed_video},
+                    "payload": {"video": processed_video, **auxiliary_payload},
                     "metadata": envelope_public_metadata,
                 }
             return processed_video
@@ -828,31 +894,27 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
         }
         if audio_sample_rate is not None:
             result["audio_sample_rate"] = int(audio_sample_rate)
-        if pending_action is not None:
+        if auxiliary_payload or envelope_public_metadata:
+            video_metadata = envelope_public_metadata.get("video")
+            audio_metadata = envelope_public_metadata.get("audio")
+            video_metadata = (
+                {"fps": result["fps"], **video_metadata} if isinstance(video_metadata, dict) else {"fps": result["fps"]}
+            )
+            audio_metadata = dict(audio_metadata) if isinstance(audio_metadata, dict) else {}
+            if audio_sample_rate is not None:
+                audio_metadata["sample_rate"] = int(audio_sample_rate)
+            else:
+                audio_metadata.setdefault("sample_rate", None)
             return {
                 "payload": {
                     "video": result["video"],
                     "audio": result["audio"],
-                    "actions": pending_action,
-                },
-                "metadata": {
-                    **pending_action_metadata,
-                    "video": {"fps": result["fps"]},
-                    "audio": {"sample_rate": result.get("audio_sample_rate")},
-                },
-            }
-        if envelope_public_metadata:
-            return {
-                "payload": {
-                    "video": result["video"],
-                    "audio": result["audio"],
+                    **auxiliary_payload,
                 },
                 "metadata": {
                     **envelope_public_metadata,
-                    "video": {"fps": result["fps"], **envelope_public_metadata.get("video", {})}
-                    if isinstance(envelope_public_metadata.get("video"), dict)
-                    else {"fps": result["fps"]},
-                    "audio": {"sample_rate": result.get("audio_sample_rate")},
+                    "video": video_metadata,
+                    "audio": audio_metadata,
                 },
             }
         return result
@@ -1190,6 +1252,8 @@ class Cosmos3OmniDiffusersPipeline(
             (
                 "proj_in.",
                 "proj_out.",
+                "lidar_proj_in.",
+                "lidar_proj_out.",
                 "time_embedder.",
                 "audio_proj_in.",
                 "audio_proj_out.",
@@ -3191,6 +3255,20 @@ class Cosmos3OmniDiffusersPipeline(
                     return detected
         return None
 
+    def _mask_transfer_noise(
+        self, noise: torch.Tensor, velocity_mask: torch.Tensor, shared_kwargs: dict[str, Any]
+    ) -> torch.Tensor:
+        return noise * velocity_mask
+
+    def _apply_transfer_condition(
+        self,
+        latents: torch.Tensor,
+        velocity_mask: torch.Tensor,
+        condition_latents: torch.Tensor,
+        shared_kwargs: dict[str, Any],
+    ) -> torch.Tensor:
+        return velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
+
     def diffuse_transfer(
         self,
         latents: torch.Tensor,
@@ -3210,6 +3288,8 @@ class Cosmos3OmniDiffusersPipeline(
         condition_latents: torch.Tensor,
         guidance_interval: tuple[float, float] | None = None,
         generator: torch.Generator | None = None,
+        normalize_cfg: bool = False,
+        open_guidance_interval: bool = False,
     ) -> torch.Tensor:
         if getattr(self, "_use_session_state", False):
             raise NotImplementedError(
@@ -3223,7 +3303,7 @@ class Cosmos3OmniDiffusersPipeline(
                 return True
             t_scalar = float(t.item()) if torch.is_tensor(t) else float(t)
             lo, hi = interval
-            return lo <= t_scalar <= hi
+            return lo < t_scalar < hi if open_guidance_interval else lo <= t_scalar <= hi
 
         self.transformer.reset_cache()
         self._cosmos3_branch_caches = {}
@@ -3234,9 +3314,10 @@ class Cosmos3OmniDiffusersPipeline(
                 timestep = t.unsqueeze(0)
                 step_guidance = guidance_scale if _active_at(t, guidance_interval) else 1.0
                 step_control = control_guidance if _active_at(t, control_guidance_interval) else 1.0
-                needs_text_cfg = step_guidance > 1.0
+                needs_text_cfg = step_guidance != 1.0
                 needs_control_cfg = step_control != 1.0
 
+                branches_kwargs = None
                 cond_full_kwargs = dict(
                     _cache_context="cond",
                     hidden_states=latents,
@@ -3282,7 +3363,7 @@ class Cosmos3OmniDiffusersPipeline(
                             "control_guidance": step_control,
                         },
                         branches_kwargs=branches_kwargs,
-                        cfg_normalize=False,
+                        cfg_normalize=normalize_cfg,
                     )
                 elif needs_control_cfg:
                     branches_kwargs = [
@@ -3306,7 +3387,7 @@ class Cosmos3OmniDiffusersPipeline(
                             "control_guidance": step_control,
                         },
                         branches_kwargs=branches_kwargs,
-                        cfg_normalize=False,
+                        cfg_normalize=normalize_cfg,
                     )
                 elif needs_text_cfg:
                     branches_kwargs = [
@@ -3331,13 +3412,16 @@ class Cosmos3OmniDiffusersPipeline(
                             "guidance_scale": step_guidance,
                         },
                         branches_kwargs=branches_kwargs,
-                        cfg_normalize=False,
+                        cfg_normalize=normalize_cfg,
                     )
                 else:
                     noise_pred = self.predict_noise(**cond_full_kwargs)
+                # CFG argument dictionaries otherwise retain the previous
+                # sample during the next transformer call.
+                del cond_full_kwargs, branches_kwargs
                 if isinstance(noise_pred, tuple):
                     raise ValueError("Cosmos3 transfer diffusion expects video-only tensor predictions.")
-                noise_pred = noise_pred * velocity_mask
+                noise_pred = self._mask_transfer_noise(noise_pred, velocity_mask, shared_kwargs)
                 latents = self.scheduler.step(
                     noise_pred,
                     t,
@@ -3345,8 +3429,13 @@ class Cosmos3OmniDiffusersPipeline(
                     generator=generator,
                     return_dict=False,
                 )[0]
-                latents = velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
+                del noise_pred
+                latents = self._apply_transfer_condition(latents, velocity_mask, condition_latents, shared_kwargs)
         finally:
+            # Transfer runs to completion here. The solver's previous samples
+            # must not overlap VAE decoding (also release them on failure).
+            if isinstance(self.scheduler, FlowUniPCMultistepScheduler):
+                self.scheduler.clear_history()
             self._clear_denoise_step_metadata()
             self._reset_mixed_precision()
             self._cosmos3_branch_caches = None

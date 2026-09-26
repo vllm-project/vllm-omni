@@ -365,6 +365,65 @@ def test_timestep_embedder_stores_frequencies_in_fp32() -> None:
     assert embedder.freqs.dtype == torch.float32
 
 
+@pytest.mark.parametrize("masked", [False, True])
+@torch.no_grad()
+def test_multiview_timestep_update_reuses_projection_output(masked: bool) -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MaskItem
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_multiview import (
+        Cosmos3MultiviewVFMTransformer,
+    )
+
+    model = object.__new__(Cosmos3MultiviewVFMTransformer)
+    nn.Module.__init__(model)
+    model.latent_patch_size = 1
+    model.proj_in = nn.Linear(2, 3, bias=False)
+    model.proj_in.weight.copy_(
+        torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, -1.0],
+            ]
+        )
+    )
+    time = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    model._embed_timestep = lambda timestep, dtype: time.to(dtype)
+
+    projected: list[torch.Tensor] = []
+    projected_before: list[torch.Tensor] = []
+    projected_versions: list[int] = []
+
+    def capture_projection(module, args, output) -> None:
+        del module, args
+        projected.append(output)
+        projected_before.append(output.clone())
+        projected_versions.append(output._version)
+
+    model.proj_in.register_forward_hook(capture_projection)
+    camera = torch.arange(2 * 2 * 2 * 1 * 2, dtype=torch.float32).reshape(2, 2, 2, 1, 2)
+    frame_mask = torch.tensor([[[[[0.0]], [[1.0]]]], [[[[1.0]], [[0.0]]]]]) if masked else None
+    item = MaskItem(token_shape=(2, 1, 2), num_views=1)
+
+    actual = model._embed_packed_streams(
+        (item,),
+        [camera],
+        timestep=torch.tensor([0.25, 0.75]),
+        camera=camera,
+        noisy_frame_mask=frame_mask,
+    )
+
+    if frame_mask is None:
+        expected = projected_before[0] + time.unsqueeze(1)
+    else:
+        token_mask = frame_mask[:, 0, :, 0, 0].repeat_interleave(2, dim=1).unsqueeze(-1)
+        expected = projected_before[0] + time.unsqueeze(1) * token_mask
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    # The projection hook retains the exact output object, so observing the
+    # updated values here proves the timestep operation reused its storage.
+    assert projected[0]._version > projected_versions[0]
+    torch.testing.assert_close(projected[0], expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     ("key", "value"),
     [

@@ -209,11 +209,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
 
         self.num_inference_steps = len(timesteps)
 
-        # Reset state
-        self.model_outputs = [None] * self.config.solver_order
-        self.timestep_list = [None] * self.config.solver_order
-        self.lower_order_nums = 0
-        self.last_sample = None
+        self.clear_history()
 
         if self.solver_p:
             self.solver_p.set_timesteps(self.num_inference_steps, device=device)
@@ -221,6 +217,17 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         self._step_index = None
         self._begin_index = None
         self.sigmas = self.sigmas.to("cpu")
+
+    def clear_history(self) -> None:
+        """Release samples after a run; call set_timesteps before starting another.
+
+        This is only for completed or abandoned runs, never between steps of
+        an active multistep solve. The schedule and progress remain available.
+        """
+        self.model_outputs = [None] * self.config.solver_order
+        self.timestep_list = [None] * self.config.solver_order
+        self.lower_order_nums = 0
+        self.last_sample = None
 
     def _threshold_sample(self, sample: torch.Tensor) -> torch.Tensor:
         """
