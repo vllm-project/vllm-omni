@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for BitsAndBytes quantization config."""
 
 import importlib.util
@@ -36,7 +36,7 @@ def _ensure_bitsandbytes_importable(monkeypatch: pytest.MonkeyPatch) -> None:
         return
     bnb = types.ModuleType("bitsandbytes")
     bnb_functional = types.ModuleType("bitsandbytes.functional")
-    bnb.functional = bnb_functional
+    bnb.__dict__["functional"] = bnb_functional
     monkeypatch.setitem(sys.modules, "bitsandbytes", bnb)
     monkeypatch.setitem(sys.modules, "bitsandbytes.functional", bnb_functional)
 
@@ -198,6 +198,7 @@ def quant_config():
     )
 
 
+@pytest.mark.cuda
 @cuda_available
 @bitsandbytes_available
 class TestCudaBnBSmoke:
@@ -256,3 +257,35 @@ class TestCudaBnBSmoke:
 
         assert output.shape == (2, 16, 128)
         assert output.dtype == torch.float16
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "ignored,prefix,skipped",
+    [
+        ("to_out", "layers.0.attention.to_out.0", True),
+        ("w2", "layers.0.feed_forward.w2", True),
+        ("w13", "layers.0.feed_forward.w13", True),
+        ("layers.0.attention.to_out.0", "layers.0.attention.to_out.0", True),
+        ("to_out", "layers.0.attention.to_qkv", False),
+        ("w2", "layers.0.feed_forward.w13", False),
+    ],
+)
+def test_ignored_layers_match_qualified_prefixes(monkeypatch, ignored, prefix, skipped):
+    """Documented short patterns must still match qualified Z-Image layers."""
+    config = build_quant_config("bitsandbytes", ignored_layers=[ignored])
+    config.packed_modules_mapping = {"w13": ["w1", "w3"]}
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    layer = object.__new__(LinearBase)
+    method = config.get_quant_method(layer, prefix)
+    assert isinstance(method, UnquantizedLinearMethod) is skipped
+
+
+@pytest.mark.cpu
+def test_ignored_layers_reject_partial_fused_shards(monkeypatch):
+    config = build_quant_config("bitsandbytes", ignored_layers=["w3"])
+    config.packed_modules_mapping = {"w13": ["w1", "w3"]}
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    layer = object.__new__(LinearBase)
+    with pytest.raises(ValueError, match="some but not all shards"):
+        config.get_quant_method(layer, "layers.0.feed_forward.w13")

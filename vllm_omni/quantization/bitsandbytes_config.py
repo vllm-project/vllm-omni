@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """BitsAndBytes 4-bit quantization config for diffusion transformers.
 
 Supports online (dynamic) NF4/FP4 weight-only quantization from BF16/FP16
@@ -102,6 +102,7 @@ class DiffusionBitsAndBytesConfig(QuantizationConfig):
                 prefix=prefix,
                 ignored_layers=self.ignored_layers,
                 fused_mapping=self.packed_modules_mapping,
+                match_mode="substring",
             ):
                 return UnquantizedLinearMethod()
             if current_omni_platform.is_cuda():

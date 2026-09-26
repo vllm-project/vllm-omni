@@ -12,7 +12,7 @@ quantize during model loading via the `bitsandbytes` CUDA kernels.
 ## Hardware Support
 
 | Device | Support |
-|--------|---------|
+| --- | --- |
 | NVIDIA CUDA GPU (SM 75+) | ✅ |
 | NVIDIA Blackwell GPU (SM 100+) | ✅ |
 | NVIDIA Ada/Hopper GPU (SM 89+) | ✅ |
@@ -28,10 +28,10 @@ Requires the optional `bitsandbytes` package (`pip install bitsandbytes`).
 
 ## Model Type Support
 
-### Diffusion Model (Qwen-Image, Wan2.2)
+### Diffusion Models
 
 | Model | HF models | CUDA | Mode | Recommendation |
-|-------|-----------|:----:|------|----------------|
+| --- | --- | :---: | --- | --- |
 | Z-Image | `Tongyi-MAI/Z-Image-Turbo` | Yes | Online W4 weight-only | All heavy linear layers; sensitive embedders stay BF16 |
 | Qwen-Image | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Not validated | Online W4 weight-only | Compare vs BF16 before enabling |
 | Wan2.2 | Wan2.2 diffusion pipelines | Not validated | Online W4 weight-only | Validate before enabling in docs |
@@ -42,14 +42,14 @@ layers, but they are not validated in this guide.
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 
 | Model | Scope | Status | Notes |
-|-------|-------|--------|-------|
+| --- | --- | --- | --- |
 | Qwen3-Omni | Thinker language-model stage | Not validated | Prefer checkpoint-supported ModelOpt FP8 or AutoRound paths |
 | Qwen3-TTS | TTS language-model stage | Not validated | No BitsAndBytes TTS stage support is documented |
 
 ### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
 
 | Model | Scope | Status | Notes |
-|-------|-------|--------|-------|
+| --- | --- | --- | --- |
 | BAGEL | Stage-specific transformer or DiT module | Not validated | Requires explicit stage routing |
 | GLM-Image | Stage-specific transformer or DiT module | Not validated | Requires quality comparison with BF16 |
 
@@ -88,11 +88,11 @@ vllm serve Tongyi-MAI/Z-Image-Turbo --omni --quantization bitsandbytes
 ## Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| --- | --- | --- | --- |
 | `method` | str | - | Quantization method (`"bitsandbytes"`) |
 | `quant_type` | str | `"nf4"` | 4-bit data type: `"nf4"` (recommended) or `"fp4"` |
-| `compress_statistics` | bool | `True` | Double-quantize block scaling statistics for better accuracy |
-| `ignored_layers` | list[str] | `[]` | Layer name patterns to keep in BF16/FP16 |
+| `compress_statistics` | bool | `True` | Double-quantize block scaling statistics to reduce memory |
+| `ignored_layers` | list[str] | `[]` | Substrings of layer names to keep in BF16/FP16 |
 
 ## Validation and Notes
 
@@ -105,7 +105,9 @@ BitsAndBytes in diffusion models; each rank quantizes its own weight shard
 independently.
 
 If quality regresses, use `ignored_layers` to keep sensitive projections in BF16
-(for example `to_out` or `w2`).
+(for example `to_out` or `w2`). These patterns match substrings of the full
+module prefix, so `to_out` also matches `layers.0.attention.to_out.0`.
+The same precision must apply to all shards of a fused projection.
 
 ```python
 omni = Omni(
