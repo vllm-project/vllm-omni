@@ -124,6 +124,7 @@ from vllm_omni.model_executor.models.step_audio2.pipeline import (
 from vllm_omni.model_executor.models.voxcpm2.pipeline import VOXCPM2_PIPELINE
 from vllm_omni.model_executor.models.voxtral_tts.pipeline import VOXTRAL_TTS_PIPELINE
 from vllm_omni.model_executor.models.wan2_2.pipeline import WAN2_2_TI2V_PIPELINE
+from vllm_omni.model_executor.models.yue2.pipeline import YUE2_PIPELINE
 
 logger = init_logger(__name__)
 
@@ -203,6 +204,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "moss_tts_local": MOSS_TTS_LOCAL_PIPELINE,
     "minicpmo_4_5": MINICPMO_4_5_PIPELINE,
     "minimax_music3": MINIMAX_MUSIC3_PIPELINE,
+    "yue2": YUE2_PIPELINE,
     "higgs_audio_v2": HIGGS_AUDIO_V2_PIPELINE,
     "higgs_multimodal_qwen3": HIGGS_AUDIO_V3_PIPELINE,
     "indextts2": INDEXTTS2_PIPELINE,
