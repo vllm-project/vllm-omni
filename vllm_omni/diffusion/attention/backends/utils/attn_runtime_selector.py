@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Runtime kernel-selection helpers for attention backends."""
 
 import torch
@@ -17,6 +17,12 @@ def can_sdpa_use_fused_gqa(
     This check is specific to the SDPA backend. Native GQA backends such as
     FlashAttention should keep compressed K/V heads and do not use this helper.
     """
+    if query.device.type == key.device.type == value.device.type == "npu":
+        # PyTorch 2.10 + torch-npu 2.10 dispatches enable_gqa=True to the
+        # native Ascend SDPA kernel. Keep K/V compressed instead of expanding
+        # them to the query-head count in Python.
+        return True
+
     if not query.is_cuda:
         return False
 
