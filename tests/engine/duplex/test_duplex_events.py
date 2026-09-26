@@ -42,6 +42,7 @@ from vllm_omni.engine.duplex.events import (
 )
 from vllm_omni.engine.duplex.realtime_events import (
     RealtimeProjectionState,
+    discard_pending_commit_item,
     project_internal_event,
     resolve_clear_output_audio,
     resolve_truncate_item,
@@ -492,6 +493,72 @@ def test_projection_leaves_error_to_typed_emit_sites():
     assert isinstance(projected[0], DuplexRawEvent)
     assert projected[0].type == "duplex.error"
     assert projected[0].to_realtime()["event"]["code"] == "bad_event"
+
+
+def test_queued_conversation_item_events_are_snapshots_not_shared_with_state():
+    """#7636 Issue 11: later deltas must not rewrite already-queued item events."""
+    state = RealtimeProjectionState(session_id="duplex-snap")
+    created = project_internal_event(
+        state, {"type": "response.created", "response_id": "resp_1", "modalities": ["audio", "text"]}
+    )
+    added = next(event for event in created if isinstance(event, ItemAdded))
+    output_added = next(event for event in created if isinstance(event, OutputItemAdded))
+    queued_item = added.item
+    assert queued_item is output_added.item or queued_item == output_added.item
+    assert queued_item is not state.conversation_items["item_resp_1"]
+
+    pcm = base64.b64encode(b"\x00\x10" * 8).decode("ascii")
+    project_internal_event(
+        state,
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "resp_1",
+            "audio": pcm,
+            "text": "later",
+            "format": "pcm16",
+        },
+    )
+
+    assert state.conversation_items["item_resp_1"]["content"][0]["transcript"] == "later"
+    # Queued event still shows the snapshot taken at response.created.
+    assert queued_item["content"] == []
+    assert queued_item["status"] == "in_progress"
+
+
+def test_explicit_input_committed_id_removes_matching_pending_commit():
+    """#7636 Issue 12: explicit realtime_item_id must still pop the pending queue."""
+    state = RealtimeProjectionState(session_id="duplex-commit")
+    state.pending_commit_item_ids.extend(["item_a", "item_b"])
+
+    committed = project_internal_event(
+        state,
+        {
+            "type": "input.committed",
+            "realtime_item_id": "item_a",
+            "message": {"role": "user", "content": "hello"},
+        },
+    )
+
+    assert state.pending_commit_item_ids == ["item_b"]
+    assert committed[0].item_id == "item_a"
+
+    # Without an explicit id, FIFO still pairs with the remaining pending entry.
+    second = project_internal_event(
+        state,
+        {"type": "input.committed", "message": {"role": "user", "content": "world"}},
+    )
+    assert state.pending_commit_item_ids == []
+    assert second[0].item_id == "item_b"
+
+
+def test_discard_pending_commit_item_clears_aborted_head():
+    """#7636 Issue 12: commit_aborted must not leave a pending id behind."""
+    state = RealtimeProjectionState(session_id="duplex-abort")
+    state.pending_commit_item_ids.extend(["item_abort", "item_keep"])
+    discard_pending_commit_item(state)
+    assert state.pending_commit_item_ids == ["item_keep"]
+    discard_pending_commit_item(state, "item_keep")
+    assert state.pending_commit_item_ids == []
 
 
 def test_response_speak_projection_keeps_vllm_omni_request_metrics():
