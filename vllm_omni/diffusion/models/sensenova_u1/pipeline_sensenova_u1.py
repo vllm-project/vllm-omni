@@ -35,6 +35,10 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_classifier_free_guidance_world_size,
+    is_cfg_group_initialized,
+)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.lora.loader import (
     LoraLoaderMixin,
@@ -53,7 +57,14 @@ from vllm_omni.transformers_utils.configs.sensenova_u1 import (
     SenseNovaU1Config,
 )
 
-from .batching import denoise_options, image_count, merge_conditioning, request_condition_key, request_mode
+from .batching import (
+    denoise_options,
+    image_count,
+    merge_cfg_branches,
+    merge_conditioning,
+    request_condition_key,
+    request_mode,
+)
 from .paged_decode import (
     DecodeGraphRunner,
     PagedDecodeCache,
@@ -1298,6 +1309,56 @@ class SenseNovaU1Pipeline(
             kwargs["cache_dit_skip"] = True
         return kwargs
 
+    def _predict_fused_cfg_branches(
+        self, branches_kwargs: list[dict[str, Any]], caches: dict
+    ) -> list[torch.Tensor] | None:
+        """Run compatible single-GPU CFG branches in one larger forward."""
+        if getattr(self.od_config, "step_execution", False):
+            return None
+        if len(branches_kwargs) < 2 or getattr(self.od_config, "cache_backend", "none") not in (None, "none"):
+            return None
+        if is_cfg_group_initialized() and get_classifier_free_guidance_world_size() > 1:
+            return None
+        branch_caches = [kwargs["past_key_values"] for kwargs in branches_kwargs]
+        # Dense padded request caches carry a per-image mask that the CFG
+        # merger cannot recover from the cache alone. Keep their masked path.
+        if any(kwargs["attn_mask"]["full_attention"] is not None for kwargs in branches_kwargs):
+            return None
+
+        batch_size = branches_kwargs[0]["input_embeds"].shape[0]
+        image_tokens = branches_kwargs[0]["image_token_num"]
+        branch_ids = tuple(id(cache) for cache in branch_caches)
+        cached = caches.get("_fused_cfg")
+        if cached is not None and cached[0] == branch_ids:
+            _, merged_cache, merged_indexes, merged_mask = cached
+        else:
+            attention = self.language_model.model.layers[0].self_attn.attn
+            packed_varlen = attention.attn_backend.supports_multi_doc_packed_varlen()
+            merged_cache, merged_indexes, merged_mask = merge_cfg_branches(
+                branch_caches,
+                [kwargs["indexes_image"] for kwargs in branches_kwargs],
+                image_tokens,
+                packed_varlen=packed_varlen,
+            )
+            if not getattr(merged_cache.layers[0], "sensenova_packed_varlen", False):
+                prepare_flash_kv_cache(
+                    merged_cache,
+                    current_len=image_tokens,
+                    batch_size=batch_size * len(branches_kwargs),
+                )
+            caches["_fused_cfg"] = (branch_ids, merged_cache, merged_indexes, merged_mask)
+        fused_kwargs = dict(branches_kwargs[0])
+        fused_kwargs.update(
+            input_embeds=torch.cat([kwargs["input_embeds"] for kwargs in branches_kwargs]),
+            z=torch.cat([kwargs["z"] for kwargs in branches_kwargs]),
+            indexes_image=merged_indexes,
+            attn_mask=merged_mask,
+            past_key_values=merged_cache,
+            cache_dit_skip=False,
+        )
+        prediction = self.predict_noise(**fused_kwargs)
+        return list(prediction.split(batch_size))
+
     def _denoise(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i):
         if not is_it2i:
             has_cached_partner = t >= p.cfg_interval[0] and t <= p.cfg_interval[1] and p.cfg_scale > 1
@@ -1310,6 +1371,15 @@ class SenseNovaU1Pipeline(
                 return self.predict_noise(**cond_kwargs)
 
             uncond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, branch="uncond")
+            fused = self._predict_fused_cfg_branches([cond_kwargs, uncond_kwargs], caches)
+            if fused is not None:
+                return self.combine_cfg_noise(
+                    (fused[0],),
+                    (fused[1],),
+                    p.cfg_scale,
+                    p.cfg_norm,
+                    kwargs={"step_i": step_i, "is_it2i": is_it2i},
+                )
             noise_pred = self.predict_noise_maybe_with_cfg(
                 do_true_cfg=True,
                 true_cfg_scale=p.cfg_scale,
@@ -1333,6 +1403,15 @@ class SenseNovaU1Pipeline(
             cfg_norm = p.cfg_norm if (p.cfg_scale > 1 or p.img_cfg_scale > 1) else None
             if p.img_cfg_scale == 1:
                 image_cond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, branch="img_cond")
+                fused = self._predict_fused_cfg_branches([cond_kwargs, image_cond_kwargs], caches)
+                if fused is not None:
+                    return self.combine_cfg_noise(
+                        (fused[0],),
+                        (fused[1],),
+                        p.cfg_scale,
+                        cfg_norm,
+                        kwargs={"is_it2i": is_it2i},
+                    )
                 noise_pred = self.predict_noise_maybe_with_cfg(
                     do_true_cfg=True,
                     true_cfg_scale=p.cfg_scale,
@@ -1343,6 +1422,15 @@ class SenseNovaU1Pipeline(
                 )
             elif p.cfg_scale == p.img_cfg_scale:
                 uncond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, branch="uncond")
+                fused = self._predict_fused_cfg_branches([cond_kwargs, uncond_kwargs], caches)
+                if fused is not None:
+                    return self.combine_cfg_noise(
+                        (fused[0],),
+                        (fused[1],),
+                        p.cfg_scale,
+                        cfg_norm,
+                        kwargs={"is_it2i": is_it2i},
+                    )
                 noise_pred = self.predict_noise_maybe_with_cfg(
                     do_true_cfg=True,
                     true_cfg_scale=p.cfg_scale,
@@ -1356,6 +1444,13 @@ class SenseNovaU1Pipeline(
                     caches, image_embeds, t, z, ns, p, branch="img_cond", cache_dit_skip=True
                 )
                 uncond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, branch="uncond")
+                fused = self._predict_fused_cfg_branches([cond_kwargs, image_cond_kwargs, uncond_kwargs], caches)
+                if fused is not None:
+                    return self.combine_multi_branch_cfg_noise(
+                        fused,
+                        {"cfg_scale": p.cfg_scale, "img_cfg_scale": p.img_cfg_scale},
+                        cfg_norm,
+                    )
                 noise_pred = self.predict_noise_with_multi_branch_cfg(
                     do_true_cfg=True,
                     true_cfg_scale={
@@ -1511,7 +1606,17 @@ class SenseNovaU1Pipeline(
                 states.append(ns)
                 prefixes.append(prefix)
                 texts.append(text)
-            caches = merge_conditioning(prefixes, counts, states[0].token_h * states[0].token_w)
+            language_model = getattr(self, "language_model", None)
+            packed_varlen = False
+            if language_model is not None:
+                attention = language_model.model.layers[0].self_attn.attn
+                packed_varlen = attention.attn_backend.supports_multi_doc_packed_varlen()
+            caches = merge_conditioning(
+                prefixes,
+                counts,
+                states[0].token_h * states[0].token_w,
+                packed_varlen=packed_varlen,
+            )
             prefixes.clear()
             del prefix, ctx
             p = SimpleNamespace(**vars(params[0]))

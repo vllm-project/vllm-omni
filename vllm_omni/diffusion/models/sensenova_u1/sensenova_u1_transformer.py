@@ -107,6 +107,19 @@ def clear_flash_kv_cache(past_key_values):
                 delattr(layer, attr)
 
 
+def write_packed_image_kv(layer, key_bshd: torch.Tensor, value_bshd: torch.Tensor):
+    """Fill the reserved image-token slots in a packed prefix cache."""
+    batch_size, image_tokens = key_bshd.shape[:2]
+    positions = layer.sensenova_image_positions
+    if positions.numel() != batch_size * image_tokens:
+        raise ValueError("SenseNova packed image positions do not match the denoise batch")
+    keys = layer.keys.transpose(1, 2)
+    values = layer.values.transpose(1, 2)
+    keys.index_copy_(1, positions, key_bshd.reshape(1, batch_size * image_tokens, *key_bshd.shape[2:]))
+    values.index_copy_(1, positions, value_bshd.reshape(1, batch_size * image_tokens, *value_bshd.shape[2:]))
+    return keys, values
+
+
 # ---------------------------------------------------------------------------
 # RoPE
 # ---------------------------------------------------------------------------
@@ -552,6 +565,29 @@ class SenseNovaU1Attention(nn.Module):
             self.k_norm_hw_mot_gen,
         )
         update_cache = kwargs.get("update_cache", True)
+
+        if past_key_values is not None and not update_cache:
+            layer = past_key_values.layers[self.layer_idx]
+            if getattr(layer, "sensenova_packed_varlen", False):
+                q = query_states.transpose(1, 2).contiguous()
+                k_cur = key_states.transpose(1, 2).contiguous()
+                v_cur = value_states.transpose(1, 2).contiguous()
+                batch_size, query_length = q.shape[:2]
+                k, v = write_packed_image_kv(layer, k_cur, v_cur)
+                packed_metadata = AttentionMetadata(
+                    extra={
+                        "cu_seqlens_q": layer.sensenova_cu_seqlens_q,
+                        "cu_seqlens_k": layer.sensenova_cu_seqlens_k,
+                        "max_seqlen_q": query_length,
+                        "max_seqlen_k": layer.sensenova_max_seqlen_k,
+                    }
+                )
+                q = q.reshape(1, batch_size * query_length, *q.shape[2:])
+                attn_output = self.attn(q, k, v, packed_metadata)
+                attn_output = attn_output.reshape(batch_size, query_length, *attn_output.shape[2:])
+                attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+                attn_output, _ = self.o_proj_mot_gen(attn_output)
+                return attn_output
 
         if attention_mask is None:
             # Bidirectional path: no causal mask, optionally attend to a prefix.

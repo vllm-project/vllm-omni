@@ -55,13 +55,19 @@ def request_condition_key(prompt, sampling) -> tuple:
     return (request_mode(prompt), image_count(sampling), *denoise_options(sampling).values())
 
 
-def merge_conditioning(caches: list[dict], counts: list[int], image_tokens: int) -> dict:
-    """Pad each CFG prefix independently, preserving each image's 3-D positions.
+def merge_conditioning(
+    caches: list[dict],
+    counts: list[int],
+    image_tokens: int,
+    *,
+    packed_varlen: bool = False,
+) -> dict:
+    """Merge each CFG prefix, preserving every image's 3-D positions.
 
-    Dense storage is [sum(counts), Hkv, max_prefix, D]. Padding is masked out
-    by a 2-D boolean key mask that compatible native backends can unpad into a
-    varlen attention call; the following image tokens remain bidirectional. No
-    AR context or scheduler row is consumed here.
+    Dense storage is [sum(counts), Hkv, max_prefix, D], with padding masked
+    by a 2-D boolean key mask. On a packed-varlen backend, ragged requests
+    instead store each [prefix, image] sequence contiguously. No AR context or
+    scheduler row is consumed here.
     """
     merged = {}
     for branch in ("cond", "uncond", "img_cond"):
@@ -72,19 +78,63 @@ def merge_conditioning(caches: list[dict], counts: list[int], image_tokens: int)
         max_len = max(lengths)
         total = sum(counts)
         kv = DynamicCache()
+        use_packed = packed_varlen and len(set(lengths)) > 1
+        if use_packed:
+            sample_lengths = [
+                length + image_tokens for count, length in zip(counts, lengths, strict=True) for _ in range(count)
+            ]
+            offsets = [0]
+            for length in sample_lengths:
+                offsets.append(offsets[-1] + length)
+            device = prefixes[0].layers[0].keys.device
+            cu_seqlens_k = torch.tensor(offsets, dtype=torch.int32, device=device)
+            cu_seqlens_q = torch.arange(
+                0,
+                (total + 1) * image_tokens,
+                image_tokens,
+                dtype=torch.int32,
+                device=cu_seqlens_k.device,
+            )
+            image_positions = torch.cat(
+                [
+                    torch.arange(start + length, end, device=device)
+                    for start, end, length in zip(
+                        offsets[:-1],
+                        offsets[1:],
+                        [length for count, length in zip(counts, lengths, strict=True) for _ in range(count)],
+                        strict=True,
+                    )
+                ]
+            )
         for layer_idx in range(len(prefixes[0].layers)):
             example = prefixes[0].layers[layer_idx].keys
-            keys = example.new_zeros(total, example.shape[1], max_len, example.shape[3])
+            if use_packed:
+                keys = example.new_zeros(1, example.shape[1], offsets[-1], example.shape[3])
+            else:
+                keys = example.new_zeros(total, example.shape[1], max_len, example.shape[3])
             values = torch.zeros_like(keys)
-            start = 0
+            batch_start = packed_start = 0
             for prefix, count, length in zip(prefixes, counts, lengths, strict=True):
                 layer = prefix.layers[layer_idx]
-                keys[start : start + count, :, :length].copy_(layer.keys)
-                values[start : start + count, :, :length].copy_(layer.values)
-                start += count
+                if use_packed:
+                    for row in range(count):
+                        keys[0, :, packed_start : packed_start + length].copy_(layer.keys[row])
+                        values[0, :, packed_start : packed_start + length].copy_(layer.values[row])
+                        packed_start += length + image_tokens
+                else:
+                    keys[batch_start : batch_start + count, :, :length].copy_(layer.keys)
+                    values[batch_start : batch_start + count, :, :length].copy_(layer.values)
+                batch_start += count
             kv.update(keys, values, layer_idx)
+            if use_packed:
+                merged_layer = kv.layers[layer_idx]
+                merged_layer.sensenova_packed_varlen = True
+                merged_layer.sensenova_cu_seqlens_q = cu_seqlens_q
+                merged_layer.sensenova_cu_seqlens_k = cu_seqlens_k
+                merged_layer.sensenova_image_positions = image_positions
+                merged_layer.sensenova_max_seqlen_k = max(sample_lengths)
         mask = None
-        if len(set(lengths)) > 1:
+        if len(set(lengths)) > 1 and not use_packed:
             mask = torch.ones(total, max_len + image_tokens, dtype=torch.bool, device=keys.device)
             start = 0
             for count, length in zip(counts, lengths, strict=True):
@@ -100,3 +150,126 @@ def merge_conditioning(caches: list[dict], counts: list[int], image_tokens: int)
             dim=1,
         )
     return merged
+
+
+def merge_cfg_branches(
+    branch_caches: list[DynamicCache],
+    branch_indexes: list[torch.Tensor],
+    image_tokens: int,
+    *,
+    packed_varlen: bool = False,
+) -> tuple[DynamicCache, torch.Tensor, dict[str, torch.Tensor | None]]:
+    """Fuse CFG branches, including request-packed and dense prefix caches.
+
+    A packed source includes reserved image slots. Copy only its prefix tokens;
+    the fused cache gets fresh image slots in branch-major order.
+    """
+    if not branch_caches:
+        raise ValueError("SenseNova CFG fusion requires at least one branch")
+    # Each entry holds (is_packed, prefix_length_per_image, packed_k_offsets).
+    layouts: list[tuple[bool, list[int], list[int] | None]] = []
+    batch_size = None
+    for cache in branch_caches:
+        layer = cache.layers[0]
+        is_packed = bool(getattr(layer, "sensenova_packed_varlen", False))
+        if is_packed:
+            if not packed_varlen:
+                raise ValueError("SenseNova packed CFG source requires a packed-varlen attention backend")
+            source_offsets = layer.sensenova_cu_seqlens_k.tolist()
+            lengths = [end - start - image_tokens for start, end in zip(source_offsets[:-1], source_offsets[1:])]
+            if any(length < 0 for length in lengths) or source_offsets[-1] != layer.keys.shape[2]:
+                raise ValueError("SenseNova packed CFG source has invalid K/V offsets")
+            rows = len(lengths)
+            if layer.sensenova_cu_seqlens_q.numel() != rows + 1:
+                raise ValueError("SenseNova packed CFG source has mismatched Q/K rows")
+        else:
+            rows = layer.keys.shape[0]
+            lengths = [cache.get_seq_length()] * rows
+            source_offsets = None
+        if batch_size is None:
+            batch_size = rows
+        elif rows != batch_size:
+            raise ValueError("SenseNova CFG branch cache batch sizes must match")
+        layouts.append((is_packed, lengths, source_offsets))
+
+    assert batch_size is not None
+    prefix_lengths = [length for _, lengths, _ in layouts for length in lengths]
+    max_len = max(prefix_lengths)
+    use_packed = packed_varlen and (any(is_packed for is_packed, _, _ in layouts) or len(set(prefix_lengths)) > 1)
+    if use_packed:
+        sample_lengths = [length + image_tokens for length in prefix_lengths]
+        device = branch_caches[0].layers[0].keys.device
+        offsets = [0]
+        for length in sample_lengths:
+            offsets.append(offsets[-1] + length)
+        cu_seqlens_k = torch.tensor(offsets, dtype=torch.int32, device=device)
+        cu_seqlens_q = torch.arange(
+            0,
+            (len(sample_lengths) + 1) * image_tokens,
+            image_tokens,
+            dtype=torch.int32,
+            device=device,
+        )
+        image_positions = torch.cat(
+            [
+                torch.arange(start + length, end, device=device)
+                for start, end, length in zip(
+                    offsets[:-1],
+                    offsets[1:],
+                    prefix_lengths,
+                    strict=True,
+                )
+            ]
+        )
+    merged = DynamicCache()
+    for layer_idx in range(len(branch_caches[0].layers)):
+        example = branch_caches[0].layers[layer_idx].keys
+        if use_packed:
+            keys = example.new_zeros(1, example.shape[1], offsets[-1], example.shape[3])
+        else:
+            keys = example.new_zeros(len(branch_caches) * batch_size, example.shape[1], max_len, example.shape[3])
+        values = torch.zeros_like(keys)
+        packed_start = 0
+        for branch_idx, (cache, layout) in enumerate(zip(branch_caches, layouts, strict=True)):
+            source_packed, row_lengths, source_offsets = layout
+            if use_packed:
+                for row, length in enumerate(row_lengths):
+                    if source_packed:
+                        assert source_offsets is not None
+                        source_start = source_offsets[row]
+                        source_key = cache.layers[layer_idx].keys[0, :, source_start : source_start + length]
+                        source_value = cache.layers[layer_idx].values[0, :, source_start : source_start + length]
+                    else:
+                        source_key = cache.layers[layer_idx].keys[row, :, :length]
+                        source_value = cache.layers[layer_idx].values[row, :, :length]
+                    keys[0, :, packed_start : packed_start + length].copy_(source_key)
+                    values[0, :, packed_start : packed_start + length].copy_(source_value)
+                    packed_start += length + image_tokens
+            else:
+                rows = slice(branch_idx * batch_size, (branch_idx + 1) * batch_size)
+                keys[rows, :, : row_lengths[0]].copy_(cache.layers[layer_idx].keys)
+                values[rows, :, : row_lengths[0]].copy_(cache.layers[layer_idx].values)
+        merged.update(keys, values, layer_idx)
+        if use_packed:
+            merged_layer = merged.layers[layer_idx]
+            merged_layer.sensenova_packed_varlen = True
+            merged_layer.sensenova_cu_seqlens_q = cu_seqlens_q
+            merged_layer.sensenova_cu_seqlens_k = cu_seqlens_k
+            merged_layer.sensenova_image_positions = image_positions
+            merged_layer.sensenova_max_seqlen_k = max(sample_lengths)
+
+    mask = None
+    if len(set(prefix_lengths)) > 1 and not use_packed:
+        mask = torch.ones(
+            len(branch_caches) * batch_size,
+            max_len + image_tokens,
+            dtype=torch.bool,
+            device=branch_caches[0].layers[0].keys.device,
+        )
+        for row, length in enumerate(prefix_lengths):
+            mask[row, length:max_len] = False
+
+    normalized_indexes = [
+        idx.unsqueeze(1).expand(-1, batch_size, -1) if idx.ndim == 2 else idx for idx in branch_indexes
+    ]
+    return merged, torch.cat(normalized_indexes, dim=1), {"full_attention": mask}

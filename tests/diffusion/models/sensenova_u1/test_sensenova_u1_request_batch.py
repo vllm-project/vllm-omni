@@ -9,11 +9,14 @@ import torch
 import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 
-from vllm_omni.diffusion.models.sensenova_u1.batching import image_count, merge_conditioning
+from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
+from vllm_omni.diffusion.models.sensenova_u1.batching import image_count, merge_cfg_branches, merge_conditioning
 from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import (
     SenseNovaU1Pipeline,
     get_sensenova_u1_pre_process_func,
 )
+from vllm_omni.diffusion.models.sensenova_u1.sensenova_u1_transformer import write_packed_image_kv
 from vllm_omni.diffusion.output_formatter import format_diffusion_outputs, normalize_diffusion_postprocess_output
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -86,6 +89,291 @@ def test_padded_attention_matches_independent_requests(lengths, branches):
                     merged[f"idx_{branch}"][:, rows], prefix[f"idx_{branch}"].unsqueeze(1).expand(-1, 2, -1)
                 )
             torch.testing.assert_close(actual, torch.cat(expected), atol=1e-6, rtol=1e-6)
+
+
+def test_packed_conditioning_places_prefixes_and_reserves_image_tokens():
+    prefixes = [_prefix(2), _prefix(5)]
+    merged = merge_conditioning(prefixes, [1, 1], image_tokens=3, packed_varlen=True)
+    assert merged["mask_cond"]["full_attention"] is None
+    layer = merged["cond"].layers[0]
+    assert layer.keys.shape == (1, 2, 13, 4)
+    assert layer.sensenova_cu_seqlens_q.tolist() == [0, 3, 6]
+    assert layer.sensenova_cu_seqlens_k.tolist() == [0, 5, 13]
+    assert layer.sensenova_image_positions.tolist() == [2, 3, 4, 10, 11, 12]
+    torch.testing.assert_close(layer.keys[0, :, :2], prefixes[0]["cond"].layers[0].keys[0])
+    torch.testing.assert_close(layer.keys[0, :, 5:10], prefixes[1]["cond"].layers[0].keys[0])
+    assert not layer.keys[0, :, layer.sensenova_image_positions].count_nonzero()
+    image_keys = torch.randn(2, 3, 2, 4)
+    image_values = torch.randn_like(image_keys)
+    keys, values = write_packed_image_kv(layer, image_keys, image_values)
+    torch.testing.assert_close(keys[0, layer.sensenova_image_positions], image_keys.flatten(0, 1))
+    torch.testing.assert_close(values[0, layer.sensenova_image_positions], image_values.flatten(0, 1))
+    torch.testing.assert_close(keys[0, :2], prefixes[0]["cond"].layers[0].keys[0].transpose(0, 1))
+    torch.testing.assert_close(keys[0, 5:10], prefixes[1]["cond"].layers[0].keys[0].transpose(0, 1))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for FlashAttention")
+@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("merge_kind", ["request", "cfg"])
+def test_packed_flash_attention_matches_independent_ragged_requests(merge_kind):
+    torch.manual_seed(17)
+    image_tokens, query_heads, kv_heads, head_dim = 12, 32, 8, 128
+    prefixes = []
+    for length in (7, 19):
+        cache = DynamicCache()
+        key = torch.randn(1, kv_heads, length, head_dim, device="cuda", dtype=torch.bfloat16)
+        value = torch.randn_like(key)
+        cache.update(key, value, 0)
+        prefixes.append({"cond": cache, "idx_cond": torch.zeros(3, image_tokens, device="cuda")})
+
+    if merge_kind == "request":
+        merged = merge_conditioning(prefixes, [1, 1], image_tokens, packed_varlen=True)["cond"]
+    else:
+        merged, _, _ = merge_cfg_branches(
+            [prefix["cond"] for prefix in prefixes],
+            [prefix["idx_cond"] for prefix in prefixes],
+            image_tokens,
+            packed_varlen=True,
+        )
+    layer = merged.layers[0]
+    query = torch.randn(2, image_tokens, query_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    image_key = torch.randn(2, image_tokens, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    image_value = torch.randn_like(image_key)
+    packed_key, packed_value = write_packed_image_kv(layer, image_key, image_value)
+
+    impl = FlashAttentionImpl(
+        num_heads=query_heads,
+        head_size=head_dim,
+        softmax_scale=head_dim**-0.5,
+        num_kv_heads=kv_heads,
+    )
+    actual = impl._forward_varlen_packed(
+        query.reshape(1, 2 * image_tokens, query_heads, head_dim),
+        packed_key,
+        packed_value,
+        cu_seqlens_q=layer.sensenova_cu_seqlens_q,
+        cu_seqlens_k=layer.sensenova_cu_seqlens_k,
+        max_seqlen_q=image_tokens,
+        max_seqlen_k=layer.sensenova_max_seqlen_k,
+    ).reshape_as(query)
+    expected = []
+    for row, prefix in enumerate(prefixes):
+        source = prefix["cond"].layers[0]
+        key = torch.cat([source.keys, image_key[row].transpose(0, 1).unsqueeze(0)], dim=2)
+        value = torch.cat([source.values, image_value[row].transpose(0, 1).unsqueeze(0)], dim=2)
+        out = F.scaled_dot_product_attention(query[row].transpose(0, 1).unsqueeze(0), key, value, enable_gqa=True)
+        expected.append(out.squeeze(0).transpose(0, 1))
+    torch.testing.assert_close(actual, torch.stack(expected), atol=0.03, rtol=0.03)
+
+
+def test_merge_cfg_branches_preserves_branch_rows_and_indexes():
+    branches = [_prefix(2, count=2), _prefix(5, count=2, offset=10)]
+    merged, indexes, mask = merge_cfg_branches(
+        [branch["cond"] for branch in branches],
+        [branch["idx_cond"] for branch in branches],
+        image_tokens=3,
+    )
+    layer = merged.layers[0]
+    assert layer.keys.shape == (4, 2, 5, 4)
+    torch.testing.assert_close(layer.keys[:2, :, :2], branches[0]["cond"].layers[0].keys)
+    torch.testing.assert_close(layer.keys[2:, :, :5], branches[1]["cond"].layers[0].keys)
+    assert indexes.shape == (3, 4, 3)
+    assert mask["full_attention"].tolist() == [
+        [True, True, False, False, False, True, True, True],
+        [True, True, False, False, False, True, True, True],
+        [True] * 8,
+        [True] * 8,
+    ]
+
+    packed, packed_indexes, packed_mask = merge_cfg_branches(
+        [branch["cond"] for branch in branches],
+        [branch["idx_cond"] for branch in branches],
+        image_tokens=3,
+        packed_varlen=True,
+    )
+    packed_layer = packed.layers[0]
+    assert packed_layer.keys.shape == (1, 2, 26, 4)
+    assert packed_layer.sensenova_cu_seqlens_q.tolist() == [0, 3, 6, 9, 12]
+    assert packed_layer.sensenova_cu_seqlens_k.tolist() == [0, 5, 10, 18, 26]
+    assert packed_indexes.shape == indexes.shape
+    assert packed_mask["full_attention"] is None
+
+
+@pytest.mark.parametrize("uncond_lengths", [(3, 3), (4, 6)])
+@pytest.mark.parametrize("branches", [("cond", "uncond"), ("cond", "img_cond", "uncond")])
+def test_merge_cfg_branches_accepts_request_packed_and_dense_sources(uncond_lengths, branches):
+    counts = [1, 2]
+    prefixes = [_prefix(length, count, offset=length, branches=branches) for length, count in zip((2, 5), counts)]
+    for request, count, length in zip(prefixes, counts, uncond_lengths, strict=True):
+        request["uncond"] = _prefix(length, count, branches=("uncond",))["uncond"]
+        if "img_cond" in branches:
+            request["img_cond"] = _prefix(4, count, branches=("img_cond",))["img_cond"]
+    request_cache = merge_conditioning(prefixes, counts, image_tokens=3, packed_varlen=True)
+    assert request_cache["cond"].layers[0].sensenova_packed_varlen
+    if "img_cond" in branches or uncond_lengths[0] == uncond_lengths[1]:
+        dense_branch = "img_cond" if "img_cond" in branches else "uncond"
+        assert not getattr(request_cache[dense_branch].layers[0], "sensenova_packed_varlen", False)
+
+    # Packed sources contain image slots; their previous contents must not be
+    # copied into the new CFG cache's freshly reserved slots.
+    for branch in branches:
+        source = request_cache[branch]
+        if getattr(source.layers[0], "sensenova_packed_varlen", False):
+            for layer in source.layers:
+                layer.keys[0, :, layer.sensenova_image_positions] = 7
+                layer.values[0, :, layer.sensenova_image_positions] = 7
+
+    merged, indexes, mask = merge_cfg_branches(
+        [request_cache[branch] for branch in branches],
+        [request_cache[f"idx_{branch}"] for branch in branches],
+        image_tokens=3,
+        packed_varlen=True,
+    )
+    assert mask["full_attention"] is None
+    expected_indexes = [request_cache[f"idx_{branch}"] for branch in branches]
+    lengths = [
+        request[branch].get_seq_length()
+        for branch in branches
+        for request, count in zip(prefixes, counts, strict=True)
+        for _ in range(count)
+    ]
+    expected_offsets = [0]
+    for length in lengths:
+        expected_offsets.append(expected_offsets[-1] + length + 3)
+    torch.testing.assert_close(indexes, torch.cat(expected_indexes, dim=1))
+    for layer_idx in range(2):
+        layer = merged.layers[layer_idx]
+        assert layer.keys.shape == (1, 2, expected_offsets[-1], 4)
+        assert layer.sensenova_cu_seqlens_q.tolist() == list(range(0, 3 * (len(lengths) + 1), 3))
+        assert layer.sensenova_cu_seqlens_k.tolist() == expected_offsets
+        for row, (branch, request_idx, source_row) in enumerate(
+            (branch, request_idx, source_row)
+            for branch in branches
+            for request_idx, count in enumerate(counts)
+            for source_row in range(count)
+        ):
+            length = lengths[row]
+            source = prefixes[request_idx][branch].layers[layer_idx]
+            start = expected_offsets[row]
+            torch.testing.assert_close(layer.keys[0, :, start : start + length], source.keys[source_row])
+            torch.testing.assert_close(layer.values[0, :, start : start + length], source.values[source_row])
+            assert not layer.keys[0, :, start + length : expected_offsets[row + 1]].count_nonzero()
+            assert not layer.values[0, :, start + length : expected_offsets[row + 1]].count_nonzero()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for FlashAttention")
+@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("uncond_lengths", [(9, 9), (5, 17)])
+@pytest.mark.parametrize("branches", [("cond", "uncond"), ("cond", "img_cond", "uncond")])
+def test_mixed_source_cfg_flash_matches_independent_branches(uncond_lengths, branches):
+    torch.manual_seed(23)
+    image_tokens, query_heads, kv_heads, head_dim = 12, 32, 8, 128
+    requests = []
+    for cond_length, uncond_length in zip((7, 19), uncond_lengths, strict=True):
+        request = {}
+        branch_lengths = {"cond": cond_length, "img_cond": 8, "uncond": uncond_length}
+        for branch in branches:
+            length = branch_lengths[branch]
+            cache = DynamicCache()
+            key = torch.randn(1, kv_heads, length, head_dim, device="cuda", dtype=torch.bfloat16)
+            cache.update(key, torch.randn_like(key), 0)
+            request[branch] = cache
+            request[f"idx_{branch}"] = torch.zeros(3, image_tokens, device="cuda")
+        requests.append(request)
+    request_cache = merge_conditioning(requests, [1, 1], image_tokens, packed_varlen=True)
+    merged, _, mask = merge_cfg_branches(
+        [request_cache[branch] for branch in branches],
+        [request_cache[f"idx_{branch}"] for branch in branches],
+        image_tokens,
+        packed_varlen=True,
+    )
+    assert mask["full_attention"] is None
+    layer = merged.layers[0]
+    total = 2 * len(branches)
+    query = torch.randn(total, image_tokens, query_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    image_key = torch.randn(total, image_tokens, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    image_value = torch.randn_like(image_key)
+    packed_key, packed_value = write_packed_image_kv(layer, image_key, image_value)
+    impl = FlashAttentionImpl(
+        num_heads=query_heads,
+        head_size=head_dim,
+        softmax_scale=head_dim**-0.5,
+        num_kv_heads=kv_heads,
+    )
+    actual = impl._forward_varlen_packed(
+        query.reshape(1, total * image_tokens, query_heads, head_dim),
+        packed_key,
+        packed_value,
+        cu_seqlens_q=layer.sensenova_cu_seqlens_q,
+        cu_seqlens_k=layer.sensenova_cu_seqlens_k,
+        max_seqlen_q=image_tokens,
+        max_seqlen_k=layer.sensenova_max_seqlen_k,
+    ).reshape_as(query)
+    expected = []
+    for row, (branch, request) in enumerate((branch, request) for branch in branches for request in requests):
+        source = request[branch].layers[0]
+        key = torch.cat([source.keys, image_key[row].transpose(0, 1).unsqueeze(0)], dim=2)
+        value = torch.cat([source.values, image_value[row].transpose(0, 1).unsqueeze(0)], dim=2)
+        out = F.scaled_dot_product_attention(query[row].transpose(0, 1).unsqueeze(0), key, value, enable_gqa=True)
+        expected.append(out.squeeze(0).transpose(0, 1))
+    torch.testing.assert_close(actual, torch.stack(expected), atol=0.03, rtol=0.03)
+
+
+def test_pipeline_fuses_packed_request_cfg_and_reuses_prefix_cache(monkeypatch):
+    pipe = _pipeline()
+    backend = SimpleNamespace(supports_multi_doc_packed_varlen=lambda: True)
+    attention = SimpleNamespace(attn_backend=backend)
+    pipe.language_model = SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(self_attn=SimpleNamespace(attn=attention))])
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1.is_cfg_group_initialized", lambda: False
+    )
+    prefixes = [_prefix(2), _prefix(5)]
+    for request in prefixes:
+        request["uncond"] = _prefix(3, branches=("uncond",))["uncond"]
+    request_cache = merge_conditioning(prefixes, [1, 1], image_tokens=3, packed_varlen=True)
+    assert request_cache["cond"].layers[0].sensenova_packed_varlen
+
+    calls = []
+
+    def predict_noise(**kwargs):
+        calls.append(kwargs)
+        return kwargs["input_embeds"][..., :1]
+
+    pipe.predict_noise = predict_noise
+    branches_kwargs = [
+        {
+            "input_embeds": torch.full((2, 3, 4), fill),
+            "z": torch.zeros(2, 3, 4),
+            "past_key_values": request_cache[branch],
+            "indexes_image": request_cache[f"idx_{branch}"],
+            "attn_mask": request_cache[f"mask_{branch}"],
+            "image_token_num": 3,
+        }
+        for branch, fill in (("cond", 1.0), ("uncond", 2.0))
+    ]
+    fused = pipe._predict_fused_cfg_branches(branches_kwargs, request_cache)
+    assert fused is not None and len(fused) == 2
+    torch.testing.assert_close(fused[0], torch.ones(2, 3, 1))
+    torch.testing.assert_close(fused[1], torch.full((2, 3, 1), 2.0))
+    assert calls[0]["past_key_values"].layers[0].sensenova_packed_varlen
+    assert calls[0]["indexes_image"].shape == (3, 4, 3)
+    merged_cache = request_cache["_fused_cfg"][1]
+    pipe._predict_fused_cfg_branches(branches_kwargs, request_cache)
+    assert request_cache["_fused_cfg"][1] is merged_cache
+    assert len(calls) == 2
+
+    branches_kwargs[0]["attn_mask"] = {"full_attention": torch.ones(2, 8, dtype=torch.bool)}
+    assert pipe._predict_fused_cfg_branches(branches_kwargs, request_cache) is None
+    assert len(calls) == 2
+
+    branches_kwargs[0]["attn_mask"] = {"full_attention": None}
+    pipe.od_config.step_execution = True
+    assert pipe._predict_fused_cfg_branches(branches_kwargs, request_cache) is None
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize("count,legacy,expected", [(1, None, 1), (2, None, 2), (1, 3, 3), (3, 3, 3)])
