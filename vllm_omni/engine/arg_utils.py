@@ -227,6 +227,27 @@ class OmniEngineArgs(EngineArgs):
     # for library callers (#7564); registered pipelines may consume it through
     # their own stage_cli_aliases or deploy YAML.
     text_encoder_tp_size: int | None = None
+    # Diffusion parallel knobs registered by the serve CLI (``--usp``,
+    # ``--ulysses-mode``, ``--ring-degree``, ``--allgather-degree``,
+    # ``--use-hsdp``, ``--hsdp-*``, ``--cfg-parallel-size``,
+    # ``--vae-patch-parallel-size``, ``--vae-parallel-mode``) and consumed by
+    # ``DiffusionParallelConfig`` through the generic diffusion fallback.
+    # Declared here for the same reason as ``text_encoder_tp_size`` above:
+    # ``from_cli_args`` keeps only dataclass fields, so an undeclared knob is
+    # silently reset to its default (#7652). They are also listed in
+    # SHARED_FIELDS because this change declares them on both classes, and
+    # invariant 1 below requires the overlap to stay a subset of that set.
+    ulysses_degree: int | None = None
+    ulysses_mode: str | None = None
+    ulysses_a2a_permute: bool | None = None
+    ring_degree: int | None = None
+    allgather_degree: int | None = None
+    use_hsdp: bool | None = None
+    hsdp_shard_size: int | None = None
+    hsdp_replicate_size: int | None = None
+    cfg_parallel_size: int | None = None
+    vae_patch_parallel_size: int | None = None
+    vae_parallel_mode: str | None = None
 
     @classmethod
     def _add_omni_specific_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -634,6 +655,19 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "log_stats",  # both want the flag
         "async_chunk",  # orch: read from CLI, redistribute; engine: per-stage flag
         "tokenizer",  # orch: detect model type; engine: tokenization
+        # Diffusion parallel knobs: the orchestrator sizes the deployment from
+        # them, the engine forwards them to DiffusionParallelConfig.
+        "ulysses_degree",
+        "ulysses_mode",
+        "ulysses_a2a_permute",
+        "ring_degree",
+        "allgather_degree",
+        "use_hsdp",
+        "hsdp_shard_size",
+        "hsdp_replicate_size",
+        "cfg_parallel_size",
+        "vae_patch_parallel_size",
+        "vae_parallel_mode",
     }
 )
 
