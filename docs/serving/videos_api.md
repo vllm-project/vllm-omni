@@ -204,6 +204,12 @@ corresponding addition. `negative_metadata_mode` accepts `same`, `inverse`, or
 `none` and defaults to `same` for transfer. See the Cosmos3 recipe for complete
 examples.
 
+Set `extra_params.video_encoder_backend` to `"ffmpeg"` to encode non-streaming
+VAE output with the `ffmpeg` executable instead of PyAV. The default is
+`"pyav"`; streaming responses continue to use PyAV fragmented MP4. The ffmpeg
+backend uses MPEG-4 Part 2 (`mpeg4`) by default rather than PyAV's H.264, so
+clients must support that codec.
+
 A client that cannot place the control on the server filesystem can upload one
 control with `control_reference` and identify it with `control_type`. The API
 streams the upload to request-scoped storage, supplies its path to the model,

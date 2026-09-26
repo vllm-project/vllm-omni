@@ -167,6 +167,34 @@ def test_preencode_rejects_invalid_batch_frames_before_generation(batch_frames):
         handler.shutdown()
 
 
+def test_preencode_rejects_ffmpeg_backend_before_generation():
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    request = VideoGenerationRequest(
+        prompt="test", extra_params={"preencode_mp4": True, "video_encoder_backend": "ffmpeg"}
+    )
+    try:
+        with pytest.raises(HTTPException, match="preencode_mp4 cannot be combined") as exc:
+            asyncio.run(handler.generate_video_bytes(request, "conflicting-encoder"))
+        assert exc.value.status_code == 400
+        assert engine.captured_prompt is None
+    finally:
+        handler.shutdown()
+
+
+def test_rejects_invalid_video_encoder_backend_before_generation():
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    request = VideoGenerationRequest(prompt="test", extra_params={"video_encoder_backend": "bogus"})
+    try:
+        with pytest.raises(HTTPException, match="Unsupported video encoder backend") as exc:
+            asyncio.run(handler.generate_video_bytes(request, "invalid-encoder"))
+        assert exc.value.status_code == 400
+        assert engine.captured_prompt is None
+    finally:
+        handler.shutdown()
+
+
 def test_preencoded_video_bytes_preserve_metadata(mocker: MockerFixture):
     from vllm_omni.entrypoints.openai.serving_video import VideoGenerationArtifacts
 
@@ -1824,8 +1852,9 @@ def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFi
         audio_sample_rate=None,
         video_codec_options=None,
         frame_converter=None,
+        backend="pyav",
     ):
-        del video, fps, audio, video_codec_options, frame_converter
+        del video, fps, audio, video_codec_options, frame_converter, backend
         audio_sample_rates.append(audio_sample_rate)
         return b"fake-video"
 

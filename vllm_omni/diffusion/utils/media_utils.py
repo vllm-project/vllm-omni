@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import io
 import queue
+import subprocess
+import tempfile
 import threading
+import time
 from collections.abc import Callable, Iterable, Mapping
 from fractions import Fraction
 from typing import Any, NamedTuple, cast
@@ -18,6 +21,9 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _CHUNKED_MP4_DONE = object()
+_FFMPEG_VIDEO_CODEC_OPTIONS = frozenset({"threads"})
+_FFMPEG_ENCODE_TIMEOUT_SECONDS = 300
+_FFMPEG_TERMINATE_GRACE_SECONDS = 5
 
 
 class _QueuedChunk(NamedTuple):
@@ -360,10 +366,11 @@ def mux_video_audio_bytes(
     *,
     fps: float = 25.0,
     audio_sample_rate: int = 44100,
-    video_codec: str = "h264",
+    video_codec: str | None = None,
     audio_codec: str = "aac",
     crf: str = "18",
     video_codec_options: dict[str, str] | None = None,
+    backend: str = "pyav",
 ) -> bytes:
     """Mux video frames and optional audio waveform into MP4 bytes.
 
@@ -379,6 +386,21 @@ def mux_video_audio_bytes(
     Returns:
         Raw MP4 bytes ready to be written to disk or streamed.
     """
+    if backend == "ffmpeg":
+        return mux_video_audio_ffmpeg_bytes(
+            video_frames,
+            audio_waveform,
+            fps=fps,
+            audio_sample_rate=audio_sample_rate,
+            video_codec=video_codec or "mpeg4",
+            audio_codec=audio_codec,
+            crf=crf,
+            video_codec_options=video_codec_options,
+        )
+    if backend != "pyav":
+        raise ValueError(f"Unsupported video encoder backend: {backend}")
+    video_codec = video_codec or "h264"
+
     buf = io.BytesIO()
     container = av.open(buf, mode="w", format="mp4")
 
@@ -430,6 +452,129 @@ def mux_video_audio_bytes(
 
     container.close()
     return buf.getvalue()
+
+
+def mux_video_audio_ffmpeg_bytes(
+    video_frames: np.ndarray,
+    audio_waveform: np.ndarray | None = None,
+    *,
+    fps: float = 25.0,
+    audio_sample_rate: int = 44100,
+    video_codec: str = "mpeg4",
+    audio_codec: str = "aac",
+    crf: str = "18",
+    video_codec_options: dict[str, str] | None = None,
+) -> bytes:
+    """Encode RGB frames and optional audio with the ``ffmpeg`` executable."""
+    if video_frames.ndim != 4 or video_frames.shape[-1] != 3 or video_frames.dtype != np.uint8:
+        raise ValueError("video frames must have shape (T, H, W, 3) and dtype uint8")
+    if not len(video_frames):
+        raise ValueError("No frames found to encode.")
+
+    height, width = video_frames.shape[1:3]
+    with tempfile.TemporaryDirectory(prefix="vllm-omni-ffmpeg-") as temp_dir:
+        output_path = f"{temp_dir}/output.mp4"
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s:v",
+            f"{width}x{height}",
+            "-r",
+            str(fps),
+            "-i",
+            "pipe:0",
+        ]
+        if audio_waveform is not None:
+            samples = audio_waveform.astype(np.float32, copy=False)
+            if samples.ndim == 1:
+                samples = samples.reshape(1, -1)
+            elif samples.ndim == 2 and samples.shape[0] > samples.shape[1]:
+                samples = samples.T
+            elif samples.ndim != 2:
+                raise ValueError("Audio waveform must be one- or two-dimensional.")
+            audio_path = f"{temp_dir}/audio.f32le"
+            np.ascontiguousarray(samples.T).tofile(audio_path)
+            command += ["-f", "f32le", "-ar", str(audio_sample_rate), "-ac", str(samples.shape[0]), "-i", audio_path]
+
+        command += ["-c:v", video_codec, "-pix_fmt", "yuv420p"]
+        if video_codec in {"libx264", "libx265"}:
+            command += ["-crf", str(crf)]
+        elif video_codec == "mpeg4":
+            command += ["-q:v", "2"]
+        if video_codec_options:
+            for option in _FFMPEG_VIDEO_CODEC_OPTIONS:
+                if option in video_codec_options:
+                    command += [f"-{option}", str(video_codec_options[option])]
+        if audio_waveform is not None:
+            command += ["-c:a", audio_codec]
+        command += ["-movflags", "+faststart", output_path]
+
+        try:
+            process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        except FileNotFoundError as exc:
+            raise RuntimeError("ffmpeg executable was not found on PATH.") from exc
+        assert process.stdin is not None
+        stderr_chunks: list[bytes] = []
+
+        def write_frames() -> None:
+            try:
+                for frame in video_frames:
+                    process.stdin.write(np.ascontiguousarray(frame).tobytes())
+            except OSError:
+                pass
+            finally:
+                if not process.stdin.closed:
+                    try:
+                        process.stdin.close()
+                    except OSError:
+                        pass
+
+        def drain_stderr() -> None:
+            if process.stderr is not None:
+                stderr_chunks.append(process.stderr.read())
+
+        deadline = time.monotonic() + _FFMPEG_ENCODE_TIMEOUT_SECONDS
+
+        def stop_process() -> None:
+            if process.poll() is not None:
+                return
+            process.terminate()
+            try:
+                process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+        stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+        writer_thread = threading.Thread(target=write_frames, daemon=True)
+        stderr_thread.start()
+        writer_thread.start()
+        returncode: int | None = None
+        timed_out = False
+        try:
+            returncode = process.wait(timeout=max(0.0, deadline - time.monotonic() - _FFMPEG_TERMINATE_GRACE_SECONDS))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+        finally:
+            stop_process()
+            writer_thread.join()
+            stderr_thread.join()
+            if process.stderr:
+                process.stderr.close()
+        stderr = b"".join(stderr_chunks)
+        if timed_out:
+            raise RuntimeError(f"ffmpeg video encoding timed out: {stderr.decode(errors='replace').strip()}")
+        if returncode != 0:
+            raise RuntimeError(f"ffmpeg video encoding failed: {stderr.decode(errors='replace').strip()}")
+        with open(output_path, "rb") as output:
+            return output.read()
 
 
 def mux_av_video_audio_bytes(
