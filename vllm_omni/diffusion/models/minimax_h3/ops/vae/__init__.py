@@ -184,6 +184,7 @@ def install_h3_vae_optimizations(
     decoder: nn.Module,
     *,
     device: torch.device,
+    preserve_linear_dtype: bool = False,
 ) -> bool:
     """Install the operators selected for ``device`` once."""
 
@@ -199,8 +200,9 @@ def install_h3_vae_optimizations(
 
     # The H3 decode path always uses FP16 CUDA autocast. Persisting these
     # rounded decoder-block weights avoids rebuilding the same casts per tile.
-    for linear in linears:
-        linear.to(dtype=torch.float16)
+    if not preserve_linear_dtype:
+        for linear in linears:
+            linear.to(dtype=torch.float16)
 
     for block in decoder.transformer_blocks:
         block.ff._omni_silu_and_mul = SiluAndMul()

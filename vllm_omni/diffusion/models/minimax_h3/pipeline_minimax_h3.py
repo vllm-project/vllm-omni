@@ -1060,9 +1060,15 @@ class MiniMaxH3Pipeline(
         # deliberately limits explicit component selection to dit/text_encoder,
         # so VAEs stay resident for new configurations.
         component_load_device = torch.device("cpu") if legacy_manual_components else self.device
+        from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+
+        video_quant = None
+        if isinstance(od_config.quantization_config, ComponentQuantizationConfig):
+            video_quant = od_config.quantization_config.component_configs.get("video_vae")
         self.video_vae = MiniMaxH3VideoVAE(
             os.path.join(vae_model_path, "video_vae"),
             device=self.device,
+            quant_config=video_quant,
             load_device=component_load_device,
             decode_only=not self.load_vae_encoder,
             trust_remote_code=od_config.trust_remote_code,
@@ -2084,6 +2090,36 @@ class MiniMaxH3Pipeline(
         # through the VAE decode peak. Decoding needs only the ViT decoder
         # half of the VAE, so the CNN encoder stays off the device.
         self._release_stage_cache()
+        overlap = os.environ.get("VLLM_OMNI_H3_VAE_AUDIO_OVERLAP", "0")
+        if overlap not in ("0", "1"):
+            raise ValueError("VLLM_OMNI_H3_VAE_AUDIO_OVERLAP must be 0 or 1")
+        if overlap == "1":
+            if self.device.type != "cuda":
+                raise ValueError("H3 VAE audio overlap requires CUDA")
+            module = torch.get_device_module(self.device)
+            caller = module.current_stream(self.device)
+            stream = module.Stream(device=self.device)
+            # Keep both residency contexts alive until the side stream drains,
+            # including exceptional video exits. No staging buffer may be
+            # offloaded while the audio decoder still reads it.
+            with self._component_on_device(self.audio_vae):
+                with self._component_on_device(self.video_vae.decoder_component):
+                    stream.wait_stream(caller)
+                    audio_latent.record_stream(stream)
+                    try:
+                        with module.stream(stream):
+                            audio = self.audio_vae.decode_latent(audio_latent)
+                        with current_omni_platform.create_autocast_context(
+                            device_type=self.device.type,
+                            dtype=torch.float16,
+                            enabled=True,
+                        ):
+                            video = self.video_vae.decode_latent(video_latent)
+                    finally:
+                        stream.synchronize()
+                    audio.record_stream(caller)
+            video = video[..., :height, :width].contiguous()
+            return video, self._offload_model_cpu_stage_output(audio)
         with self._component_on_device(self.video_vae.decoder_component):
             with current_omni_platform.create_autocast_context(
                 device_type=self.device.type,

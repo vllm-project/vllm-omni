@@ -146,6 +146,10 @@ class DiffusionMXFP8Config(QuantizationConfig):
                         "or use online MXFP8 mode without is_checkpoint_mxfp8_serialized."
                     )
                 return VllmMxfp8OnlineLinearMethod()
+            if current_omni_platform.is_cuda():
+                if self.is_checkpoint_mxfp8_serialized:
+                    raise NotImplementedError("CUDA MXFP8 currently supports online BF16/FP16 checkpoints only")
+                return CUDAMxfp8OnlineLinearMethod()
             raise NotImplementedError(
                 "DiffusionMXFP8Config (W8A8 MXFP8) is currently only supported "
                 "on NPU (Ascend) and XPU (Intel) platforms."
@@ -311,7 +315,7 @@ class MXFPLinearMethodBase(LinearMethodBase, ABC):
         ori_dtype = x.dtype
         x = x.reshape(-1, ori_shape[-1])
         output = self._apply_inner(layer, x, bias, ori_dtype)
-        return output.reshape(*ori_shape[:-1], -1)
+        return output.reshape(*ori_shape[:-1], output.shape[-1])
 
 
 # ---------------------------------------------------------------------------
@@ -543,3 +547,37 @@ class VllmMxfp8OnlineLinearMethod(_VllmMxfp8OnlineBase):
         if len(ori_shape) > 2:
             output = output.reshape(*ori_shape[:-1], -1)
         return output
+
+
+class CUDAMxfp8OnlineLinearMethod(_LazyWeightMixin, MXFPLinearMethodBase):
+    """CUDA W8A8 with E8M0 scales and native Blackwell block-scaled GEMM.
+
+    Conversion runs after the final checkpoint shard (including any fixed
+    adapter fusion) has been loaded. The shared loader preserves TP sharding.
+    """
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        from vllm_omni.diffusion.layers.mxfp8 import mxfp8_quantize_swizzled
+
+        capability = current_omni_platform.get_device_capability(layer.weight.device.index)
+        if capability is None or capability.major not in (10, 12):
+            raise ValueError("CUDA MXFP8 requires a Blackwell GPU")
+        if layer.weight.shape[0] % 16 or layer.weight.shape[1] % 32:
+            raise ValueError("CUDA MXFP8 requires partitioned N divisible by 16 and K divisible by 32")
+        if not hasattr(torch.nn.functional, "scaled_mm"):
+            raise RuntimeError("CUDA MXFP8 requires PyTorch's public block-scaled scaled_mm API")
+        weight, scale = mxfp8_quantize_swizzled(layer.weight.detach().contiguous())
+        replace_parameter(layer, "weight", weight)
+        layer.register_buffer("weight_scale", scale.view(torch.float8_e8m0fnu))
+
+    def _quantize_activation(self, x: torch.Tensor) -> tuple:
+        from vllm_omni.diffusion.layers.mxfp8 import mxfp8_quantize_swizzled
+
+        return mxfp8_quantize_swizzled(x.contiguous())
+
+    def _quant_matmul(self, x_q, x_scale, layer, bias, ori_dtype):
+        from vllm_omni.diffusion.layers.mxfp8 import mxfp8_scaled_mm
+
+        if x_q.shape[0] == 0:
+            return torch.empty((0, layer.weight.shape[0]), dtype=ori_dtype, device=x_q.device)
+        return mxfp8_scaled_mm(x_q, layer.weight, x_scale, layer.weight_scale, bias=bias, output_dtype=ori_dtype)

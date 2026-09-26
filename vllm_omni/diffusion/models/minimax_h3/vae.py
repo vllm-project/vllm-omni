@@ -332,6 +332,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         *,
         device: torch.device,
         load_device: torch.device | None = None,
+        quant_config=None,
         encode_only: bool = False,
         decode_only: bool = False,
         trust_remote_code: bool = False,
@@ -361,7 +362,13 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             install_h3_vae_optimizations(
                 decoder,
                 device=device,
+                preserve_linear_dtype=quant_config is not None,
             )
+            if quant_config is not None:
+                from .quantization import quantize_video_vae_decoder
+
+                count = quantize_video_vae_decoder(decoder, quant_config, device)
+                logger.info("H3 video VAE MXFP8: converted %d decoder projections", count)
         install_temporal_stream_patches(self.remote.model)
         self.model = self.remote.model
         self._stager = None
@@ -959,6 +966,26 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
         if getattr(self, "encode_only", False):
             raise RuntimeError("MiniMax H3 encode-only video VAE cannot decode latents")
+        if os.environ.get("VLLM_OMNI_H3_VAE_BATCHING", "none") != "none":
+            output = None
+            position = 0
+
+            def consume(frames):
+                nonlocal output, position
+                if output is None:
+                    output = torch.empty(
+                        (1, 3, 362, frames.shape[-2], frames.shape[-1]), dtype=torch.uint8, device=frames.device
+                    )
+                count = frames.shape[2]
+                output[:, :, position : position + count].copy_(frames.mul(255.0).round().to(torch.uint8))
+                position += count
+
+            self.decode_with_chunks(latent, on_chunk=consume)
+            if output is None:
+                return torch.empty((1, 3, 0, 0, 0), dtype=torch.uint8, device=latent.device)
+            if position != 362:
+                raise RuntimeError(f"Paired H3 VAE produced {position} frames, expected 362")
+            return output
         with self._decode_tiling_context(latent):
             decoded = self.model.decode_base(self._denormalize_latent(latent))
         if decoded.dtype == torch.uint8:
@@ -1016,6 +1043,39 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         # so this path needs the same too-few-tiles fallback as the complete
         # decode: without it a shape that leaves some ranks tileless hangs the
         # gather instead of decoding rank-locally.
+        batching = os.environ.get("VLLM_OMNI_H3_VAE_BATCHING", "none")
+        if batching not in ("none", "paired", "mixed"):
+            raise ValueError("VLLM_OMNI_H3_VAE_BATCHING must be none, paired or mixed")
+        if batching != "none":
+            from .vae_batching import decode_pairs, geometry, mixed_decode
+            from .vae_parallel import VAEGroup
+
+            if group is None or z.device.type != "cuda":
+                raise ValueError("Paired H3 VAE requires CUDA and distributed VAE tiling")
+            denormalized = self._denormalize_latent(z)
+            geometry(self.model, denormalized)
+            world = VAEGroup(group)
+            overlap = os.environ.get("VLLM_OMNI_H3_VAE_GATHER_OVERLAP", "0")
+            if overlap not in ("0", "1"):
+                raise ValueError("VLLM_OMNI_H3_VAE_GATHER_OVERLAP must be 0 or 1")
+            stream = self.device_module.Stream(device=z.device) if overlap == "1" else None
+            if stream is not None and os.environ.get("TORCH_NCCL_BLOCKING_WAIT", "0") != "0":
+                raise ValueError("VAE gather overlap requires nonblocking NCCL")
+
+            def consume(frames, start, total):
+                del start, total
+                on_chunk(self._normalize_decoded_frames(self._revert_decoded_inplace(frames)))
+
+            context = (
+                mixed_decode(self.model, denormalized, world.rank_in_group, world.world_size)
+                if batching == "mixed"
+                else nullcontext()
+            )
+            with context:
+                decode_pairs(
+                    self.model, denormalized, world, consume if world.rank_in_group == 0 else None, gather_stream=stream
+                )
+            return
         with self._decode_tiling_context(z):
             decode_h3_chunks(self, z, on_chunk, group=group)
 

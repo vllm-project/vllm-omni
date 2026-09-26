@@ -1546,3 +1546,60 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
 - [Diffusion parallelism](../../docs/user_guide/diffusion/parallelism/overview.md)
+
+### CUDA MXFP8 DiT projections
+
+On Blackwell, select online MXFP8 explicitly through the component config:
+
+```bash
+--diffusion-quantization-config '{"transformer":{"method":"mxfp8"},"text_encoder":null,"video_vae":null,"audio_vae":null}'
+```
+
+This converts the main DiT QKV/output and MLP projections after checkpoint
+loading and fixed adapter fusion. Token refinement, conditioning, AdaLN,
+compression gates, and patch/output projections retain their original precision.
+The native CUDA GEMM uses E4M3 operands and one E8M0 scale per 32 K elements.
+This is an approximate precision choice. It requires Blackwell and a PyTorch
+build exposing `torch.nn.functional.scaled_mm` with block-scaled recipes.
+Partitioned N must be divisible by 16 and K by 32. Offline MXFP8 checkpoints
+are not supported on CUDA by this path.
+
+At TP1 the MLP automatically fuses BF16 SwiGLU and activation quantization;
+TP>1 retains the ordinary activation and RowParallelLinear reduction.
+The fusion preserves the unfused CUDA activation and MXFP8 bytes. No FastH3
+adapter, AdaLN sidecar, fixed sampling schedule, or SP8 layout is required.
+Runtime adapter switching after conversion is not qualified by this recipe.
+
+### Optional video VAE optimizations
+
+Enable video decoder MXFP8 separately from DiT quantization:
+
+```bash
+--diffusion-quantization-config '{"transformer":null,"text_encoder":null,"video_vae":{"method":"mxfp8"},"audio_vae":null}'
+```
+
+This approximate mode quantizes the decoder's QKV, attention output and two MLP
+weights directly from the FP32 checkpoint. Residuals, normalization, encoder,
+convolutions and audio VAE keep their existing precision. Activations use the
+existing FP16 decode boundary; `ignored_layers` can exempt decoder projections.
+A global quantization setting does not implicitly select VAE quantization.
+
+For the canonical 1280x704, 362-frame decode (latent `[1,24,107,44,80]`),
+`VLLM_OMNI_H3_VAE_BATCHING=paired` balances spatial tiles across pairs of temporal
+windows. `mixed` additionally batches local tile decodes at batch sizes 4/2/1 (a three-tile
+tail splits into 2+1 to avoid the observed FP16 batch-three drift), preserving
+attention-output projection calls at their original batch-one geometry. Both
+require native distributed VAE tiling and reject incompatible geometry. The
+normal decode and chunk-consumer APIs share this path. Other geometries continue
+to use the default implementation when this option is unset.
+
+`VLLM_OMNI_H3_VAE_GATHER_OVERLAP=1` submits paired gathers on a separate stream.
+It requires nonblocking NCCL; all communication and output streams drain before
+return or error propagation. Only the output rank allocates receive storage.
+`VLLM_OMNI_H3_VAE_AUDIO_OVERLAP=1` overlaps audio with the complete video decode
+on CUDA while keeping both residency contexts alive. It increases concurrent
+memory use and does not alter the audio-first chunked MP4 mux path.
+
+These options are independent and disabled by default. Batch scheduling and
+stream overlap require their own output comparison; MXFP8 is approximate even
+when the scheduling operations preserve the reference ordering.

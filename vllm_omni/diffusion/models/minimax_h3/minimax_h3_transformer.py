@@ -57,6 +57,7 @@ from vllm_omni.platforms import current_omni_platform
 
 from .adaln_cache import MiniMaxH3RuntimeAdalnCache
 from .fasth3 import _resolve_native_target
+from .quantization import projection_quant_config
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -434,7 +435,7 @@ class MiniMaxH3Attention(nn.Module):
             total_num_kv_heads=self.total_num_heads,
             bias=False,
             params_dtype=_BF16_DTYPE,
-            quant_config=quant_config,
+            quant_config=projection_quant_config(quant_config, f"{prefix}.qkv_proj"),
             prefix=f"{prefix}.qkv_proj",
             return_bias=True,
         )
@@ -450,7 +451,7 @@ class MiniMaxH3Attention(nn.Module):
             bias=False,
             input_is_parallel=True,
             params_dtype=_BF16_DTYPE,
-            quant_config=quant_config,
+            quant_config=projection_quant_config(quant_config, f"{prefix}.out_proj"),
             prefix=f"{prefix}.out_proj",
         )
         # VSA compression gate. A FastH3 VSA artifact assigns this projection
@@ -458,7 +459,7 @@ class MiniMaxH3Attention(nn.Module):
         # created only once the loader knows a VSA artifact is coming.
         self.to_gate_compress: ColumnParallelLinear | None = None
         self._gate_hidden_size = arch.hidden_size
-        self._gate_quant_config = quant_config
+        self._gate_quant_config = projection_quant_config(quant_config, f"{prefix}.to_gate_compress")
         self._gate_prefix = f"{prefix}.to_gate_compress"
         from .attention.fastvideo_h3 import MiniMaxH3VSAImpl
 
@@ -719,7 +720,7 @@ class MiniMaxH3MLP(nn.Module):
             bias=False,
             gather_output=False,
             params_dtype=_BF16_DTYPE,
-            quant_config=quant_config,
+            quant_config=projection_quant_config(quant_config, f"{prefix}.fc1"),
             prefix=f"{prefix}.fc1",
         )
         self.act_fn = SiluAndMul()
@@ -731,12 +732,24 @@ class MiniMaxH3MLP(nn.Module):
             bias=False,
             input_is_parallel=True,
             params_dtype=_BF16_DTYPE,
-            quant_config=quant_config,
+            quant_config=projection_quant_config(quant_config, f"{prefix}.fc2"),
             prefix=f"{prefix}.fc2",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden, _ = self.fc1(x)
+        from vllm_omni.quantization.mxfp8_config import CUDAMxfp8OnlineLinearMethod
+
+        if (
+            isinstance(self.fc2.quant_method, CUDAMxfp8OnlineLinearMethod)
+            and self.fc2.tp_size == 1
+            and hidden.dtype == torch.bfloat16
+            and not self.fc2._forward_hooks
+            and not self.fc2._forward_pre_hooks
+        ):
+            from vllm_omni.diffusion.layers.mxfp8 import silu_mxfp8_linear
+
+            return silu_mxfp8_linear(hidden, self.fc2.weight, self.fc2.weight_scale)
         hidden = self.act_fn(hidden)
         out, _ = self.fc2(hidden)
         return out
@@ -778,7 +791,7 @@ class MiniMaxH3AdalnProj(nn.Module):
             bias=True,
             gather_output=True,
             params_dtype=_BF16_DTYPE,
-            quant_config=quant_config,
+            quant_config=projection_quant_config(quant_config, f"{prefix}.linear"),
             prefix=f"{prefix}.linear",
         )
 
@@ -1233,7 +1246,7 @@ class MiniMaxH3DiTModel(nn.Module):
             bias=True,
             gather_output=True,
             params_dtype=_BF16_DTYPE,
-            quant_config=quant_config,
+            quant_config=projection_quant_config(quant_config, "condition_proj"),
             prefix="condition_proj",
         )
         self.time_embedder = MiniMaxH3TimeEmbedder(
