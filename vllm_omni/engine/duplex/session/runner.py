@@ -226,9 +226,6 @@ class DuplexSessionRunner:
                 default_payload=default_payload if isinstance(default_payload, Mapping) else None,
                 initial_session_update=True,
             )
-        # Every client speaks the Realtime protocol now; the old runner forced
-        # the ACK-only playback ledger for that path.
-        session.config.playback_commit_policy = DuplexPlaybackCommitPolicy.ACK_ONLY.value
         self.control.init_turn_detection()
         self._worker = self._loop.create_task(self._run(), name=f"duplex-session-{session.session_id}")
         self.emit({"type": "session.created", "session": session.as_public_dict()})

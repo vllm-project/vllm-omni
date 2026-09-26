@@ -71,7 +71,7 @@ def test_buffer_refuses_video_frames_and_points_at_the_openai_interface():
     committed.commit()
 
 
-async def open_qwen():
+async def open_qwen(*, playback_commit_policy: str | None = "ack_only"):
     plugin = Qwen3OmniDuplexPlugin(lambda audio, *args: "AAAA")
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kw: repr(messages))
     port = RecordingStagePort(stage_count=3)
@@ -85,7 +85,14 @@ async def open_qwen():
         runtime_config=DuplexSessionRuntimeConfig(),
         model_config=None,
     )
-    config = DuplexSessionConfig(model="qwen", modalities=["text", "audio"], overlap_policy="barge_in_on_speech")
+    config_kwargs = dict(
+        model="qwen",
+        modalities=["text", "audio"],
+        overlap_policy="barge_in_on_speech",
+    )
+    if playback_commit_policy is not None:
+        config_kwargs["playback_commit_policy"] = playback_commit_policy
+    config = DuplexSessionConfig(**config_kwargs)
     await manager.handle(OpenDuplexSessionMessage(control_id="open", session_id=SESSION_ID, session_config=config))
     result = await results.get()
     assert result.ok, result
@@ -884,10 +891,10 @@ def test_text_only_turn_without_prepared_messages_is_refused_not_crashed():
 
 @pytest.mark.asyncio
 async def test_commit_all_on_done_keeps_unaligned_text_the_client_never_acks():
-    h = await open_qwen()
+    h = await open_qwen(playback_commit_policy=None)
     try:
-        # The runner starts every session ack-gated; this client opts out.
-        await h.run(UpdateSession(patch={"playback_commit_policy": "commit_all_on_done"}))
+        # A client without playback acknowledgements uses the default
+        # commit-all behavior for unaligned text.
         assert h.session.config.playback_commit_policy == "commit_all_on_done"
         await h.run(append_audio())
         await h.run(Commit(final=True, create_response=True))

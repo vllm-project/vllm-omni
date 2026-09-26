@@ -20,6 +20,7 @@ test('MiniCPM keeps native flags, reference voice, camera, acknowledgements and 
   assert.equal(url.searchParams.has('native_duplex'), false);
   const [update] = native.initialMessages({ refAudio: 'data:audio/wav;base64,AA==' }, 'Prompt');
   assert.equal(update.session.ref_audio, 'data:audio/wav;base64,AA==');
+  assert.equal(update.session.playback_commit_policy, 'ack_only');
   assert.equal(update.session.extra_body.native_duplex, undefined);
   assert.equal(update.session.instructions, 'Prompt');
   assert.deepEqual(plain(native.commitMessages()), []);
@@ -62,6 +63,7 @@ test('Qwen enables camera and playback ACK only for the duplex VAD profile', () 
 test('VAD uses nested format and interruptible endpoint detection', () => {
   const vad = profiles['qwen3-turn']({ ...config, adapter: 'vad' });
   const [update] = vad.initialMessages(config, 'help');
+  assert.equal(update.session.playback_commit_policy, 'ack_only');
   assert.deepEqual(plain(update.session.audio.input), {
     format: { type: 'audio/pcm', rate: 24000 },
     turn_detection: { type: 'server_vad', threshold: 0.5, prefix_padding_ms: 300,
@@ -455,6 +457,7 @@ test('AURA PTT profile sets duplex, is_speech append, commit on release, and she
   assert.equal(aura.ack('r1', 50).type, 'playback.ack');
   const [update] = aura.initialMessages({}, 'Be brief');
   assert.equal(update.session.instructions, 'Be brief');
+  assert.equal(update.session.playback_commit_policy, 'ack_only');
   assert.equal(update.session.extra_body.auto_response, true);
 });
 

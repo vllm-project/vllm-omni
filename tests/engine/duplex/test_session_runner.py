@@ -28,7 +28,7 @@ from vllm.sampling_params import SamplingParams
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.commands import DuplexCommand
-from vllm_omni.engine.duplex.config import DuplexSessionConfig, DuplexSessionState
+from vllm_omni.engine.duplex.config import DuplexPlaybackCommitPolicy, DuplexSessionConfig, DuplexSessionState
 from vllm_omni.engine.duplex.contracts import (
     DuplexOutputContext,
     DuplexRequestIdentity,
@@ -370,6 +370,8 @@ async def test_open_announces_the_session_and_reserves_the_stage0_request() -> N
         assert created.to_realtime()["type"] == "session.created"
         assert "incarnation" not in created.to_realtime()
         assert h.session.state == DuplexSessionState.OPEN
+        assert h.session.config.playback_commit_policy == DuplexPlaybackCommitPolicy.COMMIT_ALL_ON_DONE.value
+        assert created.session["playback_commit_policy"] == DuplexPlaybackCommitPolicy.COMMIT_ALL_ON_DONE.value
         # Admission reserves the resumable Stage0 request atomically with the open.
         assert [context.request_id for context in h.port.ensured] == [h.stage0_request_id(epoch=0)]
         assert h.stage0_request_id(epoch=0) == "duplex-s.ZHVwbGV4LXRlc3Q.e.0.r.stage0"
@@ -636,6 +638,7 @@ async def test_stage1_audio_opens_a_response_and_streams_deltas() -> None:
 async def test_turn_end_completes_the_response_and_advances_the_model_turn() -> None:
     h = await open_harness()
     try:
+        await h.run(commands.UpdateSession(patch={"playback_commit_policy": "ack_only"}))
         await h.run(append_audio())
         request_id = h.stage0_request_id()
         await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
@@ -655,7 +658,8 @@ async def test_turn_end_completes_the_response_and_advances_the_model_turn() -> 
         assert find(events, "response.output_audio_transcript.done").transcript == "hello"
         assert h.session.active_response_id is None
         assert h.session.turn_id == 1
-        # Ack-only playback: the assistant text enters history on playback ack.
+        # ACK-only playback was explicitly selected: the assistant text enters
+        # history on playback ack.
         assert h.session.history == ()
 
         ack = await h.run(commands.AckPlayback(played_ms=1000, response_id=done.response_id))
