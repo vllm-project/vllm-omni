@@ -29,6 +29,7 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_omni.diffusion.attention.layer import Attention
@@ -275,7 +276,9 @@ class MLPProj(nn.Module):
     Uses ColumnParallelLinear + RowParallelLinear (Qwen3_VisionMLP pattern).
     """
 
-    def __init__(self, in_dim: int, out_dim: int) -> None:
+    def __init__(
+        self, in_dim: int, out_dim: int, quant_config: QuantizationConfig | None = None, prefix: str = ""
+    ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(in_dim)
         self.fc1 = ColumnParallelLinear(
@@ -283,6 +286,8 @@ class MLPProj(nn.Module):
             in_dim,
             bias=True,
             return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.fc1" if prefix else "fc1",
         )
         self.act = nn.GELU()
         self.fc2 = RowParallelLinear(
@@ -290,6 +295,8 @@ class MLPProj(nn.Module):
             out_dim,
             bias=True,
             return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.fc2" if prefix else "fc2",
         )
         self.norm2 = nn.LayerNorm(out_dim)
 
@@ -311,7 +318,16 @@ class WanT2VCrossAttention(nn.Module):
     Uses vllm-omni Attention for FlashAttn backend.
     """
 
-    def __init__(self, dim: int, num_heads: int, window_size=(-1, -1), qk_norm: bool = True, eps: float = 1e-6) -> None:
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        window_size=(-1, -1),
+        qk_norm: bool = True,
+        eps: float = 1e-6,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}.")
@@ -323,10 +339,42 @@ class WanT2VCrossAttention(nn.Module):
             raise ValueError(f"num_heads={num_heads} must be divisible by tp_size={tp_size}.")
         self.tp_num_heads = num_heads // tp_size
         self.tp_inner_dim = self.tp_num_heads * self.head_dim
-        self.q = ColumnParallelLinear(dim, dim, bias=True, gather_output=False, return_bias=False)
-        self.k = ColumnParallelLinear(dim, dim, bias=True, gather_output=False, return_bias=False)
-        self.v = ColumnParallelLinear(dim, dim, bias=True, gather_output=False, return_bias=False)
-        self.o = RowParallelLinear(dim, dim, bias=True, input_is_parallel=True, return_bias=False)
+        self.q = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.q" if prefix else "q",
+        )
+        self.k = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.k" if prefix else "k",
+        )
+        self.v = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.v" if prefix else "v",
+        )
+        self.o = RowParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            input_is_parallel=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o" if prefix else "o",
+        )
         self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
         self.attn = Attention(
@@ -371,7 +419,16 @@ class WanI2VCrossAttention(nn.Module):
     Uses vllm-omni Attention for FlashAttn backend.
     """
 
-    def __init__(self, dim: int, num_heads: int, window_size=(-1, -1), qk_norm: bool = True, eps: float = 1e-6) -> None:
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        window_size=(-1, -1),
+        qk_norm: bool = True,
+        eps: float = 1e-6,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}.")
@@ -383,14 +440,62 @@ class WanI2VCrossAttention(nn.Module):
             raise ValueError(f"num_heads={num_heads} must be divisible by tp_size={tp_size}.")
         self.tp_num_heads = num_heads // tp_size
         self.tp_inner_dim = self.tp_num_heads * self.head_dim
-        self.q = ColumnParallelLinear(dim, dim, bias=True, gather_output=False, return_bias=False)
-        self.k = ColumnParallelLinear(dim, dim, bias=True, gather_output=False, return_bias=False)
-        self.v = ColumnParallelLinear(dim, dim, bias=True, gather_output=False, return_bias=False)
-        self.o = RowParallelLinear(dim, dim, bias=True, input_is_parallel=True, return_bias=False)
+        self.q = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.q" if prefix else "q",
+        )
+        self.k = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.k" if prefix else "k",
+        )
+        self.v = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.v" if prefix else "v",
+        )
+        self.o = RowParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            input_is_parallel=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o" if prefix else "o",
+        )
         self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
-        self.k_img = ColumnParallelLinear(dim, dim, bias=True, gather_output=False, return_bias=False)
-        self.v_img = ColumnParallelLinear(dim, dim, bias=True, gather_output=False, return_bias=False)
+        self.k_img = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.k_img" if prefix else "k_img",
+        )
+        self.v_img = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.v_img" if prefix else "v_img",
+        )
         self.norm_k_img = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
         self.attn = Attention(
             self.tp_num_heads,
@@ -473,6 +578,8 @@ class CausalWanSelfAttention(nn.Module):
         eps: float = 1e-6,
         num_action_per_block: int = 32,
         num_state_per_block: int = 1,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         if dim % num_heads != 0:
@@ -499,6 +606,8 @@ class CausalWanSelfAttention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=num_heads,
             bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv" if prefix else "qkv",
         )
         # The forward splits qkv into three equal q/k/v shards, which is only
         # correct without GQA. total_num_kv_heads defaults to total_num_heads
@@ -506,7 +615,15 @@ class CausalWanSelfAttention(nn.Module):
         # split does not silently misalign k/v.
         if self.qkv.total_num_kv_heads != self.qkv.total_num_heads:
             raise ValueError("Self-attn QKV fusion requires no GQA (total_num_kv_heads == total_num_heads).")
-        self.o = RowParallelLinear(dim, dim, bias=True, input_is_parallel=True, return_bias=False)
+        self.o = RowParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            input_is_parallel=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o" if prefix else "o",
+        )
         self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
         self.attn = Attention(
@@ -646,6 +763,8 @@ class CausalWanAttentionBlock(nn.Module):
         eps: float = 1e-6,
         num_action_per_block: int = 32,
         num_state_per_block: int = 1,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.norm1 = WanLayerNorm(dim, eps)
@@ -660,14 +779,41 @@ class CausalWanAttentionBlock(nn.Module):
             eps=eps,
             num_action_per_block=num_action_per_block,
             num_state_per_block=num_state_per_block,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn" if prefix else "self_attn",
         )
         self.norm3 = WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
-        self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](dim, num_heads, (-1, -1), qk_norm, eps)
+        self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](
+            dim,
+            num_heads,
+            (-1, -1),
+            qk_norm,
+            eps,
+            quant_config=quant_config,
+            prefix=f"{prefix}.cross_attn" if prefix else "cross_attn",
+        )
         self.norm2 = WanLayerNorm(dim, eps)
+        # "0"/"2" are `nn.Sequential`'s child names and the checkpoint keys; the prefixes must match them.
         self.ffn = nn.Sequential(
-            ColumnParallelLinear(dim, ffn_dim, bias=True, gather_output=False, return_bias=False),
+            ColumnParallelLinear(
+                dim,
+                ffn_dim,
+                bias=True,
+                gather_output=False,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.ffn.0" if prefix else "ffn.0",
+            ),
             nn.GELU(approximate="tanh"),
-            RowParallelLinear(ffn_dim, dim, bias=True, input_is_parallel=True, return_bias=False),
+            RowParallelLinear(
+                ffn_dim,
+                dim,
+                bias=True,
+                input_is_parallel=True,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.ffn.2" if prefix else "ffn.2",
+            ),
         )
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
@@ -773,6 +919,8 @@ class CausalWanModel(nn.Module):
         diffusion_model_pretrained_path: str | None = None,
         num_action_per_block: int = 32,
         num_state_per_block: int = 1,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         if model_type not in ["t2v", "i2v", "ti2v"]:
@@ -835,6 +983,7 @@ class CausalWanModel(nn.Module):
         )
 
         cross_attn_type = "t2v_cross_attn" if model_type == "t2v" else "i2v_cross_attn"
+        blocks_prefix = f"{prefix}.blocks" if prefix else "blocks"
         self.blocks = nn.ModuleList(
             [
                 CausalWanAttentionBlock(
@@ -851,8 +1000,10 @@ class CausalWanModel(nn.Module):
                     eps,
                     num_action_per_block,
                     num_state_per_block,
+                    quant_config=quant_config,
+                    prefix=f"{blocks_prefix}.{i}",
                 )
-                for _ in range(num_layers)
+                for i in range(num_layers)
             ]
         )
 
@@ -872,7 +1023,9 @@ class CausalWanModel(nn.Module):
         ]
 
         if model_type == "i2v":
-            self.img_emb = MLPProj(1280, dim)
+            self.img_emb = MLPProj(
+                1280, dim, quant_config=quant_config, prefix=f"{prefix}.img_emb" if prefix else "img_emb"
+            )
 
         self.init_weights()
 
