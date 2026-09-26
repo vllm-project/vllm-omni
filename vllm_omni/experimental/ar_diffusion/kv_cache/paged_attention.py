@@ -232,6 +232,15 @@ class ARDiffusionPagedForwardContext:
         only consumes prebuilt tensors via ``ARDiffusionPagedLayerInputs``.
         """
         if getattr(self, "_prepared", False):
+            # The cached addressing is reusable, but query_len and action_len are not
+            # in the key. Reject geometry changes before using stale slot mappings.
+            if int(query_len) != int(self.query_len) or int(action_len) != int(self._action_len):
+                raise RuntimeError(
+                    "AR-Diffusion paged context reused with different geometry: "
+                    f"cached query_len={self.query_len} action_len={self._action_len}, "
+                    f"requested query_len={int(query_len)} action_len={int(action_len)}. "
+                    "The forward-context cache key is missing a term."
+                )
             return
         self.ensure_video_slots(device)
         (
@@ -680,11 +689,13 @@ def _paged_write_attn_impl(
     reuse_history: bool = False,
     stage_first_block: int = 0,
 ) -> torch.Tensor:
-    key_pool[video_slots] = k_curr.to(key_pool.dtype)
-    value_pool[video_slots] = v_curr.to(value_pool.dtype)
+    # Slot indices are unique: each token owns one slot, so index_copy_
+    # preserves the assignment semantics without duplicate-index handling.
+    key_pool.index_copy_(0, video_slots, k_curr.to(key_pool.dtype))
+    value_pool.index_copy_(0, video_slots, v_curr.to(value_pool.dtype))
     if k_act is not None and v_act is not None and k_act.shape[0] > 0:
-        key_pool[action_slots] = k_act.to(key_pool.dtype)
-        value_pool[action_slots] = v_act.to(value_pool.dtype)
+        key_pool.index_copy_(0, action_slots, k_act.to(key_pool.dtype))
+        value_pool.index_copy_(0, action_slots, v_act.to(value_pool.dtype))
     key_cache = key_pool.unflatten(0, (-1, block_size))
     value_cache = value_pool.unflatten(0, (-1, block_size))
     return ar_diffusion_paged_attention(

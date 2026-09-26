@@ -22,6 +22,10 @@ torch.accelerator.get_memory_info = lambda device=None: torch.xpu.mem_get_info(d
 # The XPU sampler kernel is broken for omni on the current vLLM; use the native path.
 os.environ.setdefault("VLLM_XPU_USE_SAMPLER_KERNEL", "0")
 
+# Use DRM fd passing for oneCCL IPC on XPU; unlike pidfd, it does not
+# require ranks to share a PID namespace. Preserve explicit overrides.
+os.environ.setdefault("CCL_ZE_IPC_EXCHANGE", "drmfd")
+
 
 class XPUOmniPlatform(OmniPlatform, XPUPlatform):
     """XPU/Intel GPU implementation of OmniPlatform.
