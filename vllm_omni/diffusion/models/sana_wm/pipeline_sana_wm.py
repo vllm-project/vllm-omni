@@ -343,17 +343,18 @@ class SanaWmPipeline(
         height = int(getattr(sampling_params, "height", None) or payload["height"])
         width = int(getattr(sampling_params, "width", None) or payload["width"])
         num_frames = int(getattr(sampling_params, "num_frames", None) or payload["num_frames"])
-        steps = int(
-            getattr(sampling_params, "num_inference_steps", None)
-            or extra_args.get("num_inference_steps")
-            or SANA_WM_DEFAULT_NUM_INFERENCE_STEPS
-        )
+        steps = getattr(sampling_params, "num_inference_steps", None)
+        if steps is None:
+            steps = extra_args.get("num_inference_steps")
+        if steps is None:
+            steps = SANA_WM_DEFAULT_NUM_INFERENCE_STEPS
+        steps = int(steps)
         seed = int(getattr(sampling_params, "seed", None) or extra_args.get("seed", 0))
         if min(height, width, num_frames, steps) <= 0:
             raise ValueError("Sana-WM native height, width, num_frames, and steps must be positive.")
         cfg_scale = SANA_WM_DEFAULT_GUIDANCE_SCALE
         if sampling_params is not None and getattr(sampling_params, "guidance_scale_provided", False):
-            cfg_scale = float(getattr(sampling_params, "guidance_scale", 1.0) or 1.0)
+            cfg_scale = float(getattr(sampling_params, "guidance_scale", 1.0))
         return SanaWmNativeParams(
             height=height,
             width=width,
