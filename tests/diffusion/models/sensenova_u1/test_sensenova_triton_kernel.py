@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Correctness tests for Sensenova-U1 Triton kernels.
 
@@ -17,7 +17,11 @@ import torch
 
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    pytest.mark.cuda,
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.version.hip is not None,
+        reason="CUDA required; the fused kernel has no ROCm path",
+    ),
 ]
 
 SEED = 42
@@ -166,15 +170,17 @@ def reference_kernel(
     return query, key
 
 
-def make_input(seq_len: int, dtype: torch.dtype, device: torch.device, seed: int) -> KernelInput:
+def make_input(
+    seq_len: int, dtype: torch.dtype, device: torch.device, seed: int, batch_size: int = B, rope_batch: int = B
+) -> KernelInput:
     gen = torch.Generator(device=device)
     gen.manual_seed(seed + seq_len)
 
     # Match real model layout: q/k/v are views split from fused qkv.
-    qkv = torch.randn(B, seq_len, QKV_DIM, device=device, dtype=dtype, generator=gen)
+    qkv = torch.randn(batch_size, seq_len, QKV_DIM, device=device, dtype=dtype, generator=gen)
     q, k, _v = qkv.split([H_Q * HEAD_DIM, H_K * HEAD_DIM, H_K * HEAD_DIM], dim=-1)
-    q = q.view(B, seq_len, H_Q, HEAD_DIM)
-    k = k.view(B, seq_len, H_K, HEAD_DIM)
+    q = q.view(batch_size, seq_len, H_Q, HEAD_DIM)
+    k = k.view(batch_size, seq_len, H_K, HEAD_DIM)
 
     q_norm_weight = torch.randn(T_DIM, device=device, dtype=dtype, generator=gen)
     k_norm_weight = torch.randn(T_DIM, device=device, dtype=dtype, generator=gen)
@@ -183,8 +189,8 @@ def make_input(seq_len: int, dtype: torch.dtype, device: torch.device, seed: int
 
     # Match Qwen3RotaryEmbedding: emb = torch.cat((freqs, freqs), dim=-1).
     def make_rope_pair(dim: int) -> tuple[torch.Tensor, torch.Tensor]:
-        cos_half = torch.randn(B, seq_len, dim // 2, device=device, dtype=dtype, generator=gen)
-        sin_half = torch.randn(B, seq_len, dim // 2, device=device, dtype=dtype, generator=gen)
+        cos_half = torch.randn(rope_batch, seq_len, dim // 2, device=device, dtype=dtype, generator=gen)
+        sin_half = torch.randn(rope_batch, seq_len, dim // 2, device=device, dtype=dtype, generator=gen)
         return torch.cat((cos_half, cos_half), dim=-1), torch.cat((sin_half, sin_half), dim=-1)
 
     cos_t, sin_t = make_rope_pair(T_DIM)
@@ -227,6 +233,22 @@ def test_fused_qk_norm_rope_matches_reference(seq_len: int, dtype: torch.dtype, 
     call_args = data.args()
     ref_q, ref_k = reference_kernel(*call_args)
     out_q, out_k = triton_qk_norm_rope(*call_args, EPS)
+
+    assert_close_with_error_stats(out_q, ref_q, name="query", atol=atol, rtol=rtol)
+    assert_close_with_error_stats(out_k, ref_k, name="key", atol=atol, rtol=rtol)
+
+
+@triton_available
+@pytest.mark.parametrize("seq_len", [1, 7, 32])
+@pytest.mark.parametrize("rope_batch", [1, 2])
+@pytest.mark.parametrize(
+    ("dtype", "atol", "rtol"),
+    [(torch.float32, 1e-5, 1e-5), (torch.bfloat16, 3e-2, 3e-2)],
+)
+def test_fused_qk_norm_rope_batched(seq_len: int, rope_batch: int, dtype: torch.dtype, atol: float, rtol: float):
+    data = make_input(seq_len, dtype=dtype, device=DEVICE, seed=SEED, batch_size=2, rope_batch=rope_batch)
+    ref_q, ref_k = reference_kernel(*data.args())
+    out_q, out_k = triton_qk_norm_rope(*data.args(), EPS)
 
     assert_close_with_error_stats(out_q, ref_q, name="query", atol=atol, rtol=rtol)
     assert_close_with_error_stats(out_k, ref_k, name="key", atol=atol, rtol=rtol)
