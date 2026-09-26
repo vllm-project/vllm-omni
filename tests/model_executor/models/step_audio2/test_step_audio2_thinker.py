@@ -44,11 +44,29 @@ def test_audio_preprocessing():
     assert mel.shape[0] == 128, f"Expected 128 mel bins, got {mel.shape[0]}"
 
     mels = [mel, mel]
-    padded_mels, _mel_lens = padding_mels(mels)
+    padded_mels, mel_lens = padding_mels(mels)
 
     assert padded_mels.ndim == 3, f"Expected 3D tensor, got {padded_mels.ndim}D"
     assert padded_mels.shape[0] == 2, f"Expected batch size 2, got {padded_mels.shape[0]}"
     assert padded_mels.shape[1] == 128, f"Expected 128 mel bins, got {padded_mels.shape[1]}"
+    assert mel_lens.tolist() == [mel.shape[1], mel.shape[1]]
+
+
+def test_padding_mels_keeps_short_tail_boundary_frames():
+    """Match the Step-Audio2 reference length convention for a tiny audio tail."""
+    from vllm_omni.model_executor.models.step_audio2.step_audio2_thinker import (
+        log_mel_spectrogram,
+        padding_mels,
+    )
+
+    full_chunk = torch.zeros(128, 2502)
+    short_tail = log_mel_spectrogram(np.zeros(1, dtype=np.float32))
+
+    padded_mels, mel_lens = padding_mels([full_chunk, short_tail])
+
+    assert short_tail.shape == (128, 3)
+    assert padded_mels.shape == (2, 128, 2502)
+    assert mel_lens.tolist() == [2502, 3]
 
 
 def test_feature_length_calculation():
@@ -58,10 +76,22 @@ def test_feature_length_calculation():
     )
 
     assert calculate_audio_feature_length(1000) == 125
-
     assert calculate_audio_feature_length(100) > 0
+    assert calculate_audio_feature_length(3) == 1
+    assert calculate_audio_feature_length(2) == 0
 
-    assert calculate_audio_feature_length(1) >= 1
+
+def test_feature_lengths_for_full_chunks_and_short_tail():
+    """A non-empty tail must add one placeholder and one model embedding."""
+    from vllm_omni.model_executor.models.step_audio2.step_audio2_thinker import (
+        calculate_audio_feature_length,
+    )
+
+    mel_lens = [2502] * 10 + [3]
+    feature_lens = [calculate_audio_feature_length(length) for length in mel_lens]
+
+    assert feature_lens == [313] * 10 + [1]
+    assert sum(feature_lens) == 3131
 
 
 def test_token_config_constants():
@@ -122,6 +152,14 @@ def test_audio_encoder_output_shape():
     assert adapted.ndim == 3
     assert adapted.shape[0] == batch_size
     assert adapted.shape[2] == 4096
+
+    short_tail = torch.randn(1, n_mels, 3)
+    short_encoded, short_encoded_lens = encoder(short_tail, torch.tensor([3], dtype=torch.int32))
+    short_adapted = adapter(short_encoded)
+    short_feature_lens = (short_encoded_lens - 1) // 2 + 1
+
+    assert short_feature_lens.tolist() == [1]
+    assert short_adapted.shape[1] >= short_feature_lens.item()
 
 
 def test_token_separation():
