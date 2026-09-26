@@ -30,6 +30,7 @@ from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
+from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
@@ -49,6 +50,25 @@ from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger(__name__)
+
+
+def accept_structured_output_tokens(
+    manager: StructuredOutputManager, request: Request, new_token_ids: list[int]
+) -> bool:
+    """Support both manager APIs without requiring scheduler stubs to bind a helper."""
+    if hasattr(type(manager), "accept_tokens"):
+        return bool(manager.accept_tokens(request, new_token_ids))
+    if not manager.should_advance(request, new_token_ids=new_token_ids):
+        return True
+    grammar_token_ids = manager.trim_reasoning_for_advance(request, new_token_ids)
+    if not grammar_token_ids:
+        return True
+    struct_output_request = request.structured_output_request
+    assert struct_output_request is not None
+    grammar = struct_output_request.grammar
+    assert grammar is not None
+    return bool(grammar.accept_tokens(request.request_id, grammar_token_ids))
+
 
 _STATS_INTERVAL_S = 1.0
 
@@ -763,7 +783,7 @@ class OmniSchedulerMixin:
 
     def _reject_invalid_grammar_tokens(self, request: Request, new_token_ids: list[int]) -> bool:
         """Mark rejected tokens terminal before callers capture the finish reason."""
-        if not new_token_ids or self.structured_output_manager.accept_tokens(request, new_token_ids):
+        if not new_token_ids or accept_structured_output_tokens(self.structured_output_manager, request, new_token_ids):
             return False
         logger.error(
             "Unexpected: grammar rejected tokens %s for request %s. Terminating request.",
