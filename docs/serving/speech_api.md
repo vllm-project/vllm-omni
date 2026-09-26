@@ -973,15 +973,16 @@ Use `/v1/audio/voices` to list available voices for the loaded model.
 Multi-stage omni deployments route stage outputs through a single orchestrator
 loop. The legacy loop polls every stage replica on a 1 ms cadence. The
 event-driven mode replaces the poll with one reader task per live stage
-replica awaiting its client directly, and switches the serving-side
-final-output drain to a condition-variable wakeup at the same time. Qwen3-TTS
-uses this mode by default; other pipelines keep the legacy poll unless enabled.
+replica awaiting its client directly. Qwen3-TTS uses this mode by default;
+other pipelines keep the legacy poll unless enabled. The serving-side
+final-output drain (orchestrator to API server) is always event-driven and is
+not affected by this flag.
 
 **Configuration (environment variables):**
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | On for Qwen3-TTS; off for other pipelines | Switches the orchestration loop and the final-output drain from the legacy 1 ms poll to event-driven wakeups. An explicit value wins; otherwise the pipeline default computed at engine initialization is used. The override is resolved at orchestrator construction and separately when the final-output drain starts. `1`, `true`, `yes`, or `on` enables it, ignoring case and surrounding whitespace; other values select the legacy poll loop. |
+| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | On for Qwen3-TTS; off for other pipelines | Switches the orchestration loop from the legacy 1 ms poll to event-driven wakeups. An explicit value wins; otherwise the pipeline default computed at engine initialization is used. The override is resolved at orchestrator construction. `1`, `true`, `yes`, or `on` enables it, ignoring case and surrounding whitespace; other values select the legacy poll loop. |
 
 Set it on the process that runs the orchestrator (stage 0 of an omni deployment)
 before starting the server when overriding the pipeline default. For example,

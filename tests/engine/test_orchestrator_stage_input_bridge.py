@@ -179,7 +179,7 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
     rpc_q = janus.Queue()
     orchestrator = Orchestrator(
         request_async_queue=request_q.async_q,
-        output_async_queue=output_q.async_q,
+        output_sync_queue=output_q.sync_q,
         rpc_async_queue=rpc_q.async_q,
         stage_pools=stage_pools,
         async_chunk=False,
@@ -322,7 +322,7 @@ async def test_streaming_segment_does_not_complete_final_output_stage() -> None:
         cleanup_parent=lambda _request_id: [],
     )
     orchestrator.stage_pools = [SimpleNamespace(final_output=True)]
-    orchestrator.output_async_queue = asyncio.Queue()
+    orchestrator.output_sync_queue = asyncio.Queue()
     orchestrator._cleanup_request_ids = AsyncMock()
 
     req_state = OrchestratorRequestState(
@@ -342,5 +342,5 @@ async def test_streaming_segment_does_not_complete_final_output_stage() -> None:
 
     assert req_state.finished_final_output_stage_ids == set()
     orchestrator._cleanup_request_ids.assert_not_awaited()
-    routed = orchestrator.output_async_queue.get_nowait()
+    routed = orchestrator.output_sync_queue.get_nowait()
     assert routed.finished is False

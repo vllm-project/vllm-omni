@@ -74,12 +74,14 @@ def cleanup_request_artifact_dirs(artifact_dirs: set[str] | list[str]) -> None:
         shutil.rmtree(artifact_dir, ignore_errors=True)
 
 
-# VLLM_OMNI_EVENT_DRIVEN_ORCH=1 switches the orchestration loop (and the
-# serving-side final-output drain in entrypoints/async_omni.py) from the legacy
+# VLLM_OMNI_EVENT_DRIVEN_ORCH=1 switches the orchestration loop from the legacy
 # 1 ms poll cadence to event-driven wakeups: one reader task per live LLM stage
 # replica awaits `client.get_output_async()` directly — the same pattern vLLM's
 # own AsyncLLM output handler uses — and feeds a single serial dispatch queue.
 # Default is off except for pipelines with an explicit validated default.
+# (The serving-side final-output drain is always event-driven, independent of
+# this flag: the orchestrator pushes on ``output_sync_queue`` and the server
+# awaits the queue's async side; see ``OmniEngineBase.try_get_output_async``.)
 _EVENT_DRIVEN_ORCH_ENV = "VLLM_OMNI_EVENT_DRIVEN_ORCH"
 
 # How often the event-driven loop reconciles its reader-task set against
@@ -296,7 +298,7 @@ class OrchestratorBase:
     def __init__(
         self,
         request_async_queue: janus.AsyncQueue[EngineQueueMessage],
-        output_async_queue: janus.AsyncQueue[EngineQueueMessage],
+        output_sync_queue: janus.SyncQueue[EngineQueueMessage],
         rpc_async_queue: janus.AsyncQueue[EngineQueueMessage],
         stage_pools: list[StagePool],
         *,
@@ -312,7 +314,7 @@ class OrchestratorBase:
         event_driven_orch_default: bool = False,
     ) -> None:
         self.request_async_queue = request_async_queue
-        self.output_async_queue = output_async_queue
+        self.output_sync_queue = output_sync_queue
         self.rpc_async_queue = rpc_async_queue
 
         self.async_chunk = bool(async_chunk)
@@ -441,7 +443,7 @@ class OrchestratorBase:
         membership_watcher: asyncio.Task[None] | None = None
         if self._membership is not None:
             self._membership.install_unregister_handlers(
-                output_queue=self.output_async_queue,
+                output_queue=self.output_sync_queue,
                 cleanup_callback=lambda ids: self._cleanup_request_ids(ids, abort=True),
                 replica_removed_callback=self._remove_stage_replica_waiting,
             )
@@ -598,7 +600,7 @@ class OrchestratorBase:
 
         AR final-stage abort outputs (partial tokens) are attached to the
         result message when ``rpc_id`` is set, or enqueued on
-        ``output_async_queue`` for fire-and-forget aborts.
+        ``output_sync_queue`` for fire-and-forget aborts.
         """
         request_ids = msg.request_ids
         error: str | None = None
@@ -627,7 +629,7 @@ class OrchestratorBase:
             )
         elif abort_outputs:
             for output_msg in abort_outputs:
-                await self.output_async_queue.put(output_msg)
+                self.output_sync_queue.put_nowait(output_msg)
 
     async def _abort_request_ids(self, request_ids: list[str]) -> list[OutputMessage]:
         """Forward abort requests to all stage pools.
@@ -1232,7 +1234,7 @@ class OrchestratorBase:
             parent_id = self._cfg_tracker.get_parent_id(output.request_id) or output.request_id
         else:
             parent_id = output.request_id
-        await self.output_async_queue.put(
+        self.output_sync_queue.put_nowait(
             ErrorMessage(
                 request_id=parent_id,
                 stage_id=stage_id,
@@ -1302,7 +1304,7 @@ class OrchestratorBase:
                 continue
             bound = pool.get_bound_replica_id(req_id)
             if bound == replica_id or not stage_has_live:
-                await self.output_async_queue.put(
+                self.output_sync_queue.put_nowait(
                     ErrorMessage(
                         error=str(error),
                         fatal=True,
@@ -1343,7 +1345,7 @@ class OrchestratorBase:
             req_id,
             stage_id,
         )
-        await self.output_async_queue.put(
+        self.output_sync_queue.put_nowait(
             ErrorMessage(
                 error=f"Stage-{stage_id} has no live replica",
                 fatal=True,
@@ -1373,7 +1375,7 @@ class OrchestratorBase:
         client-error ErrorMessage (default `fatal=False`) so the engine keeps
         serving, then releases the request's state across every stage pool.
         """
-        await self.output_async_queue.put(
+        self.output_sync_queue.put_nowait(
             ErrorMessage(
                 error=error,
                 status_code=status_code,
@@ -1521,7 +1523,7 @@ class OrchestratorBase:
                 orphaned_parents.setdefault(pid, rid)
         for pid, cid in orphaned_parents.items():
             deferred = self._cfg_tracker.pop_pending_parent(pid)
-            await self.output_async_queue.put(
+            self.output_sync_queue.put_nowait(
                 ErrorMessage(
                     request_id=pid,
                     stage_id=deferred["stage_id"] if deferred is not None else None,
@@ -1613,7 +1615,7 @@ class OrchestratorBase:
             replica_id,
             error,
         )
-        await self.output_async_queue.put(
+        self.output_sync_queue.put_nowait(
             ErrorMessage(
                 error=error,
                 fatal=False,
@@ -1638,7 +1640,7 @@ class OrchestratorBase:
             if pending is not None:
                 if set(req_state.stage_submit_ts).issubset(req_state.finished_stage_ids):
                     req_state.pending_final_output = None
-                    await self.output_async_queue.put(pending)
+                    self.output_sync_queue.put_nowait(pending)
                     await self._cleanup_request_ids([request_id, *self._cfg_tracker.cleanup_parent(request_id)])
                 # A real terminal output is pending; do not replace it with
                 # the swallowed-output fallback before upstream completion.
@@ -1661,7 +1663,7 @@ class OrchestratorBase:
                 final_output_type=final_output_type,
                 audio_sample_rate=pool._infer_audio_sample_rate(),
             )
-            await self.output_async_queue.put(
+            self.output_sync_queue.put_nowait(
                 OutputMessage(
                     request_id=request_id,
                     stage_id=stage_id,
@@ -1752,9 +1754,9 @@ class OrchestratorBase:
                 req_state.pending_final_output = message
                 request_finished = False
             else:
-                await self.output_async_queue.put(message)
+                self.output_sync_queue.put_nowait(message)
         elif stage_metrics is not None:
-            await self.output_async_queue.put(
+            self.output_sync_queue.put_nowait(
                 StageMetricsMessage(
                     request_id=req_id,
                     stage_id=stage_id,
@@ -1824,7 +1826,7 @@ class OrchestratorBase:
         pending = req_state.pending_final_output
         if pending is not None and set(req_state.stage_submit_ts).issubset(req_state.finished_stage_ids):
             req_state.pending_final_output = None
-            await self.output_async_queue.put(pending)
+            self.output_sync_queue.put_nowait(pending)
             request_finished = True
 
         if request_finished and not req_state.session_owned:
@@ -2185,7 +2187,7 @@ class OrchestratorBase:
                     len(companion_outputs),
                     expected,
                 )
-                await self.output_async_queue.put(
+                self.output_sync_queue.put_nowait(
                     ErrorMessage(
                         request_id=req_id,
                         stage_id=src_stage_id,
@@ -2240,7 +2242,7 @@ class OrchestratorBase:
                         src_stage_id,
                         next_logical,
                     )
-                    await self.output_async_queue.put(
+                    self.output_sync_queue.put_nowait(
                         OutputMessage(
                             request_id=req_id,
                             stage_id=next_logical,
@@ -2266,7 +2268,7 @@ class OrchestratorBase:
                             src_stage_id,
                             next_logical,
                         )
-                        await self.output_async_queue.put(
+                        self.output_sync_queue.put_nowait(
                             OutputMessage(
                                 request_id=req_id,
                                 stage_id=next_logical,
@@ -2442,7 +2444,7 @@ class OrchestratorBase:
                 final_output_type or "text",
                 final_stage_id,
             )
-            await self.output_async_queue.put(
+            self.output_sync_queue.put_nowait(
                 OutputMessage(
                     request_id=req_id,
                     stage_id=final_stage_id,
@@ -2967,7 +2969,7 @@ class Orchestrator(OrchestratorBase):
         req_state = self.request_states.get(request_id)
         if req_state is None:
             logger.info("[Orchestrator] Dropping interaction for inactive req %s", request_id)
-            await self.output_async_queue.put(
+            self.output_sync_queue.put_nowait(
                 ErrorMessage(
                     error=f"No active request for interaction: {request_id}",
                     fatal=False,
@@ -2987,7 +2989,7 @@ class Orchestrator(OrchestratorBase):
                 exc,
                 exc_info=True,
             )
-            await self.output_async_queue.put(
+            self.output_sync_queue.put_nowait(
                 ErrorMessage(
                     error=f"Failed interaction for request {request_id}: {exc}",
                     fatal=False,

@@ -31,7 +31,7 @@ def build():
         sampling_params_list=[None, None],
     )
     o.request_states = {"r": state}
-    o.output_async_queue = asyncio.Queue()
+    o.output_sync_queue = asyncio.Queue()
     o.async_chunk = True
     o._pd_pair = None
     o._cfg_tracker = MagicMock()
@@ -58,15 +58,15 @@ async def test_terminal_metrics_precede_final_audio_for_either_arrival_order(ord
     for stage in order:
         await o._handle_processed_outputs(stage, 0, [SimpleNamespace(request_id="r", finished=True, error=None)])
         if stage == 1 and not state.finished_stage_ids.issuperset({0, 1}):
-            assert o.output_async_queue.empty()
+            assert o.output_sync_queue.empty()
             assert "r" in o.request_states
             assert cleaned == []
-    metrics = o.output_async_queue.get_nowait()
-    final = o.output_async_queue.get_nowait()
+    metrics = o.output_sync_queue.get_nowait()
+    final = o.output_sync_queue.get_nowait()
     assert type(metrics).__name__ == "StageMetricsMessage"
     assert metrics.stage_id == 0 and metrics.metrics.num_tokens_out == 42
     assert type(final).__name__ == "OutputMessage" and final.finished
-    assert o.output_async_queue.empty()
+    assert o.output_sync_queue.empty()
     assert cleaned == ["r"]
     assert state.pending_final_output is None
 
@@ -78,5 +78,5 @@ async def test_cancelled_pending_output_is_not_published_by_late_upstream():
     assert state.pending_final_output is not None
     await o._cleanup_request_ids(["r"])
     await o._handle_processed_outputs(0, 0, [SimpleNamespace(request_id="r", finished=True, error=None)])
-    assert o.output_async_queue.empty()
+    assert o.output_sync_queue.empty()
     assert cleaned == ["r"]

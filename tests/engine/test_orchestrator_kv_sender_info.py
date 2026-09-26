@@ -439,17 +439,17 @@ def test_forward_to_diffusion_returns_terminal_error_for_empty_custom_inputs():
     sender_pool = _build_sender_pool(0, {"host": "10.0.0.2", "zmq_port": 50151})
     diffusion_pool = StagePool(1, diffusion_stage)
 
-    class _AsyncQueue:
+    class _OutputQueue:
         def __init__(self):
             self.items = []
 
-        async def put(self, item):
+        def put_nowait(self, item):
             self.items.append(item)
 
     orchestrator.num_stages = 2
     orchestrator.stage_pools = [sender_pool, diffusion_pool]
     orchestrator._cfg_tracker = CfgCompanionTracker()
-    orchestrator.output_async_queue = _AsyncQueue()
+    orchestrator.output_sync_queue = _OutputQueue()
     orchestrator.request_states = {}
     orchestrator._pd_kv_params = {}
 
@@ -466,8 +466,8 @@ def test_forward_to_diffusion_returns_terminal_error_for_empty_custom_inputs():
     asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-empty", 0, output, req_state))
 
     assert diffusion_stage.calls == []
-    assert len(orchestrator.output_async_queue.items) == 1
-    terminal_msg = orchestrator.output_async_queue.items[0]
+    assert len(orchestrator.output_sync_queue.items) == 1
+    terminal_msg = orchestrator.output_sync_queue.items[0]
     assert isinstance(terminal_msg, OutputMessage)
     assert terminal_msg.type == "output"
     assert terminal_msg.request_id == "req-empty"
@@ -570,7 +570,7 @@ async def test_async_pipeline_defers_sync_stage_until_audio_finishes(mocker):
     orchestrator.async_chunk = True
     orchestrator._pd_pair = None
     orchestrator._cfg_tracker = CfgCompanionTracker()
-    orchestrator.output_async_queue = asyncio.Queue()
+    orchestrator.output_sync_queue = asyncio.Queue()
     orchestrator._duplex_output_decision = lambda *args: None
     orchestrator._is_duplex_session_request = lambda state: False
     orchestrator._forward_to_next_stage = mocker.AsyncMock()
@@ -618,5 +618,5 @@ async def test_async_pipeline_defers_sync_stage_until_audio_finishes(mocker):
     orchestrator._cleanup_request_ids.assert_not_awaited()
     await orchestrator._route_output(1, 0, output, state, None)
     orchestrator._cleanup_request_ids.assert_awaited_once()
-    messages = [orchestrator.output_async_queue.get_nowait() for _ in range(3)]
+    messages = [orchestrator.output_sync_queue.get_nowait() for _ in range(3)]
     assert [message.finished for message in messages] == [False, False, True]

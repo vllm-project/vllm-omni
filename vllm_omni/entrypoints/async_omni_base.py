@@ -33,12 +33,6 @@ from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetric
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
-_FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
-# Blocking-wait interval for the event-driven final-output drain
-# (explicit env value or the engine pipeline default): a message wakes the drain immediately via
-# the janus queue's condition variable; this timeout only bounds how often the
-# orchestrator liveness check runs while the pipeline is idle.
-_FINAL_OUTPUT_BLOCKING_WAIT_S = 1.0
 # Shared DELETE / generate() cleanup abort bound. Env is the documented knob.
 ABORT_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_ABORT_TIMEOUT", 2.0))
 
@@ -314,31 +308,18 @@ class AsyncOmniBase(OmniBase):
 
         engine = self.engine
 
-        # Event-driven drain (explicit env value or the engine pipeline default): block on the
-        # queue's condition variable in a dedicated thread instead of the
-        # get_nowait + 1 ms sleep cadence. Same flag as the orchestrator-side
-        # event-driven loop (vllm_omni/engine/orchestrator.py).
-        from vllm_omni.engine.orchestrator import _event_driven_orch_enabled
-
-        event_driven_drain = _event_driven_orch_enabled(
-            default=bool(getattr(engine, "_event_driven_orch_default", False))
-        ) and hasattr(engine, "get_output_blocking_async")
-
         async def _final_output_loop():
-            """Background coroutine that dispatches final outputs to request queues."""
+            """Background coroutine that dispatches final outputs to request queues.
+
+            ``try_get_output_async`` parks on the engine output queue and
+            returns as soon as the orchestrator pushes a message, so there
+            is no poll cadence here. Engine death surfaces as an exception
+            from the same await (the orchestrator shuts the queue down on
+            exit), which the handlers below turn into per-request errors.
+            """
             try:
                 while True:
-                    if event_driven_drain:
-                        msg = await engine.get_output_blocking_async(timeout=_FINAL_OUTPUT_BLOCKING_WAIT_S)
-                        if msg is None:
-                            # Timed out with the orchestrator alive; loop for
-                            # the periodic liveness check.
-                            continue
-                    else:
-                        msg = await engine.try_get_output_async()
-                        if msg is None:
-                            await asyncio.sleep(_FINAL_OUTPUT_IDLE_SLEEP_S)
-                            continue
+                    msg = await engine.try_get_output_async()
 
                     if self._route_engine_message(msg):
                         continue

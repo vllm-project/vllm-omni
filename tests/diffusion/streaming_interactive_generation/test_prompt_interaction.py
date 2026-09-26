@@ -569,7 +569,7 @@ class TestPromptUpdateIntegration:
         output_queue: asyncio.Queue[ErrorMessage] = asyncio.Queue()
         orchestrator = object.__new__(Orchestrator)
         orchestrator.stage_pools = [_RejectingStagePool()]  # pyright: ignore[reportAttributeAccessIssue]
-        orchestrator.output_async_queue = output_queue  # pyright: ignore[reportAttributeAccessIssue]
+        orchestrator.output_sync_queue = output_queue  # pyright: ignore[reportAttributeAccessIssue]
         orchestrator.request_states = {"req-1": OrchestratorRequestState(request_id="req-1")}
 
         await orchestrator._handle_interaction(
@@ -604,7 +604,7 @@ class TestPromptUpdateIntegration:
         orchestrator.stage_pools = [  # pyright: ignore[reportAttributeAccessIssue]
             StagePool(0, cast(StagePoolClient, inline_client))
         ]
-        orchestrator.output_async_queue = output_queue  # pyright: ignore[reportAttributeAccessIssue]
+        orchestrator.output_sync_queue = output_queue  # pyright: ignore[reportAttributeAccessIssue]
         orchestrator.request_states = {"req-1": OrchestratorRequestState(request_id="req-1")}
 
         try:
@@ -814,11 +814,16 @@ class TestPromptUpdateIntegration:
                 )
             )
 
-        async def try_get_output_async(self) -> Any | None:
-            try:
-                return self._fixture.output_sync_q.get_nowait()
-            except queue.Empty:
-                return None
+        async def try_get_output_async(self) -> Any:
+            # Mirror the real engine: park until a message is available
+            # instead of returning None on empty. The AsyncOmni output loop no
+            # longer polls, so a synchronous None return would hot-spin the
+            # loop without yielding and starve the event loop.
+            while True:
+                try:
+                    return self._fixture.output_sync_q.get_nowait()
+                except queue.Empty:
+                    await asyncio.sleep(0.001)
 
         def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
             return self.stage_metadata[stage_id]

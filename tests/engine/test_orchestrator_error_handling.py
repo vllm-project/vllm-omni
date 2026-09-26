@@ -531,7 +531,7 @@ def _build_bare_orchestrator(stage_pools) -> tuple[Orchestrator, tuple[janus.Que
     queues = (janus.Queue(), janus.Queue(), janus.Queue())
     orchestrator = Orchestrator(
         request_async_queue=queues[0].async_q,
-        output_async_queue=queues[1].async_q,
+        output_sync_queue=queues[1].sync_q,
         rpc_async_queue=queues[2].async_q,
         stage_pools=stage_pools,
     )

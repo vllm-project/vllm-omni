@@ -95,7 +95,7 @@ class DuplexSessionManager:
         *,
         plugin: DuplexModelPlugin,
         stage_port: DuplexStagePort,
-        output_sink: janus.AsyncQueue[EngineQueueMessage],
+        output_sink: janus.SyncQueue[EngineQueueMessage],
         result_sink: janus.AsyncQueue[EngineQueueMessage],
         runtime_config: DuplexSessionRuntimeConfig,
         model_config: ModelConfig | None,

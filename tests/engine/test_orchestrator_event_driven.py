@@ -5,19 +5,17 @@
 Parity suite: re-runs the legacy orchestration scenarios from
 ``test_orchestrator.py`` / ``test_orchestrator_error_handling.py`` with the
 event-driven loop selected, so both loops are held to the same behavior. Plus
-event-driven-specific coverage: reader reconcile on client swap, the blocking
-final-output drain, and flag parsing.
+event-driven-specific coverage: reader reconcile on client swap and flag
+parsing. (The serving-side final-output drain is always event-driven and is
+covered in ``test_async_omni_engine_outputs.py``.)
 """
 
 from __future__ import annotations
 
-import asyncio
 from types import SimpleNamespace
 
-import janus
 import pytest
 
-from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import ShutdownRequestMessage
 from vllm_omni.engine.orchestrator import (
     _event_driven_orch_default_for_pipeline,
@@ -195,69 +193,3 @@ async def test_reader_reconcile_picks_up_swapped_client(orchestrator_factory) ->
         assert output_msg.finished is True
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
-
-
-# ---------------------------------------------------------------------------
-# Blocking final-output drain (AsyncOmniEngine.get_output_blocking_async)
-# ---------------------------------------------------------------------------
-
-
-def _drain_engine(alive: bool = True) -> AsyncOmniEngine:
-    engine = object.__new__(AsyncOmniEngine)
-    engine.output_queue = janus.Queue()
-    engine.orchestrator_thread = SimpleNamespace(is_alive=lambda: alive)
-    return engine
-
-
-def _drain_cleanup(engine: AsyncOmniEngine) -> None:
-    if engine._output_drain_executor is not None:
-        engine._output_drain_executor.shutdown(wait=False)
-        engine._output_drain_executor = None
-    engine.output_queue.close()
-
-
-@pytest.mark.asyncio
-async def test_blocking_drain_returns_queued_message() -> None:
-    engine = _drain_engine()
-    try:
-        engine.output_queue.sync_q.put_nowait("msg-1")
-        assert await engine.get_output_blocking_async(timeout=1.0) == "msg-1"
-    finally:
-        _drain_cleanup(engine)
-
-
-@pytest.mark.asyncio
-async def test_blocking_drain_wakes_on_late_message() -> None:
-    """A message put after the wait starts wakes the drain, no polling."""
-    engine = _drain_engine()
-    try:
-
-        async def _delayed_put() -> None:
-            await asyncio.sleep(0.05)
-            engine.output_queue.sync_q.put_nowait("late-msg")
-
-        put_task = asyncio.create_task(_delayed_put())
-        msg = await engine.get_output_blocking_async(timeout=5.0)
-        await put_task
-        assert msg == "late-msg"
-    finally:
-        _drain_cleanup(engine)
-
-
-@pytest.mark.asyncio
-async def test_blocking_drain_timeout_returns_none_when_alive() -> None:
-    engine = _drain_engine(alive=True)
-    try:
-        assert await engine.get_output_blocking_async(timeout=0.05) is None
-    finally:
-        _drain_cleanup(engine)
-
-
-@pytest.mark.asyncio
-async def test_blocking_drain_raises_when_orchestrator_dead() -> None:
-    engine = _drain_engine(alive=False)
-    try:
-        with pytest.raises(RuntimeError, match="Orchestrator died"):
-            await engine.get_output_blocking_async(timeout=0.05)
-    finally:
-        _drain_cleanup(engine)

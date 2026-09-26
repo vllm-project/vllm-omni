@@ -86,7 +86,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         self.session_manager = DuplexSessionManager(
             plugin=plugin,
             stage_port=self,
-            output_sink=self.output_async_queue,
+            output_sink=self.output_sync_queue,
             result_sink=self.rpc_async_queue,
             runtime_config=self.duplex_session_config,
             model_config=model_config,

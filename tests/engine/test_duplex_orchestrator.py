@@ -67,7 +67,7 @@ def _build(
     output_q: asyncio.Queue = asyncio.Queue()
     orchestrator = DuplexOrchestrator(
         request_async_queue=asyncio.Queue(),
-        output_async_queue=output_q,
+        output_sync_queue=output_q,
         rpc_async_queue=rpc_q,
         stage_pools=pools,
         running_counter=running_counter,
@@ -166,7 +166,7 @@ def _tts_output(request_id: str, *, samples: int = 24000, text: str = "hello") -
 def test_turn_based_orchestrator_has_no_session_manager() -> None:
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
-        output_async_queue=asyncio.Queue(),
+        output_sync_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[],
     )

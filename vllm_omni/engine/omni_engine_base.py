@@ -72,6 +72,12 @@ from vllm_omni.metrics.prometheus import OmniRequestCounter
 
 logger = init_logger(__name__)
 
+# janus raises different classes on the two sides of a shut-down queue:
+# ``ShutDown`` from the sync side (``sync_q.get``) and ``QueueShutDown`` from
+# the async side (``async_q.get``). Catch both so a shut-down queue maps to
+# RuntimeError regardless of which side reads it.
+_QUEUE_SHUTDOWN_ERRORS = (janus.ShutDown, janus.QueueShutDown)
+
 _STARTUP_POLL_INTERVAL_S = 1.0
 _REQUEST_QUEUE_MAXSIZE = 256
 _ConfigResolutionResult = OmniConfigResolution | tuple[str | None, list[Any], str | None]
@@ -124,8 +130,6 @@ class OmniEngineBase:
     _prom_metrics: Any = None
     _enable_orch_monitor: bool = False
     _client_config: OmniClientConfig | None = None
-    # Lazily created by get_output_blocking_async().
-    _output_drain_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
     def __init__(
         self,
@@ -450,7 +454,7 @@ class OmniEngineBase:
 
             orchestrator = self._create_orchestrator(
                 request_async_queue=self.request_queue.async_q,
-                output_async_queue=self.output_queue.async_q,
+                output_sync_queue=self.output_queue.sync_q,
                 rpc_async_queue=self.rpc_output_queue.async_q,
                 stage_pools=self.stage_pools,
                 async_chunk=self.async_chunk,
@@ -468,6 +472,9 @@ class OmniEngineBase:
                 startup_future.set_result(asyncio.get_running_loop())
             await orchestrator.run()
 
+        # Set only on a crash (in ``except``); read by ``finally`` so the fatal
+        # error is delivered to a parked reader before the queue is shut down.
+        error_text: str | None = None
         try:
             loop.run_until_complete(_run_orchestrator())
         except Exception as e:
@@ -478,15 +485,28 @@ class OmniEngineBase:
             logger.exception("[OmniEngine] Orchestrator thread crashed")
             error_text = str(e) or "Orchestrator thread crashed"
             try:
-                error_msg = ErrorMessage(error=error_text, fatal=True)
-                if self.output_queue is not None:
-                    self.output_queue.sync_q.put_nowait(error_msg)
                 if self.rpc_output_queue is not None:
-                    self.rpc_output_queue.sync_q.put_nowait(error_msg)
+                    self.rpc_output_queue.sync_q.put_nowait(ErrorMessage(error=error_text, fatal=True))
             except Exception:
                 pass
             raise
         finally:
+            # The serving-side reader parks on ``output_queue.async_q.get()``
+            # (see ``try_get_output_async``) and cannot notice this thread
+            # dying on its own, so signal death through the queue on ANY exit
+            # -- Exception, BaseException, or clean return. On a crash the
+            # fatal message is enqueued first; ``shutdown()`` lets it drain
+            # and then wakes any still-parked getter with ``QueueShutDown``.
+            if self.output_queue is not None:
+                if error_text is not None:
+                    try:
+                        self.output_queue.sync_q.put_nowait(ErrorMessage(error=error_text, fatal=True))
+                    except Exception:
+                        pass
+                try:
+                    self.output_queue.shutdown()
+                except Exception:
+                    pass
             try:
                 pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
                 for task in pending:
@@ -950,55 +970,32 @@ class OmniEngineBase:
         """Read one output message from the Orchestrator output queue."""
         try:
             return self.output_queue.sync_q.get(timeout=timeout)
-        except queue.Empty:
-            if not self.is_alive():
-                raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
-            return None
-
-    async def try_get_output_async(self) -> EngineQueueMessage | None:
-        """Async read from the Orchestrator output queue."""
-        try:
-            return self.output_queue.sync_q.get_nowait()
-        except queue.Empty:
-            if not self.is_alive():
-                raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
-            return None
-
-    async def get_output_blocking_async(self, timeout: float = 1.0) -> EngineQueueMessage | None:
-        """Blocking-wait read from the Orchestrator output queue.
-
-        Waits up to ``timeout`` seconds in a dedicated drain thread for the
-        next message (condition-variable wakeup instead of a poll cadence);
-        returns ``None`` on timeout so the caller keeps its liveness check,
-        mirroring ``try_get_output_async``'s contract. Used by the serving
-        final-output drain when ``VLLM_OMNI_EVENT_DRIVEN_ORCH`` is on.
-        """
-        executor = self._output_drain_executor
-        if executor is None:
-            executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=1,
-                thread_name_prefix="omni-output-drain",
-            )
-            self._output_drain_executor = executor
-
-        sync_q = self.output_queue.sync_q
-
-        def _drain_get() -> EngineQueueMessage | None:
-            # Exceptions are swallowed to a None sentinel: the queue may be
-            # closed mid-shutdown, and an exception left on an executor future
-            # after task cancellation would warn as never-retrieved.
-            try:
-                return sync_q.get(timeout=timeout)
-            except queue.Empty:
-                return None
-            except Exception:
-                return None
-
-        loop = asyncio.get_running_loop()
-        msg = await loop.run_in_executor(executor, _drain_get)
-        if msg is None and not self.is_alive():
+        except _QUEUE_SHUTDOWN_ERRORS:
+            # Queue shut down by an exiting orchestrator thread (see
+            # ``_bootstrap_orchestrator``); the engine is gone.
             raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
-        return msg
+        except queue.Empty:
+            if not self.is_alive():
+                raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
+            return None
+
+    async def try_get_output_async(self) -> EngineQueueMessage:
+        """Async read from the Orchestrator output queue.
+
+        Parks on ``async_q.get()`` and wakes the instant a message arrives
+        (event-driven, no polling and no drain thread). The orchestrator
+        pushes with ``sync_q.put_nowait`` from its own thread, so ``async_q``
+        binds to the caller's loop the first time it is awaited here. When the
+        orchestrator thread exits it shuts the queue down (after enqueuing a
+        fatal ``ErrorMessage`` on a crash, see ``_bootstrap_orchestrator``);
+        ``shutdown()`` drains queued messages first and then wakes any
+        still-parked getter, so this never hangs on a dead engine regardless
+        of timing.
+        """
+        try:
+            return await self.output_queue.async_q.get()
+        except _QUEUE_SHUTDOWN_ERRORS:
+            raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
 
     def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
         """Get cached metadata for a stage."""
@@ -1190,12 +1187,6 @@ class OmniEngineBase:
                     q.close()
             except Exception:
                 pass
-
-        if self._output_drain_executor is not None:
-            # Any in-flight blocking get bails out within its ≤1 s timeout
-            # (or immediately via the queue close above), so don't wait.
-            self._output_drain_executor.shutdown(wait=False)
-            self._output_drain_executor = None
 
         if hasattr(self, "_runtime") and self._runtime is not None and orchestrator_stopped:
             try:

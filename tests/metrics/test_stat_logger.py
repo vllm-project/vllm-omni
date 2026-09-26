@@ -529,7 +529,7 @@ async def test_orchestrator_records_stats_from_late_replica(stats_config, initia
     pool.process_llm_raw_outputs = AsyncMock(return_value=[])
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
-        output_async_queue=asyncio.Queue(),
+        output_sync_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[pool],
         log_stats=True,

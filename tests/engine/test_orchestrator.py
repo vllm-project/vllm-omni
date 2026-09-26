@@ -63,7 +63,7 @@ async def test_engine_dead_broadcasts_fatal_to_rpc_waiters(monkeypatch: pytest.M
     rpc_queue: asyncio.Queue = asyncio.Queue()
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
-        output_async_queue=asyncio.Queue(),
+        output_sync_queue=asyncio.Queue(),
         rpc_async_queue=rpc_queue,
         stage_pools=[],
     )
@@ -426,7 +426,7 @@ def _build_harness(
             rpc_queue = janus.Queue()
             orchestrator = Orchestrator(
                 request_async_queue=request_queue.async_q,
-                output_async_queue=output_queue.async_q,
+                output_sync_queue=output_queue.sync_q,
                 rpc_async_queue=rpc_queue.async_q,
                 stage_pools=stage_pools,
                 async_chunk=async_chunk,
@@ -1070,7 +1070,7 @@ async def test_abort_marks_only_last_final_stage_output_finished() -> None:
 
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
-        output_async_queue=asyncio.Queue(),
+        output_sync_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=pools,
     )
@@ -1091,7 +1091,7 @@ async def test_handle_abort_emits_error_result_on_failure() -> None:
     rpc_queue: asyncio.Queue = asyncio.Queue()
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
-        output_async_queue=asyncio.Queue(),
+        output_sync_queue=asyncio.Queue(),
         rpc_async_queue=rpc_queue,
         stage_pools=[],
     )
@@ -1436,7 +1436,7 @@ async def test_add_request_attaches_native_kv_ticket_before_dispatch(mocker, nat
     target = StagePool(1, FakeStageClient(stage_type="diffusion", final_output=True))
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
-        output_async_queue=asyncio.Queue(),
+        output_sync_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[source, target],
     )
@@ -2009,7 +2009,7 @@ async def test_raw_stage_error_reaches_caller_before_normal_terminal_routing(moc
     output_queue: asyncio.Queue[ErrorMessage] = asyncio.Queue()
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
-        output_async_queue=output_queue,
+        output_sync_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[],
     )
@@ -2051,7 +2051,7 @@ async def test_duplex_session_request_error_finish_is_delivered_as_request_error
     output_queue: asyncio.Queue = asyncio.Queue()
     orchestrator = Orchestrator(
         request_async_queue=asyncio.Queue(),
-        output_async_queue=output_queue,
+        output_sync_queue=output_queue,
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[],
     )

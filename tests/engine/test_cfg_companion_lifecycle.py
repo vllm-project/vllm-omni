@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Deterministic tests for the CFG-companion output lifecycle.
 
 Regression suite for the companion-output race behind the nightly Bagel
@@ -100,7 +100,7 @@ def _make_orchestrator(num_stages: int = 2) -> Orchestrator:
     orch._cfg_tracker = CfgCompanionTracker()
     orch.request_states = {}
     orch.stage_pools = [_FakePool("llm"), _FakePool("diffusion")][:num_stages]
-    orch.output_async_queue = asyncio.Queue()
+    orch.output_sync_queue = asyncio.Queue()
     orch.async_chunk = False
     orch.duplex_control_plane = None
     orch._pd_kv_params = {}
@@ -169,7 +169,7 @@ async def test_forward_re_defers_when_bundle_incomplete():
     deferred = orch._cfg_tracker.pop_pending_parent("p")
     assert deferred is not None
     assert orch._cfg_tracker.get_companion_outputs("p") == [{"o": 1}]
-    assert orch.output_async_queue.empty()
+    assert orch.output_sync_queue.empty()
 
 
 @pytest.mark.asyncio
@@ -186,7 +186,7 @@ async def test_forward_fails_request_when_bundle_lost():
 
     await orch._forward_to_next_stage("p", 0, {"parent": True}, state)
 
-    msg = orch.output_async_queue.get_nowait()
+    msg = orch.output_sync_queue.get_nowait()
     assert isinstance(msg, ErrorMessage)
     assert msg.request_id == "p"
     assert "incomplete" in msg.error
@@ -205,7 +205,7 @@ async def test_companion_abort_fails_deferred_parent():
 
     await orch._handle_abort(AbortRequestMessage(request_ids=["p__neg"]))
 
-    msg = orch.output_async_queue.get_nowait()
+    msg = orch.output_sync_queue.get_nowait()
     assert isinstance(msg, ErrorMessage)
     assert msg.request_id == "p"
     assert "p__neg" in msg.error
@@ -213,7 +213,7 @@ async def test_companion_abort_fails_deferred_parent():
     assert not orch._cfg_tracker.is_companion("p__neg")
     # Idempotent: a repeated abort of the same companion is a no-op.
     await orch._handle_abort(AbortRequestMessage(request_ids=["p__neg"]))
-    assert orch.output_async_queue.empty()
+    assert orch.output_sync_queue.empty()
 
 
 @pytest.mark.asyncio
@@ -228,7 +228,7 @@ async def test_companion_abort_after_completion_does_not_fail_parent():
 
     await orch._handle_abort(AbortRequestMessage(request_ids=["p__neg"]))
 
-    assert orch.output_async_queue.empty()  # no parent failure emitted
+    assert orch.output_sync_queue.empty()  # no parent failure emitted
     assert "p" in orch.request_states  # parent untouched
     assert orch._cfg_tracker.get_companion_outputs("p") == [{"o": 1}]  # bundle intact
 
@@ -296,7 +296,7 @@ async def test_replica_loss_of_companion_fails_deferred_parent():
 
     await orch._cleanup_request_ids(["p__neg"])
 
-    msg = orch.output_async_queue.get_nowait()
+    msg = orch.output_sync_queue.get_nowait()
     assert isinstance(msg, ErrorMessage)
     assert msg.request_id == "p"
     assert "p__neg" in msg.error
@@ -316,7 +316,7 @@ async def test_finished_companion_cleanup_preserves_parent_bundle():
 
     await orch._cleanup_request_ids(["p__neg"])
 
-    assert orch.output_async_queue.empty()
+    assert orch.output_sync_queue.empty()
     assert "p" in orch.request_states
     assert orch._cfg_tracker.get_companion_outputs("p") == [{"o": 1}]
 
@@ -332,7 +332,7 @@ async def test_parent_abort_still_expands_to_companions():
 
     await orch._handle_abort(AbortRequestMessage(request_ids=["p"]))
 
-    assert orch.output_async_queue.empty()
+    assert orch.output_sync_queue.empty()
     assert "p" not in orch.request_states
     assert not orch._cfg_tracker.is_companion("p__neg")
     aborted = {rid for pool in orch.stage_pools for batch in pool.aborted for rid in batch}
