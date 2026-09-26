@@ -46,6 +46,7 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.quantization import resolve_component_quant_config
 from vllm_omni.transformers_utils.configs.sensenova_u1 import (
     SenseNovaU1Config,
 )
@@ -513,6 +514,7 @@ class SenseNovaU1Pipeline(
         # Language model (TP-aware)
         self.language_model = SenseNovaU1ForCausalLM(
             self.llm_cfg,
+            quant_config=resolve_component_quant_config(od_config.quantization_config, "language_model"),
             prefix="language_model",
         )
         # Cache-DiT hooks pipeline.transformer(.blocks), so it must point at the

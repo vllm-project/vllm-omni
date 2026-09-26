@@ -90,6 +90,17 @@ python examples/online_serving/sensenova_u1/openai_chat_client.py \
 
 `-s` takes the base URL; the client appends `/v1` itself.
 
+##### Online FP8 quantization
+
+For online serving on the tested A800/vLLM 0.29.0 setup, add
+`--quantization fp8` and disable the CUTLASS FP8 kernel to use Marlin W8A16:
+
+```bash
+VLLM_DISABLED_KERNELS=CutlassFP8ScaledMMLinearKernel \
+vllm serve sensenova/SenseNova-U1.5-8B-MoT --omni \
+    --quantization fp8 --port 8091
+```
+
 #### Measured latency (1x A800 80GB, 25 steps, median of 3 after a warmup)
 
 | Resolution | Step latency | Total |
