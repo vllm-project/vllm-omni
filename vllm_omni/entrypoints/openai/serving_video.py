@@ -316,7 +316,7 @@ class OmniOpenAIServingVideo:
             )
             vp.width = vp.width or video_defaults.width
             vp.height = vp.height or video_defaults.height
-            if num_frames_provided and vp.num_frames != video_defaults.num_frames:
+            if video_defaults.fixed_num_frames and num_frames_provided and vp.num_frames != video_defaults.num_frames:
                 raise HTTPException(
                     status_code=HTTPStatus.BAD_REQUEST.value,
                     detail=(f"This diffusion model requires {video_defaults.num_frames} frames; got {vp.num_frames}."),
