@@ -16,6 +16,7 @@ from pytest_mock import MockerFixture
 import vllm_omni.diffusion.diffusion_engine as diffusion_engine_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import (
+    DIFFUSION_PROGRESS_KEY,
     DIFFUSION_REQUEST_LIFECYCLE_KEY,
     DIFFUSION_REQUEST_STARTED,
     DiffusionOutput,
@@ -26,6 +27,7 @@ from vllm_omni.diffusion.diffusion_engine import (
     DiffusionExecutionMode,
     _move_tensor_tree_to_cpu,
 )
+from vllm_omni.diffusion.models.progress_bar import DiffusionProgress
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
@@ -208,6 +210,33 @@ def test_request_started_output_is_emitted_only_for_opted_in_requests() -> None:
         DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED,
     }
     assert formatted.finished is False
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("completed", "total", "expected"),
+    [(0, 49, 0), (1, 3, 33), (31, 49, 63), (49, 49, 99)],
+)
+def test_progress_output_is_non_final(completed, total, expected) -> None:
+    request = OmniDiffusionRequest(
+        prompt="test video",
+        sampling_params=OmniDiffusionSamplingParams(emit_request_lifecycle=True),
+        request_id="video-progress",
+    )
+    engine = object.__new__(DiffusionEngine)
+    emitted = []
+    engine._put_output = lambda request_id, output: emitted.append((request_id, output))
+
+    engine._on_progress(DiffusionProgress(request.request_id, completed, total))
+
+    [(request_id, output)] = emitted
+    assert request_id == request.request_id
+
+    [formatted] = engine.postprocess_output(request, output)
+    assert formatted.request_id == request.request_id
+    assert formatted.custom_output == {DIFFUSION_PROGRESS_KEY: expected}
+    assert formatted.finished is False
+    assert formatted.images == []
 
 
 class TestRequestBatchCapability:

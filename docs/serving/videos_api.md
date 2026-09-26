@@ -44,7 +44,7 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 | ---------- | -------- | ------------- |
 | `/v1/videos` | `POST` | Create an asynchronous video generation job |
 | `/v1/videos/sync` | `POST` | Generate a video synchronously and return raw video bytes |
-| `/v1/videos/{video_id}` | `GET` | Retrieve job status and metadata |
+| `/v1/videos/{video_id}` | `GET` | Retrieve job status, progress, and metadata ([response fields](#retrieve-response)) |
 | `/v1/videos` | `GET` | List stored video jobs |
 | `/v1/videos/{video_id}/content` | `GET` | Download generated video content |
 | `/v1/videos/{video_id}` | `DELETE` | Delete a video job and stored output |
@@ -133,6 +133,44 @@ In step execution mode, cancellation is handled by the scheduler between steps;
 the request-mode component-boundary checks do not apply within an active step.
 Other pipelines may still drain their current request batch.
 The job is then re-read so a completed save is not orphaned.
+
+### Retrieve Response
+
+`GET /v1/videos/{video_id}` returns the stored video job as JSON. It returns HTTP 200 for `queued`, `in_progress`, and `completed` jobs. Nullable fields are included as `null` when unavailable; the response contains metadata, not video bytes.
+
+#### OpenAI-style fields
+
+| Field | JSON type | Description |
+| --- | --- | --- |
+| `id` | string | Job identifier returned by `POST /v1/videos`. |
+| `object` | string | Always `"video"`. |
+| `model` | string | Model name recorded for the job. |
+| `prompt` | string | Generation prompt. |
+| `status` | string | `queued`, `in_progress`, `completed`, or `failed`. |
+| `progress` | integer | Best-effort denoising progress from 0 to 100. |
+| `size` | string or null | Requested `WIDTHxHEIGHT` value from `size`; may be null when dimensions were supplied through other parameters. |
+| `seconds` | string | Requested `seconds` value, or the job record default `"4"`. For the resolved duration, use `duration_s` when available. |
+| `quality` | string | Requested quality, or `"default"`. |
+| `created_at` | integer | Job creation time as a Unix timestamp in seconds. |
+| `completed_at` | integer or null | Terminal timestamp, populated on completion or failure. |
+| `remixed_from_video_id` | string or null | Source job identifier for remix flows, when populated. |
+| `error` | object or null | Failure details: `code` and `message`. On a failed GET response, `code` is the integer HTTP status code. |
+
+#### vLLM-Omni extension fields
+
+| Field | JSON type | Description |
+| --- | --- | --- |
+| `media_type` | string | `"video/mp4"`. |
+| `expires_at` | integer or null | Expiration timestamp in seconds, when provided by storage. |
+| `file_name` | string or null | Saved output filename, populated after successful storage. Download through `/v1/videos/{video_id}/content`. |
+| `inference_time_s` | number or null | Time from the background generation job starting through output storage, in seconds; populated on success. |
+| `fps` | number or null | Resolved FPS. Initially taken from request parameters and updated from output metadata when available. |
+| `num_frames` | integer or null | Resolved frame count. Initially taken from request parameters and updated from output metadata when available. |
+| `duration_s` | number or null | Resolved duration in seconds. Initially derived from request parameters and updated from output metadata when available. |
+| `metrics` | object or null | Optional generation metrics, when populated. |
+| `stage_durations` | object | Pipeline-reported stage durations; defaults to `{}`. |
+| `peak_memory_mb` | number | Pipeline-reported peak device memory in MB; defaults to `0.0` before a value is reported. |
+| `action` | object or null | Action-capable model output: `data`, `shape`, and optional `dtype`, `raw_action_dim`, `action_mode`, and `domain_id`. |
 
 ### Synchronous Response
 

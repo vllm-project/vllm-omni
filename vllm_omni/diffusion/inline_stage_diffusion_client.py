@@ -21,7 +21,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import (
     DiffusionRequestAbortedError,
-    is_diffusion_request_started_output,
+    is_diffusion_request_lifecycle_output,
 )
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -166,7 +166,7 @@ class InlineStageDiffusionClient(StageClientBase):
                 result = None
                 async for results in self._engine.step_streaming(request):
                     output = results[0]
-                    if is_diffusion_request_started_output(output):
+                    if is_diffusion_request_lifecycle_output(output):
                         if not output.request_id:
                             output.request_id = request_id
                         self._output_queue.put_nowait(output)

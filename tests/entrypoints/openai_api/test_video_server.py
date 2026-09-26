@@ -253,6 +253,7 @@ class BlockingVideoHandler:
         reference_video=None,
         reference_audio=None,
         on_started=None,
+        on_progress=None,
         latent_edit_input=None,
     ):
         del request, reference_id, reference_image, reference_video, reference_audio, latent_edit_input
@@ -293,6 +294,7 @@ class CompletingDuringAbortHandler(BlockingVideoHandler):
         reference_video=None,
         reference_audio=None,
         on_started=None,
+        on_progress=None,
         latent_edit_input=None,
     ):
         del request, reference_image, reference_video, reference_audio, latent_edit_input
@@ -330,6 +332,7 @@ class SchedulerQueuedVideoHandler(BlockingVideoHandler):
         reference_video=None,
         reference_audio=None,
         on_started=None,
+        on_progress=None,
         latent_edit_input=None,
     ):
         del request, reference_id, reference_image, reference_video, reference_audio, latent_edit_input
@@ -3282,3 +3285,41 @@ def test_worker_fps_multiplier_is_applied_to_sync_encoding(test_client, mocker: 
     assert response.status_code == 200
     assert response.content == b"fps-multiplied"
     assert fps_values == [16]
+
+
+def test_video_polling_exposes_denoising_progress_before_completion(test_client, mocker):
+    from vllm_omni.diffusion.data import DIFFUSION_PROGRESS_KEY
+
+    reached_step = threading.Event()
+    finish = threading.Event()
+
+    class ProgressOmni(FakeAsyncOmni):
+        async def generate(self, prompt, request_id, sampling_params_list):
+            assert sampling_params_list[0].emit_request_lifecycle
+            yield MockVideoResult([], custom_output={DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED})
+            # A lower progress update must not decrease the stored percentage.
+            for value in (25, 10, 50):
+                yield MockVideoResult([], custom_output={DIFFUSION_PROGRESS_KEY: value})
+            reached_step.set()
+            while not finish.is_set():
+                await asyncio.sleep(0.01)
+            yield MockVideoResult([], custom_output={DIFFUSION_PROGRESS_KEY: 99})
+            async for output in super().generate(prompt, request_id, sampling_params_list):
+                yield output
+
+    test_client.app.state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
+        ProgressOmni(), model_name="test-model"
+    )
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"video")
+    response = test_client.post("/v1/videos", data={"prompt": "test"})
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    try:
+        assert reached_step.wait(3)
+        data = test_client.get(f"/v1/videos/{video_id}").json()
+        assert data["status"] == "in_progress"
+        assert data["progress"] == 50
+    finally:
+        finish.set()
+    _wait_for_status(test_client, video_id, "completed")
+    assert test_client.get(f"/v1/videos/{video_id}").json()["progress"] == 100

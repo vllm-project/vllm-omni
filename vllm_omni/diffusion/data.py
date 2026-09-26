@@ -1765,6 +1765,19 @@ class OmniDiffusionConfig:
 
 DIFFUSION_REQUEST_LIFECYCLE_KEY = "_diffusion_request_lifecycle"
 DIFFUSION_REQUEST_STARTED = "started"
+DIFFUSION_PROGRESS_KEY = "_diffusion_progress"
+
+
+def is_diffusion_request_lifecycle_output(output: Any) -> bool:
+    return is_diffusion_request_started_output(output) or get_diffusion_progress(output) is not None
+
+
+def get_diffusion_progress(output: Any) -> int | None:
+    """Return the denoising percentage, or None for outputs without progress."""
+    custom_output = getattr(output, "custom_output", None)
+    if isinstance(custom_output, dict):
+        return custom_output.get(DIFFUSION_PROGRESS_KEY)
+    return None
 
 
 def is_diffusion_request_started_output(output: Any) -> bool:
@@ -1826,10 +1839,12 @@ class DiffusionOutput:
     # Internal control-plane event emitted on first scheduler admission.
     request_started: bool = False
 
-    # Typed video-media contract. Declared last so the pre-existing positional
+    # Typed video-media contract. Appended after legacy fields so the positional
     # constructor order (output, trajectory_timesteps, ...) that out-of-tree
     # pipelines rely on is preserved. Mutually exclusive with ``output``.
     media: DiffusionMediaOutput | None = None
+
+    denoising_progress: int | None = None
 
     def __post_init__(self) -> None:
         if self.media is not None and not isinstance(self.media, DiffusionMediaOutput):

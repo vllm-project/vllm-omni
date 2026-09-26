@@ -27,6 +27,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_omni.diffusion.cancellation import RequestCancellationRegistry
 from vllm_omni.diffusion.data import (
+    DIFFUSION_PROGRESS_KEY,
     DIFFUSION_REQUEST_LIFECYCLE_KEY,
     DIFFUSION_REQUEST_STARTED,
     DiffusionOutput,
@@ -299,6 +300,8 @@ class DiffusionEngine:
                     kv_vllm_config=kv_vllm_config,
                 )
             self._init_runtime_state()
+            if self.executor.uses_multiproc:
+                self.executor.progress_callback = self._on_progress
             self._init_execute_fn()
             self._log_execution_mode(od_config)
         except Exception:
@@ -551,6 +554,14 @@ class DiffusionEngine:
             final_output = output
         return final_output or []
 
+    def _on_progress(self, progress) -> None:
+        # Denoising is only part of the job; reserve 100 for persisted output.
+        if progress.total > 0:
+            self._put_output(
+                progress.request_id,
+                DiffusionOutput(finished=False, denoising_progress=min(99, progress.completed * 100 // progress.total)),
+            )
+
     def postprocess_output(
         self,
         request: OmniDiffusionRequest,
@@ -567,6 +578,12 @@ class DiffusionEngine:
                     error_type=output.error_type,
                 )
             raise RuntimeError(output.error)
+        if output.denoising_progress is not None:
+            return format_empty_diffusion_outputs(
+                request,
+                finished=False,
+                custom_output={DIFFUSION_PROGRESS_KEY: output.denoising_progress},
+            )
         if output.request_started:
             return format_empty_diffusion_outputs(
                 request,

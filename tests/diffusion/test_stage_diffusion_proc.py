@@ -9,7 +9,11 @@ import pytest
 
 import vllm_omni.diffusion.stage_diffusion_proc as stage_diffusion_proc
 import vllm_omni.plugins as omni_plugins
-from vllm_omni.diffusion.data import DIFFUSION_REQUEST_LIFECYCLE_KEY, DIFFUSION_REQUEST_STARTED
+from vllm_omni.diffusion.data import (
+    DIFFUSION_PROGRESS_KEY,
+    DIFFUSION_REQUEST_LIFECYCLE_KEY,
+    DIFFUSION_REQUEST_STARTED,
+)
 from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -105,11 +109,14 @@ async def test_proc_streaming_request_yields_each_engine_chunk():
 
 
 @pytest.mark.asyncio
-async def test_proc_non_streaming_forwards_lifecycle_before_final_output():
+@pytest.mark.parametrize(
+    "event", [{DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED}, {DIFFUSION_PROGRESS_KEY: 50}]
+)
+async def test_proc_non_streaming_forwards_lifecycle_before_final_output(event):
     lifecycle = OmniRequestOutput.from_diffusion(
         request_id="",
         images=[],
-        custom_output={DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED},
+        custom_output=event,
         finished=False,
     )
     intermediate = OmniRequestOutput.from_diffusion(
@@ -138,7 +145,7 @@ async def test_proc_non_streaming_forwards_lifecycle_before_final_output():
         request_id="req-lifecycle",
         prompt="prompt",
         sampling_params_dict=asdict(OmniDiffusionSamplingParams()),
-        on_request_started=_capture,
+        on_request_lifecycle=_capture,
     )
 
     assert intermediate_outputs == [lifecycle]

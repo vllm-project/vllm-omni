@@ -11,6 +11,7 @@ Original source at https://github.com/dougbtv/comfyui-vllm-omni, distributed und
 
 import asyncio
 import json
+from collections.abc import Callable
 from typing import Any
 
 import aiohttp
@@ -286,6 +287,7 @@ class VLLMOmniClient:
         lora: dict | None = None,
         latent_edit: dict | None = None,
         spec_model: str | None = None,
+        on_progress: Callable[[int], None] | None = None,
         **extra_params,
     ) -> VideoInput:
         """Post a video job and return the decoded result.
@@ -475,6 +477,17 @@ class VLLMOmniClient:
             if (job_status := data.get("status", None)) is None:
                 raise RuntimeError("API response missing job 'status' field - expected OpenAI compliant format")
 
+            progress = 0
+
+            def report_progress():
+                nonlocal progress
+                value = data.get("progress")
+                if isinstance(value, (int, float)) and 0 <= value <= 100:
+                    progress = max(progress, min(99, int(value)))
+                if on_progress is not None:
+                    on_progress(progress)
+
+            report_progress()
             # Poll for video generation job completion
             deadline = asyncio.get_running_loop().time() + self.max_poll_duration
             url = f"{self.base_url}/videos/{job_id}"
@@ -484,7 +497,8 @@ class VLLMOmniClient:
                 data = await url_json(session, url)
                 if (job_status := data.get("status", None)) is None:
                     raise RuntimeError("API response missing job 'status' field - expected OpenAI compliant format")
-                if asyncio.get_running_loop().time() >= deadline:
+                report_progress()
+                if job_status not in {"completed", "failed"} and asyncio.get_running_loop().time() >= deadline:
                     raise RuntimeError(f"Timed out waiting for video job {job_id} to complete")
 
             if job_status == "failed":
@@ -495,7 +509,10 @@ class VLLMOmniClient:
 
             # Decode video and make a best effort at cleaning up server resources
             try:
-                return bytes_to_video(video_bytes)
+                video = bytes_to_video(video_bytes)
+                if on_progress is not None:
+                    on_progress(100)
+                return video
             finally:
                 try:
                     await url_json(session, url, "delete")
