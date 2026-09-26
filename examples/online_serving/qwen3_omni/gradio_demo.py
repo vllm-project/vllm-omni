@@ -118,12 +118,14 @@ def audio_to_base64_data_url(audio_data: tuple[np.ndarray, int]) -> str:
     audio_np, sample_rate = audio_data
     # Convert to int16 format for WAV
     if audio_np.dtype != np.int16:
-        # Normalize to [-1, 1] range if needed
-        if audio_np.dtype == np.float32 or audio_np.dtype == np.float64:
-            audio_np = np.clip(audio_np, -1.0, 1.0)
-            audio_np = (audio_np * 32767).astype(np.int16)
+        if np.issubdtype(audio_np.dtype, np.floating):
+            # Normalize to [-1, 1] range if needed
+            audio_f = np.clip(audio_np.astype(np.float64), -1.0, 1.0)
         else:
-            audio_np = audio_np.astype(np.int16)
+            # Integer PCM uses the full dtype range as full scale; pydub pads
+            # 24-bit sources to int32, so a bare astype(int16) would wrap.
+            audio_f = audio_np.astype(np.float64) / (1 << (np.iinfo(audio_np.dtype).bits - 1))
+        audio_np = np.clip(audio_f * 32768, -32768, 32767).astype(np.int16)
 
     # Write to WAV bytes
     buffered = io.BytesIO()
