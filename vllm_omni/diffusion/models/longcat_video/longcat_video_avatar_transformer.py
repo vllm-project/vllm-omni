@@ -18,10 +18,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from safetensors.torch import load_file
+from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as VllmAttention
+
+logger = init_logger(__name__)
+
+_DEFAULT_BSA_PARAMS = {
+    "sparsity": 0.875,
+    "cdf_threshold": None,
+    "chunk_3d_shape_q": (4, 4, 8),
+    "chunk_3d_shape_k": (4, 4, 8),
+}
 
 
 def linear_fp32(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -406,8 +416,6 @@ class Attention(nn.Module):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("dim must be divisible by num_heads")
-        if enable_bsa:
-            raise NotImplementedError("LongCat-Video-Avatar block-sparse attention is not supported in native MVP.")
         if cp_split_hw not in (None, [1, 1], (1, 1)):
             raise NotImplementedError("LongCat-Video-Avatar context parallel attention is not supported in native MVP.")
 
@@ -415,6 +423,9 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim**-0.5
+        self.enable_bsa = enable_bsa
+        self.bsa_params = dict(_DEFAULT_BSA_PARAMS)
+        self.bsa_params.update(bsa_params or {})
 
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.q_norm = RMSNorm_FP32(self.head_dim, eps=1e-6)
@@ -432,9 +443,84 @@ class Attention(nn.Module):
             qkv_layout="BSND",
         )
 
-    def _process_attn(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    def _bsa_latent_shapes(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        shape: tuple[int, int, int] | None,
+        log_fallback: bool = False,
+    ) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
+        def fallback(reason: str) -> None:
+            if log_fallback:
+                logger.warning_once("LongCat-Video-Avatar BSA staying dense: %s", reason)
+
+        if not self.enable_bsa or q.shape[2] == 0:
+            return None
+        if shape is None:
+            fallback("latent shape metadata is missing")
+            return None
+        if q.device.type != "cuda":
+            fallback(f"device {q.device.type!r} is not CUDA")
+            return None
+        if q.shape[2] != k.shape[2]:
+            fallback(f"query/key sequence lengths differ ({q.shape[2]} vs {k.shape[2]})")
+            return None
+
+        _, num_h, num_w = shape
+        tokens_per_frame = num_h * num_w
+        if tokens_per_frame <= 0 or q.shape[2] % tokens_per_frame != 0 or k.shape[2] % tokens_per_frame != 0:
+            fallback(
+                "sequence length is not frame-aligned for latent grid "
+                f"shape={shape}, q_len={q.shape[2]}, k_len={k.shape[2]}"
+            )
+            return None
+
+        latent_shape_q = (q.shape[2] // tokens_per_frame, num_h, num_w)
+        latent_shape_k = (k.shape[2] // tokens_per_frame, num_h, num_w)
+        chunk_q = tuple(self.bsa_params["chunk_3d_shape_q"])
+        chunk_k = tuple(self.bsa_params["chunk_3d_shape_k"])
+        if any(size <= 0 for size in chunk_q + chunk_k):
+            raise ValueError("LongCat-Video-Avatar BSA chunk sizes must be positive.")
+        if any(dim % chunk != 0 for dim, chunk in zip(latent_shape_q, chunk_q, strict=True)):
+            fallback(f"query latent shape {latent_shape_q} is not divisible by chunk_3d_shape_q={chunk_q}")
+            return None
+        if any(dim % chunk != 0 for dim, chunk in zip(latent_shape_k, chunk_k, strict=True)):
+            fallback(f"key latent shape {latent_shape_k} is not divisible by chunk_3d_shape_k={chunk_k}")
+            return None
+        logger.info_once(
+            "LongCat-Video-Avatar BSA active: latent_shape_q=%s, latent_shape_k=%s, "
+            "chunk_3d_shape_q=%s, chunk_3d_shape_k=%s, sparsity=%s, cdf_threshold=%s",
+            latent_shape_q,
+            latent_shape_k,
+            chunk_q,
+            chunk_k,
+            self.bsa_params["sparsity"],
+            self.bsa_params["cdf_threshold"],
+        )
+        return latent_shape_q, latent_shape_k
+
+    def _process_attn(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        shape: tuple[int, int, int] | None = None,
+    ) -> torch.Tensor:
         if q.shape[2] == 0:
             return q
+        bsa_shapes = self._bsa_latent_shapes(q, k, shape, log_fallback=True)
+        if bsa_shapes is not None:
+            from vllm_omni.diffusion.models.longcat_video.longcat_video_avatar_bsa import flash_attn_bsa_3d
+
+            latent_shape_q, latent_shape_k = bsa_shapes
+            return flash_attn_bsa_3d(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                latent_shape_q,
+                latent_shape_k,
+                **self.bsa_params,
+            )
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
@@ -473,9 +559,9 @@ class Attention(nn.Module):
                 q_cond = q[:, :, :num_cond_latents_thw].contiguous()
                 k_cond = k[:, :, :num_cond_latents_thw].contiguous()
                 v_cond = v[:, :, :num_cond_latents_thw].contiguous()
-                x_cond = self._process_attn(q_cond, k_cond, v_cond)
+                x_cond = self._process_attn(q_cond, k_cond, v_cond, shape)
                 q_noise = q[:, :, num_cond_latents_thw:].contiguous()
-                x_noise = self._process_attn(q_noise, k, v)
+                x_noise = self._process_attn(q_noise, k, v, shape)
                 x = torch.cat([x_cond, x_noise], dim=2).contiguous()
             else:
                 if num_ref_latents is None or ref_img_index is None:
@@ -487,8 +573,8 @@ class Attention(nn.Module):
                 q_cond = q[:, :, num_ref_latents_thw:num_cond_latents_thw].contiguous()
                 k_cond = k[:, :, num_ref_latents_thw:num_cond_latents_thw].contiguous()
                 v_cond = v[:, :, num_ref_latents_thw:num_cond_latents_thw].contiguous()
-                x_ref = self._process_attn(q_ref, k_ref, v_ref)
-                x_cond = self._process_attn(q_cond, k_cond, v_cond)
+                x_ref = self._process_attn(q_ref, k_ref, v_ref, shape)
+                x_cond = self._process_attn(q_cond, k_cond, v_cond, shape)
                 if num_cond_latents == shape[0]:
                     x = torch.cat([x_ref, x_cond], dim=2).contiguous()
                 else:
@@ -506,15 +592,15 @@ class Attention(nn.Module):
                         q_noise_back = q_noise[:, :, end_pos:].contiguous()
                         k_non_ref = k[:, :, num_ref_latents_thw:].contiguous()
                         v_non_ref = v[:, :, num_ref_latents_thw:].contiguous()
-                        x_noise_front = self._process_attn(q_noise_front, k, v)
-                        x_noise_maskref = self._process_attn(q_noise_maskref, k_non_ref, v_non_ref)
-                        x_noise_back = self._process_attn(q_noise_back, k, v)
+                        x_noise_front = self._process_attn(q_noise_front, k, v, shape)
+                        x_noise_maskref = self._process_attn(q_noise_maskref, k_non_ref, v_non_ref, shape)
+                        x_noise_back = self._process_attn(q_noise_back, k, v, shape)
                         x_noise = torch.cat([x_noise_front, x_noise_maskref, x_noise_back], dim=2).contiguous()
                     else:
-                        x_noise = self._process_attn(q_noise, k, v)
+                        x_noise = self._process_attn(q_noise, k, v, shape)
                     x = torch.cat([x_ref, x_cond, x_noise], dim=2).contiguous()
         else:
-            x = self._process_attn(q, k, v)
+            x = self._process_attn(q, k, v, shape)
 
         x = x.transpose(1, 2).reshape(bsz, seq_len, channels)
         x = self.proj(x)
@@ -592,12 +678,12 @@ class Attention(nn.Module):
             q_noise_back = q[:, :, end_pos:].contiguous()
             k_non_ref = k_full[:, :, num_ref_latents_thw:].contiguous()
             v_non_ref = v_full[:, :, num_ref_latents_thw:].contiguous()
-            x_noise_front = self._process_attn(q_noise_front, k_full, v_full)
-            x_noise_maskref = self._process_attn(q_noise_maskref, k_non_ref, v_non_ref)
-            x_noise_back = self._process_attn(q_noise_back, k_full, v_full)
+            x_noise_front = self._process_attn(q_noise_front, k_full, v_full, shape)
+            x_noise_maskref = self._process_attn(q_noise_maskref, k_non_ref, v_non_ref, shape)
+            x_noise_back = self._process_attn(q_noise_back, k_full, v_full, shape)
             x_attn = torch.cat([x_noise_front, x_noise_maskref, x_noise_back], dim=2).contiguous()
         else:
-            x_attn = self._process_attn(q, k_full, v_full)
+            x_attn = self._process_attn(q, k_full, v_full, shape)
 
         x_out = x_attn.transpose(1, 2).reshape(bsz, seq_len, channels)
         x_out = self.proj(x_out)
@@ -1340,8 +1426,6 @@ class LongCatVideoAvatarTransformer3DModel(nn.Module):
         class_interval: int = 4,
     ) -> None:
         super().__init__()
-        if enable_bsa:
-            raise NotImplementedError("LongCat-Video-Avatar BSA is not supported in native MVP.")
         if cp_split_hw not in (None, [1, 1], (1, 1)):
             raise NotImplementedError("LongCat-Video-Avatar context parallel is not supported in native MVP.")
 
@@ -1491,10 +1575,12 @@ class LongCatVideoAvatarTransformer3DModel(nn.Module):
         self.active_loras.clear()
 
     def enable_bsa(self):
-        raise NotImplementedError("LongCat-Video-Avatar BSA is not supported in native MVP.")
+        for block in self.blocks:
+            block.attn.enable_bsa = True
 
     def disable_bsa(self):
-        return None
+        for block in self.blocks:
+            block.attn.enable_bsa = False
 
     def forward(
         self,
