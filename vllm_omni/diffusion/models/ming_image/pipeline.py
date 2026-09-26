@@ -366,7 +366,7 @@ class MingImageDiffusionPipeline(ZImagePipeline):
             image = self._decode_latent_frames(latent_output.output)
             return DiffusionOutput(
                 output=image,
-                stage_durations=latent_output.stage_durations,
+                stage_durations=self.stage_durations if hasattr(self, "_stage_durations") else None,
             )
         finally:
             set_forward_context_ref_latent(None)
