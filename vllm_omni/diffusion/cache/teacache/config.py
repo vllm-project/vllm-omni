@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
 
@@ -91,6 +91,9 @@ _MODEL_COEFFICIENTS = {
         -4.232669906169421e00,
         2.173782527946167e-01,
     ],
+    # Helios starts from the unscaled relative-L1 signal. Threshold calibration
+    # is kept separate because its history changes at every generated chunk.
+    "HeliosTransformer3DModel": [0.0, 0.0, 0.0, 1.0, 0.0],
 }
 
 _DEFAULT_REL_L1_THRESH = 0.2

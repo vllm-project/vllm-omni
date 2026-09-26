@@ -27,6 +27,14 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
+from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
+from vllm_omni.diffusion.cache.teacache.state import TeaCacheState
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_classifier_free_guidance_rank,
+    get_classifier_free_guidance_world_size,
+    get_sequence_parallel_world_size,
+    get_sp_group,
+)
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelOutput
 
 if TYPE_CHECKING:
@@ -793,6 +801,55 @@ class HeliosTransformer3DModel(nn.Module):
         self._projected_encoder_cache: OrderedDict[tuple, torch.Tensor] = OrderedDict()
         self._cross_attn_kv_cache: OrderedDict[tuple, list[tuple[torch.Tensor, torch.Tensor]]] = OrderedDict()
         self._cross_attn_cache_size = 2
+        self._tea_cache_config: TeaCacheConfig | None = None
+        self._tea_cache_states = {"positive": TeaCacheState(), "negative": TeaCacheState()}
+        self._tea_cache_forward_count = 0
+        self.do_true_cfg = False
+
+    def enable_teacache(self, config: TeaCacheConfig) -> None:
+        self._tea_cache_config = config
+        self.reset_teacache()
+
+    def reset_teacache(self) -> None:
+        for state in self._tea_cache_states.values():
+            state.reset()
+        self._tea_cache_forward_count = 0
+
+    def _teacache_state(self) -> TeaCacheState:
+        branch = "positive"
+        if self.do_true_cfg:
+            if get_classifier_free_guidance_world_size() > 1:
+                branch = "negative" if get_classifier_free_guidance_rank() > 0 else "positive"
+            elif self._tea_cache_forward_count % 2 == 1:
+                branch = "negative"
+        return self._tea_cache_states[branch]
+
+    def _teacache_should_compute(self, state: TeaCacheState, modulated_input: torch.Tensor) -> bool:
+        config = self._tea_cache_config
+        assert config is not None and config.rel_l1_thresh is not None and config.coefficients is not None
+        if state.cnt == 0 or state.previous_modulated_input is None:
+            state.accumulated_rel_l1_distance = 0.0
+            return True
+        relative_l1 = (
+            (modulated_input - state.previous_modulated_input).abs().mean()
+            / (state.previous_modulated_input.abs().mean() + 1e-8)
+        ).item()
+        rescaled = 0.0
+        for coefficient in config.coefficients:
+            rescaled = rescaled * relative_l1 + coefficient
+        state.accumulated_rel_l1_distance += abs(rescaled)
+        if state.accumulated_rel_l1_distance < config.rel_l1_thresh:
+            return False
+        state.accumulated_rel_l1_distance = 0.0
+        return True
+
+    @staticmethod
+    def _sync_teacache_decision(local_should_compute: bool, device: torch.device) -> bool:
+        if get_sequence_parallel_world_size() == 1:
+            return local_should_compute
+        decision = torch.tensor(int(local_should_compute), dtype=torch.int32, device=device)
+        get_sp_group().all_reduce(decision, op=torch.distributed.ReduceOp.MAX)
+        return bool(decision.item())
 
     @property
     def dtype(self) -> torch.dtype:
@@ -1024,16 +1081,47 @@ class HeliosTransformer3DModel(nn.Module):
         rotary_emb = rotary_emb.contiguous()
         cross_attn_key_values = self._get_cross_attn_key_values(encoder_hidden_states)
 
-        for block_idx, block in enumerate(self.blocks):
-            cross_attn_key_value = None if cross_attn_key_values is None else cross_attn_key_values[block_idx]
-            hidden_states = block(
-                hidden_states,
-                encoder_hidden_states,
-                timestep_proj,
-                rotary_emb,
-                original_context_length,
-                cross_attn_key_value,
+        tea_state = None
+        modulated_input = None
+        original_hidden_states = None
+        should_compute = True
+        if self._tea_cache_config is not None:
+            tea_state = self._teacache_state()
+            first_block = self.blocks[0]
+            shift_msa, scale_msa, *_ = (first_block.scale_shift_table.unsqueeze(0) + timestep_proj.float()).chunk(
+                6, dim=2
             )
+            modulated_input = (
+                first_block.norm1(hidden_states.float()) * (1 + scale_msa.squeeze(2)) + shift_msa.squeeze(2)
+            ).type_as(hidden_states)
+            local_should_compute = self._teacache_should_compute(tea_state, modulated_input)
+            should_compute = self._sync_teacache_decision(local_should_compute, hidden_states.device)
+            if should_compute and not local_should_compute:
+                tea_state.accumulated_rel_l1_distance = 0.0
+            if not should_compute and tea_state.previous_residual is not None:
+                hidden_states = hidden_states + tea_state.previous_residual
+            else:
+                should_compute = True
+                original_hidden_states = hidden_states
+
+        if should_compute:
+            for block_idx, block in enumerate(self.blocks):
+                cross_attn_key_value = None if cross_attn_key_values is None else cross_attn_key_values[block_idx]
+                hidden_states = block(
+                    hidden_states,
+                    encoder_hidden_states,
+                    timestep_proj,
+                    rotary_emb,
+                    original_context_length,
+                    cross_attn_key_value,
+                )
+
+        if tea_state is not None and modulated_input is not None:
+            if original_hidden_states is not None:
+                tea_state.previous_residual = (hidden_states - original_hidden_states).detach()
+            tea_state.previous_modulated_input = modulated_input.detach()
+            tea_state.cnt += 1
+            self._tea_cache_forward_count += 1
 
         # 7. Output normalization
         hidden_states = self.norm_out(hidden_states, temb, original_context_length)

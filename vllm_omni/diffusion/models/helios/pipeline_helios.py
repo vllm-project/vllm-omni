@@ -1209,6 +1209,8 @@ class HeliosPipeline(
         for k in range(num_latent_chunk):
             is_first_chunk = k == 0
             is_second_chunk = k == 1
+            self.transformer.do_true_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
+            self.transformer.reset_teacache()
 
             if keep_first_frame:
                 latents_history_long, latents_history_mid, latents_history_1x = history_latents[
@@ -1485,8 +1487,10 @@ class HeliosPipeline(
             start_point_list = [latents]
 
         do_true_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
+        self.transformer.do_true_cfg = do_true_cfg
 
         for i_s in range(pyramid_num_stages):
+            self.transformer.reset_teacache()
             patch_size = self.transformer.config.patch_size
             image_seq_len = (latents.shape[-1] * latents.shape[-2] * latents.shape[-3]) // (
                 patch_size[0] * patch_size[1] * patch_size[2]

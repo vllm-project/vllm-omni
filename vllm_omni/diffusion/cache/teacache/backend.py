@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 TeaCache backend implementation.
@@ -8,7 +8,7 @@ This module provides the TeaCache backend that implements the CacheBackend
 interface using the hooks-based TeaCache system.
 """
 
-from typing import Any
+from typing import Any, Protocol
 
 from vllm.logger import init_logger
 
@@ -18,6 +18,16 @@ from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook, apply_teacache
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 logger = init_logger(__name__)
+
+
+class _HeliosTransformer(Protocol):
+    def enable_teacache(self, config: TeaCacheConfig) -> None: ...
+
+    def reset_teacache(self) -> None: ...
+
+
+class _HeliosPipeline(Protocol):
+    transformer: _HeliosTransformer
 
 
 def enable_hunyuan_image3_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
@@ -120,9 +130,21 @@ def enable_flux2_klein_teacache(pipeline: Any, config: DiffusionCacheConfig) -> 
     )
 
 
+def enable_helios_teacache(pipeline: _HeliosPipeline, config: DiffusionCacheConfig) -> None:
+    """Enable chunk-scoped TeaCache for Helios."""
+    teacache_config = TeaCacheConfig(
+        transformer_type="HeliosTransformer3DModel",
+        rel_l1_thresh=config.rel_l1_thresh,
+        coefficients=config.coefficients,
+    )
+    pipeline.transformer.enable_teacache(teacache_config)
+    logger.info("TeaCache enabled for Helios with rel_l1_thresh=%s", teacache_config.rel_l1_thresh)
+
+
 CUSTOM_TEACACHE_ENABLERS = {
     "BagelPipeline": enable_bagel_teacache,
     "Flux2KleinPipeline": enable_flux2_klein_teacache,
+    "HeliosPipeline": enable_helios_teacache,
     "HunyuanImage3Pipeline": enable_hunyuan_image3_teacache,
     "MiniMaxH3Pipeline": enable_minimax_h3_teacache,
     "SenseNovaU1Pipeline": enable_sensenova_u1_teacache,
@@ -212,6 +234,12 @@ class TeaCacheBackend(CacheBackend):
                                 Currently not used by TeaCache but accepted for interface consistency.
             verbose: Whether to log refresh operations (default: True)
         """
+        if pipeline.__class__.__name__ == "HeliosPipeline":
+            pipeline.transformer.reset_teacache()
+            if verbose:
+                logger.debug("TeaCache state refreshed for Helios (num_inference_steps=%d)", num_inference_steps)
+            return
+
         # HunyuanImage3: tea cache state is managed inside the denoising loop,
         # so refresh is a no-op (state is re-initialized every __call__).
         if (
