@@ -1158,6 +1158,14 @@ def test_hunyuan_image3_peft_qkv_forward(tmp_path, monkeypatch, tp_size):
     from vllm.model_executor import parameter
     from vllm.model_executor.layers import linear
 
+    def cpu_unquantized_gemm(_layer, inputs, weight, bias=None):
+        return torch.nn.functional.linear(inputs, weight, bias)
+
+    # This numerical contract intentionally runs on CPU. Accelerator builds
+    # select the unquantized GEMM from the process-wide platform, which would
+    # otherwise dispatch CPU tensors to the ROCm-only custom operator.
+    monkeypatch.setattr(linear, "dispatch_unquantized_gemm", lambda: cpu_unquantized_gemm)
+
     adapter_dir = tmp_path / "adapter"
     adapter_dir.mkdir()
     rank = 2
