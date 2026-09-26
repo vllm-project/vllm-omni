@@ -181,7 +181,6 @@ run_case() {
       --num-inference-steps "${NUM_INFERENCE_STEPS}" \
       --seed "${seed}" \
       --enable-diffusion-pipeline-profiler \
-      --enable-cpu-offload \
       --vae-use-tiling \
       "${parallel_args[@]}" 2>&1 | tee -a "${log_file}"
 }
