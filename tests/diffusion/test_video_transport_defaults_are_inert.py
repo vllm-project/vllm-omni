@@ -19,6 +19,40 @@ def test_transport_defaults() -> None:
     transport = VideoOutputTransportConfig()
 
     assert transport.enable_device_postprocess is False
+    assert transport.transport_mode == "bytes"
+    assert transport.shared_memory_ttl_seconds == 300
+    assert transport.output_format == "mp4"
+    assert transport.video_codec is None
+    assert transport.video_codec_options == {}
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"transport_mode": "unknown"}, "transport_mode must be one of"),
+        ({"transport_mode": []}, "transport_mode must be one of"),
+        ({"shared_memory_ttl_seconds": 0}, "shared_memory_ttl_seconds must be a positive integer"),
+        ({"output_format": "avi"}, "output_format must be one of"),
+        ({"output_format": []}, "output_format must be one of"),
+        ({"video_codec": ""}, "video_codec must be a non-empty string or None"),
+        ({"video_codec_options": {"crf": 18}}, "video_codec_options must be a dict"),
+    ],
+)
+def test_transport_rejects_invalid_output_policy(kwargs: dict[str, object], message: str) -> None:
+    with pytest.raises((TypeError, ValueError), match=message):
+        VideoOutputTransportConfig(**kwargs)  # type: ignore[arg-type]
+
+
+def test_transport_mapping_rejects_unknown_keys() -> None:
+    with pytest.raises(TypeError, match="unexpected keyword argument 'transport_typo'"):
+        VideoOutputTransportConfig.from_value({"transport_typo": "url"})
+
+
+def test_existing_positional_device_postprocess_argument_is_preserved() -> None:
+    transport = VideoOutputTransportConfig(True)
+
+    assert transport.enable_device_postprocess is True
+    assert transport.transport_mode == "bytes"
 
 
 def test_a_default_diffusion_config_carries_a_default_transport() -> None:

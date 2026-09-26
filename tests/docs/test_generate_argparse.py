@@ -19,6 +19,16 @@ SPEC.loader.exec_module(generate_argparse)
 def test_static_serve_parser_supports_video_output_transport() -> None:
     parser = generate_argparse.create_parser_subparser_init(generate_argparse.OmniServeCommand)
 
-    args = parser.parse_args(["--omni", "--video-output-transport", '{"enable_device_postprocess": true}'])
+    args = parser.parse_args(
+        [
+            "--omni",
+            "--video-output-transport",
+            '{"enable_device_postprocess": true, "transport_mode": "url", "output_format": "webm"}',
+        ]
+    )
 
-    assert args.video_output_transport == {"enable_device_postprocess": True}
+    assert args.video_output_transport == {
+        "enable_device_postprocess": True,
+        "transport_mode": "url",
+        "output_format": "webm",
+    }

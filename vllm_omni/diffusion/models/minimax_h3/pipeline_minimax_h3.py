@@ -63,7 +63,11 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
-from vllm_omni.diffusion.utils.media_utils import normalize_preencode_batch_frames, normalize_video_codec_options
+from vllm_omni.diffusion.utils.media_utils import (
+    DEFAULT_VIDEO_CODEC,
+    normalize_preencode_batch_frames,
+    normalize_video_codec_options,
+)
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError, client_error_from_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -2006,6 +2010,7 @@ class MiniMaxH3Pipeline(
         width: int,
         max_pending: int = 2,
         batch_frames: int = 17,
+        video_codec: str = DEFAULT_VIDEO_CODEC,
         video_codec_options: dict[str, str] | None = None,
     ) -> bytes:
         """Decode and encode one output on the worker without full-video materialization.
@@ -2043,6 +2048,7 @@ class MiniMaxH3Pipeline(
                     audio_sample_rate=MINIMAX_H3_AUDIO_SAMPLE_RATE,
                     batch_frames=batch_frames,
                     max_pending=max_pending,
+                    video_codec=video_codec,
                     video_codec_options=video_codec_options,
                     crop=(height, width),
                 )
@@ -2604,6 +2610,7 @@ class MiniMaxH3Pipeline(
                 if extra.get("preencode_mp4", False)
                 else 17
             ),
+            "video_codec": extra.get("video_codec", DEFAULT_VIDEO_CODEC),
             "video_codec_options": normalize_video_codec_options(
                 extra.get("video_codec_options", {"preset": "ultrafast", "threads": "0"})
                 if extra.get("preencode_mp4", False)
@@ -2653,6 +2660,7 @@ class MiniMaxH3Pipeline(
                         audio_latent,
                         height=context["height"],
                         width=context["width"],
+                        video_codec=context["video_codec"],
                         video_codec_options=context["video_codec_options"],
                         batch_frames=context["preencode_batch_frames"],
                     )
@@ -2808,6 +2816,7 @@ class MiniMaxH3Pipeline(
                     "audio_t": context["audio_t"],
                     "preencode_mp4": context.get("preencode_mp4", False),
                     "preencode_batch_frames": context.get("preencode_batch_frames", 17),
+                    "video_codec": context.get("video_codec", DEFAULT_VIDEO_CODEC),
                     "video_codec_options": context.get("video_codec_options"),
                 },
             }
@@ -3034,6 +3043,7 @@ class MiniMaxH3Pipeline(
                 audio_latent,
                 height=shape["height"],
                 width=shape["width"],
+                video_codec=shape.get("video_codec", DEFAULT_VIDEO_CODEC),
                 video_codec_options=shape.get("video_codec_options"),
                 batch_frames=shape.get("preencode_batch_frames", 17),
             )

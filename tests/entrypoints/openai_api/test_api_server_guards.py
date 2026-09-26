@@ -166,6 +166,7 @@ _EXPECTED_ROUTER_ROUTES = {
     ("GET", "/v1/videos/{video_id}"),
     ("DELETE", "/v1/videos/{video_id}"),
     ("GET", "/v1/videos/{video_id}/content"),
+    ("GET", "/v1/videos/artifacts/{storage_key}"),
     ("POST", "/v1/omni/sleep"),
     ("POST", "/v1/omni/wakeup"),
 }
@@ -428,7 +429,7 @@ def test_router_openapi_paths_cover_http_manifest() -> None:
 
 
 @pytest.mark.asyncio
-async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_router(monkeypatch) -> None:
+async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_router(monkeypatch, mocker) -> None:
     """Lock worker assembly: override, mount, storage, handlers, full census.
 
     Fails if assembly stops replacing upstream chat/batch/models/health/profiler,
@@ -492,6 +493,9 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     async def fake_storage_start():
         captured["storage_started"] = True
 
+    async def fake_storage_stop():
+        captured["storage_stopped"] = True
+
     async def fake_serve_http(app, **_kwargs):
         captured["served_app"] = app
         task = asyncio.create_task(asyncio.sleep(0))
@@ -506,7 +510,11 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
         "shutdown_unsupported_routes",
         lambda app, restrictions: captured.setdefault("restrictions", restrictions),
     )
-    monkeypatch.setattr(api_server, "STORAGE_MANAGER", SimpleNamespace(start=fake_storage_start))
+    monkeypatch.setattr(
+        api_server,
+        "STORAGE_MANAGER",
+        mocker.Mock(spec=type(api_server.STORAGE_MANAGER), start=fake_storage_start, stop=fake_storage_stop),
+    )
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
 
     sock = _FakeSocket()
@@ -522,6 +530,7 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
 
     assert captured["supported_tasks"] == ("generate",)
     assert captured["storage_started"] is True
+    assert captured["storage_stopped"] is True
     assert captured["restrictions"] == {}
     assert captured["video_shutdown"] is True
     assert captured["speech_shutdown"] is True
@@ -559,7 +568,7 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
 
 
 @pytest.mark.asyncio
-async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch) -> None:
+async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch, mocker) -> None:
     """Lock outermost timestamp middleware behavior.
 
     Fails if HTTP requests lose ``request_timestamp``, or WebSocket scopes
@@ -587,7 +596,11 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
     monkeypatch.setattr(api_server, "omni_init_app_state", fake_omni_init_app_state)
     monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda *_a, **_k: None)
-    monkeypatch.setattr(api_server, "STORAGE_MANAGER", SimpleNamespace(start=lambda: asyncio.sleep(0)))
+    monkeypatch.setattr(
+        api_server,
+        "STORAGE_MANAGER",
+        mocker.Mock(spec=type(api_server.STORAGE_MANAGER)),
+    )
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
 
     await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), _minimal_args())

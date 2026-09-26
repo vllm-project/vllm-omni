@@ -69,4 +69,5 @@ same typed media contract without bypassing model-specific float consumers such
 as safety checks or audio/video packaging.
 
 See [RFC #6541](https://github.com/vllm-project/vllm-omni/issues/6541) for the
-contract, lifecycle, batching rules, and migration plan.
+contract, lifecycle, batching rules, and migration plan. Container encoding and
+client delivery are configured separately in [Video output transport](video_output_transport.md).
