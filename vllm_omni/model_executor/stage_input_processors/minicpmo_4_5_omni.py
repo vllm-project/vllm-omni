@@ -163,6 +163,23 @@ def _codec_config(transfer_manager: Any) -> tuple[int, int]:
     return chunk_frames, left_context_frames
 
 
+def _initial_chunk_frames(transfer_manager: Any, chunk_frames: int) -> int:
+    """First-payload window size in frames.
+
+    Reads ``initial_codec_chunk_frames`` from the connector extra; falls back to
+    the steady-state value when absent, non-positive, or not smaller than the
+    steady ``codec_chunk_frames`` (which means the feature is off).
+    """
+    connector = getattr(transfer_manager, "connector", None)
+    raw_config = getattr(connector, "config", {}) or {}
+    config = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
+    config = config if isinstance(config, dict) else {}
+    value = int(config.get("initial_codec_chunk_frames", 0) or 0)
+    if value <= 0 or value >= chunk_frames:
+        return chunk_frames
+    return value
+
+
 def _request_intermediate_section(request: object, section: str) -> dict[str, object]:
     merged: dict[str, object] = {}
     for attribute in ("additional_information", "model_intermediate_buffer"):
@@ -331,15 +348,22 @@ def tts2code2wav_async_chunk(
     request_finished = getattr(request, "is_finished", None)
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
+    # First-payload window: the payload with chunk_seq == 0 uses
+    # initial_codec_chunk_frames; later payloads return to the steady
+    # chunk_frames. When unset, first_window == chunk_frames and behavior is
+    # unchanged.
+    first_window = (
+        _initial_chunk_frames(transfer_manager, chunk_frames) if int(record["chunk_seq"]) == 0 else chunk_frames
+    )
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
-    if not flush_pending and len(pending) < chunk_frames:
+    if not flush_pending and len(pending) < first_window:
         return None
 
     hold_short_unit = (
         native_duplex and flush_pending and not last_chunk and 0 < len(pending) < _MINICPMO45_MIN_STREAM_BODY_FRAMES
     )
-    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else chunk_frames)
+    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else first_window)
     new_codes = pending[:new_token_count]
     del pending[:new_token_count]
     codec_start = int(state["codec_end"])

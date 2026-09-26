@@ -1,3 +1,6 @@
+# MiniCPM-o 4.5 three-stage deploy profile: all three stages on one device,
+# with stage 2 running two colocated replicas (the base deploy config runs a
+# single stage-2 replica). Only that difference is spelled out here.
 # MiniCPM-o 4.5 three-stage deploy on one large-memory GPU.
 pipeline: minicpmo_4_5
 async_chunk: true
@@ -38,8 +41,9 @@ connectors:
 stages:
   - stage_id: 0
     max_num_seqs: 4
-    # Leave headroom on the shared GPU for Talker KV + concurrent Code2Wav.
-    gpu_memory_utilization: 0.55
+    # Leave headroom on the shared GPU for Talker KV + the two stage-2
+    # replicas below; the NPU block caps stage 0/1 KV explicitly.
+    gpu_memory_utilization: 0.40
     enforce_eager: false
     # Stage-level prefix caching is NPU-only (see platforms.npu below): in the
     # platform-shared block it killed the stage-1 replica on CUDA (empty tts
@@ -76,7 +80,7 @@ stages:
     # Preserve the checkpoint's full-attention Talker prompt while it fits;
     # native duplex rolls over to a one-chunk window at context capacity.
     # Leave device-level headroom for the colocated HiFi-GAN cuDNN workspace.
-    gpu_memory_utilization: 0.15
+    gpu_memory_utilization: 0.08
     enforce_eager: false
     max_num_batched_tokens: 8192
     # Talker context is 4096 (tts_config.max_position_embeddings).
@@ -108,7 +112,10 @@ stages:
     enable_chunked_prefill: false
     max_num_batched_tokens: 65536
     max_model_len: 65536
-    devices: "0"
+    # Two replicas on the same device: `devices` repeats the card once per
+    # replica (replica r lands on card r), so this needs no extra hardware.
+    num_replicas: 2
+    devices: "0,0"
     input_connectors:
       from_stage_1: connector_of_shared_memory
     default_sampling_params:
@@ -137,6 +144,9 @@ platforms:
         max_num_batched_tokens: 8192
         # Moved here from the platform-shared block; see the base stage note.
         enable_prefix_caching: true
+        # Explicit KV cap: the auto-computed value does not leave room for the
+        # two stage-2 replicas on this card.
+        kv_cache_memory_bytes: 6442450944
         compilation_config:
           # A full decode-step graph keeps in-graph sampling and multi-frame
           # expansion. The static-shape builder gates its runtime buckets on
@@ -164,6 +174,9 @@ platforms:
         default_sampling_params:
           # The Talker's stop head emits this id to finish a request.
           stop_token_ids: [1]
+        # Explicit KV cap: the auto-computed value does not leave room for the
+        # two stage-2 replicas on this card.
+        kv_cache_memory_bytes: 2684354560
         compilation_config:
           cudagraph_mode: FULL_DECODE_ONLY
       - stage_id: 2
@@ -172,9 +185,9 @@ platforms:
         # estimator kernels through the NPU platform patch.
         additional_config:
           code2wav_enable_npu_graph: true
-          # NPU graph pool raised from 32 to 64. Once the 32 captured shapes are
-          # exhausted, later shapes permanently degrade to eager. The CFM mel
-          # bucketing already present in main (cfm_graph_bucket_frames: 16) keeps
-          # the captured shape count at 19, which is what makes a pool this size
-          # sustainable.
-          code2wav_max_npu_graphs: 64
+          # One pool entry per captured shape. With two stage-2 replicas the pool
+          # is per replica, and the CFM mel bucketing already present in main
+          # (cfm_graph_bucket_frames: 16) keeps the captured shape count near 31,
+          # so 32 covers it; 64 per replica would only add graph memory that is
+          # never replayed.
+          code2wav_max_npu_graphs: 32

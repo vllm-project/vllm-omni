@@ -1462,6 +1462,58 @@ class TestDeployConfigLoading:
         assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [6561]
         assert "codec_sampling_params" not in stages[1].yaml_engine_args
 
+    @pytest.mark.parametrize("platform", ["cuda", "npu"])
+    def test_minicpmo_talker_multi_frame_is_npu_scoped(self, platform: str):
+        """Stage 1's K-frame decode needs the NPU worker to inject constant
+        continue drafts, so the deploy block that arms it must not sit in the
+        platform-shared stage.
+
+        On NPU the ``speculative_config`` is a fingerprint: the worker replays
+        the decode graph and vLLM's n-gram proposer is never consulted. On CUDA
+        the same block hands the Talker to the real proposer plus the rejection
+        sampler, which asserts on its codec ids (device-side assert out of
+        ``get_token_bin_counts_and_mask``).
+
+        Stage 0's prefix caching is NPU-scoped for the same reason: a CUDA
+        stage-0 prefix hit hands the Thinker an empty tts handoff, and the
+        Talker then indexes past the codec vocab.
+        """
+        deploy = _apply_platform_overrides(
+            load_deploy_config(Path(get_deploy_config_path("minicpmo_4_5.yaml"))),
+            platform=platform,
+        )
+        # Check the deploy-side stop id before the merge: afterwards it is
+        # unioned with the pipeline's codec-EOS default.
+        deploy_stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+        stages = merge_pipeline_deploy(resolve_pipeline_config("minicpmo_4_5"), deploy)
+
+        if platform == "npu":
+            assert deploy_stage1.default_sampling_params["stop_token_ids"] == [1]
+            # The armed head ends on 1; the union keeps the codec EOS inert
+            # (the collapsed head cannot sample it).
+            assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1, 6561]
+            assert stages[0].yaml_engine_args["enable_prefix_caching"] is True
+            assert stages[1].yaml_engine_args["speculative_config"] == {
+                "method": "ngram",
+                "num_speculative_tokens": 7,
+                "prompt_lookup_min": 1,
+                "prompt_lookup_max": 1,
+            }
+            assert stages[1].yaml_engine_args["async_scheduling"] is False
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [8, 8, 8]
+        else:
+            assert "stop_token_ids" not in (deploy_stage1.default_sampling_params or {})
+            # Without the block the head is the full codec vocabulary, so the
+            # codec EOS is the only stop id -- the marker would end a request
+            # on an ordinary codec id.
+            assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [6561]
+            # Either absent (falls back to the top-level false) or explicitly
+            # false; the regression this guards against is true.
+            assert stages[0].yaml_engine_args.get("enable_prefix_caching") is not True
+            assert "speculative_config" not in stages[1].yaml_engine_args
+            assert stages[1].yaml_engine_args["async_scheduling"] is True
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [4, 4, 4]
+
     @pytest.mark.parametrize(
         ("filename", "stage0_devices", "stage1_devices", "stage2_devices", "stage1_replicas"),
         [

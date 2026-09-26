@@ -29,7 +29,11 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import (
+    _CODEC_EOS_TOKEN_ID,
+)
 from vllm_omni.model_executor.models.registry import _OMNI_MODELS
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -106,9 +110,14 @@ class TestPipelineTopology:
         assert talker.engine_output_type == "latent"
         # scope KV cache / mrope sizing to talker sub-config
         assert talker.hf_config_name == "tts_config"
+        # The pipeline default is the codec EOS of the one-frame head. The
+        # deploy config that arms the multi-frame row (stage 1's
+        # speculative_config, under platforms.npu) adds that row's stop marker
+        # (1) through its default_sampling_params; see
+        # test_minicpmo_talker_multi_frame_is_npu_scoped for the merged list.
         assert talker.sampling_constraints == {
             "detokenize": False,
-            "stop_token_ids": [6561],
+            "stop_token_ids": [_CODEC_EOS_TOKEN_ID],
         }
         assert talker.custom_process_next_stage_input_func == (
             "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_full_payload"
@@ -161,7 +170,11 @@ class TestDeployTopology:
         assert stages[2].yaml_extras["input_connectors"]["from_stage_1"] == "connector_of_shared_memory"
         connector = deploy.connectors["connector_of_shared_memory"]
         assert connector["name"] == "SharedMemoryConnector"
-        assert connector["extra"]["codec_chunk_frames"] == 25
+        # The single-card deploy raises the steady chunk to 75 so
+        # initial_codec_chunk_frames: 25 can take effect; multi-card variants
+        # keep the base value.
+        expected_chunk_frames = 75 if filename == "minicpmo_4_5.yaml" else 25
+        assert connector["extra"]["codec_chunk_frames"] == expected_chunk_frames
         assert connector["extra"]["codec_left_context_frames"] == 3
         assert connector["extra"]["enable_hift_graph"] is True
         assert connector["extra"]["connector_get_max_wait_first_chunk"] == 3000
@@ -170,7 +183,10 @@ class TestDeployTopology:
         assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(expected_processor)
         assert "hf_overrides" not in stages[1].yaml_engine_args
         if filename == "minicpmo_4_5.yaml":
-            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [4, 4, 4]
+            # The NPU overlay caps all three stages at 8 so the top tier is not
+            # gated by a single stage; every other platform keeps the base 4.
+            expected_seqs = 8 if (current_omni_platform.device_name or "").lower() == "npu" else 4
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [expected_seqs] * 3
             memory_utilizations = [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages]
             assert memory_utilizations == [
                 0.55,
@@ -207,12 +223,19 @@ class TestDeployTopology:
 
         deploy = _apply_platform_overrides(deploy, platform="npu")
         stages = merge_pipeline_deploy(OMNI_PIPELINES[deploy.pipeline], deploy)
-        assert stages[0].yaml_engine_args["compilation_config"]["cudagraph_mode"] == "PIECEWISE"
-        assert stages[1].yaml_engine_args["compilation_config"]["cudagraph_mode"] == "PIECEWISE"
+        # The single-card deploy captures a full decode graph, which keeps
+        # in-graph sampling and multi-frame expansion; multi-card variants keep
+        # the base mode.
+        expected_graph_mode = "FULL_DECODE_ONLY" if filename == "minicpmo_4_5.yaml" else "PIECEWISE"
+        assert stages[0].yaml_engine_args["compilation_config"]["cudagraph_mode"] == expected_graph_mode
+        assert stages[1].yaml_engine_args["compilation_config"]["cudagraph_mode"] == expected_graph_mode
         assert stages[2].yaml_engine_args["enforce_eager"] is True
+        # Only the single-card deploy raises the Code2Wav graph pool; the
+        # multi-card variants keep the base value.
+        expected_graph_pool = 64 if filename == "minicpmo_4_5.yaml" else 32
         assert stages[2].yaml_engine_args["additional_config"] == {
             "code2wav_enable_npu_graph": True,
-            "code2wav_max_npu_graphs": 32,
+            "code2wav_max_npu_graphs": expected_graph_pool,
         }
 
     def test_pipeline_exposes_full_and_async_payload_hooks(self) -> None:

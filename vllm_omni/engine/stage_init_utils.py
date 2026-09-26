@@ -1157,8 +1157,15 @@ def _project_omni_stage_engine_args(
         ):
             engine_args.update(_project_upstream_config_fields(config, field_map))
 
-    for name in ("compilation_config", "profiler_config"):
-        value = getattr(stage_config, name)
+    # Same category as the two above: vLLM config objects copied verbatim from
+    # the stage config into the engine args. Only compilation_config and
+    # profiler_config used to be copied, so a speculative_config in the deploy
+    # config (stage-0 n-gram, or the stage-1 one injected by stage_config.py)
+    # silently disappeared here (no error) and showed up engine-side as
+    # speculative_config=None. getattr(..., None) guards stage config types
+    # that lack the field.
+    for name in ("compilation_config", "profiler_config", "speculative_config"):
+        value = getattr(stage_config, name, None)
         if value is not None:
             engine_args[name] = copy.deepcopy(value)
 

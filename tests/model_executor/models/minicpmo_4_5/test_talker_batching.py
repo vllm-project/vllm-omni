@@ -109,6 +109,17 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._request_condition_states = {}
     talker._deferred_cleanup_ids = set()
     talker._tts_config = ConditionalChatTTSConfig()
+    # Codec sampling contract added by the multi-frame decode work: the fixture
+    # runs the deterministic greedy boundary (argmax over head_code) and never
+    # arms the multi-frame loop.
+    talker._codec_temperature = 0.0
+    talker._codec_top_k = 0
+    talker._codec_top_p = 1.0
+    talker._codec_repetition_penalty = 1.0
+    talker._codec_min_tokens = 0
+    talker._codec_max_tokens = 4032
+    talker._k_step_frames = 0
+    talker.supports_multi_frame_decode = False
     talker.head_code = nn.ModuleList([nn.Linear(2, 8, bias=False)])
     with torch.no_grad():
         talker.head_code[0].weight.copy_(torch.eye(8, 2))

@@ -654,6 +654,68 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             return model_outputs
         return self.talker.make_omni_output(model_outputs, **kwargs)
 
+    @property
+    def requires_request_sample_eligibility(self) -> bool:
+        """Forward the Talker's sampling-eligibility contract to the runner.
+
+        The runner only supplies ``request_sample_eligible`` when the model it
+        sees declares the flag, and it always sees this wrapper -- never the
+        inner Talker (the same resolution rule as talker_multiframe.applies
+        below). Without the forward, the Talker's K-step branch falls back to
+        treating every request as eligible, so an incomplete prefill chunk
+        advances codec history and RNG state and the generated audio starts
+        depending on prefill chunking.
+        """
+        talker = getattr(self, "talker", None)
+        return talker is not None and bool(getattr(talker, "requires_request_sample_eligibility", False))
+
+    # Runner-side forwards for multi-frame decode. The baseline declares these
+    # four methods on this outer wrapper class; the runner only ever sees the
+    # wrapper (talker_multiframe.applies / is_multi_token_decode /
+    # ensure_stop_token_vocab all resolve through getattr(model, ...)), so
+    # without them:
+    #   * missing supports_multi_frame_decode -> the check silently reads False,
+    #     the multi-frame loop never runs and no reason is logged;
+    #   * missing take/set_batch_stop_logits -> per-frame stop rows unavailable;
+    #   * missing _batch_stop_logits -> the runner's gate probe reads None and
+    #     always falls back to text_hidden_states;
+    #   * missing merge_frame_outputs -> multi-frame results cannot be merged.
+    # The speculative config alone is not enough: the runner-side loop and its
+    # vocab-width correction (ensure_stop_token_vocab) stay dormant, the
+    # rejection sampler consumes width-0 rows, AIV goes out of bounds (507035)
+    # and the stage-1 engine dies with empty audio.
+    @property
+    def supports_multi_frame_decode(self) -> bool:
+        # "This wrapper implements the multi-frame path", not "the loop is
+        # running": the Talker (tts) stage has it, the Thinker does not. Whether
+        # a step actually runs it is decided per deployment by stage 1's
+        # speculative_config (the runner checks its num_spec_tokens for that).
+        return self.model_stage == "tts"
+
+    @property
+    def _batch_stop_logits(self):
+        # The runner probes this attribute on the registered architecture
+        # (getattr in npu_model_runner); without the forward it reads None and
+        # the gate always falls back to text_hidden_states.
+        if self.model_stage != "tts":
+            return None
+        return self.talker._batch_stop_logits
+
+    def take_batch_stop_logits(self):
+        if self.model_stage != "tts":
+            return None
+        return self.talker.take_batch_stop_logits()
+
+    def set_batch_stop_logits(self, logits) -> None:
+        if self.model_stage != "tts":
+            return
+        self.talker.set_batch_stop_logits(logits)
+
+    def merge_frame_outputs(self, frame_outputs, frame_stop_logits):
+        if self.model_stage != "tts":
+            return frame_outputs
+        return self.talker.merge_frame_outputs(frame_outputs, frame_stop_logits)
+
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
         # Handle OmniOutput type
         if isinstance(hidden_states, OmniOutput):

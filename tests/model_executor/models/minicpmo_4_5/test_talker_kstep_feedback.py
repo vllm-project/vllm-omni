@@ -1,0 +1,745 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+"""No-device regression tests for the MiniCPM-o Talker K-step feedback chain.
+
+Layers pinned down here:
+
+- ``make_omni_output`` must record each frame's codec sample in the request
+  state (``last_code``) while the multi-frame loop owns sampling: the rows
+  vLLM schedules for the next step carry placeholder continue ids, so
+  without the record every frame after the first embeds a placeholder
+  instead of the real previous frame (silent audio corruption).
+- The decode preprocess must prefer that state record over input_ids.
+- The scheduler-side K-frame guard must drop continuation drafts whenever
+  prefill work is pending, so no step ever mixes prefill rows with
+  multi-row decode spans (the mixed batch that crashed a 64/4 run).
+- The multi-frame gate matrix: non-uniform decode spans stay blocked at
+  ``applies()``; the runner raise remains the assertion of last resort for
+  a combination the guard makes unschedulable.
+"""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch import nn
+
+from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+    MiniCPMO45OmniTTSForConditionalGeneration,
+)
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+_NUM_AUDIO_TOKENS = 6562
+_EOS_ID = _NUM_AUDIO_TOKENS - 1
+
+
+def _make_talker(*, k_step_frames: int, scripted_samples: list[int]):
+    """Bare talker instance: no config, no weights, deterministic sampler.
+
+    ``emb_code`` is crafted so the placeholder fallback (row 0) is all
+    zeros while real codec rows are not -- a sharp contrast for asserting
+    which id got embedded.
+    """
+    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
+    nn.Module.__init__(model)
+    model._k_step_frames = k_step_frames
+    model.supports_multi_frame_decode = k_step_frames > 0
+    model._codec_temperature = 0.0
+    model._codec_min_tokens = 0
+    model._codec_max_tokens = 4032
+    model._num_audio_tokens = _NUM_AUDIO_TOKENS
+    model._codec_eos_id = _EOS_ID
+    model._request_audio_states = {}
+    model._request_codec_history = {}
+    model._request_generators = {}
+    emb = nn.Embedding(_NUM_AUDIO_TOKENS, 4)
+    with torch.no_grad():
+        emb.weight.zero_()
+        emb.weight[42] = 1.0
+        emb.weight[43] = 2.0
+    model.emb_code = nn.ModuleList([emb])
+    queue = iter(scripted_samples)
+
+    def _greedy(_hidden, _codes, _request_id, _step, _min_tokens, _max_tokens, _eos_window_masked=False):
+        return torch.tensor(next(queue), dtype=torch.long)
+
+    model._sample_audio_code_greedy = _greedy
+    return model
+
+
+def _frame_call(model, hidden):
+    return model.make_omni_output(
+        hidden,
+        model_intermediate_buffer=[{"request_id": "r1"}],
+        request_token_spans=[(0, 1)],
+        request_sample_eligible=[True],
+    )
+
+
+def test_kstep_frame_sample_is_recorded_for_next_frame():
+    model = _make_talker(k_step_frames=8, scripted_samples=[42, 43, _EOS_ID])
+    state = {"step": 0, "codes": torch.tensor([10, 11])}
+    model._request_audio_states["r1"] = state
+    hidden = torch.randn(1, 8)
+
+    out0 = _frame_call(model, hidden)
+    assert state["last_code"] == 42
+    assert state["step"] == 1
+    assert out0.multimodal_outputs["codes"]["audio"][0].reshape(-1).tolist() == [42]
+
+    out1 = _frame_call(model, hidden)
+    assert state["last_code"] == 43
+    assert out1.multimodal_outputs["codes"]["audio"][0].reshape(-1).tolist() == [43]
+
+    # The EOS frame terminates the request: the record keeps the last real
+    # sample (there is no next frame to feed), and the delta goes empty.
+    out2 = _frame_call(model, hidden)
+    assert state["last_code"] == 43
+    assert state["finished"] is True
+    assert out2.multimodal_outputs["codes"]["audio"][0].numel() == 0
+    # Only confirmed frames are recorded: the terminating frame carries no
+    # codec id for the next step to embed, so streaming prompt recompute must
+    # not see it in the history either.
+    assert model._request_codec_history["r1"] == [42, 43]
+
+
+def test_legacy_single_frame_path_does_not_touch_last_code():
+    model = _make_talker(k_step_frames=0, scripted_samples=[42])
+    state = {"step": 0, "codes": torch.tensor([10, 11])}
+    model._request_audio_states["r1"] = state
+
+    _frame_call(model, torch.randn(1, 8))
+    assert "last_code" not in state
+
+
+def test_decode_preprocess_embeds_state_last_code():
+    model = _make_talker(k_step_frames=8, scripted_samples=[])
+    state = {"step": 3, "codes": torch.tensor([42]), "last_code": 42}
+    model._request_audio_states["r1"] = state
+    # The scheduled row carries the placeholder continue id (0), not the
+    # real previous frame's sample.
+    input_ids = torch.zeros(1, dtype=torch.long)
+
+    _, embeds, out = model.preprocess(
+        input_ids,
+        None,
+        request_id="r1",
+        audio_state=state,
+        _omni_is_prefill=False,
+    )
+    assert torch.equal(embeds, model.emb_code[0](torch.tensor([42])))
+    # Row 0 (the placeholder fallback) is all zeros in this fixture, so a
+    # non-zero embed proves the state record won.
+    assert torch.count_nonzero(embeds) == embeds.numel()
+    assert out["codes"]["audio"].reshape(-1).tolist() == [42]
+
+
+def _make_scheduler(*, num_spec: int, waiting=(), running=(), stage: str = "tts"):
+    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched._omni_talker_kstep_cache = None
+    # The armed check reads the stage and the n-gram fingerprint off the engine
+    # config; the real Scheduler exposes neither as a plain attribute.
+    sched.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(model_stage=stage),
+        speculative_config=SimpleNamespace(method="ngram", num_speculative_tokens=num_spec),
+    )
+    # vLLM's Scheduler stores the count here (vllm_config.num_speculative_tokens);
+    # the guard predicts row widths from it.
+    sched.num_spec_tokens = num_spec
+    sched.max_model_len = 40960
+    sched.waiting = list(waiting)
+    sched.running = list(running)
+    return sched
+
+
+def _req(*, computed: int, prompt: int, spec: list[int], total: int | None = None):
+    return SimpleNamespace(
+        num_computed_tokens=computed,
+        prompt_token_ids=[0] * prompt,
+        # num_tokens is prompt + generated; the guard reads the difference to
+        # predict how many rows this request will schedule this step.
+        num_tokens=prompt if total is None else total,
+        spec_token_ids=list(spec),
+    )
+
+
+def test_guard_drops_drafts_when_waiting_request_pending():
+    decode_req = _req(computed=100, prompt=100, spec=[0] * 7)
+    sched = _make_scheduler(num_spec=7, waiting=[object()], running=[decode_req])
+
+    sched._drop_talker_drafts_if_prefill_pending()
+    assert decode_req.spec_token_ids == []
+
+
+def test_guard_keeps_drafts_when_no_prefill_pending():
+    decode_req = _req(computed=100, prompt=100, spec=[0] * 7, total=101)
+    sched = _make_scheduler(num_spec=7, waiting=[], running=[decode_req])
+
+    sched._drop_talker_drafts_if_prefill_pending()
+    assert decode_req.spec_token_ids == [0] * 7
+
+
+def test_guard_drops_drafts_when_chunked_prefill_in_flight():
+    decoding_req = _req(computed=100, prompt=100, spec=[0] * 7, total=101)
+    chunking_req = _req(computed=50, prompt=100, spec=[])
+    sched = _make_scheduler(num_spec=7, waiting=[], running=[decoding_req, chunking_req])
+
+    sched._drop_talker_drafts_if_prefill_pending()
+    assert decoding_req.spec_token_ids == []
+
+
+def test_guard_noop_for_text_stage_spec_config():
+    # The text stage may carry its own n-gram config; only the Talker stage runs
+    # the multi-frame loop, so the guard must stay a no-op there.
+    text_req = _req(computed=100, prompt=100, spec=[0] * 15)
+    sched = _make_scheduler(num_spec=15, stage="llm", waiting=[object()], running=[text_req])
+
+    sched._drop_talker_drafts_if_prefill_pending()
+    assert text_req.spec_token_ids == [0] * 15
+
+
+def test_guard_arms_from_vllm_config_and_drops_drafts_for_a_running_chunk():
+    # Real vLLM Scheduler instances expose no .speculative_config attribute
+    # (and SchedulerConfig has no num_speculative_tokens), so the armed check
+    # must read vllm_config.speculative_config -- otherwise the whole guard
+    # silently stays off while the engine-side loop is armed.
+    #
+    # Steady-state decode sharing a step with a 7-token streaming chunk: both
+    # spec_token_ids lists look innocent ([] and 7 placeholders), so the guard
+    # must predict row widths from num_tokens - num_computed_tokens instead.
+    from types import SimpleNamespace
+
+    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched._omni_talker_kstep_cache = None
+    sched.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(model_stage="tts"),
+        speculative_config=SimpleNamespace(method="ngram", num_speculative_tokens=7),
+    )
+    assert sched._talker_kstep_armed() is True
+    sched.num_spec_tokens = 7
+    sched.max_model_len = 40960
+
+    steady = _req(computed=100, prompt=100, spec=[0] * 7, total=101)  # 1 token -> 8 rows
+    chunk = _req(computed=107, prompt=107, spec=[], total=114)  # 7-token chunk -> 7 rows
+    sched.waiting = []
+    sched.running = [steady, chunk]
+
+    sched._drop_talker_drafts_if_prefill_pending()
+    assert steady.spec_token_ids == []
+    assert chunk.spec_token_ids == []
+
+
+def test_guard_keeps_drafts_when_all_decodes_share_the_padded_width():
+    # A first-step decode (no placeholders yet) and a steady-state decode both
+    # schedule 1 token this step, so vLLM gives both the same 1+num_spec row
+    # width: spans stay uniform and nothing may drop.
+    steady = _req(computed=100, prompt=100, spec=[0] * 7, total=101)
+    first_step = _req(computed=100, prompt=100, spec=[], total=101)
+    sched = _make_scheduler(num_spec=7, waiting=[], running=[steady, first_step])
+
+    sched._drop_talker_drafts_if_prefill_pending()
+    assert steady.spec_token_ids == [0] * 7
+    assert first_step.spec_token_ids == []
+
+
+def test_talker_stop_token_ids_match_the_multi_frame_head():
+    """Stage 1's stop id must be one the head that actually runs can emit.
+
+    The default follows the head: the two-wide continue/stop row next to the
+    NPU worker, and the codec EOS on every platform without that worker.
+    """
+    from vllm_omni.model_executor.models.minicpmo_4_5 import pipeline as mcp_pipeline
+    from vllm_omni.platforms.npu.worker import talker_multiframe
+
+    assert talker_multiframe.STOP_TOKEN_ID == 1
+    # The pipeline default cannot depend on the platform: the block that
+    # collapses the head is a deploy-config decision, so the marker is added
+    # there (test_minicpmo_talker_multi_frame_is_npu_scoped pins the merge).
+    assert mcp_pipeline._talker_stop_token_ids() == [mcp_pipeline._CODEC_EOS_TOKEN_ID]
+
+
+def test_multiframe_gate_matrix():
+    from vllm_omni.platforms.npu.worker import talker_multiframe
+
+    model = SimpleNamespace(supports_multi_frame_decode=True)
+    state = {"step": 5}
+
+    # Uniform K-row decode: the loop engages with K=8.
+    uniform = {
+        "request_token_spans": [(0, 8), (8, 16)],
+        "model_intermediate_buffer": [
+            {"audio_state": dict(state)},
+            {"audio_state": dict(state)},
+        ],
+    }
+    assert talker_multiframe.applies(model, uniform) == 8
+
+    # Mixed decode spans (an 8-row drafted decode plus a 1-row decode):
+    # blocked, and flagged as a multi-token decode step.
+    mixed_decode = {
+        "request_token_spans": [(0, 8), (8, 9)],
+        "model_intermediate_buffer": [
+            {"audio_state": dict(state)},
+            {"audio_state": dict(state)},
+        ],
+    }
+    assert talker_multiframe.applies(model, mixed_decode) == 0
+    assert talker_multiframe.is_multi_token_decode(model, mixed_decode) is True
+
+    # Prefill rows mixed with a drafted decode: blocked the same way.
+    mixed_prefill = {
+        "request_token_spans": [(0, 515), (515, 523)],
+        "model_intermediate_buffer": [
+            {"audio_state": dict(state), "_omni_is_prefill": True},
+            {"audio_state": dict(state)},
+        ],
+    }
+    assert talker_multiframe.applies(model, mixed_prefill) == 0
+    assert talker_multiframe.is_multi_token_decode(model, mixed_prefill) is True
+
+
+def _vocab_runner(*, supports_multi_frame: bool, vocab_size: int):
+    return SimpleNamespace(
+        model=SimpleNamespace(supports_multi_frame_decode=supports_multi_frame),
+        input_batch=SimpleNamespace(vocab_size=vocab_size),
+    )
+
+
+def test_stop_vocab_gate_reports_the_two_wide_stop_row_not_the_hidden_width():
+    """``input_batch.vocab_size`` must be the stop row's width (2), not hidden.
+
+    ``InputBatch.add_request`` keeps ``top_k = vocab_size`` as its "no top-k"
+    sentinel and ``RejectionSampler.parse_output`` filters accepted tokens
+    against it; both only hold at 0 or 2. The gate used to be handed
+    ``text_hidden_states``, so it wrote the hidden width (768): that passes the
+    ``parse_output`` filter by accident while taking ``top_k`` out of its
+    sentinel range, and the two-wide stop row then never reaches the request's
+    token list -- every request runs to ``max_tokens`` instead of stopping on
+    EOS (the 910C scene where stage 1 reported ``finished_reason=length`` for
+    all 34 requests).
+    """
+    from vllm_omni.platforms.npu.worker import talker_multiframe
+
+    assert talker_multiframe.STOP_ROW_WIDTH == 2
+
+    runner = _vocab_runner(supports_multi_frame=True, vocab_size=0)
+    # Hidden-width rows on purpose: the width of this tensor is not the answer.
+    talker_multiframe.ensure_stop_token_vocab(runner, torch.randn(4, 768))
+    assert runner.input_batch.vocab_size == 2
+
+    # Idempotent: arming again must not move it.
+    talker_multiframe.ensure_stop_token_vocab(runner, torch.randn(4, 768))
+    assert runner.input_batch.vocab_size == 2
+
+
+def test_stop_vocab_gate_stays_off_without_multi_frame_or_rows():
+    from vllm_omni.platforms.npu.worker import talker_multiframe
+
+    # Single-frame models (K=1, stage 0/2) never take the branch that reads
+    # vocab_size; the gate must leave them exactly as they were.
+    single = _vocab_runner(supports_multi_frame=False, vocab_size=0)
+    talker_multiframe.ensure_stop_token_vocab(single, torch.randn(4, 768))
+    assert single.input_batch.vocab_size == 0
+
+    # No rows at hand: None must not be read as "width unknown, arm anyway".
+    armed = _vocab_runner(supports_multi_frame=True, vocab_size=0)
+    talker_multiframe.ensure_stop_token_vocab(armed, None)
+    assert armed.input_batch.vocab_size == 0
+
+
+class _MinTokensLogitsProcessor:
+    """The name is the contract: the implementation matches on ``type(proc).__name__``."""
+
+    def __init__(self, min_toks):
+        self.min_toks = min_toks
+
+
+def test_kstep_min_tokens_neutralization_clears_the_censor_list():
+    """The vLLM-level ``min_tokens`` mask list must be cleared under multi-frame decode.
+
+    It masks the request's only stop signal (id 1 of the binary stop row) and
+    unmasks only once ``len(output_token_ids) >= min_tokens`` -- a counter owned
+    by vLLM's spec bookkeeping, so a request whose counter does not advance can
+    never stop (observed: stage 1 all ``length``, zero ``stop``). The model-side
+    guard already holds the codec EOS back with ``state.step < min_tokens``, so
+    this layer is redundant.
+    """
+    from vllm_omni.platforms.npu.worker import talker_multiframe
+
+    censor = _MinTokensLogitsProcessor({0: (50, [0, 0, 0], {1})})
+    untouched = _MinTokensLogitsProcessor({0: (50, [0], {1})})
+    untouched.__class__ = type("SomeOtherProcessor", (object,), {})  # not the target processor
+
+    talker_multiframe.neutralize_kstep_min_tokens(SimpleNamespace(non_argmax_invariant=[untouched, censor]))
+    assert censor.min_toks == {}
+    assert untouched.min_toks == {0: (50, [0], {1})}
+
+    # An empty list and odd inputs must not raise either.
+    talker_multiframe.neutralize_kstep_min_tokens(SimpleNamespace(non_argmax_invariant=[]))
+    talker_multiframe.neutralize_kstep_min_tokens(None)
+
+
+def test_incomplete_prefill_chunk_skips_sampling():
+    """The runner's eligibility flag must gate the K-step sampling branch.
+
+    A request whose prompt spans several prefill chunks reports
+    ``request_sample_eligible=False`` for the incomplete chunks; sampling
+    there would advance codec history and RNG state, making the generated
+    audio depend on how the prompt happened to be chunked (review on PR
+    #7929). The flag only reaches the Talker while the outer wrapper
+    forwards ``requires_request_sample_eligibility`` -- without that forward
+    the runner never sends the flag and this branch degrades to the
+    ``[True] * len(infos)`` fallback.
+    """
+    model = _make_talker(k_step_frames=8, scripted_samples=[42])
+    state = {"step": 0, "codes": torch.tensor([10, 11])}
+    model._request_audio_states["r1"] = state
+
+    out = model.make_omni_output(
+        torch.randn(1, 8),
+        model_intermediate_buffer=[{"request_id": "r1"}],
+        request_token_spans=[(0, 1)],
+        request_sample_eligible=[False],
+    )
+    # No codec frame, no state advance, no history touch.
+    assert out.multimodal_outputs["codes"]["audio"][0].numel() == 0
+    assert state["step"] == 0
+    assert "last_code" not in state
+    assert model._request_codec_history.get("r1", []) == []
+
+    # Eligible again (the chunking completed): sampling resumes.
+    out2 = _frame_call(model, torch.randn(1, 8))
+    assert state["last_code"] == 42
+    assert out2.multimodal_outputs["codes"]["audio"][0].reshape(-1).tolist() == [42]
+
+
+def test_outer_wrapper_forwards_sampling_eligibility_flag():
+    """The runner only sees the wrapper, so the flag must resolve through it.
+
+    gpu/npu runners arm the ``request_sample_eligible`` transmission with
+    ``getattr(self.model, "requires_request_sample_eligibility", False)``,
+    and ``self.model`` is the stage's registered architecture -- the outer
+    ``MiniCPMO45OmniForConditionalGeneration`` wrapper, never the inner
+    Talker that declares the flag.
+    """
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    wrapper = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    nn.Module.__init__(wrapper)
+    # A wrapper without a Talker (stage 0 LLM) must not arm the transmission.
+    assert wrapper.requires_request_sample_eligibility is False
+
+    wrapper.talker = _make_talker(k_step_frames=8, scripted_samples=[])
+    assert wrapper.requires_request_sample_eligibility is True
+
+
+def test_request_sampling_params_pin_codec_knobs():
+    """Per-request SamplingParams override the statically resolved knobs.
+
+    Single-frame contract: temperature/seed/top-k/top-p/penalty overrides
+    steer the codec stream exactly like they steer the vLLM sampler in the
+    single-frame path. A request pinning temperature to 0 must also take
+    the deterministic boundary sampler.
+    """
+    model = _make_talker(k_step_frames=8, scripted_samples=[42])
+    # Deployment resolved a warm stochastic profile; the request pins its own.
+    model._codec_temperature = 0.8
+    model._codec_top_k = 100
+    model._codec_top_p = 0.8
+    model._codec_repetition_penalty = 1.05
+    model._codec_seed = 42
+    state = {"step": 0, "codes": torch.tensor([10, 11])}
+    model._request_audio_states["r1"] = state
+
+    model.make_omni_output(
+        torch.randn(1, 8),
+        model_intermediate_buffer=[{"request_id": "r1"}],
+        request_token_spans=[(0, 1)],
+        request_sample_eligible=[True],
+        request_sampling_params=[
+            SimpleNamespace(temperature=0.0, top_k=25, top_p=0.85, repetition_penalty=1.0, seed=7)
+        ],
+    )
+    # temperature 0 -> the deterministic boundary sampler was taken.
+    assert state["last_code"] == 42
+    # The knobs are pinned for this request's samplers.
+    assert state["codec_temperature"] == 0.0
+    assert state["codec_top_k"] == 25
+    assert state["codec_top_p"] == 0.85
+    assert state["codec_repetition_penalty"] == 1.0
+    gen = model._request_generator("r1", torch.device("cpu"))
+    assert gen.initial_seed() == 7
+
+    # A request without SamplingParams (dummy runs, CPU tests) keeps the
+    # statically resolved deployment profile.
+    model2 = _make_talker(k_step_frames=8, scripted_samples=[43])
+    model2._codec_seed = 42
+    model2._request_audio_states["r2"] = {"step": 0, "codes": torch.tensor([10, 11])}
+    model2.make_omni_output(
+        torch.randn(1, 8),
+        model_intermediate_buffer=[{"request_id": "r2"}],
+        request_token_spans=[(0, 1)],
+        request_sample_eligible=[True],
+    )
+    gen2 = model2._request_generator("r2", torch.device("cpu"))
+    assert gen2.initial_seed() == 42
+
+
+def test_request_max_tokens_remaining_caps_kstep_frames():
+    """The request's remaining output budget caps the K-step frame ceiling.
+
+    The scheduler truncates the sampled ids at the request limit while the
+    connector concatenates every emitted codec frame, so a request whose limit
+    falls inside a K-frame step must stop emitting frames at the limit instead
+    of running on to the stage's codec budget (review on PR #7929).
+    """
+    model = _make_talker(k_step_frames=8, scripted_samples=[42])
+    model._codec_max_tokens = 4032
+    state = {"step": 0, "max_tokens": 4032, "codes": torch.tensor([10, 11])}
+    model._request_audio_states["r1"] = state
+
+    model.make_omni_output(
+        torch.randn(1, 8),
+        model_intermediate_buffer=[{"request_id": "r1"}],
+        request_token_spans=[(0, 1)],
+        request_sample_eligible=[True],
+        request_sampling_params=[
+            SimpleNamespace(temperature=0.0, top_k=25, top_p=0.85, repetition_penalty=1.0, seed=7)
+        ],
+        request_max_tokens_remaining=[3],
+    )
+    # K=8 frames were available, but the request had only 3 tokens left.
+    assert state["max_tokens"] == 3
+
+    # A request without a limit keeps the stage-resolved codec budget.
+    model2 = _make_talker(k_step_frames=8, scripted_samples=[43])
+    model2._codec_max_tokens = 4032
+    state2 = {"step": 0, "max_tokens": 4032, "codes": torch.tensor([10, 11])}
+    model2._request_audio_states["r2"] = state2
+    model2.make_omni_output(
+        torch.randn(1, 8),
+        model_intermediate_buffer=[{"request_id": "r2"}],
+        request_token_spans=[(0, 1)],
+        request_sample_eligible=[True],
+        request_sampling_params=[
+            SimpleNamespace(temperature=0.0, top_k=25, top_p=0.85, repetition_penalty=1.0, seed=7)
+        ],
+        request_max_tokens_remaining=[None],
+    )
+    assert state2["max_tokens"] == 4032
+
+
+def test_reused_device_state_follows_tightened_max_tokens():
+    """A reused codec device state picks up the caller's tightened ceiling.
+
+    ``_merge_request_codec_params`` clamps ``state["max_tokens"]`` to the
+    request's remaining output budget on later steps, but the device state is
+    built once and reused. If it kept its creation-time budget, the codec loop
+    would emit past the frame the engine stops accepting ids at -- the
+    alignment the review asked to close (PR #7929).
+    """
+    model = _make_talker(k_step_frames=8, scripted_samples=[42])
+    model._codec_max_tokens = 4032
+    model._codec_repetition_penalty = 1.05
+    model.head_code = nn.ModuleList([nn.Linear(8, _NUM_AUDIO_TOKENS, bias=False)])
+    # _make_talker installs a scripted stub; this test needs the real boundary.
+    real_greedy = type(model)._sample_audio_code_greedy
+    model._sample_audio_code_greedy = real_greedy.__get__(model, type(model))
+    state = {"step": 0, "max_tokens": 4032, "codes": torch.tensor([10, 11])}
+    model._request_audio_states["r1"] = state
+    hidden = torch.randn(1, 8)
+
+    # Step 1: no request limit, so the device state starts at the stage budget.
+    model._sample_audio_code_greedy(hidden, state["codes"], "r1", 0, 0, state["max_tokens"])
+    assert int(model._request_codec_device_states["r1"].max_tokens.item()) == 4032
+
+    # Step 2: the host ceiling was tightened to 3; the reused device state has
+    # to follow it instead of staying at 4032.
+    state["max_tokens"] = 3
+    model._sample_audio_code_greedy(hidden, state["codes"], "r1", 1, 0, state["max_tokens"])
+    assert int(model._request_codec_device_states["r1"].max_tokens.item()) == 3
+
+
+def test_reused_device_state_follows_tightened_max_tokens_stochastic():
+    """The stochastic boundary refreshes the reused device state the same way.
+
+    ``_sample_audio_code`` reads the ceiling from the request state rather than
+    from an argument, so it needs its own check that a reused device state does
+    not keep the creation-time budget (PR #7929).
+    """
+    model = _make_talker(k_step_frames=8, scripted_samples=[42])
+    model._codec_max_tokens = 4032
+    model._codec_temperature = 0.8
+    model._codec_repetition_penalty = 1.05
+    model._codec_top_k = 0
+    model._codec_top_p = 1.0
+    model._codec_seed = 42
+    model.head_code = nn.ModuleList([nn.Linear(8, _NUM_AUDIO_TOKENS, bias=False)])
+    real_sample = type(model)._sample_audio_code
+    model._sample_audio_code = real_sample.__get__(model, type(model))
+    state = {"step": 0, "max_tokens": 4032, "codes": torch.tensor([10, 11])}
+    model._request_audio_states["r1"] = state
+    hidden = torch.randn(1, 8)
+
+    model._sample_audio_code(hidden, state["codes"], "r1", 0)
+    assert int(model._request_codec_device_states["r1"].max_tokens.item()) == 4032
+
+    state["max_tokens"] = 5
+    model._sample_audio_code(hidden, state["codes"], "r1", 1)
+    assert int(model._request_codec_device_states["r1"].max_tokens.item()) == 5
+
+
+def test_default_sampling_params_feed_codec_resolution():
+    """``default_sampling_params`` sits between the YAML block and tts_config.
+
+    It is the source the single-frame path's SamplingParams are built from,
+    so a deployment tuning stage 1 through it must control the K-step codec
+    sampler too (review on PR #7929). The explicit YAML block still wins key
+    by key, and untouched keys fall through to the checkpoint config.
+    """
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        resolve_codec_sampling_params,
+    )
+
+    tts_config = SimpleNamespace(
+        seed=42,
+        temperature=0.8,
+        top_k=100,
+        top_p=0.8,
+        repetition_penalty=1.05,
+        min_new_tokens=50,
+        max_new_tokens=2048,
+    )
+
+    # No YAML block: the stage defaults drive the knobs the deployment set,
+    # untouched keys keep the checkpoint values.
+    resolved = resolve_codec_sampling_params(
+        None, tts_config, deploy_defaults={"top_k": 25, "top_p": 0.85, "max_tokens": 4096}
+    )
+    assert resolved["top_k"] == 25
+    assert resolved["top_p"] == 0.85
+    assert resolved["max_tokens"] == 4096
+    assert resolved["temperature"] == 0.8
+    assert resolved["min_tokens"] == 50
+
+    # The explicit YAML block still wins key by key.
+    resolved2 = resolve_codec_sampling_params({"top_k": 9}, tts_config, deploy_defaults={"top_k": 25})
+    assert resolved2["top_k"] == 9
+
+    # No stage defaults either: back to the old chain (tts_config, then
+    # module fallbacks).
+    resolved3 = resolve_codec_sampling_params(None, tts_config)
+    assert resolved3["top_k"] == 100
+    assert resolved3["seed"] == 42
+
+
+def test_request_min_tokens_reaches_codec_state():
+    """A positive request ``min_tokens`` floor reaches the K-step state.
+
+    The NPU runner neutralizes vLLM's MinTokensLogitsProcessor, so the
+    in-model codec sampler is the only min-length guard left (PR #7929
+    review). The engine default 0 means "no extra floor" and must not
+    overwrite the stage-resolved codec minimum.
+    """
+    model = _make_talker(k_step_frames=8, scripted_samples=[42])
+    model._codec_min_tokens = 50
+
+    base = dict(temperature=0.8, top_k=25, top_p=0.85, repetition_penalty=1.05, seed=None)
+    state = {"step": 0}
+    model._merge_request_codec_params(state, SimpleNamespace(min_tokens=100, **base))
+    assert state["min_tokens"] == 100
+
+    # 0 (engine default) is not a floor: the key stays unset so the K-step
+    # loop keeps falling back to the stage-resolved minimum.
+    state_zero = {"step": 0}
+    model._merge_request_codec_params(state_zero, SimpleNamespace(min_tokens=0, **base))
+    assert "min_tokens" not in state_zero
+
+    # The min_new_tokens alias is honored too.
+    state_alias = {"step": 0}
+    model._merge_request_codec_params(state_alias, SimpleNamespace(min_new_tokens=7, **base))
+    assert state_alias["min_tokens"] == 7
+
+
+def test_top_k_then_top_p_matches_single_frame_order():
+    """K-step filtering follows the engine's order: top-k, then top-p.
+
+    The single-frame path applies top-k first and then computes top-p over the
+    top-k-filtered distribution, keeping at least one candidate
+    (vllm/v1/sample/ops/topk_topp_sampler.py:392/:404/:415). Filtering top-p
+    first -- or holding a floor of three candidates -- changes the sampling
+    distribution even for identical logits and sampling parameters, so enabling
+    K-step decoding would silently alter the single-frame contract
+    (PR #7929 review).
+    """
+    from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
+        make_device_state,
+        prepare_codec_logits,
+    )
+
+    device_state = make_device_state(torch.zeros(0, dtype=torch.int32), step=0, max_tokens=100, finished=False)
+    kwargs = dict(
+        state=device_state,
+        min_tokens=torch.tensor([0]),
+        temperature=torch.tensor([1.0]),
+        repetition_penalty=torch.tensor([1.0]),
+        eos_token_id=_EOS_ID,
+    )
+    # The review's example: candidate weights [40, 30, 20, 10] with top_k=3 and
+    # top_p=0.5. The engine keeps two candidates -- top-p runs over the
+    # renormalized top-3 distribution [0.444, 0.333, 0.222], whose ascending
+    # cumsum first exceeds 0.5 at the second candidate. Keeping three
+    # candidates was the reported bug.
+    weights = torch.tensor([40.0, 30.0, 20.0, 10.0])
+    logits = torch.full((1, _NUM_AUDIO_TOKENS), -1e4)
+    logits[0, 10:14] = weights.log()
+    filtered = prepare_codec_logits(logits.clone(), top_k=3, top_p=0.5, **kwargs)
+    assert int(torch.isfinite(filtered).sum()) == 2
+    # An explicit top_k is honored exactly: top_k=1 keeps a single candidate.
+    filtered_top_k_one = prepare_codec_logits(logits.clone(), top_k=1, top_p=1.0, **kwargs)
+    assert int(torch.isfinite(filtered_top_k_one).sum()) == 1
+    # top-p alone keeps at least one candidate, like the engine's `at least one`
+    # row (topk_topp_sampler.py:415).
+    filtered_top_p_only = prepare_codec_logits(logits.clone(), top_k=0, top_p=0.01, **kwargs)
+    assert int(torch.isfinite(filtered_top_p_only).sum()) >= 1
+
+
+def test_eos_window_mask_hides_codec_eos():
+    """``eos_window_masked=True`` masks codec EOS regardless of the step.
+
+    This is the turn-end drain path: duplex meta ``turn_end`` pins
+    ``state["turn_end_drain"]`` (tts preprocess), the K-step loop forwards it
+    as ``eos_window_masked``, and the sampler must hide EOS so the chunk can
+    drain its remaining cadence frames instead of ending early.
+    """
+    from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
+        make_device_state,
+        prepare_codec_logits,
+    )
+
+    logits = torch.full((1, _NUM_AUDIO_TOKENS), 1.0)
+    logits[0, _EOS_ID] = 10.0
+    device_state = make_device_state(torch.zeros(0, dtype=torch.int32), step=5, max_tokens=100, finished=False)
+    kwargs = dict(
+        state=device_state,
+        min_tokens=torch.tensor([0]),
+        temperature=torch.tensor([0.8]),
+        repetition_penalty=torch.tensor([1.0]),
+        eos_token_id=_EOS_ID,
+        top_p=1.0,
+        top_k=0,
+    )
+    # step >= min_tokens: EOS is eligible and keeps its dominant logit.
+    unmasked = prepare_codec_logits(logits.clone(), eos_window_masked=False, **kwargs)
+    assert unmasked[0, _EOS_ID] != float("-inf")
+    # Drain window: EOS is forced out even though the step allows it.
+    masked = prepare_codec_logits(logits.clone(), eos_window_masked=True, **kwargs)
+    assert masked[0, _EOS_ID] == float("-inf")
