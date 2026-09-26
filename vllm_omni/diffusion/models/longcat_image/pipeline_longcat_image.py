@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import LongCatImageTransformer2DModel
+from vllm_omni.diffusion.models.longcat_image.text_encoder_quantization import prepare_text_encoder_fp8
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -247,6 +248,7 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
             prefetch_list=longcat_subfolders,
             local_files_only=local_files_only,
         )
+        prepare_text_encoder_fp8(self.text_encoder, od_config.quantization_config)
         self.text_processor = Qwen2VLProcessor.from_pretrained(
             model, subfolder="text_processor", local_files_only=local_files_only
         )

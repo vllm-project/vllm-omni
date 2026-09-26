@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
 import math
@@ -35,6 +35,7 @@ from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import (
     LongCatImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.longcat_image.pipeline_longcat_image import calculate_shift
+from vllm_omni.diffusion.models.longcat_image.text_encoder_quantization import prepare_text_encoder_fp8
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.size_utils import normalize_min_aligned_size
@@ -265,6 +266,7 @@ class LongCatImageEditPipeline(
             prefetch_list=longcat_subfolders,
             local_files_only=local_files_only,
         )
+        prepare_text_encoder_fp8(self.text_encoder, od_config.quantization_config)
         self.text_processor = Qwen2VLProcessor.from_pretrained(
             model, subfolder="text_processor", local_files_only=local_files_only
         )
