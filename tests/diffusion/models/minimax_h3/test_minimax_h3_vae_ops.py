@@ -105,10 +105,10 @@ def test_h3_vae_scaled_residual_is_bit_exact():
 
 
 def test_h3_vae_exact_ops_reject_unsupported_inputs():
-    from vllm_omni.diffusion.models.minimax_h3.ops.vae.qk_norm_rope import (
+    from vllm_omni.diffusion.models.minimax_h3.ops.vae.nvidia import (
         try_qk_norm_rope_exact,
+        try_scaled_residual_exact,
     )
-    from vllm_omni.diffusion.models.minimax_h3.ops.vae.scaled_residual import try_scaled_residual_exact
 
     q = torch.randn(1, 2, 32, 64, dtype=torch.float32)
     cos = torch.randn(1, 2, 1, 48, dtype=torch.float32)
