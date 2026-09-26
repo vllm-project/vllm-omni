@@ -384,9 +384,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         self.kv_connector_output = None
 
         if self.execute_model_state is None:
-            # receive sampled token ids from the last PP rank.
-            if self.use_async_scheduling and not get_pp_group().is_last_rank:
-                self._pp_receive_prev_sampled_token_ids_to_input_batch()
+            # No PP sampled-token receive here, unlike the AR runner: this
+            # runner never samples, its async output ships an empty
+            # sampled_token_ids, and no rank ever broadcasts. Posting the
+            # receive would leave an unmatched collective (#7393).
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
             return self.attach_omni_connector_output(
