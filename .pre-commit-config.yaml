@@ -163,8 +163,11 @@ repos:
     # bypass/SKIP tip is not displaced.
     - id: suggestion
       name: Suggestion
-      entry: bash -c 'echo "To bypass all the pre-commit hooks, add --no-verify to git commit. To skip a specific hook, prefix the commit command with SKIP=<hook-id>."'
-      language: system
+      entry: python
+      args:
+        - -c
+        - print("To bypass all the pre-commit hooks, add --no-verify to git commit. To skip a specific hook, prefix the commit command with SKIP=<hook-id>.")
+      language: python
       verbose: true
       pass_filenames: false
     # Insert new entries above the `suggestion` entry

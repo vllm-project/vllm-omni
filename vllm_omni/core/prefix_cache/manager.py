@@ -57,10 +57,16 @@ from collections.abc import Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn
+from typing import Any, NamedTuple, NoReturn
 
 import torch
 
+from vllm_omni.core.prefix_cache.adapter import (
+    PrefixCacheEventKind,
+    PrefixCacheRequestEvent,
+    PrefixCacheStep,
+    PrefixCacheWriteLayout,
+)
 from vllm_omni.core.prefix_cache.block_pool import PrefixBlockPool
 from vllm_omni.core.prefix_cache.controller import (
     OmniPrefixCacheController,
@@ -84,11 +90,6 @@ from vllm_omni.core.prefix_cache.interface import (
     is_hidden_key,
     without_hidden,
 )
-
-if TYPE_CHECKING:
-    from vllm.v1.core.sched.output import SchedulerOutput
-
-    from vllm_omni.core.prefix_cache.group_view import FullAttentionGroupView
 
 logger = logging.getLogger(__name__)
 
@@ -425,12 +426,10 @@ class OmniPrefixCacheManager:
     def __init__(
         self,
         config: PrefixCacheConfig,
-        view: FullAttentionGroupView,
         *,
         eager: bool | None = None,
     ):
         self._config = config
-        self._view = view
         self._pool = PrefixBlockPool(config)
         self._controller = OmniPrefixCacheController(self._pool, config, eager=eager)
         self._policy = ModelCachePolicy()
@@ -478,8 +477,13 @@ class OmniPrefixCacheManager:
             self._slot_status.init_table(hk)
 
     @torch.inference_mode()
-    def new_step_starts(self, scheduler_output: SchedulerOutput) -> None:
-        """Handle one scheduler_output.
+    def new_step_starts(
+        self,
+        events: Iterable[PrefixCacheRequestEvent] | PrefixCacheStep,
+        *,
+        num_scheduled_tokens: Mapping[str, int] | None = None,
+    ) -> None:
+        """Handle one immutable lifecycle event batch.
 
         Engine thread only; before _update_states removes finished
         requests; exactly once per real step. Registers new-request prefix
@@ -498,8 +502,16 @@ class OmniPrefixCacheManager:
             #    those block hashes are already in vLLM; dropping the write
             #    would leave future hits ABSENT. The next save waits
             #    join_host_ready. (Not leftover_mm — those are this-step reads.)
-            finished = getattr(scheduler_output, "finished_req_ids", None) or ()
-            for req_id in finished:
+            if isinstance(events, PrefixCacheStep):
+                step = events
+                events = step.events
+                num_scheduled_tokens = dict(step.scheduled_tokens)
+            else:
+                events = tuple(events)
+            for event in events:
+                if event.kind not in (PrefixCacheEventKind.FINISHED, PrefixCacheEventKind.ABORTED):
+                    continue
+                req_id = event.req_id
                 tids, dtask = self._request_tasks.finish(req_id)
                 if dtask is not None:
                     tids.add(dtask.tid)
@@ -508,13 +520,15 @@ class OmniPrefixCacheManager:
                     to_escalate.extend(pending_tasks)
                     self._join_finished_tids.update(pending_tasks)
 
-            # 3. Copy this arrival's prefix-hit block ids. scheduled_new_reqs
-            #    is the only place they appear; after _update_states they sit
+            # 3. Copy this arrival's prefix-hit block ids. The adapter captures
+            #    them before _update_states; after that point they sit
             #    on the live request and grow as decode allocates more blocks.
             #    materialize (async builder) must not reread that live table.
             self._clear_hit_infos()
-            for new_req in getattr(scheduler_output, "scheduled_new_reqs", ()) or ():
-                req_id = new_req.req_id
+            for event in events:
+                if event.kind not in (PrefixCacheEventKind.STARTED,):
+                    continue
+                req_id = event.req_id
                 if req_id in self._request_tasks.live_reqs:
                     # Already live: async_chunk continuation, or a V2-runner
                     # resume after preemption (V1 resumes via
@@ -522,13 +536,11 @@ class OmniPrefixCacheManager:
                     # not mirrored as a hit span; see the design doc.
                     continue
                 self._request_tasks.live_reqs.add(req_id)
-                num_computed = int(getattr(new_req, "num_computed_tokens", 0) or 0)
+                num_computed = int(event.hit_end)
                 if num_computed > 0:
                     # block_ids is per-kv-group; group 0 only.
-                    blocks = getattr(new_req, "block_ids", None)
-                    if blocks is not None and len(blocks) > 0 and not isinstance(blocks[0], int):
-                        blocks = blocks[0]
-                    if not blocks:
+                    block_groups = event.block_ids
+                    if not block_groups or not block_groups[0]:
                         # Fail at the cause: a hit we cannot snapshot now would
                         # crash at materialize time with less context (materialize is
                         # forbidden from reading the live batch).
@@ -540,13 +552,15 @@ class OmniPrefixCacheManager:
                         raise OmniPrefixCacheUnmatchError(
                             f"prefix hit not block aligned (req={req_id}, hit_upto={num_computed}, block_size={bs})"
                         )
-                    hit_blocks = list(blocks[: num_computed // bs])
+                    hit_blocks = list(block_groups[0][: num_computed // bs])
                     self._hit_spans[req_id] = (num_computed, hit_blocks)
 
             # 4. Gather those spans on the prefetch thread; overlaps this forward.
             while self._prefetch_queue and self._prefetch_queue[0][0].done():
                 self._prefetch_queue.popleft()
-            self._cur_num_scheduled = dict(scheduler_output.num_scheduled_tokens)
+            self._cur_num_scheduled = dict(
+                num_scheduled_tokens or {event.req_id: event.scheduled_tokens for event in events}
+            )
             if self._hit_spans:
                 self._prefetch_hit_spans()
         if to_escalate:
@@ -560,6 +574,7 @@ class OmniPrefixCacheManager:
         *,
         num_tokens_unpadded: int,
         num_tokens_padded: int,
+        write_layout: PrefixCacheWriteLayout | None = None,
     ) -> int:
         """Write this step's outputs into the cache; returns the step id.
 
@@ -585,15 +600,13 @@ class OmniPrefixCacheManager:
         self._wait_for_host_ready()
 
         # 2. Packed batch layout for this step (req -> [start, end)).
-        req_order = self._view.batch_req_ids()
-        num_sched = {r: int(self._cur_num_scheduled.get(r, 0)) for r in req_order}
-        query_start: dict[str, int] = {}
-        current_start_idx = 0
-        for req_id in req_order:
-            query_start[req_id] = current_start_idx
-            current_start_idx += num_sched[req_id]
+        if write_layout is None:
+            raise ValueError("save_outputs requires an adapter-produced write_layout")
+        req_order = [write.req_id for write in write_layout.writes]
+        num_sched = {write.req_id: write.row_end - write.row_start for write in write_layout.writes}
+        query_start = {write.req_id: write.row_start for write in write_layout.writes}
 
-        slots_cpu: torch.Tensor | None = None
+        slots_cpu: torch.Tensor | None = write_layout.slots_cpu
         mm_outputs = mm_outputs or {}
         freeze_event = None
 
@@ -601,7 +614,8 @@ class OmniPrefixCacheManager:
         if num_tokens_unpadded > 0:
             # Derive the slot mapping on CPU: reading the device one back
             # would need a stream sync that waits on the whole forward.
-            slots_cpu = self._view.step_slots_cpu(req_order, num_sched)
+            if slots_cpu is None:
+                raise ValueError("write_layout is missing its CPU slot snapshot")
             if int(slots_cpu.numel()) != num_tokens_unpadded:
                 # Fail at the cause: skipping the save would leave rows absent
                 # behind hashes vLLM already published — a delayed crash at
@@ -1389,7 +1403,7 @@ class OmniPrefixCacheManager:
         have been given to a newer write between plan and read (block reuse).
 
         vLLM frees a request's blocks when it finishes or is aborted, one
-        step before ``finished_req_ids`` reaches us, and may reuse them at
+        step before the terminal lifecycle event reaches us, and may reuse them at
         once. A planned ``_SlotRef`` is registered in ``_pending_reads``;
         the reusing write copy-on-writes those COMMITTED rows into
         ``preserved`` before it claims the slots. Those slots are safe.
