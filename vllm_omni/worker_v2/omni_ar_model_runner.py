@@ -201,6 +201,12 @@ class OmniARModelRunner(OmniGPUModelRunner):
                 multimodal_outputs,
                 self._dispatch_mtp_batch_descriptor,
             )
+        publish_sampled = getattr(self.model_state, "publish_sampled_embeddings", None)
+        extra_outputs = (
+            publish_sampled(input_batch, sampler_output.sampled_token_ids)
+            if multimodal_outputs and callable(publish_sampled)
+            else None
+        )
         if self.pp_handler is not None:
             self.pp_handler.broadcast(
                 sampler_output.sampled_token_ids,
@@ -251,6 +257,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             finalize_output=(None if materialize_native else self._finalize_native_data_plane_output),
             check_ep_fault=self.check_ep_fault,
             routed_experts=routed_experts,
+            extra_multimodal_outputs=extra_outputs,
         )
         self._release_multimodal_snapshot(snapshot_slot, async_output.copy_event)
         _guard_graph_replay_for_pooler_copy(
@@ -543,6 +550,18 @@ def _async_copy_mm(
     }
 
 
+def _merge_payload_trees(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+    """``base`` with ``extra`` merged in; nested mappings merge key by key."""
+    merged = dict(base)
+    for key, value in extra.items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = _merge_payload_trees(current, value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def _slice_pooler_value(
     value: Any,
     *,
@@ -649,6 +668,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         finalize_output: Any | None = None,
         check_ep_fault: bool = False,
         routed_experts: RoutedExpertsTensors | None = None,
+        extra_multimodal_outputs: tuple[dict[str, Any], torch.cuda.Event] | None = None,
     ):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
@@ -745,6 +765,20 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                     copy_stream=copy_stream,
                     pin_memory=pin_memory,
                 )
+                if extra_multimodal_outputs:
+                    # Produced after the packed snapshot was laid out (on a side
+                    # stream); copied on its own once its event completes.
+                    extra_outputs, extra_ready = extra_multimodal_outputs
+                    copy_stream.wait_event(extra_ready)
+                    self._mm_snapshot = _merge_payload_trees(
+                        self._mm_snapshot,
+                        _async_copy_mm(
+                            extra_outputs,
+                            self._total_tokens,
+                            copy_stream=copy_stream,
+                            pin_memory=pin_memory,
+                        ),
+                    )
             elif self._need_pooler and text_hidden is not None:
                 self._hidden_cpu = _async_copy_tensor(
                     text_hidden,

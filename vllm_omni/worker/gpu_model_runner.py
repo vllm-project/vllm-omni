@@ -41,6 +41,7 @@ from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEm
 from vllm_omni.model_executor.models.model_local_kv import collect_model_local_kv_specs
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.utils.device_copy import index_to_device
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -210,6 +211,32 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self._init_talker_mtp()
         self._prewarm_attention_capture_workspaces()
         self._report_model_local_kv()
+        self._warn_unexposed_stage_hooks(model)
+
+    # Read on the model this runner holds. A multi-stage wrapper that builds its
+    # stage module as a child must re-export them, or the runner silently takes
+    # the per-row, host-synchronizing default paths.
+    _STAGE_HOOKS = ("gpu_resident_buffer_keys", "preprocess_decode_batch", "use_async_omni_output")
+
+    @classmethod
+    def _warn_unexposed_stage_hooks(cls, model: Any) -> None:
+        if model is None or not hasattr(model, "named_children"):
+            return
+        for child_name, child in model.named_children():
+            missing = [
+                hook
+                for hook in cls._STAGE_HOOKS
+                if getattr(child, hook, None) not in (None, False) and getattr(model, hook, None) in (None, False)
+            ]
+            if missing:
+                logger.warning(
+                    "%s.%s defines %s but %s does not expose them; the runner reads these on %s.",
+                    type(model).__name__,
+                    child_name,
+                    ", ".join(missing),
+                    type(model).__name__,
+                    type(model).__name__,
+                )
 
     def _report_model_local_kv(self) -> None:
         """Log attention KV this model holds outside the paged manager.
@@ -1821,7 +1848,8 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                         dtype=req_embeds.dtype,
                     )
 
-                offsets_t = torch.tensor(start_offsets_b, device=req_embeds.device, dtype=torch.long)
+                # A pageable H2D here would sync the host every decode step.
+                offsets_t = index_to_device(start_offsets_b, req_embeds.device)
                 inputs_embeds.index_copy_(0, offsets_t, req_embeds)
                 preprocess_input_ids.index_copy_(
                     0,

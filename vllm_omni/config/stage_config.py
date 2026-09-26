@@ -402,6 +402,9 @@ class StageDeployConfig:
 
     # False opts this stage out of pipeline-wide async chunking.
     async_chunk: bool | None = None
+    # Overrides the deploy-level ``model_runner`` for this stage, so a pipeline
+    # can run e.g. its LLM stage on v1 and its codec stages on MRv2.
+    model_runner: Literal["v1", "v2"] | None = None
 
     # Inter-stage connector wiring and request defaults.
     output_connectors: dict[str, str] | None = None
@@ -607,6 +610,7 @@ class DeployConfig:
 _STAGE_RESERVED_KEYS = frozenset(
     {
         "async_chunk",
+        "model_runner",
         "stage_id",
         "devices",
         "num_replicas",
@@ -655,6 +659,9 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
             else:
                 flat_args[k] = v
 
+    stage_runner = stage_data.get("model_runner")
+    if stage_runner is not None and stage_runner not in ("v1", "v2"):
+        raise ValueError(f"stage {stage_data['stage_id']}: model_runner must be 'v1' or 'v2', got {stage_runner!r}")
     kwargs: dict[str, Any] = {
         "stage_id": stage_data["stage_id"],
         "devices": devices,
@@ -666,6 +673,7 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
             kwargs[name] = flat_args.pop(name)
 
     kwargs["async_chunk"] = stage_data.get("async_chunk")
+    kwargs["model_runner"] = stage_runner
     kwargs["output_connectors"] = stage_data.get("output_connectors")
     kwargs["input_connectors"] = stage_data.get("input_connectors")
     kwargs["default_sampling_params"] = stage_data.get("default_sampling_params")
@@ -878,17 +886,12 @@ def _apply_platform_overrides(
         if model_runner not in ("v1", "v2"):
             raise ValueError(f"platform model_runner must be one of ('v1', 'v2'), got {model_runner!r}")
         deploy.model_runner = model_runner
-    if deploy.model_runner == "v2" and platform in {"npu", "xpu"}:
-        raise NotImplementedError(
-            f"Model Runner V2 is not supported on {platform.upper()}: "
-            "the platform worker still uses the legacy chunk-transfer data plane."
-        )
-    if platform is None or deploy.platforms is None:
-        return deploy
-    if platform_section is None:
-        return deploy
-
-    platform_stages = platform_section.get("stages", [])
+        if model_runner == "v1":
+            # A platform's V1 fallback also covers stages that opt into V2.
+            for stage in deploy.stages:
+                if stage.model_runner == "v2":
+                    stage.model_runner = None
+    platform_stages = platform_section.get("stages", []) if platform_section else []
     base_by_id = {s.stage_id: s for s in deploy.stages}
 
     for ps in platform_stages:
@@ -924,6 +927,18 @@ def _apply_platform_overrides(
             else:
                 base.engine_extras[key] = val
 
+    # Validate the final values, including stage entries from the platform
+    # overlay. A global V2 default may still apply to omitted pipeline stages.
+    for stage in deploy.stages:
+        if stage.model_runner is not None and stage.model_runner not in ("v1", "v2"):
+            raise ValueError(f"stage {stage.stage_id}: model_runner must be 'v1' or 'v2', got {stage.model_runner!r}")
+    uses_v2 = deploy.model_runner == "v2" or any(stage.model_runner == "v2" for stage in deploy.stages)
+    if uses_v2 and platform in {"npu", "xpu"}:
+        raise NotImplementedError(
+            f"Model Runner V2 is not supported on {platform.upper()}: "
+            "the platform worker still uses the legacy chunk-transfer data plane."
+        )
+
     return deploy
 
 
@@ -939,6 +954,28 @@ def _resolve_execution_mode(
 ) -> tuple[StageType, str | None]:
     """Map ``execution_type`` → ``(stage_type, worker_type)`` legacy tuple."""
     return _EXECUTION_TYPE_TO_STAGE_WORKER.get(execution_type, (StageType.LLM, None))
+
+
+def resolve_stage_model_runner(deploy: DeployConfig, stage: StageDeployConfig | None) -> str:
+    """The stage's own ``model_runner`` if set, else the deploy-level one."""
+    runner = getattr(stage, "model_runner", None) if stage is not None else None
+    return runner or deploy.model_runner
+
+
+def validate_native_mrv2_session(deploy: DeployConfig, ps: StagePipelineConfig, stage_runner: str) -> None:
+    """Reject session modes a downstream MRv2 native-data-plane stage lacks.
+
+    Streaming-session prompt replacement exists only in the V1 chunk adapter,
+    so a stage that receives from an upstream stage on MRv2 supports
+    turn-based sessions only.
+    """
+    if stage_runner != "v2" or not ps.supports_native_mrv2_data_plane or not ps.input_sources:
+        return
+    if deploy.session_mode != "turn":
+        raise ValueError(
+            f"stage {ps.stage_id}: model_runner v2 supports session_mode 'turn' only, got "
+            f"{deploy.session_mode!r}; run this stage with model_runner: v1 for streaming sessions."
+        )
 
 
 def resolve_stage_async_chunk(deploy: DeployConfig, stage: StageDeployConfig | None) -> bool:
@@ -1065,9 +1102,11 @@ def _build_engine_args(
                     "it is derived from the deploy-level `model_runner` field and the "
                     "pipeline's `supports_native_mrv2_data_plane` declaration."
                 )
-    engine_args["use_v2_model_runner"] = deploy.model_runner == "v2"
+    stage_runner = resolve_stage_model_runner(deploy, ds)
+    validate_native_mrv2_session(deploy, ps, stage_runner)
+    engine_args["use_v2_model_runner"] = stage_runner == "v2"
     engine_args["supports_native_mrv2_data_plane"] = bool(ps.supports_native_mrv2_data_plane)
-    if deploy.model_runner == "v2" and not ps.supports_native_mrv2_data_plane:
+    if stage_runner == "v2" and not ps.supports_native_mrv2_data_plane:
         logger.warning(
             "Stage %s (%s) selects model_runner=v2 without declaring "
             "supports_native_mrv2_data_plane. It will use the legacy transport path; "

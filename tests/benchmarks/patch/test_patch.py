@@ -2121,3 +2121,45 @@ async def test_benchmark_preserves_stage_metrics_request_order_and_missing_snaps
 def test_compact_request_stage_metrics_drops_empty_snapshots(snapshot):
     """Empty chat-omni snapshots must not make every result persist request_stage_metrics."""
     assert patch._compact_request_stage_metrics(snapshot) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channels", [1, 2])
+async def test_chat_wav_continuity_counts_sample_frames(monkeypatch, channels):
+    import io
+    import wave
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as writer:
+        writer.setnchannels(channels)
+        writer.setsampwidth(2)
+        writer.setframerate(24000)
+        writer.writeframes(b"\0\0" * 2400 * channels)  # 100 ms in either layout
+    audio = base64.b64encode(buffer.getvalue()).decode()
+    chunk = create_sse_chunk({"choices": [{"delta": {"audio": {"data": audio}}}], "modality": "audio"})
+    clock = [100.0]
+    monkeypatch.setattr(patch.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(patch, "_audio_continuity_threshold_s", lambda: 0.1)
+
+    class TimedResponse(MockResponse):
+        async def iter_any(self):
+            for offset, data in [(0.1, chunk), (0.5, chunk), (0.51, b"data: [DONE]\n\n")]:
+                clock[0] = 100.0 + offset
+                yield data
+
+    response = TimedResponse(200, [])
+    session = SimpleNamespace(post=lambda **kwargs: response)
+    request = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="hello",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=1,
+        output_len=1,
+    )
+    output = await async_request_openai_chat_omni_completions(request, session)
+    assert output.success
+    assert output.audio_duration == pytest.approx(0.2)
+    assert output.audio_underrun_s == pytest.approx(0.3)
+    assert output.audio_underrun_event_count == 1
+    assert output.audio_continuity_ok is False
