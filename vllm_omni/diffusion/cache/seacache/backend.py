@@ -3,45 +3,62 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cache.base import CacheBackend
 from vllm_omni.diffusion.cache.seacache.config import SeaCacheConfig
+from vllm_omni.diffusion.cache.seacache.extractors import (
+    extract_flux2_seacache_context,
+    extract_flux_seacache_context,
+    extract_qwen_seacache_context,
+)
 from vllm_omni.diffusion.cache.seacache.hook import (
     SeaCacheRootHook,
     apply_sea_cache_hook,
 )
+from vllm_omni.diffusion.cache.teacache.extractors import CacheContext
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 logger = init_logger(__name__)
 
 
-def enable_cosmos3_seacache(
+def _enable_seacache(
     pipeline: Any,
     config: DiffusionCacheConfig,
+    *,
+    extractor_fn: Callable[..., CacheContext | None] | None = None,
+    can_cache_callback: Callable[[], bool] | None = None,
 ) -> SeaCacheRootHook:
+    """Install the shared indicator and residual extrapolation hook."""
     transformer = getattr(pipeline, "transformer", None)
     if transformer is None:
         raise ValueError("SeaCache requires a pipeline with a transformer")
 
+    image_pipeline = type(pipeline).__name__ in _IMAGE_EXTRACTORS
+    max_consecutive_cached = config.sea_max_consecutive_cached
+    power_exp = config.sea_power_exp
+    if max_consecutive_cached is None:
+        max_consecutive_cached = 0 if image_pipeline else 2
+    if power_exp is None:
+        power_exp = 2.0 if image_pipeline else 3.0
+
     sea_config = SeaCacheConfig(
         threshold=config.sea_threshold,
         residual_order=config.sea_residual_order,
-        max_consecutive_cached=config.sea_max_consecutive_cached,
-        power_exp=config.sea_power_exp,
+        max_consecutive_cached=max_consecutive_cached,
+        power_exp=power_exp,
     )
     hook = apply_sea_cache_hook(
         transformer,
         sea_config,
         current_step_callback=lambda: getattr(pipeline, "current_step_index", None),
         current_sigma_callback=lambda: getattr(pipeline, "current_sigma", None),
-        num_inference_steps_callback=lambda: getattr(
-            pipeline,
-            "num_timesteps",
-            None,
-        ),
+        num_inference_steps_callback=lambda: getattr(pipeline, "num_timesteps", None),
+        extractor_fn=extractor_fn,
+        can_cache_callback=can_cache_callback,
     )
     logger.info(
         "SeaCache enabled for %s (threshold=%s, residual_order=%d, max_consecutive_cached=%d, power_exp=%s)",
@@ -54,9 +71,44 @@ def enable_cosmos3_seacache(
     return hook
 
 
+enable_cosmos3_seacache = _enable_seacache
+
+
+_IMAGE_EXTRACTORS: dict[str, Callable[..., CacheContext | None]] = {
+    "FluxPipeline": extract_flux_seacache_context,
+    "Flux2Pipeline": extract_flux2_seacache_context,
+    "Flux2KleinPipeline": extract_flux2_seacache_context,
+    "QwenImagePipeline": extract_qwen_seacache_context,
+    "QwenImageEditPipeline": extract_qwen_seacache_context,
+    "QwenImageEditPlusPipeline": extract_qwen_seacache_context,
+}
+
+
+def enable_image_seacache(pipeline: Any, config: DiffusionCacheConfig) -> SeaCacheRootHook:
+    """Adapt image modulation features."""
+
+    def can_cache() -> bool:
+        # Check after SP/offload hooks are installed: their collectives cannot be skipped.
+        od_config = getattr(pipeline, "od_config", None)
+        parallel = getattr(pipeline.transformer, "parallel_config", None)
+        if parallel is None:
+            parallel = getattr(od_config, "parallel_config", None)
+        return (getattr(parallel, "sequence_parallel_size", 1) or 1) == 1 and not getattr(
+            od_config, "enable_distributed_layerwise_offload", False
+        )
+
+    return _enable_seacache(
+        pipeline,
+        config,
+        extractor_fn=_IMAGE_EXTRACTORS[type(pipeline).__name__],
+        can_cache_callback=can_cache,
+    )
+
+
 CUSTOM_SEACACHE_ENABLERS = {
     "Cosmos3OmniDiffusersPipeline": enable_cosmos3_seacache,
     "Cosmos3OmniPipeline": enable_cosmos3_seacache,
+    **dict.fromkeys(_IMAGE_EXTRACTORS, enable_image_seacache),
 }
 
 

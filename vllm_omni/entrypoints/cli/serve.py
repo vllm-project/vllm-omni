@@ -783,6 +783,7 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="JSON string of cache configuration. "
             "TeaCache: '{\"rel_l1_thresh\": 0.2}'. "
+            "SeaCache: '{\"sea_threshold\": 0.25}'. "
             'MagCache: \'{"mag_threshold": 0.24, "mag_max_skip_steps": 5, "mag_retention_ratio": 0.1}\'. '
             "Calibration mode: add '\"mag_calibrate\": true'",
         )
