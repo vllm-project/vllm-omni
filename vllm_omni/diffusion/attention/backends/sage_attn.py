@@ -49,7 +49,31 @@ else:
         )
         sageattn = None
 
-# TODO add sage3 attention backend
+if not hasattr(torch.ops.vllm_omni, "sage_attention"):
+
+    @torch.library.custom_op("vllm_omni::sage_attention", mutates_args=())
+    def _sage_attention_op(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        is_causal: bool,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        # Keep architecture detection, quantization, and raw CUDA extension
+        # calls outside Dynamo tracing, including under fullgraph=True.
+        from sageattention import sageattn as kernel
+
+        output = kernel(query, key, value, tensor_layout="NHD", is_causal=is_causal, sm_scale=sm_scale)
+        # Sage can return a slice of a padded head dimension. Normalize its
+        # strides to match the fake implementation on every kernel path.
+        return output.contiguous()
+
+    @_sage_attention_op.register_fake
+    def _(query, key, value, is_causal, sm_scale):
+        return torch.empty(query.shape, dtype=query.dtype, device=query.device)
+
+
+_sage_attention_op = torch.ops.vllm_omni.sage_attention
 
 
 class SageAttentionBackend(AttentionBackend):
@@ -99,13 +123,12 @@ class SageAttentionImpl(AttentionImpl):
                 "SAGE_ATTN requires sageattention. Install with: "
                 "pip install git+https://github.com/thu-ml/SageAttention.git"
             )
-        output = sageattn(
+        output = _sage_attention_op(
             query,
             key,
             value,
-            tensor_layout="NHD",
-            is_causal=self.causal,
-            sm_scale=self.softmax_scale,
+            self.causal,
+            self.softmax_scale,
         )
         return output
 
