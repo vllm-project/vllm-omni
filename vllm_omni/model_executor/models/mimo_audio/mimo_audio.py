@@ -551,10 +551,7 @@ class MiMoAudioForConditionalGeneration(
         self.device = vllm_config.device_config.device
         self.pin_memory = is_pin_memory_available()
 
-        if "model_stage" in os.environ:
-            self.model_stage = os.environ["model_stage"]
-        else:
-            self.model_stage = vllm_config.model_config.model_stage
+        self.model_stage = vllm_config.model_config.model_stage
 
         if self.model_stage == "fused_thinker_talker":
             self.has_preprocess = True

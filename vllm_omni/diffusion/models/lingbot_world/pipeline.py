@@ -398,7 +398,13 @@ def get_lingbot_world_pre_process_func(
     """Materialize request-local files once before dispatching GPU workers."""
 
     model_config = getattr(od_config, "model_config", None) or {}
-    configured_action_root = model_config.get("lingbot_action_root") or os.environ.get(_ACTION_ROOT_ENV)
+    configured_action_root = model_config.get("lingbot_action_root")
+    if not configured_action_root and os.environ.get(_ACTION_ROOT_ENV):
+        logger.warning_once(
+            "VLLM_OMNI_LINGBOT_ACTION_ROOT is deprecated and will be removed in a future release. "
+            "Set model_config.lingbot_action_root instead."
+        )
+        configured_action_root = os.environ[_ACTION_ROOT_ENV]
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         prompt = request.prompt
@@ -503,7 +509,7 @@ def get_lingbot_world_pre_process_func(
                 if not configured_action_root:
                     raise ValueError(
                         "sampling_params.extra_args.action_path requires a trusted action root configured by "
-                        f"model_config.lingbot_action_root or {_ACTION_ROOT_ENV}."
+                        "model_config.lingbot_action_root."
                     )
                 action_directory = resolve_trusted_action_directory(
                     action_path,

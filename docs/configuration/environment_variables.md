@@ -190,7 +190,7 @@ collection, examples, bug reports, or logs.
 
 ## Model-specific variables
 
-The audit found 58 variables read by a single model or pipeline family. They are
+The audit found 56 variables read by a single model or pipeline family. They are
 not listed as public usage options here because doing so would turn implementation
 escape hatches into an accidental compatibility contract.
 
@@ -199,11 +199,11 @@ Every audited model-specific name has a migration disposition in the
 
 | Disposition | Count | Required outcome |
 | --- | ---: | --- |
-| Promote | 35 | Move a stable setting into typed stage or model configuration. |
-| Request scope | 6 | Move request-varying behavior into a declared request-option schema. |
+| Promote | 31 | Move a stable setting into typed stage or model configuration. |
+| Request scope | 5 | Move request-varying behavior into a declared request-option schema. |
 | External | 0 | Retain only when a supported third-party library owns the contract. |
-| Internalize | 11 | Keep a debug or diagnostic switch out of public documentation and configuration. |
-| Deprecate/remove | 6 | Remove a compatibility escape hatch that has no continuing contract. |
+| Internalize | 15 | Keep a debug or diagnostic switch out of public documentation and configuration. |
+| Deprecate/remove | 5 | Remove a compatibility escape hatch that has no continuing contract. |
 
 The disposition is a migration target, not a statement that the existing
 environment switch is stable. Promote or request-scope work should land in
