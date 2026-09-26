@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 OpenMOSS and the vLLM-Omni team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
@@ -14,6 +17,7 @@ from vllm.inputs import TokensPrompt as OmniTokensPrompt
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
+from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp, ramp_chunk_size
 
 logger = init_logger(__name__)
 
@@ -233,7 +237,9 @@ def talker2codec_raw_async_chunk(
     Stage 0 emits newly generated raw codec rows shaped ``[T, n_vq]`` (normally
     ``[1, n_vq]`` per decode step). This processor buffers those new rows until
     a codec chunk is ready, then forwards the chunk to Stage 1. No delay-pattern
-    de-delay is applied on this path.
+    de-delay is applied on this path. ``codec_chunk_ramp``, when configured,
+    specifies successive chunk lengths before returning to ``codec_chunk_frames``.
+    It takes precedence over ``initial_codec_chunk_frames``.
     """
     external_req_id = getattr(request, "external_req_id", None)
     req_id = str(external_req_id if external_req_id is not None else getattr(request, "request_id", id(request)))
@@ -283,9 +289,17 @@ def talker2codec_raw_async_chunk(
         )
         initial_chunk_frames = chunk_frames
 
+    # Connector configuration is fixed for the transfer manager lifetime.
+    if not hasattr(transfer_manager, "_moss_chunk_ramp"):
+        transfer_manager._moss_chunk_ramp = parse_chunk_ramp(cfg, steady=chunk_frames)
+    ramp = transfer_manager._moss_chunk_ramp
+
     pending = len(pending_frames)
     emitted_any = int(transfer_manager.put_req_chunk.get(req_id, 0)) > 0
     threshold = initial_chunk_frames if initial_chunk_frames > 0 and not emitted_any else chunk_frames
+    if ramp is not None:
+        chunk_index = int(transfer_manager.put_req_chunk.get(req_id, 0))
+        threshold = ramp_chunk_size(chunk_index, ramp, chunk_frames)
     if pending <= 0:
         if is_finished:
             transfer_manager.code_prompt_token_ids.pop(req_id, None)

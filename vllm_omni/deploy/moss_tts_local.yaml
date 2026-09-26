@@ -14,6 +14,9 @@ connectors:
       connector_get_max_wait: 300
       initial_codec_chunk_frames: 1   # 1 frame * 80 ms/frame = 80 ms first audio chunk
       codec_chunk_frames: 15          # 15 frames * 80 ms/frame = 1.2 s steady chunks
+      # Optional gradual startup chunks; trades extra codec calls for less underrun.
+      # Overrides initial_codec_chunk_frames; the last entry matches steady chunks.
+      # codec_chunk_ramp: [1, 2, 4, 8, 15]
       codec_left_context_frames: 0
 
 stages:
@@ -46,7 +49,7 @@ stages:
     async_scheduling: true
     compilation_config:
       # Reused by the codec as execution-batch buckets; T is derived from
-      # initial_codec_chunk_frames and codec_chunk_frames.
+      # initial_codec_chunk_frames, codec_chunk_frames, and an optional ramp.
       cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
       cudagraph_num_of_warmups: 1
     # profiler_config:
