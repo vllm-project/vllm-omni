@@ -15,6 +15,7 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.distributed import hsdp as hsdp_module
 from vllm_omni.diffusion.distributed.hsdp import (
     HSDPInferenceConfig,
+    _create_hsdp_mesh,
     _unshardable_parameters,
     shard_model,
 )
@@ -338,3 +339,35 @@ class TestHSDPShardConditions:
                 matched.append(name)
         assert "blocks.0" in matched
         assert "blocks.1" in matched
+
+
+def test_create_hsdp_mesh(cpu_process_group, mocker):
+    """Test _create_hsdp_mesh returns correct DeviceMesh shape and names."""
+    mock_init = mocker.patch("vllm_omni.diffusion.distributed.hsdp.init_device_mesh")
+    mock_mesh = mocker.MagicMock()
+    mock_init.return_value = mock_mesh
+
+    # 1. replicate_size == 1: creates a 1D DeviceMesh ("shard",)
+    mesh_1d = _create_hsdp_mesh("cpu", replicate_size=1, shard_pg=dist.group.WORLD)
+    assert mesh_1d is mock_mesh
+    mock_init.assert_called_once_with(
+        "cpu",
+        mesh_shape=(1,),
+        mesh_dim_names=("shard",),
+    )
+
+    # 2. replicate_size > 1: creates a 2D DeviceMesh ("replicate", "shard")
+    mock_init.reset_mock()
+    mesh_2d = _create_hsdp_mesh("cpu", replicate_size=2, shard_pg=dist.group.WORLD)
+    assert mesh_2d is mock_mesh
+    mock_init.assert_called_once_with(
+        "cpu",
+        mesh_shape=(2, 1),
+        mesh_dim_names=("replicate", "shard"),
+    )
+
+    # 3. replicate_size <= 0: rejected with ValueError
+    with pytest.raises(ValueError, match="HSDP replica size must be a positive integer"):
+        _create_hsdp_mesh("cpu", replicate_size=0, shard_pg=dist.group.WORLD)
+    with pytest.raises(ValueError, match="HSDP replica size must be a positive integer"):
+        _create_hsdp_mesh("cpu", replicate_size=-1, shard_pg=dist.group.WORLD)
