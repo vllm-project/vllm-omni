@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from transformers.cache_utils import DynamicCache
 
@@ -55,6 +57,44 @@ def request_condition_key(prompt, sampling) -> tuple:
     return (request_mode(prompt), image_count(sampling), *denoise_options(sampling).values())
 
 
+@dataclass(frozen=True)
+class _PackedVarlenPlan:
+    offsets: list[int]
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    image_positions: torch.Tensor
+    max_seqlen_k: int
+
+    def stamp(self, layer) -> None:
+        layer.sensenova_packed_varlen = True
+        layer.sensenova_cu_seqlens_q = self.cu_seqlens_q
+        layer.sensenova_cu_seqlens_k = self.cu_seqlens_k
+        layer.sensenova_image_positions = self.image_positions
+        layer.sensenova_max_seqlen_k = self.max_seqlen_k
+
+
+def _packed_varlen_plan(prefix_lengths: list[int], image_tokens: int, device: torch.device) -> _PackedVarlenPlan:
+    """Build the shared [prefix, image] layout for requests and CFG branches."""
+    sample_lengths = [length + image_tokens for length in prefix_lengths]
+    offsets = [0]
+    for length in sample_lengths:
+        offsets.append(offsets[-1] + length)
+    return _PackedVarlenPlan(
+        offsets=offsets,
+        cu_seqlens_q=torch.arange(
+            0, (len(prefix_lengths) + 1) * image_tokens, image_tokens, dtype=torch.int32, device=device
+        ),
+        cu_seqlens_k=torch.tensor(offsets, dtype=torch.int32, device=device),
+        image_positions=torch.cat(
+            [
+                torch.arange(start + length, end, device=device)
+                for start, end, length in zip(offsets[:-1], offsets[1:], prefix_lengths, strict=True)
+            ]
+        ),
+        max_seqlen_k=max(sample_lengths),
+    )
+
+
 def merge_conditioning(
     caches: list[dict],
     counts: list[int],
@@ -79,44 +119,24 @@ def merge_conditioning(
         total = sum(counts)
         kv = DynamicCache()
         use_packed = packed_varlen and len(set(lengths)) > 1
+        plan = None
         if use_packed:
-            sample_lengths = [
-                length + image_tokens for count, length in zip(counts, lengths, strict=True) for _ in range(count)
-            ]
-            offsets = [0]
-            for length in sample_lengths:
-                offsets.append(offsets[-1] + length)
-            device = prefixes[0].layers[0].keys.device
-            cu_seqlens_k = torch.tensor(offsets, dtype=torch.int32, device=device)
-            cu_seqlens_q = torch.arange(
-                0,
-                (total + 1) * image_tokens,
+            plan = _packed_varlen_plan(
+                [length for count, length in zip(counts, lengths, strict=True) for _ in range(count)],
                 image_tokens,
-                dtype=torch.int32,
-                device=cu_seqlens_k.device,
-            )
-            image_positions = torch.cat(
-                [
-                    torch.arange(start + length, end, device=device)
-                    for start, end, length in zip(
-                        offsets[:-1],
-                        offsets[1:],
-                        [length for count, length in zip(counts, lengths, strict=True) for _ in range(count)],
-                        strict=True,
-                    )
-                ]
+                prefixes[0].layers[0].keys.device,
             )
         for layer_idx in range(len(prefixes[0].layers)):
             example = prefixes[0].layers[layer_idx].keys
-            if use_packed:
-                keys = example.new_zeros(1, example.shape[1], offsets[-1], example.shape[3])
+            if plan is not None:
+                keys = example.new_zeros(1, example.shape[1], plan.offsets[-1], example.shape[3])
             else:
                 keys = example.new_zeros(total, example.shape[1], max_len, example.shape[3])
             values = torch.zeros_like(keys)
             batch_start = packed_start = 0
             for prefix, count, length in zip(prefixes, counts, lengths, strict=True):
                 layer = prefix.layers[layer_idx]
-                if use_packed:
+                if plan is not None:
                     for row in range(count):
                         keys[0, :, packed_start : packed_start + length].copy_(layer.keys[row])
                         values[0, :, packed_start : packed_start + length].copy_(layer.values[row])
@@ -126,13 +146,8 @@ def merge_conditioning(
                     values[batch_start : batch_start + count, :, :length].copy_(layer.values)
                 batch_start += count
             kv.update(keys, values, layer_idx)
-            if use_packed:
-                merged_layer = kv.layers[layer_idx]
-                merged_layer.sensenova_packed_varlen = True
-                merged_layer.sensenova_cu_seqlens_q = cu_seqlens_q
-                merged_layer.sensenova_cu_seqlens_k = cu_seqlens_k
-                merged_layer.sensenova_image_positions = image_positions
-                merged_layer.sensenova_max_seqlen_k = max(sample_lengths)
+            if plan is not None:
+                plan.stamp(kv.layers[layer_idx])
         mask = None
         if len(set(lengths)) > 1 and not use_packed:
             mask = torch.ones(total, max_len + image_tokens, dtype=torch.bool, device=keys.device)
@@ -196,43 +211,21 @@ def merge_cfg_branches(
     prefix_lengths = [length for _, lengths, _ in layouts for length in lengths]
     max_len = max(prefix_lengths)
     use_packed = packed_varlen and (any(is_packed for is_packed, _, _ in layouts) or len(set(prefix_lengths)) > 1)
+    plan = None
     if use_packed:
-        sample_lengths = [length + image_tokens for length in prefix_lengths]
-        device = branch_caches[0].layers[0].keys.device
-        offsets = [0]
-        for length in sample_lengths:
-            offsets.append(offsets[-1] + length)
-        cu_seqlens_k = torch.tensor(offsets, dtype=torch.int32, device=device)
-        cu_seqlens_q = torch.arange(
-            0,
-            (len(sample_lengths) + 1) * image_tokens,
-            image_tokens,
-            dtype=torch.int32,
-            device=device,
-        )
-        image_positions = torch.cat(
-            [
-                torch.arange(start + length, end, device=device)
-                for start, end, length in zip(
-                    offsets[:-1],
-                    offsets[1:],
-                    prefix_lengths,
-                    strict=True,
-                )
-            ]
-        )
+        plan = _packed_varlen_plan(prefix_lengths, image_tokens, branch_caches[0].layers[0].keys.device)
     merged = DynamicCache()
     for layer_idx in range(len(branch_caches[0].layers)):
         example = branch_caches[0].layers[layer_idx].keys
-        if use_packed:
-            keys = example.new_zeros(1, example.shape[1], offsets[-1], example.shape[3])
+        if plan is not None:
+            keys = example.new_zeros(1, example.shape[1], plan.offsets[-1], example.shape[3])
         else:
             keys = example.new_zeros(len(branch_caches) * batch_size, example.shape[1], max_len, example.shape[3])
         values = torch.zeros_like(keys)
         packed_start = 0
         for branch_idx, (cache, layout) in enumerate(zip(branch_caches, layouts, strict=True)):
             source_packed, row_lengths, source_offsets = layout
-            if use_packed:
+            if plan is not None:
                 for row, length in enumerate(row_lengths):
                     if source_packed:
                         assert source_offsets is not None
@@ -250,13 +243,8 @@ def merge_cfg_branches(
                 keys[rows, :, : row_lengths[0]].copy_(cache.layers[layer_idx].keys)
                 values[rows, :, : row_lengths[0]].copy_(cache.layers[layer_idx].values)
         merged.update(keys, values, layer_idx)
-        if use_packed:
-            merged_layer = merged.layers[layer_idx]
-            merged_layer.sensenova_packed_varlen = True
-            merged_layer.sensenova_cu_seqlens_q = cu_seqlens_q
-            merged_layer.sensenova_cu_seqlens_k = cu_seqlens_k
-            merged_layer.sensenova_image_positions = image_positions
-            merged_layer.sensenova_max_seqlen_k = max(sample_lengths)
+        if plan is not None:
+            plan.stamp(merged.layers[layer_idx])
 
     mask = None
     if len(set(prefix_lengths)) > 1 and not use_packed:
