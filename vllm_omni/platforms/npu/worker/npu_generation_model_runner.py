@@ -480,9 +480,13 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                 "model should return a single list, to return multiple lists, use a dict"
             )
             for out in multimodal_outputs_raw:
-                per_req_payloads.append(
-                    {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
-                )
+                if out is None:
+                    mm_out = None
+                elif hasattr(out, "resolve") and callable(out.resolve):
+                    mm_out = out.resolve()
+                else:
+                    mm_out = out.detach().to("cpu").contiguous()
+                per_req_payloads.append({"model_outputs": mm_out})
         elif isinstance(multimodal_outputs_raw, Mapping):
             num_reqs = self.input_batch.num_reqs
             for i in range(num_reqs):
@@ -494,7 +498,15 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                                 f"Multimodal output list for key '{key}' has length {len(out)} "
                                 f"but expected {num_reqs} (one entry per request)."
                             )
-                        mm_payload[key] = out[i].detach().to("cpu").contiguous()
+                        val = out[i]
+                        if hasattr(val, "resolve") and callable(val.resolve):
+                            mm_payload[key] = val.resolve()
+                        elif isinstance(val, torch.Tensor):
+                            mm_payload[key] = val.detach().to("cpu").contiguous()
+                        elif val is None:
+                            mm_payload[key] = None
+                        else:
+                            mm_payload[key] = val
                     elif isinstance(out, torch.Tensor):
                         mm_payload[key] = out.detach().to("cpu").contiguous()
                     else:

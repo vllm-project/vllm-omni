@@ -40,6 +40,41 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 logger = init_logger(__name__)
 
 
+class _PendingAudio:
+    """Lazy D2H audio slice: syncs the copy-stream event on first resolve().
+
+    Created by ``_MossCodecStreamSession.step`` after launching an async
+    pinned-host D2H copy on a dedicated stream.  Callers that can tolerate
+    deferred materialisation (e.g. the Stage-1 forward -> sample_tokens path)
+    pass the object through untouched so the NPU is free to start the next
+    decode while the copy completes in the background.
+    """
+
+    __slots__ = ("_pinned", "_event", "_row", "_audio_length", "_resolved")
+
+    def __init__(
+        self,
+        pinned: torch.Tensor,
+        event: torch.npu.Event | torch.cuda.Event,
+        row: int,
+        audio_length: int,
+    ) -> None:
+        self._pinned = pinned
+        self._event = event
+        self._row = row
+        self._audio_length = audio_length
+        self._resolved: torch.Tensor | None = None
+
+    def resolve(self) -> torch.Tensor:
+        if self._resolved is None:
+            self._event.wait()
+            wav = self._pinned[self._row, ..., : self._audio_length].contiguous().clone()
+            if wav.ndim == 1 or (wav.ndim > 1 and int(wav.shape[0]) == 1):
+                wav = wav.reshape(-1)
+            self._resolved = wav
+        return self._resolved
+
+
 class _MossCodecStreamSession:
     """Persistent state pool with compact per-step execution batches."""
 
@@ -61,6 +96,7 @@ class _MossCodecStreamSession:
         self._leased_slots: set[int] = set()
         self._closed = False
         self._cudagraph_wrapper: CUDAGraphStreamingDecoderWrapper | None = None
+        self._d2h_stream = None
         batch_sizes = sorted({int(size) for size in (graph_batch_sizes or []) if 0 < int(size) <= self._state_capacity})
         frame_sizes = sorted({int(size) for size in (graph_frame_sizes or []) if int(size) > 0})
         scratch_capacity = max(batch_sizes, default=0) if self._device.type in ("cuda", "npu") else 0
@@ -147,6 +183,12 @@ class _MossCodecStreamSession:
                 close_state_pool()
         self._closed = True
 
+    def _ensure_d2h_stream(self):
+        if self._d2h_stream is None:
+            stream_cls = torch.npu.Stream if self._device.type == "npu" else torch.cuda.Stream
+            self._d2h_stream = stream_cls()
+        return self._d2h_stream
+
     @torch.no_grad()
     def step(
         self,
@@ -217,11 +259,35 @@ class _MossCodecStreamSession:
             terminal_slot_ids = state_slot_ids if len(terminal_rows) == len(slots) else state_slot_ids[terminal_rows]
             self._reset_slot_ids(terminal_slot_ids)
 
-        audio = audio_tensor.detach().to("cpu", torch.float32)
-        out: dict[int, torch.Tensor] = {}
-        for row, slot in enumerate(slots):
-            audio_length = int(slot_codes[slot].shape[1]) * self._samples_per_frame
-            out[slot] = audio[row, ..., :audio_length].contiguous()
+        audio_npu = audio_tensor.to(dtype=torch.float32)
+        out: dict[int, _PendingAudio | torch.Tensor] = {}
+
+        if self._device.type in ("npu", "cuda"):
+            d2h_stream = self._ensure_d2h_stream()
+            event_cls = torch.npu.Event if self._device.type == "npu" else torch.cuda.Event
+            stream_ctx = torch.npu.stream if self._device.type == "npu" else torch.cuda.stream
+            d2h_event = event_cls()
+            try:
+                pinned = torch.empty(
+                    audio_npu.shape, dtype=audio_npu.dtype, device="cpu", pin_memory=True
+                )
+            except Exception:
+                pinned = torch.empty(audio_npu.shape, dtype=audio_npu.dtype, device="cpu")
+            main_stream = (
+                torch.npu.current_stream() if self._device.type == "npu" else torch.cuda.current_stream()
+            )
+            with stream_ctx(d2h_stream):
+                d2h_stream.wait_stream(main_stream)
+                pinned.copy_(audio_npu, non_blocking=True)
+                d2h_event.record()
+            for row, slot in enumerate(slots):
+                audio_length = int(slot_codes[slot].shape[1]) * self._samples_per_frame
+                out[slot] = _PendingAudio(pinned, d2h_event, row, audio_length)
+        else:
+            audio = audio_npu.detach().to("cpu", torch.float32)
+            for row, slot in enumerate(slots):
+                audio_length = int(slot_codes[slot].shape[1]) * self._samples_per_frame
+                out[slot] = audio[row, ..., :audio_length].contiguous()
         return out
 
 
@@ -473,7 +539,10 @@ class MossTTSCodecDecoder(nn.Module):
 
         if streaming_work:
             for i, wav in self._decode_streaming_batch(streaming_work).items():
-                audios[i] = wav.reshape(-1) if wav.ndim == 1 or int(wav.shape[0]) == 1 else wav
+                if isinstance(wav, _PendingAudio):
+                    audios[i] = wav
+                else:
+                    audios[i] = wav.reshape(-1) if wav.ndim == 1 or int(wav.shape[0]) == 1 else wav
 
         return OmniOutput(
             text_hidden_states=None,
@@ -618,6 +687,8 @@ class MossTTSCodecDecoder(nn.Module):
             )
             wav = decoded.get(slot)
             if wav is not None:
+                if isinstance(wav, _PendingAudio):
+                    wav = wav.resolve()
                 parts.append(wav)
         if not parts:
             return None
