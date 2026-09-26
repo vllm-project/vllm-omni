@@ -128,7 +128,9 @@ export COSYVOICE3_BATCH_FLOW=1
 vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remote-code
 ```
 
-Batching preserves output lengths and streaming cache alignment, but the different GEMM shapes can produce small waveform differences compared with processing each request separately. Leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
+With TensorRT enabled, the first batched-flow startup builds and caches one dual-profile estimator engine. Profile 0 preserves the legacy single-request CFG batch 2 path up to the full 3000-frame estimator limit. Profile 1 covers cross-request CFG batches 4-16 up to 1024 estimator frames, which includes the packaged Stage-1 default of `max_num_seqs: 8` while keeping TensorRT activation memory bounded. If a scheduled group is larger than eight requests or a cumulative flow window grows beyond 1024 frames, vLLM-Omni transparently serializes request pairs through profile 0 instead of falling back to Torch. The engine cache key includes the TensorRT/GPU, batch-profile version, and batched-frame limit, so the build cost is not paid on every launch. If the dual-profile engine cannot be built at all, vLLM-Omni keeps the Torch estimator rather than installing a partial TensorRT path.
+
+Batching preserves output lengths and streaming cache alignment, but the different GEMM/TensorRT tactic shapes can produce small numerical differences compared with processing each request separately. Leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
 
 ### CLI client
 
