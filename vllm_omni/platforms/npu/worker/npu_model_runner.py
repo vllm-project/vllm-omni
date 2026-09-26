@@ -45,7 +45,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         )
         if getattr(self, "_omni_prefix_cache_cfg", None) is None:
             # Same gate as the GPU runner (pooling stage, kv_consumer /
-            # kv_both, hybrid kv groups). Read the config back off
+            # kv_both, KV groups without stable full attention). Read the config back off
             # self.kv_cache_config: vllm-ascend deepcopies the one it was
             # handed, so the stored value is the authoritative one.
             # Controller runs in eager mode on NPU (no CUDA streams:
@@ -54,11 +54,13 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             cfg = stage_prefix_cache_config(
                 kv_cache_config=self.kv_cache_config,
                 cache_config=self.cache_config,
-                kv_transfer_config=getattr(self.vllm_config, "kv_transfer_config", None),
+                kv_transfer_config=self.vllm_config.kv_transfer_config,
                 scheduler_config=self.scheduler_config,
                 model_config=self.model_config,
                 is_pooling_model=self.is_pooling_model,
                 speculative_config=self.speculative_config,
+                dcp_world_size=self.parallel_config.decode_context_parallel_size,
+                allow_dcp=False,
             )
             if cfg is not None:
                 self._omni_prefix_cache_cfg = cfg

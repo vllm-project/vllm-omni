@@ -179,16 +179,17 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                             )
 
         # Stage the config; the manager is built on the first step once
-        # input_batch exists. The gate (pooling stage, kv_consumer, hybrid
-        # kv groups) is shared with the NPU runner.
+        # input_batch exists. The gate (pooling stage, kv_consumer, KV groups
+        # without a stable full-attention group) is shared with the NPU runner.
         cfg = stage_prefix_cache_config(
             kv_cache_config=kv_cache_config,
             cache_config=self.cache_config,
-            kv_transfer_config=getattr(self.vllm_config, "kv_transfer_config", None),
+            kv_transfer_config=self.vllm_config.kv_transfer_config,
             scheduler_config=self.scheduler_config,
             model_config=self.model_config,
             is_pooling_model=self.is_pooling_model,
             speculative_config=self.speculative_config,
+            dcp_world_size=self.parallel_config.decode_context_parallel_size,
         )
         if cfg is not None:
             self._omni_prefix_cache_cfg = cfg

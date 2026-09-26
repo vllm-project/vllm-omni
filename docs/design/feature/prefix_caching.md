@@ -253,16 +253,25 @@ Which stages may set `enable_prefix_caching: true`:
 
 | Stage | `enable_prefix_caching` | Why |
 | --- | --- | --- |
-| AR stage with one full-attention kv group whose hidden states / per-token mm feed the next stage (Qwen3-Omni thinker and talker) | supported | The case the cache is built for: full-prompt hidden states are merged from the pool on a hit. |
+| AR stage with a full-attention KV group whose hidden states / per-token mm feed the next stage (Qwen3-Omni thinker and talker) | supported | Full-prompt hidden states are merged from the pool on a hit. |
 | AR stage that sets `requires_full_prefix_cached_hidden_states = False`, optionally with `deferred_prefix_cache_mm_keys` (Qwen3-TTS talker, Higgs v3 talker) | supported | Hidden is not cached; deferred codec rows are written once on finish. |
 | Pooling stage | ignored | Never saves; the gate returns no config. |
 | `kv_role: kv_consumer` / `kv_both` | refused at kv-cache init (`OmniPrefixCacheUnmatchError`) | Producer KV shows up as `num_computed_tokens` and is indistinguishable from a local hit. |
 | Speculative decoding on the stage | refused at kv-cache init | Under async scheduling vLLM keeps `num_computed_tokens_cpu` optimistic (all drafts accepted) during the forward and corrects it afterwards; `step_slots_cpu` would mirror rows at the wrong slots. Not verified; refused as a whole. |
-| `prefix_match_unit` smaller than `block_size` | refused at kv-cache init | Sub-block hits make `num_computed_tokens` unaligned; the hit registry only mirrors whole blocks. |
-| Hybrid / sliding-window / multi-group kv cache (e.g. a talker with `attention_type: sliding_recompute`) | refused at kv-cache init | The cache mirrors exactly one full-attention block table. |
-| Attention backend whose kernel block size differs from `--block-size` (FlashInfer / FlashMLA / CutlassMLA with a block size they do not list natively), or decode context parallel | refused at first step (`FullAttentionGroupView`) | `step_slots_cpu` computes `table[req, pos // block_size] * block_size + pos % block_size` over allocator block ids; hybrid kernel blocks and DCP token striping change that row layout. FlashAttention / Triton accept any multiple of 16 and never split blocks. |
+| `prefix_match_unit` smaller than `block_size` | refused at kv-cache init | vLLM 0.29.0's single-group coordinator requires the hash unit to equal its allocator block size. The cache can materialize exact token intervals, but this does not lift the scheduler limitation. |
+| Multiple full-attention groups, or full-attention plus sliding-window groups | supported | Output rows use a full-attention group's stable allocator IDs for both writes and hits. Sliding-window groups may recycle their own block IDs without changing output storage. |
+| Sliding-window-only or `sliding_recompute` groups | refused at kv-cache init | No full-attention group supplies stable block IDs for output storage. |
+| Attention backend whose kernel block size divides `--block-size` (e.g. FlashInfer with allocator blocks of 128 and kernel blocks of 16/32/64) | supported for the selected full-attention group | The adapter's group view indexes the real kernel-block table using its kernel block size. Read snapshots retain allocator IDs; both address the same flat token slots. Only the actual scheduled/hit token interval is copied. |
+| CUDA decode context parallel with a full-attention group | supported | Each rank stores stage outputs using the same allocator ID and virtual block span (`physical block size × DCP world size`). KV slot mappings remain rank-local and can contain padding; they are never used as output-row identities. |
+| NPU decode context parallel | refused at kv-cache init | The sharded output storage path has only been implemented for CUDA. |
+| DCP with sliding-window groups | refused at kv-cache init | vLLM 0.29.0 does not support this KV combination. |
 | Codec decoder / Code2Wav stages (Qwen3-Omni stage 2, Qwen3-TTS stage 1) | keep `false` | Nothing downstream consumes their hidden states; the cache would only add device→host copies. Not validated. |
 | Diffusion stages | n/a | No vLLM KV cache to mirror. |
+
+For GQA/MQA, vLLM 0.29.0 also requires TP to exceed the model's KV-head count,
+DCP to fit within TP / KV heads, and query heads per KV head to be divisible by
+DCP. Qwen2.5-Omni-3B needs TP=4 for DCP=2; Qwen2.5-Omni-7B has 7 query heads
+per KV head, so it cannot use DCP=2.
 
 Hit spans come from `scheduled_new_reqs` only, as in the pre-refactor cache:
 
