@@ -609,6 +609,33 @@ def test_invalid_diffusion_offload_config_fails_before_model_loading(monkeypatch
     load_model.assert_not_called()
 
 
+def test_serve_cli_forwards_nondefault_dlo_chunk_size():
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--enable-distributed-layerwise-offload",
+            "--dlo-chunk-size-mb",
+            "32",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = StageConfigFactory.create_default_diffusion(explicit_kwargs)[0]
+    engine_args = stage_cfg["engine_args"]
+    od_config = _terminal_config(stage_cfg)
+
+    assert args.dlo_chunk_size_mb == 32
+    assert explicit_kwargs["dlo_chunk_size_mb"] == 32
+    assert engine_args["dlo_chunk_size_mb"] == 32
+    assert od_config.dlo_chunk_size_mb == 32
+
+
 def test_serve_cli_forwards_hwr_policy_for_no_allgather_dlo():
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
@@ -824,6 +851,29 @@ def test_default_stage_config_includes_quantization_config():
     stage_cfg = StageConfigFactory.create_default_diffusion({"quantization_config": quantization_config})[0]
 
     assert stage_cfg["engine_args"]["quantization_config"] == quantization_config
+
+
+@pytest.mark.parametrize("buckets", [None, 0, 4])
+def test_serve_cli_forwards_chunk_and_head_settings(buckets):
+    from vllm_omni.diffusion.offloader.base import OffloadConfig
+
+    parser = TrackingArgumentParser()
+    OmniServeCommand().subparser_init(parser.add_subparsers(dest="command"))
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--enable-distributed-layerwise-offload",
+            "--dlo-chunk-size-mb",
+            "32",
+        ]
+        + ([] if buckets is None else ["--dlo-attention-head-buckets", str(buckets)])
+    )
+    stage = StageConfigFactory.create_default_diffusion(args.get_explicit_kwargs_dict())[0]
+    config = OffloadConfig.from_od_config(_terminal_config(stage))
+    assert config.chunk_size_bytes == 32 * 1024 * 1024
+    assert config.attention_head_buckets == (buckets or 0)
 
 
 @pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
